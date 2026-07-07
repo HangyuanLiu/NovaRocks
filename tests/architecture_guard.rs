@@ -4834,3 +4834,199 @@ fn nidl_d3b_proto_schema_comparator_returns_stable_sorted_deduped_violations() {
         "expected sorted output, got: {violations:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// NIDL-E0: non-compat StarRocks-IDL ledger guard
+// ---------------------------------------------------------------------------
+//
+// Goal (see specs/2026-07-07-nidl-e0-noncompat-idl-ledger-guard-design):
+// the non-compat compile graph must eventually contain zero references to
+// StarRocks IDL (`crate::thrift`, `crate::proto::starrocks`,
+// `crate::proto::staros`). This guard is a lexical scan, so it cannot see
+// `#[cfg(feature = "compat")]`. It accounts for the current production-code
+// references via a shrink-only ledger; milestones E1..E9 remove ledger entries
+// as clusters are cleaned, and E10 empties the ledger and adds the build.rs /
+// lib.rs gate assertions.
+
+const NIDL_E0_LEDGER_PATH: &str = "tests/nidl_noncompat_idl_ledger.txt";
+
+/// Files/prefixes already gated to `#[cfg(feature = "compat")]` (or expected to
+/// be, and verified elsewhere). The lexical scan skips these so the ledger only
+/// tracks the non-compat mainline. Milestones E2/E9 append entries here as
+/// modules are gated (e.g. "src/connector/starrocks", "src/lower/compact").
+const NIDL_E0_COMPAT_SCOPE: &[&str] = &[
+    "src/service/backend_service.rs",
+    "src/service/heartbeat_service.rs",
+    "src/service/internal_service.rs",
+    "src/service/internal_rpc_client.rs",
+    "src/service/stream_load.rs",
+    "src/service/stream_load_http.rs",
+    "src/service/engine_ffi.rs",
+    "src/service/compat.rs",
+];
+
+fn nidl_e0_starrocks_idl_terms() -> &'static [&'static str] {
+    &[
+        "crate::thrift",
+        "crate::proto::starrocks",
+        "crate::proto::staros",
+    ]
+}
+
+fn nidl_e0_is_in_compat_scope(rel_path: &str) -> bool {
+    NIDL_E0_COMPAT_SCOPE
+        .iter()
+        .any(|prefix| rel_path == *prefix || rel_path.starts_with(&format!("{prefix}/")))
+}
+
+/// Collect `.rs` files under `dir` whose production code (test modules stripped)
+/// references any StarRocks IDL term. Returned sorted; no compat-scope filtering
+/// (that is applied by `nidl_e0_current_offenders`).
+fn nidl_e0_offenders_in(dir: &Path) -> Vec<PathBuf> {
+    let mut offenders = Vec::new();
+    for path in rs_files(dir) {
+        let hits = non_test_line_hits(&path, |line| {
+            nidl_e0_starrocks_idl_terms()
+                .iter()
+                .any(|term| line.contains(*term))
+        });
+        if !hits.is_empty() {
+            offenders.push(path);
+        }
+    }
+    offenders.sort();
+    offenders
+}
+
+/// Repo-relative paths of non-compat production files still referencing
+/// StarRocks IDL (compat-scope excluded).
+fn nidl_e0_current_offenders() -> Vec<String> {
+    let mut out = Vec::new();
+    for path in nidl_e0_offenders_in(&src_dir()) {
+        let rel_path = rel(&path);
+        if nidl_e0_is_in_compat_scope(&rel_path) {
+            continue;
+        }
+        out.push(rel_path);
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn nidl_e0_read_ledger() -> Vec<String> {
+    let path = Path::new(manifest_dir()).join(NIDL_E0_LEDGER_PATH);
+    let text = fs::read_to_string(&path).unwrap_or_default();
+    let mut entries: Vec<String> = text
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    entries.sort();
+    entries.dedup();
+    entries
+}
+
+fn nidl_e0_write_ledger(offenders: &[String]) {
+    let path = Path::new(manifest_dir()).join(NIDL_E0_LEDGER_PATH);
+    let mut body = String::new();
+    body.push_str("# NIDL-E non-compat StarRocks-IDL ledger (milestone E0).\n");
+    body.push_str("# Production-code files in the non-compat compile graph that still\n");
+    body.push_str("# reference crate::thrift / crate::proto::starrocks / crate::proto::staros.\n");
+    body.push_str("# This is a debt list and must only shrink. After a milestone removes a\n");
+    body.push_str("# cluster's references, regenerate with:\n");
+    body.push_str(
+        "#   NOVA_WRITE_IDL_LEDGER=1 cargo test --test architecture_guard nidl_e0_noncompat\n",
+    );
+    body.push_str("# The end state (E10) is an empty list plus the build.rs/lib.rs gate.\n");
+    for entry in offenders {
+        body.push_str(entry);
+        body.push('\n');
+    }
+    fs::write(&path, body).expect("write NIDL-E0 ledger");
+}
+
+#[test]
+fn nidl_e0_detector_flags_starrocks_idl_and_ignores_native_and_tests() {
+    let dir = std::env::temp_dir().join("nidl_e0_detector");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("offender_thrift.rs"),
+        "use crate::thrift::types::TUniqueId;\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("offender_proto.rs"),
+        "let _ = crate::proto::starrocks::StatusPb::default();\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("native.rs"),
+        "use crate::proto::plan::PlanFragment;\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("test_only.rs"),
+        "#[cfg(test)]\nmod tests {\n    use crate::thrift::types::TUniqueId;\n}\n",
+    )
+    .unwrap();
+
+    let offenders = nidl_e0_offenders_in(&dir);
+    let names: Vec<String> = offenders
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+
+    assert!(
+        names.iter().any(|n| n == "offender_thrift.rs"),
+        "must flag crate::thrift; got {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "offender_proto.rs"),
+        "must flag crate::proto::starrocks; got {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n == "native.rs"),
+        "must ignore native crate::proto::plan; got {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n == "test_only.rs"),
+        "must ignore #[cfg(test)] module references; got {names:?}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn nidl_e0_noncompat_starrocks_idl_stays_within_ledger() {
+    let offenders = nidl_e0_current_offenders();
+
+    if std::env::var_os("NOVA_WRITE_IDL_LEDGER").is_some() {
+        nidl_e0_write_ledger(&offenders);
+        return;
+    }
+
+    let ledger = nidl_e0_read_ledger();
+    let new_offenders: Vec<&String> = offenders.iter().filter(|f| !ledger.contains(f)).collect();
+    let cleared: Vec<&String> = ledger.iter().filter(|f| !offenders.contains(f)).collect();
+
+    let mut msg = String::new();
+    if !new_offenders.is_empty() {
+        msg.push_str("new non-compat StarRocks-IDL references (not in ledger) - clean them or gate to compat:\n");
+        for f in &new_offenders {
+            msg.push_str(&format!("  + {f}\n"));
+        }
+    }
+    if !cleared.is_empty() {
+        msg.push_str(
+            "ledger entries that no longer reference StarRocks IDL - regenerate the ledger \
+             (NOVA_WRITE_IDL_LEDGER=1) so it only shrinks:\n",
+        );
+        for f in &cleared {
+            msg.push_str(&format!("  - {f}\n"));
+        }
+    }
+
+    assert!(msg.is_empty(), "NIDL-E0 ledger drift:\n{msg}");
+}
