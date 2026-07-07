@@ -1698,7 +1698,7 @@ mod tests {
         RuntimeMinMaxFilter,
     };
     use crate::runtime::query_context::QueryId;
-    use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
+    use crate::runtime::runtime_filter_hub::{AcquireProgress, RuntimeFilterHub};
     use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
     use arrow::array::{Array, DictionaryArray, Int8Array, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
@@ -2495,6 +2495,51 @@ mod tests {
         assert_eq!(filter.applied_output_rows(), 3);
         assert_eq!(filter.applied_evals(), 1);
         registry.remove_query(query_key);
+    }
+
+    #[test]
+    fn probe_nonblocking_poll_and_version_track_publishes() {
+        let query_key = QueryKey::from_hi_lo(20_101, 1);
+        let hub = RuntimeFilterHub::new_for_query(
+            DependencyManager::new(),
+            crate::runtime::query_context::QueryId {
+                hi: query_key.hi,
+                lo: query_key.lo,
+            },
+        );
+        hub.set_wait_timeouts(None, Some(Duration::from_secs(60)));
+        hub.register_probe_specs(
+            42,
+            &[crate::exec::node::RuntimeFilterProbeSpec {
+                filter_id: 7,
+                expr_id: {
+                    let mut arena = ExprArena::default();
+                    arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32)
+                },
+                slot_id: SlotId::new(1),
+                data_type: DataType::Int32,
+            }],
+        );
+        let probe = ScanRuntimeFilterProbe::new(hub.register_probe(42));
+        let v0 = probe.handle_version();
+
+        let AcquireProgress::Pending(dep) = probe.poll_acquire_non_blocking() else {
+            panic!("non-blocking poll must use the non-scan wait path");
+        };
+        assert!(
+            !dep.is_ready(),
+            "dependency must remain pending before publish"
+        );
+
+        hub.publish_min_max_filter(
+            7,
+            RuntimeMinMaxFilter::empty_range(RuntimeFilterType::Int32)
+                .expect("empty min/max filter"),
+        );
+        assert!(
+            probe.handle_version() > v0,
+            "version must advance after publish"
+        );
     }
 
     #[test]

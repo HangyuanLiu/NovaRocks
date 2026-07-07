@@ -321,6 +321,16 @@ impl ScanRuntimeFilterProbe {
         self.probe.poll_acquire(true)
     }
 
+    pub(super) fn poll_acquire_non_blocking(
+        &self,
+    ) -> crate::runtime::runtime_filter_hub::AcquireProgress {
+        self.probe.poll_acquire(false)
+    }
+
+    pub(super) fn handle_version(&self) -> u64 {
+        self.probe.handle_version()
+    }
+
     pub(super) fn mark_ready(&self) -> Option<std::time::Duration> {
         self.probe.mark_ready()
     }

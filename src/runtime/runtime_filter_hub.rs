@@ -812,6 +812,10 @@ impl RuntimeFilterHub {
 }
 
 impl RuntimeFilterProbe {
+    pub(crate) fn handle_version(&self) -> u64 {
+        self.inner.entry.handle.version()
+    }
+
     pub(crate) fn poll_acquire(&self, on_scan_node: bool) -> AcquireProgress {
         let dep = self.inner.entry.dep.clone();
         if dep.is_ready() {
