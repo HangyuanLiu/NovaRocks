@@ -724,25 +724,29 @@ fn release_submit_fragment_request_fixture_decodes_through_native_boundaries() {
     let exec_params = exec_params_from_native(params, destinations)
         .expect("SubmitFragmentRequest fixture exec params boundary");
     assert_eq!(
-        exec_params.query_id.hi, 1,
+        exec_params.query_id().hi,
+        1,
         "SubmitFragmentRequest fixture exec_params.query_id.hi"
     );
     assert_eq!(
-        exec_params.query_id.lo, 2,
+        exec_params.query_id().lo,
+        2,
         "SubmitFragmentRequest fixture exec_params.query_id.lo"
     );
     assert_eq!(
-        exec_params.fragment_instance_id.hi, 3,
+        exec_params.fragment_instance_id().hi,
+        3,
         "SubmitFragmentRequest fixture exec_params.fragment_instance_id.hi"
     );
     assert_eq!(
-        exec_params.fragment_instance_id.lo, 4,
+        exec_params.fragment_instance_id().lo,
+        4,
         "SubmitFragmentRequest fixture exec_params.fragment_instance_id.lo"
     );
-    assert_eq!(exec_params.per_exch_num_senders.get(&12), Some(&3));
+    assert_eq!(exec_params.per_exch_num_senders().get(&12), Some(&3));
     assert_eq!(
-        exec_params.destinations.as_ref().map(Vec::len),
-        Some(1),
+        exec_params.destinations().len(),
+        1,
         "SubmitFragmentRequest fixture exec destinations"
     );
 }

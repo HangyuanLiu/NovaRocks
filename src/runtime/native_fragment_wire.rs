@@ -17,11 +17,15 @@
 
 //! Runtime wire adapters for native fragment submission.
 
+use crate::common::types::UniqueId;
 use crate::proto;
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
+use crate::runtime::fragment_exec_params::FragmentExecParams;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::runtime_filter_params::RuntimeFilterParams;
-use crate::thrift::{data_sinks, internal_service, partitions, types};
+#[cfg(test)]
+use crate::thrift::internal_service;
+use crate::thrift::{data_sinks, partitions, types};
 
 pub(crate) type DataStreamSink = data_sinks::TDataStreamSink;
 pub(crate) type IcebergChangeStreamRouterBranch = data_sinks::TIcebergChangeStreamRouterBranch;
@@ -29,16 +33,11 @@ pub(crate) type IcebergChangeStreamRouterBranchKind =
     data_sinks::TIcebergChangeStreamRouterBranchKind;
 pub(crate) type IcebergChangeStreamRouterSink = data_sinks::TIcebergChangeStreamRouterSink;
 pub(crate) type MultiCastDataStreamSink = data_sinks::TMultiCastDataStreamSink;
-pub(crate) type PlanFragmentDestination = data_sinks::TPlanFragmentDestination;
-pub(crate) type PlanFragmentExecParams = internal_service::TPlanFragmentExecParams;
 pub(crate) type DataPartition = partitions::TDataPartition;
 pub(crate) type ResultSinkType = data_sinks::TResultSinkType;
 
 #[cfg(test)]
 pub(crate) type SpillMode = internal_service::TSpillMode;
-#[cfg(test)]
-pub(crate) type UniqueId = types::TUniqueId;
-
 pub(crate) fn query_options_from_native(
     src: &proto::novarocks::QueryOptions,
 ) -> Result<QueryOptions, String> {
@@ -77,7 +76,7 @@ pub(crate) fn destinations_from_native(
 pub(crate) fn exec_params_from_native(
     src: &proto::novarocks::InstanceParams,
     destinations: Vec<FragmentDestination>,
-) -> Result<PlanFragmentExecParams, String> {
+) -> Result<FragmentExecParams, String> {
     let query_id = src
         .query_id
         .as_ref()
@@ -86,37 +85,22 @@ pub(crate) fn exec_params_from_native(
         .fragment_instance_id
         .as_ref()
         .ok_or_else(|| "native InstanceParams missing fragment_instance_id".to_string())?;
-    Ok(internal_service::TPlanFragmentExecParams {
-        query_id: types::TUniqueId::new(query_id.hi, query_id.lo),
-        fragment_instance_id: types::TUniqueId::new(
-            fragment_instance_id.hi,
-            fragment_instance_id.lo,
-        ),
-        per_node_scan_ranges: Default::default(),
-        per_exch_num_senders: src
-            .per_exch_num_senders
+    FragmentExecParams::new(
+        UniqueId {
+            hi: query_id.hi,
+            lo: query_id.lo,
+        },
+        UniqueId {
+            hi: fragment_instance_id.hi,
+            lo: fragment_instance_id.lo,
+        },
+        Default::default(),
+        src.per_exch_num_senders
             .iter()
             .map(|(node_id, count)| (*node_id, *count))
             .collect(),
-        destinations: Some(
-            destinations
-                .into_iter()
-                .map(plan_fragment_destination_from_runtime)
-                .collect(),
-        ),
-        sender_id: None,
-        num_senders: None,
-        send_query_statistics_with_every_batch: None,
-        use_vectorized: None,
-        runtime_filter_params: None,
-        instances_number: None,
-        enable_exchange_pass_through: None,
-        node_to_per_driver_seq_scan_ranges: None,
-        enable_exchange_perf: None,
-        pipeline_sink_dop: None,
-        report_when_finish: None,
-        exec_debug_options: None,
-    })
+        destinations,
+    )
 }
 
 pub(crate) fn data_partition_without_exprs(
@@ -182,17 +166,6 @@ pub(crate) fn stream_destinations_from_native(
         .collect()
 }
 
-pub(crate) fn plan_fragment_destination_from_runtime(
-    destination: FragmentDestination,
-) -> PlanFragmentDestination {
-    data_sinks::TPlanFragmentDestination::new(
-        destination.finst_id().clone(),
-        None::<types::TNetworkAddress>,
-        Some(destination.endpoint().to_network_address()),
-        None::<i32>,
-    )
-}
-
 pub(crate) fn multi_cast_data_stream_sink_from_native(
     src: &proto::plan::MultiCastDataStreamSink,
 ) -> Result<MultiCastDataStreamSink, String> {
@@ -218,7 +191,7 @@ pub(crate) fn multi_cast_data_stream_sink_from_native(
         .map(|group| {
             group
                 .into_iter()
-                .map(plan_fragment_destination_from_runtime)
+                .map(crate::runtime::fragment_exec_params::compact_destination_from_runtime)
                 .collect()
         })
         .collect();
