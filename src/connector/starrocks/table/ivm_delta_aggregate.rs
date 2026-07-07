@@ -1,9 +1,9 @@
-use crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls;
-use crate::connector::starrocks::table::mv_agg_state::{
+use crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls;
+use crate::engine::mv::agg_state::mv_agg_state::{
     AGG_RETRACTION_COUNT_STATE_COLUMN, aggregate_shape_needs_retraction_count_state,
     sanitize_state_column_name,
 };
-use crate::connector::starrocks::table::mv_shape::{
+use crate::engine::mv::agg_state::mv_shape::{
     AggregateCallShape, AggregateFunctionKind, AggregateInput, VisibleAggregateOutput,
 };
 use crate::exec::change_op::CHANGE_OP_COLUMN;
@@ -248,8 +248,8 @@ fn is_plain_identifier(alias: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls;
-    use crate::connector::starrocks::table::mv_shape::IncrementalMvShape;
+    use crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls;
+    use crate::engine::mv::agg_state::mv_shape::IncrementalMvShape;
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
         let normalized =
@@ -268,7 +268,7 @@ mod tests {
         let sqlparser::ast::Statement::Query(query) = stmt else {
             panic!("expected query");
         };
-        match crate::connector::starrocks::table::mv_shape::classify_incremental_mv_query(&query)
+        match crate::engine::mv::agg_state::mv_shape::classify_incremental_mv_query(&query)
             .expect("classify")
         {
             IncrementalMvShape::Aggregate(shape) => AggregateSqlCalls::from(&shape),
@@ -281,17 +281,16 @@ mod tests {
         let sql = "select d.region, count(*) as c, sum(f.amount) as s \
                from ice.ns.fact f join ice.ns.dim d on f.dim_id = d.id \
                group by d.region";
-        let shape =
-            match crate::connector::starrocks::table::mv_shape::classify_incremental_mv_query(
-                &parse_query(sql),
-            )
-            .expect("classify")
-            {
-                crate::connector::starrocks::table::mv_shape::IncrementalMvShape::JoinAggregate(
-                    shape,
-                ) => shape,
-                other => panic!("expected join aggregate, got {other:?}"),
-            };
+        let shape = match crate::engine::mv::agg_state::mv_shape::classify_incremental_mv_query(
+            &parse_query(sql),
+        )
+        .expect("classify")
+        {
+            crate::engine::mv::agg_state::mv_shape::IncrementalMvShape::JoinAggregate(shape) => {
+                shape
+            }
+            other => panic!("expected join aggregate, got {other:?}"),
+        };
 
         let rewritten = rewrite_select_sql_for_signed_delta_state_with_change_op_qualifier(
             sql,

@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::connector::iceberg::changes::{ChangeError, IcebergChangeBatch, plan_changes};
-use crate::connector::starrocks::table::model::IcebergTableRef;
 use crate::connector::starrocks::table::mv_refresh::load_current_iceberg_base_table;
 use crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin;
+use crate::engine::mv::table_ref::IcebergTableRef;
 use crate::engine::{QueryResult, StandaloneState};
 
 // Compatibility wrapper for the older two-branch materialized change stream.

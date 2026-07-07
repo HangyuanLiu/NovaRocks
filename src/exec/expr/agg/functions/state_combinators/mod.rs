@@ -25,7 +25,7 @@ mod tests {
     use arrow::array::{Array, ArrayRef, BinaryArray};
     use arrow::datatypes::DataType;
 
-    use crate::connector::starrocks::table::state_codec::{
+    use crate::engine::mv::agg_state::state_codec::{
         MultisetEntry, encode_bool_state, encode_count_state, encode_multiset, encode_sum_int64,
     };
     use crate::exec::expr::agg::functions::{AggSpec, AggStatePtr};

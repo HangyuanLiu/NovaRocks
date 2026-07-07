@@ -22,6 +22,7 @@ use crate::connector::starrocks::table::schema_adapter::{
     build_create_tablet_request, build_tablet_schema, request_schema_from_runtime,
 };
 use crate::engine::catalog::normalize_identifier;
+use crate::engine::mv::agg_state::physical_column::StarRocksPhysicalColumn;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::starrocks_table::{
     CreateStarRocksColumnRequest, CreateStarRocksTableLayoutRequest, StageStarRocksTruncateRequest,
@@ -34,33 +35,6 @@ const DEFAULT_STARROCKS_BUCKET_COUNT: u32 = 1;
 const SHORT_KEY_MAX_COLUMN_COUNT: usize = 3;
 /// Mirrors StarRocks `SHORTKEY_MAXSIZE_BYTES`: at most 36 bytes in the short-key.
 const SHORT_KEY_MAX_SIZE_BYTES: usize = 36;
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct StarRocksPhysicalColumn {
-    pub(crate) column: TableColumnDef,
-    pub(crate) visible: bool,
-    pub(crate) is_key: bool,
-}
-
-pub(crate) fn starrocks_physical_column(
-    name: String,
-    data_type: SqlType,
-    nullable: bool,
-    visible: bool,
-    is_key: bool,
-) -> StarRocksPhysicalColumn {
-    StarRocksPhysicalColumn {
-        column: TableColumnDef {
-            name,
-            data_type,
-            nullable,
-            aggregation: None,
-            default: None,
-        },
-        visible,
-        is_key,
-    }
-}
 
 pub(crate) fn table_columns_from_physical_columns(
     columns: &[StarRocksPhysicalColumn],
@@ -1087,12 +1061,13 @@ mod tests {
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::sql::parser::ast::{SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
 
+    use crate::engine::mv::agg_state::physical_column::starrocks_physical_column;
+
     use super::{
         choose_default_dup_key_columns, drop_starrocks_table, key_eligible_type, logical_type_name,
         parse_starrocks_logical_type, patch_tablet_schema_column_flags,
-        resolve_starrocks_create_defaults, starrocks_physical_column,
-        stored_columns_from_physical_columns, table_columns_from_physical_columns,
-        truncate_starrocks_table_with_hooks,
+        resolve_starrocks_create_defaults, stored_columns_from_physical_columns,
+        table_columns_from_physical_columns, truncate_starrocks_table_with_hooks,
     };
 
     fn test_starrocks_table_config() -> StarRocksTableConfig {

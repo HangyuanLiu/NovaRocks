@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use crate::connector::starrocks::table::model::IcebergTableRef;
 use crate::connector::starrocks::table::mv_ddl::ResolvedTableRef;
 use crate::engine::StandaloneState;
+use crate::engine::mv::table_ref::IcebergTableRef;
 use crate::meta::repository::mv::{
     CreateMvDependencyRequest, MvDependencyObjectRef, MvDependencyObjectType,
     MvDependencyStorageEngine, StoredMvDefinition,

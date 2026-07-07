@@ -19,8 +19,8 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
-use crate::connector::starrocks::table::model::IcebergTableRef;
 use crate::engine::StandaloneState;
+use crate::engine::mv::table_ref::IcebergTableRef;
 
 /// Per-refresh snapshot pin: each base table is pinned to the
 /// `current_snapshot_id` it had at refresh entry time.

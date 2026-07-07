@@ -29,7 +29,7 @@ use crate::sql::analysis::{ExprKind, OutputColumn, QueryBody, ResolvedQuery};
 use crate::sql::column_id::ColumnId;
 use crate::sql::parser::ast::{
     CreateMaterializedViewStmt, DropMaterializedViewStmt, IcebergPartitionFieldExpr,
-    MaterializedViewDistribution, ObjectName, ShowMaterializedViewsStmt, SqlType, TableColumnDef,
+    MaterializedViewDistribution, ObjectName, ShowMaterializedViewsStmt, TableColumnDef,
     TableKeyDesc, TableKeyKind,
 };
 use arrow::array::{ArrayRef, StringArray};
@@ -41,20 +41,24 @@ use crate::connector::starrocks::table::catalog::{
     StarRocksTableCatalog, register_starrocks_table_in_catalog,
 };
 use crate::connector::starrocks::table::ddl::{
-    StarRocksPhysicalColumn, keys_type_name, patch_tablet_schema_column_flags,
-    starrocks_physical_column, stored_columns_from_physical_columns,
+    keys_type_name, patch_tablet_schema_column_flags, stored_columns_from_physical_columns,
     table_columns_from_physical_columns,
 };
 use crate::connector::starrocks::table::model::{
-    IcebergTableRef, StarRocksMvStorageEngine, StarRocksTableKind, StarRocksTableState,
-};
-use crate::connector::starrocks::table::mv_shape::{
-    AggregateFunctionKind, AggregateMvShape, IncrementalMvShape, VisibleAggregateOutput,
+    StarRocksMvStorageEngine, StarRocksTableKind, StarRocksTableState,
 };
 use crate::connector::starrocks::table::schema_adapter::{
     build_create_tablet_request, build_tablet_schema,
 };
+use crate::engine::mv::agg_state::mv_shape::{
+    AggregateFunctionKind, AggregateMvShape, IncrementalMvShape, VisibleAggregateOutput,
+};
+use crate::engine::mv::agg_state::physical_column::{
+    StarRocksPhysicalColumn, starrocks_physical_column,
+};
+use crate::engine::mv::agg_state::sql_type::arrow_data_type_to_sql_type;
 use crate::engine::mv::lifecycle::{MvListRow, MvStorageEngine};
+use crate::engine::mv::table_ref::IcebergTableRef;
 use crate::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
 
 /// Resolved base-table reference as the MV analyzer stage returns it.
@@ -192,7 +196,8 @@ pub(crate) fn create_mv(
     if analysis.output_columns.is_empty() {
         return Err("materialized view SELECT must produce at least one column".to_string());
     }
-    let mv_shape = super::mv_shape::classify_incremental_mv_query(&stmt.select_query)?;
+    let mv_shape =
+        crate::engine::mv::agg_state::mv_shape::classify_incremental_mv_query(&stmt.select_query)?;
     validate_incremental_mv_analyzed_types(&mv_shape, &analysis.resolved_query)?;
     let storage_layout = build_mv_storage_layout(
         &mv_shape,
@@ -488,15 +493,15 @@ fn build_mv_storage_layout(
         IncrementalMvShape::Aggregate(shape) => {
             validate_aggregate_distribution_columns(distribution, shape)?;
             let aggregate_input_types = if let Some(resolved_query) = resolved_query {
-                super::mv_agg_state::aggregate_input_types_from_resolved_query(
-                    &super::aggregate_sql_calls::AggregateSqlCalls::from(shape),
+                crate::engine::mv::agg_state::mv_agg_state::aggregate_input_types_from_resolved_query(
+                    &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls::from(shape),
                     resolved_query,
                 )?
             } else {
                 vec![None; shape.aggregates.len()]
             };
-            let layout = super::mv_agg_state::build_aggregate_mv_layout_with_input_types(
-                &super::aggregate_sql_calls::AggregateSqlCalls::from(shape),
+            let layout = crate::engine::mv::agg_state::mv_agg_state::build_aggregate_mv_layout_with_input_types(
+                &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls::from(shape),
                 output_columns,
                 &aggregate_input_types,
             )?;
@@ -504,7 +509,9 @@ fn build_mv_storage_layout(
             Ok(MvStorageLayout {
                 key_desc: TableKeyDesc {
                     kind: TableKeyKind::Primary,
-                    columns: vec![super::mv_agg_state::ROW_ID_COLUMN.to_string()],
+                    columns: vec![
+                        crate::engine::mv::agg_state::mv_agg_state::ROW_ID_COLUMN.to_string(),
+                    ],
                 },
                 physical_columns: layout.physical_columns,
             })
@@ -1886,63 +1893,6 @@ pub(crate) fn output_column_to_table_column(
     })
 }
 
-pub(crate) fn arrow_data_type_to_sql_type(data_type: &DataType) -> Result<SqlType, String> {
-    match data_type {
-        DataType::Boolean => Ok(SqlType::Boolean),
-        DataType::Int8 => Ok(SqlType::TinyInt),
-        DataType::Int16 => Ok(SqlType::SmallInt),
-        DataType::Int32 => Ok(SqlType::Int),
-        DataType::Int64 => Ok(SqlType::BigInt),
-        DataType::Float32 => Ok(SqlType::Float),
-        DataType::Float64 => Ok(SqlType::Double),
-        DataType::Utf8 => Ok(SqlType::String),
-        DataType::Binary => Ok(SqlType::Binary),
-        DataType::Date32 => Ok(SqlType::Date),
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _) => Ok(SqlType::DateTimeNs),
-        DataType::Timestamp(_, _) => Ok(SqlType::DateTime),
-        DataType::Time64(_) => Ok(SqlType::Time),
-        DataType::FixedSizeBinary(width)
-            if *width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
-        {
-            Ok(SqlType::LargeInt)
-        }
-        DataType::Decimal128(precision, scale) => Ok(SqlType::Decimal {
-            precision: *precision,
-            scale: *scale,
-        }),
-        DataType::List(field) => Ok(SqlType::Array(Box::new(arrow_data_type_to_sql_type(
-            field.data_type(),
-        )?))),
-        DataType::Struct(fields) => Ok(SqlType::Struct(
-            fields
-                .iter()
-                .map(|field| {
-                    Ok((
-                        field.name().clone(),
-                        arrow_data_type_to_sql_type(field.data_type())?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, String>>()?,
-        )),
-        DataType::Map(entries, _) => {
-            let DataType::Struct(fields) = entries.data_type() else {
-                return Err("MAP output type must use struct entries".to_string());
-            };
-            let (_, key) = fields
-                .find("key")
-                .ok_or_else(|| "MAP output type is missing key field".to_string())?;
-            let (_, value) = fields
-                .find("value")
-                .ok_or_else(|| "MAP output type is missing value field".to_string())?;
-            Ok(SqlType::Map(
-                Box::new(arrow_data_type_to_sql_type(key.data_type())?),
-                Box::new(arrow_data_type_to_sql_type(value.data_type())?),
-            ))
-        }
-        other => Err(format!("unsupported MV output type: {other}")),
-    }
-}
-
 pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, String> {
     let columns = vec![
         QueryResultColumn {
@@ -2172,6 +2122,7 @@ mod tests {
     use crate::engine::catalog::InMemoryCatalog;
     use crate::meta::MetaStoreProvider;
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
+    use crate::sql::parser::ast::SqlType;
     use arrow::array::Array;
     use std::sync::RwLock;
     use tempfile::TempDir;
@@ -2755,7 +2706,7 @@ mod tests {
             "create materialized view mv1 distributed by hash(k1) buckets 2 \
              as select k1, v2 from ice.ns.orders where v2 > 10",
         );
-        super::super::mv_shape::classify_incremental_mv_query(&stmt.select_query)
+        crate::engine::mv::agg_state::mv_shape::classify_incremental_mv_query(&stmt.select_query)
             .expect("shape ok");
     }
 
@@ -2765,8 +2716,10 @@ mod tests {
             "create materialized view mv1 distributed by hash(k1) buckets 2 \
              as select k1, stddev(v2) from ice.ns.orders group by k1",
         );
-        let err = super::super::mv_shape::classify_incremental_mv_query(&stmt.select_query)
-            .expect_err("agg rejected");
+        let err = crate::engine::mv::agg_state::mv_shape::classify_incremental_mv_query(
+            &stmt.select_query,
+        )
+        .expect_err("agg rejected");
         assert!(err.contains("incremental aggregate MV"), "err={err}");
     }
 
@@ -2839,7 +2792,7 @@ mod tests {
             "create materialized view mv1 distributed by hash(k) buckets 2 \
              as select k, avg(v) as a from ice.ns.orders group by k",
         );
-        super::super::mv_shape::classify_incremental_mv_query(&stmt.select_query)
+        crate::engine::mv::agg_state::mv_shape::classify_incremental_mv_query(&stmt.select_query)
             .expect("avg shape")
     }
 
@@ -2917,7 +2870,7 @@ mod tests {
             "create materialized view mv1 distributed by hash(k) buckets 2 \
              as select k, sum(v) as s from ice.ns.orders group by k",
         );
-        super::super::mv_shape::classify_incremental_mv_query(&stmt.select_query)
+        crate::engine::mv::agg_state::mv_shape::classify_incremental_mv_query(&stmt.select_query)
             .expect("sum shape")
     }
 
@@ -2990,7 +2943,7 @@ mod tests {
             "create materialized view mv1 distributed by hash(k) buckets 2 \
              as select k, count_distinct(v) as cd from ice.ns.orders group by k",
         );
-        super::super::mv_shape::classify_incremental_mv_query(&stmt.select_query)
+        crate::engine::mv::agg_state::mv_shape::classify_incremental_mv_query(&stmt.select_query)
             .expect("count_distinct shape")
     }
 
@@ -3068,7 +3021,7 @@ mod tests {
              as select k, {agg_name}(v) as {output_name} from ice.ns.orders group by k"
         );
         let stmt = parse_create_mv(&sql);
-        super::super::mv_shape::classify_incremental_mv_query(&stmt.select_query)
+        crate::engine::mv::agg_state::mv_shape::classify_incremental_mv_query(&stmt.select_query)
             .expect("approx_count_distinct shape")
     }
 
@@ -3229,8 +3182,10 @@ AS SELECT id, customer, amount
 FROM ice.ns.orders
 WHERE amount > 0",
         );
-        let mv_shape = super::super::mv_shape::classify_incremental_mv_query(&stmt.select_query)
-            .expect("projection shape");
+        let mv_shape = crate::engine::mv::agg_state::mv_shape::classify_incremental_mv_query(
+            &stmt.select_query,
+        )
+        .expect("projection shape");
         let output_columns = vec![
             OutputColumn {
                 column_id: ColumnId::UNSET,
@@ -3296,8 +3251,10 @@ AS SELECT customer, amount
 FROM ice.ns.orders
 WHERE amount > 0",
         );
-        let mv_shape = super::super::mv_shape::classify_incremental_mv_query(&stmt.select_query)
-            .expect("projection shape");
+        let mv_shape = crate::engine::mv::agg_state::mv_shape::classify_incremental_mv_query(
+            &stmt.select_query,
+        )
+        .expect("projection shape");
         let output_columns = vec![
             OutputColumn {
                 column_id: ColumnId::UNSET,
@@ -3352,8 +3309,10 @@ AS SELECT k1, count(*) AS c, sum(v2) AS s
 FROM ice.ns.orders
 GROUP BY k1",
         );
-        let mv_shape = super::super::mv_shape::classify_incremental_mv_query(&stmt.select_query)
-            .expect("aggregate shape");
+        let mv_shape = crate::engine::mv::agg_state::mv_shape::classify_incremental_mv_query(
+            &stmt.select_query,
+        )
+        .expect("aggregate shape");
         let output_columns = vec![
             OutputColumn {
                 column_id: ColumnId::UNSET,
@@ -3385,7 +3344,7 @@ GROUP BY k1",
         assert_eq!(storage_layout.key_desc.kind, TableKeyKind::Primary);
         assert_eq!(
             storage_layout.key_desc.columns,
-            vec![super::super::mv_agg_state::ROW_ID_COLUMN.to_string()]
+            vec![crate::engine::mv::agg_state::mv_agg_state::ROW_ID_COLUMN.to_string()]
         );
         let table_columns = table_columns_from_physical_columns(&storage_layout.physical_columns);
         let request_schema = build_tablet_schema(&table_columns, &storage_layout.key_desc, 10)
@@ -3428,7 +3387,7 @@ GROUP BY k1",
         assert_eq!(runtime.table.keys_type, "PRIMARY_KEYS");
         assert_eq!(
             runtime.tablet_schema.column[0].name.as_deref(),
-            Some(super::super::mv_agg_state::ROW_ID_COLUMN)
+            Some(crate::engine::mv::agg_state::mv_agg_state::ROW_ID_COLUMN)
         );
         assert_eq!(runtime.tablet_schema.column[0].is_key, Some(true));
         assert_eq!(runtime.tablet_schema.column[0].visible, Some(false));
@@ -3452,7 +3411,10 @@ GROUP BY k1",
             .map(|column| column.name.as_str())
             .collect::<Vec<_>>();
         assert_eq!(public_column_names, vec!["k1", "c", "s"]);
-        assert!(!public_column_names.contains(&super::super::mv_agg_state::ROW_ID_COLUMN));
+        assert!(
+            !public_column_names
+                .contains(&crate::engine::mv::agg_state::mv_agg_state::ROW_ID_COLUMN)
+        );
         assert!(!public_column_names.contains(&"__agg_state_c"));
     }
 
@@ -3462,8 +3424,10 @@ GROUP BY k1",
             "create materialized view analytics.orders_mv distributed by hash(c) buckets 2 \
              as select k1, count(*) as c from ice.ns.orders group by k1",
         );
-        let mv_shape = super::super::mv_shape::classify_incremental_mv_query(&stmt.select_query)
-            .expect("aggregate shape");
+        let mv_shape = crate::engine::mv::agg_state::mv_shape::classify_incremental_mv_query(
+            &stmt.select_query,
+        )
+        .expect("aggregate shape");
         let IncrementalMvShape::Aggregate(shape) = mv_shape else {
             panic!("expected aggregate shape");
         };
@@ -3482,8 +3446,10 @@ GROUP BY k1",
             "create materialized view analytics.orders_mv distributed by hash(__agg_state_c) buckets 2 \
              as select k1 as __agg_state_c, count(*) as c from ice.ns.orders group by k1",
         );
-        let mv_shape = super::super::mv_shape::classify_incremental_mv_query(&stmt.select_query)
-            .expect("aggregate shape");
+        let mv_shape = crate::engine::mv::agg_state::mv_shape::classify_incremental_mv_query(
+            &stmt.select_query,
+        )
+        .expect("aggregate shape");
         let output_columns = vec![
             OutputColumn {
                 column_id: ColumnId::UNSET,

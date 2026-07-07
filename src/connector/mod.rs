@@ -35,8 +35,6 @@ pub(crate) use iceberg::catalog::{
 pub(crate) use iceberg::changes::plan_changes as plan_iceberg_changes;
 #[cfg(not(test))]
 pub(crate) use iceberg::compact::spawn_optimize_worker as spawn_iceberg_optimize_worker;
-#[cfg(test)]
-pub(crate) use starrocks::table::model::IcebergTableRef;
 pub(crate) use starrocks::table::{
     StarRocksTableCatalog, StarRocksTableConfig, register_starrocks_tables_in_catalog,
     runtime_registered,

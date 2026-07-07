@@ -14,13 +14,15 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
-use crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls;
-use crate::connector::starrocks::table::ddl::{StarRocksPhysicalColumn, starrocks_physical_column};
-use crate::connector::starrocks::table::mv_ddl;
-use crate::connector::starrocks::table::mv_shape::{
+use crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls;
+use crate::engine::mv::agg_state::mv_shape::{
     AggregateFunctionKind, AggregateInput, AggregateMvShape, VisibleAggregateOutput,
 };
-use crate::connector::starrocks::table::state_codec::{
+use crate::engine::mv::agg_state::physical_column::{
+    StarRocksPhysicalColumn, starrocks_physical_column,
+};
+use crate::engine::mv::agg_state::sql_type::arrow_data_type_to_sql_type;
+use crate::engine::mv::agg_state::state_codec::{
     KeyValue, decode_avg_decimal128, decode_avg_int64, decode_count_state, decode_sum_decimal128,
     decode_sum_int64,
 };
@@ -193,7 +195,7 @@ pub(crate) fn build_aggregate_mv_layout_with_input_types(
         .iter()
         .enumerate()
         .map(|(source_index, column)| {
-            let sql_type = mv_ddl::arrow_data_type_to_sql_type(&column.data_type)?;
+            let sql_type = arrow_data_type_to_sql_type(&column.data_type)?;
             physical_columns.push(starrocks_physical_column(
                 column.name.clone(),
                 sql_type.clone(),
@@ -1681,10 +1683,10 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::starrocks::table::mv_shape::{
+    use crate::engine::mv::agg_state::mv_shape::{
         IncrementalMvShape, classify_incremental_mv_query,
     };
-    use crate::connector::starrocks::table::state_codec::{
+    use crate::engine::mv::agg_state::state_codec::{
         encode_count_state, encode_sum_decimal128, encode_sum_int64,
     };
     use crate::sql::column_id::ColumnId;
@@ -2872,7 +2874,7 @@ mod tests {
 
     #[test]
     fn build_layout_avg_produces_state_columns_with_hidden_retraction_count() {
-        use crate::connector::starrocks::table::mv_shape::{
+        use crate::engine::mv::agg_state::mv_shape::{
             AggregateCallShape, AggregateInput, AggregateMvShape, GroupKeyShape,
             VisibleAggregateOutput,
         };
@@ -3051,7 +3053,7 @@ mod tests {
     // ---- AVG materialize test (state-shaped input) ----
 
     fn avg_state_shape() -> AggregateMvShape {
-        let shape = crate::connector::starrocks::table::mv_shape::classify_incremental_mv_query(
+        let shape = crate::engine::mv::agg_state::mv_shape::classify_incremental_mv_query(
             &parse_query("select k1, avg(v2) as a from ice.ns.orders group by k1"),
         )
         .expect("classify");
@@ -3249,7 +3251,7 @@ mod tests {
 
     #[test]
     fn avg_decimal128_layout_rejects_missing_input_scale_metadata() {
-        let shape = crate::connector::starrocks::table::mv_shape::classify_incremental_mv_query(
+        let shape = crate::engine::mv::agg_state::mv_shape::classify_incremental_mv_query(
             &parse_query("select k1, avg(d) as a from ice.ns.orders group by k1"),
         )
         .expect("classify");

@@ -5109,3 +5109,101 @@ fn nidl_e0_noncompat_starrocks_idl_stays_within_ledger() {
 
     assert!(msg.is_empty(), "NIDL-E0 ledger drift:\n{msg}");
 }
+
+fn nidl_e1_native_mv_starrocks_table_import_hits() -> Vec<String> {
+    nidl_e1_native_mv_starrocks_table_import_hits_in(&[
+        Path::new(manifest_dir()).join("src/exec"),
+        Path::new(manifest_dir()).join("src/engine"),
+        Path::new(manifest_dir()).join("src/sql"),
+    ])
+}
+
+fn nidl_e1_native_mv_starrocks_table_import_hits_in(roots: &[PathBuf]) -> Vec<String> {
+    let forbidden = [
+        "crate::connector::starrocks::table::state_codec",
+        "crate::connector::starrocks::table::aggregate_sql_calls",
+        "crate::connector::starrocks::table::mv_agg_state",
+        "crate::connector::starrocks::table::mv_shape",
+        "crate::connector::starrocks::table::model::IcebergTableRef",
+    ];
+    let grouped_root = "crate::connector::starrocks::table::{";
+    let grouped_terms = [
+        "state_codec",
+        "aggregate_sql_calls",
+        "mv_agg_state",
+        "mv_shape",
+        "model::IcebergTableRef",
+    ];
+
+    let mut hits = Vec::new();
+    for root in roots {
+        for path in rs_files(root) {
+            for (line, text) in non_test_line_hits(&path, |source| {
+                forbidden.iter().any(|needle| source.contains(needle))
+            }) {
+                hits.push(format!("{}:{line}: {text}", rel(&path)));
+            }
+            let text = fs::read_to_string(&path).unwrap_or_default();
+            let production = rust_production_text_without_cfg_test(&text);
+            let compact: String = non_comment_trimmed_lines(&production).join("");
+            let mut search_start = 0usize;
+            while let Some(offset) = compact[search_start..].find(grouped_root) {
+                let start = search_start + offset;
+                let span = &compact[start..];
+                let end = span.find(';').unwrap_or(span.len());
+                let import_span = &span[..end];
+                if let Some(term) = grouped_terms
+                    .iter()
+                    .find(|term| import_span.contains(**term))
+                {
+                    hits.push(format!(
+                        "{}:1: grouped import references connector::starrocks::table::{term}",
+                        rel(&path)
+                    ));
+                }
+                search_start = start + grouped_root.len();
+            }
+        }
+    }
+    hits.sort();
+    hits
+}
+
+#[test]
+fn nidl_e1_detector_flags_grouped_imports_and_ignores_tests() {
+    let dir = std::env::temp_dir().join("nidl_e1_detector");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("grouped.rs"),
+        "use crate::connector::starrocks::table::{\n    mv_shape::AggregateMvShape,\n    state_codec::decode_count_state,\n};\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("test_only.rs"),
+        "#[cfg(test)]\nmod tests {\n    use crate::connector::starrocks::table::state_codec;\n}\n",
+    )
+    .unwrap();
+
+    let hits = nidl_e1_native_mv_starrocks_table_import_hits_in(&[dir.clone()]);
+    assert!(
+        hits.iter().any(|hit| hit.contains("grouped.rs")),
+        "must flag grouped StarRocks table helper imports; got {hits:?}"
+    );
+    assert!(
+        !hits.iter().any(|hit| hit.contains("test_only.rs")),
+        "must ignore #[cfg(test)] imports; got {hits:?}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn nidl_e1_native_mv_codecs_do_not_import_starrocks_table_modules() {
+    let hits = nidl_e1_native_mv_starrocks_table_import_hits();
+    assert!(
+        hits.is_empty(),
+        "native MV/aggregate code must import native agg_state/table_ref modules, not connector::starrocks::table helpers:\n{}",
+        hits.join("\n")
+    );
+}

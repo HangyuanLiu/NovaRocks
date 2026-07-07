@@ -10,8 +10,8 @@ use crate::connector::iceberg::changes::{
     previous_snapshot_data_file_lineage_index, scan_deleted_data_file_rows,
     scan_equality_delete_rows_for_table_at,
 };
-use crate::connector::starrocks::table::model::IcebergTableRef;
 use crate::engine::catalog::InMemoryCatalog;
+use crate::engine::mv::table_ref::IcebergTableRef;
 use crate::engine::query_prep::{IcebergFileForQuery, build_iceberg_delta_table_def_with_files};
 use crate::engine::{QueryResult, StandaloneState, execute_query};
 use crate::exec::change_op::{CHANGE_OP_COLUMN, CHANGE_OP_DELETE, CHANGE_OP_INSERT};
@@ -258,7 +258,7 @@ pub(crate) fn projection_select_with_change_op(select_sql: &str) -> Result<Strin
     let Statement::Query(query) = &mut statement else {
         return Err("projection_select_with_change_op: expected SELECT query".to_string());
     };
-    if super::mv_shape::query_has_aggregate_surface(query.as_ref()) {
+    if crate::engine::mv::agg_state::mv_shape::query_has_aggregate_surface(query.as_ref()) {
         return Err(
             "projection_select_with_change_op: projection/filter SELECT must not be aggregate"
                 .to_string(),

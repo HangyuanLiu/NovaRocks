@@ -8,7 +8,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout;
+use crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout;
 use crate::engine::mv::partition::{MvPartitionKey, MvPartitionKeyField};
 use crate::exec::chunk::Chunk;
 use crate::meta::repository::mv_contract::{ExpressionKind, MvSchemaContract};
@@ -844,11 +844,11 @@ mod tests {
 
     // --- Test fixtures for bind/evaluate tests (copied verbatim from aggregate_delta.rs) ---
 
-    use crate::connector::starrocks::table::ddl::starrocks_physical_column;
-    use crate::connector::starrocks::table::mv_agg_state::{
+    use crate::engine::mv::agg_state::mv_agg_state::{
         AggregateMvLayout, AggregateStateColumn, AggregateStateRole, AggregateVisibleColumn,
     };
-    use crate::connector::starrocks::table::mv_shape::AggregateFunctionKind;
+    use crate::engine::mv::agg_state::mv_shape::AggregateFunctionKind;
+    use crate::engine::mv::agg_state::physical_column::starrocks_physical_column;
     use crate::exec::chunk::Chunk;
     use crate::sql::parser::ast::SqlType;
     use arrow::datatypes::{DataType, Field, Schema};

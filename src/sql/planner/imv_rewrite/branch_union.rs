@@ -236,10 +236,10 @@ fn branch_union_aggregate_change_stream_output_columns(
     }
     for column in &layout.state_columns {
         let data_type = match column.state_role {
-            crate::connector::starrocks::table::mv_agg_state::AggregateStateRole::Single => {
+            crate::engine::mv::agg_state::mv_agg_state::AggregateStateRole::Single => {
                 DataType::Binary
             }
-            crate::connector::starrocks::table::mv_agg_state::AggregateStateRole::RetractionCount => {
+            crate::engine::mv::agg_state::mv_agg_state::AggregateStateRole::RetractionCount => {
                 column.data_type.clone()
             }
         };

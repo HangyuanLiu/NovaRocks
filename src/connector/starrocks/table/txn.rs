@@ -19,7 +19,7 @@ use crate::connector::starrocks::lake::txn_log::append_lake_txn_log_empty_rowset
 use crate::connector::starrocks::sink::routing::{
     build_unpartitioned_hash_routing, route_chunk_rows,
 };
-use crate::connector::starrocks::table::mv_agg_state::{self, AggregateMvLayout};
+use crate::engine::mv::agg_state::mv_agg_state::{self, AggregateMvLayout};
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::formats::starrocks::data::build_native_record_batch;
 use crate::formats::starrocks::metadata::{load_bundle_segment_footers, load_tablet_snapshot};
@@ -1696,11 +1696,11 @@ mod mv_target_tests {
         StoredStarRocksPartition, StoredStarRocksSchema, StoredStarRocksTable,
         StoredStarRocksTablet,
     };
-    use crate::connector::starrocks::table::state_codec::{encode_count_state, encode_sum_int64};
     use crate::connector::starrocks::table::{
         StarRocksTableCatalog, StarRocksTableConfig, register_starrocks_tables_in_catalog,
     };
     use crate::engine::catalog::InMemoryCatalog;
+    use crate::engine::mv::agg_state::state_codec::{encode_count_state, encode_sum_int64};
     use crate::formats::starrocks::writer::bundle_meta::{
         empty_tablet_metadata, write_bundle_meta_file,
     };
@@ -2770,7 +2770,7 @@ mod mv_target_tests {
         c: &[i64],
         s: &[i64],
     ) -> (
-        crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+        crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
         Vec<Chunk>,
     ) {
         let shape = aggregate_mv_shape_for_txn_test();
@@ -2797,7 +2797,7 @@ mod mv_target_tests {
                 is_internal: false,
             },
         ];
-        let layout = crate::connector::starrocks::table::mv_agg_state::build_aggregate_mv_layout(
+        let layout = crate::engine::mv::agg_state::mv_agg_state::build_aggregate_mv_layout(
             &shape,
             &output_columns,
         )
@@ -2827,15 +2827,15 @@ mod mv_target_tests {
             chunks: vec![record_batch_to_chunk(batch).expect("state-shaped chunk")],
         };
         let chunks =
-            crate::connector::starrocks::table::mv_agg_state::materialize_aggregate_result_chunks(
+            crate::engine::mv::agg_state::mv_agg_state::materialize_aggregate_result_chunks(
                 result, &layout,
             )
             .expect("physical chunks");
         (layout, chunks)
     }
 
-    fn aggregate_mv_shape_for_txn_test()
-    -> crate::connector::starrocks::table::mv_shape::AggregateMvShape {
+    fn aggregate_mv_shape_for_txn_test() -> crate::engine::mv::agg_state::mv_shape::AggregateMvShape
+    {
         let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(
             "select k1, count(*) as c, sum(v1) as s from ice.ns.orders group by k1",
         )
@@ -2844,11 +2844,9 @@ mod mv_target_tests {
         let sqlparser::ast::Statement::Query(query) = stmt else {
             panic!("expected query");
         };
-        let shape =
-            crate::connector::starrocks::table::mv_shape::classify_incremental_mv_query(&query)
-                .expect("shape");
-        let crate::connector::starrocks::table::mv_shape::IncrementalMvShape::Aggregate(shape) =
-            shape
+        let shape = crate::engine::mv::agg_state::mv_shape::classify_incremental_mv_query(&query)
+            .expect("shape");
+        let crate::engine::mv::agg_state::mv_shape::IncrementalMvShape::Aggregate(shape) = shape
         else {
             panic!("expected aggregate shape");
         };

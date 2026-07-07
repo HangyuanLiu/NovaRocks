@@ -34,13 +34,13 @@
 //! unrepresentable shapes (e.g. a UNION ALL of joins), are still rejected. See
 //! [`RefreshFragmentProperty::into_refresh_contract`] for the precise narrowing.
 
-use crate::connector::starrocks::table::model::IcebergTableRef;
 use crate::engine::mv::apply_key::ApplyKeyValueType;
 use crate::engine::mv::refresh_contract::{
     AggregateRefreshContract, ApplyKeyContract, BranchRefreshContract, ImvRefreshContract,
     JoinRefreshContract,
 };
 use crate::engine::mv::refresh_driver::BaseSnapshotPolicy;
+use crate::engine::mv::table_ref::IcebergTableRef;
 use crate::meta::repository::mv_contract::{ApplyKeySource, MvSchemaContract};
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, QueryBody, Relation, ResolvedQuery, ResolvedSelect, ResolvedSetOp,

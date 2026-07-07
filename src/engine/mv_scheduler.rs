@@ -4,10 +4,10 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::connector::starrocks::table::model::IcebergTableRef;
 use crate::connector::starrocks::table::mv_refresh::{
     load_current_iceberg_base_table, parse_iceberg_table_refs,
 };
+use crate::engine::mv::table_ref::IcebergTableRef;
 use crate::meta::repository::mv::{
     MvRefreshState, StoredMvDefinition, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
 };
