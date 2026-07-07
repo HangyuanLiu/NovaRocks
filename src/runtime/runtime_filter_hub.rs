@@ -176,6 +176,29 @@ impl RuntimeFilterSnapshot {
         &self.min_max_filters
     }
 
+    pub(crate) fn subset(&self, filter_ids: &HashSet<i32>) -> Self {
+        Self {
+            in_filters: self
+                .in_filters
+                .iter()
+                .filter(|filter| filter_ids.contains(&filter.filter_id()))
+                .cloned()
+                .collect(),
+            membership_filters: self
+                .membership_filters
+                .iter()
+                .filter(|filter| filter_ids.contains(&filter.filter_id()))
+                .cloned()
+                .collect(),
+            min_max_filters: self
+                .min_max_filters
+                .iter()
+                .filter(|(filter_id, _)| filter_ids.contains(filter_id))
+                .map(|(filter_id, filter)| (*filter_id, Arc::clone(filter)))
+                .collect(),
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.in_filters.is_empty()
             && self.membership_filters.is_empty()
@@ -478,6 +501,13 @@ impl RuntimeFilterHub {
                 timeout_armed: AtomicBool::new(false),
             }),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_probe_complete_without_version_bump_for_test(&self, node_id: i32) {
+        let entry = self.get_or_create_entry(node_id);
+        entry.complete.store(true, Ordering::Release);
+        entry.dep.set_ready();
     }
 
     pub(crate) fn publish_filters(

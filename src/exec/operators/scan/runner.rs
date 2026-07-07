@@ -56,7 +56,7 @@ use crate::runtime::runtime_filter_observability::RfLifecycleHandle;
 use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array, Int64Array, StringArray};
 use arrow::compute::filter_record_batch;
 use roaring::RoaringTreemap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -136,6 +136,9 @@ pub(super) struct ScanAsyncRunner {
     acquired: Option<AcquiredRuntimeFilters>,
     runtime_filter_ctx: Option<Arc<RuntimeFilterContext>>,
     runtime_filters_loaded: bool,
+    self_subtree_ids: HashSet<i32>,
+    self_subtree_ctx: Option<Arc<RuntimeFilterContext>>,
+    self_subtree_version: Option<u64>,
     conjunct_predicate: Option<ExprId>,
     conjunct_encoding_policy: Option<FilterEncodingPolicy>,
     arena: Arc<ExprArena>,
@@ -318,6 +321,12 @@ impl ScanAsyncRunner {
         let conjunct_predicate = scan.conjunct_predicate();
         let conjunct_encoding_policy = conjunct_predicate
             .map(|predicate| FilterEncodingPolicy::from_predicate(&arena, predicate));
+        let self_subtree_ids = scan
+            .runtime_filter_specs()
+            .iter()
+            .filter(|spec| spec.self_subtree)
+            .map(|spec| spec.filter_id)
+            .collect();
         Self {
             conjunct_predicate,
             conjunct_encoding_policy,
@@ -337,6 +346,9 @@ impl ScanAsyncRunner {
             acquired: None,
             runtime_filter_ctx: None,
             runtime_filters_loaded: false,
+            self_subtree_ids,
+            self_subtree_ctx: None,
+            self_subtree_version: None,
             arena,
             profiles,
             last_progress: Instant::now(),
@@ -546,6 +558,34 @@ impl ScanAsyncRunner {
         self.acquired = Some(acquired);
         self.runtime_filters_loaded = true;
         Ok(())
+    }
+
+    pub(super) fn refresh_self_subtree_filters(&mut self) {
+        if self.self_subtree_ids.is_empty() {
+            return;
+        }
+        let Some(probe) = self.runtime_filter_probe.as_ref() else {
+            return;
+        };
+        let version = probe.handle_version();
+        if self.self_subtree_version == Some(version) {
+            return;
+        }
+        let crate::runtime::runtime_filter_hub::AcquireProgress::Resolved(
+            AcquiredRuntimeFilters::Complete(snapshot),
+        ) = probe.poll_acquire_non_blocking()
+        else {
+            return;
+        };
+        let subset = snapshot.subset(&self.self_subtree_ids);
+        self.self_subtree_ctx =
+            (!subset.is_empty()).then(|| Arc::new(RuntimeFilterContext::from_snapshot(subset)));
+        self.self_subtree_version = Some(version);
+    }
+
+    #[cfg(test)]
+    fn self_subtree_ctx_for_test(&self) -> Option<&Arc<RuntimeFilterContext>> {
+        self.self_subtree_ctx.as_ref()
     }
 
     pub(super) fn next_chunk(&mut self) -> Result<Option<Chunk>, String> {
@@ -2266,19 +2306,18 @@ mod tests {
         let mut arena = ExprArena::default();
         let expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
         let arena = Arc::new(arena);
-        hub.register_probe_specs(
-            42,
-            &[crate::exec::node::RuntimeFilterProbeSpec {
-                filter_id,
-                expr_id: expr,
-                slot_id: SlotId::new(1),
-                data_type: DataType::Int32,
-                self_subtree: true,
-            }],
-        );
+        let spec = crate::exec::node::RuntimeFilterProbeSpec {
+            filter_id,
+            expr_id: expr,
+            slot_id: SlotId::new(1),
+            data_type: DataType::Int32,
+            self_subtree: true,
+        };
+        hub.register_probe_specs(42, std::slice::from_ref(&spec));
         let scan_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
         let scan = ScanNode::new(Arc::new(EmptyScanOp))
             .with_node_id(42)
+            .with_runtime_filter_specs(vec![spec])
             .with_output_chunk_schema(chunk_schema_of(&scan_schema, &[SlotId::new(1)]));
         let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
             Vec::new(),
@@ -2617,6 +2656,201 @@ mod tests {
             }
             other => panic!("expected complete self-subtree snapshot after publish, got {other:?}"),
         }
+        registry.remove_query(query_key);
+    }
+
+    #[test]
+    fn self_subtree_filter_picked_up_by_repoll() {
+        let query_key = QueryKey::from_hi_lo(20_103, 1);
+        let registry = RuntimeFilterLifecycleRegistry::global();
+        registry.remove_query(query_key);
+        let hub = RuntimeFilterHub::new_for_query(
+            DependencyManager::new(),
+            crate::runtime::query_context::QueryId {
+                hi: query_key.hi,
+                lo: query_key.lo,
+            },
+        );
+        hub.set_wait_timeouts(Some(Duration::from_secs(60)), Some(Duration::from_secs(60)));
+
+        let (mut runner, _) = scan_runtime_filter_runner_self_subtree(7, query_key, &hub);
+        let state = ScanAsyncState::new(1, "self-subtree-runtime-filter-repoll-test".to_string());
+        runner
+            .prepare_runtime_filters(&state)
+            .expect("prepare runtime filters");
+        assert!(runner.self_subtree_ctx_for_test().is_none());
+
+        hub.publish_min_max_filter(
+            7,
+            RuntimeMinMaxFilter::empty_range(RuntimeFilterType::Int32)
+                .expect("empty min/max filter"),
+        );
+        runner.refresh_self_subtree_filters();
+
+        assert!(runner.self_subtree_ctx_for_test().is_some());
+        registry.remove_query(query_key);
+    }
+
+    #[test]
+    fn self_subtree_repoll_context_excludes_blocking_join_filter() {
+        let query_key = QueryKey::from_hi_lo(20_104, 1);
+        let registry = RuntimeFilterLifecycleRegistry::global();
+        registry.remove_query(query_key);
+        let hub = RuntimeFilterHub::new_for_query(
+            DependencyManager::new(),
+            crate::runtime::query_context::QueryId {
+                hi: query_key.hi,
+                lo: query_key.lo,
+            },
+        );
+        hub.set_wait_timeouts(Some(Duration::from_secs(60)), Some(Duration::from_secs(60)));
+
+        let mut arena = ExprArena::default();
+        let join_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let self_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let arena = Arc::new(arena);
+        let join_spec = crate::exec::node::RuntimeFilterProbeSpec {
+            filter_id: 7,
+            expr_id: join_expr,
+            slot_id: SlotId::new(1),
+            data_type: DataType::Int32,
+            self_subtree: false,
+        };
+        let self_spec = crate::exec::node::RuntimeFilterProbeSpec {
+            filter_id: 8,
+            expr_id: self_expr,
+            slot_id: SlotId::new(1),
+            data_type: DataType::Int32,
+            self_subtree: true,
+        };
+        let specs = vec![join_spec, self_spec];
+        hub.register_probe_specs(42, &specs);
+
+        let scan_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let scan = ScanNode::new(Arc::new(EmptyScanOp))
+            .with_node_id(42)
+            .with_runtime_filter_specs(specs)
+            .with_output_chunk_schema(chunk_schema_of(&scan_schema, &[SlotId::new(1)]));
+        let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
+            Vec::new(),
+            false,
+        )));
+        let mut runner = ScanAsyncRunner::new(
+            "scan".to_string(),
+            scan,
+            dispatch,
+            SharedRuntimeFilterDecision::new(),
+            Some(ScanRuntimeFilterProbe::new(hub.register_probe(42))),
+            HashMap::from([(7, join_expr), (8, self_expr)]),
+            2,
+            1,
+            arena,
+            None,
+            0,
+        );
+
+        hub.publish_filters(&[], &[passthrough_membership_filter(7)]);
+        hub.publish_min_max_filter(
+            8,
+            RuntimeMinMaxFilter::empty_range(RuntimeFilterType::Int32)
+                .expect("empty min/max filter"),
+        );
+        runner.refresh_self_subtree_filters();
+
+        let snapshot = runner
+            .self_subtree_ctx_for_test()
+            .expect("self-subtree context")
+            .snapshot();
+        assert!(snapshot.in_filters().is_empty());
+        assert!(snapshot.membership_filters().is_empty());
+        assert_eq!(snapshot.min_max_filters().len(), 1);
+        assert_eq!(snapshot.min_max_filters()[0].0, 8);
+        registry.remove_query(query_key);
+    }
+
+    #[test]
+    fn self_subtree_repoll_retries_after_pending_without_version_bump() {
+        let query_key = QueryKey::from_hi_lo(20_105, 1);
+        let registry = RuntimeFilterLifecycleRegistry::global();
+        registry.remove_query(query_key);
+        let hub = RuntimeFilterHub::new_for_query(
+            DependencyManager::new(),
+            crate::runtime::query_context::QueryId {
+                hi: query_key.hi,
+                lo: query_key.lo,
+            },
+        );
+        hub.set_wait_timeouts(Some(Duration::from_secs(60)), Some(Duration::from_secs(60)));
+
+        let mut arena = ExprArena::default();
+        let join_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let self_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let arena = Arc::new(arena);
+        let join_spec = crate::exec::node::RuntimeFilterProbeSpec {
+            filter_id: 7,
+            expr_id: join_expr,
+            slot_id: SlotId::new(1),
+            data_type: DataType::Int32,
+            self_subtree: false,
+        };
+        let self_spec = crate::exec::node::RuntimeFilterProbeSpec {
+            filter_id: 8,
+            expr_id: self_expr,
+            slot_id: SlotId::new(1),
+            data_type: DataType::Int32,
+            self_subtree: true,
+        };
+        let specs = vec![join_spec, self_spec];
+        hub.register_probe_specs(42, &specs);
+
+        let scan_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let scan = ScanNode::new(Arc::new(EmptyScanOp))
+            .with_node_id(42)
+            .with_runtime_filter_specs(specs)
+            .with_output_chunk_schema(chunk_schema_of(&scan_schema, &[SlotId::new(1)]));
+        let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
+            Vec::new(),
+            false,
+        )));
+        let mut runner = ScanAsyncRunner::new(
+            "scan".to_string(),
+            scan,
+            dispatch,
+            SharedRuntimeFilterDecision::new(),
+            Some(ScanRuntimeFilterProbe::new(hub.register_probe(42))),
+            HashMap::from([(7, join_expr), (8, self_expr)]),
+            2,
+            1,
+            arena,
+            None,
+            0,
+        );
+
+        hub.publish_min_max_filter(
+            8,
+            RuntimeMinMaxFilter::empty_range(RuntimeFilterType::Int32)
+                .expect("empty min/max filter"),
+        );
+        runner.refresh_self_subtree_filters();
+        assert!(
+            runner.self_subtree_ctx_for_test().is_none(),
+            "pending mixed probe must not install self-subtree context"
+        );
+
+        // Complete readiness without mutating the filter store version. This
+        // covers readiness transitions that are independent from handle-version
+        // changes.
+        hub.force_probe_complete_without_version_bump_for_test(42);
+        runner.refresh_self_subtree_filters();
+
+        let snapshot = runner
+            .self_subtree_ctx_for_test()
+            .expect("self-subtree context after ready transition")
+            .snapshot();
+        assert!(snapshot.in_filters().is_empty());
+        assert!(snapshot.membership_filters().is_empty());
+        assert_eq!(snapshot.min_max_filters().len(), 1);
+        assert_eq!(snapshot.min_max_filters()[0].0, 8);
         registry.remove_query(query_key);
     }
 
