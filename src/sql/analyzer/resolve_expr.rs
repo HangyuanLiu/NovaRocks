@@ -1018,16 +1018,10 @@ impl<'a> super::AnalyzerContext<'a> {
                         nullable: false,
                     })
                 } else if n.contains('.') && !n.contains('e') && !n.contains('E') {
-                    // Number with decimal point (no scientific notation) → Decimal
-                    // with precision/scale inferred from the literal text (e.g.
-                    // "100.00" → Decimal(5,2), "7.0" → Decimal(2,1)).
-                    // This matches StarRocks behaviour and avoids the
-                    // Float64→Decimal(38,9) promotion that inflates division
-                    // result scales.
-                    let (precision, scale) = infer_decimal_precision_scale(n);
+                    let data_type = infer_decimal_literal_type(n)?;
                     Ok(TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Decimal(n.clone())),
-                        data_type: DataType::Decimal128(precision, scale),
+                        data_type,
                         nullable: false,
                     })
                 } else if let Ok(v) = n.parse::<f64>() {
@@ -3303,27 +3297,39 @@ fn is_non_groupable_map_constructor(expr: &TypedExpr) -> bool {
     }
 }
 
-/// Infer Decimal precision and scale from a numeric literal string containing
-/// a decimal point.  For example `"100.00"` → `(5, 2)`, `"7.0"` → `(2, 1)`,
-/// `"0.2"` → `(2, 1)`.
-fn infer_decimal_precision_scale(s: &str) -> (u8, i8) {
-    let s = s.trim().trim_start_matches('+').trim_start_matches('-');
-    let (int_part, frac_part) = match s.split_once('.') {
+fn infer_decimal_literal_type(s: &str) -> Result<DataType, String> {
+    let raw = s.trim().trim_start_matches('+').trim_start_matches('-');
+    let (int_part, frac_part) = match raw.split_once('.') {
         Some((i, f)) => (i, f),
-        None => (s, ""),
+        None => (raw, ""),
     };
     let int_part = int_part.trim_start_matches('0');
     let int_digits = if int_part.is_empty() {
-        1
+        1usize
     } else {
         int_part.len()
     };
     let scale = frac_part.len();
     let precision = int_digits + scale;
-    // Clamp to Decimal128 limits
-    let precision = precision.clamp(1, 38) as u8;
-    let scale = scale.min(38) as i8;
-    (precision, scale)
+
+    if scale > 76 {
+        return Err(format!(
+            "decimal literal scale {scale} exceeds maximum scale 76: {s}"
+        ));
+    }
+    if precision == 0 || precision > 76 {
+        return Err(format!(
+            "decimal literal precision {precision} exceeds maximum precision 76: {s}"
+        ));
+    }
+
+    let precision = precision as u8;
+    let scale = scale as i8;
+    if precision > 38 {
+        Ok(DataType::Decimal256(precision, scale))
+    } else {
+        Ok(DataType::Decimal128(precision, scale))
+    }
 }
 
 /// Implicit cast: if `expr` is Utf8 and `target` is a date/timestamp type,
