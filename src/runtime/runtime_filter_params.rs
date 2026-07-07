@@ -295,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn thrift_runtime_filter_params_convert_to_native_and_back_for_compact_boundary() {
+    fn thrift_runtime_filter_params_convert_to_native_and_back_for_compat_boundary() {
         let thrift = runtime_filter::TRuntimeFilterParams {
             id_to_prober_params: Some(BTreeMap::from([(
                 11,

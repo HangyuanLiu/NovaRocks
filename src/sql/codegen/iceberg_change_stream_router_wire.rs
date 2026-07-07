@@ -45,7 +45,7 @@ pub(in crate::sql::codegen) fn build_router_sink_thrift(
         let label = format!("branch {:?} output", branch.branch_kind);
         let output_slots =
             output_slot_ids_for_ordinals(scope, output_columns, &branch.output_ordinals, &label)?;
-        let partition = compact_output_partition_for_ordinals(
+        let partition = compat_output_partition_for_ordinals(
             scope,
             output_columns,
             &branch.output_partition_ordinals,
@@ -93,7 +93,7 @@ pub(in crate::sql::codegen) fn build_router_sink_thrift(
     ))
 }
 
-pub(in crate::sql::codegen) fn compact_output_partition_for_ordinals(
+pub(in crate::sql::codegen) fn compat_output_partition_for_ordinals(
     scope: &ExprScope,
     output_columns: &[AnalysisOutputColumn],
     ordinals: &[usize],

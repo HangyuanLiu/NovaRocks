@@ -838,7 +838,7 @@ mod tests {
             target_fragment_id: tgt,
             target_exchange_node_id: exch_node_id,
             output_partition: native_partition_for_test(ptype),
-            compact_output_partition: partitions::TDataPartition::new(
+            compat_output_partition: partitions::TDataPartition::new(
                 ptype,
                 None::<Vec<crate::thrift::exprs::TExpr>>,
                 None::<Vec<partitions::TRangePartition>>,
@@ -1058,7 +1058,7 @@ mod tests {
             fake_fragment(2, None, 0),
         ];
         let mut hash_edge = fake_edge(0, 1, partitions::TPartitionType::HASH_PARTITIONED, 10);
-        hash_edge.compact_output_partition = partitions::TDataPartition::new(
+        hash_edge.compat_output_partition = partitions::TDataPartition::new(
             partitions::TPartitionType::UNPARTITIONED,
             None::<Vec<crate::thrift::exprs::TExpr>>,
             None::<Vec<partitions::TRangePartition>>,

@@ -73,7 +73,7 @@ pub(crate) struct NativePlanSidecars {
 }
 
 #[derive(Clone)]
-struct CompactCteConsumer {
+struct CompatCteConsumer {
     fragment_id: FragmentId,
     exchange_node_id: i32,
     partition: partitions::TDataPartition,
@@ -231,7 +231,7 @@ impl ExecutionCoordinator {
                         "IcebergChangeStreamRouter"
                     }
                 },
-                e.compact_output_partition.type_,
+                e.compat_output_partition.type_,
             );
         }
 
@@ -276,8 +276,8 @@ impl ExecutionCoordinator {
                 Vec<ColumnId>,
             )>,
         > = BTreeMap::new();
-        // CTE id -> compact thrift consumers used only for TMultiCastDataStreamSink.
-        let mut compact_cte_consumers: BTreeMap<CteId, Vec<CompactCteConsumer>> = BTreeMap::new();
+        // CTE id -> compat thrift consumers used only for TMultiCastDataStreamSink.
+        let mut compat_cte_consumers: BTreeMap<CteId, Vec<CompatCteConsumer>> = BTreeMap::new();
 
         for e in &edges {
             match &e.edge_kind {
@@ -297,13 +297,13 @@ impl ExecutionCoordinator {
                         e.output_slot_ids.clone(),
                         receive_producer_column_ids.clone(),
                     ));
-                    compact_cte_consumers
+                    compat_cte_consumers
                         .entry(*cte_id)
                         .or_default()
-                        .push(CompactCteConsumer {
+                        .push(CompatCteConsumer {
                             fragment_id: e.target_fragment_id,
                             exchange_node_id: e.target_exchange_node_id,
-                            partition: e.compact_output_partition.clone(),
+                            partition: e.compat_output_partition.clone(),
                             output_slot_ids: e.output_slot_ids.clone(),
                         });
                 }
@@ -330,12 +330,12 @@ impl ExecutionCoordinator {
                         receive_producer_column_ids.clone(),
                     ));
                 }
-                let compact_consumers = compact_cte_consumers.entry(*cte_id).or_default();
-                if !compact_consumers.iter().any(|consumer| {
+                let compat_consumers = compat_cte_consumers.entry(*cte_id).or_default();
+                if !compat_consumers.iter().any(|consumer| {
                     consumer.fragment_id == fr.fragment_id
                         && consumer.exchange_node_id == *exchange_node_id
                 }) {
-                    compact_consumers.push(CompactCteConsumer {
+                    compat_consumers.push(CompatCteConsumer {
                         fragment_id: fr.fragment_id,
                         exchange_node_id: *exchange_node_id,
                         partition: unpartitioned_partition(),
@@ -466,7 +466,7 @@ impl ExecutionCoordinator {
                         .collect();
                     (
                         output_sink,
-                        edge.compact_output_partition.clone(),
+                        edge.compat_output_partition.clone(),
                         Some(exec_destinations),
                     )
                 } else if let Some((router_group_id, branch_edges)) = router_edges {
@@ -494,7 +494,7 @@ impl ExecutionCoordinator {
                     let cte_id = fr
                         .cte_id
                         .ok_or_else(|| "CTE fragment missing cte_id".to_string())?;
-                    let consumers = compact_cte_consumers
+                    let consumers = compat_cte_consumers
                         .get(&cte_id)
                         .cloned()
                         .unwrap_or_default();
@@ -576,7 +576,7 @@ impl ExecutionCoordinator {
                 exec_params.query_id = query_id.clone();
                 exec_params.fragment_instance_id = placement.finst_id.clone();
                 exec_params.per_node_scan_ranges =
-                    compact_scan_ranges_for_placement(fr, placement, placements.len())?;
+                    compat_scan_ranges_for_placement(fr, placement, placements.len())?;
                 exec_params.per_exch_num_senders = placement.per_exch_num_senders.clone();
                 exec_params.destinations = exec_destinations;
                 if let Some(rf) = rf_plan.as_ref() {
@@ -588,12 +588,12 @@ impl ExecutionCoordinator {
                     exec_params.runtime_filter_params = Some(rf_params.to_thrift());
                 }
 
-                let compact_query_options = query_options.as_ref().map(QueryOptions::to_thrift);
+                let compat_query_options = query_options.as_ref().map(QueryOptions::to_thrift);
                 let params = build_exec_plan_fragment_params(
                     fr,
                     thrift_fragment,
                     exec_params,
-                    compact_query_options,
+                    compat_query_options,
                     fragment_dop,
                     ExecPlanFragmentParamOptions {
                         backend_num: Some(placement.instance_index as i32),
@@ -1018,7 +1018,7 @@ fn wrap_data_stream_sink(stream_sink: data_sinks::TDataStreamSink) -> data_sinks
 fn build_stream_sink_for_edge(edge: &FragmentEdge) -> data_sinks::TDataStreamSink {
     data_sinks::TDataStreamSink::new(
         edge.target_exchange_node_id,
-        edge.compact_output_partition.clone(),
+        edge.compat_output_partition.clone(),
         None::<bool>,
         None::<bool>,
         None::<i32>,
@@ -1208,7 +1208,7 @@ fn wrap_iceberg_change_stream_router_sink(
 
         let mut stream_sink = template_branch.stream_sink.clone();
         stream_sink.dest_node_id = edge.target_exchange_node_id;
-        stream_sink.output_partition = edge.compact_output_partition.clone();
+        stream_sink.output_partition = edge.compat_output_partition.clone();
         let destinations = placements
             .get(&edge.target_fragment_id)
             .ok_or_else(|| {
@@ -1266,7 +1266,7 @@ fn wrap_iceberg_change_stream_router_sink(
     ))
 }
 
-fn compact_scan_ranges_for_placement(
+fn compat_scan_ranges_for_placement(
     fragment: &crate::sql::codegen::FragmentBuildResult,
     placement: &FragmentInstancePlacement,
     placement_count: usize,
@@ -1274,8 +1274,8 @@ fn compact_scan_ranges_for_placement(
     let mut assigned =
         crate::runtime::scan_range::thrift_scan_range_map_from_native(&placement.scan_ranges)?;
 
-    let compact_ranges = &fragment.exec_params.per_node_scan_ranges;
-    if compact_ranges.is_empty() {
+    let compat_ranges = &fragment.exec_params.per_node_scan_ranges;
+    if compat_ranges.is_empty() {
         return Ok(assigned);
     }
     if placement_count == 0 {
@@ -1285,7 +1285,7 @@ fn compact_scan_ranges_for_placement(
         ));
     }
 
-    for (node_id, ranges) in compact_ranges {
+    for (node_id, ranges) in compat_ranges {
         if assigned.contains_key(node_id) {
             continue;
         }
@@ -3330,7 +3330,7 @@ mod tests {
             target_fragment_id,
             target_exchange_node_id,
             output_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            compact_output_partition: unpartitioned_partition(),
+            compat_output_partition: unpartitioned_partition(),
             stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
             edge_kind: FragmentEdgeKind::Stream,
             output_slot_ids: Vec::new(),
@@ -3350,7 +3350,7 @@ mod tests {
             target_fragment_id,
             target_exchange_node_id,
             output_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            compact_output_partition: unpartitioned_partition(),
+            compat_output_partition: unpartitioned_partition(),
             stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
             edge_kind: FragmentEdgeKind::IcebergChangeStreamRouter {
                 router_group_id,
@@ -3435,7 +3435,7 @@ mod tests {
         params
     }
 
-    fn compact_scan_range_for_test(
+    fn compat_scan_range_for_test(
         marker: i32,
     ) -> crate::thrift::internal_service::TScanRangeParams {
         crate::thrift::internal_service::TScanRangeParams::new(
@@ -3455,14 +3455,14 @@ mod tests {
     }
 
     fn fragment_for_scan_range_merge_test(
-        compact_ranges: BTreeMap<i32, Vec<crate::thrift::internal_service::TScanRangeParams>>,
+        compat_ranges: BTreeMap<i32, Vec<crate::thrift::internal_service::TScanRangeParams>>,
     ) -> crate::sql::codegen::FragmentBuildResult {
         let mut params = make_params_with_finst(1, 1);
         let exec_params = params
             .params
             .as_mut()
             .expect("exec params for scan range merge test");
-        exec_params.per_node_scan_ranges = compact_ranges;
+        exec_params.per_node_scan_ranges = compat_ranges;
         crate::sql::codegen::FragmentBuildResult {
             fragment_id: 0,
             has_scan_nodes: false,
@@ -3488,15 +3488,15 @@ mod tests {
     }
 
     #[test]
-    fn compact_scan_ranges_for_placement_merges_native_and_compact_only_nodes() {
+    fn compat_scan_ranges_for_placement_merges_native_and_compat_only_nodes() {
         let fragment = fragment_for_scan_range_merge_test(BTreeMap::from([
-            (10, vec![compact_scan_range_for_test(999)]),
+            (10, vec![compat_scan_range_for_test(999)]),
             (
                 20,
                 vec![
-                    compact_scan_range_for_test(201),
-                    compact_scan_range_for_test(202),
-                    compact_scan_range_for_test(203),
+                    compat_scan_range_for_test(201),
+                    compat_scan_range_for_test(202),
+                    compat_scan_range_for_test(203),
                 ],
             ),
         ]));
@@ -3505,8 +3505,8 @@ mod tests {
             .scan_ranges
             .insert(10, vec![native_file_scan_range_for_test(101)]);
 
-        let merged = compact_scan_ranges_for_placement(&fragment, &placement, 2)
-            .expect("merge native and compact scan ranges");
+        let merged = compat_scan_ranges_for_placement(&fragment, &placement, 2)
+            .expect("merge native and compat scan ranges");
 
         assert_eq!(
             merged[&10]
@@ -3514,15 +3514,15 @@ mod tests {
                 .map(|range| range.volume_id.expect("native marker"))
                 .collect::<Vec<_>>(),
             vec![101],
-            "native scan range key must not be replaced by compact projection"
+            "native scan range key must not be replaced by compat projection"
         );
         assert_eq!(
             merged[&20]
                 .iter()
-                .map(|range| range.volume_id.expect("compact marker"))
+                .map(|range| range.volume_id.expect("compat marker"))
                 .collect::<Vec<_>>(),
             vec![202],
-            "compact-only scan range key must still be assigned round-robin"
+            "compat-only scan range key must still be assigned round-robin"
         );
     }
 
@@ -3894,7 +3894,7 @@ mod tests {
         use crate::sql::common::ChangeStreamBranchKind;
 
         let mut edge = fake_router_edge(1, 2, 77, 7, 0, ChangeStreamBranchKind::DeleteDv);
-        edge.compact_output_partition = partitions::TDataPartition::new(
+        edge.compat_output_partition = partitions::TDataPartition::new(
             partitions::TPartitionType::HASH_PARTITIONED,
             None::<Vec<crate::thrift::exprs::TExpr>>,
             None::<Vec<partitions::TRangePartition>>,
@@ -3967,7 +3967,7 @@ mod tests {
         use crate::sql::common::ChangeStreamBranchKind;
 
         let mut edge = fake_router_edge(1, 2, 77, 7, 0, ChangeStreamBranchKind::DeleteDv);
-        edge.compact_output_partition = partitions::TDataPartition::new(
+        edge.compat_output_partition = partitions::TDataPartition::new(
             partitions::TPartitionType::HASH_PARTITIONED,
             None::<Vec<crate::thrift::exprs::TExpr>>,
             None::<Vec<partitions::TRangePartition>>,

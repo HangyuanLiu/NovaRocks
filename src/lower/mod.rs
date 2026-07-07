@@ -16,5 +16,5 @@
 // under the License.
 
 pub(crate) mod common;
-pub(crate) mod compact;
+pub(crate) mod compat;
 pub(crate) mod novarocks;

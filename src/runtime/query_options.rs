@@ -457,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn native_query_options_project_to_thrift_for_compact_boundary() {
+    fn native_query_options_project_to_thrift_for_compat_boundary() {
         let native = QueryOptions {
             batch_size: Some(2048),
             query_timeout: Some(60),

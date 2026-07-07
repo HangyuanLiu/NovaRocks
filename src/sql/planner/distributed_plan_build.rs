@@ -600,7 +600,7 @@ impl DistributedPlanBuilder {
             target_fragment_id: parent_fragment_id,
             target_exchange_node_id: exchange_node_id,
             output_partition: output_partition.clone(),
-            compact_output_partition: tdata_partition_placeholder(partition_type),
+            compat_output_partition: tdata_partition_placeholder(partition_type),
             stream_kind,
             edge_kind: FragmentEdgeKind::Stream,
             output_slot_ids: output_slot_ids_for_exchange(&exchange_output_columns)?,
@@ -703,7 +703,7 @@ impl DistributedPlanBuilder {
             target_fragment_id,
             target_exchange_node_id: exchange_node_id,
             output_partition: DataPartition::unpartitioned(),
-            compact_output_partition: tdata_partition_placeholder(
+            compat_output_partition: tdata_partition_placeholder(
                 partitions::TPartitionType::UNPARTITIONED,
             ),
             stream_kind: FragmentStreamKind::Broadcast,
@@ -2338,7 +2338,7 @@ mod tests {
         assert!(matches!(edge.output_partition.kind, PartitionKind::Hash));
         assert_eq!(edge.output_partition.exprs.len(), 1);
         assert_eq!(
-            edge.compact_output_partition.type_,
+            edge.compat_output_partition.type_,
             TPartitionType::HASH_PARTITIONED
         );
         assert!(matches!(
@@ -2574,7 +2574,7 @@ mod tests {
             PartitionKind::Unpartitioned
         ));
         assert_eq!(
-            dp.edges[0].compact_output_partition.type_,
+            dp.edges[0].compat_output_partition.type_,
             TPartitionType::UNPARTITIONED
         );
         assert_no_physical_redistribute(root);
@@ -2724,7 +2724,7 @@ mod tests {
             PartitionKind::Unpartitioned
         ));
         assert_eq!(
-            edge.compact_output_partition.type_,
+            edge.compat_output_partition.type_,
             TPartitionType::UNPARTITIONED
         );
         assert!(edge.output_slot_ids.is_empty());
@@ -2996,7 +2996,7 @@ mod tests {
             PartitionKind::Unpartitioned
         ));
         assert_eq!(
-            edge.compact_output_partition.type_,
+            edge.compat_output_partition.type_,
             TPartitionType::UNPARTITIONED
         );
         assert!(edge.output_slot_ids.is_empty());
@@ -3092,7 +3092,7 @@ mod tests {
             PartitionKind::Unpartitioned
         ));
         assert_eq!(
-            edge.compact_output_partition.type_,
+            edge.compat_output_partition.type_,
             TPartitionType::UNPARTITIONED
         );
 

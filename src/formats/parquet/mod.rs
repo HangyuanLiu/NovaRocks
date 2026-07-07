@@ -2718,7 +2718,7 @@ mod tests {
                 .zip(slot_types.iter().copied())
                 .map(|(name, primitive)| {
                     let data_type =
-                        crate::lower::compact::type_lowering::arrow_type_from_primitive(primitive)
+                        crate::lower::compat::type_lowering::arrow_type_from_primitive(primitive)
                             .expect("arrow type");
                     Field::new(name.clone(), data_type, true)
                 })

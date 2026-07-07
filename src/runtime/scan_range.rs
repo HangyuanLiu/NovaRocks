@@ -407,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_projection_preserves_native_file_scan_range_fields() {
+    fn compat_projection_preserves_native_file_scan_range_fields() {
         let native = native_file_range();
 
         let thrift = thrift_scan_range_params_from_native(&native).expect("project native range");
