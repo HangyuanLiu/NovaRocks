@@ -109,6 +109,31 @@ fn spill_config_from_thrift(opts: &TQueryOptions) -> Result<Option<SpillConfig>,
         .or(opts.spill_mode)
         .ok_or_else(|| "spill_mode is required when enable_spill=true".to_string())
         .and_then(spill_mode_from_thrift)?;
+    validate_spill_mode(spill_mode)?;
+
+    let spill_enable_direct_io = spill_opts
+        .and_then(|v| v.spill_enable_direct_io)
+        .or(opts.spill_enable_direct_io)
+        .unwrap_or(false);
+    if spill_enable_direct_io {
+        return Err("spill_enable_direct_io=true is not supported".to_string());
+    }
+
+    let enable_spill_to_remote_storage = spill_opts
+        .and_then(|v| v.enable_spill_to_remote_storage)
+        .unwrap_or(false);
+    if enable_spill_to_remote_storage {
+        return Err("spill to remote storage is not supported".to_string());
+    }
+
+    if let Some(opts) = spill_opts.and_then(|v| v.spill_to_remote_storage_options.as_ref())
+        && opts.disable_spill_to_local_disk.unwrap_or(false)
+    {
+        return Err(
+            "spill_to_remote_storage_options.disable_spill_to_local_disk=true is not supported"
+                .to_string(),
+        );
+    }
 
     Ok(Some(SpillConfig {
         enable_spill,
@@ -163,6 +188,13 @@ fn spill_mode_from_thrift(mode: TSpillMode) -> Result<SpillMode, String> {
     }
 }
 
+fn validate_spill_mode(mode: SpillMode) -> Result<(), String> {
+    if mode == SpillMode::Random {
+        return Err("spill_mode RANDOM is not supported yet".to_string());
+    }
+    Ok(())
+}
+
 fn spill_mode_to_thrift(mode: SpillMode) -> TSpillMode {
     match mode {
         SpillMode::None => TSpillMode::NONE,
@@ -175,12 +207,25 @@ fn spill_mode_to_thrift(mode: SpillMode) -> TSpillMode {
 #[cfg(test)]
 mod tests {
     use crate::exec::spill::SpillMode;
-    use crate::thrift::internal_service::{TQueryOptions, TSpillMode, TSpillOptions};
+    use crate::thrift::internal_service::{
+        TQueryOptions, TSpillMode, TSpillOptions, TSpillToRemoteStorageOptions,
+    };
     use thrift::OrderedFloat;
 
     use crate::engine::query_options::StandaloneQueryOptions;
 
     use super::{standalone_query_options_from_thrift, standalone_query_options_to_thrift};
+
+    fn spill_options_with_mode(mode: TSpillMode) -> TQueryOptions {
+        TQueryOptions {
+            enable_spill: Some(true),
+            spill_options: Some(TSpillOptions {
+                spill_mode: Some(mode),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn query_options_defaults_are_thrift_free_and_spill_disabled() {
@@ -310,5 +355,65 @@ mod tests {
                 .map(|v: OrderedFloat<f64>| v.into_inner()),
             Some(0.7)
         );
+    }
+
+    #[test]
+    fn query_options_reject_random_spill_mode() {
+        let err = standalone_query_options_from_thrift(Some(&spill_options_with_mode(
+            TSpillMode::RANDOM,
+        )))
+        .expect_err("reject random spill mode");
+
+        assert!(err.contains("spill_mode RANDOM"), "{err}");
+    }
+
+    #[test]
+    fn query_options_reject_legacy_direct_io_spill() {
+        let mut thrift = spill_options_with_mode(TSpillMode::FORCE);
+        thrift.spill_enable_direct_io = Some(true);
+
+        let err =
+            standalone_query_options_from_thrift(Some(&thrift)).expect_err("reject direct io");
+
+        assert!(err.contains("spill_enable_direct_io=true"), "{err}");
+    }
+
+    #[test]
+    fn query_options_reject_nested_direct_io_spill() {
+        let mut thrift = spill_options_with_mode(TSpillMode::FORCE);
+        thrift
+            .spill_options
+            .as_mut()
+            .expect("spill options")
+            .spill_enable_direct_io = Some(true);
+
+        let err =
+            standalone_query_options_from_thrift(Some(&thrift)).expect_err("reject direct io");
+
+        assert!(err.contains("spill_enable_direct_io=true"), "{err}");
+    }
+
+    #[test]
+    fn query_options_reject_remote_spill() {
+        let mut thrift = spill_options_with_mode(TSpillMode::FORCE);
+        let spill_options = thrift.spill_options.as_mut().expect("spill options");
+        spill_options.enable_spill_to_remote_storage = Some(true);
+
+        let err = standalone_query_options_from_thrift(Some(&thrift))
+            .expect_err("reject remote spill enablement");
+
+        assert!(err.contains("remote storage"), "{err}");
+
+        let mut thrift = spill_options_with_mode(TSpillMode::FORCE);
+        let spill_options = thrift.spill_options.as_mut().expect("spill options");
+        spill_options.spill_to_remote_storage_options = Some(TSpillToRemoteStorageOptions {
+            disable_spill_to_local_disk: Some(true),
+            ..Default::default()
+        });
+
+        let err = standalone_query_options_from_thrift(Some(&thrift))
+            .expect_err("reject remote-only spill");
+
+        assert!(err.contains("disable_spill_to_local_disk=true"), "{err}");
     }
 }
