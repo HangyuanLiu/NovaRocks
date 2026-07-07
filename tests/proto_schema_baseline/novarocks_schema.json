@@ -7049,14 +7049,14 @@
               "number": 7,
               "name": "runtime_filter_scan_wait_time_ms",
               "type_name": "int64",
-              "label": "singular",
+              "label": "optional",
               "oneof": null
             },
             "8": {
               "number": 8,
               "name": "runtime_filter_wait_timeout_ms",
               "type_name": "int32",
-              "label": "singular",
+              "label": "optional",
               "oneof": null
             },
             "9": {
@@ -7070,7 +7070,7 @@
               "number": 10,
               "name": "group_concat_max_len",
               "type_name": "int64",
-              "label": "singular",
+              "label": "optional",
               "oneof": null
             },
             "11": {
@@ -7085,6 +7085,97 @@
               "name": "spill_options",
               "type_name": "SpillOptions",
               "label": "optional",
+              "oneof": null
+            },
+            "13": {
+              "number": 13,
+              "name": "enable_scan_datacache",
+              "type_name": "bool",
+              "label": "singular",
+              "oneof": null
+            },
+            "14": {
+              "number": 14,
+              "name": "enable_populate_datacache",
+              "type_name": "bool",
+              "label": "singular",
+              "oneof": null
+            },
+            "15": {
+              "number": 15,
+              "name": "enable_datacache_async_populate_mode",
+              "type_name": "bool",
+              "label": "singular",
+              "oneof": null
+            },
+            "16": {
+              "number": 16,
+              "name": "enable_datacache_io_adaptor",
+              "type_name": "bool",
+              "label": "singular",
+              "oneof": null
+            },
+            "17": {
+              "number": 17,
+              "name": "enable_cache_select",
+              "type_name": "bool",
+              "label": "singular",
+              "oneof": null
+            },
+            "18": {
+              "number": 18,
+              "name": "datacache_evict_probability",
+              "type_name": "int32",
+              "label": "optional",
+              "oneof": null
+            },
+            "19": {
+              "number": 19,
+              "name": "datacache_priority",
+              "type_name": "int32",
+              "label": "singular",
+              "oneof": null
+            },
+            "20": {
+              "number": 20,
+              "name": "datacache_ttl_seconds",
+              "type_name": "int64",
+              "label": "singular",
+              "oneof": null
+            },
+            "21": {
+              "number": 21,
+              "name": "datacache_sharing_work_period",
+              "type_name": "int64",
+              "label": "singular",
+              "oneof": null
+            },
+            "22": {
+              "number": 22,
+              "name": "query_delivery_timeout",
+              "type_name": "int32",
+              "label": "singular",
+              "oneof": null
+            },
+            "23": {
+              "number": 23,
+              "name": "runtime_profile_report_interval",
+              "type_name": "int64",
+              "label": "singular",
+              "oneof": null
+            },
+            "24": {
+              "number": 24,
+              "name": "enable_join_runtime_bitset_filter",
+              "type_name": "bool",
+              "label": "optional",
+              "oneof": null
+            },
+            "25": {
+              "number": 25,
+              "name": "global_runtime_filter_build_max_size",
+              "type_name": "int64",
+              "label": "singular",
               "oneof": null
             }
           },

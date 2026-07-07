@@ -187,7 +187,7 @@ message ProberParams {
   string grpc_endpoint = 2;
 }
 
-// TQueryOptions consumed subset, projected into NovaRocks native wire form.
+// Query options consumed by NovaRocks native runtime.
 message QueryOptions {
   int32 batch_size = 1;
   int32 query_timeout = 2;
@@ -195,15 +195,28 @@ message QueryOptions {
   int32 pipeline_dop = 4;
   int64 query_mem_limit = 5;
   int32 connector_io_tasks_per_scan_operator = 6;
-  int64 runtime_filter_scan_wait_time_ms = 7;
-  int32 runtime_filter_wait_timeout_ms = 8;
+  optional int64 runtime_filter_scan_wait_time_ms = 7;
+  optional int32 runtime_filter_wait_timeout_ms = 8;
   bool allow_throw_exception = 9;
-  int64 group_concat_max_len = 10;
+  optional int64 group_concat_max_len = 10;
   bool enable_spill = 11;
   optional SpillOptions spill_options = 12;
+  bool enable_scan_datacache = 13;
+  bool enable_populate_datacache = 14;
+  bool enable_datacache_async_populate_mode = 15;
+  bool enable_datacache_io_adaptor = 16;
+  bool enable_cache_select = 17;
+  optional int32 datacache_evict_probability = 18;
+  int32 datacache_priority = 19;
+  int64 datacache_ttl_seconds = 20;
+  int64 datacache_sharing_work_period = 21;
+  int32 query_delivery_timeout = 22;
+  int64 runtime_profile_report_interval = 23;
+  optional bool enable_join_runtime_bitset_filter = 24;
+  int64 global_runtime_filter_build_max_size = 25;
 }
 
-// TSpillOptions consumed subset.
+// Spill options consumed by NovaRocks native runtime.
 message SpillOptions {
   int32 spill_mode = 1;  // TSpillMode
   double spill_mem_limit_threshold = 2;

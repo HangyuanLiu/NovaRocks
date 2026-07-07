@@ -17,28 +17,27 @@
 
 use crate::engine::query_options::StandaloneQueryOptions;
 use crate::exec::spill::{SpillConfig, SpillMode};
+use crate::runtime::query_options::QueryOptions;
 use crate::thrift::internal_service::{TQueryOptions, TSpillMode, TSpillOptions};
 use thrift::OrderedFloat;
 
 pub(crate) fn standalone_query_options_from_thrift(
     opts: Option<&TQueryOptions>,
 ) -> Result<StandaloneQueryOptions, String> {
-    let Some(opts) = opts else {
-        return Ok(StandaloneQueryOptions::default());
-    };
+    let native = QueryOptions::from_thrift(opts)?;
 
     Ok(StandaloneQueryOptions {
-        pipeline_dop: opts.pipeline_dop,
-        query_timeout: opts.query_timeout,
-        batch_size: opts.batch_size,
-        enable_profile: opts.enable_profile.unwrap_or(false),
-        exec_mem_limit: opts.query_mem_limit.or(opts.mem_limit),
-        connector_io_tasks_per_scan_operator: opts.connector_io_tasks_per_scan_operator,
-        runtime_filter_scan_wait_time_ms: opts.runtime_filter_scan_wait_time_ms,
-        runtime_filter_wait_timeout_ms: opts.runtime_filter_wait_timeout_ms,
-        allow_throw_exception: opts.allow_throw_exception.unwrap_or(false),
-        group_concat_max_len: opts.group_concat_max_len,
-        spill: crate::exec::spill::query_options_wire::spill_config_from_query_options(Some(opts))?,
+        pipeline_dop: native.pipeline_dop,
+        query_timeout: native.query_timeout,
+        batch_size: native.batch_size,
+        enable_profile: native.enable_profile,
+        exec_mem_limit: native.exec_mem_limit,
+        connector_io_tasks_per_scan_operator: native.connector_io_tasks_per_scan_operator,
+        runtime_filter_scan_wait_time_ms: native.runtime_filter_scan_wait_time_ms,
+        runtime_filter_wait_timeout_ms: native.runtime_filter_wait_timeout_ms,
+        allow_throw_exception: native.allow_throw_exception,
+        group_concat_max_len: native.group_concat_max_len,
+        spill: native.spill,
     })
 }
 
@@ -69,6 +68,29 @@ pub(crate) fn standalone_query_options_to_optional_thrift(
     opts: Option<&StandaloneQueryOptions>,
 ) -> Option<TQueryOptions> {
     opts.map(standalone_query_options_to_thrift)
+}
+
+pub(crate) fn standalone_query_options_to_runtime(opts: &StandaloneQueryOptions) -> QueryOptions {
+    QueryOptions {
+        pipeline_dop: opts.pipeline_dop,
+        query_timeout: opts.query_timeout,
+        batch_size: opts.batch_size,
+        enable_profile: opts.enable_profile,
+        exec_mem_limit: opts.exec_mem_limit,
+        connector_io_tasks_per_scan_operator: opts.connector_io_tasks_per_scan_operator,
+        runtime_filter_scan_wait_time_ms: opts.runtime_filter_scan_wait_time_ms,
+        runtime_filter_wait_timeout_ms: opts.runtime_filter_wait_timeout_ms,
+        allow_throw_exception: opts.allow_throw_exception,
+        group_concat_max_len: opts.group_concat_max_len,
+        spill: opts.spill.clone(),
+        ..Default::default()
+    }
+}
+
+pub(crate) fn standalone_query_options_to_optional_runtime(
+    opts: Option<&StandaloneQueryOptions>,
+) -> Option<QueryOptions> {
+    opts.map(standalone_query_options_to_runtime)
 }
 
 fn apply_spill_config_to_thrift(spill: &SpillConfig, thrift: &mut TQueryOptions) {

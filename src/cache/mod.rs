@@ -20,7 +20,7 @@ pub mod cached_reader;
 pub mod data_cache;
 pub mod page_cache;
 
-use crate::thrift::internal_service;
+use crate::runtime::query_options::QueryOptions;
 
 pub use block_cache::{BlockCache, BlockCacheOptions, CacheKey};
 pub use cache_input_stream::{CacheBlockRead, CacheInputStream};
@@ -68,43 +68,42 @@ pub struct CacheOptions {
     pub datacache_evict_probability: i32,
     pub datacache_priority: i32,
     pub datacache_ttl_seconds: i64,
-    // Optional until FE includes the session variable in TQueryOptions.
+    // Optional until FE includes the session variable in query options.
     pub datacache_sharing_work_period: Option<i64>,
 }
 
 impl CacheOptions {
-    pub fn from_query_options(
-        query_opts: Option<&internal_service::TQueryOptions>,
-    ) -> Result<Self, String> {
+    pub(crate) fn from_query_options(query_opts: Option<&QueryOptions>) -> Result<Self, String> {
         // Align with StarRocks BE semantics: only honor cache switches when FE explicitly
         // carries the corresponding query option field.
         let opts = query_opts;
         Ok(Self {
-            enable_scan_datacache: opts.and_then(|v| v.enable_scan_datacache).unwrap_or(false),
+            enable_scan_datacache: opts.map(|v| v.cache.enable_scan_datacache).unwrap_or(false),
             enable_populate_datacache: opts
-                .and_then(|v| v.enable_populate_datacache)
+                .map(|v| v.cache.enable_populate_datacache)
                 .unwrap_or(false),
             enable_datacache_async_populate_mode: opts
-                .and_then(|v| v.enable_datacache_async_populate_mode)
+                .map(|v| v.cache.enable_datacache_async_populate_mode)
                 .unwrap_or(false),
             enable_datacache_io_adaptor: opts
-                .and_then(|v| v.enable_datacache_io_adaptor)
+                .map(|v| v.cache.enable_datacache_io_adaptor)
                 .unwrap_or(false),
-            enable_cache_select: opts.and_then(|v| v.enable_cache_select).unwrap_or(false),
+            enable_cache_select: opts.map(|v| v.cache.enable_cache_select).unwrap_or(false),
             datacache_evict_probability: require_evict_probability(
                 "datacache_evict_probability",
-                opts.and_then(|v| v.datacache_evict_probability)
+                opts.and_then(|v| v.cache.datacache_evict_probability)
                     .unwrap_or(100),
             )?,
             datacache_priority: parse_datacache_priority(
                 "datacache_priority",
-                opts.and_then(|v| v.datacache_priority).unwrap_or(0),
+                opts.and_then(|v| v.cache.datacache_priority).unwrap_or(0),
             )?,
             datacache_ttl_seconds: parse_non_negative_i64(
                 "datacache_ttl_seconds",
-                opts.and_then(|v| v.datacache_ttl_seconds).unwrap_or(0),
+                opts.and_then(|v| v.cache.datacache_ttl_seconds)
+                    .unwrap_or(0),
             )?,
-            datacache_sharing_work_period: opts.and_then(|v| v.datacache_sharing_work_period),
+            datacache_sharing_work_period: opts.and_then(|v| v.cache.datacache_sharing_work_period),
         })
     }
 
@@ -185,7 +184,7 @@ fn parse_non_negative_i64(name: &str, value: i64) -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use super::CacheOptions;
-    use crate::thrift::internal_service::TQueryOptions;
+    use crate::runtime::query_options::{QueryCacheOptions, QueryOptions};
 
     #[test]
     fn cache_switches_are_disabled_when_query_options_missing() {
@@ -199,12 +198,15 @@ mod tests {
 
     #[test]
     fn cache_switches_follow_explicit_query_options() {
-        let query_opts = TQueryOptions {
-            enable_scan_datacache: Some(true),
-            enable_populate_datacache: Some(true),
-            enable_datacache_async_populate_mode: Some(true),
-            enable_datacache_io_adaptor: Some(true),
-            enable_cache_select: Some(true),
+        let query_opts = QueryOptions {
+            cache: QueryCacheOptions {
+                enable_scan_datacache: true,
+                enable_populate_datacache: true,
+                enable_datacache_async_populate_mode: true,
+                enable_datacache_io_adaptor: true,
+                enable_cache_select: true,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let opts =

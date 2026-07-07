@@ -32,6 +32,7 @@ use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::novarocks_logging::debug;
 use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher, FragmentSubmission};
 use crate::runtime::exec_params::{ExecPlanFragmentParamOptions, build_exec_plan_fragment_params};
+use crate::runtime::query_options::QueryOptions;
 use crate::runtime::query_state::QueryState;
 use crate::runtime::scheduler::{
     FragmentInstancePlacement, FragmentScheduler, topological_sort_bottom_up,
@@ -75,7 +76,7 @@ pub(crate) struct ExecutionCoordinator {
     native_plan: Option<crate::sql::planner::DistributedPlan>,
     dispatcher: Arc<dyn FragmentDispatcher>,
     scheduler: Arc<FragmentScheduler>,
-    query_options: Option<crate::thrift::internal_service::TQueryOptions>,
+    query_options: Option<QueryOptions>,
 }
 
 impl ExecutionCoordinator {
@@ -83,7 +84,7 @@ impl ExecutionCoordinator {
         build_result: MultiFragmentBuildResult,
         dispatcher: Arc<dyn FragmentDispatcher>,
         scheduler: Arc<FragmentScheduler>,
-        query_options: Option<crate::thrift::internal_service::TQueryOptions>,
+        query_options: Option<QueryOptions>,
     ) -> Self {
         Self {
             build_result,
@@ -99,7 +100,7 @@ impl ExecutionCoordinator {
         native_plan: crate::sql::planner::DistributedPlan,
         dispatcher: Arc<dyn FragmentDispatcher>,
         scheduler: Arc<FragmentScheduler>,
-        query_options: Option<crate::thrift::internal_service::TQueryOptions>,
+        query_options: Option<QueryOptions>,
     ) -> Self {
         Self {
             build_result,
@@ -253,7 +254,7 @@ impl ExecutionCoordinator {
         // ---------------------------------------------------------------
         // 4. Translate every placement into a fragment params and submit.
         // ---------------------------------------------------------------
-        // Honor a per-session `SET pipeline_dop = N` override (carried on TQueryOptions); 0/None
+        // Honor a per-session `SET pipeline_dop = N` override; 0/None
         // means auto (cores/2).
         let session_dop = query_options
             .as_ref()
@@ -479,11 +480,12 @@ impl ExecutionCoordinator {
                     ));
                 }
 
+                let compact_query_options = query_options.as_ref().map(QueryOptions::to_thrift);
                 let params = build_exec_plan_fragment_params(
                     fr,
                     thrift_fragment,
                     exec_params,
-                    query_options.clone(),
+                    compact_query_options,
                     fragment_dop,
                     ExecPlanFragmentParamOptions {
                         backend_num: Some(placement.instance_index as i32),
@@ -3379,7 +3381,7 @@ mod tests {
             None::<types::TNetworkAddress>,
             None::<i32>,
             None::<internal_service::TQueryGlobals>,
-            None::<internal_service::TQueryOptions>,
+            None,
             None::<bool>,
             None::<types::TResourceInfo>,
             None::<String>,

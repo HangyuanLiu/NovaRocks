@@ -2715,7 +2715,7 @@ fn explain_analyze_query(
     let (dispatcher, scheduler) = coordinated_execution_services()?;
     let execution_start = std::time::Instant::now();
     let query_opts =
-        crate::engine::query_options_wire::standalone_query_options_to_thrift(&query_opts);
+        crate::engine::query_options_wire::standalone_query_options_to_runtime(&query_opts);
     let outcome = crate::runtime::coordinator::ExecutionCoordinator::new_with_native_plan(
         build_result,
         dp.clone(),
@@ -3108,7 +3108,7 @@ pub(crate) fn execute_query_as_iceberg_write(
         dp,
         dispatcher,
         scheduler,
-        crate::engine::query_options_wire::standalone_query_options_to_optional_thrift(
+        crate::engine::query_options_wire::standalone_query_options_to_optional_runtime(
             query_opts.as_ref(),
         ),
     )
@@ -3294,7 +3294,7 @@ pub(crate) fn execute_planned_iceberg_change_stream_write(
 ) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
     let (dispatcher, scheduler) = coordinated_execution_services()?;
     let query_options =
-        crate::engine::query_options_wire::standalone_query_options_to_optional_thrift(
+        crate::engine::query_options_wire::standalone_query_options_to_optional_runtime(
             query_opts.as_ref(),
         );
     match distributed_plan {
@@ -3690,7 +3690,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         native_dp,
         dispatcher,
         scheduler,
-        crate::engine::query_options_wire::standalone_query_options_to_optional_thrift(
+        crate::engine::query_options_wire::standalone_query_options_to_optional_runtime(
             query_opts.as_ref(),
         ),
     )
@@ -3755,7 +3755,7 @@ pub(crate) fn execute_logical_plan_with_options(
         native_dp,
         dispatcher,
         scheduler,
-        crate::engine::query_options_wire::standalone_query_options_to_optional_thrift(
+        crate::engine::query_options_wire::standalone_query_options_to_optional_runtime(
             query_opts.as_ref(),
         ),
     )

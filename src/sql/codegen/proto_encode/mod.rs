@@ -1218,17 +1218,32 @@ mod tests {
             runtime_filter_prober_params: BTreeMap::new(),
             per_exch_num_senders,
         };
-        let query_options = crate::thrift::internal_service::TQueryOptions {
+        let query_options = crate::runtime::query_options::QueryOptions {
             batch_size: Some(4096),
             query_timeout: Some(60),
-            enable_profile: Some(true),
+            query_delivery_timeout: Some(30),
+            enable_profile: true,
+            runtime_profile_report_interval: Some(7),
             pipeline_dop: Some(8),
-            query_mem_limit: Some(1 << 20),
+            exec_mem_limit: Some(1 << 20),
             connector_io_tasks_per_scan_operator: Some(12),
             runtime_filter_scan_wait_time_ms: Some(250),
             runtime_filter_wait_timeout_ms: Some(5_000),
-            allow_throw_exception: Some(true),
+            allow_throw_exception: true,
             group_concat_max_len: Some(65_535),
+            enable_join_runtime_bitset_filter: Some(false),
+            global_runtime_filter_build_max_size: Some(1 << 19),
+            cache: crate::runtime::query_options::QueryCacheOptions {
+                enable_scan_datacache: true,
+                enable_populate_datacache: true,
+                enable_datacache_async_populate_mode: true,
+                enable_datacache_io_adaptor: true,
+                enable_cache_select: true,
+                datacache_evict_probability: Some(75),
+                datacache_priority: Some(2),
+                datacache_ttl_seconds: Some(3600),
+                datacache_sharing_work_period: Some(10),
+            },
             ..Default::default()
         };
         let runtime_filter_prober_params = BTreeMap::from([(
@@ -1309,8 +1324,15 @@ mod tests {
         let opts = encoded.query_options.as_ref().expect("query options");
         assert_eq!(opts.batch_size, 4096);
         assert_eq!(opts.query_timeout, 60);
+        assert_eq!(opts.query_delivery_timeout, 30);
+        assert_eq!(opts.runtime_profile_report_interval, 7);
         assert_eq!(opts.pipeline_dop, 8);
         assert_eq!(opts.query_mem_limit, 1 << 20);
-        assert_eq!(opts.runtime_filter_wait_timeout_ms, 5_000);
+        assert_eq!(opts.runtime_filter_wait_timeout_ms, Some(5_000));
+        assert!(opts.enable_scan_datacache);
+        assert_eq!(opts.datacache_evict_probability, Some(75));
+        assert_eq!(opts.datacache_sharing_work_period, 10);
+        assert_eq!(opts.enable_join_runtime_bitset_filter, Some(false));
+        assert_eq!(opts.global_runtime_filter_build_max_size, 1 << 19);
     }
 }

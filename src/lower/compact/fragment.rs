@@ -43,6 +43,7 @@ use crate::lower::compact::node::{Lowered, PlanOrigin, lower_plan};
 use crate::runtime::fragment_output::FragmentOutput;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::{QueryId, query_context_manager};
+use crate::runtime::query_options::QueryOptions;
 use crate::thrift::{data_sinks, descriptors, internal_service, planner, types};
 
 fn merge_row_pos_descs(
@@ -165,7 +166,10 @@ pub(crate) fn execute_fragment(
     typed_result_sink: bool,
     plan_origin: PlanOrigin,
 ) -> Result<FragmentOutput, String> {
-    let query_opts = apply_query_option_overrides(query_opts.cloned());
+    let runtime_query_opts = query_opts
+        .map(|opts| QueryOptions::from_thrift(Some(opts)))
+        .transpose()?;
+    let runtime_query_opts = apply_query_option_overrides(runtime_query_opts);
 
     let profile_name = fragment
         .plan
@@ -175,9 +179,9 @@ pub(crate) fn execute_fragment(
         .map(|id| format!("execute_fragment (plan_node_id={id})"));
     let profiler = if profiler.is_some() {
         profiler
-    } else if query_opts
+    } else if runtime_query_opts
         .as_ref()
-        .and_then(|opts| opts.enable_profile)
+        .map(|opts| opts.enable_profile)
         .unwrap_or(false)
     {
         Some(Profiler::new(
@@ -198,7 +202,7 @@ pub(crate) fn execute_fragment(
     });
     let runtime_state = build_runtime_state(
         RuntimeStateInputs {
-            query_options: query_opts.clone(),
+            query_options: runtime_query_opts.clone(),
             query_id,
             runtime_filter_params,
             fragment_instance_id,
@@ -223,16 +227,17 @@ pub(crate) fn execute_fragment(
         }
         reorder_tuple_slots(&mut tuple_slots, desc_tbl);
         let mut arena = ExprArena::default();
-        let allow_throw_exception = query_opts
+        let allow_throw_exception = runtime_query_opts
             .as_ref()
-            .map(|opts| {
-                opts.allow_throw_exception.unwrap_or(false)
-                    || matches!(
-                        opts.overflow_mode,
-                        Some(mode) if mode == internal_service::TOverflowMode::REPORT_ERROR
-                    )
-            })
+            .map(|opts| opts.allow_throw_exception)
             .unwrap_or(false);
+        let allow_throw_exception = allow_throw_exception
+            || query_opts.is_some_and(|opts| {
+                matches!(
+                    opts.overflow_mode,
+                    Some(mode) if mode == internal_service::TOverflowMode::REPORT_ERROR
+                )
+            });
         arena.set_allow_throw_exception(allow_throw_exception);
         arena.set_session_time_zone(session_time_zone.map(|s| s.to_string()));
         // Layout hints are used by scan nodes to decide which columns to materialize.
@@ -253,7 +258,7 @@ pub(crate) fn execute_fragment(
                 fragment.query_global_dicts.as_deref(),
                 fragment.query_global_dict_exprs.as_ref(),
                 exec_params,
-                query_opts.as_ref(),
+                query_opts,
                 db_name,
                 &connectors,
                 &layout_hints,

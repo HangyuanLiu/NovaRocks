@@ -35,6 +35,7 @@ use crate::runtime::query_context::{
     observe_total_fragments, query_context_manager, query_expire_durations,
     resolve_desc_tbl_for_instance,
 };
+use crate::runtime::query_options::QueryOptions;
 use crate::runtime::result_buffer;
 use crate::service::fe_report;
 use crate::thrift::{data_sinks, descriptors, internal_service, planner, types};
@@ -510,7 +511,9 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
     let sender_counts = collect_exchange_sender_counts(common, &unique);
     let mut sender_counts_applied = false;
     if let Some(query_id) = common_query_id {
-        let (delivery_expire, query_expire) = query_expire_durations(common_query_opts);
+        let common_query_opts_native = QueryOptions::from_thrift(common_query_opts)?;
+        let (delivery_expire, query_expire) =
+            query_expire_durations(Some(&common_query_opts_native));
         let require_existing = common_desc_tbl.map(desc_tbl_is_cached).unwrap_or(false);
         mgr.ensure_context(query_id, require_existing, delivery_expire, query_expire)?;
         if let Some(desc_tbl) = common_desc_tbl
@@ -590,14 +593,15 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
             query_id_for_batch = Some(query_id);
         }
 
-        let (delivery_expire, query_expire) = query_expire_durations(query_opts);
+        let query_opts_native = QueryOptions::from_thrift(query_opts)?;
+        let (delivery_expire, query_expire) = query_expire_durations(Some(&query_opts_native));
         let require_existing = one
             .desc_tbl
             .as_ref()
             .map(desc_tbl_is_cached)
             .unwrap_or(false);
         mgr.get_or_register(query_id, require_existing, delivery_expire, query_expire)?;
-        let cache_options = CacheOptions::from_query_options(query_opts)?;
+        let cache_options = CacheOptions::from_query_options(Some(&query_opts_native))?;
         mgr.set_cache_options(query_id, cache_options)?;
         if !sender_counts_applied && !sender_counts.is_empty() {
             mgr.update_exchange_sender_counts(query_id, sender_counts.clone())?;
@@ -772,7 +776,8 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
         .and_then(|g| g.last_query_id.as_deref())
         .map(|s| s.to_string());
     let session_time_zone = query_globals.and_then(|g| g.time_zone.clone());
-    let (delivery_expire, query_expire) = query_expire_durations(query_opts);
+    let query_opts_native = QueryOptions::from_thrift(query_opts)?;
+    let (delivery_expire, query_expire) = query_expire_durations(Some(&query_opts_native));
     let mgr = query_context_manager();
     let require_existing = one
         .desc_tbl
@@ -780,7 +785,7 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
         .map(desc_tbl_is_cached)
         .unwrap_or(false);
     mgr.get_or_register(query_id, require_existing, delivery_expire, query_expire)?;
-    let cache_options = CacheOptions::from_query_options(query_opts)?;
+    let cache_options = CacheOptions::from_query_options(Some(&query_opts_native))?;
     mgr.set_cache_options(query_id, cache_options)?;
     mgr.with_context_mut(query_id, |ctx| {
         observe_total_fragments(ctx, params);
@@ -913,7 +918,8 @@ pub(crate) fn execute_plan_fragment_sync(
     let query_globals = one.query_globals.as_ref();
     let last_query_id = query_globals.and_then(|g| g.last_query_id.as_deref());
     let session_time_zone = query_globals.and_then(|g| g.time_zone.as_deref());
-    let (delivery_expire, query_expire) = query_expire_durations(query_opts);
+    let query_opts_native = QueryOptions::from_thrift(query_opts)?;
+    let (delivery_expire, query_expire) = query_expire_durations(Some(&query_opts_native));
     let mgr = query_context_manager();
     let require_existing = one
         .desc_tbl
@@ -921,7 +927,7 @@ pub(crate) fn execute_plan_fragment_sync(
         .map(desc_tbl_is_cached)
         .unwrap_or(false);
     mgr.get_or_register(query_id, require_existing, delivery_expire, query_expire)?;
-    let cache_options = CacheOptions::from_query_options(query_opts)?;
+    let cache_options = CacheOptions::from_query_options(Some(&query_opts_native))?;
     mgr.set_cache_options(query_id, cache_options)?;
     mgr.with_context_mut(query_id, |ctx| {
         observe_total_fragments(ctx, params);
