@@ -165,7 +165,6 @@ pub(crate) fn stream_destinations_from_native(
         .collect()
 }
 
-#[cfg(feature = "compat")]
 pub(crate) fn multi_cast_data_stream_sink_from_native(
     src: &proto::plan::MultiCastDataStreamSink,
 ) -> Result<MultiCastDataStreamSink, String> {
@@ -191,7 +190,7 @@ pub(crate) fn multi_cast_data_stream_sink_from_native(
         .map(|group| {
             group
                 .into_iter()
-                .map(crate::runtime::fragment_exec_params::compat_destination_from_runtime)
+                .map(crate::runtime::exec_params::fragment_destination_to_thrift)
                 .collect()
         })
         .collect();

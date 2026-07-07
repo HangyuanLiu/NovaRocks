@@ -68,7 +68,6 @@ impl FragmentExecParams {
         &self.per_exch_num_senders
     }
 
-    #[cfg(test)]
     pub(crate) fn destinations(&self) -> &[FragmentDestination] {
         &self.destinations
     }

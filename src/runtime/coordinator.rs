@@ -583,13 +583,6 @@ impl ExecutionCoordinator {
                     exec_params.per_node_scan_ranges =
                         compat_scan_ranges_for_placement(fr, placement, placements.len())?;
                 }
-                #[cfg(not(feature = "compat"))]
-                if !placement.scan_ranges.is_empty() {
-                    return Err(
-                        "coordinator scan range thrift projection requires feature compat"
-                            .to_string(),
-                    );
-                }
                 exec_params.per_exch_num_senders = placement.per_exch_num_senders.clone();
                 exec_params.destinations = exec_destinations;
                 #[cfg(feature = "compat")]
@@ -3599,6 +3592,65 @@ mod tests {
             query_global_dicts: None,
             query_global_dict_exprs: None,
         }
+    }
+
+    #[test]
+    fn proto_coordinator_submits_native_scan_ranges_without_compat_projection() {
+        let mut fragment = fragment_for_scan_range_merge_test(BTreeMap::new());
+        fragment
+            .native_scan_ranges
+            .insert(10, vec![native_file_scan_range_for_test(101)]);
+        let mut native_fragment = crate::proto::plan::PlanFragment {
+            fragment_id: fragment.fragment_id,
+            root: Some(crate::proto::plan::DistributedNode {
+                node_id: 10,
+                fragment_id: fragment.fragment_id,
+                limit: -1,
+                payload: Some(crate::proto::plan::distributed_node::Payload::Physical(
+                    crate::proto::plan::PlanNode {
+                        kind: Some(crate::proto::plan::plan_node::Kind::Values(
+                            crate::proto::plan::ValuesNode::default(),
+                        )),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }),
+            sink: Some(crate::proto::plan::DataSink {
+                kind: Some(crate::proto::plan::data_sink::Kind::Result(true)),
+            }),
+            ..Default::default()
+        };
+        native_fragment.output_columns = Vec::new();
+        let native_sidecars = NativePlanSidecars {
+            fragments_by_id: BTreeMap::from([(fragment.fragment_id, native_fragment)]),
+        };
+        let build = MultiFragmentBuildResult {
+            fragment_results: vec![fragment],
+            root_fragment_id: 0,
+            edges: Vec::new(),
+            boundary_schemas: Vec::new(),
+            rf_plan: None,
+        };
+        let dispatcher = MockDispatcher::new();
+        let scheduler = Arc::new(FragmentScheduler::new(vec![
+            "127.0.0.1:19010".parse().expect("backend addr"),
+        ]));
+
+        let result = ExecutionCoordinator::new_with_native_plan_sidecars(
+            build,
+            native_sidecars,
+            dispatcher.clone(),
+            scheduler,
+            None,
+        )
+        .execute_with_write_outcome();
+
+        assert!(
+            result.is_ok(),
+            "coordinator rejected native scan ranges: {result:?}"
+        );
+        assert_eq!(dispatcher.submitted_count(), 1);
     }
 
     #[cfg(feature = "compat")]
