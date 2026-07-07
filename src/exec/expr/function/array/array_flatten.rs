@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::chunk::type_compatibility::{check_exact, retag_column};
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, ListArray, make_array};
 use arrow::compute::cast;
@@ -62,14 +63,19 @@ pub fn eval_array_flatten(
 
     let mut inner_values = inner.values().clone();
     if inner_values.data_type() != &target_item_type {
-        inner_values = cast(&inner_values, &target_item_type).map_err(|e| {
-            format!(
-                "array_flatten failed to cast inner element {:?} -> {:?}: {}",
-                inner_values.data_type(),
-                target_item_type,
-                e
-            )
-        })?;
+        inner_values = if check_exact(&target_item_type, inner_values.data_type()).is_ok() {
+            retag_column(&inner_values, &target_item_type)
+                .map_err(|mismatch| format!("array_flatten failed to retag values: {mismatch:?}"))?
+        } else {
+            cast(&inner_values, &target_item_type).map_err(|e| {
+                format!(
+                    "array_flatten failed to cast inner element {:?} -> {:?}: {}",
+                    inner_values.data_type(),
+                    target_item_type,
+                    e
+                )
+            })?
+        };
     }
 
     let inner_values_data = inner_values.to_data();
@@ -111,7 +117,13 @@ pub fn eval_array_flatten(
         null_builder.append_non_null();
     }
 
-    let out_values = make_array(mutable.freeze());
+    let mut out_values = make_array(mutable.freeze());
+    if out_values.data_type() != output_field.data_type()
+        && check_exact(output_field.data_type(), out_values.data_type()).is_ok()
+    {
+        out_values = retag_column(&out_values, output_field.data_type())
+            .map_err(|mismatch| format!("array_flatten failed to retag output: {mismatch:?}"))?;
+    }
     let out = ListArray::new(
         output_field,
         OffsetBuffer::new(out_offsets.into()),

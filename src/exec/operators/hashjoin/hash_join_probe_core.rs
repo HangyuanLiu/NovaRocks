@@ -46,7 +46,7 @@ use super::join_hash_map::match_flags::BuildMatchFlags;
 use super::join_hash_map::method::JoinHashMap;
 use super::join_hash_map::search::{JoinSelection, SearchStats, append_cross_selection};
 use super::join_probe_utils::cross_join_batches;
-use crate::exec::chunk::{Chunk, ChunkSchemaRef};
+use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::join::JoinType;
 use crate::exec::runtime_filter::LocalRuntimeFilterSet;
@@ -279,6 +279,32 @@ impl HashJoinProbeCore {
 
     pub(crate) fn join_scope_chunk_schema(&self) -> &ChunkSchemaRef {
         &self.join_scope_chunk_schema
+    }
+
+    fn outer_output_chunk_schema(&self) -> Result<ChunkSchemaRef, String> {
+        let left_len = self.left_chunk_schema.slots().len();
+        let slots = self
+            .join_scope_chunk_schema
+            .slots()
+            .iter()
+            .enumerate()
+            .map(|(idx, slot)| {
+                let nullable = match self.join_type {
+                    JoinType::LeftOuter => idx >= left_len,
+                    JoinType::RightOuter => idx < left_len,
+                    JoinType::FullOuter => true,
+                    _ => false,
+                };
+                if nullable {
+                    slot.with_nullable(true)
+                } else {
+                    slot.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        ChunkSchema::try_new(slots)
+            .map(Arc::new)
+            .map_err(|e| format!("outer join output schema: {e}"))
     }
 
     pub(crate) fn is_build_loaded(&self) -> bool {
@@ -548,7 +574,7 @@ impl HashJoinProbeCore {
                 let flags = merged_build_flags
                     .or_else(|| self.take_build_matched())
                     .unwrap_or_default();
-                let schema = Arc::clone(self.join_scope_chunk_schema());
+                let schema = self.outer_output_chunk_schema()?;
                 let build_unmatched = self.build_unmatched_build_output_from_flags(&flags)?;
                 out = self.merge_join_outputs(out, build_unmatched, &schema, count_build_rows)?;
             }
@@ -776,19 +802,20 @@ impl HashJoinProbeCore {
             .filter_map(|(row, matched)| (!matched).then_some(row as u32))
             .collect::<Vec<_>>();
         let output_start = std::time::Instant::now();
+        let output_schema = self.outer_output_chunk_schema()?.arrow_schema_ref();
         let out = if self.probe_is_left {
             crate::exec::operators::hashjoin::join_hash_map::gather::gather_null_left_with_right(
                 &build_chunk,
                 &indices,
                 &self.left_chunk_schema.arrow_schema_ref(),
-                &self.join_scope_schema,
+                &output_schema,
             )?
         } else {
             crate::exec::operators::hashjoin::join_hash_map::gather::gather_left_with_null_right(
                 &build_chunk,
                 &indices,
                 &self.right_chunk_schema.arrow_schema_ref(),
-                &self.join_scope_schema,
+                &output_schema,
             )?
         };
         self.record_out_build_ns(output_start);
@@ -891,11 +918,11 @@ impl HashJoinProbeCore {
                     return Ok(Some(left_chunk));
                 }
                 let batches = vec![left_chunk.batch, right_batch];
-                let batch =
-                    concat_compatible_batches(&self.join_scope_schema, &batches, "join merge")?;
+                let output_schema = batch_chunk_schema.arrow_schema_ref();
+                let batch = concat_compatible_batches(&output_schema, &batches, "join merge")?;
                 Ok(Some(Chunk::try_new_with_chunk_schema(
                     batch,
-                    Arc::clone(&self.join_scope_chunk_schema),
+                    Arc::clone(batch_chunk_schema),
                 )?))
             }
         }
@@ -1019,7 +1046,8 @@ impl HashJoinProbeCore {
         if self.probe_keys.is_empty() {
             return Err("outer join requires non-empty eq join keys".to_string());
         }
-        let output_schema = Arc::clone(&self.join_scope_schema);
+        let output_chunk_schema = self.outer_output_chunk_schema()?;
+        let output_schema = output_chunk_schema.arrow_schema_ref();
         let output_unmatched_probe =
             matches!(self.join_type, JoinType::LeftOuter | JoinType::FullOuter);
         let track_build_matches =
@@ -1142,14 +1170,14 @@ impl HashJoinProbeCore {
         if output_batches.len() == 1 {
             return Ok(Some(Chunk::try_new_with_chunk_schema(
                 output_batches.remove(0),
-                Arc::clone(&self.join_scope_chunk_schema),
+                Arc::clone(&output_chunk_schema),
             )?));
         }
         let batch =
             concat_compatible_batches(&output_schema, &output_batches, "inner join concat")?;
         Ok(Some(Chunk::try_new_with_chunk_schema(
             batch,
-            Arc::clone(&self.join_scope_chunk_schema),
+            Arc::clone(&output_chunk_schema),
         )?))
     }
 
@@ -2097,6 +2125,73 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(core.lookup_hit_rows(), 1);
         assert_eq!(core.lookup_miss_rows(), 1);
+    }
+
+    #[test]
+    fn left_outer_join_marks_null_padded_right_slots_nullable() {
+        let left_schema = schema_kv("lk", "lv");
+        let right_schema = schema_kv("rk", "rw");
+        let join_scope_schema = join_schema(&left_schema, &right_schema);
+
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(LEFT_K_SLOT_ID), DataType::Int32);
+        let arena = Arc::new(arena);
+
+        let build_chunk = chunk_of_two(
+            Arc::clone(&right_schema),
+            &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID],
+            &[100],
+            &[10],
+        );
+        let artifact = Arc::new(direct_build_artifact_with_contract(
+            build_chunk,
+            JoinType::LeftOuter,
+            false,
+            false,
+            None,
+        ));
+
+        let mut core = HashJoinProbeCore::new(
+            Arc::clone(&arena),
+            JoinType::LeftOuter,
+            vec![probe_key],
+            None,
+            true,
+            true,
+            chunk_schema_of(&left_schema, &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID]),
+            chunk_schema_of(&right_schema, &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID]),
+            chunk_schema_of(
+                &join_scope_schema,
+                &[
+                    LEFT_K_SLOT_ID,
+                    LEFT_V_SLOT_ID,
+                    RIGHT_K_SLOT_ID,
+                    RIGHT_W_SLOT_ID,
+                ],
+            ),
+        );
+        core.set_build_artifact(artifact, 1, false)
+            .expect("set build");
+
+        let probe_chunk = chunk_of_two(
+            Arc::clone(&left_schema),
+            &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID],
+            &[200],
+            &[2],
+        );
+
+        let out = core
+            .join_probe_chunks(vec![probe_chunk])
+            .expect("probe")
+            .expect("left outer output");
+
+        assert!(!out.chunk_schema().slots()[0].nullable());
+        assert!(!out.chunk_schema().slots()[1].nullable());
+        assert!(out.chunk_schema().slots()[2].nullable());
+        assert!(out.chunk_schema().slots()[3].nullable());
+        assert_eq!(int32_values(&out, 0), vec![Some(200)]);
+        assert_eq!(int32_values(&out, 2), vec![None]);
+        assert_eq!(int32_values(&out, 3), vec![None]);
     }
 
     #[test]

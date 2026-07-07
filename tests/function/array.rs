@@ -954,6 +954,36 @@ fn test_array_generate_date_with_unit_arg() {
     assert_eq!(list.value_length(0), 5);
 }
 
+#[test]
+fn test_array_generate_datetime_null_step_errors() {
+    use arrow::datatypes::TimeUnit;
+    let mut arena = ExprArena::default();
+    let chunk = common::chunk_len_1();
+    let list_type = DataType::List(Arc::new(Field::new(
+        "item",
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+        true,
+    )));
+    let expr = common::typed_null(&mut arena, list_type);
+    let start = arena.push_typed(
+        ExprNode::Literal(LiteralValue::Utf8("2025-10-01".to_string())),
+        DataType::Utf8,
+    );
+    let stop = arena.push_typed(
+        ExprNode::Literal(LiteralValue::Utf8("2025-10-05".to_string())),
+        DataType::Utf8,
+    );
+    let step = common::typed_null(&mut arena, DataType::Null);
+
+    let err = eval_array_function("array_generate", &arena, expr, &[start, stop, step], &chunk)
+        .expect_err("NULL datetime step must error");
+
+    assert!(
+        err.contains("array_generate requires step parameter must be a constant integer"),
+        "err={err}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // array_intersect tests
 // ---------------------------------------------------------------------------

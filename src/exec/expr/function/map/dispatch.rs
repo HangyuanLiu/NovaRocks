@@ -52,6 +52,7 @@ pub fn eval_map_function(
         .unwrap_or(name);
 
     match canonical {
+        "map" => super::map_literal::eval_map_literal(arena, expr, args, chunk),
         "map_from_arrays" => super::map_from_arrays::eval_map_from_arrays(arena, expr, args, chunk),
         "arrays_zip" => super::arrays_zip::eval_arrays_zip(arena, expr, args, chunk),
         "map_size" => super::map_size::eval_map_size(arena, expr, args, chunk),
@@ -73,7 +74,7 @@ pub fn eval_map_function(
 }
 
 static MAP_FUNCTIONS: &[(&str, &str)] = &[
-    ("map", "map_from_arrays"),
+    ("map", "map"),
     ("map_from_arrays", "map_from_arrays"),
     ("arrays_zip", "arrays_zip"),
     ("map_size", "map_size"),
@@ -94,8 +95,8 @@ static MAP_FUNCTIONS: &[(&str, &str)] = &[
 static MAP_METADATA: &[FunctionMeta] = &[
     FunctionMeta {
         name: "map",
-        min_args: 2,
-        max_args: 2,
+        min_args: 0,
+        max_args: usize::MAX,
     },
     FunctionMeta {
         name: "map_from_arrays",

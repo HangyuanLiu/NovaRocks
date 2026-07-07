@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::chunk::type_compatibility::{check_exact, retag_column};
 use crate::exec::expr::function::compare_values_with_null;
-use crate::exec::expr::{ExprArena, ExprId, ExprNode};
+use crate::exec::expr::{ExprArena, ExprId, ExprNode, cast_with_special_rules};
 use crate::exec::variant::VariantValue;
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Decimal128Array, Decimal256Array,
@@ -227,6 +228,8 @@ fn eq_with_candidate(
         candidate.data_type(),
         DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
     ) {
+        let (array, candidate) =
+            normalize_nested_candidate_types(array.clone(), candidate.clone())?;
         if array.data_type() != candidate.data_type() {
             return Err(format!(
                 "IN nested type mismatch: {:?} vs {:?}",
@@ -242,9 +245,9 @@ fn eq_with_candidate(
                 builder.append_null();
             } else {
                 match compare_values_for_in(
-                    array,
+                    &array,
                     i,
-                    candidate,
+                    &candidate,
                     row_index(i, candidate.len()),
                     lhs_is_literal_like,
                     single_candidate,
@@ -277,6 +280,12 @@ fn eq_with_candidate(
     if let Some(result) = eq_signed_integer_input_with_candidate(array, candidate)? {
         return Ok(result);
     }
+    if matches!(array.data_type(), DataType::Utf8)
+        && is_numeric_json_candidate(candidate.data_type())
+    {
+        return eq_utf8_json_with_numeric_candidate(array, candidate);
+    }
+    let (array, candidate) = normalize_scalar_candidate_types(array.clone(), candidate.clone())?;
     match candidate.data_type() {
         DataType::Int8 => {
             let arr = candidate.as_any().downcast_ref::<Int8Array>().unwrap();
@@ -531,6 +540,144 @@ fn eq_with_candidate(
         }
         other => Err(format!("unsupported IN predicate type: {:?}", other)),
     }
+}
+
+fn is_numeric_json_candidate(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+    )
+}
+
+fn candidate_numeric_json_value(candidate: &ArrayRef, idx: usize) -> Option<JsonValue> {
+    match candidate.data_type() {
+        DataType::Int8 => candidate
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .map(|arr| JsonValue::Number(serde_json::Number::from(arr.value(idx) as i64))),
+        DataType::Int16 => candidate
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .map(|arr| JsonValue::Number(serde_json::Number::from(arr.value(idx) as i64))),
+        DataType::Int32 => candidate
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .map(|arr| JsonValue::Number(serde_json::Number::from(arr.value(idx) as i64))),
+        DataType::Int64 => candidate
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .map(|arr| JsonValue::Number(serde_json::Number::from(arr.value(idx)))),
+        DataType::Float32 => candidate
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .and_then(|arr| serde_json::Number::from_f64(arr.value(idx) as f64))
+            .map(JsonValue::Number),
+        DataType::Float64 => candidate
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .and_then(|arr| serde_json::Number::from_f64(arr.value(idx)))
+            .map(JsonValue::Number),
+        _ => None,
+    }
+}
+
+fn eq_utf8_json_with_numeric_candidate(
+    array: &ArrayRef,
+    candidate: &ArrayRef,
+) -> Result<BooleanArray, String> {
+    let input = array
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| "failed to downcast IN input to StringArray".to_string())?;
+    let mut builder = BooleanBuilder::with_capacity(input.len());
+    for row in 0..input.len() {
+        let candidate_idx = row_index(row, candidate.len());
+        if input.is_null(row) || candidate.is_null(candidate_idx) {
+            builder.append_null();
+            continue;
+        }
+        let Some(candidate_json) = candidate_numeric_json_value(candidate, candidate_idx) else {
+            builder.append_value(false);
+            continue;
+        };
+        let matched = json_value_from_text_or_variant(input.value(row))
+            .map(|lhs_json| lhs_json == candidate_json)
+            .unwrap_or_else(|| input.value(row) == candidate_json.to_string());
+        builder.append_value(matched);
+    }
+    Ok(builder.finish())
+}
+
+fn is_nested_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
+    )
+}
+
+fn same_nested_kind(left: &DataType, right: &DataType) -> bool {
+    matches!(
+        (left, right),
+        (DataType::List(_), DataType::List(_))
+            | (DataType::Struct(_), DataType::Struct(_))
+            | (DataType::Map(_, _), DataType::Map(_, _))
+    )
+}
+
+fn normalize_nested_candidate_types(
+    left: ArrayRef,
+    right: ArrayRef,
+) -> Result<(ArrayRef, ArrayRef), String> {
+    if !is_nested_type(left.data_type()) || !is_nested_type(right.data_type()) {
+        return Ok((left, right));
+    }
+    if check_exact(left.data_type(), right.data_type()).is_ok() {
+        let right = retag_column(&right, left.data_type()).map_err(|m| format!("{m:?}"))?;
+        return Ok((left, right));
+    }
+    if check_exact(right.data_type(), left.data_type()).is_ok() {
+        let left = retag_column(&left, right.data_type()).map_err(|m| format!("{m:?}"))?;
+        return Ok((left, right));
+    }
+    if same_nested_kind(left.data_type(), right.data_type())
+        && let Ok(casted) = cast_with_special_rules(&right, left.data_type())
+    {
+        return Ok((left, casted));
+    }
+    Ok((left, right))
+}
+
+fn normalize_scalar_candidate_types(
+    left: ArrayRef,
+    right: ArrayRef,
+) -> Result<(ArrayRef, ArrayRef), String> {
+    if left.data_type() == right.data_type()
+        || is_nested_type(left.data_type())
+        || is_nested_type(right.data_type())
+    {
+        return Ok((left, right));
+    }
+
+    let Some(target) = crate::types::comparison_common_type(left.data_type(), right.data_type())?
+    else {
+        return Ok((left, right));
+    };
+    let left = if left.data_type() == &target {
+        left
+    } else {
+        cast(&left, &target).map_err(|e| e.to_string())?
+    };
+    let right = if right.data_type() == &target {
+        right
+    } else {
+        cast(&right, &target).map_err(|e| e.to_string())?
+    };
+    Ok((left, right))
 }
 
 fn compare_values_for_in(
@@ -838,10 +985,12 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use arrow::array::{
-        DictionaryArray, Int32Builder, Int64Builder, LargeStringDictionaryBuilder, MapArray,
-        MapBuilder, MapFieldNames, PrimitiveDictionaryBuilder, RecordBatch,
+        DictionaryArray, Int32Builder, Int64Array, Int64Builder, LargeStringDictionaryBuilder,
+        ListArray, MapArray, MapBuilder, MapFieldNames, PrimitiveDictionaryBuilder, RecordBatch,
     };
+    use arrow::buffer::{NullBuffer, OffsetBuffer};
     use arrow::datatypes::{Field, Int8Type, Int32Type, Schema};
+    use std::collections::HashMap;
 
     fn create_test_map_array(rows: &[Option<&[(i32, i64)]>]) -> MapArray {
         let mut builder = MapBuilder::new(
@@ -925,6 +1074,50 @@ mod tests {
             .collect()
     }
 
+    fn chunk_from_arrays(columns: Vec<(SlotId, &'static str, ArrayRef)>) -> Chunk {
+        let fields = columns
+            .iter()
+            .map(|(_, name, array)| Field::new(*name, array.data_type().clone(), true))
+            .collect::<Vec<_>>();
+        let arrays = columns
+            .iter()
+            .map(|(_, _, array)| array.clone())
+            .collect::<Vec<_>>();
+        let slot_ids = columns.iter().map(|(slot, _, _)| *slot).collect::<Vec<_>>();
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema, arrays).unwrap();
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &slot_ids,
+        )
+        .unwrap();
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
+
+    fn list_i64_with_field_id(field_id: &str) -> ArrayRef {
+        let field = Arc::new(Field::new("item", DataType::Int64, true).with_metadata(
+            HashMap::from([("PARQUET:field_id".to_string(), field_id.to_string())]),
+        ));
+        Arc::new(ListArray::new(
+            field,
+            OffsetBuffer::new(vec![0, 2, 4].into()),
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+            None::<NullBuffer>,
+        ))
+    }
+
+    fn list_i32_with_field_id(field_id: &str) -> ArrayRef {
+        let field = Arc::new(Field::new("item", DataType::Int32, true).with_metadata(
+            HashMap::from([("PARQUET:field_id".to_string(), field_id.to_string())]),
+        ));
+        Arc::new(ListArray::new(
+            field,
+            OffsetBuffer::new(vec![0, 2, 4].into()),
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+            None::<NullBuffer>,
+        ))
+    }
+
     #[test]
     fn eq_with_scalar_supports_map_values() {
         let array = Arc::new(create_test_map_array(&[
@@ -938,6 +1131,127 @@ mod tests {
         assert!(result.value(0));
         assert!(!result.value(1));
         assert!(result.is_null(2));
+    }
+
+    #[test]
+    fn nested_in_ignores_arrow_field_metadata() {
+        let child_array = list_i64_with_field_id("6");
+        let candidate_array = list_i64_with_field_id("7");
+        let chunk = chunk_from_arrays(vec![
+            (SlotId::new(1), "child", child_array.clone()),
+            (SlotId::new(2), "candidate", candidate_array.clone()),
+        ]);
+        let mut arena = ExprArena::default();
+        let child = arena.push_typed(
+            ExprNode::SlotId(SlotId::new(1)),
+            child_array.data_type().clone(),
+        );
+        let candidate = arena.push_typed(
+            ExprNode::SlotId(SlotId::new(2)),
+            candidate_array.data_type().clone(),
+        );
+        let expr = arena.push_typed(
+            ExprNode::In {
+                child,
+                values: vec![candidate],
+                is_not_in: false,
+            },
+            DataType::Boolean,
+        );
+
+        let result = arena
+            .eval(expr, &chunk)
+            .expect("metadata-only nested IN type difference");
+
+        assert_eq!(bool_values(&result), vec![Some(true), Some(true)]);
+    }
+
+    #[test]
+    fn nested_in_casts_candidate_list_to_lhs_item_type() {
+        let child_array = list_i32_with_field_id("10");
+        let candidate_array = list_i64_with_field_id("11");
+        let chunk = chunk_from_arrays(vec![
+            (SlotId::new(1), "child", child_array.clone()),
+            (SlotId::new(2), "candidate", candidate_array.clone()),
+        ]);
+        let mut arena = ExprArena::default();
+        let child = arena.push_typed(
+            ExprNode::SlotId(SlotId::new(1)),
+            child_array.data_type().clone(),
+        );
+        let candidate = arena.push_typed(
+            ExprNode::SlotId(SlotId::new(2)),
+            candidate_array.data_type().clone(),
+        );
+        let expr = arena.push_typed(
+            ExprNode::In {
+                child,
+                values: vec![candidate],
+                is_not_in: false,
+            },
+            DataType::Boolean,
+        );
+
+        let result = arena
+            .eval(expr, &chunk)
+            .expect("nested IN candidate should cast to lhs item type");
+
+        assert_eq!(bool_values(&result), vec![Some(true), Some(true)]);
+    }
+
+    #[test]
+    fn scalar_in_casts_int_candidate_to_bigint_input() {
+        let values = Arc::new(Int64Array::from(vec![Some(10), Some(11), None])) as ArrayRef;
+        let chunk = chunk_from_arrays(vec![(SlotId::new(1), "c_int", values)]);
+        let mut arena = ExprArena::default();
+        let child = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
+        let ten = arena.push_typed(ExprNode::Literal(LiteralValue::Int32(10)), DataType::Int32);
+        let expr = arena.push_typed(
+            ExprNode::In {
+                child,
+                values: vec![ten],
+                is_not_in: false,
+            },
+            DataType::Boolean,
+        );
+
+        let result = arena
+            .eval(expr, &chunk)
+            .expect("IN should cast scalar candidate to comparison common type");
+
+        assert_eq!(bool_values(&result), vec![Some(true), Some(false), None]);
+    }
+
+    #[test]
+    fn utf8_json_in_numeric_candidate_compares_json_scalar_values() {
+        let json_values = Arc::new(StringArray::from(vec![
+            None,
+            Some("{\"a\":1}"),
+            Some("1"),
+            Some("3"),
+            Some("{}"),
+        ])) as ArrayRef;
+        let chunk = chunk_from_arrays(vec![(SlotId::new(1), "json_col", json_values.clone())]);
+        let mut arena = ExprArena::default();
+        let child = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let one = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(1)), DataType::Int64);
+        let expr = arena.push_typed(
+            ExprNode::In {
+                child,
+                values: vec![one],
+                is_not_in: false,
+            },
+            DataType::Boolean,
+        );
+
+        let result = arena
+            .eval(expr, &chunk)
+            .expect("JSON text IN numeric candidate");
+
+        assert_eq!(
+            bool_values(&result),
+            vec![None, Some(false), Some(true), Some(false), Some(false)]
+        );
     }
 
     #[test]

@@ -54,7 +54,17 @@ fn encode_expr_kind(e: &TypedExpr) -> Result<expr::expr::Kind, String> {
             distinct: *distinct,
         }),
         ExprKind::LambdaFunction { params, body } => Kind::Lambda(Box::new(expr::LambdaExpr {
-            params: params.iter().map(|param| param.name.clone()).collect(),
+            params: params
+                .iter()
+                .map(|param| {
+                    Ok(expr::LambdaParam {
+                        slot_id: param.slot_id,
+                        name: Some(param.name.clone()),
+                        r#type: Some(encode_type(&param.data_type)?),
+                        nullable: param.nullable,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?,
             body: Some(Box::new(encode_expr(body)?)),
         })),
         ExprKind::AggregateCall {
@@ -168,10 +178,12 @@ fn encode_expr_kind(e: &TypedExpr) -> Result<expr::expr::Kind, String> {
                 "unexpected SubqueryPlaceholder (id={id}) in FE proto expression encoder"
             ));
         }
-        ExprKind::Lambda { params, body } => Kind::Lambda(Box::new(expr::LambdaExpr {
-            params: params.clone(),
-            body: Some(Box::new(encode_expr(body)?)),
-        })),
+        ExprKind::Lambda { .. } => {
+            return Err(
+                "ExprKind::Lambda cannot be encoded as native proto without parameter slot/type bindings; use LambdaFunction"
+                    .to_string(),
+            );
+        }
     })
 }
 

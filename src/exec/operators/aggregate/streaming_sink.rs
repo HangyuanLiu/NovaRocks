@@ -36,7 +36,10 @@ use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use super::streaming_state::AggregateStreamingState;
-use super::{ENABLE_GROUP_KEY_OPTIMIZATIONS, align_schema_with_arrays, build_agg_views};
+use super::{
+    ENABLE_GROUP_KEY_OPTIMIZATIONS, align_schema_with_arrays, build_agg_views,
+    normalize_aggregate_group_arrays,
+};
 use crate::common::failpoint;
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
@@ -266,6 +269,8 @@ impl AggregateStreamingSinkOperator {
         }
 
         let group_arrays = self.eval_group_by_arrays(&chunk)?;
+        let group_arrays =
+            normalize_aggregate_group_arrays(&self.expected_group_types()?, group_arrays)?;
         let agg_arrays = self.eval_agg_arrays(&chunk)?;
 
         self.ensure_data_initialized(&group_arrays, &agg_arrays)

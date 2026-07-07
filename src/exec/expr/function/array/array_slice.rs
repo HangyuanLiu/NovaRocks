@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::chunk::type_compatibility::{check_exact, retag_column};
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, Int64Array, ListArray, make_array};
 use arrow::datatypes::DataType;
@@ -139,7 +140,13 @@ pub fn eval_array_slice(
         null_builder.append_non_null();
     }
 
-    let out_values = make_array(mutable.freeze());
+    let mut out_values = make_array(mutable.freeze());
+    if out_values.data_type() != output_field.data_type()
+        && check_exact(output_field.data_type(), out_values.data_type()).is_ok()
+    {
+        out_values = retag_column(&out_values, output_field.data_type())
+            .map_err(|mismatch| format!("array_slice failed to retag values: {mismatch:?}"))?;
+    }
     let list = ListArray::new(
         output_field,
         OffsetBuffer::new(offsets.into()),

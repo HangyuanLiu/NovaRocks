@@ -93,7 +93,7 @@ fn value_form_marker_query(
         column_id: marker_col_id,
         name: marker_col_name.clone(),
         data_type: marker_dtype.clone(),
-        nullable: false,
+        nullable: true,
         is_internal: false,
     };
     let source_outputs = source.output_columns.clone();
@@ -109,21 +109,30 @@ fn value_form_marker_query(
             having: None,
             projection: vec![ProjectItem {
                 expr: TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Int(1)),
+                    kind: ExprKind::AggregateCall {
+                        name: "max".to_string(),
+                        args: vec![TypedExpr {
+                            kind: ExprKind::Literal(LiteralValue::Int(1)),
+                            data_type: marker_dtype.clone(),
+                            nullable: false,
+                        }],
+                        distinct: false,
+                        order_by: vec![],
+                    },
                     data_type: marker_dtype.clone(),
-                    nullable: false,
+                    nullable: true,
                 },
                 output_name: marker_col_name.clone(),
                 output_column_id: marker_col_id,
             }],
-            has_aggregation: false,
+            has_aggregation: true,
             distinct: false,
             repeat: None,
             apply_specs: Vec::new(),
             predicate_apply_specs: Vec::new(),
         }),
         order_by: Vec::new(),
-        limit: Some(1),
+        limit: None,
         offset: None,
         output_columns: vec![marker_output],
         local_cte_ids: Vec::new(),
@@ -4844,5 +4853,63 @@ mod tests {
         ));
         assert_eq!(coerced.data_type, DataType::Boolean);
         assert!(coerced.nullable);
+    }
+
+    #[test]
+    fn value_form_marker_query_uses_scalar_aggregate_not_limit() {
+        let source = ResolvedQuery {
+            body: QueryBody::Select(ResolvedSelect {
+                from: None,
+                filter: None,
+                group_by: Vec::new(),
+                having: None,
+                projection: vec![ProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::Literal(LiteralValue::Int(1)),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                    },
+                    output_name: "x".to_string(),
+                    output_column_id: crate::sql::column_id::ColumnId(1),
+                }],
+                has_aggregation: false,
+                distinct: false,
+                repeat: None,
+                apply_specs: Vec::new(),
+                predicate_apply_specs: Vec::new(),
+            }),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            output_columns: vec![OutputColumn {
+                column_id: crate::sql::column_id::ColumnId(1),
+                name: "x".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                is_internal: false,
+            }],
+            local_cte_ids: Vec::new(),
+        };
+
+        let marker = value_form_nonempty_marker_query(
+            source,
+            "__src".to_string(),
+            crate::sql::column_id::ColumnId(2),
+            "__has_row".to_string(),
+        );
+
+        assert!(marker.limit.is_none());
+        assert!(marker.output_columns[0].nullable);
+        let QueryBody::Select(select) = marker.body else {
+            panic!("expected marker SELECT");
+        };
+        assert!(select.has_aggregation);
+        assert_eq!(select.group_by.len(), 0);
+        assert!(select.projection[0].expr.nullable);
+        let ExprKind::AggregateCall { name, args, .. } = &select.projection[0].expr.kind else {
+            panic!("expected aggregate marker expression");
+        };
+        assert_eq!(name, "max");
+        assert_eq!(args.len(), 1);
     }
 }

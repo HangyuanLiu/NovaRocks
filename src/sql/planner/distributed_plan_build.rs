@@ -17,8 +17,8 @@ use crate::sql::planner::optimizer_bridge::property::{
     ordering_spec_from_sort_items, window_ordering_spec,
 };
 use crate::sql::planner::plan::{
-    ExchangeFlavor, PhysicalPlanKind, PhysicalPlanNode, PhysicalSetOpNode, PlanSetOpKind,
-    RedistributeMode, RedistributeNode,
+    ExchangeFlavor, PhysicalPlanKind, PhysicalPlanNode, PhysicalSetOpNode, PlanScanNode,
+    PlanSetOpKind, RedistributeMode, RedistributeNode,
 };
 use crate::sql::planner::{
     OrderingSpec, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent, TopNPhase,
@@ -458,7 +458,7 @@ impl DistributedPlanBuilder {
             stream_kind,
             ExchangeFlavor::Distribution,
             -1,
-            redistribute.output_columns.clone(),
+            stream_exchange_output_columns(child_plan, &redistribute.output_columns),
             None,
             node.stats.clone(),
         )
@@ -798,9 +798,49 @@ fn set_op_payload_output_columns(
     }
 }
 
+fn stream_exchange_output_columns(
+    child_plan: &PhysicalPlanNode,
+    requested_output_columns: &[OutputColumn],
+) -> Vec<OutputColumn> {
+    if requested_output_columns.is_empty() {
+        return Vec::new();
+    }
+
+    let actual_output_columns = stream_exchange_source_output_columns(child_plan);
+    if actual_output_columns.is_empty() {
+        return requested_output_columns.to_vec();
+    }
+
+    let actual_ids: HashSet<ColumnId> = actual_output_columns
+        .iter()
+        .map(|column| column.column_id)
+        .collect();
+    let mut seen_requested = HashSet::new();
+    let requested_projected: Vec<OutputColumn> = requested_output_columns
+        .iter()
+        .filter(|column| {
+            actual_ids.contains(&column.column_id) && seen_requested.insert(column.column_id)
+        })
+        .cloned()
+        .collect();
+    if requested_projected.is_empty() {
+        dedup_output_columns(actual_output_columns)
+    } else {
+        requested_projected
+    }
+}
+
+fn dedup_output_columns(columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
+    let mut seen = HashSet::new();
+    columns
+        .into_iter()
+        .filter(|column| seen.insert(column.column_id))
+        .collect()
+}
+
 fn stream_exchange_source_output_columns(plan: &PhysicalPlanNode) -> Vec<OutputColumn> {
     match &plan.kind {
-        PhysicalPlanKind::Scan(scan) => scan.columns.clone(),
+        PhysicalPlanKind::Scan(scan) => scan_materialized_output_columns(scan, plan),
         PhysicalPlanKind::Values(values) => values.columns.clone(),
         PhysicalPlanKind::Project(project) => project_items_output_columns(&project.items),
         PhysicalPlanKind::Sort(sort) => {
@@ -953,6 +993,44 @@ fn normalize_stream_exchange_output_columns(
         requested
     } else {
         source_output_columns.to_vec()
+    }
+}
+
+fn scan_materialized_output_columns(
+    scan: &PlanScanNode,
+    plan: &PhysicalPlanNode,
+) -> Vec<OutputColumn> {
+    let Some(required_columns) = scan.required_columns.as_ref() else {
+        return plan.output_columns.clone();
+    };
+    let required: HashSet<String> = required_columns
+        .iter()
+        .map(|column| column.to_lowercase())
+        .collect();
+    let variant_ids: HashSet<ColumnId> = scan
+        .variant_columns
+        .iter()
+        .map(|column| column.synthetic_column_id)
+        .collect();
+
+    let projected: Vec<OutputColumn> = scan
+        .columns
+        .iter()
+        .filter(|column| {
+            required.contains(&column.name.to_lowercase())
+                || variant_ids.contains(&column.column_id)
+                || !scan
+                    .table
+                    .columns
+                    .iter()
+                    .any(|table_column| table_column.name.eq_ignore_ascii_case(&column.name))
+        })
+        .cloned()
+        .collect();
+    if projected.is_empty() {
+        plan.output_columns.clone()
+    } else {
+        projected
     }
 }
 

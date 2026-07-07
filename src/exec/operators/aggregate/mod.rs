@@ -38,6 +38,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use crate::common::failpoint;
 use crate::common::ids::SlotId;
+use crate::exec::chunk::type_compatibility::{check_exact, retag_column};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::agg;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
@@ -130,6 +131,40 @@ pub(super) fn is_compatible_aggregate_group_data_type(
         return true;
     }
     expected == actual
+}
+
+pub(super) fn normalize_aggregate_group_arrays(
+    expected: &[DataType],
+    arrays: Vec<ArrayRef>,
+) -> Result<Vec<ArrayRef>, String> {
+    if expected.len() != arrays.len() {
+        return Err("group by type length mismatch".to_string());
+    }
+    expected
+        .iter()
+        .zip(arrays)
+        .enumerate()
+        .map(|(idx, (expected_type, array))| {
+            let actual_type = array.data_type();
+            if expected_type == actual_type
+                || is_compatible_aggregate_group_data_type(expected_type, actual_type)
+            {
+                return Ok(array);
+            }
+            check_exact(expected_type, actual_type).map_err(|_| {
+                format!(
+                    "group by type mismatch at {}: expected {:?}, got {:?}",
+                    idx, expected_type, actual_type
+                )
+            })?;
+            retag_column(&array, expected_type).map_err(|mismatch| {
+                format!(
+                    "retag aggregate group by column {} to target type {:?} failed: {:?}",
+                    idx, expected_type, mismatch
+                )
+            })
+        })
+        .collect()
 }
 
 pub(super) fn aggregate_accepts_encoded_group_column(
@@ -463,6 +498,8 @@ impl AggregateProcessorOperator {
         }
 
         let group_arrays = self.eval_group_by_arrays(&chunk)?;
+        let group_arrays =
+            normalize_aggregate_group_arrays(&self.expected_group_types()?, group_arrays)?;
         let agg_arrays = self.eval_agg_arrays(&chunk)?;
 
         self.ensure_data_initialized(&group_arrays, &agg_arrays)
@@ -1287,9 +1324,17 @@ impl Drop for AggregateProcessorOperator {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int32Array, ListArray};
+    use arrow::buffer::OffsetBuffer;
     use arrow::datatypes::DataType;
 
-    use super::{is_compatible_aggregate_data_type, is_compatible_aggregate_group_data_type};
+    use super::{
+        is_compatible_aggregate_data_type, is_compatible_aggregate_group_data_type,
+        normalize_aggregate_group_arrays,
+    };
 
     #[test]
     fn aggregate_rejects_decimal_precision_drift() {
@@ -1329,6 +1374,29 @@ mod tests {
             &DataType::Utf8,
             &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
         ));
+    }
+
+    #[test]
+    fn aggregate_group_key_retags_nested_metadata_only_type() {
+        use arrow::datatypes::Field;
+
+        let values = Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef;
+        let actual_field = Field::new("item", DataType::Int32, true).with_metadata(HashMap::from(
+            [("PARQUET:field_id".to_string(), "10".to_string())],
+        ));
+        let actual = Arc::new(ListArray::new(
+            Arc::new(actual_field),
+            OffsetBuffer::from_lengths([2]),
+            values,
+            None,
+        )) as ArrayRef;
+        let expected = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
+
+        let normalized =
+            normalize_aggregate_group_arrays(std::slice::from_ref(&expected), vec![actual])
+                .expect("metadata-only retag");
+
+        assert_eq!(normalized[0].data_type(), &expected);
     }
 
     #[test]
@@ -1417,9 +1485,7 @@ mod tests {
 
     #[test]
     fn aggregate_output_schema_rejects_runtime_type_drift() {
-        use std::sync::Arc;
-
-        use arrow::array::{ArrayRef, Int64Array};
+        use arrow::array::Int64Array;
         use arrow::datatypes::{DataType, Field, Schema};
 
         let schema = Arc::new(Schema::new(vec![Field::new(

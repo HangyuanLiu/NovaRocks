@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::chunk::type_compatibility::{check_exact, nested_path_label};
+use crate::exec::chunk::type_compatibility::{check_exact, nested_path_label, retag_column};
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{ArrayRef, StructArray, new_null_array};
 use arrow::datatypes::DataType;
@@ -85,6 +85,17 @@ fn eval_new_struct(
         let expected_type = struct_fields[idx].data_type();
         if array.data_type() == &DataType::Null && expected_type != &DataType::Null {
             array = new_null_array(expected_type, num_rows);
+        }
+        if array.data_type() != expected_type
+            && check_exact(expected_type, array.data_type()).is_ok()
+        {
+            array = retag_column(&array, expected_type).map_err(|mismatch| {
+                let path = nested_path_label(&format!("field[{idx}]"), &mismatch.nested_path);
+                format!(
+                    "{fn_name} failed to retag field at {path}: expected {:?}, got {:?}",
+                    mismatch.expected, mismatch.actual
+                )
+            })?;
         }
         assert_struct_child_type(fn_name, idx, expected_type, array.data_type())?;
         arrays.push(array);
