@@ -26,13 +26,30 @@ use crate::sql::planner::{
     PlanFragment, TopNPhase,
 };
 
+pub(crate) struct NativePlanEncodeContext<'a> {
+    pub(crate) mv_refresh_ctx:
+        Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+}
+
 pub(crate) fn encode_distributed_plan(
     src: &DistributedPlan,
+) -> Result<plan::DistributedPlan, String> {
+    encode_distributed_plan_with_context(
+        src,
+        NativePlanEncodeContext {
+            mv_refresh_ctx: None,
+        },
+    )
+}
+
+pub(crate) fn encode_distributed_plan_with_context(
+    src: &DistributedPlan,
+    ctx: NativePlanEncodeContext<'_>,
 ) -> Result<plan::DistributedPlan, String> {
     let mut fragments = src
         .fragments
         .iter()
-        .map(encode_plan_fragment)
+        .map(|fragment| encode_plan_fragment_with_context(fragment, &ctx))
         .collect::<Result<Vec<_>, _>>()?;
     attach_stream_sinks(src, &mut fragments)?;
     Ok(plan::DistributedPlan {
@@ -264,10 +281,22 @@ fn patch_exchange_receiver_output_columns_in_node(
 }
 
 pub(crate) fn encode_plan_fragment(src: &PlanFragment) -> Result<plan::PlanFragment, String> {
+    encode_plan_fragment_with_context(
+        src,
+        &NativePlanEncodeContext {
+            mv_refresh_ctx: None,
+        },
+    )
+}
+
+fn encode_plan_fragment_with_context(
+    src: &PlanFragment,
+    ctx: &NativePlanEncodeContext<'_>,
+) -> Result<plan::PlanFragment, String> {
     let (output_exprs, output_columns) = encode_fragment_output_contract(src)?;
     Ok(plan::PlanFragment {
         fragment_id: src.fragment_id,
-        root: Some(encode_node(&src.root)?),
+        root: Some(encode_node_with_context(&src.root, ctx)?),
         data_partition: Some(encode_data_partition(&src.data_partition)?),
         output_partition: Some(encode_data_partition(&src.output_partition)?),
         sink: Some(encode_data_sink(&src.sink, &src.output_columns)?),
@@ -383,9 +412,21 @@ fn encode_iceberg_write_sink_output_columns(
 }
 
 pub(crate) fn encode_node(src: &DistributedNode) -> Result<plan::DistributedNode, String> {
+    encode_node_with_context(
+        src,
+        &NativePlanEncodeContext {
+            mv_refresh_ctx: None,
+        },
+    )
+}
+
+fn encode_node_with_context(
+    src: &DistributedNode,
+    ctx: &NativePlanEncodeContext<'_>,
+) -> Result<plan::DistributedNode, String> {
     let payload = match &src.payload {
         DistributedPayload::Physical(physical) => {
-            plan::distributed_node::Payload::Physical(encode_physical_node(physical)?)
+            plan::distributed_node::Payload::Physical(encode_physical_node(physical, ctx)?)
         }
         DistributedPayload::Exchange(exchange) => {
             plan::distributed_node::Payload::Exchange(encode_exchange_receiver(exchange)?)
@@ -410,7 +451,7 @@ pub(crate) fn encode_node(src: &DistributedNode) -> Result<plan::DistributedNode
         children: src
             .children
             .iter()
-            .map(encode_node)
+            .map(|child| encode_node_with_context(child, ctx))
             .collect::<Result<Vec<_>, _>>()?,
         payload: Some(payload),
     })
@@ -443,13 +484,16 @@ pub(super) fn encoded_physical_variant_names_for_test() -> &'static [&'static st
     ]
 }
 
-fn encode_physical_node(src: &PhysicalPlanKind) -> Result<plan::PlanNode, String> {
+fn encode_physical_node(
+    src: &PhysicalPlanKind,
+    ctx: &NativePlanEncodeContext<'_>,
+) -> Result<plan::PlanNode, String> {
     use plan::plan_node::Kind;
 
     let (output_columns, kind) = match src {
         PhysicalPlanKind::Scan(node) => (
             encode_output_columns(&node.columns)?,
-            Kind::Scan(encode_scan_node(node)?),
+            Kind::Scan(encode_scan_node(node, ctx)?),
         ),
         PhysicalPlanKind::Filter(node) => (
             Vec::new(),
@@ -805,10 +849,11 @@ fn encode_row_count_assertion(assertion: PlanRowCountAssertion) -> i32 {
 
 fn encode_scan_node(
     src: &crate::sql::planner::plan::PlanScanNode,
+    ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::ScanNode, String> {
     Ok(plan::ScanNode {
         database: src.database.clone(),
-        table: Some(encode_table_def(&src.table)?),
+        table: Some(encode_table_def_with_context(&src.table, ctx)?),
         alias: src.alias.clone(),
         columns: encode_output_columns(&src.columns)?,
         predicates: encode_exprs(&src.predicates)?,
@@ -1045,6 +1090,18 @@ fn encode_wired_runtime_filter_probe(
 }
 
 fn encode_table_def(src: &catalog::TableDef) -> Result<plan::TableDef, String> {
+    encode_table_def_with_context(
+        src,
+        &NativePlanEncodeContext {
+            mv_refresh_ctx: None,
+        },
+    )
+}
+
+fn encode_table_def_with_context(
+    src: &catalog::TableDef,
+    ctx: &NativePlanEncodeContext<'_>,
+) -> Result<plan::TableDef, String> {
     Ok(plan::TableDef {
         name: src.name.clone(),
         columns: src
@@ -1057,7 +1114,7 @@ fn encode_table_def(src: &catalog::TableDef) -> Result<plan::TableDef, String> {
             .iter()
             .map(encode_column_def)
             .collect::<Result<Vec<_>, _>>()?,
-        source: Some(encode_scan_source(&src.source)?),
+        source: Some(encode_scan_source(&src.source, ctx)?),
     })
 }
 
@@ -1135,7 +1192,10 @@ fn iceberg_type_for_arrow_data_type(data_type: &DataType) -> Result<Type, String
     }))
 }
 
-fn encode_scan_source(src: &catalog::ScanSource) -> Result<plan::ScanSource, String> {
+fn encode_scan_source(
+    src: &catalog::ScanSource,
+    ctx: &NativePlanEncodeContext<'_>,
+) -> Result<plan::ScanSource, String> {
     use plan::scan_source::Kind;
 
     Ok(plan::ScanSource {
@@ -1183,12 +1243,27 @@ fn encode_scan_source(src: &catalog::ScanSource) -> Result<plan::ScanSource, Str
                 table,
                 from_snapshot_id,
                 to_snapshot_id,
-            } => Kind::IcebergDeltaTable(plan::IcebergDeltaTable {
-                table: Some(encode_iceberg_table_info(table)?),
-                from_snapshot_id: *from_snapshot_id,
-                to_snapshot_id: *to_snapshot_id,
-                delta_plan: None,
-            }),
+            } => {
+                let runtime_plan =
+                    crate::sql::codegen::iceberg_delta_scan_wire::build_iceberg_delta_scan_runtime_plan(
+                        table,
+                        *from_snapshot_id,
+                        *to_snapshot_id,
+                        ctx.mv_refresh_ctx,
+                    )
+                    .map_err(|err| format!("Iceberg delta scan native sidecar: {err}"))?;
+
+                Kind::IcebergDeltaTable(plan::IcebergDeltaTable {
+                    table: Some(encode_iceberg_table_info(table)?),
+                    from_snapshot_id: *from_snapshot_id,
+                    to_snapshot_id: *to_snapshot_id,
+                    delta_plan: Some(
+                        crate::sql::codegen::iceberg_delta_scan_wire::encode_iceberg_delta_scan_plan_native(
+                            &runtime_plan,
+                        )?,
+                    ),
+                })
+            }
             catalog::ScanSource::IcebergVersionTable { table, snapshot_id } => {
                 Kind::IcebergVersionTable(plan::IcebergVersionTable {
                     table: Some(encode_iceberg_table_info(table)?),
@@ -1862,6 +1937,105 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(2, "delta"), (1, "old")]
         );
+    }
+
+    #[test]
+    fn iceberg_delta_table_encoder_requires_mv_refresh_context() {
+        use crate::sql::codegen::proto_encode::plan;
+
+        let plan = iceberg_delta_distributed_plan_for_test();
+
+        let err = plan::encode_distributed_plan_with_context(
+            &plan,
+            plan::NativePlanEncodeContext {
+                mv_refresh_ctx: None,
+            },
+        )
+        .expect_err("Iceberg delta native sidecar must require MV refresh context");
+
+        assert!(err.contains("Iceberg delta scan native sidecar"), "{err}");
+        assert!(err.contains("MV refresh context"), "{err}");
+    }
+
+    fn iceberg_delta_distributed_plan_for_test() -> DistributedPlan {
+        let output_columns = vec![output_column(1, "order_id", DataType::Int64)];
+        DistributedPlan {
+            fragments: vec![PlanFragment {
+                fragment_id: 0,
+                root: DistributedNode {
+                    node_id: 10,
+                    fragment_id: 0,
+                    tuple_ids: vec![10],
+                    nullable_tuple_ids: Vec::new(),
+                    limit: -1,
+                    build_runtime_filters: Vec::new(),
+                    probe_runtime_filters: Vec::new(),
+                    children: Vec::new(),
+                    stats: stats(),
+                    payload: DistributedPayload::Physical(PhysicalPlanKind::Scan(
+                        crate::sql::planner::plan::PlanScanNode {
+                            database: "db".to_string(),
+                            table: iceberg_delta_table_for_test(),
+                            alias: None,
+                            columns: output_columns.clone(),
+                            predicates: Vec::new(),
+                            required_columns: None,
+                            variant_columns: Vec::new(),
+                            mv_rewritten_from: None,
+                        },
+                    )),
+                },
+                data_partition: DataPartition::unpartitioned(),
+                output_partition: DataPartition::unpartitioned(),
+                sink: DataSink::Result,
+                output_exprs: None,
+                output_columns,
+                cte_id: None,
+                cte_exchange_nodes: Vec::new(),
+            }],
+            root_fragment_id: 0,
+            edges: Vec::new(),
+        }
+    }
+
+    fn iceberg_delta_table_for_test() -> catalog::TableDef {
+        catalog::TableDef {
+            name: "orders".to_string(),
+            columns: vec![catalog::ColumnDef {
+                name: "order_id".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            }],
+            iceberg_row_lineage_metadata_columns: Vec::new(),
+            source: catalog::ScanSource::IcebergDeltaTable {
+                table: catalog::IcebergTableInfo {
+                    catalog: "ice".to_string(),
+                    namespace: "db".to_string(),
+                    table: "orders".to_string(),
+                    table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
+                    current_snapshot_id: Some(2),
+                    schema_id: 1,
+                    location: "file:///warehouse/orders".to_string(),
+                    schema: catalog::IcebergSchemaDef {
+                        fields: vec![catalog::IcebergSchemaFieldDef {
+                            field_id: 1,
+                            name: "order_id".to_string(),
+                            initial_default: None,
+                            write_default: None,
+                            initial_default_json: None,
+                            write_default_json: None,
+                            children: Vec::new(),
+                        }],
+                    },
+                    serialized_metadata: None,
+                    serialized_metadata_rows: None,
+                },
+                from_snapshot_id: 1,
+                to_snapshot_id: 2,
+            },
+        }
     }
 
     fn two_fragment_stream_plan_for_test() -> DistributedPlan {

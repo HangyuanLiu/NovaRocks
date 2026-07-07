@@ -3536,6 +3536,39 @@ fn nidl_d3i_native_fragment_exec_params_are_not_thrift_shaped() {
     );
 }
 
+#[test]
+fn nidl_d3j_native_delta_scan_sidecar_is_not_patched_from_thrift_plan() {
+    let repo = Path::new(manifest_dir());
+    let coordinator = fs::read_to_string(repo.join("src/runtime/coordinator.rs")).unwrap();
+    let mut violations = Vec::new();
+
+    for forbidden in [
+        "patch_native_iceberg_delta_scan_payloads",
+        "TIcebergDeltaScanNode",
+        "TIcebergDeltaScanPlan",
+        "encode_native_delta_scan_plan",
+    ] {
+        if coordinator.contains(forbidden) {
+            violations.push(format!(
+                "src/runtime/coordinator.rs: native Iceberg delta sidecar must not use `{forbidden}`"
+            ));
+        }
+    }
+
+    let proto_plan = fs::read_to_string(repo.join("src/sql/codegen/proto_encode/plan.rs")).unwrap();
+    if proto_plan.contains("delta_plan: None") {
+        violations.push(
+            "src/sql/codegen/proto_encode/plan.rs: IcebergDeltaTable native encoder must not leave delta_plan as None".to_string(),
+        );
+    }
+
+    assert!(
+        violations.is_empty(),
+        "D3J native Iceberg delta sidecar guard failed:\n{}",
+        violations.join("\n")
+    );
+}
+
 fn nidl_d3b_baseline_update_hint() -> String {
     format!(
         "To intentionally update the proto schema ledger, run:\n{}",

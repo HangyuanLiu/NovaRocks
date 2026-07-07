@@ -13,6 +13,7 @@ pub(crate) mod fragment_builder;
 pub(crate) mod fragment_request;
 pub(crate) mod helpers;
 pub(crate) mod iceberg_change_stream_router_wire;
+pub(crate) mod iceberg_delta_scan_wire;
 pub(crate) mod iceberg_write_sink_wire;
 pub(crate) mod ir;
 pub(crate) mod nodes;
