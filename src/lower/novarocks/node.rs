@@ -2375,6 +2375,7 @@ fn lower_hash_aggregate_node(
         }
     }
 
+    let need_finalize = matches!(mode, plan::AggMode::Single | plan::AggMode::Global);
     let mut functions = Vec::with_capacity(aggregate.aggregates.len());
     for (idx, call) in aggregate.aggregates.iter().enumerate() {
         let is_merge = aggregate.is_merge[idx];
@@ -2389,11 +2390,16 @@ fn lower_hash_aggregate_node(
             .and_then(super::decode_type)?;
         let function_name = aggregate_function_name(call)?;
         let signature_arg_types = aggregate_signature_arg_types(call)?;
-        let (_, intermediate_type) =
+        let (semantic_output_type, intermediate_type) =
             infer_agg_function_types(&function_name, &signature_arg_types, call.distinct).map_err(
                 |err| format!("HashAggregateNode aggregate {idx} type inference: {err}"),
             )?;
         let signature_input_arg_type = signature_arg_types.first().cloned();
+        let signature_output_type = if need_finalize {
+            result_type
+        } else {
+            semantic_output_type
+        };
 
         let raw_args = if is_merge {
             let slot = SlotId::new(output_col.column_id);
@@ -2405,15 +2411,7 @@ fn lower_hash_aggregate_node(
             })?;
             vec![arena.push_typed(ExprNode::SlotId(slot), data_type)]
         } else {
-            call.args
-                .iter()
-                .enumerate()
-                .map(|(arg_idx, expr)| {
-                    lower_proto_expr(expr, arena, &child.layout).map_err(|err| {
-                        format!("HashAggregateNode aggregate {idx} arg {arg_idx}: {err}")
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?
+            lower_aggregate_update_inputs(call, idx, &child, arena)?
         };
         let inputs =
             select_aggregate_inputs(&call.name.to_ascii_lowercase(), is_merge, raw_args, arena)?;
@@ -2423,7 +2421,7 @@ fn lower_hash_aggregate_node(
             input_is_intermediate: is_merge,
             types: Some(AggTypeSignature {
                 intermediate_type,
-                output_type: Some(result_type),
+                output_type: Some(signature_output_type),
                 input_arg_type: signature_input_arg_type,
             }),
             order: aggregate_order_spec(call),
@@ -2431,7 +2429,6 @@ fn lower_hash_aggregate_node(
     }
 
     let input_is_intermediate = functions.iter().all(|f| f.input_is_intermediate);
-    let need_finalize = matches!(mode, plan::AggMode::Single | plan::AggMode::Global);
     let aggregate_node = LoweredNode {
         node: ExecNode {
             kind: ExecNodeKind::Aggregate(AggregateNode {
@@ -2510,6 +2507,36 @@ fn aggregate_signature_arg_types(call: &plan::PlanAggregateCall) -> Result<Vec<D
         types.push(data_type);
     }
     Ok(types)
+}
+
+fn lower_aggregate_update_inputs(
+    call: &plan::PlanAggregateCall,
+    aggregate_idx: usize,
+    child: &LoweredNode,
+    arena: &mut ExprArena,
+) -> Result<Vec<crate::exec::expr::ExprId>, String> {
+    if call.name.eq_ignore_ascii_case("count_if") && !call.order_by.is_empty() {
+        return Err(format!(
+            "HashAggregateNode aggregate {aggregate_idx} count_if does not support ORDER BY"
+        ));
+    }
+    let mut inputs = Vec::with_capacity(call.args.len() + call.order_by.len());
+    for (arg_idx, expr) in call.args.iter().enumerate() {
+        inputs.push(lower_proto_expr(expr, arena, &child.layout).map_err(|err| {
+            format!("HashAggregateNode aggregate {aggregate_idx} arg {arg_idx}: {err}")
+        })?);
+    }
+    for (order_idx, item) in call.order_by.iter().enumerate() {
+        let expr = item.expr.as_ref().ok_or_else(|| {
+            format!(
+                "HashAggregateNode aggregate {aggregate_idx} order_by[{order_idx}] expr missing"
+            )
+        })?;
+        inputs.push(lower_proto_expr(expr, arena, &child.layout).map_err(|err| {
+            format!("HashAggregateNode aggregate {aggregate_idx} order_by[{order_idx}]: {err}")
+        })?);
+    }
+    Ok(inputs)
 }
 
 fn aggregate_order_spec(call: &plan::PlanAggregateCall) -> AggOrderSpec {
@@ -5438,6 +5465,139 @@ mod tests {
         assert_eq!(types.intermediate_type, Some(DataType::Utf8));
         assert_eq!(types.output_type, Some(DataType::Float64));
         assert_eq!(types.input_arg_type, Some(DataType::Int64));
+    }
+
+    #[test]
+    fn hash_aggregate_local_avg_signature_keeps_final_output_type() {
+        let output_columns = vec![output_column(2, "avg_id", DataType::Utf8)];
+        let aggregate = physical_node(
+            20,
+            plan::plan_node::Kind::HashAggregate(plan::HashAggregateNode {
+                mode: plan::AggMode::Local as i32,
+                group_by: Vec::new(),
+                aggregates: vec![plan::PlanAggregateCall {
+                    name: "avg".to_string(),
+                    args: vec![column_ref(1, DataType::Int64)],
+                    distinct: false,
+                    result_type: Some(type_desc(&DataType::Utf8)),
+                    order_by: Vec::new(),
+                    output_column_id: 2,
+                }],
+                is_merge: vec![false],
+                output_layout: Some(plan::AggregateOutputLayout {
+                    group_key_columns: Vec::new(),
+                    aggregate_columns: output_columns.clone(),
+                }),
+                output_columns: output_columns.clone(),
+            }),
+            output_columns,
+            vec![one_col_values_node(10)],
+        );
+        let lowered = lower(&aggregate);
+        let ExecNodeKind::Aggregate(aggregate) = lowered.node.kind else {
+            panic!("expected Aggregate");
+        };
+        let types = aggregate.functions[0]
+            .types
+            .as_ref()
+            .expect("aggregate type signature");
+        assert_eq!(types.intermediate_type, Some(DataType::Utf8));
+        assert_eq!(types.output_type, Some(DataType::Float64));
+        assert_eq!(types.input_arg_type, Some(DataType::Int64));
+        assert_eq!(
+            aggregate
+                .output_chunk_schema
+                .field(0)
+                .expect("avg output field")
+                .data_type(),
+            &DataType::Utf8
+        );
+    }
+
+    #[test]
+    fn hash_aggregate_ordered_inputs_pack_order_by_exprs() {
+        let output_columns = vec![output_column(3, "gc", DataType::Utf8)];
+        let aggregate = physical_node(
+            20,
+            plan::plan_node::Kind::HashAggregate(plan::HashAggregateNode {
+                mode: plan::AggMode::Local as i32,
+                group_by: Vec::new(),
+                aggregates: vec![plan::PlanAggregateCall {
+                    name: "group_concat".to_string(),
+                    args: vec![column_ref(2, DataType::Utf8), string_literal("|")],
+                    distinct: true,
+                    result_type: Some(type_desc(&DataType::Utf8)),
+                    order_by: vec![sort_item(1)],
+                    output_column_id: 3,
+                }],
+                is_merge: vec![false],
+                output_layout: Some(plan::AggregateOutputLayout {
+                    group_key_columns: Vec::new(),
+                    aggregate_columns: output_columns.clone(),
+                }),
+                output_columns: output_columns.clone(),
+            }),
+            output_columns,
+            vec![values_node(10)],
+        );
+
+        let mut arena = ExprArena::default();
+        let lowered = lower_proto_node(&aggregate, &mut arena, &NodeLoweringContext::default())
+            .expect("lower ordered aggregate");
+        let ExecNodeKind::Aggregate(aggregate) = lowered.node.kind else {
+            panic!("expected Aggregate");
+        };
+        assert_eq!(aggregate.functions[0].inputs.len(), 1);
+        let input_type = arena
+            .data_type(aggregate.functions[0].inputs[0])
+            .expect("packed input type");
+        let DataType::Struct(fields) = input_type else {
+            panic!("expected packed struct input, got {input_type:?}");
+        };
+
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].data_type(), &DataType::Utf8);
+        assert_eq!(fields[1].data_type(), &DataType::Utf8);
+        assert_eq!(fields[2].data_type(), &DataType::Int64);
+        assert_eq!(aggregate.functions[0].order.is_asc_order, vec![true]);
+        assert_eq!(aggregate.functions[0].order.nulls_first, vec![false]);
+        assert!(aggregate.functions[0].order.is_distinct);
+    }
+
+    #[test]
+    fn hash_aggregate_rejects_count_if_order_by_before_input_selection() {
+        let output_columns = vec![output_column(3, "cnt", DataType::Int64)];
+        let aggregate = physical_node(
+            21,
+            plan::plan_node::Kind::HashAggregate(plan::HashAggregateNode {
+                mode: plan::AggMode::Local as i32,
+                group_by: Vec::new(),
+                aggregates: vec![plan::PlanAggregateCall {
+                    name: "count_if".to_string(),
+                    args: vec![bool_literal(true)],
+                    distinct: false,
+                    result_type: Some(type_desc(&DataType::Int64)),
+                    order_by: vec![sort_item(1)],
+                    output_column_id: 3,
+                }],
+                is_merge: vec![false],
+                output_layout: Some(plan::AggregateOutputLayout {
+                    group_key_columns: Vec::new(),
+                    aggregate_columns: output_columns.clone(),
+                }),
+                output_columns: output_columns.clone(),
+            }),
+            output_columns,
+            vec![values_node(10)],
+        );
+
+        let mut arena = ExprArena::default();
+        let err = lower_proto_node(&aggregate, &mut arena, &NodeLoweringContext::default())
+            .expect_err("count_if ORDER BY should be rejected before input selection");
+        assert!(
+            err.contains("count_if does not support ORDER BY"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

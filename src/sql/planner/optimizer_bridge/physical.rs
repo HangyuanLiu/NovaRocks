@@ -40,10 +40,12 @@ impl BridgeCtx<'_> {
             .collect::<Result<Vec<_>, _>>()?;
         let kind = self.convert_kind(node)?;
 
+        let output_columns = physical_node_output_columns(node);
+
         Ok(PhysicalPlanNode {
             kind,
             children,
-            output_columns: node.output_columns.clone(),
+            output_columns,
             stats: planner_stats(node),
             probe_runtime_filters: convert_probe_runtime_filters(self.scalars, node),
         })
@@ -284,7 +286,7 @@ impl BridgeCtx<'_> {
                 Ok(PhysicalPlanKind::Redistribute(RedistributeNode {
                     mode,
                     partition_exprs,
-                    output_columns: child.output_columns.clone(),
+                    output_columns: physical_node_output_columns(child),
                 }))
             }
             op if op.is_logical() => Err(format!(
@@ -292,6 +294,36 @@ impl BridgeCtx<'_> {
             )),
             op => Err(format!("Bridge 2a cannot convert physical operator {op:?}")),
         }
+    }
+}
+
+fn physical_node_output_columns(node: &OptimizerPhysicalNode) -> Vec<OutputColumn> {
+    match &node.op {
+        Operator::PhysicalScan(scan) => scan_materialized_output_columns(scan),
+        _ => node.output_columns.clone(),
+    }
+}
+
+fn scan_materialized_output_columns(
+    scan: &crate::sql::optimizer::operator::ScanOp,
+) -> Vec<OutputColumn> {
+    let Some(required_columns) = scan.required_columns.as_ref() else {
+        return scan.columns.clone();
+    };
+    let required: std::collections::HashSet<String> = required_columns
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+    let output_columns: Vec<_> = scan
+        .columns
+        .iter()
+        .filter(|column| required.contains(&column.name.to_ascii_lowercase()))
+        .cloned()
+        .collect();
+    if output_columns.is_empty() {
+        scan.columns.iter().take(1).cloned().collect()
+    } else {
+        output_columns
     }
 }
 
@@ -613,12 +645,13 @@ pub(crate) fn optimizer_physical_to_plan(
 mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
+    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::{ChangeStreamBranchKind, JoinKind, OutputColumn};
     use crate::sql::optimizer::operator::{
         AggMode, AggregateOutputLayout, ChangeEventExpandOp, ChangeEventOutputExpr,
         ChangeEventSpec, JoinDistribution, Operator, PhysicalDistributionOp,
-        PhysicalHashAggregateOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp, UnionOp,
+        PhysicalHashAggregateOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp, ScanOp, UnionOp,
         ValuesOp,
     };
     use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
@@ -720,6 +753,27 @@ mod tests {
         }))
     }
 
+    fn table_def(columns: &[OutputColumn]) -> TableDef {
+        TableDef {
+            name: "t".to_string(),
+            columns: columns
+                .iter()
+                .map(|column| ColumnDef {
+                    name: column.name.clone(),
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                    write_default: None,
+                    logical_type: None,
+                })
+                .collect(),
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::StarRocks {
+                db_id: 0,
+                table_id: 0,
+            },
+        }
+    }
+
     fn values_node() -> OptimizerPhysicalNode {
         attach_arena(
             base_node(Operator::PhysicalValues(ValuesOp {
@@ -742,6 +796,29 @@ mod tests {
         assert!(matches!(physical.kind, PhysicalPlanKind::Values(_)));
         assert!(physical.probe_runtime_filters.is_empty());
         assert_eq!(physical.stats.output_row_count, 1.0);
+    }
+
+    #[test]
+    fn physical_scan_output_columns_follow_required_columns() {
+        let columns = vec![output_column(1, "k"), output_column(2, "s")];
+        let mut node = base_node(Operator::PhysicalScan(ScanOp {
+            database: "db".to_string(),
+            table: table_def(&columns),
+            alias: None,
+            stats_ref: None,
+            columns: columns.clone(),
+            predicates: vec![],
+            required_columns: Some(vec!["s".to_string()]),
+            variant_columns: vec![],
+            mv_rewritten_from: None,
+        }));
+        node.output_columns = columns;
+        let node = attach_arena(node, Arc::new(ScalarArena::new()));
+
+        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+
+        assert!(matches!(physical.kind, PhysicalPlanKind::Scan(_)));
+        assert_output_columns_eq(&physical.output_columns, &[output_column(2, "s")]);
     }
 
     #[test]
@@ -806,6 +883,36 @@ mod tests {
             physical.children[0].kind,
             PhysicalPlanKind::Values(_)
         ));
+    }
+
+    #[test]
+    fn physical_distribution_over_pruned_scan_uses_materialized_outputs() {
+        let columns = vec![output_column(1, "k"), output_column(2, "s")];
+        let mut child = base_node(Operator::PhysicalScan(ScanOp {
+            database: "db".to_string(),
+            table: table_def(&columns),
+            alias: None,
+            stats_ref: None,
+            columns: columns.clone(),
+            predicates: vec![],
+            required_columns: Some(vec!["s".to_string()]),
+            variant_columns: vec![],
+            mv_rewritten_from: None,
+        }));
+        child.output_columns = columns.clone();
+
+        let mut node = base_node(Operator::PhysicalDistribution(PhysicalDistributionOp {
+            spec: DistributionSpec::Gather,
+        }));
+        node.output_columns = columns;
+        node.children.push(child);
+        let node = attach_arena(node, Arc::new(ScalarArena::new()));
+
+        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        let PhysicalPlanKind::Redistribute(redistribute) = physical.kind else {
+            panic!("expected Redistribute");
+        };
+        assert_output_columns_eq(&redistribute.output_columns, &[output_column(2, "s")]);
     }
 
     #[test]
