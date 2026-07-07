@@ -582,6 +582,7 @@ impl ExecutionCoordinator {
                     compat_scan_ranges_for_placement(fr, placement, placements.len())?;
                 exec_params.per_exch_num_senders = placement.per_exch_num_senders.clone();
                 exec_params.destinations = exec_destinations;
+                #[cfg(feature = "compat")]
                 if let Some(rf) = rf_plan.as_ref() {
                     let rf_params = build_instance_runtime_filter_params(
                         rf,
@@ -591,7 +592,10 @@ impl ExecutionCoordinator {
                     exec_params.runtime_filter_params = Some(rf_params.to_thrift());
                 }
 
+                #[cfg(feature = "compat")]
                 let compat_query_options = query_options.as_ref().map(QueryOptions::to_thrift);
+                #[cfg(not(feature = "compat"))]
+                let compat_query_options = None;
                 let params = build_exec_plan_fragment_params(
                     CompatFragmentPlanPayload {
                         plan: fr.plan.clone(),

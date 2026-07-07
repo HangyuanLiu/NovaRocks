@@ -592,7 +592,7 @@ mod tests {
             allow_throw_exception: true,
             enable_spill: true,
             spill_options: Some(proto::novarocks::SpillOptions {
-                spill_mode: native_wire::SpillMode::FORCE.0,
+                spill_mode: 1,
                 spill_mem_limit_threshold: 0.5,
                 spill_operator_min_bytes: 1024,
                 spill_mem_table_size: 32,
@@ -652,7 +652,7 @@ mod tests {
         let prober = &rf.id_to_prober_params()[&3][0];
         assert_eq!(
             prober.fragment_instance_id(),
-            &crate::thrift::types::TUniqueId::new(1, 2)
+            crate::common::types::UniqueId { hi: 1, lo: 2 }
         );
         assert_eq!(prober.endpoint().as_host_port(), "127.0.0.1:9050");
     }

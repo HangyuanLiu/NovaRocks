@@ -1702,7 +1702,7 @@ mod tests {
             9,
             vec![
                 crate::runtime::endpoint::RuntimeFilterProberDestination::new(
-                    crate::thrift::types::TUniqueId::new(30, 40),
+                    crate::common::types::UniqueId { hi: 30, lo: 40 },
                     crate::runtime::endpoint::RuntimeEndpoint::new("10.0.0.30", 8060)
                         .expect("prober endpoint"),
                 ),

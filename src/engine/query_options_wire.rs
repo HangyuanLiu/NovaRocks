@@ -24,20 +24,24 @@ use thrift::OrderedFloat;
 pub(crate) fn standalone_query_options_from_thrift(
     opts: Option<&TQueryOptions>,
 ) -> Result<StandaloneQueryOptions, String> {
-    let native = QueryOptions::from_thrift(opts)?;
+    let Some(opts) = opts else {
+        return Ok(StandaloneQueryOptions::default());
+    };
 
     Ok(StandaloneQueryOptions {
-        pipeline_dop: native.pipeline_dop,
-        query_timeout: native.query_timeout,
-        batch_size: native.batch_size,
-        enable_profile: native.enable_profile,
-        exec_mem_limit: native.exec_mem_limit,
-        connector_io_tasks_per_scan_operator: native.connector_io_tasks_per_scan_operator,
-        runtime_filter_scan_wait_time_ms: native.runtime_filter_scan_wait_time_ms,
-        runtime_filter_wait_timeout_ms: native.runtime_filter_wait_timeout_ms,
-        allow_throw_exception: native.allow_throw_exception,
-        group_concat_max_len: native.group_concat_max_len,
-        spill: native.spill,
+        pipeline_dop: opts.pipeline_dop,
+        query_timeout: opts.query_timeout,
+        batch_size: opts.batch_size,
+        enable_profile: opts.enable_profile.unwrap_or(false),
+        exec_mem_limit: opts.query_mem_limit.or(opts.mem_limit),
+        connector_io_tasks_per_scan_operator: opts
+            .connector_io_tasks_per_scan_operator
+            .or(opts.io_tasks_per_scan_operator),
+        runtime_filter_scan_wait_time_ms: opts.runtime_filter_scan_wait_time_ms,
+        runtime_filter_wait_timeout_ms: opts.runtime_filter_wait_timeout_ms,
+        allow_throw_exception: opts.allow_throw_exception.unwrap_or(false),
+        group_concat_max_len: opts.group_concat_max_len,
+        spill: spill_config_from_thrift(opts)?,
     })
 }
 
@@ -93,6 +97,46 @@ pub(crate) fn standalone_query_options_to_optional_runtime(
     opts.map(standalone_query_options_to_runtime)
 }
 
+fn spill_config_from_thrift(opts: &TQueryOptions) -> Result<Option<SpillConfig>, String> {
+    let enable_spill = opts.enable_spill.unwrap_or(false);
+    if !enable_spill {
+        return Ok(None);
+    }
+
+    let spill_opts = opts.spill_options.as_ref();
+    let spill_mode = spill_opts
+        .and_then(|v| v.spill_mode)
+        .or(opts.spill_mode)
+        .ok_or_else(|| "spill_mode is required when enable_spill=true".to_string())
+        .and_then(spill_mode_from_thrift)?;
+
+    Ok(Some(SpillConfig {
+        enable_spill,
+        spill_mode,
+        spill_mem_limit_threshold: spill_opts
+            .and_then(|v| v.spill_mem_limit_threshold.map(|v| v.into_inner()))
+            .or_else(|| opts.spill_mem_limit_threshold.map(|v| v.into_inner())),
+        spill_operator_min_bytes: spill_opts
+            .and_then(|v| v.spill_operator_min_bytes)
+            .or(opts.spill_operator_min_bytes),
+        spill_operator_max_bytes: spill_opts
+            .and_then(|v| v.spill_operator_max_bytes)
+            .or(opts.spill_operator_max_bytes),
+        spill_encode_level: spill_opts
+            .and_then(|v| v.spill_encode_level)
+            .or(opts.spill_encode_level),
+        enable_spill_buffer_read: spill_opts.and_then(|v| v.enable_spill_buffer_read),
+        max_spill_read_buffer_bytes_per_driver: spill_opts
+            .and_then(|v| v.max_spill_read_buffer_bytes_per_driver),
+        spill_mem_table_size: spill_opts
+            .and_then(|v| v.spill_mem_table_size)
+            .or(opts.spill_mem_table_size),
+        spill_mem_table_num: spill_opts
+            .and_then(|v| v.spill_mem_table_num)
+            .or(opts.spill_mem_table_num),
+    }))
+}
+
 fn apply_spill_config_to_thrift(spill: &SpillConfig, thrift: &mut TQueryOptions) {
     thrift.enable_spill = Some(spill.enable_spill);
     thrift.spill_options = Some(TSpillOptions {
@@ -107,6 +151,16 @@ fn apply_spill_config_to_thrift(spill: &SpillConfig, thrift: &mut TQueryOptions)
         spill_mem_table_num: spill.spill_mem_table_num,
         ..Default::default()
     });
+}
+
+fn spill_mode_from_thrift(mode: TSpillMode) -> Result<SpillMode, String> {
+    match mode {
+        TSpillMode::NONE => Ok(SpillMode::None),
+        TSpillMode::FORCE => Ok(SpillMode::Force),
+        TSpillMode::AUTO => Ok(SpillMode::Auto),
+        TSpillMode::RANDOM => Ok(SpillMode::Random),
+        TSpillMode(value) => Err(format!("unknown spill_mode value: {value}")),
+    }
 }
 
 fn spill_mode_to_thrift(mode: SpillMode) -> TSpillMode {

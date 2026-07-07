@@ -252,7 +252,8 @@ fn is_cfg_test_or_compat_attr(trimmed: &str) -> bool {
     if trimmed.starts_with("#[cfg(test") {
         return true;
     }
-    compact_line(trimmed) == "#[cfg(feature=\"compat\")]"
+    let compact = compact_line(trimmed);
+    compact.starts_with("#[cfg(all(test,") || compact == "#[cfg(feature=\"compat\")]"
 }
 
 fn rust_production_text_without_cfg_test_or_compat(text: &str) -> String {
@@ -6303,5 +6304,54 @@ fn nidl_e2_noncompat_code_does_not_import_starrocks_connector_or_format_modules(
         hits.is_empty(),
         "non-compat production code must not import StarRocks connector/format modules outside compat scopes:\n{}",
         nidl_e2_format_hits_by_file(&hits, 5)
+    );
+}
+
+#[test]
+fn nidl_e6_query_options_and_runtime_filter_adapters_are_compat_only() {
+    let repo = Path::new(manifest_dir());
+    let guarded = [
+        (
+            "src/runtime/query_options.rs",
+            &[
+                "crate::thrift",
+                "TQueryOptions",
+                "TSpillMode",
+                "TSpillOptions",
+            ][..],
+        ),
+        (
+            "src/runtime/runtime_filter_params.rs",
+            &[
+                "crate::thrift",
+                "runtime_filter::TRuntimeFilterParams",
+                "runtime_filter::TRuntimeFilterProberParams",
+            ][..],
+        ),
+    ];
+
+    let mut violations = Vec::new();
+    for (source, terms) in guarded {
+        let text = fs::read_to_string(repo.join(source)).expect(source);
+        let default_build_text = rust_production_text_without_cfg_test_or_compat(&text);
+        for term in terms {
+            if let Some((idx, line)) = default_build_text
+                .lines()
+                .enumerate()
+                .find(|(_, line)| !is_comment_or_blank(line) && line.contains(term))
+            {
+                violations.push(format!(
+                    "{source}:{}: `{term}` in `{}`",
+                    idx + 1,
+                    line.trim()
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "E6 query/rf thrift adapters must be compat-only in the default build:\n{}",
+        violations.join("\n")
     );
 }

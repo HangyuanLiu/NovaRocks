@@ -587,6 +587,48 @@ fn result_projections_from_thrift_exprs(
         .map(Some)
 }
 
+#[cfg(feature = "compat")]
+fn runtime_query_options_from_thrift(
+    query_opts: Option<&internal_service::TQueryOptions>,
+) -> Result<Option<QueryOptions>, String> {
+    query_opts
+        .map(|opts| QueryOptions::from_thrift(Some(opts)))
+        .transpose()
+}
+
+#[cfg(not(feature = "compat"))]
+fn runtime_query_options_from_thrift(
+    query_opts: Option<&internal_service::TQueryOptions>,
+) -> Result<Option<QueryOptions>, String> {
+    if query_opts.is_some() {
+        return Err("thrift query options require the compat feature".to_string());
+    }
+    Ok(None)
+}
+
+#[cfg(feature = "compat")]
+fn runtime_filter_params_from_thrift(
+    exec_params: Option<&internal_service::TPlanFragmentExecParams>,
+) -> Result<Option<RuntimeFilterParams>, String> {
+    exec_params
+        .and_then(|params| params.runtime_filter_params.as_ref())
+        .map(RuntimeFilterParams::from_thrift)
+        .transpose()
+}
+
+#[cfg(not(feature = "compat"))]
+fn runtime_filter_params_from_thrift(
+    exec_params: Option<&internal_service::TPlanFragmentExecParams>,
+) -> Result<Option<RuntimeFilterParams>, String> {
+    if exec_params
+        .and_then(|params| params.runtime_filter_params.as_ref())
+        .is_some()
+    {
+        return Err("thrift runtime filter params require the compat feature".to_string());
+    }
+    Ok(None)
+}
+
 pub(crate) fn execute_fragment(
     fragment: &planner::TPlanFragment,
     desc_tbl: Option<&descriptors::TDescriptorTable>,
@@ -604,9 +646,7 @@ pub(crate) fn execute_fragment(
     typed_result_sink: bool,
     plan_origin: PlanOrigin,
 ) -> Result<FragmentOutput, String> {
-    let runtime_query_opts = query_opts
-        .map(|opts| QueryOptions::from_thrift(Some(opts)))
-        .transpose()?;
+    let runtime_query_opts = runtime_query_options_from_thrift(query_opts)?;
     let runtime_query_opts = apply_query_option_overrides(runtime_query_opts);
 
     let profile_name = fragment
@@ -633,10 +673,7 @@ pub(crate) fn execute_fragment(
         hi: params.query_id.hi,
         lo: params.query_id.lo,
     });
-    let runtime_filter_params = exec_params
-        .and_then(|params| params.runtime_filter_params.as_ref())
-        .map(RuntimeFilterParams::from_thrift)
-        .transpose()?;
+    let runtime_filter_params = runtime_filter_params_from_thrift(exec_params)?;
     let fragment_instance_id = exec_params.map(|params| UniqueId {
         hi: params.fragment_instance_id.hi,
         lo: params.fragment_instance_id.lo,
