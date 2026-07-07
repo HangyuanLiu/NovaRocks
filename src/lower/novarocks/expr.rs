@@ -29,6 +29,7 @@ use crate::exec::chunk::ChunkFieldSchema;
 use crate::exec::expr::function::{FunctionKind, function_metadata, lookup_function};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use crate::proto::{common, expr};
+use crate::types::comparison_common_type;
 
 #[allow(dead_code)]
 pub(crate) fn lower_proto_expr(
@@ -448,8 +449,14 @@ fn lower_in_list(
     input_layout: &Layout,
     data_type: DataType,
 ) -> Result<ExprId, String> {
-    let child = lower_required_child(&in_list.operand, "InList.operand", arena, input_layout)?;
-    let values = lower_expr_list(&in_list.list, arena, input_layout)?;
+    let mut child = lower_required_child(&in_list.operand, "InList.operand", arena, input_layout)?;
+    let mut values = lower_expr_list(&in_list.list, arena, input_layout)?;
+    if let Some(compare_type) = in_list_comparison_type(arena, child, &values)? {
+        child = cast_to_type_if_needed(arena, child, &compare_type)?;
+        for value in &mut values {
+            *value = cast_to_type_if_needed(arena, *value, &compare_type)?;
+        }
+    }
     Ok(arena.push_typed(
         ExprNode::In {
             child,
@@ -458,6 +465,70 @@ fn lower_in_list(
         },
         data_type,
     ))
+}
+
+fn in_list_comparison_type(
+    arena: &ExprArena,
+    child: ExprId,
+    values: &[ExprId],
+) -> Result<Option<DataType>, String> {
+    let mut compare_type = arena
+        .data_type(child)
+        .cloned()
+        .ok_or_else(|| "IN list operand missing data type".to_string())?;
+    let mut changed = false;
+
+    for value in values {
+        let value_type = arena
+            .data_type(*value)
+            .ok_or_else(|| "IN list value missing data type".to_string())?;
+        if value_type == &compare_type {
+            continue;
+        }
+        let common_type = if is_string_type(&compare_type) && is_numeric_type(value_type) {
+            compare_type.clone()
+        } else if let Some(common_type) = comparison_common_type(&compare_type, value_type)? {
+            common_type
+        } else {
+            return Ok(None);
+        };
+        changed |= common_type != compare_type || value_type != &common_type;
+        compare_type = common_type;
+    }
+
+    Ok(changed.then_some(compare_type))
+}
+
+fn is_string_type(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Utf8 | DataType::LargeUtf8)
+}
+
+fn is_numeric_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+    )
+}
+
+fn cast_to_type_if_needed(
+    arena: &mut ExprArena,
+    expr: ExprId,
+    target_type: &DataType,
+) -> Result<ExprId, String> {
+    let source_type = arena
+        .data_type(expr)
+        .ok_or_else(|| "expression missing data type for implicit cast".to_string())?;
+    if source_type == target_type {
+        return Ok(expr);
+    }
+    Ok(arena.push_typed(ExprNode::Cast(expr), target_type.clone()))
 }
 
 fn lower_between(
@@ -1476,6 +1547,33 @@ mod tests {
         assert!(err.contains("CAST to VARIANT is not supported"));
         let err = lower_err_with_slots(&variant_to_decimal, &[1]);
         assert!(err.contains("CAST from VARIANT is not supported"));
+    }
+
+    #[test]
+    fn in_list_casts_numeric_candidates_to_string_operand_type() {
+        let in_list = scalar_expr(
+            DataType::Boolean,
+            expr::expr::Kind::InList(Box::new(expr::InListExpr {
+                operand: Some(Box::new(col(1, DataType::Utf8))),
+                list: vec![int_lit(1)],
+                negated: false,
+            })),
+        );
+
+        let (arena, id) = lower_with_slots(&in_list, &[1]);
+        let Some(ExprNode::In { child, values, .. }) = arena.node(id) else {
+            panic!("expected IN node");
+        };
+        assert_eq!(arena.data_type(*child), Some(&DataType::Utf8));
+        assert_eq!(values.len(), 1);
+        assert_eq!(arena.data_type(values[0]), Some(&DataType::Utf8));
+        let Some(ExprNode::Cast(inner)) = arena.node(values[0]) else {
+            panic!("expected numeric candidate cast to Utf8");
+        };
+        assert!(matches!(
+            arena.node(*inner),
+            Some(ExprNode::Literal(LiteralValue::Int64(1)))
+        ));
     }
 
     #[test]
