@@ -52,6 +52,7 @@ impl ChangeStreamBranchKind {
     }
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn branch_kind_from_thrift(
     value: crate::thrift::data_sinks::TIcebergChangeStreamRouterBranchKind,
 ) -> Result<ChangeStreamBranchKind, String> {
@@ -101,6 +102,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "compat")]
     #[test]
     fn from_thrift_accepts_known_branch_kinds() {
         assert_eq!(
@@ -126,6 +128,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "compat")]
     #[test]
     fn from_thrift_rejects_unknown_branch_kind_without_panic() {
         let err = branch_kind_from_thrift(

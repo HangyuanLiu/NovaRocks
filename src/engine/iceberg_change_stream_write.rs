@@ -190,8 +190,8 @@ pub(crate) fn route_change_stream_writer_reports(
     let mut routed = ChangeStreamRoutedWriterFiles::default();
 
     for writer in &write_commit.writers {
-        let reports = crate::runtime::sink_commit_wire::sink_commit_infos_to_writer_reports(
-            writer.sink_commit_infos.clone(),
+        let reports = crate::runtime::sink_commit::iceberg_commit_infos_to_writer_reports(
+            writer.iceberg_commits.clone(),
             table_metadata,
         )
         .map_err(|message| {
@@ -336,7 +336,8 @@ mod tests {
     use crate::connector::iceberg::report::{
         IcebergPartitionReport, IcebergWriterReport, IcebergWrittenFileReport,
     };
-    use crate::runtime::sink_commit_wire::writer_report_to_sink_commit_info;
+    use crate::proto::novarocks;
+    use crate::runtime::sink_commit::writer_report_to_iceberg_commit_info;
     use crate::runtime::write_coordinator::{WriteCommitInput, WriterCommitInput, WriterKey};
     use crate::thrift::types;
 
@@ -381,7 +382,7 @@ mod tests {
     fn sink_commit_info_for_data_file(
         metadata: &TableMetadata,
         path: &str,
-    ) -> types::TSinkCommitInfo {
+    ) -> novarocks::IcebergCommitInfo {
         let report = IcebergWriterReport {
             file: IcebergWrittenFileReport {
                 path: path.to_string(),
@@ -408,20 +409,16 @@ mod tests {
             is_overwrite: None,
             is_rewrite: None,
         };
-        writer_report_to_sink_commit_info(report, metadata).expect("wire encode")
+        writer_report_to_iceberg_commit_info(report, metadata).expect("wire encode")
     }
 
-    fn writer_key(
-        query_id: &types::TUniqueId,
-        writer_fragment_id: i32,
-        backend_num: i32,
-    ) -> WriterKey {
+    fn writer_key(query_id: UniqueId, writer_fragment_id: i32, backend_num: i32) -> WriterKey {
         WriterKey {
-            query_id: query_id.clone(),
-            fragment_instance_id: types::TUniqueId::new(
-                101,
-                ((writer_fragment_id as i64) << 16) | backend_num as i64,
-            ),
+            query_id,
+            fragment_instance_id: UniqueId {
+                hi: 101,
+                lo: ((writer_fragment_id as i64) << 16) | backend_num as i64,
+            },
             backend_num,
         }
     }
@@ -430,7 +427,7 @@ mod tests {
         metadata: &TableMetadata,
         fragments: Vec<(i32, &str)>,
     ) -> WriteCommitInput {
-        let query_id = types::TUniqueId::new(10, 20);
+        let query_id = UniqueId { hi: 10, lo: 20 };
         let writers = fragments
             .into_iter()
             .enumerate()
@@ -438,10 +435,8 @@ mod tests {
                 let backend_num = idx as i32;
                 WriterCommitInput {
                     writer_id: idx,
-                    writer_key: writer_key(&query_id, writer_fragment_id, backend_num),
-                    sink_commit_infos: vec![sink_commit_info_for_data_file(metadata, path)],
-                    tablet_commit_infos: Vec::new(),
-                    tablet_fail_infos: Vec::new(),
+                    writer_key: writer_key(query_id, writer_fragment_id, backend_num),
+                    iceberg_commits: vec![sink_commit_info_for_data_file(metadata, path)],
                     load_counters: BTreeMap::new(),
                     loaded_rows: 2,
                     loaded_bytes: 128,

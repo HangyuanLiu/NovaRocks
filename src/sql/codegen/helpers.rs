@@ -17,6 +17,7 @@
 
 use crate::sql::analysis::{self as query_ir, BinOp, ExprKind, TypedExpr};
 use crate::sql::planner::plan::{AggregateCall, WindowExpr};
+#[cfg(feature = "compat")]
 use crate::thrift::plan_nodes;
 
 /// Split a TypedExpr on AND into a flat list of conjuncts.
@@ -515,6 +516,7 @@ pub(crate) fn agg_call_display_name(call: &AggregateCall) -> String {
 }
 
 /// Map JoinKind to TJoinOp.
+#[cfg(feature = "compat")]
 pub(crate) fn join_kind_to_op(kind: query_ir::JoinKind) -> plan_nodes::TJoinOp {
     match kind {
         query_ir::JoinKind::Inner => plan_nodes::TJoinOp::INNER_JOIN,

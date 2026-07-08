@@ -38,9 +38,7 @@ use crate::fs::scan_context::{FileScanContext, FileScanRange};
 #[cfg(feature = "compat")]
 use crate::novarocks_connectors::{StarRocksScanConfig, StarRocksScanOp};
 use crate::runtime::descriptor_snapshot::{DescriptorSlot, DescriptorSnapshot};
-use crate::runtime::descriptor_snapshot_thrift::{
-    is_iceberg_v3_row_position, lookup_file_format_config,
-};
+use crate::runtime::descriptor_snapshot::{is_iceberg_v3_row_position, lookup_file_format_config};
 use crate::runtime::query_context::{QueryId, query_context_manager};
 
 #[derive(Clone, Debug)]

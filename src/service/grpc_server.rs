@@ -525,8 +525,9 @@ fn handle_native_standalone_report_exec_status(
         .map_err(EngineError::protocol_decode)?
     {
         crate::runtime::write_coordinator::WriterReportLookup::Expected => {
-            let result =
-                crate::runtime::write_coordinator::handle_native_report_exec_status(report);
+            let result = crate::runtime::write_report::report_from_native(report)
+                .map_err(EngineError::protocol_decode)
+                .and_then(crate::runtime::write_coordinator::handle_fragment_report_exec_status);
             match result {
                 Ok(_) => Ok(()),
                 Err(err) => {
@@ -1375,8 +1376,16 @@ mod pr3_tests {
         ReportExecStatusRequest, SubmitFragmentRequest,
     };
     use super::proto::{novarocks, plan};
+    use crate::common::types::UniqueId;
     use crate::thrift::types;
     use tonic::Request;
+
+    fn runtime_id(id: &types::TUniqueId) -> UniqueId {
+        UniqueId {
+            hi: id.hi,
+            lo: id.lo,
+        }
+    }
 
     fn ok_report(query: types::TUniqueId, finst: types::TUniqueId) -> ExecStatusReport {
         ExecStatusReport {
@@ -1696,10 +1705,10 @@ mod pr3_tests {
         let finst = types::TUniqueId::new(702, 802);
         guard
             .register_query(
-                query.clone(),
+                runtime_id(&query),
                 vec![crate::runtime::write_coordinator::WriterKey {
-                    query_id: query.clone(),
-                    fragment_instance_id: finst.clone(),
+                    query_id: runtime_id(&query),
+                    fragment_instance_id: runtime_id(&finst),
                     backend_num: 0,
                 }],
             )
@@ -1726,10 +1735,10 @@ mod pr3_tests {
         let ordinary_finst = types::TUniqueId::new(713, 813);
         let coord = guard
             .register_query(
-                query.clone(),
+                runtime_id(&query),
                 vec![crate::runtime::write_coordinator::WriterKey {
-                    query_id: query.clone(),
-                    fragment_instance_id: writer_finst.clone(),
+                    query_id: runtime_id(&query),
+                    fragment_instance_id: runtime_id(&writer_finst),
                     backend_num: 0,
                 }],
             )
@@ -1776,10 +1785,10 @@ mod pr3_tests {
         let unknown_writer_finst = types::TUniqueId::new(716, 816);
         let coord = guard
             .register_query(
-                query.clone(),
+                runtime_id(&query),
                 vec![crate::runtime::write_coordinator::WriterKey {
-                    query_id: query.clone(),
-                    fragment_instance_id: writer_finst,
+                    query_id: runtime_id(&query),
+                    fragment_instance_id: runtime_id(&writer_finst),
                     backend_num: 0,
                 }],
             )
@@ -1815,10 +1824,10 @@ mod pr3_tests {
         let ordinary_finst = types::TUniqueId::new(723, 823);
         let coord = guard
             .register_query(
-                query.clone(),
+                runtime_id(&query),
                 vec![crate::runtime::write_coordinator::WriterKey {
-                    query_id: query.clone(),
-                    fragment_instance_id: writer_finst,
+                    query_id: runtime_id(&query),
+                    fragment_instance_id: runtime_id(&writer_finst),
                     backend_num: 0,
                 }],
             )

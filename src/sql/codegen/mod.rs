@@ -21,31 +21,44 @@
 //! compiles `TypedExpr` into Thrift `TExpr`, and assembles the Thrift
 //! plan structures expected by the pipeline executor.
 
+pub(crate) mod agg_type_infer;
 pub(crate) mod boundary_schema;
 pub(crate) mod connector_scan_wire;
+#[cfg(feature = "compat")]
 pub(crate) mod descriptors;
+#[cfg(feature = "compat")]
 pub(crate) mod expr_compiler;
 pub(crate) mod fallback_audit;
 pub(crate) mod fragment_builder;
 pub(crate) mod fragment_request;
 pub(crate) mod helpers;
+#[cfg(feature = "compat")]
 pub(crate) mod iceberg_change_stream_router_wire;
 pub(crate) mod iceberg_delta_scan_wire;
+pub(crate) mod iceberg_literal_json;
+#[cfg(feature = "compat")]
 pub(crate) mod iceberg_write_sink_wire;
 pub(crate) mod ir;
+#[cfg(feature = "compat")]
 pub(crate) mod nodes;
 pub(crate) mod proto_encode;
 pub(crate) mod resolve;
 pub(crate) mod runtime_filter_lowering;
 pub(crate) mod scalar_materialize;
+#[cfg(feature = "compat")]
 pub(crate) mod type_infer;
 
 use arrow::datatypes::DataType;
 
+#[cfg(feature = "compat")]
 use crate::thrift::data_sinks;
+#[cfg(feature = "compat")]
 use crate::thrift::descriptors as thrift_descriptors;
+#[cfg(feature = "compat")]
 use crate::thrift::internal_service;
+#[cfg(feature = "compat")]
 use crate::thrift::partitions;
+#[cfg(feature = "compat")]
 use crate::thrift::plan_nodes;
 
 use super::analysis::cte::CteId;
@@ -114,6 +127,7 @@ pub(crate) struct FragmentEdge {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(feature = "compat")]
 pub(crate) struct LoweredFragmentEdge {
     pub edge: FragmentEdge,
     pub compat_partition: partitions::TDataPartition,
@@ -145,6 +159,7 @@ pub(crate) struct MultiFragmentBuildResult {
     /// Fragment-to-fragment data edges.
     pub edges: Vec<FragmentEdge>,
     /// Codegen-side lowering products for edges that still feed compat thrift runtime sinks.
+    #[cfg(feature = "compat")]
     pub lowered_edges: Vec<LoweredFragmentEdge>,
     pub boundary_schemas: Vec<boundary_schema::BoundarySchemaReport>,
     /// Runtime filter planning result (populated for standalone mode).
@@ -180,14 +195,19 @@ pub(crate) struct FragmentBuildResult {
     pub fragment_id: FragmentId,
     pub has_scan_nodes: bool,
     pub output_kind: FragmentOutputKind,
+    #[cfg(feature = "compat")]
     pub plan: plan_nodes::TPlan,
+    #[cfg(feature = "compat")]
     pub desc_tbl: thrift_descriptors::TDescriptorTable,
+    #[cfg(feature = "compat")]
     pub exec_params: internal_service::TPlanFragmentExecParams,
     pub native_scan_ranges:
         std::collections::BTreeMap<i32, Vec<crate::runtime::scan_range::ScanRangeParams>>,
+    #[cfg(feature = "compat")]
     #[allow(dead_code)]
     // populated by fragment builder, will be read when standalone multi-fragment execution is wired
     pub output_sink: data_sinks::TDataSink,
+    #[cfg(feature = "compat")]
     pub output_exprs: Option<Vec<crate::thrift::exprs::TExpr>>,
     pub output_columns: Vec<OutputColumn>,
     pub boundary_schemas: Vec<boundary_schema::BoundarySchemaReport>,
@@ -199,10 +219,12 @@ pub(crate) struct FragmentBuildResult {
     /// Per-fragment global dictionaries emitted to `TPlanFragment.query_global_dicts`.
     /// Standalone SQL lowering no longer populates this after the native Decode
     /// path was retired; external fragment producers may still carry it.
+    #[cfg(feature = "compat")]
     pub query_global_dicts: Option<Vec<crate::thrift::data::TGlobalDict>>,
     /// Per-fragment dictionary expressions emitted to
     /// `TPlanFragment.query_global_dict_exprs`. Wired through for Task 7+;
     /// today this stays `None` because no codegen path populates it.
+    #[cfg(feature = "compat")]
     pub query_global_dict_exprs:
         Option<std::collections::BTreeMap<i32, crate::thrift::exprs::TExpr>>,
 }

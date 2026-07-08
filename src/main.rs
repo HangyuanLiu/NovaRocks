@@ -779,6 +779,7 @@ fn main() {
             let advertise_endpoint =
                 network::advertise_endpoint_for_config(&cfg).expect("resolve advertise endpoint");
 
+            #[cfg(feature = "compat")]
             novarocks::service::frontend_rpc::init_frontend_rpc_manager();
 
             // Start NovaRocks gRPC servers first to guarantee Starlet endpoint is online

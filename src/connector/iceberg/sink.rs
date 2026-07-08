@@ -2637,7 +2637,7 @@ mod tests {
             .await
             .expect("write equality-delete chunk");
 
-        let infos = crate::runtime::sink_commit::list(finst_id);
+        let infos = crate::runtime::sink_commit::list_iceberg_commits(finst_id);
         crate::runtime::sink_commit::unregister(finst_id);
         let target_writer_schema =
             iceberg_schema_from_arrow_schema(&backend.plan.target_schema).expect("target schema");
@@ -2645,7 +2645,7 @@ mod tests {
             .plan
             .build_target_table_metadata(&target_writer_schema)
             .expect("target metadata");
-        let reports = crate::runtime::sink_commit_wire::sink_commit_infos_to_writer_reports(
+        let reports = crate::runtime::sink_commit::iceberg_commit_infos_to_writer_reports(
             infos,
             &target_metadata,
         )
@@ -2983,7 +2983,7 @@ mod tests {
             .await
             .expect("write chunk");
 
-        let infos = crate::runtime::sink_commit::list(finst_id);
+        let infos = crate::runtime::sink_commit::list_iceberg_commits(finst_id);
         crate::runtime::sink_commit::unregister(finst_id);
         let target_writer_schema =
             iceberg_schema_from_arrow_schema(&backend.plan.target_schema).expect("target schema");
@@ -2991,7 +2991,7 @@ mod tests {
             .plan
             .build_target_table_metadata(&target_writer_schema)
             .expect("target metadata");
-        let reports = crate::runtime::sink_commit_wire::sink_commit_infos_to_writer_reports(
+        let reports = crate::runtime::sink_commit::iceberg_commit_infos_to_writer_reports(
             infos,
             &target_metadata,
         )
@@ -3213,9 +3213,9 @@ mod tests {
             .push_chunk_position_delete(&state, chunk)
             .expect("write position deletes");
 
-        let infos = crate::runtime::sink_commit::list(finst_id);
+        let infos = crate::runtime::sink_commit::list_iceberg_commits(finst_id);
         crate::runtime::sink_commit::unregister(finst_id);
-        let reports = crate::runtime::sink_commit_wire::sink_commit_infos_to_writer_reports(
+        let reports = crate::runtime::sink_commit::iceberg_commit_infos_to_writer_reports(
             infos,
             &target_metadata,
         )
@@ -3349,9 +3349,9 @@ mod tests {
             .push_chunk_position_delete(&state, chunk)
             .expect("write position deletes");
 
-        let infos = crate::runtime::sink_commit::list(finst_id);
+        let infos = crate::runtime::sink_commit::list_iceberg_commits(finst_id);
         crate::runtime::sink_commit::unregister(finst_id);
-        let reports = crate::runtime::sink_commit_wire::sink_commit_infos_to_writer_reports(
+        let reports = crate::runtime::sink_commit::iceberg_commit_infos_to_writer_reports(
             infos,
             &target_metadata,
         )
@@ -3545,7 +3545,7 @@ mod tests {
             .push_chunk_deletion_vector(&state, chunk)
             .expect("buffer deletion vector");
 
-        let infos = crate::runtime::sink_commit::list(finst_id);
+        let infos = crate::runtime::sink_commit::list_iceberg_commits(finst_id);
         assert!(
             infos.is_empty(),
             "deletion-vector sink should report only during finish"
@@ -3557,9 +3557,9 @@ mod tests {
             .expect("finish runtime")
             .expect("finish deletion vectors");
 
-        let infos = crate::runtime::sink_commit::list(finst_id);
+        let infos = crate::runtime::sink_commit::list_iceberg_commits(finst_id);
         crate::runtime::sink_commit::unregister(finst_id);
-        let reports = crate::runtime::sink_commit_wire::sink_commit_infos_to_writer_reports(
+        let reports = crate::runtime::sink_commit::iceberg_commit_infos_to_writer_reports(
             infos,
             &target_metadata,
         )
@@ -3624,7 +3624,7 @@ mod tests {
         backend
             .push_chunk_deletion_vector(&state, second_chunk)
             .expect("buffer second deletion-vector chunk");
-        let infos = crate::runtime::sink_commit::list(finst_id);
+        let infos = crate::runtime::sink_commit::list_iceberg_commits(finst_id);
         assert!(
             infos.is_empty(),
             "deletion-vector sink should report only during finish"
@@ -3636,14 +3636,14 @@ mod tests {
             .expect("finish runtime")
             .expect("finish deletion vectors");
 
-        let infos = crate::runtime::sink_commit::list(finst_id);
+        let infos = crate::runtime::sink_commit::list_iceberg_commits(finst_id);
         crate::runtime::sink_commit::unregister(finst_id);
         assert_eq!(
             infos.len(),
             1,
             "same referenced data file should produce one Puffin DV per sink lifecycle"
         );
-        let reports = crate::runtime::sink_commit_wire::sink_commit_infos_to_writer_reports(
+        let reports = crate::runtime::sink_commit::iceberg_commit_infos_to_writer_reports(
             infos,
             &target_metadata,
         )
@@ -3696,21 +3696,21 @@ mod tests {
             .expect("finish runtime")
             .expect("finish first driver");
         assert!(
-            crate::runtime::sink_commit::list(finst_id).is_empty(),
+            crate::runtime::sink_commit::list_iceberg_commits(finst_id).is_empty(),
             "first finishing driver must not publish a partial DV"
         );
         crate::runtime::global_async_runtime::data_block_on(right.finish())
             .expect("finish runtime")
             .expect("finish second driver");
 
-        let infos = crate::runtime::sink_commit::list(finst_id);
+        let infos = crate::runtime::sink_commit::list_iceberg_commits(finst_id);
         crate::runtime::sink_commit::unregister(finst_id);
         assert_eq!(
             infos.len(),
             1,
             "same referenced data file should produce one Puffin DV across drivers"
         );
-        let reports = crate::runtime::sink_commit_wire::sink_commit_infos_to_writer_reports(
+        let reports = crate::runtime::sink_commit::iceberg_commit_infos_to_writer_reports(
             infos,
             &target_metadata,
         )
@@ -3747,7 +3747,7 @@ mod tests {
             err.contains("pos must be non-negative"),
             "unexpected error: {err}"
         );
-        let infos = crate::runtime::sink_commit::list(finst_id);
+        let infos = crate::runtime::sink_commit::list_iceberg_commits(finst_id);
         crate::runtime::sink_commit::unregister(finst_id);
         assert!(infos.is_empty());
     }

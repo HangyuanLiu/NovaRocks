@@ -1661,7 +1661,7 @@ mod tests {
         let mut scan_ranges = BTreeMap::new();
         scan_ranges.insert(11, vec![scan_range]);
         let destination = crate::runtime::endpoint::FragmentDestination::new(
-            crate::thrift::types::TUniqueId::new(3, 4),
+            crate::common::types::UniqueId { hi: 3, lo: 4 },
             crate::runtime::endpoint::RuntimeEndpoint::new("10.0.0.9", 8060)
                 .expect("destination endpoint"),
         );
@@ -1670,7 +1670,7 @@ mod tests {
         let placement = crate::runtime::scheduler::FragmentInstancePlacement {
             fragment_id: 0,
             instance_index: 5,
-            finst_id: crate::thrift::types::TUniqueId::new(1, 2),
+            finst_id: crate::common::types::UniqueId { hi: 1, lo: 2 },
             backend_idx: 7,
             endpoint: crate::runtime::endpoint::RuntimeEndpoint::new("10.0.0.7", 8060)
                 .expect("placement endpoint"),
@@ -1720,7 +1720,7 @@ mod tests {
         let runtime_filter_builder_number = BTreeMap::from([(9, 3)]);
 
         let encoded = instance::encode_instance_params(
-            &crate::thrift::types::TUniqueId::new(100, 200),
+            &crate::common::types::UniqueId { hi: 100, lo: 200 },
             &placement,
             Some(&query_options),
             &runtime_filter_prober_params,

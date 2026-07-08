@@ -56,18 +56,20 @@ use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 
 use super::operator_factory::OperatorFactory;
 use crate::exec::operators::AssertNumRowsProcessorFactory;
+#[cfg(feature = "compat")]
+use crate::exec::operators::FetchProcessorFactory;
 use crate::exec::operators::analytic_shared::AnalyticSharedState;
 use crate::exec::operators::local_exchanger::{LocalExchangePartitionSpec, LocalExchanger};
 use crate::exec::operators::{
     AggregateProcessorFactory, AggregateStreamingSinkFactory, AggregateStreamingSourceFactory,
     AggregateStreamingState, AnalyticSinkFactory, AnalyticSourceFactory,
     BroadcastJoinProbeProcessorFactory, ChangeEventExpandProcessorFactory, ExceptSinkFactory,
-    ExceptSourceFactory, ExchangeSourceFactory, FetchProcessorFactory, FilterProcessorFactory,
-    HashJoinBuildSinkFactory, IntersectSinkFactory, IntersectSourceFactory, LimitProcessorFactory,
-    LocalExchangeSinkFactory, LocalExchangeSourceFactory, LookUpSourceFactory,
-    PartitionedJoinProbeProcessorFactory, ProjectProcessorFactory, RepeatProcessorFactory,
-    ScanSourceFactory, SortProcessorFactory, TableFunctionProcessorFactory, UnionAllSharedState,
-    UnionAllSinkFactory, UnionAllSourceFactory, ValuesSourceFactory,
+    ExceptSourceFactory, ExchangeSourceFactory, FilterProcessorFactory, HashJoinBuildSinkFactory,
+    IntersectSinkFactory, IntersectSourceFactory, LimitProcessorFactory, LocalExchangeSinkFactory,
+    LocalExchangeSourceFactory, LookUpSourceFactory, PartitionedJoinProbeProcessorFactory,
+    ProjectProcessorFactory, RepeatProcessorFactory, ScanSourceFactory, SortProcessorFactory,
+    TableFunctionProcessorFactory, UnionAllSharedState, UnionAllSinkFactory, UnionAllSourceFactory,
+    ValuesSourceFactory,
 };
 use crate::exec::operators::{ExceptSharedState, IntersectSharedState, SetOpStageController};
 use crate::exec::operators::{
@@ -417,6 +419,7 @@ fn output_chunk_schema_for_node(node: &ExecNode) -> Option<crate::exec::chunk::C
         ExecNodeKind::ExchangeSource(exchange) => Some(Arc::clone(&exchange.expected_chunk_schema)),
         ExecNodeKind::Scan(scan) => Some(scan.output_chunk_schema()),
         ExecNodeKind::IcebergDeltaScan(scan) => Some(Arc::clone(&scan.output_chunk_schema)),
+        #[cfg(feature = "compat")]
         ExecNodeKind::Fetch(fetch) => Some(Arc::clone(&fetch.output_chunk_schema)),
         ExecNodeKind::LookUp(lookup) => Some(Arc::clone(&lookup.output_chunk_schema)),
         ExecNodeKind::Aggregate(aggregate) => Some(Arc::clone(&aggregate.output_chunk_schema)),
@@ -1444,6 +1447,7 @@ fn build_pipeline_for_node(
                 stream: StreamDesc::any(ctx.pipeline_dop),
             })
         }
+        #[cfg(feature = "compat")]
         ExecNodeKind::Fetch(fetch) => {
             let mut child_build = build_pipeline_for_node(&fetch.input, ctx)?;
             child_build

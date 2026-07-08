@@ -24,22 +24,21 @@ use arrow::array::{Array, Int8Array, Int16Array, Int32Array, Int64Array, NullArr
 use arrow::compute::take;
 
 use crate::common::ids::SlotId;
+use crate::common::types::UniqueId;
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprArena;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
-use crate::lower::compat::layout::Layout;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::OperatorProfiles;
 use crate::runtime::runtime_state::RuntimeState;
 use crate::sql::common::{
     CHANGE_OP_DELETE, CHANGE_OP_INSERT, ChangeStreamBranchKind, ChangeStreamRouteKey,
-    DATA_ROUTE_FRESH, DATA_ROUTE_REUSE, branch_kind_from_thrift,
+    DATA_ROUTE_FRESH, DATA_ROUTE_REUSE,
 };
-use crate::thrift::{data_sinks, internal_service, types};
 
-use super::DataStreamSinkFactory;
+use super::{DataStreamSinkFactory, DataStreamSinkFactoryInput};
 
 fn int32_value(array: &dyn Array, row: usize, label: &str) -> Result<Option<i32>, String> {
     if row >= array.len() {
@@ -169,6 +168,18 @@ pub(crate) fn route_indices_for_test(
     route_indices(change_op.as_ref(), data_route.as_deref(), branch_map)
 }
 
+pub(crate) struct IcebergChangeStreamRouterBranchFactoryInput {
+    pub(crate) branch_id: i32,
+    pub(crate) branch_kind: ChangeStreamBranchKind,
+    pub(crate) stream_sink: DataStreamSinkFactoryInput,
+}
+
+pub(crate) struct IcebergChangeStreamRouterSinkFactoryInput {
+    pub(crate) change_op_slot_id: i32,
+    pub(crate) data_route_slot_id: Option<i32>,
+    pub(crate) branches: Vec<IcebergChangeStreamRouterBranchFactoryInput>,
+}
+
 /// Factory for typed Iceberg change-stream router sinks.
 pub(crate) struct IcebergChangeStreamRouterSinkFactory {
     name: String,
@@ -182,51 +193,11 @@ pub(crate) struct IcebergChangeStreamRouterSinkFactory {
 impl IcebergChangeStreamRouterSinkFactory {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        router: data_sinks::TIcebergChangeStreamRouterSink,
-        exec_params: internal_service::TPlanFragmentExecParams,
-        layout: Layout,
+        input: IcebergChangeStreamRouterSinkFactoryInput,
+        fragment_instance_id: UniqueId,
+        sender_id: Option<i32>,
+        partition_arena: ExprArena,
         plan_node_id: i32,
-        last_query_id: Option<String>,
-        fe_addr: Option<types::TNetworkAddress>,
-    ) -> Self {
-        Self::new_internal(
-            router,
-            exec_params,
-            Some(layout),
-            None,
-            plan_node_id,
-            last_query_id,
-            fe_addr,
-        )
-    }
-
-    pub(crate) fn new_with_pre_lowered_partitions(
-        router: data_sinks::TIcebergChangeStreamRouterSink,
-        exec_params: internal_service::TPlanFragmentExecParams,
-        pre_lowered_partitions: Vec<(ExprArena, Vec<ExprId>)>,
-        plan_node_id: i32,
-        last_query_id: Option<String>,
-        fe_addr: Option<types::TNetworkAddress>,
-    ) -> Self {
-        Self::new_internal(
-            router,
-            exec_params,
-            None,
-            Some(pre_lowered_partitions),
-            plan_node_id,
-            last_query_id,
-            fe_addr,
-        )
-    }
-
-    fn new_internal(
-        router: data_sinks::TIcebergChangeStreamRouterSink,
-        exec_params: internal_service::TPlanFragmentExecParams,
-        layout: Option<Layout>,
-        pre_lowered_partitions: Option<Vec<(ExprArena, Vec<ExprId>)>>,
-        plan_node_id: i32,
-        last_query_id: Option<String>,
-        fe_addr: Option<types::TNetworkAddress>,
     ) -> Self {
         let name = if plan_node_id >= 0 {
             format!("ICEBERG_CHANGE_STREAM_ROUTER_SINK (id={plan_node_id})")
@@ -235,7 +206,7 @@ impl IcebergChangeStreamRouterSinkFactory {
         };
 
         let mut init_error = None;
-        let change_op_slot_id = match SlotId::try_from(router.change_op_slot_id) {
+        let change_op_slot_id = match SlotId::try_from(input.change_op_slot_id) {
             Ok(slot_id) => Some(slot_id),
             Err(err) => {
                 init_error = Some(format!(
@@ -244,7 +215,7 @@ impl IcebergChangeStreamRouterSinkFactory {
                 None
             }
         };
-        let data_route_slot_id = match router.data_route_slot_id {
+        let data_route_slot_id = match input.data_route_slot_id {
             Some(raw) => match SlotId::try_from(raw) {
                 Ok(slot_id) => Some(slot_id),
                 Err(err) => {
@@ -274,42 +245,24 @@ impl IcebergChangeStreamRouterSinkFactory {
         let mut seen_branch_ids = BTreeSet::new();
         let mut seen_branch_kinds = BTreeSet::new();
 
-        if router.branches.is_empty() && init_error.is_none() {
+        if input.branches.is_empty() && init_error.is_none() {
             init_error =
                 Some("ICEBERG_CHANGE_STREAM_ROUTER_SINK requires at least one branch".to_string());
-        } else if pre_lowered_partitions
-            .as_ref()
-            .is_some_and(|partitions| partitions.len() != router.branches.len())
-            && init_error.is_none()
-        {
-            init_error = Some(format!(
-                "ICEBERG_CHANGE_STREAM_ROUTER_SINK: pre-lowered partition size {} != branches size {}",
-                pre_lowered_partitions.as_ref().map(Vec::len).unwrap_or(0),
-                router.branches.len()
-            ));
         }
 
-        let raw_branches = router.branches;
-        let data_branch_count = raw_branches
+        let data_branch_count = input
+            .branches
             .iter()
             .filter(|branch| {
                 matches!(
-                    branch_kind_from_thrift(branch.branch_kind),
-                    Ok(ChangeStreamBranchKind::ReuseData) | Ok(ChangeStreamBranchKind::FreshData)
+                    branch.branch_kind,
+                    ChangeStreamBranchKind::ReuseData | ChangeStreamBranchKind::FreshData
                 )
             })
             .count();
 
-        for branch in raw_branches {
-            let branch_kind = match branch_kind_from_thrift(branch.branch_kind) {
-                Ok(kind) => kind,
-                Err(err) => {
-                    if init_error.is_none() {
-                        init_error = Some(err);
-                    }
-                    continue;
-                }
-            };
+        for branch in input.branches {
+            let branch_kind = branch.branch_kind;
             if !seen_branch_ids.insert(branch.branch_id) && init_error.is_none() {
                 init_error = Some(format!(
                     "ICEBERG_CHANGE_STREAM_ROUTER_SINK: duplicate branch_id {}",
@@ -334,40 +287,13 @@ impl IcebergChangeStreamRouterSinkFactory {
                     branch_kind
                 ));
             }
-            let mut branch_exec_params = exec_params.clone();
-            branch_exec_params.destinations = Some(branch.destinations);
-            let data_stream = if let Some((arena, exprs)) = pre_lowered_partitions
-                .as_ref()
-                .and_then(|partitions| partitions.get(branch_index))
-            {
-                DataStreamSinkFactory::new_with_pre_lowered_partition(
-                    branch.stream_sink,
-                    branch_exec_params,
-                    plan_node_id,
-                    arena.clone(),
-                    exprs.clone(),
-                    last_query_id.clone(),
-                    fe_addr.clone(),
-                )
-            } else {
-                let Some(layout) = layout.as_ref().cloned() else {
-                    if init_error.is_none() {
-                        init_error = Some(
-                            "ICEBERG_CHANGE_STREAM_ROUTER_SINK: thrift partition lowering requires layout"
-                                .to_string(),
-                        );
-                    }
-                    continue;
-                };
-                DataStreamSinkFactory::new(
-                    branch.stream_sink,
-                    branch_exec_params,
-                    layout,
-                    plan_node_id,
-                    last_query_id.clone(),
-                    fe_addr.clone(),
-                )
-            };
+            let data_stream = DataStreamSinkFactory::new(
+                branch.stream_sink,
+                fragment_instance_id,
+                sender_id,
+                plan_node_id,
+                partition_arena.clone(),
+            );
             branches.push(IcebergChangeStreamRouterBranchFactory {
                 branch_id: branch.branch_id,
                 branch_kind,
@@ -394,43 +320,18 @@ impl IcebergChangeStreamRouterSinkFactory {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
-        router: data_sinks::TIcebergChangeStreamRouterSink,
-        exec_params: internal_service::TPlanFragmentExecParams,
-        layout: Layout,
+        input: IcebergChangeStreamRouterSinkFactoryInput,
+        fragment_instance_id: UniqueId,
+        sender_id: Option<i32>,
+        partition_arena: ExprArena,
         plan_node_id: i32,
-        last_query_id: Option<String>,
-        fe_addr: Option<types::TNetworkAddress>,
     ) -> Result<Self, String> {
         let factory = Self::new(
-            router,
-            exec_params,
-            layout,
+            input,
+            fragment_instance_id,
+            sender_id,
+            partition_arena,
             plan_node_id,
-            last_query_id,
-            fe_addr,
-        );
-        if let Some(err) = factory.init_error.as_ref() {
-            return Err(err.clone());
-        }
-        Ok(factory)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn try_new_with_pre_lowered_partitions(
-        router: data_sinks::TIcebergChangeStreamRouterSink,
-        exec_params: internal_service::TPlanFragmentExecParams,
-        pre_lowered_partitions: Vec<(ExprArena, Vec<ExprId>)>,
-        plan_node_id: i32,
-        last_query_id: Option<String>,
-        fe_addr: Option<types::TNetworkAddress>,
-    ) -> Result<Self, String> {
-        let factory = Self::new_with_pre_lowered_partitions(
-            router,
-            exec_params,
-            pre_lowered_partitions,
-            plan_node_id,
-            last_query_id,
-            fe_addr,
         );
         if let Some(err) = factory.init_error.as_ref() {
             return Err(err.clone());
@@ -721,7 +622,7 @@ fn take_chunk_rows(chunk: &Chunk, rows: Vec<u32>) -> Result<Option<Chunk>, Strin
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use arrow::array::{ArrayRef, Int8Array, Int32Array, Int64Array};
@@ -886,38 +787,15 @@ mod tests {
     #[test]
     fn factory_rejects_same_change_op_and_data_route_slot() {
         let factory = IcebergChangeStreamRouterSinkFactory::new(
-            data_sinks::TIcebergChangeStreamRouterSink::new(7, Some(7), Vec::new()),
-            internal_service::TPlanFragmentExecParams::new(
-                types::TUniqueId::new(0, 1),
-                types::TUniqueId::new(0, 2),
-                BTreeMap::new(),
-                BTreeMap::new(),
-                None::<Vec<data_sinks::TPlanFragmentDestination>>,
-                None::<i32>,
-                None::<i32>,
-                None::<bool>,
-                None::<bool>,
-                None::<crate::thrift::runtime_filter::TRuntimeFilterParams>,
-                None::<i32>,
-                None::<bool>,
-                None::<
-                    BTreeMap<
-                        types::TPlanNodeId,
-                        BTreeMap<i32, Vec<internal_service::TScanRangeParams>>,
-                    >,
-                >,
-                None::<bool>,
-                None::<i32>,
-                None::<bool>,
-                None::<Vec<internal_service::TExecDebugOption>>,
-            ),
-            Layout {
-                order: Vec::new(),
-                index: HashMap::new(),
+            IcebergChangeStreamRouterSinkFactoryInput {
+                change_op_slot_id: 7,
+                data_route_slot_id: Some(7),
+                branches: Vec::new(),
             },
+            UniqueId { hi: 0, lo: 2 },
+            None,
+            ExprArena::default(),
             -1,
-            None,
-            None,
         );
 
         let err = factory.init_error.expect("same slot must fail");

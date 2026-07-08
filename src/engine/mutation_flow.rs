@@ -1971,8 +1971,8 @@ fn run_one_cow_file_rewrite(
     // bidirectional set equality).
     let mut paths = Vec::new();
     for writer in &commit.writers {
-        let reports = crate::runtime::sink_commit_wire::sink_commit_infos_to_writer_reports(
-            writer.sink_commit_infos.clone(),
+        let reports = crate::runtime::sink_commit::iceberg_commit_infos_to_writer_reports(
+            writer.iceberg_commits.clone(),
             metadata,
         )?;
         for report in reports {
@@ -3461,8 +3461,8 @@ impl DistributedMergeExecutor {
         };
         let mut files = Vec::new();
         for writer in &commit.writers {
-            let reports = crate::runtime::sink_commit_wire::sink_commit_infos_to_writer_reports(
-                writer.sink_commit_infos.clone(),
+            let reports = crate::runtime::sink_commit::iceberg_commit_infos_to_writer_reports(
+                writer.iceberg_commits.clone(),
                 self.commit_executor.table.metadata(),
             )?;
             for report in reports {

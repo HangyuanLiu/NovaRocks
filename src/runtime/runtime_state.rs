@@ -167,6 +167,7 @@ impl RuntimeState {
         self.fragment_instance_id
     }
 
+    #[cfg(feature = "compat")]
     pub(crate) fn add_sink_commit_info(&self, info: crate::thrift::types::TSinkCommitInfo) {
         let Some(finst_id) = self.fragment_instance_id else {
             debug!(
@@ -186,7 +187,15 @@ impl RuntimeState {
             file_path = %file_path,
             "add sink_commit_info"
         );
-        sink_commit::add(finst_id, info);
+        match crate::runtime::sink_commit_wire::sink_commit_info_to_native(info) {
+            Ok(info) => sink_commit::add_iceberg_commit(finst_id, info),
+            Err(err) => debug!(
+                target: "novarocks::sink_commit",
+                finst_id = %finst_id,
+                error = %err,
+                "skip invalid sink_commit_info"
+            ),
+        }
     }
 
     pub(crate) fn add_iceberg_writer_report(
@@ -195,8 +204,15 @@ impl RuntimeState {
         metadata: &iceberg::spec::TableMetadata,
     ) -> Result<(), String> {
         let commit_info =
-            crate::runtime::sink_commit_wire::writer_report_to_sink_commit_info(report, metadata)?;
-        self.add_sink_commit_info(commit_info);
+            crate::runtime::sink_commit::writer_report_to_iceberg_commit_info(report, metadata)?;
+        let Some(finst_id) = self.fragment_instance_id else {
+            debug!(
+                target: "novarocks::sink_commit",
+                "skip iceberg commit info because fragment_instance_id is missing"
+            );
+            return Ok(());
+        };
+        sink_commit::add_iceberg_commit(finst_id, commit_info);
         Ok(())
     }
 
@@ -263,6 +279,7 @@ impl RuntimeState {
         }
     }
 
+    #[cfg(feature = "compat")]
     pub(crate) fn add_tablet_commit_info(&self, info: crate::thrift::types::TTabletCommitInfo) {
         let Some(finst_id) = self.fragment_instance_id else {
             debug!(
@@ -281,6 +298,7 @@ impl RuntimeState {
         sink_commit::add_tablet_commit_info(finst_id, info);
     }
 
+    #[cfg(feature = "compat")]
     pub(crate) fn add_tablet_commit_infos(
         &self,
         infos: impl IntoIterator<Item = crate::thrift::types::TTabletCommitInfo>,
@@ -290,6 +308,7 @@ impl RuntimeState {
         }
     }
 
+    #[cfg(feature = "compat")]
     pub(crate) fn add_tablet_fail_info(&self, info: crate::thrift::types::TTabletFailInfo) {
         let Some(finst_id) = self.fragment_instance_id else {
             debug!(
@@ -308,6 +327,7 @@ impl RuntimeState {
         sink_commit::add_tablet_fail_info(finst_id, info);
     }
 
+    #[cfg(feature = "compat")]
     pub(crate) fn add_tablet_fail_infos(
         &self,
         infos: impl IntoIterator<Item = crate::thrift::types::TTabletFailInfo>,

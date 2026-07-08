@@ -369,7 +369,7 @@ impl IcebergCommitCollector {
             .to_bracketed_user_message()
         })?;
         let reports =
-            crate::runtime::sink_commit_wire::list_iceberg_writer_reports(self.finst_id, metadata)?;
+            crate::runtime::sink_commit::list_iceberg_writer_reports(self.finst_id, metadata)?;
         let mut out = Vec::with_capacity(reports.len());
         for report in reports {
             let wf = self.convert_writer_report(report)?;

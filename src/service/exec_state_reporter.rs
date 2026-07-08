@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![cfg(feature = "compat")]
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -23,7 +25,7 @@ use crate::UniqueId;
 use crate::common::config;
 use crate::novarocks_logging::{debug, warn};
 use crate::runtime::query_context::QueryId;
-use crate::service::fe_report;
+use crate::service::fe_report_compat as fe_report;
 use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
 use crate::thrift::frontend_service;
 use crate::thrift::types;

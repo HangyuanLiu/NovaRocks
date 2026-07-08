@@ -171,6 +171,7 @@ pub(crate) fn build_dml_change_stream_write_plan(
     })
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn inject_dml_pre_expand_keyed_assert(
     build_result: &mut crate::sql::codegen::MultiFragmentBuildResult,
     keyed_assert: Option<&DmlPreExpandKeyedAssert>,
@@ -196,6 +197,7 @@ pub(crate) fn inject_dml_pre_expand_keyed_assert(
     Ok(())
 }
 
+#[cfg(feature = "compat")]
 fn change_event_expand_positions(
     build_result: &crate::sql::codegen::MultiFragmentBuildResult,
 ) -> Vec<(usize, usize)> {
@@ -218,6 +220,7 @@ fn change_event_expand_positions(
         .collect()
 }
 
+#[cfg(feature = "compat")]
 fn inject_keyed_assert_before_expand_node(
     fragment: &mut crate::sql::codegen::FragmentBuildResult,
     expand_idx: usize,
@@ -262,6 +265,7 @@ fn inject_keyed_assert_before_expand_node(
     Ok(())
 }
 
+#[cfg(feature = "compat")]
 fn find_key_slot_for_pre_expand_assert(
     desc_tbl: &crate::thrift::descriptors::TDescriptorTable,
     expand: &crate::thrift::plan_nodes::TPlanNode,
@@ -286,6 +290,7 @@ fn can_derive_key_from_row_id_assignment(keyed_assert: &DmlPreExpandKeyedAssert)
             .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_ID_COL)
 }
 
+#[cfg(feature = "compat")]
 fn find_key_slot_from_change_event_assignment(
     desc_tbl: &crate::thrift::descriptors::TDescriptorTable,
     expand: &crate::thrift::plan_nodes::TPlanNode,
@@ -336,6 +341,7 @@ fn find_key_slot_from_change_event_assignment(
     Ok(key_slot_id)
 }
 
+#[cfg(feature = "compat")]
 fn find_slot_id_by_name(
     desc_tbl: &crate::thrift::descriptors::TDescriptorTable,
     slot_ids: &[i32],
@@ -362,6 +368,7 @@ fn find_slot_id_by_name(
     Ok(slot.id)
 }
 
+#[cfg(feature = "compat")]
 fn direct_slot_ref_slot_id(expr: &crate::thrift::exprs::TExpr) -> Option<i32> {
     let [node] = expr.nodes.as_slice() else {
         return None;
@@ -372,6 +379,7 @@ fn direct_slot_ref_slot_id(expr: &crate::thrift::exprs::TExpr) -> Option<i32> {
     node.slot_ref.as_ref().map(|slot_ref| slot_ref.slot_id)
 }
 
+#[cfg(feature = "compat")]
 fn slot_id_belongs_to_row_tuples(
     desc_tbl: &crate::thrift::descriptors::TDescriptorTable,
     row_tuples: &[i32],
@@ -388,6 +396,7 @@ fn slot_id_belongs_to_row_tuples(
     }))
 }
 
+#[cfg(feature = "compat")]
 fn find_slot_id_in_row_tuples(
     desc_tbl: &crate::thrift::descriptors::TDescriptorTable,
     row_tuples: &[i32],
@@ -417,6 +426,7 @@ fn find_slot_id_in_row_tuples(
     })
 }
 
+#[cfg(feature = "compat")]
 fn renumber_plan_node_ids_preserving_preorder(
     build_result: &mut crate::sql::codegen::MultiFragmentBuildResult,
 ) -> Result<(), String> {
@@ -446,6 +456,7 @@ fn renumber_plan_node_ids_preserving_preorder(
     Ok(())
 }
 
+#[cfg(feature = "compat")]
 fn assign_preorder_invariant_node_ids(
     nodes: &mut [crate::thrift::plan_nodes::TPlanNode],
     root_idx: usize,
@@ -484,6 +495,7 @@ fn assign_preorder_invariant_node_ids(
     Ok(next_idx)
 }
 
+#[cfg(feature = "compat")]
 fn remap_plan_node_references(
     build_result: &mut crate::sql::codegen::MultiFragmentBuildResult,
     node_id_map: &HashMap<i32, i32>,
@@ -537,6 +549,7 @@ fn remap_plan_node_references(
     Ok(())
 }
 
+#[cfg(feature = "compat")]
 fn remap_plan_node_payload_references(
     node: &mut crate::thrift::plan_nodes::TPlanNode,
     node_id_map: &HashMap<i32, i32>,
@@ -573,6 +586,7 @@ fn remap_plan_node_payload_references(
     Ok(())
 }
 
+#[cfg(feature = "compat")]
 fn remap_runtime_filter_description(
     desc: &mut crate::thrift::runtime_filter::TRuntimeFilterDescription,
     node_id_map: &HashMap<i32, i32>,
@@ -589,6 +603,7 @@ fn remap_runtime_filter_description(
     Ok(())
 }
 
+#[cfg(feature = "compat")]
 fn remap_boundary_schema_node_id(
     boundary: &mut crate::sql::codegen::boundary_schema::BoundarySchemaReport,
     node_id_map: &HashMap<i32, i32>,
@@ -599,6 +614,7 @@ fn remap_boundary_schema_node_id(
     Ok(())
 }
 
+#[cfg(feature = "compat")]
 fn remap_btree_map_keys<V>(
     map: &mut BTreeMap<i32, V>,
     node_id_map: &HashMap<i32, i32>,
@@ -615,6 +631,7 @@ fn remap_btree_map_keys<V>(
     Ok(())
 }
 
+#[cfg(feature = "compat")]
 fn remap_node_id(node_id: i32, node_id_map: &HashMap<i32, i32>) -> Result<i32, String> {
     node_id_map.get(&node_id).copied().ok_or_else(|| {
         format!("DML change-stream keyed assert cannot remap unknown TPlan node id {node_id}")
@@ -767,6 +784,7 @@ pub(crate) fn plan_dml_change_stream_write(
         #[cfg(test)]
         topology,
     } = planned;
+    #[cfg(feature = "compat")]
     inject_dml_pre_expand_keyed_assert(&mut build_result, plan.pre_expand_keyed_assert.as_ref())?;
     Ok(crate::engine::PlannedIcebergChangeStreamWrite {
         build_result,
@@ -1242,7 +1260,7 @@ fn output_ordinal_by_name(
     Ok(ordinal)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 mod tests {
     use super::*;
 
@@ -1602,7 +1620,7 @@ mod tests {
             result: CoordinatedQueryResult {
                 query_result: crate::runtime::query_result::QueryResult::empty(),
                 write_commit: Some(crate::runtime::write_coordinator::WriteCommitInput {
-                    write_id: crate::thrift::types::TUniqueId::new(1, 2),
+                    write_id: crate::common::types::UniqueId { hi: 1, lo: 2 },
                     writers: Vec::new(),
                 }),
                 write_abort: None,
@@ -1620,7 +1638,7 @@ mod tests {
 
     fn empty_writer_commit_for_test() -> crate::runtime::write_coordinator::WriteCommitInput {
         crate::runtime::write_coordinator::WriteCommitInput {
-            write_id: crate::thrift::types::TUniqueId::new(1, 2),
+            write_id: crate::common::types::UniqueId { hi: 1, lo: 2 },
             writers: Vec::new(),
         }
     }

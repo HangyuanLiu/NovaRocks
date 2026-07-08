@@ -27,14 +27,20 @@ use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{ScanMorsel, ScanMorsels, ScanOp};
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::runtime::backend_id;
-use crate::thrift::types;
+#[cfg(feature = "compat")]
+type SchemaFeAddress = crate::thrift::types::TNetworkAddress;
+#[cfg(not(feature = "compat"))]
+type SchemaFeAddress = crate::runtime::endpoint::RuntimeEndpoint;
 
 use super::be_compaction_stats_store;
 use super::be_tablet_write_log_store;
 use super::be_txn_store;
 use super::chunk_builder::{SchemaRow, SchemaValue, build_chunk, normalize_column_key};
+#[cfg(feature = "compat")]
 use super::fe_tables;
+#[cfg(feature = "compat")]
 use super::load_tracking_logs;
+#[cfg(feature = "compat")]
 use super::loads;
 use super::{BeSchemaTable, SchemaScanContext, SchemaTable};
 
@@ -46,7 +52,7 @@ pub(crate) struct SchemaScanOp {
     context: SchemaScanContext,
     output_chunk_schema: ChunkSchemaRef,
     should_scan: bool,
-    fe_addr: Option<types::TNetworkAddress>,
+    fe_addr: Option<SchemaFeAddress>,
 }
 
 impl SchemaScanOp {
@@ -55,7 +61,7 @@ impl SchemaScanOp {
         context: SchemaScanContext,
         output_chunk_schema: ChunkSchemaRef,
         should_scan: bool,
-        fe_addr: Option<types::TNetworkAddress>,
+        fe_addr: Option<SchemaFeAddress>,
     ) -> Self {
         Self {
             table,
@@ -68,10 +74,13 @@ impl SchemaScanOp {
 
     fn collect_rows(&self) -> Result<Vec<SchemaRow>, String> {
         let mut rows = match &self.table {
+            #[cfg(feature = "compat")]
             SchemaTable::Loads => loads::fetch_rows(&self.context, self.fe_addr.as_ref())?,
+            #[cfg(feature = "compat")]
             SchemaTable::LoadTrackingLogs => {
                 load_tracking_logs::fetch_rows(&self.context, self.fe_addr.as_ref())?
             }
+            #[cfg(feature = "compat")]
             SchemaTable::AnalyzeStatus
             | SchemaTable::CharacterSets
             | SchemaTable::Collations
@@ -317,6 +326,8 @@ impl SchemaScanOp {
             SchemaTable::Be(BeSchemaTable::Threads) => Vec::new(),
             SchemaTable::Be(BeSchemaTable::Bvars) => Vec::new(),
             SchemaTable::Be(BeSchemaTable::Unsupported(_)) => Vec::new(),
+            #[cfg(not(feature = "compat"))]
+            table => return Err(fe_only_schema_table_error(table)),
         };
 
         if let Some(limit) = self.context.limit_as_usize()
@@ -326,6 +337,14 @@ impl SchemaScanOp {
         }
         Ok(rows)
     }
+}
+
+#[cfg(not(feature = "compat"))]
+fn fe_only_schema_table_error(table: &SchemaTable) -> String {
+    format!(
+        "schema table {} requires StarRocks FE compatibility mode",
+        table.table_name()
+    )
 }
 
 fn build_be_config_rows() -> Result<Vec<SchemaRow>, String> {
@@ -681,6 +700,7 @@ mod tests {
             port: None,
             thread_id: None,
             user_ip: None,
+            #[cfg(feature = "compat")]
             current_user_ident: None,
             catalog_name: None,
             table_id: None,
@@ -697,6 +717,7 @@ mod tests {
             log_level: None,
             log_pattern: None,
             log_limit: None,
+            #[cfg(feature = "compat")]
             frontends: Vec::new(),
         }
     }
@@ -773,5 +794,31 @@ mod tests {
         assert_eq!(txn_col.value(0), 888);
 
         super::be_tablet_write_log_store::clear_for_test();
+    }
+
+    #[cfg(not(feature = "compat"))]
+    #[test]
+    fn schema_scan_op_rejects_fe_only_tables_without_compat() {
+        let schema = Arc::new(Schema::new(vec![Field::new("LABEL", DataType::Utf8, true)]));
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
+                .expect("chunk schema");
+        let op = SchemaScanOp::new(SchemaTable::Loads, ctx("loads"), chunk_schema, true, None);
+
+        let err = match op.execute_iter(
+            ScanMorsel::Schema {
+                table_name: "loads".to_string(),
+            },
+            None,
+            None,
+        ) {
+            Ok(_) => panic!("loads should require FE compatibility mode"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("schema table loads requires StarRocks FE compatibility mode"),
+            "err={err}"
+        );
     }
 }

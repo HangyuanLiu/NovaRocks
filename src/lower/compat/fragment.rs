@@ -33,9 +33,10 @@ use crate::common::types::UniqueId;
 #[cfg(feature = "compat")]
 use crate::exec::operators::OlapTableSinkFactory;
 use crate::exec::operators::{
-    DataStreamSinkFactory, IcebergChangeStreamRouterSinkFactory, IcebergTableSinkFactory,
-    MultiCastDataStreamSinkFactory, NoopSinkFactory, ResultBufferSinkFactory,
-    SplitDataStreamSinkFactory,
+    DataStreamSinkFactory, DataStreamSinkFactoryInput, IcebergChangeStreamRouterBranchFactoryInput,
+    IcebergChangeStreamRouterSinkFactory, IcebergChangeStreamRouterSinkFactoryInput,
+    IcebergTableSinkFactory, MultiCastDataStreamSinkFactory, NoopSinkFactory,
+    ResultBufferSinkFactory, SplitDataStreamSinkFactory,
 };
 use crate::exec::pipeline::executor::{
     execute_plan_with_pipeline, execute_plan_with_pipeline_with_root_sink_dop,
@@ -50,6 +51,7 @@ use crate::lower::compat::node::{Lowered, PlanOrigin, lower_plan};
 use crate::lower::compat::type_lowering::{
     native_primitive_type_from_desc, render_schema_from_type_desc,
 };
+use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::fragment_output::FragmentOutput;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::{QueryId, query_context_manager};
@@ -151,6 +153,191 @@ fn collect_glm_metadata(
         ExecNodeKind::IcebergDeltaScan(_) => {}
     }
     Ok(())
+}
+
+fn unique_id_from_exec_params(exec_params: &internal_service::TPlanFragmentExecParams) -> UniqueId {
+    UniqueId {
+        hi: exec_params.fragment_instance_id.hi,
+        lo: exec_params.fragment_instance_id.lo,
+    }
+}
+
+fn runtime_destination_from_thrift(
+    dest: data_sinks::TPlanFragmentDestination,
+) -> Result<FragmentDestination, String> {
+    let endpoint = if dest.fragment_instance_id.lo == -1 {
+        RuntimeEndpoint::new("pseudo-destination", 1)?
+    } else {
+        let addr = dest
+            .brpc_server
+            .as_ref()
+            .or(dest.deprecated_server.as_ref())
+            .ok_or_else(|| "DATA_STREAM_SINK destination missing brpc_server".to_string())?;
+        RuntimeEndpoint::from_network_address(addr)?
+    };
+    Ok(FragmentDestination::new(
+        UniqueId {
+            hi: dest.fragment_instance_id.hi,
+            lo: dest.fragment_instance_id.lo,
+        },
+        endpoint,
+    ))
+}
+
+fn runtime_destinations_from_thrift(
+    destinations: Vec<data_sinks::TPlanFragmentDestination>,
+) -> Result<Vec<FragmentDestination>, String> {
+    destinations
+        .into_iter()
+        .map(runtime_destination_from_thrift)
+        .collect()
+}
+
+fn lower_stream_partition_exprs(
+    stream: &data_sinks::TDataStreamSink,
+    arena: &mut ExprArena,
+    layout: &crate::lower::compat::layout::Layout,
+    last_query_id: Option<&str>,
+    fe_addr: Option<&types::TNetworkAddress>,
+) -> Result<Vec<crate::exec::expr::ExprId>, String> {
+    let partition_type =
+        DataStreamSinkFactoryInput::partition_type_from_compat(stream.output_partition.type_)?;
+    if !DataStreamSinkFactoryInput::partition_type_requires_exprs(partition_type) {
+        return Ok(Vec::new());
+    }
+    stream
+        .output_partition
+        .partition_exprs
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+        .map(|(idx, expr)| {
+            crate::lower::compat::expr::lower_t_expr(expr, arena, layout, last_query_id, fe_addr)
+                .map_err(|err| format!("DATA_STREAM_SINK partition expr[{idx}]: {err}"))
+        })
+        .collect()
+}
+
+fn data_stream_input_from_compat(
+    stream: &data_sinks::TDataStreamSink,
+    destinations: Vec<data_sinks::TPlanFragmentDestination>,
+    arena: &mut ExprArena,
+    layout: &crate::lower::compat::layout::Layout,
+    last_query_id: Option<&str>,
+    fe_addr: Option<&types::TNetworkAddress>,
+) -> Result<DataStreamSinkFactoryInput, String> {
+    let partition_exprs =
+        lower_stream_partition_exprs(stream, arena, layout, last_query_id, fe_addr)?;
+    let partition_type =
+        DataStreamSinkFactoryInput::partition_type_from_compat(stream.output_partition.type_)?;
+    DataStreamSinkFactoryInput::try_new(
+        stream.dest_node_id,
+        partition_type,
+        Vec::new(),
+        partition_exprs,
+        stream.output_columns.clone().unwrap_or_default(),
+        runtime_destinations_from_thrift(destinations)?,
+    )
+}
+
+fn multi_cast_inputs_from_compat(
+    multi_cast: &data_sinks::TMultiCastDataStreamSink,
+    arena: &mut ExprArena,
+    layout: &crate::lower::compat::layout::Layout,
+    last_query_id: Option<&str>,
+    fe_addr: Option<&types::TNetworkAddress>,
+) -> Result<Vec<(DataStreamSinkFactoryInput, Option<i64>)>, String> {
+    if multi_cast.sinks.len() != multi_cast.destinations.len() {
+        return Err(format!(
+            "MULTI_CAST_DATA_STREAM_SINK: sinks size {} != destinations size {}",
+            multi_cast.sinks.len(),
+            multi_cast.destinations.len()
+        ));
+    }
+    multi_cast
+        .sinks
+        .iter()
+        .zip(multi_cast.destinations.iter())
+        .map(|(stream, destinations)| {
+            Ok((
+                data_stream_input_from_compat(
+                    stream,
+                    destinations.clone(),
+                    arena,
+                    layout,
+                    last_query_id,
+                    fe_addr,
+                )?,
+                stream.limit,
+            ))
+        })
+        .collect()
+}
+
+fn split_inputs_from_compat(
+    split: &data_sinks::TSplitDataStreamSink,
+    arena: &mut ExprArena,
+    layout: &crate::lower::compat::layout::Layout,
+    last_query_id: Option<&str>,
+    fe_addr: Option<&types::TNetworkAddress>,
+) -> Result<Vec<DataStreamSinkFactoryInput>, String> {
+    let sinks = split.sinks.as_ref().cloned().unwrap_or_default();
+    let destinations = split.destinations.as_ref().cloned().unwrap_or_default();
+    if sinks.len() != destinations.len() {
+        return Err(format!(
+            "SPLIT_DATA_STREAM_SINK: sinks size {} != destinations size {}",
+            sinks.len(),
+            destinations.len()
+        ));
+    }
+    sinks
+        .iter()
+        .zip(destinations)
+        .map(|(stream, destinations)| {
+            data_stream_input_from_compat(
+                stream,
+                destinations,
+                arena,
+                layout,
+                last_query_id,
+                fe_addr,
+            )
+        })
+        .collect()
+}
+
+fn iceberg_router_input_from_compat(
+    router: &data_sinks::TIcebergChangeStreamRouterSink,
+    arena: &mut ExprArena,
+    layout: &crate::lower::compat::layout::Layout,
+    last_query_id: Option<&str>,
+    fe_addr: Option<&types::TNetworkAddress>,
+) -> Result<IcebergChangeStreamRouterSinkFactoryInput, String> {
+    let branches = router
+        .branches
+        .iter()
+        .map(|branch| {
+            let branch_kind = crate::sql::common::branch_kind_from_thrift(branch.branch_kind)?;
+            Ok(IcebergChangeStreamRouterBranchFactoryInput {
+                branch_id: branch.branch_id,
+                branch_kind,
+                stream_sink: data_stream_input_from_compat(
+                    &branch.stream_sink,
+                    branch.destinations.clone(),
+                    arena,
+                    layout,
+                    last_query_id,
+                    fe_addr,
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(IcebergChangeStreamRouterSinkFactoryInput {
+        change_op_slot_id: router.change_op_slot_id,
+        data_route_slot_id: router.data_route_slot_id,
+        branches,
+    })
 }
 
 fn iceberg_sink_type_name(t: data_sinks::TDataSinkType) -> &'static str {
@@ -774,14 +961,22 @@ pub(crate) fn execute_fragment(
                     .ok_or_else(|| "DATA_STREAM_SINK missing stream_sink payload".to_string())?;
                 let exec_params = exec_params
                     .ok_or_else(|| "DATA_STREAM_SINK requires exec_params".to_string())?;
+                let sink_input = data_stream_input_from_compat(
+                    stream_sink,
+                    exec_params.destinations.clone().unwrap_or_default(),
+                    &mut exec_plan.arena,
+                    &lowered.layout,
+                    last_query_id,
+                    fe_addr,
+                )?;
+                let fragment_instance_id = unique_id_from_exec_params(exec_params);
 
                 let sink_factory = DataStreamSinkFactory::new(
-                    stream_sink.clone(),
-                    exec_params.clone(),
-                    lowered.layout.clone(),
+                    sink_input,
+                    fragment_instance_id,
+                    exec_params.sender_id,
                     root_plan_node_id,
-                    last_query_id.map(|id| id.to_string()),
-                    fe_addr.cloned(),
+                    exec_plan.arena.clone(),
                 );
                 let exchange_finst_id = Some((
                     exec_params.fragment_instance_id.hi,
@@ -813,14 +1008,21 @@ pub(crate) fn execute_fragment(
                 let exec_params = exec_params.ok_or_else(|| {
                     "MULTI_CAST_DATA_STREAM_SINK requires exec_params".to_string()
                 })?;
+                let sink_inputs = multi_cast_inputs_from_compat(
+                    multi_cast_stream_sink,
+                    &mut exec_plan.arena,
+                    &lowered.layout,
+                    last_query_id,
+                    fe_addr,
+                )?;
+                let fragment_instance_id = unique_id_from_exec_params(exec_params);
 
                 let sink_factory = MultiCastDataStreamSinkFactory::new(
-                    multi_cast_stream_sink.clone(),
-                    exec_params.clone(),
-                    lowered.layout.clone(),
+                    sink_inputs,
+                    fragment_instance_id,
+                    exec_params.sender_id,
+                    exec_plan.arena.clone(),
                     root_plan_node_id,
-                    last_query_id.map(|id| id.to_string()),
-                    fe_addr.cloned(),
                 );
                 let exchange_finst_id = Some((
                     exec_params.fragment_instance_id.hi,
@@ -863,14 +1065,21 @@ pub(crate) fn execute_fragment(
                         fe_addr,
                     )?);
                 }
+                let sink_inputs = split_inputs_from_compat(
+                    split_stream_sink,
+                    &mut exec_plan.arena,
+                    &lowered.layout,
+                    last_query_id,
+                    fe_addr,
+                )?;
+                let fragment_instance_id = unique_id_from_exec_params(exec_params);
 
                 let sink_factory = SplitDataStreamSinkFactory::new(
-                    split_stream_sink.clone(),
-                    exec_params.clone(),
-                    lowered.layout.clone(),
+                    sink_inputs,
+                    fragment_instance_id,
+                    exec_params.sender_id,
+                    exec_plan.arena.clone(),
                     root_plan_node_id,
-                    last_query_id.map(|id| id.to_string()),
-                    fe_addr.cloned(),
                     Arc::new(exec_plan.arena.clone()),
                     split_expr_ids,
                 );
@@ -903,14 +1112,21 @@ pub(crate) fn execute_fragment(
                 let exec_params = exec_params.ok_or_else(|| {
                     "ICEBERG_CHANGE_STREAM_ROUTER_SINK requires exec_params".to_string()
                 })?;
+                let router_input = iceberg_router_input_from_compat(
+                    router,
+                    &mut exec_plan.arena,
+                    &lowered.layout,
+                    last_query_id,
+                    fe_addr,
+                )?;
+                let fragment_instance_id = unique_id_from_exec_params(exec_params);
 
                 let sink_factory = IcebergChangeStreamRouterSinkFactory::try_new(
-                    router.clone(),
-                    exec_params.clone(),
-                    lowered.layout.clone(),
+                    router_input,
+                    fragment_instance_id,
+                    exec_params.sender_id,
+                    exec_plan.arena.clone(),
                     root_plan_node_id,
-                    last_query_id.map(|id| id.to_string()),
-                    fe_addr.cloned(),
                 )?;
                 let exchange_finst_id = Some((
                     exec_params.fragment_instance_id.hi,
@@ -1206,6 +1422,53 @@ mod tests {
         )
     }
 
+    fn slot_ref_expr_for_test(tuple_id: i32, slot_id: i32) -> exprs::TExpr {
+        exprs::TExpr::new(vec![exprs::TExprNode {
+            node_type: exprs::TExprNodeType::SLOT_REF,
+            type_: scalar_type_desc(types::TPrimitiveType::INT),
+            opcode: None,
+            num_children: 0,
+            agg_expr: None,
+            bool_literal: None,
+            case_expr: None,
+            date_literal: None,
+            float_literal: None,
+            int_literal: None,
+            in_predicate: None,
+            is_null_pred: None,
+            like_pred: None,
+            literal_pred: None,
+            slot_ref: Some(exprs::TSlotRef { tuple_id, slot_id }),
+            string_literal: None,
+            tuple_is_null_pred: None,
+            info_func: None,
+            decimal_literal: None,
+            output_scale: 0,
+            fn_call_expr: None,
+            large_int_literal: None,
+            output_column: None,
+            output_type: None,
+            vector_opcode: None,
+            fn_: None,
+            vararg_start_idx: None,
+            child_type: None,
+            vslot_ref: None,
+            used_subfield_names: None,
+            binary_literal: None,
+            copy_flag: None,
+            check_is_out_of_bounds: None,
+            use_vectorized: None,
+            has_nullable_child: None,
+            is_nullable: None,
+            child_type_desc: None,
+            is_monotonic: None,
+            dict_query_expr: None,
+            dictionary_get_expr: None,
+            is_index_only_filter: None,
+            is_nondeterministic: None,
+        }])
+    }
+
     fn router_branch_for_test(
         branch_id: i32,
         branch_kind: data_sinks::TIcebergChangeStreamRouterBranchKind,
@@ -1400,5 +1663,26 @@ mod tests {
             err.contains("duplicate change-stream branch kind"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn compat_random_stream_partition_exprs_are_not_lowered() {
+        let mut stream = stream_sink_for_test(30);
+        stream.output_partition = partitions::TDataPartition::new(
+            partitions::TPartitionType::RANDOM,
+            Some(vec![slot_ref_expr_for_test(99, 100)]),
+            None::<Vec<partitions::TRangePartition>>,
+            None::<Vec<partitions::TBucketProperty>>,
+        );
+        let mut arena = crate::exec::expr::ExprArena::default();
+        let layout = crate::lower::compat::layout::Layout {
+            order: Vec::new(),
+            index: std::collections::HashMap::new(),
+        };
+
+        let exprs = super::lower_stream_partition_exprs(&stream, &mut arena, &layout, None, None)
+            .expect("random partition exprs should be ignored");
+
+        assert!(exprs.is_empty());
     }
 }

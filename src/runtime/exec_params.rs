@@ -149,7 +149,7 @@ pub(crate) fn fragment_destination_to_thrift(
     destination: crate::runtime::endpoint::FragmentDestination,
 ) -> data_sinks::TPlanFragmentDestination {
     data_sinks::TPlanFragmentDestination::new(
-        destination.finst_id().clone(),
+        types::TUniqueId::new(destination.finst_id().hi, destination.finst_id().lo),
         None::<types::TNetworkAddress>,
         Some(destination.endpoint().to_network_address()),
         None::<i32>,

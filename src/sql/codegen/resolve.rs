@@ -22,6 +22,7 @@ use arrow::datatypes::DataType;
 use crate::connector::scan_planning::{ScanHandle, Split};
 use crate::sql::catalog::TableDef;
 use crate::sql::column_id::ColumnId;
+#[cfg(feature = "compat")]
 use crate::thrift::types;
 
 #[derive(Clone, Debug)]
@@ -45,6 +46,7 @@ pub(crate) struct ColumnBinding {
     pub tuple_id: i32,
     pub slot_id: i32,
     pub data_type: DataType,
+    #[cfg(feature = "compat")]
     pub type_desc: Option<types::TTypeDesc>,
     pub nullable: bool,
 }
@@ -201,6 +203,7 @@ mod tests {
             tuple_id: 1,
             slot_id,
             data_type,
+            #[cfg(feature = "compat")]
             type_desc: None,
             nullable: false,
         }

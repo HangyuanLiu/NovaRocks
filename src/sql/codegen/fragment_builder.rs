@@ -24,13 +24,13 @@
 
 use std::collections::HashMap;
 
-use crate::thrift::data_sinks;
-
 use crate::sql::codegen::FragmentId;
 use crate::sql::codegen::boundary_schema::{
     BoundaryKind, BoundarySchemaReport, output_columns_to_boundary_columns,
 };
 use crate::sql::codegen::{FragmentBuildRequest, MultiFragmentBuildResult, OutputColumn};
+#[cfg(feature = "compat")]
+use crate::thrift::data_sinks;
 
 pub(in crate::sql::codegen) fn output_columns_for_boundary(
     columns: &[crate::sql::analysis::OutputColumn],
@@ -199,6 +199,7 @@ pub(in crate::sql::codegen) fn synthetic_iceberg_table_id(scan_node_id: i32) -> 
 // Helpers
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "compat")]
 pub(in crate::sql::codegen) fn build_result_sink() -> data_sinks::TDataSink {
     data_sinks::TDataSink::new(
         data_sinks::TDataSinkType::RESULT_SINK,
@@ -224,6 +225,7 @@ pub(in crate::sql::codegen) fn build_result_sink() -> data_sinks::TDataSink {
 /// Placeholder sink for child / CTE fragments.  The coordinator replaces
 /// this with the real DataStreamSink or MultiCastDataStreamSink after
 /// fragment instance IDs are assigned.
+#[cfg(feature = "compat")]
 pub(in crate::sql::codegen) fn build_noop_sink() -> data_sinks::TDataSink {
     data_sinks::TDataSink::new(
         data_sinks::TDataSinkType::NOOP_SINK,
@@ -246,7 +248,7 @@ pub(in crate::sql::codegen) fn build_noop_sink() -> data_sinks::TDataSink {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::path::PathBuf;
@@ -3315,10 +3317,15 @@ mod tests {
             .iter()
             .find(|fragment| fragment.fragment_id == build.root_fragment_id)
             .expect("root fragment");
-        assert_eq!(
-            root.output_sink.type_,
-            data_sinks::TDataSinkType::ICEBERG_EQUALITY_DELETE_SINK
-        );
+        #[cfg(feature = "compat")]
+        let expected_sink_type = data_sinks::TDataSinkType::ICEBERG_EQUALITY_DELETE_SINK;
+        #[cfg(not(feature = "compat"))]
+        let expected_sink_type = data_sinks::TDataSinkType::NOOP_SINK;
+        assert_eq!(root.output_sink.type_, expected_sink_type);
+        #[cfg(feature = "compat")]
+        assert!(root.output_sink.iceberg_table_sink.is_some());
+        #[cfg(not(feature = "compat"))]
+        assert!(root.output_sink.iceberg_table_sink.is_none());
         let target_desc = root
             .desc_tbl
             .table_descriptors

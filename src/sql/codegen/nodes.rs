@@ -21,7 +21,7 @@ use crate::common::min_max_predicate::MinMaxPredicate;
 use crate::common::types::UniqueId;
 #[cfg(feature = "compat")]
 use crate::connector::scan_planning::ConnectorScanPlanner;
-use crate::lower::compat::expr::parse_min_max_conjuncts_with_column_resolver;
+use crate::lower::common::min_max::parse_min_max_conjuncts_with_column_resolver;
 use crate::runtime::fragment_exec_params::FragmentExecParams;
 #[cfg(feature = "compat")]
 use crate::runtime::fragment_exec_params::compat_exec_params_from_parts;
@@ -186,23 +186,25 @@ fn build_iceberg_delta_scan_node(
         Some(conjuncts)
     };
     node.compact_data = true;
-    let runtime_plan =
-        crate::sql::codegen::iceberg_delta_scan_wire::build_iceberg_delta_scan_runtime_plan(
-            table_info,
-            from_snapshot_id,
-            to_snapshot_id,
-            mv_refresh_ctx,
-        )?;
+    let delta_plan = {
+        let runtime_plan =
+            crate::sql::codegen::iceberg_delta_scan_wire::build_iceberg_delta_scan_runtime_plan(
+                table_info,
+                from_snapshot_id,
+                to_snapshot_id,
+                mv_refresh_ctx,
+            )?;
+        crate::sql::codegen::iceberg_delta_scan_wire::encode_iceberg_delta_scan_plan_thrift(
+            &runtime_plan,
+        )?
+    };
     node.iceberg_delta_scan_node = Some(plan_nodes::TIcebergDeltaScanNode {
         catalog: table_info.catalog.clone(),
         iceberg_namespace: table_info.namespace.clone(),
         table: table_info.table.clone(),
         from_snapshot_id,
         to_snapshot_id,
-        delta_plan:
-            crate::sql::codegen::iceberg_delta_scan_wire::encode_iceberg_delta_scan_plan_thrift(
-                &runtime_plan,
-            )?,
+        delta_plan,
     });
     Ok(node)
 }
@@ -1031,7 +1033,7 @@ pub(crate) fn build_starrocks_scan_ranges_from_planned_scan(
 /// Build a single placeholder scan range that drives the native
 /// iceberg-rust metadata scan operator. The operator keys off
 /// `serialized_table` on the `THdfsScanNode`, so the per-range payload
-/// only needs to satisfy `lower::compat::node::hdfs_scan` invariants: a
+/// only needs to satisfy HDFS scan-range lowering invariants: a
 /// non-empty path. (The earlier embedded-JVM bridge keyed the same
 /// way; that path has been replaced by `IcebergMetadataScanOp` —
 /// see `src/connector/iceberg/metadata.rs`.)
@@ -1061,6 +1063,191 @@ fn build_iceberg_metadata_scan_range_params() -> crate::runtime::scan_range::Sca
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::collections::{BTreeSet, HashMap};
+    use std::rc::Rc;
+
+    use arrow::datatypes::DataType;
+
+    use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
+    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
+    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+    use crate::sql::codegen::expr_compiler::ExprCompiler;
+    use crate::sql::codegen::resolve::{ColumnBinding, ExprScope, ResolvedTable};
+    use crate::sql::column_id::ColumnId;
+
+    use super::PlannedScanTable;
+
+    #[test]
+    fn pushed_scan_conjuncts_still_feed_native_min_max_predicates() {
+        let column_id = ColumnId::new_for_test(1);
+        let mut scope = ExprScope::new();
+        scope.add_column_with_id(
+            column_id,
+            None,
+            "k".to_string(),
+            ColumnBinding {
+                tuple_id: 1,
+                slot_id: 7,
+                data_type: DataType::Int64,
+                type_desc: None,
+                nullable: false,
+            },
+        );
+        let predicate = TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id,
+                        qualifier: None,
+                        column: "k".to_string(),
+                    },
+                    data_type: DataType::Int64,
+                    nullable: false,
+                }),
+                op: BinOp::Gt,
+                right: Box::new(TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Int(10)),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                }),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        };
+        let mut compiler = ExprCompiler::new(Rc::new(RefCell::new(1000)), &scope);
+        let conjunct = compiler
+            .compile_typed(&predicate)
+            .expect("compile predicate");
+
+        let slot_to_column = HashMap::from([(7, "k".to_string())]);
+        let min_max_predicates =
+            super::scan_file_min_max_predicates_from_state(&[conjunct.clone()], &slot_to_column);
+        assert_eq!(
+            min_max_predicates,
+            vec![MinMaxPredicate::Gt {
+                column: "k".to_string(),
+                value: MinMaxPredicateValue::Int64(10),
+            }]
+        );
+
+        let planned = PlannedScanTable {
+            scan_node_id: 3,
+            scan_tuple_id: 1,
+            resolved: ResolvedTable {
+                database: "db".to_string(),
+                table: TableDef {
+                    name: "t".to_string(),
+                    columns: vec![ColumnDef {
+                        name: "k".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        write_default: None,
+                        logical_type: None,
+                    }],
+                    iceberg_row_lineage_metadata_columns: Vec::new(),
+                    source: ScanSource::StarRocks {
+                        db_id: 1,
+                        table_id: 2,
+                    },
+                },
+                planned_scan: None,
+                alias: None,
+            },
+            min_max_conjuncts: vec![conjunct],
+            slot_to_column,
+            iceberg_metadata_pseudo_column_slots: BTreeSet::new(),
+        };
+
+        assert_eq!(
+            super::scan_file_min_max_predicates(&planned),
+            vec![MinMaxPredicate::Gt {
+                column: "k".to_string(),
+                value: MinMaxPredicateValue::Int64(10),
+            }]
+        );
+    }
+
+    #[test]
+    fn late_filter_appended_scan_conjuncts_feed_native_min_max_predicates() {
+        let column_id = ColumnId::new_for_test(1);
+        let mut scope = ExprScope::new();
+        scope.add_column_with_id(
+            column_id,
+            None,
+            "k".to_string(),
+            ColumnBinding {
+                tuple_id: 1,
+                slot_id: 7,
+                data_type: DataType::Int64,
+                type_desc: None,
+                nullable: false,
+            },
+        );
+        let predicate = TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id,
+                        qualifier: None,
+                        column: "k".to_string(),
+                    },
+                    data_type: DataType::Int64,
+                    nullable: false,
+                }),
+                op: BinOp::Gt,
+                right: Box::new(TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Int(10)),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                }),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        };
+        let mut compiler = ExprCompiler::new(Rc::new(RefCell::new(1000)), &scope);
+        let late_conjunct = compiler
+            .compile_typed(&predicate)
+            .expect("compile predicate");
+        let mut planned = PlannedScanTable {
+            scan_node_id: 3,
+            scan_tuple_id: 1,
+            resolved: ResolvedTable {
+                database: "db".to_string(),
+                table: TableDef {
+                    name: "t".to_string(),
+                    columns: vec![ColumnDef {
+                        name: "k".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        write_default: None,
+                        logical_type: None,
+                    }],
+                    iceberg_row_lineage_metadata_columns: Vec::new(),
+                    source: ScanSource::StarRocks {
+                        db_id: 1,
+                        table_id: 2,
+                    },
+                },
+                planned_scan: None,
+                alias: None,
+            },
+            min_max_conjuncts: Vec::new(),
+            slot_to_column: HashMap::from([(7, "k".to_string())]),
+            iceberg_metadata_pseudo_column_slots: BTreeSet::new(),
+        };
+
+        planned.min_max_conjuncts.push(late_conjunct);
+
+        assert_eq!(
+            super::scan_file_min_max_predicates(&planned),
+            vec![MinMaxPredicate::Gt {
+                column: "k".to_string(),
+                value: MinMaxPredicateValue::Int64(10),
+            }]
+        );
+    }
+
     #[test]
     fn native_change_op_tag_records_plain_slot_metadata_without_thrift_expr() {
         let native = crate::sql::codegen::connector_scan_wire::build_native_file_scan_range_params(

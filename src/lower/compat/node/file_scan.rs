@@ -24,6 +24,7 @@ use csv::{ReaderBuilder, Terminator, Trim};
 use serde_json::Value;
 
 use crate::common::ids::SlotId;
+#[cfg(feature = "compat")]
 use crate::common::types::format_uuid;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprId, cast_with_special_rules};
@@ -36,6 +37,7 @@ use crate::lower::compat::layout::{
 };
 use crate::lower::compat::node::{Lowered, local_rf_waiting_set};
 use crate::lower::compat::type_lowering::arrow_type_from_desc;
+#[cfg(feature = "compat")]
 use crate::service::stream_load_registry;
 use crate::thrift::{descriptors, internal_service, plan_nodes, types};
 
@@ -426,13 +428,24 @@ pub(crate) fn lower_file_scan_node(
                             node.node_id
                         )
                     })?;
-                    stream_load_registry::resolve_stream_load_file_path(load_id).ok_or_else(|| {
+                    #[cfg(feature = "compat")]
+                    {
+                        stream_load_registry::resolve_stream_load_file_path(load_id).ok_or_else(|| {
                         format!(
                             "FILE_SCAN_NODE node_id={} has no registered local file for load_id={}",
                             node.node_id,
                             format_uuid(load_id.hi, load_id.lo)
                         )
                     })?
+                    }
+                    #[cfg(not(feature = "compat"))]
+                    {
+                        let _ = load_id;
+                        return Err(format!(
+                            "FILE_SCAN_NODE node_id={} FILE_STREAM range requires StarRocks FE compatibility mode",
+                            node.node_id
+                        ));
+                    }
                 }
                 _ => {
                     return Err(format!(

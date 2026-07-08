@@ -17,7 +17,7 @@
 
 use arrow::datatypes::DataType;
 
-use crate::sql::codegen::expr_compiler::infer_agg_function_types;
+use crate::sql::codegen::agg_type_infer::infer_agg_function_types;
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::OutputColumn;
 use crate::sql::optimizer::memo::{MExpr, Memo};

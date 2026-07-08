@@ -350,6 +350,76 @@ fn rust_production_text_without_cfg_test_or_compat(text: &str) -> String {
     production
 }
 
+fn nidl_e9_rust_production_text_without_cfg_test(text: &str) -> String {
+    let mut production = String::with_capacity(text.len());
+    let mut pending_skip_attr = false;
+    let mut skipping_cfg_item = false;
+    let mut skip_depth = 0isize;
+    let mut skip_paren_depth = 0isize;
+
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+
+        if skip_depth > 0 {
+            skip_depth += brace_delta(line);
+            if skip_depth <= 0 {
+                skip_depth = 0;
+                skipping_cfg_item = false;
+                skip_paren_depth = 0;
+            }
+            production.push('\n');
+            continue;
+        }
+
+        if skipping_cfg_item {
+            skip_paren_depth += paren_delta(line);
+            let delta = brace_delta(line);
+            if line.contains('{') {
+                skip_depth = delta.max(0);
+                skipping_cfg_item = skip_depth > 0;
+                skip_paren_depth = 0;
+            } else if skip_paren_depth <= 0 && (trimmed.ends_with(';') || trimmed.ends_with(',')) {
+                skipping_cfg_item = false;
+                skip_paren_depth = 0;
+            }
+            production.push('\n');
+            continue;
+        }
+
+        if pending_skip_attr {
+            if trimmed.is_empty() || trimmed.starts_with("#[") {
+                production.push('\n');
+                continue;
+            }
+
+            let delta = brace_delta(line);
+            if line.contains('{') {
+                skip_depth = delta.max(0);
+                skipping_cfg_item = skip_depth > 0;
+                skip_paren_depth = 0;
+            } else if !trimmed.ends_with(';') && !trimmed.ends_with(',') {
+                skipping_cfg_item = true;
+                skip_paren_depth = paren_delta(line).max(0);
+            }
+            pending_skip_attr = false;
+            production.push('\n');
+            continue;
+        }
+
+        if trimmed.starts_with("#[cfg(test") || compact_line(trimmed).starts_with("#[cfg(all(test,")
+        {
+            pending_skip_attr = true;
+            production.push('\n');
+            continue;
+        }
+
+        production.push_str(line);
+        production.push('\n');
+    }
+
+    production
+}
+
 fn nidl_e2_rust_text_without_cfg_test_or_compat(text: &str) -> String {
     rust_production_text_without_cfg_test_or_compat(text)
 }
@@ -5204,8 +5274,25 @@ const NIDL_E0_LEDGER_PATH: &str = "tests/nidl_noncompat_idl_ledger.txt";
 /// Files/prefixes already gated to `#[cfg(feature = "compat")]` (or expected to
 /// be, and verified elsewhere). The lexical scan skips these so the ledger only
 /// tracks the non-compat mainline. Milestones E2/E9 append entries here as
-/// modules are gated (e.g. "src/connector/starrocks", "src/lower/compact").
+/// modules are gated (e.g. "src/lower/compat").
 const NIDL_E0_COMPAT_SCOPE: &[&str] = &[
+    "src/connector/iceberg/file_pruning_wire.rs",
+    "src/connector/starrocks",
+    "src/connector/schema/fe_tables.rs",
+    "src/connector/schema/frontend.rs",
+    "src/connector/schema/load_tracking_logs.rs",
+    "src/connector/schema/loads.rs",
+    "src/formats/starrocks",
+    "src/exec/chunk/schema_thrift.rs",
+    "src/exec/node/fetch.rs",
+    "src/exec/operators/fetch_processor.rs",
+    "src/lower/compat",
+    "src/lower/common/min_max.rs",
+    "src/runtime/descriptor_snapshot_thrift.rs",
+    "src/runtime/exec_params.rs",
+    "src/runtime/exec_params_compat.rs",
+    "src/runtime/sink_commit_wire.rs",
+    "src/runtime/write_coordinator_compat.rs",
     "src/service/backend_service.rs",
     "src/service/heartbeat_service.rs",
     "src/service/internal_service.rs",
@@ -5214,6 +5301,20 @@ const NIDL_E0_COMPAT_SCOPE: &[&str] = &[
     "src/service/stream_load_http.rs",
     "src/service/engine_ffi.rs",
     "src/service/compat.rs",
+    "src/service/disk_report.rs",
+    "src/service/exec_state_reporter.rs",
+    "src/service/exec_status_report.rs",
+    "src/service/fe_report_compat.rs",
+    "src/service/frontend_rpc.rs",
+    "src/service/stream_load_registry.rs",
+    "src/sql/codegen/iceberg_write_sink_wire.rs",
+    "src/sql/codegen/descriptors.rs",
+    "src/sql/codegen/expr_compiler.rs",
+    "src/sql/codegen/iceberg_change_stream_router_wire.rs",
+    "src/sql/codegen/ir/lowering.rs",
+    "src/sql/codegen/nodes.rs",
+    "src/sql/codegen/type_infer.rs",
+    "src/types/arrow_thrift.rs",
 ];
 
 fn nidl_e0_starrocks_idl_terms() -> &'static [&'static str] {
@@ -5463,6 +5564,372 @@ fn nidl_e0_noncompat_starrocks_idl_stays_within_ledger() {
     }
 
     assert!(msg.is_empty(), "NIDL-E0 ledger drift:\n{msg}");
+}
+
+fn nidl_e9_module_has_compat_cfg(module_file: &Path, module_name: &str) -> bool {
+    let Ok(text) = fs::read_to_string(module_file) else {
+        return false;
+    };
+    let mut previous_non_blank = "";
+    let mut in_block_comment = false;
+    let target = format!("mod {module_name};");
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if nidl_e9_is_comment_or_blank_line(trimmed, &mut in_block_comment) {
+            continue;
+        }
+        if trimmed == target
+            || trimmed == format!("pub(crate) mod {module_name};")
+            || trimmed == format!("pub mod {module_name};")
+        {
+            return previous_non_blank == "#[cfg(feature = \"compat\")]";
+        }
+        previous_non_blank = trimmed;
+    }
+    false
+}
+
+fn nidl_e9_file_is_cfg_compat_module(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+
+    if file_name == "mod.rs" {
+        let Some(module_name) = parent.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        let Some(parent_parent) = parent.parent() else {
+            return false;
+        };
+        return nidl_e9_module_has_compat_cfg(&parent_parent.join("mod.rs"), module_name);
+    }
+
+    let Some(module_name) = path.file_stem().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    nidl_e9_module_has_compat_cfg(&parent.join("mod.rs"), module_name)
+}
+
+fn nidl_e9_is_comment_or_blank_line(trimmed: &str, in_block_comment: &mut bool) -> bool {
+    if *in_block_comment {
+        if trimmed.contains("*/") {
+            *in_block_comment = false;
+        }
+        return true;
+    }
+
+    if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('*') {
+        return true;
+    }
+
+    if trimmed.starts_with("/*") {
+        if !trimmed.contains("*/") {
+            *in_block_comment = true;
+        }
+        return true;
+    }
+
+    false
+}
+
+fn nidl_e9_noncompat_lower_compat_import_hits_in(root: &Path) -> Vec<String> {
+    let mut hits = Vec::new();
+    for path in rs_files(root) {
+        let rel_path = rel(&path);
+        if nidl_e9_is_lower_compat_scope(&rel_path) {
+            continue;
+        }
+        if nidl_e9_file_is_cfg_compat_module(&path) {
+            continue;
+        }
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        let production = nidl_e9_rust_production_text_without_cfg_test(&text);
+        let mut in_block_comment = false;
+        for (idx, line) in production.lines().enumerate() {
+            let trimmed = line.trim();
+            if nidl_e9_is_comment_or_blank_line(trimmed, &mut in_block_comment) {
+                continue;
+            }
+            if line.contains("crate::lower::compat") || line.contains("lower::compat") {
+                hits.push(format!("{rel_path}:{}:{line}", idx + 1));
+            }
+        }
+    }
+    hits.sort();
+    hits
+}
+
+fn nidl_e9_is_lower_compat_scope(rel_path: &str) -> bool {
+    rel_path == "src/lower/compat" || rel_path.starts_with("src/lower/compat/")
+}
+
+fn nidl_e9_noncompat_lower_compat_import_hits() -> Vec<String> {
+    nidl_e9_noncompat_lower_compat_import_hits_in(&src_dir())
+}
+
+fn nidl_e9_is_lower_compat_type_lowering_hit(hit: &str) -> bool {
+    hit.contains("crate::lower::compat::type_lowering")
+        || hit.contains("lower::compat::type_lowering")
+}
+
+fn nidl_e9_read(rel_path: &str) -> String {
+    fs::read_to_string(Path::new(manifest_dir()).join(rel_path))
+        .unwrap_or_else(|err| panic!("read {rel_path}: {err}"))
+}
+
+fn nidl_e9_text_region_between<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
+    let start_idx = text
+        .find(start)
+        .unwrap_or_else(|| panic!("missing start marker `{start}`"));
+    let after_start = &text[start_idx..];
+    let end_idx = after_start
+        .find(end)
+        .unwrap_or_else(|| panic!("missing end marker `{end}` after `{start}`"));
+    &after_start[..end_idx]
+}
+
+#[test]
+fn nidl_e9_native_fragment_wire_has_no_starrocks_thrift_aliases() {
+    let text = nidl_e9_read("src/runtime/native_fragment_wire.rs");
+    let production = rust_production_text_without_cfg_test_or_compat(&text);
+    for forbidden in [
+        "type DataStreamSink = data_sinks::TDataStreamSink",
+        "type MultiCastDataStreamSink = data_sinks::TMultiCastDataStreamSink",
+        "type DataPartition = partitions::TDataPartition",
+        "crate::thrift::{data_sinks, partitions, types}",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "native_fragment_wire must not keep StarRocks thrift alias `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn nidl_e9_write_coordinator_uses_native_report_types() {
+    let coordinator = nidl_e9_read("src/runtime/write_coordinator.rs");
+    let coordinator_region = nidl_e9_text_region_between(
+        &coordinator,
+        "pub(crate) use crate::runtime::write_report",
+        "impl WriteCoordinator",
+    );
+    let write_report = nidl_e9_read("src/runtime/write_report.rs");
+    let write_report_region = nidl_e9_text_region_between(
+        &write_report,
+        "pub(crate) struct WriterKey",
+        "pub(crate) fn unique_id_from_native",
+    );
+    let region = format!("{coordinator_region}\n{write_report_region}");
+    for forbidden in [
+        "types::TUniqueId",
+        "status::TStatus",
+        "types::TSinkCommitInfo",
+        "types::TTabletCommitInfo",
+        "types::TTabletFailInfo",
+    ] {
+        assert!(
+            !region.contains(forbidden),
+            "write coordinator public report structs must not contain `{forbidden}`:\n{region}"
+        );
+    }
+}
+
+#[test]
+fn nidl_e9_noncompat_startup_does_not_init_frontend_rpc() {
+    let text = nidl_e9_read("src/main.rs");
+    let production = rust_production_text_without_cfg_test_or_compat(&text);
+    assert!(
+        !production.contains("frontend_rpc::init_frontend_rpc_manager"),
+        "non-compat startup must not initialize Frontend RPC manager"
+    );
+}
+
+#[test]
+fn nidl_e9_lower_compat_import_detector_ignores_cfg_compat_files() {
+    let dir = std::env::temp_dir().join("nidl_e9_lower_compat_detector");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("native_hit.rs"),
+        "use crate::lower::compat::type_lowering::scalar_type_desc;\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("native_generic_hit.rs"),
+        "use crate::lower::compat::expr::parse_min_max_conjuncts;\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("compat_only.rs"),
+        "#[cfg(feature = \"compat\")]\nfn compat_only() { let _ = crate::lower::compat::type_lowering::scalar_type_desc; }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("mod.rs"),
+        "#[cfg(feature = \"compat\")]\npub(crate) mod compat_module;\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("compat_module.rs"),
+        "use crate::lower::compat::fragment::execute_fragment;\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("comment_note.rs"),
+        "// This note mentions crate::lower::compat::type_lowering but is not production code.\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("block_comment_note.rs"),
+        "/* This note mentions crate::lower::compat::type_lowering but is not production code. */\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("multiline_block_comment_note.rs"),
+        "/*\n * This note mentions lower::compat::type_lowering but is not production code.\n */\n",
+    )
+    .unwrap();
+
+    let hits = nidl_e9_noncompat_lower_compat_import_hits_in(&dir);
+    assert!(
+        hits.iter().any(|hit| hit.contains("native_hit.rs")),
+        "must report default-build lower::compat::type_lowering imports: {hits:?}"
+    );
+    assert!(
+        hits.iter().any(|hit| hit.contains("native_generic_hit.rs")),
+        "must report default-build lower::compat imports: {hits:?}"
+    );
+    assert!(
+        hits.iter().any(|hit| hit.contains("compat_only.rs")),
+        "must report item-level cfg(feature=\"compat\") lower::compat imports in non-compat files: {hits:?}"
+    );
+    assert!(
+        !hits.iter().any(|hit| hit.contains("compat_module.rs")),
+        "must ignore lower::compat imports from modules declared cfg(feature=\"compat\"): {hits:?}"
+    );
+    assert!(
+        !hits.iter().any(|hit| hit.contains("comment_note.rs")),
+        "must ignore commented lower::compat::type_lowering mentions: {hits:?}"
+    );
+    assert!(
+        !hits.iter().any(|hit| hit.contains("block_comment_note.rs")),
+        "must ignore block-commented lower::compat::type_lowering mentions: {hits:?}"
+    );
+    assert!(
+        !hits
+            .iter()
+            .any(|hit| hit.contains("multiline_block_comment_note.rs")),
+        "must ignore multiline block-commented lower::compat::type_lowering mentions: {hits:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn nidl_e9_lower_compat_scope_only_skips_lower_compat_implementation() {
+    assert!(nidl_e9_is_lower_compat_scope("src/lower/compat"));
+    assert!(nidl_e9_is_lower_compat_scope(
+        "src/lower/compat/node/hdfs_scan.rs"
+    ));
+    assert!(
+        !nidl_e9_is_lower_compat_scope("src/service/compat.rs"),
+        "E9 must not inherit E0 service compat scope"
+    );
+    assert!(
+        nidl_e9_file_is_cfg_compat_module(
+            &Path::new(manifest_dir()).join("src/service/internal_service.rs")
+        ),
+        "E9 may ignore service/internal_service.rs only because its module declaration is cfg(feature=\"compat\")"
+    );
+    assert!(
+        !nidl_e9_is_lower_compat_scope("src/connector/starrocks/lake/schema_change.rs"),
+        "E9 must report connector lower::compat imports"
+    );
+    assert!(
+        !nidl_e9_is_lower_compat_scope("src/exec/chunk/schema_thrift.rs"),
+        "E9 must report exec/chunk lower::compat imports"
+    );
+}
+
+#[test]
+fn nidl_e9_native_codegen_does_not_import_lower_compat_type_lowering() {
+    let hits: Vec<String> = nidl_e9_noncompat_lower_compat_import_hits()
+        .into_iter()
+        .filter(|hit| {
+            hit.contains("src/sql/codegen/")
+                || hit.contains("src/runtime/")
+                || hit.contains("src/formats/parquet/")
+        })
+        .filter(|hit| nidl_e9_is_lower_compat_type_lowering_hit(hit))
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "native codegen/runtime must not import lower::compat type lowering helpers:\n{}",
+        hits.join("\n")
+    );
+}
+
+#[test]
+fn nidl_e9_noncompat_paths_do_not_import_lower_compat() {
+    let hits = nidl_e9_noncompat_lower_compat_import_hits();
+    assert!(
+        hits.is_empty(),
+        "non-compat paths must not import lower::compat:\n{}",
+        hits.join("\n")
+    );
+}
+
+#[test]
+fn nidl_e9_lower_compat_module_is_cfg_gated() {
+    let module_file = Path::new(manifest_dir()).join("src/lower/mod.rs");
+    assert!(
+        nidl_e9_module_has_compat_cfg(&module_file, "compat"),
+        "src/lower/mod.rs must gate lower::compat with #[cfg(feature = \"compat\")]"
+    );
+}
+
+#[test]
+fn nidl_e9_guard_helpers_find_text_regions() {
+    let text = "alpha\nstart\nbody\nend\nomega\n";
+    assert_eq!(
+        nidl_e9_text_region_between(text, "start", "end"),
+        "start\nbody\n"
+    );
+}
+
+#[test]
+#[should_panic(expected = "missing start marker `start`")]
+fn nidl_e9_guard_helpers_panic_when_text_region_start_is_missing() {
+    let text = "alpha\nbody\nend\nomega\n";
+    let _ = nidl_e9_text_region_between(text, "start", "end");
+}
+
+#[test]
+#[should_panic(expected = "missing end marker `end` after `start`")]
+fn nidl_e9_guard_helpers_panic_when_text_region_end_is_missing() {
+    let text = "alpha\nstart\nbody\nomega\n";
+    let _ = nidl_e9_text_region_between(text, "start", "end");
+}
+
+#[test]
+fn nidl_e9_guard_helpers_ignore_block_comments_between_cfg_and_module() {
+    let dir = std::env::temp_dir().join("nidl_e9_module_cfg_detector");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("mod_fixture.rs");
+    fs::write(
+        &file,
+        "#[cfg(feature = \"compat\")]\n/* compatibility module note */\npub(crate) mod compat_only;\n",
+    )
+    .unwrap();
+
+    assert!(
+        nidl_e9_module_has_compat_cfg(&file, "compat_only"),
+        "must ignore block comments between cfg(feature=\"compat\") and module declarations"
+    );
+    let _ = fs::remove_dir_all(&dir);
 }
 
 fn nidl_e1_native_mv_starrocks_table_import_hits() -> Vec<String> {

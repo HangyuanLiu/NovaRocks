@@ -22,6 +22,7 @@ use crate::exec::node::iceberg_delta_scan::{
     DeltaSourceRole, EqualityDeleteTargetData, IcebergDeltaDataColumnPayload,
     PositionDeleteFileFormat, PositionDeleteSourceData,
 };
+#[cfg(feature = "compat")]
 use crate::thrift::plan_nodes;
 
 pub(crate) struct IcebergDeltaScanRuntimePlan {
@@ -199,6 +200,7 @@ pub(crate) fn build_iceberg_delta_scan_runtime_plan(
     })
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn encode_iceberg_delta_scan_plan_thrift(
     plan: &IcebergDeltaScanRuntimePlan,
 ) -> Result<plan_nodes::TIcebergDeltaScanPlan, String> {
@@ -243,6 +245,7 @@ pub(crate) fn encode_iceberg_delta_scan_plan_native(
     })
 }
 
+#[cfg(feature = "compat")]
 fn cloud_configuration_from_properties(
     cloud_properties: &BTreeMap<String, String>,
 ) -> Option<crate::thrift::cloud_configuration::TCloudConfiguration> {
@@ -450,12 +453,14 @@ fn delete_visibility_delete_file_to_native(
     }
 }
 
+#[cfg(feature = "compat")]
 fn change_files_to_thrift(
     files: &[DeltaSourceFile],
 ) -> Result<Vec<plan_nodes::TIcebergDeltaSourceFile>, String> {
     files.iter().map(change_file_to_thrift).collect()
 }
 
+#[cfg(feature = "compat")]
 fn change_file_to_thrift(
     file: &DeltaSourceFile,
 ) -> Result<plan_nodes::TIcebergDeltaSourceFile, String> {
@@ -519,6 +524,7 @@ fn change_file_to_thrift(
     ))
 }
 
+#[cfg(feature = "compat")]
 fn position_delete_source_to_thrift(
     delete: &PositionDeleteSourceData,
 ) -> plan_nodes::TIcebergDeltaPositionDeleteSource {
@@ -539,6 +545,7 @@ fn position_delete_source_to_thrift(
     )
 }
 
+#[cfg(feature = "compat")]
 fn equality_target_to_thrift(
     target: &EqualityDeleteTargetData,
 ) -> plan_nodes::TIcebergDeltaEqualityDeleteTarget {
@@ -550,6 +557,7 @@ fn equality_target_to_thrift(
     )
 }
 
+#[cfg(feature = "compat")]
 fn deleted_file_visibility_to_thrift(
     visibility: &DeletedFileVisibility,
 ) -> plan_nodes::TIcebergDeltaDeletedFileVisibility {
@@ -558,6 +566,7 @@ fn deleted_file_visibility_to_thrift(
     )
 }
 
+#[cfg(feature = "compat")]
 fn delete_side_to_thrift(
     payload: Option<&DeltaScanDeleteSidePayload>,
 ) -> Result<Option<plan_nodes::TIcebergDeltaDeleteSidePlan>, String> {
@@ -577,6 +586,7 @@ fn delete_side_to_thrift(
     )))
 }
 
+#[cfg(feature = "compat")]
 fn lineage_map_to_thrift(
     input: &HashMap<String, BaseDataFileLineage>,
 ) -> BTreeMap<String, plan_nodes::TIcebergDeltaBaseDataFileLineage> {
@@ -594,6 +604,7 @@ fn lineage_map_to_thrift(
         .collect()
 }
 
+#[cfg(feature = "compat")]
 fn previous_deleted_positions_to_thrift(
     input: &HashMap<String, Vec<u64>>,
 ) -> Result<BTreeMap<String, Vec<i64>>, String> {
@@ -616,6 +627,7 @@ fn previous_deleted_positions_to_thrift(
         .collect()
 }
 
+#[cfg(feature = "compat")]
 fn delete_visibility_data_file_to_thrift(
     file: &crate::connector::iceberg::changes::DeleteVisibilityDataFileDescriptor,
 ) -> plan_nodes::TIcebergDeltaDeleteVisibilityDataFile {
@@ -631,6 +643,7 @@ fn delete_visibility_data_file_to_thrift(
     )
 }
 
+#[cfg(feature = "compat")]
 fn delete_visibility_delete_file_to_thrift(
     file: &crate::connector::iceberg::changes::DeleteVisibilityDeleteFileDescriptor,
 ) -> plan_nodes::TIcebergDeltaDeleteVisibilityDeleteFile {

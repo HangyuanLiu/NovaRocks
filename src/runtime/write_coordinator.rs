@@ -24,32 +24,12 @@ use std::collections::{BTreeMap, HashMap, hash_map::Entry};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::common::engine_error::EngineError;
-use crate::proto::{common, novarocks};
-use crate::runtime::sink_commit_wire;
-use crate::thrift::{status, status_code, types};
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub(crate) struct WriterKey {
-    pub(crate) query_id: types::TUniqueId,
-    pub(crate) fragment_instance_id: types::TUniqueId,
-    pub(crate) backend_num: i32,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct FragmentExecStatusReport {
-    pub(crate) query_id: types::TUniqueId,
-    pub(crate) fragment_instance_id: types::TUniqueId,
-    pub(crate) backend_num: i32,
-    pub(crate) done: bool,
-    pub(crate) status: status::TStatus,
-    pub(crate) sink_commit_infos: Vec<types::TSinkCommitInfo>,
-    pub(crate) tablet_commit_infos: Vec<types::TTabletCommitInfo>,
-    pub(crate) tablet_fail_infos: Vec<types::TTabletFailInfo>,
-    pub(crate) load_counters: BTreeMap<String, String>,
-    pub(crate) loaded_rows: i64,
-    pub(crate) loaded_bytes: i64,
-    pub(crate) filtered_rows: i64,
-}
+use crate::common::types::UniqueId;
+use crate::proto::novarocks;
+use crate::runtime::write_report;
+pub(crate) use crate::runtime::write_report::{
+    FragmentExecStatusReport, WriteAbortInput, WriteCommitInput, WriterCommitInput, WriterKey,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ReportOutcome {
@@ -59,34 +39,7 @@ pub(crate) enum ReportOutcome {
     Failed,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct WriteCommitInput {
-    pub(crate) write_id: types::TUniqueId,
-    pub(crate) writers: Vec<WriterCommitInput>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct WriterCommitInput {
-    pub(crate) writer_id: usize,
-    pub(crate) writer_key: WriterKey,
-    pub(crate) sink_commit_infos: Vec<types::TSinkCommitInfo>,
-    pub(crate) tablet_commit_infos: Vec<types::TTabletCommitInfo>,
-    pub(crate) tablet_fail_infos: Vec<types::TTabletFailInfo>,
-    pub(crate) load_counters: BTreeMap<String, String>,
-    pub(crate) loaded_rows: i64,
-    pub(crate) loaded_bytes: i64,
-    pub(crate) filtered_rows: i64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct WriteAbortInput {
-    pub(crate) write_id: types::TUniqueId,
-    pub(crate) reason: String,
-    pub(crate) completed_writer_outputs: Vec<WriterCommitInput>,
-    pub(crate) incomplete_writers: Vec<WriterKey>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum WriterState {
     Pending,
     Running {
@@ -110,13 +63,13 @@ struct WriterSlot {
 
 #[derive(Debug)]
 pub(crate) struct WriteCoordinator {
-    write_id: types::TUniqueId,
+    write_id: UniqueId,
     writers: BTreeMap<WriterKey, WriterSlot>,
     failed_reason: Option<String>,
 }
 
 impl WriteCoordinator {
-    pub(crate) fn new(query_id: types::TUniqueId, writers: Vec<WriterKey>) -> Result<Self, String> {
+    pub(crate) fn new(query_id: UniqueId, writers: Vec<WriterKey>) -> Result<Self, String> {
         let mut slots = BTreeMap::new();
         for (writer_id, key) in writers.into_iter().enumerate() {
             if key.query_id != query_id {
@@ -177,7 +130,7 @@ impl WriteCoordinator {
             }
         }
 
-        if report.status.status_code != status_code::TStatusCode::OK {
+        if !report_is_ok(&report) {
             let error = status_message(&report.status);
             match &slot.state {
                 WriterState::Failed { error: existing } if existing == &error => {
@@ -214,9 +167,7 @@ impl WriteCoordinator {
         let output = WriterCommitInput {
             writer_id: slot.writer_id,
             writer_key: slot.key.clone(),
-            sink_commit_infos: report.sink_commit_infos,
-            tablet_commit_infos: report.tablet_commit_infos,
-            tablet_fail_infos: report.tablet_fail_infos,
+            iceberg_commits: report.iceberg_commits,
             load_counters: report.load_counters,
             loaded_rows: report.loaded_rows,
             loaded_bytes: report.loaded_bytes,
@@ -346,75 +297,21 @@ impl WriteCoordinator {
     }
 }
 
-pub(crate) fn report_from_native(
-    report: novarocks::ExecStatusReport,
-) -> Result<FragmentExecStatusReport, String> {
-    let query_id = unique_id_from_native(report.query_id, "ExecStatusReport missing query_id")?;
-    let fragment_instance_id = unique_id_from_native(
-        report.fragment_instance_id,
-        "ExecStatusReport missing fragment_instance_id",
-    )?;
-    let status = status_from_native(report.status)?;
-    let sink_commit_infos = report
-        .iceberg_commits
-        .into_iter()
-        .map(sink_commit_wire::sink_commit_info_from_native)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(FragmentExecStatusReport {
-        query_id,
-        fragment_instance_id,
-        backend_num: report.backend_num,
-        done: report.done,
-        status,
-        sink_commit_infos,
-        tablet_commit_infos: Vec::new(),
-        tablet_fail_infos: Vec::new(),
-        load_counters: BTreeMap::new(),
-        loaded_rows: report.loaded_rows,
-        loaded_bytes: report.sink_load_bytes,
-        filtered_rows: report.filtered_rows,
-    })
+fn report_is_ok(report: &FragmentExecStatusReport) -> bool {
+    report.status.code == 0
 }
 
-fn unique_id_from_native(
-    id: Option<common::UniqueId>,
-    missing_message: &'static str,
-) -> Result<types::TUniqueId, String> {
-    let id = id.ok_or_else(|| missing_message.to_string())?;
-    Ok(types::TUniqueId {
-        hi: id.hi,
-        lo: id.lo,
-    })
-}
-
-fn status_from_native(status: Option<common::Status>) -> Result<status::TStatus, String> {
-    let status = status.ok_or_else(|| "ExecStatusReport missing status".to_string())?;
-    let error_msgs = if status.message.is_empty() {
-        None
+fn status_message(status: &crate::proto::common::Status) -> String {
+    if status.message.is_empty() {
+        format!("status={}", status.code)
     } else {
-        Some(vec![status.message])
-    };
-    Ok(status::TStatus::new(
-        status_code::TStatusCode(status.code),
-        error_msgs,
-    ))
-}
-
-fn status_message(status: &status::TStatus) -> String {
-    status
-        .error_msgs
-        .as_ref()
-        .filter(|msgs| !msgs.is_empty())
-        .map(|msgs| msgs.join("; "))
-        .unwrap_or_else(|| format!("status={:?}", status.status_code))
+        status.message.clone()
+    }
 }
 
 fn apply_report_to_query_state(report: &FragmentExecStatusReport) {
-    let finst_id = crate::common::types::UniqueId {
-        hi: report.fragment_instance_id.hi,
-        lo: report.fragment_instance_id.lo,
-    };
-    if report.status.status_code != status_code::TStatusCode::OK {
+    let finst_id = report.fragment_instance_id;
+    if !report_is_ok(report) {
         crate::runtime::query_state::in_flight_table()
             .on_fragment_done(finst_id, Err(status_message(&report.status)));
     } else if report.done {
@@ -423,9 +320,7 @@ fn apply_report_to_query_state(report: &FragmentExecStatusReport) {
 }
 
 fn report_has_write_metadata(report: &FragmentExecStatusReport) -> bool {
-    !report.sink_commit_infos.is_empty()
-        || !report.tablet_commit_infos.is_empty()
-        || !report.tablet_fail_infos.is_empty()
+    !report.iceberg_commits.is_empty()
 }
 
 fn format_writer_key(key: &WriterKey) -> String {
@@ -449,12 +344,12 @@ fn registry() -> &'static WriteCoordinatorRegistry {
     REGISTRY.get_or_init(WriteCoordinatorRegistry::default)
 }
 
-fn query_key(query_id: &types::TUniqueId) -> (i64, i64) {
+fn query_key(query_id: &UniqueId) -> (i64, i64) {
     (query_id.hi, query_id.lo)
 }
 
 pub(crate) fn register_query(
-    query_id: types::TUniqueId,
+    query_id: UniqueId,
     writers: Vec<WriterKey>,
 ) -> Result<Arc<Mutex<WriteCoordinator>>, String> {
     let coord = Arc::new(Mutex::new(WriteCoordinator::new(
@@ -477,7 +372,7 @@ pub(crate) fn register_query(
     }
 }
 
-pub(crate) fn unregister_query(query_id: &types::TUniqueId) {
+pub(crate) fn unregister_query(query_id: &UniqueId) {
     registry()
         .queries
         .lock()
@@ -499,7 +394,7 @@ pub(crate) fn handle_fragment_report_exec_status(
 
     let Some(coord) = coord else {
         if report_has_write_metadata(&report) {
-            return Err(EngineError::write_coordinator_gone(report.query_id.clone()));
+            return Err(EngineError::write_coordinator_gone(report.query_id));
         }
         return Ok(ReportOutcome::Accepted);
     };
@@ -512,26 +407,21 @@ pub(crate) fn handle_fragment_report_exec_status(
         })
 }
 
-pub(crate) fn handle_native_report_exec_status(
-    report: novarocks::ExecStatusReport,
-) -> Result<ReportOutcome, EngineError> {
-    let report = report_from_native(report).map_err(EngineError::protocol_decode)?;
-    handle_fragment_report_exec_status(report)
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum WriterReportLookup {
     Expected,
-    UnknownWriter { query_id: types::TUniqueId },
-    UnknownQuery { query_id: types::TUniqueId },
+    UnknownWriter { query_id: UniqueId },
+    UnknownQuery { query_id: UniqueId },
 }
 
 pub(crate) fn lookup_native_writer_report(
     report: &novarocks::ExecStatusReport,
 ) -> Result<WriterReportLookup, String> {
-    let query_id =
-        unique_id_from_native(report.query_id.clone(), "ExecStatusReport missing query_id")?;
-    let fragment_instance_id = unique_id_from_native(
+    let query_id = write_report::unique_id_from_native(
+        report.query_id.clone(),
+        "ExecStatusReport missing query_id",
+    )?;
+    let fragment_instance_id = write_report::unique_id_from_native(
         report.fragment_instance_id.clone(),
         "ExecStatusReport missing fragment_instance_id",
     )?;
@@ -560,7 +450,7 @@ pub(crate) fn lookup_native_writer_report(
     }
 }
 
-pub(crate) fn mark_query_failed(query_id: &types::TUniqueId, reason: String) -> bool {
+pub(crate) fn mark_query_failed(query_id: &UniqueId, reason: String) -> bool {
     let coord = registry()
         .queries
         .lock()
@@ -589,14 +479,14 @@ pub(crate) fn test_clear_registry() {
 #[cfg(test)]
 pub(crate) struct WriteRegistryTestGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
-    registered_queries: Vec<types::TUniqueId>,
+    registered_queries: Vec<UniqueId>,
 }
 
 #[cfg(test)]
 impl WriteRegistryTestGuard {
     pub(crate) fn register_query(
         &mut self,
-        query_id: types::TUniqueId,
+        query_id: UniqueId,
         writers: Vec<WriterKey>,
     ) -> Result<Arc<Mutex<WriteCoordinator>>, String> {
         let coord = register_query(query_id.clone(), writers)?;
@@ -604,7 +494,7 @@ impl WriteRegistryTestGuard {
         Ok(coord)
     }
 
-    pub(crate) fn unregister_query(&mut self, query_id: &types::TUniqueId) {
+    pub(crate) fn unregister_query(&mut self, query_id: &UniqueId) {
         unregister_query(query_id);
         self.registered_queries.retain(|id| id != query_id);
     }
@@ -637,9 +527,10 @@ pub(crate) fn write_registry_test_guard() -> WriteRegistryTestGuard {
 mod tests {
     use super::*;
     use crate::common::engine_error::EngineErrorCode;
+    use crate::proto::common;
 
-    fn id(hi: i64, lo: i64) -> types::TUniqueId {
-        types::TUniqueId::new(hi, lo)
+    fn id(hi: i64, lo: i64) -> UniqueId {
+        UniqueId { hi, lo }
     }
 
     fn runtime_query_id(hi: i64, lo: i64) -> crate::runtime::query_context::QueryId {
@@ -660,35 +551,39 @@ mod tests {
         }
     }
 
-    fn ok_status() -> status::TStatus {
-        status::TStatus::new(status_code::TStatusCode::OK, None)
+    fn ok_status() -> common::Status {
+        common::Status {
+            code: 0,
+            message: String::new(),
+        }
     }
 
-    fn err_status(msg: &str) -> status::TStatus {
-        status::TStatus::new(
-            status_code::TStatusCode::INTERNAL_ERROR,
-            Some(vec![msg.to_string()]),
-        )
+    fn err_status(msg: &str) -> common::Status {
+        common::Status {
+            code: 1,
+            message: msg.to_string(),
+        }
     }
 
-    fn coord(query_id: types::TUniqueId, writers: Vec<WriterKey>) -> WriteCoordinator {
+    fn coord(query_id: UniqueId, writers: Vec<WriterKey>) -> WriteCoordinator {
         WriteCoordinator::new(query_id, writers).expect("coordinator")
     }
 
     fn report(
         writer: &WriterKey,
         done: bool,
-        status: status::TStatus,
+        status: common::Status,
         path: &str,
     ) -> FragmentExecStatusReport {
-        let sink_commit_infos = if path.is_empty() {
+        let iceberg_commits = if path.is_empty() {
             Vec::new()
         } else {
-            vec![types::TSinkCommitInfo {
-                iceberg_data_file: Some(types::TIcebergDataFile {
+            vec![novarocks::IcebergCommitInfo {
+                iceberg_data_file: Some(novarocks::IcebergDataFile {
                     path: Some(path.to_string()),
                     record_count: Some(7),
                     file_size_in_bytes: Some(70),
+                    file_content: novarocks::IcebergFileContent::Data as i32,
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -700,9 +595,7 @@ mod tests {
             backend_num: writer.backend_num,
             done,
             status,
-            sink_commit_infos,
-            tablet_commit_infos: Vec::new(),
-            tablet_fail_infos: Vec::new(),
+            iceberg_commits,
             load_counters: std::collections::BTreeMap::from([
                 ("dpp.norm.ALL".to_string(), "7".to_string()),
                 ("loaded.bytes".to_string(), "70".to_string()),
@@ -725,7 +618,7 @@ mod tests {
             }),
             backend_num: writer.backend_num,
             status: Some(common::Status {
-                code: status_code::TStatusCode::OK.0,
+                code: 0,
                 message: String::new(),
             }),
             done: true,
@@ -794,14 +687,14 @@ mod tests {
         assert_eq!(input.writers[0].writer_id, 0);
         assert_eq!(input.writers[1].writer_id, 1);
         assert_eq!(
-            input.writers[0].sink_commit_infos[0]
+            input.writers[0].iceberg_commits[0]
                 .iceberg_data_file
                 .as_ref()
                 .and_then(|f| f.path.as_deref()),
             Some("s3://w/a.parquet")
         );
         assert_eq!(
-            input.writers[1].sink_commit_infos[0]
+            input.writers[1].iceberg_commits[0]
                 .iceberg_data_file
                 .as_ref()
                 .and_then(|f| f.path.as_deref()),
@@ -1186,7 +1079,8 @@ mod tests {
     fn report_from_native_preserves_iceberg_commit_metadata() {
         let writer = key(25, 35, 126, 226, 2);
 
-        let report = report_from_native(native_report(&writer)).expect("native report");
+        let report =
+            write_report::report_from_native(native_report(&writer)).expect("native report");
 
         assert_eq!(report.query_id, writer.query_id);
         assert_eq!(report.fragment_instance_id, writer.fragment_instance_id);
@@ -1195,10 +1089,8 @@ mod tests {
         assert_eq!(report.loaded_rows, 9);
         assert_eq!(report.loaded_bytes, 90);
         assert_eq!(report.filtered_rows, 1);
-        assert!(report.tablet_commit_infos.is_empty());
-        assert!(report.tablet_fail_infos.is_empty());
         assert!(report.load_counters.is_empty());
-        let commit = report.sink_commit_infos.first().expect("sink commit");
+        let commit = report.iceberg_commits.first().expect("iceberg commit");
         assert_eq!(commit.is_overwrite, Some(true));
         assert_eq!(commit.is_rewrite, Some(false));
         let data_file = commit
@@ -1207,15 +1099,23 @@ mod tests {
             .expect("iceberg data file");
         assert_eq!(data_file.path.as_deref(), Some("s3://w/native.parquet"));
         assert_eq!(data_file.format.as_deref(), Some("parquet"));
-        assert_eq!(data_file.split_offsets, Some(vec![4, 8]));
-        assert_eq!(data_file.equality_ids, Some(vec![1, 2]));
+        assert_eq!(
+            data_file
+                .split_offsets
+                .as_ref()
+                .map(|values| &values.values),
+            Some(&vec![4, 8])
+        );
+        assert_eq!(
+            data_file.equality_ids.as_ref().map(|values| &values.values),
+            Some(&vec![1, 2])
+        );
         assert_eq!(data_file.content_size_in_bytes, Some(256));
         assert_eq!(
             data_file
                 .column_stats
                 .as_ref()
-                .and_then(|stats| stats.lower_bounds.as_ref())
-                .and_then(|bounds| bounds.get(&1)),
+                .and_then(|stats| stats.lower_bounds.get(&1)),
             Some(&vec![1])
         );
     }
@@ -1263,14 +1163,14 @@ mod tests {
         assert_eq!(commit.writers[0].writer_key, writer_a);
         assert_eq!(commit.writers[1].writer_key, writer_b);
         assert_eq!(
-            commit.writers[0].sink_commit_infos[0]
+            commit.writers[0].iceberg_commits[0]
                 .iceberg_data_file
                 .as_ref()
                 .and_then(|f| f.path.as_deref()),
             Some("s3://w/registry-a.parquet")
         );
         assert_eq!(
-            commit.writers[1].sink_commit_infos[0]
+            commit.writers[1].iceberg_commits[0]
                 .iceberg_data_file
                 .as_ref()
                 .and_then(|f| f.path.as_deref()),
@@ -1303,9 +1203,7 @@ mod tests {
             backend_num: 7,
             done: true,
             status: ok_status(),
-            sink_commit_infos: Vec::new(),
-            tablet_commit_infos: Vec::new(),
-            tablet_fail_infos: Vec::new(),
+            iceberg_commits: Vec::new(),
             load_counters: Default::default(),
             loaded_rows: 0,
             loaded_bytes: 0,
@@ -1335,9 +1233,7 @@ mod tests {
             backend_num: 8,
             done: true,
             status: err_status("select fragment failed"),
-            sink_commit_infos: Vec::new(),
-            tablet_commit_infos: Vec::new(),
-            tablet_fail_infos: Vec::new(),
+            iceberg_commits: Vec::new(),
             load_counters: Default::default(),
             loaded_rows: 0,
             loaded_bytes: 0,

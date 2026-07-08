@@ -18,6 +18,7 @@ use crate::common::largeint;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue, function};
 use arrow::datatypes::DataType;
 
+#[cfg(feature = "compat")]
 use crate::service::fe_report;
 use crate::thrift::exprs;
 use crate::thrift::types;
@@ -429,8 +430,17 @@ pub(crate) fn lower_function_call(
         if arg.is_empty() {
             Ok(arena.push_typed(ExprNode::Literal(LiteralValue::Null), data_type))
         } else {
-            let profile = fe_report::fetch_query_profile(fe_addr, arg)?;
-            Ok(arena.push_typed(ExprNode::Literal(LiteralValue::Utf8(profile)), data_type))
+            #[cfg(feature = "compat")]
+            {
+                let profile = fe_report::fetch_query_profile(fe_addr, arg)?;
+                Ok(arena.push_typed(ExprNode::Literal(LiteralValue::Utf8(profile)), data_type))
+            }
+            #[cfg(not(feature = "compat"))]
+            {
+                let _ = fe_addr;
+                let _ = arg;
+                Err("get_query_profile requires StarRocks FE compatibility mode".to_string())
+            }
         }
     } else {
         // Use function registry for standard functions

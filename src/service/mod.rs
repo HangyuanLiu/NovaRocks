@@ -18,14 +18,20 @@
 pub mod backend_service;
 #[cfg(feature = "compat")]
 pub mod compat;
+#[cfg(feature = "compat")]
 pub mod disk_report;
 #[cfg(feature = "compat")]
 pub mod engine_ffi;
 pub mod exchange_sender;
+#[cfg(feature = "compat")]
 pub(crate) mod exec_state_reporter;
+#[cfg(feature = "compat")]
 pub(crate) mod exec_status_report;
 pub mod fe_report;
+#[cfg(feature = "compat")]
+pub mod fe_report_compat;
 pub mod fragment_control;
+#[cfg(feature = "compat")]
 pub mod frontend_rpc;
 pub mod grpc_client;
 pub mod grpc_server;
@@ -47,4 +53,5 @@ pub(crate) mod standalone_exec_state_reporter;
 pub mod stream_load;
 #[cfg(feature = "compat")]
 pub mod stream_load_http;
+#[cfg(feature = "compat")]
 pub(crate) mod stream_load_registry;

@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![cfg(feature = "compat")]
+
 use std::collections::BTreeMap;
 
 use crate::common::engine_error::EngineError;
@@ -24,7 +26,6 @@ use crate::connector::iceberg::report::{
 };
 use crate::connector::iceberg::write_descriptor::{
     IcebergPartitionDescriptor, IcebergPartitionValueDescriptor, IcebergWriteDescriptorError,
-    encode_partition_descriptor,
 };
 use crate::proto::novarocks;
 use crate::thrift::types;
@@ -258,40 +259,9 @@ pub(crate) fn writer_report_to_sink_commit_info(
     report: IcebergWriterReport,
     metadata: &iceberg::spec::TableMetadata,
 ) -> Result<types::TSinkCommitInfo, String> {
-    let partition_values_descriptor = partition_descriptor_to_thrift(
-        encode_partition_descriptor(
-            &report.file.partition.partition_values,
-            report.file.partition.partition_spec_id,
-            metadata,
-        )
-        .map_err(|e| EngineError::from(e).to_bracketed_user_message())?,
-    );
-    Ok(types::TSinkCommitInfo {
-        iceberg_data_file: Some(types::TIcebergDataFile {
-            path: Some(report.file.path),
-            format: Some(report.file.format),
-            record_count: Some(report.file.record_count),
-            file_size_in_bytes: Some(report.file.file_size_in_bytes),
-            partition_path: Some(report.file.partition.partition_path),
-            split_offsets: report.file.split_offsets,
-            column_stats: report.file.column_stats.and_then(column_stats_to_thrift),
-            partition_null_fingerprint: Some(report.file.partition.null_fingerprint),
-            file_content: Some(file_content_to_thrift(report.file.content)),
-            referenced_data_file: report.file.referenced_data_file,
-            first_row_id: report.file.first_row_id,
-            equality_ids: report.file.equality_ids,
-            key_metadata: report.file.key_metadata,
-            partition_values_descriptor: Some(partition_values_descriptor),
-            partition_spec_id: Some(report.file.partition.partition_spec_id),
-            content_offset: report.file.content_offset,
-            content_size_in_bytes: report.file.content_size_in_bytes,
-            cardinality: report.file.cardinality,
-        }),
-        hive_file_info: None,
-        is_overwrite: report.is_overwrite,
-        staging_dir: None,
-        is_rewrite: report.is_rewrite,
-    })
+    sink_commit_info_from_native(
+        crate::runtime::sink_commit::writer_report_to_iceberg_commit_info(report, metadata)?,
+    )
 }
 
 pub(crate) fn sink_commit_info_to_writer_report(
@@ -369,13 +339,6 @@ where
         .into_iter()
         .map(|info| sink_commit_info_to_writer_report(info, metadata))
         .collect()
-}
-
-pub(crate) fn list_iceberg_writer_reports(
-    finst_id: crate::common::types::UniqueId,
-    metadata: &iceberg::spec::TableMetadata,
-) -> Result<Vec<IcebergWriterReport>, String> {
-    sink_commit_infos_to_writer_reports(crate::runtime::sink_commit::list(finst_id), metadata)
 }
 
 fn column_stats_to_thrift(stats: IcebergColumnStats) -> Option<types::TIcebergColumnStats> {

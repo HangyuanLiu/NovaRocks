@@ -16,3 +16,6 @@
 // under the License.
 
 pub(crate) mod fragment_runtime;
+#[cfg(feature = "compat")]
+pub(crate) mod min_max;
+pub(crate) mod type_mapping;

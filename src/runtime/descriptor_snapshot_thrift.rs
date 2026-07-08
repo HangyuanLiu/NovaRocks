@@ -20,9 +20,6 @@ use std::collections::HashMap;
 use arrow::datatypes::Field;
 
 use crate::common::ids::SlotId;
-use crate::exec::node::scan::HdfsScanFileFormat;
-use crate::exec::row_position::RowPositionType;
-use crate::formats::{FileFormatConfig, parquet::ParquetScanConfig};
 use crate::runtime::descriptor_snapshot::{
     DescriptorIcebergSchema, DescriptorIcebergSchemaField, DescriptorLogicalType, DescriptorSlot,
     DescriptorSnapshot, DescriptorTable, DescriptorTableKind,
@@ -61,7 +58,7 @@ pub(crate) fn descriptor_snapshot_from_thrift(
             continue;
         };
         let slot_id = SlotId::try_from(raw_slot_id)?;
-        let data_type = crate::lower::compat::type_lowering::arrow_type_from_desc(type_desc)
+        let data_type = crate::types::arrow_thrift::thrift_desc_to_arrow_type(type_desc)
             .ok_or_else(|| {
                 format!(
                     "unsupported descriptor slot type for tuple_id={} slot_id={}",
@@ -82,24 +79,6 @@ pub(crate) fn descriptor_snapshot_from_thrift(
     }
 
     DescriptorSnapshot::new_with_tables(slots, tuple_to_table, tables)
-}
-
-pub(crate) fn is_iceberg_v3_row_position(row_position_type: RowPositionType) -> bool {
-    row_position_type == RowPositionType::Iceberg
-}
-
-pub(crate) fn is_lake_row_position(row_position_type: RowPositionType) -> bool {
-    row_position_type == RowPositionType::Lake
-}
-
-pub(crate) fn lookup_file_format_config(
-    file_format: HdfsScanFileFormat,
-    parquet_cfg: ParquetScanConfig,
-) -> Result<FileFormatConfig, String> {
-    match file_format {
-        HdfsScanFileFormat::Parquet => Ok(FileFormatConfig::Parquet(parquet_cfg)),
-        other => Err(format!("lookup only supports PARQUET, got {:?}", other)),
-    }
 }
 
 #[cfg(all(test, feature = "compat"))]
@@ -261,7 +240,7 @@ mod tests {
     };
 
     fn scalar(primitive: TPrimitiveType) -> TTypeDesc {
-        crate::lower::compat::type_lowering::scalar_type_desc(primitive)
+        crate::types::arrow_thrift::thrift_type_desc_from_primitive(primitive)
     }
 
     fn decimal256(precision: i32, scale: i32) -> TTypeDesc {

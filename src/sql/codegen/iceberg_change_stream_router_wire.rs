@@ -17,14 +17,20 @@
 
 use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
 use crate::sql::analysis::{ExprKind, TypedExpr};
+#[cfg(feature = "compat")]
 use crate::sql::codegen::expr_compiler;
 use crate::sql::codegen::resolve::{ColumnBinding, ExprScope};
+#[cfg(feature = "compat")]
 use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::planner::{DataPartition, PartitionKind};
+#[cfg(feature = "compat")]
 use crate::thrift::data_sinks;
+#[cfg(feature = "compat")]
 use crate::thrift::exprs;
+#[cfg(feature = "compat")]
 use crate::thrift::partitions;
 
+#[cfg(feature = "compat")]
 pub(in crate::sql::codegen) fn branch_kind_to_thrift(
     kind: ChangeStreamBranchKind,
 ) -> data_sinks::TIcebergChangeStreamRouterBranchKind {
@@ -41,6 +47,7 @@ pub(in crate::sql::codegen) fn branch_kind_to_thrift(
     }
 }
 
+#[cfg(feature = "compat")]
 pub(in crate::sql::codegen) fn build_router_sink_thrift(
     sink: &crate::sql::planner::IcebergChangeStreamRouterSink,
     scope: &ExprScope,
@@ -110,6 +117,7 @@ pub(in crate::sql::codegen) fn build_router_sink_thrift(
     ))
 }
 
+#[cfg(feature = "compat")]
 pub(in crate::sql::codegen) fn compat_output_partition_for_ordinals(
     scope: &ExprScope,
     output_columns: &[AnalysisOutputColumn],
@@ -184,6 +192,7 @@ pub(in crate::sql::codegen) fn output_slot_ids_for_ordinals(
         .collect()
 }
 
+#[cfg(feature = "compat")]
 fn slot_ref_expr_for_ordinal(
     scope: &ExprScope,
     output_columns: &[AnalysisOutputColumn],
@@ -225,6 +234,7 @@ fn binding_for_ordinal<'a>(
     })
 }
 
+#[cfg(feature = "compat")]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -21,7 +21,6 @@ use std::rc::Rc;
 
 use arrow::datatypes::DataType;
 
-use crate::lower::compat::type_lowering::arrow_type_from_desc;
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn as AnalysisOutputColumn, TypedExpr,
 };
@@ -41,13 +40,16 @@ use crate::sql::codegen::helpers::{
     join_kind_to_op, split_and_conjuncts_typed, typed_expr_display_name,
     typed_expr_display_name_without_qualifiers,
 };
+#[cfg(feature = "compat")]
 use crate::sql::codegen::iceberg_change_stream_router_wire::{
     build_router_sink_thrift, compat_output_partition_for_ordinals,
+};
+use crate::sql::codegen::iceberg_change_stream_router_wire::{
     native_output_partition_for_ordinals, output_slot_ids_for_ordinals,
 };
-use crate::sql::codegen::iceberg_write_sink_wire::{
-    add_iceberg_sink_target_table_to_desc_builder, build_iceberg_write_sink_thrift,
-};
+use crate::sql::codegen::iceberg_write_sink_wire::add_iceberg_sink_target_table_to_desc_builder;
+#[cfg(feature = "compat")]
+use crate::sql::codegen::iceberg_write_sink_wire::build_iceberg_write_sink_thrift;
 use crate::sql::codegen::nodes;
 use crate::sql::codegen::resolve::{ColumnBinding, ExprScope, ResolvedTable};
 use crate::sql::codegen::runtime_filter_lowering::{
@@ -74,6 +76,7 @@ use crate::thrift::exprs;
 use crate::thrift::partitions;
 use crate::thrift::plan_nodes;
 use crate::thrift::types;
+use crate::types::arrow_thrift::thrift_desc_to_arrow_type as arrow_type_from_desc;
 
 pub(crate) fn lower_distributed_plan(
     dp: &crate::sql::planner::DistributedPlan,
@@ -784,6 +787,16 @@ fn ensure_unpartitioned(
     Ok(())
 }
 
+#[cfg(not(feature = "compat"))]
+fn unpartitioned_compat_partition_placeholder() -> partitions::TDataPartition {
+    partitions::TDataPartition::new(
+        partitions::TPartitionType::UNPARTITIONED,
+        None::<Vec<exprs::TExpr>>,
+        None::<Vec<partitions::TRangePartition>>,
+        None::<Vec<partitions::TBucketProperty>>,
+    )
+}
+
 fn lower_fragment_edges(
     dp: &crate::sql::planner::DistributedPlan,
     state: &mut OwnedLoweringState<'_>,
@@ -873,12 +886,19 @@ fn lower_fragment_edges(
                     &route.output_partition_ordinals,
                     &format!("branch {:?} partition", route.branch_kind),
                 )?;
-                compat_partition = compat_output_partition_for_ordinals(
-                    &source.scope,
-                    &source_fragment.output_columns,
-                    &route.output_partition_ordinals,
-                    &format!("branch {:?} partition", route.branch_kind),
-                )?;
+                #[cfg(feature = "compat")]
+                {
+                    compat_partition = compat_output_partition_for_ordinals(
+                        &source.scope,
+                        &source_fragment.output_columns,
+                        &route.output_partition_ordinals,
+                        &format!("branch {:?} partition", route.branch_kind),
+                    )?;
+                }
+                #[cfg(not(feature = "compat"))]
+                {
+                    compat_partition = unpartitioned_compat_partition_placeholder();
+                }
                 lowered_edge.output_slot_ids = output_slot_ids_for_ordinals(
                     &source.scope,
                     &source_fragment.output_columns,
@@ -3609,7 +3629,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             scan_tuple_id,
             &resolved,
             pushed_conjuncts.clone(),
-            min_max_predicates,
+            min_max_predicates.clone(),
             change_op_slot,
         )?;
 
@@ -5551,7 +5571,6 @@ fn lower_fragment_sink(
             }
             let output_exprs =
                 slot_ref_exprs_for_columns(scope, &sink_columns, "iceberg write sink")?;
-            let tuple_id = iceberg_sink_tuple_id(scope, &sink_columns)?;
             let output_columns = sink
                 .spec
                 .target_columns
@@ -5562,17 +5581,23 @@ fn lower_fragment_sink(
                     nullable: column.nullable,
                 })
                 .collect();
-            Ok((
-                build_iceberg_write_sink_thrift(&sink.spec, tuple_id),
-                output_exprs,
-                output_columns,
-            ))
+            #[cfg(feature = "compat")]
+            let tuple_id = iceberg_sink_tuple_id(scope, &sink_columns)?;
+            #[cfg(feature = "compat")]
+            let output_sink = build_iceberg_write_sink_thrift(&sink.spec, tuple_id);
+            #[cfg(not(feature = "compat"))]
+            let output_sink = build_noop_sink();
+            Ok((output_sink, output_exprs, output_columns))
         }
-        crate::sql::planner::DataSink::IcebergChangeStreamRouter(sink) => Ok((
-            build_router_sink_thrift(sink, scope, output_columns)?,
-            None,
-            boundary_columns,
-        )),
+        crate::sql::planner::DataSink::IcebergChangeStreamRouter(sink) => {
+            #[cfg(feature = "compat")]
+            let output_sink = build_router_sink_thrift(sink, scope, output_columns)?;
+            #[cfg(not(feature = "compat"))]
+            let _ = sink;
+            #[cfg(not(feature = "compat"))]
+            let output_sink = build_noop_sink();
+            Ok((output_sink, None, boundary_columns))
+        }
     }
 }
 
@@ -5596,6 +5621,7 @@ fn iceberg_sink_columns_for_input(
     }
 }
 
+#[cfg(feature = "compat")]
 fn iceberg_sink_tuple_id(
     scope: &ExprScope,
     output_columns: &[AnalysisOutputColumn],
@@ -5857,7 +5883,6 @@ mod tests {
 
     use crate::connector::ConnectorRegistry;
     use crate::connector::iceberg::IcebergMetadataTableType;
-    use crate::lower::compat::type_lowering::arrow_type_from_desc;
     use crate::sql::analysis::{
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
@@ -5899,6 +5924,7 @@ mod tests {
         PlannerConfidence, WiredRuntimeFilterBuild,
     };
     use crate::thrift::plan_nodes::TPlanNodeType;
+    use crate::types::arrow_thrift::thrift_desc_to_arrow_type as arrow_type_from_desc;
 
     fn build_distributed_plan(plan: &OptimizerPhysicalNode) -> Result<DistributedPlan, String> {
         crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
@@ -7329,14 +7355,25 @@ mod tests {
             .find(|fragment| fragment.fragment_id == result.root_fragment_id)
             .expect("root fragment");
 
-        assert_eq!(
-            root.output_sink.type_,
-            crate::thrift::data_sinks::TDataSinkType::ICEBERG_TABLE_SINK
-        );
+        #[cfg(feature = "compat")]
+        {
+            assert_eq!(
+                root.output_sink.type_,
+                crate::thrift::data_sinks::TDataSinkType::ICEBERG_TABLE_SINK
+            );
+            assert!(root.output_sink.iceberg_table_sink.is_some());
+        }
+        #[cfg(not(feature = "compat"))]
+        {
+            assert_eq!(
+                root.output_sink.type_,
+                crate::thrift::data_sinks::TDataSinkType::NOOP_SINK
+            );
+            assert!(root.output_sink.iceberg_table_sink.is_none());
+        }
         assert!(root.has_scan_nodes);
         assert_eq!(root.output_kind, FragmentOutputKind::TerminalWrite);
         assert!(root.output_kind.is_terminal_write());
-        assert!(root.output_sink.iceberg_table_sink.is_some());
         assert!(
             root.output_exprs
                 .as_ref()
@@ -7396,28 +7433,42 @@ mod tests {
             .iter()
             .find(|fragment| fragment.fragment_id == result.root_fragment_id)
             .expect("root fragment");
-        assert_eq!(
-            root.output_sink.type_,
-            crate::thrift::data_sinks::TDataSinkType::ICEBERG_CHANGE_STREAM_ROUTER_SINK
-        );
+        #[cfg(feature = "compat")]
+        {
+            assert_eq!(
+                root.output_sink.type_,
+                crate::thrift::data_sinks::TDataSinkType::ICEBERG_CHANGE_STREAM_ROUTER_SINK
+            );
+        }
+        #[cfg(not(feature = "compat"))]
+        {
+            assert_eq!(
+                root.output_sink.type_,
+                crate::thrift::data_sinks::TDataSinkType::NOOP_SINK
+            );
+            assert!(root.output_sink.iceberg_change_stream_router_sink.is_none());
+        }
         assert_eq!(root.output_kind, FragmentOutputKind::NonTerminal);
         assert!(!root.output_kind.is_terminal_write());
-        let router = root
-            .output_sink
-            .iceberg_change_stream_router_sink
-            .as_ref()
-            .expect("router sink");
-        assert_eq!(router.change_op_slot_id, 1);
-        assert_eq!(router.data_route_slot_id, None);
-        assert_eq!(router.branches.len(), 1);
-        assert_eq!(
-            router.branches[0].stream_sink.output_columns.as_ref(),
-            Some(&vec![3])
-        );
-        assert_eq!(
-            router.branches[0].stream_sink.output_partition.type_,
-            crate::thrift::partitions::TPartitionType::HASH_PARTITIONED
-        );
+        #[cfg(feature = "compat")]
+        {
+            let router = root
+                .output_sink
+                .iceberg_change_stream_router_sink
+                .as_ref()
+                .expect("router sink");
+            assert_eq!(router.change_op_slot_id, 1);
+            assert_eq!(router.data_route_slot_id, None);
+            assert_eq!(router.branches.len(), 1);
+            assert_eq!(
+                router.branches[0].stream_sink.output_columns.as_ref(),
+                Some(&vec![3])
+            );
+            assert_eq!(
+                router.branches[0].stream_sink.output_partition.type_,
+                crate::thrift::partitions::TPartitionType::HASH_PARTITIONED
+            );
+        }
 
         let edge = &result.edges[0];
         assert_eq!(edge.source_fragment_id, 0);
@@ -7440,12 +7491,15 @@ mod tests {
         };
         assert_eq!(*column_id, ColumnId(3));
         assert_eq!(column, "delete_id");
-        assert_eq!(
-            assert_single_slot_ref_partition_expr_for_test(
-                &result.lowered_edges[0].compat_partition
-            ),
-            3
-        );
+        #[cfg(feature = "compat")]
+        {
+            assert_eq!(
+                assert_single_slot_ref_partition_expr_for_test(
+                    &result.lowered_edges[0].compat_partition
+                ),
+                3
+            );
+        }
 
         let writer = result
             .fragment_results
@@ -7454,10 +7508,20 @@ mod tests {
             .expect("writer fragment");
         assert_eq!(writer.output_kind, FragmentOutputKind::TerminalWrite);
         assert!(writer.output_kind.is_terminal_write());
-        assert_eq!(
-            writer.output_sink.type_,
-            crate::thrift::data_sinks::TDataSinkType::ICEBERG_DV_SINK
-        );
+        #[cfg(feature = "compat")]
+        {
+            assert_eq!(
+                writer.output_sink.type_,
+                crate::thrift::data_sinks::TDataSinkType::ICEBERG_DV_SINK
+            );
+        }
+        #[cfg(not(feature = "compat"))]
+        {
+            assert_eq!(
+                writer.output_sink.type_,
+                crate::thrift::data_sinks::TDataSinkType::NOOP_SINK
+            );
+        }
         assert!(
             writer
                 .output_exprs

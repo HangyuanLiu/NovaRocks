@@ -75,16 +75,17 @@ pub(crate) fn record_writer_abort_fact(
 pub(crate) mod test_support {
     use std::collections::BTreeMap;
 
+    use crate::common::types::UniqueId;
+    use crate::proto::novarocks;
     use crate::runtime::write_coordinator::{
         WriteAbortInput, WriteCommitInput, WriterCommitInput, WriterKey,
     };
-    use crate::thrift::types;
 
     fn staging_writer_key() -> WriterKey {
-        let query_id = types::TUniqueId::new(10, 20);
+        let query_id = UniqueId { hi: 10, lo: 20 };
         WriterKey {
-            query_id: query_id.clone(),
-            fragment_instance_id: types::TUniqueId::new(101, 201),
+            query_id,
+            fragment_instance_id: UniqueId { hi: 101, lo: 201 },
             backend_num: 0,
         }
     }
@@ -93,17 +94,16 @@ pub(crate) mod test_support {
         WriterCommitInput {
             writer_id: 0,
             writer_key,
-            sink_commit_infos: vec![types::TSinkCommitInfo {
-                iceberg_data_file: Some(types::TIcebergDataFile {
+            iceberg_commits: vec![novarocks::IcebergCommitInfo {
+                iceberg_data_file: Some(novarocks::IcebergDataFile {
                     path: Some("s3://warehouse/orders/_staging/a.parquet".to_string()),
                     record_count: Some(11),
                     file_size_in_bytes: Some(110),
+                    file_content: novarocks::IcebergFileContent::Data as i32,
                     ..Default::default()
                 }),
                 ..Default::default()
             }],
-            tablet_commit_infos: Vec::new(),
-            tablet_fail_infos: Vec::new(),
             load_counters: BTreeMap::from([("loaded.rows".to_string(), "11".to_string())]),
             loaded_rows: 11,
             loaded_bytes: 110,
@@ -112,7 +112,7 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn write_commit_with_data_file() -> WriteCommitInput {
-        let query_id = types::TUniqueId::new(10, 20);
+        let query_id = UniqueId { hi: 10, lo: 20 };
         let writer_key = staging_writer_key();
         WriteCommitInput {
             write_id: query_id,
@@ -121,7 +121,7 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn write_abort_with_data_file() -> WriteAbortInput {
-        let query_id = types::TUniqueId::new(10, 20);
+        let query_id = UniqueId { hi: 10, lo: 20 };
         let writer_key = staging_writer_key();
         WriteAbortInput {
             write_id: query_id,
@@ -138,14 +138,15 @@ mod tests {
 
     use std::collections::BTreeMap;
 
+    use crate::common::types::UniqueId;
     use crate::connector::iceberg::commit::CommitOpKind;
     use crate::meta::repository::iceberg_operation::{
         IcebergOperationFailureKind, IcebergOperationKind, IcebergOperationNextAction,
         IcebergOperationState, IcebergOperationTarget,
     };
     use crate::meta::{MetaStoreProvider, SqliteMetaStoreProvider};
+    use crate::proto::novarocks;
     use crate::runtime::write_coordinator::{WriteAbortInput, WriterCommitInput, WriterKey};
-    use crate::thrift::types;
 
     struct WriterOperationTestState {
         state: Arc<StandaloneState>,
@@ -153,8 +154,8 @@ mod tests {
         _dir: tempfile::TempDir,
     }
 
-    fn id(hi: i64, lo: i64) -> types::TUniqueId {
-        types::TUniqueId::new(hi, lo)
+    fn id(hi: i64, lo: i64) -> UniqueId {
+        UniqueId { hi, lo }
     }
 
     fn key(
@@ -175,17 +176,16 @@ mod tests {
         WriterCommitInput {
             writer_id,
             writer_key,
-            sink_commit_infos: vec![types::TSinkCommitInfo {
-                iceberg_data_file: Some(types::TIcebergDataFile {
+            iceberg_commits: vec![novarocks::IcebergCommitInfo {
+                iceberg_data_file: Some(novarocks::IcebergDataFile {
                     path: Some(path.to_string()),
                     record_count: Some(11),
                     file_size_in_bytes: Some(110),
+                    file_content: novarocks::IcebergFileContent::Data as i32,
                     ..Default::default()
                 }),
                 ..Default::default()
             }],
-            tablet_commit_infos: Vec::new(),
-            tablet_fail_infos: Vec::new(),
             load_counters: BTreeMap::from([("loaded.rows".to_string(), "11".to_string())]),
             loaded_rows: 11,
             loaded_bytes: 110,

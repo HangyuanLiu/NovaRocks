@@ -36,6 +36,7 @@ mod membership;
 mod merger;
 pub(crate) mod min_max;
 mod proto_type;
+mod starrocks_primitive;
 mod types;
 
 #[allow(unused_imports)]

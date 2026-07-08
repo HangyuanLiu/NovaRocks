@@ -671,6 +671,21 @@ mod tests {
             .metadata
     }
 
+    fn raw_descriptor(
+        values: impl IntoIterator<Item = IcebergPartitionValueDescriptor>,
+    ) -> Option<IcebergPartitionDescriptor> {
+        Some(IcebergPartitionDescriptor {
+            values: values.into_iter().collect(),
+        })
+    }
+
+    fn raw_value(is_null: bool, datum_bytes: Option<Vec<u8>>) -> IcebergPartitionValueDescriptor {
+        IcebergPartitionValueDescriptor {
+            is_null,
+            datum_bytes,
+        }
+    }
+
     #[test]
     fn descriptor_encode_returns_internal_values() {
         let metadata = metadata_with_identity_partition();
@@ -797,20 +812,10 @@ mod tests {
     fn descriptor_decodes_minimal_negative_decimal_payload() {
         let metadata = metadata_with_decimal_partition();
         let spec_id = metadata.default_partition_spec_id();
-        let desc = crate::thrift::types::TIcebergPartitionDescriptor {
-            values: Some(vec![crate::thrift::types::TIcebergPartitionValue {
-                is_null: Some(false),
-                datum_bytes: Some(vec![0xff]),
-            }]),
-        };
+        let desc = raw_descriptor([raw_value(false, Some(vec![0xff]))]);
 
-        let decoded = decode_partition_descriptor(
-            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc))
-                .expect("wire descriptor"),
-            spec_id,
-            &metadata,
-        )
-        .expect("minimal negative payload should decode");
+        let decoded = decode_partition_descriptor(desc, spec_id, &metadata)
+            .expect("minimal negative payload should decode");
 
         assert_eq!(
             decoded,
@@ -824,20 +829,10 @@ mod tests {
         let spec_id = metadata.default_partition_spec_id();
         for value in [1000_i128, -1000_i128] {
             let bytes = i128_to_be_bytes_min(value);
-            let desc = crate::thrift::types::TIcebergPartitionDescriptor {
-                values: Some(vec![crate::thrift::types::TIcebergPartitionValue {
-                    is_null: Some(false),
-                    datum_bytes: Some(bytes),
-                }]),
-            };
+            let desc = raw_descriptor([raw_value(false, Some(bytes))]);
 
-            let err = decode_partition_descriptor(
-                crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc))
-                    .expect("wire descriptor"),
-                spec_id,
-                &metadata,
-            )
-            .expect_err("expected precision overflow");
+            let err = decode_partition_descriptor(desc, spec_id, &metadata)
+                .expect_err("expected precision overflow");
 
             assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
             assert!(
@@ -852,20 +847,10 @@ mod tests {
         let metadata = metadata_with_decimal_partition();
         let spec_id = metadata.default_partition_spec_id();
         for bytes in [vec![], vec![0x00, 0x00, 0x01], vec![0xff, 0xff, 0xff]] {
-            let desc = crate::thrift::types::TIcebergPartitionDescriptor {
-                values: Some(vec![crate::thrift::types::TIcebergPartitionValue {
-                    is_null: Some(false),
-                    datum_bytes: Some(bytes.clone()),
-                }]),
-            };
+            let desc = raw_descriptor([raw_value(false, Some(bytes.clone()))]);
 
-            let err = decode_partition_descriptor(
-                crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc))
-                    .expect("wire descriptor"),
-                spec_id,
-                &metadata,
-            )
-            .expect_err("expected malformed decimal payload");
+            let err = decode_partition_descriptor(desc, spec_id, &metadata)
+                .expect_err("expected malformed decimal payload");
 
             assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
             assert!(
@@ -894,20 +879,10 @@ mod tests {
     fn descriptor_rejects_decoded_fixed_length_mismatch() {
         let metadata = metadata_with_fixed_partition();
         let spec_id = metadata.default_partition_spec_id();
-        let desc = crate::thrift::types::TIcebergPartitionDescriptor {
-            values: Some(vec![crate::thrift::types::TIcebergPartitionValue {
-                is_null: Some(false),
-                datum_bytes: Some(vec![1, 2, 3]),
-            }]),
-        };
+        let desc = raw_descriptor([raw_value(false, Some(vec![1, 2, 3]))]);
 
-        let err = decode_partition_descriptor(
-            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc))
-                .expect("wire descriptor"),
-            spec_id,
-            &metadata,
-        )
-        .expect_err("expected fixed length mismatch");
+        let err = decode_partition_descriptor(desc, spec_id, &metadata)
+            .expect_err("expected fixed length mismatch");
 
         assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
         assert!(err.to_string().contains("fixed length"));
@@ -931,20 +906,10 @@ mod tests {
     fn descriptor_rejects_missing_payload_for_non_null_value() {
         let metadata = metadata_with_identity_partition();
         let spec_id = metadata.default_partition_spec_id();
-        let desc = crate::thrift::types::TIcebergPartitionDescriptor {
-            values: Some(vec![crate::thrift::types::TIcebergPartitionValue {
-                is_null: Some(false),
-                datum_bytes: None,
-            }]),
-        };
+        let desc = raw_descriptor([raw_value(false, None)]);
 
-        let err = decode_partition_descriptor(
-            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc))
-                .expect("wire descriptor"),
-            spec_id,
-            &metadata,
-        )
-        .expect_err("expected error");
+        let err =
+            decode_partition_descriptor(desc, spec_id, &metadata).expect_err("expected error");
 
         assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
         assert!(err.to_string().contains("has no payload"));
@@ -954,20 +919,10 @@ mod tests {
     fn descriptor_rejects_payload_for_null_value() {
         let metadata = metadata_with_identity_partition();
         let spec_id = metadata.default_partition_spec_id();
-        let desc = crate::thrift::types::TIcebergPartitionDescriptor {
-            values: Some(vec![crate::thrift::types::TIcebergPartitionValue {
-                is_null: Some(true),
-                datum_bytes: Some(b"west".to_vec()),
-            }]),
-        };
+        let desc = raw_descriptor([raw_value(true, Some(b"west".to_vec()))]);
 
-        let err = decode_partition_descriptor(
-            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc))
-                .expect("wire descriptor"),
-            spec_id,
-            &metadata,
-        )
-        .expect_err("expected malformed null payload");
+        let err = decode_partition_descriptor(desc, spec_id, &metadata)
+            .expect_err("expected malformed null payload");
 
         assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
         assert!(
@@ -976,6 +931,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "compat")]
     #[test]
     fn descriptor_rejects_missing_null_marker() {
         let desc = crate::thrift::types::TIcebergPartitionDescriptor {
@@ -1000,20 +956,10 @@ mod tests {
         let metadata = metadata_with_single_primitive_partition("flag", PrimitiveType::Boolean, 11);
         let spec_id = metadata.default_partition_spec_id();
         for bytes in [vec![], vec![2], vec![0, 0]] {
-            let desc = crate::thrift::types::TIcebergPartitionDescriptor {
-                values: Some(vec![crate::thrift::types::TIcebergPartitionValue {
-                    is_null: Some(false),
-                    datum_bytes: Some(bytes.clone()),
-                }]),
-            };
+            let desc = raw_descriptor([raw_value(false, Some(bytes.clone()))]);
 
-            let err = decode_partition_descriptor(
-                crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc))
-                    .expect("wire descriptor"),
-                spec_id,
-                &metadata,
-            )
-            .expect_err("expected malformed boolean payload");
+            let err = decode_partition_descriptor(desc, spec_id, &metadata)
+                .expect_err("expected malformed boolean payload");
 
             assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
             assert!(
@@ -1027,20 +973,10 @@ mod tests {
     fn descriptor_rejects_promoted_long_payload() {
         let metadata = metadata_with_single_primitive_partition("l", PrimitiveType::Long, 12);
         let spec_id = metadata.default_partition_spec_id();
-        let desc = crate::thrift::types::TIcebergPartitionDescriptor {
-            values: Some(vec![crate::thrift::types::TIcebergPartitionValue {
-                is_null: Some(false),
-                datum_bytes: Some(7_i32.to_le_bytes().to_vec()),
-            }]),
-        };
+        let desc = raw_descriptor([raw_value(false, Some(7_i32.to_le_bytes().to_vec()))]);
 
-        let err = decode_partition_descriptor(
-            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc))
-                .expect("wire descriptor"),
-            spec_id,
-            &metadata,
-        )
-        .expect_err("expected non-canonical long payload");
+        let err = decode_partition_descriptor(desc, spec_id, &metadata)
+            .expect_err("expected non-canonical long payload");
 
         assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
         assert!(
@@ -1053,20 +989,10 @@ mod tests {
     fn descriptor_rejects_promoted_double_payload() {
         let metadata = metadata_with_single_primitive_partition("d", PrimitiveType::Double, 13);
         let spec_id = metadata.default_partition_spec_id();
-        let desc = crate::thrift::types::TIcebergPartitionDescriptor {
-            values: Some(vec![crate::thrift::types::TIcebergPartitionValue {
-                is_null: Some(false),
-                datum_bytes: Some(7.0_f32.to_le_bytes().to_vec()),
-            }]),
-        };
+        let desc = raw_descriptor([raw_value(false, Some(7.0_f32.to_le_bytes().to_vec()))]);
 
-        let err = decode_partition_descriptor(
-            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc))
-                .expect("wire descriptor"),
-            spec_id,
-            &metadata,
-        )
-        .expect_err("expected non-canonical double payload");
+        let err = decode_partition_descriptor(desc, spec_id, &metadata)
+            .expect_err("expected non-canonical double payload");
 
         assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
         assert!(
@@ -1116,20 +1042,10 @@ mod tests {
         let metadata = metadata_with_single_primitive_partition("t", PrimitiveType::Time, 14);
         let spec_id = metadata.default_partition_spec_id();
         for value in [-1_i64, MAX_TIME_MICROS + 1] {
-            let desc = crate::thrift::types::TIcebergPartitionDescriptor {
-                values: Some(vec![crate::thrift::types::TIcebergPartitionValue {
-                    is_null: Some(false),
-                    datum_bytes: Some(value.to_le_bytes().to_vec()),
-                }]),
-            };
+            let desc = raw_descriptor([raw_value(false, Some(value.to_le_bytes().to_vec()))]);
 
-            let err = decode_partition_descriptor(
-                crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc))
-                    .expect("wire descriptor"),
-                spec_id,
-                &metadata,
-            )
-            .expect_err("expected out-of-range time payload");
+            let err = decode_partition_descriptor(desc, spec_id, &metadata)
+                .expect_err("expected out-of-range time payload");
 
             assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
             assert!(
@@ -1153,17 +1069,9 @@ mod tests {
     #[test]
     fn descriptor_rejects_unknown_partition_spec_id() {
         let metadata = metadata_with_identity_partition();
-        let desc = crate::thrift::types::TIcebergPartitionDescriptor {
-            values: Some(vec![]),
-        };
+        let desc = raw_descriptor([]);
 
-        let err = decode_partition_descriptor(
-            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc))
-                .expect("wire descriptor"),
-            99,
-            &metadata,
-        )
-        .expect_err("expected error");
+        let err = decode_partition_descriptor(desc, 99, &metadata).expect_err("expected error");
 
         assert_eq!(
             err,
@@ -1175,17 +1083,10 @@ mod tests {
     fn descriptor_rejects_field_count_mismatch() {
         let metadata = metadata_with_identity_partition();
         let spec_id = metadata.default_partition_spec_id();
-        let desc = crate::thrift::types::TIcebergPartitionDescriptor {
-            values: Some(vec![]),
-        };
+        let desc = raw_descriptor([]);
 
-        let err = decode_partition_descriptor(
-            crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc))
-                .expect("wire descriptor"),
-            spec_id,
-            &metadata,
-        )
-        .expect_err("expected error");
+        let err =
+            decode_partition_descriptor(desc, spec_id, &metadata).expect_err("expected error");
 
         assert_eq!(
             err,

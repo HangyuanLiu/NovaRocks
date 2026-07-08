@@ -26,18 +26,17 @@ use std::sync::Arc;
 use arrow::array::{Array, BooleanArray};
 use arrow::compute::filter_record_batch;
 
+use crate::common::types::UniqueId;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
-use crate::lower::compat::layout::Layout;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::OperatorProfiles;
 use crate::runtime::runtime_state::RuntimeState;
-use crate::thrift::{data_sinks, internal_service, types};
 
-use super::DataStreamSinkFactory;
+use super::{DataStreamSinkFactory, DataStreamSinkFactoryInput};
 
 struct InnerSinkSpec {
     factory: DataStreamSinkFactory,
@@ -55,12 +54,11 @@ pub(crate) struct SplitDataStreamSinkFactory {
 impl SplitDataStreamSinkFactory {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        split: data_sinks::TSplitDataStreamSink,
-        exec_params: internal_service::TPlanFragmentExecParams,
-        layout: Layout,
+        sinks: Vec<DataStreamSinkFactoryInput>,
+        fragment_instance_id: UniqueId,
+        sender_id: Option<i32>,
+        partition_arena: ExprArena,
         plan_node_id: i32,
-        last_query_id: Option<String>,
-        fe_addr: Option<types::TNetworkAddress>,
         split_arena: Arc<ExprArena>,
         split_exprs: Vec<ExprId>,
     ) -> Self {
@@ -73,17 +71,8 @@ impl SplitDataStreamSinkFactory {
         let mut init_error = None;
         let mut sinks_out = Vec::new();
 
-        let sinks = split.sinks.unwrap_or_default();
-        let destinations = split.destinations.unwrap_or_default();
-
         if sinks.is_empty() {
             init_error = Some("SPLIT_DATA_STREAM_SINK requires at least one sink".to_string());
-        } else if sinks.len() != destinations.len() {
-            init_error = Some(format!(
-                "SPLIT_DATA_STREAM_SINK: sinks size {} != destinations size {}",
-                sinks.len(),
-                destinations.len()
-            ));
         } else if split_exprs.len() != sinks.len() {
             init_error = Some(format!(
                 "SPLIT_DATA_STREAM_SINK: split_exprs size {} != sinks size {}",
@@ -91,18 +80,14 @@ impl SplitDataStreamSinkFactory {
                 sinks.len()
             ));
         } else {
-            for (sink, destinations) in sinks.into_iter().zip(destinations.into_iter()) {
-                let mut params = exec_params.clone();
-                params.destinations = Some(destinations);
-
+            for sink in sinks {
                 sinks_out.push(InnerSinkSpec {
                     factory: DataStreamSinkFactory::new(
                         sink,
-                        params,
-                        layout.clone(),
+                        fragment_instance_id,
+                        sender_id,
                         plan_node_id,
-                        last_query_id.clone(),
-                        fe_addr.clone(),
+                        partition_arena.clone(),
                     ),
                 });
             }

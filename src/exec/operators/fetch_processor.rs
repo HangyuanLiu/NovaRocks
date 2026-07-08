@@ -38,9 +38,8 @@ use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::proto;
-use crate::runtime::descriptor_snapshot_thrift::{
-    LookupNodeInfo, LookupNodesInfo, is_lake_row_position,
-};
+use crate::runtime::descriptor_snapshot::is_lake_row_position;
+use crate::runtime::descriptor_snapshot_thrift::{LookupNodeInfo, LookupNodesInfo};
 use crate::runtime::lookup::{decode_column_ipc, encode_column_ipc, execute_lookup_request};
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::runtime_state::RuntimeState;

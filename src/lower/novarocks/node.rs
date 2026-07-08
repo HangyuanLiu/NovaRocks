@@ -60,7 +60,7 @@ use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{common, expr, novarocks, plan};
 use crate::runtime::exchange::ExchangeKey;
 use crate::runtime::query_options::QueryOptions;
-use crate::sql::codegen::expr_compiler::infer_agg_function_types;
+use crate::sql::codegen::agg_type_infer::infer_agg_function_types;
 use crate::sql::common::ChangeStreamBranchKind;
 use crate::types::wider_type;
 
@@ -289,6 +289,7 @@ fn exec_node_kind_label(kind: &ExecNodeKind) -> &'static str {
         ExecNodeKind::ChangeEventExpand(_) => "ChangeEventExpand",
         ExecNodeKind::AssertNumRows(_) => "AssertNumRows",
         ExecNodeKind::Analytic(_) => "Analytic",
+        #[cfg(feature = "compat")]
         ExecNodeKind::Fetch(_) => "Fetch",
         ExecNodeKind::LookUp(_) => "LookUp",
     }

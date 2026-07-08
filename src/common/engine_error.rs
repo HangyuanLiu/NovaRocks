@@ -17,6 +17,8 @@
 
 use std::fmt;
 
+use crate::common::types::UniqueId;
+
 pub const REPORT_EXEC_STATUS_OK: i32 = 0;
 pub const REPORT_EXEC_STATUS_ERROR: i32 = 1;
 pub const REPORT_EXEC_STATUS_QUERY_GONE: i32 = 2;
@@ -41,7 +43,7 @@ impl InternalInvariantCode {
 #[derive(Clone, Debug)]
 pub enum EngineErrorDetail {
     WriteCoordinatorGone {
-        query_id: crate::thrift::types::TUniqueId,
+        query_id: UniqueId,
     },
     ProtocolDecode {
         message: String,
@@ -88,7 +90,7 @@ impl EngineError {
         self.code.as_str()
     }
 
-    pub fn write_coordinator_gone(query_id: crate::thrift::types::TUniqueId) -> Self {
+    pub fn write_coordinator_gone(query_id: UniqueId) -> Self {
         Self::new(
             EngineErrorCode::WriteCoordinatorGone,
             EngineErrorDetail::WriteCoordinatorGone { query_id },
@@ -209,6 +211,7 @@ impl EngineError {
         }
     }
 
+    #[cfg(feature = "compat")]
     pub fn to_tstatus_code(&self) -> crate::thrift::status_code::TStatusCode {
         match self.code {
             EngineErrorCode::UnsupportedDistributedDmlShape => {
@@ -277,10 +280,10 @@ mod tests {
 
     #[test]
     fn write_coordinator_gone_maps_to_query_gone_report_status() {
-        let err =
-            EngineError::write_coordinator_gone(crate::thrift::types::TUniqueId { hi: 11, lo: 22 });
+        let err = EngineError::write_coordinator_gone(UniqueId { hi: 11, lo: 22 });
         assert_eq!(err.code(), EngineErrorCode::WriteCoordinatorGone);
         assert_eq!(err.to_report_status_code(), REPORT_EXEC_STATUS_QUERY_GONE);
+        #[cfg(feature = "compat")]
         assert_eq!(
             err.to_tstatus_code(),
             crate::thrift::status_code::TStatusCode::INTERNAL_ERROR
@@ -300,6 +303,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "compat")]
     fn unsupported_distributed_dml_shape_maps_to_not_supported() {
         let err = EngineError::unsupported_distributed_dml_shape("insert", "missing coordinator");
         assert_eq!(
@@ -313,6 +317,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "compat")]
     fn protocol_decode_error_maps_to_invalid_argument_and_parse_error() {
         let err = EngineError::protocol_decode("bad report payload");
         assert_eq!(
@@ -326,6 +331,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "compat")]
     fn default_engine_error_maps_to_internal_and_unknown() {
         let err = EngineError::internal_invariant(
             InternalInvariantCode::UnexpectedReportStatusShape,
