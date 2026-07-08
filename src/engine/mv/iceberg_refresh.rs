@@ -19761,6 +19761,25 @@ mod tests {
             !candidates.is_empty(),
             "permissive MV property alone (no session override) must be eligible"
         );
+
+        // A malformed staleness value on ALTER must fail fast (not silently
+        // persist and degrade to strict) — mirrors the CREATE-MV validation and
+        // the project's fail-fast rule.
+        {
+            let session = crate::engine::StandaloneSession {
+                inner: Arc::clone(&env.state),
+            };
+            let rejected = session.execute_in_context(
+                "ALTER MATERIALIZED VIEW mv_orders SET TBLPROPERTIES ('query_rewrite_max_staleness_sec' = 'not-a-number')",
+                Some("ice"),
+                &env.current_db,
+                None,
+            );
+            assert!(
+                rejected.is_err(),
+                "malformed query_rewrite_max_staleness_sec on ALTER must be rejected, got {rejected:?}"
+            );
+        }
     }
 
     #[test]

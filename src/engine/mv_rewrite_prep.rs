@@ -43,7 +43,7 @@ const MAX_MV_CANDIDATES: usize = 16;
 /// Target-table Iceberg property carrying the per-MV query-rewrite staleness
 /// tolerance, in seconds. `0`/absent/unparseable = strict (default). Set at
 /// CREATE via `PROPERTIES('query_rewrite_max_staleness_sec'='N')` or later via
-/// `ALTER MATERIALIZED VIEW ... SET PROPERTIES(...)`.
+/// `ALTER MATERIALIZED VIEW ... SET TBLPROPERTIES(...)`.
 pub(crate) const MV_QUERY_REWRITE_MAX_STALENESS_SEC_PROP: &str = "query_rewrite_max_staleness_sec";
 
 /// Parse the per-MV staleness tolerance (seconds) from target-table properties.
@@ -81,7 +81,9 @@ fn staleness_within_window(
     if current < pinned {
         return false;
     }
-    (current - pinned) as u64 <= window_sec.saturating_mul(1000)
+    // `current >= pinned` here, so abs_diff is the exact non-negative gap; it
+    // also sidesteps any theoretical i64 subtraction overflow.
+    current.abs_diff(pinned) <= window_sec.saturating_mul(1000)
 }
 
 struct PreparedMvRewriteCandidate {
@@ -236,9 +238,15 @@ fn build_candidate(
                     mv_property_window.unwrap()
                 }
             };
+            if window == 0 {
+                // Strict: skip before touching base commit timestamps, matching
+                // the original strict gate's immediate short-circuit (spec §3.3
+                // order). Keeps the strict-default path off the commit-ts read.
+                return Ok(None);
+            }
             let (pinned_commit, current_commit) = base_commit_ts_pair(state, r, *pinned)?;
             if !staleness_within_window(window, pinned_commit, current_commit) {
-                return Ok(None); // strict (window 0), beyond window, rollback, or unresolvable
+                return Ok(None); // beyond window, rollback, or unresolvable
             }
         }
         if let Some(pinned_uuid) = def.last_refresh_table_uuids.get(&fqn)
