@@ -29,13 +29,18 @@ use async_trait::async_trait;
 use iceberg::io::FileIO;
 use iceberg::spec::{
     DataContentType, DataFile, FormatVersion, ManifestContentType, ManifestFile,
-    ManifestWriterBuilder, Operation, PartitionSpecRef, SchemaRef, Snapshot, SnapshotReference,
-    SnapshotRetention, Summary,
+    ManifestWriterBuilder, Operation, PartitionSpecRef, PrimitiveLiteral, PrimitiveType, SchemaRef,
+    Snapshot, SnapshotReference, SnapshotRetention, Summary,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
 use iceberg::{TableRequirement, TableUpdate};
 use uuid::Uuid;
+
+use crate::exec::row_position::{
+    ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+    ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL,
+};
 
 use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction};
@@ -43,7 +48,7 @@ use super::fast_append::carry_forward_puffin_stats;
 use super::helpers::{
     finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms, write_manifest_list,
 };
-use super::overwrite::write_added_data_manifest;
+use super::overwrite::{build_minimal_data_file, write_added_data_manifest};
 use super::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
 
 pub struct RewriteDataFilesCommit;
@@ -51,7 +56,7 @@ pub struct RewriteDataFilesCommit;
 #[async_trait]
 impl IcebergCommitAction for RewriteDataFilesCommit {
     async fn commit(&self, ctx: CommitCtx<'_>) -> Result<CommitOutcome, String> {
-        let written = ctx.collector.take_written_files()?;
+        let mut written = ctx.collector.take_written_files()?;
         for f in &written {
             if f.content != DataContentType::Data {
                 return Err(format!(
@@ -67,15 +72,19 @@ impl IcebergCommitAction for RewriteDataFilesCommit {
         //    `_row_id` values are already stamped at the reserved field IDs
         //    (e.g. OPTIMIZE row-lineage preserve). The Replace snapshot must
         //    still set `row_range` because iceberg-rs vendor 0.9 enforces a
-        //    non-null `first-row-id` on V3 snapshots, but we set
-        //    `added_rows = 0` so `next_row_id` does not advance and no fresh
-        //    row identity range is reserved.
+        //    non-null `first-row-id` on V3 snapshots. Replacement data files
+        //    get explicit `first_row_id`s from their stored `_row_id` bounds so
+        //    readers do not inherit a fresh manifest-level range. The snapshot
+        //    uses `added_rows = 0` so `next_row_id` does not advance.
         // 2. `RowLineageV3` non-preserve — historical behaviour: allocate a
         //    contiguous range of size `record_count` starting at the
         //    table's current `next_row_id`.
         // 3. `LegacyPositionDeletes` (V2) — no row-lineage at all; omit
         //    `row_range` entirely.
         let preserve_row_lineage = ctx.collector.preserve_row_lineage();
+        if preserve_row_lineage {
+            stamp_preserve_row_lineage_first_row_ids(&mut written)?;
+        }
         let written_record_count = written.iter().try_fold(0u64, |sum, f| {
             sum.checked_add(f.record_count)
                 .ok_or_else(|| "row-lineage rewrite added row count overflow".to_string())
@@ -235,25 +244,42 @@ impl TransactionAction for RewriteDataFilesTxnAction {
                 self.commit_uuid
             );
             self.record_manifest_path(path.clone());
-            let mut mf = write_added_data_manifest(
-                &self.file_io,
-                &path,
-                &self.written,
-                self.partition_spec.clone(),
-                m.current_schema().clone(),
-                new_seq,
-                new_snapshot_id,
-                format_version,
-            )
-            .await
+            let mut mf = if self.preserve_row_lineage {
+                write_preserve_row_lineage_data_manifest(
+                    &self.file_io,
+                    &path,
+                    &self.written,
+                    self.partition_spec.clone(),
+                    m.current_schema().clone(),
+                    new_snapshot_id,
+                    format_version,
+                )
+                .await
+            } else {
+                write_added_data_manifest(
+                    &self.file_io,
+                    &path,
+                    &self.written,
+                    self.partition_spec.clone(),
+                    m.current_schema().clone(),
+                    new_seq,
+                    new_snapshot_id,
+                    format_version,
+                )
+                .await
+            }
             .map_err(to_iceberg_unexpected)?;
             if self.preserve_row_lineage {
-                let first_row_id = self.row_lineage_first_row_id.ok_or_else(|| {
-                    to_iceberg_unexpected(
-                        "preserve-mode RewriteDataFilesCommit requires row_lineage_first_row_id"
-                            .to_string(),
-                    )
-                })?;
+                let first_row_id =
+                    preserve_replacement_manifest_first_row_id(&self.written)
+                        .map_err(to_iceberg_unexpected)?
+                        .or(self.row_lineage_first_row_id)
+                        .ok_or_else(|| {
+                            to_iceberg_unexpected(
+                                "preserve-mode RewriteDataFilesCommit requires row lineage first_row_id"
+                                    .to_string(),
+                            )
+                        })?;
                 mf.first_row_id = Some(first_row_id);
             }
             new_manifests.push(mf);
@@ -487,6 +513,47 @@ async fn enumerate_live_files(table: &Table, file_io: &FileIO) -> Result<LiveFil
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn write_preserve_row_lineage_data_manifest(
+    file_io: &FileIO,
+    out_path: &str,
+    written: &[WrittenFile],
+    partition_spec: PartitionSpecRef,
+    schema: SchemaRef,
+    new_snapshot_id: i64,
+    format_version: FormatVersion,
+) -> Result<ManifestFile, String> {
+    let output_file = file_io
+        .new_output(out_path)
+        .map_err(|e| format!("FileIO::new_output({out_path}) failed: {e}"))?;
+    let builder = ManifestWriterBuilder::new(
+        output_file,
+        Some(new_snapshot_id),
+        None,
+        schema,
+        (*partition_spec).clone(),
+    );
+    let mut writer = match format_version {
+        FormatVersion::V3 => builder.build_v3_data(),
+        FormatVersion::V1 | FormatVersion::V2 => {
+            return Err("preserve row-lineage rewrite requires V3 data manifests".to_string());
+        }
+    };
+    for f in written {
+        let df = build_minimal_data_file(f)?;
+        let sequence_number = preserve_row_lineage_sequence_number(f)?;
+        writer
+            .add_file(df, sequence_number)
+            .map_err(|e| format!("ManifestWriter::add_file failed: {e}"))?;
+    }
+    let manifest_file = writer
+        .write_manifest_file()
+        .await
+        .map_err(|e| format!("ManifestWriter::write_manifest_file failed: {e}"))?;
+    debug_assert_eq!(manifest_file.content, ManifestContentType::Data);
+    Ok(manifest_file)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn write_deleted_manifest(
     file_io: &FileIO,
     out_path: &str,
@@ -640,9 +707,127 @@ fn to_iceberg_unexpected(s: String) -> iceberg::Error {
     iceberg::Error::new(iceberg::ErrorKind::Unexpected, s)
 }
 
+fn stamp_preserve_row_lineage_first_row_ids(written: &mut [WrittenFile]) -> Result<(), String> {
+    for file in written.iter_mut() {
+        if file.record_count == 0 || file.first_row_id.is_some() {
+            continue;
+        }
+        file.first_row_id = Some(row_id_lower_bound_as_first_row_id(file)?);
+    }
+    Ok(())
+}
+
+fn preserve_replacement_manifest_first_row_id(
+    written: &[WrittenFile],
+) -> Result<Option<u64>, String> {
+    let mut first_row_id = None;
+    for file in written.iter().filter(|file| file.record_count > 0) {
+        let file_first_row_id = file.first_row_id.ok_or_else(|| {
+            format!(
+                "preserve-mode RewriteDataFilesCommit replacement data file {} is missing first_row_id",
+                file.path
+            )
+        })?;
+        let file_first_row_id = u64::try_from(file_first_row_id).map_err(|_| {
+            format!(
+                "preserve-mode RewriteDataFilesCommit replacement data file {} has negative first_row_id {}",
+                file.path, file_first_row_id
+            )
+        })?;
+        first_row_id = Some(first_row_id.map_or(file_first_row_id, |current: u64| {
+            current.min(file_first_row_id)
+        }));
+    }
+    Ok(first_row_id)
+}
+
+fn row_id_lower_bound_as_first_row_id(file: &WrittenFile) -> Result<i64, String> {
+    let datum = file
+        .lower_bounds
+        .get(&ICEBERG_RESERVED_FIELD_ID_ROW_ID)
+        .ok_or_else(|| {
+            format!(
+                "preserve-mode RewriteDataFilesCommit replacement data file {} is missing `{ICEBERG_ROW_ID_COL}` lower bound",
+                file.path
+            )
+        })?;
+    let (PrimitiveType::Long, PrimitiveLiteral::Long(first_row_id)) =
+        (datum.data_type(), datum.literal())
+    else {
+        return Err(format!(
+            "preserve-mode RewriteDataFilesCommit replacement data file {} has non-Long `{ICEBERG_ROW_ID_COL}` lower bound: type={}, value={}",
+            file.path,
+            datum.data_type(),
+            datum
+        ));
+    };
+    if *first_row_id < 0 {
+        return Err(format!(
+            "preserve-mode RewriteDataFilesCommit replacement data file {} has negative `{ICEBERG_ROW_ID_COL}` lower bound {}",
+            file.path, first_row_id
+        ));
+    }
+    Ok(*first_row_id)
+}
+
+fn preserve_row_lineage_sequence_number(file: &WrittenFile) -> Result<i64, String> {
+    let lower = lineage_long_bound(
+        file,
+        &file.lower_bounds,
+        ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+        ICEBERG_LAST_UPDATED_SEQ_COL,
+        "lower",
+    )?;
+    let upper = lineage_long_bound(
+        file,
+        &file.upper_bounds,
+        ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+        ICEBERG_LAST_UPDATED_SEQ_COL,
+        "upper",
+    )?;
+    if lower != upper {
+        return Err(format!(
+            "preserve-mode RewriteDataFilesCommit replacement data file {} spans multiple `{ICEBERG_LAST_UPDATED_SEQ_COL}` values: lower={lower}, upper={upper}",
+            file.path
+        ));
+    }
+    if lower < 0 {
+        return Err(format!(
+            "preserve-mode RewriteDataFilesCommit replacement data file {} has negative `{ICEBERG_LAST_UPDATED_SEQ_COL}` {lower}",
+            file.path
+        ));
+    }
+    Ok(lower)
+}
+
+fn lineage_long_bound(
+    file: &WrittenFile,
+    bounds: &HashMap<i32, iceberg::spec::Datum>,
+    field_id: i32,
+    field_name: &str,
+    label: &str,
+) -> Result<i64, String> {
+    let datum = bounds.get(&field_id).ok_or_else(|| {
+        format!(
+            "preserve-mode RewriteDataFilesCommit replacement data file {} is missing `{field_name}` {label} bound",
+            file.path
+        )
+    })?;
+    let (PrimitiveType::Long, PrimitiveLiteral::Long(value)) = (datum.data_type(), datum.literal())
+    else {
+        return Err(format!(
+            "preserve-mode RewriteDataFilesCommit replacement data file {} has non-Long `{field_name}` {label} bound: type={}, value={}",
+            file.path,
+            datum.data_type(),
+            datum
+        ));
+    };
+    Ok(*value)
+}
+
 #[cfg(test)]
 mod tests {
-    use iceberg::spec::{DataFileBuilder, DataFileFormat, Struct};
+    use iceberg::spec::{DataFileBuilder, DataFileFormat, Datum, Struct};
 
     use super::*;
 
@@ -695,6 +880,42 @@ mod tests {
         assert_eq!(summary["added-delete-files"], "0");
     }
 
+    #[test]
+    fn preserve_row_lineage_stamps_replacement_first_row_id_from_bounds() {
+        let mut written = vec![
+            test_written_data_file_with_lineage_bounds("file:///x/rewrite-1.parquet", 3, 20, 4),
+            test_written_data_file_with_lineage_bounds("file:///x/rewrite-2.parquet", 2, 7, 2),
+        ];
+
+        stamp_preserve_row_lineage_first_row_ids(&mut written).expect("stamp first_row_id");
+
+        assert_eq!(written[0].first_row_id, Some(20));
+        assert_eq!(written[1].first_row_id, Some(7));
+        assert_eq!(
+            preserve_replacement_manifest_first_row_id(&written).expect("manifest first row id"),
+            Some(7),
+            "preserve-mode manifest marker must come from replacement row ids, not table next_row_id"
+        );
+        assert_eq!(
+            preserve_row_lineage_sequence_number(&written[0])
+                .expect("last updated sequence number"),
+            4
+        );
+    }
+
+    #[test]
+    fn preserve_row_lineage_rejects_missing_row_id_bound() {
+        let mut written = vec![test_written_data_file("file:///x/rewrite.parquet", 1)];
+
+        let err = stamp_preserve_row_lineage_first_row_ids(&mut written)
+            .expect_err("missing row-id lower bound must fail");
+
+        assert!(
+            err.contains("missing `_row_id` lower bound"),
+            "unexpected error: {err}"
+        );
+    }
+
     fn test_written_data_file(path: &str, record_count: u64) -> WrittenFile {
         WrittenFile {
             path: path.to_string(),
@@ -719,6 +940,28 @@ mod tests {
             content_size_in_bytes: None,
             cardinality: None,
         }
+    }
+
+    fn test_written_data_file_with_lineage_bounds(
+        path: &str,
+        record_count: u64,
+        row_id_lower_bound: i64,
+        last_updated_lower_bound: i64,
+    ) -> WrittenFile {
+        let mut file = test_written_data_file(path, record_count);
+        file.lower_bounds.insert(
+            ICEBERG_RESERVED_FIELD_ID_ROW_ID,
+            Datum::long(row_id_lower_bound),
+        );
+        file.lower_bounds.insert(
+            ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+            Datum::long(last_updated_lower_bound),
+        );
+        file.upper_bounds.insert(
+            ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+            Datum::long(last_updated_lower_bound),
+        );
+        file
     }
 
     fn test_live_entry(
