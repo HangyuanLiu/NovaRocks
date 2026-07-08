@@ -19,9 +19,13 @@ mod be_tablet_write_log_store;
 mod be_txn_store;
 mod chunk_builder;
 mod context;
+#[cfg(feature = "compat")]
 mod fe_tables;
+#[cfg(feature = "compat")]
 mod frontend;
+#[cfg(feature = "compat")]
 mod load_tracking_logs;
+#[cfg(feature = "compat")]
 mod loads;
 mod op;
 

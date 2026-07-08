@@ -5708,6 +5708,16 @@ fn nidl_e9_write_coordinator_uses_native_report_types() {
 }
 
 #[test]
+fn nidl_e9_noncompat_startup_does_not_init_frontend_rpc() {
+    let text = nidl_e9_read("src/main.rs");
+    let production = rust_production_text_without_cfg_test_or_compat(&text);
+    assert!(
+        !production.contains("frontend_rpc::init_frontend_rpc_manager"),
+        "non-compat startup must not initialize Frontend RPC manager"
+    );
+}
+
+#[test]
 fn nidl_e9_lower_compat_import_detector_ignores_cfg_compat_files() {
     let dir = std::env::temp_dir().join("nidl_e9_lower_compat_detector");
     let _ = fs::remove_dir_all(&dir);

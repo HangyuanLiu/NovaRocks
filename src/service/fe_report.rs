@@ -47,12 +47,15 @@ use crate::runtime::sink_commit;
 use crate::service::exec_state_reporter::{self, ExecStateReportTask};
 #[cfg(feature = "compat")]
 use crate::service::exec_status_report::{self, ExecStatusReportInput};
+#[cfg(feature = "compat")]
 use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
 use crate::service::report_worker;
 use crate::service::standalone_exec_state_reporter::{self, StandaloneExecStateReportTask};
 #[cfg(feature = "compat")]
 use crate::thrift::data_cache;
-use crate::thrift::{frontend_service, metrics, runtime_profile, status, status_code, types};
+#[cfg(feature = "compat")]
+use crate::thrift::{frontend_service, types};
+use crate::thrift::{metrics, runtime_profile, status, status_code};
 
 #[derive(Clone, Debug)]
 enum ReportDestination {
@@ -382,6 +385,7 @@ pub(crate) fn report_exec_state(finst_id: UniqueId) {
     }
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn fetch_query_profile(
     coord: &types::TNetworkAddress,
     query_id: &str,
