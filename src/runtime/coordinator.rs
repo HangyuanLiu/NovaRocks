@@ -27,11 +27,12 @@ use arrow::record_batch::RecordBatch;
 
 use crate::common::app_config::PlanWireFormat;
 use crate::common::ids::SlotId;
-use crate::exec::chunk::schema_thrift::chunk_slot_schema_from_type_desc;
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
+use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::novarocks_logging::debug;
 use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher, FragmentSubmission};
-use crate::runtime::exec_params::{ExecPlanFragmentParamOptions, build_exec_plan_fragment_params};
+use crate::runtime::exec_params::{
+    CompatFragmentPlanPayload, ExecPlanFragmentParamOptions, build_exec_plan_fragment_params,
+};
 use crate::runtime::profile::RuntimeProfileTree;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::query_state::QueryState;
@@ -52,7 +53,6 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::planner::{DataPartition, PartitionKind};
 use crate::thrift::data_sinks;
 use crate::thrift::partitions;
-use crate::thrift::planner;
 use crate::thrift::types;
 
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
@@ -193,6 +193,7 @@ impl ExecutionCoordinator {
     ) -> Result<CoordinatedQueryResult, String> {
         let MultiFragmentBuildResult {
             mut fragment_results,
+            fragment_schedules,
             root_fragment_id,
             edges,
             lowered_edges,
@@ -241,9 +242,10 @@ impl ExecutionCoordinator {
             );
         }
 
+        validate_fragment_schedule_payloads(&fragment_results, &fragment_schedules)?;
         let live = scheduler.live_backend_entries().to_vec();
         let mut plan =
-            scheduler.assign_with_live(&fragment_results, &edges, query_id.clone(), &live)?;
+            scheduler.assign_with_live(&fragment_schedules, &edges, query_id.clone(), &live)?;
         scheduler.fill_destinations_with_live(&mut plan, &edges, &live)?;
         if let Some(rf) = rf_plan.as_ref() {
             scheduler.fill_runtime_filter_params_with_live(&mut plan, rf, &live)?;
@@ -319,15 +321,16 @@ impl ExecutionCoordinator {
         }
         // CTE consumers may also be expressed via `cte_exchange_nodes` on the
         // consumer fragment when no explicit edge carries them.
-        for fr in &fragment_results {
-            for (cte_id, exchange_node_id, receive_producer_column_ids) in &fr.cte_exchange_nodes {
+        for schedule in &fragment_schedules {
+            for (cte_id, exchange_node_id, receive_producer_column_ids) in
+                &schedule.cte_exchange_nodes
+            {
                 let consumers = cte_consumers.entry(*cte_id).or_default();
-                if !consumers
-                    .iter()
-                    .any(|(fid, nid, _, _, _)| *fid == fr.fragment_id && *nid == *exchange_node_id)
-                {
+                if !consumers.iter().any(|(fid, nid, _, _, _)| {
+                    *fid == schedule.fragment_id && *nid == *exchange_node_id
+                }) {
                     consumers.push((
-                        fr.fragment_id,
+                        schedule.fragment_id,
                         *exchange_node_id,
                         crate::proto::plan::DataPartition {
                             kind: crate::proto::plan::PartitionKind::Unpartitioned as i32,
@@ -339,11 +342,11 @@ impl ExecutionCoordinator {
                 }
                 let compat_consumers = compat_cte_consumers.entry(*cte_id).or_default();
                 if !compat_consumers.iter().any(|consumer| {
-                    consumer.fragment_id == fr.fragment_id
+                    consumer.fragment_id == schedule.fragment_id
                         && consumer.exchange_node_id == *exchange_node_id
                 }) {
                     compat_consumers.push(CompatCteConsumer {
-                        fragment_id: fr.fragment_id,
+                        fragment_id: schedule.fragment_id,
                         exchange_node_id: *exchange_node_id,
                         partition: unpartitioned_partition(),
                         output_slot_ids: Vec::new(),
@@ -405,6 +408,11 @@ impl ExecutionCoordinator {
                 .iter()
                 .map(|fr| (fr.fragment_id, fr))
                 .collect();
+        let schedule_by_id: BTreeMap<FragmentId, &crate::sql::codegen::FragmentSchedulingMetadata> =
+            fragment_schedules
+                .iter()
+                .map(|fr| (fr.fragment_id, fr))
+                .collect();
 
         // Build a fragment-id -> instance count map from the scheduling plan.
         // This is used by build_instance_runtime_filter_params to set the correct
@@ -428,18 +436,21 @@ impl ExecutionCoordinator {
             let fr = *fr_by_id
                 .get(&fragment_id)
                 .ok_or_else(|| format!("fragment {fragment_id} missing from build results"))?;
+            let schedule = *schedule_by_id
+                .get(&fragment_id)
+                .ok_or_else(|| format!("fragment {fragment_id} missing from native schedules"))?;
             let is_root = fragment_id == execution_root_fragment_id;
             let stream_edge = stream_edge_by_source.get(&fragment_id).copied();
             let router_edges = router_edges_by_source.get(&fragment_id);
             let is_terminal_write = stream_edge.is_none()
                 && router_edges.is_none()
-                && fr.cte_id.is_none()
-                && fr.output_kind.is_terminal_write();
+                && schedule.cte_id.is_none()
+                && schedule.output_kind.is_terminal_write();
 
             // Classify the fragment once.
             if !is_root
                 && !is_terminal_write
-                && fr.cte_id.is_none()
+                && schedule.cte_id.is_none()
                 && stream_edge.is_none()
                 && router_edges.is_none()
             {
@@ -456,7 +467,7 @@ impl ExecutionCoordinator {
                 is_terminal_write,
                 stream_edge.is_some(),
                 router_edges.is_some(),
-                fr.cte_id.is_some(),
+                schedule.cte_id.is_some(),
             )?;
 
             for placement in placements {
@@ -497,7 +508,7 @@ impl ExecutionCoordinator {
                     (fr.output_sink.clone(), unpartitioned_partition(), None)
                 } else {
                     // CTE producer.
-                    let cte_id = fr
+                    let cte_id = schedule
                         .cte_id
                         .ok_or_else(|| "CTE fragment missing cte_id".to_string())?;
                     let consumers = compat_cte_consumers
@@ -564,20 +575,6 @@ impl ExecutionCoordinator {
                     pipeline_dop
                 };
 
-                let thrift_fragment = planner::TPlanFragment::new(
-                    Some(fr.plan.clone()),
-                    fr.output_exprs.clone(),
-                    Some(output_sink),
-                    fragment_partition,
-                    None::<i64>,
-                    None::<i64>,
-                    fr.query_global_dicts.clone(),
-                    None::<Vec<crate::thrift::data::TGlobalDict>>,
-                    None::<planner::TCacheParam>,
-                    fr.query_global_dict_exprs.clone(),
-                    None::<planner::TGroupExecutionParam>,
-                );
-
                 let mut exec_params = fr.exec_params.clone();
                 exec_params.query_id = query_id.clone();
                 exec_params.fragment_instance_id = placement.finst_id.clone();
@@ -596,8 +593,15 @@ impl ExecutionCoordinator {
 
                 let compat_query_options = query_options.as_ref().map(QueryOptions::to_thrift);
                 let params = build_exec_plan_fragment_params(
-                    fr,
-                    thrift_fragment,
+                    CompatFragmentPlanPayload {
+                        plan: fr.plan.clone(),
+                        desc_tbl: fr.desc_tbl.clone(),
+                        output_sink,
+                        output_exprs: fr.output_exprs.clone(),
+                        fragment_partition,
+                        query_global_dicts: fr.query_global_dicts.clone(),
+                        query_global_dict_exprs: fr.query_global_dict_exprs.clone(),
+                    },
                     exec_params,
                     compat_query_options,
                     fragment_dop,
@@ -640,7 +644,7 @@ impl ExecutionCoordinator {
                                     branch_edges,
                                     &plan.by_fragment,
                                 )?;
-                            } else if let Some(cte_id) = fr.cte_id {
+                            } else if let Some(cte_id) = schedule.cte_id {
                                 let consumers =
                                     cte_consumers.get(&cte_id).cloned().unwrap_or_default();
                                 patch_native_cte_multicast_sink(
@@ -697,7 +701,7 @@ impl ExecutionCoordinator {
             return Err("root fragment produced no placement".to_string());
         }
         let mut submissions: Vec<(usize, FragmentSubmission)> = Vec::new();
-        for fragment_id in topological_sort_bottom_up(&fragment_results, &edges)?
+        for fragment_id in topological_sort_bottom_up(&fragment_schedules, &edges)?
             .into_iter()
             .rev()
         {
@@ -727,12 +731,12 @@ impl ExecutionCoordinator {
             .and_then(|q| q.query_timeout)
             .map(|t| t as i64 * 1000)
             .unwrap_or(300_000); // 5 minute default
-        let root_fragment = fr_by_id
+        let root_schedule = schedule_by_id
             .get(&execution_root_fragment_id)
-            .ok_or_else(|| "root fragment not found in build results".to_string())?;
+            .ok_or_else(|| "root fragment not found in native schedules".to_string())?;
         let expected_root_chunk_schema =
             if root_uses_typed_result_sink(&submissions, &plan.root_finst_id)? {
-                Some(build_root_expected_chunk_schema(root_fragment)?)
+                Some(build_root_expected_chunk_schema(root_schedule)?)
             } else {
                 None
             };
@@ -761,10 +765,10 @@ impl ExecutionCoordinator {
 
         let chunks = align_fetch_chunks_to_output_columns(
             fetch_result.chunks,
-            &root_fragment.output_columns,
+            &root_schedule.output_columns,
         )?;
         let query_result = QueryResult {
-            columns: root_fragment
+            columns: root_schedule
                 .output_columns
                 .iter()
                 .map(|c| QueryResultColumn {
@@ -803,88 +807,25 @@ fn query_result_or_write_abort_error(
 }
 
 fn build_root_expected_chunk_schema(
-    root_fragment: &crate::sql::codegen::FragmentBuildResult,
+    root_fragment: &crate::sql::codegen::FragmentSchedulingMetadata,
 ) -> Result<ChunkSchemaRef, String> {
     let output_columns = &root_fragment.output_columns;
     if output_columns.is_empty() {
-        if root_fragment
-            .output_exprs
-            .as_ref()
-            .is_some_and(|exprs| !exprs.is_empty())
-        {
-            return Err(
-                "root typed result metadata mismatch: output_exprs present for zero output columns"
-                    .to_string(),
-            );
-        }
         return Ok(Arc::new(ChunkSchema::empty()));
     }
 
-    let output_exprs = root_fragment
-        .output_exprs
-        .as_ref()
-        .ok_or_else(|| "root typed result requires output_exprs metadata".to_string())?;
-    if output_exprs.len() != output_columns.len() {
-        return Err(format!(
-            "root typed result output expr count mismatch: exprs={} columns={}",
-            output_exprs.len(),
-            output_columns.len()
-        ));
-    }
-
-    let mut output_specs = Vec::with_capacity(output_columns.len());
-    for (idx, (expr, output)) in output_exprs.iter().zip(output_columns.iter()).enumerate() {
-        if expr.nodes.len() != 1 {
-            return Err(format!(
-                "root typed result output expr {idx} must be a single SLOT_REF node, got {} nodes",
-                expr.nodes.len()
-            ));
-        }
-        let node = &expr.nodes[0];
-        if node.node_type != crate::thrift::exprs::TExprNodeType::SLOT_REF {
-            return Err(format!(
-                "root typed result output expr {idx} must be SLOT_REF, got {:?}",
-                node.node_type
-            ));
-        }
-        let slot_ref = node
-            .slot_ref
-            .as_ref()
-            .ok_or_else(|| format!("root typed result output expr {idx} missing slot_ref"))?;
-        let slot_id = u32::try_from(slot_ref.slot_id).map_err(|_| {
-            format!(
-                "root typed result output expr {idx} has negative slot id {}",
-                slot_ref.slot_id
-            )
-        })?;
-        output_specs.push((
-            SlotId::new(slot_id),
-            output.name.clone(),
-            output.nullable,
-            node.type_.clone(),
-        ));
-    }
-
-    let mut seen_slot_ids = BTreeSet::new();
-    let has_duplicate_slot_ids = output_specs
-        .iter()
-        .any(|(slot_id, _, _, _)| !seen_slot_ids.insert(slot_id.as_u32()));
-
-    let mut slots = Vec::with_capacity(output_specs.len());
-    for (idx, (slot_id, name, nullable, type_desc)) in output_specs.into_iter().enumerate() {
-        let output_slot_id = if has_duplicate_slot_ids {
-            let positional = u32::try_from(idx + 1)
-                .map_err(|_| "too many root typed result output columns".to_string())?;
-            SlotId::new(positional)
-        } else {
-            slot_id
-        };
-        slots.push(
-            chunk_slot_schema_from_type_desc(output_slot_id, name, nullable, type_desc, None)
-                .map_err(|e| {
-                    format!("build root typed result slot schema at index {idx} failed: {e}")
-                })?,
+    let mut slots = Vec::with_capacity(output_columns.len());
+    for (idx, output) in output_columns.iter().enumerate() {
+        let slot_id = SlotId::new(
+            u32::try_from(idx + 1)
+                .map_err(|_| "too many root typed result output columns".to_string())?,
         );
+        let field = Field::new(
+            output.name.clone(),
+            output.data_type.clone(),
+            output.nullable,
+        );
+        slots.push(ChunkSlotSchema::new_with_field(slot_id, field, None, None));
     }
 
     ChunkSchema::try_new(slots).map(Arc::new)
@@ -1558,6 +1499,23 @@ fn native_fragment_sidecars(
             Ok(native_sidecars.fragments_by_id.clone())
         }
     }
+}
+
+fn validate_fragment_schedule_payloads(
+    fragment_results: &[crate::sql::codegen::FragmentBuildResult],
+    fragment_schedules: &[crate::sql::codegen::FragmentSchedulingMetadata],
+) -> Result<(), String> {
+    let result_ids: BTreeSet<FragmentId> =
+        fragment_results.iter().map(|fr| fr.fragment_id).collect();
+    let schedule_ids: BTreeSet<FragmentId> =
+        fragment_schedules.iter().map(|fr| fr.fragment_id).collect();
+    if result_ids != schedule_ids {
+        return Err(format!(
+            "native fragment_schedules ids {:?} do not match compat fragment_results ids {:?}",
+            schedule_ids, result_ids
+        ));
+    }
+    Ok(())
 }
 
 fn patch_native_iceberg_change_stream_router_sink(
@@ -2610,6 +2568,27 @@ mod tests {
             err.contains("native DistributedPlan") || err.contains("native sidecar"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn fragment_schedule_payload_validation_rejects_id_mismatch() {
+        let fragment_results = vec![fragment_for_scan_range_merge_test(BTreeMap::new())];
+        let fragment_schedules = vec![crate::sql::codegen::FragmentSchedulingMetadata {
+            fragment_id: 7,
+            has_scan_nodes: false,
+            output_kind: crate::sql::codegen::FragmentOutputKind::Result,
+            native_scan_ranges: BTreeMap::new(),
+            output_columns: Vec::new(),
+            boundary_schemas: Vec::new(),
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        }];
+
+        let err = validate_fragment_schedule_payloads(&fragment_results, &fragment_schedules)
+            .expect_err("mismatched native schedules must be rejected");
+
+        assert!(err.contains("native fragment_schedules ids {7}"), "{err}");
+        assert!(err.contains("compat fragment_results ids {0}"), "{err}");
     }
 
     #[cfg(feature = "compat")]

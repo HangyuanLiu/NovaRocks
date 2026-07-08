@@ -425,6 +425,7 @@ fn renumber_plan_node_ids_preserving_preorder(
         }
     }
     remap_plan_node_references(build_result, &node_id_map)?;
+    build_result.refresh_fragment_schedules();
     Ok(())
 }
 
@@ -1525,8 +1526,14 @@ mod tests {
     fn keyed_assert_build_result(
         nodes: Vec<crate::thrift::plan_nodes::TPlanNode>,
     ) -> crate::sql::codegen::MultiFragmentBuildResult {
+        let fragment_results = vec![keyed_assert_fragment(nodes)];
+        let fragment_schedules = fragment_results
+            .iter()
+            .map(crate::sql::codegen::FragmentBuildResult::scheduling_metadata)
+            .collect();
         crate::sql::codegen::MultiFragmentBuildResult {
-            fragment_results: vec![keyed_assert_fragment(nodes)],
+            fragment_results,
+            fragment_schedules,
             root_fragment_id: 0,
             edges: Vec::new(),
             lowered_edges: Vec::new(),
@@ -1766,6 +1773,20 @@ mod tests {
                 .native_scan_ranges
                 .contains_key(&20),
             "native scan range map must not retain stale TPlan node ids"
+        );
+        let schedule_scan_ranges = build_result.fragment_schedules[0]
+            .native_scan_ranges
+            .iter()
+            .map(|(node_id, ranges)| (*node_id, ranges.len()))
+            .collect::<Vec<_>>();
+        let fragment_scan_ranges = build_result.fragment_results[0]
+            .native_scan_ranges
+            .iter()
+            .map(|(node_id, ranges)| (*node_id, ranges.len()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            schedule_scan_ranges, fragment_scan_ranges,
+            "fragment schedule native scan ranges must be refreshed after remapping TPlan node ids"
         );
         assert!(
             build_result.fragment_results[0]
