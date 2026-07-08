@@ -57,7 +57,7 @@ use crate::runtime::endpoint::{
 };
 use crate::runtime::scan_range::ScanRangeParams;
 use crate::sql::codegen::{
-    FragmentBuildResult, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind,
+    FragmentEdge, FragmentEdgeKind, FragmentId, FragmentSchedulingMetadata, FragmentStreamKind,
     RuntimeFilterPlanResult,
 };
 use crate::sql::planner::PartitionKind;
@@ -160,7 +160,7 @@ impl FragmentScheduler {
     /// `fill_*` methods to populate them.
     pub(crate) fn assign(
         &self,
-        fragments: &[FragmentBuildResult],
+        fragments: &[FragmentSchedulingMetadata],
         edges: &[FragmentEdge],
         query_id: TUniqueId,
     ) -> Result<SchedulingPlan, String> {
@@ -170,7 +170,7 @@ impl FragmentScheduler {
 
     pub(crate) fn assign_with_live(
         &self,
-        fragments: &[FragmentBuildResult],
+        fragments: &[FragmentSchedulingMetadata],
         edges: &[FragmentEdge],
         query_id: TUniqueId,
         live: &[LiveBackend],
@@ -187,8 +187,8 @@ impl FragmentScheduler {
         let root_selection = select_execution_root_fragment(fragments, edges)?;
         let root_fragment_id = root_selection.fragment_id;
 
-        // Build lookup from fragment_id -> FragmentBuildResult index.
-        let fr_by_id: BTreeMap<FragmentId, &FragmentBuildResult> =
+        // Build lookup from fragment_id -> FragmentSchedulingMetadata index.
+        let fr_by_id: BTreeMap<FragmentId, &FragmentSchedulingMetadata> =
             fragments.iter().map(|fr| (fr.fragment_id, fr)).collect();
 
         // Step 3: compute instance counts in topo order.
@@ -494,7 +494,7 @@ impl FragmentScheduler {
 
 /// Return the fragment ids in topological order (leaves first, root last).
 pub(crate) fn topological_sort_bottom_up(
-    fragments: &[FragmentBuildResult],
+    fragments: &[FragmentSchedulingMetadata],
     edges: &[FragmentEdge],
 ) -> Result<Vec<FragmentId>, String> {
     // In-degree is the number of incoming edges (i.e. number of upstream
@@ -550,13 +550,13 @@ struct ExecutionRootSelection {
 }
 
 fn select_execution_root_fragment(
-    fragments: &[FragmentBuildResult],
+    fragments: &[FragmentSchedulingMetadata],
     edges: &[FragmentEdge],
 ) -> Result<ExecutionRootSelection, String> {
     use std::collections::BTreeSet;
 
     let sources: BTreeSet<FragmentId> = edges.iter().map(|e| e.source_fragment_id).collect();
-    let terminal_fragments: Vec<&FragmentBuildResult> = fragments
+    let terminal_fragments: Vec<&FragmentSchedulingMetadata> = fragments
         .iter()
         .filter(|fr| !sources.contains(&fr.fragment_id))
         .collect();
@@ -611,14 +611,11 @@ mod tests {
 
     use crate::sql::codegen::RuntimeFilterPlanResult;
     use crate::sql::codegen::{
-        FragmentBuildResult, FragmentEdge, FragmentEdgeKind, FragmentOutputKind, FragmentStreamKind,
+        FragmentEdge, FragmentEdgeKind, FragmentOutputKind, FragmentSchedulingMetadata,
+        FragmentStreamKind,
     };
     use crate::sql::planner::{DataPartition, PartitionKind};
-    use crate::thrift::data_sinks;
-    use crate::thrift::descriptors as thrift_descriptors;
-    use crate::thrift::internal_service;
     use crate::thrift::partitions;
-    use crate::thrift::plan_nodes;
     use crate::thrift::types;
 
     // -----------------------------------------------------------------------
@@ -649,67 +646,6 @@ mod tests {
         make_query_id(1, 0)
     }
 
-    fn minimal_exec_params() -> internal_service::TPlanFragmentExecParams {
-        internal_service::TPlanFragmentExecParams {
-            query_id: types::TUniqueId::new(0, 0),
-            fragment_instance_id: types::TUniqueId::new(0, 0),
-            per_node_scan_ranges: BTreeMap::new(),
-            per_exch_num_senders: Default::default(),
-            destinations: None,
-            sender_id: None,
-            num_senders: None,
-            send_query_statistics_with_every_batch: None,
-            use_vectorized: None,
-            runtime_filter_params: None,
-            instances_number: None,
-            enable_exchange_pass_through: None,
-            node_to_per_driver_seq_scan_ranges: None,
-            enable_exchange_perf: None,
-            pipeline_sink_dop: None,
-            report_when_finish: None,
-            exec_debug_options: None,
-        }
-    }
-
-    fn minimal_noop_sink() -> data_sinks::TDataSink {
-        minimal_sink(data_sinks::TDataSinkType::NOOP_SINK)
-    }
-
-    fn minimal_write_sink() -> data_sinks::TDataSink {
-        minimal_sink(data_sinks::TDataSinkType::ICEBERG_TABLE_SINK)
-    }
-
-    fn minimal_sink(sink_type: data_sinks::TDataSinkType) -> data_sinks::TDataSink {
-        data_sinks::TDataSink::new(
-            sink_type,
-            None::<data_sinks::TDataStreamSink>,
-            None::<data_sinks::TResultSink>,
-            None::<data_sinks::TMysqlTableSink>,
-            None::<data_sinks::TExportSink>,
-            None::<data_sinks::TOlapTableSink>,
-            None::<data_sinks::TMemoryScratchSink>,
-            None::<data_sinks::TMultiCastDataStreamSink>,
-            None::<data_sinks::TSchemaTableSink>,
-            None::<data_sinks::TIcebergTableSink>,
-            None::<data_sinks::THiveTableSink>,
-            None::<data_sinks::TTableFunctionTableSink>,
-            None::<data_sinks::TDictionaryCacheSink>,
-            None::<Vec<Box<data_sinks::TDataSink>>>,
-            None::<i64>,
-            None::<data_sinks::TSplitDataStreamSink>,
-            None::<data_sinks::TIcebergChangeStreamRouterSink>,
-        )
-    }
-
-    fn minimal_desc_tbl() -> thrift_descriptors::TDescriptorTable {
-        thrift_descriptors::TDescriptorTable::new(
-            None::<Vec<thrift_descriptors::TSlotDescriptor>>,
-            vec![],
-            None::<Vec<thrift_descriptors::TTableDescriptor>>,
-            None::<bool>,
-        )
-    }
-
     fn scan_range_params(marker: i32) -> crate::runtime::scan_range::ScanRangeParams {
         let mut params = crate::runtime::scan_range::ScanRangeParams::file(
             crate::runtime::scan_range::FileScanRange {
@@ -738,52 +674,29 @@ mod tests {
         params
     }
 
-    /// Build a minimal `FragmentBuildResult`.
-    ///
-    /// - `scan_node_id`: if `Some(id)`, plan has one HDFS_SCAN_NODE with that
-    ///   id, and `n_ranges` scan range params are added; if `None`, plan has
-    ///   an AGGREGATION_NODE (non-scan).
     fn fake_fragment(
         fid: FragmentId,
         scan_node_id: Option<i32>,
         n_ranges: usize,
-    ) -> FragmentBuildResult {
-        let (nodes, native_scan_ranges) = match scan_node_id {
+    ) -> FragmentSchedulingMetadata {
+        let native_scan_ranges = match scan_node_id {
             Some(node_id) => {
-                let mut node = crate::sql::codegen::nodes::default_plan_node();
-                node.node_id = node_id;
-                node.node_type = plan_nodes::TPlanNodeType::HDFS_SCAN_NODE;
                 let ranges: Vec<crate::runtime::scan_range::ScanRangeParams> =
                     (0..n_ranges as i32).map(scan_range_params).collect();
-                let mut scan_map: BTreeMap<i32, Vec<crate::runtime::scan_range::ScanRangeParams>> =
-                    BTreeMap::new();
-                scan_map.insert(node_id, ranges);
-                (vec![node], scan_map)
+                BTreeMap::from([(node_id, ranges)])
             }
-            None => {
-                let mut node = crate::sql::codegen::nodes::default_plan_node();
-                node.node_id = 999;
-                node.node_type = plan_nodes::TPlanNodeType::AGGREGATION_NODE;
-                (vec![node], BTreeMap::new())
-            }
+            None => BTreeMap::new(),
         };
 
-        FragmentBuildResult {
+        FragmentSchedulingMetadata {
             fragment_id: fid,
             has_scan_nodes: scan_node_id.is_some(),
             output_kind: FragmentOutputKind::NonTerminal,
-            plan: plan_nodes::TPlan { nodes },
-            desc_tbl: minimal_desc_tbl(),
-            exec_params: minimal_exec_params(),
             native_scan_ranges,
-            output_sink: minimal_noop_sink(),
-            output_exprs: None,
             output_columns: vec![],
             boundary_schemas: vec![],
             cte_id: None,
             cte_exchange_nodes: vec![],
-            query_global_dicts: None,
-            query_global_dict_exprs: None,
         }
     }
 
@@ -791,9 +704,8 @@ mod tests {
         fid: FragmentId,
         scan_node_id: Option<i32>,
         n_ranges: usize,
-    ) -> FragmentBuildResult {
+    ) -> FragmentSchedulingMetadata {
         let mut fragment = fake_fragment(fid, scan_node_id, n_ranges);
-        fragment.output_sink = minimal_write_sink();
         fragment.output_kind = FragmentOutputKind::TerminalWrite;
         fragment
     }
@@ -1051,8 +963,9 @@ mod tests {
             fake_fragment(1, None, 0),
             fake_fragment(2, None, 0),
         ];
-        let mut hash_edge = fake_edge(0, 1, partitions::TPartitionType::HASH_PARTITIONED, 10);
-        hash_edge.output_partition = DataPartition::unpartitioned();
+        let mut hash_edge = fake_edge(0, 1, partitions::TPartitionType::UNPARTITIONED, 10);
+        hash_edge.output_partition = DataPartition::hash(Vec::new());
+        hash_edge.stream_kind = FragmentStreamKind::Partitioned;
         let edges = vec![
             hash_edge,
             fake_edge(1, 2, partitions::TPartitionType::UNPARTITIONED, 20),
