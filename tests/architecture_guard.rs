@@ -5383,25 +5383,6 @@ fn nidl_e0_read_ledger() -> Vec<String> {
     entries
 }
 
-fn nidl_e0_write_ledger(offenders: &[String]) {
-    let path = Path::new(manifest_dir()).join(NIDL_E0_LEDGER_PATH);
-    let mut body = String::new();
-    body.push_str("# NIDL-E non-compat StarRocks-IDL ledger (milestone E0).\n");
-    body.push_str("# Production-code files in the non-compat compile graph that still\n");
-    body.push_str("# reference crate::thrift / crate::proto::starrocks / crate::proto::staros.\n");
-    body.push_str("# This is a debt list and must only shrink. After a milestone removes a\n");
-    body.push_str("# cluster's references, regenerate with:\n");
-    body.push_str(
-        "#   NOVA_WRITE_IDL_LEDGER=1 cargo test --test architecture_guard nidl_e0_noncompat\n",
-    );
-    body.push_str("# The end state (E10) is an empty list plus the build.rs/lib.rs gate.\n");
-    for entry in offenders {
-        body.push_str(entry);
-        body.push('\n');
-    }
-    fs::write(&path, body).expect("write NIDL-E0 ledger");
-}
-
 #[test]
 fn nidl_e0_detector_flags_starrocks_idl_and_ignores_native_and_tests() {
     let dir = std::env::temp_dir().join("nidl_e0_detector");
@@ -5536,34 +5517,18 @@ fn nidl_e6_ledger_detector_ignores_compat_cfg_items() {
 #[test]
 fn nidl_e0_noncompat_starrocks_idl_stays_within_ledger() {
     let offenders = nidl_e0_current_offenders();
-
-    if std::env::var_os("NOVA_WRITE_IDL_LEDGER").is_some() {
-        nidl_e0_write_ledger(&offenders);
-        return;
-    }
-
     let ledger = nidl_e0_read_ledger();
-    let new_offenders: Vec<&String> = offenders.iter().filter(|f| !ledger.contains(f)).collect();
-    let cleared: Vec<&String> = ledger.iter().filter(|f| !offenders.contains(f)).collect();
 
-    let mut msg = String::new();
-    if !new_offenders.is_empty() {
-        msg.push_str("new non-compat StarRocks-IDL references (not in ledger) - clean them or gate to compat:\n");
-        for f in &new_offenders {
-            msg.push_str(&format!("  + {f}\n"));
-        }
-    }
-    if !cleared.is_empty() {
-        msg.push_str(
-            "ledger entries that no longer reference StarRocks IDL - regenerate the ledger \
-             (NOVA_WRITE_IDL_LEDGER=1) so it only shrinks:\n",
-        );
-        for f in &cleared {
-            msg.push_str(&format!("  - {f}\n"));
-        }
-    }
-
-    assert!(msg.is_empty(), "NIDL-E0 ledger drift:\n{msg}");
+    assert!(
+        ledger.is_empty(),
+        "NIDL-E10 final ledger must stay empty; remove these stale entries:\n{}",
+        ledger.join("\n")
+    );
+    assert!(
+        offenders.is_empty(),
+        "NIDL-E10 non-compat production code must not reference StarRocks IDL:\n{}",
+        offenders.join("\n")
+    );
 }
 
 fn nidl_e9_module_has_compat_cfg(module_file: &Path, module_name: &str) -> bool {
@@ -5689,6 +5654,92 @@ fn nidl_e9_text_region_between<'a>(text: &'a str, start: &str, end: &str) -> &'a
         .find(end)
         .unwrap_or_else(|| panic!("missing end marker `{end}` after `{start}`"));
     &after_start[..end_idx]
+}
+
+fn nidl_e10_without_explicit_compat_regions(text: &str) -> String {
+    let mut out = String::new();
+    let mut in_region = false;
+    for line in text.lines() {
+        if line.contains("// NIDL-E10 compat-only generated IDL/codegen start")
+            || line.contains("// NIDL-E10 compat-only Rust proto codegen start")
+        {
+            in_region = true;
+            continue;
+        }
+        if line.contains("// NIDL-E10 compat-only generated IDL/codegen end")
+            || line.contains("// NIDL-E10 compat-only Rust proto codegen end")
+        {
+            in_region = false;
+            continue;
+        }
+        if !in_region {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn nidl_e10_previous_nonblank_line<'a>(lines: &'a [&'a str], idx: usize) -> Option<&'a str> {
+    lines[..idx]
+        .iter()
+        .rev()
+        .map(|line| line.trim())
+        .find(|line| !line.is_empty())
+}
+
+#[test]
+fn nidl_e10_build_rs_gates_compat_generated_idl() {
+    let build_rs = nidl_e9_read("src/build.rs");
+    let default_region = nidl_e10_without_explicit_compat_regions(&build_rs);
+    for forbidden in [
+        "validate_thrift_rs_namespaces();",
+        "resolve_thirdparty_root(&manifest_dir)",
+        "let thrift_rs_cmd = find_tool(\"thrift\", &tp_bin);",
+        "patch_plan_nodes_rs(&thrift_rs_out);",
+        "thrift_root_mod.rs",
+        "let starrocks_protos = [",
+        "compile_protos(&starrocks_protos",
+        "let staros_protos = [",
+        "compile_protos(&staros_protos",
+    ] {
+        assert!(
+            !default_region.contains(forbidden),
+            "default build.rs path must not contain compat generated IDL/codegen `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn nidl_e10_proto_root_only_exposes_starrocks_and_staros_for_compat() {
+    let build_rs = nidl_e9_read("src/build.rs");
+    let emit_region = nidl_e9_text_region_between(&build_rs, "fn emit_proto_root_mod", "fn main()");
+    assert!(
+        emit_region.contains("fn emit_proto_root_mod(out_dir: &Path, compat: bool)"),
+        "emit_proto_root_mod must accept compat so generated proto root can hide compat modules in default builds"
+    );
+    let default_region = nidl_e10_without_explicit_compat_regions(emit_region);
+    for forbidden in ["pub mod starrocks", "pub mod staros"] {
+        assert!(
+            !default_region.contains(forbidden),
+            "proto_root_mod default wrapper must not expose `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn nidl_e10_lib_only_includes_thrift_root_for_compat() {
+    let lib_rs = nidl_e9_read("src/lib.rs");
+    let lines = lib_rs.lines().collect::<Vec<_>>();
+    let include_idx = lines
+        .iter()
+        .position(|line| line.contains("thrift_root_mod.rs"))
+        .expect("src/lib.rs must contain thrift_root_mod include for compat builds");
+    assert_eq!(
+        nidl_e10_previous_nonblank_line(&lines, include_idx),
+        Some("#[cfg(feature = \"compat\")]"),
+        "src/lib.rs must cfg-gate thrift_root_mod.rs include to compat builds"
+    );
 }
 
 #[test]
