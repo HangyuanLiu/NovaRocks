@@ -1,3 +1,22 @@
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
 # Variant 类型（V3）
 
 > Iceberg v3 引入 `variant` 类型，物理上由 metadata + value 两个 binary stream 组成（参考 Parquet variant proposal），逻辑上承载 schema-less 半结构化数据。NovaRocks 实现了读路径 + 表达式函数族，并在 PR #87 落地了 **INSERT happy path**（可以把 variant 列写出去）；其他 DML（OVERWRITE / DELETE / UPDATE / MERGE / equality-delete）以及 variant 在 partition / sort order 中的使用仍 fail-fast 拒绝。

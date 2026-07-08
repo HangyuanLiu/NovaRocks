@@ -1,3 +1,22 @@
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
 # Metadata Tables
 
 > Spec 定义的虚拟表，用来查表内部状态（snapshot 历史、refs、文件统计、partition 统计 ...）。PR #81 落地了 BE 端的 `snapshots / history / refs / partitions` 四张，PR #85 接通了 standalone parser 的 `<tbl>$<metatype>` 路由 —— **首批四张端到端 SQL 现在可用**。其余 metadata table（`$manifests` / `$files` / `$delete_files` / `$entries` / `$metadata_log_entries` / `$position_deletes` / `$all_files` 等）仍在路线图上。
