@@ -339,7 +339,7 @@ impl SpjgDescriptor {
                 (Some(SpjgAggregate { group_by }), outputs)
             }
             None => {
-                let scan_outputs: Vec<SpjgOutput> = scan
+                let mut scan_outputs: Vec<SpjgOutput> = scan
                     .columns
                     .iter()
                     .map(|c| SpjgOutput {
@@ -348,6 +348,25 @@ impl SpjgDescriptor {
                         expr: SpjgOutputExpr::Dimension(column_ref(arena, c)),
                     })
                     .collect();
+                // Multi-table SPJ (no aggregate, no mid_project): the top
+                // project can reference any joined table's column directly
+                // (e.g. `SELECT o.id, c.name FROM o JOIN c ...`), so the base
+                // map `apply_top_project` rebinds against must expose every
+                // join input's columns too, not just the driving scan's.
+                // Mirrors `SpjgDescriptor::base_name_of`'s driving +
+                // join-inputs union. A no-op for single-table descriptors
+                // (`joins` is `None`).
+                if let Some(j) = &joins {
+                    for input in &j.inputs {
+                        for c in &input.scan_columns {
+                            scan_outputs.push(SpjgOutput {
+                                name: c.name.clone(),
+                                column_id: c.column_id,
+                                expr: SpjgOutputExpr::Dimension(column_ref(arena, c)),
+                            });
+                        }
+                    }
+                }
                 // mid_project without aggregate is just "the" project.
                 let scan_outputs = match mid_project {
                     Some(p) => p
@@ -1137,13 +1156,13 @@ pub(crate) fn column_ref(arena: &mut ScalarArena, c: &OutputColumn) -> ScalarId 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
+    use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalPlanKind, LogicalPlanNode,
-        LogicalScanNode, LogicalSortNode,
+        LogicalProjectNode, LogicalScanNode, LogicalSortNode,
     };
     use arrow::datatypes::DataType;
 
@@ -1407,6 +1426,63 @@ mod tests {
         assert_eq!(joins.equi_edges.len(), 1);
         assert_eq!(joins.equi_edges[0].left, ColumnId(1));
         assert_eq!(joins.equi_edges[0].right, ColumnId(3));
+    }
+
+    #[test]
+    fn from_opt_expr_top_project_over_multitable_join_binds_both_sides() {
+        // A bare `SELECT <driving col>, <join-input col> FROM t1 JOIN t2 ...`
+        // (no aggregate, no project directly under the join) is the shape a
+        // real 2-table-join MV definition produces end-to-end through the
+        // standalone analyze/plan pipeline (E1-bc Task 6). Regression guard
+        // for a `from_opt_expr` gap where the no-aggregate arm's base map
+        // only carried the driving scan's own columns, so a top-project item
+        // addressing a join INPUT's column (here, t2.d) failed with "top
+        // project references unknown column" even though the join shape
+        // itself was extracted correctly.
+        use crate::sql::common::expr::JoinKind;
+
+        let a = col(1, "a");
+        let c = col(3, "c");
+        let d = col(4, "d");
+        let on = cmp(col_ref(&a), crate::sql::analysis::BinOp::Eq, col_ref(&c));
+        let join = join_plan(
+            JoinKind::Inner,
+            scan_plan_named("t1", std::slice::from_ref(&a)),
+            scan_plan_named("t2", &[c.clone(), d.clone()]),
+            Some(on),
+        );
+        let out_a = col(10, "out_a");
+        let out_d = col(11, "out_d");
+        let project = LogicalPlanNode::new(
+            LogicalPlanKind::Project(LogicalProjectNode {
+                items: vec![
+                    ProjectItem {
+                        expr: col_ref(&a),
+                        output_name: "out_a".to_string(),
+                        output_column_id: out_a.column_id,
+                    },
+                    ProjectItem {
+                        expr: col_ref(&d),
+                        output_name: "out_d".to_string(),
+                        output_column_id: out_d.column_id,
+                    },
+                ],
+                output_qualifier: None,
+            }),
+            vec![join],
+            None,
+        );
+
+        let (desc, _arena) =
+            descriptor_from_plan(&project).expect("top project over multitable join spjg");
+        assert_eq!(desc.outputs.len(), 2);
+        assert_eq!(desc.outputs[0].column_id, out_a.column_id);
+        assert_eq!(desc.outputs[0].name, "out_a");
+        assert_eq!(
+            desc.outputs[1].column_id, out_d.column_id,
+            "top project item addressing the JOIN INPUT's column (t2.d) must bind"
+        );
+        assert_eq!(desc.outputs[1].name, "out_d");
     }
 
     #[test]
