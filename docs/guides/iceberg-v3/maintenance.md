@@ -1,3 +1,22 @@
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
 # 维护 / 治理
 
 > Iceberg 的运维操作：压缩小文件、清理历史 snapshot、回收孤儿文件、重写 manifest 等。NovaRocks 支持 OPTIMIZE TABLE（whole-table 压缩）、EXPIRE SNAPSHOTS、REMOVE ORPHAN FILES、REWRITE MANIFESTS；增量压缩、自动调度等高级治理能力仍待补。

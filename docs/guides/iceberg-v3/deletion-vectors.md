@@ -1,3 +1,22 @@
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
 # Deletion Vector / Position-delete / Equality-delete / Puffin
 
 > Iceberg v3 引入 deletion vector（DV）作为行级 delete 的标准物理形态，存在 Puffin 文件中；V2 的 position-delete + equality-delete 仍然兼容。NovaRocks 全链路覆盖三种 delete 模型，但其他 Puffin blob 类型（NDV / partition stats / bloom filter）尚未实现。
