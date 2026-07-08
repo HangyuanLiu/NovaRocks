@@ -431,7 +431,7 @@ impl PartitionedJoinProbeProcessorOperator {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::Int32Array;
+    use arrow::array::{Array, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::record_batch::RecordBatch;
 
@@ -628,6 +628,36 @@ mod tests {
             .unwrap();
         for i in 0..chunk.len() {
             out.push((c0.value(i), c1.value(i)));
+        }
+    }
+
+    fn int32_options_by_slot(chunk: &Chunk, slot_id: SlotId) -> Vec<Option<i32>> {
+        let array = chunk.column_by_slot_id(slot_id).expect("slot column");
+        let values = array
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32 column");
+        (0..values.len())
+            .map(|row| {
+                if values.is_null(row) {
+                    None
+                } else {
+                    Some(values.value(row))
+                }
+            })
+            .collect()
+    }
+
+    fn append_slot_quad_rows(
+        chunk: Chunk,
+        out: &mut Vec<(Option<i32>, Option<i32>, Option<i32>, Option<i32>)>,
+    ) {
+        let left_k = int32_options_by_slot(&chunk, LEFT_K_SLOT_ID);
+        let left_v = int32_options_by_slot(&chunk, LEFT_V_SLOT_ID);
+        let right_k = int32_options_by_slot(&chunk, RIGHT_K_SLOT_ID);
+        let right_w = int32_options_by_slot(&chunk, RIGHT_W_SLOT_ID);
+        for row in 0..chunk.len() {
+            out.push((left_k[row], left_v[row], right_k[row], right_w[row]));
         }
     }
 
@@ -1226,13 +1256,13 @@ mod tests {
             push_expect_consumed(proc, &rt, c);
             while proc.has_output() {
                 if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pairs(out, &mut rows);
+                    append_pair_columns(out, 2, 3, &mut rows);
                 }
             }
             proc.set_finishing(&rt).expect("probe finish");
             while proc.has_output() {
                 if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pairs(out, &mut rows);
+                    append_pair_columns(out, 2, 3, &mut rows);
                 }
             }
         }
@@ -1341,13 +1371,13 @@ mod tests {
             push_expect_consumed(proc, &rt, c);
             while proc.has_output() {
                 if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pairs(out, &mut rows);
+                    append_pair_columns(out, 2, 3, &mut rows);
                 }
             }
             proc.set_finishing(&rt).expect("probe finish");
             while proc.has_output() {
                 if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pairs(out, &mut rows);
+                    append_pair_columns(out, 2, 3, &mut rows);
                 }
             }
         }
@@ -1450,19 +1480,126 @@ mod tests {
             push_expect_consumed(proc, &rt, c);
             while proc.has_output() {
                 if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pairs(out, &mut rows);
+                    append_pair_columns(out, 2, 3, &mut rows);
                 }
             }
             proc.set_finishing(&rt).expect("probe finish");
             while proc.has_output() {
                 if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
-                    append_pairs(out, &mut rows);
+                    append_pair_columns(out, 2, 3, &mut rows);
                 }
             }
         }
 
         rows.sort();
         assert_eq!(rows, vec![(2, 200)]);
+    }
+
+    #[test]
+    fn partitioned_right_semi_join_outputs_join_scope_order_with_right_probe() {
+        let rt = RuntimeState::default();
+        let mut arena = ExprArena::default();
+        let build_key = arena.push_typed(ExprNode::SlotId(LEFT_K_SLOT_ID), DataType::Int32);
+        let probe_key = arena.push_typed(ExprNode::SlotId(RIGHT_K_SLOT_ID), DataType::Int32);
+        let arena = Arc::new(arena);
+
+        let dep_manager = DependencyManager::new();
+        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(dep_manager.clone()));
+        let join_state = Arc::new(PartitionedJoinSharedState::new(
+            1,
+            2,
+            dep_manager.clone(),
+            false,
+        ));
+
+        let left_schema = schema_kv(LEFT_K_SLOT_ID, LEFT_V_SLOT_ID, "l", false);
+        let right_schema = schema_kv(RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID, "r", false);
+        let join_scope_schema = join_schema(&left_schema, &right_schema);
+
+        let build_state: Arc<dyn JoinBuildSinkState> = join_state.clone();
+        let build_factory = HashJoinBuildSinkFactory::new(
+            Arc::clone(&arena),
+            JoinType::RightSemi,
+            false,
+            false,
+            true,
+            vec![build_key],
+            vec![false],
+            Vec::new(),
+            JoinDistributionMode::Partitioned,
+            build_state,
+            Arc::clone(&runtime_filter_hub),
+            None,
+        );
+        let probe_factory = PartitionedJoinProbeProcessorFactory::new(
+            Arc::clone(&arena),
+            JoinType::RightSemi,
+            vec![probe_key],
+            None,
+            false,
+            true,
+            chunk_schema_of(&left_schema, &LEFT_KV_SLOT_IDS),
+            chunk_schema_of(&right_schema, &RIGHT_KV_SLOT_IDS),
+            chunk_schema_of(&join_scope_schema, &JOIN_KV_SLOT_IDS),
+            Arc::clone(&join_state),
+        );
+
+        let build = chunk_of_two(&[1, 2], LEFT_K_SLOT_ID, &[10, 20], LEFT_V_SLOT_ID, "l");
+        let probe = chunk_of_two(&[2, 3], RIGHT_K_SLOT_ID, &[200, 300], RIGHT_W_SLOT_ID, "r");
+
+        let build_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
+            &build,
+            &[build_key],
+            &arena,
+            2,
+            false,
+        )
+        .expect("partition build");
+        let probe_parts = crate::exec::operators::data_stream_sink::partition_chunk_by_hash(
+            &probe,
+            &[probe_key],
+            &arena,
+            2,
+            false,
+        )
+        .expect("partition probe");
+
+        for (part, build_part) in build_parts.iter().enumerate() {
+            let mut op = build_factory.create(2, part as i32);
+            let Some(sink) = op.as_processor_mut() else {
+                panic!("build operator missing processor");
+            };
+            let c = build_part.clone();
+            if !c.is_empty() {
+                push_expect_consumed(sink, &rt, c);
+            }
+            sink.set_finishing(&rt).expect("build finish");
+        }
+
+        let mut rows = Vec::new();
+        for (part, probe_part) in probe_parts.iter().enumerate() {
+            let mut op = probe_factory.create(2, part as i32);
+            let Some(proc) = op.as_processor_mut() else {
+                panic!("probe operator missing processor");
+            };
+
+            assert!(proc.need_input());
+            push_expect_consumed(proc, &rt, probe_part.clone());
+            while proc.has_output() {
+                if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
+                    append_slot_quad_rows(out, &mut rows);
+                }
+            }
+            proc.set_finishing(&rt).expect("probe finish");
+            while proc.has_output() {
+                if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
+                    append_slot_quad_rows(out, &mut rows);
+                }
+            }
+        }
+
+        rows.sort();
+        assert_eq!(rows, vec![(None, None, Some(2), Some(200))]);
     }
 
     #[test]

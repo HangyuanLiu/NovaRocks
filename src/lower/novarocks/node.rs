@@ -2623,6 +2623,7 @@ fn lower_hash_join_node(
     let mut probe_keys = Vec::with_capacity(join.eq_conditions.len());
     let mut build_keys = Vec::with_capacity(join.eq_conditions.len());
     let mut eq_null_safe = Vec::with_capacity(join.eq_conditions.len());
+    let right_semi_physical_right_probe = join_type == JoinType::RightSemi;
     for (idx, cond) in join.eq_conditions.iter().enumerate() {
         let left_expr = cond
             .left
@@ -2636,8 +2637,13 @@ fn lower_hash_join_node(
             .map_err(|err| format!("HashJoinNode eq_conditions[{idx}] left: {err}"))?;
         let build_key = lower_proto_expr(right_expr, arena, &right.layout)
             .map_err(|err| format!("HashJoinNode eq_conditions[{idx}] right: {err}"))?;
-        probe_keys.push(probe_key);
-        build_keys.push(build_key);
+        if right_semi_physical_right_probe {
+            probe_keys.push(build_key);
+            build_keys.push(probe_key);
+        } else {
+            probe_keys.push(probe_key);
+            build_keys.push(build_key);
+        }
         eq_null_safe.push(cond.null_safe);
     }
     let raw_probe_keys = probe_keys.clone();
@@ -2660,8 +2666,16 @@ fn lower_hash_join_node(
     let runtime_filters = lower_join_runtime_filters(
         join,
         join_type,
-        &left.layout,
-        &right.layout,
+        if right_semi_physical_right_probe {
+            &right.layout
+        } else {
+            &left.layout
+        },
+        if right_semi_physical_right_probe {
+            &left.layout
+        } else {
+            &right.layout
+        },
         &raw_probe_keys,
         &raw_build_keys,
         &probe_keys,
@@ -2788,6 +2802,8 @@ fn lower_join_runtime_filters(
         runtime_filters.push(JoinRuntimeFilterSpec {
             filter_id: rf.filter_id,
             expr_order,
+            probe_expr_id: probe_keys[expr_order],
+            build_expr_id: build_keys[expr_order],
             probe_slot_id: *probe_slot_id,
             build_data_type,
             merge_nodes: Vec::new(),

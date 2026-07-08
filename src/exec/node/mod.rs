@@ -491,11 +491,12 @@ fn push_down_local_runtime_filters_inner(
             runtime_filters,
             ..
         }) => {
-            // StarRocks plans define the probe side as the left child and the build side
-            // as the right child. Do not swap based on join type.
-            let probe_child = left.as_mut();
-            let build_child = right.as_mut();
-            let probe_exprs = probe_keys;
+            let right_semi_physical_right_probe = *join_type == JoinType::RightSemi;
+            let (probe_child, build_child) = if right_semi_physical_right_probe {
+                (right.as_mut(), left.as_mut())
+            } else {
+                (left.as_mut(), right.as_mut())
+            };
 
             let mut probe_filters = inherited.to_vec();
             if matches!(
@@ -503,6 +504,7 @@ fn push_down_local_runtime_filters_inner(
                 JoinType::Inner | JoinType::LeftSemi | JoinType::RightSemi
             ) && !runtime_filters.is_empty()
             {
+                let probe_exprs = probe_keys;
                 for rf in runtime_filters {
                     if let Some(expr_id) = probe_exprs.get(rf.expr_order) {
                         probe_filters.push(RuntimeFilterPushSpec {
@@ -576,6 +578,87 @@ mod tests {
         ChunkSchema::try_ref_from_schema_and_slot_ids(&schema, &[slot_id]).expect("chunk schema")
     }
 
+    fn scan_node_with_slot(node_id: i32, slot_id: SlotId, name: &str) -> ExecNode {
+        ExecNode {
+            kind: ExecNodeKind::Scan(
+                ScanNode::new(Arc::new(DummyScanOp))
+                    .with_node_id(node_id)
+                    .with_output_chunk_schema(int_schema_for_slot(slot_id, name)),
+            ),
+        }
+    }
+
+    fn scan_runtime_filter_ids(node: &ExecNode) -> Vec<i32> {
+        let ExecNodeKind::Scan(scan) = &node.kind else {
+            panic!("expected scan node");
+        };
+        scan.runtime_filter_specs()
+            .iter()
+            .map(|spec| spec.filter_id)
+            .collect()
+    }
+
+    #[test]
+    fn right_semi_local_runtime_filter_pushes_to_preserved_right_child() {
+        let left_slot = SlotId::new(11);
+        let right_slot = SlotId::new(22);
+        let mut arena = ExprArena::default();
+        let left_key = arena.push_typed(ExprNode::SlotId(left_slot), DataType::Int32);
+        let right_key = arena.push_typed(ExprNode::SlotId(right_slot), DataType::Int32);
+        let left_schema = int_schema_for_slot(left_slot, "l_k");
+        let right_schema = int_schema_for_slot(right_slot, "r_k");
+        let join_scope_schema = {
+            let schema = Schema::new(vec![
+                Field::new("l_k", DataType::Int32, true),
+                Field::new("r_k", DataType::Int32, true),
+            ]);
+            ChunkSchema::try_ref_from_schema_and_slot_ids(&schema, &[left_slot, right_slot])
+                .expect("chunk schema")
+        };
+
+        let mut root = ExecNode {
+            kind: ExecNodeKind::Join(JoinNode {
+                left: Box::new(scan_node_with_slot(101, left_slot, "l_k")),
+                right: Box::new(scan_node_with_slot(202, right_slot, "r_k")),
+                node_id: 10,
+                join_type: JoinType::RightSemi,
+                distribution_mode: JoinDistributionMode::Broadcast,
+                left_chunk_schema: left_schema,
+                right_chunk_schema: right_schema,
+                join_scope_chunk_schema: join_scope_schema,
+                probe_keys: vec![right_key],
+                build_keys: vec![left_key],
+                eq_null_safe: vec![false],
+                residual_predicate: None,
+                runtime_filters: vec![JoinRuntimeFilterSpec {
+                    filter_id: 7,
+                    expr_order: 0,
+                    probe_expr_id: right_key,
+                    build_expr_id: left_key,
+                    probe_slot_id: right_slot,
+                    build_data_type: DataType::Int32,
+                    merge_nodes: Vec::new(),
+                    has_remote_targets: false,
+                }],
+            }),
+        };
+
+        push_down_local_runtime_filters(&mut root, &arena);
+
+        let ExecNodeKind::Join(join) = &root.kind else {
+            panic!("expected join node");
+        };
+        assert!(
+            scan_runtime_filter_ids(&join.left).is_empty(),
+            "left existence-only child must not receive the RightSemi RF probe"
+        );
+        assert_eq!(
+            scan_runtime_filter_ids(&join.right),
+            vec![7],
+            "right preserved child must receive the RightSemi RF probe"
+        );
+    }
+
     #[test]
     fn runtime_filter_pushdown_accepts_probe_slot_target() {
         let mut arena = ExprArena::default();
@@ -643,6 +726,8 @@ mod tests {
                 runtime_filters: vec![JoinRuntimeFilterSpec {
                     filter_id: 7,
                     expr_order: 0,
+                    probe_expr_id: probe_expr,
+                    build_expr_id: build_expr,
                     probe_slot_id: SlotId::new(3),
                     build_data_type: DataType::Int32,
                     merge_nodes: Vec::new(),

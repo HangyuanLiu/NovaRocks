@@ -278,10 +278,14 @@ mod tests {
     use arrow::datatypes::DataType;
 
     fn output_column(id: u32, name: &str) -> OutputColumn {
+        typed_output_column(id, name, DataType::Int64)
+    }
+
+    fn typed_output_column(id: u32, name: &str, data_type: DataType) -> OutputColumn {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
+            data_type,
             nullable: false,
             is_internal: false,
         }
@@ -627,7 +631,10 @@ mod tests {
                 &mut memo,
                 vec![nullable_col_ref(1, "k", true)],
                 vec![avg_call()],
-                vec![output_column(1, "k"), output_column(3, "avg(v)")],
+                vec![
+                    output_column(1, "k"),
+                    typed_output_column(3, "avg(v)", DataType::Float64),
+                ],
             )),
             children: vec![child],
         };
@@ -638,6 +645,17 @@ mod tests {
         };
         assert_eq!(global.stage, AggStage::Global);
         assert_eq!(global.is_merge, vec![true]);
+        let local_group_id = out[0].children[0];
+        let local_group = &memo.groups[local_group_id];
+        let Operator::LogicalAggregate(local) = &local_group.logical_exprs[0].op else {
+            panic!("expected local aggregate child");
+        };
+        assert_eq!(local.stage, AggStage::Local);
+        assert_eq!(
+            local.output_layout.aggregate_columns[0].data_type,
+            DataType::Utf8
+        );
+        assert_eq!(local.output_columns[1].data_type, DataType::Utf8);
     }
 
     #[test]
