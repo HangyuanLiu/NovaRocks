@@ -7809,6 +7809,75 @@ path = "meta/operations.sqlite"
     }
 
     #[test]
+    fn iceberg_row_lineage_optimize_preserves_row_identity() {
+        use crate::meta::repository::job::{IcebergOptimizeJobState, StoredIcebergOptimizeJob};
+
+        let warehouse = TempDir::new().expect("warehouse");
+        let (engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
+        session
+            .execute_in_database(
+                "insert into ice.db1.t values (1, '10'), (2, '20')",
+                "default",
+            )
+            .expect("seed first files");
+        session
+            .execute_in_database(
+                "insert into ice.db1.t values (3, '30'), (4, '40')",
+                "default",
+            )
+            .expect("seed second files");
+        session
+            .execute_in_database(
+                "insert into ice.db1.t values (5, '50'), (6, '60')",
+                "default",
+            )
+            .expect("seed third files");
+        session
+            .execute_in_database("update ice.db1.t set v = '99' where id = 2", "default")
+            .expect("update before optimize");
+        session
+            .execute_in_database("delete from ice.db1.t where id = 4", "default")
+            .expect("delete before optimize");
+
+        let before = collect_id_rowid_seq(
+            &session,
+            "select id, _row_id, _last_updated_sequence_number from ice.db1.t order by id",
+        );
+        assert_eq!(before.len(), 5, "test setup should leave five live rows");
+
+        let base_snapshot_id =
+            current_iceberg_snapshot_id(&engine, "ice", "db1", "t").expect("base snapshot");
+        let job = StoredIcebergOptimizeJob {
+            id: 2,
+            catalog: "ice".to_string(),
+            namespace: "db1".to_string(),
+            table: "t".to_string(),
+            base_snapshot_id,
+            state: IcebergOptimizeJobState::Pending,
+            created_at_ms: 0,
+            started_at_ms: None,
+            finished_at_ms: None,
+            error_message: None,
+            outcome: None,
+        };
+        let outcome = crate::connector::iceberg::compact::run_one_optimize_job(&engine.inner, &job)
+            .expect("run optimize job");
+        assert!(
+            outcome.target_snapshot_id.is_some(),
+            "OPTIMIZE on a non-empty row-lineage table must commit"
+        );
+
+        let after = collect_id_rowid_seq(
+            &session,
+            "select id, _row_id, _last_updated_sequence_number from ice.db1.t order by id",
+        );
+        assert_eq!(
+            after, before,
+            "OPTIMIZE must preserve row identity and last-updated sequence for live rows"
+        );
+    }
+
+    #[test]
     fn iceberg_row_lineage_overwrite_writes_row_range() {
         let warehouse = TempDir::new().expect("warehouse");
         let (engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);

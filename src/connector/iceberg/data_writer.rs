@@ -612,15 +612,118 @@ pub(crate) async fn write_row_lineage_batches_as_data_files(
         schema_to_arrow_schema(&writer_schema)
             .map_err(|e| format!("convert row-lineage iceberg schema to arrow failed: {e}"))?,
     );
-    let mut enriched = Vec::with_capacity(batches.len());
-    for batch in batches {
-        enriched.push(append_row_lineage_columns(
-            &batch.user_batch,
-            batch.lineage.clone(),
-        )?);
+    let runs = split_row_lineage_batches_into_manifest_runs(batches)?;
+    let mut data_files = Vec::new();
+    for run in runs {
+        let enriched = append_row_lineage_columns(&run.user_batch, run.lineage)?;
+        data_files.extend(
+            write_record_batches_as_data_files_with_schema(
+                table,
+                [enriched],
+                Arc::clone(&writer_schema),
+                Arc::clone(&annotated_schema),
+            )
+            .await?,
+        );
     }
-    write_record_batches_as_data_files_with_schema(table, enriched, writer_schema, annotated_schema)
-        .await
+    Ok(data_files)
+}
+
+fn split_row_lineage_batches_into_manifest_runs(
+    batches: &[RowLineageWriteBatch],
+) -> Result<Vec<RowLineageWriteBatch>, String> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let rows = batch.user_batch.num_rows();
+        if rows == 0 {
+            continue;
+        }
+        if batch.lineage.row_ids.len() != rows
+            || batch.lineage.last_updated_sequence_numbers.len() != rows
+        {
+            return Err(format!(
+                "row-lineage writer batch length mismatch: rows={}, row_ids={}, last_updated={}",
+                rows,
+                batch.lineage.row_ids.len(),
+                batch.lineage.last_updated_sequence_numbers.len()
+            ));
+        }
+
+        let mut start = 0;
+        let mut prev_row_id = row_lineage_row_id_at(&batch.lineage.row_ids, 0)?;
+        let mut prev_seq = row_lineage_sequence_at(&batch.lineage.last_updated_sequence_numbers, 0);
+        for row in 1..rows {
+            let row_id = row_lineage_row_id_at(&batch.lineage.row_ids, row)?;
+            let seq = row_lineage_sequence_at(&batch.lineage.last_updated_sequence_numbers, row);
+            if row_id != prev_row_id + 1 || seq != prev_seq {
+                out.push(slice_row_lineage_write_batch(batch, start, row - start));
+                start = row;
+            }
+            prev_row_id = row_id;
+            prev_seq = seq;
+        }
+        out.push(slice_row_lineage_write_batch(batch, start, rows - start));
+    }
+    Ok(out)
+}
+
+fn row_lineage_row_id_at(row_ids: &arrow::array::Int64Array, row: usize) -> Result<i64, String> {
+    if row_ids.is_null(row) {
+        return Err(format!(
+            "row-lineage {ICEBERG_ROW_ID_COL} column contains null at row {row}"
+        ));
+    }
+    let row_id = row_ids.value(row);
+    if row_id < 0 {
+        return Err(format!(
+            "row-lineage {ICEBERG_ROW_ID_COL} column must be non-negative: row={row}, value={row_id}"
+        ));
+    }
+    Ok(row_id)
+}
+
+fn row_lineage_sequence_at(seqs: &arrow::array::Int64Array, row: usize) -> Option<i64> {
+    if seqs.is_null(row) {
+        None
+    } else {
+        Some(seqs.value(row))
+    }
+}
+
+fn slice_row_lineage_write_batch(
+    batch: &RowLineageWriteBatch,
+    offset: usize,
+    len: usize,
+) -> RowLineageWriteBatch {
+    RowLineageWriteBatch {
+        user_batch: batch.user_batch.slice(offset, len),
+        lineage: RowLineageColumns {
+            row_ids: slice_i64_array(&batch.lineage.row_ids, offset, len),
+            last_updated_sequence_numbers: slice_i64_array(
+                &batch.lineage.last_updated_sequence_numbers,
+                offset,
+                len,
+            ),
+        },
+    }
+}
+
+fn slice_i64_array(
+    array: &arrow::array::Int64Array,
+    offset: usize,
+    len: usize,
+) -> arrow::array::Int64Array {
+    arrow::array::Int64Array::from(
+        (offset..offset + len)
+            .map(|row| {
+                if array.is_null(row) {
+                    None
+                } else {
+                    Some(array.value(row))
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn build_row_lineage_writer_schema(current_schema: &SchemaRef) -> Result<SchemaRef, String> {
@@ -2746,7 +2849,6 @@ mod tests {
     fn reannotate_null_array_coerces_to_boolean() {
         use arrow::array::{ArrayRef, BooleanArray};
         use arrow::datatypes::DataType;
-        use std::sync::Arc;
 
         let src: ArrayRef = arrow::array::new_null_array(&DataType::Null, 3);
         let result =
@@ -2766,7 +2868,6 @@ mod tests {
     fn reannotate_null_array_coerces_to_int64() {
         use arrow::array::{ArrayRef, Int64Array};
         use arrow::datatypes::DataType;
-        use std::sync::Arc;
 
         let src: ArrayRef = arrow::array::new_null_array(&DataType::Null, 3);
         let result = reannotate_array(&src, &DataType::Int64).expect("Null->Int64 must succeed");
@@ -2785,7 +2886,6 @@ mod tests {
     fn reannotate_null_array_coerces_to_utf8() {
         use arrow::array::{ArrayRef, StringArray};
         use arrow::datatypes::DataType;
-        use std::sync::Arc;
 
         let src: ArrayRef = arrow::array::new_null_array(&DataType::Null, 3);
         let result = reannotate_array(&src, &DataType::Utf8).expect("Null->Utf8 must succeed");

@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Cursor;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::array::{
     Array, ArrayRef, BinaryArray, Decimal128Array, Int32Array, Int64Array, RecordBatch,
@@ -82,6 +82,7 @@ pub struct IcebergTableSinkFactory {
     name: String,
     arena: Arc<ExprArena>,
     plan: Arc<IcebergSinkPlan>,
+    shared_deletion_vectors: Arc<Mutex<SharedDeletionVectorState>>,
 }
 
 impl IcebergTableSinkFactory {
@@ -90,6 +91,7 @@ impl IcebergTableSinkFactory {
             name: input.name,
             arena: Arc::new(input.arena),
             plan: Arc::new(input.plan),
+            shared_deletion_vectors: Arc::new(Mutex::new(SharedDeletionVectorState::default())),
         })
     }
 }
@@ -271,8 +273,8 @@ impl OperatorFactory for IcebergTableSinkFactory {
         &self.name
     }
 
-    fn create(&self, _dop: i32, driver_id: i32) -> Box<dyn Operator> {
-        Box::new(self.create_async_operator(driver_id))
+    fn create(&self, dop: i32, driver_id: i32) -> Box<dyn Operator> {
+        Box::new(self.create_async_operator(dop, driver_id))
     }
 
     fn is_sink(&self) -> bool {
@@ -281,29 +283,43 @@ impl OperatorFactory for IcebergTableSinkFactory {
 }
 
 impl IcebergTableSinkFactory {
-    fn create_async_operator(&self, driver_id: i32) -> AsyncSinkOperator<IcebergTableSinkBackend> {
+    fn create_async_operator(
+        &self,
+        dop: i32,
+        driver_id: i32,
+    ) -> AsyncSinkOperator<IcebergTableSinkBackend> {
         AsyncSinkOperator::new(
             self.name.clone(),
             IcebergTableSinkBackend {
                 arena: Arc::clone(&self.arena),
                 plan: Arc::clone(&self.plan),
                 driver_id,
+                driver_count: usize::try_from(dop.max(1)).unwrap_or(1),
                 file_seq: 0,
                 runtime_state: None,
-                pending_deletion_vectors: BTreeMap::new(),
+                shared_deletion_vectors: Arc::clone(&self.shared_deletion_vectors),
+                deletion_vectors_finished: false,
             },
             config::async_sink_queue_capacity(),
         )
     }
 }
 
+#[derive(Default)]
+struct SharedDeletionVectorState {
+    pending: BTreeMap<String, crate::connector::iceberg::commit::DeletionVector>,
+    finished_drivers: usize,
+}
+
 struct IcebergTableSinkBackend {
     arena: Arc<ExprArena>,
     plan: Arc<IcebergSinkPlan>,
     driver_id: i32,
+    driver_count: usize,
     file_seq: u64,
     runtime_state: Option<RuntimeState>,
-    pending_deletion_vectors: BTreeMap<String, crate::connector::iceberg::commit::DeletionVector>,
+    shared_deletion_vectors: Arc<Mutex<SharedDeletionVectorState>>,
+    deletion_vectors_finished: bool,
 }
 
 #[async_trait::async_trait]
@@ -667,8 +683,13 @@ impl IcebergTableSinkBackend {
         let batch = self.build_file_pos_batch(&chunk, "deletion-vector")?;
         let positions_by_file = group_positions_by_file(&batch, "deletion-vector")?;
         let vectors = merge_deletion_vectors_by_file(HashMap::new(), &positions_by_file)?;
+        let mut shared = self
+            .shared_deletion_vectors
+            .lock()
+            .map_err(|e| format!("iceberg deletion-vector sink shared state lock failed: {e}"))?;
         for (referenced_data_file, dv) in vectors {
-            self.pending_deletion_vectors
+            shared
+                .pending
                 .entry(referenced_data_file)
                 .or_default()
                 .merge(&dv);
@@ -677,7 +698,21 @@ impl IcebergTableSinkBackend {
     }
 
     fn finish_deletion_vectors(&mut self) -> Result<(), String> {
-        if self.pending_deletion_vectors.is_empty() {
+        if self.deletion_vectors_finished {
+            return Ok(());
+        }
+        self.deletion_vectors_finished = true;
+        let pending_deletion_vectors = {
+            let mut shared = self.shared_deletion_vectors.lock().map_err(|e| {
+                format!("iceberg deletion-vector sink shared state lock failed: {e}")
+            })?;
+            shared.finished_drivers = shared.finished_drivers.saturating_add(1);
+            if shared.finished_drivers < self.driver_count {
+                return Ok(());
+            }
+            std::mem::take(&mut shared.pending)
+        };
+        if pending_deletion_vectors.is_empty() {
             return Ok(());
         }
         let state = self.runtime_state.clone().ok_or_else(|| {
@@ -699,10 +734,10 @@ impl IcebergTableSinkBackend {
         let existing = self.read_existing_dv_positions(
             &metadata,
             &file_io,
-            self.pending_deletion_vectors.keys().map(String::as_str),
+            pending_deletion_vectors.keys().map(String::as_str),
         )?;
         let vectors =
-            merge_existing_with_pending_deletion_vectors(existing, &self.pending_deletion_vectors);
+            merge_existing_with_pending_deletion_vectors(existing, &pending_deletion_vectors);
 
         for (referenced_data_file, dv) in vectors {
             let mut partition_report = self.referenced_data_file_partition_report(
@@ -767,7 +802,6 @@ impl IcebergTableSinkBackend {
             state.add_iceberg_writer_report(report, &metadata)?;
         }
 
-        self.pending_deletion_vectors.clear();
         Ok(())
     }
 
@@ -2320,7 +2354,7 @@ fn format_datetime(dt: chrono::NaiveDateTime) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use arrow::array::{Array, ArrayRef, Int32Array, Int64Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -2337,8 +2371,8 @@ mod tests {
     use super::{
         ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
         ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL, IcebergSinkMode, IcebergSinkPlan,
-        IcebergTableSinkBackend, IcebergTableSinkFactory, align_arrays_to_schema,
-        collect_theta_sketches_by_name, iceberg_partition_key_for_row,
+        IcebergTableSinkBackend, IcebergTableSinkFactory, SharedDeletionVectorState,
+        align_arrays_to_schema, collect_theta_sketches_by_name, iceberg_partition_key_for_row,
         iceberg_schema_from_arrow_schema, merge_deletion_vectors_by_file, row_lineage_row_id_index,
         schema_has_reserved_row_lineage_columns, unique_file_path, write_parquet_file,
         write_parquet_to_bytes,
@@ -2486,8 +2520,9 @@ mod tests {
                 transform_exprs: Vec::new(),
                 position_delete_binding: None,
             }),
+            shared_deletion_vectors: Arc::new(Mutex::new(SharedDeletionVectorState::default())),
         };
-        let op = factory.create_async_operator(0);
+        let op = factory.create_async_operator(1, 0);
 
         assert_eq!(op.name(), "ICEBERG_TABLE_SINK");
     }
@@ -2556,9 +2591,11 @@ mod tests {
             arena: Arc::new(arena),
             plan,
             driver_id: 17,
+            driver_count: 1,
             file_seq: 0,
             runtime_state: None,
-            pending_deletion_vectors: BTreeMap::new(),
+            shared_deletion_vectors: Arc::new(Mutex::new(SharedDeletionVectorState::default())),
+            deletion_vectors_finished: false,
         };
         let batch_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -2915,9 +2952,11 @@ mod tests {
             arena: Arc::new(arena),
             plan,
             driver_id: 3,
+            driver_count: 1,
             file_seq: 0,
             runtime_state: None,
-            pending_deletion_vectors: BTreeMap::new(),
+            shared_deletion_vectors: Arc::new(Mutex::new(SharedDeletionVectorState::default())),
+            deletion_vectors_finished: false,
         };
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![7, 7]))])
             .expect("record batch");
@@ -3135,9 +3174,11 @@ mod tests {
             arena: Arc::new(arena),
             plan,
             driver_id: 5,
+            driver_count: 1,
             file_seq: 0,
             runtime_state: None,
-            pending_deletion_vectors: BTreeMap::new(),
+            shared_deletion_vectors: Arc::new(Mutex::new(SharedDeletionVectorState::default())),
+            deletion_vectors_finished: false,
         };
         let batch = RecordBatch::try_new(
             source_schema,
@@ -3270,9 +3311,11 @@ mod tests {
             arena: Arc::new(arena),
             plan,
             driver_id: 9,
+            driver_count: 1,
             file_seq: 0,
             runtime_state: None,
-            pending_deletion_vectors: BTreeMap::new(),
+            shared_deletion_vectors: Arc::new(Mutex::new(SharedDeletionVectorState::default())),
+            deletion_vectors_finished: false,
         };
         let batch = RecordBatch::try_new(
             source_schema,
@@ -3443,9 +3486,11 @@ mod tests {
             arena: Arc::new(arena),
             plan,
             driver_id: 13,
+            driver_count: 1,
             file_seq: 0,
             runtime_state: None,
-            pending_deletion_vectors: BTreeMap::new(),
+            shared_deletion_vectors: Arc::new(Mutex::new(SharedDeletionVectorState::default())),
+            deletion_vectors_finished: false,
         };
         (backend, state, chunk, target_metadata)
     }
@@ -3597,6 +3642,73 @@ mod tests {
             infos.len(),
             1,
             "same referenced data file should produce one Puffin DV per sink lifecycle"
+        );
+        let reports = crate::runtime::sink_commit_wire::sink_commit_infos_to_writer_reports(
+            infos,
+            &target_metadata,
+        )
+        .expect("decode writer reports");
+        let data_file = &reports[0].file;
+        assert_eq!(data_file.referenced_data_file.as_deref(), Some(referenced));
+        assert_eq!(data_file.cardinality, Some(3));
+        assert_eq!(data_file.record_count, 3);
+    }
+
+    #[test]
+    fn deletion_vector_sink_merges_same_file_across_drivers_at_finish() {
+        let dir = tempfile::Builder::new()
+            .prefix("novarocks-iceberg-dv-multi-driver-")
+            .tempdir()
+            .expect("temp dir");
+        let table_location = dir.path().display().to_string();
+        let data_location = dir.path().join("custom-data").display().to_string();
+        let referenced = "f.parquet";
+        let finst_id = UniqueId { hi: 707, lo: 42 };
+        let (mut left, state, left_chunk, target_metadata) = build_deletion_vector_backend_chunk(
+            table_location,
+            data_location,
+            referenced,
+            vec![0, 2],
+            finst_id,
+        );
+        left.driver_count = 2;
+        let mut right = IcebergTableSinkBackend {
+            arena: Arc::clone(&left.arena),
+            plan: Arc::clone(&left.plan),
+            driver_id: 14,
+            driver_count: 2,
+            file_seq: 0,
+            runtime_state: None,
+            shared_deletion_vectors: Arc::clone(&left.shared_deletion_vectors),
+            deletion_vectors_finished: false,
+        };
+        let right_chunk = build_deletion_vector_chunk(referenced, vec![5]);
+
+        left.push_chunk_deletion_vector(&state, left_chunk)
+            .expect("buffer left deletion-vector chunk");
+        right
+            .push_chunk_deletion_vector(&state, right_chunk)
+            .expect("buffer right deletion-vector chunk");
+        left.bind_runtime_state(&state).expect("bind left state");
+        right.bind_runtime_state(&state).expect("bind right state");
+
+        crate::runtime::global_async_runtime::data_block_on(left.finish())
+            .expect("finish runtime")
+            .expect("finish first driver");
+        assert!(
+            crate::runtime::sink_commit::list(finst_id).is_empty(),
+            "first finishing driver must not publish a partial DV"
+        );
+        crate::runtime::global_async_runtime::data_block_on(right.finish())
+            .expect("finish runtime")
+            .expect("finish second driver");
+
+        let infos = crate::runtime::sink_commit::list(finst_id);
+        crate::runtime::sink_commit::unregister(finst_id);
+        assert_eq!(
+            infos.len(),
+            1,
+            "same referenced data file should produce one Puffin DV across drivers"
         );
         let reports = crate::runtime::sink_commit_wire::sink_commit_infos_to_writer_reports(
             infos,

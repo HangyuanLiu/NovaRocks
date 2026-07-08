@@ -115,6 +115,7 @@ struct RuntimeFilterPushSpec {
     filter_id: i32,
     expr_id: ExprId,
     slot_id: SlotId,
+    build_node_id: Option<i32>,
 }
 
 fn expr_slot_ref(arena: &ExprArena, expr_id: ExprId) -> Option<SlotId> {
@@ -308,7 +309,9 @@ fn filter_specs_by_output_slots(
         .iter()
         .filter(|spec| {
             let slots = expr_slot_ids(arena, spec.expr_id);
-            slots.is_empty() || slots.iter().all(|slot| output_slots.contains(slot))
+            output_slots.contains(&spec.slot_id)
+                || slots.is_empty()
+                || slots.iter().all(|slot| output_slots.contains(slot))
         })
         .cloned()
         .collect()
@@ -342,10 +345,6 @@ fn push_down_local_runtime_filters_inner(
         }
         ExecNodeKind::Values(_) => {}
         ExecNodeKind::Project(project) => {
-            if inherited.is_empty() {
-                return;
-            }
-
             let mut rewritten = Vec::new();
             for spec in inherited {
                 let Some(slot_id) = expr_slot_ref(arena, spec.expr_id) else {
@@ -444,6 +443,14 @@ fn push_down_local_runtime_filters_inner(
                 })
                 .collect();
             scan.add_runtime_filter_specs(&specs);
+            let waiting_set = filtered
+                .iter()
+                .filter_map(|spec| spec.build_node_id)
+                .chain(scan.local_rf_waiting_set().iter().copied())
+                .collect::<Vec<_>>();
+            if !waiting_set.is_empty() {
+                *scan = scan.clone().with_local_rf_waiting_set(waiting_set);
+            }
         }
         ExecNodeKind::IcebergDeltaScan(_) => {
             // delta source is a leaf; runtime filters do not apply for A1
@@ -456,9 +463,6 @@ fn push_down_local_runtime_filters_inner(
         ExecNodeKind::Aggregate(AggregateNode {
             input, group_by, ..
         }) => {
-            if inherited.is_empty() {
-                return;
-            }
             let mut group_by_slots = HashSet::new();
             for expr_id in group_by {
                 if let Some(slot_id) = expr_slot_ref(arena, *expr_id) {
@@ -480,7 +484,7 @@ fn push_down_local_runtime_filters_inner(
         ExecNodeKind::Join(JoinNode {
             left,
             right,
-            node_id: _node_id,
+            node_id,
             join_type,
             probe_keys,
             build_keys: _build_keys,
@@ -505,6 +509,7 @@ fn push_down_local_runtime_filters_inner(
                             filter_id: rf.filter_id,
                             expr_id: *expr_id,
                             slot_id: rf.probe_slot_id,
+                            build_node_id: Some(*node_id),
                         });
                     }
                 }
@@ -533,5 +538,147 @@ fn push_down_local_runtime_filters_inner(
                 push_down_local_runtime_filters_inner(input, arena, &filtered);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    use crate::exec::chunk::ChunkSchema;
+    use crate::exec::node::join::{JoinDistributionMode, JoinRuntimeFilterSpec};
+    use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanOp};
+    use crate::runtime::profile::RuntimeProfile;
+
+    use super::*;
+
+    struct DummyScanOp;
+
+    impl ScanOp for DummyScanOp {
+        fn execute_iter(
+            &self,
+            _morsel: ScanMorsel,
+            _profile: Option<RuntimeProfile>,
+            _runtime_filters: Option<&RuntimeFilterContext>,
+        ) -> Result<BoxedExecIter, String> {
+            Ok(Box::new(std::iter::empty()))
+        }
+
+        fn build_morsels(&self) -> Result<ScanMorsels, String> {
+            Ok(ScanMorsels::default())
+        }
+    }
+
+    fn int_schema_for_slot(slot_id: SlotId, name: &str) -> crate::exec::chunk::ChunkSchemaRef {
+        let schema = Schema::new(vec![Field::new(name, DataType::Int32, true)]);
+        ChunkSchema::try_ref_from_schema_and_slot_ids(&schema, &[slot_id]).expect("chunk schema")
+    }
+
+    #[test]
+    fn runtime_filter_pushdown_accepts_probe_slot_target() {
+        let mut arena = ExprArena::default();
+        let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(9)), DataType::Int32);
+        let specs = vec![RuntimeFilterPushSpec {
+            filter_id: 1,
+            expr_id,
+            slot_id: SlotId::new(3),
+            build_node_id: None,
+        }];
+        let output_slots = HashSet::from([SlotId::new(3)]);
+
+        let filtered = filter_specs_by_output_slots(&arena, &specs, &output_slots);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].filter_id, 1);
+    }
+
+    #[test]
+    fn runtime_filter_pushdown_rejects_unrelated_slot_target() {
+        let mut arena = ExprArena::default();
+        let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(9)), DataType::Int32);
+        let specs = vec![RuntimeFilterPushSpec {
+            filter_id: 1,
+            expr_id,
+            slot_id: SlotId::new(8),
+            build_node_id: None,
+        }];
+        let output_slots = HashSet::from([SlotId::new(3)]);
+
+        let filtered = filter_specs_by_output_slots(&arena, &specs, &output_slots);
+
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn runtime_filter_pushdown_traverses_project_to_join() {
+        let mut arena = ExprArena::default();
+        let probe_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(3)), DataType::Int32);
+        let build_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(8)), DataType::Int32);
+        let probe_schema = int_schema_for_slot(SlotId::new(3), "probe_key");
+        let build_schema = int_schema_for_slot(SlotId::new(8), "build_key");
+        let scan =
+            ScanNode::new(Arc::new(DummyScanOp)).with_output_chunk_schema(probe_schema.clone());
+        let build =
+            ScanNode::new(Arc::new(DummyScanOp)).with_output_chunk_schema(build_schema.clone());
+        let join = ExecNode {
+            kind: ExecNodeKind::Join(JoinNode {
+                left: Box::new(ExecNode {
+                    kind: ExecNodeKind::Scan(scan),
+                }),
+                right: Box::new(ExecNode {
+                    kind: ExecNodeKind::Scan(build),
+                }),
+                node_id: 4,
+                join_type: JoinType::Inner,
+                distribution_mode: JoinDistributionMode::Broadcast,
+                left_chunk_schema: probe_schema.clone(),
+                right_chunk_schema: build_schema.clone(),
+                join_scope_chunk_schema: probe_schema.clone(),
+                probe_keys: vec![probe_expr],
+                build_keys: vec![build_expr],
+                eq_null_safe: vec![false],
+                residual_predicate: None,
+                runtime_filters: vec![JoinRuntimeFilterSpec {
+                    filter_id: 7,
+                    expr_order: 0,
+                    probe_slot_id: SlotId::new(3),
+                    build_data_type: DataType::Int32,
+                    merge_nodes: Vec::new(),
+                    has_remote_targets: false,
+                }],
+            }),
+        };
+        let mut root = ExecNode {
+            kind: ExecNodeKind::Project(ProjectNode {
+                input: Box::new(join),
+                node_id: 5,
+                is_subordinate: false,
+                exprs: vec![probe_expr],
+                expr_slot_ids: vec![SlotId::new(3)],
+                expr_slot_schemas: None,
+                output_indices: None,
+                output_chunk_schema: probe_schema,
+            }),
+        };
+
+        push_down_local_runtime_filters(&mut root, &arena);
+
+        let ExecNodeKind::Project(project) = root.kind else {
+            panic!("expected project root");
+        };
+        let ExecNodeKind::Join(join) = project.input.kind else {
+            panic!("expected join child");
+        };
+        let ExecNodeKind::Scan(scan) = join.left.kind else {
+            panic!("expected probe scan");
+        };
+        let specs = scan.runtime_filter_specs();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].filter_id, 7);
+        assert_eq!(specs[0].slot_id, SlotId::new(3));
+        assert_eq!(specs[0].expr_id, probe_expr);
+        assert_eq!(scan.local_rf_waiting_set(), &[4]);
     }
 }

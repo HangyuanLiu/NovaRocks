@@ -293,7 +293,6 @@ impl HdfsScanOp {
             .iceberg_runtime_pruning
             .as_ref()
             .is_some_and(Self::has_iceberg_runtime_pruning_bindings)
-            && self.has_iceberg_file_pruning_metadata()
     }
 
     fn build_morsels_from_ordered_ranges(
@@ -1193,6 +1192,84 @@ mod tests {
         assert_eq!(counters.files_total, 2);
         assert_eq!(counters.files_selected, 0);
         assert_eq!(counters.files_pruned, 2);
+    }
+
+    #[test]
+    fn selected_file_runtime_file_pruning_flushes_profile_from_source() {
+        let op = Arc::new(HdfsScanOp::new(hdfs_cfg_with_two_iceberg_files_for_test()));
+        let scan = hdfs_scan_node_for_runtime_pruning_test(
+            Arc::clone(&op),
+            vec![runtime_filter_probe_spec_for_test(1, SlotId::new(3))],
+        );
+        let filter = runtime_membership_filter_for_test(1, SlotId::new(3), &[100_i32]);
+        let hub = runtime_filter_hub_for_test();
+        let profile = RuntimeProfile::new("hdfs-scan");
+        let mut source =
+            hdfs_scan_source_for_runtime_pruning_test(scan, Arc::clone(&hub), 0, profile.clone());
+        hub.publish_filters(&[], &[filter]);
+
+        let _ = source
+            .as_processor_mut()
+            .expect("scan source processor")
+            .has_output();
+
+        let common = profile.child("CommonMetrics");
+        assert_eq!(
+            common.counter_value("IcebergRuntimeFilePruning/FilesTotal"),
+            Some(2)
+        );
+        assert_eq!(
+            common.counter_value("IcebergRuntimeFilePruning/FilesSelected"),
+            Some(1)
+        );
+        assert_eq!(
+            common.counter_value("IcebergRuntimeFilePruning/FilesPruned"),
+            Some(1)
+        );
+        assert_eq!(
+            common.counter_value("IcebergRuntimeFilePruning/Unavailable"),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn missing_metadata_runtime_file_pruning_flushes_profile_from_source() {
+        let op = Arc::new(HdfsScanOp::new(
+            hdfs_cfg_with_two_iceberg_files_without_metadata_for_test(),
+        ));
+        let scan = hdfs_scan_node_for_runtime_pruning_test(
+            Arc::clone(&op),
+            vec![runtime_filter_probe_spec_for_test(1, SlotId::new(3))],
+        );
+        let filter = runtime_membership_filter_for_test(1, SlotId::new(3), &[100_i32]);
+        let hub = runtime_filter_hub_for_test();
+        let profile = RuntimeProfile::new("hdfs-scan");
+        let mut source =
+            hdfs_scan_source_for_runtime_pruning_test(scan, Arc::clone(&hub), 0, profile.clone());
+        hub.publish_filters(&[], &[filter]);
+
+        let _ = source
+            .as_processor_mut()
+            .expect("scan source processor")
+            .has_output();
+
+        let common = profile.child("CommonMetrics");
+        assert_eq!(
+            common.counter_value("IcebergRuntimeFilePruning/FilesTotal"),
+            Some(2)
+        );
+        assert_eq!(
+            common.counter_value("IcebergRuntimeFilePruning/FilesSelected"),
+            Some(2)
+        );
+        assert_eq!(
+            common.counter_value("IcebergRuntimeFilePruning/FilesPruned"),
+            Some(0)
+        );
+        assert_eq!(
+            common.counter_value("IcebergRuntimeFilePruning/Unsupported"),
+            Some(2)
+        );
     }
 
     #[test]

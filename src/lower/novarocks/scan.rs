@@ -52,7 +52,9 @@ use crate::exec::node::project::ProjectNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::exec::row_position::IcebergVirtualSpec;
 use crate::formats::FileFormatConfig;
-use crate::formats::parquet::{ParquetReadCachePolicy, ParquetScanConfig, ParquetSlotKind};
+use crate::formats::parquet::{
+    ParquetReadCachePolicy, ParquetScanConfig, ParquetSlotKind, VariantPathSpec,
+};
 use crate::fs::object_store::{ObjectStoreConfig, apply_object_store_runtime_defaults};
 use crate::fs::object_store_credentials::{ObjectStoreCredentials, ObjectStoreCredentialsSource};
 use crate::fs::scan_context::FileScanRange;
@@ -76,11 +78,6 @@ pub(crate) fn lower_scan_node(
     if !scan.dict_columns.is_empty() {
         return Err("ScanNode dict_columns are not supported by native lowering yet".to_string());
     }
-    if !scan.variant_columns.is_empty() {
-        return Err(
-            "ScanNode variant_columns are not supported by native lowering yet".to_string(),
-        );
-    }
     let table = scan
         .table
         .as_ref()
@@ -95,21 +92,38 @@ pub(crate) fn lower_scan_node(
             lower_iceberg_data_files_scan(node, scan, source, ctx, arena)
         }
         plan::scan_source::Kind::IcebergMetadataTable(source) => {
+            reject_variant_columns_for_source(scan, "IcebergMetadataTable")?;
             lower_iceberg_metadata_scan(node, scan, source, ctx, arena)
         }
         plan::scan_source::Kind::IcebergDeltaTable(source) => {
+            reject_variant_columns_for_source(scan, "IcebergDeltaTable")?;
             lower_iceberg_delta_table_scan(node, scan, source, arena)
         }
         plan::scan_source::Kind::IcebergVersionTable(_) => {
+            reject_variant_columns_for_source(scan, "IcebergVersionTable")?;
             unsupported_scan_source("IcebergVersionTable")
         }
         plan::scan_source::Kind::IcebergMvTargetState(_) => {
+            reject_variant_columns_for_source(scan, "IcebergMvTargetState")?;
             unsupported_scan_source("IcebergMvTargetState")
         }
         plan::scan_source::Kind::IcebergMvTargetLocator(_) => {
+            reject_variant_columns_for_source(scan, "IcebergMvTargetLocator")?;
             unsupported_scan_source("IcebergMvTargetLocator")
         }
     }
+}
+
+fn reject_variant_columns_for_source(
+    scan: &plan::ScanNode,
+    source_name: &str,
+) -> Result<(), String> {
+    if scan.variant_columns.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{source_name} native scan does not support variant_columns"
+    ))
 }
 
 fn lower_iceberg_data_files_scan(
@@ -124,7 +138,7 @@ fn lower_iceberg_data_files_scan(
         .table
         .as_ref()
         .ok_or_else(|| "IcebergDataFiles table missing".to_string())?;
-    let read_plan = scan_read_plan(scan, table, output_columns)?;
+    let read_plan = scan_read_plan(scan, table, &output_columns)?;
     let ranges = decode_file_scan_ranges(node.node_id, table, ctx.scan_ranges(node.node_id)?)?;
     let cache_options = CacheOptions::from_query_options(ctx.query_options())?;
     let batch_size = scan_batch_size(ctx.query_options())?;
@@ -142,7 +156,7 @@ fn lower_iceberg_data_files_scan(
         cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
         profile_label: Some(format!("native_scan_node_id={}", node.node_id)),
         iceberg_output_schema: Some(read_plan.parquet_schema.arrow_schema_ref()),
-        variant_path_columns: Vec::new(),
+        variant_path_columns: read_plan.variant_path_columns.clone(),
         query_global_dicts: Default::default(),
     };
     let object_store_config = resolve_cloud_object_store_config(&source.cloud_properties)?;
@@ -196,8 +210,8 @@ fn lower_iceberg_metadata_scan(
     arena: &mut ExprArena,
 ) -> Result<LoweredNode, String> {
     let output_columns = scan_output_columns(scan)?;
-    let layout = layout_from_output_columns(output_columns)?;
-    let output_schema = chunk_schema_from_output_columns(output_columns)?;
+    let layout = layout_from_output_columns(&output_columns)?;
+    let output_schema = chunk_schema_from_output_columns(&output_columns)?;
     let metadata_table_type = metadata_table_type(source.metadata_table_type)?;
     let ranges = decode_metadata_scan_ranges(ctx.scan_ranges(node.node_id)?)?;
     let cfg = IcebergMetadataScanConfig {
@@ -207,21 +221,17 @@ fn lower_iceberg_metadata_scan(
         load_column_stats: false,
         ranges,
         batch_size: 4096,
-        output_columns: metadata_output_columns(output_columns)?,
+        output_columns: metadata_output_columns(&output_columns)?,
         profile_label: Some(format!("native_scan_node_id={}", node.node_id)),
     };
     let predicate = lower_scan_predicate(scan, arena, &layout)?;
-    if predicate.is_some() {
-        return Err(
-            "IcebergMetadataTable native scan predicates are not supported yet".to_string(),
-        );
-    }
     let scan_node = ctx
         .connectors()?
         .create_scan_node("iceberg", ScanConfig::IcebergMetadata(cfg))?
         .with_node_id(node.node_id)
         .with_output_chunk_schema(output_schema.clone())
         .with_limit(parse_scan_limit(node.limit)?)
+        .with_conjunct_predicate(predicate)
         .with_accept_empty_scan_ranges(true);
     Ok(LoweredNode {
         node: ExecNode {
@@ -239,8 +249,8 @@ fn lower_iceberg_delta_table_scan(
     arena: &mut ExprArena,
 ) -> Result<LoweredNode, String> {
     let output_columns = scan_output_columns(scan)?;
-    let layout = layout_from_output_columns(output_columns)?;
-    let output_schema = chunk_schema_from_output_columns(output_columns)?;
+    let layout = layout_from_output_columns(&output_columns)?;
+    let output_schema = chunk_schema_from_output_columns(&output_columns)?;
     let table = source
         .table
         .as_ref()
@@ -646,11 +656,32 @@ fn build_delta_delete_side_from_payload(
     }))
 }
 
-fn scan_output_columns(scan: &plan::ScanNode) -> Result<&[common::OutputColumn], String> {
+fn scan_output_columns(scan: &plan::ScanNode) -> Result<Vec<common::OutputColumn>, String> {
     if scan.columns.is_empty() {
         return Err("ScanNode columns are empty".to_string());
     }
-    Ok(&scan.columns)
+    if scan.required_columns.is_empty() {
+        return Ok(scan.columns.clone());
+    }
+
+    let required = scan
+        .required_columns
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let output_columns = scan
+        .columns
+        .iter()
+        .filter(|column| required.contains(&column.name.to_ascii_lowercase()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if output_columns.is_empty() {
+        return Err(format!(
+            "ScanNode required_columns {:?} do not match any scan columns",
+            scan.required_columns
+        ));
+    }
+    Ok(output_columns)
 }
 
 #[derive(Clone, Debug)]
@@ -663,7 +694,14 @@ struct ScanReadPlan {
     read_columns: Vec<String>,
     read_slot_ids: Vec<SlotId>,
     slot_kinds: Vec<ParquetSlotKind>,
+    variant_path_columns: Vec<VariantPathSpec>,
     iceberg_virtual: IcebergVirtualSpec,
+}
+
+#[derive(Clone, Debug, Default)]
+struct NativeVariantPathPlan {
+    specs: Vec<VariantPathSpec>,
+    output_slot_ids: HashSet<SlotId>,
 }
 
 #[derive(Clone, Debug)]
@@ -680,7 +718,13 @@ fn scan_read_plan(
     output_columns: &[common::OutputColumn],
 ) -> Result<ScanReadPlan, String> {
     let output_layout = layout_from_output_columns(output_columns)?;
-    let output_schema = iceberg_chunk_schema_from_output_columns(table, output_columns)?;
+    let mut variant_path_plan =
+        parse_native_scan_variant_path_columns(scan, table, output_columns)?;
+    let output_schema = iceberg_chunk_schema_from_output_columns_with_variants(
+        table,
+        output_columns,
+        &variant_path_plan,
+    )?;
 
     let mut scan_columns = output_columns.to_vec();
     let mut scan_names = output_columns
@@ -696,6 +740,12 @@ fn scan_read_plan(
     let mut read_slots = HashSet::new();
     let mut iceberg_virtual = IcebergVirtualSpec::default();
     for col in output_columns {
+        if variant_path_plan
+            .output_slot_ids
+            .contains(&SlotId::new(col.column_id))
+        {
+            continue;
+        }
         if record_iceberg_virtual_column(table, col, &mut iceberg_virtual)? {
             continue;
         }
@@ -776,14 +826,41 @@ fn scan_read_plan(
         )?;
     }
 
+    ensure_native_variant_source_read_columns(
+        scan,
+        &mut variant_path_plan,
+        &mut physical_read_columns,
+        &mut read_names,
+        &mut read_slots,
+        &mut scan_slots,
+        &mut next_hidden_column_id,
+    )?;
+    ensure_virtual_only_scan_has_row_count_carrier(
+        &mut scan_columns,
+        &mut scan_names,
+        &mut scan_slots,
+        &mut physical_read_columns,
+        &mut read_names,
+        &mut read_slots,
+        &mut next_hidden_column_id,
+        &iceberg_virtual,
+    )?;
+
     let read_layout = layout_from_output_columns(&scan_columns)?;
-    let read_schema = iceberg_chunk_schema_from_output_columns(table, &scan_columns)?;
+    let read_schema = iceberg_chunk_schema_from_output_columns_with_variants(
+        table,
+        &scan_columns,
+        &variant_path_plan,
+    )?;
     let parquet_schema = iceberg_chunk_schema_from_output_columns(table, &physical_read_columns)?;
     let read_slot_ids = physical_read_columns
         .iter()
         .map(|col| SlotId::new(col.column_id))
         .collect::<Vec<_>>();
-    let slot_kinds = vec![ParquetSlotKind::Regular; physical_read_columns.len()];
+    let slot_kinds = physical_read_columns
+        .iter()
+        .map(parquet_slot_kind_from_native_column)
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(ScanReadPlan {
         output_layout,
         output_schema,
@@ -796,6 +873,7 @@ fn scan_read_plan(
             .collect(),
         read_slot_ids,
         slot_kinds,
+        variant_path_columns: variant_path_plan.specs,
         iceberg_virtual,
     })
 }
@@ -848,6 +926,309 @@ fn push_scan_column(
     }
     scan_columns.push(col);
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ensure_virtual_only_scan_has_row_count_carrier(
+    scan_columns: &mut Vec<common::OutputColumn>,
+    scan_names: &mut HashSet<String>,
+    scan_slots: &mut HashSet<u32>,
+    physical_read_columns: &mut Vec<common::OutputColumn>,
+    read_names: &mut HashSet<String>,
+    read_slots: &mut HashSet<u32>,
+    next_hidden_column_id: &mut u32,
+    iceberg_virtual: &IcebergVirtualSpec,
+) -> Result<(), String> {
+    if !physical_read_columns.is_empty() || iceberg_virtual.is_empty() {
+        return Ok(());
+    }
+    let column_id = allocate_hidden_column_id(next_hidden_column_id, scan_slots)?;
+    let column = iceberg_virtual_count_column(column_id);
+    if !scan_names.insert(column.name.clone()) {
+        return Err(format!(
+            "ScanNode duplicate read column name {}",
+            column.name
+        ));
+    }
+    if !scan_slots.insert(column.column_id) {
+        return Err(format!(
+            "ScanNode duplicate read column id {} for {}",
+            column.column_id, column.name
+        ));
+    }
+    scan_columns.push(column.clone());
+    push_physical_read_column(physical_read_columns, read_names, read_slots, column)
+}
+
+fn iceberg_virtual_count_column(column_id: u32) -> common::OutputColumn {
+    common::OutputColumn {
+        column_id,
+        name: "___count___".to_string(),
+        r#type: Some(common::TypeDesc {
+            kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
+                r#type: common::PrimitiveType::Boolean as i32,
+                len: None,
+                precision: None,
+                scale: None,
+                time_unit: None,
+            })),
+        }),
+        nullable: false,
+        is_internal: true,
+    }
+}
+
+fn parse_native_scan_variant_path_columns(
+    scan: &plan::ScanNode,
+    table: &plan::IcebergTableInfo,
+    output_columns: &[common::OutputColumn],
+) -> Result<NativeVariantPathPlan, String> {
+    if scan.variant_columns.is_empty() {
+        return Ok(NativeVariantPathPlan::default());
+    }
+    let table_def = scan
+        .table
+        .as_ref()
+        .ok_or_else(|| "ScanNode table missing".to_string())?;
+    let output_by_slot = output_columns
+        .iter()
+        .map(|col| (SlotId::new(col.column_id), col))
+        .collect::<HashMap<_, _>>();
+    let scan_by_slot = scan
+        .columns
+        .iter()
+        .map(|col| (SlotId::new(col.column_id), col))
+        .collect::<HashMap<_, _>>();
+    let mut plan = NativeVariantPathPlan::default();
+
+    for (idx, column) in scan.variant_columns.iter().enumerate() {
+        let source_slot_id = SlotId::new(column.source_column_id);
+        let output_slot_id = SlotId::new(column.synthetic_column_id);
+        if source_slot_id == output_slot_id {
+            return Err(format!(
+                "ScanNode variant_columns[{idx}] source_column_id must differ from synthetic_column_id"
+            ));
+        }
+
+        let source_name =
+            required_native_variant_path_string(idx, "source_column", &column.source_column)?;
+        let output_name =
+            required_native_variant_path_string(idx, "synthetic_column", &column.synthetic_column)?;
+        let canonical_path =
+            required_native_variant_path_string(idx, "canonical_path", &column.canonical_path)?;
+        validate_native_variant_path_column_path(idx, &canonical_path)?;
+
+        let source_scan_column = scan_by_slot.get(&source_slot_id).ok_or_else(|| {
+            format!(
+                "ScanNode variant_columns[{idx}] source_column_id={source_slot_id} is not a scan column"
+            )
+        })?;
+        if source_scan_column.name != source_name {
+            return Err(format!(
+                "ScanNode variant_columns[{idx}] source_column={source_name:?} does not match source_column_id={source_slot_id} name {:?}",
+                source_scan_column.name
+            ));
+        }
+        let source_table_column = table_def
+            .columns
+            .iter()
+            .find(|col| col.name == source_name)
+            .ok_or_else(|| {
+                format!(
+                    "ScanNode variant_columns[{idx}] source_column={source_name:?} is not in table column definitions"
+                )
+            })?;
+        let source_type = column_def_data_type(source_table_column).map_err(|err| {
+            format!(
+                "ScanNode variant_columns[{idx}] source_column={source_name:?} type error: {err}"
+            )
+        })?;
+        if !matches!(source_type, DataType::LargeBinary) {
+            return Err(format!(
+                "ScanNode variant_columns[{idx}] source_column={source_name:?} expects VARIANT/LargeBinary, got {:?}",
+                source_type
+            ));
+        }
+        let source_field_id = iceberg_schema_field_id(table, &source_name).ok_or_else(|| {
+            format!(
+                "ScanNode variant_columns[{idx}] source_column={source_name:?} is missing from Iceberg schema"
+            )
+        })?;
+
+        let output_column = output_by_slot.get(&output_slot_id).ok_or_else(|| {
+            format!(
+                "ScanNode variant_columns[{idx}] synthetic_column_id={output_slot_id} is not an output column"
+            )
+        })?;
+        if output_column.name != output_name {
+            return Err(format!(
+                "ScanNode variant_columns[{idx}] synthetic_column={output_name:?} does not match synthetic_column_id={output_slot_id} name {:?}",
+                output_column.name
+            ));
+        }
+        let output_type = output_column_data_type(output_column).map_err(|err| {
+            format!(
+                "ScanNode variant_columns[{idx}] synthetic_column={output_name:?} type error: {err}"
+            )
+        })?;
+        let requested_type_desc = column
+            .requested_type
+            .as_ref()
+            .ok_or_else(|| format!("ScanNode variant_columns[{idx}] missing requested_type"))?;
+        let requested_type = super::decode_type(requested_type_desc).map_err(|err| {
+            format!("ScanNode variant_columns[{idx}] requested_type decode failed: {err}")
+        })?;
+        if !is_supported_native_variant_path_requested_type(&requested_type) {
+            return Err(format!(
+                "ScanNode variant_columns[{idx}] unsupported requested_type {:?} for synthetic_column_id={output_slot_id}",
+                requested_type
+            ));
+        }
+        if requested_type != output_type {
+            return Err(format!(
+                "ScanNode variant_columns[{idx}] requested_type {:?} does not match synthetic_column_id={output_slot_id} type {:?}",
+                requested_type, output_type
+            ));
+        }
+        if !plan.output_slot_ids.insert(output_slot_id) {
+            return Err(format!(
+                "ScanNode duplicate variant_columns synthetic_column_id={output_slot_id}"
+            ));
+        }
+
+        plan.specs.push(VariantPathSpec {
+            source_slot_id,
+            source_read_slot_id: source_slot_id,
+            output_slot_id,
+            source_field_id: Some(source_field_id),
+            source_name: source_name.clone(),
+            output_name: output_name.clone(),
+            source_field: Field::new(source_name, source_type, source_table_column.nullable),
+            output_field: Field::new(output_name, output_type, output_column.nullable),
+            canonical_path,
+            requested_type,
+            strict: column.strict,
+        });
+    }
+
+    Ok(plan)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ensure_native_variant_source_read_columns(
+    scan: &plan::ScanNode,
+    plan: &mut NativeVariantPathPlan,
+    physical_read_columns: &mut Vec<common::OutputColumn>,
+    read_names: &mut HashSet<String>,
+    read_slots: &mut HashSet<u32>,
+    scan_slots: &mut HashSet<u32>,
+    next_hidden_column_id: &mut u32,
+) -> Result<(), String> {
+    if plan.specs.is_empty() {
+        return Ok(());
+    }
+
+    let mut reserved_slots = scan_slots.clone();
+    reserved_slots.extend(plan.specs.iter().map(|spec| spec.source_slot_id.as_u32()));
+    reserved_slots.extend(plan.specs.iter().map(|spec| spec.output_slot_id.as_u32()));
+
+    for spec in &mut plan.specs {
+        if let Some(read_col) = physical_read_columns.iter().find(|col| {
+            SlotId::new(col.column_id) == spec.source_slot_id || col.name == spec.source_name
+        }) {
+            spec.source_read_slot_id = SlotId::new(read_col.column_id);
+            continue;
+        }
+
+        let hidden_id = allocate_hidden_column_id(next_hidden_column_id, &reserved_slots)?;
+        reserved_slots.insert(hidden_id);
+        scan_slots.insert(hidden_id);
+        let source_col = output_column_from_table_def(scan, &spec.source_name, hidden_id)?;
+        push_physical_read_column(physical_read_columns, read_names, read_slots, source_col)?;
+        spec.source_read_slot_id = SlotId::new(hidden_id);
+    }
+
+    Ok(())
+}
+
+fn required_native_variant_path_string(
+    idx: usize,
+    field_name: &str,
+    value: &str,
+) -> Result<String, String> {
+    value
+        .trim()
+        .is_empty()
+        .then(|| format!("ScanNode variant_columns[{idx}] missing {field_name}"))
+        .map_or_else(|| Ok(value.trim().to_string()), Err)
+}
+
+fn validate_native_variant_path_column_path(
+    idx: usize,
+    canonical_path: &str,
+) -> Result<(), String> {
+    let parsed = crate::exec::variant::parse_variant_path(canonical_path).map_err(|err| {
+        format!("ScanNode variant_columns[{idx}] invalid canonical_path={canonical_path:?}: {err}")
+    })?;
+    if parsed.segments.is_empty() {
+        return Err(format!(
+            "ScanNode variant_columns[{idx}] canonical_path={canonical_path:?} must reference at least one object key"
+        ));
+    }
+    if parsed.segments.iter().any(|segment| {
+        !matches!(
+            segment,
+            crate::exec::variant::VariantPathSegment::ObjectKey(_)
+        )
+    }) {
+        return Err(format!(
+            "ScanNode variant_columns[{idx}] canonical_path={canonical_path:?} only supports object-key path segments"
+        ));
+    }
+    Ok(())
+}
+
+fn is_supported_native_variant_path_requested_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Boolean | DataType::Int64 | DataType::Float64 | DataType::Utf8 | DataType::Date32
+    )
+}
+
+fn column_def_data_type(column: &plan::ColumnDef) -> Result<DataType, String> {
+    let desc = column
+        .logical_type
+        .as_ref()
+        .or(column.data_type.as_ref())
+        .ok_or_else(|| format!("column {} type missing", column.name))?;
+    super::decode_type(desc)
+}
+
+fn output_column_data_type(column: &common::OutputColumn) -> Result<DataType, String> {
+    let desc = column
+        .r#type
+        .as_ref()
+        .ok_or_else(|| format!("output column {} type missing", column.name))?;
+    super::decode_type(desc)
+}
+
+fn parquet_slot_kind_from_native_column(
+    column: &common::OutputColumn,
+) -> Result<ParquetSlotKind, String> {
+    let data_type = output_column_data_type(column)?;
+    if matches!(data_type, DataType::LargeBinary) {
+        Ok(ParquetSlotKind::Variant)
+    } else {
+        Ok(ParquetSlotKind::Regular)
+    }
+}
+
+fn iceberg_schema_field_id(table: &plan::IcebergTableInfo, name: &str) -> Option<i32> {
+    table
+        .schema
+        .as_ref()
+        .and_then(|schema| schema.fields.iter().find(|field| field.name == name))
+        .map(|field| field.field_id)
 }
 
 fn record_iceberg_virtual_column(
@@ -1174,11 +1555,27 @@ fn iceberg_chunk_schema_from_output_columns(
     table: &plan::IcebergTableInfo,
     output_columns: &[common::OutputColumn],
 ) -> Result<ChunkSchemaRef, String> {
+    iceberg_chunk_schema_from_output_columns_with_variants(
+        table,
+        output_columns,
+        &NativeVariantPathPlan::default(),
+    )
+}
+
+fn iceberg_chunk_schema_from_output_columns_with_variants(
+    table: &plan::IcebergTableInfo,
+    output_columns: &[common::OutputColumn],
+    variant_path_plan: &NativeVariantPathPlan,
+) -> Result<ChunkSchemaRef, String> {
     let slot_ids = output_columns
         .iter()
         .map(|col| SlotId::new(col.column_id))
         .collect::<Vec<_>>();
-    let arrow_schema = iceberg_arrow_schema_from_output_columns(table, output_columns)?;
+    let arrow_schema = iceberg_arrow_schema_from_output_columns_with_variants(
+        table,
+        output_columns,
+        variant_path_plan,
+    )?;
     ChunkSchema::try_ref_from_schema_and_slot_ids(arrow_schema.as_ref(), &slot_ids)
 }
 
@@ -1186,9 +1583,30 @@ fn iceberg_arrow_schema_from_output_columns(
     table: &plan::IcebergTableInfo,
     output_columns: &[common::OutputColumn],
 ) -> Result<std::sync::Arc<Schema>, String> {
+    iceberg_arrow_schema_from_output_columns_with_variants(
+        table,
+        output_columns,
+        &NativeVariantPathPlan::default(),
+    )
+}
+
+fn iceberg_arrow_schema_from_output_columns_with_variants(
+    table: &plan::IcebergTableInfo,
+    output_columns: &[common::OutputColumn],
+    variant_path_plan: &NativeVariantPathPlan,
+) -> Result<std::sync::Arc<Schema>, String> {
     let descriptor = iceberg_table_descriptor(table)?;
+    let variant_output_fields = variant_path_plan
+        .specs
+        .iter()
+        .map(|spec| (spec.output_slot_id, spec.output_field.clone()))
+        .collect::<HashMap<_, _>>();
     let mut fields = Vec::with_capacity(output_columns.len());
     for col in output_columns {
+        if let Some(field) = variant_output_fields.get(&SlotId::new(col.column_id)) {
+            fields.push(field.clone());
+            continue;
+        }
         if let Some(field) = iceberg_virtual_projected_field(table, col)? {
             fields.push(field);
             continue;
@@ -1790,13 +2208,13 @@ fn unsupported_scan_source(source: &str) -> Result<LoweredNode, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use arrow::datatypes::DataType;
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
     use super::*;
-    use crate::connector::ConnectorRegistry;
+    use crate::connector::{ConnectorRegistry, ScanConnector};
     use crate::exec::node::ExecNodeKind;
     use crate::exec::node::scan::ScanMorsel;
     use crate::proto::{common, expr};
@@ -1853,6 +2271,15 @@ mod tests {
         }
     }
 
+    fn variant_table_info() -> plan::IcebergTableInfo {
+        plan::IcebergTableInfo {
+            schema: Some(plan::IcebergSchemaDef {
+                fields: vec![schema_field(101, "v")],
+            }),
+            ..table_info()
+        }
+    }
+
     fn scan_node(source: plan::scan_source::Kind) -> plan::DistributedNode {
         let columns = vec![output_column(1, "id", DataType::Int64)];
         scan_node_with(columns, Vec::new(), Vec::new(), source)
@@ -1896,6 +2323,104 @@ mod tests {
                 })),
             })),
         }
+    }
+
+    fn variant_scan_node() -> plan::DistributedNode {
+        variant_scan_node_with_source_ids(1, 1)
+    }
+
+    fn variant_scan_node_with_source_ids(
+        variant_source_column_id: u32,
+        scan_source_column_id: u32,
+    ) -> plan::DistributedNode {
+        let output_columns = vec![output_column(2, "__nr_var_v_0", DataType::Int64)];
+        let scan_columns = vec![
+            output_column(scan_source_column_id, "v", DataType::LargeBinary),
+            output_column(2, "__nr_var_v_0", DataType::Int64),
+        ];
+        plan::DistributedNode {
+            node_id: 10,
+            fragment_id: 0,
+            tuple_ids: Vec::new(),
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
+                output_columns,
+                kind: Some(plan::plan_node::Kind::Scan(plan::ScanNode {
+                    database: "db".to_string(),
+                    table: Some(plan::TableDef {
+                        name: "t".to_string(),
+                        columns: vec![
+                            column_def("v", DataType::LargeBinary),
+                            column_def("__nr_var_v_0", DataType::Int64),
+                        ],
+                        iceberg_row_lineage_metadata_columns: Vec::new(),
+                        source: Some(plan::ScanSource {
+                            kind: Some(plan::scan_source::Kind::IcebergDataFiles(
+                                plan::IcebergDataFiles {
+                                    table: Some(variant_table_info()),
+                                    files: Vec::new(),
+                                    cloud_properties: HashMap::new(),
+                                    binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
+                                },
+                            )),
+                        }),
+                    }),
+                    alias: None,
+                    columns: scan_columns,
+                    predicates: Vec::new(),
+                    required_columns: vec!["__nr_var_v_0".to_string()],
+                    dict_columns: Vec::new(),
+                    variant_columns: vec![plan::ScanVariantColumn {
+                        source_column_id: variant_source_column_id,
+                        source_column: "v".to_string(),
+                        synthetic_column_id: 2,
+                        synthetic_column: "__nr_var_v_0".to_string(),
+                        canonical_path: "$.a.b".to_string(),
+                        requested_type: Some(type_desc(&DataType::Int64)),
+                        strict: true,
+                    }],
+                    mv_rewritten_from: None,
+                })),
+            })),
+        }
+    }
+
+    #[derive(Clone)]
+    struct CapturingHdfsConnector {
+        captured: Arc<Mutex<Option<HdfsScanConfig>>>,
+    }
+
+    impl ScanConnector for CapturingHdfsConnector {
+        fn name(&self) -> &'static str {
+            "hdfs"
+        }
+
+        fn create_scan_node(
+            &self,
+            cfg: ScanConfig,
+        ) -> Result<crate::exec::node::scan::ScanNode, String> {
+            let ScanConfig::Hdfs(cfg) = cfg else {
+                return Err("capturing hdfs connector received non-HDFS config".to_string());
+            };
+            let cfg = *cfg;
+            *self.captured.lock().expect("captured hdfs config lock") = Some(cfg.clone());
+            Ok(crate::exec::node::scan::ScanNode::new(Arc::new(
+                crate::connector::hdfs::HdfsScanOp::new(cfg),
+            )))
+        }
+    }
+
+    fn capturing_hdfs_registry() -> (Arc<ConnectorRegistry>, Arc<Mutex<Option<HdfsScanConfig>>>) {
+        let captured = Arc::new(Mutex::new(None));
+        let mut registry = ConnectorRegistry::default();
+        registry.register_scan_connector(Arc::new(CapturingHdfsConnector {
+            captured: Arc::clone(&captured),
+        }));
+        (Arc::new(registry), captured)
     }
 
     fn column_ref(column_id: u32, name: &str, data_type: DataType) -> expr::Expr {
@@ -1994,6 +2519,16 @@ mod tests {
                 }],
                 delete_side: None,
             }),
+        })
+    }
+
+    fn iceberg_metadata_table_source() -> plan::scan_source::Kind {
+        plan::scan_source::Kind::IcebergMetadataTable(plan::IcebergMetadataTable {
+            table: Some(table_info()),
+            metadata_table_type: plan::IcebergMetadataTableType::Snapshots as i32,
+            serialized_table: "{}".to_string(),
+            cloud_properties: HashMap::new(),
+            metadata_payload: None,
         })
     }
 
@@ -2206,6 +2741,102 @@ mod tests {
     }
 
     #[test]
+    fn lowers_native_iceberg_scan_variant_path_columns() {
+        let node = variant_scan_node();
+        let (registry, captured_hdfs) = capturing_hdfs_registry();
+        let ctx = NodeLoweringContext::default()
+            .with_connector_registry(registry)
+            .with_scan_ranges(10, vec![file_range()]);
+        let mut arena = ExprArena::default();
+
+        let lowered = crate::lower::novarocks::lower_proto_node(&node, &mut arena, &ctx)
+            .expect("lower native scan with variant path column");
+
+        assert_eq!(lowered.output_schema.slot_ids(), &[SlotId::new(2)]);
+        let scan = match lowered.node.kind {
+            ExecNodeKind::Scan(scan) => scan,
+            ExecNodeKind::Project(project) => {
+                assert!(project.is_subordinate);
+                assert_eq!(project.output_chunk_schema.slot_ids(), &[SlotId::new(2)]);
+                let ExecNodeKind::Scan(scan) = project.input.kind else {
+                    panic!("expected project input scan");
+                };
+                scan
+            }
+            other => panic!("expected Scan or Project over Scan, got {other:?}"),
+        };
+        assert_eq!(scan.output_chunk_schema().slot_ids(), &[SlotId::new(2)]);
+
+        let hdfs_cfg = captured_hdfs
+            .lock()
+            .expect("captured hdfs config lock")
+            .clone()
+            .expect("captured hdfs config");
+        let Some(FileFormatConfig::Parquet(parquet_cfg)) = hdfs_cfg.format else {
+            panic!("expected parquet scan config");
+        };
+        assert_eq!(parquet_cfg.columns, vec!["v".to_string()]);
+        assert_eq!(parquet_cfg.chunk_schema.slot_ids(), &[SlotId::new(3)]);
+        assert_eq!(parquet_cfg.variant_path_columns.len(), 1);
+        let spec = &parquet_cfg.variant_path_columns[0];
+        assert_eq!(spec.source_slot_id, SlotId::new(1));
+        assert_eq!(spec.source_read_slot_id, SlotId::new(3));
+        assert_eq!(spec.output_slot_id, SlotId::new(2));
+        assert_eq!(spec.source_name, "v");
+        assert_eq!(spec.output_name, "__nr_var_v_0");
+        assert_eq!(spec.canonical_path, "$.a.b");
+        assert_eq!(spec.requested_type, DataType::Int64);
+        assert!(spec.strict);
+        assert_eq!(spec.source_field_id, Some(101));
+    }
+
+    #[test]
+    fn native_variant_source_hidden_slot_reserves_source_slot_id() {
+        let node = variant_scan_node_with_source_ids(3, 3);
+        let (registry, captured_hdfs) = capturing_hdfs_registry();
+        let ctx = NodeLoweringContext::default()
+            .with_connector_registry(registry)
+            .with_scan_ranges(10, vec![file_range()]);
+        let mut arena = ExprArena::default();
+
+        let lowered = crate::lower::novarocks::lower_proto_node(&node, &mut arena, &ctx)
+            .expect("lower native scan with colliding source slot");
+
+        assert_eq!(lowered.output_schema.slot_ids(), &[SlotId::new(2)]);
+        let hdfs_cfg = captured_hdfs
+            .lock()
+            .expect("captured hdfs config lock")
+            .clone()
+            .expect("captured hdfs config");
+        let Some(FileFormatConfig::Parquet(parquet_cfg)) = hdfs_cfg.format else {
+            panic!("expected parquet scan config");
+        };
+        assert_eq!(parquet_cfg.chunk_schema.slot_ids(), &[SlotId::new(4)]);
+        let spec = &parquet_cfg.variant_path_columns[0];
+        assert_eq!(spec.source_slot_id, SlotId::new(3));
+        assert_eq!(spec.source_read_slot_id, SlotId::new(4));
+        assert_ne!(spec.source_read_slot_id, spec.source_slot_id);
+    }
+
+    #[test]
+    fn rejects_native_variant_source_id_name_mismatch() {
+        let node = variant_scan_node_with_source_ids(4, 3);
+        let (registry, _) = capturing_hdfs_registry();
+        let ctx = NodeLoweringContext::default()
+            .with_connector_registry(registry)
+            .with_scan_ranges(10, vec![file_range()]);
+        let mut arena = ExprArena::default();
+
+        let err = crate::lower::novarocks::lower_proto_node(&node, &mut arena, &ctx)
+            .expect_err("reject source id/name drift");
+
+        assert!(
+            err.contains("source_column_id=4 is not a scan column"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn lowers_iceberg_delta_table_scan_from_native_payload() {
         let node = scan_node(iceberg_delta_table_source());
         let ctx = NodeLoweringContext::default();
@@ -2259,6 +2890,30 @@ mod tests {
         };
         assert_eq!(scan.node_id, 10);
         assert_eq!(scan.output_chunk_schema.slot_ids(), &[SlotId::new(1)]);
+    }
+
+    #[test]
+    fn lowers_iceberg_metadata_scan_predicate_to_scan_conjunct() {
+        let node = scan_node_with(
+            vec![output_column(1, "snapshot_id", DataType::Int64)],
+            vec![greater_than(
+                column_ref(1, "snapshot_id", DataType::Int64),
+                int_literal(0),
+            )],
+            Vec::new(),
+            iceberg_metadata_table_source(),
+        );
+        let ctx = NodeLoweringContext::default()
+            .with_connector_registry(Arc::new(ConnectorRegistry::default()))
+            .with_scan_ranges(10, vec![file_range()]);
+        let mut arena = ExprArena::default();
+
+        let lowered = crate::lower::novarocks::lower_proto_node(&node, &mut arena, &ctx)
+            .expect("lower metadata scan with predicate");
+        let ExecNodeKind::Scan(scan) = lowered.node.kind else {
+            panic!("expected Scan");
+        };
+        assert!(scan.conjunct_predicate().is_some());
     }
 
     #[test]
@@ -2341,6 +2996,55 @@ mod tests {
         assert_eq!(virtual_spec.row_pos_slot, Some(SlotId::new(3)));
         assert_eq!(virtual_spec.row_id_slot, Some(SlotId::new(4)));
         assert_eq!(virtual_spec.last_updated_seq_slot, Some(SlotId::new(5)));
+    }
+
+    #[test]
+    fn iceberg_virtual_only_scan_reads_count_carrier_and_projects_outputs() {
+        let node = scan_node_with(
+            vec![output_column(4, "_row_id", DataType::Int64)],
+            Vec::new(),
+            Vec::new(),
+            plan::scan_source::Kind::IcebergDataFiles(plan::IcebergDataFiles {
+                table: Some(table_info()),
+                files: Vec::new(),
+                cloud_properties: HashMap::new(),
+                binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
+            }),
+        );
+        let (registry, captured) = capturing_hdfs_registry();
+        let ctx = NodeLoweringContext::default()
+            .with_connector_registry(registry)
+            .with_scan_ranges(10, vec![file_range()]);
+        let mut arena = ExprArena::default();
+        let lowered = crate::lower::novarocks::lower_proto_node(&node, &mut arena, &ctx)
+            .expect("lower virtual-only native scan");
+
+        assert_eq!(lowered.output_schema.slot_ids(), &[SlotId::new(4)]);
+        let ExecNodeKind::Project(project) = lowered.node.kind else {
+            panic!("expected scan wrapper project");
+        };
+        assert!(project.is_subordinate);
+        assert_eq!(project.output_chunk_schema.slot_ids(), &[SlotId::new(4)]);
+        let ExecNodeKind::Scan(scan) = project.input.kind else {
+            panic!("expected project input scan");
+        };
+        assert_eq!(
+            scan.output_chunk_schema().slot_ids(),
+            &[SlotId::new(4), SlotId::new(5)]
+        );
+        let virtual_spec = scan.iceberg_virtual().expect("iceberg virtual spec");
+        assert_eq!(virtual_spec.row_id_slot, Some(SlotId::new(4)));
+
+        let cfg = captured
+            .lock()
+            .expect("captured hdfs config lock")
+            .clone()
+            .expect("captured hdfs config");
+        let Some(FileFormatConfig::Parquet(parquet_cfg)) = cfg.format else {
+            panic!("expected parquet scan config");
+        };
+        assert_eq!(parquet_cfg.columns, ["___count___".to_string()]);
+        assert_eq!(parquet_cfg.chunk_schema.slot_ids(), &[SlotId::new(5)]);
     }
 
     #[test]
