@@ -16,8 +16,8 @@ use arrow::datatypes::{DataType, TimeUnit};
 use iceberg::spec::Schema;
 
 use crate::connector::iceberg::catalog::registry::{IcebergCatalogEntry, IcebergCatalogRegistry};
-use crate::connector::starrocks::table::model::IcebergTableRef;
 use crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin;
+use crate::engine::mv::table_ref::IcebergTableRef;
 use crate::meta::repository::mv::StoredMvDefinition;
 use crate::meta::repository::mv_contract::MvSchemaContract;
 use crate::sql::catalog::{
@@ -302,8 +302,8 @@ impl IcebergMvRewriteContext {
         &self,
     ) -> Result<
         (
-            crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
-            crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+            crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
+            crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
         ),
         String,
     > {
@@ -323,7 +323,7 @@ impl IcebergMvRewriteContext {
             query.clone()
         };
         let aggregate_calls =
-            crate::connector::starrocks::table::aggregate_sql_calls::extract_aggregate_sql_calls(
+            crate::engine::mv::agg_state::aggregate_sql_calls::extract_aggregate_sql_calls(
                 &aggregate_query,
             )
             .map_err(|e| format!("extract aggregate calls for execution layout: {e}"))?;
@@ -356,11 +356,11 @@ impl IcebergMvRewriteContext {
         let aggregate_input_types =
             aggregate_input_types_from_schema_contract(&aggregate_calls, &self.schema_contract)?;
         let layout =
-            crate::connector::starrocks::table::mv_agg_state::build_aggregate_mv_layout_with_input_types(
-            &aggregate_calls,
-            &output_columns,
-            &aggregate_input_types,
-        )?;
+            crate::engine::mv::agg_state::mv_agg_state::build_aggregate_mv_layout_with_input_types(
+                &aggregate_calls,
+                &output_columns,
+                &aggregate_input_types,
+            )?;
         Ok((aggregate_calls, layout))
     }
 }
@@ -399,10 +399,10 @@ fn first_union_branch_query(
 }
 
 fn aggregate_input_types_from_schema_contract(
-    calls: &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
+    calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
     contract: &MvSchemaContract,
 ) -> Result<Vec<Option<DataType>>, String> {
-    use crate::connector::starrocks::table::mv_shape::{AggregateInput, VisibleAggregateOutput};
+    use crate::engine::mv::agg_state::mv_shape::{AggregateInput, VisibleAggregateOutput};
 
     let mut input_types = vec![None; calls.aggregates.len()];
     for (aggregate_index, aggregate) in calls.aggregates.iter().enumerate() {
@@ -437,9 +437,9 @@ fn aggregate_input_types_from_schema_contract(
 }
 
 fn aggregate_input_cast_type(
-    input: &crate::connector::starrocks::table::mv_shape::AggregateInput,
+    input: &crate::engine::mv::agg_state::mv_shape::AggregateInput,
 ) -> Result<Option<DataType>, String> {
-    let crate::connector::starrocks::table::mv_shape::AggregateInput::Expr(expr) = input else {
+    let crate::engine::mv::agg_state::mv_shape::AggregateInput::Expr(expr) = input else {
         return Ok(None);
     };
     explicit_cast_type(expr)
@@ -1468,8 +1468,8 @@ pub(crate) mod tests_support {
 
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
-    use crate::connector::starrocks::table::model::IcebergTableRef;
     use crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin;
+    use crate::engine::mv::table_ref::IcebergTableRef;
     use crate::meta::repository::mv::StoredMvDefinition;
     use crate::meta::repository::mv_contract::{
         ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
@@ -1675,8 +1675,8 @@ mod tests {
 
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
-    use crate::connector::starrocks::table::model::IcebergTableRef;
     use crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin;
+    use crate::engine::mv::table_ref::IcebergTableRef;
     use crate::meta::repository::mv_contract::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource, BRANCH_ID_COLUMN_NAME, BranchIdColumnContract, BranchUnionContract,

@@ -1,4 +1,4 @@
-use super::mv_shape::IncrementalMvShape;
+use crate::engine::mv::agg_state::mv_shape::IncrementalMvShape;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MvApplyPolicy {
@@ -46,7 +46,7 @@ pub(crate) fn apply_policy_for_change(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::starrocks::table::mv_shape::{
+    use crate::engine::mv::agg_state::mv_shape::{
         AggregateCallShape, AggregateFunctionKind, AggregateInput, AggregateMvShape,
         IncrementalMvShape, JoinProjectionFilterMvShape, ProjectionFilterMvShape,
     };

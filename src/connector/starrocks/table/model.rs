@@ -1,3 +1,6 @@
+#[cfg(test)]
+use crate::engine::mv::table_ref::IcebergTableRef;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct StarRocksTableSnapshot {
     pub global: StarRocksGlobalMeta,
@@ -57,19 +60,6 @@ pub(crate) enum StarRocksTableKind {
 pub(crate) enum StarRocksMvRefreshMode {
     #[default]
     DeferredManual,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub(crate) struct IcebergTableRef {
-    pub catalog: String,
-    pub namespace: String,
-    pub table: String,
-}
-
-impl IcebergTableRef {
-    pub(crate) fn fqn(&self) -> String {
-        format!("{}.{}.{}", self.catalog, self.namespace, self.table)
-    }
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
-use crate::connector::starrocks::table::model::IcebergTableRef;
 use crate::engine::mv::apply_key::ApplyKeyValueType;
+use crate::engine::mv::table_ref::IcebergTableRef;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RewriteEvidence {

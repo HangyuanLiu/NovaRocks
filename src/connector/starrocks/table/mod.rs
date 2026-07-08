@@ -6,7 +6,6 @@
 //!
 //! Files will be added incrementally by the next tasks in this plan.
 
-pub(crate) mod aggregate_sql_calls;
 pub(crate) mod backend;
 pub(crate) mod catalog;
 pub(crate) mod config;
@@ -17,16 +16,13 @@ pub(crate) mod ivm_delta_aggregate;
 pub(crate) mod ivm_delta_source;
 pub(crate) mod ivm_row_identity;
 pub(crate) mod model;
-pub(crate) mod mv_agg_state;
 pub(crate) mod mv_apply_policy;
 pub(crate) mod mv_ddl;
 pub(crate) mod mv_refresh;
 pub(crate) mod mv_refresh_strategy;
-pub(crate) mod mv_shape;
 pub(crate) mod refresh_pin;
 pub(crate) mod scan_planner;
 pub(crate) mod schema_adapter;
-pub(crate) mod state_codec;
 pub(crate) mod txn;
 
 pub(crate) use catalog::{

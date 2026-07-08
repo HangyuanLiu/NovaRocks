@@ -21,7 +21,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, BinaryBuilder, Int64Builder};
 use arrow::datatypes::DataType;
 
-use crate::connector::starrocks::table::state_codec::{
+use crate::engine::mv::agg_state::state_codec::{
     KeyValue, decode_multiset_self_describing, read_key,
 };
 use crate::exec::chunk::Chunk;
@@ -147,9 +147,7 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::connector::starrocks::table::state_codec::{
-        MultisetEntry, encode_multiset, write_key_at,
-    };
+    use crate::engine::mv::agg_state::state_codec::{MultisetEntry, encode_multiset, write_key_at};
     use crate::exec::expr::agg::{
         HLL_REGISTERS_COUNT, estimate_cardinality_from_registers, hash_array_value_for_hll,
         update_register_from_hash,

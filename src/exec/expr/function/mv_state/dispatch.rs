@@ -110,7 +110,7 @@ fn eval_mv_group_row_id(
         .iter()
         .map(|arg| arena.eval(*arg, chunk))
         .collect::<Result<Vec<_>, _>>()?;
-    crate::connector::starrocks::table::mv_agg_state::aggregate_group_row_id_array(&columns)
+    crate::engine::mv::agg_state::mv_agg_state::aggregate_group_row_id_array(&columns)
 }
 
 static MV_STATE_FUNCTIONS: &[(&str, &str)] = &[
@@ -300,11 +300,10 @@ mod tests {
 
         let out = arena.eval(expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<StringArray>().unwrap();
-        let expected =
-            crate::connector::starrocks::table::mv_agg_state::aggregate_group_row_id_array(
-                chunk.columns(),
-            )
-            .unwrap();
+        let expected = crate::engine::mv::agg_state::mv_agg_state::aggregate_group_row_id_array(
+            chunk.columns(),
+        )
+        .unwrap();
         let expected = expected.as_any().downcast_ref::<StringArray>().unwrap();
 
         assert_eq!(out.len(), expected.len());

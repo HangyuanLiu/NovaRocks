@@ -1624,10 +1624,9 @@ mod tests {
                 "select region, count(*) as c, sum(amount) as s from ice.ns.orders group by region",
             ),
         );
-        let base_refs: Arc<[crate::connector::starrocks::table::model::IcebergTableRef]> =
-            Arc::from(vec![
-                crate::engine::mv::refresh_context::tests_support::make_ref("ice", "ns", "orders"),
-            ]);
+        let base_refs: Arc<[crate::engine::mv::table_ref::IcebergTableRef]> = Arc::from(vec![
+            crate::engine::mv::refresh_context::tests_support::make_ref("ice", "ns", "orders"),
+        ]);
         let pin = Arc::new(crate::engine::mv::refresh_context::tests_support::make_pin(
             &[("ice.ns.orders", 22, "uuid-orders")],
         ));

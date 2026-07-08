@@ -1,3 +1,4 @@
+pub(crate) mod agg_state;
 pub(crate) mod apply_key;
 pub(crate) mod dependency;
 pub(crate) mod iceberg_aggregate_state;
@@ -19,3 +20,4 @@ pub(crate) mod refresh_driver;
 pub(crate) mod refresh_property;
 pub(crate) mod schema_contract;
 pub(crate) mod stateless_rebuild;
+pub(crate) mod table_ref;

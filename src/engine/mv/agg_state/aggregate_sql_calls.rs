@@ -200,7 +200,7 @@ pub(crate) fn extract_aggregate_sql_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::starrocks::table::mv_shape::{
+    use crate::engine::mv::agg_state::mv_shape::{
         AggregateFunctionKind, AggregateInput, VisibleAggregateOutput,
     };
 

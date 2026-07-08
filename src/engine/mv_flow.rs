@@ -767,7 +767,7 @@ pub(crate) fn execute_query_for_mv_refresh_with_catalog(
 }
 
 fn normalize_incremental_mv_base_ref(
-    base_ref: &crate::connector::starrocks::table::model::IcebergTableRef,
+    base_ref: &crate::engine::mv::table_ref::IcebergTableRef,
 ) -> Result<(String, String, String), String> {
     Ok((
         normalize_identifier(&base_ref.catalog)?,
@@ -778,7 +778,7 @@ fn normalize_incremental_mv_base_ref(
 
 pub(crate) fn validate_incremental_mv_base_ref(
     query: &sqlparser::ast::Query,
-    base_ref: &crate::connector::starrocks::table::model::IcebergTableRef,
+    base_ref: &crate::engine::mv::table_ref::IcebergTableRef,
 ) -> Result<(String, String, String), String> {
     let refs = extract_three_part_table_ref_occurrences(query);
     if refs.len() != 1 {
@@ -882,8 +882,8 @@ mod tests {
         *query
     }
 
-    fn base_ref() -> crate::connector::starrocks::table::model::IcebergTableRef {
-        crate::connector::starrocks::table::model::IcebergTableRef {
+    fn base_ref() -> crate::engine::mv::table_ref::IcebergTableRef {
+        crate::engine::mv::table_ref::IcebergTableRef {
             catalog: "ice".to_string(),
             namespace: "db".to_string(),
             table: "t".to_string(),

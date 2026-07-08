@@ -4,8 +4,8 @@
 //! windows from `IcebergMvRewriteContext`. It must never fall back to the
 //! current Iceberg snapshot: the refresh pin is the read upper bound.
 
-use crate::connector::starrocks::table::model::IcebergTableRef;
 use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
+use crate::engine::mv::table_ref::IcebergTableRef;
 use crate::sql::catalog::{IcebergTableInfo, ScanSource};
 pub(crate) use crate::sql::common::ImvVersionRole;
 use crate::sql::optimizer::opt_expr::OptExpr;

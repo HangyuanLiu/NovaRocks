@@ -5,7 +5,7 @@ use arrow::array::{Array, ArrayRef, BooleanArray, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::connector::starrocks::table::mv_agg_state::{
+use crate::engine::mv::agg_state::mv_agg_state::{
     AggregateMvLayout, build_old_state_map, merge_aggregate_state_batches_with_retractions,
 };
 use crate::engine::mv::refresh_context::MvRefreshPruningLimits;
@@ -410,12 +410,12 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
-    use crate::connector::starrocks::table::ddl::starrocks_physical_column;
-    use crate::connector::starrocks::table::mv_agg_state::{
+    use crate::engine::mv::agg_state::mv_agg_state::{
         AggregateMvLayout, AggregateStateColumn, AggregateStateRole, AggregateVisibleColumn,
     };
-    use crate::connector::starrocks::table::mv_shape::AggregateFunctionKind;
-    use crate::connector::starrocks::table::state_codec::encode_count_state;
+    use crate::engine::mv::agg_state::mv_shape::AggregateFunctionKind;
+    use crate::engine::mv::agg_state::physical_column::starrocks_physical_column;
+    use crate::engine::mv::agg_state::state_codec::encode_count_state;
     use crate::sql::parser::ast::SqlType;
 
     fn chunk(batch: RecordBatch) -> crate::exec::chunk::Chunk {

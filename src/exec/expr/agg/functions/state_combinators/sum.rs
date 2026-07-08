@@ -8,7 +8,7 @@ use arrow::array::{
 };
 use arrow::datatypes::DataType;
 
-use crate::connector::starrocks::table::state_codec::{
+use crate::engine::mv::agg_state::state_codec::{
     decode_sum_decimal128, decode_sum_int64, encode_sum_decimal128, encode_sum_int64,
 };
 use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
@@ -841,7 +841,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use arrow_buffer::NullBufferBuilder;
 
-    use crate::connector::starrocks::table::state_codec::{
+    use crate::engine::mv::agg_state::state_codec::{
         decode_sum_decimal128, decode_sum_int64, encode_sum_decimal128, encode_sum_int64,
     };
     use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};

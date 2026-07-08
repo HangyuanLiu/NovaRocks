@@ -22,8 +22,8 @@ pub(crate) const JOIN_DELTA_TARGET_LOCATOR_TABLE: &str = "__nr_join_delta_target
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct JoinDeltaBranchPlan {
-    pub(crate) left_base: crate::connector::starrocks::table::model::IcebergTableRef,
-    pub(crate) right_base: crate::connector::starrocks::table::model::IcebergTableRef,
+    pub(crate) left_base: crate::engine::mv::table_ref::IcebergTableRef,
+    pub(crate) right_base: crate::engine::mv::table_ref::IcebergTableRef,
     pub(crate) left: BranchSide,
     pub(crate) right: BranchSide,
 }
@@ -39,8 +39,8 @@ impl JoinDeltaBranchPlan {
 }
 
 pub(crate) fn plan_join_delta_branches(
-    left_base: &crate::connector::starrocks::table::model::IcebergTableRef,
-    right_base: &crate::connector::starrocks::table::model::IcebergTableRef,
+    left_base: &crate::engine::mv::table_ref::IcebergTableRef,
+    right_base: &crate::engine::mv::table_ref::IcebergTableRef,
     left_window: SnapshotWindow,
     right_window: SnapshotWindow,
     left_has_changes: bool,
@@ -549,7 +549,7 @@ fn replace_branch_cte_queries(
 
 fn rewrite_branch_factor(
     factor: &mut sqlparser::ast::TableFactor,
-    base: &crate::connector::starrocks::table::model::IcebergTableRef,
+    base: &crate::engine::mv::table_ref::IcebergTableRef,
     side: BranchSide,
     alias: &str,
 ) -> Result<BranchRewrite, String> {
@@ -614,7 +614,7 @@ fn table_factor_alias(
 }
 
 fn base_table_object_name(
-    base: &crate::connector::starrocks::table::model::IcebergTableRef,
+    base: &crate::engine::mv::table_ref::IcebergTableRef,
 ) -> sqlparser::ast::ObjectName {
     sqlparser::ast::ObjectName(vec![
         sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(&base.catalog)),
@@ -624,7 +624,7 @@ fn base_table_object_name(
 }
 
 fn build_nr_ivm_delta_table_factor_for_join(
-    base: &crate::connector::starrocks::table::model::IcebergTableRef,
+    base: &crate::engine::mv::table_ref::IcebergTableRef,
     window: SnapshotWindow,
     alias: sqlparser::ast::Ident,
 ) -> sqlparser::ast::TableFactor {
@@ -721,8 +721,8 @@ fn qualified_alias(
 mod tests {
     use super::*;
 
-    fn base(name: &str) -> crate::connector::starrocks::table::model::IcebergTableRef {
-        crate::connector::starrocks::table::model::IcebergTableRef {
+    fn base(name: &str) -> crate::engine::mv::table_ref::IcebergTableRef {
+        crate::engine::mv::table_ref::IcebergTableRef {
             catalog: "ice".to_string(),
             namespace: "ns".to_string(),
             table: name.to_string(),

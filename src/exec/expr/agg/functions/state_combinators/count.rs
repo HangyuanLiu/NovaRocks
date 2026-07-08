@@ -5,7 +5,7 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, BinaryArray, BinaryBuilder, Int8Array, StructArray};
 use arrow::datatypes::DataType;
 
-use crate::connector::starrocks::table::state_codec::{decode_count_state, encode_count_state};
+use crate::engine::mv::agg_state::state_codec::{decode_count_state, encode_count_state};
 use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
 use crate::exec::node::aggregate::AggFunction;
 
@@ -383,7 +383,7 @@ mod tests {
     use arrow::array::{Array, ArrayRef, BinaryArray, Int8Array, Int64Array, StructArray};
     use arrow::datatypes::{DataType, Field};
 
-    use crate::connector::starrocks::table::state_codec::{decode_count_state, encode_count_state};
+    use crate::engine::mv::agg_state::state_codec::{decode_count_state, encode_count_state};
     use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
 

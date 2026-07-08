@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, BinaryBuilder, BooleanBuilder, Int64Array, Int64Builder};
 
-use crate::connector::starrocks::table::state_codec::{decode_count_state, encode_count_state};
+use crate::engine::mv::agg_state::state_codec::{decode_count_state, encode_count_state};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 
@@ -148,7 +148,7 @@ pub(crate) fn eval_state_all_zero_array(input: &ArrayRef) -> Result<ArrayRef, St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::starrocks::table::state_codec::{decode_count_state, encode_count_state};
+    use crate::engine::mv::agg_state::state_codec::{decode_count_state, encode_count_state};
     use arrow::array::{Array, BinaryArray, BinaryBuilder, BooleanArray, Int64Array};
     use std::sync::Arc;
 
@@ -255,10 +255,9 @@ mod tests {
 
     #[test]
     fn state_all_zero_does_not_treat_zero_visible_sum_as_empty_group() {
-        let net_zero_sum = crate::connector::starrocks::table::state_codec::encode_sum_int64(2, 0);
+        let net_zero_sum = crate::engine::mv::agg_state::state_codec::encode_sum_int64(2, 0);
         let (rows, sum) =
-            crate::connector::starrocks::table::state_codec::decode_sum_int64(&net_zero_sum)
-                .unwrap();
+            crate::engine::mv::agg_state::state_codec::decode_sum_int64(&net_zero_sum).unwrap();
         assert_eq!((rows, sum), (2, 0));
 
         assert!(!state_all_zero(&encode_count_state(2)).unwrap());
