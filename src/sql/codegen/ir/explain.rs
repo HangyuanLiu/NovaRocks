@@ -27,11 +27,10 @@ use crate::sql::planner::stats::{
 };
 use crate::sql::planner::{
     AggMode, DistributedNode, DistributedPayload, DistributedPlan, ExchangeReceiver,
-    JoinDistribution, JoinExecutionMode, PhysicalPlanStats, PlanFragment, PlannerBroadcastDecision,
-    PlannerConfidence, PlannerCostEstimate, TopNPhase, WiredRuntimeFilterBuild,
-    WiredRuntimeFilterProbe,
+    JoinDistribution, JoinExecutionMode, PartitionKind, PhysicalPlanStats, PlanFragment,
+    PlannerBroadcastDecision, PlannerConfidence, PlannerCostEstimate, TopNPhase,
+    WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
 };
-use crate::thrift::partitions;
 
 pub(crate) fn explain_distributed_plan(dp: &DistributedPlan, level: ExplainLevel) -> Vec<String> {
     explain_distributed_plan_inner(dp, level, None, None)
@@ -951,14 +950,10 @@ fn exchange_label(exchange: &ExchangeReceiver) -> String {
         ExchangeFlavor::TopNSplit { .. } => "MERGING-EXCHANGE".to_string(),
         ExchangeFlavor::CteMulticast { .. } => "EXCHANGE".to_string(),
         ExchangeFlavor::Distribution | ExchangeFlavor::LimitOffset { .. } => {
-            match exchange.partition_type {
-                partitions::TPartitionType::HASH_PARTITIONED
-                | partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED => {
-                    "HASH EXCHANGE".to_string()
-                }
-                partitions::TPartitionType::UNPARTITIONED => "GATHER".to_string(),
-                partitions::TPartitionType::RANDOM => "EXCHANGE".to_string(),
-                _ => "EXCHANGE".to_string(),
+            match exchange.partition.kind {
+                PartitionKind::Hash => "HASH EXCHANGE".to_string(),
+                PartitionKind::Unpartitioned => "GATHER".to_string(),
+                PartitionKind::Random => "EXCHANGE".to_string(),
             }
         }
     }
@@ -1696,8 +1691,7 @@ mod tests {
                 broadcast_decision: None,
             },
             payload: DistributedPayload::Exchange(ExchangeReceiver {
-                partition_type: crate::thrift::partitions::TPartitionType::UNPARTITIONED,
-                partition_exprs: vec![],
+                partition: crate::sql::planner::DataPartition::unpartitioned(),
                 source_fragment_id: 0,
                 output_columns: vec![],
                 output_qualifier: None,

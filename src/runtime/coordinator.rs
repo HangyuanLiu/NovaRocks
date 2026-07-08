@@ -44,9 +44,11 @@ use crate::runtime::write_coordinator::{
 };
 use crate::sql::analysis::cte::CteId;
 use crate::sql::codegen::{
-    FragmentEdge, FragmentEdgeKind, FragmentId, MultiFragmentBuildResult, RuntimeFilterPlanResult,
+    FragmentEdge, FragmentEdgeKind, FragmentId, LoweredFragmentEdge, MultiFragmentBuildResult,
+    RuntimeFilterPlanResult,
 };
 use crate::sql::column_id::ColumnId;
+use crate::sql::planner::{DataPartition, PartitionKind};
 use crate::thrift::data_sinks;
 use crate::thrift::partitions;
 use crate::thrift::planner;
@@ -79,6 +81,8 @@ struct CompatCteConsumer {
     partition: partitions::TDataPartition,
     output_slot_ids: Vec<i32>,
 }
+
+type FragmentEdgeKey = (FragmentId, FragmentId, i32);
 
 pub(crate) fn prepare_native_plan_sidecars(
     native_plan: &crate::sql::planner::DistributedPlan,
@@ -190,6 +194,7 @@ impl ExecutionCoordinator {
             mut fragment_results,
             root_fragment_id,
             edges,
+            lowered_edges,
             boundary_schemas: _,
             rf_plan,
         } = self.build_result;
@@ -231,7 +236,7 @@ impl ExecutionCoordinator {
                         "IcebergChangeStreamRouter"
                     }
                 },
-                e.compat_output_partition.type_,
+                partition_type_for_data_partition(&e.output_partition),
             );
         }
 
@@ -244,6 +249,7 @@ impl ExecutionCoordinator {
         }
         scheduler.fill_per_exch_num_senders(&mut plan, &edges);
         let execution_root_fragment_id = plan.root_fragment_id;
+        let compat_partition_by_edge = build_compat_partition_by_edge(&edges, lowered_edges)?;
 
         // ---------------------------------------------------------------
         // 2. Build per-edge / CTE consumer indices used for sink wiring.
@@ -303,7 +309,7 @@ impl ExecutionCoordinator {
                         .push(CompatCteConsumer {
                             fragment_id: e.target_fragment_id,
                             exchange_node_id: e.target_exchange_node_id,
-                            partition: e.compat_output_partition.clone(),
+                            partition: compat_partition_for_edge(&compat_partition_by_edge, e)?,
                             output_slot_ids: e.output_slot_ids.clone(),
                         });
                 }
@@ -457,18 +463,16 @@ impl ExecutionCoordinator {
                 let (output_sink, fragment_partition, exec_destinations) = if is_root {
                     (fr.output_sink.clone(), unpartitioned_partition(), None)
                 } else if let Some(edge) = stream_edge {
-                    let stream_sink = build_stream_sink_for_edge(edge);
+                    let compat_partition =
+                        compat_partition_for_edge(&compat_partition_by_edge, edge)?;
+                    let stream_sink = build_stream_sink_for_edge(edge, compat_partition.clone());
                     let output_sink = wrap_data_stream_sink(stream_sink);
                     let exec_destinations = placement
                         .destinations
                         .iter()
                         .map(exec_destination_from_runtime)
                         .collect();
-                    (
-                        output_sink,
-                        edge.compat_output_partition.clone(),
-                        Some(exec_destinations),
-                    )
+                    (output_sink, compat_partition, Some(exec_destinations))
                 } else if let Some((router_group_id, branch_edges)) = router_edges {
                     let template = fr
                         .output_sink
@@ -483,6 +487,7 @@ impl ExecutionCoordinator {
                     let output_sink = wrap_iceberg_change_stream_router_sink(
                         template,
                         branch_edges,
+                        &compat_partition_by_edge,
                         &plan.by_fragment,
                     )?;
                     // Router branches carry their own destinations in the sink payload.
@@ -992,6 +997,61 @@ fn unpartitioned_partition() -> partitions::TDataPartition {
     )
 }
 
+fn partition_type_for_data_partition(partition: &DataPartition) -> partitions::TPartitionType {
+    match partition.kind {
+        PartitionKind::Unpartitioned => partitions::TPartitionType::UNPARTITIONED,
+        PartitionKind::Random => partitions::TPartitionType::RANDOM,
+        PartitionKind::Hash => partitions::TPartitionType::HASH_PARTITIONED,
+    }
+}
+
+fn fragment_edge_key(edge: &FragmentEdge) -> FragmentEdgeKey {
+    (
+        edge.source_fragment_id,
+        edge.target_fragment_id,
+        edge.target_exchange_node_id,
+    )
+}
+
+fn build_compat_partition_by_edge(
+    edges: &[FragmentEdge],
+    lowered_edges: Vec<LoweredFragmentEdge>,
+) -> Result<BTreeMap<FragmentEdgeKey, partitions::TDataPartition>, String> {
+    let mut by_key = BTreeMap::new();
+    for lowered in lowered_edges {
+        let key = fragment_edge_key(&lowered.edge);
+        if by_key.insert(key, lowered.compat_partition).is_some() {
+            return Err(format!(
+                "lowered edge sidecars contain duplicate edge source={} target={} exchange={}",
+                key.0, key.1, key.2
+            ));
+        }
+    }
+    for edge in edges {
+        let key = fragment_edge_key(edge);
+        if !by_key.contains_key(&key) {
+            return Err(format!(
+                "fragment edge source={} target={} exchange={} is missing lowered compat partition",
+                key.0, key.1, key.2
+            ));
+        }
+    }
+    Ok(by_key)
+}
+
+fn compat_partition_for_edge(
+    compat_partition_by_edge: &BTreeMap<FragmentEdgeKey, partitions::TDataPartition>,
+    edge: &FragmentEdge,
+) -> Result<partitions::TDataPartition, String> {
+    let key = fragment_edge_key(edge);
+    compat_partition_by_edge.get(&key).cloned().ok_or_else(|| {
+        format!(
+            "fragment edge source={} target={} exchange={} is missing lowered compat partition",
+            key.0, key.1, key.2
+        )
+    })
+}
+
 /// Wrap a `TDataStreamSink` in a DATA_STREAM_SINK `TDataSink`.
 fn wrap_data_stream_sink(stream_sink: data_sinks::TDataStreamSink) -> data_sinks::TDataSink {
     data_sinks::TDataSink::new(
@@ -1015,10 +1075,13 @@ fn wrap_data_stream_sink(stream_sink: data_sinks::TDataStreamSink) -> data_sinks
     )
 }
 
-fn build_stream_sink_for_edge(edge: &FragmentEdge) -> data_sinks::TDataStreamSink {
+fn build_stream_sink_for_edge(
+    edge: &FragmentEdge,
+    compat_partition: partitions::TDataPartition,
+) -> data_sinks::TDataStreamSink {
     data_sinks::TDataStreamSink::new(
         edge.target_exchange_node_id,
-        edge.compat_output_partition.clone(),
+        compat_partition,
         None::<bool>,
         None::<bool>,
         None::<i32>,
@@ -1171,6 +1234,7 @@ fn group_router_edges_by_source<'a>(
 fn wrap_iceberg_change_stream_router_sink(
     template: &data_sinks::TIcebergChangeStreamRouterSink,
     branch_edges: &[&FragmentEdge],
+    compat_partition_by_edge: &BTreeMap<FragmentEdgeKey, partitions::TDataPartition>,
     placements: &BTreeMap<FragmentId, Vec<FragmentInstancePlacement>>,
 ) -> Result<data_sinks::TDataSink, String> {
     if branch_edges.is_empty() {
@@ -1208,7 +1272,7 @@ fn wrap_iceberg_change_stream_router_sink(
 
         let mut stream_sink = template_branch.stream_sink.clone();
         stream_sink.dest_node_id = edge.target_exchange_node_id;
-        stream_sink.output_partition = edge.compat_output_partition.clone();
+        stream_sink.output_partition = compat_partition_for_edge(compat_partition_by_edge, edge)?;
         let destinations = placements
             .get(&edge.target_fragment_id)
             .ok_or_else(|| {
@@ -3330,7 +3394,6 @@ mod tests {
             target_fragment_id,
             target_exchange_node_id,
             output_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            compat_output_partition: unpartitioned_partition(),
             stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
             edge_kind: FragmentEdgeKind::Stream,
             output_slot_ids: Vec::new(),
@@ -3350,7 +3413,6 @@ mod tests {
             target_fragment_id,
             target_exchange_node_id,
             output_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            compat_output_partition: unpartitioned_partition(),
             stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
             edge_kind: FragmentEdgeKind::IcebergChangeStreamRouter {
                 router_group_id,
@@ -3359,6 +3421,66 @@ mod tests {
             },
             output_slot_ids: Vec::new(),
         }
+    }
+
+    fn hash_key_expr_for_test(column_id: u32, column: &str) -> crate::sql::analysis::TypedExpr {
+        crate::sql::analysis::TypedExpr {
+            kind: crate::sql::analysis::ExprKind::ColumnRef {
+                column_id: ColumnId::new_for_test(column_id),
+                qualifier: None,
+                column: column.to_string(),
+            },
+            data_type: DataType::Int64,
+            nullable: false,
+        }
+    }
+
+    fn assert_single_slot_ref_partition_expr(
+        partition: &partitions::TDataPartition,
+        expected_slot_id: i32,
+    ) {
+        assert_eq!(
+            partition.type_,
+            partitions::TPartitionType::HASH_PARTITIONED
+        );
+        let exprs = partition
+            .partition_exprs
+            .as_ref()
+            .expect("hash partition should carry compiled partition exprs");
+        assert_eq!(exprs.len(), 1);
+        let node = exprs[0].nodes.first().expect("slot-ref expr node");
+        assert_eq!(
+            node.node_type,
+            crate::thrift::exprs::TExprNodeType::SLOT_REF
+        );
+        assert_eq!(
+            node.slot_ref.as_ref().expect("slot_ref").slot_id,
+            expected_slot_id
+        );
+    }
+
+    fn compiled_hash_partition_for_test(slot_id: i32) -> partitions::TDataPartition {
+        partitions::TDataPartition::new(
+            partitions::TPartitionType::HASH_PARTITIONED,
+            Some(vec![
+                crate::sql::codegen::expr_compiler::build_slot_ref_texpr(
+                    slot_id,
+                    1,
+                    crate::lower::compat::type_lowering::scalar_type_desc(
+                        crate::thrift::types::TPrimitiveType::BIGINT,
+                    ),
+                ),
+            ]),
+            None::<Vec<partitions::TRangePartition>>,
+            None::<Vec<partitions::TBucketProperty>>,
+        )
+    }
+
+    fn compat_partition_map_for_test(
+        edge: &FragmentEdge,
+        partition: partitions::TDataPartition,
+    ) -> BTreeMap<FragmentEdgeKey, partitions::TDataPartition> {
+        BTreeMap::from([(fragment_edge_key(edge), partition)])
     }
 
     fn empty_router_sink_for_test() -> data_sinks::TIcebergChangeStreamRouterSink {
@@ -3863,18 +3985,20 @@ mod tests {
     fn plain_stream_sink_carries_edge_output_columns() {
         let mut edge = fake_stream_edge(1, 2, 77);
         edge.output_slot_ids = vec![31, 12, 9];
+        edge.output_partition = DataPartition::hash(vec![hash_key_expr_for_test(1, "bucket")]);
 
-        let sink = build_stream_sink_for_edge(&edge);
+        let sink = build_stream_sink_for_edge(&edge, compiled_hash_partition_for_test(31));
 
         assert_eq!(sink.dest_node_id, 77);
         assert_eq!(sink.output_columns, Some(vec![31, 12, 9]));
+        assert_single_slot_ref_partition_expr(&sink.output_partition, 31);
     }
 
     #[test]
     fn plain_stream_sink_omits_empty_output_columns() {
         let edge = fake_stream_edge(1, 2, 77);
 
-        let sink = build_stream_sink_for_edge(&edge);
+        let sink = build_stream_sink_for_edge(&edge, unpartitioned_partition());
 
         assert_eq!(sink.output_columns, None);
     }
@@ -3894,12 +4018,7 @@ mod tests {
         use crate::sql::common::ChangeStreamBranchKind;
 
         let mut edge = fake_router_edge(1, 2, 77, 7, 0, ChangeStreamBranchKind::DeleteDv);
-        edge.compat_output_partition = partitions::TDataPartition::new(
-            partitions::TPartitionType::HASH_PARTITIONED,
-            None::<Vec<crate::thrift::exprs::TExpr>>,
-            None::<Vec<partitions::TRangePartition>>,
-            None::<Vec<partitions::TBucketProperty>>,
-        );
+        edge.output_partition = DataPartition::hash(vec![hash_key_expr_for_test(1, "bucket")]);
         let placeholder_partition = unpartitioned_partition();
         let template_stream_sink = data_sinks::TDataStreamSink::new(
             999,
@@ -3927,9 +4046,16 @@ mod tests {
                 fake_placement(2, 1, 201, "10.0.0.21"),
             ],
         )]);
+        let compat_partitions =
+            compat_partition_map_for_test(&edge, compiled_hash_partition_for_test(10));
 
-        let wrapped =
-            wrap_iceberg_change_stream_router_sink(&template, &[&edge], &placements).expect("wrap");
+        let wrapped = wrap_iceberg_change_stream_router_sink(
+            &template,
+            &[&edge],
+            &compat_partitions,
+            &placements,
+        )
+        .expect("wrap");
         let router = wrapped
             .iceberg_change_stream_router_sink
             .as_ref()
@@ -3947,6 +4073,7 @@ mod tests {
             branch.stream_sink.output_partition.type_,
             partitions::TPartitionType::HASH_PARTITIONED
         );
+        assert_single_slot_ref_partition_expr(&branch.stream_sink.output_partition, 10);
         assert_eq!(branch.destinations.len(), 2);
         assert_eq!(branch.destinations[0].fragment_instance_id.lo, 200);
         assert_eq!(
@@ -3967,12 +4094,7 @@ mod tests {
         use crate::sql::common::ChangeStreamBranchKind;
 
         let mut edge = fake_router_edge(1, 2, 77, 7, 0, ChangeStreamBranchKind::DeleteDv);
-        edge.compat_output_partition = partitions::TDataPartition::new(
-            partitions::TPartitionType::HASH_PARTITIONED,
-            None::<Vec<crate::thrift::exprs::TExpr>>,
-            None::<Vec<partitions::TRangePartition>>,
-            None::<Vec<partitions::TBucketProperty>>,
-        );
+        edge.output_partition = DataPartition::hash(Vec::new());
         let mut fragment = native_plan::PlanFragment {
             fragment_id: 1,
             root: None,

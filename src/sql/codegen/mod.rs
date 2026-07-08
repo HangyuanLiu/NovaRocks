@@ -90,14 +90,16 @@ pub(crate) struct FragmentEdge {
     pub source_fragment_id: FragmentId,
     pub target_fragment_id: FragmentId,
     pub target_exchange_node_id: i32,
-    #[allow(dead_code)]
-    // Planner-native semantics used by native fragment wire.
     pub output_partition: crate::sql::planner::DataPartition,
-    // Thrift projection used by compat sinks.
-    pub compat_output_partition: partitions::TDataPartition,
     pub stream_kind: FragmentStreamKind,
     pub edge_kind: FragmentEdgeKind,
     pub output_slot_ids: Vec<i32>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct LoweredFragmentEdge {
+    pub edge: FragmentEdge,
+    pub compat_partition: partitions::TDataPartition,
 }
 
 pub(crate) struct MultiFragmentBuildResult {
@@ -107,21 +109,22 @@ pub(crate) struct MultiFragmentBuildResult {
     pub root_fragment_id: FragmentId,
     /// Fragment-to-fragment data edges.
     pub edges: Vec<FragmentEdge>,
+    /// Codegen-side lowering products for edges that still feed compat thrift runtime sinks.
+    pub lowered_edges: Vec<LoweredFragmentEdge>,
     pub boundary_schemas: Vec<boundary_schema::BoundarySchemaReport>,
     /// Runtime filter planning result (populated for standalone mode).
     pub rf_plan: Option<RuntimeFilterPlanResult>,
 }
 
-/// Result of lowering runtime-filter annotations to thrift.
+/// Result of lowering runtime-filter annotations to execution wiring.
 ///
 /// Assembled by [`fragment_builder::PlanFragmentBuilder`] directly from the
 /// `RuntimeFilterDesc` / `RuntimeFilterProbe` annotations attached to the
 /// physical plan by `runtime_filter_pass`. Consumed by the execution
 /// coordinator (`setup_runtime_filter_params`).
 pub(crate) struct RuntimeFilterPlanResult {
-    /// filter_id -> RF description.
-    pub all_filters:
-        std::collections::HashMap<i32, crate::thrift::runtime_filter::TRuntimeFilterDescription>,
+    /// filter_id -> native RF descriptor for coordinator-side wiring.
+    pub all_filters: std::collections::HashMap<i32, crate::sql::planner::PlannedRuntimeFilter>,
     /// fragment_id -> build-side filter IDs in that fragment.
     pub build_side_filters: std::collections::HashMap<FragmentId, Vec<i32>>,
     /// fragment_id -> (filter_id, probe_target_node_id) for probe-side targets.

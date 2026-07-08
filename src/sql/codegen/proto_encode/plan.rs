@@ -1525,8 +1525,8 @@ fn encode_scan_node(
 
 fn encode_exchange_receiver(src: &ExchangeReceiver) -> Result<plan::ExchangeReceiver, String> {
     Ok(plan::ExchangeReceiver {
-        partition_type: encode_partition_type(src.partition_type)?,
-        partition_exprs: encode_exprs(&src.partition_exprs)?,
+        partition_type: encode_edge_partition_type(&src.partition),
+        partition_exprs: encode_exprs(&src.partition.exprs)?,
         source_fragment_id: src.source_fragment_id,
         output_columns: encode_output_columns(&src.output_columns)?,
         output_qualifier: src.output_qualifier.clone(),
@@ -2412,26 +2412,6 @@ fn encode_edge_partition_type(src: &DataPartition) -> i32 {
     }
 }
 
-fn encode_partition_type(src: crate::thrift::partitions::TPartitionType) -> Result<i32, String> {
-    use crate::thrift::partitions::TPartitionType;
-    Ok(match src {
-        TPartitionType::UNPARTITIONED => plan::PartitionType::Unpartitioned as i32,
-        TPartitionType::RANDOM => plan::PartitionType::Random as i32,
-        TPartitionType::HASH_PARTITIONED => plan::PartitionType::Hash as i32,
-        TPartitionType::RANGE_PARTITIONED => plan::PartitionType::Range as i32,
-        TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED => {
-            plan::PartitionType::BucketShuffleHash as i32
-        }
-        TPartitionType::HYBRID_HASH_PARTITIONED => plan::PartitionType::HybridHash as i32,
-        other => {
-            return Err(format!(
-                "unsupported thrift partition type {:?} for native plan encoding",
-                other
-            ));
-        }
-    })
-}
-
 fn encode_join_kind(src: JoinKind) -> i32 {
     match src {
         JoinKind::Inner => plan::JoinKind::Inner as i32,
@@ -2679,8 +2659,7 @@ mod tests {
             children: Vec::new(),
             stats: stats(),
             payload: DistributedPayload::Exchange(ExchangeReceiver {
-                partition_type: crate::thrift::partitions::TPartitionType::UNPARTITIONED,
-                partition_exprs: Vec::new(),
+                partition: DataPartition::unpartitioned(),
                 source_fragment_id: 1,
                 output_columns: target_output_columns.clone(),
                 output_qualifier: None,
@@ -2726,12 +2705,6 @@ mod tests {
                 target_fragment_id: 0,
                 target_exchange_node_id: 20,
                 output_partition: DataPartition::unpartitioned(),
-                compat_output_partition: crate::thrift::partitions::TDataPartition::new(
-                    crate::thrift::partitions::TPartitionType::UNPARTITIONED,
-                    None::<Vec<crate::thrift::exprs::TExpr>>,
-                    None::<Vec<crate::thrift::partitions::TRangePartition>>,
-                    None::<Vec<crate::thrift::partitions::TBucketProperty>>,
-                ),
                 stream_kind: FragmentStreamKind::Gather,
                 edge_kind: FragmentEdgeKind::Stream,
                 output_slot_ids: vec![1, 1],
@@ -3497,8 +3470,7 @@ mod tests {
                 children: Vec::new(),
                 stats: stats(),
                 payload: DistributedPayload::Exchange(ExchangeReceiver {
-                    partition_type: crate::thrift::partitions::TPartitionType::UNPARTITIONED,
-                    partition_exprs: Vec::new(),
+                    partition: DataPartition::unpartitioned(),
                     source_fragment_id: 1,
                     output_columns: receiver_columns,
                     output_qualifier: None,
@@ -3521,12 +3493,6 @@ mod tests {
                 target_fragment_id: 0,
                 target_exchange_node_id: 20,
                 output_partition: DataPartition::unpartitioned(),
-                compat_output_partition: crate::thrift::partitions::TDataPartition::new(
-                    crate::thrift::partitions::TPartitionType::UNPARTITIONED,
-                    None::<Vec<crate::thrift::exprs::TExpr>>,
-                    None::<Vec<crate::thrift::partitions::TRangePartition>>,
-                    None::<Vec<crate::thrift::partitions::TBucketProperty>>,
-                ),
                 stream_kind: FragmentStreamKind::Gather,
                 edge_kind: FragmentEdgeKind::Stream,
                 output_slot_ids: vec![84, 85, 999],
@@ -3729,9 +3695,7 @@ mod tests {
                         children: Vec::new(),
                         stats: stats(),
                         payload: DistributedPayload::Exchange(ExchangeReceiver {
-                            partition_type:
-                                crate::thrift::partitions::TPartitionType::UNPARTITIONED,
-                            partition_exprs: Vec::new(),
+                            partition: DataPartition::unpartitioned(),
                             source_fragment_id: 1,
                             output_columns: receiver_columns,
                             output_qualifier: None,
@@ -3753,12 +3717,6 @@ mod tests {
                 target_fragment_id: 0,
                 target_exchange_node_id: 20,
                 output_partition: DataPartition::unpartitioned(),
-                compat_output_partition: crate::thrift::partitions::TDataPartition::new(
-                    crate::thrift::partitions::TPartitionType::UNPARTITIONED,
-                    None::<Vec<crate::thrift::exprs::TExpr>>,
-                    None::<Vec<crate::thrift::partitions::TRangePartition>>,
-                    None::<Vec<crate::thrift::partitions::TBucketProperty>>,
-                ),
                 stream_kind: FragmentStreamKind::Gather,
                 edge_kind: FragmentEdgeKind::Stream,
                 output_slot_ids: vec![2, 1],
@@ -3809,9 +3767,7 @@ mod tests {
                         children: Vec::new(),
                         stats: stats(),
                         payload: DistributedPayload::Exchange(ExchangeReceiver {
-                            partition_type:
-                                crate::thrift::partitions::TPartitionType::UNPARTITIONED,
-                            partition_exprs: Vec::new(),
+                            partition: DataPartition::unpartitioned(),
                             source_fragment_id: 1,
                             output_columns: Vec::new(),
                             output_qualifier: None,
@@ -3833,12 +3789,6 @@ mod tests {
                 target_fragment_id: 0,
                 target_exchange_node_id: 20,
                 output_partition: DataPartition::unpartitioned(),
-                compat_output_partition: crate::thrift::partitions::TDataPartition::new(
-                    crate::thrift::partitions::TPartitionType::UNPARTITIONED,
-                    None::<Vec<crate::thrift::exprs::TExpr>>,
-                    None::<Vec<crate::thrift::partitions::TRangePartition>>,
-                    None::<Vec<crate::thrift::partitions::TBucketProperty>>,
-                ),
                 stream_kind: FragmentStreamKind::Gather,
                 edge_kind: FragmentEdgeKind::Stream,
                 output_slot_ids: Vec::new(),
@@ -3894,9 +3844,7 @@ mod tests {
                         children: Vec::new(),
                         stats: stats(),
                         payload: DistributedPayload::Exchange(ExchangeReceiver {
-                            partition_type:
-                                crate::thrift::partitions::TPartitionType::UNPARTITIONED,
-                            partition_exprs: Vec::new(),
+                            partition: DataPartition::unpartitioned(),
                             source_fragment_id: 1,
                             output_columns,
                             output_qualifier: None,
@@ -3918,12 +3866,6 @@ mod tests {
                 target_fragment_id: 0,
                 target_exchange_node_id: 20,
                 output_partition: DataPartition::unpartitioned(),
-                compat_output_partition: crate::thrift::partitions::TDataPartition::new(
-                    crate::thrift::partitions::TPartitionType::UNPARTITIONED,
-                    None::<Vec<crate::thrift::exprs::TExpr>>,
-                    None::<Vec<crate::thrift::partitions::TRangePartition>>,
-                    None::<Vec<crate::thrift::partitions::TBucketProperty>>,
-                ),
                 stream_kind: FragmentStreamKind::Gather,
                 edge_kind: FragmentEdgeKind::Stream,
                 output_slot_ids: vec![7],

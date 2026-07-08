@@ -3806,11 +3806,14 @@ fn nidl_d3k_native_dynamic_sink_partition_does_not_roundtrip_thrift_partition() 
     }
 
     let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/mod.rs")).unwrap();
-    if !codegen_mod.contains("pub output_partition: crate::sql::planner::DataPartition")
-        || !codegen_mod.contains("pub compat_output_partition: partitions::TDataPartition")
-    {
+    if !codegen_mod.contains("pub output_partition: crate::sql::planner::DataPartition") {
         violations.push(
-            "src/sql/codegen/mod.rs: FragmentEdge must split native output_partition from compat_output_partition"
+            "src/sql/codegen/mod.rs: FragmentEdge must carry native output_partition".to_string(),
+        );
+    }
+    if codegen_mod.contains("pub compat_output_partition: partitions::TDataPartition") {
+        violations.push(
+            "src/sql/codegen/mod.rs: FragmentEdge must no longer carry compat TDataPartition in planner IR"
                 .to_string(),
         );
     }
@@ -5292,5 +5295,65 @@ fn nidl_e1_native_mv_codecs_do_not_import_starrocks_table_modules() {
         hits.is_empty(),
         "native MV/aggregate code must import native agg_state/table_ref modules, not connector::starrocks::table helpers:\n{}",
         hits.join("\n")
+    );
+}
+
+#[test]
+fn nidl_e3_planner_ir_uses_native_partition_and_runtime_filter_types() {
+    let repo = Path::new(manifest_dir());
+    let mut violations = Vec::new();
+
+    for source in [
+        "src/sql/planner/distributed_fragment.rs",
+        "src/sql/planner/distributed_node.rs",
+        "src/sql/planner/distributed_plan_build.rs",
+        "src/sql/planner/runtime_filter.rs",
+        "src/sql/planner/write_plan.rs",
+        "src/sql/planner/plan.rs",
+    ] {
+        let text = fs::read_to_string(repo.join(source)).unwrap();
+        let text = rust_production_text_without_cfg_test(&text);
+        push_forbidden_terms(
+            &mut violations,
+            source,
+            &text,
+            &[
+                "crate::thrift",
+                "thrift::",
+                "TPartitionType",
+                "TDataPartition",
+                "TRuntimeFilterDescription",
+            ],
+            "planner-owned DistributedPlan IR must use native partition and runtime-filter types",
+        );
+    }
+
+    let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/mod.rs")).unwrap();
+    let codegen_mod = rust_production_text_without_cfg_test(&codegen_mod);
+    push_forbidden_terms(
+        &mut violations,
+        "src/sql/codegen/mod.rs",
+        &codegen_mod,
+        &[
+            "pub compat_output_partition:",
+            "crate::thrift::runtime_filter::TRuntimeFilterDescription",
+        ],
+        "codegen public IR must not expose thrift partition/RF descriptor fields",
+    );
+
+    let proto_plan = fs::read_to_string(repo.join("src/sql/codegen/proto_encode/plan.rs")).unwrap();
+    let proto_plan = rust_production_text_without_cfg_test(&proto_plan);
+    push_forbidden_terms(
+        &mut violations,
+        "src/sql/codegen/proto_encode/plan.rs",
+        &proto_plan,
+        &["crate::thrift::partitions", "TPartitionType"],
+        "native proto encoder must encode ExchangeReceiver from native DataPartition",
+    );
+
+    assert!(
+        violations.is_empty(),
+        "NIDL-E3 planner IR native-type guard failed:\n{}",
+        violations.join("\n")
     );
 }

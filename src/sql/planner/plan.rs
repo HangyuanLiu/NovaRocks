@@ -276,8 +276,7 @@ pub(crate) struct PhysicalTopNNode {
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct DistributedExchangeNode {
-    pub partition_type: crate::thrift::partitions::TPartitionType,
-    pub partition_exprs: Vec<TypedExpr>,
+    pub partition: crate::sql::planner::DataPartition,
     pub source_fragment_id: u32,
     pub output_columns: Vec<OutputColumn>,
     pub output_qualifier: Option<String>,

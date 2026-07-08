@@ -6323,15 +6323,28 @@ mysql_port = 47892
             has_rf,
             "expected a hash join thrift node with build_runtime_filters"
         );
-        // The coordinator-facing RF plan must be assembled (all_filters +
-        // build-side mapping populated; probe placed onto the scan target).
+        // The coordinator-facing RF plan must be assembled with native
+        // descriptor metadata plus build/probe placement maps.
         let rf_plan = build
             .rf_plan
             .as_ref()
             .expect("rf_plan should be Some when a join emits filters");
         assert!(
             !rf_plan.all_filters.is_empty(),
-            "all_filters must carry the lowered descriptor"
+            "all_filters must carry the native descriptor"
+        );
+        let descriptor = rf_plan
+            .all_filters
+            .values()
+            .next()
+            .expect("expected one native runtime filter descriptor");
+        assert!(
+            descriptor.build_plan_node_id >= 0,
+            "native descriptor must record the build plan node"
+        );
+        assert!(
+            !descriptor.probe_target_node_ids.is_empty(),
+            "native descriptor must record probe target plan nodes"
         );
         assert!(
             rf_plan.build_side_filters.values().any(|v| !v.is_empty()),

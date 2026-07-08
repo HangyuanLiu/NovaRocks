@@ -39,7 +39,8 @@ use crate::sql::codegen::runtime_filter_lowering::{
 };
 use crate::sql::codegen::type_infer;
 use crate::sql::codegen::{
-    FragmentBuildResult, FragmentId, FragmentOutputKind, MultiFragmentBuildResult, OutputColumn,
+    FragmentBuildResult, FragmentId, FragmentOutputKind, LoweredFragmentEdge,
+    MultiFragmentBuildResult, OutputColumn,
 };
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::ChangeStreamBranchKind;
@@ -48,7 +49,8 @@ use crate::sql::planner::optimizer_bridge::property::{
 };
 use crate::sql::planner::plan::{AggregateCall, WindowExpr};
 use crate::sql::planner::{
-    AggMode, JoinDistribution, JoinExecutionMode, OrderingSpec, TopNPhase, WiredRuntimeFilterBuild,
+    AggMode, JoinDistribution, JoinExecutionMode, OrderingSpec, PlannedRuntimeFilter, TopNPhase,
+    WiredRuntimeFilterBuild,
 };
 use crate::thrift::data_sinks;
 use crate::thrift::exprs;
@@ -74,7 +76,11 @@ pub(crate) fn lower_distributed_plan(
     state.lower_fragment_by_id(dp.root_fragment_id)?;
     state.fragment_stack.clear();
 
-    let edges = lower_fragment_edges(dp, &mut state)?;
+    let lowered_edges = lower_fragment_edges(dp, &mut state)?;
+    let edges = lowered_edges
+        .iter()
+        .map(|lowered| lowered.edge.clone())
+        .collect();
     let rf_builds = state.rf_build_targets.clone();
     let rf_probes: Vec<(i32, i32, FragmentId)> = state
         .rf_probe_targets
@@ -162,6 +168,7 @@ pub(crate) fn lower_distributed_plan(
         fragment_results,
         root_fragment_id: dp.root_fragment_id,
         edges,
+        lowered_edges,
         boundary_schemas,
         rf_plan: if state.rf_all_filters.is_empty() {
             None
@@ -731,7 +738,7 @@ fn ensure_unpartitioned(
 fn lower_fragment_edges(
     dp: &crate::sql::planner::DistributedPlan,
     state: &mut OwnedLoweringState<'_>,
-) -> Result<Vec<crate::sql::codegen::FragmentEdge>, String> {
+) -> Result<Vec<LoweredFragmentEdge>, String> {
     let fragments_by_id: BTreeMap<FragmentId, &crate::sql::planner::PlanFragment> = dp
         .fragments
         .iter()
@@ -741,6 +748,7 @@ fn lower_fragment_edges(
 
     for edge in &dp.edges {
         let mut lowered_edge = edge.clone();
+        let compat_partition;
         match edge.edge_kind {
             crate::sql::codegen::FragmentEdgeKind::Stream
             | crate::sql::codegen::FragmentEdgeKind::CteMulticast { .. } => {
@@ -761,7 +769,7 @@ fn lower_fragment_edges(
                         )
                     })?;
                 lowered_edge.output_partition = native_exchange_output_partition(exchange)?;
-                lowered_edge.compat_output_partition = lower_exchange_output_partition(
+                compat_partition = lower_exchange_compat_partition(
                     exchange,
                     &source.scope,
                     state.slot_allocator(),
@@ -816,7 +824,7 @@ fn lower_fragment_edges(
                     &route.output_partition_ordinals,
                     &format!("branch {:?} partition", route.branch_kind),
                 )?;
-                lowered_edge.compat_output_partition = compat_output_partition_for_ordinals(
+                compat_partition = compat_output_partition_for_ordinals(
                     &source.scope,
                     &source_fragment.output_columns,
                     &route.output_partition_ordinals,
@@ -836,7 +844,10 @@ fn lower_fragment_edges(
                 }
             }
         }
-        lowered_edges.push(lowered_edge);
+        lowered_edges.push(LoweredFragmentEdge {
+            edge: lowered_edge,
+            compat_partition,
+        });
     }
 
     Ok(lowered_edges)
@@ -845,33 +856,58 @@ fn lower_fragment_edges(
 fn native_exchange_output_partition(
     exchange: &super::kind::DistributedExchangeNode,
 ) -> Result<crate::sql::planner::DataPartition, String> {
-    let kind = match exchange.partition_type {
-        partitions::TPartitionType::UNPARTITIONED => {
-            crate::sql::planner::PartitionKind::Unpartitioned
-        }
-        partitions::TPartitionType::RANDOM => crate::sql::planner::PartitionKind::Random,
-        partitions::TPartitionType::HASH_PARTITIONED
-        | partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED => {
-            crate::sql::planner::PartitionKind::Hash
-        }
-        other => {
-            return Err(format!(
-                "DistributedPlan Exchange cannot encode native output partition for {:?}",
-                other
-            ));
-        }
-    };
-    if matches!(kind, crate::sql::planner::PartitionKind::Hash)
-        && exchange.partition_exprs.is_empty()
+    if matches!(
+        exchange.partition.kind,
+        crate::sql::planner::PartitionKind::Hash
+    ) && exchange.partition.exprs.is_empty()
     {
         return Err(
             "DistributedPlan HASH Exchange has no native partition expressions".to_string(),
         );
     }
-    Ok(crate::sql::planner::DataPartition {
-        kind,
-        exprs: exchange.partition_exprs.clone(),
-    })
+    Ok(exchange.partition.clone())
+}
+
+fn exchange_partition_type(
+    exchange: &super::kind::DistributedExchangeNode,
+) -> partitions::TPartitionType {
+    match exchange.partition.kind {
+        crate::sql::planner::PartitionKind::Unpartitioned => {
+            partitions::TPartitionType::UNPARTITIONED
+        }
+        crate::sql::planner::PartitionKind::Random => partitions::TPartitionType::RANDOM,
+        crate::sql::planner::PartitionKind::Hash => partitions::TPartitionType::HASH_PARTITIONED,
+    }
+}
+
+fn lower_exchange_compat_partition(
+    exchange: &super::kind::DistributedExchangeNode,
+    source_scope: &ExprScope,
+    slot_allocator: expr_compiler::SlotAllocator,
+) -> Result<partitions::TDataPartition, String> {
+    let partition_type = exchange_partition_type(exchange);
+    if partition_type != partitions::TPartitionType::HASH_PARTITIONED {
+        return Ok(partitions::TDataPartition::new(
+            partition_type,
+            None::<Vec<exprs::TExpr>>,
+            None::<Vec<partitions::TRangePartition>>,
+            None::<Vec<partitions::TBucketProperty>>,
+        ));
+    }
+    if exchange.partition.exprs.is_empty() {
+        return Err("DistributedPlan HASH Exchange has no partition expressions".to_string());
+    }
+    let mut partition_exprs = Vec::with_capacity(exchange.partition.exprs.len());
+    for expr in &exchange.partition.exprs {
+        let mut compiler = ExprCompiler::new(Rc::clone(&slot_allocator), source_scope);
+        partition_exprs.push(compiler.compile_typed(expr)?);
+    }
+    Ok(partitions::TDataPartition::new(
+        partitions::TPartitionType::HASH_PARTITIONED,
+        Some(partition_exprs),
+        None::<Vec<partitions::TRangePartition>>,
+        None::<Vec<partitions::TBucketProperty>>,
+    ))
 }
 
 fn router_route_for_edge<'a>(
@@ -924,49 +960,6 @@ fn router_route_for_edge<'a>(
                 edge.source_fragment_id, router_group_id, branch_id, branch_kind
             )
         })
-}
-
-fn lower_exchange_output_partition(
-    exchange: &super::kind::DistributedExchangeNode,
-    source_scope: &ExprScope,
-    slot_allocator: expr_compiler::SlotAllocator,
-) -> Result<partitions::TDataPartition, String> {
-    if exchange.partition_type == partitions::TPartitionType::UNPARTITIONED
-        || exchange.partition_type == partitions::TPartitionType::RANDOM
-    {
-        return Ok(partitions::TDataPartition::new(
-            exchange.partition_type,
-            None::<Vec<exprs::TExpr>>,
-            None::<Vec<partitions::TRangePartition>>,
-            None::<Vec<partitions::TBucketProperty>>,
-        ));
-    }
-
-    if exchange.partition_type != partitions::TPartitionType::HASH_PARTITIONED {
-        return Ok(partitions::TDataPartition::new(
-            exchange.partition_type,
-            None::<Vec<exprs::TExpr>>,
-            None::<Vec<partitions::TRangePartition>>,
-            None::<Vec<partitions::TBucketProperty>>,
-        ));
-    }
-
-    if exchange.partition_exprs.is_empty() {
-        return Err("DistributedPlan HASH Exchange has no partition expressions".to_string());
-    }
-
-    let mut partition_exprs = Vec::with_capacity(exchange.partition_exprs.len());
-    for expr in &exchange.partition_exprs {
-        let mut compiler = ExprCompiler::new(Rc::clone(&slot_allocator), source_scope);
-        partition_exprs.push(compiler.compile_typed(expr)?);
-    }
-
-    Ok(partitions::TDataPartition::new(
-        partitions::TPartitionType::HASH_PARTITIONED,
-        Some(partition_exprs),
-        None::<Vec<partitions::TRangePartition>>,
-        None::<Vec<partitions::TBucketProperty>>,
-    ))
 }
 
 fn lower_cte_receive_output_slot_ids(
@@ -1472,9 +1465,7 @@ pub(in crate::sql::codegen) trait LoweringStateAccess<'a> {
     fn scan_tables(&mut self) -> &mut Vec<nodes::PlannedScanTable>;
     fn fragment_stack(&self) -> &[FragmentId];
     fn rf_probe_targets(&mut self) -> &mut HashMap<i32, Vec<RfProbeTarget>>;
-    fn rf_all_filters(
-        &mut self,
-    ) -> &mut HashMap<i32, crate::thrift::runtime_filter::TRuntimeFilterDescription>;
+    fn rf_all_filters(&mut self) -> &mut HashMap<i32, PlannedRuntimeFilter>;
     fn rf_build_targets(&mut self) -> &mut Vec<(i32, i32, FragmentId)>;
     fn rf_build_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<i32>>;
     fn rf_probe_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<(i32, i32)>>;
@@ -1516,7 +1507,7 @@ pub(crate) struct OwnedLoweringState<'a> {
     next_slot_id: Rc<RefCell<i32>>,
     fragment_stack: Vec<FragmentId>,
     rf_probe_targets: HashMap<i32, Vec<RfProbeTarget>>,
-    rf_all_filters: HashMap<i32, crate::thrift::runtime_filter::TRuntimeFilterDescription>,
+    rf_all_filters: HashMap<i32, PlannedRuntimeFilter>,
     rf_build_targets: Vec<(i32, i32, FragmentId)>,
     rf_build_side_filters: HashMap<FragmentId, Vec<i32>>,
     rf_probe_side_filters: HashMap<FragmentId, Vec<(i32, i32)>>,
@@ -1666,9 +1657,7 @@ impl<'a> LoweringStateAccess<'a> for OwnedLoweringState<'a> {
         &mut self.rf_probe_targets
     }
 
-    fn rf_all_filters(
-        &mut self,
-    ) -> &mut HashMap<i32, crate::thrift::runtime_filter::TRuntimeFilterDescription> {
+    fn rf_all_filters(&mut self) -> &mut HashMap<i32, PlannedRuntimeFilter> {
         &mut self.rf_all_filters
     }
 
@@ -2051,6 +2040,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 node.children.len()
             ));
         }
+        let partition_type = exchange_partition_type(exchange);
         match &exchange.flavor {
             super::kind::ExchangeFlavor::Distribution => {
                 if exchange.output_columns.is_empty() {
@@ -2059,7 +2049,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                         plan_nodes: vec![nodes::build_exchange_node(
                             node.node_id,
                             source.tuple_ids.clone(),
-                            exchange.partition_type,
+                            partition_type,
                         )],
                         scope: source.scope,
                         tuple_ids: source.tuple_ids,
@@ -2101,7 +2091,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                         plan_nodes: vec![nodes::build_exchange_node(
                             node.node_id,
                             vec![exchange_tuple_id],
-                            exchange.partition_type,
+                            partition_type,
                         )],
                         scope,
                         tuple_ids: vec![exchange_tuple_id],
@@ -2116,7 +2106,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     plan_nodes: vec![nodes::build_limit_exchange_node(
                         node.node_id,
                         source.tuple_ids.clone(),
-                        exchange.partition_type,
+                        partition_type,
                         *limit,
                         *offset,
                     )],
@@ -2147,7 +2137,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     plan_nodes: vec![nodes::build_merging_exchange_node(
                         node.node_id,
                         source.tuple_ids.clone(),
-                        exchange.partition_type,
+                        partition_type,
                         partial_sort_info,
                         *limit,
                         *offset,
@@ -2179,7 +2169,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     plan_nodes: vec![nodes::build_exchange_node(
                         node.node_id,
                         vec![exchange_tuple_id],
-                        exchange.partition_type,
+                        partition_type,
                     )],
                     scope,
                     tuple_ids: vec![exchange_tuple_id],
@@ -3062,6 +3052,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             for target in &probe_targets {
                 target_map.insert(target.thrift_node_id, target.probe_texpr.clone());
             }
+            let probe_target_node_ids = target_map.keys().copied().collect();
 
             let desc = runtime_filter::TRuntimeFilterDescription::new(
                 filter_id,
@@ -3089,7 +3080,17 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             );
 
             descs.push(desc.clone());
-            self.state.rf_all_filters().insert(filter_id, desc);
+            self.state.rf_all_filters().insert(
+                filter_id,
+                PlannedRuntimeFilter {
+                    filter_id,
+                    build_plan_node_id: join_node_id,
+                    probe_target_node_ids,
+                    has_remote_targets,
+                    execution_mode: rf.execution_mode,
+                    expr_order: post_demote_expr_order as i32,
+                },
+            );
             self.state
                 .rf_build_targets()
                 .push((filter_id, join_node_id, join_fragment));
@@ -5703,6 +5704,26 @@ mod tests {
         PlanFragmentBuilder::build(FragmentBuildRequest::result(&dp, catalog, connectors, None))
     }
 
+    fn assert_single_slot_ref_partition_expr_for_test(
+        partition: &crate::thrift::partitions::TDataPartition,
+    ) -> i32 {
+        assert_eq!(
+            partition.type_,
+            crate::thrift::partitions::TPartitionType::HASH_PARTITIONED
+        );
+        let exprs = partition
+            .partition_exprs
+            .as_ref()
+            .expect("hash partition should carry partition exprs");
+        assert_eq!(exprs.len(), 1);
+        let node = exprs[0].nodes.first().expect("partition expr root");
+        assert_eq!(
+            node.node_type,
+            crate::thrift::exprs::TExprNodeType::SLOT_REF
+        );
+        node.slot_ref.as_ref().expect("slot ref").slot_id
+    }
+
     #[test]
     fn rf_probe_targets_retain_multiple_targets_per_filter_id() {
         use crate::sql::codegen::expr_compiler::int_literal_node;
@@ -6799,8 +6820,7 @@ mod tests {
             },
         );
         let exchange = DistributedExchangeNode {
-            partition_type: crate::thrift::partitions::TPartitionType::UNPARTITIONED,
-            partition_exprs: Vec::new(),
+            partition: crate::sql::planner::DataPartition::unpartitioned(),
             source_fragment_id: 0,
             output_columns: vec![output_col(13, "total", DataType::Int64, false)],
             output_qualifier: None,
@@ -6890,6 +6910,36 @@ mod tests {
         );
         assert_eq!(result.boundary_schemas[3].columns.len(), 1);
         assert_eq!(result.boundary_schemas[3].columns[0].name, "child_k");
+    }
+
+    #[test]
+    fn lower_distributed_plan_compiles_hash_exchange_partition_expr_sidecar() {
+        let catalog = DummyCatalog;
+        let connectors = ConnectorRegistry::new();
+        let mut dp = distributed_values_multi_fragment_plan();
+        let DistributedPayload::Exchange(exchange) = &mut dp.fragments[1].root.payload else {
+            panic!("root fragment should be exchange");
+        };
+        exchange.partition =
+            DataPartition::hash(vec![column_ref_expr(1, "child_k", DataType::Int64, false)]);
+
+        let result = super::lower_distributed_plan(&dp, &catalog, &connectors, None)
+            .expect("lower hash exchange plan");
+
+        assert_eq!(result.edges.len(), 1);
+        assert_eq!(result.lowered_edges.len(), 1);
+        assert!(matches!(
+            result.edges[0].output_partition.kind,
+            PartitionKind::Hash
+        ));
+        assert_eq!(result.edges[0].output_partition.exprs.len(), 1);
+        let slot_id = assert_single_slot_ref_partition_expr_for_test(
+            &result.lowered_edges[0].compat_partition,
+        );
+        assert!(
+            slot_id > 0,
+            "compiled hash expr should reference a materialized slot"
+        );
     }
 
     #[test]
@@ -7005,6 +7055,7 @@ mod tests {
 
         assert_eq!(result.fragment_results.len(), 2);
         assert_eq!(result.edges.len(), 1);
+        assert_eq!(result.lowered_edges.len(), 1);
         let root = result
             .fragment_results
             .iter()
@@ -7055,8 +7106,10 @@ mod tests {
         assert_eq!(*column_id, ColumnId(3));
         assert_eq!(column, "delete_id");
         assert_eq!(
-            edge.compat_output_partition.type_,
-            crate::thrift::partitions::TPartitionType::HASH_PARTITIONED
+            assert_single_slot_ref_partition_expr_for_test(
+                &result.lowered_edges[0].compat_partition
+            ),
+            3
         );
 
         let writer = result
@@ -7410,8 +7463,7 @@ mod tests {
             children: vec![],
             stats: distributed_stats(),
             payload: DistributedPayload::Exchange(DistributedExchangeNode {
-                partition_type: crate::thrift::partitions::TPartitionType::UNPARTITIONED,
-                partition_exprs: vec![],
+                partition: crate::sql::planner::DataPartition::unpartitioned(),
                 source_fragment_id: 0,
                 output_columns: output_columns.clone(),
                 output_qualifier: None,
@@ -7510,12 +7562,6 @@ mod tests {
             target_fragment_id,
             target_exchange_node_id,
             output_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            compat_output_partition: crate::thrift::partitions::TDataPartition::new(
-                crate::thrift::partitions::TPartitionType::UNPARTITIONED,
-                None::<Vec<crate::thrift::exprs::TExpr>>,
-                None::<Vec<crate::thrift::partitions::TRangePartition>>,
-                None::<Vec<crate::thrift::partitions::TBucketProperty>>,
-            ),
             stream_kind: FragmentStreamKind::Gather,
             edge_kind: FragmentEdgeKind::Stream,
             output_slot_ids: Vec::new(),
@@ -7689,8 +7735,7 @@ mod tests {
             children: vec![],
             stats: distributed_stats(),
             payload: DistributedPayload::Exchange(DistributedExchangeNode {
-                partition_type: crate::thrift::partitions::TPartitionType::UNPARTITIONED,
-                partition_exprs: vec![],
+                partition: crate::sql::planner::DataPartition::unpartitioned(),
                 source_fragment_id,
                 output_columns: Vec::new(),
                 output_qualifier: None,
