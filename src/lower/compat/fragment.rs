@@ -30,9 +30,11 @@ use crate::novarocks_connectors::ConnectorRegistry;
 use crate::common::config::debug_exec_node_output;
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
+#[cfg(feature = "compat")]
+use crate::exec::operators::OlapTableSinkFactory;
 use crate::exec::operators::{
     DataStreamSinkFactory, IcebergChangeStreamRouterSinkFactory, IcebergTableSinkFactory,
-    MultiCastDataStreamSinkFactory, NoopSinkFactory, OlapTableSinkFactory, ResultBufferSinkFactory,
+    MultiCastDataStreamSinkFactory, NoopSinkFactory, ResultBufferSinkFactory,
     SplitDataStreamSinkFactory,
 };
 use crate::exec::pipeline::executor::{
@@ -1033,37 +1035,43 @@ pub(crate) fn execute_fragment(
                 )?;
             }
             data_sinks::TDataSinkType::OLAP_TABLE_SINK => {
-                let olap_sink = sink
-                    .olap_table_sink
-                    .as_ref()
-                    .ok_or_else(|| "OLAP_TABLE_SINK missing olap_table_sink payload".to_string())?;
-                let sink_input =
-                    crate::lower::compat::sink::starrocks::lower_starrocks_sink_factory_input(
-                        olap_sink,
-                        fragment.output_exprs.as_deref(),
-                        Some(&exec_plan),
-                        Some(&lowered.layout),
-                        last_query_id,
-                        session_time_zone,
-                        fe_addr,
+                #[cfg(feature = "compat")]
+                {
+                    let olap_sink = sink.olap_table_sink.as_ref().ok_or_else(|| {
+                        "OLAP_TABLE_SINK missing olap_table_sink payload".to_string()
+                    })?;
+                    let sink_input =
+                        crate::lower::compat::sink::starrocks::lower_starrocks_sink_factory_input(
+                            olap_sink,
+                            fragment.output_exprs.as_deref(),
+                            Some(&exec_plan),
+                            Some(&lowered.layout),
+                            last_query_id,
+                            session_time_zone,
+                            fe_addr,
+                        )?;
+                    let sink_factory = OlapTableSinkFactory::try_new(sink_input)?;
+                    let _exec_timer = profiler
+                        .as_ref()
+                        .map(|p| p.scoped_timer("PipelineExecuteTime"));
+                    execute_plan_with_pipeline(
+                        exec_plan,
+                        debug_exec_node_output(),
+                        Duration::from_millis(50),
+                        Box::new(sink_factory),
+                        None,
+                        profiler.clone(),
+                        pipeline_dop,
+                        Arc::clone(&runtime_state),
+                        query_id,
+                        fe_addr.cloned(),
+                        backend_num,
                     )?;
-                let sink_factory = OlapTableSinkFactory::try_new(sink_input)?;
-                let _exec_timer = profiler
-                    .as_ref()
-                    .map(|p| p.scoped_timer("PipelineExecuteTime"));
-                execute_plan_with_pipeline(
-                    exec_plan,
-                    debug_exec_node_output(),
-                    Duration::from_millis(50),
-                    Box::new(sink_factory),
-                    None,
-                    profiler.clone(),
-                    pipeline_dop,
-                    Arc::clone(&runtime_state),
-                    query_id,
-                    fe_addr.cloned(),
-                    backend_num,
-                )?;
+                }
+                #[cfg(not(feature = "compat"))]
+                {
+                    return Err("OLAP_TABLE_SINK requires the compat feature".to_string());
+                }
             }
             other => {
                 return Err(format!(

@@ -1,4 +1,5 @@
 pub(crate) mod agg_state;
+pub(crate) mod analysis;
 pub(crate) mod apply_key;
 pub(crate) mod dependency;
 pub(crate) mod iceberg_aggregate_state;
@@ -17,6 +18,8 @@ pub(crate) mod recovery;
 pub(crate) mod refresh_context;
 pub(crate) mod refresh_contract;
 pub(crate) mod refresh_driver;
+pub(crate) mod refresh_io;
+pub(crate) mod refresh_pin;
 pub(crate) mod refresh_property;
 pub(crate) mod schema_contract;
 pub(crate) mod stateless_rebuild;

@@ -3264,6 +3264,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
         // Determine which columns to emit
         let planned_scan = match &table.source {
+            #[cfg(feature = "compat")]
             crate::sql::catalog::ScanSource::StarRocks { db_id, table_id } => {
                 let planner = state.connectors().scan_planner("starrocks")?;
                 let table_handle =
@@ -3280,6 +3281,10 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 let splits = planner
                     .plan_splits(&scan, crate::connector::scan_planning::SplitPlanningContext)?;
                 Some(crate::sql::codegen::resolve::PlannedConnectorScan { scan, splits })
+            }
+            #[cfg(not(feature = "compat"))]
+            crate::sql::catalog::ScanSource::StarRocks { .. } => {
+                return Err("StarRocks scan planning requires the compat feature".to_string());
             }
             crate::sql::catalog::ScanSource::IcebergDataFiles {
                 table: iceberg_table,

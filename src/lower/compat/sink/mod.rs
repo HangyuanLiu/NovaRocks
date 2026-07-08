@@ -16,4 +16,5 @@
 // under the License.
 
 pub(crate) mod iceberg;
+#[cfg(feature = "compat")]
 pub(crate) mod starrocks;

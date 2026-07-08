@@ -1247,6 +1247,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "compat")]
     fn starrocks_scan_ranges_use_planned_connector_scan_without_physical_layout() {
         use crate::connector::scan_planning::{ScanHandle, Split};
         use crate::connector::starrocks::table::scan_planner::{
@@ -1343,6 +1344,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "compat")]
     fn starrocks_scan_ranges_include_catalog_identity() {
         use crate::connector::scan_planning::{ScanHandle, Split};
         use crate::connector::starrocks::table::scan_planner::{

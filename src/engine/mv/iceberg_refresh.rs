@@ -31,16 +31,11 @@ use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
 use crate::connector::iceberg::operation_lifecycle::{
     operation_fact_from_commit_result, operation_fact_from_finalize_failure,
 };
-use crate::connector::starrocks::table::model::StarRocksMvStorageEngine;
-use crate::connector::starrocks::table::mv_ddl::{
+use crate::engine::mv::agg_state::mv_shape::UnionBranchKind;
+use crate::engine::mv::analysis::{
     MvAnalysis, analyze_mv_select, canonicalize_iceberg_mv_select_query, now_ms,
     output_column_to_table_column, resolve_mv_name, validate_mv_partition_columns,
 };
-use crate::connector::starrocks::table::mv_refresh::{
-    acquire_mv_refresh_lock, load_current_iceberg_base_table, parse_iceberg_table_refs,
-    run_mv_full_select_chunks_with_catalog, single_snapshot_map, single_table_uuid_map,
-};
-use crate::engine::mv::agg_state::mv_shape::UnionBranchKind;
 use crate::engine::mv::iceberg_target_apply::{
     ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_APPLY_KEY_SOURCE_BASE_ROW_ID,
     ICEBERG_MV_APPLY_KEY_SOURCE_GROUP_ROW_ID, ICEBERG_MV_APPLY_KEY_SOURCE_JOIN_ROW_KEY,
@@ -61,6 +56,10 @@ use crate::engine::mv::refresh_context::IcebergMvRefreshContext;
 use crate::engine::mv::refresh_contract::{ApplyKeyContract, ImvRefreshContract, RewriteEvidence};
 use crate::engine::mv::refresh_driver::{
     BaseSnapshotPolicy, BaseSnapshotStatus, RefreshDecision, decide_refresh,
+};
+use crate::engine::mv::refresh_io::{
+    acquire_mv_refresh_lock, load_current_iceberg_base_table, parse_iceberg_table_refs,
+    run_mv_full_select_chunks_with_catalog, single_snapshot_map, single_table_uuid_map,
 };
 use crate::engine::mv::refresh_property::{
     RefreshCapabilities, RefreshFragmentProperty, RefreshIdentity, TargetIdentity,
@@ -244,14 +243,10 @@ pub(crate) fn create_iceberg_mv(
     if let Some(pk_cols) = stmt.primary_key.as_deref() {
         match &property.identity {
             TargetIdentity::BaseRowId => {
-                let descriptor = crate::connector::starrocks::table::mv_ddl::descriptor_from_loaded(
-                    &loaded_bases[0].1,
-                );
-                crate::connector::starrocks::table::mv_ddl::validate_ivm_primary_key(
-                    pk_cols,
-                    &descriptor,
-                )
-                .map_err(|e| e.to_string())?;
+                let descriptor =
+                    crate::engine::mv::analysis::descriptor_from_loaded(&loaded_bases[0].1);
+                crate::engine::mv::analysis::validate_ivm_primary_key(pk_cols, &descriptor)
+                    .map_err(|e| e.to_string())?;
             }
             TargetIdentity::JoinRowKey(_, _) => {
                 return Err(
@@ -428,7 +423,7 @@ pub(crate) fn create_iceberg_mv(
                     select_sql: canonical_select_query.to_string(),
                     base_table_refs: base_refs.iter().map(IcebergTableRef::fqn).collect(),
                     primary_key_columns: primary_key_columns.clone(),
-                    storage_engine: StarRocksMvStorageEngine::Iceberg.as_sql_str().to_string(),
+                    storage_engine: MvStorageEngine::Iceberg.as_sql_str().to_string(),
                     target_catalog: Some(target.catalog.clone()),
                     target_namespace: Some(target.namespace.clone()),
                     target_table: Some(target.table.clone()),
@@ -1184,7 +1179,7 @@ pub(crate) fn sync_iceberg_mv_descriptor(
     refresh_paused: bool,
     refresh_interval_ms: Option<i64>,
 ) -> Result<(), String> {
-    if definition.storage_engine != StarRocksMvStorageEngine::Iceberg.as_sql_str() {
+    if definition.storage_engine != MvStorageEngine::Iceberg.as_sql_str() {
         return Ok(());
     }
     let catalog_name = definition
@@ -1334,14 +1329,14 @@ fn iceberg_aggregate_target_columns_from_resolved_query(
 fn iceberg_aggregate_target_columns_from_layout(
     layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
 ) -> Result<Vec<crate::sql::parser::ast::TableColumnDef>, String> {
-    crate::connector::starrocks::table::mv_ddl::validate_unique_aggregate_physical_column_names(
+    crate::engine::mv::analysis::validate_unique_aggregate_physical_column_names(
         &layout.physical_columns,
     )?;
-    Ok(
-        crate::connector::starrocks::table::ddl::table_columns_from_physical_columns(
-            &layout.physical_columns,
-        ),
-    )
+    Ok(layout
+        .physical_columns
+        .iter()
+        .map(|column| column.column.clone())
+        .collect())
 }
 
 fn build_aggregate_layout_from_analysis(
@@ -1406,7 +1401,7 @@ fn build_iceberg_mv_schema_contract(
     refresh_contract: &ImvRefreshContract,
     property: &RefreshFragmentProperty,
     canonical_query: &sqlparser::ast::Query,
-    analysis: &crate::connector::starrocks::table::mv_ddl::MvAnalysis,
+    analysis: &crate::engine::mv::analysis::MvAnalysis,
     loaded_bases: &[(
         IcebergTableRef,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
@@ -1476,7 +1471,7 @@ fn build_non_branch_schema_contract(
     identity: &TargetIdentity,
     query: &sqlparser::ast::Query,
     resolved_query: &crate::sql::analysis::ResolvedQuery,
-    analysis: &crate::connector::starrocks::table::mv_ddl::MvAnalysis,
+    analysis: &crate::engine::mv::analysis::MvAnalysis,
     loaded_bases: &[(
         IcebergTableRef,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
@@ -1522,7 +1517,7 @@ fn build_non_branch_contract_core(
     identity: &TargetIdentity,
     query: &sqlparser::ast::Query,
     resolved_query: &crate::sql::analysis::ResolvedQuery,
-    analysis: &crate::connector::starrocks::table::mv_ddl::MvAnalysis,
+    analysis: &crate::engine::mv::analysis::MvAnalysis,
     loaded_bases: &[(
         IcebergTableRef,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
@@ -1736,7 +1731,7 @@ fn mixed_output_contract(
 fn build_aggregate_contract_core(
     query: &sqlparser::ast::Query,
     resolved_query: &crate::sql::analysis::ResolvedQuery,
-    analysis: &crate::connector::starrocks::table::mv_ddl::MvAnalysis,
+    analysis: &crate::engine::mv::analysis::MvAnalysis,
     loaded_bases: &[(
         IcebergTableRef,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
@@ -1960,7 +1955,7 @@ fn build_join_base_contracts_and_lineage(
 fn build_branch_union_schema_contract(
     inner: &TargetIdentity,
     canonical_query: &sqlparser::ast::Query,
-    analysis: &crate::connector::starrocks::table::mv_ddl::MvAnalysis,
+    analysis: &crate::engine::mv::analysis::MvAnalysis,
     loaded_bases: &[(
         IcebergTableRef,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
@@ -2320,7 +2315,7 @@ fn target_field_id_by_column(
 }
 
 fn target_contract(
-    analysis: &crate::connector::starrocks::table::mv_ddl::MvAnalysis,
+    analysis: &crate::engine::mv::analysis::MvAnalysis,
     target: &IcebergMvTarget,
     target_loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
     actual_apply_key_field_id: i32,
@@ -2559,7 +2554,7 @@ pub(crate) fn restore_iceberg_mv_targets(state: &Arc<StandaloneState>) -> Result
         .into_iter()
         .filter(|mv| {
             mv.storage_engine
-                .eq_ignore_ascii_case(StarRocksMvStorageEngine::Iceberg.as_sql_str())
+                .eq_ignore_ascii_case(MvStorageEngine::Iceberg.as_sql_str())
         })
     {
         let target = IcebergMvTarget {
@@ -2705,7 +2700,7 @@ fn recorded_target_snapshot_id(
 
 fn rewrite_full_refresh_select_with_pin_for_scope(
     select_sql: &str,
-    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+    pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<String, String> {
@@ -2716,7 +2711,7 @@ fn rewrite_full_refresh_select_with_pin_for_scope(
     let sqlparser::ast::Statement::Query(query) = &mut stmt else {
         return Err("iceberg MV full refresh pin SELECT expects a SELECT query".to_string());
     };
-    crate::connector::starrocks::table::refresh_pin::inject_pin_as_for_version_as_of(
+    crate::engine::mv::refresh_pin::inject_pin_as_for_version_as_of(
         query,
         pin,
         &HashSet::new(),
@@ -2728,7 +2723,7 @@ fn rewrite_full_refresh_select_with_pin_for_scope(
 
 fn rewrite_full_refresh_select_with_pin(
     select_sql: &str,
-    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+    pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
     base_ref: &IcebergTableRef,
 ) -> Result<String, String> {
     rewrite_full_refresh_select_with_pin_for_scope(
@@ -2741,7 +2736,7 @@ fn rewrite_full_refresh_select_with_pin(
 
 fn rewrite_union_projection_full_refresh_select_with_pin(
     select_sql: &str,
-    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+    pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
     branch_count: usize,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -2755,7 +2750,7 @@ fn rewrite_union_projection_full_refresh_select_with_pin(
     let sqlparser::ast::Statement::Query(query) = &mut stmt else {
         return Err("iceberg UNION ALL MV full refresh expects a SELECT query".to_string());
     };
-    crate::connector::starrocks::table::refresh_pin::inject_pin_as_for_version_as_of(
+    crate::engine::mv::refresh_pin::inject_pin_as_for_version_as_of(
         query,
         pin,
         &HashSet::new(),
@@ -3002,9 +2997,7 @@ pub(crate) fn repartition_iceberg_mv(
         return Err("partitioned composed aggregate Iceberg MV is not supported".to_string());
     }
 
-    let pin = crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::capture(
-        state, &base_refs,
-    )?;
+    let pin = crate::engine::mv::refresh_pin::RefreshSnapshotPin::capture(state, &base_refs)?;
     validate_repartition_refresh_pin_table_uuids(&mv_definition, &pin, &base_refs)?;
 
     let expected_main_snapshot_id = target_loaded
@@ -3578,9 +3571,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
         | RefreshDecision::Incremental => {}
     }
 
-    let pin = crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::capture(
-        state, &base_refs,
-    )?;
+    let pin = crate::engine::mv::refresh_pin::RefreshSnapshotPin::capture(state, &base_refs)?;
     let current_snapshot_id = pin.get(base_ref);
     let current_table_uuid = pin
         .uuid(base_ref)
@@ -3863,9 +3854,7 @@ fn refresh_iceberg_union_projection_mv(
         | RefreshDecision::Incremental => {}
     }
 
-    let pin = crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::capture(
-        state, base_refs,
-    )?;
+    let pin = crate::engine::mv::refresh_pin::RefreshSnapshotPin::capture(state, base_refs)?;
     validate_refresh_pin_table_uuids(mv_definition, &pin, base_refs)?;
     let mut loaded_bases = Vec::with_capacity(base_refs.len());
     for base_ref in base_refs {
@@ -4241,9 +4230,7 @@ fn refresh_single_aggregate_iceberg_mv(
         | RefreshDecision::Incremental => {}
     }
 
-    let pin = crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::capture(
-        state, base_refs,
-    )?;
+    let pin = crate::engine::mv::refresh_pin::RefreshSnapshotPin::capture(state, base_refs)?;
     validate_refresh_pin_table_uuids(mv_definition, &pin, base_refs)?;
     let current = pin
         .get(base_ref)
@@ -4569,9 +4556,7 @@ fn refresh_fan_in_aggregate_iceberg_mv(
         | RefreshDecision::Incremental => {}
     }
 
-    let pin = crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::capture(
-        state, base_refs,
-    )?;
+    let pin = crate::engine::mv::refresh_pin::RefreshSnapshotPin::capture(state, base_refs)?;
     validate_refresh_pin_table_uuids(mv_definition, &pin, base_refs)?;
 
     let mut loaded_bases = Vec::with_capacity(base_refs.len());
@@ -4862,9 +4847,7 @@ fn refresh_join_aggregate_iceberg_mv(
         | RefreshDecision::Incremental => {}
     }
 
-    let pin = crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::capture(
-        state, base_refs,
-    )?;
+    let pin = crate::engine::mv::refresh_pin::RefreshSnapshotPin::capture(state, base_refs)?;
     if pin.len() != 2 {
         return Err(format!(
             "iceberg join aggregate MV refresh expected two refresh pins, got {}",
@@ -8759,7 +8742,7 @@ fn prepare_aggregate_first_refresh_chunks(
     current_database: &str,
     mv_definition: &StoredMvDefinition,
     calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
-    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+    pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
 ) -> Result<Vec<crate::exec::chunk::Chunk>, String> {
     prepare_aggregate_first_refresh_chunks_for_select_sql(
         state,
@@ -8777,11 +8760,11 @@ fn prepare_aggregate_first_refresh_chunks_for_select_sql(
     current_database: &str,
     select_sql: &str,
     calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
-    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+    pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
 ) -> Result<Vec<crate::exec::chunk::Chunk>, String> {
     let state_sql = iceberg_aggregate_first_refresh_select_sql(select_sql, calls)?;
     let mut state_query = parse_mv_select_query(&state_sql)?;
-    crate::connector::starrocks::table::refresh_pin::inject_pin_as_for_version_as_of(
+    crate::engine::mv::refresh_pin::inject_pin_as_for_version_as_of(
         &mut state_query,
         pin,
         &HashSet::new(),
@@ -8805,7 +8788,7 @@ fn build_aggregate_repartition_payload(
     current_catalog: Option<&str>,
     current_database: &str,
     select_sql: &str,
-    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+    pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
 ) -> Result<RepartitionRebuildPayload, String> {
     let select_query = parse_mv_select_query(select_sql)?;
     let calls = crate::engine::mv::agg_state::aggregate_sql_calls::extract_aggregate_sql_calls(
@@ -8829,7 +8812,7 @@ fn build_union_projection_repartition_payload(
     select_sql: &str,
     canonical_select_query: &sqlparser::ast::Query,
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
-    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+    pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
 ) -> Result<RepartitionRebuildPayload, String> {
     let branch_count = schema_contract
         .branch
@@ -8859,7 +8842,7 @@ fn prepare_branch_union_aggregate_first_refresh_chunks(
     mv_definition: &StoredMvDefinition,
     branch_count: usize,
     first_branch_calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
-    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+    pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
 ) -> Result<Vec<crate::exec::chunk::Chunk>, String> {
     // Flatten the stored UNION ALL SELECT into one full SELECT per branch. The
     // per-branch SELECT keeps its own FROM (a scan, a join, or a fan-in union):
@@ -9327,7 +9310,7 @@ struct RepartitionRebuildPayload {
 impl RepartitionRebuildPayload {
     fn from_chunks(
         chunks: Vec<crate::exec::chunk::Chunk>,
-        pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+        pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
     ) -> Self {
         Self {
             chunks,
@@ -9348,7 +9331,7 @@ fn collect_repartition_rebuild_payload(
     current_catalog: Option<&str>,
     current_database: &str,
     pinned_full_select_sql: &str,
-    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+    pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
 ) -> Result<RepartitionRebuildPayload, String> {
     let physical_sql = iceberg_mv_physical_select_sql(pinned_full_select_sql)?;
     let chunks = run_mv_full_select_chunks_with_catalog(
@@ -10420,9 +10403,7 @@ fn refresh_iceberg_join_mv(
         | RefreshDecision::Incremental => {}
     }
 
-    let pin = crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::capture(
-        state, base_refs,
-    )?;
+    let pin = crate::engine::mv::refresh_pin::RefreshSnapshotPin::capture(state, base_refs)?;
     if pin.len() != 2 {
         return Err(format!(
             "iceberg join MV refresh expected two refresh pins, got {}",
@@ -10616,7 +10597,7 @@ fn join_base_refs_for_schema_contract<'a>(
 
 fn validate_refresh_pin_table_uuids(
     mv_definition: &StoredMvDefinition,
-    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+    pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
     base_refs: &[IcebergTableRef],
 ) -> Result<(), String> {
     validate_refresh_pin_table_uuids_for_operation(
@@ -10629,7 +10610,7 @@ fn validate_refresh_pin_table_uuids(
 
 fn validate_repartition_refresh_pin_table_uuids(
     mv_definition: &StoredMvDefinition,
-    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+    pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
     base_refs: &[IcebergTableRef],
 ) -> Result<(), String> {
     validate_refresh_pin_table_uuids_for_operation(
@@ -10642,7 +10623,7 @@ fn validate_repartition_refresh_pin_table_uuids(
 
 fn validate_refresh_pin_table_uuids_for_operation(
     mv_definition: &StoredMvDefinition,
-    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+    pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
     base_refs: &[IcebergTableRef],
     unsafe_message: &str,
 ) -> Result<(), String> {
@@ -10862,7 +10843,7 @@ fn build_join_projection_repartition_context(
     current_database: &str,
     mv_definition: &StoredMvDefinition,
     base_refs: &[IcebergTableRef],
-    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+    pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
     aliases: &crate::engine::mv::agg_state::aggregate_sql_calls::JoinAliases,
 ) -> Result<(IcebergMvRefreshContext, IcebergTableRef, IcebergTableRef), String> {
     if base_refs.len() != 2 {
@@ -12502,9 +12483,7 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
         validate_aggregate_schema_contract_metadata(&target, &mv_definition)?;
     }
 
-    let pin = crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::capture(
-        state, &base_refs,
-    )?;
+    let pin = crate::engine::mv::refresh_pin::RefreshSnapshotPin::capture(state, &base_refs)?;
     validate_refresh_pin_table_uuids(&mv_definition, &pin, &base_refs)?;
 
     let ctx = {
@@ -14066,7 +14045,7 @@ fn execute_join_delta_branches(
     current_database: &str,
     mv_definition: &StoredMvDefinition,
     aliases: &crate::engine::mv::agg_state::aggregate_sql_calls::JoinAliases,
-    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+    pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
     ctx: &IcebergMvRefreshContext,
     affected_partitions: &crate::engine::mv::partition::AffectedTargetPartitions,
     branches: Vec<crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan>,
@@ -14389,7 +14368,7 @@ fn execute_join_delta_branches(
 fn build_imv_refresh_catalog(
     state: &Arc<StandaloneState>,
     base_refs: &[&IcebergTableRef],
-    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+    pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
 ) -> Result<crate::engine::catalog::InMemoryCatalog, String> {
     let mut catalog = crate::engine::catalog::InMemoryCatalog::default();
     for base_ref in base_refs {
@@ -20794,10 +20773,9 @@ mod tests {
         let [base_ref] = base_refs.as_slice() else {
             panic!("expected single base ref");
         };
-        let pin = crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::capture(
-            &env.state, &base_refs,
-        )
-        .expect("capture pin");
+        let pin =
+            crate::engine::mv::refresh_pin::RefreshSnapshotPin::capture(&env.state, &base_refs)
+                .expect("capture pin");
         let pinned_full_select_sql =
             rewrite_full_refresh_select_with_pin(&mv.select_sql, &pin, base_ref)
                 .expect("rewrite select with pin");
@@ -22701,10 +22679,9 @@ mod tests {
         let [base_ref] = base_refs.as_slice() else {
             panic!("expected single base ref");
         };
-        let pin = crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::capture(
-            &env.state, &base_refs,
-        )
-        .expect("capture pin");
+        let pin =
+            crate::engine::mv::refresh_pin::RefreshSnapshotPin::capture(&env.state, &base_refs)
+                .expect("capture pin");
         let snapshot_id = pin.get(base_ref).expect("pinned snapshot");
 
         let rewritten = rewrite_full_refresh_select_with_pin(&mv.select_sql, &pin, base_ref)
@@ -22716,13 +22693,10 @@ mod tests {
 
     #[test]
     fn rewrite_full_refresh_select_with_pin_injects_all_base_versions() {
-        let pin =
-            crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::from_entries_for_tests(
-                &[
-                    ("ice.db.left_orders", 101, "left-uuid"),
-                    ("ice.db.right_orders", 202, "right-uuid"),
-                ],
-            );
+        let pin = crate::engine::mv::refresh_pin::RefreshSnapshotPin::from_entries_for_tests(&[
+            ("ice.db.left_orders", 101, "left-uuid"),
+            ("ice.db.right_orders", 202, "right-uuid"),
+        ]);
 
         let rewritten = rewrite_full_refresh_select_with_pin_for_scope(
             "SELECT l.id, r.name FROM ice.db.left_orders l JOIN ice.db.right_orders r ON l.rid = r.id",
@@ -23214,7 +23188,7 @@ mod tests {
                     select_sql: "SELECT id, name FROM ice.sales.orders".to_string(),
                     base_table_refs: vec!["ice.sales.orders".to_string()],
                     primary_key_columns: Vec::new(),
-                    storage_engine: StarRocksMvStorageEngine::Iceberg.as_sql_str().to_string(),
+                    storage_engine: MvStorageEngine::Iceberg.as_sql_str().to_string(),
                     target_catalog: Some("ice".to_string()),
                     target_namespace: Some("analytics".to_string()),
                     target_table: Some("mv_orders".to_string()),
@@ -23326,10 +23300,9 @@ mod tests {
         let [base_ref] = base_refs.as_slice() else {
             panic!("expected single base ref");
         };
-        let pin = crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::capture(
-            &env.state, &base_refs,
-        )
-        .expect("capture pin");
+        let pin =
+            crate::engine::mv::refresh_pin::RefreshSnapshotPin::capture(&env.state, &base_refs)
+                .expect("capture pin");
         let base_snapshot_id = pin.get(base_ref).expect("base snapshot");
         let current_table_uuid = pin.uuid(base_ref).expect("base table uuid").to_string();
         let pinned_full_select_sql =

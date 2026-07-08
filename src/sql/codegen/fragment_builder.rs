@@ -797,11 +797,13 @@ mod tests {
     }
 
     #[derive(Debug)]
+    #[cfg(feature = "compat")]
     struct MockScanPlanner {
         schema_id: i64,
         splits: Vec<crate::connector::starrocks::table::scan_planner::StarRocksSplit>,
     }
 
+    #[cfg(feature = "compat")]
     impl crate::connector::scan_planning::ConnectorScanPlanner for MockScanPlanner {
         fn name(&self) -> &'static str {
             "starrocks"
@@ -847,11 +849,13 @@ mod tests {
     }
 
     #[derive(Debug)]
+    #[cfg(feature = "compat")]
     struct CountingScanPlanner {
         inner: MockScanPlanner,
         counts: std::sync::Arc<ScanPlannerCallCounts>,
     }
 
+    #[cfg(feature = "compat")]
     impl crate::connector::scan_planning::ConnectorScanPlanner for CountingScanPlanner {
         fn name(&self) -> &'static str {
             self.inner.name()
@@ -941,6 +945,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "compat")]
     fn mock_starrocks_registry(
         layout: &crate::sql::catalog::PhysicalTableLayout,
     ) -> crate::connector::ConnectorRegistry {
@@ -1122,6 +1127,7 @@ mod tests {
         files.clone()
     }
 
+    #[cfg(feature = "compat")]
     fn mock_starrocks_and_iceberg_registry(
         layout: &crate::sql::catalog::PhysicalTableLayout,
     ) -> crate::connector::ConnectorRegistry {
@@ -1623,6 +1629,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "compat")]
     fn starrocks_scan_plan() -> OptimizerPhysicalNode {
         attach_test_scalar_arena(OptimizerPhysicalNode {
             op: Operator::PhysicalScan(ScanOp {
@@ -2024,6 +2031,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "compat")]
     fn mixed_starrocks_iceberg_join_plan() -> OptimizerPhysicalNode {
         let id_col = crate::sql::column_id::ColumnId::new_for_test(1);
         let mut scalars = ScalarArena::new();
@@ -2344,6 +2352,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "compat")]
     fn hash_join_thrift_distribution_uses_execution_metadata_partitioned() {
         let mut plan = mixed_starrocks_iceberg_join_plan();
         let Operator::PhysicalHashJoin(op) = &mut plan.op else {
@@ -2391,6 +2400,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "compat")]
     fn runtime_filter_uses_execution_distribution_metadata() {
         let mut plan = mixed_starrocks_iceberg_join_plan();
         let Operator::PhysicalHashJoin(op) = &plan.op else {
@@ -2452,6 +2462,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "compat")]
     fn runtime_filter_invalid_build_binding_is_skipped() {
         let mut plan = mixed_starrocks_iceberg_join_plan();
         let Operator::PhysicalHashJoin(op) = &plan.op else {
@@ -2521,6 +2532,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "compat")]
     fn runtime_filter_unknown_uses_execution_metadata_broadcast() {
         let mut plan = mixed_starrocks_iceberg_join_plan();
         let Operator::PhysicalHashJoin(op) = &plan.op else {
@@ -3081,6 +3093,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "compat")]
     fn build_starrocks_scan_emits_lake_scan_with_internal_ranges() {
         let layout = PhysicalTableLayout {
             db_id: 11,
@@ -3751,6 +3764,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "compat")]
     fn mixed_starrocks_and_iceberg_scan_table_ids_do_not_collide() {
         let starrocks_layout = PhysicalTableLayout {
             db_id: 11,
@@ -3920,6 +3934,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "compat")]
     fn starrocks_fragment_exec_params_are_generated_from_planned_connector_scan() {
         let layout = starrocks_layout();
         let plan = starrocks_scan_plan();
@@ -3958,6 +3973,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "compat")]
     fn ir_scan_lowering_calls_connector_begin_scan_and_plan_splits_for_starrocks() {
         use crate::connector::starrocks::table::scan_planner::StarRocksSplit;
         let layout = starrocks_layout();

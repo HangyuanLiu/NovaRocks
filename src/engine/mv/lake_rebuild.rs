@@ -14,9 +14,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::connector::iceberg::commit::mv_provenance::MvProvenanceV1;
-use crate::connector::starrocks::table::model::StarRocksMvStorageEngine;
 use crate::engine::StandaloneState;
 use crate::engine::mv::iceberg_discovery::{DiscoveredIcebergMv, discover_iceberg_mvs_from_entry};
+use crate::engine::mv::lifecycle::MvStorageEngine;
 use crate::meta::repository::mv::{
     CreateMvDefinitionRequest, CreateMvDependencyRequest, MvDependencyObjectRef,
     MvDependencyObjectType, MvDependencyStorageEngine,
@@ -63,7 +63,7 @@ pub(crate) fn rebuild_mv_definition_from_lake(
         // W1 descriptors carry no primary-key metadata; a rebuilt definition
         // is indistinguishable from one created without `PRIMARY KEY (...)`.
         primary_key_columns: Vec::new(),
-        storage_engine: StarRocksMvStorageEngine::Iceberg.as_sql_str().to_string(),
+        storage_engine: MvStorageEngine::Iceberg.as_sql_str().to_string(),
         target_catalog: Some(discovered.catalog.clone()),
         target_namespace: Some(discovered.namespace.clone()),
         target_table: Some(discovered.table.clone()),
@@ -417,7 +417,7 @@ mod tests {
         assert!(request.primary_key_columns.is_empty());
         assert_eq!(
             request.storage_engine,
-            StarRocksMvStorageEngine::Iceberg.as_sql_str()
+            MvStorageEngine::Iceberg.as_sql_str()
         );
         assert_eq!(request.target_catalog.as_deref(), Some("ice"));
         assert_eq!(request.target_namespace.as_deref(), Some("analytics"));

@@ -248,6 +248,76 @@ fn rust_production_text_without_cfg_test(text: &str) -> String {
     production
 }
 
+fn nidl_e2_is_cfg_test_or_compat_attr(trimmed: &str) -> bool {
+    trimmed.starts_with("#[cfg(test")
+        || trimmed == "#[cfg(feature = \"compat\")]"
+        || trimmed == "#[cfg(feature=\"compat\")]"
+        || trimmed.starts_with("#[cfg(all(feature = \"compat\"")
+        || trimmed.starts_with("#[cfg(any(feature = \"compat\"")
+}
+
+fn nidl_e2_rust_text_without_cfg_test_or_compat(text: &str) -> String {
+    let mut production = String::with_capacity(text.len());
+    let mut pending_cfg = false;
+    let mut skipping_cfg_item = false;
+    let mut skip_depth = 0isize;
+
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+
+        if skip_depth > 0 {
+            skip_depth += brace_delta(line);
+            if skip_depth <= 0 {
+                skip_depth = 0;
+                skipping_cfg_item = false;
+            }
+            production.push('\n');
+            continue;
+        }
+
+        if skipping_cfg_item {
+            let delta = brace_delta(line);
+            if line.contains('{') {
+                skip_depth = delta.max(0);
+                skipping_cfg_item = skip_depth > 0;
+            } else if trimmed.ends_with(';') {
+                skipping_cfg_item = false;
+            }
+            production.push('\n');
+            continue;
+        }
+
+        if pending_cfg {
+            if trimmed.is_empty() || trimmed.starts_with("#[") {
+                production.push('\n');
+                continue;
+            }
+
+            let delta = brace_delta(line);
+            if line.contains('{') {
+                skip_depth = delta.max(0);
+                skipping_cfg_item = skip_depth > 0;
+            } else if !trimmed.ends_with(';') {
+                skipping_cfg_item = true;
+            }
+            pending_cfg = false;
+            production.push('\n');
+            continue;
+        }
+
+        if nidl_e2_is_cfg_test_or_compat_attr(trimmed) {
+            pending_cfg = true;
+            production.push('\n');
+            continue;
+        }
+
+        production.push_str(line);
+        production.push('\n');
+    }
+
+    production
+}
+
 fn push_forbidden_terms(
     violations: &mut Vec<String>,
     source: &str,
@@ -5793,5 +5863,367 @@ fn nidl_e4_scheduler_and_coordinator_use_native_scheduling_metadata() {
         violations.is_empty(),
         "NIDL-E4 native scheduling metadata guard failed:\n{}",
         violations.join("\n")
+    );
+}
+// ---------------------------------------------------------------------------
+// NIDL-E2: StarRocks connector/format compat gate
+// ---------------------------------------------------------------------------
+
+fn nidl_e2_is_allowed_compat_scope(rel_path: &str) -> bool {
+    rel_path == "src/connector/starrocks"
+        || rel_path.starts_with("src/connector/starrocks/")
+        || rel_path == "src/formats/starrocks"
+        || rel_path.starts_with("src/formats/starrocks/")
+        || rel_path == "src/lower/compat"
+        || rel_path.starts_with("src/lower/compat/")
+        || nidl_e0_is_in_compat_scope(rel_path)
+}
+
+fn nidl_e2_forbidden_terms() -> &'static [&'static str] {
+    &[
+        "crate::connector::starrocks",
+        "crate::formats::starrocks",
+        "crate::novarocks_connector_starrocks",
+    ]
+}
+
+fn nidl_e2_rel_path_under_scan_root(root: &Path, path: &Path) -> String {
+    root.parent()
+        .and_then(|base| path.strip_prefix(base).ok())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| rel(path))
+}
+
+fn nidl_e2_is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn nidl_e2_has_token(text: &str, token: &str) -> bool {
+    let mut search_start = 0usize;
+    while let Some(offset) = text[search_start..].find(token) {
+        let start = search_start + offset;
+        let end = start + token.len();
+        let before_is_ident = start
+            .checked_sub(1)
+            .and_then(|idx| text.as_bytes().get(idx))
+            .is_some_and(|byte| nidl_e2_is_ident_byte(*byte));
+        let after_is_ident = text
+            .as_bytes()
+            .get(end)
+            .is_some_and(|byte| nidl_e2_is_ident_byte(*byte));
+        if !before_is_ident && !after_is_ident {
+            return true;
+        }
+        search_start = end;
+    }
+    false
+}
+
+fn nidl_e2_import_span_has_grouped_module(import_span: &str, parent: &str, module: &str) -> bool {
+    let grouped_parent = format!("{parent}::{{");
+    import_span.find(&grouped_parent).is_some_and(|start| {
+        nidl_e2_has_token(&import_span[start + grouped_parent.len()..], module)
+    })
+}
+
+fn nidl_e2_grouped_import_hits(path: &Path) -> Vec<String> {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let production = nidl_e2_rust_text_without_cfg_test_or_compat(&text);
+    let compact: String = non_comment_trimmed_lines(&production).join("");
+    let mut hits = Vec::new();
+
+    for grouped_root in ["crate::connector::{", "crate::formats::{", "crate::{"] {
+        let mut search_start = 0usize;
+        while let Some(offset) = compact[search_start..].find(grouped_root) {
+            let start = search_start + offset;
+            let span = &compact[start..];
+            let end = span.find(';').unwrap_or(span.len());
+            let import_span = &span[..end];
+
+            if grouped_root == "crate::connector::{" && nidl_e2_has_token(import_span, "starrocks")
+            {
+                hits.push("grouped import references connector::starrocks".to_string());
+            }
+            if grouped_root == "crate::formats::{" && nidl_e2_has_token(import_span, "starrocks") {
+                hits.push("grouped import references formats::starrocks".to_string());
+            }
+            if grouped_root == "crate::{" {
+                if nidl_e2_has_token(import_span, "connector::starrocks")
+                    || nidl_e2_import_span_has_grouped_module(import_span, "connector", "starrocks")
+                {
+                    hits.push(
+                        "grouped import references StarRocks connector/format module: connector::starrocks"
+                            .to_string(),
+                    );
+                }
+                if nidl_e2_has_token(import_span, "formats::starrocks")
+                    || nidl_e2_import_span_has_grouped_module(import_span, "formats", "starrocks")
+                {
+                    hits.push(
+                        "grouped import references StarRocks connector/format module: formats::starrocks"
+                            .to_string(),
+                    );
+                }
+                if nidl_e2_has_token(import_span, "novarocks_connector_starrocks") {
+                    hits.push(
+                        "grouped import references StarRocks connector/format module: novarocks_connector_starrocks"
+                            .to_string(),
+                    );
+                }
+            }
+            search_start = start + grouped_root.len();
+        }
+    }
+
+    hits.sort();
+    hits.dedup();
+    hits
+}
+
+fn nidl_e2_format_hits_by_file(hits: &[String], max_per_file: usize) -> String {
+    let mut by_file = BTreeMap::<String, Vec<String>>::new();
+    for hit in hits {
+        let file = hit.split_once(':').map(|(file, _)| file).unwrap_or(hit);
+        by_file
+            .entry(file.to_string())
+            .or_default()
+            .push(hit.to_string());
+    }
+
+    let mut out = Vec::new();
+    for (_file, file_hits) in by_file {
+        for hit in file_hits.iter().take(max_per_file) {
+            out.push(hit.clone());
+        }
+        if file_hits.len() > max_per_file {
+            out.push(format!(
+                "{}: ... {} more hit(s)",
+                file_hits[0].split_once(':').map(|(file, _)| file).unwrap(),
+                file_hits.len() - max_per_file
+            ));
+        }
+    }
+    out.join("\n")
+}
+
+fn nidl_e2_noncompat_starrocks_gateway_hits_in(root: &Path) -> Vec<String> {
+    let mut hits = Vec::new();
+    for path in rs_files(root) {
+        let rel_path = nidl_e2_rel_path_under_scan_root(root, &path);
+        if nidl_e2_is_allowed_compat_scope(&rel_path) {
+            continue;
+        }
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        let production = nidl_e2_rust_text_without_cfg_test_or_compat(&text);
+        for (idx, line) in production.lines().enumerate() {
+            if !is_comment_or_blank(line)
+                && nidl_e2_forbidden_terms()
+                    .iter()
+                    .any(|term| line.contains(*term))
+            {
+                hits.push(format!("{rel_path}:{}: {}", idx + 1, line.trim()));
+            }
+        }
+        for text in nidl_e2_grouped_import_hits(&path) {
+            hits.push(format!("{rel_path}:1: {text}"));
+        }
+    }
+    hits.sort();
+    hits
+}
+
+fn has_cfg_feature_compat_before_item(text: &str, item: &str) -> bool {
+    let lines: Vec<&str> = text.lines().collect();
+    for (idx, line) in lines.iter().enumerate() {
+        if line.trim() == item {
+            let mut cursor = idx;
+            while cursor > 0 {
+                cursor -= 1;
+                let previous = lines[cursor].trim();
+                if previous.is_empty() || previous.starts_with("//") {
+                    continue;
+                }
+                return previous == "#[cfg(feature = \"compat\")]";
+            }
+        }
+    }
+    false
+}
+
+#[test]
+fn nidl_e2_detector_flags_noncompat_gateway_imports_and_ignores_compat_scopes() {
+    let dir = std::env::temp_dir().join("nidl_e2_detector");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("src/engine")).unwrap();
+    fs::create_dir_all(dir.join("src/connector/starrocks")).unwrap();
+    fs::create_dir_all(dir.join("src/lower/compat")).unwrap();
+    fs::write(
+        dir.join("src/engine/offender.rs"),
+        "use crate::connector::starrocks::scan::StarRocksScanRange;\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/engine/grouped_parent.rs"),
+        "use crate::connector::{starrocks::scan::StarRocksScanRange};\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/engine/grouped_crate.rs"),
+        "use crate::{connector::starrocks, formats::starrocks};\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/engine/nested_grouped_crate.rs"),
+        "use crate::{connector::{starrocks::scan::StarRocksScanRange}, formats::{starrocks::metadata::load_tablet_snapshot}};\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/engine/similar_name.rs"),
+        "use crate::connector::{iceberg::starrocks_profile};\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/engine/test_only.rs"),
+        "#[cfg(test)]\nmod tests {\n    use crate::{connector::starrocks, formats::starrocks};\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/engine/compat_direct.rs"),
+        "#[cfg(feature = \"compat\")]\nuse crate::connector::starrocks::scan::StarRocksScanRange;\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/engine/compat_grouped.rs"),
+        "#[cfg(feature = \"compat\")]\nuse crate::{connector::{starrocks::scan::StarRocksScanRange}, formats::{starrocks::metadata::load_tablet_snapshot}};\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/connector/starrocks/allowed.rs"),
+        "use crate::connector::starrocks::scan::StarRocksScanRange;\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/lower/compat/allowed.rs"),
+        "use crate::formats::starrocks::metadata::load_tablet_snapshot;\n",
+    )
+    .unwrap();
+
+    let hits = nidl_e2_noncompat_starrocks_gateway_hits_in(&dir.join("src"));
+    assert!(
+        hits.iter()
+            .any(|hit| hit.contains("src/engine/offender.rs")),
+        "must flag non-compat StarRocks connector imports; got {hits:?}"
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.contains("src/engine/grouped_parent.rs")),
+        "must flag grouped connector parent imports; got {hits:?}"
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.contains("src/engine/grouped_crate.rs")),
+        "must flag grouped crate imports; got {hits:?}"
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.contains("src/engine/nested_grouped_crate.rs")),
+        "must flag nested grouped crate imports; got {hits:?}"
+    );
+    assert!(
+        !hits
+            .iter()
+            .any(|hit| hit.contains("src/engine/similar_name.rs")),
+        "must not flag similar names that are not the starrocks module; got {hits:?}"
+    );
+    assert!(
+        !hits
+            .iter()
+            .any(|hit| hit.contains("src/engine/test_only.rs")),
+        "must ignore #[cfg(test)] grouped imports; got {hits:?}"
+    );
+    assert!(
+        !hits
+            .iter()
+            .any(|hit| hit.contains("src/engine/compat_direct.rs")),
+        "must ignore #[cfg(feature = \"compat\")] direct imports; got {hits:?}"
+    );
+    assert!(
+        !hits
+            .iter()
+            .any(|hit| hit.contains("src/engine/compat_grouped.rs")),
+        "must ignore #[cfg(feature = \"compat\")] grouped imports; got {hits:?}"
+    );
+    assert!(
+        !hits
+            .iter()
+            .any(|hit| hit.contains("src/connector/starrocks/allowed.rs")),
+        "must ignore the gated connector module itself; got {hits:?}"
+    );
+    assert!(
+        !hits
+            .iter()
+            .any(|hit| hit.contains("src/lower/compat/allowed.rs")),
+        "must ignore lower compat scope; got {hits:?}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn nidl_e2_cfg_feature_helper_checks_nearest_non_comment_attribute() {
+    assert!(
+        has_cfg_feature_compat_before_item(
+            "#[cfg(feature = \"compat\")]\n// module comment\npub mod starrocks;\n",
+            "pub mod starrocks;"
+        ),
+        "must accept compat cfg immediately before module item"
+    );
+    assert!(
+        !has_cfg_feature_compat_before_item(
+            "#[cfg(feature = \"other\")]\npub mod starrocks;\n",
+            "pub mod starrocks;"
+        ),
+        "must reject non-compat cfg before module item"
+    );
+    assert!(
+        !has_cfg_feature_compat_before_item(
+            "#[cfg(feature = \"compat\")]\npub mod iceberg;\npub mod starrocks;\n",
+            "pub mod starrocks;"
+        ),
+        "must not treat cfg on a previous item as gating starrocks"
+    );
+}
+
+#[test]
+fn nidl_e2_starrocks_connector_and_format_modules_are_compat_gated() {
+    let connector_mod = fs::read_to_string(Path::new(manifest_dir()).join("src/connector/mod.rs"))
+        .expect("connector mod");
+    let formats_mod = fs::read_to_string(Path::new(manifest_dir()).join("src/formats/mod.rs"))
+        .expect("formats mod");
+    let mut violations = Vec::new();
+    if !has_cfg_feature_compat_before_item(&connector_mod, "pub mod starrocks;") {
+        violations.push(
+            "src/connector/mod.rs must gate pub mod starrocks with #[cfg(feature = \"compat\")]",
+        );
+    }
+    if !has_cfg_feature_compat_before_item(&formats_mod, "pub mod starrocks;") {
+        violations.push(
+            "src/formats/mod.rs must gate pub mod starrocks with #[cfg(feature = \"compat\")]",
+        );
+    }
+    assert!(
+        violations.is_empty(),
+        "StarRocks connector/format modules must be compat-gated:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn nidl_e2_noncompat_code_does_not_import_starrocks_connector_or_format_modules() {
+    let hits = nidl_e2_noncompat_starrocks_gateway_hits_in(&src_dir());
+    assert!(
+        hits.is_empty(),
+        "non-compat production code must not import StarRocks connector/format modules outside compat scopes:\n{}",
+        nidl_e2_format_hits_by_file(&hits, 5)
     );
 }

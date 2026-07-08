@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+#[cfg(test)]
+use std::sync::Mutex;
+use std::sync::{Arc, MutexGuard};
 
 use arrow::array::{Array, ArrayRef, BooleanArray, Int8Array};
 use arrow::compute::filter_record_batch;
@@ -1541,13 +1543,7 @@ fn collect_current_base_metadata_or_cleanup_staged_partition(
 }
 
 pub(crate) fn acquire_mv_refresh_lock() -> Result<MutexGuard<'static, ()>, String> {
-    static MV_REFRESH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    lock_mv_refresh_mutex(MV_REFRESH_LOCK.get_or_init(|| Mutex::new(())))
-}
-
-fn lock_mv_refresh_mutex(lock: &Mutex<()>) -> Result<MutexGuard<'_, ()>, String> {
-    lock.lock()
-        .map_err(|_| "materialized view refresh lock poisoned".to_string())
+    crate::engine::mv::refresh_io::acquire_mv_refresh_lock()
 }
 
 fn cleanup_staged_partition(
@@ -3912,27 +3908,6 @@ enable_path_style_access = true
             err.contains("currently disabled pending redesign"),
             "err={err}"
         );
-    }
-
-    #[test]
-    fn lock_mv_refresh_mutex_reports_poisoned_lock() {
-        let lock: &'static std::sync::Mutex<()> = Box::leak(Box::new(std::sync::Mutex::new(())));
-        static PANIC_HOOK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _hook_guard = PANIC_HOOK_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("panic hook lock");
-        let old_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let poison_result = std::panic::catch_unwind(|| {
-            let _guard = lock.lock().expect("lock");
-            panic!("poison test lock");
-        });
-        std::panic::set_hook(old_hook);
-        assert!(poison_result.is_err());
-
-        let err = lock_mv_refresh_mutex(lock).expect_err("poisoned lock should fail");
-        assert!(err.contains("poisoned"), "err={err}");
     }
 
     fn seed_mv_refresh_state() -> (tempfile::TempDir, Arc<StandaloneState>, i64) {

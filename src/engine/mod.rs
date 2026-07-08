@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+#[cfg(feature = "compat")]
 use std::collections::{HashMap, HashSet};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -21,8 +22,9 @@ use self::catalog::{DEFAULT_DATABASE, InMemoryCatalog, normalize_identifier};
 use crate::connector::{
     IcebergCatalogRegistry, StarRocksTableCatalog, StarRocksTableConfig, create_iceberg_namespace,
     iceberg_namespace_exists, register_existing_iceberg_table,
-    register_starrocks_tables_in_catalog, runtime_registered,
 };
+#[cfg(feature = "compat")]
+use crate::connector::{register_starrocks_tables_in_catalog, runtime_registered};
 use crate::meta::repository::backend::BackendMetaRepository;
 use crate::meta::repository::iceberg_catalog::{
     IcebergCatalogMetaRepository, IcebergCatalogProperties,
@@ -108,6 +110,7 @@ pub use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use crate::sql::catalog::LegacyRangePartition;
 pub use crate::sql::catalog::{CatalogProvider, ColumnDef, ScanSource, TableDef};
 
+#[cfg(feature = "compat")]
 pub(crate) fn recover_starrocks_tablet_paths_from_current_engine(
     table: &crate::connector::starrocks::fe_v2_meta::LakeTableIdentity,
     tablet_ids: &[i64],
@@ -115,6 +118,7 @@ pub(crate) fn recover_starrocks_tablet_paths_from_current_engine(
     recover_starrocks_tablet_paths_from_installed_config(table, tablet_ids)
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn recover_starrocks_tablet_paths_from_installed_config(
     table: &crate::connector::starrocks::fe_v2_meta::LakeTableIdentity,
     tablet_ids: &[i64],
@@ -158,6 +162,7 @@ pub(crate) fn recover_starrocks_tablet_paths_from_installed_config(
     Ok(paths)
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn recover_starrocks_tablet_paths_from_state(
     state: &Arc<StandaloneState>,
     table: &crate::connector::starrocks::fe_v2_meta::LakeTableIdentity,
@@ -222,6 +227,7 @@ pub(crate) fn recover_starrocks_tablet_paths_from_state(
     Ok(paths)
 }
 
+#[cfg(feature = "compat")]
 fn select_starrocks_tablet_paths_from_catalog(
     catalog: &StarRocksTableCatalog,
     table: &crate::connector::starrocks::fe_v2_meta::LakeTableIdentity,
@@ -243,6 +249,7 @@ fn select_starrocks_tablet_paths_from_catalog(
     Ok(paths)
 }
 
+#[cfg(feature = "compat")]
 fn starrocks_tablet_paths_cover(tablet_ids: &[i64], paths: &HashMap<i64, String>) -> bool {
     tablet_ids.iter().all(|tablet_id| {
         paths
@@ -251,6 +258,7 @@ fn starrocks_tablet_paths_cover(tablet_ids: &[i64], paths: &HashMap<i64, String>
     })
 }
 
+#[cfg(feature = "compat")]
 fn register_starrocks_shard_infos_from_paths(
     state: &StandaloneState,
     paths: &HashMap<i64, String>,
@@ -261,6 +269,7 @@ fn register_starrocks_shard_infos_from_paths(
     register_starrocks_shard_infos(&config.s3, paths)
 }
 
+#[cfg(feature = "compat")]
 fn register_starrocks_shard_infos(
     s3: &crate::runtime::starlet_shard_registry::S3StoreConfig,
     paths: &HashMap<i64, String>,
@@ -602,6 +611,7 @@ impl StandaloneNovaRocks {
         crate::connector::iceberg::compact::run_optimize_jobs_once(&self.inner)
     }
 
+    #[cfg(feature = "compat")]
     pub fn starrocks_table_info(
         &self,
         database_name: &str,
@@ -4507,11 +4517,18 @@ mod build_iceberg_create_table_ddl_tests {
 mod tests {
     use super::{
         QueryResult, StandaloneNovaRocks, StandaloneOptions, StandaloneSession, StandaloneState,
-        StatementResult, dispatch_statement, recover_starrocks_tablet_paths_from_installed_config,
-        recover_starrocks_tablet_paths_from_state, register_connector_backends,
+        StatementResult, dispatch_statement, register_connector_backends,
     };
+    #[cfg(feature = "compat")]
+    use super::{
+        recover_starrocks_tablet_paths_from_installed_config,
+        recover_starrocks_tablet_paths_from_state,
+    };
+    #[cfg(feature = "compat")]
     use crate::connector::starrocks::fe_v2_meta::LakeTableIdentity;
+    #[cfg(feature = "compat")]
     use crate::connector::starrocks::lake::context::lock_runtime_test_state;
+    #[cfg(feature = "compat")]
     use crate::connector::starrocks::table::config::StarRocksTableConfig;
     use crate::meta::MetaStoreProvider;
     use arrow::array::{
@@ -4563,6 +4580,12 @@ path = "{metadata_path}"
         config_path
     }
 
+    #[cfg(not(feature = "compat"))]
+    fn lock_runtime_test_state() -> super::TestSerializationGuard {
+        super::acquire_standalone_test_guard()
+    }
+
+    #[cfg(feature = "compat")]
     fn test_starrocks_table_config() -> StarRocksTableConfig {
         StarRocksTableConfig {
             warehouse_uri: "s3://test/warehouse".to_string(),
@@ -4579,6 +4602,7 @@ path = "{metadata_path}"
     }
 
     #[test]
+    #[cfg(feature = "compat")]
     fn recovers_starrocks_tablet_paths_from_metadata_after_be_startup() {
         let _runtime_guard = lock_runtime_test_state();
         use crate::meta::repository::starrocks_table::{
@@ -4656,6 +4680,7 @@ path = "{metadata_path}"
     }
 
     #[test]
+    #[cfg(feature = "compat")]
     fn recovers_starrocks_tablet_paths_from_installed_config_without_engine_state() {
         let _guard = super::acquire_standalone_test_guard();
         let _runtime_guard = lock_runtime_test_state();
@@ -5361,6 +5386,7 @@ mysql_port = 47892
         })
     }
 
+    #[cfg(feature = "compat")]
     fn build_fragments_for_query(sql: &str) -> crate::sql::codegen::MultiFragmentBuildResult {
         use crate::sql::catalog::{
             ColumnDef, PhysicalTableLayout, ScanSource, StarRocksTabletRef, TableDef,
@@ -5478,6 +5504,7 @@ mysql_port = 47892
     /// returns the schema_id and tablet splits from the given layout. Used by
     /// engine-level tests that build fragments for a StarRocks table but do not
     /// have a full `StandaloneState` available.
+    #[cfg(feature = "compat")]
     fn mock_starrocks_registry_for_engine_test(
         layout: &crate::sql::catalog::PhysicalTableLayout,
     ) -> crate::connector::ConnectorRegistry {
@@ -6307,6 +6334,7 @@ mysql_port = 47892
     /// catalog's fact-like `tbl(id int, name varchar)` joined to the small
     /// `date_dim` fixture on `id`.
     #[test]
+    #[cfg(feature = "compat")]
     fn codegen_emits_build_runtime_filters_from_annotation() {
         let build =
             build_fragments_for_query("SELECT count(*) FROM tbl a JOIN date_dim b ON a.id = b.id");
@@ -6357,6 +6385,7 @@ mysql_port = 47892
     }
 
     #[test]
+    #[cfg(feature = "compat")]
     fn embedded_query_builder_splits_non_cte_join_into_multiple_fragments() {
         let build = build_fragments_for_query(
             "SELECT a.id FROM tbl a JOIN tbl b ON a.id = b.id ORDER BY 1",
@@ -6376,6 +6405,7 @@ mysql_port = 47892
     }
 
     #[test]
+    #[cfg(feature = "compat")]
     fn builder_preserves_cte_coordinator_shape_for_nested_cte_query() {
         let build = build_fragments_for_query(
             "WITH outer_cte AS ( \

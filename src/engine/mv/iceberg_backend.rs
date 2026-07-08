@@ -57,7 +57,7 @@ impl MvBackend for IcebergMvBackend {
 
     fn list_mvs(&self, req: ListMvsRequest) -> Result<Vec<MvListRow>, String> {
         let state = self.state()?;
-        crate::connector::starrocks::table::mv_ddl::list_mv_rows(
+        crate::engine::mv::analysis::list_mv_rows(
             &state,
             req.current_catalog.as_deref(),
             &req.stmt,

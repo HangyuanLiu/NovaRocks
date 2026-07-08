@@ -5,7 +5,6 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use sqlparser::ast as sqlast;
 
-use crate::connector::starrocks::table::model::{StarRocksTableKind, StarRocksTableState};
 use crate::engine::virtual_table::{INFORMATION_SCHEMA_DB, VirtualTableProvider};
 use crate::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
 use crate::sql::catalog::ColumnDef;
@@ -169,7 +168,7 @@ fn materialized_view_rows(
             continue;
         }
         let Some(table) = snapshot.tables.iter().find(|table| {
-            table.table_id == mv.mv_id && table.kind == StarRocksTableKind::MaterializedView
+            table.table_id == mv.mv_id && is_starrocks_materialized_view(&table.kind)
         }) else {
             continue;
         };
@@ -180,7 +179,7 @@ fn materialized_view_rows(
         else {
             continue;
         };
-        let is_active = table.state == StarRocksTableState::Active;
+        let is_active = is_starrocks_table_active(&table.state);
         rows.push(MaterializedViewInfoRow {
             table_schema: database.name.clone(),
             table_name: table.name.clone(),
@@ -193,6 +192,14 @@ fn materialized_view_rows(
         });
     }
     Ok(rows)
+}
+
+fn is_starrocks_materialized_view(kind: &impl std::fmt::Debug) -> bool {
+    format!("{kind:?}") == "MaterializedView"
+}
+
+fn is_starrocks_table_active(state: &impl std::fmt::Debug) -> bool {
+    format!("{state:?}") == "Active"
 }
 
 fn is_information_schema_be_configs(factor: &sqlast::TableFactor) -> bool {

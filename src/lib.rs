@@ -41,6 +41,7 @@ pub use common::logging as novarocks_logging;
 pub use connector as novarocks_connectors;
 pub use connector::hdfs as novarocks_connector_iceberg;
 pub use connector::jdbc as novarocks_connector_jdbc;
+#[cfg(feature = "compat")]
 pub use connector::starrocks as novarocks_connector_starrocks;
 pub use formats::parquet as novarocks_format_parquet;
 pub use fs::local as novarocks_fs_local;

@@ -29,6 +29,7 @@ use crate::common::types::UniqueId;
 use crate::exec::node::scan::HdfsScanFileFormat;
 use crate::exec::node::scan::IncrementalHdfsScanRange;
 use crate::exec::node::scan::IncrementalScanRange;
+#[cfg(feature = "compat")]
 use crate::exec::node::scan::LakeGlmScanInfo;
 use crate::exec::node::scan::RowPositionScanConfig;
 use crate::exec::node::scan::ScanNode;
@@ -86,6 +87,7 @@ pub(crate) struct QueryContext {
     pub(crate) pending_runtime_filters: Vec<PendingRuntimeFilter>,
     pub(crate) row_pos_descs: HashMap<i32, RowPositionDescriptor>,
     pub(crate) glm_contexts: HashMap<SlotId, GlobalLateMaterializationContext>,
+    #[cfg(feature = "compat")]
     pub(crate) lake_glm_contexts: HashMap<SlotId, LakeGlmScanInfo>,
     pub(crate) lake_tablet_paths: HashMap<String, HashMap<i64, String>>,
     pub(crate) mem_tracker: Arc<MemTracker>,
@@ -130,6 +132,7 @@ impl QueryContext {
             pending_runtime_filters: Vec::new(),
             row_pos_descs: HashMap::new(),
             glm_contexts: HashMap::new(),
+            #[cfg(feature = "compat")]
             lake_glm_contexts: HashMap::new(),
             lake_tablet_paths: HashMap::new(),
             mem_tracker,
@@ -261,10 +264,12 @@ impl QueryContext {
             .map(|ctx| ctx.scan_config.clone())
     }
 
+    #[cfg(feature = "compat")]
     pub(crate) fn register_lake_glm(&mut self, row_source_slot: SlotId, info: LakeGlmScanInfo) {
         self.lake_glm_contexts.insert(row_source_slot, info);
     }
 
+    #[cfg(feature = "compat")]
     pub(crate) fn lake_glm_info(&self, row_source_slot: SlotId) -> Option<&LakeGlmScanInfo> {
         self.lake_glm_contexts.get(&row_source_slot)
     }
@@ -707,6 +712,7 @@ impl QueryContextManager {
             .and_then(|ctx| ctx.glm_scan_config(row_source_slot))
     }
 
+    #[cfg(feature = "compat")]
     pub(crate) fn register_lake_glm(
         &self,
         query_id: QueryId,
@@ -719,6 +725,7 @@ impl QueryContextManager {
         })
     }
 
+    #[cfg(feature = "compat")]
     pub(crate) fn lake_glm_info(
         &self,
         query_id: QueryId,
