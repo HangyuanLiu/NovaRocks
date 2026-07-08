@@ -529,7 +529,12 @@ fn expr_kind_match_is_exhaustive_over_current_oneof() {
             name: Some("x".to_string()),
         }),
         Kind::Lambda(Box::new(expr_proto::LambdaExpr {
-            params: vec!["x".to_string()],
+            params: vec![expr_proto::LambdaParam {
+                slot_id: 3,
+                name: Some("x".to_string()),
+                r#type: Some(type_to_proto(&scalar_type(common::PrimitiveType::Bigint))),
+                nullable: true,
+            }],
             body: Some(Box::new(expr.clone())),
         })),
         Kind::Nested(Box::new(expr_proto::NestedExpr {

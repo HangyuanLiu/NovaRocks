@@ -30,7 +30,7 @@ message Expr {
     CaseExpr case_expr = 22;              // CASE expression.
     IsTruthExpr is_truth = 23;            // IS TRUE/FALSE predicate.
     LambdaParamRef lambda_param_ref = 24; // lambda parameter reference.
-    LambdaExpr lambda = 25;               // lambda body and parameter names.
+    LambdaExpr lambda = 25;               // lambda body and parameter bindings.
     NestedExpr nested = 26;               // parenthesized expression wrapper.
     // ExprKind::SubqueryPlaceholder is intentionally absent: subqueries are
     // decorrelated before codegen; BE prepare must fail fast if one reaches it.
@@ -183,9 +183,16 @@ message LambdaParamRef {
 // Lambda expression.
 // Owner: produced by the future FE/native plan encoder and consumed by the
 // future BE/native plan prepare layer.
+message LambdaParam {
+  int32 slot_id = 1;                     // authoritative lambda parameter slot id.
+  optional string name = 2;              // optional display-only parameter name.
+  novarocks.common.TypeDesc type = 3;    // SQL type of this parameter.
+  bool nullable = 4;                     // true when this parameter can be NULL.
+}
+
 message LambdaExpr {
-  repeated string params = 1;  // lambda parameter names in source order.
-  Expr body = 2;               // lambda body expression.
+  repeated LambdaParam params = 1;  // lambda parameter bindings in source order.
+  Expr body = 2;                    // lambda body expression.
 }
 
 // Parenthesized expression wrapper.

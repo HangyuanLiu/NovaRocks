@@ -432,6 +432,14 @@ fn project_output_columns_for_edge(
         return Ok(columns);
     }
     if !source_output_columns.is_empty() {
+        let source_encoded_columns = encode_output_columns(source_output_columns)?;
+        let mut encoded_by_column_id: HashMap<u32, Vec<common::OutputColumn>> = HashMap::new();
+        for column in columns.iter().cloned() {
+            encoded_by_column_id
+                .entry(column.column_id)
+                .or_default()
+                .push(column);
+        }
         let mut ordinals_by_column_id: HashMap<u32, Vec<usize>> = HashMap::new();
         for (idx, column) in source_output_columns.iter().enumerate() {
             ordinals_by_column_id
@@ -440,6 +448,7 @@ fn project_output_columns_for_edge(
                 .push(idx);
         }
         let mut next_ordinal_by_column_id = HashMap::new();
+        let mut next_encoded_ordinal_by_column_id = HashMap::new();
         let mut resolved = Vec::with_capacity(output_slot_ids.len());
         let mut resolved_all_by_ordinal = true;
         for slot_id in output_slot_ids {
@@ -455,12 +464,28 @@ fn project_output_columns_for_edge(
                 resolved_all_by_ordinal = false;
                 break;
             };
-            if ordinal >= columns.len() {
+            if ordinal >= source_encoded_columns.len() {
                 resolved_all_by_ordinal = false;
                 break;
             }
             *next += 1;
-            resolved.push(columns[ordinal].clone());
+            let source_column = source_encoded_columns.get(ordinal).ok_or_else(|| {
+                format!("native stream edge source output ordinal {ordinal} is missing")
+            })?;
+            let encoded = encoded_by_column_id
+                .get(&source_column.column_id)
+                .and_then(|candidates| {
+                    let encoded_next = next_encoded_ordinal_by_column_id
+                        .entry(source_column.column_id)
+                        .or_insert(0);
+                    let column = candidates.get(*encoded_next).cloned();
+                    if column.is_some() {
+                        *encoded_next += 1;
+                    }
+                    column
+                })
+                .unwrap_or_else(|| source_column.clone());
+            resolved.push(encoded);
         }
         if resolved_all_by_ordinal {
             return Ok(resolved);

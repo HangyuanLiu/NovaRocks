@@ -1071,16 +1071,17 @@ fn plan_select_scoped(
             }
         }
 
+        let aggregate_group_by = dedup_group_by_exprs(&select.group_by);
         let (project_items, agg_calls, output_columns, rewritten_having) =
             split_projection_for_aggregate(
                 &select.projection,
-                &select.group_by,
+                &aggregate_group_by,
                 select.having.as_ref(),
                 factory,
             );
         current = LogicalPlanNode::new(
             LogicalPlanKind::Aggregate(LogicalAggregateNode {
-                group_by: select.group_by,
+                group_by: aggregate_group_by,
                 aggregates: agg_calls,
                 output_columns: output_columns,
                 already_pushed: false,
@@ -1533,6 +1534,7 @@ fn build_window_and_project(
     project_items: Vec<ProjectItem>,
     factory: &mut ColumnRefFactory,
 ) -> Result<LogicalPlanNode, String> {
+    let project_items = dedup_project_item_output_ids(project_items, factory);
     let has_window = project_items.iter().any(|item| has_window_call(&item.expr));
     if has_window {
         let mut output_columns = plan_output_columns(&input)?;
@@ -1608,6 +1610,26 @@ fn build_window_and_project(
     } else {
         Ok(input)
     }
+}
+
+fn dedup_project_item_output_ids(
+    mut project_items: Vec<ProjectItem>,
+    factory: &mut ColumnRefFactory,
+) -> Vec<ProjectItem> {
+    let mut seen = std::collections::HashSet::new();
+    for item in &mut project_items {
+        if item.output_column_id != ColumnId::UNSET && seen.insert(item.output_column_id) {
+            continue;
+        }
+        item.output_column_id = factory.create(
+            None,
+            item.output_name.clone(),
+            item.expr.data_type.clone(),
+            item.expr.nullable,
+        );
+        seen.insert(item.output_column_id);
+    }
+    project_items
 }
 
 fn logical_plan_satisfies_window_ordering(
@@ -2277,6 +2299,19 @@ fn split_projection_for_aggregate(
     });
 
     (project_items, agg_calls, output_columns, rewritten_having)
+}
+
+fn dedup_group_by_exprs(group_by: &[TypedExpr]) -> Vec<TypedExpr> {
+    let mut deduped = Vec::with_capacity(group_by.len());
+    for expr in group_by {
+        if !deduped
+            .iter()
+            .any(|existing| typed_expr_semantically_eq(existing, expr))
+        {
+            deduped.push(expr.clone());
+        }
+    }
+    deduped
 }
 
 fn ensure_aggregate_output_columns(agg: &mut LogicalAggregateNode) {
@@ -3949,6 +3984,40 @@ mod tests {
         }
 
         visit(plan).unwrap_or_else(|| panic!("missing Repeat node in {plan:?}"))
+    }
+
+    #[test]
+    fn planner_deduplicates_repeated_group_by_but_keeps_repeated_projection_outputs() {
+        let plan = parse_analyze_and_plan(
+            "SELECT o_orderkey, o_orderkey, count(DISTINCT o_orderkey) \
+             FROM orders GROUP BY o_orderkey, o_orderkey",
+        )
+        .expect("planner should succeed");
+        let (project, aggregate) = root_project_over_aggregate(&plan);
+
+        assert_eq!(aggregate.group_by.len(), 1);
+        assert_eq!(
+            aggregate
+                .output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            aggregate.output_columns.len()
+        );
+        assert_eq!(project.items.len(), 3);
+        assert_ne!(
+            project.items[0].output_column_id,
+            project.items[1].output_column_id
+        );
+        assert_eq!(
+            column_ref_id(&project.items[0].expr),
+            aggregate.output_columns[0].column_id
+        );
+        assert_eq!(
+            column_ref_id(&project.items[1].expr),
+            aggregate.output_columns[0].column_id
+        );
     }
 
     fn column_ref_id(expr: &TypedExpr) -> ColumnId {

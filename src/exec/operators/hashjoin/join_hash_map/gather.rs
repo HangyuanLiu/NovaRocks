@@ -24,6 +24,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
 use crate::exec::chunk::Chunk;
+use crate::exec::chunk::type_compatibility::{check_exact, retag_column};
 use crate::runtime::profile::clamp_u128_to_i64;
 
 pub(crate) const MAX_JOIN_OUTPUT_ROWS_PER_BATCH: usize = 16 * 1024;
@@ -54,11 +55,11 @@ impl GatherTimings {
     }
 }
 
-fn assert_columns_match_schema(
+fn normalize_columns_to_schema(
     output_schema: &SchemaRef,
-    columns: &[ArrayRef],
+    columns: Vec<ArrayRef>,
     context: &str,
-) -> Result<(), String> {
+) -> Result<Vec<ArrayRef>, String> {
     if output_schema.fields().len() != columns.len() {
         return Err(format!(
             "{context} column count mismatch: schema_fields={} arrays={}",
@@ -66,17 +67,32 @@ fn assert_columns_match_schema(
             columns.len()
         ));
     }
-    for (idx, column) in columns.iter().enumerate() {
+
+    let mut normalized = Vec::with_capacity(columns.len());
+    for (idx, column) in columns.into_iter().enumerate() {
         let descriptor = output_schema.field(idx).data_type();
-        if descriptor != column.data_type() {
+        if descriptor == column.data_type() {
+            normalized.push(column);
+            continue;
+        }
+
+        let actual = column.data_type().clone();
+        if let Err(_mismatch) = check_exact(descriptor, &actual) {
             return Err(format!(
                 "{context} type mismatch at column {idx}: descriptor={:?} actual={:?}",
-                descriptor,
-                column.data_type(),
+                descriptor, actual,
             ));
         }
+
+        let column = retag_column(&column, descriptor).map_err(|mismatch| {
+            format!(
+                "{context} type retag failed at column {idx}: descriptor={:?} actual={:?} mismatch={:?}",
+                descriptor, actual, mismatch
+            )
+        })?;
+        normalized.push(column);
     }
-    Ok(())
+    Ok(normalized)
 }
 
 fn build_output_record_batch(
@@ -84,7 +100,7 @@ fn build_output_record_batch(
     columns: Vec<ArrayRef>,
     context: &str,
 ) -> Result<RecordBatch, String> {
-    assert_columns_match_schema(output_schema, &columns, context)?;
+    let columns = normalize_columns_to_schema(output_schema, columns, context)?;
     let schema = output_schema_for_columns(output_schema, &columns);
     RecordBatch::try_new(schema, columns).map_err(|e| e.to_string())
 }
@@ -339,9 +355,11 @@ pub(crate) fn gather_null_left_with_right(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow::array::{Array, ArrayRef, Decimal128Array, Int32Array};
+    use arrow::array::{Array, ArrayRef, Decimal128Array, Int32Array, ListArray};
+    use arrow::buffer::{NullBuffer, OffsetBuffer};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
@@ -545,6 +563,31 @@ mod tests {
         );
         assert!(err.contains("Decimal128(10, 2)"), "err={err}");
         assert!(err.contains("Decimal128(38, 2)"), "err={err}");
+    }
+
+    #[test]
+    fn build_output_record_batch_retags_nested_metadata_to_descriptor() {
+        let actual_item = Arc::new(Field::new("item", DataType::Int32, true).with_metadata(
+            HashMap::from([("PARQUET:field_id".to_string(), "3".to_string())]),
+        ));
+        let actual = Arc::new(ListArray::new(
+            actual_item,
+            OffsetBuffer::from_lengths([2]),
+            Arc::new(Int32Array::from(vec![1, 2])),
+            None::<NullBuffer>,
+        )) as ArrayRef;
+        let descriptor_type = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "arr",
+            descriptor_type.clone(),
+            true,
+        )]));
+
+        let batch = super::build_output_record_batch(&output_schema, vec![actual], "join output")
+            .expect("retagged output");
+
+        assert_eq!(batch.schema().field(0).data_type(), &descriptor_type);
+        assert_eq!(batch.column(0).data_type(), &descriptor_type);
     }
 
     #[test]

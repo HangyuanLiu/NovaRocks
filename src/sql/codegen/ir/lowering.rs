@@ -2212,7 +2212,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             plan_nodes,
             scope,
             tuple_ids: vec![agg_tuple_id],
-            output_columns: agg.output_columns.clone(),
+            output_columns: agg.output_layout.full_output_columns(),
             ordering: OrderingSpec::Any,
         })
     }
@@ -3541,13 +3541,10 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             };
             let gb_column_id = hash_aggregate_group_layout_column(op, agg_node_id, idx)?.column_id;
             agg_scope.add_column_with_id(gb_column_id, None, name, binding.clone());
-            if let ExprKind::ColumnRef {
-                qualifier: Some(ref q),
-                ref column,
-                ..
-            } = gb_expr.kind
+            if let ExprKind::ColumnRef { column_id, .. } = gb_expr.kind
+                && column_id != gb_column_id
             {
-                let _ = (q, column, binding);
+                agg_scope.add_id_alias(column_id, binding.clone());
             }
             grouping_exprs.push(texpr);
         }
@@ -6299,12 +6296,78 @@ mod tests {
             "layout group key output id should be registered even when omitted from public outputs"
         );
         assert!(
+            scope.resolve_by_id(ColumnId::new_for_test(1)).is_some(),
+            "column-ref group key id should resolve to the aggregate output slot"
+        );
+        assert!(
             scope.resolve_by_id(aggregate_layout_output_id).is_some(),
             "layout aggregate output alias id should be registered even when omitted from public outputs"
         );
         assert!(
             scope.resolve_by_id(aggregate_call_output_id).is_some(),
             "aggregate call output id remains registered"
+        );
+    }
+
+    #[test]
+    fn hash_aggregate_node_output_columns_use_full_layout_for_fragment_edges() {
+        let connectors = ConnectorRegistry::new();
+        let mut state = super::OwnedLoweringState::new(&connectors, None, 0);
+        let child = distributed_values_node(
+            29,
+            0,
+            1,
+            vec![
+                output_col(1, "k", DataType::Int64, false),
+                output_col(2, "v", DataType::Int64, true),
+            ],
+        );
+        let op = DistributedHashAggregateNode {
+            mode: AggMode::Single,
+            group_by: vec![column_ref_expr(1, "k", DataType::Int64, false)],
+            aggregates: vec![AggregateCall {
+                name: "sum".to_string(),
+                args: vec![column_ref_expr(2, "v", DataType::Int64, true)],
+                distinct: false,
+                result_type: DataType::Int64,
+                order_by: vec![],
+                output_column_id: ColumnId::new_for_test(20),
+            }],
+            is_merge: vec![false],
+            output_layout: AggregateOutputLayout::new(
+                vec![output_col(10, "k", DataType::Int64, false)],
+                vec![output_col(21, "sum(v)", DataType::Int64, true)],
+            ),
+            output_columns: vec![output_col(20, "sum(v)", DataType::Int64, true)],
+        };
+        let node = DistributedNode {
+            node_id: 30,
+            fragment_id: 0,
+            tuple_ids: vec![3],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: vec![child],
+            stats: distributed_stats(),
+            payload: DistributedPayload::Physical(PhysicalPlanKind::HashAggregate(Box::new(
+                op.clone(),
+            ))),
+        };
+
+        let lowered = {
+            let mut ctx = super::LoweringCtx::new(&mut state);
+            ctx.lower_hash_aggregate_node(&node, &op)
+                .expect("lower hash aggregate")
+        };
+
+        assert_eq!(
+            lowered
+                .output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![ColumnId::new_for_test(10), ColumnId::new_for_test(21)]
         );
     }
 

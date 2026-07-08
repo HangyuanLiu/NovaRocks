@@ -438,7 +438,7 @@ pub(crate) fn lower_function_call(
             .ok_or_else(|| "FUNCTION_CALL missing function name".to_string())?
             .to_lowercase();
 
-        let kind = function::lookup_function(&fn_name_lower).ok_or_else(|| {
+        let mut kind = function::lookup_function(&fn_name_lower).ok_or_else(|| {
             format!(
                 "unsupported function call: {}",
                 fn_name.unwrap_or("<unknown>")
@@ -1287,9 +1287,21 @@ pub(crate) fn lower_function_call(
                 _ => {}
             }
         }
+        if matches!(kind, function::FunctionKind::Map("map")) && children.len() == 2 {
+            let arg0 = arena
+                .data_type(children[0])
+                .ok_or_else(|| "map missing arg0 type".to_string())?;
+            let arg1 = arena
+                .data_type(children[1])
+                .ok_or_else(|| "map missing arg1 type".to_string())?;
+            if matches!(arg0, DataType::List(_)) && matches!(arg1, DataType::List(_)) {
+                kind = function::FunctionKind::Map("map_from_arrays");
+            }
+        }
+
         if let function::FunctionKind::Map(name) = kind {
             match name {
-                "map" | "map_from_arrays" => {
+                "map_from_arrays" => {
                     let arg0 = arena
                         .data_type(children[0])
                         .ok_or_else(|| format!("{} missing arg0 type", name))?;
@@ -1301,6 +1313,17 @@ pub(crate) fn lower_function_call(
                     }
                     if !matches!(data_type, DataType::Map(_, _)) {
                         return Err(format!("{} must return MAP type", name));
+                    }
+                }
+                "map" => {
+                    if !children.len().is_multiple_of(2) {
+                        return Err(format!(
+                            "map expects an even number of key/value arguments, got {}",
+                            children.len()
+                        ));
+                    }
+                    if !matches!(data_type, DataType::Map(_, _)) {
+                        return Err("map must return MAP type".to_string());
                     }
                 }
                 "arrays_zip" => {

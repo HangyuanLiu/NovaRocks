@@ -161,7 +161,10 @@ fn is_empty_map_literal_expr(arena: &ExprArena, expr_id: ExprId) -> bool {
     let Some(ExprNode::FunctionCall { kind, args }) = arena.node(expr_id) else {
         return false;
     };
-    if !matches!(kind, FunctionKind::Map("map")) {
+    if !matches!(
+        kind,
+        FunctionKind::Map("map") | FunctionKind::Map("map_from_arrays")
+    ) {
         return false;
     }
     let Some(keys_expr) = args.first().copied() else {

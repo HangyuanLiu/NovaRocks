@@ -248,6 +248,16 @@ fn aggregate_phase_output_columns(
     outputs
 }
 
+fn scalar_key_matches(arena: &ScalarArena, left: ScalarId, right: ScalarId) -> bool {
+    if left == right {
+        return true;
+    }
+    matches!(
+        (arena.node(left), arena.node(right)),
+        (ScalarNode::ColumnRef(left_id), ScalarNode::ColumnRef(right_id)) if left_id == right_id
+    )
+}
+
 fn apply_three_phase(
     expr: &MExpr,
     memo: &mut Memo,
@@ -257,49 +267,53 @@ fn apply_three_phase(
     non_distinct: &[ScalarAggregateSpec],
     non_distinct_indices: &[usize],
 ) -> Vec<NewExpr> {
-    // Group-by for LOCAL and DISTINCT_GLOBAL: original group_by + distinct_col.
+    // Group-by for LOCAL and DISTINCT_GLOBAL: original group_by plus the
+    // DISTINCT column when it is not already a group key.
     let mut gb_with_distinct = group_by.to_vec();
-    gb_with_distinct.push(distinct_col);
-    // Reuse the original aggregate's group output ids (real ids even for
-    // non-ColumnRef group keys such as `group by 1+1`); the distinct column is a
-    // plain ColumnRef so it resolves to its own id. The previous
-    // phase_group_output_columns derived ids from the expressions and assigned
-    // ColumnId::UNSET to any non-ColumnRef group key, which the id-binding
-    // verifier rejects ("group output: ColumnId::UNSET"). This mirrors
-    // split_aggregate::local_output_columns.
+    if !gb_with_distinct
+        .iter()
+        .any(|key| scalar_key_matches(&memo.scalars, *key, distinct_col))
+    {
+        gb_with_distinct.push(distinct_col);
+    }
+    let distinct_phase_arg_idx = gb_with_distinct
+        .iter()
+        .position(|key| scalar_key_matches(&memo.scalars, *key, distinct_col))
+        .unwrap_or_else(|| gb_with_distinct.len().saturating_sub(1));
+    // Reuse the original aggregate's group output ids for real group keys. The
+    // parent GLOBAL phase consumes the DISTINCT_GLOBAL output layout, so its
+    // group_by refs must target these phase output ids instead of the scan input
+    // ids. The appended distinct column is still a plain input ColumnRef and
+    // keeps its own id.
     let gb_with_distinct_outputs: Vec<OutputColumn> = gb_with_distinct
         .iter()
         .enumerate()
         .map(|(idx, expr)| {
-            let name = scalar_expr::scalar_display_name(&memo.scalars, *expr);
-            // A plain ColumnRef uses its own id; a non-ColumnRef key
-            // (constant/alias/expression, e.g. `'a' as g`) reuses the original
-            // aggregate's group output id by position. The distinct column is
-            // always a ColumnRef and is the trailing entry, so the positional
-            // lookup never needs to reach past the real group outputs.
-            let column_id = match memo.scalars.node(*expr) {
-                ScalarNode::ColumnRef(column_id) => *column_id,
-                _ => agg
-                    .output_layout
-                    .group_key_columns
-                    .get(idx)
-                    .map(|output| output.column_id)
-                    .filter(|id| *id != ColumnId::UNSET)
-                    .unwrap_or_else(|| {
-                        group_key_output_column_id(
-                            &memo.scalars,
-                            *expr,
-                            &name,
-                            &agg.output_layout.group_key_columns,
-                        )
-                    }),
-            };
+            let layout_column = (idx < group_by.len())
+                .then(|| agg.output_layout.group_key_columns.get(idx))
+                .flatten()
+                .filter(|output| output.column_id != ColumnId::UNSET);
+            let name = layout_column
+                .map(|output| output.name.clone())
+                .unwrap_or_else(|| scalar_expr::scalar_display_name(&memo.scalars, *expr));
+            let column_id = layout_column
+                .map(|output| output.column_id)
+                .unwrap_or_else(|| {
+                    group_key_output_column_id(
+                        &memo.scalars,
+                        *expr,
+                        &name,
+                        &agg.output_layout.group_key_columns,
+                    )
+                });
             OutputColumn {
                 column_id,
                 name,
                 data_type: memo.scalars.data_type(*expr).clone(),
                 nullable: memo.scalars.nullable(*expr),
-                is_internal: false,
+                is_internal: layout_column
+                    .map(|output| output.is_internal)
+                    .unwrap_or(false),
             }
         })
         .collect();
@@ -348,7 +362,10 @@ fn apply_three_phase(
         &gb_with_distinct_outputs,
         gb_with_distinct_outputs.len(),
     );
-    let distinct_phase_arg = dg_group_by.last().copied().unwrap_or(distinct_col);
+    let distinct_phase_arg = dg_group_by
+        .get(distinct_phase_arg_idx)
+        .copied()
+        .unwrap_or(distinct_col);
     let dg_id = memo.next_expr_id();
     let dg = MExpr {
         id: dg_id,
@@ -1124,6 +1141,89 @@ mod tests {
     }
 
     #[test]
+    fn three_phase_deduplicates_group_key_that_is_distinct_arg() {
+        let mut memo = Memo::new();
+        let sg = scan_group(&mut memo);
+        let id = memo.next_expr_id();
+        let mexpr = MExpr {
+            id,
+            op: Operator::LogicalAggregate(single_agg(
+                &mut memo,
+                vec![col("x")],
+                vec![count_distinct("x")],
+                vec![],
+            )),
+            children: vec![sg],
+        };
+        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        assert_eq!(out.len(), 1, "expected one multi-phase alternative");
+
+        let dg_group = &memo.groups[out[0].children[0]];
+        let dg = match &dg_group.physical_exprs[0].op {
+            Operator::PhysicalHashAggregate(p) => p,
+            other => panic!("expected DISTINCT_GLOBAL, got {:?}", other),
+        };
+        assert!(matches!(dg.mode, AggMode::DistinctGlobal));
+        assert_eq!(dg.group_by.len(), 1);
+        assert_eq!(dg.output_layout.group_key_columns.len(), 1);
+        let dg_ids = dg
+            .output_columns
+            .iter()
+            .map(|column| column.column_id)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(dg_ids.len(), dg.output_columns.len());
+
+        let local_group = &memo.groups[dg_group.physical_exprs[0].children[0]];
+        let local = match &local_group.physical_exprs[0].op {
+            Operator::PhysicalHashAggregate(p) => p,
+            other => panic!("expected LOCAL, got {:?}", other),
+        };
+        assert!(matches!(local.mode, AggMode::Local));
+        assert_eq!(local.group_by.len(), 1);
+        assert_eq!(local.output_layout.group_key_columns.len(), 1);
+    }
+
+    #[test]
+    fn three_phase_rebinds_existing_distinct_key_by_position() {
+        let mut memo = Memo::new();
+        let sg = scan_group(&mut memo);
+        let id = memo.next_expr_id();
+        let mexpr = MExpr {
+            id,
+            op: Operator::LogicalAggregate(single_agg(
+                &mut memo,
+                vec![col("x"), col("g")],
+                vec![count_distinct("x")],
+                vec![],
+            )),
+            children: vec![sg],
+        };
+        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        assert_eq!(out.len(), 1, "expected one multi-phase alternative");
+
+        let top = match &out[0].op {
+            Operator::PhysicalHashAggregate(p) => p,
+            other => panic!("expected GLOBAL PhysicalHashAggregate, got {:?}", other),
+        };
+        assert!(matches!(top.mode, AggMode::Global));
+        assert_eq!(top.group_by.len(), 2);
+        assert_eq!(top.aggregates.len(), 1);
+        let arg = top.aggregates[0]
+            .args
+            .first()
+            .copied()
+            .expect("distinct arg");
+        let ScalarNode::ColumnRef(column_id) = memo.scalars.node(arg) else {
+            panic!("expected distinct arg to be ColumnRef");
+        };
+        assert_eq!(
+            *column_id,
+            test_col_id("x"),
+            "count(distinct x) must not rebind to the trailing group key"
+        );
+    }
+
+    #[test]
     fn three_phase_top_preserves_pruned_public_outputs() {
         let mut memo = Memo::new();
         let sg = scan_group(&mut memo);
@@ -1191,7 +1291,7 @@ mod tests {
     }
 
     #[test]
-    fn three_phase_intermediate_outputs_preserve_group_and_distinct_input_ids() {
+    fn three_phase_intermediate_outputs_use_group_layout_id_and_distinct_input_id() {
         let mut memo = Memo::new();
         let sg = scan_group(&mut memo);
         let g = col_with_id("g", 4);
@@ -1250,6 +1350,10 @@ mod tests {
 
         let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
         assert_eq!(out.len(), 1);
+        let top = match &out[0].op {
+            Operator::PhysicalHashAggregate(p) => p,
+            other => panic!("expected GLOBAL, got {:?}", other),
+        };
         let dg_group = &memo.groups[out[0].children[0]];
         let dg = match &dg_group.physical_exprs[0].op {
             Operator::PhysicalHashAggregate(p) => p,
@@ -1262,10 +1366,15 @@ mod tests {
         };
 
         let expected = vec![
-            ColumnId::new_for_test(4),
+            ColumnId::new_for_test(9),
             ColumnId::new_for_test(5),
             ColumnId::new_for_test(8),
         ];
+        let top_group_id = match memo.scalars.node(top.group_by[0]) {
+            ScalarNode::ColumnRef(column_id) => *column_id,
+            other => panic!("expected top group_by ColumnRef, got {other:?}"),
+        };
+        assert_eq!(top_group_id, ColumnId::new_for_test(9));
         assert_eq!(
             dg.output_columns
                 .iter()

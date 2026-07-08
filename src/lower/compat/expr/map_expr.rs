@@ -21,7 +21,7 @@ use std::sync::Arc;
 /// Lower MAP_EXPR to internal map function call.
 ///
 /// StarRocks MAP_EXPR children are interleaved as: key1, value1, key2, value2, ...
-/// novarocks map function expects exactly two ARRAY arguments: keys and values.
+/// novarocks map_from_arrays function expects exactly two ARRAY arguments: keys and values.
 pub(crate) fn lower_map_expr(
     children: &[ExprId],
     arena: &mut ExprArena,
@@ -95,7 +95,7 @@ pub(crate) fn lower_map_expr(
 
     Ok(arena.push_typed(
         ExprNode::FunctionCall {
-            kind: FunctionKind::Map("map"),
+            kind: FunctionKind::Map("map_from_arrays"),
             args: vec![keys_array, values_array],
         },
         data_type,
@@ -136,7 +136,7 @@ mod tests {
         let ExprNode::FunctionCall { kind, args } = arena.node(map_expr).expect("node") else {
             panic!("MAP_EXPR should lower to FunctionCall");
         };
-        assert_eq!(*kind, FunctionKind::Map("map"));
+        assert_eq!(*kind, FunctionKind::Map("map_from_arrays"));
         assert_eq!(args.len(), 2);
 
         let ExprNode::ArrayExpr {
@@ -164,7 +164,7 @@ mod tests {
         let ExprNode::FunctionCall { kind, args } = arena.node(map_expr).expect("node") else {
             panic!("MAP_EXPR should lower to FunctionCall");
         };
-        assert_eq!(*kind, FunctionKind::Map("map"));
+        assert_eq!(*kind, FunctionKind::Map("map_from_arrays"));
         assert_eq!(args.len(), 2);
 
         let ExprNode::ArrayExpr {

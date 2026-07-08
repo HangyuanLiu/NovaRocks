@@ -17,10 +17,9 @@
 
 //! Proto expression lowering.
 
-use arrow::datatypes::{DataType, Field};
+use arrow::datatypes::DataType;
 use arrow_buffer::i256;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use super::layout::Layout;
 use super::{decode_field_type, decode_type};
@@ -148,6 +147,37 @@ fn lower_expr_list(
         .iter()
         .map(|value| lower_proto_expr(value, arena, input_layout))
         .collect()
+}
+
+fn lower_lambda(
+    lambda: &expr::LambdaExpr,
+    arena: &mut ExprArena,
+    input_layout: &Layout,
+    data_type: DataType,
+) -> Result<ExprId, String> {
+    let body = lower_required_child(&lambda.body, "Lambda.body", arena, input_layout)?;
+    let mut arg_slots = Vec::with_capacity(lambda.params.len());
+    for (idx, param) in lambda.params.iter().enumerate() {
+        let type_desc = param
+            .r#type
+            .as_ref()
+            .ok_or_else(|| format!("Lambda.params[{idx}].type missing"))?;
+        let _param_type = decode_type(type_desc)
+            .map_err(|err| format!("Lambda.params[{idx}].type decode failed: {err}"))?;
+        if param.slot_id <= 0 {
+            return Err(format!("Lambda.params[{idx}].slot_id must be positive"));
+        }
+        arg_slots.push(SlotId::try_from(param.slot_id)?);
+    }
+    Ok(arena.push_typed(
+        ExprNode::LambdaFunction {
+            body,
+            arg_slots,
+            common_sub_exprs: Vec::new(),
+            is_nondeterministic: false,
+        },
+        data_type,
+    ))
 }
 
 fn lower_binary_op(
@@ -315,23 +345,16 @@ fn lower_map_constructor(
         }
     }
 
-    let keys_array = arena.push_typed(
-        ExprNode::ArrayExpr {
-            elements: key_elements,
-        },
-        DataType::List(Arc::new(Field::new("item", expected_key_type, true))),
-    );
-    let values_array = arena.push_typed(
-        ExprNode::ArrayExpr {
-            elements: value_elements,
-        },
-        DataType::List(Arc::new(Field::new("item", expected_value_type, true))),
-    );
+    let mut args = Vec::with_capacity(call.args.len());
+    for (key, value) in key_elements.into_iter().zip(value_elements) {
+        args.push(key);
+        args.push(value);
+    }
 
     Ok(arena.push_typed(
         ExprNode::FunctionCall {
             kind: FunctionKind::Map("map"),
-            args: vec![keys_array, values_array],
+            args,
         },
         data_type,
     ))
@@ -635,29 +658,6 @@ fn lower_is_truth(
     }
 }
 
-fn lower_lambda(
-    lambda: &expr::LambdaExpr,
-    arena: &mut ExprArena,
-    input_layout: &Layout,
-    data_type: DataType,
-) -> Result<ExprId, String> {
-    let body_expr = lambda
-        .body
-        .as_ref()
-        .ok_or_else(|| "LambdaExpr.body missing".to_string())?;
-    let arg_slots = infer_lambda_arg_slots(lambda)?;
-    let body = lower_proto_expr(body_expr, arena, input_layout)?;
-    Ok(arena.push_typed(
-        ExprNode::LambdaFunction {
-            body,
-            arg_slots,
-            common_sub_exprs: Vec::new(),
-            is_nondeterministic: false,
-        },
-        data_type,
-    ))
-}
-
 fn infer_lambda_arg_slots(lambda: &expr::LambdaExpr) -> Result<Vec<SlotId>, String> {
     let body = lambda
         .body
@@ -670,7 +670,11 @@ fn infer_lambda_arg_slots(lambda: &expr::LambdaExpr) -> Result<Vec<SlotId>, Stri
     let mut ordered_params = Vec::with_capacity(lambda.params.len());
     let mut target_names = HashSet::with_capacity(lambda.params.len());
     for param in &lambda.params {
-        let name = normalize_lambda_param_name(param);
+        let name = param
+            .name
+            .as_deref()
+            .map(normalize_lambda_param_name)
+            .unwrap_or_default();
         if name.is_empty() {
             return Err("LambdaExpr.params contains an empty parameter name".to_string());
         }
@@ -899,7 +903,9 @@ fn collect_lambda_param_slots(
         expr::expr::Kind::Lambda(lambda) => {
             let mut nested_shadowed_names = shadowed_names.clone();
             for param in &lambda.params {
-                nested_shadowed_names.insert(normalize_lambda_param_name(param));
+                if let Some(name) = param.name.as_deref() {
+                    nested_shadowed_names.insert(normalize_lambda_param_name(name));
+                }
             }
             collect_optional_box_lambda_param_slots(
                 &lambda.body,
@@ -1659,7 +1665,7 @@ mod tests {
     }
 
     #[test]
-    fn lowers_variadic_map_constructor_to_array_pair_call() {
+    fn lowers_variadic_map_constructor_to_literal_call() {
         let map_type = DataType::Map(
             Arc::new(Field::new(
                 "entries",
@@ -1685,31 +1691,11 @@ mod tests {
             panic!("expected map constructor to lower as function call");
         };
         assert_eq!(*kind, FunctionKind::Map("map"));
-        assert_eq!(args.len(), 2);
-        let Some(ExprNode::ArrayExpr { elements: keys }) = arena.node(args[0]) else {
-            panic!("expected map keys to lower as ArrayExpr");
-        };
-        let Some(ExprNode::ArrayExpr { elements: values }) = arena.node(args[1]) else {
-            panic!("expected map values to lower as ArrayExpr");
-        };
-        assert_eq!(keys.len(), 2);
-        assert_eq!(values.len(), 2);
-        assert_eq!(
-            arena.data_type(args[0]),
-            Some(&DataType::List(Arc::new(Field::new(
-                "item",
-                DataType::Int64,
-                true
-            ))))
-        );
-        assert_eq!(
-            arena.data_type(args[1]),
-            Some(&DataType::List(Arc::new(Field::new(
-                "item",
-                DataType::Utf8,
-                true
-            ))))
-        );
+        assert_eq!(args.len(), 4);
+        assert_eq!(arena.data_type(args[0]), Some(&DataType::Int64));
+        assert_eq!(arena.data_type(args[1]), Some(&DataType::Utf8));
+        assert_eq!(arena.data_type(args[2]), Some(&DataType::Int64));
+        assert_eq!(arena.data_type(args[3]), Some(&DataType::Utf8));
         assert_eq!(arena.data_type(id), Some(&map_type));
     }
 
@@ -1744,17 +1730,12 @@ mod tests {
         let Some(ExprNode::FunctionCall { args, .. }) = arena.node(id) else {
             panic!("expected map constructor to lower as function call");
         };
-        let Some(ExprNode::ArrayExpr { elements: keys }) = arena.node(args[0]) else {
-            panic!("expected map keys to lower as ArrayExpr");
-        };
-        let Some(ExprNode::ArrayExpr { elements: values }) = arena.node(args[1]) else {
-            panic!("expected map values to lower as ArrayExpr");
-        };
 
-        assert_eq!(arena.data_type(keys[0]), Some(&DataType::Int64));
-        assert!(matches!(arena.node(keys[0]), Some(ExprNode::Cast(_))));
-        assert_eq!(arena.data_type(values[1]), Some(&DataType::Int64));
-        assert!(matches!(arena.node(values[1]), Some(ExprNode::Cast(_))));
+        assert_eq!(args.len(), 4);
+        assert_eq!(arena.data_type(args[0]), Some(&DataType::Int64));
+        assert!(matches!(arena.node(args[0]), Some(ExprNode::Cast(_))));
+        assert_eq!(arena.data_type(args[3]), Some(&DataType::Int64));
+        assert!(matches!(arena.node(args[3]), Some(ExprNode::Cast(_))));
     }
 
     #[test]
@@ -1795,7 +1776,12 @@ mod tests {
         let lambda = scalar_expr(
             item_type.clone(),
             expr::expr::Kind::Lambda(Box::new(expr::LambdaExpr {
-                params: vec!["x".to_string()],
+                params: vec![expr::LambdaParam {
+                    slot_id: lambda_slot,
+                    name: Some("x".to_string()),
+                    r#type: Some(type_desc(&item_type)),
+                    nullable: true,
+                }],
                 body: Some(Box::new(body)),
             })),
         );
@@ -1978,6 +1964,42 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn lambda_expr_lowers_to_lambda_function() {
+        let lambda = scalar_expr(
+            DataType::Int64,
+            expr::expr::Kind::Lambda(Box::new(expr::LambdaExpr {
+                params: vec![expr::LambdaParam {
+                    slot_id: 3,
+                    name: Some("x".to_string()),
+                    r#type: Some(type_desc(&DataType::Int64)),
+                    nullable: true,
+                }],
+                body: Some(Box::new(scalar_expr(
+                    DataType::Int64,
+                    expr::expr::Kind::LambdaParamRef(expr::LambdaParamRef {
+                        slot_id: 3,
+                        name: Some("x".to_string()),
+                    }),
+                ))),
+            })),
+        );
+
+        let (arena, id) = lower(&lambda);
+        let Some(ExprNode::LambdaFunction {
+            arg_slots,
+            common_sub_exprs,
+            is_nondeterministic,
+            ..
+        }) = arena.node(id)
+        else {
+            panic!("expected LambdaFunction");
+        };
+        assert_eq!(arg_slots, &vec![SlotId::new(3)]);
+        assert!(common_sub_exprs.is_empty());
+        assert!(!is_nondeterministic);
     }
 
     #[test]

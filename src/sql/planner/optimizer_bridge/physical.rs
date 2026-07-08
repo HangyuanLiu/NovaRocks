@@ -286,7 +286,7 @@ impl BridgeCtx<'_> {
                 Ok(PhysicalPlanKind::Redistribute(RedistributeNode {
                     mode,
                     partition_exprs,
-                    output_columns: physical_node_output_columns(child),
+                    output_columns: physical_node_materialized_output_columns(child),
                 }))
             }
             op if op.is_logical() => Err(format!(
@@ -301,6 +301,13 @@ fn physical_node_output_columns(node: &OptimizerPhysicalNode) -> Vec<OutputColum
     match &node.op {
         Operator::PhysicalScan(scan) => scan_materialized_output_columns(scan),
         _ => node.output_columns.clone(),
+    }
+}
+
+fn physical_node_materialized_output_columns(node: &OptimizerPhysicalNode) -> Vec<OutputColumn> {
+    match &node.op {
+        Operator::PhysicalHashAggregate(aggregate) => aggregate.output_layout.full_output_columns(),
+        _ => physical_node_output_columns(node),
     }
 }
 
@@ -967,6 +974,50 @@ mod tests {
         assert_eq!(*column_id, ColumnId::new_for_test(7));
         assert_eq!(qualifier.as_deref(), None);
         assert_eq!(column, "k");
+    }
+
+    #[test]
+    fn physical_distribution_over_aggregate_uses_materialized_layout_outputs() {
+        let mut arena = ScalarArena::new();
+        let group_expr = crate::sql::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &col_expr(7, "map2"),
+        );
+        let distinct_expr = crate::sql::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &col_expr(2, "s2"),
+        );
+        let map2_column = output_column(7, "map2");
+        let s2_column = output_column(2, "s2");
+        let mut aggregate = base_node(Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+            mode: AggMode::Local,
+            group_by: vec![group_expr, distinct_expr],
+            aggregates: vec![],
+            output_layout: AggregateOutputLayout::new(
+                vec![map2_column.clone(), s2_column.clone()],
+                vec![],
+            ),
+            output_columns: vec![map2_column.clone()],
+            is_merge: vec![],
+        }));
+        aggregate.output_columns = vec![output_column(1, "stale_visible")];
+        aggregate.children.push(raw_values_node());
+        let mut node = base_node(Operator::PhysicalDistribution(PhysicalDistributionOp {
+            spec: DistributionSpec::HashPartitioned {
+                cols: vec![ColumnId::new_for_test(7), ColumnId::new_for_test(2)],
+                source: OptimizerHashSource::ShuffleAgg,
+            },
+        }));
+        node.output_columns = vec![output_column(1, "stale_parent")];
+        node.children.push(aggregate);
+        let node = attach_arena(node, Arc::new(arena));
+
+        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        let PhysicalPlanKind::Redistribute(redistribute) = physical.kind else {
+            panic!("expected Redistribute");
+        };
+
+        assert_output_columns_eq(&redistribute.output_columns, &[map2_column, s2_column]);
     }
 
     #[test]

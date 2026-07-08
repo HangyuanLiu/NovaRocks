@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::chunk::type_compatibility::{check_exact, retag_column};
 use crate::exec::expr::cast::cast_with_special_rules;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{
@@ -24,7 +25,7 @@ use arrow::array::{
 use arrow::compute::cast;
 use arrow::compute::kernels::boolean::not;
 use arrow::compute::kernels::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field, Fields};
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -1095,6 +1096,14 @@ fn normalize_comparison_types(
         return Ok((left, right));
     }
 
+    if let Some(normalized) = normalize_nested_metadata_only_types(left.clone(), right.clone())? {
+        return Ok(normalized);
+    }
+
+    if let Some(normalized) = normalize_nested_comparison_types(left.clone(), right.clone())? {
+        return Ok(normalized);
+    }
+
     if let Some(normalized) = normalize_dictionary_comparison_types(left.clone(), right.clone())? {
         return Ok(normalized);
     }
@@ -1180,6 +1189,118 @@ fn comparison_fields_match(
     left.name() == right.name()
         && left.is_nullable() == right.is_nullable()
         && comparison_data_types_match(left.data_type(), right.data_type())
+}
+
+fn normalize_nested_metadata_only_types(
+    left: ArrayRef,
+    right: ArrayRef,
+) -> Result<Option<(ArrayRef, ArrayRef)>, String> {
+    if !matches!(
+        left.data_type(),
+        DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
+    ) || !matches!(
+        right.data_type(),
+        DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
+    ) {
+        return Ok(None);
+    }
+    if check_exact(left.data_type(), right.data_type()).is_ok() {
+        let right = retag_column(&right, left.data_type()).map_err(|m| format!("{m:?}"))?;
+        return Ok(Some((left, right)));
+    }
+    if check_exact(right.data_type(), left.data_type()).is_ok() {
+        let left = retag_column(&left, right.data_type()).map_err(|m| format!("{m:?}"))?;
+        return Ok(Some((left, right)));
+    }
+    Ok(None)
+}
+
+fn same_nested_kind(left: &DataType, right: &DataType) -> bool {
+    matches!(
+        (left, right),
+        (DataType::List(_), DataType::List(_))
+            | (DataType::Struct(_), DataType::Struct(_))
+            | (DataType::Map(_, _), DataType::Map(_, _))
+    )
+}
+
+fn nested_comparison_field(left: &Field, right: &Field) -> Result<Option<Field>, String> {
+    let Some(data_type) = nested_comparison_target_type(left.data_type(), right.data_type())?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        Field::new(
+            left.name().clone(),
+            data_type,
+            left.is_nullable() || right.is_nullable(),
+        )
+        .with_metadata(left.metadata().clone()),
+    ))
+}
+
+fn nested_comparison_target_type(
+    left: &DataType,
+    right: &DataType,
+) -> Result<Option<DataType>, String> {
+    if left == right {
+        return Ok(Some(left.clone()));
+    }
+    if !same_nested_kind(left, right) {
+        return crate::types::comparison_common_type(left, right);
+    }
+    match (left, right) {
+        (DataType::List(left_field), DataType::List(right_field)) => {
+            let Some(field) = nested_comparison_field(left_field, right_field)? else {
+                return Ok(None);
+            };
+            Ok(Some(DataType::List(Arc::new(field))))
+        }
+        (DataType::Struct(left_fields), DataType::Struct(right_fields)) => {
+            if left_fields.len() != right_fields.len() {
+                return Ok(None);
+            }
+            let mut fields = Vec::with_capacity(left_fields.len());
+            for (left_field, right_field) in left_fields.iter().zip(right_fields.iter()) {
+                let Some(field) = nested_comparison_field(left_field, right_field)? else {
+                    return Ok(None);
+                };
+                fields.push(field);
+            }
+            Ok(Some(DataType::Struct(Fields::from(fields))))
+        }
+        (DataType::Map(left_entries, left_ordered), DataType::Map(right_entries, _)) => {
+            let Some(entries) = nested_comparison_field(left_entries, right_entries)? else {
+                return Ok(None);
+            };
+            Ok(Some(DataType::Map(Arc::new(entries), *left_ordered)))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn normalize_nested_comparison_types(
+    left: ArrayRef,
+    right: ArrayRef,
+) -> Result<Option<(ArrayRef, ArrayRef)>, String> {
+    if !same_nested_kind(left.data_type(), right.data_type()) {
+        return Ok(None);
+    }
+    let Some(target_type) = nested_comparison_target_type(left.data_type(), right.data_type())?
+    else {
+        return Ok(None);
+    };
+    let left = if left.data_type() == &target_type {
+        left
+    } else {
+        cast_with_special_rules(&left, &target_type)?
+    };
+    let right = if right.data_type() == &target_type {
+        right
+    } else {
+        cast_with_special_rules(&right, &target_type)?
+    };
+    Ok(Some((left, right)))
 }
 
 fn is_string_or_null_type(data_type: &DataType) -> bool {
@@ -1593,9 +1714,9 @@ mod tests {
         Int64Builder, LargeStringDictionaryBuilder, ListArray, MapArray, MapBuilder, MapFieldNames,
         PrimitiveDictionaryBuilder, StringArray, StructArray,
     };
+    use arrow::buffer::{NullBuffer, OffsetBuffer};
     use arrow::datatypes::{Field, Fields, Int8Type, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
-    use arrow_buffer::OffsetBuffer;
     use std::collections::HashMap;
 
     fn create_test_chunk_int(values: Vec<i64>) -> Chunk {
@@ -1724,6 +1845,62 @@ mod tests {
         (0..array.len())
             .map(|idx| (!array.is_null(idx)).then(|| array.value(idx)))
             .collect()
+    }
+
+    fn chunk_from_arrays(columns: Vec<(SlotId, &'static str, ArrayRef)>) -> Chunk {
+        let fields = columns
+            .iter()
+            .map(|(_, name, array)| Field::new(*name, array.data_type().clone(), true))
+            .collect::<Vec<_>>();
+        let arrays = columns
+            .iter()
+            .map(|(_, _, array)| array.clone())
+            .collect::<Vec<_>>();
+        let slot_ids = columns.iter().map(|(slot, _, _)| *slot).collect::<Vec<_>>();
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema, arrays).unwrap();
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &slot_ids,
+        )
+        .unwrap();
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
+
+    fn list_i64_with_field_id(field_id: &str) -> ArrayRef {
+        let field = Arc::new(Field::new("item", DataType::Int64, true).with_metadata(
+            HashMap::from([("PARQUET:field_id".to_string(), field_id.to_string())]),
+        ));
+        Arc::new(ListArray::new(
+            field,
+            OffsetBuffer::new(vec![0, 2, 4].into()),
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+            None::<NullBuffer>,
+        ))
+    }
+
+    fn list_decimal_26_2() -> ArrayRef {
+        let field = Arc::new(Field::new("item", DataType::Decimal128(26, 2), true));
+        Arc::new(ListArray::new(
+            field,
+            OffsetBuffer::new(vec![0, 2, 4].into()),
+            Arc::new(
+                Decimal128Array::from(vec![100_i128, 200_i128, 300_i128, 400_i128])
+                    .with_precision_and_scale(26, 2)
+                    .unwrap(),
+            ),
+            None::<NullBuffer>,
+        ))
+    }
+
+    fn list_utf8_numeric_text() -> ArrayRef {
+        let field = Arc::new(Field::new("item", DataType::Utf8, true));
+        Arc::new(ListArray::new(
+            field,
+            OffsetBuffer::new(vec![0, 2, 4].into()),
+            Arc::new(StringArray::from(vec!["1.00", "2.00", "3.00", "4.00"])),
+            None::<NullBuffer>,
+        ))
     }
 
     fn create_test_chunk_list_i64(left: ListArray, right: ListArray, list_type: DataType) -> Chunk {
@@ -1910,6 +2087,58 @@ mod tests {
             bool_values(&result),
             vec![Some(true), Some(false), None, Some(true)]
         );
+    }
+
+    #[test]
+    fn nested_eq_ignores_arrow_field_metadata() {
+        let left_array = list_i64_with_field_id("6");
+        let right_array = list_i64_with_field_id("7");
+        let chunk = chunk_from_arrays(vec![
+            (SlotId::new(1), "l", left_array.clone()),
+            (SlotId::new(2), "r", right_array.clone()),
+        ]);
+        let mut arena = ExprArena::default();
+        let left_slot = arena.push_typed(
+            ExprNode::SlotId(SlotId::new(1)),
+            left_array.data_type().clone(),
+        );
+        let right_slot = arena.push_typed(
+            ExprNode::SlotId(SlotId::new(2)),
+            right_array.data_type().clone(),
+        );
+        let expr = arena.push_typed(ExprNode::Eq(left_slot, right_slot), DataType::Boolean);
+
+        let result = arena
+            .eval(expr, &chunk)
+            .expect("metadata-only nested type difference");
+
+        assert_eq!(bool_values(&result), vec![Some(true), Some(true)]);
+    }
+
+    #[test]
+    fn nested_ne_casts_string_items_to_decimal_items() {
+        let left_array = list_decimal_26_2();
+        let right_array = list_utf8_numeric_text();
+        let chunk = chunk_from_arrays(vec![
+            (SlotId::new(1), "l", left_array.clone()),
+            (SlotId::new(2), "r", right_array.clone()),
+        ]);
+        let mut arena = ExprArena::default();
+        let left_slot = arena.push_typed(
+            ExprNode::SlotId(SlotId::new(1)),
+            left_array.data_type().clone(),
+        );
+        let right_slot = arena.push_typed(
+            ExprNode::SlotId(SlotId::new(2)),
+            right_array.data_type().clone(),
+        );
+        let expr = arena.push_typed(ExprNode::Ne(left_slot, right_slot), DataType::Boolean);
+
+        let result = arena
+            .eval(expr, &chunk)
+            .expect("nested comparison should cast string items to decimal");
+
+        assert_eq!(bool_values(&result), vec![Some(false), Some(false)]);
     }
 
     #[test]
@@ -2649,7 +2878,6 @@ mod tests {
     #[test]
     fn normalize_utf8_vs_nanosecond_preserves_sub_microsecond() {
         use arrow::array::TimestampNanosecondArray;
-        use arrow::datatypes::TimeUnit;
 
         // Build a nanosecond timestamp column value: 2024-01-02 03:04:05.000000001
         // 1704164645_000000001 ns from epoch

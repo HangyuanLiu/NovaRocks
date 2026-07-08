@@ -345,9 +345,9 @@ fn eval_array_generate_datetime(
         let step_v = if let Some(steps) = step_values {
             let step_row = super::common::row_index(row, steps.len());
             if steps.is_null(step_row) {
-                null_builder.append_null();
-                offsets.push(current_offset as i32);
-                continue;
+                return Err(
+                    "array_generate requires step parameter must be a constant integer".to_string(),
+                );
             }
             steps.value(step_row)
         } else {
