@@ -2268,7 +2268,7 @@ impl<'a> AnalyzerContext<'a> {
 
     /// Analyze a query that can reference columns from an outer scope.
     /// Returns (ResolvedQuery, inner_scope_from_FROM_clause).
-    fn analyze_query_with_outer_scope_inner(
+    pub(super) fn analyze_query_with_outer_scope_inner(
         &self,
         query: &sqlparser::ast::Query,
         outer_scope: &AnalyzerScope,
