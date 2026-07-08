@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Helpers for building `TExecPlanFragmentParams` from fragment build results.
+//! Helpers for building `TExecPlanFragmentParams` from compat fragment payloads.
 //!
 //! `build_exec_plan_fragment_params` consolidates root, CTE, and
 //! Stream-source fragment metadata into one place, replacing ad-hoc
@@ -23,10 +23,21 @@
 
 use std::collections::BTreeMap;
 
-use crate::sql::codegen::FragmentBuildResult;
+use crate::thrift::data_sinks;
+use crate::thrift::descriptors;
 use crate::thrift::internal_service;
 use crate::thrift::planner;
 use crate::thrift::types;
+
+pub(crate) struct CompatFragmentPlanPayload {
+    pub(crate) plan: crate::thrift::plan_nodes::TPlan,
+    pub(crate) desc_tbl: descriptors::TDescriptorTable,
+    pub(crate) output_sink: data_sinks::TDataSink,
+    pub(crate) output_exprs: Option<Vec<crate::thrift::exprs::TExpr>>,
+    pub(crate) fragment_partition: crate::thrift::partitions::TDataPartition,
+    pub(crate) query_global_dicts: Option<Vec<crate::thrift::data::TGlobalDict>>,
+    pub(crate) query_global_dict_exprs: Option<BTreeMap<i32, crate::thrift::exprs::TExpr>>,
+}
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ExecPlanFragmentParamOptions {
@@ -35,28 +46,41 @@ pub(crate) struct ExecPlanFragmentParamOptions {
     pub(crate) novarocks_typed_result_sink: bool,
 }
 
-/// Assemble a `TExecPlanFragmentParams` from a pre-built fragment result.
+/// Assemble a `TExecPlanFragmentParams` from a compat fragment payload.
 ///
 /// The caller is responsible for:
 /// - Mutating `exec_params.query_id`, `fragment_instance_id`,
 ///   `per_exch_num_senders`, and `runtime_filter_params` before calling.
-/// - Constructing the `thrift_fragment` with the correct output sink
-///   (DATA_STREAM_SINK, MULTI_CAST_DATA_STREAM_SINK, or RESULT_SINK).
+/// - Passing a payload with the correct output sink (DATA_STREAM_SINK,
+///   MULTI_CAST_DATA_STREAM_SINK, or RESULT_SINK).
 /// - Passing `backend_num` = the FE-assigned instance index (ExecutionDAG
 ///   index). This becomes `RuntimeState.backend_num` and drives the sink's
 ///   `be_number`. See `src/service/internal_service.rs:1194`.
 pub(crate) fn build_exec_plan_fragment_params(
-    fr: &FragmentBuildResult,
-    thrift_fragment: planner::TPlanFragment,
+    payload: CompatFragmentPlanPayload,
     exec_params: internal_service::TPlanFragmentExecParams,
     query_options: Option<internal_service::TQueryOptions>,
     pipeline_dop: i32,
     options: ExecPlanFragmentParamOptions,
 ) -> internal_service::TExecPlanFragmentParams {
+    let thrift_fragment = planner::TPlanFragment::new(
+        Some(payload.plan),
+        payload.output_exprs,
+        Some(payload.output_sink),
+        payload.fragment_partition,
+        None::<i64>,
+        None::<i64>,
+        payload.query_global_dicts,
+        None::<Vec<crate::thrift::data::TGlobalDict>>,
+        None::<planner::TCacheParam>,
+        payload.query_global_dict_exprs,
+        None::<planner::TGroupExecutionParam>,
+    );
+
     internal_service::TExecPlanFragmentParams::new(
         internal_service::InternalServiceVersion::V1,
         Some(thrift_fragment),
-        Some(fr.desc_tbl.clone()),
+        Some(payload.desc_tbl),
         Some(exec_params),
         None::<types::TNetworkAddress>,          // coord
         options.backend_num,                     // backend_num (FE instance index)
@@ -96,16 +120,18 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::sql::codegen::{FragmentBuildResult, FragmentOutputKind};
     use crate::thrift::data_sinks;
     use crate::thrift::descriptors;
     use crate::thrift::partitions;
     use crate::thrift::types;
 
-    /// Build a minimal `FragmentBuildResult` for testing.
-    fn empty_fragment_build_result(finst_hi: i64, finst_lo: i64) -> FragmentBuildResult {
-        use crate::sql::codegen::OutputColumn;
-
+    fn empty_fragment_payload_and_exec_params(
+        finst_hi: i64,
+        finst_lo: i64,
+    ) -> (
+        CompatFragmentPlanPayload,
+        internal_service::TPlanFragmentExecParams,
+    ) {
         let exec_params = internal_service::TPlanFragmentExecParams {
             query_id: types::TUniqueId::new(0, 0),
             fragment_instance_id: types::TUniqueId::new(finst_hi, finst_lo),
@@ -126,51 +152,21 @@ mod tests {
             exec_debug_options: None,
         };
 
-        let output_sink = data_sinks::TDataSink::new(
-            data_sinks::TDataSinkType::RESULT_SINK,
-            None::<data_sinks::TDataStreamSink>,
-            Some(data_sinks::TResultSink::default()),
-            None::<data_sinks::TMysqlTableSink>,
-            None::<data_sinks::TExportSink>,
-            None::<data_sinks::TOlapTableSink>,
-            None::<data_sinks::TMemoryScratchSink>,
-            None::<data_sinks::TMultiCastDataStreamSink>,
-            None::<data_sinks::TSchemaTableSink>,
-            None::<data_sinks::TIcebergTableSink>,
-            None::<data_sinks::THiveTableSink>,
-            None::<data_sinks::TTableFunctionTableSink>,
-            None::<data_sinks::TDictionaryCacheSink>,
-            None::<Vec<Box<data_sinks::TDataSink>>>,
-            None::<i64>,
-            None::<data_sinks::TSplitDataStreamSink>,
-            None::<data_sinks::TIcebergChangeStreamRouterSink>,
-        );
-
-        FragmentBuildResult {
-            fragment_id: 0,
-            has_scan_nodes: false,
-            output_kind: FragmentOutputKind::Result,
+        let payload = CompatFragmentPlanPayload {
             plan: crate::thrift::plan_nodes::TPlan::new(vec![]),
             desc_tbl: descriptors::TDescriptorTable::new(vec![], vec![], vec![], false),
-            exec_params,
-            native_scan_ranges: Default::default(),
-            output_sink,
+            output_sink: minimal_noop_sink(),
             output_exprs: None,
-            output_columns: vec![OutputColumn {
-                name: "col".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
-            }],
-            boundary_schemas: vec![],
-            cte_id: None,
-            cte_exchange_nodes: vec![],
+            fragment_partition: unpartitioned_partition(),
             query_global_dicts: None,
             query_global_dict_exprs: None,
-        }
+        };
+
+        (payload, exec_params)
     }
 
-    fn noop_thrift_fragment() -> planner::TPlanFragment {
-        let noop_sink = data_sinks::TDataSink::new(
+    fn minimal_noop_sink() -> data_sinks::TDataSink {
+        data_sinks::TDataSink::new(
             data_sinks::TDataSinkType::NOOP_SINK,
             None::<data_sinks::TDataStreamSink>,
             None::<data_sinks::TResultSink>,
@@ -188,24 +184,15 @@ mod tests {
             None::<i64>,
             None::<data_sinks::TSplitDataStreamSink>,
             None::<data_sinks::TIcebergChangeStreamRouterSink>,
-        );
-        planner::TPlanFragment::new(
-            None::<crate::thrift::plan_nodes::TPlan>,
+        )
+    }
+
+    fn unpartitioned_partition() -> partitions::TDataPartition {
+        partitions::TDataPartition::new(
+            partitions::TPartitionType::UNPARTITIONED,
             None::<Vec<crate::thrift::exprs::TExpr>>,
-            Some(noop_sink),
-            partitions::TDataPartition::new(
-                partitions::TPartitionType::UNPARTITIONED,
-                None::<Vec<crate::thrift::exprs::TExpr>>,
-                None::<Vec<partitions::TRangePartition>>,
-                None::<Vec<partitions::TBucketProperty>>,
-            ),
-            None::<i64>,
-            None::<i64>,
-            None::<Vec<crate::thrift::data::TGlobalDict>>,
-            None::<Vec<crate::thrift::data::TGlobalDict>>,
-            None::<planner::TCacheParam>,
-            None::<BTreeMap<i32, crate::thrift::exprs::TExpr>>,
-            None::<planner::TGroupExecutionParam>,
+            None::<Vec<partitions::TRangePartition>>,
+            None::<Vec<partitions::TBucketProperty>>,
         )
     }
 
@@ -216,14 +203,12 @@ mod tests {
         let query_hi = 100i64;
         let query_lo = 1i64;
 
-        let fr = empty_fragment_build_result(finst_hi, finst_lo);
-        let mut exec_params = fr.exec_params.clone();
+        let (payload, mut exec_params) = empty_fragment_payload_and_exec_params(finst_hi, finst_lo);
         exec_params.query_id = types::TUniqueId::new(query_hi, query_lo);
         exec_params.fragment_instance_id = types::TUniqueId::new(finst_hi, finst_lo);
 
         let result = build_exec_plan_fragment_params(
-            &fr,
-            noop_thrift_fragment(),
+            payload,
             exec_params,
             None,
             4,
@@ -239,15 +224,13 @@ mod tests {
 
     #[test]
     fn preserves_per_exch_num_senders() {
-        let fr = empty_fragment_build_result(1, 2);
-        let mut exec_params = fr.exec_params.clone();
+        let (payload, mut exec_params) = empty_fragment_payload_and_exec_params(1, 2);
         exec_params.query_id = types::TUniqueId::new(1, 1);
         exec_params.fragment_instance_id = types::TUniqueId::new(1, 2);
         exec_params.per_exch_num_senders = BTreeMap::from([(3, 4)]);
 
         let result = build_exec_plan_fragment_params(
-            &fr,
-            noop_thrift_fragment(),
+            payload,
             exec_params,
             None,
             4,
@@ -262,8 +245,7 @@ mod tests {
     fn preserves_runtime_filter_params() {
         use crate::thrift::runtime_filter;
 
-        let fr = empty_fragment_build_result(1, 2);
-        let mut exec_params = fr.exec_params.clone();
+        let (payload, mut exec_params) = empty_fragment_payload_and_exec_params(1, 2);
         exec_params.query_id = types::TUniqueId::new(1, 1);
         exec_params.fragment_instance_id = types::TUniqueId::new(1, 2);
         let rf_params = runtime_filter::TRuntimeFilterParams::new(
@@ -275,8 +257,7 @@ mod tests {
         exec_params.runtime_filter_params = Some(rf_params.clone());
 
         let result = build_exec_plan_fragment_params(
-            &fr,
-            noop_thrift_fragment(),
+            payload,
             exec_params,
             None,
             4,
@@ -292,14 +273,12 @@ mod tests {
 
     #[test]
     fn desc_tbl_is_embedded() {
-        let fr = empty_fragment_build_result(1, 2);
-        let mut exec_params = fr.exec_params.clone();
+        let (payload, mut exec_params) = empty_fragment_payload_and_exec_params(1, 2);
         exec_params.query_id = types::TUniqueId::new(1, 1);
         exec_params.fragment_instance_id = types::TUniqueId::new(1, 2);
 
         let result = build_exec_plan_fragment_params(
-            &fr,
-            noop_thrift_fragment(),
+            payload,
             exec_params,
             None,
             4,
@@ -311,14 +290,12 @@ mod tests {
 
     #[test]
     fn pipeline_dop_is_set() {
-        let fr = empty_fragment_build_result(1, 2);
-        let mut exec_params = fr.exec_params.clone();
+        let (payload, mut exec_params) = empty_fragment_payload_and_exec_params(1, 2);
         exec_params.query_id = types::TUniqueId::new(1, 1);
         exec_params.fragment_instance_id = types::TUniqueId::new(1, 2);
 
         let result = build_exec_plan_fragment_params(
-            &fr,
-            noop_thrift_fragment(),
+            payload,
             exec_params,
             None,
             8,
@@ -330,14 +307,12 @@ mod tests {
 
     #[test]
     fn backend_num_is_threaded_to_params() {
-        let fr = empty_fragment_build_result(1, 2);
-        let mut exec_params = fr.exec_params.clone();
+        let (payload, mut exec_params) = empty_fragment_payload_and_exec_params(1, 2);
         exec_params.query_id = types::TUniqueId::new(1, 1);
         exec_params.fragment_instance_id = types::TUniqueId::new(1, 2);
 
         let result = build_exec_plan_fragment_params(
-            &fr,
-            noop_thrift_fragment(),
+            payload,
             exec_params,
             None,
             4,
@@ -356,14 +331,11 @@ mod tests {
 
     #[test]
     fn build_exec_params_preserves_novarocks_report_addr() {
-        let fr = empty_fragment_build_result(1, 2);
-        let thrift_fragment = noop_thrift_fragment();
-        let exec_params = fr.exec_params.clone();
+        let (payload, exec_params) = empty_fragment_payload_and_exec_params(1, 2);
         let report_addr = types::TNetworkAddress::new("127.0.0.1".to_string(), 18040);
 
         let params = build_exec_plan_fragment_params(
-            &fr,
-            thrift_fragment,
+            payload,
             exec_params,
             None,
             1,
@@ -383,14 +355,11 @@ mod tests {
 
     #[test]
     fn build_exec_params_sets_typed_result_sink_only_when_requested() {
-        let fr = empty_fragment_build_result(1, 2);
-        let thrift_fragment = noop_thrift_fragment();
-        let exec_params = fr.exec_params.clone();
+        let (legacy_payload, legacy_exec_params) = empty_fragment_payload_and_exec_params(1, 2);
 
         let legacy = build_exec_plan_fragment_params(
-            &fr,
-            thrift_fragment.clone(),
-            exec_params.clone(),
+            legacy_payload,
+            legacy_exec_params,
             None,
             1,
             ExecPlanFragmentParamOptions {
@@ -400,10 +369,10 @@ mod tests {
         );
         assert_eq!(legacy.novarocks_typed_result_sink, None);
 
+        let (typed_payload, typed_exec_params) = empty_fragment_payload_and_exec_params(1, 2);
         let typed = build_exec_plan_fragment_params(
-            &fr,
-            thrift_fragment,
-            exec_params,
+            typed_payload,
+            typed_exec_params,
             None,
             1,
             ExecPlanFragmentParamOptions {
@@ -417,12 +386,9 @@ mod tests {
 
     #[test]
     fn build_exec_params_marks_novarocks_generated_plan() {
-        let fr = empty_fragment_build_result(1, 2);
-        let thrift_fragment = noop_thrift_fragment();
-        let exec_params = fr.exec_params.clone();
+        let (payload, exec_params) = empty_fragment_payload_and_exec_params(1, 2);
         let params = build_exec_plan_fragment_params(
-            &fr,
-            thrift_fragment,
+            payload,
             exec_params,
             None,
             1,

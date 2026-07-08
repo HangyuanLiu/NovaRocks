@@ -31,7 +31,9 @@ use crate::exec::chunk::schema_thrift::chunk_slot_schema_from_type_desc;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::novarocks_logging::debug;
 use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher, FragmentSubmission};
-use crate::runtime::exec_params::{ExecPlanFragmentParamOptions, build_exec_plan_fragment_params};
+use crate::runtime::exec_params::{
+    CompatFragmentPlanPayload, ExecPlanFragmentParamOptions, build_exec_plan_fragment_params,
+};
 use crate::runtime::profile::RuntimeProfileTree;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::query_state::QueryState;
@@ -52,7 +54,6 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::planner::{DataPartition, PartitionKind};
 use crate::thrift::data_sinks;
 use crate::thrift::partitions;
-use crate::thrift::planner;
 use crate::thrift::types;
 
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
@@ -566,20 +567,6 @@ impl ExecutionCoordinator {
                     pipeline_dop
                 };
 
-                let thrift_fragment = planner::TPlanFragment::new(
-                    Some(fr.plan.clone()),
-                    fr.output_exprs.clone(),
-                    Some(output_sink),
-                    fragment_partition,
-                    None::<i64>,
-                    None::<i64>,
-                    fr.query_global_dicts.clone(),
-                    None::<Vec<crate::thrift::data::TGlobalDict>>,
-                    None::<planner::TCacheParam>,
-                    fr.query_global_dict_exprs.clone(),
-                    None::<planner::TGroupExecutionParam>,
-                );
-
                 let mut exec_params = fr.exec_params.clone();
                 exec_params.query_id = query_id.clone();
                 exec_params.fragment_instance_id = placement.finst_id.clone();
@@ -598,8 +585,15 @@ impl ExecutionCoordinator {
 
                 let compat_query_options = query_options.as_ref().map(QueryOptions::to_thrift);
                 let params = build_exec_plan_fragment_params(
-                    fr,
-                    thrift_fragment,
+                    CompatFragmentPlanPayload {
+                        plan: fr.plan.clone(),
+                        desc_tbl: fr.desc_tbl.clone(),
+                        output_sink,
+                        output_exprs: fr.output_exprs.clone(),
+                        fragment_partition,
+                        query_global_dicts: fr.query_global_dicts.clone(),
+                        query_global_dict_exprs: fr.query_global_dict_exprs.clone(),
+                    },
                     exec_params,
                     compat_query_options,
                     fragment_dop,
