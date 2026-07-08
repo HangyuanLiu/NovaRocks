@@ -23,6 +23,7 @@
 //! executable target TableDef, and loads target-table statistics.
 //! Every failure is a warn-and-skip: rewrite is an optional optimization.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::sql::catalog::{CatalogProvider, ScanSource};
@@ -38,6 +39,51 @@ use super::query_stats::{QueryStatsPlan, QueryStatsProviders};
 /// Upper bound on candidates per query; aligned with the StarRocks default
 /// cbo_materialized_view_rewrite_related_mvs_limit = 16.
 const MAX_MV_CANDIDATES: usize = 16;
+
+/// Target-table Iceberg property carrying the per-MV query-rewrite staleness
+/// tolerance, in seconds. `0`/absent/unparseable = strict (default). Set at
+/// CREATE via `PROPERTIES('query_rewrite_max_staleness_sec'='N')` or later via
+/// `ALTER MATERIALIZED VIEW ... SET PROPERTIES(...)`.
+pub(crate) const MV_QUERY_REWRITE_MAX_STALENESS_SEC_PROP: &str =
+    "query_rewrite_max_staleness_sec";
+
+/// Parse the per-MV staleness tolerance (seconds) from target-table properties.
+/// Absent or unparseable => 0 (strict).
+fn parse_mv_staleness_property_sec(props: &HashMap<String, String>) -> u64 {
+    props
+        .get(MV_QUERY_REWRITE_MAX_STALENESS_SEC_PROP)
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Resolve the effective tolerance window (seconds): session override wins when
+/// set (including an explicit `Some(0)` to force strict); otherwise the MV's own
+/// property value. Default (both unset) => 0 = strict.
+fn effective_staleness_window_sec(session: Option<u64>, mv_property_sec: u64) -> u64 {
+    session.unwrap_or(mv_property_sec)
+}
+
+/// Sound bounded-staleness verdict for one base table. `true` iff the base has
+/// advanced no more than `window_sec` (measured by snapshot commit-ts gap in ms,
+/// compared exactly in ms). `window_sec == 0` is strict (always false here — the
+/// caller only reaches this on a stale base). Missing commit timestamps or a
+/// negative gap (rollback/anomaly) => false (skip), never a wrong answer.
+fn staleness_within_window(
+    window_sec: u64,
+    pinned_commit_ms: Option<i64>,
+    current_commit_ms: Option<i64>,
+) -> bool {
+    if window_sec == 0 {
+        return false;
+    }
+    let (Some(pinned), Some(current)) = (pinned_commit_ms, current_commit_ms) else {
+        return false;
+    };
+    if current < pinned {
+        return false;
+    }
+    (current - pinned) as u64 <= window_sec.saturating_mul(1000)
+}
 
 struct PreparedMvRewriteCandidate {
     mv_name: String,
@@ -401,5 +447,41 @@ mod tests {
             rewrite_candidate_display_name("target_agg_mv"),
             "target_agg_mv"
         );
+    }
+
+    #[test]
+    fn parse_mv_staleness_property_reads_seconds_or_zero() {
+        use std::collections::HashMap;
+        let mut p = HashMap::new();
+        assert_eq!(super::parse_mv_staleness_property_sec(&p), 0, "absent -> strict");
+        p.insert("query_rewrite_max_staleness_sec".to_string(), "300".to_string());
+        assert_eq!(super::parse_mv_staleness_property_sec(&p), 300);
+        p.insert("query_rewrite_max_staleness_sec".to_string(), "  90 ".to_string());
+        assert_eq!(super::parse_mv_staleness_property_sec(&p), 90, "trims");
+        p.insert("query_rewrite_max_staleness_sec".to_string(), "bad".to_string());
+        assert_eq!(super::parse_mv_staleness_property_sec(&p), 0, "unparseable -> strict");
+    }
+
+    #[test]
+    fn effective_window_prefers_session_over_property() {
+        assert_eq!(super::effective_staleness_window_sec(Some(10), 300), 10, "session wins");
+        assert_eq!(super::effective_staleness_window_sec(Some(0), 300), 0, "session 0 forces strict");
+        assert_eq!(super::effective_staleness_window_sec(None, 300), 300, "fall back to property");
+        assert_eq!(super::effective_staleness_window_sec(None, 0), 0, "default strict");
+    }
+
+    #[test]
+    fn staleness_within_window_boundary_and_anomalies() {
+        // window 0 => always skip (strict), even with zero gap.
+        assert!(!super::staleness_within_window(0, Some(1_000), Some(1_000)));
+        // exact boundary in ms: 300s window, gap 300_000ms -> within.
+        assert!(super::staleness_within_window(300, Some(1_000_000), Some(1_300_000)));
+        // one ms over -> skip.
+        assert!(!super::staleness_within_window(300, Some(1_000_000), Some(1_300_001)));
+        // negative gap (rollback) -> skip.
+        assert!(!super::staleness_within_window(300, Some(2_000_000), Some(1_000_000)));
+        // missing commit ts -> skip.
+        assert!(!super::staleness_within_window(300, None, Some(1_000_000)));
+        assert!(!super::staleness_within_window(300, Some(1_000_000), None));
     }
 }
