@@ -110,7 +110,7 @@ fn staged_artifacts_from_writer_outputs(
 ) -> Result<Vec<String>, String> {
     let mut paths = BTreeSet::new();
     for writer in writers {
-        for commit_info in &writer.sink_commit_infos {
+        for commit_info in &writer.iceberg_commits {
             let Some(data_file) = commit_info.iceberg_data_file.as_ref() else {
                 continue;
             };
@@ -123,7 +123,7 @@ fn staged_artifacts_from_writer_outputs(
     Ok(paths.into_iter().collect())
 }
 
-fn format_unique_id(id: &crate::thrift::types::TUniqueId) -> String {
+fn format_unique_id(id: &crate::common::types::UniqueId) -> String {
     format!("{}/{}", id.hi, id.lo)
 }
 
@@ -147,14 +147,15 @@ fn operation_kind_for_commit_op_kind(kind: CommitOpKind) -> IcebergOperationKind
 mod tests {
     use super::*;
 
+    use crate::common::types::UniqueId;
     use crate::meta::repository::iceberg_operation::{
         IcebergOperationFailureKind, IcebergOperationNextAction, IcebergOperationState,
     };
+    use crate::proto::novarocks;
     use crate::runtime::write_coordinator::{WriteAbortInput, WriterKey};
-    use crate::thrift::types;
 
-    fn id(hi: i64, lo: i64) -> types::TUniqueId {
-        types::TUniqueId::new(hi, lo)
+    fn id(hi: i64, lo: i64) -> UniqueId {
+        UniqueId { hi, lo }
     }
 
     fn key(
@@ -175,17 +176,16 @@ mod tests {
         WriterCommitInput {
             writer_id,
             writer_key,
-            sink_commit_infos: vec![types::TSinkCommitInfo {
-                iceberg_data_file: Some(types::TIcebergDataFile {
+            iceberg_commits: vec![novarocks::IcebergCommitInfo {
+                iceberg_data_file: Some(novarocks::IcebergDataFile {
                     path: Some(path.to_string()),
                     record_count: Some(7),
                     file_size_in_bytes: Some(70),
+                    file_content: novarocks::IcebergFileContent::Data as i32,
                     ..Default::default()
                 }),
                 ..Default::default()
             }],
-            tablet_commit_infos: Vec::new(),
-            tablet_fail_infos: Vec::new(),
             load_counters: BTreeMap::from([("loaded.rows".to_string(), "7".to_string())]),
             loaded_rows: 7,
             loaded_bytes: 70,
@@ -335,16 +335,16 @@ mod tests {
     #[test]
     fn staged_artifacts_ignore_non_iceberg_commit_infos_and_deduplicate_paths() {
         let mut writer = writer_output(0, key(70, 80, 701, 801, 0), "s3://w/a.parquet");
-        writer.sink_commit_infos.push(types::TSinkCommitInfo {
-            iceberg_data_file: Some(types::TIcebergDataFile {
+        writer.iceberg_commits.push(novarocks::IcebergCommitInfo {
+            iceberg_data_file: Some(novarocks::IcebergDataFile {
                 path: Some("s3://w/a.parquet".to_string()),
                 ..Default::default()
             }),
             ..Default::default()
         });
         writer
-            .sink_commit_infos
-            .push(types::TSinkCommitInfo::default());
+            .iceberg_commits
+            .push(novarocks::IcebergCommitInfo::default());
 
         let artifacts = staged_artifacts_from_writer_outputs(&[writer]).expect("artifacts");
 
@@ -354,8 +354,8 @@ mod tests {
     #[test]
     fn staged_artifacts_reject_missing_iceberg_path() {
         let mut writer = writer_output(0, key(90, 100, 901, 1001, 0), "s3://w/a.parquet");
-        writer.sink_commit_infos.push(types::TSinkCommitInfo {
-            iceberg_data_file: Some(types::TIcebergDataFile {
+        writer.iceberg_commits.push(novarocks::IcebergCommitInfo {
+            iceberg_data_file: Some(novarocks::IcebergDataFile {
                 path: None,
                 ..Default::default()
             }),

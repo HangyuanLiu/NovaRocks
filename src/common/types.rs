@@ -18,7 +18,7 @@ use std::fmt;
 
 use crate::common::result_batch::ResultBatch;
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct UniqueId {
     pub hi: i64,
     pub lo: i64,

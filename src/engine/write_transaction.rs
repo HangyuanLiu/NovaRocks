@@ -130,8 +130,8 @@ impl IcebergWriteCommitExecutor {
     ) -> Result<CommitOutcome, CommitServiceError> {
         let mut writer_files = Vec::new();
         for writer in &write_commit.writers {
-            let reports = crate::runtime::sink_commit_wire::sink_commit_infos_to_writer_reports(
-                writer.sink_commit_infos.clone(),
+            let reports = crate::runtime::sink_commit_wire::iceberg_commit_infos_to_writer_reports(
+                writer.iceberg_commits.clone(),
                 self.table.metadata(),
             )
             .map_err(|message| {
@@ -240,7 +240,7 @@ pub(crate) fn write_commit_has_files(write_commit: &WriteCommitInput) -> bool {
     write_commit
         .writers
         .iter()
-        .any(|writer| !writer.sink_commit_infos.is_empty())
+        .any(|writer| !writer.iceberg_commits.is_empty())
 }
 
 /// Drives one Iceberg write transaction through the operation state machine.
@@ -414,6 +414,7 @@ impl<'a, E: IcebergWriteTransactionExecutor> IcebergWriteTransactionRunner<'a, E
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::types::UniqueId;
     use crate::connector::iceberg::commit::{CommitOutcome, CommitServiceError};
     use crate::meta::repository::iceberg_operation::IcebergOperationState;
     use crate::runtime::query_result::QueryResult;
@@ -479,10 +480,10 @@ mod tests {
     }
 
     fn write_commit_with_writer_without_files() -> WriteCommitInput {
-        let write_id = crate::thrift::types::TUniqueId::new(10, 20);
+        let write_id = UniqueId { hi: 10, lo: 20 };
         let writer_key = WriterKey {
-            query_id: write_id.clone(),
-            fragment_instance_id: crate::thrift::types::TUniqueId::new(101, 201),
+            query_id: write_id,
+            fragment_instance_id: UniqueId { hi: 101, lo: 201 },
             backend_num: 0,
         };
         WriteCommitInput {
@@ -490,9 +491,7 @@ mod tests {
             writers: vec![WriterCommitInput {
                 writer_id: 0,
                 writer_key,
-                sink_commit_infos: Vec::new(),
-                tablet_commit_infos: Vec::new(),
-                tablet_fail_infos: Vec::new(),
+                iceberg_commits: Vec::new(),
                 load_counters: BTreeMap::new(),
                 loaded_rows: 0,
                 loaded_bytes: 0,

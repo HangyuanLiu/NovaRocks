@@ -44,6 +44,7 @@ use arrow::record_batch::RecordBatch;
 
 use crate::common::app_config::PlanWireFormat;
 use crate::common::ids::SlotId;
+use crate::common::types::UniqueId;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::novarocks_logging::debug;
 use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher, FragmentSubmission};
@@ -664,8 +665,8 @@ impl ExecutionCoordinator {
                         "write sink fragment missing exec params in coordinator".to_string()
                     })?;
                     expected_writers.push(WriterKey {
-                        query_id: exec.query_id.clone(),
-                        fragment_instance_id: exec.fragment_instance_id.clone(),
+                        query_id: unique_id_from_thrift(&exec.query_id),
+                        fragment_instance_id: unique_id_from_thrift(&exec.fragment_instance_id),
                         backend_num: placement.instance_index as i32,
                     });
                 }
@@ -766,7 +767,7 @@ impl ExecutionCoordinator {
         let (write_coordinator, _write_registration) = if expected_writers.is_empty() {
             (None, None)
         } else {
-            let write = register_query(query_id.clone(), expected_writers)?;
+            let write = register_query(unique_id_from_thrift(&query_id), expected_writers)?;
             (
                 Some(write),
                 Some(RegisteredWriteCoordinator::new(query_id.clone())),
@@ -1472,18 +1473,27 @@ fn root_uses_typed_result_sink(
 }
 
 struct RegisteredWriteCoordinator {
-    query_id: types::TUniqueId,
+    query_id: UniqueId,
 }
 
 impl RegisteredWriteCoordinator {
     fn new(query_id: types::TUniqueId) -> Self {
-        Self { query_id }
+        Self {
+            query_id: unique_id_from_thrift(&query_id),
+        }
     }
 }
 
 impl Drop for RegisteredWriteCoordinator {
     fn drop(&mut self) {
         unregister_query(&self.query_id);
+    }
+}
+
+fn unique_id_from_thrift(id: &types::TUniqueId) -> UniqueId {
+    UniqueId {
+        hi: id.hi,
+        lo: id.lo,
     }
 }
 
@@ -2612,6 +2622,7 @@ mod tests {
     use super::*;
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema};
+    use crate::proto::{common, novarocks};
     use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher};
     use crate::runtime::profile::ProfileUnit;
     use crate::runtime::write_coordinator::{
@@ -3972,6 +3983,10 @@ mod tests {
         types::TUniqueId::new(hi, lo)
     }
 
+    fn native_id(hi: i64, lo: i64) -> UniqueId {
+        UniqueId { hi, lo }
+    }
+
     fn runtime_query_id(hi: i64, lo: i64) -> crate::runtime::query_context::QueryId {
         crate::runtime::query_context::QueryId { hi, lo }
     }
@@ -3984,8 +3999,8 @@ mod tests {
         backend_num: i32,
     ) -> WriterKey {
         WriterKey {
-            query_id: id(query_hi, query_lo),
-            fragment_instance_id: id(finst_hi, finst_lo),
+            query_id: native_id(query_hi, query_lo),
+            fragment_instance_id: native_id(finst_hi, finst_lo),
             backend_num,
         }
     }
@@ -4007,28 +4022,35 @@ mod tests {
         status: status::TStatus,
         path: &str,
     ) -> FragmentExecStatusReport {
-        let sink_commit_infos = if path.is_empty() {
+        let iceberg_commits = if path.is_empty() {
             Vec::new()
         } else {
-            vec![types::TSinkCommitInfo {
-                iceberg_data_file: Some(types::TIcebergDataFile {
+            vec![novarocks::IcebergCommitInfo {
+                iceberg_data_file: Some(novarocks::IcebergDataFile {
                     path: Some(path.to_string()),
                     record_count: Some(3),
                     file_size_in_bytes: Some(30),
+                    file_content: novarocks::IcebergFileContent::Data as i32,
                     ..Default::default()
                 }),
                 ..Default::default()
             }]
         };
+        let status = common::Status {
+            code: status.status_code.0,
+            message: status
+                .error_msgs
+                .as_ref()
+                .map(|msgs| msgs.join("; "))
+                .unwrap_or_default(),
+        };
         FragmentExecStatusReport {
-            query_id: writer.query_id.clone(),
-            fragment_instance_id: writer.fragment_instance_id.clone(),
+            query_id: writer.query_id,
+            fragment_instance_id: writer.fragment_instance_id,
             backend_num: writer.backend_num,
             done,
             status,
-            sink_commit_infos,
-            tablet_commit_infos: Vec::new(),
-            tablet_fail_infos: Vec::new(),
+            iceberg_commits,
             load_counters: Default::default(),
             loaded_rows: 3,
             loaded_bytes: 30,
@@ -4765,10 +4787,10 @@ mod tests {
     #[test]
     fn write_failure_seen_by_coordinator_cancels_inflight_fragments() {
         let mut guard = write_registry_test_guard();
-        let query_id = id(710, 711);
+        let query_id = native_id(710, 711);
         let writer = writer_key(710, 711, 712, 713, 0);
         let write = guard
-            .register_query(query_id.clone(), vec![writer.clone()])
+            .register_query(query_id, vec![writer.clone()])
             .expect("register writer");
 
         write
@@ -4800,11 +4822,10 @@ mod tests {
 
     #[test]
     fn write_commit_readiness_helper_accepts_finished_writers() {
-        let query_id = id(720, 721);
+        let query_id = native_id(720, 721);
         let writer = writer_key(720, 721, 722, 723, 0);
         let write = Arc::new(Mutex::new(
-            WriteCoordinator::new(query_id.clone(), vec![writer.clone()])
-                .expect("write coordinator"),
+            WriteCoordinator::new(query_id, vec![writer.clone()]).expect("write coordinator"),
         ));
         write
             .lock()
@@ -4826,7 +4847,7 @@ mod tests {
 
     #[test]
     fn write_commit_readiness_helper_rejects_missing_final_report() {
-        let query_id = id(730, 731);
+        let query_id = native_id(730, 731);
         let writer = writer_key(730, 731, 732, 733, 0);
         let write = Arc::new(Mutex::new(
             WriteCoordinator::new(query_id, vec![writer]).expect("write coordinator"),
@@ -4840,10 +4861,10 @@ mod tests {
 
     #[test]
     fn delayed_write_final_report_after_root_eof_is_accepted() {
-        let query_id = id(740, 741);
         let writer = writer_key(740, 741, 742, 743, 0);
         let write = Arc::new(Mutex::new(
-            WriteCoordinator::new(query_id, vec![writer.clone()]).expect("write coordinator"),
+            WriteCoordinator::new(native_id(740, 741), vec![writer.clone()])
+                .expect("write coordinator"),
         ));
         let (eof_tx, eof_rx) = std::sync::mpsc::channel();
         let inner = EofSignalDispatcher::new(eof_tx);
@@ -4899,7 +4920,7 @@ mod tests {
         let query_id = id(760, 761);
         let writer = writer_key(760, 761, 762, 763, 0);
         let write = Arc::new(Mutex::new(
-            WriteCoordinator::new(query_id.clone(), vec![writer.clone()])
+            WriteCoordinator::new(native_id(760, 761), vec![writer.clone()])
                 .expect("write coordinator"),
         ));
         let (eof_tx, _eof_rx) = std::sync::mpsc::channel();
@@ -4984,12 +5005,14 @@ mod tests {
 
     #[test]
     fn write_failure_before_root_eof_surfaces_abort_with_completed_writer_outputs() {
-        let query_id = id(780, 781);
         let writer_ok = writer_key(780, 781, 782, 783, 0);
         let writer_failed = writer_key(780, 781, 784, 785, 0);
         let write = Arc::new(Mutex::new(
-            WriteCoordinator::new(query_id, vec![writer_ok.clone(), writer_failed.clone()])
-                .expect("write coordinator"),
+            WriteCoordinator::new(
+                native_id(780, 781),
+                vec![writer_ok.clone(), writer_failed.clone()],
+            )
+            .expect("write coordinator"),
         ));
         write
             .lock()
@@ -5046,7 +5069,7 @@ mod tests {
         );
         assert_eq!(abort.completed_writer_outputs.len(), 1);
         assert_eq!(
-            abort.completed_writer_outputs[0].sink_commit_infos[0]
+            abort.completed_writer_outputs[0].iceberg_commits[0]
                 .iceberg_data_file
                 .as_ref()
                 .and_then(|file| file.path.as_deref()),
@@ -5223,7 +5246,7 @@ mod tests {
         let query_id = id(790, 791);
         let writer = writer_key(790, 791, 790, 1, 0);
         let write = Arc::new(Mutex::new(
-            WriteCoordinator::new(query_id.clone(), vec![writer.clone()])
+            WriteCoordinator::new(native_id(790, 791), vec![writer.clone()])
                 .expect("write coordinator"),
         ));
         write
@@ -5239,7 +5262,10 @@ mod tests {
 
         let inner = ControllableDispatcher::fetch_returns_err("no result for this query");
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
-        let root_finst_id = writer.fragment_instance_id.clone();
+        let root_finst_id = types::TUniqueId::new(
+            writer.fragment_instance_id.hi,
+            writer.fragment_instance_id.lo,
+        );
         let params = single_backend(vec![
             make_params_with_finst(790, 10),
             make_params_with_finst_and_sink_type(
@@ -5279,7 +5305,8 @@ mod tests {
         let query_id = id(750, 751);
         let writer = writer_key(750, 751, 752, 753, 0);
         let write = Arc::new(Mutex::new(
-            WriteCoordinator::new(query_id, vec![writer.clone()]).expect("write coordinator"),
+            WriteCoordinator::new(native_id(750, 751), vec![writer.clone()])
+                .expect("write coordinator"),
         ));
         let inner = ControllableDispatcher::succeeds_always_eof();
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
@@ -5334,7 +5361,7 @@ mod tests {
             query_result,
             write_commit: None,
             write_abort: Some(WriteAbortInput {
-                write_id: id(770, 771),
+                write_id: native_id(770, 771),
                 reason: "write abort reason".to_string(),
                 completed_writer_outputs: Vec::new(),
                 incomplete_writers: Vec::new(),

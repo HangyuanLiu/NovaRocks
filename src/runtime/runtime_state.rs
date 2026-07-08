@@ -186,7 +186,15 @@ impl RuntimeState {
             file_path = %file_path,
             "add sink_commit_info"
         );
-        sink_commit::add(finst_id, info);
+        match crate::runtime::sink_commit_wire::sink_commit_info_to_native(info) {
+            Ok(info) => sink_commit::add_iceberg_commit(finst_id, info),
+            Err(err) => debug!(
+                target: "novarocks::sink_commit",
+                finst_id = %finst_id,
+                error = %err,
+                "skip invalid sink_commit_info"
+            ),
+        }
     }
 
     pub(crate) fn add_iceberg_writer_report(
@@ -194,9 +202,17 @@ impl RuntimeState {
         report: crate::connector::iceberg::report::IcebergWriterReport,
         metadata: &iceberg::spec::TableMetadata,
     ) -> Result<(), String> {
-        let commit_info =
-            crate::runtime::sink_commit_wire::writer_report_to_sink_commit_info(report, metadata)?;
-        self.add_sink_commit_info(commit_info);
+        let commit_info = crate::runtime::sink_commit_wire::writer_report_to_iceberg_commit_info(
+            report, metadata,
+        )?;
+        let Some(finst_id) = self.fragment_instance_id else {
+            debug!(
+                target: "novarocks::sink_commit",
+                "skip iceberg commit info because fragment_instance_id is missing"
+            );
+            return Ok(());
+        };
+        sink_commit::add_iceberg_commit(finst_id, commit_info);
         Ok(())
     }
 

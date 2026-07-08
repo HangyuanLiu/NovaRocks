@@ -1098,8 +1098,7 @@ mod tests {
         let finst_id = UniqueId { hi: 7007, lo: 1 };
         crate::runtime::sink_commit::unregister(finst_id);
         crate::runtime::sink_commit::register(finst_id);
-        crate::runtime::sink_commit::add(
-            finst_id,
+        let commit_info = crate::runtime::sink_commit_wire::sink_commit_info_to_native(
             crate::thrift::types::TSinkCommitInfo {
                 iceberg_data_file: Some(test_thrift_puffin_dv_file()),
                 hive_file_info: None,
@@ -1107,7 +1106,9 @@ mod tests {
                 staging_dir: None,
                 is_rewrite: None,
             },
-        );
+        )
+        .expect("native commit info");
+        crate::runtime::sink_commit::add_iceberg_commit(finst_id, commit_info);
 
         let collector = IcebergCommitCollector::new(
             CommitOpKind::RowDeltaDvFromFiles,

@@ -41,11 +41,12 @@ pub(crate) struct ExecStatusReportInput {
 pub(crate) fn build_report_params(
     input: ExecStatusReportInput,
 ) -> frontend_service::TReportExecStatusParams {
-    let sink_commit_infos = sink_commit::list(input.finst_id);
+    let iceberg_commits = sink_commit::list_iceberg_commits(input.finst_id);
+    let sink_commit_infos = thrift_sink_commit_infos_for_report(input.finst_id, &iceberg_commits);
     let tablet_commit_infos = sink_commit::list_tablet_commit_infos(input.finst_id);
     let tablet_fail_infos = sink_commit::list_tablet_fail_infos(input.finst_id);
     let (normal_rows, loaded_bytes, filtered_rows) =
-        load_stats_for_report(input.finst_id, &sink_commit_infos);
+        load_stats_for_report(input.finst_id, &iceberg_commits);
 
     // FE derives loaded rows from these LoadEtlTask-recognized counters.
     // Missing or mismatched keys make FE see loadedRows=0.
@@ -129,19 +130,9 @@ pub(crate) fn build_report_params(
 pub(crate) fn build_native_report(
     input: ExecStatusReportInput,
 ) -> Result<novarocks::ExecStatusReport, String> {
-    let sink_commit_infos = sink_commit::list(input.finst_id);
+    let iceberg_commits = sink_commit::list_iceberg_commits(input.finst_id);
     let (loaded_rows, sink_load_bytes, filtered_rows) =
-        load_stats_for_report(input.finst_id, &sink_commit_infos);
-    let mut iceberg_commits = Vec::new();
-    for info in sink_commit_infos {
-        if info.hive_file_info.is_some() && info.iceberg_data_file.is_none() {
-            continue;
-        }
-        iceberg_commits.push(
-            sink_commit_wire::sink_commit_info_to_native(info)
-                .map_err(|err| format!("failed to convert sink commit info to native: {err}"))?,
-        );
-    }
+        load_stats_for_report(input.finst_id, &iceberg_commits);
 
     Ok(novarocks::ExecStatusReport {
         query_id: Some(common::UniqueId {
@@ -173,23 +164,15 @@ pub(crate) fn build_native_report(
 
 fn load_stats_for_report(
     finst_id: UniqueId,
-    sink_commit_infos: &[types::TSinkCommitInfo],
+    iceberg_commits: &[novarocks::IcebergCommitInfo],
 ) -> (i64, i64, i64) {
     let state_stats = sink_commit::get_load_stats(finst_id);
     let mut normal_rows: i64 = state_stats.loaded_rows.max(0);
     let mut loaded_bytes: i64 = state_stats.loaded_bytes.max(0);
     let filtered_rows: i64 = state_stats.filtered_rows.max(0);
 
-    for info in sink_commit_infos {
+    for info in iceberg_commits {
         if let Some(file) = info.iceberg_data_file.as_ref() {
-            if let Some(rows) = file.record_count {
-                normal_rows = normal_rows.saturating_add(rows);
-            }
-            if let Some(bytes) = file.file_size_in_bytes {
-                loaded_bytes = loaded_bytes.saturating_add(bytes);
-            }
-        }
-        if let Some(file) = info.hive_file_info.as_ref() {
             if let Some(rows) = file.record_count {
                 normal_rows = normal_rows.saturating_add(rows);
             }
@@ -200,6 +183,29 @@ fn load_stats_for_report(
     }
 
     (normal_rows, loaded_bytes, filtered_rows)
+}
+
+fn thrift_sink_commit_infos_for_report(
+    finst_id: UniqueId,
+    iceberg_commits: &[novarocks::IcebergCommitInfo],
+) -> Vec<types::TSinkCommitInfo> {
+    iceberg_commits
+        .iter()
+        .filter_map(
+            |info| match sink_commit_wire::sink_commit_info_from_native(info.clone()) {
+                Ok(info) => Some(info),
+                Err(err) => {
+                    debug!(
+                        target: "novarocks::sink_commit",
+                        finst_id = %finst_id,
+                        error = %err,
+                        "skip invalid native iceberg commit in thrift report"
+                    );
+                    None
+                }
+            },
+        )
+        .collect()
 }
 
 #[cfg(test)]
@@ -213,21 +219,26 @@ mod tests {
         status::TStatus::new(status_code::TStatusCode::OK, None)
     }
 
+    fn iceberg_commit(path: &str, rows: i64, bytes: i64) -> novarocks::IcebergCommitInfo {
+        novarocks::IcebergCommitInfo {
+            iceberg_data_file: Some(novarocks::IcebergDataFile {
+                path: Some(path.to_string()),
+                record_count: Some(rows),
+                file_size_in_bytes: Some(bytes),
+                file_content: novarocks::IcebergFileContent::Data as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn builder_collects_sink_commit_infos_and_load_counters() {
         let finst_id = UniqueId { hi: 91, lo: 92 };
         sink_commit::register(finst_id);
-        sink_commit::add(
+        sink_commit::add_iceberg_commit(
             finst_id,
-            types::TSinkCommitInfo {
-                iceberg_data_file: Some(types::TIcebergDataFile {
-                    path: Some("s3://warehouse/table/data-1.parquet".to_string()),
-                    record_count: Some(9),
-                    file_size_in_bytes: Some(90),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
+            iceberg_commit("s3://warehouse/table/data-1.parquet", 9, 90),
         );
         sink_commit::add_load_stats(finst_id, 3, 30, 2);
 
@@ -362,30 +373,30 @@ mod tests {
     fn native_builder_collects_iceberg_commits_and_load_stats_without_compat_fields() {
         let finst_id = UniqueId { hi: 191, lo: 192 };
         sink_commit::register(finst_id);
-        sink_commit::add(
+        sink_commit::add_iceberg_commit(
             finst_id,
-            types::TSinkCommitInfo {
-                iceberg_data_file: Some(types::TIcebergDataFile {
+            novarocks::IcebergCommitInfo {
+                iceberg_data_file: Some(novarocks::IcebergDataFile {
                     path: Some("s3://warehouse/table/data-1.parquet".to_string()),
                     format: Some("parquet".to_string()),
                     record_count: Some(9),
                     file_size_in_bytes: Some(90),
                     partition_spec_id: Some(3),
-                    file_content: Some(types::TIcebergFileContent::DATA),
-                    split_offsets: Some(vec![4, 8]),
-                    column_stats: Some(types::TIcebergColumnStats {
-                        column_sizes: Some([(1, 100)].into_iter().collect()),
-                        value_counts: None,
-                        null_value_counts: None,
-                        nan_value_counts: None,
-                        lower_bounds: Some([(1, vec![1])].into_iter().collect()),
-                        upper_bounds: None,
+                    file_content: novarocks::IcebergFileContent::Data as i32,
+                    split_offsets: Some(novarocks::Int64List { values: vec![4, 8] }),
+                    column_stats: Some(novarocks::IcebergColumnStats {
+                        column_sizes: [(1, 100)].into_iter().collect(),
+                        value_counts: Default::default(),
+                        null_value_counts: Default::default(),
+                        nan_value_counts: Default::default(),
+                        lower_bounds: [(1, vec![1])].into_iter().collect(),
+                        upper_bounds: Default::default(),
                     }),
-                    partition_values_descriptor: Some(types::TIcebergPartitionDescriptor {
-                        values: Some(vec![types::TIcebergPartitionValue {
+                    partition_values_descriptor: Some(novarocks::IcebergPartitionDescriptor {
+                        values: vec![novarocks::IcebergPartitionValue {
                             is_null: Some(false),
                             datum_bytes: Some(b"us".to_vec()),
-                        }]),
+                        }],
                     }),
                     ..Default::default()
                 }),
@@ -465,18 +476,18 @@ mod tests {
     }
 
     #[test]
-    fn native_builder_fails_when_sink_commit_cannot_convert_to_native() {
+    fn thrift_builder_skips_malformed_native_commit() {
         let finst_id = UniqueId { hi: 193, lo: 194 };
         sink_commit::register(finst_id);
-        sink_commit::add(
+        sink_commit::add_iceberg_commit(
             finst_id,
-            types::TSinkCommitInfo {
+            novarocks::IcebergCommitInfo {
                 is_overwrite: Some(true),
                 ..Default::default()
             },
         );
 
-        let err = build_native_report(ExecStatusReportInput {
+        let params = build_report_params(ExecStatusReportInput {
             finst_id,
             query_id: QueryId { hi: 183, lo: 184 },
             backend_num: 7,
@@ -487,13 +498,9 @@ mod tests {
             load_channel_profile: None,
             load_datacache_metrics: None,
             native_profile: None,
-        })
-        .expect_err("native report must fail instead of dropping malformed commit metadata");
+        });
 
-        assert!(
-            err.contains("missing iceberg_data_file"),
-            "unexpected error: {err}"
-        );
+        assert!(params.sink_commit_infos.is_none());
         sink_commit::unregister(finst_id);
     }
 }

@@ -19,7 +19,7 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::common::types::UniqueId;
 use crate::connector::iceberg::stats_assembler::FileSketchSet;
-use crate::thrift::types::{TSinkCommitInfo, TTabletCommitInfo, TTabletFailInfo};
+use crate::proto::novarocks::IcebergCommitInfo;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct SinkLoadStats {
@@ -34,9 +34,9 @@ struct SinkCommitStore {
 
 #[derive(Default)]
 struct SinkCommitEntry {
-    sink_commit_infos: Vec<TSinkCommitInfo>,
-    tablet_commit_infos: Vec<TTabletCommitInfo>,
-    tablet_fail_infos: Vec<TTabletFailInfo>,
+    iceberg_commits: Vec<IcebergCommitInfo>,
+    tablet_commit_infos: Vec<crate::thrift::types::TTabletCommitInfo>,
+    tablet_fail_infos: Vec<crate::thrift::types::TTabletFailInfo>,
     /// Per-file Theta sketch sets produced by the Iceberg sink for Puffin
     /// NDV statistics. These are not Cloneable (the `ThetaSketchHandle`
     /// holds an underlying `ThetaSketch` that does not implement `Clone`),
@@ -69,22 +69,22 @@ pub(crate) fn unregister(finst_id: UniqueId) {
     guard.remove(&finst_id);
 }
 
-pub(crate) fn add(finst_id: UniqueId, info: TSinkCommitInfo) {
+pub(crate) fn add_iceberg_commit(finst_id: UniqueId, info: IcebergCommitInfo) {
     let store = store();
     let mut guard = store.mu.lock().expect("sink commit store lock");
     guard
         .entry(finst_id)
         .or_default()
-        .sink_commit_infos
+        .iceberg_commits
         .push(info);
 }
 
-pub(crate) fn list(finst_id: UniqueId) -> Vec<TSinkCommitInfo> {
+pub(crate) fn list_iceberg_commits(finst_id: UniqueId) -> Vec<IcebergCommitInfo> {
     let store = store();
     let guard = store.mu.lock().expect("sink commit store lock");
     guard
         .get(&finst_id)
-        .map(|entry| entry.sink_commit_infos.clone())
+        .map(|entry| entry.iceberg_commits.clone())
         .unwrap_or_default()
 }
 
@@ -110,7 +110,10 @@ pub(crate) fn take_sketch_sets(finst_id: UniqueId) -> Vec<FileSketchSet> {
         .unwrap_or_default()
 }
 
-pub(crate) fn add_tablet_commit_info(finst_id: UniqueId, info: TTabletCommitInfo) {
+pub(crate) fn add_tablet_commit_info(
+    finst_id: UniqueId,
+    info: crate::thrift::types::TTabletCommitInfo,
+) {
     let store = store();
     let mut guard = store.mu.lock().expect("sink commit store lock");
     let entry = guard.entry(finst_id).or_default();
@@ -122,7 +125,9 @@ pub(crate) fn add_tablet_commit_info(finst_id: UniqueId, info: TTabletCommitInfo
     }
 }
 
-pub(crate) fn list_tablet_commit_infos(finst_id: UniqueId) -> Vec<TTabletCommitInfo> {
+pub(crate) fn list_tablet_commit_infos(
+    finst_id: UniqueId,
+) -> Vec<crate::thrift::types::TTabletCommitInfo> {
     let store = store();
     let guard = store.mu.lock().expect("sink commit store lock");
     guard
@@ -131,7 +136,10 @@ pub(crate) fn list_tablet_commit_infos(finst_id: UniqueId) -> Vec<TTabletCommitI
         .unwrap_or_default()
 }
 
-pub(crate) fn add_tablet_fail_info(finst_id: UniqueId, info: TTabletFailInfo) {
+pub(crate) fn add_tablet_fail_info(
+    finst_id: UniqueId,
+    info: crate::thrift::types::TTabletFailInfo,
+) {
     let store = store();
     let mut guard = store.mu.lock().expect("sink commit store lock");
     let entry = guard.entry(finst_id).or_default();
@@ -143,7 +151,9 @@ pub(crate) fn add_tablet_fail_info(finst_id: UniqueId, info: TTabletFailInfo) {
     }
 }
 
-pub(crate) fn list_tablet_fail_infos(finst_id: UniqueId) -> Vec<TTabletFailInfo> {
+pub(crate) fn list_tablet_fail_infos(
+    finst_id: UniqueId,
+) -> Vec<crate::thrift::types::TTabletFailInfo> {
     let store = store();
     let guard = store.mu.lock().expect("sink commit store lock");
     guard
@@ -187,6 +197,7 @@ pub(crate) fn get_load_stats(finst_id: UniqueId) -> SinkLoadStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::thrift::types::{TTabletCommitInfo, TTabletFailInfo};
 
     #[test]
     fn dedup_tablet_commit_infos_by_tablet_backend_pair() {

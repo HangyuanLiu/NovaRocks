@@ -5679,6 +5679,35 @@ fn nidl_e9_native_fragment_wire_has_no_starrocks_thrift_aliases() {
 }
 
 #[test]
+fn nidl_e9_write_coordinator_uses_native_report_types() {
+    let coordinator = nidl_e9_read("src/runtime/write_coordinator.rs");
+    let coordinator_region = nidl_e9_text_region_between(
+        &coordinator,
+        "pub(crate) use crate::runtime::write_report",
+        "impl WriteCoordinator",
+    );
+    let write_report = nidl_e9_read("src/runtime/write_report.rs");
+    let write_report_region = nidl_e9_text_region_between(
+        &write_report,
+        "pub(crate) struct WriterKey",
+        "pub(crate) fn unique_id_from_native",
+    );
+    let region = format!("{coordinator_region}\n{write_report_region}");
+    for forbidden in [
+        "types::TUniqueId",
+        "status::TStatus",
+        "types::TSinkCommitInfo",
+        "types::TTabletCommitInfo",
+        "types::TTabletFailInfo",
+    ] {
+        assert!(
+            !region.contains(forbidden),
+            "write coordinator public report structs must not contain `{forbidden}`:\n{region}"
+        );
+    }
+}
+
+#[test]
 fn nidl_e9_lower_compat_import_detector_ignores_cfg_compat_files() {
     let dir = std::env::temp_dir().join("nidl_e9_lower_compat_detector");
     let _ = fs::remove_dir_all(&dir);

@@ -1602,7 +1602,7 @@ mod tests {
             result: CoordinatedQueryResult {
                 query_result: crate::runtime::query_result::QueryResult::empty(),
                 write_commit: Some(crate::runtime::write_coordinator::WriteCommitInput {
-                    write_id: crate::thrift::types::TUniqueId::new(1, 2),
+                    write_id: crate::common::types::UniqueId { hi: 1, lo: 2 },
                     writers: Vec::new(),
                 }),
                 write_abort: None,
@@ -1620,7 +1620,7 @@ mod tests {
 
     fn empty_writer_commit_for_test() -> crate::runtime::write_coordinator::WriteCommitInput {
         crate::runtime::write_coordinator::WriteCommitInput {
-            write_id: crate::thrift::types::TUniqueId::new(1, 2),
+            write_id: crate::common::types::UniqueId { hi: 1, lo: 2 },
             writers: Vec::new(),
         }
     }

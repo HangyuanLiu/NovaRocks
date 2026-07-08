@@ -18,18 +18,25 @@
 //! StarRocks-compatible thrift report adapters for distributed write reports.
 
 use crate::common::engine_error::EngineError;
+use crate::common::types::UniqueId;
+use crate::proto::common;
+use crate::runtime::sink_commit_wire;
 use crate::runtime::write_coordinator::{self, FragmentExecStatusReport, ReportOutcome};
 use crate::thrift::frontend_service;
 
 pub(crate) fn report_from_thrift(
     params: frontend_service::TReportExecStatusParams,
 ) -> Result<FragmentExecStatusReport, String> {
-    let query_id = params
-        .query_id
-        .ok_or_else(|| "TReportExecStatusParams missing query_id".to_string())?;
-    let fragment_instance_id = params
-        .fragment_instance_id
-        .ok_or_else(|| "TReportExecStatusParams missing fragment_instance_id".to_string())?;
+    let query_id = unique_id_from_thrift(
+        params
+            .query_id
+            .ok_or_else(|| "TReportExecStatusParams missing query_id".to_string())?,
+    );
+    let fragment_instance_id = unique_id_from_thrift(
+        params
+            .fragment_instance_id
+            .ok_or_else(|| "TReportExecStatusParams missing fragment_instance_id".to_string())?,
+    );
     let backend_num = params
         .backend_num
         .ok_or_else(|| "TReportExecStatusParams missing backend_num".to_string())?;
@@ -39,15 +46,19 @@ pub(crate) fn report_from_thrift(
     let done = params
         .done
         .ok_or_else(|| "TReportExecStatusParams missing done".to_string())?;
+    let iceberg_commits = params
+        .sink_commit_infos
+        .unwrap_or_default()
+        .into_iter()
+        .map(sink_commit_wire::sink_commit_info_to_native)
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(FragmentExecStatusReport {
         query_id,
         fragment_instance_id,
         backend_num,
         done,
-        status,
-        sink_commit_infos: params.sink_commit_infos.unwrap_or_default(),
-        tablet_commit_infos: params.commit_infos.unwrap_or_default(),
-        tablet_fail_infos: params.fail_infos.unwrap_or_default(),
+        status: status_from_thrift(status),
+        iceberg_commits,
         load_counters: params.load_counters.unwrap_or_default(),
         loaded_rows: params.loaded_rows.unwrap_or_default(),
         loaded_bytes: params.sink_load_bytes.unwrap_or_default(),
@@ -62,6 +73,40 @@ pub(crate) fn handle_report_exec_status(
     write_coordinator::handle_fragment_report_exec_status(report)
 }
 
+fn unique_id_from_thrift(id: crate::thrift::types::TUniqueId) -> UniqueId {
+    UniqueId {
+        hi: id.hi,
+        lo: id.lo,
+    }
+}
+
+fn unique_id_to_thrift(id: UniqueId) -> crate::thrift::types::TUniqueId {
+    crate::thrift::types::TUniqueId::new(id.hi, id.lo)
+}
+
+fn status_from_thrift(status: crate::thrift::status::TStatus) -> common::Status {
+    common::Status {
+        code: status.status_code.0,
+        message: status
+            .error_msgs
+            .as_ref()
+            .map(|msgs| msgs.join("; "))
+            .unwrap_or_default(),
+    }
+}
+
+fn status_to_thrift(status: common::Status) -> crate::thrift::status::TStatus {
+    let error_msgs = if status.message.is_empty() {
+        None
+    } else {
+        Some(vec![status.message])
+    };
+    crate::thrift::status::TStatus::new(
+        crate::thrift::status_code::TStatusCode(status.code),
+        error_msgs,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -70,8 +115,8 @@ mod tests {
     use crate::runtime::write_coordinator::{self, WriterKey};
     use crate::thrift::{status, status_code, types};
 
-    fn id(hi: i64, lo: i64) -> types::TUniqueId {
-        types::TUniqueId { hi, lo }
+    fn id(hi: i64, lo: i64) -> UniqueId {
+        UniqueId { hi, lo }
     }
 
     fn ok_status() -> status::TStatus {
@@ -81,12 +126,18 @@ mod tests {
     fn thrift_params(
         report: FragmentExecStatusReport,
     ) -> frontend_service::TReportExecStatusParams {
+        let sink_commit_infos = report
+            .iceberg_commits
+            .into_iter()
+            .map(sink_commit_wire::sink_commit_info_from_native)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("native commit to thrift");
         frontend_service::TReportExecStatusParams::new(
             frontend_service::FrontendServiceVersion::V1,
-            Some(report.query_id),
+            Some(unique_id_to_thrift(report.query_id)),
             Some(report.backend_num),
-            Some(report.fragment_instance_id),
-            Some(report.status),
+            Some(unique_id_to_thrift(report.fragment_instance_id)),
+            Some(status_to_thrift(report.status)),
             Some(report.done),
             None,
             Option::<Vec<String>>::None,
@@ -94,18 +145,18 @@ mod tests {
             Some(report.load_counters),
             None,
             Option::<Vec<String>>::None,
-            Some(report.tablet_commit_infos),
+            None,
             Some(report.loaded_rows),
             None,
             Some(report.loaded_bytes),
             None,
             None,
             None,
-            Some(report.tablet_fail_infos),
+            None,
             Some(report.filtered_rows),
             None,
             None,
-            Some(report.sink_commit_infos),
+            Some(sink_commit_infos),
             None,
             None,
             None,
@@ -118,18 +169,17 @@ mod tests {
             fragment_instance_id: writer.fragment_instance_id.clone(),
             backend_num: writer.backend_num,
             done: true,
-            status: ok_status(),
-            sink_commit_infos: vec![types::TSinkCommitInfo {
-                iceberg_data_file: Some(types::TIcebergDataFile {
+            status: status_from_thrift(ok_status()),
+            iceberg_commits: vec![crate::proto::novarocks::IcebergCommitInfo {
+                iceberg_data_file: Some(crate::proto::novarocks::IcebergDataFile {
                     path: Some(path.to_string()),
                     record_count: Some(7),
                     file_size_in_bytes: Some(70),
+                    file_content: crate::proto::novarocks::IcebergFileContent::Data as i32,
                     ..Default::default()
                 }),
                 ..Default::default()
             }],
-            tablet_commit_infos: Vec::new(),
-            tablet_fail_infos: Vec::new(),
             load_counters: BTreeMap::new(),
             loaded_rows: 7,
             loaded_bytes: 70,
@@ -194,9 +244,9 @@ mod tests {
         ]);
         let params = frontend_service::TReportExecStatusParams::new(
             frontend_service::FrontendServiceVersion::V1,
-            Some(query_id.clone()),
+            Some(unique_id_to_thrift(query_id)),
             Some(7),
-            Some(finst_id.clone()),
+            Some(unique_id_to_thrift(finst_id)),
             Some(ok_status()),
             Some(true),
             None,
@@ -227,9 +277,14 @@ mod tests {
         assert_eq!(report.fragment_instance_id, finst_id);
         assert_eq!(report.backend_num, 7);
         assert!(report.done);
-        assert_eq!(report.sink_commit_infos, vec![sink_commit]);
-        assert_eq!(report.tablet_commit_infos, vec![tablet_commit]);
-        assert_eq!(report.tablet_fail_infos, vec![tablet_fail]);
+        assert_eq!(report.iceberg_commits.len(), 1);
+        assert_eq!(
+            report.iceberg_commits[0]
+                .iceberg_data_file
+                .as_ref()
+                .and_then(|file| file.path.as_deref()),
+            Some("s3://w/from-thrift.parquet")
+        );
         assert_eq!(report.load_counters, load_counters);
         assert_eq!(report.loaded_rows, 123);
         assert_eq!(report.loaded_bytes, 456);
@@ -261,7 +316,7 @@ mod tests {
             .expect("commit input");
         assert_eq!(commit.write_id, query_id);
         assert_eq!(
-            commit.writers[0].sink_commit_infos[0]
+            commit.writers[0].iceberg_commits[0]
                 .iceberg_data_file
                 .as_ref()
                 .and_then(|f| f.path.as_deref()),
