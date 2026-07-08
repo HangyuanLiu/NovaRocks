@@ -161,3 +161,9 @@ if ! grep -q -- 'cargo test --profile "$NOVA_CI_CARGO_PROFILE" --features compat
   echo "compat test stage must pass --features compat" >&2
   exit 1
 fi
+
+server_lib_text="$(cat "$REPO_ROOT/tools/ci/lib/server.sh")"
+if ! grep -q -- 'NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD=1' <<<"$server_lib_text"; then
+  echo "local full CI standalone-server must enable test-only IMV stateless rebuild procedure" >&2
+  exit 1
+fi
