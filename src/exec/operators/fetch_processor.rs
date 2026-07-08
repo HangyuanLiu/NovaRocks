@@ -41,9 +41,7 @@ use crate::proto;
 use crate::runtime::descriptor_snapshot_thrift::{
     LookupNodeInfo, LookupNodesInfo, is_lake_row_position,
 };
-use crate::runtime::lookup::{
-    decode_column_ipc, encode_column_ipc, execute_lake_lookup_request, execute_lookup_request,
-};
+use crate::runtime::lookup::{decode_column_ipc, encode_column_ipc, execute_lookup_request};
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::runtime_state::RuntimeState;
 
@@ -200,7 +198,7 @@ impl FetchProcessor {
                 }
 
                 let response_columns = if is_lake {
-                    execute_lake_lookup_request(query_id, *tuple_id, request_columns)?
+                    execute_lake_lookup(query_id, *tuple_id, request_columns)?
                 } else if self.is_local_backend(*backend_id)? {
                     execute_lookup_request(query_id, *tuple_id, request_columns)?
                 } else {
@@ -524,6 +522,23 @@ fn build_scatter_indices(groups: &[(i32, Vec<usize>)], total_rows: usize) -> Vec
         offset = offset.saturating_add(positions.len() as u32);
     }
     out
+}
+
+fn execute_lake_lookup(
+    query_id: QueryId,
+    tuple_id: i32,
+    request_columns: HashMap<SlotId, ArrayRef>,
+) -> Result<Vec<(SlotId, ArrayRef)>, String> {
+    #[cfg(feature = "compat")]
+    {
+        crate::runtime::lookup::execute_lake_lookup_request(query_id, tuple_id, request_columns)
+    }
+
+    #[cfg(not(feature = "compat"))]
+    {
+        let _ = (query_id, tuple_id, request_columns);
+        Err("lake lookup is only available with the compat feature".to_string())
+    }
 }
 
 fn find_node(nodes_info: &LookupNodesInfo, backend_id: i32) -> Option<&LookupNodeInfo> {

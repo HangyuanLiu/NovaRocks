@@ -5,6 +5,7 @@ use crate::connector::iceberg::scan_planner::{
     IcebergScanHandle, iceberg_scan_handle, iceberg_split,
 };
 use crate::connector::scan_planning::{ScanHandle, Split, validate_split_connectors};
+#[cfg(feature = "compat")]
 use crate::connector::starrocks::table::scan_planner::{
     StarRocksScanHandle, StarRocksSplit, starrocks_scan_handle, starrocks_split,
 };
@@ -13,9 +14,12 @@ use crate::sql::catalog::{
     ColumnDef, IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
     IcebergDeleteFileInfo,
 };
-use crate::thrift::{descriptors, exprs, internal_service, partitions, plan_nodes, types};
+#[cfg(feature = "compat")]
+use crate::thrift::descriptors;
+use crate::thrift::{exprs, internal_service, partitions, plan_nodes, types};
 use arrow::datatypes::DataType;
 
+#[cfg(feature = "compat")]
 const DEFAULT_FE_CATALOG: &str = "default_catalog";
 const ICEBERG_SCAN_SPLIT_TARGET_BYTES: i64 = 128 * 1024 * 1024;
 const ICEBERG_DELETE_APPLY_MAX_FILES_PER_DATA_FILE: usize = 1024;
@@ -23,6 +27,7 @@ const ICEBERG_DELETE_APPLY_MAX_BYTES_PER_DATA_FILE: i64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ThriftScanContext {
+    #[cfg_attr(not(feature = "compat"), allow(dead_code))]
     pub(crate) database: String,
     pub(crate) table: String,
     pub(crate) node_id: i32,
@@ -55,7 +60,10 @@ pub(crate) fn to_thrift_scan(
     validate_split_connectors(scan, splits)?;
     match connector_id {
         "iceberg" => iceberg_to_thrift_scan(scan, splits, ctx),
+        #[cfg(feature = "compat")]
         "starrocks" => starrocks_to_thrift_scan(scan, splits, ctx),
+        #[cfg(not(feature = "compat"))]
+        "starrocks" => Err("StarRocks connector scan emission requires the compat feature".into()),
         other => Err(format!(
             "unsupported connector scan thrift emitter: {other}"
         )),
@@ -653,6 +661,7 @@ pub(crate) fn build_hdfs_scan_range_params(
     scan_range::thrift_scan_range_params_from_native(&native)
 }
 
+#[cfg(feature = "compat")]
 fn starrocks_to_thrift_scan(
     scan: &ScanHandle,
     splits: &[Split],
@@ -679,6 +688,7 @@ fn starrocks_to_thrift_scan(
     })
 }
 
+#[cfg(feature = "compat")]
 fn build_starrocks_internal_scan_range_params(
     database: &str,
     table: &str,
@@ -721,6 +731,7 @@ fn build_starrocks_internal_scan_range_params(
     )
 }
 
+#[cfg(feature = "compat")]
 fn build_starrocks_lake_scan_node(
     scan: &StarRocksScanHandle,
     ctx: &ThriftScanContext,
@@ -785,6 +796,7 @@ mod tests {
     use crate::connector::scan_planning::{
         ConnectorScanHandle, ConnectorScanPlanner, ConnectorSplit,
     };
+    #[cfg(feature = "compat")]
     use crate::connector::starrocks::table::scan_planner::{
         StarRocksScanHandle, StarRocksSplit, StarRocksTableHandle,
     };
@@ -888,6 +900,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "compat")]
     #[test]
     fn to_thrift_scan_dispatches_starrocks_wire_emission() {
         let scan = ScanHandle::new(

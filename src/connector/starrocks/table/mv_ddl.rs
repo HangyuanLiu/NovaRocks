@@ -141,9 +141,30 @@ pub(crate) fn create_mv(
         &analysis.output_columns,
     )?;
     let created_at_ms = now_ms();
+    let dependency_refs: Vec<crate::engine::mv::analysis::ResolvedTableRef> = analysis
+        .resolved_refs
+        .iter()
+        .map(|table_ref| match table_ref {
+            ResolvedTableRef::Iceberg {
+                catalog,
+                namespace,
+                table,
+            } => crate::engine::mv::analysis::ResolvedTableRef::Iceberg {
+                catalog: catalog.clone(),
+                namespace: namespace.clone(),
+                table: table.clone(),
+            },
+            ResolvedTableRef::StarRocks { database, table } => {
+                crate::engine::mv::analysis::ResolvedTableRef::StarRocks {
+                    database: database.clone(),
+                    table: table.clone(),
+                }
+            }
+        })
+        .collect();
     let resolved_dependencies = crate::engine::mv::dependency::resolve_create_mv_dependencies(
         state,
-        &analysis.resolved_refs,
+        &dependency_refs,
         created_at_ms,
     )?;
     let dependency_target =

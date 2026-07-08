@@ -52,8 +52,8 @@ use crate::connector::iceberg::position_delete_descriptor::{
     ICEBERG_POSITION_DELETE_POS_COLUMN, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
     PositionDeleteDescriptorInput, PositionDeleteOutputField, PositionDeletePartitionSourceField,
 };
-use crate::connector::starrocks::table::mv_refresh::query_result_to_chunks;
 use crate::engine::backend_resolver::TargetBackend;
+use crate::engine::mv::refresh_io::query_result_to_chunks;
 use crate::engine::write_transaction::{
     IcebergWriteCommitExecutor, IcebergWriteCommitPolicy, IcebergWriteSource,
     IcebergWriteTransactionExecutor, IcebergWriteTransactionRunner, IcebergWriteTransactionSpec,

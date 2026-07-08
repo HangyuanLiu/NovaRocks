@@ -105,7 +105,7 @@ pub(crate) struct BranchRefreshContract {
 }
 
 pub(crate) fn derive_imv_refresh_contract(
-    analysis: &crate::connector::starrocks::table::mv_ddl::MvAnalysis,
+    analysis: &crate::engine::mv::analysis::MvAnalysis,
 ) -> Result<ImvRefreshContract, String> {
     crate::engine::mv::refresh_property::derive_fragment_property(&analysis.resolved_query)?
         .into_refresh_contract()
@@ -114,7 +114,7 @@ pub(crate) fn derive_imv_refresh_contract(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::starrocks::table::mv_ddl::{MvAnalysis, ResolvedTableRef};
+    use crate::engine::mv::analysis::{MvAnalysis, ResolvedTableRef};
     use crate::sql::analysis::{
         ExprKind, LiteralValue, QueryBody, SortItem, SubqueryKind, TypedExpr,
     };

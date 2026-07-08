@@ -141,9 +141,7 @@ fn build_candidate(
     if def.last_refresh_snapshots.is_empty() {
         return Ok(None);
     }
-    let base_refs = crate::connector::starrocks::table::mv_refresh::parse_iceberg_table_refs(
-        &def.base_table_refs,
-    )?;
+    let base_refs = crate::engine::mv::refresh_io::parse_iceberg_table_refs(&def.base_table_refs)?;
     for r in &base_refs {
         let fqn = r.fqn();
         let Some(pinned) = def.last_refresh_snapshots.get(&fqn) else {

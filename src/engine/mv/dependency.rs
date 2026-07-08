@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
-use crate::connector::starrocks::table::mv_ddl::ResolvedTableRef;
+#[cfg(feature = "compat")]
+use crate::connector::starrocks::table::model::StarRocksTableKind;
 use crate::engine::StandaloneState;
+use crate::engine::mv::analysis::ResolvedTableRef;
 use crate::engine::mv::table_ref::IcebergTableRef;
 use crate::meta::repository::mv::{
     CreateMvDependencyRequest, MvDependencyObjectRef, MvDependencyObjectType,
@@ -157,25 +159,32 @@ pub(crate) fn resolve_create_mv_dependencies(
                 });
             }
             ResolvedTableRef::StarRocks { database, table } => {
-                let starrocks = state
-                    .starrocks_table
-                    .read()
-                    .expect("standalone StarRocks table read lock");
-                let runtime = starrocks.table(database, table).map_err(|err| {
-                    format!(
-                        "resolve StarRocks table MV dependency {database}.{table} failed: {err}"
-                    )
-                })?;
-                if runtime.table.kind
-                    != crate::connector::starrocks::table::model::StarRocksTableKind::MaterializedView
+                #[cfg(not(feature = "compat"))]
                 {
                     return Err(format!(
-                        "materialized view base tables must be Iceberg tables or materialized views; found StarRocks table `{database}.{table}`"
+                        "StarRocks table MV dependency `{database}.{table}` requires the compat feature"
                     ));
                 }
-                return Err(format!(
-                    "StarRocks table MV-on-MV dependency `{database}.{table}` is recognized but cannot be used as an incremental Iceberg base in this release"
-                ));
+                #[cfg(feature = "compat")]
+                {
+                    let starrocks = state
+                        .starrocks_table
+                        .read()
+                        .expect("standalone StarRocks table read lock");
+                    let runtime = starrocks.table(database, table).map_err(|err| {
+                        format!(
+                            "resolve StarRocks table MV dependency {database}.{table} failed: {err}"
+                        )
+                    })?;
+                    if runtime.table.kind != StarRocksTableKind::MaterializedView {
+                        return Err(format!(
+                            "materialized view base tables must be Iceberg tables or materialized views; found StarRocks table `{database}.{table}`"
+                        ));
+                    }
+                    return Err(format!(
+                        "StarRocks table MV-on-MV dependency `{database}.{table}` is recognized but cannot be used as an incremental Iceberg base in this release"
+                    ));
+                }
             }
         }
     }

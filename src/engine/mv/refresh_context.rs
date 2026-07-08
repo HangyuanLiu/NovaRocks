@@ -16,7 +16,7 @@ use arrow::datatypes::{DataType, TimeUnit};
 use iceberg::spec::Schema;
 
 use crate::connector::iceberg::catalog::registry::{IcebergCatalogEntry, IcebergCatalogRegistry};
-use crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin;
+use crate::engine::mv::refresh_pin::RefreshSnapshotPin;
 use crate::engine::mv::table_ref::IcebergTableRef;
 use crate::meta::repository::mv::StoredMvDefinition;
 use crate::meta::repository::mv_contract::MvSchemaContract;
@@ -1468,7 +1468,7 @@ pub(crate) mod tests_support {
 
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
-    use crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin;
+    use crate::engine::mv::refresh_pin::RefreshSnapshotPin;
     use crate::engine::mv::table_ref::IcebergTableRef;
     use crate::meta::repository::mv::StoredMvDefinition;
     use crate::meta::repository::mv_contract::{
@@ -1675,7 +1675,7 @@ mod tests {
 
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
-    use crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin;
+    use crate::engine::mv::refresh_pin::RefreshSnapshotPin;
     use crate::engine::mv::table_ref::IcebergTableRef;
     use crate::meta::repository::mv_contract::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,

@@ -21,6 +21,7 @@ use crate::runtime::profile::RuntimeProfile;
 
 pub mod orc;
 pub mod parquet;
+#[cfg(feature = "compat")]
 pub mod starrocks;
 
 #[derive(Clone, Debug)]

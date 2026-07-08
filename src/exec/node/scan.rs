@@ -14,12 +14,15 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::collections::{BTreeMap, HashMap};
+#[cfg(feature = "compat")]
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::cache::ExternalDataCacheRangeOptions;
 use crate::connector::iceberg::delete_file::IcebergDeleteFileSpec;
 use crate::connector::iceberg::equality_delete::EqualityDeleteSet;
+#[cfg(feature = "compat")]
 use crate::connector::starrocks::scan::{LakeScanSchemaMeta, StarRocksScanRange};
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::ExprId;
@@ -53,6 +56,7 @@ pub enum ScanMorsel {
         iceberg_file_pruning:
             Option<crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata>,
     },
+    #[cfg(feature = "compat")]
     StarRocksRange {
         index: usize,
         tablet_id: i64,
@@ -99,6 +103,7 @@ impl ScanMorsel {
                 delete_files.len(),
                 iceberg_file_pruning.is_some()
             ),
+            #[cfg(feature = "compat")]
             ScanMorsel::StarRocksRange { index, tablet_id } => {
                 format!("starrocks_range_index={index} tablet_id={tablet_id}")
             }
@@ -350,6 +355,7 @@ pub trait ScanOp: Send + Sync {
 
 /// Metadata needed to re-scan a lake tablet for late materialization lookups.
 #[derive(Clone, Debug)]
+#[cfg(feature = "compat")]
 pub struct LakeGlmScanInfo {
     pub ranges: Vec<StarRocksScanRange>,
     pub properties: BTreeMap<String, String>,
@@ -385,6 +391,7 @@ pub struct ScanNode {
     row_position_scan: Option<RowPositionScanConfig>,
     row_position_ranges: Option<Vec<FileScanRange>>,
     lake_row_position: Option<LakeRowPositionSpec>,
+    #[cfg(feature = "compat")]
     lake_glm_info: Option<LakeGlmScanInfo>,
     iceberg_virtual: Option<IcebergVirtualSpec>,
 }
@@ -405,6 +412,7 @@ impl ScanNode {
             row_position_scan: None,
             row_position_ranges: None,
             lake_row_position: None,
+            #[cfg(feature = "compat")]
             lake_glm_info: None,
             iceberg_virtual: None,
         }
@@ -473,6 +481,7 @@ impl ScanNode {
         self
     }
 
+    #[cfg(feature = "compat")]
     pub fn with_lake_glm_info(mut self, info: Option<LakeGlmScanInfo>) -> Self {
         self.lake_glm_info = info;
         self
@@ -540,6 +549,7 @@ impl ScanNode {
         self.lake_row_position.as_ref()
     }
 
+    #[cfg(feature = "compat")]
     pub fn lake_glm_info(&self) -> Option<&LakeGlmScanInfo> {
         self.lake_glm_info.as_ref()
     }

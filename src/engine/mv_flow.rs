@@ -670,7 +670,7 @@ pub(crate) fn list_mvs(
             .then(left.name.cmp(&right.name))
     });
     Ok(StatementResult::Query(
-        crate::connector::starrocks::table::mv_ddl::build_mv_rows_result(&rows)?,
+        crate::engine::mv::analysis::build_mv_rows_result(&rows)?,
     ))
 }
 

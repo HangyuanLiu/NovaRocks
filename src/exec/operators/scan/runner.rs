@@ -729,16 +729,24 @@ impl ScanAsyncRunner {
     }
 
     fn build_lake_row_position_state(&self, morsel: &ScanMorsel) -> Option<LakeRowPositionState> {
-        let spec = self.scan.lake_row_position()?;
-        let ScanMorsel::StarRocksRange { tablet_id, index } = morsel else {
+        #[cfg(not(feature = "compat"))]
+        {
+            let _ = morsel;
             return None;
-        };
-        Some(LakeRowPositionState {
-            spec: spec.clone(),
-            tablet_id: *tablet_id,
-            range_idx: i32::try_from(*index).unwrap_or(i32::MAX),
-            next_row_offset: 0,
-        })
+        }
+        #[cfg(feature = "compat")]
+        {
+            let spec = self.scan.lake_row_position()?;
+            let ScanMorsel::StarRocksRange { tablet_id, index } = morsel else {
+                return None;
+            };
+            Some(LakeRowPositionState {
+                spec: spec.clone(),
+                tablet_id: *tablet_id,
+                range_idx: i32::try_from(*index).unwrap_or(i32::MAX),
+                next_row_offset: 0,
+            })
+        }
     }
 
     fn build_iceberg_virtual_state(

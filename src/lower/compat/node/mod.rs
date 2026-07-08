@@ -28,7 +28,9 @@ mod hash_join;
 pub(crate) mod hdfs_scan;
 mod iceberg_delta_scan;
 mod jdbc_scan;
+#[cfg(feature = "compat")]
 mod lake_meta_scan;
+#[cfg(feature = "compat")]
 mod lake_scan;
 mod lookup;
 mod mysql_scan;
@@ -40,6 +42,7 @@ mod schema_scan;
 mod select;
 mod set_op;
 mod sort;
+#[cfg(feature = "compat")]
 mod starrocks_scan;
 mod table_function;
 mod union;
@@ -73,7 +76,9 @@ pub(crate) use hash_join::lower_hash_join_node;
 pub(crate) use hdfs_scan::lower_hdfs_scan_node;
 pub(crate) use iceberg_delta_scan::lower_iceberg_delta_scan_node;
 pub(crate) use jdbc_scan::lower_jdbc_scan_node;
+#[cfg(feature = "compat")]
 pub(crate) use lake_meta_scan::lower_lake_meta_scan_node;
+#[cfg(feature = "compat")]
 pub(crate) use lake_scan::lower_lake_scan_node;
 pub(crate) use lookup::lower_lookup_node;
 pub(crate) use mysql_scan::lower_mysql_scan_node;
@@ -85,6 +90,7 @@ pub(crate) use schema_scan::lower_schema_scan_node;
 pub(crate) use select::lower_select_node;
 pub(crate) use set_op::{lower_except_node, lower_intersect_node};
 pub(crate) use sort::lower_sort_node;
+#[cfg(feature = "compat")]
 pub(crate) use starrocks_scan::lower_starrocks_scan_node;
 pub(crate) use table_function::lower_table_function_node;
 pub(crate) use union::lower_union_node;
@@ -566,39 +572,66 @@ fn lower_node_with_children(
             }
             lower_iceberg_delta_scan_node(node, desc_tbl, out_layout)?
         }
-        t if t == plan_nodes::TPlanNodeType::LAKE_SCAN_NODE => lower_lake_scan_node(
-            node,
-            desc_tbl,
-            tuple_slots,
-            layout_hints,
-            exec_params,
-            query_opts,
-            arena,
-            connectors,
-            query_global_dict_map,
-            db_name,
-            fe_addr,
-        )?,
-        t if t == plan_nodes::TPlanNodeType::LAKE_META_SCAN_NODE => lower_lake_meta_scan_node(
-            node,
-            desc_tbl,
-            tuple_slots,
-            layout_hints,
-            exec_params,
-            db_name,
-            fe_addr,
-        )?,
-        t if t == plan_nodes::TPlanNodeType::OLAP_SCAN_NODE => lower_starrocks_scan_node(
-            node,
-            desc_tbl,
-            tuple_slots,
-            layout_hints,
-            exec_params,
-            query_opts,
-            connectors,
-            query_global_dict_map,
-            plan_origin,
-        )?,
+        t if t == plan_nodes::TPlanNodeType::LAKE_SCAN_NODE => {
+            #[cfg(feature = "compat")]
+            {
+                lower_lake_scan_node(
+                    node,
+                    desc_tbl,
+                    tuple_slots,
+                    layout_hints,
+                    exec_params,
+                    query_opts,
+                    arena,
+                    connectors,
+                    query_global_dict_map,
+                    db_name,
+                    fe_addr,
+                )?
+            }
+            #[cfg(not(feature = "compat"))]
+            {
+                return Err("LAKE_SCAN_NODE requires the compat feature".to_string());
+            }
+        }
+        t if t == plan_nodes::TPlanNodeType::LAKE_META_SCAN_NODE => {
+            #[cfg(feature = "compat")]
+            {
+                lower_lake_meta_scan_node(
+                    node,
+                    desc_tbl,
+                    tuple_slots,
+                    layout_hints,
+                    exec_params,
+                    db_name,
+                    fe_addr,
+                )?
+            }
+            #[cfg(not(feature = "compat"))]
+            {
+                return Err("LAKE_META_SCAN_NODE requires the compat feature".to_string());
+            }
+        }
+        t if t == plan_nodes::TPlanNodeType::OLAP_SCAN_NODE => {
+            #[cfg(feature = "compat")]
+            {
+                lower_starrocks_scan_node(
+                    node,
+                    desc_tbl,
+                    tuple_slots,
+                    layout_hints,
+                    exec_params,
+                    query_opts,
+                    connectors,
+                    query_global_dict_map,
+                    plan_origin,
+                )?
+            }
+            #[cfg(not(feature = "compat"))]
+            {
+                return Err("OLAP_SCAN_NODE requires the compat feature".to_string());
+            }
+        }
         t if t == plan_nodes::TPlanNodeType::AGGREGATION_NODE => {
             if children.len() != 1 {
                 return Err(format!(

@@ -277,19 +277,27 @@ impl ScanSourceOperator {
             self.lake_row_position_registered = true;
             return Ok(());
         };
-        let Some(info) = self.scan.lake_glm_info() else {
-            return Err("lake_row_position set but lake_glm_info missing".to_string());
-        };
-        let Some(query_id) = state.query_id() else {
-            return Err("lake row position requires query_id".to_string());
-        };
-        crate::runtime::query_context::query_context_manager().register_lake_glm(
-            query_id,
-            spec.source_id_slot,
-            info.clone(),
-        )?;
-        self.lake_row_position_registered = true;
-        Ok(())
+        #[cfg(not(feature = "compat"))]
+        {
+            let _ = (state, spec);
+            return Err("lake row position requires the compat feature".to_string());
+        }
+        #[cfg(feature = "compat")]
+        {
+            let Some(info) = self.scan.lake_glm_info() else {
+                return Err("lake_row_position set but lake_glm_info missing".to_string());
+            };
+            let Some(query_id) = state.query_id() else {
+                return Err("lake row position requires query_id".to_string());
+            };
+            crate::runtime::query_context::query_context_manager().register_lake_glm(
+                query_id,
+                spec.source_id_slot,
+                info.clone(),
+            )?;
+            self.lake_row_position_registered = true;
+            Ok(())
+        }
     }
 
     fn register_incremental_dispatch(&mut self, state: &RuntimeState) -> Result<(), String> {
