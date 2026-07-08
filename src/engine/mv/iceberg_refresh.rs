@@ -19783,6 +19783,62 @@ mod tests {
     }
 
     #[test]
+    fn mv_rewrite_candidate_accepts_two_table_inner_join_mv() {
+        // E1-bc: a real 2-table inner-join MV, refreshed against real
+        // Iceberg data, must survive the relaxed engine-side shape gate
+        // (`supports_current_mv_rewrite_shape`) and produce a candidate
+        // whose descriptor correctly reflects the join shape end-to-end
+        // through the REAL analyze -> plan -> from_opt_expr pipeline (not
+        // the hand-built LogicalPlanNode fixtures the optimizer-rule unit
+        // tests in rule.rs use).
+        let env = open_test_state_with_iceberg_catalog("ice", "sales");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        create_base_table(&env.state, "ice", "sales", "customers");
+        execute_iceberg_sql(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            "INSERT INTO ice.sales.orders VALUES (1, 'o1')",
+        );
+        execute_iceberg_sql(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            "INSERT INTO ice.sales.customers VALUES (1, 'c1')",
+        );
+
+        let join_sql = "SELECT o.id, c.name FROM ice.sales.orders o \
+                         JOIN ice.sales.customers c ON o.id = c.id";
+        let stmt = parse_create_mv(&format!(
+            "CREATE MATERIALIZED VIEW mv_join
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS {join_sql}"
+        ));
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg join mv");
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_join");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("refresh iceberg join mv");
+
+        let candidates =
+            mv_rewrite_candidates_for_select(&env.state, Some("ice"), &env.current_db, join_sql);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "a real 2-table inner-join MV must survive the relaxed shape gate \
+             and become exactly one candidate"
+        );
+        let joins = candidates[0]
+            .mv
+            .joins
+            .as_ref()
+            .expect("candidate descriptor must carry a JoinShape for a 2-table MV");
+        assert_eq!(joins.inputs.len(), 1, "one non-driving join input (customers)");
+        assert_eq!(joins.equi_edges.len(), 1, "one equi-join edge (id = id)");
+    }
+
+    #[test]
     fn create_iceberg_mv_writes_query_rewrite_staleness_property() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_base_table(&env.state, "ice", "sales", "orders");
