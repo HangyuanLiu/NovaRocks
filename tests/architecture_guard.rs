@@ -5465,6 +5465,193 @@ fn nidl_e0_noncompat_starrocks_idl_stays_within_ledger() {
     assert!(msg.is_empty(), "NIDL-E0 ledger drift:\n{msg}");
 }
 
+fn nidl_e9_module_has_compat_cfg(rel_path: &str, module_name: &str) -> bool {
+    let path = Path::new(manifest_dir()).join(rel_path);
+    let text = fs::read_to_string(path).expect("read module file");
+    let mut previous_non_blank = "";
+    let mut in_block_comment = false;
+    let target = format!("mod {module_name};");
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if nidl_e9_is_comment_or_blank_line(trimmed, &mut in_block_comment) {
+            continue;
+        }
+        if trimmed == target
+            || trimmed == format!("pub(crate) mod {module_name};")
+            || trimmed == format!("pub mod {module_name};")
+        {
+            return previous_non_blank == "#[cfg(feature = \"compat\")]";
+        }
+        previous_non_blank = trimmed;
+    }
+    false
+}
+
+fn nidl_e9_is_comment_or_blank_line(trimmed: &str, in_block_comment: &mut bool) -> bool {
+    if *in_block_comment {
+        if trimmed.contains("*/") {
+            *in_block_comment = false;
+        }
+        return true;
+    }
+
+    if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('*') {
+        return true;
+    }
+
+    if trimmed.starts_with("/*") {
+        if !trimmed.contains("*/") {
+            *in_block_comment = true;
+        }
+        return true;
+    }
+
+    false
+}
+
+fn nidl_e9_noncompat_lower_compat_import_hits_in(root: &Path) -> Vec<String> {
+    let mut hits = Vec::new();
+    for path in rs_files(root) {
+        let rel_path = rel(&path);
+        if nidl_e0_is_in_compat_scope(&rel_path) {
+            continue;
+        }
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        let production = rust_production_text_without_cfg_test_or_compat(&text);
+        let mut in_block_comment = false;
+        for (idx, line) in production.lines().enumerate() {
+            let trimmed = line.trim();
+            if nidl_e9_is_comment_or_blank_line(trimmed, &mut in_block_comment) {
+                continue;
+            }
+            if line.contains("crate::lower::compat") || line.contains("lower::compat") {
+                hits.push(format!("{rel_path}:{}:{line}", idx + 1));
+            }
+        }
+    }
+    hits.sort();
+    hits
+}
+
+fn nidl_e9_noncompat_lower_compat_import_hits() -> Vec<String> {
+    nidl_e9_noncompat_lower_compat_import_hits_in(&src_dir())
+}
+
+fn nidl_e9_read(rel_path: &str) -> String {
+    fs::read_to_string(Path::new(manifest_dir()).join(rel_path))
+        .unwrap_or_else(|err| panic!("read {rel_path}: {err}"))
+}
+
+fn nidl_e9_text_region_between<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
+    let start_idx = text
+        .find(start)
+        .unwrap_or_else(|| panic!("missing start marker `{start}`"));
+    let after_start = &text[start_idx..];
+    let end_idx = after_start
+        .find(end)
+        .unwrap_or_else(|| panic!("missing end marker `{end}` after `{start}`"));
+    &after_start[..end_idx]
+}
+
+#[test]
+fn nidl_e9_lower_compat_import_detector_ignores_cfg_compat_files() {
+    let dir = std::env::temp_dir().join("nidl_e9_lower_compat_detector");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("native_hit.rs"),
+        "use crate::lower::compat::type_lowering::scalar_type_desc;\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("compat_only.rs"),
+        "#[cfg(feature = \"compat\")]\nfn compat_only() { let _ = crate::lower::compat::node::PlanOrigin::StarRocksFeCompatible; }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("comment_note.rs"),
+        "// This note mentions crate::lower::compat but is not production code.\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("block_comment_note.rs"),
+        "/* This note mentions crate::lower::compat but is not production code. */\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("multiline_block_comment_note.rs"),
+        "/*\n * This note mentions lower::compat but is not production code.\n */\n",
+    )
+    .unwrap();
+
+    let hits = nidl_e9_noncompat_lower_compat_import_hits_in(&dir);
+    assert!(
+        hits.iter().any(|hit| hit.contains("native_hit.rs")),
+        "must report default-build lower::compat imports: {hits:?}"
+    );
+    assert!(
+        !hits.iter().any(|hit| hit.contains("compat_only.rs")),
+        "must ignore cfg(feature=\"compat\") lower::compat imports: {hits:?}"
+    );
+    assert!(
+        !hits.iter().any(|hit| hit.contains("comment_note.rs")),
+        "must ignore commented lower::compat mentions: {hits:?}"
+    );
+    assert!(
+        !hits.iter().any(|hit| hit.contains("block_comment_note.rs")),
+        "must ignore block-commented lower::compat mentions: {hits:?}"
+    );
+    assert!(
+        !hits
+            .iter()
+            .any(|hit| hit.contains("multiline_block_comment_note.rs")),
+        "must ignore multiline block-commented lower::compat mentions: {hits:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn nidl_e9_guard_helpers_find_text_regions() {
+    let text = "alpha\nstart\nbody\nend\nomega\n";
+    assert_eq!(
+        nidl_e9_text_region_between(text, "start", "end"),
+        "start\nbody\n"
+    );
+}
+
+#[test]
+#[should_panic(expected = "missing start marker `start`")]
+fn nidl_e9_guard_helpers_panic_when_text_region_start_is_missing() {
+    let text = "alpha\nbody\nend\nomega\n";
+    let _ = nidl_e9_text_region_between(text, "start", "end");
+}
+
+#[test]
+#[should_panic(expected = "missing end marker `end` after `start`")]
+fn nidl_e9_guard_helpers_panic_when_text_region_end_is_missing() {
+    let text = "alpha\nstart\nbody\nomega\n";
+    let _ = nidl_e9_text_region_between(text, "start", "end");
+}
+
+#[test]
+fn nidl_e9_guard_helpers_ignore_block_comments_between_cfg_and_module() {
+    let dir = std::env::temp_dir().join("nidl_e9_module_cfg_detector");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("mod_fixture.rs");
+    fs::write(
+        &file,
+        "#[cfg(feature = \"compat\")]\n/* compatibility module note */\npub(crate) mod compat_only;\n",
+    )
+    .unwrap();
+
+    assert!(
+        nidl_e9_module_has_compat_cfg(file.to_str().unwrap(), "compat_only"),
+        "must ignore block comments between cfg(feature=\"compat\") and module declarations"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 fn nidl_e1_native_mv_starrocks_table_import_hits() -> Vec<String> {
     nidl_e1_native_mv_starrocks_table_import_hits_in(&[
         Path::new(manifest_dir()).join("src/exec"),
