@@ -95,7 +95,7 @@ struct PreparedMvRewriteCandidate {
 }
 
 fn supports_current_mv_rewrite_shape(desc: &SpjgDescriptor) -> bool {
-    desc.joins.is_none()
+    !desc.has_unsupported_multitable_identity()
 }
 
 pub(crate) fn prepare_mv_rewrite_candidates(
@@ -506,6 +506,10 @@ mod tests {
 
     #[test]
     fn current_mv_rewrite_shape_support_rejects_join_descriptor() {
+        // `table("t2")` is non-Iceberg (StarRocks source) -- rejected because
+        // its identity cannot be verified, not because it is multi-table.
+        // A well-formed Iceberg multi-table shape IS accepted after E1-bc:
+        // see `current_mv_rewrite_shape_support_accepts_well_formed_multitable_descriptor`.
         let desc = descriptor_with_joins(Some(JoinShape {
             inputs: vec![JoinInput {
                 table: table("t2"),
@@ -516,6 +520,71 @@ mod tests {
                 right: ColumnId(2),
             }],
         }));
+
+        assert!(!supports_current_mv_rewrite_shape(&desc));
+    }
+
+    /// An Iceberg-sourced `TableDef` for the well-formed-multitable-gate
+    /// tests below. `table()` (used by the sibling tests above) is
+    /// deliberately non-Iceberg (`ScanSource::StarRocks`), which is why
+    /// `current_mv_rewrite_shape_support_rejects_join_descriptor` rejects
+    /// -- these two new tests need a genuinely Iceberg-identified pair to
+    /// exercise the "well-formed" accept path and the self-join reject path.
+    fn iceberg_table_for_test(catalog: &str, ns: &str, name: &str) -> crate::sql::catalog::TableDef {
+        crate::sql::catalog::TableDef {
+            name: name.to_string(),
+            columns: Vec::new(),
+            iceberg_row_lineage_metadata_columns: Vec::new(),
+            source: ScanSource::IcebergDataFiles {
+                table: crate::sql::catalog::IcebergTableInfo {
+                    catalog: catalog.to_string(),
+                    namespace: ns.to_string(),
+                    table: name.to_string(),
+                    table_uuid: None,
+                    current_snapshot_id: None,
+                    schema_id: 0,
+                    location: String::new(),
+                    schema: crate::sql::catalog::IcebergSchemaDef { fields: vec![] },
+                    serialized_metadata: None,
+                    serialized_metadata_rows: None,
+                },
+                files: vec![],
+                cloud_properties: Default::default(),
+                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+            },
+        }
+    }
+
+    #[test]
+    fn current_mv_rewrite_shape_support_accepts_well_formed_multitable_descriptor() {
+        let mut desc = descriptor_with_joins(Some(JoinShape {
+            inputs: vec![JoinInput {
+                table: iceberg_table_for_test("cat", "ns", "t2"),
+                scan_columns: vec![output_column(2, "c")],
+            }],
+            equi_edges: vec![EquiEdge {
+                left: ColumnId(1),
+                right: ColumnId(2),
+            }],
+        }));
+        desc.table = iceberg_table_for_test("cat", "ns", "t1"); // distinct from "t2"
+
+        assert!(supports_current_mv_rewrite_shape(&desc));
+    }
+
+    #[test]
+    fn current_mv_rewrite_shape_support_rejects_self_join_descriptor() {
+        let mut desc = descriptor_with_joins(Some(JoinShape {
+            inputs: vec![JoinInput {
+                table: iceberg_table_for_test("cat", "ns", "t1"), // SAME fqn as driving
+                scan_columns: vec![output_column(2, "a")],
+            }],
+            equi_edges: vec![EquiEdge {
+                left: ColumnId(1),
+                right: ColumnId(2),
+            }],
+        }));
+        desc.table = iceberg_table_for_test("cat", "ns", "t1");
 
         assert!(!supports_current_mv_rewrite_shape(&desc));
     }
