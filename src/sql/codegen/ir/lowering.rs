@@ -163,9 +163,14 @@ pub(crate) fn lower_distributed_plan(
         boundary_schemas.extend(fragment.boundary_schemas.clone());
     }
     boundary_schemas.extend(edge_boundary_schemas(dp)?);
+    let fragment_schedules = fragment_results
+        .iter()
+        .map(FragmentBuildResult::scheduling_metadata)
+        .collect();
 
     Ok(MultiFragmentBuildResult {
         fragment_results,
+        fragment_schedules,
         root_fragment_id: dp.root_fragment_id,
         edges,
         lowered_edges,

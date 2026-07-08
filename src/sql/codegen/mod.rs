@@ -42,7 +42,7 @@ pub(crate) use fragment_request::FragmentBuildRequest;
 // Public types
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct OutputColumn {
     pub name: String,
     pub data_type: DataType,
@@ -102,9 +102,27 @@ pub(crate) struct LoweredFragmentEdge {
     pub compat_partition: partitions::TDataPartition,
 }
 
+/// Native per-fragment metadata used by scheduling and coordinator routing.
+/// This intentionally contains no thrift plan, descriptor, sink, or exec-param
+/// payload. Compat payloads stay in `FragmentBuildResult` until E9 gates the
+/// compact lowering path.
+#[derive(Clone, Debug)]
+pub(crate) struct FragmentSchedulingMetadata {
+    pub fragment_id: FragmentId,
+    pub has_scan_nodes: bool,
+    pub output_kind: FragmentOutputKind,
+    pub native_scan_ranges:
+        std::collections::BTreeMap<i32, Vec<crate::runtime::scan_range::ScanRangeParams>>,
+    pub output_columns: Vec<OutputColumn>,
+    pub boundary_schemas: Vec<boundary_schema::BoundarySchemaReport>,
+    pub cte_id: Option<CteId>,
+    pub cte_exchange_nodes: Vec<(CteId, i32, Vec<ColumnId>)>,
+}
+
 pub(crate) struct MultiFragmentBuildResult {
     /// Per-fragment build results.
     pub fragment_results: Vec<FragmentBuildResult>,
+    pub fragment_schedules: Vec<FragmentSchedulingMetadata>,
     /// Which fragment is the root (result sink).
     pub root_fragment_id: FragmentId,
     /// Fragment-to-fragment data edges.
@@ -114,6 +132,16 @@ pub(crate) struct MultiFragmentBuildResult {
     pub boundary_schemas: Vec<boundary_schema::BoundarySchemaReport>,
     /// Runtime filter planning result (populated for standalone mode).
     pub rf_plan: Option<RuntimeFilterPlanResult>,
+}
+
+impl MultiFragmentBuildResult {
+    pub(crate) fn refresh_fragment_schedules(&mut self) {
+        self.fragment_schedules = self
+            .fragment_results
+            .iter()
+            .map(FragmentBuildResult::scheduling_metadata)
+            .collect();
+    }
 }
 
 /// Result of lowering runtime-filter annotations to execution wiring.
@@ -161,6 +189,21 @@ pub(crate) struct FragmentBuildResult {
     /// today this stays `None` because no codegen path populates it.
     pub query_global_dict_exprs:
         Option<std::collections::BTreeMap<i32, crate::thrift::exprs::TExpr>>,
+}
+
+impl FragmentBuildResult {
+    pub(crate) fn scheduling_metadata(&self) -> FragmentSchedulingMetadata {
+        FragmentSchedulingMetadata {
+            fragment_id: self.fragment_id,
+            has_scan_nodes: self.has_scan_nodes,
+            output_kind: self.output_kind,
+            native_scan_ranges: self.native_scan_ranges.clone(),
+            output_columns: self.output_columns.clone(),
+            boundary_schemas: self.boundary_schemas.clone(),
+            cte_id: self.cte_id,
+            cte_exchange_nodes: self.cte_exchange_nodes.clone(),
+        }
+    }
 }
 
 #[cfg(test)]

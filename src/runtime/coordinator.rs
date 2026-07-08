@@ -198,6 +198,7 @@ impl ExecutionCoordinator {
             lowered_edges,
             boundary_schemas: _,
             rf_plan,
+            ..
         } = self.build_result;
         let native_sidecars = self.native_sidecars;
         let query_options = self.query_options;
