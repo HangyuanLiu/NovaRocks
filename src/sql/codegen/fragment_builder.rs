@@ -3315,10 +3315,15 @@ mod tests {
             .iter()
             .find(|fragment| fragment.fragment_id == build.root_fragment_id)
             .expect("root fragment");
-        assert_eq!(
-            root.output_sink.type_,
-            data_sinks::TDataSinkType::ICEBERG_EQUALITY_DELETE_SINK
-        );
+        #[cfg(feature = "compat")]
+        let expected_sink_type = data_sinks::TDataSinkType::ICEBERG_EQUALITY_DELETE_SINK;
+        #[cfg(not(feature = "compat"))]
+        let expected_sink_type = data_sinks::TDataSinkType::NOOP_SINK;
+        assert_eq!(root.output_sink.type_, expected_sink_type);
+        #[cfg(feature = "compat")]
+        assert!(root.output_sink.iceberg_table_sink.is_some());
+        #[cfg(not(feature = "compat"))]
+        assert!(root.output_sink.iceberg_table_sink.is_none());
         let target_desc = root
             .desc_tbl
             .table_descriptors
