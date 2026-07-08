@@ -3508,7 +3508,7 @@ mod tests {
                 crate::sql::codegen::expr_compiler::build_slot_ref_texpr(
                     slot_id,
                     1,
-                    crate::lower::compat::type_lowering::scalar_type_desc(
+                    crate::types::arrow_thrift::thrift_type_desc_from_primitive(
                         crate::thrift::types::TPrimitiveType::BIGINT,
                     ),
                 ),

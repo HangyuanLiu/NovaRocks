@@ -426,12 +426,20 @@ mod tests {
         assert_eq!(field.name.as_deref(), Some(name));
         assert_eq!(field.field_id, Some(field_id));
         assert_eq!(
-            field
-                .type_desc
-                .as_ref()
-                .and_then(crate::lower::compat::type_lowering::primitive_type_from_desc),
+            field.type_desc.as_ref().and_then(primitive_type_from_desc),
             Some(primitive)
         );
+    }
+
+    fn primitive_type_from_desc(
+        desc: &crate::thrift::types::TTypeDesc,
+    ) -> Option<crate::thrift::types::TPrimitiveType> {
+        let nodes = desc.types.as_ref()?;
+        let first = nodes.first()?;
+        if first.type_ != crate::thrift::types::TTypeNodeType::SCALAR {
+            return None;
+        }
+        first.scalar_type.as_ref().map(|scalar| scalar.type_)
     }
 
     fn test_position_delete_descriptor() -> PositionDeleteDescriptorInput {

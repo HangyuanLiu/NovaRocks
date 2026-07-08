@@ -5537,6 +5537,11 @@ fn nidl_e9_noncompat_lower_compat_import_hits() -> Vec<String> {
     nidl_e9_noncompat_lower_compat_import_hits_in(&src_dir())
 }
 
+fn nidl_e9_is_lower_compat_type_lowering_hit(hit: &str) -> bool {
+    hit.contains("crate::lower::compat::type_lowering")
+        || hit.contains("lower::compat::type_lowering")
+}
+
 fn nidl_e9_read(rel_path: &str) -> String {
     fs::read_to_string(Path::new(manifest_dir()).join(rel_path))
         .unwrap_or_else(|err| panic!("read {rel_path}: {err}"))
@@ -5564,50 +5569,77 @@ fn nidl_e9_lower_compat_import_detector_ignores_cfg_compat_files() {
     )
     .unwrap();
     fs::write(
+        dir.join("native_generic_hit.rs"),
+        "use crate::lower::compat::expr::parse_min_max_conjuncts;\n",
+    )
+    .unwrap();
+    fs::write(
         dir.join("compat_only.rs"),
-        "#[cfg(feature = \"compat\")]\nfn compat_only() { let _ = crate::lower::compat::node::PlanOrigin::StarRocksFeCompatible; }\n",
+        "#[cfg(feature = \"compat\")]\nfn compat_only() { let _ = crate::lower::compat::type_lowering::scalar_type_desc; }\n",
     )
     .unwrap();
     fs::write(
         dir.join("comment_note.rs"),
-        "// This note mentions crate::lower::compat but is not production code.\n",
+        "// This note mentions crate::lower::compat::type_lowering but is not production code.\n",
     )
     .unwrap();
     fs::write(
         dir.join("block_comment_note.rs"),
-        "/* This note mentions crate::lower::compat but is not production code. */\n",
+        "/* This note mentions crate::lower::compat::type_lowering but is not production code. */\n",
     )
     .unwrap();
     fs::write(
         dir.join("multiline_block_comment_note.rs"),
-        "/*\n * This note mentions lower::compat but is not production code.\n */\n",
+        "/*\n * This note mentions lower::compat::type_lowering but is not production code.\n */\n",
     )
     .unwrap();
 
     let hits = nidl_e9_noncompat_lower_compat_import_hits_in(&dir);
     assert!(
         hits.iter().any(|hit| hit.contains("native_hit.rs")),
+        "must report default-build lower::compat::type_lowering imports: {hits:?}"
+    );
+    assert!(
+        hits.iter().any(|hit| hit.contains("native_generic_hit.rs")),
         "must report default-build lower::compat imports: {hits:?}"
     );
     assert!(
         !hits.iter().any(|hit| hit.contains("compat_only.rs")),
-        "must ignore cfg(feature=\"compat\") lower::compat imports: {hits:?}"
+        "must ignore cfg(feature=\"compat\") lower::compat::type_lowering imports: {hits:?}"
     );
     assert!(
         !hits.iter().any(|hit| hit.contains("comment_note.rs")),
-        "must ignore commented lower::compat mentions: {hits:?}"
+        "must ignore commented lower::compat::type_lowering mentions: {hits:?}"
     );
     assert!(
         !hits.iter().any(|hit| hit.contains("block_comment_note.rs")),
-        "must ignore block-commented lower::compat mentions: {hits:?}"
+        "must ignore block-commented lower::compat::type_lowering mentions: {hits:?}"
     );
     assert!(
         !hits
             .iter()
             .any(|hit| hit.contains("multiline_block_comment_note.rs")),
-        "must ignore multiline block-commented lower::compat mentions: {hits:?}"
+        "must ignore multiline block-commented lower::compat::type_lowering mentions: {hits:?}"
     );
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn nidl_e9_native_codegen_does_not_import_lower_compat_type_lowering() {
+    let hits: Vec<String> = nidl_e9_noncompat_lower_compat_import_hits()
+        .into_iter()
+        .filter(|hit| {
+            hit.contains("src/sql/codegen/")
+                || hit.contains("src/runtime/")
+                || hit.contains("src/formats/parquet/")
+        })
+        .filter(|hit| nidl_e9_is_lower_compat_type_lowering_hit(hit))
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "native codegen/runtime must not import lower::compat type lowering helpers:\n{}",
+        hits.join("\n")
+    );
 }
 
 #[test]

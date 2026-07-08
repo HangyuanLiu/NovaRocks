@@ -21,7 +21,6 @@ use std::rc::Rc;
 
 use arrow::datatypes::DataType;
 
-use crate::lower::compat::type_lowering::arrow_type_from_desc;
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn as AnalysisOutputColumn, TypedExpr,
 };
@@ -74,6 +73,7 @@ use crate::thrift::exprs;
 use crate::thrift::partitions;
 use crate::thrift::plan_nodes;
 use crate::thrift::types;
+use crate::types::arrow_thrift::thrift_desc_to_arrow_type as arrow_type_from_desc;
 
 pub(crate) fn lower_distributed_plan(
     dp: &crate::sql::planner::DistributedPlan,
@@ -5857,7 +5857,6 @@ mod tests {
 
     use crate::connector::ConnectorRegistry;
     use crate::connector::iceberg::IcebergMetadataTableType;
-    use crate::lower::compat::type_lowering::arrow_type_from_desc;
     use crate::sql::analysis::{
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
@@ -5899,6 +5898,7 @@ mod tests {
         PlannerConfidence, WiredRuntimeFilterBuild,
     };
     use crate::thrift::plan_nodes::TPlanNodeType;
+    use crate::types::arrow_thrift::thrift_desc_to_arrow_type as arrow_type_from_desc;
 
     fn build_distributed_plan(plan: &OptimizerPhysicalNode) -> Result<DistributedPlan, String> {
         crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(

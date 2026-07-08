@@ -17,9 +17,47 @@
 
 use arrow::datatypes::{DataType, Field};
 
-use crate::lower::compat::type_lowering::{scalar_type_desc, thrift_primitive_from_native};
 use crate::thrift::types;
+use crate::types::PrimitiveType;
 use crate::types::arrow_primitive::{arrow_type_to_primitive, field_logical_primitive};
+use crate::types::arrow_thrift::{
+    thrift_time_unit_for_arrow, thrift_type_desc_from_primitive as scalar_type_desc,
+};
+
+fn thrift_primitive_from_native(primitive: PrimitiveType) -> types::TPrimitiveType {
+    match primitive {
+        PrimitiveType::Invalid => types::TPrimitiveType::INVALID_TYPE,
+        PrimitiveType::Null => types::TPrimitiveType::NULL_TYPE,
+        PrimitiveType::Boolean => types::TPrimitiveType::BOOLEAN,
+        PrimitiveType::TinyInt => types::TPrimitiveType::TINYINT,
+        PrimitiveType::SmallInt => types::TPrimitiveType::SMALLINT,
+        PrimitiveType::Int => types::TPrimitiveType::INT,
+        PrimitiveType::BigInt => types::TPrimitiveType::BIGINT,
+        PrimitiveType::LargeInt => types::TPrimitiveType::LARGEINT,
+        PrimitiveType::Int256 => types::TPrimitiveType::INT256,
+        PrimitiveType::Float => types::TPrimitiveType::FLOAT,
+        PrimitiveType::Double => types::TPrimitiveType::DOUBLE,
+        PrimitiveType::Date => types::TPrimitiveType::DATE,
+        PrimitiveType::DateTime => types::TPrimitiveType::DATETIME,
+        PrimitiveType::Time => types::TPrimitiveType::TIME,
+        PrimitiveType::Decimal => types::TPrimitiveType::DECIMAL,
+        PrimitiveType::DecimalV2 => types::TPrimitiveType::DECIMALV2,
+        PrimitiveType::Decimal32 => types::TPrimitiveType::DECIMAL32,
+        PrimitiveType::Decimal64 => types::TPrimitiveType::DECIMAL64,
+        PrimitiveType::Decimal128 => types::TPrimitiveType::DECIMAL128,
+        PrimitiveType::Decimal256 => types::TPrimitiveType::DECIMAL256,
+        PrimitiveType::Char => types::TPrimitiveType::CHAR,
+        PrimitiveType::Varchar => types::TPrimitiveType::VARCHAR,
+        PrimitiveType::Binary => types::TPrimitiveType::BINARY,
+        PrimitiveType::Varbinary => types::TPrimitiveType::VARBINARY,
+        PrimitiveType::Json => types::TPrimitiveType::JSON,
+        PrimitiveType::Hll => types::TPrimitiveType::HLL,
+        PrimitiveType::Object => types::TPrimitiveType::OBJECT,
+        PrimitiveType::Percentile => types::TPrimitiveType::PERCENTILE,
+        PrimitiveType::Function => types::TPrimitiveType::FUNCTION,
+        PrimitiveType::Variant => types::TPrimitiveType::VARIANT,
+    }
+}
 
 /// Convert Arrow DataType to Thrift TTypeDesc.
 pub(crate) fn arrow_type_to_type_desc(data_type: &DataType) -> Result<types::TTypeDesc, String> {
@@ -145,7 +183,7 @@ fn append_arrow_type_nodes(
             // carried (DATETIME descriptors are tz-less); the nanosecond value is
             // preserved regardless. Microsecond keeps time_unit absent so
             // FE-compat descriptors stay byte-identical.
-            let time_unit = crate::lower::compat::type_lowering::thrift_time_unit_for_arrow(*unit)?;
+            let time_unit = thrift_time_unit_for_arrow(*unit)?;
             let scalar = types::TScalarType::new(
                 types::TPrimitiveType::DATETIME,
                 None::<i32>,
@@ -179,7 +217,12 @@ mod tests {
     use crate::types::logical::LogicalType;
 
     fn primitive_from_desc(desc: &types::TTypeDesc) -> Option<types::TPrimitiveType> {
-        crate::lower::compat::type_lowering::primitive_type_from_desc(desc)
+        let nodes = desc.types.as_ref()?;
+        let first = nodes.first()?;
+        if first.type_ != types::TTypeNodeType::SCALAR {
+            return None;
+        }
+        first.scalar_type.as_ref().map(|scalar| scalar.type_)
     }
 
     fn logical_field(name: &str, data_type: DataType, logical_type: LogicalType) -> Field {
@@ -290,19 +333,19 @@ mod tests {
 
     #[test]
     fn timestamp_unit_roundtrips_through_thrift_desc() {
-        use crate::lower::compat::type_lowering::arrow_type_from_desc;
+        use crate::types::arrow_thrift::thrift_desc_to_arrow_type;
         use arrow::datatypes::{DataType, TimeUnit};
 
         // microsecond stays microsecond (FE-compat default)
         let micro = DataType::Timestamp(TimeUnit::Microsecond, None);
         let desc = arrow_type_to_type_desc(&micro).unwrap();
-        assert_eq!(arrow_type_from_desc(&desc), Some(micro));
+        assert_eq!(thrift_desc_to_arrow_type(&desc), Some(micro));
 
         // nanosecond must survive the round-trip (the bug this task fixes)
         let nano = DataType::Timestamp(TimeUnit::Nanosecond, None);
         let desc = arrow_type_to_type_desc(&nano).unwrap();
         assert_eq!(
-            arrow_type_from_desc(&desc),
+            thrift_desc_to_arrow_type(&desc),
             Some(DataType::Timestamp(TimeUnit::Nanosecond, None))
         );
     }
