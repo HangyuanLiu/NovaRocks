@@ -2645,7 +2645,7 @@ mod tests {
             .plan
             .build_target_table_metadata(&target_writer_schema)
             .expect("target metadata");
-        let reports = crate::runtime::sink_commit_wire::iceberg_commit_infos_to_writer_reports(
+        let reports = crate::runtime::sink_commit::iceberg_commit_infos_to_writer_reports(
             infos,
             &target_metadata,
         )
@@ -2991,7 +2991,7 @@ mod tests {
             .plan
             .build_target_table_metadata(&target_writer_schema)
             .expect("target metadata");
-        let reports = crate::runtime::sink_commit_wire::iceberg_commit_infos_to_writer_reports(
+        let reports = crate::runtime::sink_commit::iceberg_commit_infos_to_writer_reports(
             infos,
             &target_metadata,
         )
@@ -3215,7 +3215,7 @@ mod tests {
 
         let infos = crate::runtime::sink_commit::list_iceberg_commits(finst_id);
         crate::runtime::sink_commit::unregister(finst_id);
-        let reports = crate::runtime::sink_commit_wire::iceberg_commit_infos_to_writer_reports(
+        let reports = crate::runtime::sink_commit::iceberg_commit_infos_to_writer_reports(
             infos,
             &target_metadata,
         )
@@ -3351,7 +3351,7 @@ mod tests {
 
         let infos = crate::runtime::sink_commit::list_iceberg_commits(finst_id);
         crate::runtime::sink_commit::unregister(finst_id);
-        let reports = crate::runtime::sink_commit_wire::iceberg_commit_infos_to_writer_reports(
+        let reports = crate::runtime::sink_commit::iceberg_commit_infos_to_writer_reports(
             infos,
             &target_metadata,
         )
@@ -3559,7 +3559,7 @@ mod tests {
 
         let infos = crate::runtime::sink_commit::list_iceberg_commits(finst_id);
         crate::runtime::sink_commit::unregister(finst_id);
-        let reports = crate::runtime::sink_commit_wire::iceberg_commit_infos_to_writer_reports(
+        let reports = crate::runtime::sink_commit::iceberg_commit_infos_to_writer_reports(
             infos,
             &target_metadata,
         )
@@ -3643,7 +3643,7 @@ mod tests {
             1,
             "same referenced data file should produce one Puffin DV per sink lifecycle"
         );
-        let reports = crate::runtime::sink_commit_wire::iceberg_commit_infos_to_writer_reports(
+        let reports = crate::runtime::sink_commit::iceberg_commit_infos_to_writer_reports(
             infos,
             &target_metadata,
         )
@@ -3710,7 +3710,7 @@ mod tests {
             1,
             "same referenced data file should produce one Puffin DV across drivers"
         );
-        let reports = crate::runtime::sink_commit_wire::iceberg_commit_infos_to_writer_reports(
+        let reports = crate::runtime::sink_commit::iceberg_commit_infos_to_writer_reports(
             infos,
             &target_metadata,
         )

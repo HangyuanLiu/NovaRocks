@@ -47,7 +47,7 @@ pub mod query_result;
 pub(crate) mod query_state;
 pub(crate) mod registry_cleanup;
 pub(crate) mod write_coordinator;
-#[cfg(any(test, feature = "compat"))]
+#[cfg(feature = "compat")]
 pub(crate) mod write_coordinator_compat;
 pub(crate) mod write_report;
 // Result buffer fetch infrastructure is accessed from C++ shim FFI path.
@@ -62,6 +62,7 @@ pub mod scan_executor;
 pub(crate) mod scan_range;
 pub(crate) mod scheduler;
 pub mod sink_commit;
+#[cfg(feature = "compat")]
 pub(crate) mod sink_commit_wire;
 pub mod starlet_shard_registry;
 pub mod start_epoch;

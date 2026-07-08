@@ -130,7 +130,7 @@ impl IcebergWriteCommitExecutor {
     ) -> Result<CommitOutcome, CommitServiceError> {
         let mut writer_files = Vec::new();
         for writer in &write_commit.writers {
-            let reports = crate::runtime::sink_commit_wire::iceberg_commit_infos_to_writer_reports(
+            let reports = crate::runtime::sink_commit::iceberg_commit_infos_to_writer_reports(
                 writer.iceberg_commits.clone(),
                 self.table.metadata(),
             )

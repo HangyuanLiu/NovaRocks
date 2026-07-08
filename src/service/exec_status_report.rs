@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![cfg(feature = "compat")]
+
 use std::collections::BTreeMap;
 
 use crate::common::types::UniqueId;

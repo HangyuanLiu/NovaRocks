@@ -190,7 +190,7 @@ pub(crate) fn route_change_stream_writer_reports(
     let mut routed = ChangeStreamRoutedWriterFiles::default();
 
     for writer in &write_commit.writers {
-        let reports = crate::runtime::sink_commit_wire::iceberg_commit_infos_to_writer_reports(
+        let reports = crate::runtime::sink_commit::iceberg_commit_infos_to_writer_reports(
             writer.iceberg_commits.clone(),
             table_metadata,
         )
@@ -337,7 +337,7 @@ mod tests {
         IcebergPartitionReport, IcebergWriterReport, IcebergWrittenFileReport,
     };
     use crate::proto::novarocks;
-    use crate::runtime::sink_commit_wire::writer_report_to_iceberg_commit_info;
+    use crate::runtime::sink_commit::writer_report_to_iceberg_commit_info;
     use crate::runtime::write_coordinator::{WriteCommitInput, WriterCommitInput, WriterKey};
     use crate::thrift::types;
 

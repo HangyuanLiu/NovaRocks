@@ -167,6 +167,7 @@ impl RuntimeState {
         self.fragment_instance_id
     }
 
+    #[cfg(feature = "compat")]
     pub(crate) fn add_sink_commit_info(&self, info: crate::thrift::types::TSinkCommitInfo) {
         let Some(finst_id) = self.fragment_instance_id else {
             debug!(
@@ -202,9 +203,8 @@ impl RuntimeState {
         report: crate::connector::iceberg::report::IcebergWriterReport,
         metadata: &iceberg::spec::TableMetadata,
     ) -> Result<(), String> {
-        let commit_info = crate::runtime::sink_commit_wire::writer_report_to_iceberg_commit_info(
-            report, metadata,
-        )?;
+        let commit_info =
+            crate::runtime::sink_commit::writer_report_to_iceberg_commit_info(report, metadata)?;
         let Some(finst_id) = self.fragment_instance_id else {
             debug!(
                 target: "novarocks::sink_commit",

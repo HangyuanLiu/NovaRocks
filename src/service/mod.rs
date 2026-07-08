@@ -22,9 +22,13 @@ pub mod disk_report;
 #[cfg(feature = "compat")]
 pub mod engine_ffi;
 pub mod exchange_sender;
+#[cfg(feature = "compat")]
 pub(crate) mod exec_state_reporter;
+#[cfg(feature = "compat")]
 pub(crate) mod exec_status_report;
 pub mod fe_report;
+#[cfg(feature = "compat")]
+pub mod fe_report_compat;
 pub mod fragment_control;
 pub mod frontend_rpc;
 pub mod grpc_client;

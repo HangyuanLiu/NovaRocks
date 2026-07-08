@@ -23,13 +23,17 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 
+#[cfg(feature = "compat")]
 use crate::cache::DataCacheManager;
+#[cfg(feature = "compat")]
 use crate::common::network;
 use crate::common::types::UniqueId;
+#[cfg(feature = "compat")]
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_logging::{debug, warn};
-use crate::proto::novarocks;
+use crate::proto::{common, novarocks};
 use crate::runtime::endpoint::RuntimeEndpoint;
+#[cfg(feature = "compat")]
 use crate::runtime::load_tracking;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::{
@@ -39,17 +43,20 @@ use crate::runtime::profile::{
 use crate::runtime::query_context::QueryId;
 use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
 use crate::runtime::sink_commit;
+#[cfg(feature = "compat")]
 use crate::service::exec_state_reporter::{self, ExecStateReportTask};
+#[cfg(feature = "compat")]
 use crate::service::exec_status_report::{self, ExecStatusReportInput};
 use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
 use crate::service::report_worker;
 use crate::service::standalone_exec_state_reporter::{self, StandaloneExecStateReportTask};
-use crate::thrift::{
-    data_cache, frontend_service, metrics, runtime_profile, status, status_code, types,
-};
+#[cfg(feature = "compat")]
+use crate::thrift::data_cache;
+use crate::thrift::{frontend_service, metrics, runtime_profile, status, status_code, types};
 
 #[derive(Clone, Debug)]
 enum ReportDestination {
+    #[cfg(feature = "compat")]
     StarRocksFrontend(types::TNetworkAddress),
     NovaRocksCoordinator(RuntimeEndpoint),
 }
@@ -73,6 +80,7 @@ fn registry() -> &'static Mutex<HashMap<UniqueId, ReportInstance>> {
     REPORT_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn register_instance(
     finst_id: UniqueId,
     query_id: QueryId,
@@ -134,6 +142,7 @@ fn register_instance_with_destination(
 ) {
     report_worker::ensure_started();
     match &destination {
+        #[cfg(feature = "compat")]
         ReportDestination::StarRocksFrontend(_) => exec_state_reporter::ensure_started(),
         ReportDestination::NovaRocksCoordinator(_) => {
             standalone_exec_state_reporter::ensure_started()
@@ -179,6 +188,12 @@ pub(crate) fn list_report_instances() -> Vec<(UniqueId, ReportInstanceSnapshot)>
 }
 
 pub(crate) fn mark_fe_query_gone(finst_id: UniqueId) {
+    #[cfg(not(feature = "compat"))]
+    {
+        let _ = finst_id;
+        return;
+    }
+    #[cfg(feature = "compat")]
     if let Ok(mut guard) = registry().lock()
         && let Some(instance) = guard.get_mut(&finst_id)
         && matches!(
@@ -218,14 +233,10 @@ pub(crate) fn report_fragment_done(
         sink_commit::unregister(finst_id);
         return;
     }
-    let status = match error {
-        Some(msg) => {
-            status::TStatus::new(status_code::TStatusCode::INTERNAL_ERROR, Some(vec![msg]))
-        }
-        None => status::TStatus::new(status_code::TStatusCode::OK, None),
-    };
     match instance.destination {
+        #[cfg(feature = "compat")]
         ReportDestination::StarRocksFrontend(coord) => {
+            let status = thrift_status_from_error(error.clone());
             let profile = build_profile_tree(
                 instance.query_id,
                 instance.enable_profile,
@@ -263,36 +274,14 @@ pub(crate) fn report_fragment_done(
                 instance.query_mem_tracker.as_ref(),
                 include_runtime_filters,
             );
-            let report = match exec_status_report::build_native_report(ExecStatusReportInput {
+            let report = build_native_report(NativeExecStatusReportInput {
                 finst_id,
                 query_id: instance.query_id,
                 backend_num: instance.backend_num,
-                status: status.clone(),
-                profile: None,
+                status: native_status_from_error(error.clone()),
                 done: true,
-                tracking_url: None,
-                load_channel_profile: None,
-                load_datacache_metrics: None,
                 native_profile,
-            }) {
-                Ok(report) => report,
-                Err(err) => {
-                    warn!(
-                        target: "novarocks::report",
-                        finst_id = %finst_id,
-                        query_id = %instance.query_id,
-                        error = %err,
-                        "failed to build native final reportExecStatus"
-                    );
-                    native_error_report(
-                        instance.query_id,
-                        finst_id,
-                        instance.backend_num,
-                        true,
-                        format!("failed to build native reportExecStatus: {err}"),
-                    )
-                }
-            };
+            });
             enqueue_standalone_final_report(StandaloneExecStateReportTask {
                 finst_id,
                 query_id: instance.query_id,
@@ -326,9 +315,10 @@ pub(crate) fn report_exec_state(finst_id: UniqueId) {
         );
         return;
     }
-    let status = status::TStatus::new(status_code::TStatusCode::OK, None);
     let enqueue_result = match instance.destination {
+        #[cfg(feature = "compat")]
         ReportDestination::StarRocksFrontend(coord) => {
+            let status = thrift_ok_status();
             let profile = build_profile_tree(
                 instance.query_id,
                 instance.enable_profile,
@@ -366,30 +356,14 @@ pub(crate) fn report_exec_state(finst_id: UniqueId) {
                 instance.query_mem_tracker.as_ref(),
                 false,
             );
-            let report = match exec_status_report::build_native_report(ExecStatusReportInput {
+            let report = build_native_report(NativeExecStatusReportInput {
                 finst_id,
                 query_id: instance.query_id,
                 backend_num: instance.backend_num,
-                status: status.clone(),
-                profile: None,
+                status: native_ok_status(),
                 done: false,
-                tracking_url: None,
-                load_channel_profile: None,
-                load_datacache_metrics: None,
                 native_profile,
-            }) {
-                Ok(report) => report,
-                Err(err) => {
-                    warn!(
-                        target: "novarocks::report",
-                        finst_id = %finst_id,
-                        query_id = %instance.query_id,
-                        error = %err,
-                        "failed to build native non-final reportExecStatus"
-                    );
-                    return;
-                }
-            };
+            });
             enqueue_standalone_non_final_report(StandaloneExecStateReportTask {
                 finst_id,
                 query_id: instance.query_id,
@@ -433,8 +407,9 @@ pub(crate) fn fetch_query_profile(
     Ok(payload)
 }
 
+#[cfg(feature = "compat")]
 fn enqueue_final_report(task: ExecStateReportTask) {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "compat"))]
     if test_capture_final_report(&task) {
         return;
     }
@@ -442,8 +417,9 @@ fn enqueue_final_report(task: ExecStateReportTask) {
     exec_state_reporter::enqueue_final(task);
 }
 
+#[cfg(feature = "compat")]
 fn enqueue_non_final_report(task: ExecStateReportTask) -> Result<(), String> {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "compat"))]
     if test_capture_non_final_report(&task) {
         return Ok(());
     }
@@ -452,7 +428,7 @@ fn enqueue_non_final_report(task: ExecStateReportTask) -> Result<(), String> {
 }
 
 fn enqueue_standalone_final_report(task: StandaloneExecStateReportTask) {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "compat"))]
     if test_capture_standalone_final_report(&task) {
         return;
     }
@@ -461,7 +437,7 @@ fn enqueue_standalone_final_report(task: StandaloneExecStateReportTask) {
 }
 
 fn enqueue_standalone_non_final_report(task: StandaloneExecStateReportTask) -> Result<(), String> {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "compat"))]
     if test_capture_standalone_non_final_report(&task) {
         return Ok(());
     }
@@ -469,6 +445,7 @@ fn enqueue_standalone_non_final_report(task: StandaloneExecStateReportTask) -> R
     standalone_exec_state_reporter::enqueue_non_final(task)
 }
 
+#[cfg(feature = "compat")]
 fn build_tracking_url(query_id: QueryId) -> Option<String> {
     if !load_tracking::has_tracking_log(query_id) {
         return None;
@@ -482,6 +459,7 @@ fn build_tracking_url(query_id: QueryId) -> Option<String> {
     ))
 }
 
+#[cfg(feature = "compat")]
 fn sum_counter_from_profile_tree(
     profile: &runtime_profile::TRuntimeProfileTree,
     name: &str,
@@ -495,6 +473,7 @@ fn sum_counter_from_profile_tree(
         .fold(0i64, |acc, value| acc.saturating_add(value))
 }
 
+#[cfg(feature = "compat")]
 fn count_datacache_active_nodes(profile: &runtime_profile::TRuntimeProfileTree) -> i64 {
     profile
         .nodes
@@ -517,10 +496,12 @@ fn count_datacache_active_nodes(profile: &runtime_profile::TRuntimeProfileTree) 
         .count() as i64
 }
 
+#[cfg(feature = "compat")]
 fn clamp_u64_to_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
+#[cfg(feature = "compat")]
 fn build_datacache_runtime_metrics() -> Option<data_cache::TDataCacheMetrics> {
     let cache = DataCacheManager::instance().block_cache()?;
     Some(data_cache::TDataCacheMetrics::new(
@@ -532,6 +513,7 @@ fn build_datacache_runtime_metrics() -> Option<data_cache::TDataCacheMetrics> {
     ))
 }
 
+#[cfg(feature = "compat")]
 fn build_load_datacache_metrics(
     profile: Option<&runtime_profile::TRuntimeProfileTree>,
 ) -> Option<data_cache::TLoadDataCacheMetrics> {
@@ -560,33 +542,89 @@ fn build_load_datacache_metrics(
     ))
 }
 
-fn native_error_report(
-    query_id: QueryId,
+struct NativeExecStatusReportInput {
     finst_id: UniqueId,
+    query_id: QueryId,
     backend_num: i32,
+    status: common::Status,
     done: bool,
-    message: String,
-) -> novarocks::ExecStatusReport {
+    native_profile: Option<novarocks::RuntimeProfileTree>,
+}
+
+fn build_native_report(input: NativeExecStatusReportInput) -> novarocks::ExecStatusReport {
+    let iceberg_commits = sink_commit::list_iceberg_commits(input.finst_id);
+    let (loaded_rows, sink_load_bytes, filtered_rows) =
+        load_stats_for_native_report(input.finst_id, &iceberg_commits);
+
     novarocks::ExecStatusReport {
         query_id: Some(crate::proto::common::UniqueId {
-            hi: query_id.hi,
-            lo: query_id.lo,
+            hi: input.query_id.hi,
+            lo: input.query_id.lo,
         }),
         fragment_instance_id: Some(crate::proto::common::UniqueId {
-            hi: finst_id.hi,
-            lo: finst_id.lo,
+            hi: input.finst_id.hi,
+            lo: input.finst_id.lo,
         }),
-        backend_num,
-        status: Some(crate::proto::common::Status {
-            code: status_code::TStatusCode::INTERNAL_ERROR.0,
-            message,
-        }),
-        done,
-        iceberg_commits: Vec::new(),
-        loaded_rows: 0,
-        sink_load_bytes: 0,
-        filtered_rows: 0,
-        profile: None,
+        backend_num: input.backend_num,
+        status: Some(input.status),
+        done: input.done,
+        iceberg_commits,
+        loaded_rows,
+        sink_load_bytes,
+        filtered_rows,
+        profile: input.native_profile,
+    }
+}
+
+fn load_stats_for_native_report(
+    finst_id: UniqueId,
+    iceberg_commits: &[novarocks::IcebergCommitInfo],
+) -> (i64, i64, i64) {
+    let state_stats = sink_commit::get_load_stats(finst_id);
+    let mut normal_rows: i64 = state_stats.loaded_rows.max(0);
+    let mut loaded_bytes: i64 = state_stats.loaded_bytes.max(0);
+    let filtered_rows: i64 = state_stats.filtered_rows.max(0);
+
+    for info in iceberg_commits {
+        if let Some(file) = info.iceberg_data_file.as_ref() {
+            if let Some(rows) = file.record_count {
+                normal_rows = normal_rows.saturating_add(rows);
+            }
+            if let Some(bytes) = file.file_size_in_bytes {
+                loaded_bytes = loaded_bytes.saturating_add(bytes);
+            }
+        }
+    }
+
+    (normal_rows, loaded_bytes, filtered_rows)
+}
+
+fn native_ok_status() -> common::Status {
+    common::Status {
+        code: 0,
+        message: String::new(),
+    }
+}
+
+fn native_status_from_error(error: Option<String>) -> common::Status {
+    match error {
+        Some(message) => common::Status { code: 1, message },
+        None => native_ok_status(),
+    }
+}
+
+#[cfg(feature = "compat")]
+fn thrift_ok_status() -> status::TStatus {
+    status::TStatus::new(status_code::TStatusCode::OK, None)
+}
+
+#[cfg(feature = "compat")]
+fn thrift_status_from_error(error: Option<String>) -> status::TStatus {
+    match error {
+        Some(msg) => {
+            status::TStatus::new(status_code::TStatusCode::INTERNAL_ERROR, Some(vec![msg]))
+        }
+        None => thrift_ok_status(),
     }
 }
 
@@ -1056,7 +1094,7 @@ pub(crate) fn is_query_gone_status(status: &status::TStatus) -> bool {
             .unwrap_or(false)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 pub(crate) fn test_insert_report_instance(finst_id: UniqueId, query_id: QueryId) {
     let mut guard = registry().lock().expect("report registry lock");
     guard.insert(
@@ -1078,7 +1116,7 @@ pub(crate) fn test_insert_report_instance(finst_id: UniqueId, query_id: QueryId)
     );
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 pub(crate) fn test_insert_standalone_report_instance(
     finst_id: UniqueId,
     query_id: QueryId,
@@ -1102,14 +1140,14 @@ pub(crate) fn test_insert_standalone_report_instance(
     );
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 pub(crate) fn test_reset_report_registry() {
     if let Ok(mut guard) = registry().lock() {
         guard.clear();
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 pub(crate) fn test_is_fe_query_gone(finst_id: UniqueId) -> bool {
     registry()
         .lock()
@@ -1118,76 +1156,76 @@ pub(crate) fn test_is_fe_query_gone(finst_id: UniqueId) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 pub(crate) fn test_report_registry_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 type FinalReportHook = Box<dyn Fn(&ExecStateReportTask) + Send + Sync + 'static>;
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 type NonFinalReportHook = Box<dyn Fn(&ExecStateReportTask) + Send + Sync + 'static>;
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 type StandaloneFinalReportHook =
     Box<dyn Fn(&StandaloneExecStateReportTask) + Send + Sync + 'static>;
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 type StandaloneNonFinalReportHook =
     Box<dyn Fn(&StandaloneExecStateReportTask) + Send + Sync + 'static>;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 fn test_final_report_hook() -> &'static Mutex<Option<FinalReportHook>> {
     static HOOK: OnceLock<Mutex<Option<FinalReportHook>>> = OnceLock::new();
     HOOK.get_or_init(|| Mutex::new(None))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 fn test_non_final_report_hook() -> &'static Mutex<Option<NonFinalReportHook>> {
     static HOOK: OnceLock<Mutex<Option<NonFinalReportHook>>> = OnceLock::new();
     HOOK.get_or_init(|| Mutex::new(None))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 fn test_standalone_final_report_hook() -> &'static Mutex<Option<StandaloneFinalReportHook>> {
     static HOOK: OnceLock<Mutex<Option<StandaloneFinalReportHook>>> = OnceLock::new();
     HOOK.get_or_init(|| Mutex::new(None))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 fn test_standalone_non_final_report_hook() -> &'static Mutex<Option<StandaloneNonFinalReportHook>> {
     static HOOK: OnceLock<Mutex<Option<StandaloneNonFinalReportHook>>> = OnceLock::new();
     HOOK.get_or_init(|| Mutex::new(None))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 fn test_set_final_report_hook(hook: Option<FinalReportHook>) {
     *test_final_report_hook()
         .lock()
         .expect("final report hook lock") = hook;
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 fn test_set_non_final_report_hook(hook: Option<NonFinalReportHook>) {
     *test_non_final_report_hook()
         .lock()
         .expect("non-final report hook lock") = hook;
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 fn test_set_standalone_final_report_hook(hook: Option<StandaloneFinalReportHook>) {
     *test_standalone_final_report_hook()
         .lock()
         .expect("standalone final report hook lock") = hook;
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 fn test_set_standalone_non_final_report_hook(hook: Option<StandaloneNonFinalReportHook>) {
     *test_standalone_non_final_report_hook()
         .lock()
         .expect("standalone non-final report hook lock") = hook;
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 fn test_capture_final_report(task: &ExecStateReportTask) -> bool {
     let guard = test_final_report_hook()
         .lock()
@@ -1199,7 +1237,7 @@ fn test_capture_final_report(task: &ExecStateReportTask) -> bool {
     true
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 fn test_capture_non_final_report(task: &ExecStateReportTask) -> bool {
     let guard = test_non_final_report_hook()
         .lock()
@@ -1211,7 +1249,7 @@ fn test_capture_non_final_report(task: &ExecStateReportTask) -> bool {
     true
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 fn test_capture_standalone_final_report(task: &StandaloneExecStateReportTask) -> bool {
     let guard = test_standalone_final_report_hook()
         .lock()
@@ -1223,7 +1261,7 @@ fn test_capture_standalone_final_report(task: &StandaloneExecStateReportTask) ->
     true
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 fn test_capture_standalone_non_final_report(task: &StandaloneExecStateReportTask) -> bool {
     let guard = test_standalone_non_final_report_hook()
         .lock()
@@ -1235,7 +1273,7 @@ fn test_capture_standalone_non_final_report(task: &StandaloneExecStateReportTask
     true
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};

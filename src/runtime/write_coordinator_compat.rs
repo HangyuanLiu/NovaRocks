@@ -17,6 +17,8 @@
 
 //! StarRocks-compatible thrift report adapters for distributed write reports.
 
+#![cfg(feature = "compat")]
+
 use crate::common::engine_error::EngineError;
 use crate::common::types::UniqueId;
 use crate::proto::common;
