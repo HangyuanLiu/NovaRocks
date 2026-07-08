@@ -387,6 +387,24 @@ pub(crate) fn create_iceberg_mv(
         ));
     }
     target_properties.extend(descriptor.to_storage_properties()?);
+    // Query-side MV-rewrite staleness tolerance (E2): forward the user PROPERTIES
+    // key onto the target table so the rewrite candidate gate can read it. Validate
+    // it parses as a non-negative integer (seconds); reject a malformed value rather
+    // than silently ignoring it.
+    if let Some((_, raw)) = stmt.properties.iter().find(|(k, _)| {
+        k.eq_ignore_ascii_case(crate::engine::mv_rewrite_prep::MV_QUERY_REWRITE_MAX_STALENESS_SEC_PROP)
+    }) {
+        let secs: u64 = raw.trim().parse().map_err(|_| {
+            format!(
+                "invalid {} property value `{raw}`: expected a non-negative integer (seconds)",
+                crate::engine::mv_rewrite_prep::MV_QUERY_REWRITE_MAX_STALENESS_SEC_PROP
+            )
+        })?;
+        target_properties.push((
+            crate::engine::mv_rewrite_prep::MV_QUERY_REWRITE_MAX_STALENESS_SEC_PROP.to_string(),
+            secs.to_string(),
+        ));
+    }
     crate::connector::iceberg::catalog::registry::create_table(
         &entry,
         &target.namespace,
@@ -19556,6 +19574,38 @@ mod tests {
         assert!(
             missing_direct_target_err.contains(&legacy_alias_name),
             "{missing_direct_target_err}"
+        );
+    }
+
+    #[test]
+    fn create_iceberg_mv_writes_query_rewrite_staleness_property() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg', 'query_rewrite_max_staleness_sec'='300')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let loaded =
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
+                .expect("load target table");
+        assert_eq!(
+            loaded
+                .table
+                .metadata()
+                .properties()
+                .get("query_rewrite_max_staleness_sec")
+                .map(String::as_str),
+            Some("300"),
         );
     }
 
