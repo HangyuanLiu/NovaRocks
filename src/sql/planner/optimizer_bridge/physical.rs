@@ -5,7 +5,7 @@ use crate::sql::codegen::scalar_materialize::{
     materialize, materialize_aggregate_calls, materialize_exprs, materialize_project_items,
     materialize_sort_keys, materialize_window_exprs,
 };
-use crate::sql::common::OutputColumn;
+use crate::sql::common::{JoinKind, OutputColumn};
 use crate::sql::optimizer::operator::{Operator, PhysicalDistributionOp};
 use crate::sql::optimizer::physical_tree::{JoinExecutionDistribution, OptimizerPhysicalNode};
 use crate::sql::optimizer::property::DistributionSpec;
@@ -145,14 +145,14 @@ impl BridgeCtx<'_> {
                             ),
                         })
                         .collect(),
-                    output_columns: node.output_columns.clone(),
+                    output_columns: physical_join_output_columns(op.join_type, node),
                 })))
             }
             Operator::PhysicalNestLoopJoin(op) => {
                 Ok(PhysicalPlanKind::NestLoopJoin(PhysicalNestLoopJoinNode {
                     join_type: op.join_type,
                     condition: op.condition.map(|expr| materialize(self.scalars, expr)),
-                    output_columns: node.output_columns.clone(),
+                    output_columns: physical_join_output_columns(op.join_type, node),
                 }))
             }
             Operator::PhysicalValues(op) => Ok(PhysicalPlanKind::Values(PlanValuesNode {
@@ -286,7 +286,7 @@ impl BridgeCtx<'_> {
                 Ok(PhysicalPlanKind::Redistribute(RedistributeNode {
                     mode,
                     partition_exprs,
-                    output_columns: physical_node_materialized_output_columns(child),
+                    output_columns: physical_distribution_output_columns(node),
                 }))
             }
             op if op.is_logical() => Err(format!(
@@ -300,6 +300,9 @@ impl BridgeCtx<'_> {
 fn physical_node_output_columns(node: &OptimizerPhysicalNode) -> Vec<OutputColumn> {
     match &node.op {
         Operator::PhysicalScan(scan) => scan_materialized_output_columns(scan),
+        Operator::PhysicalDistribution(_) => physical_distribution_output_columns(node),
+        Operator::PhysicalHashJoin(join) => physical_join_output_columns(join.join_type, node),
+        Operator::PhysicalNestLoopJoin(join) => physical_join_output_columns(join.join_type, node),
         _ => node.output_columns.clone(),
     }
 }
@@ -309,6 +312,94 @@ fn physical_node_materialized_output_columns(node: &OptimizerPhysicalNode) -> Ve
         Operator::PhysicalHashAggregate(aggregate) => aggregate.output_layout.full_output_columns(),
         _ => physical_node_output_columns(node),
     }
+}
+
+fn physical_distribution_output_columns(node: &OptimizerPhysicalNode) -> Vec<OutputColumn> {
+    node.children
+        .first()
+        .map(physical_node_materialized_output_columns)
+        .unwrap_or_else(|| node.output_columns.clone())
+}
+
+fn physical_join_output_columns(
+    join_type: JoinKind,
+    node: &OptimizerPhysicalNode,
+) -> Vec<OutputColumn> {
+    if node.children.len() != 2 {
+        return node.output_columns.clone();
+    }
+
+    let left = physical_node_materialized_output_columns(&node.children[0]);
+    let right = physical_node_materialized_output_columns(&node.children[1]);
+    let derived = join_output_columns_from_children(join_type, left, right);
+    project_requested_output_columns(&node.output_columns, &derived).unwrap_or(derived)
+}
+
+fn project_requested_output_columns(
+    requested: &[OutputColumn],
+    available: &[OutputColumn],
+) -> Option<Vec<OutputColumn>> {
+    if requested.is_empty() || available.is_empty() {
+        return None;
+    }
+    let available_ids: std::collections::HashSet<_> =
+        available.iter().map(|column| column.column_id).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut projected = Vec::with_capacity(requested.len());
+    for column in requested {
+        if !available_ids.contains(&column.column_id) {
+            return None;
+        }
+        if seen.insert(column.column_id) {
+            let available_column = available
+                .iter()
+                .find(|available| available.column_id == column.column_id)
+                .expect("available column id was prevalidated");
+            projected.push(available_column.clone());
+        }
+    }
+    Some(projected)
+}
+
+fn join_output_columns_from_children(
+    join_type: JoinKind,
+    left: Vec<OutputColumn>,
+    right: Vec<OutputColumn>,
+) -> Vec<OutputColumn> {
+    let mut output = match join_type {
+        JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => left,
+        JoinKind::RightSemi | JoinKind::RightAnti => right,
+        JoinKind::LeftOuter => {
+            let mut output = left;
+            output.extend(nullable_output_columns(right));
+            output
+        }
+        JoinKind::RightOuter => {
+            let mut output = nullable_output_columns(left);
+            output.extend(right);
+            output
+        }
+        JoinKind::FullOuter => {
+            let mut output = nullable_output_columns(left);
+            output.extend(nullable_output_columns(right));
+            output
+        }
+        JoinKind::Inner | JoinKind::Cross => {
+            let mut output = left;
+            output.extend(right);
+            output
+        }
+    };
+    let mut seen = std::collections::HashSet::new();
+    output.retain(|column| seen.insert(column.column_id));
+    output
+}
+
+fn nullable_output_columns(mut columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
+    for column in &mut columns {
+        column.nullable = true;
+    }
+    columns
 }
 
 fn scan_materialized_output_columns(
@@ -1017,7 +1108,11 @@ mod tests {
             panic!("expected Redistribute");
         };
 
-        assert_output_columns_eq(&redistribute.output_columns, &[map2_column, s2_column]);
+        assert_output_columns_eq(
+            &redistribute.output_columns,
+            &[map2_column.clone(), s2_column.clone()],
+        );
+        assert_output_columns_eq(&physical.output_columns, &[map2_column, s2_column]);
     }
 
     #[test]
@@ -1194,6 +1289,36 @@ mod tests {
         let err = optimizer_physical_to_plan(&node).expect_err("hash join needs two children");
         assert!(err.contains("PhysicalHashJoin"));
         assert!(err.contains("expected 2 children, got 1"));
+    }
+
+    #[test]
+    fn physical_hash_join_outputs_are_derived_from_children() {
+        let left_a = output_column(1, "left_a");
+        let left_b = output_column(2, "left_b");
+        let right_c = output_column(3, "right_c");
+        let mut left = raw_values_node();
+        left.output_columns = vec![left_a.clone(), left_b.clone()];
+        let mut right = raw_values_node();
+        right.output_columns = vec![right_c.clone()];
+        let mut node = base_node(Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![],
+            other_condition: None,
+            distribution: JoinDistribution::Broadcast,
+        }));
+        node.output_columns = vec![output_column(10, "stale_parent_state")];
+        node.children.push(left);
+        node.children.push(right);
+        let node = attach_arena(node, Arc::new(ScalarArena::new()));
+
+        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        let PhysicalPlanKind::HashJoin(join) = &physical.kind else {
+            panic!("expected HashJoin");
+        };
+
+        let expected = &[left_a, left_b, right_c];
+        assert_output_columns_eq(&join.output_columns, expected);
+        assert_output_columns_eq(&physical.output_columns, expected);
     }
 
     #[test]

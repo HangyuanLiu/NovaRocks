@@ -15,11 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Metadata-only v3 row-lineage DV commit.
+//! v3 row-lineage DV commit for BE-written deletion-vector files.
 //!
 //! The BE `DeletionVectors` sink has already read and merged old DVs and
-//! written the replacement Puffin files. This commit action only validates
-//! those descriptors and registers them in Iceberg metadata.
+//! written replacement Puffin files. Multiple drivers may still report separate
+//! replacement DVs for the same referenced data file, so this commit action
+//! coalesces those reports before registering one live Puffin DV per data file
+//! in Iceberg metadata.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -43,6 +45,9 @@ use super::helpers::{
     finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
     required_target_ref_snapshot_id, snapshot_summary, snapshot_total_records,
     target_ref_snapshot_id, write_manifest_list,
+};
+use super::puffin_dv::{
+    DeletionVector, read_deletion_vector_puffin, write_single_deletion_vector_puffin,
 };
 use super::row_delta_dv_metadata::{
     WrittenDvFile, build_snapshot_index_metadata_only, dv_summary, dv_total_records,
@@ -91,7 +96,14 @@ impl IcebergCommitAction for RowDeltaDvFromFilesCommit {
             }
         }
         let (written_dvs, written_data) = partition_written_for_dv_from_files(written)?;
-        validate_unique_referenced_files(&written_dvs)?;
+        let (written_dvs, superseded_writer_dvs) = coalesce_written_dvs_by_referenced_file(
+            ctx.file_io,
+            ctx.table.metadata().location(),
+            ctx.commit_uuid,
+            written_dvs,
+            ctx.abort_handle.as_ref(),
+        )
+        .await?;
 
         let manifest_paths_out: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let action = RowDeltaDvFromFilesTxnAction {
@@ -121,6 +133,7 @@ impl IcebergCommitAction for RowDeltaDvFromFilesCommit {
             .commit(ctx.catalog)
             .await
             .map_err(|e| format!("RowDeltaDvFromFiles commit failed: {e}"))?;
+        cleanup_superseded_writer_dvs(ctx.file_io, superseded_writer_dvs).await;
         let new_snapshot_id = required_target_ref_snapshot_id(
             table_after.metadata(),
             ctx.target_ref,
@@ -605,17 +618,73 @@ fn validate_content_range(
     Ok(())
 }
 
-fn validate_unique_referenced_files(dvs: &[WrittenDvFile]) -> Result<(), String> {
-    let mut seen = HashSet::new();
+async fn coalesce_written_dvs_by_referenced_file(
+    file_io: &FileIO,
+    table_location: &str,
+    commit_uuid: Uuid,
+    dvs: Vec<WrittenDvFile>,
+    abort_handle: &AbortLog,
+) -> Result<(Vec<WrittenDvFile>, Vec<String>), String> {
+    let mut by_referenced: BTreeMap<String, Vec<WrittenDvFile>> = BTreeMap::new();
     for dv in dvs {
-        if !seen.insert(dv.referenced_data_file.as_str()) {
-            return Err(format!(
-                "RowDeltaDvFromFilesCommit received multiple Puffin DV files for data file `{}`; per-file shuffle must produce exactly one merged DV",
-                dv.referenced_data_file
-            ));
+        by_referenced
+            .entry(dv.referenced_data_file.clone())
+            .or_default()
+            .push(dv);
+    }
+
+    let mut coalesced = Vec::with_capacity(by_referenced.len());
+    let mut superseded_paths = Vec::new();
+    for (idx, (referenced, group)) in by_referenced.into_iter().enumerate() {
+        if group.len() == 1 {
+            coalesced.push(group.into_iter().next().expect("one DV"));
+            continue;
+        }
+
+        let mut merged = DeletionVector::new();
+        for dv in &group {
+            let existing = read_deletion_vector_puffin(
+                file_io,
+                &dv.path,
+                dv.content_offset,
+                dv.content_size_in_bytes,
+            )
+            .await
+            .map_err(|e| {
+                format!(
+                    "RowDeltaDvFromFilesCommit read BE-written Puffin DV {} failed: {e}",
+                    dv.path
+                )
+            })?;
+            merged.merge(&existing);
+        }
+
+        let path = format!(
+            "{table_location}/data/_staging/{commit_uuid}/dv-from-files-merge-{idx:08x}.puffin"
+        );
+        abort_handle.record_data_file(path.clone());
+        let written = write_single_deletion_vector_puffin(file_io, &path, &referenced, &merged)
+            .await
+            .map_err(|e| {
+                format!("RowDeltaDvFromFilesCommit write coalesced Puffin DV {path} failed: {e}")
+            })?;
+        coalesced.push(WrittenDvFile::from(written));
+        superseded_paths.extend(group.into_iter().map(|dv| dv.path));
+    }
+
+    Ok((coalesced, superseded_paths))
+}
+
+async fn cleanup_superseded_writer_dvs(file_io: &FileIO, paths: Vec<String>) {
+    for path in paths {
+        if let Err(err) = file_io.delete(&path).await {
+            tracing::warn!(
+                path = %path,
+                error = %err,
+                "failed to delete superseded BE-written Puffin DV after coalesced commit"
+            );
         }
     }
-    Ok(())
 }
 
 /// Partition BE-written files into Puffin DV descriptors and replacement data
@@ -890,24 +959,115 @@ mod tests {
         );
     }
 
-    #[test]
-    fn duplicate_referenced_data_file_is_rejected() {
-        let left = dv_descriptor_from_written(&test_written_puffin_dv_file()).unwrap();
-        let mut right_file = test_written_puffin_dv_file();
-        right_file.path = "s3://b/data/dv-00000001.puffin".to_string();
-        let right = dv_descriptor_from_written(&right_file).unwrap();
+    #[tokio::test]
+    async fn commit_coalesces_duplicate_writer_dvs_for_same_referenced_file() {
+        use super::super::test_helpers::v3_table_with_n_data_files;
 
-        let err = validate_unique_referenced_files(&[left, right]).unwrap_err();
+        let fixture = v3_table_with_n_data_files(1).await;
+        let file_io = fixture.table.file_io().clone();
+        let table_location = fixture.table.metadata().location().to_string();
+        let referenced = format!("{table_location}/data/file-0.parquet");
 
-        assert!(err.contains("multiple Puffin DV files"));
-        assert!(err.contains("s3://b/data/f.parquet"));
-    }
+        let first = write_test_puffin_dv(
+            &file_io,
+            &format!("{table_location}/data/_staging/test/dv-a.puffin"),
+            &referenced,
+            &[0, 2],
+        )
+        .await;
+        let second = write_test_puffin_dv(
+            &file_io,
+            &format!("{table_location}/data/_staging/test/dv-b.puffin"),
+            &referenced,
+            &[2, 5],
+        )
+        .await;
 
-    #[test]
-    fn source_does_not_call_puffin_read_or_write_helpers() {
-        let source = include_str!("row_delta_dv_from_files.rs");
-        assert!(!source.contains(concat!("read_", "deletion_vector_puffin")));
-        assert!(!source.contains(concat!("write_", "single_deletion_vector_puffin")));
+        let metadata = fixture.table.metadata().clone();
+        let collector = IcebergCommitCollector::new(
+            CommitOpKind::RowDeltaDvFromFiles,
+            fixture.table_ident.clone(),
+            metadata.current_snapshot().map(|s| s.snapshot_id()),
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            format!("{table_location}/staging"),
+            UniqueId { hi: 7017, lo: 1 },
+        )
+        .with_table_metadata(metadata);
+        collector.inject_written_files(vec![first, second]);
+
+        let snapshot_properties = BTreeMap::new();
+        let ctx = CommitCtx {
+            collector: &collector,
+            table: &fixture.table,
+            catalog: fixture.catalog.as_ref(),
+            file_io: &file_io,
+            commit_uuid: Uuid::new_v4(),
+            abort_handle: collector.abort_log.clone(),
+            target_ref: "main",
+            snapshot_properties: &snapshot_properties,
+        };
+
+        let outcome = RowDeltaDvFromFilesCommit
+            .commit(ctx)
+            .await
+            .expect("duplicate writer DVs should be coalesced");
+        let table_after = fixture
+            .catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("reload table");
+        let snapshot = table_after
+            .metadata()
+            .snapshot_by_id(outcome.new_snapshot_id)
+            .expect("row-delta snapshot");
+        assert_eq!(
+            snapshot.summary().additional_properties["added-delete-files"],
+            "1"
+        );
+        assert_eq!(
+            snapshot.summary().additional_properties["added-position-deletes"],
+            "3"
+        );
+
+        let manifest_list = snapshot
+            .load_manifest_list(&file_io, table_after.metadata())
+            .await
+            .expect("load manifest list");
+        let delete_manifests = manifest_list
+            .entries()
+            .iter()
+            .filter(|manifest| manifest.content == iceberg::spec::ManifestContentType::Deletes)
+            .collect::<Vec<_>>();
+        assert_eq!(delete_manifests.len(), 1);
+        let manifest = delete_manifests[0]
+            .load_manifest(&file_io)
+            .await
+            .expect("load delete manifest");
+        let entries = manifest.entries().iter().collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        let data_file = entries[0].data_file();
+        assert_eq!(
+            data_file.referenced_data_file().as_deref(),
+            Some(referenced.as_str())
+        );
+        assert_eq!(data_file.record_count(), 3);
+
+        let merged = super::super::puffin_dv::read_deletion_vector_puffin(
+            &file_io,
+            data_file.file_path(),
+            data_file.content_offset().expect("content offset"),
+            data_file
+                .content_size_in_bytes()
+                .expect("content size in bytes"),
+        )
+        .await
+        .expect("read merged dv");
+        assert_eq!(merged.cardinality(), 3);
+        assert!(merged.contains(0));
+        assert!(merged.contains(2));
+        assert!(merged.contains(5));
     }
 
     #[test]
@@ -1059,6 +1219,47 @@ mod tests {
             content_offset: None,
             content_size_in_bytes: None,
             cardinality: None,
+        }
+    }
+
+    async fn write_test_puffin_dv(
+        file_io: &FileIO,
+        path: &str,
+        referenced: &str,
+        positions: &[u64],
+    ) -> WrittenFile {
+        let mut dv = super::super::DeletionVector::new();
+        for pos in positions {
+            dv.insert(*pos).expect("insert position");
+        }
+        let written = super::super::puffin_dv::write_single_deletion_vector_puffin(
+            file_io, path, referenced, &dv,
+        )
+        .await
+        .expect("write puffin dv");
+        let cardinality = written.cardinality;
+        WrittenFile {
+            path: written.path,
+            format: DataFileFormat::Puffin,
+            content: DataContentType::PositionDeletes,
+            partition_values: Struct::empty(),
+            partition_spec_id: 0,
+            record_count: cardinality,
+            file_size_in_bytes: written.file_size_in_bytes,
+            split_offsets: Vec::new(),
+            column_sizes: HashMap::new(),
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            nan_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            key_metadata: None,
+            referenced_data_file: Some(written.referenced_data_file),
+            equality_ids: None,
+            first_row_id: None,
+            content_offset: Some(written.content_offset),
+            content_size_in_bytes: Some(written.content_size_in_bytes),
+            cardinality: Some(cardinality),
         }
     }
 
