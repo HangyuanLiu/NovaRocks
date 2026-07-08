@@ -20,7 +20,7 @@
 //! pushed by BE via reportExecStatus. novarocks therefore does not expose a trigger entry point
 //! and keeps this module focused on BE-initiated reports.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::cache::DataCacheManager;
@@ -32,7 +32,10 @@ use crate::proto::novarocks;
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::load_tracking;
 use crate::runtime::mem_tracker::MemTracker;
-use crate::runtime::profile::Profiler;
+use crate::runtime::profile::{
+    CounterAggregateType, CounterMergeType, CounterMinMaxType, CounterStrategy, ProfileCounter,
+    ProfileNode, ProfileUnit, Profiler, RuntimeProfileTree, default_counter_strategy,
+};
 use crate::runtime::query_context::QueryId;
 use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
 use crate::runtime::sink_commit;
@@ -587,6 +590,278 @@ fn native_error_report(
     }
 }
 
+pub(crate) fn profile_to_thrift_tree_for_fe(
+    profiler: &Profiler,
+) -> runtime_profile::TRuntimeProfileTree {
+    runtime_profile_tree_to_thrift_for_fe(&profiler.to_native_tree())
+        .expect("RuntimeProfile should always produce thrift-compatible profile units")
+}
+
+pub(crate) fn runtime_profile_tree_to_thrift_for_fe(
+    tree: &RuntimeProfileTree,
+) -> Result<runtime_profile::TRuntimeProfileTree, String> {
+    let mut nodes = Vec::new();
+    native_profile_node_to_thrift_for_fe(&tree.root, &mut nodes)?;
+    Ok(runtime_profile::TRuntimeProfileTree::new(nodes))
+}
+
+pub(crate) fn runtime_profile_tree_from_thrift_for_fe(
+    tree: &runtime_profile::TRuntimeProfileTree,
+) -> Result<RuntimeProfileTree, String> {
+    let Some((root, consumed)) = native_profile_node_from_thrift_for_fe(&tree.nodes, 0)? else {
+        return Err("TRuntimeProfileTree missing root".to_string());
+    };
+    if consumed != tree.nodes.len() {
+        return Err(format!(
+            "TRuntimeProfileTree has trailing nodes: consumed {consumed} of {}",
+            tree.nodes.len()
+        ));
+    }
+    Ok(RuntimeProfileTree { root })
+}
+
+fn native_profile_node_to_thrift_for_fe(
+    node: &ProfileNode,
+    out: &mut Vec<runtime_profile::TRuntimeProfileNode>,
+) -> Result<(), String> {
+    let mut counters = node
+        .counters
+        .iter()
+        .map(native_counter_to_thrift_for_fe)
+        .collect::<Result<Vec<_>, _>>()?;
+    counters.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let mut child_counters_map = BTreeMap::<String, BTreeSet<String>>::new();
+    for counter in &node.counters {
+        child_counters_map
+            .entry(counter.parent_name.clone())
+            .or_default()
+            .insert(counter.name.clone());
+    }
+
+    let info_strings = node.info_strings.clone();
+    let info_strings_display_order = info_strings.keys().cloned().collect::<Vec<_>>();
+
+    out.push(runtime_profile::TRuntimeProfileNode::new(
+        node.name.clone(),
+        node.children.len() as i32,
+        counters,
+        i64::from(node.node_id),
+        false,
+        info_strings,
+        info_strings_display_order,
+        child_counters_map,
+        None,
+    ));
+
+    for child in &node.children {
+        native_profile_node_to_thrift_for_fe(child, out)?;
+    }
+    Ok(())
+}
+
+fn native_counter_to_thrift_for_fe(
+    counter: &ProfileCounter,
+) -> Result<runtime_profile::TCounter, String> {
+    Ok(runtime_profile::TCounter::new(
+        counter.name.clone(),
+        profile_unit_to_thrift_for_fe(counter.unit),
+        counter.value,
+        Some(counter_strategy_to_thrift_for_fe(counter.strategy)),
+        counter.min_value,
+        counter.max_value,
+    ))
+}
+
+fn native_profile_node_from_thrift_for_fe(
+    nodes: &[runtime_profile::TRuntimeProfileNode],
+    idx: usize,
+) -> Result<Option<(ProfileNode, usize)>, String> {
+    let Some(node) = nodes.get(idx) else {
+        return Ok(None);
+    };
+    if node.num_children < 0 {
+        return Err(format!(
+            "TRuntimeProfileTree node {} has negative num_children {}",
+            node.name, node.num_children
+        ));
+    }
+
+    let mut next = idx + 1;
+    let mut children = Vec::new();
+    for _ in 0..node.num_children {
+        let Some((child, consumed)) = native_profile_node_from_thrift_for_fe(nodes, next)? else {
+            return Err(format!(
+                "TRuntimeProfileTree node {} declares more children than available nodes",
+                node.name
+            ));
+        };
+        children.push(child);
+        next = consumed;
+    }
+
+    let counter_parents = node
+        .child_counters_map
+        .iter()
+        .flat_map(|(parent, children)| {
+            children
+                .iter()
+                .map(|child| (child.clone(), parent.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let counters = node
+        .counters
+        .iter()
+        .map(|counter| {
+            thrift_counter_to_native_for_fe(
+                counter,
+                counter_parents
+                    .get(&counter.name)
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Some((
+        ProfileNode {
+            name: node.name.clone(),
+            node_id: metadata_to_native_node_id_for_fe(node.metadata),
+            counters,
+            info_strings: node.info_strings.clone(),
+            children,
+        },
+        next,
+    )))
+}
+
+fn thrift_counter_to_native_for_fe(
+    counter: &runtime_profile::TCounter,
+    parent_name: String,
+) -> Result<ProfileCounter, String> {
+    let unit = profile_unit_from_thrift_for_fe(counter.type_)?;
+    let strategy = counter
+        .strategy
+        .as_ref()
+        .map(counter_strategy_from_thrift_for_fe)
+        .transpose()?
+        .unwrap_or_else(|| default_counter_strategy(unit));
+    Ok(ProfileCounter {
+        name: counter.name.clone(),
+        parent_name,
+        unit,
+        strategy,
+        value: counter.value,
+        min_value: counter.min_value,
+        max_value: counter.max_value,
+    })
+}
+
+fn metadata_to_native_node_id_for_fe(metadata: i64) -> i32 {
+    match i32::try_from(metadata) {
+        Ok(value) => value,
+        Err(_) if metadata.is_negative() => i32::MIN,
+        Err(_) => i32::MAX,
+    }
+}
+
+fn profile_unit_to_thrift_for_fe(unit: ProfileUnit) -> metrics::TUnit {
+    match unit {
+        ProfileUnit::Unit => metrics::TUnit::UNIT,
+        ProfileUnit::CpuTicks => metrics::TUnit::CPU_TICKS,
+        ProfileUnit::Bytes => metrics::TUnit::BYTES,
+        ProfileUnit::TimeNs => metrics::TUnit::TIME_NS,
+        ProfileUnit::TimeMs => metrics::TUnit::TIME_MS,
+        ProfileUnit::TimeS => metrics::TUnit::TIME_S,
+        ProfileUnit::None => metrics::TUnit::NONE,
+    }
+}
+
+fn profile_unit_from_thrift_for_fe(unit: metrics::TUnit) -> Result<ProfileUnit, String> {
+    match unit {
+        metrics::TUnit::UNIT => Ok(ProfileUnit::Unit),
+        metrics::TUnit::CPU_TICKS => Ok(ProfileUnit::CpuTicks),
+        metrics::TUnit::BYTES => Ok(ProfileUnit::Bytes),
+        metrics::TUnit::TIME_NS => Ok(ProfileUnit::TimeNs),
+        metrics::TUnit::TIME_MS => Ok(ProfileUnit::TimeMs),
+        metrics::TUnit::TIME_S => Ok(ProfileUnit::TimeS),
+        metrics::TUnit::NONE => Ok(ProfileUnit::None),
+        other => Err(format!(
+            "unsupported thrift profile unit for FE report: {other:?}"
+        )),
+    }
+}
+
+fn counter_strategy_to_thrift_for_fe(
+    strategy: CounterStrategy,
+) -> runtime_profile::TCounterStrategy {
+    let aggregate_type = match strategy.aggregate_type() {
+        CounterAggregateType::Sum => runtime_profile::TCounterAggregateType::SUM,
+        CounterAggregateType::Avg => runtime_profile::TCounterAggregateType::AVG,
+        CounterAggregateType::SumAvg => runtime_profile::TCounterAggregateType::SUM_AVG,
+        CounterAggregateType::AvgSum => runtime_profile::TCounterAggregateType::AVG_SUM,
+    };
+    let merge_type = match strategy.merge_type() {
+        CounterMergeType::MergeAll => runtime_profile::TCounterMergeType::MERGE_ALL,
+        CounterMergeType::SkipAll => runtime_profile::TCounterMergeType::SKIP_ALL,
+        CounterMergeType::SkipFirstMerge => runtime_profile::TCounterMergeType::SKIP_FIRST_MERGE,
+        CounterMergeType::SkipSecondMerge => runtime_profile::TCounterMergeType::SKIP_SECOND_MERGE,
+    };
+    let min_max_type = strategy
+        .min_max_type()
+        .map(|min_max_type| match min_max_type {
+            CounterMinMaxType::MinMaxAll => runtime_profile::TCounterMinMaxType::MIN_MAX_ALL,
+            CounterMinMaxType::SkipAll => runtime_profile::TCounterMinMaxType::SKIP_ALL,
+        });
+    runtime_profile::TCounterStrategy::new(
+        aggregate_type,
+        merge_type,
+        strategy.display_threshold(),
+        min_max_type,
+    )
+}
+
+fn counter_strategy_from_thrift_for_fe(
+    strategy: &runtime_profile::TCounterStrategy,
+) -> Result<CounterStrategy, String> {
+    let aggregate_type = match strategy.aggregate_type {
+        runtime_profile::TCounterAggregateType::SUM => CounterAggregateType::Sum,
+        runtime_profile::TCounterAggregateType::AVG => CounterAggregateType::Avg,
+        runtime_profile::TCounterAggregateType::SUM_AVG => CounterAggregateType::SumAvg,
+        runtime_profile::TCounterAggregateType::AVG_SUM => CounterAggregateType::AvgSum,
+        other => {
+            return Err(format!(
+                "unsupported thrift counter aggregate type: {other:?}"
+            ));
+        }
+    };
+    let merge_type = match strategy.merge_type {
+        runtime_profile::TCounterMergeType::MERGE_ALL => CounterMergeType::MergeAll,
+        runtime_profile::TCounterMergeType::SKIP_ALL => CounterMergeType::SkipAll,
+        runtime_profile::TCounterMergeType::SKIP_FIRST_MERGE => CounterMergeType::SkipFirstMerge,
+        runtime_profile::TCounterMergeType::SKIP_SECOND_MERGE => CounterMergeType::SkipSecondMerge,
+        other => return Err(format!("unsupported thrift counter merge type: {other:?}")),
+    };
+    let min_max_type = strategy
+        .min_max_type
+        .map(|min_max_type| match min_max_type {
+            runtime_profile::TCounterMinMaxType::MIN_MAX_ALL => Ok(CounterMinMaxType::MinMaxAll),
+            runtime_profile::TCounterMinMaxType::SKIP_ALL => Ok(CounterMinMaxType::SkipAll),
+            other => Err(format!(
+                "unsupported thrift counter min/max type: {other:?}"
+            )),
+        });
+    let min_max_type = min_max_type.transpose()?;
+    Ok(CounterStrategy::custom(
+        aggregate_type,
+        merge_type,
+        strategy.display_threshold,
+        min_max_type,
+    ))
+}
+
 fn build_profile_tree(
     query_id: QueryId,
     enable_profile: bool,
@@ -603,7 +878,7 @@ fn build_profile_tree(
         query_mem_tracker,
         include_runtime_filters,
     )?;
-    let mut tree = merged.to_thrift_tree();
+    let mut tree = profile_to_thrift_tree_for_fe(&merged);
     normalize_profile_tree_for_fe(&mut tree);
     Some(tree)
 }
@@ -648,26 +923,22 @@ fn build_merged_profile_for_report(
     if let Some(tracker) = mem_tracker {
         merged.counter_set(
             "InstancePeakMemoryUsage",
-            metrics::TUnit::BYTES,
+            ProfileUnit::Bytes,
             tracker.peak(),
         );
         merged.counter_set(
             "InstanceAllocatedMemoryUsage",
-            metrics::TUnit::BYTES,
+            ProfileUnit::Bytes,
             tracker.allocated(),
         );
         merged.counter_set(
             "InstanceDeallocatedMemoryUsage",
-            metrics::TUnit::BYTES,
+            ProfileUnit::Bytes,
             tracker.deallocated(),
         );
     }
     if let Some(tracker) = query_mem_tracker {
-        merged.counter_set(
-            "QueryPeakMemoryUsage",
-            metrics::TUnit::BYTES,
-            tracker.peak(),
-        );
+        merged.counter_set("QueryPeakMemoryUsage", ProfileUnit::Bytes, tracker.peak());
     }
     Some(merged)
 }
@@ -966,6 +1237,7 @@ fn test_capture_standalone_non_final_report(task: &StandaloneExecStateReportTask
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
     use super::{
@@ -977,12 +1249,15 @@ mod tests {
     use crate::proto::novarocks;
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime::load_tracking;
-    use crate::runtime::profile::Profiler;
+    use crate::runtime::profile::{
+        CounterAggregateType, CounterMergeType, CounterMinMaxType, CounterStrategy, ProfileCounter,
+        ProfileNode, ProfileUnit, Profiler, RuntimeProfileTree, default_counter_strategy,
+    };
     use crate::runtime::query_context::QueryId;
     use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
     use crate::service::exec_state_reporter;
     use crate::thrift::frontend_service;
-    use crate::thrift::{status, status_code};
+    use crate::thrift::{metrics, runtime_profile, status, status_code};
 
     #[test]
     fn query_gone_status_is_treated_as_benign() {
@@ -1070,6 +1345,201 @@ mod tests {
                 Some((task.coord.clone(), task.report.clone()));
         })));
         ReportHookGuard
+    }
+
+    fn empty_thrift_profile_node(
+        name: &str,
+        num_children: i32,
+    ) -> runtime_profile::TRuntimeProfileNode {
+        runtime_profile::TRuntimeProfileNode::new(
+            name.to_string(),
+            num_children,
+            vec![],
+            0,
+            false,
+            BTreeMap::new(),
+            vec![],
+            BTreeMap::new(),
+            None,
+        )
+    }
+
+    #[test]
+    fn runtime_profile_tree_from_thrift_for_fe_rejects_negative_num_children() {
+        let tree =
+            runtime_profile::TRuntimeProfileTree::new(vec![empty_thrift_profile_node("Root", -1)]);
+
+        let err = super::runtime_profile_tree_from_thrift_for_fe(&tree)
+            .expect_err("negative child count should be rejected");
+
+        assert!(
+            err.contains("negative num_children"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn runtime_profile_tree_from_thrift_for_fe_rejects_missing_declared_children() {
+        let tree = runtime_profile::TRuntimeProfileTree::new(vec![
+            empty_thrift_profile_node("Root", 2),
+            empty_thrift_profile_node("OnlyChild", 0),
+        ]);
+
+        let err = super::runtime_profile_tree_from_thrift_for_fe(&tree)
+            .expect_err("missing declared child should be rejected");
+
+        assert!(
+            err.contains("declares more children than available nodes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn runtime_profile_tree_from_thrift_for_fe_rejects_trailing_nodes() {
+        let tree = runtime_profile::TRuntimeProfileTree::new(vec![
+            empty_thrift_profile_node("Root", 0),
+            empty_thrift_profile_node("Trailing", 0),
+        ]);
+
+        let err = super::runtime_profile_tree_from_thrift_for_fe(&tree)
+            .expect_err("trailing nodes should be rejected");
+
+        assert!(err.contains("trailing nodes"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn runtime_profile_tree_to_thrift_for_fe_preserves_counter_strategy_fields() {
+        let profile = Profiler::new("strategy-profile");
+        let counter = profile.add_counter_with_strategy(
+            "CustomCounter",
+            ProfileUnit::TimeMs,
+            CounterStrategy::custom(
+                CounterAggregateType::SumAvg,
+                CounterMergeType::SkipFirstMerge,
+                42,
+                Some(CounterMinMaxType::SkipAll),
+            ),
+        );
+        counter.set(99);
+        counter.set_min(7);
+        counter.set_max(123);
+
+        let tree = super::profile_to_thrift_tree_for_fe(&profile);
+        let thrift_counter = tree.nodes[0]
+            .counters
+            .iter()
+            .find(|counter| counter.name == "CustomCounter")
+            .expect("custom counter");
+        let strategy = thrift_counter.strategy.as_ref().expect("counter strategy");
+
+        assert_eq!(thrift_counter.type_, metrics::TUnit::TIME_MS);
+        assert_eq!(thrift_counter.value, 99);
+        assert_eq!(thrift_counter.min_value, Some(7));
+        assert_eq!(thrift_counter.max_value, Some(123));
+        assert_eq!(
+            strategy.aggregate_type,
+            runtime_profile::TCounterAggregateType::SUM_AVG
+        );
+        assert_eq!(
+            strategy.merge_type,
+            runtime_profile::TCounterMergeType::SKIP_FIRST_MERGE
+        );
+        assert_eq!(strategy.display_threshold, 42);
+        assert_eq!(
+            strategy.min_max_type,
+            Some(runtime_profile::TCounterMinMaxType::SKIP_ALL)
+        );
+    }
+
+    #[test]
+    fn runtime_profile_tree_to_thrift_for_fe_reconstructs_flat_tree() {
+        let native = RuntimeProfileTree {
+            root: ProfileNode {
+                name: "Root".to_string(),
+                node_id: 10,
+                counters: vec![
+                    ProfileCounter {
+                        name: "TotalTime".to_string(),
+                        parent_name: String::new(),
+                        unit: ProfileUnit::TimeNs,
+                        strategy: default_counter_strategy(ProfileUnit::TimeNs),
+                        value: 100,
+                        min_value: Some(90),
+                        max_value: Some(110),
+                    },
+                    ProfileCounter {
+                        name: "ScanTime".to_string(),
+                        parent_name: "TotalTime".to_string(),
+                        unit: ProfileUnit::TimeNs,
+                        strategy: default_counter_strategy(ProfileUnit::TimeNs),
+                        value: 70,
+                        min_value: None,
+                        max_value: None,
+                    },
+                ],
+                info_strings: BTreeMap::from([
+                    ("z_key".to_string(), "last".to_string()),
+                    ("a_key".to_string(), "first".to_string()),
+                ]),
+                children: vec![ProfileNode {
+                    name: "Child".to_string(),
+                    node_id: 20,
+                    counters: vec![ProfileCounter {
+                        name: "RowsRead".to_string(),
+                        parent_name: String::new(),
+                        unit: ProfileUnit::Unit,
+                        strategy: default_counter_strategy(ProfileUnit::Unit),
+                        value: 9,
+                        min_value: None,
+                        max_value: None,
+                    }],
+                    info_strings: BTreeMap::new(),
+                    children: vec![],
+                }],
+            },
+        };
+
+        let thrift =
+            super::runtime_profile_tree_to_thrift_for_fe(&native).expect("native profile encodes");
+
+        assert_eq!(thrift.nodes.len(), 2);
+        assert_eq!(thrift.nodes[0].name, "Root");
+        assert_eq!(thrift.nodes[0].num_children, 1);
+        assert_eq!(thrift.nodes[0].metadata, 10);
+        assert_eq!(
+            thrift.nodes[0].info_strings_display_order,
+            vec!["a_key".to_string(), "z_key".to_string()]
+        );
+        assert_eq!(
+            thrift.nodes[0]
+                .child_counters_map
+                .get("")
+                .expect("root counters"),
+            &["TotalTime".to_string()].into_iter().collect()
+        );
+        assert_eq!(
+            thrift.nodes[0]
+                .child_counters_map
+                .get("TotalTime")
+                .expect("child counters"),
+            &["ScanTime".to_string()].into_iter().collect()
+        );
+        assert_eq!(thrift.nodes[1].name, "Child");
+        assert_eq!(thrift.nodes[1].metadata, 20);
+
+        let decoded = super::runtime_profile_tree_from_thrift_for_fe(&thrift)
+            .expect("thrift profile decodes");
+        let scan_time = decoded
+            .root
+            .counters
+            .iter()
+            .find(|counter| counter.name == "ScanTime")
+            .expect("ScanTime counter");
+        assert_eq!(scan_time.parent_name, "TotalTime");
+        assert_eq!(
+            scan_time.strategy.aggregate_type(),
+            CounterAggregateType::Avg
+        );
     }
 
     #[test]

@@ -17,8 +17,7 @@
 
 use std::collections::HashMap;
 
-use crate::runtime::profile::Profiler;
-use crate::thrift::runtime_profile;
+use crate::runtime::profile::{ProfileNode, Profiler, RuntimeProfileTree};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ActualMetrics {
@@ -74,41 +73,36 @@ pub(crate) fn collect_actuals_by_plan_node_id(profiler: &Profiler) -> HashMap<i3
 pub(crate) fn collect_actuals_by_plan_node_id_multi(
     profilers: &[Profiler],
 ) -> HashMap<i32, ActualMetrics> {
-    let mut actuals = HashMap::new();
-    for profiler in profilers {
-        let merged = crate::service::fe_report::merge_pipeline_profiles_for_fe(profiler);
-        collect_rec(&merged, &mut actuals);
-    }
-    actuals
+    let trees = profilers
+        .iter()
+        .map(|profiler| crate::service::fe_report::merge_pipeline_profiles_for_fe(profiler))
+        .map(|profiler| profiler.to_native_tree())
+        .collect::<Vec<_>>();
+    collect_actuals_by_plan_node_id_from_profile_trees(&trees)
 }
 
 pub(crate) fn collect_actuals_by_plan_node_id_from_profile_trees(
-    trees: &[runtime_profile::TRuntimeProfileTree],
+    trees: &[RuntimeProfileTree],
 ) -> HashMap<i32, ActualMetrics> {
     let mut actuals = HashMap::new();
     for tree in trees {
-        if !tree.nodes.is_empty() {
-            collect_thrift_rec(&tree.nodes, 0, &mut actuals);
-        }
+        collect_native_tree_rec(&tree.root, &mut actuals);
     }
     actuals
 }
 
 pub(crate) fn collect_distributed_profile_summary_from_profile_trees(
-    trees: &[runtime_profile::TRuntimeProfileTree],
+    trees: &[RuntimeProfileTree],
 ) -> DistributedProfileSummary {
     let mut summary = DistributedProfileSummary::default();
     for tree in trees {
-        if tree.nodes.is_empty() {
-            continue;
-        }
         merge_summary(&mut summary, &summarize_one_tree(tree));
     }
     summary
 }
 
 pub(crate) fn sum_profile_counters_by_name_from_profile_trees<'a>(
-    trees: &[runtime_profile::TRuntimeProfileTree],
+    trees: &[RuntimeProfileTree],
     names: &[&'a str],
 ) -> HashMap<&'a str, i64> {
     let mut sums = names
@@ -117,19 +111,24 @@ pub(crate) fn sum_profile_counters_by_name_from_profile_trees<'a>(
         .map(|name| (name, 0_i64))
         .collect::<HashMap<_, _>>();
     for tree in trees {
-        for node in &tree.nodes {
-            for counter in &node.counters {
-                if let Some(total) = sums.get_mut(counter.name.as_str()) {
-                    *total = total.saturating_add(counter.value);
-                }
-            }
-        }
+        sum_profile_counters_by_name_rec(&tree.root, &mut sums);
     }
     sums
 }
 
+fn sum_profile_counters_by_name_rec<'a>(node: &ProfileNode, sums: &mut HashMap<&'a str, i64>) {
+    for counter in &node.counters {
+        if let Some(total) = sums.get_mut(counter.name.as_str()) {
+            *total = total.saturating_add(counter.value);
+        }
+    }
+    for child in &node.children {
+        sum_profile_counters_by_name_rec(child, sums);
+    }
+}
+
 pub(crate) fn format_counter_sums_from_profile_trees(
-    trees: &[runtime_profile::TRuntimeProfileTree],
+    trees: &[RuntimeProfileTree],
     names: &[&str],
     label: &str,
 ) -> Option<String> {
@@ -150,13 +149,10 @@ pub(crate) fn format_counter_sums_from_profile_trees(
 /// prints the matching summary. Reuses `summarize_one_tree` so the math matches the query-level
 /// summary exactly.
 pub(crate) fn collect_per_fragment_profile_summaries(
-    trees: &[runtime_profile::TRuntimeProfileTree],
+    trees: &[RuntimeProfileTree],
 ) -> HashMap<i32, DistributedProfileSummary> {
     let mut by_fragment: HashMap<i32, DistributedProfileSummary> = HashMap::new();
     for tree in trees {
-        if tree.nodes.is_empty() {
-            continue;
-        }
         let Some(fragment_key) = fragment_root_plan_node_id(tree) else {
             continue;
         };
@@ -174,37 +170,123 @@ pub(crate) fn collect_per_fragment_profile_summaries(
 /// so it avoids the collision that a min-over-nodes representative hits on shared exchange ids.
 /// Falls back to the smallest operator id only if the tree root carries no plan-node id (e.g. some
 /// synthetic test trees) — real fragment trees always have the `execute_fragment` root.
-fn fragment_root_plan_node_id(tree: &runtime_profile::TRuntimeProfileTree) -> Option<i32> {
-    if let Some(id) = tree
-        .nodes
-        .first()
-        .and_then(|root| parse_plan_node_id(&root.name))
-    {
+fn fragment_root_plan_node_id(tree: &RuntimeProfileTree) -> Option<i32> {
+    if let Some(id) = parse_plan_node_id(&tree.root.name) {
         return Some(id);
     }
     let mut operators: HashMap<i32, ActualMetrics> = HashMap::new();
-    collect_thrift_rec(&tree.nodes, 0, &mut operators);
+    collect_native_tree_rec(&tree.root, &mut operators);
     operators.keys().copied().min()
 }
 
 /// Summarize one fragment-instance profile tree into a single-instance summary.
-fn summarize_one_tree(tree: &runtime_profile::TRuntimeProfileTree) -> DistributedProfileSummary {
-    let fragment_wall_ns = thrift_counter_in_tree(tree, "FragmentWallTime");
+fn summarize_one_tree(tree: &RuntimeProfileTree) -> DistributedProfileSummary {
+    let fragment_wall_ns = native_counter_in_tree(tree, "FragmentWallTime");
     DistributedProfileSummary {
         fragment_instance_count: 1,
         fragment_wall_max_ns: fragment_wall_ns,
         fragment_wall_sum_ns: fragment_wall_ns,
-        driver_total_time_ns: thrift_counter_in_tree(tree, "DriverTotalTime"),
-        operator_active_time_ns: thrift_counter_in_tree(tree, "OperatorTotalTime"),
-        driver_blocked_time_ns: thrift_counter_in_tree(tree, "DriverBlockedTime"),
-        source_wait_time_ns: thrift_counter_in_tree(tree, "DriverInputEmptyTime"),
-        sink_wait_time_ns: thrift_counter_in_tree(tree, "DriverOutputFullTime"),
-        dependency_wait_time_ns: thrift_counter_in_tree(tree, "DriverDependencyWaitTime"),
-        exchange_wait_time_ns: thrift_counter_in_tree(tree, "WaitTime"),
-        exchange_process_time_ns: thrift_counter_in_tree(tree, "ReceiverProcessTotalTime"),
-        network_time_ns: thrift_counter_in_tree(tree, "NetworkTime"),
-        scan_io_time_ns: thrift_counter_in_tree(tree, "IOTaskExecTime"),
+        driver_total_time_ns: native_counter_in_tree(tree, "DriverTotalTime"),
+        operator_active_time_ns: native_counter_in_tree(tree, "OperatorTotalTime"),
+        driver_blocked_time_ns: native_counter_in_tree(tree, "DriverBlockedTime"),
+        source_wait_time_ns: native_counter_in_tree(tree, "DriverInputEmptyTime"),
+        sink_wait_time_ns: native_counter_in_tree(tree, "DriverOutputFullTime"),
+        dependency_wait_time_ns: native_counter_in_tree(tree, "DriverDependencyWaitTime"),
+        exchange_wait_time_ns: native_counter_in_tree(tree, "WaitTime"),
+        exchange_process_time_ns: native_counter_in_tree(tree, "ReceiverProcessTotalTime"),
+        network_time_ns: native_counter_in_tree(tree, "NetworkTime"),
+        scan_io_time_ns: native_counter_in_tree(tree, "IOTaskExecTime"),
     }
+}
+
+fn collect_native_tree_rec(node: &ProfileNode, actuals: &mut HashMap<i32, ActualMetrics>) {
+    if let Some(node_id) = parse_plan_node_id(&node.name) {
+        let common = node
+            .children
+            .iter()
+            .find(|child| child.name == COMMON_METRICS);
+        let unique = node
+            .children
+            .iter()
+            .find(|child| child.name == UNIQUE_METRICS);
+        if let Some(common) = common {
+            let (total_time_ns, total_time_min_ns, total_time_max_ns) =
+                native_counter_value_min_max(common, "OperatorTotalTime");
+            merge_actual_metrics(
+                actuals,
+                node_id,
+                ActualMetrics {
+                    output_rows: native_counter(common, "PullRowNum"),
+                    total_time_ns,
+                    peak_mem_bytes: native_counter(common, "OperatorPeakMemoryUsage"),
+                    total_time_max_ns,
+                    total_time_min_ns,
+                    build_ht_ns: native_counter(common, "BuildHashTableTime"),
+                    search_ns: native_counter(common, "SearchHashTableTime"),
+                    out_build_ns: native_counter(common, "OutputBuildColumnTime"),
+                    out_probe_ns: native_counter(common, "OutputProbeColumnTime"),
+                    dict_input_rows: native_optional_counter(unique, DICT_INPUT_ROWS),
+                    dict_input_columns: native_optional_counter(unique, DICT_INPUT_COLUMNS),
+                    dict_kept_rows: native_optional_counter(unique, DICT_KEPT_ROWS),
+                    dict_kept_columns: native_optional_counter(unique, DICT_KEPT_COLUMNS),
+                    dict_hydrated_rows: native_optional_counter(unique, DICT_HYDRATED_ROWS),
+                    dict_hydrated_columns: native_optional_counter(unique, DICT_HYDRATED_COLUMNS),
+                    dict_unsupported_columns: native_optional_counter(
+                        unique,
+                        DICT_UNSUPPORTED_COLUMNS,
+                    ),
+                },
+            );
+        }
+    }
+
+    for child in &node.children {
+        collect_native_tree_rec(child, actuals);
+    }
+}
+
+fn native_counter(node: &ProfileNode, name: &str) -> i64 {
+    node.counters
+        .iter()
+        .filter(|counter| counter.name == name)
+        .map(|counter| counter.value)
+        .fold(0_i64, i64::saturating_add)
+}
+
+fn native_optional_counter(node: Option<&ProfileNode>, name: &str) -> i64 {
+    node.map_or(0, |node| native_counter(node, name))
+}
+
+fn native_counter_value_min_max(node: &ProfileNode, name: &str) -> (i64, i64, i64) {
+    let mut value = 0_i64;
+    let mut max_of_max = None;
+    let mut min_of_min = None;
+    for counter in node.counters.iter().filter(|counter| counter.name == name) {
+        value = value.saturating_add(counter.value);
+        if let Some(max) = counter.max_value {
+            max_of_max = Some(max_of_max.map_or(max, |current: i64| current.max(max)));
+        }
+        if let Some(min) = counter.min_value {
+            min_of_min = Some(min_of_min.map_or(min, |current: i64| current.min(min)));
+        }
+    }
+    (
+        value,
+        min_of_min.unwrap_or(value),
+        max_of_max.unwrap_or(value),
+    )
+}
+
+fn native_counter_in_tree(tree: &RuntimeProfileTree, name: &str) -> i64 {
+    native_counter_in_node(&tree.root, name)
+}
+
+fn native_counter_in_node(node: &ProfileNode, name: &str) -> i64 {
+    let local = native_counter(node, name);
+    node.children
+        .iter()
+        .map(|child| native_counter_in_node(child, name))
+        .fold(local, i64::saturating_add)
 }
 
 /// Fold `other` into `into`: counts/times sum, fragment wall takes max — identical to the
@@ -241,115 +323,6 @@ fn merge_summary(into: &mut DistributedProfileSummary, other: &DistributedProfil
         .saturating_add(other.exchange_process_time_ns);
     into.network_time_ns = into.network_time_ns.saturating_add(other.network_time_ns);
     into.scan_io_time_ns = into.scan_io_time_ns.saturating_add(other.scan_io_time_ns);
-}
-
-fn collect_rec(node: &Profiler, actuals: &mut HashMap<i32, ActualMetrics>) {
-    if let Some(node_id) = parse_plan_node_id(&node.name()) {
-        if let Some(common) = node.get_child(COMMON_METRICS) {
-            let unique = node.get_child(UNIQUE_METRICS);
-            let (total_time_ns, total_time_min_ns, total_time_max_ns) = common
-                .counter_value_min_max("OperatorTotalTime")
-                .unwrap_or((0, 0, 0));
-            merge_actual_metrics(
-                actuals,
-                node_id,
-                ActualMetrics {
-                    output_rows: counter(&common, "PullRowNum"),
-                    total_time_ns,
-                    peak_mem_bytes: counter(&common, "OperatorPeakMemoryUsage"),
-                    total_time_max_ns,
-                    total_time_min_ns,
-                    build_ht_ns: counter(&common, "BuildHashTableTime"),
-                    search_ns: counter(&common, "SearchHashTableTime"),
-                    out_build_ns: counter(&common, "OutputBuildColumnTime"),
-                    out_probe_ns: counter(&common, "OutputProbeColumnTime"),
-                    dict_input_rows: optional_counter(unique.as_ref(), DICT_INPUT_ROWS),
-                    dict_input_columns: optional_counter(unique.as_ref(), DICT_INPUT_COLUMNS),
-                    dict_kept_rows: optional_counter(unique.as_ref(), DICT_KEPT_ROWS),
-                    dict_kept_columns: optional_counter(unique.as_ref(), DICT_KEPT_COLUMNS),
-                    dict_hydrated_rows: optional_counter(unique.as_ref(), DICT_HYDRATED_ROWS),
-                    dict_hydrated_columns: optional_counter(unique.as_ref(), DICT_HYDRATED_COLUMNS),
-                    dict_unsupported_columns: optional_counter(
-                        unique.as_ref(),
-                        DICT_UNSUPPORTED_COLUMNS,
-                    ),
-                },
-            );
-        }
-    }
-
-    for child in node.children() {
-        collect_rec(&child, actuals);
-    }
-}
-
-fn collect_thrift_rec(
-    nodes: &[runtime_profile::TRuntimeProfileNode],
-    idx: usize,
-    actuals: &mut HashMap<i32, ActualMetrics>,
-) -> usize {
-    let Some(node) = nodes.get(idx) else {
-        return idx;
-    };
-    let mut next = idx + 1;
-    let mut child_ranges = Vec::new();
-    for _ in 0..node.num_children.max(0) {
-        let child_start = next;
-        next = collect_thrift_rec(nodes, child_start, actuals);
-        child_ranges.push(child_start..next);
-    }
-
-    if let Some(node_id) = parse_plan_node_id(&node.name) {
-        let mut common_range = None;
-        let mut unique_range = None;
-        for range in child_ranges {
-            if nodes
-                .get(range.start)
-                .is_some_and(|child| child.name == COMMON_METRICS)
-            {
-                common_range = Some(range);
-            } else if nodes
-                .get(range.start)
-                .is_some_and(|child| child.name == UNIQUE_METRICS)
-            {
-                unique_range = Some(range);
-            }
-        }
-        if let Some(common_range) = common_range {
-            let (total_time_max_ns, total_time_min_ns) =
-                thrift_counter_min_max(nodes, common_range.clone(), "OperatorTotalTime");
-            let unique_counter = |name| {
-                unique_range
-                    .as_ref()
-                    .map_or(0, |range| thrift_counter(nodes, range.clone(), name))
-            };
-            let metrics = ActualMetrics {
-                output_rows: thrift_counter(nodes, common_range.clone(), "PullRowNum"),
-                total_time_ns: thrift_counter(nodes, common_range.clone(), "OperatorTotalTime"),
-                peak_mem_bytes: thrift_counter(
-                    nodes,
-                    common_range.clone(),
-                    "OperatorPeakMemoryUsage",
-                ),
-                total_time_max_ns,
-                total_time_min_ns,
-                build_ht_ns: thrift_counter(nodes, common_range.clone(), "BuildHashTableTime"),
-                search_ns: thrift_counter(nodes, common_range.clone(), "SearchHashTableTime"),
-                out_build_ns: thrift_counter(nodes, common_range.clone(), "OutputBuildColumnTime"),
-                out_probe_ns: thrift_counter(nodes, common_range, "OutputProbeColumnTime"),
-                dict_input_rows: unique_counter(DICT_INPUT_ROWS),
-                dict_input_columns: unique_counter(DICT_INPUT_COLUMNS),
-                dict_kept_rows: unique_counter(DICT_KEPT_ROWS),
-                dict_kept_columns: unique_counter(DICT_KEPT_COLUMNS),
-                dict_hydrated_rows: unique_counter(DICT_HYDRATED_ROWS),
-                dict_hydrated_columns: unique_counter(DICT_HYDRATED_COLUMNS),
-                dict_unsupported_columns: unique_counter(DICT_UNSUPPORTED_COLUMNS),
-            };
-            merge_actual_metrics(actuals, node_id, metrics);
-        }
-    }
-
-    next
 }
 
 fn merge_actual_metrics(
@@ -408,58 +381,6 @@ fn sanitize_operator_total_time(mut metrics: ActualMetrics) -> ActualMetrics {
     metrics
 }
 
-fn counter(common: &Profiler, name: &str) -> i64 {
-    common.counter_value(name).unwrap_or(0)
-}
-
-fn optional_counter(profile: Option<&Profiler>, name: &str) -> i64 {
-    profile.and_then(|p| p.counter_value(name)).unwrap_or(0)
-}
-
-fn thrift_counter(
-    nodes: &[runtime_profile::TRuntimeProfileNode],
-    range: std::ops::Range<usize>,
-    name: &str,
-) -> i64 {
-    nodes[range]
-        .iter()
-        .flat_map(|node| node.counters.iter())
-        .filter(|counter| counter.name == name)
-        .map(|counter| counter.value)
-        .sum()
-}
-
-fn thrift_counter_min_max(
-    nodes: &[runtime_profile::TRuntimeProfileNode],
-    range: std::ops::Range<usize>,
-    name: &str,
-) -> (i64, i64) {
-    let mut max_of_max = None;
-    let mut min_of_min = None;
-    for counter in nodes[range]
-        .iter()
-        .flat_map(|node| node.counters.iter())
-        .filter(|counter| counter.name == name)
-    {
-        if let Some(max) = counter.max_value {
-            max_of_max = Some(max_of_max.map_or(max, |current: i64| current.max(max)));
-        }
-        if let Some(min) = counter.min_value {
-            min_of_min = Some(min_of_min.map_or(min, |current: i64| current.min(min)));
-        }
-    }
-    (max_of_max.unwrap_or(0), min_of_min.unwrap_or(0))
-}
-
-fn thrift_counter_in_tree(tree: &runtime_profile::TRuntimeProfileTree, name: &str) -> i64 {
-    tree.nodes
-        .iter()
-        .flat_map(|node| node.counters.iter())
-        .filter(|counter| counter.name == name)
-        .map(|counter| counter.value)
-        .fold(0_i64, i64::saturating_add)
-}
-
 fn parse_plan_node_id(name: &str) -> Option<i32> {
     let key = if name.contains("plan_node_id=") {
         "plan_node_id="
@@ -484,8 +405,7 @@ mod tests {
         collect_distributed_profile_summary_from_profile_trees,
         collect_per_fragment_profile_summaries, merge_actual_metrics,
     };
-    use crate::runtime::profile::Profiler;
-    use crate::thrift::metrics;
+    use crate::runtime::profile::{ProfileUnit, Profiler};
 
     fn add_operator_metrics(
         parent: &Profiler,
@@ -495,11 +415,11 @@ mod tests {
         peak_mem_bytes: i64,
     ) {
         let common = parent.child(name).child(COMMON_METRICS);
-        common.counter_set("PullRowNum", metrics::TUnit::UNIT, output_rows);
-        common.counter_set("OperatorTotalTime", metrics::TUnit::TIME_NS, total_time_ns);
+        common.counter_set("PullRowNum", ProfileUnit::Unit, output_rows);
+        common.counter_set("OperatorTotalTime", ProfileUnit::TimeNs, total_time_ns);
         common.counter_set(
             "OperatorPeakMemoryUsage",
-            metrics::TUnit::BYTES,
+            ProfileUnit::Bytes,
             peak_mem_bytes,
         );
     }
@@ -516,19 +436,15 @@ mod tests {
         unsupported_columns: i64,
     ) {
         let unique = parent.child(name).child(UNIQUE_METRICS);
-        unique.counter_set(DICT_INPUT_ROWS, metrics::TUnit::UNIT, input_rows);
-        unique.counter_set(DICT_INPUT_COLUMNS, metrics::TUnit::UNIT, input_columns);
-        unique.counter_set(DICT_KEPT_ROWS, metrics::TUnit::UNIT, kept_rows);
-        unique.counter_set(DICT_KEPT_COLUMNS, metrics::TUnit::UNIT, kept_columns);
-        unique.counter_set(DICT_HYDRATED_ROWS, metrics::TUnit::UNIT, hydrated_rows);
-        unique.counter_set(
-            DICT_HYDRATED_COLUMNS,
-            metrics::TUnit::UNIT,
-            hydrated_columns,
-        );
+        unique.counter_set(DICT_INPUT_ROWS, ProfileUnit::Unit, input_rows);
+        unique.counter_set(DICT_INPUT_COLUMNS, ProfileUnit::Unit, input_columns);
+        unique.counter_set(DICT_KEPT_ROWS, ProfileUnit::Unit, kept_rows);
+        unique.counter_set(DICT_KEPT_COLUMNS, ProfileUnit::Unit, kept_columns);
+        unique.counter_set(DICT_HYDRATED_ROWS, ProfileUnit::Unit, hydrated_rows);
+        unique.counter_set(DICT_HYDRATED_COLUMNS, ProfileUnit::Unit, hydrated_columns);
         unique.counter_set(
             DICT_UNSUPPORTED_COLUMNS,
-            metrics::TUnit::UNIT,
+            ProfileUnit::Unit,
             unsupported_columns,
         );
     }
@@ -556,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_actuals_reads_dictionary_unique_metrics_from_thrift_tree() {
+    fn collect_actuals_reads_dictionary_unique_metrics_from_native_tree() {
         let profiler = Profiler::new("query");
         let driver = profiler
             .child("Pipeline (id=0)")
@@ -564,7 +480,7 @@ mod tests {
         add_operator_metrics(&driver, "SCAN (plan_node_id=2)", 10, 5, 64);
         add_dictionary_metrics(&driver, "SCAN (plan_node_id=2)", 101, 4, 81, 3, 21, 2, 5);
         let tree =
-            crate::service::fe_report::merge_pipeline_profiles_for_fe(&profiler).to_thrift_tree();
+            crate::service::fe_report::merge_pipeline_profiles_for_fe(&profiler).to_native_tree();
 
         let actuals = collect_actuals_by_plan_node_id_from_profile_trees(&[tree]);
         let metrics = actuals.get(&2).expect("node 2 metrics");
@@ -775,14 +691,14 @@ mod tests {
     }
 
     #[test]
-    fn collects_actuals_from_thrift_profile_trees() {
+    fn collects_actuals_from_native_profile_trees_after_pipeline_merge() {
         let profiler = Profiler::new("query");
         let driver = profiler
             .child("Pipeline (id=0)")
             .child("PipelineDriver (id=0)");
         add_operator_metrics(&driver, "HASH JOIN (plan_node_id=4)", 8, 900_000, 4096);
         let tree =
-            crate::service::fe_report::merge_pipeline_profiles_for_fe(&profiler).to_thrift_tree();
+            crate::service::fe_report::merge_pipeline_profiles_for_fe(&profiler).to_native_tree();
 
         let actuals = collect_actuals_by_plan_node_id_from_profile_trees(&[tree]);
 
@@ -800,33 +716,58 @@ mod tests {
     }
 
     #[test]
-    fn summarizes_distributed_profile_attribution_from_thrift_trees() {
-        let profiler = Profiler::new("fragment");
-        profiler.counter_set("FragmentWallTime", metrics::TUnit::TIME_NS, 20_000);
+    fn collects_actuals_from_native_profile_trees() {
+        let profiler = Profiler::new("query");
         let driver = profiler
             .child("Pipeline (id=0)")
             .child("PipelineDriver (id=0)");
-        driver.counter_set("DriverTotalTime", metrics::TUnit::TIME_NS, 10_000);
-        driver.counter_set("DriverBlockedTime", metrics::TUnit::TIME_NS, 4_500);
-        driver.counter_set("DriverInputEmptyTime", metrics::TUnit::TIME_NS, 2_000);
-        driver.counter_set("DriverOutputFullTime", metrics::TUnit::TIME_NS, 1_500);
-        driver.counter_set("DriverDependencyWaitTime", metrics::TUnit::TIME_NS, 1_000);
+        add_operator_metrics(&driver, "HASH JOIN (plan_node_id=4)", 8, 900_000, 4096);
+        let tree =
+            crate::service::fe_report::merge_pipeline_profiles_for_fe(&profiler).to_native_tree();
+
+        let actuals = collect_actuals_by_plan_node_id_from_profile_trees(&[tree]);
+
+        assert_eq!(
+            actuals.get(&4).copied(),
+            Some(ActualMetrics {
+                output_rows: 8,
+                total_time_ns: 900_000,
+                peak_mem_bytes: 4096,
+                total_time_max_ns: 900_000,
+                total_time_min_ns: 900_000,
+                ..ActualMetrics::default()
+            })
+        );
+    }
+
+    #[test]
+    fn summarizes_distributed_profile_attribution_from_native_trees() {
+        let profiler = Profiler::new("fragment");
+        profiler.counter_set("FragmentWallTime", ProfileUnit::TimeNs, 20_000);
+        let driver = profiler
+            .child("Pipeline (id=0)")
+            .child("PipelineDriver (id=0)");
+        driver.counter_set("DriverTotalTime", ProfileUnit::TimeNs, 10_000);
+        driver.counter_set("DriverBlockedTime", ProfileUnit::TimeNs, 4_500);
+        driver.counter_set("DriverInputEmptyTime", ProfileUnit::TimeNs, 2_000);
+        driver.counter_set("DriverOutputFullTime", ProfileUnit::TimeNs, 1_500);
+        driver.counter_set("DriverDependencyWaitTime", ProfileUnit::TimeNs, 1_000);
         add_operator_metrics(&driver, "EXCHANGE_SOURCE (plan_node_id=2)", 8, 3_000, 512);
         let exchange_unique = driver
             .child("EXCHANGE_SOURCE (plan_node_id=2)")
             .child("UniqueMetrics");
-        exchange_unique.counter_set("WaitTime", metrics::TUnit::TIME_NS, 700);
-        exchange_unique.counter_set("ReceiverProcessTotalTime", metrics::TUnit::TIME_NS, 300);
+        exchange_unique.counter_set("WaitTime", ProfileUnit::TimeNs, 700);
+        exchange_unique.counter_set("ReceiverProcessTotalTime", ProfileUnit::TimeNs, 300);
         add_operator_metrics(&driver, "DATA_STREAM_SINK (plan_node_id=3)", 8, 2_000, 256);
         let sink_unique = driver
             .child("DATA_STREAM_SINK (plan_node_id=3)")
             .child("UniqueMetrics");
-        sink_unique.counter_set("NetworkTime", metrics::TUnit::TIME_NS, 900);
+        sink_unique.counter_set("NetworkTime", ProfileUnit::TimeNs, 900);
         let scan_unique = driver.child("SCAN (plan_node_id=4)").child("UniqueMetrics");
-        scan_unique.counter_set("IOTaskExecTime", metrics::TUnit::TIME_NS, 1_100);
+        scan_unique.counter_set("IOTaskExecTime", ProfileUnit::TimeNs, 1_100);
 
         let summary =
-            collect_distributed_profile_summary_from_profile_trees(&[profiler.to_thrift_tree()]);
+            collect_distributed_profile_summary_from_profile_trees(&[profiler.to_native_tree()]);
 
         assert_eq!(summary.fragment_instance_count, 1);
         assert_eq!(summary.fragment_wall_max_ns, 20_000);
@@ -844,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn sums_named_profile_counters_from_thrift_trees() {
+    fn sums_named_profile_counters_from_native_trees() {
         let make_tree = |files_pruned: i64, unsupported: i64| {
             let profiler = Profiler::new("fragment");
             let common = profiler
@@ -854,15 +795,15 @@ mod tests {
                 .child("CommonMetrics");
             common.counter_set(
                 "IcebergRuntimeFilePruning/FilesPruned",
-                metrics::TUnit::UNIT,
+                ProfileUnit::Unit,
                 files_pruned,
             );
             common.counter_set(
                 "IcebergRuntimeFilePruning/Unsupported",
-                metrics::TUnit::UNIT,
+                ProfileUnit::Unit,
                 unsupported,
             );
-            profiler.to_thrift_tree()
+            profiler.to_native_tree()
         };
         let names = [
             "IcebergRuntimeFilePruning/FilesPruned",
@@ -879,26 +820,24 @@ mod tests {
     }
 
     #[test]
-    fn collects_phase_timers_and_minmax_from_thrift_tree() {
+    fn collects_phase_timers_and_minmax_from_native_tree() {
         let profiler = Profiler::new("Fragment");
         let op = profiler.child("HASH JOIN (plan_node_id=9)");
         let common = op.child("CommonMetrics");
-        common
-            .add_counter("PullRowNum", metrics::TUnit::UNIT)
-            .set(100);
+        common.add_counter("PullRowNum", ProfileUnit::Unit).set(100);
         let total = common.add_timer("OperatorTotalTime");
         total.set(44_000);
         total.set_min(43_000);
         total.set_max(46_000);
         common
-            .add_counter("OperatorPeakMemoryUsage", metrics::TUnit::BYTES)
+            .add_counter("OperatorPeakMemoryUsage", ProfileUnit::Bytes)
             .set(640);
         common.add_timer("BuildHashTableTime").set(0);
         common.add_timer("SearchHashTableTime").set(20_000);
         common.add_timer("OutputBuildColumnTime").set(6_000);
         common.add_timer("OutputProbeColumnTime").set(9_000);
 
-        let tree = profiler.to_thrift_tree();
+        let tree = profiler.to_native_tree();
         let actuals = collect_actuals_by_plan_node_id_from_profile_trees(&[tree]);
         let m = actuals.get(&9).expect("node 9 metrics");
         assert_eq!(m.output_rows, 100);
@@ -921,22 +860,22 @@ mod tests {
         let make_a = |active: i64, blocked: i64| {
             let p = Profiler::new("execute_fragment (plan_node_id=9)");
             let pipeline = p.child("Pipeline (id=0)");
-            pipeline.counter_set("DriverTotalTime", metrics::TUnit::TIME_NS, 1);
+            pipeline.counter_set("DriverTotalTime", ProfileUnit::TimeNs, 1);
             let driver = pipeline.child("PipelineDriver (id=0)");
-            driver.counter_set("DriverBlockedTime", metrics::TUnit::TIME_NS, blocked);
+            driver.counter_set("DriverBlockedTime", ProfileUnit::TimeNs, blocked);
             add_operator_metrics(&driver, "HASH JOIN (plan_node_id=9)", 1, active, 0);
             add_operator_metrics(&driver, "SCAN (plan_node_id=4)", 1, 0, 0);
-            p.to_thrift_tree()
+            p.to_native_tree()
         };
         // Fragment B: root (output) plan-node id = 2.
         let make_b = || {
             let p = Profiler::new("execute_fragment (plan_node_id=2)");
             let pipeline = p.child("Pipeline (id=0)");
-            pipeline.counter_set("DriverTotalTime", metrics::TUnit::TIME_NS, 1);
+            pipeline.counter_set("DriverTotalTime", ProfileUnit::TimeNs, 1);
             let driver = pipeline.child("PipelineDriver (id=0)");
-            driver.counter_set("DriverBlockedTime", metrics::TUnit::TIME_NS, 300);
+            driver.counter_set("DriverBlockedTime", ProfileUnit::TimeNs, 300);
             add_operator_metrics(&driver, "SCAN (plan_node_id=2)", 1, 5_000, 0);
-            p.to_thrift_tree()
+            p.to_native_tree()
         };
 
         let trees = vec![make_a(10_000, 100), make_a(20_000, 200), make_b()];
@@ -963,7 +902,7 @@ mod tests {
         total.set_min(-5_000);
         total.set_max(-1_000);
 
-        let tree = profiler.to_thrift_tree();
+        let tree = profiler.to_native_tree();
         let actuals = collect_actuals_by_plan_node_id_from_profile_trees(&[tree]);
         let m = actuals.get(&2).expect("node 2 metrics");
         assert_eq!(m.total_time_ns, 0);

@@ -21,14 +21,13 @@ use std::time::Instant;
 
 use crate::proto::novarocks;
 use crate::runtime::mem_tracker::MemTracker;
-use crate::thrift::{metrics, runtime_profile};
 
 #[derive(Clone, Debug)]
 struct CounterSnapshot {
     name: String,
     parent_name: String,
-    unit: metrics::TUnit,
-    strategy: runtime_profile::TCounterStrategy,
+    unit: ProfileUnit,
+    strategy: CounterStrategy,
     value: i64,
     min_value: Option<i64>,
     max_value: Option<i64>,
@@ -40,6 +39,233 @@ pub struct RuntimeProfile {
 }
 
 pub type Profiler = RuntimeProfile;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ProfileUnit {
+    Unit,
+    CpuTicks,
+    Bytes,
+    TimeNs,
+    TimeMs,
+    TimeS,
+    None,
+}
+
+impl ProfileUnit {
+    pub(crate) fn to_proto(self) -> novarocks::ProfileUnit {
+        match self {
+            Self::Unit => novarocks::ProfileUnit::Unit,
+            Self::CpuTicks => novarocks::ProfileUnit::CpuTicks,
+            Self::Bytes => novarocks::ProfileUnit::Bytes,
+            Self::TimeNs => novarocks::ProfileUnit::TimeNs,
+            Self::TimeMs => novarocks::ProfileUnit::TimeMs,
+            Self::TimeS => novarocks::ProfileUnit::TimeS,
+            Self::None => novarocks::ProfileUnit::None,
+        }
+    }
+
+    pub(crate) fn from_proto(unit: i32) -> Result<Self, String> {
+        match novarocks::ProfileUnit::try_from(unit) {
+            Ok(novarocks::ProfileUnit::Unit) => Ok(Self::Unit),
+            Ok(novarocks::ProfileUnit::CpuTicks) => Ok(Self::CpuTicks),
+            Ok(novarocks::ProfileUnit::Bytes) => Ok(Self::Bytes),
+            Ok(novarocks::ProfileUnit::TimeNs) => Ok(Self::TimeNs),
+            Ok(novarocks::ProfileUnit::TimeMs) => Ok(Self::TimeMs),
+            Ok(novarocks::ProfileUnit::TimeS) => Ok(Self::TimeS),
+            Ok(novarocks::ProfileUnit::None) => Ok(Self::None),
+            Ok(novarocks::ProfileUnit::Unspecified) => {
+                Err("ProfileUnit is unspecified in native runtime profile".to_string())
+            }
+            Err(_) => Err(format!(
+                "unknown ProfileUnit value {unit} in native runtime profile"
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CounterAggregateType {
+    Sum,
+    Avg,
+    SumAvg,
+    AvgSum,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CounterMergeType {
+    MergeAll,
+    SkipAll,
+    SkipFirstMerge,
+    SkipSecondMerge,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CounterMinMaxType {
+    MinMaxAll,
+    SkipAll,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CounterStrategy {
+    aggregate_type: CounterAggregateType,
+    merge_type: CounterMergeType,
+    display_threshold: i64,
+    min_max_type: Option<CounterMinMaxType>,
+}
+
+impl CounterStrategy {
+    pub fn new(aggregate_type: CounterAggregateType) -> Self {
+        Self {
+            aggregate_type,
+            merge_type: CounterMergeType::MergeAll,
+            display_threshold: 0,
+            min_max_type: Some(CounterMinMaxType::MinMaxAll),
+        }
+    }
+
+    pub fn custom(
+        aggregate_type: CounterAggregateType,
+        merge_type: CounterMergeType,
+        display_threshold: i64,
+        min_max_type: Option<CounterMinMaxType>,
+    ) -> Self {
+        Self {
+            aggregate_type,
+            merge_type,
+            display_threshold,
+            min_max_type,
+        }
+    }
+
+    pub fn aggregate_type(self) -> CounterAggregateType {
+        self.aggregate_type
+    }
+
+    pub fn merge_type(self) -> CounterMergeType {
+        self.merge_type
+    }
+
+    pub fn display_threshold(self) -> i64 {
+        self.display_threshold
+    }
+
+    pub fn min_max_type(self) -> Option<CounterMinMaxType> {
+        self.min_max_type
+    }
+}
+
+pub fn default_counter_strategy(unit: ProfileUnit) -> CounterStrategy {
+    let aggregate_type = match unit {
+        ProfileUnit::CpuTicks | ProfileUnit::TimeNs | ProfileUnit::TimeMs | ProfileUnit::TimeS => {
+            CounterAggregateType::Avg
+        }
+        ProfileUnit::Unit | ProfileUnit::Bytes | ProfileUnit::None => CounterAggregateType::Sum,
+    };
+    CounterStrategy::new(aggregate_type)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeProfileTree {
+    pub root: ProfileNode,
+}
+
+impl RuntimeProfileTree {
+    pub(crate) fn to_proto(&self) -> novarocks::RuntimeProfileTree {
+        novarocks::RuntimeProfileTree {
+            root: Some(self.root.to_proto()),
+        }
+    }
+
+    pub(crate) fn from_proto(tree: &novarocks::RuntimeProfileTree) -> Result<Self, String> {
+        let root = tree
+            .root
+            .as_ref()
+            .ok_or_else(|| "RuntimeProfileTree missing root".to_string())?;
+        Ok(Self {
+            root: ProfileNode::from_proto(root)?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileNode {
+    pub name: String,
+    pub node_id: i32,
+    pub counters: Vec<ProfileCounter>,
+    pub info_strings: BTreeMap<String, String>,
+    pub children: Vec<ProfileNode>,
+}
+
+impl ProfileNode {
+    fn to_proto(&self) -> novarocks::ProfileNode {
+        novarocks::ProfileNode {
+            name: self.name.clone(),
+            node_id: self.node_id,
+            counters: self.counters.iter().map(ProfileCounter::to_proto).collect(),
+            info_strings: self.info_strings.clone().into_iter().collect(),
+            children: self.children.iter().map(ProfileNode::to_proto).collect(),
+        }
+    }
+
+    fn from_proto(node: &novarocks::ProfileNode) -> Result<Self, String> {
+        Ok(Self {
+            name: node.name.clone(),
+            node_id: node.node_id,
+            counters: node
+                .counters
+                .iter()
+                .map(ProfileCounter::from_proto)
+                .collect::<Result<Vec<_>, _>>()?,
+            info_strings: node
+                .info_strings
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            children: node
+                .children
+                .iter()
+                .map(ProfileNode::from_proto)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileCounter {
+    pub name: String,
+    pub parent_name: String,
+    pub unit: ProfileUnit,
+    pub strategy: CounterStrategy,
+    pub value: i64,
+    pub min_value: Option<i64>,
+    pub max_value: Option<i64>,
+}
+
+impl ProfileCounter {
+    fn to_proto(&self) -> novarocks::Counter {
+        novarocks::Counter {
+            name: self.name.clone(),
+            parent_name: self.parent_name.clone(),
+            unit: self.unit.to_proto() as i32,
+            value: self.value,
+            min_value: self.min_value,
+            max_value: self.max_value,
+        }
+    }
+
+    fn from_proto(counter: &novarocks::Counter) -> Result<Self, String> {
+        let unit = ProfileUnit::from_proto(counter.unit)?;
+        Ok(Self {
+            name: counter.name.clone(),
+            parent_name: counter.parent_name.clone(),
+            unit,
+            strategy: default_counter_strategy(unit),
+            value: counter.value,
+            min_value: counter.min_value,
+            max_value: counter.max_value,
+        })
+    }
+}
 
 #[derive(Debug)]
 struct RuntimeProfileInner {
@@ -203,7 +429,7 @@ impl RuntimeProfile {
         }
     }
 
-    pub fn add_counter(&self, name: impl Into<String>, unit: metrics::TUnit) -> CounterRef {
+    pub fn add_counter(&self, name: impl Into<String>, unit: ProfileUnit) -> CounterRef {
         self.add_counter_with_parent_and_strategy(
             name,
             unit,
@@ -213,17 +439,17 @@ impl RuntimeProfile {
     }
 
     pub fn add_unit_counter(&self, name: impl Into<String>) -> CounterRef {
-        self.add_counter(name, metrics::TUnit::UNIT)
+        self.add_counter(name, ProfileUnit::Unit)
     }
 
     pub fn add_bytes_counter(&self, name: impl Into<String>) -> CounterRef {
-        self.add_counter(name, metrics::TUnit::BYTES)
+        self.add_counter(name, ProfileUnit::Bytes)
     }
 
     pub fn add_child_counter(
         &self,
         name: impl Into<String>,
-        unit: metrics::TUnit,
+        unit: ProfileUnit,
         parent_name: impl Into<String>,
     ) -> CounterRef {
         self.add_counter_with_parent_and_strategy(
@@ -237,8 +463,8 @@ impl RuntimeProfile {
     pub fn add_counter_with_strategy(
         &self,
         name: impl Into<String>,
-        unit: metrics::TUnit,
-        strategy: runtime_profile::TCounterStrategy,
+        unit: ProfileUnit,
+        strategy: CounterStrategy,
     ) -> CounterRef {
         self.add_counter_with_parent_and_strategy(name, unit, strategy, ROOT_COUNTER)
     }
@@ -246,8 +472,8 @@ impl RuntimeProfile {
     pub fn add_counter_with_parent_and_strategy(
         &self,
         name: impl Into<String>,
-        unit: metrics::TUnit,
-        strategy: runtime_profile::TCounterStrategy,
+        unit: ProfileUnit,
+        strategy: CounterStrategy,
         parent_name: impl Into<String>,
     ) -> CounterRef {
         let name = name.into();
@@ -271,23 +497,23 @@ impl RuntimeProfile {
         counter
     }
 
-    pub fn counter_add(&self, name: &str, unit: metrics::TUnit, delta: i64) {
+    pub fn counter_add(&self, name: &str, unit: ProfileUnit, delta: i64) {
         let c = self.add_counter(name.to_string(), unit);
         c.add(delta);
     }
 
     pub fn counter_add_unit(&self, name: &str, delta: i64) {
-        self.counter_add(name, metrics::TUnit::UNIT, delta);
+        self.counter_add(name, ProfileUnit::Unit, delta);
     }
 
     pub fn counter_add_bytes(&self, name: &str, delta: i64) {
-        self.counter_add(name, metrics::TUnit::BYTES, delta);
+        self.counter_add(name, ProfileUnit::Bytes, delta);
     }
 
     pub fn counter_add_with_parent(
         &self,
         name: &str,
-        unit: metrics::TUnit,
+        unit: ProfileUnit,
         delta: i64,
         parent_name: &str,
     ) {
@@ -295,17 +521,17 @@ impl RuntimeProfile {
         c.add(delta);
     }
 
-    pub fn counter_set(&self, name: &str, unit: metrics::TUnit, value: i64) {
+    pub fn counter_set(&self, name: &str, unit: ProfileUnit, value: i64) {
         let c = self.add_counter(name.to_string(), unit);
         c.set(value);
     }
 
     pub fn counter_set_unit(&self, name: &str, value: i64) {
-        self.counter_set(name, metrics::TUnit::UNIT, value);
+        self.counter_set(name, ProfileUnit::Unit, value);
     }
 
     pub fn counter_set_bytes(&self, name: &str, value: i64) {
-        self.counter_set(name, metrics::TUnit::BYTES, value);
+        self.counter_set(name, ProfileUnit::Bytes, value);
     }
 
     pub(crate) fn counter_value(&self, name: &str) -> Option<i64> {
@@ -324,7 +550,7 @@ impl RuntimeProfile {
     }
 
     pub fn add_timer(&self, name: impl Into<String>) -> CounterRef {
-        self.add_counter(name, metrics::TUnit::TIME_NS)
+        self.add_counter(name, ProfileUnit::TimeNs)
     }
 
     pub fn add_child_timer(
@@ -332,7 +558,7 @@ impl RuntimeProfile {
         name: impl Into<String>,
         parent_name: impl Into<String>,
     ) -> CounterRef {
-        self.add_child_counter(name, metrics::TUnit::TIME_NS, parent_name)
+        self.add_child_counter(name, ProfileUnit::TimeNs, parent_name)
     }
 
     pub fn scoped_timer(&self, name: impl Into<String>) -> ScopedTimer {
@@ -340,16 +566,14 @@ impl RuntimeProfile {
         ScopedTimer::new(counter)
     }
 
-    pub fn to_thrift_tree(&self) -> runtime_profile::TRuntimeProfileTree {
-        let mut nodes = Vec::new();
-        self.to_thrift_nodes(&mut nodes);
-        runtime_profile::TRuntimeProfileTree::new(nodes)
+    pub fn to_native_tree(&self) -> RuntimeProfileTree {
+        RuntimeProfileTree {
+            root: self.to_native_node(),
+        }
     }
 
     pub(crate) fn to_proto(&self) -> novarocks::RuntimeProfileTree {
-        novarocks::RuntimeProfileTree {
-            root: Some(self.to_proto_node()),
-        }
+        self.to_native_tree().to_proto()
     }
 
     pub fn merge_isomorphic_profiles(profiles: &[RuntimeProfile]) -> RuntimeProfile {
@@ -383,7 +607,7 @@ impl RuntimeProfile {
                 continue;
             }
             let unit = snapshots[0].unit;
-            let strategy = snapshots[0].strategy.clone();
+            let strategy = snapshots[0].strategy;
             let parent_name = snapshots[0].parent_name.clone();
             let values: Vec<i64> = snapshots.iter().map(|s| s.value).collect();
             let (merged_value, min_value, max_value) = merge_counter_values(&strategy, &values);
@@ -413,68 +637,7 @@ impl RuntimeProfile {
         merged
     }
 
-    fn to_thrift_nodes(&self, out: &mut Vec<runtime_profile::TRuntimeProfileNode>) {
-        let name = self.name();
-        let metadata = self.metadata();
-
-        let info_strings = self
-            .inner
-            .info_strings
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let info_strings_display_order = info_strings.keys().cloned().collect::<Vec<_>>();
-
-        let counters = self
-            .inner
-            .counters
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .map(|entry| entry.counter.to_thrift())
-            .collect::<Vec<_>>();
-
-        let child_counters_map = self
-            .inner
-            .counters
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .fold(
-                BTreeMap::<String, BTreeSet<String>>::new(),
-                |mut acc, (name, entry)| {
-                    acc.entry(entry.parent_name.clone())
-                        .or_default()
-                        .insert(name.clone());
-                    acc
-                },
-            );
-
-        let children = self
-            .inner
-            .children
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-
-        out.push(runtime_profile::TRuntimeProfileNode::new(
-            name,
-            children.len() as i32,
-            counters,
-            metadata,
-            false,
-            info_strings,
-            info_strings_display_order,
-            child_counters_map,
-            None,
-        ));
-
-        for child in children {
-            child.to_thrift_nodes(out);
-        }
-    }
-
-    fn to_proto_node(&self) -> novarocks::ProfileNode {
+    fn to_native_node(&self) -> ProfileNode {
         let info_strings = self
             .inner
             .info_strings
@@ -489,19 +652,19 @@ impl RuntimeProfile {
         });
         let counters = counter_snapshots
             .into_iter()
-            .map(counter_snapshot_to_proto)
+            .map(counter_snapshot_to_native)
             .collect();
         let children = self
             .children()
             .into_iter()
-            .map(|child| child.to_proto_node())
+            .map(|child| child.to_native_node())
             .collect();
 
-        novarocks::ProfileNode {
+        ProfileNode {
             name: self.name(),
             node_id: metadata_to_proto_node_id(self.metadata()),
             counters,
-            info_strings: info_strings.into_iter().collect(),
+            info_strings,
             children,
         }
     }
@@ -520,7 +683,7 @@ impl RuntimeProfile {
             name: c.name.clone(),
             parent_name: entry.parent_name.clone(),
             unit: c.unit,
-            strategy: c.strategy.clone(),
+            strategy: c.strategy,
             value: c.value(),
             min_value,
             max_value,
@@ -543,7 +706,7 @@ impl RuntimeProfile {
                     name: c.name.clone(),
                     parent_name: entry.parent_name.clone(),
                     unit: c.unit,
-                    strategy: c.strategy.clone(),
+                    strategy: c.strategy,
                     value: c.value(),
                     min_value,
                     max_value,
@@ -561,116 +724,15 @@ fn metadata_to_proto_node_id(metadata: i64) -> i32 {
     }
 }
 
-fn counter_snapshot_to_proto(snapshot: CounterSnapshot) -> novarocks::Counter {
-    novarocks::Counter {
+fn counter_snapshot_to_native(snapshot: CounterSnapshot) -> ProfileCounter {
+    ProfileCounter {
         name: snapshot.name,
         parent_name: snapshot.parent_name,
-        unit: unit_to_proto(snapshot.unit) as i32,
+        unit: snapshot.unit,
+        strategy: snapshot.strategy,
         value: snapshot.value,
         min_value: snapshot.min_value,
         max_value: snapshot.max_value,
-    }
-}
-
-fn unit_to_proto(unit: metrics::TUnit) -> novarocks::ProfileUnit {
-    use novarocks::ProfileUnit as P;
-
-    match unit {
-        metrics::TUnit::UNIT => P::Unit,
-        metrics::TUnit::CPU_TICKS => P::CpuTicks,
-        metrics::TUnit::BYTES => P::Bytes,
-        metrics::TUnit::TIME_NS => P::TimeNs,
-        metrics::TUnit::TIME_MS => P::TimeMs,
-        metrics::TUnit::TIME_S => P::TimeS,
-        _ => P::None,
-    }
-}
-
-pub(crate) fn native_profile_tree_to_thrift(
-    tree: &novarocks::RuntimeProfileTree,
-) -> Result<runtime_profile::TRuntimeProfileTree, String> {
-    let root = tree
-        .root
-        .as_ref()
-        .ok_or_else(|| "RuntimeProfileTree missing root".to_string())?;
-    let mut nodes = Vec::new();
-    native_profile_node_to_thrift(root, &mut nodes)?;
-    Ok(runtime_profile::TRuntimeProfileTree::new(nodes))
-}
-
-fn native_profile_node_to_thrift(
-    node: &novarocks::ProfileNode,
-    out: &mut Vec<runtime_profile::TRuntimeProfileNode>,
-) -> Result<(), String> {
-    let mut counters = node
-        .counters
-        .iter()
-        .map(native_counter_to_thrift)
-        .collect::<Result<Vec<_>, _>>()?;
-    counters.sort_by(|left, right| left.name.cmp(&right.name));
-
-    let mut child_counters_map = BTreeMap::<String, BTreeSet<String>>::new();
-    for counter in &node.counters {
-        child_counters_map
-            .entry(counter.parent_name.clone())
-            .or_default()
-            .insert(counter.name.clone());
-    }
-
-    let info_strings = node
-        .info_strings
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let info_strings_display_order = info_strings.keys().cloned().collect::<Vec<_>>();
-
-    out.push(runtime_profile::TRuntimeProfileNode::new(
-        node.name.clone(),
-        node.children.len() as i32,
-        counters,
-        i64::from(node.node_id),
-        false,
-        info_strings,
-        info_strings_display_order,
-        child_counters_map,
-        None,
-    ));
-
-    for child in &node.children {
-        native_profile_node_to_thrift(child, out)?;
-    }
-    Ok(())
-}
-
-fn native_counter_to_thrift(
-    counter: &novarocks::Counter,
-) -> Result<runtime_profile::TCounter, String> {
-    let unit = unit_from_proto(counter.unit)?;
-    Ok(runtime_profile::TCounter::new(
-        counter.name.clone(),
-        unit,
-        counter.value,
-        Some(default_counter_strategy(unit)),
-        counter.min_value,
-        counter.max_value,
-    ))
-}
-
-fn unit_from_proto(unit: i32) -> Result<metrics::TUnit, String> {
-    match novarocks::ProfileUnit::try_from(unit) {
-        Ok(novarocks::ProfileUnit::Unit) => Ok(metrics::TUnit::UNIT),
-        Ok(novarocks::ProfileUnit::CpuTicks) => Ok(metrics::TUnit::CPU_TICKS),
-        Ok(novarocks::ProfileUnit::Bytes) => Ok(metrics::TUnit::BYTES),
-        Ok(novarocks::ProfileUnit::TimeNs) => Ok(metrics::TUnit::TIME_NS),
-        Ok(novarocks::ProfileUnit::TimeMs) => Ok(metrics::TUnit::TIME_MS),
-        Ok(novarocks::ProfileUnit::TimeS) => Ok(metrics::TUnit::TIME_S),
-        Ok(novarocks::ProfileUnit::None) => Ok(metrics::TUnit::NONE),
-        Ok(novarocks::ProfileUnit::Unspecified) => {
-            Err("ProfileUnit is unspecified in native runtime profile".to_string())
-        }
-        Err(_) => Err(format!(
-            "unknown ProfileUnit value {unit} in native runtime profile"
-        )),
     }
 }
 
@@ -679,19 +741,15 @@ pub type CounterRef = Arc<Counter>;
 #[derive(Debug)]
 pub struct Counter {
     name: String,
-    unit: metrics::TUnit,
-    strategy: runtime_profile::TCounterStrategy,
+    unit: ProfileUnit,
+    strategy: CounterStrategy,
     value: AtomicI64,
     min_value: Mutex<Option<i64>>,
     max_value: Mutex<Option<i64>>,
 }
 
 impl Counter {
-    pub fn new(
-        name: impl Into<String>,
-        unit: metrics::TUnit,
-        strategy: runtime_profile::TCounterStrategy,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, unit: ProfileUnit, strategy: CounterStrategy) -> Self {
         Self {
             name: name.into(),
             unit,
@@ -722,19 +780,6 @@ impl Counter {
     pub fn set_max(&self, max: i64) {
         let mut guard = self.max_value.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(max);
-    }
-
-    fn to_thrift(&self) -> runtime_profile::TCounter {
-        let min_value = *self.min_value.lock().unwrap_or_else(|e| e.into_inner());
-        let max_value = *self.max_value.lock().unwrap_or_else(|e| e.into_inner());
-        runtime_profile::TCounter::new(
-            self.name.clone(),
-            self.unit,
-            self.value(),
-            Some(self.strategy.clone()),
-            min_value,
-            max_value,
-        )
     }
 }
 
@@ -787,20 +832,16 @@ pub fn attach_mem_tracker_tree(profile: &RuntimeProfile, root: &Arc<MemTracker>)
 fn fill_mem_tracker_profile(profile: &RuntimeProfile, tracker: &Arc<MemTracker>) {
     profile.add_info_string("Label", tracker.label());
     let common = profile.child("CommonMetrics");
-    common.counter_set(
-        "CurrentMemoryBytes",
-        metrics::TUnit::BYTES,
-        tracker.current(),
-    );
-    common.counter_set("PeakMemoryBytes", metrics::TUnit::BYTES, tracker.peak());
+    common.counter_set("CurrentMemoryBytes", ProfileUnit::Bytes, tracker.current());
+    common.counter_set("PeakMemoryBytes", ProfileUnit::Bytes, tracker.peak());
     common.counter_set(
         "AllocatedMemoryBytes",
-        metrics::TUnit::BYTES,
+        ProfileUnit::Bytes,
         tracker.allocated(),
     );
     common.counter_set(
         "DeallocatedMemoryBytes",
-        metrics::TUnit::BYTES,
+        ProfileUnit::Bytes,
         tracker.deallocated(),
     );
     let _ = profile.child("UniqueMetrics");
@@ -808,22 +849,6 @@ fn fill_mem_tracker_profile(profile: &RuntimeProfile, tracker: &Arc<MemTracker>)
         let child_profile = profile.child(child.label().to_string());
         fill_mem_tracker_profile(&child_profile, &child);
     }
-}
-
-pub fn default_counter_strategy(unit: metrics::TUnit) -> runtime_profile::TCounterStrategy {
-    let aggregate_type = match unit {
-        metrics::TUnit::CPU_TICKS
-        | metrics::TUnit::TIME_NS
-        | metrics::TUnit::TIME_MS
-        | metrics::TUnit::TIME_S => runtime_profile::TCounterAggregateType::AVG,
-        _ => runtime_profile::TCounterAggregateType::SUM,
-    };
-    runtime_profile::TCounterStrategy::new(
-        aggregate_type,
-        runtime_profile::TCounterMergeType::MERGE_ALL,
-        0,
-        runtime_profile::TCounterMinMaxType::MIN_MAX_ALL,
-    )
 }
 
 pub fn clamp_u128_to_i64(value: u128) -> i64 {
@@ -834,10 +859,7 @@ pub fn clamp_u128_to_i64(value: u128) -> i64 {
     }
 }
 
-fn merge_counter_values(
-    strategy: &runtime_profile::TCounterStrategy,
-    values: &[i64],
-) -> (i64, i64, i64) {
+fn merge_counter_values(strategy: &CounterStrategy, values: &[i64]) -> (i64, i64, i64) {
     let min_value = values.iter().copied().min().unwrap_or(0);
     let max_value = values.iter().copied().max().unwrap_or(0);
     let n = i64::try_from(values.len()).unwrap_or(i64::MAX);
@@ -846,147 +868,213 @@ fn merge_counter_values(
         .copied()
         .fold(0i64, |acc, v| acc.saturating_add(v));
     let avg = if n <= 0 { 0 } else { sum / n };
-    let value = match strategy.aggregate_type.0 {
-        0 => sum, // SUM
-        1 => avg, // AVG
-        2 => sum, // SUM_AVG (sum at BE phase)
-        3 => avg, // AVG_SUM (avg at BE phase)
-        _ => sum,
+    let value = match strategy.aggregate_type() {
+        CounterAggregateType::Sum => sum,
+        CounterAggregateType::Avg => avg,
+        CounterAggregateType::SumAvg => sum,
+        CounterAggregateType::AvgSum => avg,
     };
     (value, min_value, max_value)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ROOT_COUNTER, RuntimeProfile, native_profile_tree_to_thrift};
+    use super::{
+        CounterAggregateType, CounterMergeType, CounterMinMaxType, CounterStrategy, ProfileUnit,
+        ROOT_COUNTER, RuntimeProfile, RuntimeProfileTree, default_counter_strategy,
+    };
     use crate::proto::novarocks;
-    use crate::thrift::metrics;
 
     #[test]
-    fn thrift_tree_keeps_child_counter_hierarchy() {
-        let profile = RuntimeProfile::new("test");
-        profile.counter_add("IOTaskExecTime", metrics::TUnit::TIME_NS, 10);
-        profile.counter_add_with_parent(
-            "ColumnReadTime",
-            metrics::TUnit::TIME_NS,
-            5,
-            "IOTaskExecTime",
+    fn native_profile_unit_roundtrips_proto_values() {
+        let cases = [
+            (ProfileUnit::Unit, novarocks::ProfileUnit::Unit),
+            (ProfileUnit::CpuTicks, novarocks::ProfileUnit::CpuTicks),
+            (ProfileUnit::Bytes, novarocks::ProfileUnit::Bytes),
+            (ProfileUnit::TimeNs, novarocks::ProfileUnit::TimeNs),
+            (ProfileUnit::TimeMs, novarocks::ProfileUnit::TimeMs),
+            (ProfileUnit::TimeS, novarocks::ProfileUnit::TimeS),
+            (ProfileUnit::None, novarocks::ProfileUnit::None),
+        ];
+        for (unit, proto) in cases {
+            assert_eq!(
+                ProfileUnit::from_proto(proto as i32).expect("valid unit converts"),
+                unit
+            );
+            assert_eq!(unit.to_proto(), proto);
+        }
+        assert!(
+            ProfileUnit::from_proto(novarocks::ProfileUnit::Unspecified as i32).is_err(),
+            "unspecified proto unit must not silently become a runtime unit"
         );
-        let _ = profile.add_child_counter("InputStream", metrics::TUnit::NONE, "IOTaskExecTime");
-        profile.counter_add_with_parent("AppIOTime", metrics::TUnit::TIME_NS, 3, "InputStream");
+    }
 
-        let tree = profile.to_thrift_tree();
-        let node = tree.nodes.first().expect("runtime profile node");
-        let root_children = node
-            .child_counters_map
-            .get(ROOT_COUNTER)
-            .expect("root children");
-        assert!(root_children.contains("IOTaskExecTime"));
-        let io_children = node
-            .child_counters_map
-            .get("IOTaskExecTime")
-            .expect("IOTaskExecTime children");
-        assert!(io_children.contains("ColumnReadTime"));
-        assert!(io_children.contains("InputStream"));
-        let input_stream_children = node
-            .child_counters_map
-            .get("InputStream")
-            .expect("InputStream children");
-        assert!(input_stream_children.contains("AppIOTime"));
+    #[test]
+    fn native_counter_strategy_defaults_match_existing_merge_behavior() {
+        let cases = [
+            (ProfileUnit::Unit, CounterAggregateType::Sum),
+            (ProfileUnit::CpuTicks, CounterAggregateType::Avg),
+            (ProfileUnit::Bytes, CounterAggregateType::Sum),
+            (ProfileUnit::TimeNs, CounterAggregateType::Avg),
+            (ProfileUnit::TimeMs, CounterAggregateType::Avg),
+            (ProfileUnit::TimeS, CounterAggregateType::Avg),
+            (ProfileUnit::None, CounterAggregateType::Sum),
+        ];
+        for (native_unit, aggregate_type) in cases {
+            let strategy = default_counter_strategy(native_unit);
+            assert_eq!(
+                strategy.aggregate_type(),
+                aggregate_type,
+                "native aggregate strategy for {native_unit:?} must match existing merge behavior"
+            );
+            assert_eq!(strategy.merge_type(), CounterMergeType::MergeAll);
+            assert_eq!(strategy.display_threshold(), 0);
+            assert_eq!(strategy.min_max_type(), Some(CounterMinMaxType::MinMaxAll));
+        }
+    }
+
+    #[test]
+    fn runtime_profile_counters_use_native_units() {
+        let profile = RuntimeProfile::new("native-profile");
+        profile.counter_set("RowsRead", ProfileUnit::Unit, 7);
+        profile.counter_set("ScanTime", ProfileUnit::TimeNs, 11);
+
+        let rows = profile
+            .counter_snapshot("RowsRead")
+            .expect("RowsRead counter");
+        let scan = profile
+            .counter_snapshot("ScanTime")
+            .expect("ScanTime counter");
+
+        assert_eq!(rows.unit, ProfileUnit::Unit);
+        assert_eq!(scan.unit, ProfileUnit::TimeNs);
+        assert_eq!(rows.strategy.aggregate_type(), CounterAggregateType::Sum);
+        assert_eq!(scan.strategy.aggregate_type(), CounterAggregateType::Avg);
+    }
+
+    #[test]
+    fn runtime_profile_builds_native_tree_with_recursive_children() {
+        let profile = RuntimeProfile::new("Root");
+        profile.set_metadata(10);
+        profile.counter_set("RowsRead", ProfileUnit::Unit, 3);
+        let child = profile.child("Child");
+        child.set_metadata(20);
+        child.counter_set("ScanTime", ProfileUnit::TimeNs, 5);
+
+        let tree = profile.to_native_tree();
+
+        assert_eq!(tree.root.name, "Root");
+        assert_eq!(tree.root.node_id, 10);
+        assert_eq!(tree.root.counters[0].unit, ProfileUnit::Unit);
+        assert_eq!(tree.root.children.len(), 1);
+        assert_eq!(tree.root.children[0].name, "Child");
+        assert_eq!(tree.root.children[0].node_id, 20);
+        assert_eq!(tree.root.children[0].counters[0].unit, ProfileUnit::TimeNs);
+    }
+
+    #[test]
+    fn native_profile_tree_from_proto_rebuilds_default_strategy() {
+        let profile = RuntimeProfile::new("Root");
+        profile.counter_set("ScanTime", ProfileUnit::TimeNs, 5);
+        let proto = profile.to_native_tree().to_proto();
+
+        let tree = RuntimeProfileTree::from_proto(&proto).expect("native profile proto decodes");
+        let counter = tree
+            .root
+            .counters
+            .iter()
+            .find(|counter| counter.name == "ScanTime")
+            .expect("ScanTime counter");
+
+        assert_eq!(counter.unit, ProfileUnit::TimeNs);
+        assert_eq!(counter.strategy.aggregate_type(), CounterAggregateType::Avg);
+    }
+
+    #[test]
+    fn native_tree_preserves_counter_strategy_fields() {
+        let profile = RuntimeProfile::new("strategy-profile");
+        let counter = profile.add_counter_with_strategy(
+            "CustomCounter",
+            ProfileUnit::TimeMs,
+            CounterStrategy::custom(
+                CounterAggregateType::SumAvg,
+                CounterMergeType::SkipFirstMerge,
+                42,
+                Some(CounterMinMaxType::SkipAll),
+            ),
+        );
+        counter.set(99);
+        counter.set_min(7);
+        counter.set_max(123);
+
+        let tree = profile.to_native_tree();
+        let native_counter = tree
+            .root
+            .counters
+            .iter()
+            .find(|counter| counter.name == "CustomCounter")
+            .expect("custom counter");
+
+        assert_eq!(native_counter.unit, ProfileUnit::TimeMs);
+        assert_eq!(native_counter.value, 99);
+        assert_eq!(native_counter.min_value, Some(7));
+        assert_eq!(native_counter.max_value, Some(123));
+        assert_eq!(
+            native_counter.strategy.aggregate_type(),
+            CounterAggregateType::SumAvg
+        );
+        assert_eq!(
+            native_counter.strategy.merge_type(),
+            CounterMergeType::SkipFirstMerge
+        );
+        assert_eq!(native_counter.strategy.display_threshold(), 42);
+        assert_eq!(
+            native_counter.strategy.min_max_type(),
+            Some(CounterMinMaxType::SkipAll)
+        );
+    }
+
+    #[test]
+    fn native_tree_keeps_child_counter_hierarchy() {
+        let profile = RuntimeProfile::new("test");
+        profile.counter_add("IOTaskExecTime", ProfileUnit::TimeNs, 10);
+        profile.counter_add_with_parent("ColumnReadTime", ProfileUnit::TimeNs, 5, "IOTaskExecTime");
+        let _ = profile.add_child_counter("InputStream", ProfileUnit::None, "IOTaskExecTime");
+        profile.counter_add_with_parent("AppIOTime", ProfileUnit::TimeNs, 3, "InputStream");
+
+        let tree = profile.to_native_tree();
+        let parent_name = |name: &str| {
+            tree.root
+                .counters
+                .iter()
+                .find(|counter| counter.name == name)
+                .map(|counter| counter.parent_name.as_str())
+        };
+
+        assert_eq!(parent_name("IOTaskExecTime"), Some(ROOT_COUNTER));
+        assert_eq!(parent_name("ColumnReadTime"), Some("IOTaskExecTime"));
+        assert_eq!(parent_name("InputStream"), Some("IOTaskExecTime"));
+        assert_eq!(parent_name("AppIOTime"), Some("InputStream"));
     }
 
     #[test]
     fn merge_isomorphic_profiles_keeps_counter_parent() {
         let p1 = RuntimeProfile::new("p");
-        p1.counter_add("IOTaskExecTime", metrics::TUnit::TIME_NS, 10);
-        p1.counter_add_with_parent("OpenFile", metrics::TUnit::TIME_NS, 4, "IOTaskExecTime");
+        p1.counter_add("IOTaskExecTime", ProfileUnit::TimeNs, 10);
+        p1.counter_add_with_parent("OpenFile", ProfileUnit::TimeNs, 4, "IOTaskExecTime");
 
         let p2 = RuntimeProfile::new("p");
-        p2.counter_add("IOTaskExecTime", metrics::TUnit::TIME_NS, 12);
-        p2.counter_add_with_parent("OpenFile", metrics::TUnit::TIME_NS, 5, "IOTaskExecTime");
+        p2.counter_add("IOTaskExecTime", ProfileUnit::TimeNs, 12);
+        p2.counter_add_with_parent("OpenFile", ProfileUnit::TimeNs, 5, "IOTaskExecTime");
 
         let merged = RuntimeProfile::merge_isomorphic_profiles(&[p1, p2]);
-        let tree = merged.to_thrift_tree();
-        let node = tree.nodes.first().expect("runtime profile node");
-        let io_children = node
-            .child_counters_map
-            .get("IOTaskExecTime")
-            .expect("IOTaskExecTime children");
-        assert!(io_children.contains("OpenFile"));
-    }
-
-    #[test]
-    fn native_profile_tree_to_thrift_reconstructs_flat_tree() {
-        let native = novarocks::RuntimeProfileTree {
-            root: Some(novarocks::ProfileNode {
-                name: "Root".to_string(),
-                node_id: 10,
-                counters: vec![
-                    novarocks::Counter {
-                        name: "TotalTime".to_string(),
-                        parent_name: String::new(),
-                        unit: novarocks::ProfileUnit::TimeNs as i32,
-                        value: 100,
-                        min_value: Some(90),
-                        max_value: Some(110),
-                    },
-                    novarocks::Counter {
-                        name: "ScanTime".to_string(),
-                        parent_name: "TotalTime".to_string(),
-                        unit: novarocks::ProfileUnit::TimeNs as i32,
-                        value: 70,
-                        min_value: None,
-                        max_value: None,
-                    },
-                ],
-                info_strings: [
-                    ("z_key".to_string(), "last".to_string()),
-                    ("a_key".to_string(), "first".to_string()),
-                ]
-                .into_iter()
-                .collect(),
-                children: vec![novarocks::ProfileNode {
-                    name: "Child".to_string(),
-                    node_id: 20,
-                    counters: vec![novarocks::Counter {
-                        name: "RowsRead".to_string(),
-                        parent_name: String::new(),
-                        unit: novarocks::ProfileUnit::Unit as i32,
-                        value: 9,
-                        min_value: None,
-                        max_value: None,
-                    }],
-                    info_strings: Default::default(),
-                    children: vec![],
-                }],
-            }),
-        };
-
-        let thrift = native_profile_tree_to_thrift(&native).expect("native profile decode");
-
-        assert_eq!(thrift.nodes.len(), 2);
-        assert_eq!(thrift.nodes[0].name, "Root");
-        assert_eq!(thrift.nodes[0].num_children, 1);
-        assert_eq!(thrift.nodes[0].metadata, 10);
-        assert_eq!(
-            thrift.nodes[0].info_strings_display_order,
-            vec!["a_key".to_string(), "z_key".to_string()]
-        );
-        assert_eq!(
-            thrift.nodes[0]
-                .child_counters_map
-                .get(ROOT_COUNTER)
-                .expect("root counters"),
-            &["TotalTime".to_string()].into_iter().collect()
-        );
-        assert_eq!(
-            thrift.nodes[0]
-                .child_counters_map
-                .get("TotalTime")
-                .expect("child counters"),
-            &["ScanTime".to_string()].into_iter().collect()
-        );
-        assert_eq!(thrift.nodes[1].name, "Child");
-        assert_eq!(thrift.nodes[1].metadata, 20);
+        let tree = merged.to_native_tree();
+        let open_file = tree
+            .root
+            .counters
+            .iter()
+            .find(|counter| counter.name == "OpenFile")
+            .expect("OpenFile counter");
+        assert_eq!(open_file.parent_name, "IOTaskExecTime");
     }
 }
