@@ -1098,7 +1098,7 @@ mod tests {
 
     fn assert_non_empty_scan_ranges(case_name: &str, result: &MultiFragmentBuildResult) {
         let root = fragment_by_id(case_name, result, result.root_fragment_id);
-        let ranges = &root.exec_params.per_node_scan_ranges;
+        let ranges = &root.native_scan_ranges;
         assert!(
             !ranges.is_empty() && ranges.values().any(|node_ranges| !node_ranges.is_empty()),
             "{case_name}: expected non-empty scan ranges"

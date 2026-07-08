@@ -65,7 +65,7 @@ is_test_line() {
         }
       }
 
-      prev_cfg_test = ($0 ~ /^[[:space:]]*#\[cfg\(test\)\][[:space:]]*$/)
+      prev_cfg_test = ($0 ~ /^[[:space:]]*#\[cfg\((test|all\(test,.*)\)\][[:space:]]*$/)
     }
 
     END {

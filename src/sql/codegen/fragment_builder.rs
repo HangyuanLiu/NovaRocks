@@ -1829,6 +1829,25 @@ mod tests {
         })
     }
 
+    fn native_scan_ranges_for_node(
+        fragment: &crate::sql::codegen::FragmentBuildResult,
+        scan_node_id: i32,
+    ) -> &[crate::runtime::scan_range::ScanRangeParams] {
+        fragment
+            .native_scan_ranges
+            .get(&scan_node_id)
+            .map(Vec::as_slice)
+            .expect("native scan ranges")
+    }
+
+    fn native_file_range(
+        range: &crate::runtime::scan_range::ScanRangeParams,
+    ) -> &crate::runtime::scan_range::FileScanRange {
+        match &range.range {
+            crate::runtime::scan_range::ScanRange::File(file) => file,
+        }
+    }
+
     fn iceberg_scan_plan_with_many_delete_files(delete_count: usize) -> OptimizerPhysicalNode {
         let mut file = iceberg_i32_file("s3://bucket/delete-heavy.parquet", 1, 100);
         file.delete_files = (0..delete_count)
@@ -1901,21 +1920,13 @@ mod tests {
         );
         assert_eq!(hdfs.min_max_tuple_id, hdfs.tuple_id);
 
-        let ranges = root
-            .exec_params
-            .per_node_scan_ranges
-            .get(&scan.node_id)
-            .expect("scan ranges");
+        let ranges = native_scan_ranges_for_node(root, scan.node_id);
         assert_eq!(
             ranges.len(),
             1,
             "file-level Iceberg stats should prune the file whose id range cannot contain 12"
         );
-        let kept_path = ranges[0]
-            .scan_range
-            .hdfs_scan_range
-            .as_ref()
-            .and_then(|range| range.full_path.as_deref());
+        let kept_path = native_file_range(&ranges[0]).full_path.as_deref();
         assert_eq!(kept_path, Some("s3://bucket/file-10-20.parquet"));
     }
 
@@ -1941,22 +1952,14 @@ mod tests {
             .iter()
             .find(|node| node.node_type == plan_nodes::TPlanNodeType::HDFS_SCAN_NODE)
             .expect("hdfs scan node");
-        let ranges = root
-            .exec_params
-            .per_node_scan_ranges
-            .get(&scan.node_id)
-            .expect("scan ranges");
+        let ranges = native_scan_ranges_for_node(root, scan.node_id);
 
         assert_eq!(
             ranges.len(),
             1,
             "identity partition values should prune files before scan range planning"
         );
-        let kept_path = ranges[0]
-            .scan_range
-            .hdfs_scan_range
-            .as_ref()
-            .and_then(|range| range.full_path.as_deref());
+        let kept_path = native_file_range(&ranges[0]).full_path.as_deref();
         assert_eq!(kept_path, Some("s3://bucket/id-12.parquet"));
     }
 
@@ -1982,23 +1985,19 @@ mod tests {
             .iter()
             .find(|node| node.node_type == plan_nodes::TPlanNodeType::HDFS_SCAN_NODE)
             .expect("hdfs scan node");
-        let ranges = root
-            .exec_params
-            .per_node_scan_ranges
-            .get(&scan.node_id)
-            .expect("scan ranges");
+        let ranges = native_scan_ranges_for_node(root, scan.node_id);
 
         assert_eq!(ranges.len(), 3);
-        let first = ranges[0].scan_range.hdfs_scan_range.as_ref().unwrap();
-        let second = ranges[1].scan_range.hdfs_scan_range.as_ref().unwrap();
-        let third = ranges[2].scan_range.hdfs_scan_range.as_ref().unwrap();
-        assert_eq!(first.offset, Some(0));
-        assert_eq!(first.length, Some(128 * 1024 * 1024));
-        assert_eq!(first.file_length, Some(300 * 1024 * 1024));
-        assert_eq!(second.offset, Some(128 * 1024 * 1024));
-        assert_eq!(second.length, Some(128 * 1024 * 1024));
-        assert_eq!(third.offset, Some(256 * 1024 * 1024));
-        assert_eq!(third.length, Some(44 * 1024 * 1024));
+        let first = native_file_range(&ranges[0]);
+        let second = native_file_range(&ranges[1]);
+        let third = native_file_range(&ranges[2]);
+        assert_eq!(first.offset, 0);
+        assert_eq!(first.length, 128 * 1024 * 1024);
+        assert_eq!(first.file_length, 300 * 1024 * 1024);
+        assert_eq!(second.offset, 128 * 1024 * 1024);
+        assert_eq!(second.length, 128 * 1024 * 1024);
+        assert_eq!(third.offset, 256 * 1024 * 1024);
+        assert_eq!(third.length, 44 * 1024 * 1024);
     }
 
     #[test]
@@ -3980,11 +3979,7 @@ mod tests {
                 .is_some_and(|exprs| !exprs.is_empty()),
             "scan node emission must carry pushed predicates"
         );
-        let ranges = root
-            .exec_params
-            .per_node_scan_ranges
-            .get(&scan.node_id)
-            .expect("scan ranges must be keyed by the emitted scan node id");
+        let ranges = native_scan_ranges_for_node(root, scan.node_id);
         assert_eq!(
             ranges.len(),
             1,
