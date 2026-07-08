@@ -105,7 +105,8 @@ pub(crate) fn prepare_mv_rewrite_candidates(
     factory: &mut ColumnRefFactory,
     query_stats: &mut QueryStatsPlan,
 ) -> Vec<MvRewriteCandidate> {
-    if !crate::sql::optimizer::options::current_session_optimizer_settings().mv_rewrite_enabled() {
+    let settings = crate::sql::optimizer::options::current_session_optimizer_settings();
+    if !settings.mv_rewrite_enabled() {
         return Vec::new();
     }
     match try_prepare(
@@ -115,6 +116,7 @@ pub(crate) fn prepare_mv_rewrite_candidates(
         logical,
         factory,
         query_stats,
+        settings.mv_rewrite_max_staleness_sec,
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -131,6 +133,7 @@ fn try_prepare(
     logical: &LogicalPlanNode,
     factory: &mut ColumnRefFactory,
     query_stats: &mut QueryStatsPlan,
+    session_max_staleness_sec: Option<u64>,
 ) -> Result<Vec<MvRewriteCandidate>, String> {
     // 1. Iceberg base tables referenced by the query, as "cat.ns.tbl" FQNs
     //    (the exact format of StoredMvDefinition.base_table_refs, produced
@@ -168,7 +171,14 @@ fn try_prepare(
         if !def.base_table_refs.iter().any(|r| query_fqns.contains(r)) {
             continue;
         }
-        match build_candidate(state, analyzer_catalog, current_database, &def, factory) {
+        match build_candidate(
+            state,
+            analyzer_catalog,
+            current_database,
+            &def,
+            factory,
+            session_max_staleness_sec,
+        ) {
             Ok(Some(c)) => {
                 let (target_label, target_stats) = super::query_stats::collect_table_stats(
                     &stats_providers,
@@ -198,13 +208,18 @@ fn build_candidate(
     current_database: &str,
     def: &crate::meta::repository::mv::StoredMvDefinition,
     factory: &mut ColumnRefFactory,
+    session_max_staleness_sec: Option<u64>,
 ) -> Result<Option<PreparedMvRewriteCandidate>, String> {
-    // 2b. Strict freshness: every base table's CURRENT snapshot must equal
-    //     the pinned snapshot from the last refresh. Never refreshed -> skip.
+    // 2b. Bounded-staleness freshness: every base table's CURRENT snapshot must
+    //     equal the pinned snapshot from the last refresh, UNLESS the effective
+    //     staleness window (session var, else MV property, else strict 0) covers
+    //     the commit-ts gap. Never refreshed -> skip.
     if def.last_refresh_snapshots.is_empty() {
         return Ok(None);
     }
     let base_refs = crate::engine::mv::refresh_io::parse_iceberg_table_refs(&def.base_table_refs)?;
+    // Lazily loaded once (only if a base is stale and no session override is set).
+    let mut mv_property_window: Option<u64> = None;
     for r in &base_refs {
         let fqn = r.fqn();
         let Some(pinned) = def.last_refresh_snapshots.get(&fqn) else {
@@ -212,7 +227,20 @@ fn build_candidate(
         };
         let current = current_snapshot_id(state, r)?;
         if current != Some(*pinned) {
-            return Ok(None); // stale (or unreadable) -> strict mode skips
+            // Base advanced. Rewrite only if within the effective tolerance window.
+            let window = match session_max_staleness_sec {
+                Some(w) => w,
+                None => {
+                    if mv_property_window.is_none() {
+                        mv_property_window = Some(load_mv_staleness_property_sec(state, def)?);
+                    }
+                    mv_property_window.unwrap()
+                }
+            };
+            let (pinned_commit, current_commit) = base_commit_ts_pair(state, r, *pinned)?;
+            if !staleness_within_window(window, pinned_commit, current_commit) {
+                return Ok(None); // strict (window 0), beyond window, rollback, or unresolvable
+            }
         }
         if let Some(pinned_uuid) = def.last_refresh_table_uuids.get(&fqn)
             && current_table_uuid(state, r)?.as_deref() != Some(pinned_uuid.as_str())
