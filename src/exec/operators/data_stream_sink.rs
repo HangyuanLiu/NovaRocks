@@ -32,12 +32,11 @@ use crate::common::ids::SlotId;
 use crate::common::types::{UniqueId, format_uuid};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use crate::lower::compat::expr::lower_t_expr;
-use crate::lower::compat::layout::Layout;
+use crate::runtime::endpoint::FragmentDestination;
 use crate::runtime::exchange;
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::service::exchange_sender::{ExchangeSendTask, ExchangeSendTracker, exchange_send_queue};
-use crate::thrift::{data_sinks, internal_service, partitions, types};
+use crate::thrift::partitions;
 use arrow::datatypes::DataType;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -987,70 +986,86 @@ mod data_stream_sink_hash_partition {
 pub(crate) use data_stream_sink_hash_partition::partition_chunk_by_hash;
 pub(crate) use data_stream_sink_hash_partition::partition_chunk_by_hash_arrays;
 
+#[derive(Clone)]
+pub(crate) struct DataStreamSinkFactoryInput {
+    pub(crate) dest_node_id: i32,
+    pub(crate) output_exprs: Vec<ExprId>,
+    pub(crate) output_partition_type: partitions::TPartitionType,
+    pub(crate) output_partition_exprs: Vec<ExprId>,
+    pub(crate) output_columns: Vec<SlotId>,
+    pub(crate) destinations: Vec<FragmentDestination>,
+}
+
+impl DataStreamSinkFactoryInput {
+    pub(crate) fn partition_type_requires_exprs(
+        partition_type: partitions::TPartitionType,
+    ) -> bool {
+        matches!(
+            partition_type,
+            partitions::TPartitionType::HASH_PARTITIONED
+                | partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED
+        )
+    }
+
+    pub(crate) fn try_new(
+        dest_node_id: i32,
+        output_partition_type: partitions::TPartitionType,
+        output_exprs: Vec<ExprId>,
+        output_partition_exprs: Vec<ExprId>,
+        output_columns: Vec<i32>,
+        destinations: Vec<FragmentDestination>,
+    ) -> Result<Self, String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut parsed_output_columns = Vec::with_capacity(output_columns.len());
+        for raw in output_columns {
+            let slot_id = SlotId::try_from(raw).map_err(|err| {
+                format!("DATA_STREAM_SINK: invalid output_columns slot id: {err}")
+            })?;
+            if !seen.insert(slot_id) {
+                return Err(format!(
+                    "DATA_STREAM_SINK: duplicate output_columns slot id: {slot_id}"
+                ));
+            }
+            parsed_output_columns.push(slot_id);
+        }
+
+        let output_partition_exprs = if Self::partition_type_requires_exprs(output_partition_type) {
+            output_partition_exprs
+        } else {
+            Vec::new()
+        };
+
+        Ok(Self {
+            dest_node_id,
+            output_exprs,
+            output_partition_type,
+            output_partition_exprs,
+            output_columns: parsed_output_columns,
+            destinations,
+        })
+    }
+}
+
 /// Factory for distributed stream sinks that serialize and transmit chunks to remote fragment instances.
 pub(crate) struct DataStreamSinkFactory {
     name: String,
     init_error: Option<String>,
-    sink: data_sinks::TDataStreamSink,
-    exec_params: internal_service::TPlanFragmentExecParams,
-    layout: Option<Layout>,
+    input: DataStreamSinkFactoryInput,
+    fragment_instance_id: UniqueId,
+    sender_id: Option<i32>,
+    partition_arena: ExprArena,
     plan_node_id: i32,
-    output_columns: Vec<SlotId>,
-    pre_lowered_partition: Option<(ExprArena, Vec<ExprId>)>,
-    last_query_id: Option<String>,
-    fe_addr: Option<types::TNetworkAddress>,
     finish_state: Arc<DataStreamSinkFinishState>,
     shared_sequence: Arc<AtomicI64>,
 }
 
 impl DataStreamSinkFactory {
     pub(crate) fn new(
-        sink: data_sinks::TDataStreamSink,
-        exec_params: internal_service::TPlanFragmentExecParams,
-        layout: Layout,
-        plan_node_id: i32,
-        last_query_id: Option<String>,
-        fe_addr: Option<types::TNetworkAddress>,
-    ) -> Self {
-        Self::new_internal(
-            sink,
-            exec_params,
-            Some(layout),
-            plan_node_id,
-            None,
-            last_query_id,
-            fe_addr,
-        )
-    }
-
-    pub(crate) fn new_with_pre_lowered_partition(
-        sink: data_sinks::TDataStreamSink,
-        exec_params: internal_service::TPlanFragmentExecParams,
+        input: DataStreamSinkFactoryInput,
+        fragment_instance_id: UniqueId,
+        sender_id: Option<i32>,
         plan_node_id: i32,
         partition_arena: ExprArena,
-        partition_exprs: Vec<ExprId>,
-        last_query_id: Option<String>,
-        fe_addr: Option<types::TNetworkAddress>,
-    ) -> Self {
-        Self::new_internal(
-            sink,
-            exec_params,
-            None,
-            plan_node_id,
-            Some((partition_arena, partition_exprs)),
-            last_query_id,
-            fe_addr,
-        )
-    }
-
-    fn new_internal(
-        sink: data_sinks::TDataStreamSink,
-        exec_params: internal_service::TPlanFragmentExecParams,
-        layout: Option<Layout>,
-        plan_node_id: i32,
-        pre_lowered_partition: Option<(ExprArena, Vec<ExprId>)>,
-        last_query_id: Option<String>,
-        fe_addr: Option<types::TNetworkAddress>,
     ) -> Self {
         // Align with StarRocks FE ExplainAnalyzer: ExchangeSinkOperator uses the *upstream plan node id*
         // (not the destination exchange node id) as `plan_node_id`.
@@ -1059,42 +1074,17 @@ impl DataStreamSinkFactory {
         } else {
             "EXCHANGE_SINK".to_string()
         };
-        let mut init_error = None;
-        let mut output_columns = Vec::new();
-        if let Some(cols) = sink.output_columns.as_ref() {
-            let mut seen = std::collections::HashSet::new();
-            output_columns.reserve(cols.len());
-            for &cid in cols {
-                let slot_id = match SlotId::try_from(cid) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        init_error = Some(format!(
-                            "DATA_STREAM_SINK: invalid output_columns slot id: {e}"
-                        ));
-                        break;
-                    }
-                };
-                if !seen.insert(slot_id) {
-                    init_error = Some(format!(
-                        "DATA_STREAM_SINK: duplicate output_columns slot id: {slot_id}"
-                    ));
-                    break;
-                }
-                output_columns.push(slot_id);
-            }
-        }
+        let init_error = (!input.output_exprs.is_empty())
+            .then(|| "DATA_STREAM_SINK output_exprs are not supported".to_string());
 
         Self {
             name,
             init_error,
-            sink,
-            exec_params,
-            layout,
+            input,
+            fragment_instance_id,
+            sender_id,
+            partition_arena,
             plan_node_id,
-            output_columns,
-            pre_lowered_partition,
-            last_query_id,
-            fe_addr,
             finish_state: Arc::new(DataStreamSinkFinishState::default()),
             shared_sequence: Arc::new(AtomicI64::new(0)),
         }
@@ -1110,16 +1100,15 @@ impl OperatorFactory for DataStreamSinkFactory {
         use crate::novarocks_logging::debug;
 
         let sender_id = self
-            .exec_params
             .sender_id
-            .unwrap_or((self.exec_params.fragment_instance_id.lo as i32) & 0x7fffffff);
+            .unwrap_or((self.fragment_instance_id.lo as i32) & 0x7fffffff);
         // Initial value only; overwritten by bind_runtime_state /
         // sync_be_number from RuntimeState.backend_num (the FE-assigned instance
         // index) before the sink sends. At instance 0 this stays 0.
         let be_number = 0i32;
 
         if driver_id == 0 {
-            let part_type = match self.sink.output_partition.type_ {
+            let part_type = match self.input.output_partition_type {
                 partitions::TPartitionType::UNPARTITIONED => "UNPARTITIONED",
                 partitions::TPartitionType::RANDOM => "RANDOM",
                 partitions::TPartitionType::HASH_PARTITIONED => "HASH_PARTITIONED",
@@ -1128,32 +1117,20 @@ impl OperatorFactory for DataStreamSinkFactory {
                 }
                 _ => "UNKNOWN",
             };
-            let dest_count = self
-                .exec_params
-                .destinations
-                .as_ref()
-                .map(|v| v.len())
-                .unwrap_or(0);
+            let dest_count = self.input.destinations.len();
             let dest_preview = self
-                .exec_params
+                .input
                 .destinations
-                .as_ref()
-                .map(|v| {
-                    v.iter()
-                        .take(3)
-                        .map(|d| format_uuid(d.fragment_instance_id.hi, d.fragment_instance_id.lo))
-                        .collect::<Vec<_>>()
-                        .join(",")
-                })
-                .unwrap_or_default();
+                .iter()
+                .take(3)
+                .map(|d| format_uuid(d.finst_id().hi, d.finst_id().lo))
+                .collect::<Vec<_>>()
+                .join(",");
             debug!(
                 "DataStreamSink created: finst={} plan_node_id={} dest_node_id={} part_type={} dop={} sender_id={} be_number={} destinations={} dest_preview=[{}]",
-                format_uuid(
-                    self.exec_params.fragment_instance_id.hi,
-                    self.exec_params.fragment_instance_id.lo
-                ),
+                format_uuid(self.fragment_instance_id.hi, self.fragment_instance_id.lo),
                 self.plan_node_id,
-                self.sink.dest_node_id,
+                self.input.dest_node_id,
                 part_type,
                 dop.max(1),
                 sender_id,
@@ -1163,87 +1140,40 @@ impl OperatorFactory for DataStreamSinkFactory {
             );
         }
 
-        let mut arena = self
-            .pre_lowered_partition
-            .as_ref()
-            .map(|(arena, _)| arena.clone())
-            .unwrap_or_default();
         let mut init_error = self.init_error.clone();
-        let expr_ids = if let Some((_, exprs)) = self.pre_lowered_partition.as_ref() {
-            exprs.clone()
-        } else if init_error.is_none()
+        let arena = self.partition_arena.clone();
+        let expr_ids = self.input.output_partition_exprs.clone();
+        if init_error.is_none()
             && matches!(
-                self.sink.output_partition.type_,
+                self.input.output_partition_type,
                 partitions::TPartitionType::HASH_PARTITIONED
                     | partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED
             )
         {
-            let exprs = self
-                .sink
-                .output_partition
-                .partition_exprs
-                .as_deref()
-                .unwrap_or(&[]);
-            let layout = self.layout.as_ref().ok_or_else(|| {
-                "DATA_STREAM_SINK: thrift partition lowering requires layout".to_string()
+            let has_variant = expr_ids.iter().any(|id| {
+                arena
+                    .data_type(*id)
+                    .is_some_and(|dt| matches!(dt, arrow::datatypes::DataType::LargeBinary))
             });
-            match exprs
-                .iter()
-                .map(|e| {
-                    let layout = layout.as_ref().map_err(|err| err.to_string())?;
-                    lower_t_expr(
-                        e,
-                        &mut arena,
-                        layout,
-                        self.last_query_id.as_deref(),
-                        self.fe_addr.as_ref(),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()
-            {
-                Ok(ids) => {
-                    let mut has_variant = false;
-                    for id in &ids {
-                        if let Some(dt) = arena.data_type(*id)
-                            && matches!(dt, arrow::datatypes::DataType::LargeBinary)
-                        {
-                            has_variant = true;
-                            break;
-                        }
-                    }
-                    if has_variant {
-                        init_error = Some(
-                            "VARIANT is not supported in HASH_PARTITIONED partition keys"
-                                .to_string(),
-                        );
-                        Vec::new()
-                    } else {
-                        ids
-                    }
-                }
-                Err(err) => {
-                    init_error = Some(err);
-                    Vec::new()
-                }
+            if has_variant {
+                init_error =
+                    Some("VARIANT is not supported in HASH_PARTITIONED partition keys".to_string());
             }
-        } else {
-            Vec::new()
-        };
+        }
 
         let send_observable = Arc::new(Observable::new());
         exchange_send_queue().register_send_observer(&send_observable);
 
         Box::new(DataStreamSinkOperator {
             name: self.name.clone(),
-            sink: self.sink.clone(),
-            exec_params: self.exec_params.clone(),
+            input: self.input.clone(),
+            fragment_instance_id: self.fragment_instance_id,
             arena,
             expr_ids,
             init_error,
             driver_id,
             sender_id,
             be_number,
-            output_columns: self.output_columns.clone(),
             shared_sequence: Arc::clone(&self.shared_sequence),
             random_next: 0,
             pending_per_dest: Vec::new(),
@@ -1286,15 +1216,14 @@ enum PayloadEnqueue {
 
 struct DataStreamSinkOperator {
     name: String,
-    sink: data_sinks::TDataStreamSink,
-    exec_params: internal_service::TPlanFragmentExecParams,
+    input: DataStreamSinkFactoryInput,
+    fragment_instance_id: UniqueId,
     arena: ExprArena,
     expr_ids: Vec<ExprId>,
     init_error: Option<String>,
     driver_id: i32,
     sender_id: i32,
     be_number: i32,
-    output_columns: Vec<SlotId>,
     shared_sequence: Arc<AtomicI64>,
     random_next: usize,
     pending_per_dest: Vec<VecDeque<Chunk>>,
@@ -1363,12 +1292,9 @@ impl Operator for DataStreamSinkOperator {
         self.finish_state.register_driver();
         crate::novarocks_logging::debug!(
             "DataStreamSink registered driver: finst={} driver_id={} dest_node_id={} sender_id={} remaining_drivers={}",
-            format_uuid(
-                self.exec_params.fragment_instance_id.hi,
-                self.exec_params.fragment_instance_id.lo
-            ),
+            format_uuid(self.fragment_instance_id.hi, self.fragment_instance_id.lo),
             self.driver_id,
-            self.sink.dest_node_id,
+            self.input.dest_node_id,
             self.sender_id,
             self.finish_state.remaining_drivers.load(Ordering::SeqCst)
         );
@@ -1484,10 +1410,7 @@ impl DataStreamSinkOperator {
         debug!(
             "DataStreamSink need_input blocked: reason={} finst={} driver_id={} sender_id={} pending_chunk_bytes={} pending_chunks={} pending_payloads={} pending_payload_bytes={} reserve_bytes={} inflight_bytes={} max_inflight_bytes={} finishing={} send_idle={} send_inflight_bytes={}",
             reason,
-            format_uuid(
-                self.exec_params.fragment_instance_id.hi,
-                self.exec_params.fragment_instance_id.lo
-            ),
+            format_uuid(self.fragment_instance_id.hi, self.fragment_instance_id.lo),
             self.driver_id,
             self.sender_id,
             self.pending_chunk_bytes_total(),
@@ -1534,8 +1457,8 @@ impl DataStreamSinkOperator {
         self.profile_initialized = true;
 
         let channel_num = self.destinations().len() as u128;
-        let dest_id = self.sink.dest_node_id;
-        let part_type = match self.sink.output_partition.type_ {
+        let dest_id = self.input.dest_node_id;
+        let part_type = match self.input.output_partition_type {
             partitions::TPartitionType::UNPARTITIONED => "UNPARTITIONED",
             partitions::TPartitionType::RANDOM => "RANDOM",
             partitions::TPartitionType::HASH_PARTITIONED => "HASH_PARTITIONED",
@@ -1557,8 +1480,8 @@ impl DataStreamSinkOperator {
         }
     }
 
-    fn destinations(&self) -> &[data_sinks::TPlanFragmentDestination] {
-        self.exec_params.destinations.as_deref().unwrap_or(&[])
+    fn destinations(&self) -> &[FragmentDestination] {
+        &self.input.destinations
     }
 
     /// Returns true if the destination at index `i` is a pseudo (pruned-bucket) destination.
@@ -1571,13 +1494,13 @@ impl DataStreamSinkOperator {
     /// no data buffering, no serialization, no EOS packet.
     /// StarRocks BE applies the same `lo == -1` check in DataStreamSender::send_chunk(),
     /// ExchangeSinkOperator::push_chunk(), and Channel::close().
-    fn is_pseudo_destination(dest: &data_sinks::TPlanFragmentDestination) -> bool {
-        dest.fragment_instance_id.lo == -1
+    fn is_pseudo_destination(dest: &FragmentDestination) -> bool {
+        dest.finst_id().lo == -1
     }
 
     fn partition_chunk(&mut self, chunk: &Chunk) -> Result<Vec<Vec<Chunk>>, String> {
         // Get destinations first to avoid borrowing self
-        let dests: Vec<data_sinks::TPlanFragmentDestination> = self.destinations().to_vec();
+        let dests: Vec<FragmentDestination> = self.destinations().to_vec();
         if dests.is_empty() {
             return Ok(vec![]);
         }
@@ -1588,7 +1511,7 @@ impl DataStreamSinkOperator {
 
         let n = dests.len();
 
-        match self.sink.output_partition.type_ {
+        match self.input.output_partition_type {
             partitions::TPartitionType::UNPARTITIONED => {
                 // Broadcast to all destinations
                 let mut per_dest_chunks: Vec<Vec<Chunk>> = Vec::with_capacity(n);
@@ -1641,7 +1564,7 @@ impl DataStreamSinkOperator {
 
                 // Use vectorized hash partition without row conversion
                 let use_crc32 = matches!(
-                    self.sink.output_partition.type_,
+                    self.input.output_partition_type,
                     partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED
                 );
 
@@ -1669,7 +1592,7 @@ impl DataStreamSinkOperator {
 
     fn try_enqueue_payload(
         &mut self,
-        dest: &data_sinks::TPlanFragmentDestination,
+        dest: &FragmentDestination,
         mut pending: PendingPayload,
         allow_overflow: bool,
     ) -> Result<PayloadEnqueue, String> {
@@ -1677,14 +1600,10 @@ impl DataStreamSinkOperator {
             allow_overflow || pending.payload_bytes > exchange_send_queue().max_inflight_bytes();
         let reserve_bytes = pending.payload_bytes.max(1);
 
-        let addr = dest
-            .brpc_server
-            .as_ref()
-            .or(dest.deprecated_server.as_ref())
-            .ok_or_else(|| "missing destination brpc_server".to_string())?;
+        let addr = dest.endpoint();
         let dest_finst_id = UniqueId {
-            hi: dest.fragment_instance_id.hi,
-            lo: dest.fragment_instance_id.lo,
+            hi: dest.finst_id().hi,
+            lo: dest.finst_id().lo,
         };
         let error_state = self
             .error_state
@@ -1692,10 +1611,10 @@ impl DataStreamSinkOperator {
             .ok_or_else(|| "missing runtime error state".to_string())?;
         if !allow_overflow
             && !exchange_send_queue().reserve_bytes_for(
-                &addr.hostname,
-                addr.port as u16,
+                addr.host(),
+                addr.port() as u16,
                 dest_finst_id,
-                self.sink.dest_node_id,
+                self.input.dest_node_id,
                 self.sender_id,
                 reserve_bytes,
             )
@@ -1710,8 +1629,8 @@ impl DataStreamSinkOperator {
             accounting.transfer_to(Arc::clone(tracker));
         }
         let task = self.build_exchange_send_task(
-            addr.hostname.to_string(),
-            addr.port as u16,
+            addr.host().to_string(),
+            addr.port() as u16,
             dest_finst_id,
             pending,
             Arc::clone(error_state),
@@ -1737,10 +1656,10 @@ impl DataStreamSinkOperator {
             dest_port,
             finst_id: dest_finst_id,
             sender_finst_id: UniqueId {
-                hi: self.exec_params.fragment_instance_id.hi,
-                lo: self.exec_params.fragment_instance_id.lo,
+                hi: self.fragment_instance_id.hi,
+                lo: self.fragment_instance_id.lo,
             },
-            node_id: self.sink.dest_node_id,
+            node_id: self.input.dest_node_id,
             sender_id: self.sender_id,
             be_number: pending.be_number,
             eos: pending.eos,
@@ -1763,7 +1682,7 @@ impl DataStreamSinkOperator {
     fn transmit_partition(
         &mut self,
         _dest_idx: usize,
-        dest: &data_sinks::TPlanFragmentDestination,
+        dest: &FragmentDestination,
         chunks: &[Chunk],
         eos: bool,
         allow_overflow: bool,
@@ -1773,8 +1692,8 @@ impl DataStreamSinkOperator {
         self.init_profile_if_needed();
 
         let dest_finst_id = UniqueId {
-            hi: dest.fragment_instance_id.hi,
-            lo: dest.fragment_instance_id.lo,
+            hi: dest.finst_id().hi,
+            lo: dest.finst_id().lo,
         };
 
         let row_count: usize = chunks.iter().map(|c| c.len()).sum();
@@ -1782,7 +1701,7 @@ impl DataStreamSinkOperator {
         debug!(
             "DataStreamSink::transmit_partition: dest_finst={} node_id={} sender_id={} chunks={} rows={} eos={} seq={}",
             dest_finst_id,
-            self.sink.dest_node_id,
+            self.input.dest_node_id,
             self.sender_id,
             chunks.len(),
             row_count,
@@ -1791,12 +1710,12 @@ impl DataStreamSinkOperator {
         );
 
         let projected_storage;
-        let chunks = if self.output_columns.is_empty() || chunks.is_empty() {
+        let chunks = if self.input.output_columns.is_empty() || chunks.is_empty() {
             chunks
         } else {
             projected_storage = chunks
                 .iter()
-                .map(|c| project_chunk_by_slot_ids(c, &self.output_columns))
+                .map(|c| project_chunk_by_slot_ids(c, &self.input.output_columns))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?;
             projected_storage.as_slice()
@@ -1843,7 +1762,7 @@ impl DataStreamSinkOperator {
             PayloadEnqueue::Enqueued => {
                 debug!(
                     "DataStreamSink::transmit_partition enqueued: dest_finst={} node_id={} eos={} seq={} bytes={}",
-                    dest_finst_id, self.sink.dest_node_id, eos, sequence, payload_bytes
+                    dest_finst_id, self.input.dest_node_id, eos, sequence, payload_bytes
                 );
                 Ok(PayloadEnqueue::Enqueued)
             }
@@ -1944,7 +1863,7 @@ impl DataStreamSinkOperator {
 
     fn flush_pending(&mut self, force: bool, allow_overflow: bool) -> Result<(), String> {
         self.ensure_pending_buffers_initialized();
-        let dests: Vec<data_sinks::TPlanFragmentDestination> = self.destinations().to_vec();
+        let dests: Vec<FragmentDestination> = self.destinations().to_vec();
         for (i, dest) in dests.iter().enumerate() {
             if Self::is_pseudo_destination(dest) {
                 continue;
@@ -1989,7 +1908,7 @@ impl DataStreamSinkOperator {
 
     fn send_eos(&mut self) -> Result<(), String> {
         self.ensure_pending_buffers_initialized();
-        let dests: Vec<data_sinks::TPlanFragmentDestination> = self.destinations().to_vec();
+        let dests: Vec<FragmentDestination> = self.destinations().to_vec();
         for (i, dest) in dests.iter().enumerate() {
             // No fragment instance is running for pseudo destinations — do not send EOS.
             if Self::is_pseudo_destination(dest) {
@@ -2010,7 +1929,7 @@ impl ProcessorOperator for DataStreamSinkOperator {
     fn accepts_encoded_column(&self, _slot_id: SlotId, data_type: &DataType) -> bool {
         is_low_cardinality_exchange_dictionary(data_type)
             && matches!(
-                self.sink.output_partition.type_,
+                self.input.output_partition_type,
                 partitions::TPartitionType::UNPARTITIONED
                     | partitions::TPartitionType::RANDOM
                     | partitions::TPartitionType::HASH_PARTITIONED
@@ -2090,12 +2009,9 @@ impl ProcessorOperator for DataStreamSinkOperator {
 
         debug!(
             "DataStreamSink set_finishing: finst={} driver_id={} dest_node_id={} sender_id={} be_number={} destinations={} pending_dests={} pending_chunk_bytes_total={} pending_payload_bytes_total={}",
-            format_uuid(
-                self.exec_params.fragment_instance_id.hi,
-                self.exec_params.fragment_instance_id.lo
-            ),
+            format_uuid(self.fragment_instance_id.hi, self.fragment_instance_id.lo),
             self.driver_id,
-            self.sink.dest_node_id,
+            self.input.dest_node_id,
             self.sender_id,
             self.be_number,
             self.destinations().len(),
@@ -2108,12 +2024,9 @@ impl ProcessorOperator for DataStreamSinkOperator {
         let is_last_driver = self.finish_state.driver_finished();
         debug!(
             "DataStreamSink finishing progressed: finst={} driver_id={} dest_node_id={} sender_id={} last_driver={} (only last driver sends EOS)",
-            format_uuid(
-                self.exec_params.fragment_instance_id.hi,
-                self.exec_params.fragment_instance_id.lo
-            ),
+            format_uuid(self.fragment_instance_id.hi, self.fragment_instance_id.lo),
             self.driver_id,
-            self.sink.dest_node_id,
+            self.input.dest_node_id,
             self.sender_id,
             is_last_driver
         );
@@ -2270,51 +2183,29 @@ mod tests {
     };
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use arrow::record_batch::RecordBatchOptions;
-    use std::collections::BTreeMap;
+
+    use crate::runtime::endpoint::RuntimeEndpoint;
+    use crate::thrift::types;
 
     fn make_test_operator() -> DataStreamSinkOperator {
         DataStreamSinkOperator {
             name: "DataStreamSink(test)".to_string(),
-            sink: data_sinks::TDataStreamSink::new(
+            input: DataStreamSinkFactoryInput::try_new(
                 1,
-                partitions::TDataPartition::new(
-                    partitions::TPartitionType::UNPARTITIONED,
-                    None::<Vec<crate::thrift::exprs::TExpr>>,
-                    None::<Vec<partitions::TRangePartition>>,
-                    None::<Vec<partitions::TBucketProperty>>,
-                ),
-                None::<bool>,
-                None::<bool>,
-                None::<i32>,
-                None::<Vec<i32>>,
-                None::<i64>,
-            ),
-            exec_params: internal_service::TPlanFragmentExecParams {
-                query_id: types::TUniqueId::new(1, 1),
-                fragment_instance_id: types::TUniqueId::new(1, 2),
-                per_node_scan_ranges: BTreeMap::new(),
-                per_exch_num_senders: BTreeMap::new(),
-                destinations: Some(Vec::new()),
-                sender_id: Some(11),
-                num_senders: None,
-                send_query_statistics_with_every_batch: None,
-                use_vectorized: None,
-                runtime_filter_params: None,
-                instances_number: None,
-                enable_exchange_pass_through: None,
-                node_to_per_driver_seq_scan_ranges: None,
-                enable_exchange_perf: None,
-                pipeline_sink_dop: None,
-                report_when_finish: None,
-                exec_debug_options: None,
-            },
+                partitions::TPartitionType::UNPARTITIONED,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("test sink input"),
+            fragment_instance_id: UniqueId { hi: 1, lo: 2 },
             arena: ExprArena::default(),
             expr_ids: Vec::new(),
             init_error: None,
             driver_id: 0,
             sender_id: 11,
             be_number: 0,
-            output_columns: Vec::new(),
             shared_sequence: Arc::new(AtomicI64::new(0)),
             random_next: 0,
             pending_per_dest: Vec::new(),
@@ -2335,18 +2226,16 @@ mod tests {
         }
     }
 
-    fn make_test_destination() -> data_sinks::TPlanFragmentDestination {
-        data_sinks::TPlanFragmentDestination::new(
+    fn make_test_destination() -> FragmentDestination {
+        FragmentDestination::new(
             types::TUniqueId::new(9, 9),
-            None::<types::TNetworkAddress>,
-            Some(types::TNetworkAddress::new("127.0.0.1".to_string(), 9030)),
-            None::<i32>,
+            RuntimeEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
         )
     }
 
     fn make_test_exchange_send_task() -> ExchangeSendTask {
         let mut op = make_test_operator();
-        op.exec_params.fragment_instance_id = types::TUniqueId::new(81, 82);
+        op.fragment_instance_id = UniqueId { hi: 81, lo: 82 };
         op.build_exchange_send_task(
             "127.0.0.1".to_string(),
             9030,
@@ -2401,7 +2290,7 @@ mod tests {
     #[test]
     fn data_stream_sink_accepts_dictionary_for_hash_partition_after_hash_support() {
         let mut op = make_test_operator();
-        op.sink.output_partition.type_ = partitions::TPartitionType::HASH_PARTITIONED;
+        op.input.output_partition_type = partitions::TPartitionType::HASH_PARTITIONED;
         let utf8_dict = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
 
         assert!(op.accepts_encoded_column(SlotId::new(91), &utf8_dict));
@@ -2421,7 +2310,7 @@ mod tests {
     #[test]
     fn zero_byte_pending_chunks_are_tracked_for_force_flush() {
         let mut op = make_test_operator();
-        op.exec_params.destinations = Some(vec![make_test_destination()]);
+        op.input.destinations = vec![make_test_destination()];
 
         op.buffer_chunk(zero_column_chunk_with_rows(1))
             .expect("buffer chunk");

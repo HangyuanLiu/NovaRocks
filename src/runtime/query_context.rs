@@ -420,60 +420,11 @@ fn incremental_change_op_from_thrift(
     let slot = SlotId::try_from(slot_id).map_err(|e| {
         format!("incremental hdfs scan range has invalid __change_op slot_id={slot_id}: {e}")
     })?;
-    extract_change_op_from_extended_columns(-1, hdfs_range, Some(slot))
-}
-
-fn extract_change_op_from_extended_columns(
-    node_id: i32,
-    hdfs_range: &crate::thrift::plan_nodes::THdfsScanRange,
-    change_op_slot: Option<SlotId>,
-) -> Result<Option<i8>, String> {
-    let Some(slot) = change_op_slot else {
-        return Ok(None);
-    };
-    let slot_id = i32::try_from(slot.as_u32()).map_err(|_| {
-        format!("HDFS_SCAN_NODE node_id={node_id} __change_op slot_id={slot} exceeds i32")
-    })?;
-    let context = || format!("HDFS_SCAN_NODE node_id={node_id} __change_op slot_id={slot_id}");
-    let Some(expr) = hdfs_range
-        .extended_columns
-        .as_ref()
-        .and_then(|extended_columns| extended_columns.get(&slot_id))
-    else {
-        return Ok(None);
-    };
-    if expr.nodes.len() != 1 {
-        return Err(format!(
-            "{} expects exactly one INT_LITERAL extended column node, got {}",
-            context(),
-            expr.nodes.len()
-        ));
-    }
-    let node = &expr.nodes[0];
-    if node.node_type != crate::thrift::exprs::TExprNodeType::INT_LITERAL {
-        return Err(format!(
-            "{} expects INT_LITERAL extended column, got {:?}",
-            context(),
-            node.node_type
-        ));
-    }
-    if node.num_children != 0 {
-        return Err(format!(
-            "{} INT_LITERAL extended column expects 0 children, got {}",
-            context(),
-            node.num_children
-        ));
-    }
-    let value = node
-        .int_literal
-        .as_ref()
-        .ok_or_else(|| format!("{} INT_LITERAL missing int payload", context()))?
-        .value;
-    let value = i8::try_from(value)
-        .map_err(|_| format!("{} value {} does not fit in int8", context(), value))?;
-    crate::exec::change_op::validate_change_op_value(value)
-        .map_err(|e| format!("{} invalid value: {e}", context()))?;
-    Ok(Some(value))
+    crate::runtime::change_op::extract_change_op_from_hdfs_range_extended_columns(
+        -1,
+        hdfs_range,
+        Some(slot),
+    )
 }
 
 fn external_datacache_options_from_thrift(

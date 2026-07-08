@@ -37,6 +37,8 @@ pub(crate) mod replay_policy;
 pub(crate) mod schema;
 pub(crate) mod schema_adapter;
 pub(crate) mod schema_change;
+#[cfg(feature = "compat")]
+pub(crate) mod schema_change_compat;
 #[allow(dead_code)]
 pub(crate) mod transactions;
 #[allow(dead_code)]

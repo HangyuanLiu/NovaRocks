@@ -3609,7 +3609,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             scan_tuple_id,
             &resolved,
             pushed_conjuncts.clone(),
-            min_max_predicates,
+            min_max_predicates.clone(),
             change_op_slot,
         )?;
 

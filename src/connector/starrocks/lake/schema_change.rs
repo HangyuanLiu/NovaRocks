@@ -36,7 +36,6 @@ use crate::connector::starrocks::lake::txn_log::{
     parse_default_literal_to_singleton_array, read_txn_log_if_exists, write_txn_log_file,
 };
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
-use crate::exec::expr::ExprArena;
 use crate::formats::starrocks::metadata::{
     collect_delete_predicates, lake_rowset_visibility_version,
 };
@@ -53,8 +52,6 @@ use crate::formats::starrocks::writer::{
     StarRocksWriteFormat, build_single_segment_metadata, build_starrocks_native_segment_bytes,
     build_txn_data_file_name, sort_batch_for_native_write,
 };
-use crate::lower::compat::expr::lower_t_expr;
-use crate::lower::compat::layout::{Layout, normalize_slot_name};
 use crate::runtime::starlet_shard_registry::{self, S3StoreConfig};
 use crate::service::grpc_client::proto::starrocks::{
     CompactionStrategyPb, FlatJsonConfigPb, KeysType, MetadataUpdateInfoPb, PersistentIndexTypePb,
@@ -73,6 +70,26 @@ enum AlterMode {
 
 const ALTER_METADATA_LOAD_MAX_ATTEMPTS: usize = 30;
 const ALTER_METADATA_LOAD_RETRY_INTERVAL_MS: u64 = 100;
+
+#[derive(Clone, Debug)]
+pub(super) struct RollupExprLayout {
+    pub(super) order: Vec<(i32, i32)>,
+    pub(super) index: HashMap<(i32, i32), usize>,
+}
+
+fn normalize_slot_name(name: &str) -> String {
+    let mut s = name.trim();
+    if let Some(rest) = s.strip_prefix('`').and_then(|x| x.strip_suffix('`')) {
+        s = rest;
+    }
+    if let Some((_prefix, last)) = s.rsplit_once('.') {
+        s = last;
+        if let Some(rest) = s.strip_prefix('`').and_then(|x| x.strip_suffix('`')) {
+            s = rest;
+        }
+    }
+    s.to_ascii_lowercase()
+}
 
 pub(crate) fn execute_alter_tablet_task(request: &TAlterTabletReqV2) -> Result<(), String> {
     let alter_mode = validate_schema_change_request(request)?;
@@ -1140,9 +1157,9 @@ fn build_rollup_materialized_param_map(
     Ok(out)
 }
 
-struct RollupExprInput {
-    chunk: Chunk,
-    layout: Layout,
+pub(super) struct RollupExprInput {
+    pub(super) chunk: Chunk,
+    pub(super) layout: RollupExprLayout,
 }
 
 fn build_rollup_expr_input(
@@ -1261,10 +1278,11 @@ fn build_rollup_expr_input(
     let index = order.iter().enumerate().map(|(i, key)| (*key, i)).collect();
     Ok(RollupExprInput {
         chunk,
-        layout: Layout { order, index },
+        layout: RollupExprLayout { order, index },
     })
 }
 
+#[cfg(feature = "compat")]
 fn eval_rollup_expr(
     expr: &crate::thrift::exprs::TExpr,
     eval_input: &RollupExprInput,
@@ -1273,19 +1291,29 @@ fn eval_rollup_expr(
     target_idx: usize,
     target_name: &str,
 ) -> Result<ArrayRef, String> {
-    let mut arena = ExprArena::default();
-    let expr_id = lower_t_expr(expr, &mut arena, &eval_input.layout, None, None).map_err(|e| {
-        format!(
-            "rollup lower expression failed: rowset_idx={} target_index={} target_name={} context={} error={}",
-            rowset_idx, target_idx, target_name, expr_context, e
-        )
-    })?;
-    arena.eval(expr_id, &eval_input.chunk).map_err(|e| {
-        format!(
-            "rollup evaluate expression failed: rowset_idx={} target_index={} target_name={} context={} error={}",
-            rowset_idx, target_idx, target_name, expr_context, e
-        )
-    })
+    super::schema_change_compat::eval_rollup_expr(
+        expr,
+        eval_input,
+        expr_context,
+        rowset_idx,
+        target_idx,
+        target_name,
+    )
+}
+
+#[cfg(not(feature = "compat"))]
+fn eval_rollup_expr(
+    _expr: &crate::thrift::exprs::TExpr,
+    _eval_input: &RollupExprInput,
+    expr_context: &str,
+    rowset_idx: usize,
+    target_idx: usize,
+    target_name: &str,
+) -> Result<ArrayRef, String> {
+    Err(format!(
+        "rollup expression evaluation requires compat feature: rowset_idx={} target_index={} target_name={} context={}",
+        rowset_idx, target_idx, target_name, expr_context
+    ))
 }
 
 fn apply_rollup_where_expr(

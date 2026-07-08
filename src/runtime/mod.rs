@@ -16,6 +16,7 @@
 // under the License.
 pub mod backend_id;
 pub mod backend_registry;
+pub(crate) mod change_op;
 pub(crate) mod coordinator;
 pub(crate) mod descriptor_snapshot;
 pub(crate) mod descriptor_snapshot_thrift;

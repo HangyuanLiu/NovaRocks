@@ -27,15 +27,14 @@ use crate::common::types::UniqueId;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
 use crate::exec::operators::{
-    DataStreamSinkFactory, IcebergChangeStreamRouterSinkFactory, IcebergTableSinkFactory,
-    MultiCastDataStreamSinkFactory, NoopSinkFactory, ResultBufferSinkFactory,
+    DataStreamSinkFactory, DataStreamSinkFactoryInput, IcebergChangeStreamRouterBranchFactoryInput,
+    IcebergChangeStreamRouterSinkFactory, IcebergChangeStreamRouterSinkFactoryInput,
+    IcebergTableSinkFactory, MultiCastDataStreamSinkFactory, NoopSinkFactory,
+    ResultBufferSinkFactory,
 };
 use crate::exec::pipeline::executor::execute_plan_with_pipeline;
 use crate::lower::common::fragment_runtime::{
     RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
-};
-use crate::runtime::exec_params::{
-    build_sink_exec_params_without_scan_ranges, fragment_destination_to_thrift,
 };
 use crate::runtime::fragment_output::FragmentOutput;
 use crate::runtime::mem_tracker::MemTracker;
@@ -171,6 +170,57 @@ fn query_id_from_native(src: &proto::common::UniqueId) -> QueryId {
     }
 }
 
+fn fragment_instance_id_from_native_params(
+    params: &proto::novarocks::InstanceParams,
+) -> Result<UniqueId, String> {
+    params
+        .fragment_instance_id
+        .as_ref()
+        .ok_or_else(|| "native InstanceParams missing fragment_instance_id".to_string())
+        .map(unique_id_from_native)
+}
+
+fn data_stream_input_from_native(
+    stream: &proto::plan::DataStreamSink,
+    destinations: Vec<crate::runtime::endpoint::FragmentDestination>,
+    partition_exprs: Vec<crate::exec::expr::ExprId>,
+) -> Result<DataStreamSinkFactoryInput, String> {
+    let partition = stream
+        .output_partition
+        .as_ref()
+        .ok_or_else(|| "native DATA_STREAM_SINK missing output_partition".to_string())?;
+    let partition_type = native_wire::data_partition_without_exprs(partition)?.type_;
+    DataStreamSinkFactoryInput::try_new(
+        stream.dest_node_id,
+        partition_type,
+        Vec::new(),
+        partition_exprs,
+        stream.output_columns.clone(),
+        destinations,
+    )
+}
+
+fn lower_stream_partition_exprs_from_native(
+    partition: &proto::plan::DataPartition,
+    partition_arena: &mut ExprArena,
+    layout: &super::layout::Layout,
+    context: impl Fn(usize) -> String,
+) -> Result<Vec<crate::exec::expr::ExprId>, String> {
+    let partition_type = native_wire::data_partition_without_exprs(partition)?.type_;
+    if !DataStreamSinkFactoryInput::partition_type_requires_exprs(partition_type) {
+        return Ok(Vec::new());
+    }
+    partition
+        .exprs
+        .iter()
+        .enumerate()
+        .map(|(idx, expr)| {
+            lower_proto_expr(expr, partition_arena, layout)
+                .map_err(|err| format!("{}: {err}", context(idx)))
+        })
+        .collect()
+}
+
 fn node_context_from_instance_params(
     instance_params: &proto::novarocks::InstanceParams,
     query_options: Option<QueryOptions>,
@@ -267,90 +317,86 @@ fn sink_factory_from_native(
         }
         proto::plan::data_sink::Kind::DataStream(stream) => {
             let mut partition_arena = ExprArena::default();
-            let partition_exprs = stream
+            let partition = stream
                 .output_partition
                 .as_ref()
-                .ok_or_else(|| "native DATA_STREAM_SINK missing output_partition".to_string())?
-                .exprs
-                .iter()
-                .enumerate()
-                .map(|(idx, expr)| {
-                    lower_proto_expr(expr, &mut partition_arena, layout).map_err(|err| {
-                        format!("native DATA_STREAM_SINK partition expr[{idx}]: {err}")
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let stream_sink = native_wire::data_stream_sink_from_native(stream)?;
+                .ok_or_else(|| "native DATA_STREAM_SINK missing output_partition".to_string())?;
+            let partition_exprs = lower_stream_partition_exprs_from_native(
+                partition,
+                &mut partition_arena,
+                layout,
+                |idx| format!("native DATA_STREAM_SINK partition expr[{idx}]"),
+            )?;
             let destinations =
                 native_wire::destinations_from_native(&instance_params.destinations)?;
-            let exec_params = build_sink_exec_params_without_scan_ranges(
-                &native_wire::exec_params_from_native(instance_params, destinations)?,
-            );
+            let sink_input = data_stream_input_from_native(stream, destinations, partition_exprs)?;
+            let fragment_instance_id = fragment_instance_id_from_native_params(instance_params)?;
             let root_plan_node_id = fragment
                 .root
                 .as_ref()
                 .map(|node| node.node_id)
                 .unwrap_or(-1);
-            Ok(Box::new(
-                DataStreamSinkFactory::new_with_pre_lowered_partition(
-                    stream_sink,
-                    exec_params,
-                    root_plan_node_id,
-                    partition_arena,
-                    partition_exprs,
-                    None,
-                    None,
-                ),
-            ))
+            Ok(Box::new(DataStreamSinkFactory::new(
+                sink_input,
+                fragment_instance_id,
+                None,
+                root_plan_node_id,
+                partition_arena,
+            )))
         }
         proto::plan::data_sink::Kind::MultiCastDataStream(multi_cast) => {
-            let pre_lowered_partitions = multi_cast
+            if multi_cast.sinks.len() != multi_cast.destinations.len() {
+                return Err(format!(
+                    "native MULTI_CAST_DATA_STREAM_SINK sinks size {} != destinations size {}",
+                    multi_cast.sinks.len(),
+                    multi_cast.destinations.len()
+                ));
+            }
+            let mut partition_arena = ExprArena::default();
+            let sink_inputs = multi_cast
                 .sinks
                 .iter()
+                .zip(multi_cast.destinations.iter())
                 .enumerate()
-                .map(|(sink_idx, stream)| {
-                    let mut partition_arena = ExprArena::default();
-                    let partition_exprs = stream
+                .map(|(sink_idx, (stream, destinations))| {
+                    let partition = stream
                         .output_partition
                         .as_ref()
                         .ok_or_else(|| {
                             format!(
                                 "native MULTI_CAST_DATA_STREAM_SINK sink[{sink_idx}] missing output_partition"
                             )
-                        })?
-                        .exprs
-                        .iter()
-                        .enumerate()
-                        .map(|(expr_idx, expr)| {
-                            lower_proto_expr(expr, &mut partition_arena, layout).map_err(|err| {
-                                format!(
-                                    "native MULTI_CAST_DATA_STREAM_SINK sink[{sink_idx}] partition expr[{expr_idx}]: {err}"
-                                )
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    Ok((partition_arena, partition_exprs))
+                        })?;
+                    let partition_exprs = lower_stream_partition_exprs_from_native(
+                        partition,
+                        &mut partition_arena,
+                        layout,
+                        |expr_idx| {
+                            format!(
+                                "native MULTI_CAST_DATA_STREAM_SINK sink[{sink_idx}] partition expr[{expr_idx}]"
+                            )
+                        },
+                    )?;
+                    let destinations = native_wire::stream_destinations_from_native(destinations)?;
+                    Ok((
+                        data_stream_input_from_native(stream, destinations, partition_exprs)?,
+                        stream.limit,
+                    ))
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            let multi_cast_sink = native_wire::multi_cast_data_stream_sink_from_native(multi_cast)?;
-            let exec_params = build_sink_exec_params_without_scan_ranges(
-                &native_wire::exec_params_from_native(instance_params, Vec::new())?,
-            );
+            let fragment_instance_id = fragment_instance_id_from_native_params(instance_params)?;
             let root_plan_node_id = fragment
                 .root
                 .as_ref()
                 .map(|node| node.node_id)
                 .unwrap_or(-1);
-            Ok(Box::new(
-                MultiCastDataStreamSinkFactory::new_with_pre_lowered_partitions(
-                    multi_cast_sink,
-                    exec_params,
-                    pre_lowered_partitions,
-                    root_plan_node_id,
-                    None,
-                    None,
-                ),
-            ))
+            Ok(Box::new(MultiCastDataStreamSinkFactory::new(
+                sink_inputs,
+                fragment_instance_id,
+                None,
+                partition_arena,
+                root_plan_node_id,
+            )))
         }
         proto::plan::data_sink::Kind::IcebergWrite(iceberg) => {
             let (sink_input, _sink_mode) = super::sink::lower_iceberg_write_sink_factory_input(
@@ -362,31 +408,26 @@ fn sink_factory_from_native(
             Ok(Box::new(IcebergTableSinkFactory::try_new(sink_input)?))
         }
         proto::plan::data_sink::Kind::IcebergChangeStreamRouter(router) => {
-            let (router_sink, pre_lowered_partitions) =
+            let (router_input, partition_arena) =
                 lower_iceberg_change_stream_router_sink_from_native(
                     router,
                     &fragment.output_exprs,
                     &fragment.output_columns,
                     layout,
                 )?;
-            let exec_params = build_sink_exec_params_without_scan_ranges(
-                &native_wire::exec_params_from_native(instance_params, Vec::new())?,
-            );
+            let fragment_instance_id = fragment_instance_id_from_native_params(instance_params)?;
             let root_plan_node_id = fragment
                 .root
                 .as_ref()
                 .map(|node| node.node_id)
                 .unwrap_or(-1);
-            Ok(Box::new(
-                IcebergChangeStreamRouterSinkFactory::try_new_with_pre_lowered_partitions(
-                    router_sink,
-                    exec_params,
-                    pre_lowered_partitions,
-                    root_plan_node_id,
-                    None,
-                    None,
-                )?,
-            ))
+            Ok(Box::new(IcebergChangeStreamRouterSinkFactory::try_new(
+                router_input,
+                fragment_instance_id,
+                None,
+                partition_arena,
+                root_plan_node_id,
+            )?))
         }
     }
 }
@@ -396,13 +437,7 @@ fn lower_iceberg_change_stream_router_sink_from_native(
     output_exprs: &[proto::expr::Expr],
     output_columns: &[proto::common::OutputColumn],
     layout: &super::layout::Layout,
-) -> Result<
-    (
-        native_wire::IcebergChangeStreamRouterSink,
-        Vec<(ExprArena, Vec<crate::exec::expr::ExprId>)>,
-    ),
-    String,
-> {
+) -> Result<(IcebergChangeStreamRouterSinkFactoryInput, ExprArena), String> {
     let change_op_slot_id =
         output_slot_id_for_ordinal(output_columns, router.change_op_output_ordinal, "change_op")?;
     let data_route_slot_id = router
@@ -410,22 +445,19 @@ fn lower_iceberg_change_stream_router_sink_from_native(
         .map(|ordinal| output_slot_id_for_ordinal(output_columns, ordinal, "data_route"))
         .transpose()?;
     let mut branches = Vec::with_capacity(router.branches.len());
-    let mut pre_lowered_partitions = Vec::with_capacity(router.branches.len());
+    let mut partition_arena = ExprArena::default();
     for (branch_idx, branch) in router.branches.iter().enumerate() {
         let partition = branch_partition_from_native(branch, output_exprs)?;
-        let mut partition_arena = ExprArena::default();
-        let partition_exprs = partition
-            .exprs
-            .iter()
-            .enumerate()
-            .map(|(expr_idx, expr)| {
-                lower_proto_expr(expr, &mut partition_arena, layout).map_err(|err| {
-                    format!(
-                        "native ICEBERG_CHANGE_STREAM_ROUTER_SINK branch[{branch_idx}] partition expr[{expr_idx}]: {err}"
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let partition_exprs = lower_stream_partition_exprs_from_native(
+            &partition,
+            &mut partition_arena,
+            layout,
+            |expr_idx| {
+                format!(
+                    "native ICEBERG_CHANGE_STREAM_ROUTER_SINK branch[{branch_idx}] partition expr[{expr_idx}]"
+                )
+            },
+        )?;
         let output_columns = branch
             .output_ordinals
             .iter()
@@ -437,15 +469,6 @@ fn lower_iceberg_change_stream_router_sink_from_native(
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let stream_sink = native_wire::DataStreamSink::new(
-            branch.target_exchange_node_id,
-            native_wire::data_partition_without_exprs(&partition)?,
-            None::<bool>,
-            None::<bool>,
-            None::<i32>,
-            Some(output_columns),
-            None::<i64>,
-        );
         let destinations = branch
             .destinations
             .as_ref()
@@ -455,25 +478,46 @@ fn lower_iceberg_change_stream_router_sink_from_native(
                 )
             })
             .and_then(native_wire::stream_destinations_from_native)?;
-        let branch_destinations = destinations
-            .into_iter()
-            .map(fragment_destination_to_thrift)
-            .collect();
-        branches.push(native_wire::IcebergChangeStreamRouterBranch::new(
-            branch.branch_id,
-            native_wire::iceberg_change_stream_branch_kind_from_native(branch.branch_kind)?,
-            stream_sink,
-            branch_destinations,
-        ));
-        pre_lowered_partitions.push((partition_arena, partition_exprs));
+        let branch_kind = match proto::plan::ChangeStreamBranchKind::try_from(branch.branch_kind)
+            .map_err(|_| {
+                format!(
+                    "unknown native ChangeStreamBranchKind value {}",
+                    branch.branch_kind
+                )
+            })? {
+            proto::plan::ChangeStreamBranchKind::DeleteDv => {
+                crate::sql::common::ChangeStreamBranchKind::DeleteDv
+            }
+            proto::plan::ChangeStreamBranchKind::ReuseData => {
+                crate::sql::common::ChangeStreamBranchKind::ReuseData
+            }
+            proto::plan::ChangeStreamBranchKind::FreshData => {
+                crate::sql::common::ChangeStreamBranchKind::FreshData
+            }
+            proto::plan::ChangeStreamBranchKind::Unspecified => {
+                return Err("native ChangeStreamBranchKind is unspecified".to_string());
+            }
+        };
+        branches.push(IcebergChangeStreamRouterBranchFactoryInput {
+            branch_id: branch.branch_id,
+            branch_kind,
+            stream_sink: DataStreamSinkFactoryInput::try_new(
+                branch.target_exchange_node_id,
+                native_wire::data_partition_without_exprs(&partition)?.type_,
+                Vec::new(),
+                partition_exprs,
+                output_columns,
+                destinations,
+            )?,
+        });
     }
     Ok((
-        native_wire::IcebergChangeStreamRouterSink::new(
+        IcebergChangeStreamRouterSinkFactoryInput {
             change_op_slot_id,
             data_route_slot_id,
             branches,
-        ),
-        pre_lowered_partitions,
+        },
+        partition_arena,
     ))
 }
 
@@ -591,6 +635,13 @@ mod tests {
         plan::DataPartition {
             kind: plan::PartitionKind::Unpartitioned as i32,
             exprs: Vec::new(),
+        }
+    }
+
+    fn random_partition_with_unlowerable_expr() -> plan::DataPartition {
+        plan::DataPartition {
+            kind: plan::PartitionKind::Random as i32,
+            exprs: vec![crate::proto::expr::Expr::default()],
         }
     }
 
@@ -792,6 +843,28 @@ mod tests {
         let params = instance_params_with_destination();
 
         assert_sink_factory_available(&fragment, &params, "DATA_STREAM_SINK");
+    }
+
+    #[test]
+    fn native_random_stream_partition_exprs_are_not_lowered() {
+        let mut fragment = data_stream_sink_fragment();
+        let sink = fragment.sink.as_mut().expect("fragment sink");
+        let Some(plan::data_sink::Kind::DataStream(stream)) =
+            sink.kind.as_mut().map(|kind| match kind {
+                plan::data_sink::Kind::DataStream(stream) => {
+                    plan::data_sink::Kind::DataStream(stream.clone())
+                }
+                other => other.clone(),
+            })
+        else {
+            panic!("expected data stream sink");
+        };
+        let mut stream = stream;
+        stream.output_partition = Some(random_partition_with_unlowerable_expr());
+        sink.kind = Some(plan::data_sink::Kind::DataStream(stream));
+        let params = instance_params_with_destination();
+
+        assert_sink_factory_available(&fragment, &params, "RANDOM DATA_STREAM_SINK");
     }
 
     #[test]

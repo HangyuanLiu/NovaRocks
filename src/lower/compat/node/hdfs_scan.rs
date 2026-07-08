@@ -37,7 +37,6 @@ use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::formats::parquet::{
     ParquetReadCachePolicy, ParquetSlotKind, VariantPathPruningPredicate, VariantPathSpec,
 };
-use crate::lower::compat::expr::parse_min_max_conjuncts_with_column_resolver;
 use crate::lower::compat::layout::{Layout, layout_from_slot_ids};
 use crate::lower::compat::node::decode::{QueryGlobalDictMap, build_scan_query_global_dicts};
 use crate::lower::compat::node::{Lowered, local_rf_waiting_set};
@@ -359,59 +358,6 @@ where
     let mut cfg = credentials.to_object_store_config();
     crate::fs::object_store::apply_object_store_runtime_defaults(&mut cfg);
     Ok(Some(cfg))
-}
-
-pub(crate) fn extract_change_op_from_extended_columns(
-    node_id: i32,
-    hdfs_range: &plan_nodes::THdfsScanRange,
-    change_op_slot: Option<SlotId>,
-) -> Result<Option<i8>, String> {
-    let Some(slot) = change_op_slot else {
-        return Ok(None);
-    };
-    let slot_id = i32::try_from(slot.as_u32()).map_err(|_| {
-        format!("HDFS_SCAN_NODE node_id={node_id} __change_op slot_id={slot} exceeds i32")
-    })?;
-    let context = || format!("HDFS_SCAN_NODE node_id={node_id} __change_op slot_id={slot_id}");
-    let Some(expr) = hdfs_range
-        .extended_columns
-        .as_ref()
-        .and_then(|extended_columns| extended_columns.get(&slot_id))
-    else {
-        return Ok(None);
-    };
-    if expr.nodes.len() != 1 {
-        return Err(format!(
-            "{} expects exactly one INT_LITERAL extended column node, got {}",
-            context(),
-            expr.nodes.len()
-        ));
-    }
-    let node = &expr.nodes[0];
-    if node.node_type != crate::thrift::exprs::TExprNodeType::INT_LITERAL {
-        return Err(format!(
-            "{} expects INT_LITERAL extended column, got {:?}",
-            context(),
-            node.node_type
-        ));
-    }
-    if node.num_children != 0 {
-        return Err(format!(
-            "{} INT_LITERAL extended column expects 0 children, got {}",
-            context(),
-            node.num_children
-        ));
-    }
-    let value = node
-        .int_literal
-        .as_ref()
-        .ok_or_else(|| format!("{} INT_LITERAL missing int payload", context()))?
-        .value;
-    let value = i8::try_from(value)
-        .map_err(|_| format!("{} value {} does not fit in int8", context(), value))?;
-    crate::exec::change_op::validate_change_op_value(value)
-        .map_err(|e| format!("{} invalid value: {e}", context()))?;
-    Ok(Some(value))
 }
 
 fn validate_included_positions_full_file_range(
@@ -851,24 +797,27 @@ fn parse_hdfs_scan_pruning_predicates(
     let mut predicates = HdfsScanPruningPredicates::default();
 
     for conjunct in min_max_conjuncts {
-        let parsed = parse_min_max_conjuncts_with_column_resolver(conjunct, |slot_ref| {
-            let slot_id = SlotId::try_from(slot_ref.slot_id).map_err(|e| {
-                format!(
-                    "HDFS_SCAN_NODE node_id={node_id} min_max_conjunct slot_ref has invalid slot_id={}: {e}",
-                    slot_ref.slot_id
-                )
-            })?;
-            if variant_by_output.contains_key(&slot_id) {
-                return Ok(format!("variant:{}", slot_id.as_u32()));
-            }
+        let parsed = crate::lower::common::min_max::parse_min_max_conjuncts_with_column_resolver(
+            conjunct,
+            |slot_ref| {
+                let slot_id = SlotId::try_from(slot_ref.slot_id).map_err(|e| {
+                        format!(
+                            "HDFS_SCAN_NODE node_id={node_id} min_max_conjunct slot_ref has invalid slot_id={}: {e}",
+                            slot_ref.slot_id
+                        )
+                    })?;
+                if variant_by_output.contains_key(&slot_id) {
+                    return Ok(format!("variant:{}", slot_id.as_u32()));
+                }
 
-            let key = (slot_ref.tuple_id, slot_ref.slot_id);
-            let idx = out_layout
-                .index
-                .get(&key)
-                .ok_or_else(|| format!("slot not found in layout: {:?}", key))?;
-            Ok(idx.to_string())
-        })?;
+                let key = (slot_ref.tuple_id, slot_ref.slot_id);
+                let idx = out_layout
+                    .index
+                    .get(&key)
+                    .ok_or_else(|| format!("slot not found in layout: {:?}", key))?;
+                Ok(idx.to_string())
+            },
+        )?;
 
         for predicate in parsed {
             let Some(slot_text) = predicate.column().strip_prefix("variant:") else {
@@ -1519,11 +1468,12 @@ pub(crate) fn lower_hdfs_scan_node(
         // None, which is acceptable: the incremental morsel builder also
         // produces None for FE-driven ranges (see build_incremental_morsels).
         let data_sequence_number = hdfs_range.data_sequence_number;
-        let ivm_change_op = extract_change_op_from_extended_columns(
-            node.node_id,
-            hdfs_range,
-            iceberg_virtual_change_op_slot,
-        )?;
+        let ivm_change_op =
+            crate::runtime::change_op::extract_change_op_from_hdfs_range_extended_columns(
+                node.node_id,
+                hdfs_range,
+                iceberg_virtual_change_op_slot,
+            )?;
         if iceberg_virtual_change_op_slot.is_some() && ivm_change_op.is_none() {
             return Err(format!(
                 "HDFS_SCAN_NODE node_id={} __change_op virtual slot requires every scan range to carry extended_columns",
@@ -1936,11 +1886,10 @@ mod tests {
     use super::{
         DescriptorLogicalType, HdfsScanReadColumns, HdfsSlotInfo, apply_row_position_pruning_gate,
         build_hdfs_slot_info_map, build_topn_filter_column_map, descriptor_snapshot_from_thrift,
-        extract_change_op_from_extended_columns, file_cache_flags_from_query_options,
-        iceberg_file_pruning_from_hdfs_range, parse_hdfs_scan_pruning_predicates,
-        parse_hdfs_scan_variant_path_columns, resolve_cloud_object_store_config,
-        scan_ranges_have_position_delete_files, validate_included_positions_full_file_range,
-        variant_path_ensure_source_read_columns,
+        file_cache_flags_from_query_options, iceberg_file_pruning_from_hdfs_range,
+        parse_hdfs_scan_pruning_predicates, parse_hdfs_scan_variant_path_columns,
+        resolve_cloud_object_store_config, scan_ranges_have_position_delete_files,
+        validate_included_positions_full_file_range, variant_path_ensure_source_read_columns,
     };
 
     #[test]
@@ -3029,8 +2978,12 @@ mod tests {
         let mut range = plan_nodes::THdfsScanRange::default();
         range.extended_columns = Some(BTreeMap::from([(9, int_expr(-1))]));
 
-        let value =
-            extract_change_op_from_extended_columns(7, &range, Some(SlotId::new(9))).unwrap();
+        let value = crate::runtime::change_op::extract_change_op_from_hdfs_range_extended_columns(
+            7,
+            &range,
+            Some(SlotId::new(9)),
+        )
+        .unwrap();
 
         assert_eq!(value, Some(-1));
     }
@@ -3039,8 +2992,12 @@ mod tests {
     fn extract_change_op_ignores_missing_extended_columns_entry() {
         let range = plan_nodes::THdfsScanRange::default();
 
-        let value =
-            extract_change_op_from_extended_columns(7, &range, Some(SlotId::new(9))).unwrap();
+        let value = crate::runtime::change_op::extract_change_op_from_hdfs_range_extended_columns(
+            7,
+            &range,
+            Some(SlotId::new(9)),
+        )
+        .unwrap();
 
         assert_eq!(value, None);
     }
@@ -3073,8 +3030,12 @@ mod tests {
         let mut range = plan_nodes::THdfsScanRange::default();
         range.extended_columns = Some(BTreeMap::from([(9, expr)]));
 
-        let error =
-            extract_change_op_from_extended_columns(7, &range, Some(SlotId::new(9))).unwrap_err();
+        let error = crate::runtime::change_op::extract_change_op_from_hdfs_range_extended_columns(
+            7,
+            &range,
+            Some(SlotId::new(9)),
+        )
+        .unwrap_err();
 
         assert!(error.contains("exactly one INT_LITERAL"));
         assert!(error.contains("got 2"));
@@ -3087,8 +3048,12 @@ mod tests {
         let mut range = plan_nodes::THdfsScanRange::default();
         range.extended_columns = Some(BTreeMap::from([(9, expr)]));
 
-        let error =
-            extract_change_op_from_extended_columns(7, &range, Some(SlotId::new(9))).unwrap_err();
+        let error = crate::runtime::change_op::extract_change_op_from_hdfs_range_extended_columns(
+            7,
+            &range,
+            Some(SlotId::new(9)),
+        )
+        .unwrap_err();
 
         assert!(error.contains("expects 0 children"));
         assert!(error.contains("got 1"));
