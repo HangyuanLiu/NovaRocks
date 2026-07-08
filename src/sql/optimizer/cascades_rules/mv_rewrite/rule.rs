@@ -161,6 +161,20 @@ fn try_rewrite(
     //    unchanged; multi-table requires exact table-set + equi-edge-set
     //    structural equality (self-justifying, no PK/FK proof needed).
     join_graph_matches(query, &cand.mv)?;
+
+    // 1b. Fail open on a multi-table *SPJ* (no-aggregate) query. `from_memo`'s
+    //     no-aggregate arm derives `outputs` from the driving scan only, so a
+    //     matched Filter(Join)/Join query silently omits join-input columns
+    //     (e.g. `c.v` in `SELECT o.k, c.v FROM o JOIN c ... WHERE ...`); the SPJ
+    //     arm below would then emit a schema-short rewrite into a group whose
+    //     true schema includes those columns — an unsound, column-dropping
+    //     alternative. Multi-table SPJ *queries* are out of v1 scope (the
+    //     target is aggregate SPJG); run the original query instead. Aggregate
+    //     multi-table queries are unaffected: their `outputs` come from the
+    //     complete aggregate output layout, not the driving scan.
+    if query.joins.is_some() && matches!(shape, MatchedShape::Spj) {
+        return None;
+    }
     let q_names = query.base_name_of();
     let m_names = cand.mv.base_name_of();
 
@@ -1498,7 +1512,7 @@ mod tests {
         let rule = MvRewriteRule::new(vec![candidate]);
         assert!(
             rule.apply(&root_expr, &mut memo).is_empty(),
-            "multi-table MV descriptor must not rewrite before join matching exists"
+            "multi-table MV descriptor must not rewrite against a single-table query (asymmetric join shape -> fail open)"
         );
     }
 
@@ -1720,6 +1734,79 @@ mod tests {
         assert!(
             rule.apply(&root_expr, &mut memo).is_empty(),
             "table-set mismatch (t2 vs t3) must fail open"
+        );
+    }
+
+    #[test]
+    fn multitable_spj_query_fails_open_never_drops_join_columns() {
+        // A multi-table *SPJ* (no-aggregate) query is out of v1 scope: `from_memo`'s
+        // no-aggregate arm derives `outputs` from the driving scan only, so without
+        // the `try_rewrite` fail-open guard the (Spj, None) arm would emit a rewrite
+        // reproducing only the driving columns and silently DROP every join-input
+        // column (here t2.c) — a schema-short, unsound alternative inserted into a
+        // group whose true schema includes c. The guard must make this fail open.
+        //
+        // Load-bearing: query and MV both have the SPJ shape below, so join_graph_matches
+        // passes and (without the guard) the (Spj, None) arm produces exactly one such
+        // rewrite. The assertion therefore fails if the guard is ever removed.
+        //
+        // Query: Filter(a >= 5, t1[a,v] JOIN t2[c] ON a = c). Shape = SPJ, multi-table.
+        let a = col(1, "a");
+        let v = col(2, "v");
+        let c = col(3, "c");
+        let query_plan = LogicalPlanNode::new(
+            LogicalPlanKind::Filter(LogicalFilterNode {
+                predicate: ge(col_ref(&a), 5),
+            }),
+            vec![join_plan(
+                crate::sql::common::expr::JoinKind::Inner,
+                base_scan_named("t1", &[a.clone(), v.clone()]),
+                base_scan_named("t2", std::slice::from_ref(&c)),
+                Some(eq(col_ref(&a), col_ref(&c))),
+            )],
+            None,
+        );
+
+        let mut memo = Memo::new();
+        let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
+        advance_factory(&mut memo, 200);
+        let root_expr = memo.groups[root].logical_exprs[0].clone();
+
+        // MV: the identical SPJ join shape (aggregate = None), whose from_opt_expr
+        // outputs include the join-input column c (commit 7d0377f88).
+        let mv_a = col(100, "a");
+        let mv_v = col(102, "v");
+        let mv_c = col(103, "c");
+        let mv_plan = LogicalPlanNode::new(
+            LogicalPlanKind::Filter(LogicalFilterNode {
+                predicate: ge(col_ref(&mv_a), 5),
+            }),
+            vec![join_plan(
+                crate::sql::common::expr::JoinKind::Inner,
+                base_scan_named("t1", &[mv_a.clone(), mv_v.clone()]),
+                base_scan_named("t2", std::slice::from_ref(&mv_c)),
+                Some(eq(col_ref(&mv_a), col_ref(&mv_c))),
+            )],
+            None,
+        );
+        let (mv, mv_scalars) = spjg_descriptor_for_test(&mv_plan);
+        assert!(
+            mv.joins.is_some() && mv.aggregate.is_none(),
+            "fixture precondition: MV must be a multi-table SPJ descriptor"
+        );
+        let candidate = MvRewriteCandidate {
+            mv_name: "spj_join_mv".to_string(),
+            mv,
+            mv_scalars,
+            target_database: "ns".to_string(),
+            target_table: iceberg_table("cat", "ns", "spj_join_mv", &["a", "v", "c"]),
+            target_stats_ref: stats_ref_for_test(712),
+        };
+
+        let rule = MvRewriteRule::new(vec![candidate]);
+        assert!(
+            rule.apply(&root_expr, &mut memo).is_empty(),
+            "multi-table SPJ query must fail open (never emit a join-column-dropping rewrite)"
         );
     }
 

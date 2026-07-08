@@ -134,8 +134,15 @@ pub(crate) struct SpjgDescriptor {
 fn iceberg_fqn(table: &TableDef) -> Option<String> {
     use crate::sql::catalog::ScanSource;
     match &table.source {
+        // Separate the three identity components with `\u{1}` (a control char
+        // no SQL identifier can contain) rather than `.`, so a multi-level
+        // (dot-joined) namespace can never make two distinct tables collapse to
+        // the same key — e.g. `{ns:"a.b", tbl:"t"}` vs `{ns:"a", tbl:"b.t"}`.
+        // This matches the field-wise identity `rule::same_iceberg_table` uses
+        // and the `\u{1}` care `qualified_key` already takes for columns. The
+        // key is internal-only (matching/self-join detection), never serialized.
         ScanSource::IcebergDataFiles { table: info, .. } => Some(format!(
-            "{}.{}.{}",
+            "{}\u{1}{}\u{1}{}",
             info.catalog, info.namespace, info.table
         )),
         _ => None,
