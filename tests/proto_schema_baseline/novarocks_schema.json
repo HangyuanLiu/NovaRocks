@@ -858,7 +858,7 @@
             "1": {
               "number": 1,
               "name": "params",
-              "type_name": "string",
+              "type_name": "LambdaParam",
               "label": "repeated",
               "oneof": null
             },
@@ -866,6 +866,40 @@
               "number": 2,
               "name": "body",
               "type_name": "Expr",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "LambdaParam": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "slot_id",
+              "type_name": "int32",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "name",
+              "type_name": "string",
+              "label": "optional",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "type",
+              "type_name": "novarocks.common.TypeDesc",
+              "label": "singular",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "nullable",
+              "type_name": "bool",
               "label": "singular",
               "oneof": null
             }
@@ -6166,6 +6200,13 @@
               "number": 1,
               "name": "ack_sequence",
               "type_name": "int64",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "status",
+              "type_name": "novarocks.common.Status",
               "label": "singular",
               "oneof": null
             }

@@ -152,27 +152,17 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                     }
                 };
 
-                let params = proto::starrocks::PTransmitChunkParams {
-                    finst_id: Some(proto::starrocks::PUniqueId {
-                        hi: req.finst_id_hi,
-                        lo: req.finst_id_lo,
-                    }),
-                    node_id: Some(req.node_id),
-                    sender_id: Some(req.sender_id),
-                    be_number: Some(req.be_number),
-                    eos: Some(req.eos),
-                    sequence: Some(req.sequence),
-                    chunks: vec![proto::starrocks::ChunkPb {
-                        data: Some(req.payload),
-                        data_size: Some(0),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                };
+                let finst_id_hi = req.finst_id_hi;
+                let finst_id_lo = req.finst_id_lo;
+                let node_id = req.node_id;
+                let sender_id = req.sender_id;
+                let be_number = req.be_number;
+                let eos = req.eos;
+                let sequence = req.sequence;
                 // handle_transmit_chunk includes Arrow IPC decoding which is CPU-intensive.
                 // Offload to the blocking thread pool so async worker threads stay free for I/O.
                 let result = match tokio::task::spawn_blocking(move || {
-                    internal_rpc::handle_transmit_chunk(params)
+                    internal_rpc::handle_transmit_chunk(req)
                 })
                 .await
                 {
@@ -186,39 +176,32 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                         break;
                     }
                 };
-                if let Some(status) = result.status.as_ref()
-                    && status.status_code != 0
-                {
-                    let _ = tx
-                        .send(Err(tonic::Status::internal(status.error_msgs.join("; "))))
-                        .await;
-                    break;
-                }
-
-                let ack = proto::novarocks::ExchangeResponse {
-                    ack_sequence: req.sequence,
-                };
+                let ack = result;
+                let handler_failed = ack.status.as_ref().is_some_and(|status| status.code != 0);
                 debug!(
                     "exchange ack SEND: finst={} node_id={} sender_id={} be_number={} eos={} seq={}",
-                    format_uuid(req.finst_id_hi, req.finst_id_lo),
-                    req.node_id,
-                    req.sender_id,
-                    req.be_number,
-                    req.eos,
-                    req.sequence
+                    format_uuid(finst_id_hi, finst_id_lo),
+                    node_id,
+                    sender_id,
+                    be_number,
+                    eos,
+                    sequence
                 );
 
                 if tx.send(Ok(ack)).await.is_err() {
                     break;
                 }
+                if handler_failed {
+                    break;
+                }
                 debug!(
                     "exchange ack SENT: finst={} node_id={} sender_id={} be_number={} eos={} seq={}",
-                    format_uuid(req.finst_id_hi, req.finst_id_lo),
-                    req.node_id,
-                    req.sender_id,
-                    req.be_number,
-                    req.eos,
-                    req.sequence
+                    format_uuid(finst_id_hi, finst_id_lo),
+                    node_id,
+                    sender_id,
+                    be_number,
+                    eos,
+                    sequence
                 );
             }
         });
@@ -232,37 +215,12 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
     ) -> Result<tonic::Response<proto::novarocks::ExchangeResponse>, tonic::Status> {
         self.require_local_execution("ExchangeUnary")?;
         let req = request.into_inner();
-        let params = proto::starrocks::PTransmitChunkParams {
-            finst_id: Some(proto::starrocks::PUniqueId {
-                hi: req.finst_id_hi,
-                lo: req.finst_id_lo,
-            }),
-            node_id: Some(req.node_id),
-            sender_id: Some(req.sender_id),
-            be_number: Some(req.be_number),
-            eos: Some(req.eos),
-            sequence: Some(req.sequence),
-            chunks: vec![proto::starrocks::ChunkPb {
-                data: Some(req.payload),
-                data_size: Some(0),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let result =
-            tokio::task::spawn_blocking(move || internal_rpc::handle_transmit_chunk(params))
-                .await
-                .map_err(|e| {
-                    tonic::Status::internal(format!("exchange_unary handler panicked: {e}"))
-                })?;
-        if let Some(status) = result.status.as_ref()
-            && status.status_code != 0
-        {
-            return Err(tonic::Status::internal(status.error_msgs.join("; ")));
-        }
-        Ok(tonic::Response::new(proto::novarocks::ExchangeResponse {
-            ack_sequence: req.sequence,
-        }))
+        let result = tokio::task::spawn_blocking(move || internal_rpc::handle_transmit_chunk(req))
+            .await
+            .map_err(|e| {
+                tonic::Status::internal(format!("exchange_unary handler panicked: {e}"))
+            })?;
+        Ok(tonic::Response::new(result))
     }
 
     async fn transmit_runtime_filter(
@@ -1412,9 +1370,9 @@ mod pr3_tests {
     use super::proto::novarocks::fetch_result_response::Status as FetchStatus;
     use super::proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc as _;
     use super::proto::novarocks::{
-        CancelFragmentRequest, ExecStatusReport, FetchResultRequest, HeartbeatRequest,
-        IcebergCommitInfo, IcebergDataFile, IcebergFileContent, ReportExecStatusRequest,
-        SubmitFragmentRequest,
+        CancelFragmentRequest, ExchangeRequest, ExecStatusReport, FetchResultRequest,
+        HeartbeatRequest, IcebergCommitInfo, IcebergDataFile, IcebergFileContent,
+        ReportExecStatusRequest, SubmitFragmentRequest,
     };
     use super::proto::{novarocks, plan};
     use crate::thrift::types;
@@ -1473,6 +1431,33 @@ mod pr3_tests {
             message: message.to_string(),
         });
         report
+    }
+
+    #[tokio::test]
+    async fn exchange_unary_decode_error_returns_native_status_not_rpc_error() {
+        let svc = GrpcService::default();
+        let resp = svc
+            .exchange_unary(Request::new(ExchangeRequest {
+                finst_id_hi: 11,
+                finst_id_lo: 22,
+                node_id: 7,
+                sender_id: 3,
+                be_number: 9,
+                eos: false,
+                sequence: 42,
+                payload: vec![1, 2, 3],
+            }))
+            .await
+            .expect("handler status must not become tonic error");
+        let body = resp.into_inner();
+        assert_eq!(body.ack_sequence, 42);
+        let status = body.status.expect("exchange response status");
+        assert_ne!(status.code, 0);
+        assert!(
+            status.message.contains("exchange decode failed"),
+            "unexpected status message: {}",
+            status.message
+        );
     }
 
     #[tokio::test]

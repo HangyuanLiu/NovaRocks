@@ -323,9 +323,20 @@ pub fn send_chunks(
             .max_encoding_message_size(64 * 1024 * 1024)
             .max_decoding_message_size(64 * 1024 * 1024);
 
-        cli.exchange_unary(req)
+        let response = cli
+            .exchange_unary(req)
             .await
-            .map_err(|e| format!("exchange rpc failed: {e}"))?;
+            .map_err(|e| format!("exchange rpc failed: {e}"))?
+            .into_inner();
+        if let Some(status) = response.status.as_ref()
+            && status.code != 0
+        {
+            return Err(if status.message.is_empty() {
+                format!("exchange rpc returned status_code={}", status.code)
+            } else {
+                format!("exchange rpc failed: {}", status.message)
+            });
+        }
         Ok(())
     })?
 }

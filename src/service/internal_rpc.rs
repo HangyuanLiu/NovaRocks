@@ -16,6 +16,7 @@
 // under the License.
 use std::collections::HashMap;
 
+#[cfg(feature = "compat")]
 use crate::common::failpoint::{self, FailPointMode};
 use crate::common::ids::SlotId;
 use crate::exec::runtime_filter::arrow_type_from_common_type_desc;
@@ -25,6 +26,10 @@ use crate::runtime::exchange;
 use crate::runtime::lookup::{decode_column_ipc, encode_column_ipc, execute_lookup_request};
 use crate::runtime::query_context::{QueryId, query_context_manager, query_expire_durations};
 
+#[cfg(feature = "compat")]
+type CompatTransmitChunkRequest = proto::starrocks::PTransmitChunkParams; // cfg(feature = "compat")
+#[cfg(feature = "compat")]
+type CompatTransmitChunkResponse = proto::starrocks::PTransmitChunkResult; // cfg(feature = "compat")
 #[cfg(feature = "compat")]
 type CompatTransmitRuntimeFilterRequest = proto::starrocks::PTransmitRuntimeFilterParams; // cfg(feature = "compat")
 #[cfg(feature = "compat")]
@@ -36,6 +41,7 @@ type CompatLookupResponse = proto::starrocks::PLookUpResponse; // cfg(feature = 
 #[cfg(feature = "compat")]
 type CompatColumn = proto::starrocks::PColumn; // cfg(feature = "compat")
 
+#[cfg(feature = "compat")]
 fn ok_status() -> proto::starrocks::StatusPb {
     proto::starrocks::StatusPb {
         status_code: 0,
@@ -43,6 +49,7 @@ fn ok_status() -> proto::starrocks::StatusPb {
     }
 }
 
+#[cfg(feature = "compat")]
 fn error_status(message: impl Into<String>) -> proto::starrocks::StatusPb {
     proto::starrocks::StatusPb {
         status_code: 1,
@@ -64,7 +71,20 @@ fn error_common_status(message: impl Into<String>) -> proto::common::Status {
     }
 }
 
+#[cfg(feature = "compat")]
+fn common_status_to_compat(status: proto::common::Status) -> proto::starrocks::StatusPb {
+    proto::starrocks::StatusPb {
+        status_code: status.code,
+        error_msgs: if status.message.is_empty() {
+            Vec::new()
+        } else {
+            vec![status.message]
+        },
+    }
+}
+
 // Used by engine_ffi.rs when feature = "compat" is enabled.
+#[cfg(feature = "compat")]
 #[allow(dead_code)]
 pub(crate) fn handle_update_fail_point_status(
     request: proto::starrocks::PUpdateFailPointStatusRequest,
@@ -116,9 +136,52 @@ pub(crate) fn handle_update_fail_point_status(
 }
 
 pub(crate) fn handle_transmit_chunk(
-    params: proto::starrocks::PTransmitChunkParams,
-) -> proto::starrocks::PTransmitChunkResult {
-    let mut response = proto::starrocks::PTransmitChunkResult {
+    params: proto::novarocks::ExchangeRequest,
+) -> proto::novarocks::ExchangeResponse {
+    let mut response = proto::novarocks::ExchangeResponse {
+        ack_sequence: params.sequence,
+        status: Some(ok_common_status()),
+    };
+
+    let decode_start = std::time::Instant::now();
+    let key = exchange::ExchangeKey {
+        finst_id_hi: params.finst_id_hi,
+        finst_id_lo: params.finst_id_lo,
+        node_id: params.node_id,
+    };
+    let chunks = match exchange::decode_chunks_for_sender(
+        key,
+        params.sender_id,
+        params.be_number,
+        &params.payload,
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            response.status = Some(error_common_status(format!(
+                "exchange decode failed: {err}"
+            )));
+            return response;
+        }
+    };
+    let decode_ns = decode_start.elapsed().as_nanos();
+
+    exchange::push_chunks_with_stats(
+        key,
+        params.sender_id,
+        params.be_number,
+        chunks,
+        params.eos,
+        params.payload.len(),
+        decode_ns,
+    );
+    response
+}
+
+#[cfg(feature = "compat")]
+pub(crate) fn handle_transmit_chunk_compat(
+    params: CompatTransmitChunkRequest,
+) -> CompatTransmitChunkResponse {
+    let mut response = CompatTransmitChunkResponse {
         status: Some(ok_status()),
         receive_timestamp: None,
         receiver_post_process_time: None,
@@ -144,7 +207,7 @@ pub(crate) fn handle_transmit_chunk(
         response.status = Some(error_status("missing eos for transmit_chunk"));
         return response;
     };
-    let Some(_sequence) = params.sequence else {
+    let Some(sequence) = params.sequence else {
         response.status = Some(error_status("missing sequence for transmit_chunk"));
         return response;
     };
@@ -153,30 +216,18 @@ pub(crate) fn handle_transmit_chunk(
         return response;
     };
 
-    let decode_start = std::time::Instant::now();
-    let key = exchange::ExchangeKey {
+    let native = proto::novarocks::ExchangeRequest {
         finst_id_hi: finst_id.hi,
         finst_id_lo: finst_id.lo,
         node_id,
-    };
-    let chunks = match exchange::decode_chunks_for_sender(key, sender_id, be_number, payload) {
-        Ok(v) => v,
-        Err(err) => {
-            response.status = Some(error_status(format!("exchange decode failed: {err}")));
-            return response;
-        }
-    };
-    let decode_ns = decode_start.elapsed().as_nanos();
-
-    exchange::push_chunks_with_stats(
-        key,
         sender_id,
         be_number,
-        chunks,
         eos,
-        payload.len(),
-        decode_ns,
-    );
+        sequence,
+        payload: payload.clone(),
+    };
+    let native_response = handle_transmit_chunk(native);
+    response.status = native_response.status.map(common_status_to_compat);
     response
 }
 
@@ -478,8 +529,9 @@ mod tests {
 
     #[cfg(feature = "compat")]
     use super::{
-        CompatColumn, CompatLookupRequest, CompatTransmitRuntimeFilterRequest,
-        handle_lookup_compat, handle_transmit_runtime_filter_compat,
+        CompatColumn, CompatLookupRequest, CompatTransmitChunkRequest,
+        CompatTransmitRuntimeFilterRequest, handle_lookup_compat, handle_transmit_chunk_compat,
+        handle_transmit_runtime_filter_compat,
     };
     use super::{
         decode_column_ipc, encode_column_ipc, handle_lookup, handle_transmit_chunk,
@@ -653,7 +705,7 @@ mod tests {
 
     #[test]
     fn test_handle_transmit_chunk_delivers_payload_and_eos() {
-        let finst_id = unique_id(11, 22);
+        let finst_id = common_unique_id(31, 42);
         let key = exchange::ExchangeKey {
             finst_id_hi: finst_id.hi,
             finst_id_lo: finst_id.lo,
@@ -677,28 +729,79 @@ mod tests {
             .expect("register expected chunk schema");
         let payload = exchange::encode_chunks(&[chunk], true).expect("encode chunks");
 
-        let response = handle_transmit_chunk(proto::starrocks::PTransmitChunkParams {
-            finst_id: Some(finst_id),
-            node_id: Some(7),
-            sender_id: Some(3),
-            be_number: Some(9),
-            eos: Some(true),
-            sequence: Some(42),
-            chunks: vec![proto::starrocks::ChunkPb {
-                data: Some(payload),
-                data_size: Some(0),
-                ..Default::default()
-            }],
-            ..Default::default()
+        let response = handle_transmit_chunk(proto::novarocks::ExchangeRequest {
+            finst_id_hi: finst_id.hi,
+            finst_id_lo: finst_id.lo,
+            node_id: 7,
+            sender_id: 3,
+            be_number: 9,
+            eos: true,
+            sequence: 42,
+            payload,
         });
 
-        assert!(ok_status(response.status.as_ref()));
+        assert!(ok_common_status(response.status.as_ref()));
+        assert_eq!(response.ack_sequence, 42);
         let snapshot =
             exchange::snapshot_receiver_state(key).expect("receiver snapshot after transmit_chunk");
         assert_eq!(snapshot.queued_chunks, 1);
         assert_eq!(snapshot.queued_rows, 3);
         assert_eq!(snapshot.finished_senders, 1);
         exchange::cancel_exchange_key(key);
+    }
+
+    #[test]
+    fn test_handle_transmit_chunk_empty_payload_marks_eos_sender_finished() {
+        let key = exchange::ExchangeKey {
+            finst_id_hi: 11,
+            finst_id_lo: 22,
+            node_id: 7,
+        };
+
+        let response = handle_transmit_chunk(proto::novarocks::ExchangeRequest {
+            finst_id_hi: key.finst_id_hi,
+            finst_id_lo: key.finst_id_lo,
+            node_id: key.node_id,
+            sender_id: 3,
+            be_number: 9,
+            eos: true,
+            sequence: 42,
+            payload: Vec::new(),
+        });
+
+        assert_eq!(response.ack_sequence, 42);
+        assert!(ok_common_status(response.status.as_ref()));
+        let snapshot =
+            exchange::snapshot_receiver_state(key).expect("receiver snapshot after empty EOS");
+        assert_eq!(snapshot.queued_chunks, 0);
+        assert_eq!(snapshot.queued_rows, 0);
+        assert_eq!(snapshot.finished_senders, 1);
+        exchange::cancel_exchange_key(key);
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn test_handle_transmit_chunk_legacy_wrapper_rejects_missing_payload() {
+        let response = handle_transmit_chunk_compat(CompatTransmitChunkRequest {
+            finst_id: Some(unique_id(1, 2)),
+            node_id: Some(7),
+            sender_id: Some(3),
+            be_number: Some(9),
+            eos: Some(true),
+            sequence: Some(42),
+            chunks: vec![proto::starrocks::ChunkPb::default()],
+            ..Default::default()
+        });
+
+        assert!(!ok_status(response.status.as_ref()));
+        assert_eq!(
+            response
+                .status
+                .as_ref()
+                .and_then(|status| status.error_msgs.first())
+                .map(String::as_str),
+            Some("missing chunks[0].data for transmit_chunk")
+        );
     }
 
     #[test]
