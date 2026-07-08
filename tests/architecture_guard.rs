@@ -5432,3 +5432,366 @@ fn nidl_e3_planner_ir_uses_native_partition_and_runtime_filter_types() {
         violations.join("\n")
     );
 }
+
+#[derive(Clone, Copy)]
+enum NidlE4CodeScanState {
+    Code,
+    BlockComment { depth: usize },
+    String { escaped: bool },
+    RawString { hashes: usize },
+}
+
+fn nidl_e4_has_code_line<F>(text: &str, mut predicate: F) -> bool
+where
+    F: FnMut(&str) -> bool,
+{
+    nidl_e4_code_line_entries(text)
+        .into_iter()
+        .map(|(_, line)| line)
+        .any(|line| !line.is_empty() && predicate(&line))
+}
+
+fn nidl_e4_is_ident_char(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
+}
+
+fn nidl_e4_raw_string_start(chars: &[char], index: usize) -> Option<(usize, usize)> {
+    if index > 0 && nidl_e4_is_ident_char(chars[index - 1]) {
+        return None;
+    }
+
+    let mut cursor = match chars.get(index).copied()? {
+        'r' => index + 1,
+        'b' if chars.get(index + 1) == Some(&'r') => index + 2,
+        _ => return None,
+    };
+
+    let mut hashes = 0usize;
+    while chars.get(cursor) == Some(&'#') {
+        hashes += 1;
+        cursor += 1;
+    }
+
+    if chars.get(cursor) == Some(&'"') {
+        Some((cursor - index + 1, hashes))
+    } else {
+        None
+    }
+}
+
+fn nidl_e4_raw_string_end(chars: &[char], index: usize, hashes: usize) -> Option<usize> {
+    if chars.get(index) != Some(&'"') {
+        return None;
+    }
+
+    for offset in 0..hashes {
+        if chars.get(index + 1 + offset) != Some(&'#') {
+            return None;
+        }
+    }
+
+    Some(1 + hashes)
+}
+
+fn nidl_e4_char_literal_len(chars: &[char], index: usize) -> Option<usize> {
+    if chars.get(index) != Some(&'\'') {
+        return None;
+    }
+
+    let mut cursor = index + 1;
+    let first = chars.get(cursor).copied()?;
+    if first == '\'' {
+        return None;
+    }
+
+    if first == '\\' {
+        cursor += 1;
+        let escaped = chars.get(cursor).copied()?;
+        if escaped == 'u' && chars.get(cursor + 1) == Some(&'{') {
+            cursor += 2;
+            while chars.get(cursor).is_some() && chars[cursor] != '}' {
+                cursor += 1;
+            }
+            if chars.get(cursor) != Some(&'}') {
+                return None;
+            }
+            cursor += 1;
+        } else {
+            cursor += 1;
+        }
+    } else {
+        cursor += 1;
+    }
+
+    if chars.get(cursor) == Some(&'\'') {
+        Some(cursor - index + 1)
+    } else {
+        None
+    }
+}
+
+fn nidl_e4_code_line_entries(text: &str) -> Vec<(usize, String)> {
+    let mut lines = Vec::new();
+    let mut state = NidlE4CodeScanState::Code;
+
+    for (idx, line) in text.lines().enumerate() {
+        let chars: Vec<char> = line.chars().collect();
+        let mut code = String::with_capacity(line.len());
+        let mut cursor = 0usize;
+
+        while cursor < chars.len() {
+            match state {
+                NidlE4CodeScanState::Code => {
+                    if chars.get(cursor) == Some(&'/') && chars.get(cursor + 1) == Some(&'/') {
+                        break;
+                    }
+
+                    if chars.get(cursor) == Some(&'/') && chars.get(cursor + 1) == Some(&'*') {
+                        state = NidlE4CodeScanState::BlockComment { depth: 1 };
+                        cursor += 2;
+                        continue;
+                    }
+
+                    if let Some((len, hashes)) = nidl_e4_raw_string_start(&chars, cursor) {
+                        state = NidlE4CodeScanState::RawString { hashes };
+                        cursor += len;
+                        continue;
+                    }
+
+                    if chars.get(cursor) == Some(&'"') {
+                        state = NidlE4CodeScanState::String { escaped: false };
+                        cursor += 1;
+                        continue;
+                    }
+
+                    if let Some(len) = nidl_e4_char_literal_len(&chars, cursor) {
+                        cursor += len;
+                        continue;
+                    }
+
+                    code.push(chars[cursor]);
+                    cursor += 1;
+                }
+                NidlE4CodeScanState::BlockComment { mut depth } => {
+                    if chars.get(cursor) == Some(&'/') && chars.get(cursor + 1) == Some(&'*') {
+                        depth += 1;
+                        state = NidlE4CodeScanState::BlockComment { depth };
+                        cursor += 2;
+                    } else if chars.get(cursor) == Some(&'*') && chars.get(cursor + 1) == Some(&'/')
+                    {
+                        depth -= 1;
+                        cursor += 2;
+                        if depth == 0 {
+                            state = NidlE4CodeScanState::Code;
+                        } else {
+                            state = NidlE4CodeScanState::BlockComment { depth };
+                        }
+                    } else {
+                        cursor += 1;
+                    }
+                }
+                NidlE4CodeScanState::String { mut escaped } => {
+                    if escaped {
+                        escaped = false;
+                        state = NidlE4CodeScanState::String { escaped };
+                    } else if chars[cursor] == '\\' {
+                        state = NidlE4CodeScanState::String { escaped: true };
+                    } else if chars[cursor] == '"' {
+                        state = NidlE4CodeScanState::Code;
+                    } else {
+                        state = NidlE4CodeScanState::String { escaped };
+                    }
+                    cursor += 1;
+                }
+                NidlE4CodeScanState::RawString { hashes } => {
+                    if let Some(len) = nidl_e4_raw_string_end(&chars, cursor, hashes) {
+                        state = NidlE4CodeScanState::Code;
+                        cursor += len;
+                    } else {
+                        cursor += 1;
+                    }
+                }
+            }
+        }
+
+        let code = code.trim().to_string();
+        if !code.is_empty() {
+            lines.push((idx + 1, code));
+        }
+    }
+
+    lines
+}
+
+fn nidl_e4_has_exact_code_line(text: &str, expected: &str) -> bool {
+    nidl_e4_has_code_line(text, |line| line == expected)
+}
+
+fn nidl_e4_struct_code_span(text: &str, header: &str) -> Option<Vec<(usize, String)>> {
+    let lines = nidl_e4_code_line_entries(text);
+    let start = lines.iter().position(|(_, line)| line == header)?;
+    let mut depth = 0isize;
+    let mut seen_open = false;
+
+    for idx in start..lines.len() {
+        let line = &lines[idx].1;
+        if line.contains('{') {
+            seen_open = true;
+        }
+        depth += brace_delta(line);
+        if seen_open && depth <= 0 {
+            return Some(lines[start..=idx].to_vec());
+        }
+    }
+
+    None
+}
+
+fn nidl_e4_struct_has_code_line<F>(text: &str, header: &str, mut predicate: F) -> bool
+where
+    F: FnMut(&str) -> bool,
+{
+    nidl_e4_struct_code_span(text, header)
+        .map(|span| span.into_iter().any(|(_, line)| predicate(&line)))
+        .unwrap_or(false)
+}
+
+fn nidl_e4_function_signature_contains(text: &str, fn_name: &str, needle: &str) -> bool {
+    let lines = nidl_e4_code_line_entries(text);
+    let fn_pattern = format!("fn {fn_name}(");
+    let Some(start) = lines
+        .iter()
+        .position(|(_, line)| line.contains(&fn_pattern))
+    else {
+        return false;
+    };
+
+    let mut signature = String::new();
+    for (_, line) in lines.iter().skip(start) {
+        if !signature.is_empty() {
+            signature.push(' ');
+        }
+        signature.push_str(line);
+        if line.contains('{') {
+            break;
+        }
+    }
+
+    signature.contains(needle)
+}
+
+fn nidl_e4_push_forbidden_code_terms(
+    violations: &mut Vec<String>,
+    source: &str,
+    text: &str,
+    terms: &[&str],
+    reason: &str,
+) {
+    let lines = nidl_e4_code_line_entries(text);
+    for term in terms {
+        if let Some((line, text)) = lines.iter().find(|(_, line)| line.contains(term)) {
+            violations.push(format!("{source}:{line}: {reason}: `{term}` in `{text}`"));
+        }
+    }
+}
+
+#[test]
+fn nidl_e4_scheduler_and_coordinator_use_native_scheduling_metadata() {
+    let repo = Path::new(manifest_dir());
+    let mut violations = Vec::new();
+
+    let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/mod.rs")).unwrap();
+    let codegen_mod_prod = rust_production_text_without_cfg_test(&codegen_mod);
+    if !nidl_e4_has_exact_code_line(
+        &codegen_mod_prod,
+        "pub(crate) struct FragmentSchedulingMetadata {",
+    ) {
+        violations.push(
+            "src/sql/codegen/mod.rs: E4 must expose a native FragmentSchedulingMetadata result"
+                .to_string(),
+        );
+    }
+    if !nidl_e4_struct_has_code_line(
+        &codegen_mod_prod,
+        "pub(crate) struct MultiFragmentBuildResult {",
+        |line| {
+            line.trim_end_matches(',') == "pub fragment_schedules: Vec<FragmentSchedulingMetadata>"
+        },
+    ) {
+        violations.push(
+            "src/sql/codegen/mod.rs: MultiFragmentBuildResult must carry native fragment_schedules"
+                .to_string(),
+        );
+    }
+
+    let scheduler = fs::read_to_string(repo.join("src/runtime/scheduler.rs")).unwrap();
+    let scheduler_prod = rust_production_text_without_cfg_test(&scheduler);
+    nidl_e4_push_forbidden_code_terms(
+        &mut violations,
+        "src/runtime/scheduler.rs",
+        &scheduler_prod,
+        &[
+            "FragmentBuildResult",
+            "plan_nodes::TPlan",
+            "TPlanNodeType",
+            ".plan.nodes",
+            ".exec_params",
+            ".output_sink",
+        ],
+        "scheduler must consume native FragmentSchedulingMetadata, not thrift fragment build payloads",
+    );
+    for fn_name in ["assign", "assign_with_live"] {
+        if !nidl_e4_function_signature_contains(
+            &scheduler_prod,
+            fn_name,
+            "fragments: &[FragmentSchedulingMetadata]",
+        ) {
+            violations.push(format!(
+                "src/runtime/scheduler.rs: {fn_name} signature must accept FragmentSchedulingMetadata"
+            ));
+        }
+    }
+
+    let exec_params = fs::read_to_string(repo.join("src/runtime/exec_params.rs")).unwrap();
+    let exec_params_prod = rust_production_text_without_cfg_test(&exec_params);
+    nidl_e4_push_forbidden_code_terms(
+        &mut violations,
+        "src/runtime/exec_params.rs",
+        &exec_params_prod,
+        &["FragmentBuildResult", "fr.desc_tbl"],
+        "exec-params helper must accept explicit compat descriptor payload, not FragmentBuildResult",
+    );
+
+    let coordinator = fs::read_to_string(repo.join("src/runtime/coordinator.rs")).unwrap();
+    let coordinator_prod = rust_production_text_without_cfg_test(&coordinator);
+    nidl_e4_push_forbidden_code_terms(
+        &mut violations,
+        "src/runtime/coordinator.rs",
+        &coordinator_prod,
+        &[
+            "scheduler.assign_with_live(&fragment_results",
+            "topological_sort_bottom_up(&fragment_results",
+            "TPlanFragment::new",
+            "crate::thrift::planner::TPlanFragment",
+            "planner::TPlanFragment",
+            "TPlanFragment as",
+            "use crate::thrift::planner::TPlanFragment",
+            "use crate::thrift::planner::{TPlanFragment",
+        ],
+        "coordinator must schedule from native metadata and must not directly construct thrift TPlanFragment",
+    );
+    if !nidl_e4_has_code_line(&coordinator_prod, |line| {
+        line.contains("fragment_schedules")
+    }) {
+        violations.push(
+            "src/runtime/coordinator.rs: coordinator must destructure and use fragment_schedules"
+                .to_string(),
+        );
+    }
+
+    assert!(
+        violations.is_empty(),
+        "NIDL-E4 native scheduling metadata guard failed:\n{}",
+        violations.join("\n")
+    );
+}
