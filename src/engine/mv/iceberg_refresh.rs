@@ -392,7 +392,9 @@ pub(crate) fn create_iceberg_mv(
     // it parses as a non-negative integer (seconds); reject a malformed value rather
     // than silently ignoring it.
     if let Some((_, raw)) = stmt.properties.iter().find(|(k, _)| {
-        k.eq_ignore_ascii_case(crate::engine::mv_rewrite_prep::MV_QUERY_REWRITE_MAX_STALENESS_SEC_PROP)
+        k.eq_ignore_ascii_case(
+            crate::engine::mv_rewrite_prep::MV_QUERY_REWRITE_MAX_STALENESS_SEC_PROP,
+        )
     }) {
         let secs: u64 = raw.trim().parse().map_err(|_| {
             format!(
@@ -19647,7 +19649,8 @@ mod tests {
                 &mut scalar_arena,
             )
             .expect("build opt expr");
-        let providers = crate::engine::query_stats::QueryStatsProviders::from_standalone_state(state);
+        let providers =
+            crate::engine::query_stats::QueryStatsProviders::from_standalone_state(state);
         let mut query_stats =
             crate::engine::query_stats::QueryStatsCollector::new(providers).collect(&mut opt_expr);
 

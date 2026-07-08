@@ -44,8 +44,7 @@ const MAX_MV_CANDIDATES: usize = 16;
 /// tolerance, in seconds. `0`/absent/unparseable = strict (default). Set at
 /// CREATE via `PROPERTIES('query_rewrite_max_staleness_sec'='N')` or later via
 /// `ALTER MATERIALIZED VIEW ... SET PROPERTIES(...)`.
-pub(crate) const MV_QUERY_REWRITE_MAX_STALENESS_SEC_PROP: &str =
-    "query_rewrite_max_staleness_sec";
+pub(crate) const MV_QUERY_REWRITE_MAX_STALENESS_SEC_PROP: &str = "query_rewrite_max_staleness_sec";
 
 /// Parse the per-MV staleness tolerance (seconds) from target-table properties.
 /// Absent or unparseable => 0 (strict).
@@ -428,9 +427,11 @@ fn load_mv_staleness_property_sec(
     state: &Arc<StandaloneState>,
     def: &crate::meta::repository::mv::StoredMvDefinition,
 ) -> Result<u64, String> {
-    let (Some(cat), Some(ns), Some(tbl)) =
-        (&def.target_catalog, &def.target_namespace, &def.target_table)
-    else {
+    let (Some(cat), Some(ns), Some(tbl)) = (
+        &def.target_catalog,
+        &def.target_namespace,
+        &def.target_table,
+    ) else {
         return Ok(0);
     };
     let registry = state
@@ -439,7 +440,9 @@ fn load_mv_staleness_property_sec(
         .expect("iceberg catalogs read lock");
     let entry = registry.get(cat)?;
     let loaded = crate::connector::iceberg::catalog::load_table(&entry, ns, tbl)?;
-    Ok(parse_mv_staleness_property_sec(loaded.table.metadata().properties()))
+    Ok(parse_mv_staleness_property_sec(
+        loaded.table.metadata().properties(),
+    ))
 }
 
 #[cfg(test)]
@@ -522,21 +525,54 @@ mod tests {
     fn parse_mv_staleness_property_reads_seconds_or_zero() {
         use std::collections::HashMap;
         let mut p = HashMap::new();
-        assert_eq!(super::parse_mv_staleness_property_sec(&p), 0, "absent -> strict");
-        p.insert("query_rewrite_max_staleness_sec".to_string(), "300".to_string());
+        assert_eq!(
+            super::parse_mv_staleness_property_sec(&p),
+            0,
+            "absent -> strict"
+        );
+        p.insert(
+            "query_rewrite_max_staleness_sec".to_string(),
+            "300".to_string(),
+        );
         assert_eq!(super::parse_mv_staleness_property_sec(&p), 300);
-        p.insert("query_rewrite_max_staleness_sec".to_string(), "  90 ".to_string());
+        p.insert(
+            "query_rewrite_max_staleness_sec".to_string(),
+            "  90 ".to_string(),
+        );
         assert_eq!(super::parse_mv_staleness_property_sec(&p), 90, "trims");
-        p.insert("query_rewrite_max_staleness_sec".to_string(), "bad".to_string());
-        assert_eq!(super::parse_mv_staleness_property_sec(&p), 0, "unparseable -> strict");
+        p.insert(
+            "query_rewrite_max_staleness_sec".to_string(),
+            "bad".to_string(),
+        );
+        assert_eq!(
+            super::parse_mv_staleness_property_sec(&p),
+            0,
+            "unparseable -> strict"
+        );
     }
 
     #[test]
     fn effective_window_prefers_session_over_property() {
-        assert_eq!(super::effective_staleness_window_sec(Some(10), 300), 10, "session wins");
-        assert_eq!(super::effective_staleness_window_sec(Some(0), 300), 0, "session 0 forces strict");
-        assert_eq!(super::effective_staleness_window_sec(None, 300), 300, "fall back to property");
-        assert_eq!(super::effective_staleness_window_sec(None, 0), 0, "default strict");
+        assert_eq!(
+            super::effective_staleness_window_sec(Some(10), 300),
+            10,
+            "session wins"
+        );
+        assert_eq!(
+            super::effective_staleness_window_sec(Some(0), 300),
+            0,
+            "session 0 forces strict"
+        );
+        assert_eq!(
+            super::effective_staleness_window_sec(None, 300),
+            300,
+            "fall back to property"
+        );
+        assert_eq!(
+            super::effective_staleness_window_sec(None, 0),
+            0,
+            "default strict"
+        );
     }
 
     #[test]
@@ -544,11 +580,23 @@ mod tests {
         // window 0 => always skip (strict), even with zero gap.
         assert!(!super::staleness_within_window(0, Some(1_000), Some(1_000)));
         // exact boundary in ms: 300s window, gap 300_000ms -> within.
-        assert!(super::staleness_within_window(300, Some(1_000_000), Some(1_300_000)));
+        assert!(super::staleness_within_window(
+            300,
+            Some(1_000_000),
+            Some(1_300_000)
+        ));
         // one ms over -> skip.
-        assert!(!super::staleness_within_window(300, Some(1_000_000), Some(1_300_001)));
+        assert!(!super::staleness_within_window(
+            300,
+            Some(1_000_000),
+            Some(1_300_001)
+        ));
         // negative gap (rollback) -> skip.
-        assert!(!super::staleness_within_window(300, Some(2_000_000), Some(1_000_000)));
+        assert!(!super::staleness_within_window(
+            300,
+            Some(2_000_000),
+            Some(1_000_000)
+        ));
         // missing commit ts -> skip.
         assert!(!super::staleness_within_window(300, None, Some(1_000_000)));
         assert!(!super::staleness_within_window(300, Some(1_000_000), None));
