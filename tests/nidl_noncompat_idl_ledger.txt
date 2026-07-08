@@ -7,9 +7,6 @@
 # The end state (E10) is an empty list plus the build.rs/lib.rs gate.
 src/cache/cached_reader.rs
 src/common/engine_error.rs
-src/common/thrift.rs
-src/common/types.rs
-src/common/util.rs
 src/connector/iceberg/file_pruning_wire.rs
 src/connector/schema/context.rs
 src/connector/schema/fe_tables.rs
@@ -39,7 +36,6 @@ src/exec/operators/exchange_source.rs
 src/exec/operators/fetch_processor.rs
 src/exec/operators/iceberg_change_stream_router_sink.rs
 src/exec/operators/multi_cast_data_stream_sink.rs
-src/exec/operators/result_buffer_sink.rs
 src/exec/operators/scan/runner.rs
 src/exec/operators/split_data_stream_sink.rs
 src/exec/pipeline/driver.rs
@@ -114,7 +110,6 @@ src/runtime/profile.rs
 src/runtime/profile_correlate.rs
 src/runtime/query_context.rs
 src/runtime/query_options.rs
-src/runtime/result_buffer.rs
 src/runtime/runtime_filter_params.rs
 src/runtime/runtime_state.rs
 src/runtime/scan_range.rs
@@ -131,7 +126,6 @@ src/service/exec_status_report.rs
 src/service/fe_report.rs
 src/service/frontend_rpc.rs
 src/service/native_fragment_service.rs
-src/service/result_batch_wire.rs
 src/service/stream_load_registry.rs
 src/sql/codegen/connector_scan_wire.rs
 src/sql/codegen/descriptors.rs
