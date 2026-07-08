@@ -26,6 +26,8 @@ pub mod exchange;
 pub mod exchange_scan;
 pub mod exec_env;
 pub(crate) mod exec_params;
+#[cfg(feature = "compat")]
+pub(crate) mod exec_params_compat;
 pub mod execution_services;
 pub(crate) mod fragment_exec_params;
 pub(crate) mod fragment_output;

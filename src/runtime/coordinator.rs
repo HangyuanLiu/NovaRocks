@@ -420,7 +420,7 @@ impl ExecutionCoordinator {
                     .iter()
                     .map(|inst| {
                         crate::runtime::endpoint::FragmentDestination::new(
-                            inst.finst_id.clone(),
+                            runtime_unique_id_from_thrift(&inst.finst_id),
                             inst.endpoint.clone(),
                         )
                     })
@@ -515,22 +515,33 @@ impl ExecutionCoordinator {
                         .collect();
                     (output_sink, compat_partition, Some(exec_destinations))
                 } else if let Some((router_group_id, branch_edges)) = router_edges {
-                    let template = fr
-                        .output_sink
-                        .iceberg_change_stream_router_sink
-                        .as_ref()
-                        .ok_or_else(|| {
-                            format!(
-                                "fragment {fragment_id} is router source for group {router_group_id} \
-                                 but output sink is missing ICEBERG_CHANGE_STREAM_ROUTER_SINK payload"
-                            )
-                        })?;
-                    let output_sink = wrap_iceberg_change_stream_router_sink(
-                        template,
-                        branch_edges,
-                        &compat_edge_sidecars,
-                        &plan.by_fragment,
-                    )?;
+                    #[cfg(not(feature = "compat"))]
+                    {
+                        let _ = router_group_id;
+                        let _ = branch_edges;
+                    }
+                    let output_sink = match plan_wire_format {
+                        #[cfg(feature = "compat")]
+                        PlanWireFormat::Thrift => {
+                            let template = fr
+                                .output_sink
+                                .iceberg_change_stream_router_sink
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    format!(
+                                        "fragment {fragment_id} is router source for group {router_group_id} \
+                                         but output sink is missing ICEBERG_CHANGE_STREAM_ROUTER_SINK payload"
+                                    )
+                                })?;
+                            wrap_iceberg_change_stream_router_sink(
+                                template,
+                                branch_edges,
+                                &compat_edge_sidecars,
+                                &plan.by_fragment,
+                            )?
+                        }
+                        PlanWireFormat::Proto => fr.output_sink.clone(),
+                    };
                     // Router branches carry their own destinations in the sink payload.
                     (output_sink, unpartitioned_partition(), None)
                 } else if is_terminal_write {
@@ -648,7 +659,7 @@ impl ExecutionCoordinator {
                     },
                 );
 
-                if is_write_sink(&params) {
+                if fragment_has_write_sink {
                     let exec = params.params.as_ref().ok_or_else(|| {
                         "write sink fragment missing exec params in coordinator".to_string()
                     })?;
@@ -1292,13 +1303,13 @@ fn wrap_iceberg_change_stream_router_sink(
                 )
             })?
             .iter()
-            .map(|placement| {
-                let destination = crate::runtime::endpoint::FragmentDestination::new(
-                    placement.finst_id.clone(),
-                    placement.endpoint.clone(),
-                );
-                exec_destination_from_runtime(&destination)
-            })
+                .map(|placement| {
+                    let destination = crate::runtime::endpoint::FragmentDestination::new(
+                        runtime_unique_id_from_thrift(&placement.finst_id),
+                        placement.endpoint.clone(),
+                    );
+                    exec_destination_from_runtime(&destination)
+                })
             .collect();
 
         branches.push(data_sinks::TIcebergChangeStreamRouterBranch::new(
@@ -1660,7 +1671,7 @@ fn patch_native_iceberg_change_stream_router_sink(
                 .iter()
                 .map(|placement| {
                     native_stream_destination(&crate::runtime::endpoint::FragmentDestination::new(
-                        placement.finst_id.clone(),
+                        runtime_unique_id_from_thrift(&placement.finst_id),
                         placement.endpoint.clone(),
                     ))
                 })
@@ -1766,11 +1777,18 @@ fn exec_destination_from_runtime(
     src: &crate::runtime::endpoint::FragmentDestination,
 ) -> data_sinks::TPlanFragmentDestination {
     data_sinks::TPlanFragmentDestination::new(
-        src.finst_id().clone(),
+        types::TUniqueId::new(src.finst_id().hi, src.finst_id().lo),
         None::<types::TNetworkAddress>,
         Some(src.endpoint().to_network_address()),
         None::<i32>,
     )
+}
+
+fn runtime_unique_id_from_thrift(src: &types::TUniqueId) -> crate::common::types::UniqueId {
+    crate::common::types::UniqueId {
+        hi: src.hi,
+        lo: src.lo,
+    }
 }
 
 fn native_stream_destination(
@@ -2903,17 +2921,23 @@ mod tests {
     /// immediately returns `Eof` for `fetch_result`.
     struct MockDispatcher {
         submitted_finst_ids: Mutex<Vec<(i64, i64)>>,
+        submitted_native_fragments: Mutex<Vec<crate::proto::plan::PlanFragment>>,
     }
 
     impl MockDispatcher {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 submitted_finst_ids: Mutex::new(Vec::new()),
+                submitted_native_fragments: Mutex::new(Vec::new()),
             })
         }
 
         fn submitted_count(&self) -> usize {
             self.submitted_finst_ids.lock().unwrap().len()
+        }
+
+        fn submitted_native_fragments(&self) -> Vec<crate::proto::plan::PlanFragment> {
+            self.submitted_native_fragments.lock().unwrap().clone()
         }
     }
 
@@ -2934,6 +2958,20 @@ mod tests {
                 .unwrap_or((0, 0));
             self.submitted_finst_ids.lock().unwrap().push(finst);
             Ok(())
+        }
+
+        fn submit_fragment_submission(
+            &self,
+            backend_idx: usize,
+            submission: FragmentSubmission,
+        ) -> Result<(), String> {
+            if let Some(native_plan) = submission.native_plan_for_test() {
+                self.submitted_native_fragments
+                    .lock()
+                    .unwrap()
+                    .push(native_plan.clone());
+            }
+            self.submit_fragment(backend_idx, submission.into_thrift_params())
         }
 
         fn fetch_result(
@@ -3720,6 +3758,157 @@ mod tests {
         assert_eq!(dispatcher.submitted_count(), 1);
     }
 
+    #[test]
+    fn proto_coordinator_submits_native_router_sidecar_with_noop_compat_carrier() {
+        use crate::proto::plan as native_plan;
+        use crate::sql::codegen::FragmentOutputKind;
+        use crate::sql::common::ChangeStreamBranchKind;
+
+        let root_fragment = fragment_for_scan_range_merge_test(BTreeMap::new());
+        let mut router_fragment = fragment_for_scan_range_merge_test(BTreeMap::new());
+        router_fragment.fragment_id = 1;
+        router_fragment.output_kind = FragmentOutputKind::NonTerminal;
+        router_fragment.output_sink =
+            empty_data_sink_for_test(data_sinks::TDataSinkType::NOOP_SINK);
+
+        let edge = fake_router_edge(1, 0, 77, 7, 0, ChangeStreamBranchKind::DeleteDv);
+        let native_root = native_plan::PlanFragment {
+            fragment_id: root_fragment.fragment_id,
+            root: Some(native_plan::DistributedNode {
+                node_id: 10,
+                fragment_id: root_fragment.fragment_id,
+                limit: -1,
+                payload: Some(native_plan::distributed_node::Payload::Physical(
+                    native_plan::PlanNode {
+                        kind: Some(native_plan::plan_node::Kind::Values(
+                            native_plan::ValuesNode::default(),
+                        )),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }),
+            sink: Some(native_plan::DataSink {
+                kind: Some(native_plan::data_sink::Kind::Result(true)),
+            }),
+            ..Default::default()
+        };
+        let native_router = native_plan::PlanFragment {
+            fragment_id: router_fragment.fragment_id,
+            root: Some(native_plan::DistributedNode {
+                node_id: 20,
+                fragment_id: router_fragment.fragment_id,
+                limit: -1,
+                payload: Some(native_plan::distributed_node::Payload::Physical(
+                    native_plan::PlanNode {
+                        kind: Some(native_plan::plan_node::Kind::Values(
+                            native_plan::ValuesNode::default(),
+                        )),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }),
+            data_partition: Some(native_plan::DataPartition {
+                kind: native_plan::PartitionKind::Unpartitioned as i32,
+                exprs: Vec::new(),
+            }),
+            output_partition: Some(native_plan::DataPartition {
+                kind: native_plan::PartitionKind::Unpartitioned as i32,
+                exprs: Vec::new(),
+            }),
+            sink: Some(native_plan::DataSink {
+                kind: Some(native_plan::data_sink::Kind::IcebergChangeStreamRouter(
+                    native_plan::IcebergChangeStreamRouterSink {
+                        group_id: 7,
+                        change_op_output_ordinal: 0,
+                        data_route_output_ordinal: None,
+                        branches: vec![native_plan::IcebergChangeStreamBranchRoute {
+                            branch_id: 0,
+                            branch_kind: native_plan::ChangeStreamBranchKind::DeleteDv as i32,
+                            target_fragment_id: u32::MAX,
+                            target_exchange_node_id: -1,
+                            output_ordinals: Vec::new(),
+                            output_partition_ordinals: Vec::new(),
+                            output_partition: Some(native_plan::DataPartition {
+                                kind: native_plan::PartitionKind::Unpartitioned as i32,
+                                exprs: Vec::new(),
+                            }),
+                            destinations: None,
+                        }],
+                    },
+                )),
+            }),
+            output_exprs: Vec::new(),
+            output_columns: Vec::new(),
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        };
+        let native_sidecars = NativePlanSidecars {
+            fragments_by_id: BTreeMap::from([
+                (root_fragment.fragment_id, native_root),
+                (router_fragment.fragment_id, native_router),
+            ]),
+        };
+        let fragment_schedules = vec![
+            root_fragment.scheduling_metadata(),
+            router_fragment.scheduling_metadata(),
+        ];
+        let build = MultiFragmentBuildResult {
+            fragment_results: vec![root_fragment, router_fragment],
+            fragment_schedules,
+            root_fragment_id: 0,
+            edges: vec![edge.clone()],
+            lowered_edges: vec![LoweredFragmentEdge {
+                edge,
+                compat_partition: unpartitioned_partition(),
+            }],
+            boundary_schemas: Vec::new(),
+            rf_plan: None,
+        };
+        let dispatcher = MockDispatcher::new();
+        let scheduler = Arc::new(FragmentScheduler::new(vec![
+            "127.0.0.1:19010".parse().expect("backend addr"),
+        ]));
+
+        let result = ExecutionCoordinator::new_with_native_plan_sidecars(
+            build,
+            native_sidecars,
+            dispatcher.clone(),
+            scheduler,
+            None,
+        )
+        .execute_with_write_outcome();
+
+        assert!(
+            result.is_ok(),
+            "coordinator rejected proto router with noop compat carrier: {result:?}"
+        );
+        assert_eq!(dispatcher.submitted_count(), 2);
+        let submitted = dispatcher.submitted_native_fragments();
+        let router = submitted
+            .iter()
+            .find(|fragment| fragment.fragment_id == 1)
+            .expect("submitted native router fragment");
+        let Some(native_plan::data_sink::Kind::IcebergChangeStreamRouter(router_sink)) =
+            router.sink.as_ref().and_then(|sink| sink.kind.as_ref())
+        else {
+            panic!("expected submitted native router sink");
+        };
+        let branch = router_sink.branches.first().expect("router branch");
+        assert_eq!(branch.target_fragment_id, 0);
+        assert_eq!(branch.target_exchange_node_id, 77);
+        assert_eq!(
+            branch
+                .destinations
+                .as_ref()
+                .expect("patched destinations")
+                .destinations
+                .len(),
+            1
+        );
+    }
+
     #[cfg(feature = "compat")]
     #[test]
     fn compat_scan_ranges_for_placement_merges_native_and_compat_only_nodes() {
@@ -3765,7 +3954,10 @@ mod tests {
         host: &str,
     ) -> crate::runtime::endpoint::FragmentDestination {
         crate::runtime::endpoint::FragmentDestination::new(
-            types::TUniqueId::new(11, finst_lo),
+            crate::common::types::UniqueId {
+                hi: 11,
+                lo: finst_lo,
+            },
             crate::runtime::endpoint::RuntimeEndpoint::new(host, 9010).expect("test endpoint"),
         )
     }

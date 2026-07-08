@@ -367,13 +367,13 @@ impl FragmentScheduler {
     ) -> Result<(), String> {
         for e in edges {
             // Snapshot target placements to avoid borrow conflict.
-            let target_placements: Vec<(TUniqueId, usize)> = plan
+            let target_placements: Vec<(UniqueId, usize)> = plan
                 .by_fragment
                 .get(&e.target_fragment_id)
                 .map(|insts| {
                     insts
                         .iter()
-                        .map(|inst| (inst.finst_id.clone(), inst.backend_idx))
+                        .map(|inst| (unique_id_from_thrift(&inst.finst_id), inst.backend_idx))
                         .collect()
                 })
                 .unwrap_or_default();

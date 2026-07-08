@@ -82,16 +82,16 @@ impl RuntimeEndpoint {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FragmentDestination {
-    finst_id: types::TUniqueId,
+    finst_id: UniqueId,
     endpoint: RuntimeEndpoint,
 }
 
 impl FragmentDestination {
-    pub(crate) fn new(finst_id: types::TUniqueId, endpoint: RuntimeEndpoint) -> Self {
+    pub(crate) fn new(finst_id: UniqueId, endpoint: RuntimeEndpoint) -> Self {
         Self { finst_id, endpoint }
     }
 
-    pub(crate) fn finst_id(&self) -> &types::TUniqueId {
+    pub(crate) fn finst_id(&self) -> &UniqueId {
         &self.finst_id
     }
 

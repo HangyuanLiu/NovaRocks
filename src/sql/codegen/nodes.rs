@@ -186,23 +186,25 @@ fn build_iceberg_delta_scan_node(
         Some(conjuncts)
     };
     node.compact_data = true;
-    let runtime_plan =
-        crate::sql::codegen::iceberg_delta_scan_wire::build_iceberg_delta_scan_runtime_plan(
-            table_info,
-            from_snapshot_id,
-            to_snapshot_id,
-            mv_refresh_ctx,
-        )?;
+    let delta_plan = {
+        let runtime_plan =
+            crate::sql::codegen::iceberg_delta_scan_wire::build_iceberg_delta_scan_runtime_plan(
+                table_info,
+                from_snapshot_id,
+                to_snapshot_id,
+                mv_refresh_ctx,
+            )?;
+        crate::sql::codegen::iceberg_delta_scan_wire::encode_iceberg_delta_scan_plan_thrift(
+            &runtime_plan,
+        )?
+    };
     node.iceberg_delta_scan_node = Some(plan_nodes::TIcebergDeltaScanNode {
         catalog: table_info.catalog.clone(),
         iceberg_namespace: table_info.namespace.clone(),
         table: table_info.table.clone(),
         from_snapshot_id,
         to_snapshot_id,
-        delta_plan:
-            crate::sql::codegen::iceberg_delta_scan_wire::encode_iceberg_delta_scan_plan_thrift(
-                &runtime_plan,
-            )?,
+        delta_plan,
     });
     Ok(node)
 }

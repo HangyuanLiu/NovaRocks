@@ -5662,6 +5662,23 @@ fn nidl_e9_text_region_between<'a>(text: &'a str, start: &str, end: &str) -> &'a
 }
 
 #[test]
+fn nidl_e9_native_fragment_wire_has_no_starrocks_thrift_aliases() {
+    let text = nidl_e9_read("src/runtime/native_fragment_wire.rs");
+    let production = rust_production_text_without_cfg_test_or_compat(&text);
+    for forbidden in [
+        "type DataStreamSink = data_sinks::TDataStreamSink",
+        "type MultiCastDataStreamSink = data_sinks::TMultiCastDataStreamSink",
+        "type DataPartition = partitions::TDataPartition",
+        "crate::thrift::{data_sinks, partitions, types}",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "native_fragment_wire must not keep StarRocks thrift alias `{forbidden}`"
+        );
+    }
+}
+
+#[test]
 fn nidl_e9_lower_compat_import_detector_ignores_cfg_compat_files() {
     let dir = std::env::temp_dir().join("nidl_e9_lower_compat_detector");
     let _ = fs::remove_dir_all(&dir);

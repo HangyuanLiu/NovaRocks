@@ -85,6 +85,13 @@ fn encode_unique_id(src: &types::TUniqueId) -> common::UniqueId {
     }
 }
 
+fn encode_runtime_unique_id(src: &crate::common::types::UniqueId) -> common::UniqueId {
+    common::UniqueId {
+        hi: src.hi,
+        lo: src.lo,
+    }
+}
+
 fn encode_scan_range_params(
     src: &scan_range::ScanRangeParams,
 ) -> Result<novarocks::ScanRangeParams, String> {
@@ -201,7 +208,7 @@ fn encode_datacache_options(src: &scan_range::DatacacheOptions) -> novarocks::Da
 
 fn encode_destination(src: &FragmentDestination) -> Result<novarocks::Destination, String> {
     Ok(novarocks::Destination {
-        finst_id: Some(encode_unique_id(src.finst_id())),
+        finst_id: Some(encode_runtime_unique_id(src.finst_id())),
         endpoint: src.endpoint().as_host_port(),
     })
 }

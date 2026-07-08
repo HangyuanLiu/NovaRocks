@@ -1661,7 +1661,7 @@ mod tests {
         let mut scan_ranges = BTreeMap::new();
         scan_ranges.insert(11, vec![scan_range]);
         let destination = crate::runtime::endpoint::FragmentDestination::new(
-            crate::thrift::types::TUniqueId::new(3, 4),
+            crate::common::types::UniqueId { hi: 3, lo: 4 },
             crate::runtime::endpoint::RuntimeEndpoint::new("10.0.0.9", 8060)
                 .expect("destination endpoint"),
         );

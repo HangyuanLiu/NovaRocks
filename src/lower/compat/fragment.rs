@@ -176,7 +176,10 @@ fn runtime_destination_from_thrift(
         RuntimeEndpoint::from_network_address(addr)?
     };
     Ok(FragmentDestination::new(
-        dest.fragment_instance_id,
+        UniqueId {
+            hi: dest.fragment_instance_id.hi,
+            lo: dest.fragment_instance_id.lo,
+        },
         endpoint,
     ))
 }

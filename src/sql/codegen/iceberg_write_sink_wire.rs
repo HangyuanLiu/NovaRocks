@@ -15,27 +15,33 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(feature = "compat")]
 use std::collections::BTreeMap;
 
 use arrow::datatypes::{DataType, TimeUnit};
 use iceberg::spec::{PrimitiveType, Transform, Type};
 
+#[cfg(feature = "compat")]
 use crate::connector::iceberg::position_delete_descriptor::{
     PositionDeleteDescriptorInput, PositionDeleteOutputField, PositionDeletePartitionSourceField,
 };
 use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo};
 use crate::sql::codegen::descriptors::DescriptorTableBuilder;
+#[cfg(feature = "compat")]
+use crate::sql::planner::write_sink::IcebergWriteFileCompression;
 use crate::sql::planner::write_sink::{
-    IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
-    transform_to_sink_string,
+    IcebergWriteSinkMode, IcebergWriteSinkSpec, transform_to_sink_string,
 };
+#[cfg(feature = "compat")]
 use crate::thrift::cloud_configuration;
+#[cfg(feature = "compat")]
 use crate::thrift::data_sinks;
 use crate::thrift::descriptors;
 use crate::thrift::types;
 
 use super::type_infer::arrow_type_to_type_desc;
 
+#[cfg(feature = "compat")]
 pub(crate) fn build_iceberg_write_sink_thrift(
     spec: &IcebergWriteSinkSpec,
     tuple_id: i32,
@@ -145,6 +151,7 @@ fn equality_delete_schema_for_sink(
     Ok(Some(IcebergSchemaDef { fields }))
 }
 
+#[cfg(feature = "compat")]
 fn data_sink_type(mode: IcebergWriteSinkMode) -> data_sinks::TDataSinkType {
     match mode {
         IcebergWriteSinkMode::Data | IcebergWriteSinkMode::RowLineageData => {
@@ -158,12 +165,14 @@ fn data_sink_type(mode: IcebergWriteSinkMode) -> data_sinks::TDataSinkType {
     }
 }
 
+#[cfg(feature = "compat")]
 fn compression_to_thrift(compression: IcebergWriteFileCompression) -> types::TCompressionType {
     match compression {
         IcebergWriteFileCompression::Snappy => types::TCompressionType::SNAPPY,
     }
 }
 
+#[cfg(feature = "compat")]
 fn cloud_configuration_from_properties(
     cloud_properties: &BTreeMap<String, String>,
 ) -> Option<cloud_configuration::TCloudConfiguration> {
@@ -178,6 +187,7 @@ fn cloud_configuration_from_properties(
     ))
 }
 
+#[cfg(feature = "compat")]
 fn position_delete_descriptor_to_thrift(
     desc: &PositionDeleteDescriptorInput,
 ) -> data_sinks::TIcebergPositionDeleteOutputDescriptor {
@@ -194,6 +204,7 @@ fn position_delete_descriptor_to_thrift(
     )
 }
 
+#[cfg(feature = "compat")]
 fn position_delete_output_field_to_thrift(
     field: &PositionDeleteOutputField,
 ) -> data_sinks::TIcebergPositionDeleteOutputField {
@@ -211,6 +222,7 @@ fn position_delete_output_field_to_thrift(
     )
 }
 
+#[cfg(feature = "compat")]
 fn position_delete_partition_source_field_to_thrift(
     field: &PositionDeletePartitionSourceField,
 ) -> data_sinks::TIcebergPositionDeletePartitionSourceField {
@@ -401,7 +413,7 @@ fn iceberg_type_to_arrow_type(ty: &Type) -> Result<DataType, String> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 mod tests {
     use super::*;
     use crate::connector::iceberg::position_delete_descriptor::{

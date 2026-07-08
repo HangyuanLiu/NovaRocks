@@ -171,6 +171,11 @@ impl FragmentSubmission {
         &self.thrift_params
     }
 
+    #[cfg(test)]
+    pub(crate) fn native_plan_for_test(&self) -> Option<&crate::proto::plan::PlanFragment> {
+        self.native_plan.as_ref()
+    }
+
     pub(crate) fn into_thrift_params(self) -> internal_service::TExecPlanFragmentParams {
         self.thrift_params
     }

@@ -997,6 +997,25 @@ pub(crate) struct DataStreamSinkFactoryInput {
 }
 
 impl DataStreamSinkFactoryInput {
+    pub(crate) fn partition_type_from_native_kind(
+        kind: i32,
+    ) -> Result<partitions::TPartitionType, String> {
+        match crate::proto::plan::PartitionKind::try_from(kind)
+            .map_err(|_| format!("unknown native PartitionKind value {kind}"))?
+        {
+            crate::proto::plan::PartitionKind::Unpartitioned => {
+                Ok(partitions::TPartitionType::UNPARTITIONED)
+            }
+            crate::proto::plan::PartitionKind::Random => Ok(partitions::TPartitionType::RANDOM),
+            crate::proto::plan::PartitionKind::Hash => {
+                Ok(partitions::TPartitionType::HASH_PARTITIONED)
+            }
+            crate::proto::plan::PartitionKind::Unspecified => {
+                Err("native DataPartition kind is unspecified".to_string())
+            }
+        }
+    }
+
     pub(crate) fn partition_type_requires_exprs(
         partition_type: partitions::TPartitionType,
     ) -> bool {
@@ -2228,7 +2247,7 @@ mod tests {
 
     fn make_test_destination() -> FragmentDestination {
         FragmentDestination::new(
-            types::TUniqueId::new(9, 9),
+            UniqueId { hi: 9, lo: 9 },
             RuntimeEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
         )
     }

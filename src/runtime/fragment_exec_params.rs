@@ -91,7 +91,7 @@ pub(crate) fn compat_destination_from_runtime(
     destination: FragmentDestination,
 ) -> data_sinks::TPlanFragmentDestination {
     data_sinks::TPlanFragmentDestination::new(
-        destination.finst_id().clone(),
+        thrift_unique_id(*destination.finst_id()),
         None::<types::TNetworkAddress>,
         Some(destination.endpoint().to_network_address()),
         None::<i32>,

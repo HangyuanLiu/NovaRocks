@@ -170,6 +170,28 @@ fn query_id_from_native(src: &proto::common::UniqueId) -> QueryId {
     }
 }
 
+fn stream_destination_from_native(
+    src: &proto::plan::StreamDestination,
+) -> Result<crate::runtime::endpoint::FragmentDestination, String> {
+    let finst_id = src
+        .finst_id
+        .as_ref()
+        .ok_or_else(|| "native StreamDestination missing finst_id".to_string())?;
+    Ok(crate::runtime::endpoint::FragmentDestination::new(
+        unique_id_from_native(finst_id),
+        crate::runtime::endpoint::RuntimeEndpoint::parse(&src.endpoint)?,
+    ))
+}
+
+fn stream_destinations_from_native(
+    src: &proto::plan::StreamDestinationList,
+) -> Result<Vec<crate::runtime::endpoint::FragmentDestination>, String> {
+    src.destinations
+        .iter()
+        .map(stream_destination_from_native)
+        .collect()
+}
+
 fn fragment_instance_id_from_native_params(
     params: &proto::novarocks::InstanceParams,
 ) -> Result<UniqueId, String> {
@@ -189,7 +211,8 @@ fn data_stream_input_from_native(
         .output_partition
         .as_ref()
         .ok_or_else(|| "native DATA_STREAM_SINK missing output_partition".to_string())?;
-    let partition_type = native_wire::data_partition_without_exprs(partition)?.type_;
+    let partition_type =
+        DataStreamSinkFactoryInput::partition_type_from_native_kind(partition.kind)?;
     DataStreamSinkFactoryInput::try_new(
         stream.dest_node_id,
         partition_type,
@@ -206,7 +229,8 @@ fn lower_stream_partition_exprs_from_native(
     layout: &super::layout::Layout,
     context: impl Fn(usize) -> String,
 ) -> Result<Vec<crate::exec::expr::ExprId>, String> {
-    let partition_type = native_wire::data_partition_without_exprs(partition)?.type_;
+    let partition_type =
+        DataStreamSinkFactoryInput::partition_type_from_native_kind(partition.kind)?;
     if !DataStreamSinkFactoryInput::partition_type_requires_exprs(partition_type) {
         return Ok(Vec::new());
     }
@@ -377,7 +401,7 @@ fn sink_factory_from_native(
                             )
                         },
                     )?;
-                    let destinations = native_wire::stream_destinations_from_native(destinations)?;
+                    let destinations = stream_destinations_from_native(destinations)?;
                     Ok((
                         data_stream_input_from_native(stream, destinations, partition_exprs)?,
                         stream.limit,
@@ -477,7 +501,7 @@ fn lower_iceberg_change_stream_router_sink_from_native(
                     "native ICEBERG_CHANGE_STREAM_ROUTER_SINK branch[{branch_idx}] missing destinations"
                 )
             })
-            .and_then(native_wire::stream_destinations_from_native)?;
+            .and_then(stream_destinations_from_native)?;
         let branch_kind = match proto::plan::ChangeStreamBranchKind::try_from(branch.branch_kind)
             .map_err(|_| {
                 format!(
@@ -503,7 +527,7 @@ fn lower_iceberg_change_stream_router_sink_from_native(
             branch_kind,
             stream_sink: DataStreamSinkFactoryInput::try_new(
                 branch.target_exchange_node_id,
-                native_wire::data_partition_without_exprs(&partition)?.type_,
+                DataStreamSinkFactoryInput::partition_type_from_native_kind(partition.kind)?,
                 Vec::new(),
                 partition_exprs,
                 output_columns,
