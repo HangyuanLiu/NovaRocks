@@ -52,6 +52,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
+use crate::common::types::UniqueId;
 use crate::runtime::endpoint::{
     FragmentDestination, RuntimeEndpoint, RuntimeFilterProberDestination,
 };
@@ -64,6 +65,13 @@ use crate::sql::planner::PartitionKind;
 use crate::thrift::types::TUniqueId;
 
 type LiveBackend = (usize, SocketAddr);
+
+fn unique_id_from_thrift(src: &TUniqueId) -> UniqueId {
+    UniqueId {
+        hi: src.hi,
+        lo: src.lo,
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct IncomingEdge {
@@ -412,12 +420,12 @@ impl FragmentScheduler {
     ) -> Result<(), String> {
         // Collect probe instances per filter_id.
         // probe_side_filters: HashMap<FragmentId, Vec<(filter_id, scan_node_id)>>
-        let mut probe_instances_by_filter: BTreeMap<i32, Vec<(TUniqueId, usize)>> = BTreeMap::new();
+        let mut probe_instances_by_filter: BTreeMap<i32, Vec<(UniqueId, usize)>> = BTreeMap::new();
         for (frag_id, probes) in &rf_plan.probe_side_filters {
             if let Some(instances) = plan.by_fragment.get(frag_id) {
-                let snapped: Vec<(TUniqueId, usize)> = instances
+                let snapped: Vec<(UniqueId, usize)> = instances
                     .iter()
-                    .map(|inst| (inst.finst_id.clone(), inst.backend_idx))
+                    .map(|inst| (unique_id_from_thrift(&inst.finst_id), inst.backend_idx))
                     .collect();
                 for (filter_id, _scan_node_id) in probes {
                     probe_instances_by_filter
@@ -439,7 +447,7 @@ impl FragmentScheduler {
                             .map(|(finst_id, backend_idx)| {
                                 let addr = live_backend_addr(live, *backend_idx)?;
                                 Ok(RuntimeFilterProberDestination::new(
-                                    finst_id.clone(),
+                                    *finst_id,
                                     RuntimeEndpoint::from_socket_addr(addr),
                                 ))
                             })
@@ -667,7 +675,7 @@ mod tests {
                 use_iceberg_jni_metadata_reader: false,
                 ivm_change_op: None,
                 file_pruning_min_max_values: None,
-                extended_columns: None,
+                compat_change_op_slot_id: None,
             },
         );
         params.volume_id = Some(marker);

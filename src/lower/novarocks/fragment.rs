@@ -34,6 +34,9 @@ use crate::exec::pipeline::executor::execute_plan_with_pipeline;
 use crate::lower::common::fragment_runtime::{
     RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
 };
+use crate::runtime::exec_params::{
+    build_sink_exec_params_without_scan_ranges, fragment_destination_to_thrift,
+};
 use crate::runtime::fragment_output::FragmentOutput;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::native_fragment_wire as native_wire;
@@ -280,8 +283,9 @@ fn sink_factory_from_native(
             let stream_sink = native_wire::data_stream_sink_from_native(stream)?;
             let destinations =
                 native_wire::destinations_from_native(&instance_params.destinations)?;
-            let exec_params = native_wire::exec_params_from_native(instance_params, destinations)?
-                .to_compat_exec_params()?;
+            let exec_params = build_sink_exec_params_without_scan_ranges(
+                &native_wire::exec_params_from_native(instance_params, destinations)?,
+            );
             let root_plan_node_id = fragment
                 .root
                 .as_ref()
@@ -329,8 +333,9 @@ fn sink_factory_from_native(
                 })
                 .collect::<Result<Vec<_>, String>>()?;
             let multi_cast_sink = native_wire::multi_cast_data_stream_sink_from_native(multi_cast)?;
-            let exec_params = native_wire::exec_params_from_native(instance_params, Vec::new())?
-                .to_compat_exec_params()?;
+            let exec_params = build_sink_exec_params_without_scan_ranges(
+                &native_wire::exec_params_from_native(instance_params, Vec::new())?,
+            );
             let root_plan_node_id = fragment
                 .root
                 .as_ref()
@@ -364,8 +369,9 @@ fn sink_factory_from_native(
                     &fragment.output_columns,
                     layout,
                 )?;
-            let exec_params = native_wire::exec_params_from_native(instance_params, Vec::new())?
-                .to_compat_exec_params()?;
+            let exec_params = build_sink_exec_params_without_scan_ranges(
+                &native_wire::exec_params_from_native(instance_params, Vec::new())?,
+            );
             let root_plan_node_id = fragment
                 .root
                 .as_ref()
@@ -451,7 +457,7 @@ fn lower_iceberg_change_stream_router_sink_from_native(
             .and_then(native_wire::stream_destinations_from_native)?;
         let branch_destinations = destinations
             .into_iter()
-            .map(crate::runtime::fragment_exec_params::compat_destination_from_runtime)
+            .map(fragment_destination_to_thrift)
             .collect();
         branches.push(native_wire::IcebergChangeStreamRouterBranch::new(
             branch.branch_id,
@@ -581,6 +587,96 @@ mod tests {
         }
     }
 
+    fn unpartitioned_partition() -> plan::DataPartition {
+        plan::DataPartition {
+            kind: plan::PartitionKind::Unpartitioned as i32,
+            exprs: Vec::new(),
+        }
+    }
+
+    fn data_stream_sink(dest_node_id: i32) -> plan::DataStreamSink {
+        plan::DataStreamSink {
+            dest_node_id,
+            output_partition: Some(unpartitioned_partition()),
+            output_columns: Vec::new(),
+            limit: None,
+        }
+    }
+
+    fn stream_destination_list() -> plan::StreamDestinationList {
+        plan::StreamDestinationList {
+            destinations: vec![plan::StreamDestination {
+                finst_id: Some(common::UniqueId { hi: 31, lo: 32 }),
+                endpoint: "127.0.0.1:9031".to_string(),
+            }],
+        }
+    }
+
+    fn with_sink(kind: plan::data_sink::Kind) -> plan::PlanFragment {
+        let mut fragment = noop_values_fragment();
+        fragment.sink = Some(plan::DataSink { kind: Some(kind) });
+        fragment
+    }
+
+    fn data_stream_sink_fragment() -> plan::PlanFragment {
+        with_sink(plan::data_sink::Kind::DataStream(data_stream_sink(30)))
+    }
+
+    fn multi_cast_data_stream_sink_fragment() -> plan::PlanFragment {
+        with_sink(plan::data_sink::Kind::MultiCastDataStream(
+            plan::MultiCastDataStreamSink {
+                sinks: vec![data_stream_sink(30)],
+                destinations: vec![stream_destination_list()],
+            },
+        ))
+    }
+
+    fn change_stream_router_sink_fragment() -> plan::PlanFragment {
+        with_sink(plan::data_sink::Kind::IcebergChangeStreamRouter(
+            plan::IcebergChangeStreamRouterSink {
+                group_id: 7,
+                change_op_output_ordinal: 0,
+                data_route_output_ordinal: None,
+                branches: vec![plan::IcebergChangeStreamBranchRoute {
+                    branch_id: 0,
+                    branch_kind: plan::ChangeStreamBranchKind::DeleteDv as i32,
+                    target_fragment_id: 2,
+                    target_exchange_node_id: 30,
+                    output_ordinals: vec![0],
+                    output_partition_ordinals: Vec::new(),
+                    output_partition: Some(unpartitioned_partition()),
+                    destinations: Some(stream_destination_list()),
+                }],
+            },
+        ))
+    }
+
+    fn instance_params_with_destination() -> proto::novarocks::InstanceParams {
+        let mut params = instance_params();
+        params.destinations.push(proto::novarocks::Destination {
+            finst_id: Some(common::UniqueId { hi: 31, lo: 32 }),
+            endpoint: "127.0.0.1:9031".to_string(),
+        });
+        params
+    }
+
+    fn assert_sink_factory_available(
+        fragment: &plan::PlanFragment,
+        params: &proto::novarocks::InstanceParams,
+        label: &str,
+    ) {
+        let sink = fragment.sink.as_ref().expect("fragment sink");
+        let layout = super::super::layout::Layout::default();
+
+        let factory = sink_factory_from_native(fragment, sink, params, false, &layout);
+
+        assert!(
+            factory.is_ok(),
+            "native {label} was rejected: {}",
+            factory.err().unwrap_or_else(|| "unknown error".to_string())
+        );
+    }
+
     #[test]
     fn converts_native_query_options_consumed_subset() {
         let opts = native_wire::query_options_from_native(&proto::novarocks::QueryOptions {
@@ -592,7 +688,7 @@ mod tests {
             allow_throw_exception: true,
             enable_spill: true,
             spill_options: Some(proto::novarocks::SpillOptions {
-                spill_mode: native_wire::SpillMode::FORCE.0,
+                spill_mode: 1,
                 spill_mem_limit_threshold: 0.5,
                 spill_operator_min_bytes: 1024,
                 spill_mem_table_size: 32,
@@ -652,7 +748,7 @@ mod tests {
         let prober = &rf.id_to_prober_params()[&3][0];
         assert_eq!(
             prober.fragment_instance_id(),
-            &crate::thrift::types::TUniqueId::new(1, 2)
+            crate::common::types::UniqueId { hi: 1, lo: 2 }
         );
         assert_eq!(prober.endpoint().as_host_port(), "127.0.0.1:9050");
     }
@@ -688,6 +784,30 @@ mod tests {
         let err = execute_fragment_native(&fragment, &params, None, 1, None, None, None)
             .expect_err("sender count must be positive");
         assert!(err.contains("must be positive"), "{err}");
+    }
+
+    #[test]
+    fn native_data_stream_sink_factory_is_available_without_compat_projection_gate() {
+        let fragment = data_stream_sink_fragment();
+        let params = instance_params_with_destination();
+
+        assert_sink_factory_available(&fragment, &params, "DATA_STREAM_SINK");
+    }
+
+    #[test]
+    fn native_multi_cast_data_stream_sink_factory_is_available_without_compat_projection_gate() {
+        let fragment = multi_cast_data_stream_sink_fragment();
+        let params = instance_params();
+
+        assert_sink_factory_available(&fragment, &params, "MULTI_CAST_DATA_STREAM_SINK");
+    }
+
+    #[test]
+    fn native_change_stream_router_sink_factory_is_available_without_compat_projection_gate() {
+        let fragment = change_stream_router_sink_fragment();
+        let params = instance_params();
+
+        assert_sink_factory_available(&fragment, &params, "ICEBERG_CHANGE_STREAM_ROUTER_SINK");
     }
 
     #[test]

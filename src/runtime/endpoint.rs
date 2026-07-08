@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+use crate::common::types::UniqueId;
 use crate::thrift::types;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,20 +85,20 @@ impl FragmentDestination {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeFilterProberDestination {
-    fragment_instance_id: types::TUniqueId,
+    fragment_instance_id: UniqueId,
     endpoint: RuntimeEndpoint,
 }
 
 impl RuntimeFilterProberDestination {
-    pub(crate) fn new(fragment_instance_id: types::TUniqueId, endpoint: RuntimeEndpoint) -> Self {
+    pub(crate) fn new(fragment_instance_id: UniqueId, endpoint: RuntimeEndpoint) -> Self {
         Self {
             fragment_instance_id,
             endpoint,
         }
     }
 
-    pub(crate) fn fragment_instance_id(&self) -> &types::TUniqueId {
-        &self.fragment_instance_id
+    pub(crate) fn fragment_instance_id(&self) -> UniqueId {
+        self.fragment_instance_id
     }
 
     pub(crate) fn endpoint(&self) -> &RuntimeEndpoint {

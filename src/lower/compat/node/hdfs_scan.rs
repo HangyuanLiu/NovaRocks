@@ -58,6 +58,25 @@ pub(crate) fn cache_iceberg_table_locations(snapshot: Option<&DescriptorSnapshot
     crate::connector::iceberg::cache_iceberg_table_locations(snapshot);
 }
 
+#[cfg(feature = "compat")]
+fn runtime_query_options_from_thrift(
+    query_opts: Option<&internal_service::TQueryOptions>,
+) -> Result<Option<crate::runtime::query_options::QueryOptions>, String> {
+    query_opts
+        .map(|opts| crate::runtime::query_options::QueryOptions::from_thrift(Some(opts)))
+        .transpose()
+}
+
+#[cfg(not(feature = "compat"))]
+fn runtime_query_options_from_thrift(
+    query_opts: Option<&internal_service::TQueryOptions>,
+) -> Result<Option<crate::runtime::query_options::QueryOptions>, String> {
+    if query_opts.is_some() {
+        return Err("thrift query options require the compat feature".to_string());
+    }
+    Ok(None)
+}
+
 fn next_hidden_slot_id(visible_slot_ids: &[SlotId]) -> Result<SlotId, String> {
     let max_slot = visible_slot_ids
         .iter()
@@ -1185,9 +1204,7 @@ pub(crate) fn lower_hdfs_scan_node(
     let needs_first_row_id = row_position_spec.is_some() || iceberg_virtual_row_id_slot.is_some();
 
     let case_sensitive = hdfs.case_sensitive.unwrap_or(true);
-    let runtime_query_opts = query_opts
-        .map(|opts| crate::runtime::query_options::QueryOptions::from_thrift(Some(opts)))
-        .transpose()?;
+    let runtime_query_opts = runtime_query_options_from_thrift(query_opts)?;
     let mut cache_options = CacheOptions::from_query_options(runtime_query_opts.as_ref())?;
     if let Some(node_datacache_options) = hdfs.datacache_options.as_ref() {
         let node_range_options = ExternalDataCacheRangeOptions {

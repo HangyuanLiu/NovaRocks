@@ -19,7 +19,10 @@ use std::time::Duration;
 
 use crate::exec::spill::{SpillConfig, SpillMode};
 use crate::proto::novarocks;
+
+#[cfg(feature = "compat")]
 use crate::thrift::internal_service::{TQueryOptions, TSpillMode, TSpillOptions};
+#[cfg(feature = "compat")]
 use thrift::OrderedFloat;
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -56,6 +59,7 @@ pub(crate) struct QueryCacheOptions {
 }
 
 impl QueryOptions {
+    #[cfg(feature = "compat")]
     pub(crate) fn from_thrift(opts: Option<&TQueryOptions>) -> Result<Self, String> {
         let Some(opts) = opts else {
             return Ok(Self::default());
@@ -94,6 +98,7 @@ impl QueryOptions {
         })
     }
 
+    #[cfg(feature = "compat")]
     pub(crate) fn to_thrift(&self) -> TQueryOptions {
         let mut thrift = TQueryOptions {
             batch_size: self.batch_size,
@@ -224,6 +229,7 @@ pub(crate) fn query_expire_durations(query_opts: Option<&QueryOptions>) -> (Dura
     )
 }
 
+#[cfg(feature = "compat")]
 fn spill_config_from_thrift(opts: &TQueryOptions) -> Result<Option<SpillConfig>, String> {
     let enable_spill = opts.enable_spill.unwrap_or(false);
     if !enable_spill {
@@ -320,6 +326,7 @@ fn spill_config_from_native(src: &novarocks::QueryOptions) -> Result<Option<Spil
     }))
 }
 
+#[cfg(feature = "compat")]
 fn apply_spill_config_to_thrift(spill: &SpillConfig, thrift: &mut TQueryOptions) {
     thrift.enable_spill = Some(spill.enable_spill);
     thrift.spill_options = Some(TSpillOptions {
@@ -338,7 +345,7 @@ fn apply_spill_config_to_thrift(spill: &SpillConfig, thrift: &mut TQueryOptions)
 
 fn spill_config_to_native(spill: &SpillConfig) -> novarocks::SpillOptions {
     novarocks::SpillOptions {
-        spill_mode: i32::from(spill_mode_to_thrift(spill.spill_mode)),
+        spill_mode: spill_mode_to_native_i32(spill.spill_mode),
         spill_mem_limit_threshold: spill.spill_mem_limit_threshold.unwrap_or_default(),
         spill_operator_min_bytes: spill.spill_operator_min_bytes.unwrap_or_default(),
         spill_operator_max_bytes: spill.spill_operator_max_bytes.unwrap_or_default(),
@@ -352,6 +359,7 @@ fn spill_config_to_native(spill: &SpillConfig) -> novarocks::SpillOptions {
     }
 }
 
+#[cfg(feature = "compat")]
 fn spill_mode_from_thrift(mode: TSpillMode) -> Result<SpillMode, String> {
     match mode {
         TSpillMode::NONE => Ok(SpillMode::None),
@@ -363,9 +371,25 @@ fn spill_mode_from_thrift(mode: TSpillMode) -> Result<SpillMode, String> {
 }
 
 fn spill_mode_from_i32(mode: i32) -> Result<SpillMode, String> {
-    spill_mode_from_thrift(TSpillMode::from(mode))
+    match mode {
+        0 => Ok(SpillMode::Auto),
+        1 => Ok(SpillMode::Force),
+        2 => Ok(SpillMode::None),
+        3 => Ok(SpillMode::Random),
+        value => Err(format!("unknown spill_mode value: {value}")),
+    }
 }
 
+fn spill_mode_to_native_i32(mode: SpillMode) -> i32 {
+    match mode {
+        SpillMode::Auto => 0,
+        SpillMode::Force => 1,
+        SpillMode::None => 2,
+        SpillMode::Random => 3,
+    }
+}
+
+#[cfg(feature = "compat")]
 fn spill_mode_to_thrift(mode: SpillMode) -> TSpillMode {
     match mode {
         SpillMode::None => TSpillMode::NONE,
@@ -382,8 +406,8 @@ fn validate_spill_mode(mode: SpillMode) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(all(test, feature = "compat"))]
+mod compat_tests {
     use super::*;
     use crate::thrift::internal_service::{TQueryOptions, TSpillMode, TSpillOptions};
     use thrift::OrderedFloat;
@@ -504,6 +528,11 @@ mod tests {
         assert_eq!(thrift.global_runtime_filter_build_max_size, Some(123456));
         assert_eq!(thrift.enable_spill, Some(false));
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     #[test]
     fn query_expire_durations_use_delivery_timeout_cap() {

@@ -578,10 +578,14 @@ impl ExecutionCoordinator {
                 let mut exec_params = fr.exec_params.clone();
                 exec_params.query_id = query_id.clone();
                 exec_params.fragment_instance_id = placement.finst_id.clone();
-                exec_params.per_node_scan_ranges =
-                    compat_scan_ranges_for_placement(fr, placement, placements.len())?;
+                #[cfg(feature = "compat")]
+                {
+                    exec_params.per_node_scan_ranges =
+                        compat_scan_ranges_for_placement(fr, placement, placements.len())?;
+                }
                 exec_params.per_exch_num_senders = placement.per_exch_num_senders.clone();
                 exec_params.destinations = exec_destinations;
+                #[cfg(feature = "compat")]
                 if let Some(rf) = rf_plan.as_ref() {
                     let rf_params = build_instance_runtime_filter_params(
                         rf,
@@ -591,7 +595,10 @@ impl ExecutionCoordinator {
                     exec_params.runtime_filter_params = Some(rf_params.to_thrift());
                 }
 
+                #[cfg(feature = "compat")]
                 let compat_query_options = query_options.as_ref().map(QueryOptions::to_thrift);
+                #[cfg(not(feature = "compat"))]
+                let compat_query_options = None;
                 let params = build_exec_plan_fragment_params(
                     CompatFragmentPlanPayload {
                         plan: fr.plan.clone(),
@@ -1272,6 +1279,7 @@ fn wrap_iceberg_change_stream_router_sink(
     ))
 }
 
+#[cfg(feature = "compat")]
 fn compat_scan_ranges_for_placement(
     fragment: &crate::sql::codegen::FragmentBuildResult,
     placement: &FragmentInstancePlacement,
@@ -3527,7 +3535,7 @@ mod tests {
                 use_iceberg_jni_metadata_reader: false,
                 ivm_change_op: None,
                 file_pruning_min_max_values: None,
-                extended_columns: None,
+                compat_change_op_slot_id: None,
             },
         );
         params.volume_id = Some(marker);
@@ -3586,6 +3594,69 @@ mod tests {
         }
     }
 
+    #[test]
+    fn proto_coordinator_submits_native_scan_ranges_without_compat_projection() {
+        let mut fragment = fragment_for_scan_range_merge_test(BTreeMap::new());
+        fragment
+            .native_scan_ranges
+            .insert(10, vec![native_file_scan_range_for_test(101)]);
+        let mut native_fragment = crate::proto::plan::PlanFragment {
+            fragment_id: fragment.fragment_id,
+            root: Some(crate::proto::plan::DistributedNode {
+                node_id: 10,
+                fragment_id: fragment.fragment_id,
+                limit: -1,
+                payload: Some(crate::proto::plan::distributed_node::Payload::Physical(
+                    crate::proto::plan::PlanNode {
+                        kind: Some(crate::proto::plan::plan_node::Kind::Values(
+                            crate::proto::plan::ValuesNode::default(),
+                        )),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }),
+            sink: Some(crate::proto::plan::DataSink {
+                kind: Some(crate::proto::plan::data_sink::Kind::Result(true)),
+            }),
+            ..Default::default()
+        };
+        native_fragment.output_columns = Vec::new();
+        let native_sidecars = NativePlanSidecars {
+            fragments_by_id: BTreeMap::from([(fragment.fragment_id, native_fragment)]),
+        };
+        let fragment_schedule = fragment.scheduling_metadata();
+        let build = MultiFragmentBuildResult {
+            fragment_results: vec![fragment],
+            fragment_schedules: vec![fragment_schedule],
+            root_fragment_id: 0,
+            edges: Vec::new(),
+            lowered_edges: Vec::new(),
+            boundary_schemas: Vec::new(),
+            rf_plan: None,
+        };
+        let dispatcher = MockDispatcher::new();
+        let scheduler = Arc::new(FragmentScheduler::new(vec![
+            "127.0.0.1:19010".parse().expect("backend addr"),
+        ]));
+
+        let result = ExecutionCoordinator::new_with_native_plan_sidecars(
+            build,
+            native_sidecars,
+            dispatcher.clone(),
+            scheduler,
+            None,
+        )
+        .execute_with_write_outcome();
+
+        assert!(
+            result.is_ok(),
+            "coordinator rejected native scan ranges: {result:?}"
+        );
+        assert_eq!(dispatcher.submitted_count(), 1);
+    }
+
+    #[cfg(feature = "compat")]
     #[test]
     fn compat_scan_ranges_for_placement_merges_native_and_compat_only_nodes() {
         let fragment = fragment_for_scan_range_merge_test(BTreeMap::from([

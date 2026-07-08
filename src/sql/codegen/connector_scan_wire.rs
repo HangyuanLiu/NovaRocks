@@ -15,8 +15,8 @@ use crate::sql::catalog::{
     IcebergDeleteFileInfo,
 };
 #[cfg(feature = "compat")]
-use crate::thrift::descriptors;
-use crate::thrift::{exprs, internal_service, partitions, plan_nodes, types};
+use crate::thrift::{descriptors, internal_service};
+use crate::thrift::{exprs, partitions, plan_nodes, types};
 use arrow::datatypes::DataType;
 
 #[cfg(feature = "compat")]
@@ -40,6 +40,7 @@ pub(crate) struct ThriftScanContext {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(feature = "compat")]
 pub(crate) struct ThriftScanPlan {
     pub(crate) node: Option<plan_nodes::TPlanNode>,
     pub(crate) scan_ranges: Vec<internal_service::TScanRangeParams>,
@@ -51,6 +52,7 @@ pub(crate) struct NativeFileScanPlan {
     pub(crate) scan_ranges: Vec<scan_range::ScanRangeParams>,
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn to_thrift_scan(
     connector_id: &str,
     scan: &ScanHandle,
@@ -85,6 +87,7 @@ pub(crate) fn to_native_file_scan(
     }
 }
 
+#[cfg(feature = "compat")]
 fn iceberg_to_thrift_scan(
     scan: &ScanHandle,
     splits: &[Split],
@@ -436,7 +439,7 @@ fn decode_float_bound_for_type(bytes: &[u8], data_type: &DataType) -> Option<f64
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 fn build_hdfs_scan_range_params_for_file(
     file: &IcebergDataFileInfo,
     change_op_slot: Option<types::TSlotId>,
@@ -516,12 +519,6 @@ fn validate_iceberg_delete_apply_cost(
     Ok(())
 }
 
-fn int_literal_expr(value: i64) -> exprs::TExpr {
-    exprs::TExpr::new(vec![crate::sql::codegen::expr_compiler::int_literal_node(
-        value,
-    )])
-}
-
 pub(crate) fn build_native_file_scan_range_params(
     full_path: &str,
     file_len: i64,
@@ -542,31 +539,19 @@ pub(crate) fn build_native_file_scan_range_params(
             IcebergDeleteFileFormat::Parquet => {
                 let file_content = match delete_file.file_content {
                     IcebergDeleteFileContent::Position => {
-                        types::TIcebergFileContent::POSITION_DELETES
+                        scan_range::IcebergFileContent::PositionDeletes
                     }
                     IcebergDeleteFileContent::Equality => {
                         // Equality field IDs are read from the equality-delete Parquet schema by
-                        // the Rust scan runner. The Thrift scan range only needs to identify the
+                        // the Rust scan runner. The scan range only needs to identify the
                         // delete file as an equality-delete file.
-                        types::TIcebergFileContent::EQUALITY_DELETES
+                        scan_range::IcebergFileContent::EqualityDeletes
                     }
                 };
                 parquet_delete_files.push(scan_range::IcebergDeleteFile {
                     full_path: Some(delete_file.path.clone()),
                     file_format: scan_range::IcebergFileFormat::Parquet,
-                    file_content: match file_content {
-                        types::TIcebergFileContent::POSITION_DELETES => {
-                            scan_range::IcebergFileContent::PositionDeletes
-                        }
-                        types::TIcebergFileContent::EQUALITY_DELETES => {
-                            scan_range::IcebergFileContent::EqualityDeletes
-                        }
-                        other => {
-                            return Err(format!(
-                                "unsupported Iceberg delete file content for native scan range: {other:?}"
-                            ));
-                        }
-                    },
+                    file_content,
                     length: delete_file.length,
                 });
             }
@@ -599,13 +584,9 @@ pub(crate) fn build_native_file_scan_range_params(
             }
         }
     }
-    let extended_columns = match (ivm_change_op, change_op_slot) {
-        (Some(op), Some(slot_id)) => {
-            crate::exec::change_op::validate_change_op_value(op)?;
-            Some(BTreeMap::from([(slot_id, int_literal_expr(op as i64))]))
-        }
-        _ => None,
-    };
+    if let Some(op) = ivm_change_op {
+        crate::exec::change_op::validate_change_op_value(op)?;
+    }
     Ok(scan_range::ScanRangeParams::file(
         scan_range::FileScanRange {
             file_format: scan_range::FileFormat::Parquet,
@@ -626,12 +607,12 @@ pub(crate) fn build_native_file_scan_range_params(
             use_iceberg_jni_metadata_reader: false,
             ivm_change_op,
             file_pruning_min_max_values,
-            extended_columns,
+            compat_change_op_slot_id: change_op_slot,
         },
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 pub(crate) fn build_hdfs_scan_range_params(
     full_path: &str,
     file_len: i64,
@@ -785,7 +766,7 @@ fn build_starrocks_lake_scan_node(
     node
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 mod tests {
     use std::any::Any;
 

@@ -125,7 +125,10 @@ pub(crate) fn lower_distributed_plan(
         &state.scan_tables,
         mv_refresh_ctx,
     )?;
+    #[cfg(feature = "compat")]
     let exec_params = scan_range_build.to_compat_exec_params()?;
+    #[cfg(not(feature = "compat"))]
+    let exec_params = empty_exec_params_without_compat_scan_ranges();
 
     let mut fragment_results = Vec::with_capacity(prepared_fragments.len());
     for (fragment, lowered, output_sink, output_exprs, output_columns, root_node_id) in
@@ -333,6 +336,30 @@ fn apply_local_rf_waiting_sets(
             }
             node.local_rf_waiting_set = Some(build_node_ids.iter().copied().collect());
         }
+    }
+}
+
+#[cfg(not(feature = "compat"))]
+fn empty_exec_params_without_compat_scan_ranges()
+-> crate::thrift::internal_service::TPlanFragmentExecParams {
+    crate::thrift::internal_service::TPlanFragmentExecParams {
+        query_id: types::TUniqueId::new(1, 1),
+        fragment_instance_id: types::TUniqueId::new(2, 2),
+        per_node_scan_ranges: BTreeMap::new(),
+        per_exch_num_senders: BTreeMap::new(),
+        destinations: None,
+        sender_id: None,
+        num_senders: None,
+        send_query_statistics_with_every_batch: None,
+        use_vectorized: None,
+        runtime_filter_params: None,
+        instances_number: None,
+        enable_exchange_pass_through: None,
+        node_to_per_driver_seq_scan_ranges: None,
+        enable_exchange_perf: None,
+        pipeline_sink_dop: None,
+        report_when_finish: None,
+        exec_debug_options: None,
     }
 }
 

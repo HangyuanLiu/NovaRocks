@@ -23,6 +23,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::runtime::fragment_exec_params::FragmentExecParams;
 use crate::thrift::data_sinks;
 use crate::thrift::descriptors;
 use crate::thrift::internal_service;
@@ -108,6 +109,51 @@ pub(crate) fn build_exec_plan_fragment_params(
         options.novarocks_report_addr,
         options.novarocks_typed_result_sink.then_some(true),
         Some(true), // novarocks_generated_plan
+    )
+}
+
+pub(crate) fn build_sink_exec_params_without_scan_ranges(
+    params: &FragmentExecParams,
+) -> internal_service::TPlanFragmentExecParams {
+    internal_service::TPlanFragmentExecParams {
+        query_id: types::TUniqueId::new(params.query_id().hi, params.query_id().lo),
+        fragment_instance_id: types::TUniqueId::new(
+            params.fragment_instance_id().hi,
+            params.fragment_instance_id().lo,
+        ),
+        per_node_scan_ranges: BTreeMap::new(),
+        per_exch_num_senders: params.per_exch_num_senders().clone(),
+        destinations: Some(
+            params
+                .destinations()
+                .iter()
+                .cloned()
+                .map(fragment_destination_to_thrift)
+                .collect(),
+        ),
+        sender_id: None,
+        num_senders: None,
+        send_query_statistics_with_every_batch: None,
+        use_vectorized: None,
+        runtime_filter_params: None,
+        instances_number: None,
+        enable_exchange_pass_through: None,
+        node_to_per_driver_seq_scan_ranges: None,
+        enable_exchange_perf: None,
+        pipeline_sink_dop: None,
+        report_when_finish: None,
+        exec_debug_options: None,
+    }
+}
+
+pub(crate) fn fragment_destination_to_thrift(
+    destination: crate::runtime::endpoint::FragmentDestination,
+) -> data_sinks::TPlanFragmentDestination {
+    data_sinks::TPlanFragmentDestination::new(
+        destination.finst_id().clone(),
+        None::<types::TNetworkAddress>,
+        Some(destination.endpoint().to_network_address()),
+        None::<i32>,
     )
 }
 
