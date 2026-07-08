@@ -530,7 +530,11 @@ mod tests {
     /// `current_mv_rewrite_shape_support_rejects_join_descriptor` rejects
     /// -- these two new tests need a genuinely Iceberg-identified pair to
     /// exercise the "well-formed" accept path and the self-join reject path.
-    fn iceberg_table_for_test(catalog: &str, ns: &str, name: &str) -> crate::sql::catalog::TableDef {
+    fn iceberg_table_for_test(
+        catalog: &str,
+        ns: &str,
+        name: &str,
+    ) -> crate::sql::catalog::TableDef {
         crate::sql::catalog::TableDef {
             name: name.to_string(),
             columns: Vec::new(),

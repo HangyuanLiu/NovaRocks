@@ -19834,7 +19834,11 @@ mod tests {
             .joins
             .as_ref()
             .expect("candidate descriptor must carry a JoinShape for a 2-table MV");
-        assert_eq!(joins.inputs.len(), 1, "one non-driving join input (customers)");
+        assert_eq!(
+            joins.inputs.len(),
+            1,
+            "one non-driving join input (customers)"
+        );
         assert_eq!(joins.equi_edges.len(), 1, "one equi-join edge (id = id)");
     }
 

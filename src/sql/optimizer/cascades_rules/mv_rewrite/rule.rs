@@ -1145,7 +1145,10 @@ mod tests {
         assert!(join_graph_matches(&a, &b).is_some(), "same table -> match");
 
         let c = descriptor_single(iceberg_table("cat", "ns", "other", &["a"]));
-        assert!(join_graph_matches(&a, &c).is_none(), "different table -> no match");
+        assert!(
+            join_graph_matches(&a, &c).is_none(),
+            "different table -> no match"
+        );
     }
 
     #[test]
@@ -1811,8 +1814,13 @@ mod tests {
         let root_expr = memo.groups[root].logical_exprs[0].clone();
 
         let mut candidate = agg_join_candidate();
-        candidate.mv.joins.as_mut().expect("join shape present").inputs[0].table =
-            iceberg_table("cat", "ns", "t1", &["c"]); // same FQN as the driving table "t1"
+        candidate
+            .mv
+            .joins
+            .as_mut()
+            .expect("join shape present")
+            .inputs[0]
+            .table = iceberg_table("cat", "ns", "t1", &["c"]); // same FQN as the driving table "t1"
 
         let rule = MvRewriteRule::new(vec![candidate]);
         assert!(

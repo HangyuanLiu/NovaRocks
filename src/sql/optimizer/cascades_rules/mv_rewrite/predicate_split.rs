@@ -553,8 +553,8 @@ mod tests {
 
         let query_conjuncts = [ge_col(&t1_x, 5), ge_col(&t2_x, 100)];
         let mv_conjuncts = [ge_col(&t1_x, 5)];
-        let r = check_containment(&query_conjuncts, &mv_conjuncts, &names, &names)
-            .expect("contained");
+        let r =
+            check_containment(&query_conjuncts, &mv_conjuncts, &names, &names).expect("contained");
         // t2.x >= 100 is unconstrained by the MV -> compensates as its OWN,
         // separate range bucket (a bare-name bug would merge it onto t1.x's
         // bucket and either wrongly imply it or wrongly drop it).

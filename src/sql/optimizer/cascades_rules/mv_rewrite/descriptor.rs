@@ -134,9 +134,10 @@ pub(crate) struct SpjgDescriptor {
 fn iceberg_fqn(table: &TableDef) -> Option<String> {
     use crate::sql::catalog::ScanSource;
     match &table.source {
-        ScanSource::IcebergDataFiles { table: info, .. } => {
-            Some(format!("{}.{}.{}", info.catalog, info.namespace, info.table))
-        }
+        ScanSource::IcebergDataFiles { table: info, .. } => Some(format!(
+            "{}.{}.{}",
+            info.catalog, info.namespace, info.table
+        )),
         _ => None,
     }
 }
@@ -1506,11 +1507,23 @@ mod tests {
         // fixture uses non-Iceberg `test_scan_source()`, so qualification
         // falls back to the bare table name ("t1"/"t2") rather than an
         // Iceberg FQN -- see `table_qualifier`.
-        assert_eq!(names.get(&ColumnId(1)).map(String::as_str), Some("t1\u{1}a"));
-        assert_eq!(names.get(&ColumnId(2)).map(String::as_str), Some("t1\u{1}b"));
+        assert_eq!(
+            names.get(&ColumnId(1)).map(String::as_str),
+            Some("t1\u{1}a")
+        );
+        assert_eq!(
+            names.get(&ColumnId(2)).map(String::as_str),
+            Some("t1\u{1}b")
+        );
         // Join-input columns must also be present, qualified by "t2":
-        assert_eq!(names.get(&ColumnId(3)).map(String::as_str), Some("t2\u{1}c"));
-        assert_eq!(names.get(&ColumnId(4)).map(String::as_str), Some("t2\u{1}d"));
+        assert_eq!(
+            names.get(&ColumnId(3)).map(String::as_str),
+            Some("t2\u{1}c")
+        );
+        assert_eq!(
+            names.get(&ColumnId(4)).map(String::as_str),
+            Some("t2\u{1}d")
+        );
     }
 
     #[test]
