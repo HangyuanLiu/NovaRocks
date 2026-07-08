@@ -511,7 +511,7 @@ pub(crate) fn handle_lookup_compat(req: CompatLookupRequest) -> CompatLookupResp
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 mod tests {
     #[cfg(feature = "compat")]
     use std::collections::BTreeMap;

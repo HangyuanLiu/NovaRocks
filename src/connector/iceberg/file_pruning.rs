@@ -635,7 +635,7 @@ fn decode_f64_bound(bytes: &[u8]) -> Option<f64> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
 

@@ -578,18 +578,10 @@ fn handle_native_standalone_report_exec_status(
             } else if profile_report_accepted {
                 Ok(())
             } else {
-                Err(EngineError::write_coordinator_gone(
-                    thrift_unique_id_from_runtime(query_id),
-                ))
+                Err(EngineError::write_coordinator_gone(query_id))
             }
         }
     }
-}
-
-fn thrift_unique_id_from_runtime(
-    id: crate::common::types::UniqueId,
-) -> crate::thrift::types::TUniqueId {
-    crate::thrift::types::TUniqueId::new(id.hi, id.lo)
 }
 
 struct FailedQueryReport {

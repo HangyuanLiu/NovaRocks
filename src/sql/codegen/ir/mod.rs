@@ -19,9 +19,12 @@
 
 pub(crate) mod explain;
 pub(crate) mod kind;
+#[cfg(feature = "compat")]
 pub(crate) mod lowering;
+#[cfg(not(feature = "compat"))]
+mod lowering_native;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 pub(crate) mod equiv;
 
 #[cfg(test)]
@@ -30,7 +33,12 @@ pub(crate) use crate::sql::planner::{
     PlanFragment,
 };
 pub(crate) use explain::{explain_distributed_plan, explain_distributed_plan_analyze};
+#[cfg(feature = "compat")]
 pub(crate) use lowering::{lower_distributed_plan, refresh_distributed_plan_for_native_sidecar};
+#[cfg(not(feature = "compat"))]
+pub(crate) use lowering_native::{
+    lower_distributed_plan, refresh_distributed_plan_for_native_sidecar,
+};
 
 #[cfg(test)]
 mod tests {

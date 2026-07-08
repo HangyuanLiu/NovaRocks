@@ -18,9 +18,12 @@
 use crate::engine::query_options::StandaloneQueryOptions;
 use crate::exec::spill::{SpillConfig, SpillMode};
 use crate::runtime::query_options::QueryOptions;
+#[cfg(feature = "compat")]
 use crate::thrift::internal_service::{TQueryOptions, TSpillMode, TSpillOptions};
+#[cfg(feature = "compat")]
 use thrift::OrderedFloat;
 
+#[cfg(feature = "compat")]
 pub(crate) fn standalone_query_options_from_thrift(
     opts: Option<&TQueryOptions>,
 ) -> Result<StandaloneQueryOptions, String> {
@@ -45,6 +48,7 @@ pub(crate) fn standalone_query_options_from_thrift(
     })
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn standalone_query_options_to_thrift(opts: &StandaloneQueryOptions) -> TQueryOptions {
     let mut thrift = TQueryOptions {
         pipeline_dop: opts.pipeline_dop,
@@ -68,6 +72,7 @@ pub(crate) fn standalone_query_options_to_thrift(opts: &StandaloneQueryOptions) 
     thrift
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn standalone_query_options_to_optional_thrift(
     opts: Option<&StandaloneQueryOptions>,
 ) -> Option<TQueryOptions> {
@@ -97,6 +102,7 @@ pub(crate) fn standalone_query_options_to_optional_runtime(
     opts.map(standalone_query_options_to_runtime)
 }
 
+#[cfg(feature = "compat")]
 fn spill_config_from_thrift(opts: &TQueryOptions) -> Result<Option<SpillConfig>, String> {
     let enable_spill = opts.enable_spill.unwrap_or(false);
     if !enable_spill {
@@ -162,6 +168,7 @@ fn spill_config_from_thrift(opts: &TQueryOptions) -> Result<Option<SpillConfig>,
     }))
 }
 
+#[cfg(feature = "compat")]
 fn apply_spill_config_to_thrift(spill: &SpillConfig, thrift: &mut TQueryOptions) {
     thrift.enable_spill = Some(spill.enable_spill);
     thrift.spill_options = Some(TSpillOptions {
@@ -178,6 +185,7 @@ fn apply_spill_config_to_thrift(spill: &SpillConfig, thrift: &mut TQueryOptions)
     });
 }
 
+#[cfg(feature = "compat")]
 fn spill_mode_from_thrift(mode: TSpillMode) -> Result<SpillMode, String> {
     match mode {
         TSpillMode::NONE => Ok(SpillMode::None),
@@ -195,6 +203,7 @@ fn validate_spill_mode(mode: SpillMode) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "compat")]
 fn spill_mode_to_thrift(mode: SpillMode) -> TSpillMode {
     match mode {
         SpillMode::None => TSpillMode::NONE,
@@ -204,7 +213,7 @@ fn spill_mode_to_thrift(mode: SpillMode) -> TSpillMode {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 mod tests {
     use crate::exec::spill::SpillMode;
     use crate::thrift::internal_service::{

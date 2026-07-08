@@ -17,6 +17,7 @@
 
 mod arithmetic;
 pub(crate) mod arrow_primitive;
+#[cfg(feature = "compat")]
 pub(crate) mod arrow_thrift;
 pub(crate) mod coercion;
 pub(crate) mod logical;

@@ -18,6 +18,7 @@
 use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::codegen::FragmentId;
 use crate::sql::column_id::ColumnId;
+#[cfg(feature = "compat")]
 use crate::thrift::exprs;
 
 // ---------------------------------------------------------------------------
@@ -29,6 +30,7 @@ use crate::thrift::exprs;
 /// probe descendants) looks this up by `filter_id` to wire the RF's
 /// `plan_node_id_to_target_expr` and the probe-side prober params.
 #[derive(Clone, Debug)]
+#[cfg(feature = "compat")]
 pub(in crate::sql::codegen) struct RfProbeTarget {
     /// Thrift node id of the node that consumes the probe (scan or the
     /// root thrift node of an intermediate operator's subtree).

@@ -3884,10 +3884,9 @@ mod tests {
     use super::*;
     use crate::common::ids::SlotId;
     use crate::common::largeint;
-    use crate::exec::chunk::schema_thrift::chunk_field_schema_from_type_desc;
-    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
+    use crate::exec::chunk::{Chunk, ChunkFieldSchema, ChunkSchema, ChunkSlotSchema};
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
-    use crate::thrift::types;
+    use crate::types::logical::{LogicalType, field_with_logical_type};
     use arrow::array::{
         ArrayRef, BinaryArray, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Int8Array,
         Int32Array, Int64Array, LargeBinaryArray, StringArray, StructArray,
@@ -3915,26 +3914,11 @@ mod tests {
         }
     }
 
-    fn json_struct_type_desc() -> types::TTypeDesc {
-        types::TTypeDesc::new(vec![
-            types::TTypeNode {
-                type_: types::TTypeNodeType::STRUCT,
-                scalar_type: None,
-                struct_fields: Some(vec![types::TStructField::new(
-                    Some("a".to_string()),
-                    None::<String>,
-                    None::<i32>,
-                    None::<String>,
-                )]),
-                is_named: None,
-            },
-            types::TTypeNode::new(
-                types::TTypeNodeType::SCALAR,
-                types::TScalarType::new(types::TPrimitiveType::JSON, None, None, None, None),
-                None,
-                None,
-            ),
-        ])
+    fn json_struct_field_schema() -> ChunkFieldSchema {
+        let json_child =
+            field_with_logical_type(Field::new("a", DataType::Utf8, true), LogicalType::Json);
+        let field = Field::new("out", DataType::Struct(vec![json_child].into()), true);
+        ChunkFieldSchema::from_field(&field).expect("json struct field schema")
     }
 
     fn days_since_epoch(year: i32, month: u32, day: u32) -> i32 {
@@ -4016,11 +4000,7 @@ mod tests {
         let child = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
         let target_type = DataType::Struct(vec![Field::new("a", DataType::Utf8, true)].into());
         let cast_expr = arena.push_typed(ExprNode::Cast(child), target_type);
-        arena.set_field_schema(
-            cast_expr,
-            chunk_field_schema_from_type_desc("out", true, json_struct_type_desc())
-                .expect("field schema"),
-        );
+        arena.set_field_schema(cast_expr, json_struct_field_schema());
 
         let out = eval(&arena, cast_expr, child, &chunk).expect("cast");
         let out = out.as_any().downcast_ref::<StructArray>().expect("struct");

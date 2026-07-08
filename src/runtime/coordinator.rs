@@ -48,6 +48,7 @@ use crate::common::types::UniqueId;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::novarocks_logging::debug;
 use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher, FragmentSubmission};
+#[cfg(feature = "compat")]
 use crate::runtime::exec_params::{
     CompatFragmentPlanPayload, ExecPlanFragmentParamOptions, build_exec_plan_fragment_params,
 };
@@ -63,14 +64,18 @@ use crate::runtime::write_coordinator::{
     unregister_query,
 };
 use crate::sql::analysis::cte::CteId;
+#[cfg(feature = "compat")]
+use crate::sql::codegen::LoweredFragmentEdge;
 use crate::sql::codegen::{
-    FragmentEdge, FragmentEdgeKind, FragmentId, LoweredFragmentEdge, MultiFragmentBuildResult,
-    RuntimeFilterPlanResult,
+    FragmentEdge, FragmentEdgeKind, FragmentId, MultiFragmentBuildResult, RuntimeFilterPlanResult,
 };
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::{DataPartition, PartitionKind};
+#[cfg(feature = "compat")]
 use crate::thrift::data_sinks;
+#[cfg(feature = "compat")]
 use crate::thrift::partitions;
+#[cfg(feature = "compat")]
 use crate::thrift::types;
 
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
@@ -94,6 +99,7 @@ pub(crate) struct NativePlanSidecars {
 }
 
 #[derive(Clone)]
+#[cfg(feature = "compat")]
 struct CompatCteConsumer {
     fragment_id: FragmentId,
     exchange_node_id: i32,
@@ -103,6 +109,7 @@ struct CompatCteConsumer {
 
 type FragmentEdgeKey = (FragmentId, FragmentId, i32);
 
+#[cfg(feature = "compat")]
 struct CompatEdgeSidecar {
     partition: partitions::TDataPartition,
     output_slot_ids: Vec<i32>,
@@ -219,6 +226,7 @@ impl ExecutionCoordinator {
             fragment_schedules,
             root_fragment_id,
             edges,
+            #[cfg(feature = "compat")]
             lowered_edges,
             boundary_schemas: _,
             rf_plan,
@@ -239,7 +247,10 @@ impl ExecutionCoordinator {
         // Use query_base for both hi and lo so the scheduler's
         // `root_backend_idx = query_id.lo % n` scatters across backends per
         // query instead of always landing on backend 1 % n.
-        let query_id = types::TUniqueId::new(query_base, query_base);
+        let query_id = UniqueId {
+            hi: query_base,
+            lo: query_base,
+        };
 
         debug!(
             "coordinator topology: fragments={} edges={} root={} backends={}",
@@ -261,7 +272,7 @@ impl ExecutionCoordinator {
                         "IcebergChangeStreamRouter"
                     }
                 },
-                partition_type_for_data_partition(&e.output_partition),
+                e.output_partition.kind,
             );
         }
 
@@ -275,6 +286,7 @@ impl ExecutionCoordinator {
         }
         scheduler.fill_per_exch_num_senders(&mut plan, &edges);
         let execution_root_fragment_id = plan.root_fragment_id;
+        #[cfg(feature = "compat")]
         let compat_edge_sidecars = build_compat_edge_sidecars(&edges, lowered_edges)?;
 
         // ---------------------------------------------------------------
@@ -308,7 +320,8 @@ impl ExecutionCoordinator {
                 Vec<ColumnId>,
             )>,
         > = BTreeMap::new();
-        // CTE id -> compat thrift consumers used only for TMultiCastDataStreamSink.
+        // CTE id -> compat consumers used only for TMultiCastDataStreamSink.
+        #[cfg(feature = "compat")]
         let mut compat_cte_consumers: BTreeMap<CteId, Vec<CompatCteConsumer>> = BTreeMap::new();
 
         for e in &edges {
@@ -329,19 +342,22 @@ impl ExecutionCoordinator {
                         e.output_slot_ids.clone(),
                         receive_producer_column_ids.clone(),
                     ));
-                    compat_cte_consumers
-                        .entry(*cte_id)
-                        .or_default()
-                        .push(CompatCteConsumer {
-                            fragment_id: e.target_fragment_id,
-                            exchange_node_id: e.target_exchange_node_id,
-                            partition: compat_partition_for_edge(&compat_edge_sidecars, e)?,
-                            output_slot_ids: compat_output_slot_ids_for_edge(
-                                &compat_edge_sidecars,
-                                e,
-                            )?
-                            .to_vec(),
-                        });
+                    #[cfg(feature = "compat")]
+                    {
+                        compat_cte_consumers
+                            .entry(*cte_id)
+                            .or_default()
+                            .push(CompatCteConsumer {
+                                fragment_id: e.target_fragment_id,
+                                exchange_node_id: e.target_exchange_node_id,
+                                partition: compat_partition_for_edge(&compat_edge_sidecars, e)?,
+                                output_slot_ids: compat_output_slot_ids_for_edge(
+                                    &compat_edge_sidecars,
+                                    e,
+                                )?
+                                .to_vec(),
+                            });
+                    }
                 }
                 FragmentEdgeKind::IcebergChangeStreamRouter { .. } => {}
             }
@@ -367,17 +383,20 @@ impl ExecutionCoordinator {
                         receive_producer_column_ids.clone(),
                     ));
                 }
-                let compat_consumers = compat_cte_consumers.entry(*cte_id).or_default();
-                if !compat_consumers.iter().any(|consumer| {
-                    consumer.fragment_id == schedule.fragment_id
-                        && consumer.exchange_node_id == *exchange_node_id
-                }) {
-                    compat_consumers.push(CompatCteConsumer {
-                        fragment_id: schedule.fragment_id,
-                        exchange_node_id: *exchange_node_id,
-                        partition: unpartitioned_partition(),
-                        output_slot_ids: Vec::new(),
-                    });
+                #[cfg(feature = "compat")]
+                {
+                    let compat_consumers = compat_cte_consumers.entry(*cte_id).or_default();
+                    if !compat_consumers.iter().any(|consumer| {
+                        consumer.fragment_id == schedule.fragment_id
+                            && consumer.exchange_node_id == *exchange_node_id
+                    }) {
+                        compat_consumers.push(CompatCteConsumer {
+                            fragment_id: schedule.fragment_id,
+                            exchange_node_id: *exchange_node_id,
+                            partition: unpartitioned_partition(),
+                            output_slot_ids: Vec::new(),
+                        });
+                    }
                 }
             }
         }
@@ -388,8 +407,9 @@ impl ExecutionCoordinator {
         // The merge node is the backend that hosts the execution anchor. For
         // result roots this is the single root instance; for write-only DAGs it
         // is the first instance of the selected writer anchor.
-        let merge_addr = backend_to_network_addr(&live, plan.root_backend_idx)?;
+        #[cfg(feature = "compat")]
         if rf_plan.is_some() {
+            let merge_addr = backend_to_network_addr(&live, plan.root_backend_idx)?;
             inject_runtime_filter_merge_nodes(&mut fragment_results, &merge_addr);
         }
 
@@ -405,6 +425,7 @@ impl ExecutionCoordinator {
         let pipeline_dop = crate::runtime::dispatcher::compute_pipeline_dop(session_dop);
         let needs_fragment_status_report =
             dispatcher.needs_fragment_status_report() || collect_profiles;
+        #[cfg(feature = "compat")]
         let mut novarocks_report_addr: Option<types::TNetworkAddress> = None;
         let mut novarocks_report_endpoint: Option<crate::runtime::endpoint::RuntimeEndpoint> = None;
 
@@ -421,7 +442,7 @@ impl ExecutionCoordinator {
                     .iter()
                     .map(|inst| {
                         crate::runtime::endpoint::FragmentDestination::new(
-                            runtime_unique_id_from_thrift(&inst.finst_id),
+                            inst.finst_id,
                             inst.endpoint.clone(),
                         )
                     })
@@ -498,6 +519,7 @@ impl ExecutionCoordinator {
             )?;
 
             for placement in placements {
+                #[cfg(feature = "compat")]
                 // Build the output sink for this fragment class.
                 let (output_sink, fragment_partition, exec_destinations) = if is_root {
                     (fr.output_sink.clone(), unpartitioned_partition(), None)
@@ -593,6 +615,7 @@ impl ExecutionCoordinator {
                 };
 
                 let fragment_has_write_sink = is_terminal_write;
+                #[cfg(feature = "compat")]
                 let (fragment_report_addr, fragment_report_endpoint) =
                     if fragment_has_write_sink || needs_fragment_status_report {
                         if novarocks_report_addr.is_none() || novarocks_report_endpoint.is_none() {
@@ -607,6 +630,16 @@ impl ExecutionCoordinator {
                     } else {
                         (None, None)
                     };
+                #[cfg(not(feature = "compat"))]
+                let fragment_report_endpoint =
+                    if fragment_has_write_sink || needs_fragment_status_report {
+                        if novarocks_report_endpoint.is_none() {
+                            novarocks_report_endpoint = Some(local_coordinator_report_endpoint()?);
+                        }
+                        novarocks_report_endpoint.clone()
+                    } else {
+                        None
+                    };
                 // Align with StarRocks: a write/data-sink fragment (iceberg/hive/olap load/insert)
                 // runs at the lower sink DOP curve so it doesn't starve query CPU; compute fragments
                 // keep cores/2 (`pipeline_dop`). A `SET pipeline_dop = N` override pins both.
@@ -616,57 +649,50 @@ impl ExecutionCoordinator {
                     pipeline_dop
                 };
 
-                let mut exec_params = fr.exec_params.clone();
-                exec_params.query_id = query_id.clone();
-                exec_params.fragment_instance_id = placement.finst_id.clone();
                 #[cfg(feature = "compat")]
-                {
+                let params = {
+                    let mut exec_params = fr.exec_params.clone();
+                    exec_params.query_id = unique_id_to_thrift(query_id);
+                    exec_params.fragment_instance_id = unique_id_to_thrift(placement.finst_id);
                     exec_params.per_node_scan_ranges =
                         compat_scan_ranges_for_placement(fr, placement, placements.len())?;
-                }
-                exec_params.per_exch_num_senders = placement.per_exch_num_senders.clone();
-                exec_params.destinations = exec_destinations;
-                #[cfg(feature = "compat")]
-                if let Some(rf) = rf_plan.as_ref() {
-                    let rf_params = build_instance_runtime_filter_params(
-                        rf,
-                        &placement.runtime_filter_prober_params,
-                        &instance_counts,
-                    );
-                    exec_params.runtime_filter_params = Some(rf_params.to_thrift());
-                }
+                    exec_params.per_exch_num_senders = placement.per_exch_num_senders.clone();
+                    exec_params.destinations = exec_destinations;
+                    if let Some(rf) = rf_plan.as_ref() {
+                        let rf_params = build_instance_runtime_filter_params(
+                            rf,
+                            &placement.runtime_filter_prober_params,
+                            &instance_counts,
+                        );
+                        exec_params.runtime_filter_params = Some(rf_params.to_thrift());
+                    }
 
-                #[cfg(feature = "compat")]
-                let compat_query_options = query_options.as_ref().map(QueryOptions::to_thrift);
-                #[cfg(not(feature = "compat"))]
-                let compat_query_options = None;
-                let params = build_exec_plan_fragment_params(
-                    CompatFragmentPlanPayload {
-                        plan: fr.plan.clone(),
-                        desc_tbl: fr.desc_tbl.clone(),
-                        output_sink,
-                        output_exprs: fr.output_exprs.clone(),
-                        fragment_partition,
-                        query_global_dicts: fr.query_global_dicts.clone(),
-                        query_global_dict_exprs: fr.query_global_dict_exprs.clone(),
-                    },
-                    exec_params,
-                    compat_query_options,
-                    fragment_dop,
-                    ExecPlanFragmentParamOptions {
-                        backend_num: Some(placement.instance_index as i32),
-                        novarocks_report_addr: fragment_report_addr,
-                        novarocks_typed_result_sink: is_root && needs_fragment_status_report,
-                    },
-                );
+                    let compat_query_options = query_options.as_ref().map(QueryOptions::to_thrift);
+                    build_exec_plan_fragment_params(
+                        CompatFragmentPlanPayload {
+                            plan: fr.plan.clone(),
+                            desc_tbl: fr.desc_tbl.clone(),
+                            output_sink,
+                            output_exprs: fr.output_exprs.clone(),
+                            fragment_partition,
+                            query_global_dicts: fr.query_global_dicts.clone(),
+                            query_global_dict_exprs: fr.query_global_dict_exprs.clone(),
+                        },
+                        exec_params,
+                        compat_query_options,
+                        fragment_dop,
+                        ExecPlanFragmentParamOptions {
+                            backend_num: Some(placement.instance_index as i32),
+                            novarocks_report_addr: fragment_report_addr,
+                            novarocks_typed_result_sink: is_root && needs_fragment_status_report,
+                        },
+                    )
+                };
 
                 if fragment_has_write_sink {
-                    let exec = params.params.as_ref().ok_or_else(|| {
-                        "write sink fragment missing exec params in coordinator".to_string()
-                    })?;
                     expected_writers.push(WriterKey {
-                        query_id: unique_id_from_thrift(&exec.query_id),
-                        fragment_instance_id: unique_id_from_thrift(&exec.fragment_instance_id),
+                        query_id,
+                        fragment_instance_id: placement.finst_id,
                         backend_num: placement.instance_index as i32,
                     });
                 }
@@ -704,11 +730,16 @@ impl ExecutionCoordinator {
                                 )?;
                             }
                         }
+                        #[cfg(feature = "compat")]
                         params.params.as_ref().ok_or_else(|| {
                             format!(
                                 "fragment {fragment_id} missing exec params while plan_wire_format=proto"
                             )
                         })?;
+                        #[cfg(feature = "compat")]
+                        let typed_result_sink = params.novarocks_typed_result_sink.unwrap_or(false);
+                        #[cfg(not(feature = "compat"))]
+                        let typed_result_sink = is_root && needs_fragment_status_report;
                         let native_rf_builder_number = runtime_filter_builder_number_for_instance(
                             rf_plan.as_ref(),
                             &instance_counts,
@@ -728,13 +759,20 @@ impl ExecutionCoordinator {
                                 native_rf_max_size,
                                 placement.instance_index as i32,
                                 fragment_report_endpoint.as_ref(),
-                                params.novarocks_typed_result_sink.unwrap_or(false),
+                                typed_result_sink,
                             )?;
-                        FragmentSubmission::with_native(
-                            params,
-                            native_fragment,
-                            native_instance_params,
-                        )
+                        #[cfg(feature = "compat")]
+                        {
+                            FragmentSubmission::with_native(
+                                params,
+                                native_fragment,
+                                native_instance_params,
+                            )
+                        }
+                        #[cfg(not(feature = "compat"))]
+                        {
+                            FragmentSubmission::with_native(native_fragment, native_instance_params)
+                        }
                     }
                 };
 
@@ -767,11 +805,8 @@ impl ExecutionCoordinator {
         let (write_coordinator, _write_registration) = if expected_writers.is_empty() {
             (None, None)
         } else {
-            let write = register_query(unique_id_from_thrift(&query_id), expected_writers)?;
-            (
-                Some(write),
-                Some(RegisteredWriteCoordinator::new(query_id.clone())),
-            )
+            let write = register_query(query_id, expected_writers)?;
+            (Some(write), Some(RegisteredWriteCoordinator::new(query_id)))
         };
 
         let timeout_ms = query_options
@@ -782,12 +817,23 @@ impl ExecutionCoordinator {
         let root_schedule = schedule_by_id
             .get(&execution_root_fragment_id)
             .ok_or_else(|| "root fragment not found in native schedules".to_string())?;
+        #[cfg(feature = "compat")]
+        let root_uses_result_buffer = root_uses_result_buffer(&submissions, &plan.root_finst_id)?;
+        #[cfg(not(feature = "compat"))]
+        let root_uses_result_buffer = !root_schedule.output_kind.is_terminal_write();
+        #[cfg(feature = "compat")]
         let expected_root_chunk_schema =
             if root_uses_typed_result_sink(&submissions, &plan.root_finst_id)? {
                 Some(build_root_expected_chunk_schema(root_schedule)?)
             } else {
                 None
             };
+        #[cfg(not(feature = "compat"))]
+        let expected_root_chunk_schema = if root_uses_result_buffer {
+            Some(build_root_expected_chunk_schema(root_schedule)?)
+        } else {
+            None
+        };
 
         let fetch_result = submit_and_fetch_loop(
             &dispatcher,
@@ -796,6 +842,7 @@ impl ExecutionCoordinator {
             plan.root_backend_idx,
             plan.root_finst_id.clone(),
             &query_id,
+            root_uses_result_buffer,
             timeout_ms,
             expected_root_chunk_schema.as_ref(),
             write_coordinator.as_ref(),
@@ -978,6 +1025,7 @@ fn same_unit_timestamp_metadata_mismatch(expected: &DataType, actual: &DataType)
 }
 
 /// An `UNPARTITIONED` data partition (the common default).
+#[cfg(feature = "compat")]
 fn unpartitioned_partition() -> partitions::TDataPartition {
     partitions::TDataPartition::new(
         partitions::TPartitionType::UNPARTITIONED,
@@ -987,6 +1035,7 @@ fn unpartitioned_partition() -> partitions::TDataPartition {
     )
 }
 
+#[cfg(feature = "compat")]
 fn partition_type_for_data_partition(partition: &DataPartition) -> partitions::TPartitionType {
     match partition.kind {
         PartitionKind::Unpartitioned => partitions::TPartitionType::UNPARTITIONED,
@@ -1003,6 +1052,7 @@ fn fragment_edge_key(edge: &FragmentEdge) -> FragmentEdgeKey {
     )
 }
 
+#[cfg(feature = "compat")]
 fn build_compat_edge_sidecars(
     edges: &[FragmentEdge],
     lowered_edges: Vec<LoweredFragmentEdge>,
@@ -1033,6 +1083,7 @@ fn build_compat_edge_sidecars(
     Ok(by_key)
 }
 
+#[cfg(feature = "compat")]
 fn compat_partition_for_edge(
     compat_edge_sidecars: &BTreeMap<FragmentEdgeKey, CompatEdgeSidecar>,
     edge: &FragmentEdge,
@@ -1049,6 +1100,7 @@ fn compat_partition_for_edge(
         })
 }
 
+#[cfg(feature = "compat")]
 fn compat_output_slot_ids_for_edge<'a>(
     compat_edge_sidecars: &'a BTreeMap<FragmentEdgeKey, CompatEdgeSidecar>,
     edge: &FragmentEdge,
@@ -1066,6 +1118,7 @@ fn compat_output_slot_ids_for_edge<'a>(
 }
 
 /// Wrap a `TDataStreamSink` in a DATA_STREAM_SINK `TDataSink`.
+#[cfg(feature = "compat")]
 fn wrap_data_stream_sink(stream_sink: data_sinks::TDataStreamSink) -> data_sinks::TDataSink {
     data_sinks::TDataSink::new(
         data_sinks::TDataSinkType::DATA_STREAM_SINK,
@@ -1088,6 +1141,7 @@ fn wrap_data_stream_sink(stream_sink: data_sinks::TDataStreamSink) -> data_sinks
     )
 }
 
+#[cfg(feature = "compat")]
 fn build_stream_sink_for_edge(
     edge: &FragmentEdge,
     compat_partition: partitions::TDataPartition,
@@ -1104,6 +1158,7 @@ fn build_stream_sink_for_edge(
     )
 }
 
+#[cfg(feature = "compat")]
 fn stream_sink_output_columns(output_slot_ids: &[i32]) -> Option<Vec<i32>> {
     if output_slot_ids.is_empty() {
         None
@@ -1113,6 +1168,7 @@ fn stream_sink_output_columns(output_slot_ids: &[i32]) -> Option<Vec<i32>> {
 }
 
 /// Wrap a `TMultiCastDataStreamSink` in a MULTI_CAST_DATA_STREAM_SINK `TDataSink`.
+#[cfg(feature = "compat")]
 fn wrap_multi_cast_sink(
     multi_cast_sink: data_sinks::TMultiCastDataStreamSink,
 ) -> data_sinks::TDataSink {
@@ -1245,6 +1301,7 @@ fn group_router_edges_by_source<'a>(
     Ok(grouped)
 }
 
+#[cfg(feature = "compat")]
 fn wrap_iceberg_change_stream_router_sink(
     template: &data_sinks::TIcebergChangeStreamRouterSink,
     branch_edges: &[&FragmentEdge],
@@ -1306,7 +1363,7 @@ fn wrap_iceberg_change_stream_router_sink(
             .iter()
                 .map(|placement| {
                     let destination = crate::runtime::endpoint::FragmentDestination::new(
-                        runtime_unique_id_from_thrift(&placement.finst_id),
+                        placement.finst_id,
                         placement.endpoint.clone(),
                     );
                     exec_destination_from_runtime(&destination)
@@ -1386,6 +1443,7 @@ fn compat_scan_ranges_for_placement(
     Ok(assigned)
 }
 
+#[cfg(feature = "compat")]
 fn is_write_sink(params: &crate::thrift::internal_service::TExecPlanFragmentParams) -> bool {
     params
         .fragment
@@ -1395,6 +1453,7 @@ fn is_write_sink(params: &crate::thrift::internal_service::TExecPlanFragmentPara
         .unwrap_or(false)
 }
 
+#[cfg(feature = "compat")]
 fn compat_data_sink_requires_write_report(sink: &data_sinks::TDataSink) -> bool {
     matches!(
         sink.type_,
@@ -1407,6 +1466,7 @@ fn compat_data_sink_requires_write_report(sink: &data_sinks::TDataSink) -> bool 
     )
 }
 
+#[cfg(feature = "compat")]
 fn uses_result_buffer_sink(
     params: &crate::thrift::internal_service::TExecPlanFragmentParams,
 ) -> bool {
@@ -1420,9 +1480,10 @@ fn uses_result_buffer_sink(
     )
 }
 
+#[cfg(feature = "compat")]
 fn root_uses_result_buffer(
     submissions: &[(usize, FragmentSubmission)],
-    root_finst_id: &types::TUniqueId,
+    root_finst_id: &UniqueId,
 ) -> Result<bool, String> {
     let root = submissions
         .iter()
@@ -1446,9 +1507,10 @@ fn root_uses_result_buffer(
     Ok(uses_result_buffer_sink(root))
 }
 
+#[cfg(feature = "compat")]
 fn root_uses_typed_result_sink(
     submissions: &[(usize, FragmentSubmission)],
-    root_finst_id: &types::TUniqueId,
+    root_finst_id: &UniqueId,
 ) -> Result<bool, String> {
     let root = submissions
         .iter()
@@ -1477,10 +1539,8 @@ struct RegisteredWriteCoordinator {
 }
 
 impl RegisteredWriteCoordinator {
-    fn new(query_id: types::TUniqueId) -> Self {
-        Self {
-            query_id: unique_id_from_thrift(&query_id),
-        }
+    fn new(query_id: UniqueId) -> Self {
+        Self { query_id }
     }
 }
 
@@ -1490,11 +1550,9 @@ impl Drop for RegisteredWriteCoordinator {
     }
 }
 
-fn unique_id_from_thrift(id: &types::TUniqueId) -> UniqueId {
-    UniqueId {
-        hi: id.hi,
-        lo: id.lo,
-    }
+#[cfg(feature = "compat")]
+fn unique_id_to_thrift(id: UniqueId) -> types::TUniqueId {
+    types::TUniqueId::new(id.hi, id.lo)
 }
 
 fn validate_write_commit_ready(
@@ -1504,6 +1562,7 @@ fn validate_write_commit_ready(
 }
 
 /// Convert `backends[idx]` into a `TNetworkAddress`.
+#[cfg(feature = "compat")]
 fn backend_to_network_addr(
     live: &[(usize, SocketAddr)],
     idx: usize,
@@ -1524,6 +1583,7 @@ fn live_backend_addr(
         .ok_or_else(|| format!("backend index {backend_idx} missing from live snapshot"))
 }
 
+#[cfg(feature = "compat")]
 fn local_coordinator_report_addr() -> Result<types::TNetworkAddress, String> {
     let cfg = crate::novarocks_config::config()
         .map_err(|e| format!("cannot read coordinator config: {e}"))?;
@@ -1535,8 +1595,12 @@ fn local_coordinator_report_addr() -> Result<types::TNetworkAddress, String> {
 
 fn local_coordinator_report_endpoint() -> Result<crate::runtime::endpoint::RuntimeEndpoint, String>
 {
-    let addr = local_coordinator_report_addr()?;
-    crate::runtime::endpoint::RuntimeEndpoint::from_network_address(&addr)
+    let cfg = crate::novarocks_config::config()
+        .map_err(|e| format!("cannot read coordinator config: {e}"))?;
+    let host = crate::common::network::advertise_host().unwrap_or_else(|_| cfg.server.host.clone());
+    let port =
+        crate::service::grpc_server::grpc_server_bound_port().unwrap_or(cfg.server.grpc_port);
+    crate::runtime::endpoint::RuntimeEndpoint::new(host, port as i32)
 }
 
 fn current_plan_wire_format() -> PlanWireFormat {
@@ -1681,7 +1745,7 @@ fn patch_native_iceberg_change_stream_router_sink(
                 .iter()
                 .map(|placement| {
                     native_stream_destination(&crate::runtime::endpoint::FragmentDestination::new(
-                        runtime_unique_id_from_thrift(&placement.finst_id),
+                        placement.finst_id,
                         placement.endpoint.clone(),
                     ))
                 })
@@ -1783,6 +1847,7 @@ fn patch_native_cte_multicast_sink(
     Ok(())
 }
 
+#[cfg(feature = "compat")]
 fn exec_destination_from_runtime(
     src: &crate::runtime::endpoint::FragmentDestination,
 ) -> data_sinks::TPlanFragmentDestination {
@@ -1792,13 +1857,6 @@ fn exec_destination_from_runtime(
         Some(src.endpoint().to_network_address()),
         None::<i32>,
     )
-}
-
-fn runtime_unique_id_from_thrift(src: &types::TUniqueId) -> crate::common::types::UniqueId {
-    crate::common::types::UniqueId {
-        hi: src.hi,
-        lo: src.lo,
-    }
 }
 
 fn native_stream_destination(
@@ -1993,6 +2051,7 @@ fn runtime_filter_builder_number_for_instance(
 /// descriptors in place (these are what actually ship to the BE). The merge
 /// node is the backend hosting the root instance; at one backend it equals the
 /// local exchange address (prior behavior).
+#[cfg(feature = "compat")]
 fn inject_runtime_filter_merge_nodes(
     fragment_results: &mut [crate::sql::codegen::FragmentBuildResult],
     merge_addr: &types::TNetworkAddress,
@@ -2020,12 +2079,12 @@ fn inject_runtime_filter_merge_nodes(
 /// failure, cancellation can fan out to every backend that accepted work.
 #[derive(Default)]
 pub(crate) struct InFlightTracker {
-    pub(crate) by_backend: BTreeMap<usize, Vec<types::TUniqueId>>,
+    pub(crate) by_backend: BTreeMap<usize, Vec<UniqueId>>,
 }
 
 impl InFlightTracker {
     /// Record that `finst_id` was submitted to `backend_idx`.
-    pub(crate) fn record_submitted(&mut self, backend_idx: usize, finst_id: types::TUniqueId) {
+    pub(crate) fn record_submitted(&mut self, backend_idx: usize, finst_id: UniqueId) {
         self.by_backend
             .entry(backend_idx)
             .or_default()
@@ -2074,7 +2133,7 @@ fn standalone_query_failures() -> &'static Mutex<StandaloneQueryFailureRegistry>
     REGISTRY.get_or_init(|| Mutex::new(StandaloneQueryFailureRegistry::default()))
 }
 
-fn query_failure_key(query_id: &types::TUniqueId) -> (i64, i64) {
+fn query_failure_key(query_id: &UniqueId) -> (i64, i64) {
     (query_id.hi, query_id.lo)
 }
 
@@ -2091,7 +2150,7 @@ pub(crate) fn record_standalone_query_failure(
     }
 }
 
-fn take_standalone_query_failure(query_id: &types::TUniqueId) -> Option<String> {
+fn take_standalone_query_failure(query_id: &UniqueId) -> Option<String> {
     standalone_query_failures()
         .lock()
         .expect("standalone query failure registry lock")
@@ -2104,7 +2163,7 @@ struct StandaloneQueryFailureGuard {
 }
 
 impl StandaloneQueryFailureGuard {
-    fn register(query_id: &types::TUniqueId) -> Self {
+    fn register(query_id: &UniqueId) -> Self {
         let key = query_failure_key(query_id);
         let mut guard = standalone_query_failures()
             .lock()
@@ -2136,13 +2195,14 @@ fn standalone_query_profiles() -> &'static Mutex<StandaloneQueryProfileRegistry>
     REGISTRY.get_or_init(|| Mutex::new(StandaloneQueryProfileRegistry::default()))
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn record_standalone_query_profile_report(
     params: &crate::thrift::frontend_service::TReportExecStatusParams,
 ) -> Result<bool, String> {
     let Some(query_id) = params.query_id.as_ref() else {
         return Ok(false);
     };
-    let key = query_failure_key(query_id);
+    let key = (query_id.hi, query_id.lo);
     let mut guard = standalone_query_profiles()
         .lock()
         .expect("standalone query profile registry lock");
@@ -2168,7 +2228,7 @@ pub(crate) fn record_standalone_query_profile_report(
             .profiles
             .entry(key)
             .or_default()
-            .insert(query_failure_key(finst_id), native);
+            .insert((finst_id.hi, finst_id.lo), native);
     }
     Ok(true)
 }
@@ -2207,7 +2267,7 @@ pub(crate) fn record_native_standalone_query_profile_report(
     Ok(true)
 }
 
-fn standalone_query_profile_count(query_id: &types::TUniqueId) -> usize {
+fn standalone_query_profile_count(query_id: &UniqueId) -> usize {
     standalone_query_profiles()
         .lock()
         .expect("standalone query profile registry lock")
@@ -2217,7 +2277,7 @@ fn standalone_query_profile_count(query_id: &types::TUniqueId) -> usize {
         .unwrap_or(0)
 }
 
-fn take_standalone_query_profiles(query_id: &types::TUniqueId) -> Vec<RuntimeProfileTree> {
+fn take_standalone_query_profiles(query_id: &UniqueId) -> Vec<RuntimeProfileTree> {
     standalone_query_profiles()
         .lock()
         .expect("standalone query profile registry lock")
@@ -2232,7 +2292,7 @@ struct StandaloneQueryProfileGuard {
 }
 
 impl StandaloneQueryProfileGuard {
-    fn register(query_id: &types::TUniqueId) -> Self {
+    fn register(query_id: &UniqueId) -> Self {
         let key = query_failure_key(query_id);
         let mut guard = standalone_query_profiles()
             .lock()
@@ -2285,15 +2345,15 @@ pub(crate) fn submit_and_fetch_loop(
     tracker: &mut InFlightTracker,
     submissions: Vec<(usize, FragmentSubmission)>,
     root_backend_idx: usize,
-    root_finst_id: types::TUniqueId,
-    query_id: &types::TUniqueId,
+    root_finst_id: UniqueId,
+    query_id: &UniqueId,
+    root_uses_result_buffer: bool,
     timeout_ms: i64,
     expected_root_chunk_schema: Option<&ChunkSchemaRef>,
     write_coordinator: Option<&Arc<Mutex<WriteCoordinator>>>,
     collect_profiles: bool,
 ) -> Result<SubmitAndFetchResult, String> {
     const REMOTE_FETCH_POLL_INTERVAL_MS: i64 = 300;
-    let root_uses_result_buffer = root_uses_result_buffer(&submissions, &root_finst_id)?;
     let runtime_query_id = crate::runtime::query_context::QueryId {
         hi: query_id.hi,
         lo: query_id.lo,
@@ -2305,12 +2365,7 @@ pub(crate) fn submit_and_fetch_loop(
     let _profile_guard = collect_profiles.then(|| StandaloneQueryProfileGuard::register(query_id));
 
     for (backend_idx, submission) in submissions {
-        let finst_id = submission
-            .thrift_params()
-            .params
-            .as_ref()
-            .map(|ep| types::TUniqueId::new(ep.fragment_instance_id.hi, ep.fragment_instance_id.lo))
-            .unwrap_or_else(|| types::TUniqueId::new(0, 0));
+        let finst_id = submission.fragment_instance_id()?;
         if let Err(e) = dispatcher.submit_fragment_submission(backend_idx, submission) {
             tracker.cancel_all(dispatcher.as_ref());
             return Err(e);
@@ -2326,10 +2381,7 @@ pub(crate) fn submit_and_fetch_loop(
                 hi: query_id.hi,
                 lo: query_id.lo,
             },
-            crate::common::types::UniqueId {
-                hi: finst_id.hi,
-                lo: finst_id.lo,
-            },
+            finst_id,
             backend_idx,
         );
     }
@@ -2452,7 +2504,7 @@ pub(crate) fn submit_and_fetch_loop(
 }
 
 fn wait_for_profile_reports(
-    query_id: &types::TUniqueId,
+    query_id: &UniqueId,
     expected_reports: usize,
     tracker: &InFlightTracker,
     dispatcher: &dyn FragmentDispatcher,
@@ -2613,7 +2665,7 @@ fn notify_write_commit_wait_observer(commit_error: &str) {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -2988,14 +3040,14 @@ mod tests {
         fn fetch_result(
             &self,
             _backend_idx: usize,
-            _finst_id: types::TUniqueId,
+            _finst_id: UniqueId,
             _max_wait_ms: i64,
             _expected_chunk_schema: Option<&ChunkSchemaRef>,
         ) -> Result<FetchOutcome, String> {
             Ok(FetchOutcome::Eof)
         }
 
-        fn cancel_fragments(&self, _backend_idx: usize, _finst_ids: &[types::TUniqueId]) {}
+        fn cancel_fragments(&self, _backend_idx: usize, _finst_ids: &[UniqueId]) {}
 
         fn backend_count(&self) -> usize {
             1
@@ -3014,9 +3066,9 @@ mod tests {
 
     struct ControllableDispatcher {
         /// All submitted finst ids (in order).
-        submitted: Mutex<Vec<types::TUniqueId>>,
+        submitted: Mutex<Vec<UniqueId>>,
         /// All cancelled finst ids (accumulated across cancel_fragments calls).
-        cancelled: Mutex<Vec<types::TUniqueId>>,
+        cancelled: Mutex<Vec<UniqueId>>,
         /// Number of submits completed so far.
         submit_count: AtomicUsize,
         /// Number of fetch_result calls completed so far.
@@ -3071,11 +3123,11 @@ mod tests {
             })
         }
 
-        fn submitted_ids(&self) -> Vec<types::TUniqueId> {
+        fn submitted_ids(&self) -> Vec<UniqueId> {
             self.submitted.lock().unwrap().clone()
         }
 
-        fn cancelled_ids(&self) -> Vec<types::TUniqueId> {
+        fn cancelled_ids(&self) -> Vec<UniqueId> {
             self.cancelled.lock().unwrap().clone()
         }
 
@@ -3085,8 +3137,8 @@ mod tests {
     }
 
     struct QueryStateFailureDispatcher {
-        submitted: Mutex<Vec<types::TUniqueId>>,
-        cancelled: Mutex<Vec<types::TUniqueId>>,
+        submitted: Mutex<Vec<UniqueId>>,
+        cancelled: Mutex<Vec<UniqueId>>,
         fetch_count: AtomicUsize,
         first_fetch: AtomicBool,
         failure_reason: String,
@@ -3103,11 +3155,11 @@ mod tests {
             })
         }
 
-        fn cancelled_ids(&self) -> Vec<types::TUniqueId> {
+        fn cancelled_ids(&self) -> Vec<UniqueId> {
             self.cancelled.lock().unwrap().clone()
         }
 
-        fn submitted_ids(&self) -> Vec<types::TUniqueId> {
+        fn submitted_ids(&self) -> Vec<UniqueId> {
             self.submitted.lock().unwrap().clone()
         }
 
@@ -3117,14 +3169,14 @@ mod tests {
     }
 
     struct RecordingWaitDispatcher {
-        submitted: Mutex<Vec<types::TUniqueId>>,
+        submitted: Mutex<Vec<UniqueId>>,
         fetch_waits_ms: Mutex<Vec<i64>>,
         fetch_count: AtomicUsize,
     }
 
     struct EofSignalDispatcher {
-        submitted: Mutex<Vec<types::TUniqueId>>,
-        cancelled: Mutex<Vec<types::TUniqueId>>,
+        submitted: Mutex<Vec<UniqueId>>,
+        cancelled: Mutex<Vec<UniqueId>>,
         eof_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     }
 
@@ -3151,7 +3203,7 @@ mod tests {
             })
         }
 
-        fn cancelled_ids(&self) -> Vec<types::TUniqueId> {
+        fn cancelled_ids(&self) -> Vec<UniqueId> {
             self.cancelled.lock().unwrap().clone()
         }
     }
@@ -3173,10 +3225,8 @@ mod tests {
             let finst_id = params
                 .params
                 .as_ref()
-                .map(|ep| {
-                    types::TUniqueId::new(ep.fragment_instance_id.hi, ep.fragment_instance_id.lo)
-                })
-                .unwrap_or_else(|| types::TUniqueId::new(0, 0));
+                .map(|ep| native_id(ep.fragment_instance_id.hi, ep.fragment_instance_id.lo))
+                .unwrap_or_else(|| native_id(0, 0));
             self.submitted.lock().unwrap().push(finst_id);
             Ok(())
         }
@@ -3184,7 +3234,7 @@ mod tests {
         fn fetch_result(
             &self,
             _backend_idx: usize,
-            _finst_id: types::TUniqueId,
+            _finst_id: UniqueId,
             _max_wait_ms: i64,
             _expected_chunk_schema: Option<&ChunkSchemaRef>,
         ) -> Result<FetchOutcome, String> {
@@ -3196,7 +3246,7 @@ mod tests {
             }
         }
 
-        fn cancel_fragments(&self, _backend_idx: usize, finst_ids: &[types::TUniqueId]) {
+        fn cancel_fragments(&self, _backend_idx: usize, finst_ids: &[UniqueId]) {
             self.cancelled.lock().unwrap().extend_from_slice(finst_ids);
         }
 
@@ -3218,10 +3268,8 @@ mod tests {
             let finst_id = params
                 .params
                 .as_ref()
-                .map(|ep| {
-                    types::TUniqueId::new(ep.fragment_instance_id.hi, ep.fragment_instance_id.lo)
-                })
-                .unwrap_or_else(|| types::TUniqueId::new(0, 0));
+                .map(|ep| native_id(ep.fragment_instance_id.hi, ep.fragment_instance_id.lo))
+                .unwrap_or_else(|| native_id(0, 0));
             self.submitted.lock().unwrap().push(finst_id);
             Ok(())
         }
@@ -3229,25 +3277,21 @@ mod tests {
         fn fetch_result(
             &self,
             _backend_idx: usize,
-            finst_id: types::TUniqueId,
+            finst_id: UniqueId,
             _max_wait_ms: i64,
             _expected_chunk_schema: Option<&ChunkSchemaRef>,
         ) -> Result<FetchOutcome, String> {
             self.fetch_count.fetch_add(1, Ordering::SeqCst);
             if self.first_fetch.swap(false, Ordering::SeqCst) {
-                let finst = crate::common::types::UniqueId {
-                    hi: finst_id.hi,
-                    lo: finst_id.lo,
-                };
                 crate::runtime::query_state::in_flight_table()
-                    .on_fragment_done(finst, Err(self.failure_reason.clone()));
+                    .on_fragment_done(finst_id, Err(self.failure_reason.clone()));
                 Ok(FetchOutcome::NotReady)
             } else {
                 panic!("fetch_result called after query state failure should have been observed");
             }
         }
 
-        fn cancel_fragments(&self, _backend_idx: usize, finst_ids: &[types::TUniqueId]) {
+        fn cancel_fragments(&self, _backend_idx: usize, finst_ids: &[UniqueId]) {
             self.cancelled.lock().unwrap().extend_from_slice(finst_ids);
         }
 
@@ -3269,10 +3313,8 @@ mod tests {
             let finst_id = params
                 .params
                 .as_ref()
-                .map(|ep| {
-                    types::TUniqueId::new(ep.fragment_instance_id.hi, ep.fragment_instance_id.lo)
-                })
-                .unwrap_or_else(|| types::TUniqueId::new(0, 0));
+                .map(|ep| native_id(ep.fragment_instance_id.hi, ep.fragment_instance_id.lo))
+                .unwrap_or_else(|| native_id(0, 0));
             self.submitted.lock().unwrap().push(finst_id);
             Ok(())
         }
@@ -3280,7 +3322,7 @@ mod tests {
         fn fetch_result(
             &self,
             _backend_idx: usize,
-            _finst_id: types::TUniqueId,
+            _finst_id: UniqueId,
             max_wait_ms: i64,
             _expected_chunk_schema: Option<&ChunkSchemaRef>,
         ) -> Result<FetchOutcome, String> {
@@ -3293,7 +3335,7 @@ mod tests {
             }
         }
 
-        fn cancel_fragments(&self, _backend_idx: usize, _finst_ids: &[types::TUniqueId]) {}
+        fn cancel_fragments(&self, _backend_idx: usize, _finst_ids: &[UniqueId]) {}
 
         fn backend_count(&self) -> usize {
             1
@@ -3313,10 +3355,8 @@ mod tests {
             let finst_id = params
                 .params
                 .as_ref()
-                .map(|ep| {
-                    types::TUniqueId::new(ep.fragment_instance_id.hi, ep.fragment_instance_id.lo)
-                })
-                .unwrap_or_else(|| types::TUniqueId::new(0, 0));
+                .map(|ep| native_id(ep.fragment_instance_id.hi, ep.fragment_instance_id.lo))
+                .unwrap_or_else(|| native_id(0, 0));
             self.submitted.lock().unwrap().push(finst_id);
             Ok(())
         }
@@ -3324,7 +3364,7 @@ mod tests {
         fn fetch_result(
             &self,
             _backend_idx: usize,
-            _finst_id: types::TUniqueId,
+            _finst_id: UniqueId,
             _max_wait_ms: i64,
             _expected_chunk_schema: Option<&ChunkSchemaRef>,
         ) -> Result<FetchOutcome, String> {
@@ -3334,7 +3374,7 @@ mod tests {
             Ok(FetchOutcome::Eof)
         }
 
-        fn cancel_fragments(&self, _backend_idx: usize, finst_ids: &[types::TUniqueId]) {
+        fn cancel_fragments(&self, _backend_idx: usize, finst_ids: &[UniqueId]) {
             self.cancelled.lock().unwrap().extend_from_slice(finst_ids);
         }
 
@@ -3616,7 +3656,7 @@ mod tests {
         FragmentInstancePlacement {
             fragment_id,
             instance_index,
-            finst_id: types::TUniqueId::new(11, finst_lo),
+            finst_id: native_id(11, finst_lo),
             backend_idx: instance_index,
             endpoint: crate::runtime::endpoint::RuntimeEndpoint::new(host, 9010)
                 .expect("test endpoint"),
@@ -4145,9 +4185,9 @@ mod tests {
     #[test]
     fn in_flight_tracker_groups_by_backend() {
         let mut tracker = InFlightTracker::default();
-        tracker.record_submitted(0, types::TUniqueId::new(1, 10));
-        tracker.record_submitted(1, types::TUniqueId::new(1, 20));
-        tracker.record_submitted(0, types::TUniqueId::new(1, 11));
+        tracker.record_submitted(0, native_id(1, 10));
+        tracker.record_submitted(1, native_id(1, 20));
+        tracker.record_submitted(0, native_id(1, 11));
 
         assert_eq!(tracker.by_backend.len(), 2, "two distinct backends");
         assert_eq!(
@@ -4165,7 +4205,7 @@ mod tests {
     /// Mock dispatcher that records the (backend_idx, finst_ids) of every
     /// cancel_fragments call so cancel fan-out can be asserted.
     struct RecordingCancelDispatcher {
-        cancels: Mutex<Vec<(usize, Vec<types::TUniqueId>)>>,
+        cancels: Mutex<Vec<(usize, Vec<UniqueId>)>>,
     }
 
     impl RecordingCancelDispatcher {
@@ -4192,14 +4232,14 @@ mod tests {
         fn fetch_result(
             &self,
             _backend_idx: usize,
-            _finst_id: types::TUniqueId,
+            _finst_id: UniqueId,
             _max_wait_ms: i64,
             _expected_chunk_schema: Option<&ChunkSchemaRef>,
         ) -> Result<FetchOutcome, String> {
             Ok(FetchOutcome::Eof)
         }
 
-        fn cancel_fragments(&self, backend_idx: usize, finst_ids: &[types::TUniqueId]) {
+        fn cancel_fragments(&self, backend_idx: usize, finst_ids: &[UniqueId]) {
             self.cancels
                 .lock()
                 .unwrap()
@@ -4215,9 +4255,9 @@ mod tests {
     fn in_flight_tracker_cancel_all_fans_out_per_backend() {
         let dispatcher = RecordingCancelDispatcher::new();
         let mut tracker = InFlightTracker::default();
-        tracker.record_submitted(0, types::TUniqueId::new(7, 1));
-        tracker.record_submitted(1, types::TUniqueId::new(7, 2));
-        tracker.record_submitted(1, types::TUniqueId::new(7, 3));
+        tracker.record_submitted(0, native_id(7, 1));
+        tracker.record_submitted(1, native_id(7, 2));
+        tracker.record_submitted(1, native_id(7, 3));
 
         tracker.cancel_all(dispatcher.as_ref());
 
@@ -4801,7 +4841,7 @@ mod tests {
 
         let dispatcher = RecordingCancelDispatcher::new();
         let mut tracker = InFlightTracker::default();
-        let submitted = id(710, 900);
+        let submitted = native_id(710, 900);
         tracker.record_submitted(0, submitted.clone());
 
         let err = poll_write_failure_and_cancel(&write, &tracker, dispatcher.as_ref())
@@ -4885,7 +4925,7 @@ mod tests {
                 .expect("delayed writer report");
         });
 
-        let root_finst_id = types::TUniqueId::new(740, 1);
+        let root_finst_id = native_id(740, 1);
         let params = single_backend(vec![
             make_params_with_finst(740, 10),
             make_params_with_finst(740, 1),
@@ -4897,7 +4937,8 @@ mod tests {
             params,
             0,
             root_finst_id,
-            &types::TUniqueId::new(740, 741),
+            &native_id(740, 741),
+            true,
             1_000,
             None,
             Some(&write),
@@ -4917,7 +4958,7 @@ mod tests {
 
     #[test]
     fn write_failure_during_post_eof_wait_surfaces_abort_and_cancels_submitted_fragments() {
-        let query_id = id(760, 761);
+        let query_id = native_id(760, 761);
         let writer = writer_key(760, 761, 762, 763, 0);
         let write = Arc::new(Mutex::new(
             WriteCoordinator::new(native_id(760, 761), vec![writer.clone()])
@@ -4953,7 +4994,7 @@ mod tests {
                 .expect("delayed writer failure report");
         });
 
-        let root_finst_id = types::TUniqueId::new(760, 1);
+        let root_finst_id = native_id(760, 1);
         let params = single_backend(vec![
             make_params_with_finst(760, 10),
             make_params_with_finst(760, 1),
@@ -4966,6 +5007,7 @@ mod tests {
             0,
             root_finst_id,
             &query_id,
+            true,
             1_000,
             None,
             Some(&write),
@@ -4986,10 +5028,7 @@ mod tests {
         assert_eq!(abort.incomplete_writers, vec![writer]);
         assert_eq!(
             inner.cancelled_ids(),
-            vec![
-                types::TUniqueId::new(760, 10),
-                types::TUniqueId::new(760, 1)
-            ],
+            vec![native_id(760, 10), native_id(760, 1)],
             "post-EOF writer failure must cancel all submitted fragments"
         );
         let commit_err = write
@@ -5037,7 +5076,7 @@ mod tests {
 
         let inner = ControllableDispatcher::fetch_returns_not_ready();
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
-        let root_finst_id = types::TUniqueId::new(780, 1);
+        let root_finst_id = native_id(780, 1);
         let params = single_backend(vec![
             make_params_with_finst(780, 10),
             make_params_with_finst(780, 1),
@@ -5050,7 +5089,8 @@ mod tests {
             params,
             0,
             root_finst_id,
-            &types::TUniqueId::new(780, 781),
+            &native_id(780, 781),
+            true,
             1_000,
             None,
             Some(&write),
@@ -5078,10 +5118,7 @@ mod tests {
         assert_eq!(abort.incomplete_writers, vec![writer_failed]);
         assert_eq!(
             inner.cancelled_ids(),
-            vec![
-                types::TUniqueId::new(780, 10),
-                types::TUniqueId::new(780, 1)
-            ],
+            vec![native_id(780, 10), native_id(780, 1)],
             "pre-EOF writer failure must cancel submitted fragments"
         );
         assert_eq!(
@@ -5095,7 +5132,7 @@ mod tests {
     fn standalone_report_failure_cancels_inflight_fragments() {
         let inner = ControllableDispatcher::fetch_returns_not_ready();
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
-        let root_finst_id = types::TUniqueId::new(786, 1);
+        let root_finst_id = native_id(786, 1);
         let params = single_backend(vec![
             make_params_with_finst(786, 10),
             make_params_with_finst(786, 1),
@@ -5116,7 +5153,8 @@ mod tests {
             params,
             0,
             root_finst_id,
-            &types::TUniqueId::new(786, 1),
+            &native_id(786, 1),
+            true,
             1_000,
             None,
             None,
@@ -5128,28 +5166,23 @@ mod tests {
         assert!(err.contains("remote fragment failed"), "{err}");
         assert_eq!(
             inner.cancelled_ids(),
-            vec![
-                types::TUniqueId::new(786, 10),
-                types::TUniqueId::new(786, 1)
-            ],
+            vec![native_id(786, 10), native_id(786, 1)],
             "standalone report failure must cancel all submitted fragments"
         );
     }
 
     #[test]
     fn collect_profiles_waits_for_final_report_after_root_eof() {
-        let query_id = id(787, 1);
-        let root_finst_id = types::TUniqueId::new(787, 10);
+        let query_id = native_id(787, 1);
+        let root_finst_id = native_id(787, 10);
         let (eof_tx, eof_rx) = std::sync::mpsc::channel();
         let inner = EofSignalDispatcher::new(eof_tx);
         let dispatcher: Arc<dyn FragmentDispatcher> = inner;
-        let report_query_id = query_id.clone();
-        let report_finst_id = root_finst_id.clone();
         let report_thread = std::thread::spawn(move || {
             eof_rx.recv().expect("root EOF signal");
             let accepted = record_standalone_query_profile_report(&profile_report_params(
-                report_query_id,
-                report_finst_id,
+                id(787, 1),
+                id(787, 10),
                 profile_tree_for_plan_node(2),
             ))
             .expect("record profile report");
@@ -5165,6 +5198,7 @@ mod tests {
             0,
             root_finst_id,
             &query_id,
+            true,
             1_000,
             None,
             None,
@@ -5180,14 +5214,10 @@ mod tests {
 
     #[test]
     fn duplicate_profile_reports_for_same_fragment_count_once() {
-        let query_id = id(788, 1);
-        let finst_id = id(788, 10);
+        let query_id = native_id(788, 1);
+        let finst_id = native_id(788, 10);
         let _guard = StandaloneQueryProfileGuard::register(&query_id);
-        let params = profile_report_params(
-            query_id.clone(),
-            finst_id.clone(),
-            profile_tree_for_plan_node(2),
-        );
+        let params = profile_report_params(id(788, 1), id(788, 10), profile_tree_for_plan_node(2));
 
         assert!(
             record_standalone_query_profile_report(&params).expect("first thrift profile report")
@@ -5243,7 +5273,7 @@ mod tests {
 
     #[test]
     fn write_only_root_waits_for_commit_without_fetching_result_buffer() {
-        let query_id = id(790, 791);
+        let query_id = native_id(790, 791);
         let writer = writer_key(790, 791, 790, 1, 0);
         let write = Arc::new(Mutex::new(
             WriteCoordinator::new(native_id(790, 791), vec![writer.clone()])
@@ -5262,10 +5292,7 @@ mod tests {
 
         let inner = ControllableDispatcher::fetch_returns_err("no result for this query");
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
-        let root_finst_id = types::TUniqueId::new(
-            writer.fragment_instance_id.hi,
-            writer.fragment_instance_id.lo,
-        );
+        let root_finst_id = writer.fragment_instance_id;
         let params = single_backend(vec![
             make_params_with_finst(790, 10),
             make_params_with_finst_and_sink_type(
@@ -5283,6 +5310,7 @@ mod tests {
             0,
             root_finst_id,
             &query_id,
+            false,
             1_000,
             None,
             Some(&write),
@@ -5302,15 +5330,14 @@ mod tests {
 
     #[test]
     fn missing_write_final_report_after_root_eof_times_out_and_cancels() {
-        let query_id = id(750, 751);
+        let query_id = native_id(750, 751);
         let writer = writer_key(750, 751, 752, 753, 0);
         let write = Arc::new(Mutex::new(
-            WriteCoordinator::new(native_id(750, 751), vec![writer.clone()])
-                .expect("write coordinator"),
+            WriteCoordinator::new(query_id, vec![writer.clone()]).expect("write coordinator"),
         ));
         let inner = ControllableDispatcher::succeeds_always_eof();
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
-        let root_finst_id = types::TUniqueId::new(750, 1);
+        let root_finst_id = native_id(750, 1);
         let params = single_backend(vec![
             make_params_with_finst(750, 10),
             make_params_with_finst(750, 1),
@@ -5323,7 +5350,8 @@ mod tests {
             params,
             0,
             root_finst_id,
-            &types::TUniqueId::new(750, 751),
+            &query_id,
+            true,
             25,
             None,
             Some(&write),
@@ -5383,9 +5411,9 @@ mod tests {
     fn execute_submits_all_fragments_and_fetches_to_eof() {
         let inner = ControllableDispatcher::succeeds_always_eof();
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
-        let query_id = types::TUniqueId::new(1, 99);
+        let query_id = native_id(1, 99);
         let runtime_query_id = runtime_query_id(query_id.hi, query_id.lo);
-        let root_finst_id = types::TUniqueId::new(1, 1);
+        let root_finst_id = native_id(1, 1);
         let params = single_backend(vec![
             make_params_with_finst(1, 10),
             make_params_with_finst(1, 1),
@@ -5398,6 +5426,7 @@ mod tests {
             0,
             root_finst_id,
             &query_id,
+            true,
             100,
             None,
             None,
@@ -5435,7 +5464,7 @@ mod tests {
     fn execute_cancels_already_submitted_on_submit_failure() {
         let inner = ControllableDispatcher::fails_on_submit_n(2);
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
-        let root_finst_id = types::TUniqueId::new(2, 1);
+        let root_finst_id = native_id(2, 1);
         let params = single_backend(vec![
             make_params_with_finst(2, 10),
             make_params_with_finst(2, 1),
@@ -5447,7 +5476,8 @@ mod tests {
             params,
             0,
             root_finst_id,
-            &types::TUniqueId::new(2, 99),
+            &native_id(2, 99),
+            true,
             100,
             None,
             None,
@@ -5483,7 +5513,7 @@ mod tests {
     fn execute_cancels_all_submitted_on_fetch_error() {
         let inner = ControllableDispatcher::fetch_returns_err("boom");
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
-        let root_finst_id = types::TUniqueId::new(3, 1);
+        let root_finst_id = native_id(3, 1);
         let params = single_backend(vec![
             make_params_with_finst(3, 10),
             make_params_with_finst(3, 1),
@@ -5495,7 +5525,8 @@ mod tests {
             params,
             0,
             root_finst_id,
-            &types::TUniqueId::new(3, 99),
+            &native_id(3, 99),
+            true,
             100,
             None,
             None,
@@ -5525,7 +5556,7 @@ mod tests {
     fn query_timeout_triggers_cancel() {
         let inner = ControllableDispatcher::fetch_returns_not_ready();
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
-        let root_finst_id = types::TUniqueId::new(4, 1);
+        let root_finst_id = native_id(4, 1);
         let params = single_backend(vec![
             make_params_with_finst(4, 10),
             make_params_with_finst(4, 1),
@@ -5537,7 +5568,8 @@ mod tests {
             params,
             0,
             root_finst_id,
-            &types::TUniqueId::new(4, 99),
+            &native_id(4, 99),
+            true,
             10,
             None,
             None,
@@ -5565,7 +5597,7 @@ mod tests {
     fn execute_aborts_before_second_fetch_when_query_state_failed() {
         let inner = QueryStateFailureDispatcher::new("remote query failed");
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
-        let root_finst_id = types::TUniqueId::new(8, 1);
+        let root_finst_id = native_id(8, 1);
         let params = single_backend(vec![
             make_params_with_finst(8, 10),
             make_params_with_finst(8, 1),
@@ -5578,7 +5610,8 @@ mod tests {
             params,
             0,
             root_finst_id,
-            &types::TUniqueId::new(8, 99),
+            &native_id(8, 99),
+            true,
             100,
             None,
             None,
@@ -5611,7 +5644,7 @@ mod tests {
     fn fetch_loop_caps_remote_waits_below_full_timeout() {
         let inner = RecordingWaitDispatcher::new();
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
-        let root_finst_id = types::TUniqueId::new(6, 1);
+        let root_finst_id = native_id(6, 1);
         let params = single_backend(vec![
             make_params_with_finst(6, 10),
             make_params_with_finst(6, 1),
@@ -5624,7 +5657,8 @@ mod tests {
             params,
             0,
             root_finst_id,
-            &types::TUniqueId::new(6, 99),
+            &native_id(6, 99),
+            true,
             300_000,
             None,
             None,
@@ -5648,7 +5682,7 @@ mod tests {
     fn client_disconnect_triggers_cancel() {
         let inner = ControllableDispatcher::fetch_returns_not_ready();
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
-        let root_finst_id = types::TUniqueId::new(5, 1);
+        let root_finst_id = native_id(5, 1);
         let params = single_backend(vec![
             make_params_with_finst(5, 10),
             make_params_with_finst(5, 1),
@@ -5664,7 +5698,8 @@ mod tests {
                     params,
                     0,
                     root_finst_id,
-                    &types::TUniqueId::new(5, 99),
+                    &native_id(5, 99),
+                    true,
                     100,
                     None,
                     None,

@@ -394,9 +394,7 @@ pub(crate) fn handle_fragment_report_exec_status(
 
     let Some(coord) = coord else {
         if report_has_write_metadata(&report) {
-            return Err(EngineError::write_coordinator_gone(thrift_unique_id(
-                report.query_id,
-            )));
+            return Err(EngineError::write_coordinator_gone(report.query_id));
         }
         return Ok(ReportOutcome::Accepted);
     };
@@ -500,10 +498,6 @@ impl WriteRegistryTestGuard {
         unregister_query(query_id);
         self.registered_queries.retain(|id| id != query_id);
     }
-}
-
-fn thrift_unique_id(id: UniqueId) -> crate::thrift::types::TUniqueId {
-    crate::thrift::types::TUniqueId::new(id.hi, id.lo)
 }
 
 #[cfg(test)]

@@ -24,31 +24,34 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 use std::sync::Arc;
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 use crate::common::ids::SlotId;
+use crate::common::types::UniqueId;
 use crate::exec::chunk::Chunk;
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 use crate::exec::chunk::ChunkSchema;
 use crate::exec::chunk::ChunkSchemaRef;
-use crate::proto::common::UniqueId;
+use crate::proto::common::UniqueId as ProtoUniqueId;
 use crate::proto::novarocks::{
     CancelFragmentRequest, FetchResultRequest, SubmitFragmentRequest,
     fetch_result_response::Status as FetchStatus,
 };
 use crate::service::grpc_client::NovaRocksGrpcRemoteClient;
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 use crate::thrift::data_sinks;
+#[cfg(feature = "compat")]
 use crate::thrift::internal_service;
+#[cfg(all(test, feature = "compat"))]
 use crate::thrift::types;
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 use arrow::datatypes::{DataType, Field, Schema};
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 use arrow::record_batch::RecordBatch;
 use tracing::warn;
 
@@ -78,6 +81,7 @@ pub trait FragmentDispatcher: Send + Sync + 'static {
 
     /// Submit a fragment for asynchronous execution to the given backend.
     /// Returns immediately.
+    #[cfg(feature = "compat")]
     fn submit_fragment(
         &self,
         backend_idx: usize,
@@ -94,7 +98,16 @@ pub trait FragmentDispatcher: Send + Sync + 'static {
         backend_idx: usize,
         submission: FragmentSubmission,
     ) -> Result<(), String> {
-        self.submit_fragment(backend_idx, submission.into_thrift_params())
+        #[cfg(feature = "compat")]
+        {
+            return self.submit_fragment(backend_idx, submission.into_thrift_params());
+        }
+        #[cfg(not(feature = "compat"))]
+        {
+            let _ = backend_idx;
+            let _ = submission;
+            Err("fragment dispatcher must implement native fragment submission".to_string())
+        }
     }
 
     /// Poll for the next result chunk from the root fragment on the given
@@ -102,13 +115,13 @@ pub trait FragmentDispatcher: Send + Sync + 'static {
     fn fetch_result(
         &self,
         backend_idx: usize,
-        finst_id: types::TUniqueId,
+        finst_id: UniqueId,
         max_wait_ms: i64,
         expected_chunk_schema: Option<&ChunkSchemaRef>,
     ) -> Result<FetchOutcome, String>;
 
     /// Cancel all listed fragment instances on the given backend.  Idempotent.
-    fn cancel_fragments(&self, backend_idx: usize, finst_ids: &[types::TUniqueId]);
+    fn cancel_fragments(&self, backend_idx: usize, finst_ids: &[UniqueId]);
 
     /// Number of backends this dispatcher can route to.
     fn backend_count(&self) -> usize;
@@ -141,12 +154,14 @@ pub(crate) fn compute_sink_pipeline_dop(session_dop: i32) -> i32 {
 }
 
 pub(crate) struct FragmentSubmission {
+    #[cfg(feature = "compat")]
     thrift_params: internal_service::TExecPlanFragmentParams,
     native_plan: Option<crate::proto::plan::PlanFragment>,
     native_instance_params: Option<crate::proto::novarocks::InstanceParams>,
 }
 
 impl FragmentSubmission {
+    #[cfg(feature = "compat")]
     pub(crate) fn thrift_only(params: internal_service::TExecPlanFragmentParams) -> Self {
         Self {
             thrift_params: params,
@@ -155,6 +170,7 @@ impl FragmentSubmission {
         }
     }
 
+    #[cfg(feature = "compat")]
     pub(crate) fn with_native(
         params: internal_service::TExecPlanFragmentParams,
         native_plan: crate::proto::plan::PlanFragment,
@@ -167,6 +183,18 @@ impl FragmentSubmission {
         }
     }
 
+    #[cfg(not(feature = "compat"))]
+    pub(crate) fn with_native(
+        native_plan: crate::proto::plan::PlanFragment,
+        native_instance_params: crate::proto::novarocks::InstanceParams,
+    ) -> Self {
+        Self {
+            native_plan: Some(native_plan),
+            native_instance_params: Some(native_instance_params),
+        }
+    }
+
+    #[cfg(feature = "compat")]
     pub(crate) fn thrift_params(&self) -> &internal_service::TExecPlanFragmentParams {
         &self.thrift_params
     }
@@ -176,6 +204,26 @@ impl FragmentSubmission {
         self.native_plan.as_ref()
     }
 
+    pub(crate) fn fragment_instance_id(&self) -> Result<UniqueId, String> {
+        #[cfg(feature = "compat")]
+        if let Some(exec) = self.thrift_params.params.as_ref() {
+            return Ok(UniqueId {
+                hi: exec.fragment_instance_id.hi,
+                lo: exec.fragment_instance_id.lo,
+            });
+        }
+        let id = self
+            .native_instance_params
+            .as_ref()
+            .and_then(|params| params.fragment_instance_id.as_ref())
+            .ok_or_else(|| "fragment submission missing fragment_instance_id".to_string())?;
+        Ok(UniqueId {
+            hi: id.hi,
+            lo: id.lo,
+        })
+    }
+
+    #[cfg(feature = "compat")]
     pub(crate) fn into_thrift_params(self) -> internal_service::TExecPlanFragmentParams {
         self.thrift_params
     }
@@ -272,6 +320,7 @@ impl FragmentDispatcher for RemoteDispatcher {
         self
     }
 
+    #[cfg(feature = "compat")]
     fn submit_fragment(
         &self,
         backend_idx: usize,
@@ -312,7 +361,7 @@ impl FragmentDispatcher for RemoteDispatcher {
     fn fetch_result(
         &self,
         backend_idx: usize,
-        finst_id: types::TUniqueId,
+        finst_id: UniqueId,
         max_wait_ms: i64,
         expected_chunk_schema: Option<&ChunkSchemaRef>,
     ) -> Result<FetchOutcome, String> {
@@ -329,7 +378,7 @@ impl FragmentDispatcher for RemoteDispatcher {
         }
         let resp = client
             .blocking_fetch_result(FetchResultRequest {
-                finst_id: Some(UniqueId {
+                finst_id: Some(ProtoUniqueId {
                     hi: finst_id.hi,
                     lo: finst_id.lo,
                 }),
@@ -374,7 +423,7 @@ impl FragmentDispatcher for RemoteDispatcher {
         }
     }
 
-    fn cancel_fragments(&self, backend_idx: usize, finst_ids: &[types::TUniqueId]) {
+    fn cancel_fragments(&self, backend_idx: usize, finst_ids: &[UniqueId]) {
         if self.check_idx(backend_idx).is_err() {
             return;
         }
@@ -382,7 +431,7 @@ impl FragmentDispatcher for RemoteDispatcher {
         let req = CancelFragmentRequest {
             finst_ids: finst_ids
                 .iter()
-                .map(|id| UniqueId {
+                .map(|id| ProtoUniqueId {
                     hi: id.hi,
                     lo: id.lo,
                 })
@@ -428,7 +477,7 @@ impl FragmentDispatcher for RemoteDispatcher {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 mod tests {
     use super::*;
 
@@ -449,8 +498,8 @@ mod tests {
     };
     use tonic::{Request, Response, Status, Streaming};
 
-    fn make_finst_id(hi: i64, lo: i64) -> types::TUniqueId {
-        types::TUniqueId::new(hi, lo)
+    fn make_finst_id(hi: i64, lo: i64) -> UniqueId {
+        UniqueId { hi, lo }
     }
 
     fn make_empty_exec_params(hi: i64, lo: i64) -> internal_service::TPlanFragmentExecParams {
@@ -951,9 +1000,7 @@ mod tests {
             .map(|(before, _)| before)
             .expect("dispatcher tests section exists");
         let cancel_start = source
-            .find(
-                "fn cancel_fragments(&self, backend_idx: usize, finst_ids: &[types::TUniqueId]) {",
-            )
+            .find("fn cancel_fragments(&self, backend_idx: usize, finst_ids: &[UniqueId]) {")
             .expect("cancel_fragments implementation exists");
         let cancel_tail = &impl_source[cancel_start..];
         assert!(

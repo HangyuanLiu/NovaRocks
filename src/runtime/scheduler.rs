@@ -62,16 +62,8 @@ use crate::sql::codegen::{
     RuntimeFilterPlanResult,
 };
 use crate::sql::planner::PartitionKind;
-use crate::thrift::types::TUniqueId;
 
 type LiveBackend = (usize, SocketAddr);
-
-fn unique_id_from_thrift(src: &TUniqueId) -> UniqueId {
-    UniqueId {
-        hi: src.hi,
-        lo: src.lo,
-    }
-}
 
 #[derive(Clone, Copy, Debug)]
 struct IncomingEdge {
@@ -93,7 +85,7 @@ pub(crate) struct FragmentInstancePlacement {
     #[allow(dead_code)]
     pub(crate) fragment_id: FragmentId,
     pub(crate) instance_index: usize,
-    pub(crate) finst_id: TUniqueId,
+    pub(crate) finst_id: UniqueId,
     /// Backend id from the scheduler's live backend snapshot.
     pub(crate) backend_idx: usize,
     /// Native runtime endpoint for this fragment instance.
@@ -116,7 +108,7 @@ pub(crate) struct SchedulingPlan {
     /// All instance placements, indexed by fragment id.
     pub(crate) by_fragment: BTreeMap<FragmentId, Vec<FragmentInstancePlacement>>,
     /// The finst id of the root fragment's (single) instance.
-    pub(crate) root_finst_id: TUniqueId,
+    pub(crate) root_finst_id: UniqueId,
     /// Which backend index the root instance is assigned to.
     pub(crate) root_backend_idx: usize,
 }
@@ -170,7 +162,7 @@ impl FragmentScheduler {
         &self,
         fragments: &[FragmentSchedulingMetadata],
         edges: &[FragmentEdge],
-        query_id: TUniqueId,
+        query_id: UniqueId,
     ) -> Result<SchedulingPlan, String> {
         let live = self.full_live_snapshot();
         self.assign_with_live(fragments, edges, query_id, &live)
@@ -180,7 +172,7 @@ impl FragmentScheduler {
         &self,
         fragments: &[FragmentSchedulingMetadata],
         edges: &[FragmentEdge],
-        query_id: TUniqueId,
+        query_id: UniqueId,
         live: &[LiveBackend],
     ) -> Result<SchedulingPlan, String> {
         let n = live.len();
@@ -294,10 +286,10 @@ impl FragmentScheduler {
                             instance_index < (1 << 16),
                             "instance_index {instance_index} overflows finst_id encoding"
                         );
-                        let finst_id = TUniqueId::new(
-                            query_id.hi,
-                            ((fid as i64) << 16) | (instance_index as i64),
-                        );
+                        let finst_id = UniqueId {
+                            hi: query_id.hi,
+                            lo: ((fid as i64) << 16) | (instance_index as i64),
+                        };
                         Ok(FragmentInstancePlacement {
                             fragment_id: fid,
                             instance_index,
@@ -373,7 +365,7 @@ impl FragmentScheduler {
                 .map(|insts| {
                     insts
                         .iter()
-                        .map(|inst| (unique_id_from_thrift(&inst.finst_id), inst.backend_idx))
+                        .map(|inst| (inst.finst_id, inst.backend_idx))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -425,7 +417,7 @@ impl FragmentScheduler {
             if let Some(instances) = plan.by_fragment.get(frag_id) {
                 let snapped: Vec<(UniqueId, usize)> = instances
                     .iter()
-                    .map(|inst| (unique_id_from_thrift(&inst.finst_id), inst.backend_idx))
+                    .map(|inst| (inst.finst_id, inst.backend_idx))
                     .collect();
                 for (filter_id, _scan_node_id) in probes {
                     probe_instances_by_filter
@@ -624,7 +616,6 @@ mod tests {
     };
     use crate::sql::planner::{DataPartition, PartitionKind};
     use crate::thrift::partitions;
-    use crate::thrift::types;
 
     // -----------------------------------------------------------------------
     // Test helpers
@@ -646,11 +637,11 @@ mod tests {
         vec![be("10.0.0.1:9010"), be("10.0.0.2:9010")]
     }
 
-    fn make_query_id(hi: i64, lo: i64) -> types::TUniqueId {
-        types::TUniqueId::new(hi, lo)
+    fn make_query_id(hi: i64, lo: i64) -> UniqueId {
+        UniqueId { hi, lo }
     }
 
-    fn dummy_query_id() -> types::TUniqueId {
+    fn dummy_query_id() -> UniqueId {
         make_query_id(1, 0)
     }
 

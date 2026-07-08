@@ -20,7 +20,9 @@
 //! pushed by BE via reportExecStatus. novarocks therefore does not expose a trigger entry point
 //! and keeps this module focused on BE-initiated reports.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::HashMap;
+#[cfg(feature = "compat")]
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(feature = "compat")]
@@ -55,6 +57,7 @@ use crate::service::standalone_exec_state_reporter::{self, StandaloneExecStateRe
 use crate::thrift::data_cache;
 #[cfg(feature = "compat")]
 use crate::thrift::{frontend_service, types};
+#[cfg(feature = "compat")]
 use crate::thrift::{metrics, runtime_profile, status, status_code};
 
 #[derive(Clone, Debug)]
@@ -632,6 +635,7 @@ fn thrift_status_from_error(error: Option<String>) -> status::TStatus {
     }
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn profile_to_thrift_tree_for_fe(
     profiler: &Profiler,
 ) -> runtime_profile::TRuntimeProfileTree {
@@ -639,6 +643,7 @@ pub(crate) fn profile_to_thrift_tree_for_fe(
         .expect("RuntimeProfile should always produce thrift-compatible profile units")
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn runtime_profile_tree_to_thrift_for_fe(
     tree: &RuntimeProfileTree,
 ) -> Result<runtime_profile::TRuntimeProfileTree, String> {
@@ -647,6 +652,7 @@ pub(crate) fn runtime_profile_tree_to_thrift_for_fe(
     Ok(runtime_profile::TRuntimeProfileTree::new(nodes))
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn runtime_profile_tree_from_thrift_for_fe(
     tree: &runtime_profile::TRuntimeProfileTree,
 ) -> Result<RuntimeProfileTree, String> {
@@ -662,6 +668,7 @@ pub(crate) fn runtime_profile_tree_from_thrift_for_fe(
     Ok(RuntimeProfileTree { root })
 }
 
+#[cfg(feature = "compat")]
 fn native_profile_node_to_thrift_for_fe(
     node: &ProfileNode,
     out: &mut Vec<runtime_profile::TRuntimeProfileNode>,
@@ -702,6 +709,7 @@ fn native_profile_node_to_thrift_for_fe(
     Ok(())
 }
 
+#[cfg(feature = "compat")]
 fn native_counter_to_thrift_for_fe(
     counter: &ProfileCounter,
 ) -> Result<runtime_profile::TCounter, String> {
@@ -715,6 +723,7 @@ fn native_counter_to_thrift_for_fe(
     ))
 }
 
+#[cfg(feature = "compat")]
 fn native_profile_node_from_thrift_for_fe(
     nodes: &[runtime_profile::TRuntimeProfileNode],
     idx: usize,
@@ -779,6 +788,7 @@ fn native_profile_node_from_thrift_for_fe(
     )))
 }
 
+#[cfg(feature = "compat")]
 fn thrift_counter_to_native_for_fe(
     counter: &runtime_profile::TCounter,
     parent_name: String,
@@ -801,6 +811,7 @@ fn thrift_counter_to_native_for_fe(
     })
 }
 
+#[cfg(feature = "compat")]
 fn metadata_to_native_node_id_for_fe(metadata: i64) -> i32 {
     match i32::try_from(metadata) {
         Ok(value) => value,
@@ -809,6 +820,7 @@ fn metadata_to_native_node_id_for_fe(metadata: i64) -> i32 {
     }
 }
 
+#[cfg(feature = "compat")]
 fn profile_unit_to_thrift_for_fe(unit: ProfileUnit) -> metrics::TUnit {
     match unit {
         ProfileUnit::Unit => metrics::TUnit::UNIT,
@@ -821,6 +833,7 @@ fn profile_unit_to_thrift_for_fe(unit: ProfileUnit) -> metrics::TUnit {
     }
 }
 
+#[cfg(feature = "compat")]
 fn profile_unit_from_thrift_for_fe(unit: metrics::TUnit) -> Result<ProfileUnit, String> {
     match unit {
         metrics::TUnit::UNIT => Ok(ProfileUnit::Unit),
@@ -836,6 +849,7 @@ fn profile_unit_from_thrift_for_fe(unit: metrics::TUnit) -> Result<ProfileUnit, 
     }
 }
 
+#[cfg(feature = "compat")]
 fn counter_strategy_to_thrift_for_fe(
     strategy: CounterStrategy,
 ) -> runtime_profile::TCounterStrategy {
@@ -865,6 +879,7 @@ fn counter_strategy_to_thrift_for_fe(
     )
 }
 
+#[cfg(feature = "compat")]
 fn counter_strategy_from_thrift_for_fe(
     strategy: &runtime_profile::TCounterStrategy,
 ) -> Result<CounterStrategy, String> {
@@ -904,6 +919,7 @@ fn counter_strategy_from_thrift_for_fe(
     ))
 }
 
+#[cfg(feature = "compat")]
 fn build_profile_tree(
     query_id: QueryId,
     enable_profile: bool,
@@ -1022,6 +1038,7 @@ pub(crate) fn merge_pipeline_profiles_for_fe(profiler: &Profiler) -> Profiler {
     merged
 }
 
+#[cfg(feature = "compat")]
 fn normalize_profile_tree_for_fe(tree: &mut runtime_profile::TRuntimeProfileTree) {
     let mut stack: Vec<(String, i32, bool)> = Vec::new();
     for node in &mut tree.nodes {
@@ -1086,6 +1103,7 @@ fn normalize_profile_tree_for_fe(tree: &mut runtime_profile::TRuntimeProfileTree
     }
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn is_query_gone_status(status: &status::TStatus) -> bool {
     status.status_code == status_code::TStatusCode::NOT_FOUND
         && status

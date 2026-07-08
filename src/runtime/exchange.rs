@@ -1423,9 +1423,7 @@ mod tests {
         push_chunks, register_expected_chunk_schema, set_expected_senders, snapshot_receiver_state,
     };
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::schema_thrift::chunk_slot_schema_from_type_desc;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-    use crate::thrift::types;
 
     const EXCHANGE_TEST_SLOT_IDS: [SlotId; 4] = [
         SlotId::new(33),
@@ -1505,17 +1503,20 @@ mod tests {
         Chunk::new_with_chunk_schema(batch, chunk_schema)
     }
 
-    fn decimal_type_desc(
-        primitive: types::TPrimitiveType,
-        precision: i32,
-        scale: i32,
-    ) -> types::TTypeDesc {
-        types::TTypeDesc::new(vec![types::TTypeNode::new(
-            types::TTypeNodeType::SCALAR,
-            types::TScalarType::new(primitive, None, Some(precision), Some(scale), None),
+    fn decimal_slot_schema(
+        slot_id: SlotId,
+        name: &str,
+        nullable: bool,
+        precision: u8,
+        scale: i8,
+        unique_id: Option<i32>,
+    ) -> ChunkSlotSchema {
+        ChunkSlotSchema::new_with_field(
+            slot_id,
+            Field::new(name, DataType::Decimal128(precision, scale), nullable),
             None,
-            None,
-        )])
+            unique_id,
+        )
     }
 
     fn dictionary_status_chunk(
@@ -1792,16 +1793,14 @@ mod tests {
         let chunk = decimal128_chunk_with_over_precision_value(value);
         let payload = encode_chunks(&[chunk], true).expect("encode");
         let expected_schema = Arc::new(
-            ChunkSchema::try_new(vec![
-                chunk_slot_schema_from_type_desc(
-                    SlotId::new(55),
-                    "price",
-                    true,
-                    decimal_type_desc(types::TPrimitiveType::DECIMAL128, 38, 2),
-                    None,
-                )
-                .expect("expected decimal slot"),
-            ])
+            ChunkSchema::try_new(vec![decimal_slot_schema(
+                SlotId::new(55),
+                "price",
+                true,
+                38,
+                2,
+                None,
+            )])
             .expect("expected chunk schema"),
         );
 
@@ -1822,16 +1821,14 @@ mod tests {
             node_id: 33,
         };
         let expected_schema = Arc::new(
-            ChunkSchema::try_new(vec![
-                chunk_slot_schema_from_type_desc(
-                    SlotId::new(55),
-                    "price",
-                    true,
-                    decimal_type_desc(types::TPrimitiveType::DECIMAL128, 38, 2),
-                    None,
-                )
-                .expect("expected decimal slot"),
-            ])
+            ChunkSchema::try_new(vec![decimal_slot_schema(
+                SlotId::new(55),
+                "price",
+                true,
+                38,
+                2,
+                None,
+            )])
             .expect("expected chunk schema"),
         );
         register_expected_chunk_schema(key, 1, expected_schema).expect("register expected schema");
@@ -1908,16 +1905,14 @@ mod tests {
         let payload = encode_chunks(&[Chunk::new_with_chunk_schema(batch, chunk_schema)], true)
             .expect("encode");
         let expected_schema = Arc::new(
-            ChunkSchema::try_new(vec![
-                chunk_slot_schema_from_type_desc(
-                    SlotId::new(55),
-                    "price",
-                    true,
-                    decimal_type_desc(types::TPrimitiveType::DECIMAL128, 38, 2),
-                    None,
-                )
-                .expect("expected decimal slot"),
-            ])
+            ChunkSchema::try_new(vec![decimal_slot_schema(
+                SlotId::new(55),
+                "price",
+                true,
+                38,
+                2,
+                None,
+            )])
             .expect("expected chunk schema"),
         );
 

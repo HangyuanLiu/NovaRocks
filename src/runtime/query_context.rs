@@ -39,6 +39,7 @@ use crate::exec::pipeline::global_driver_executor::FragmentCompletion;
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::fs::scan_context::FileScanRange;
 use crate::runtime::descriptor_snapshot::DescriptorSnapshot;
+#[cfg(feature = "compat")]
 use crate::runtime::descriptor_snapshot_thrift::descriptor_snapshot_from_thrift;
 use crate::runtime::lookup::GlobalLateMaterializationContext;
 use crate::runtime::mem_tracker::{self, MemTracker};
@@ -47,7 +48,9 @@ use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
 use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 use crate::runtime::runtime_filter_worker::{RuntimeFilterWorker, RuntimeFilterWorkerParams};
+#[cfg(feature = "compat")]
 use crate::thrift::descriptors;
+#[cfg(feature = "compat")]
 use crate::thrift::internal_service;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -67,6 +70,7 @@ pub(crate) struct QueryContext {
     #[allow(dead_code)]
     pub(crate) query_id: QueryId,
     pub(crate) cache_options: Option<CacheOptions>,
+    #[cfg(feature = "compat")]
     pub(crate) desc_tbl: Option<descriptors::TDescriptorTable>,
     pub(crate) desc_snapshot: Option<Arc<DescriptorSnapshot>>,
     pub(crate) num_fragments: usize,
@@ -114,6 +118,7 @@ impl QueryContext {
         Self {
             query_id,
             cache_options: None,
+            #[cfg(feature = "compat")]
             desc_tbl: None,
             desc_snapshot: None,
             num_fragments: 0,
@@ -321,12 +326,14 @@ impl QueryContext {
     }
 }
 
+#[cfg(feature = "compat")]
 struct IncrementalScanNodeHandle {
     scan: ScanNode,
     dispatch: Arc<ScanDispatchState>,
     update_mu: Mutex<()>,
 }
 
+#[cfg(feature = "compat")]
 impl IncrementalScanNodeHandle {
     fn new(scan: ScanNode, dispatch: Arc<ScanDispatchState>) -> Self {
         Self {
@@ -348,6 +355,7 @@ impl IncrementalScanNodeHandle {
     }
 }
 
+#[cfg(feature = "compat")]
 fn incremental_scan_ranges_from_thrift(
     scan_ranges: &[internal_service::TScanRangeParams],
 ) -> Result<Vec<IncrementalScanRange>, String> {
@@ -357,6 +365,7 @@ fn incremental_scan_ranges_from_thrift(
         .collect()
 }
 
+#[cfg(feature = "compat")]
 fn incremental_scan_range_from_thrift(
     params: &internal_service::TScanRangeParams,
 ) -> Result<IncrementalScanRange, String> {
@@ -390,6 +399,7 @@ fn incremental_scan_range_from_thrift(
     })
 }
 
+#[cfg(feature = "compat")]
 fn hdfs_file_format_from_thrift(format: &descriptors::THdfsFileFormat) -> HdfsScanFileFormat {
     match *format {
         descriptors::THdfsFileFormat::PARQUET => HdfsScanFileFormat::Parquet,
@@ -398,6 +408,7 @@ fn hdfs_file_format_from_thrift(format: &descriptors::THdfsFileFormat) -> HdfsSc
     }
 }
 
+#[cfg(feature = "compat")]
 fn incremental_change_op_from_thrift(
     hdfs_range: &crate::thrift::plan_nodes::THdfsScanRange,
 ) -> Result<Option<i8>, String> {
@@ -427,6 +438,7 @@ fn incremental_change_op_from_thrift(
     )
 }
 
+#[cfg(feature = "compat")]
 fn external_datacache_options_from_thrift(
     hdfs_range: &crate::thrift::plan_nodes::THdfsScanRange,
 ) -> Option<ExternalDataCacheRangeOptions> {
@@ -465,7 +477,9 @@ struct QueryContextManagerInner {
     second_chance: HashMap<QueryId, QueryContext>,
     finst_to_query: HashMap<UniqueId, QueryId>,
     fragment_completions: HashMap<UniqueId, Weak<FragmentCompletion>>,
+    #[cfg(feature = "compat")]
     incremental_scan_nodes: HashMap<UniqueId, HashMap<i32, Arc<IncrementalScanNodeHandle>>>,
+    #[cfg(feature = "compat")]
     pending_incremental_scan_ranges:
         HashMap<UniqueId, HashMap<i32, Vec<internal_service::TScanRangeParams>>>,
 }
@@ -758,6 +772,7 @@ impl QueryContextManager {
             .map(|ctx| ctx.mem_tracker())
     }
 
+    #[cfg(feature = "compat")]
     pub(crate) fn desc_tbl(&self, query_id: QueryId) -> Option<descriptors::TDescriptorTable> {
         let guard = self.inner.lock().expect("query_ctx_manager lock");
         guard
@@ -916,6 +931,7 @@ impl QueryContextManager {
         })
     }
 
+    #[cfg(feature = "compat")]
     pub(crate) fn register_incremental_scan_node(
         &self,
         finst_id: UniqueId,
@@ -951,6 +967,7 @@ impl QueryContextManager {
         Ok(())
     }
 
+    #[cfg(feature = "compat")]
     pub(crate) fn append_incremental_scan_ranges(
         &self,
         finst_id: UniqueId,
@@ -1001,7 +1018,9 @@ impl QueryContextManager {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
         guard.finst_to_query.remove(&finst_id);
         guard.fragment_completions.remove(&finst_id);
+        #[cfg(feature = "compat")]
         guard.incremental_scan_nodes.remove(&finst_id);
+        #[cfg(feature = "compat")]
         guard.pending_incremental_scan_ranges.remove(&finst_id);
     }
 
@@ -1383,6 +1402,7 @@ mod runtime_filter_lifecycle_cleanup_tests {
     }
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn observe_total_fragments(
     ctx: &mut QueryContext,
     exec_params: &internal_service::TPlanFragmentExecParams,
@@ -1393,10 +1413,12 @@ pub(crate) fn observe_total_fragments(
     }
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn desc_tbl_is_cached(desc: &descriptors::TDescriptorTable) -> bool {
     desc.is_cached.unwrap_or(false)
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn is_desc_tbl_effectively_empty(desc: &descriptors::TDescriptorTable) -> bool {
     let has_tuple = !desc.tuple_descriptors.is_empty();
     let has_table = desc
@@ -1410,6 +1432,7 @@ pub(crate) fn is_desc_tbl_effectively_empty(desc: &descriptors::TDescriptorTable
     !(has_tuple || has_table || has_slot)
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn resolve_desc_tbl_for_instance(
     mgr: &QueryContextManager,
     query_id: QueryId,
@@ -1450,7 +1473,7 @@ pub(crate) fn resolve_desc_tbl_for_instance(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 mod descriptor_snapshot_tests {
     use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
@@ -1565,7 +1588,7 @@ mod descriptor_snapshot_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 mod incremental_scan_range_wire_tests {
     use std::collections::BTreeMap;
 

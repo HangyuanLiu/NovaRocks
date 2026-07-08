@@ -44,7 +44,9 @@ struct SinkCommitStore {
 #[derive(Default)]
 struct SinkCommitEntry {
     iceberg_commits: Vec<IcebergCommitInfo>,
+    #[cfg(feature = "compat")]
     tablet_commit_infos: Vec<crate::thrift::types::TTabletCommitInfo>,
+    #[cfg(feature = "compat")]
     tablet_fail_infos: Vec<crate::thrift::types::TTabletFailInfo>,
     /// Per-file Theta sketch sets produced by the Iceberg sink for Puffin
     /// NDV statistics. These are not Cloneable (the `ThetaSketchHandle`
@@ -119,6 +121,7 @@ pub(crate) fn take_sketch_sets(finst_id: UniqueId) -> Vec<FileSketchSet> {
         .unwrap_or_default()
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn add_tablet_commit_info(
     finst_id: UniqueId,
     info: crate::thrift::types::TTabletCommitInfo,
@@ -134,6 +137,7 @@ pub(crate) fn add_tablet_commit_info(
     }
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn list_tablet_commit_infos(
     finst_id: UniqueId,
 ) -> Vec<crate::thrift::types::TTabletCommitInfo> {
@@ -145,6 +149,7 @@ pub(crate) fn list_tablet_commit_infos(
         .unwrap_or_default()
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn add_tablet_fail_info(
     finst_id: UniqueId,
     info: crate::thrift::types::TTabletFailInfo,
@@ -160,6 +165,7 @@ pub(crate) fn add_tablet_fail_info(
     }
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn list_tablet_fail_infos(
     finst_id: UniqueId,
 ) -> Vec<crate::thrift::types::TTabletFailInfo> {
@@ -429,7 +435,7 @@ pub(crate) fn list_iceberg_writer_reports(
     iceberg_commit_infos_to_writer_reports(list_iceberg_commits(finst_id), metadata)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 mod tests {
     use super::*;
     use crate::thrift::types::{TTabletCommitInfo, TTabletFailInfo};

@@ -36,6 +36,7 @@ use crate::runtime::endpoint::FragmentDestination;
 use crate::runtime::exchange;
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::service::exchange_sender::{ExchangeSendTask, ExchangeSendTracker, exchange_send_queue};
+#[cfg(feature = "compat")]
 use crate::thrift::partitions;
 use arrow::datatypes::DataType;
 use std::collections::VecDeque;
@@ -986,11 +987,37 @@ mod data_stream_sink_hash_partition {
 pub(crate) use data_stream_sink_hash_partition::partition_chunk_by_hash;
 pub(crate) use data_stream_sink_hash_partition::partition_chunk_by_hash_arrays;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DataStreamPartitionType {
+    Unpartitioned,
+    Random,
+    HashPartitioned,
+    BucketShuffleHashPartitioned,
+}
+
+impl DataStreamPartitionType {
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Unpartitioned => "UNPARTITIONED",
+            Self::Random => "RANDOM",
+            Self::HashPartitioned => "HASH_PARTITIONED",
+            Self::BucketShuffleHashPartitioned => "BUCKET_SHUFFLE_HASH_PARTITIONED",
+        }
+    }
+
+    fn requires_exprs(self) -> bool {
+        matches!(
+            self,
+            Self::HashPartitioned | Self::BucketShuffleHashPartitioned
+        )
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct DataStreamSinkFactoryInput {
     pub(crate) dest_node_id: i32,
     pub(crate) output_exprs: Vec<ExprId>,
-    pub(crate) output_partition_type: partitions::TPartitionType,
+    pub(crate) output_partition_type: DataStreamPartitionType,
     pub(crate) output_partition_exprs: Vec<ExprId>,
     pub(crate) output_columns: Vec<SlotId>,
     pub(crate) destinations: Vec<FragmentDestination>,
@@ -999,36 +1026,48 @@ pub(crate) struct DataStreamSinkFactoryInput {
 impl DataStreamSinkFactoryInput {
     pub(crate) fn partition_type_from_native_kind(
         kind: i32,
-    ) -> Result<partitions::TPartitionType, String> {
+    ) -> Result<DataStreamPartitionType, String> {
         match crate::proto::plan::PartitionKind::try_from(kind)
             .map_err(|_| format!("unknown native PartitionKind value {kind}"))?
         {
             crate::proto::plan::PartitionKind::Unpartitioned => {
-                Ok(partitions::TPartitionType::UNPARTITIONED)
+                Ok(DataStreamPartitionType::Unpartitioned)
             }
-            crate::proto::plan::PartitionKind::Random => Ok(partitions::TPartitionType::RANDOM),
-            crate::proto::plan::PartitionKind::Hash => {
-                Ok(partitions::TPartitionType::HASH_PARTITIONED)
-            }
+            crate::proto::plan::PartitionKind::Random => Ok(DataStreamPartitionType::Random),
+            crate::proto::plan::PartitionKind::Hash => Ok(DataStreamPartitionType::HashPartitioned),
             crate::proto::plan::PartitionKind::Unspecified => {
                 Err("native DataPartition kind is unspecified".to_string())
             }
         }
     }
 
-    pub(crate) fn partition_type_requires_exprs(
+    #[cfg(feature = "compat")]
+    pub(crate) fn partition_type_from_compat(
         partition_type: partitions::TPartitionType,
-    ) -> bool {
-        matches!(
-            partition_type,
-            partitions::TPartitionType::HASH_PARTITIONED
-                | partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED
-        )
+    ) -> Result<DataStreamPartitionType, String> {
+        match partition_type {
+            partitions::TPartitionType::UNPARTITIONED => Ok(DataStreamPartitionType::Unpartitioned),
+            partitions::TPartitionType::RANDOM => Ok(DataStreamPartitionType::Random),
+            partitions::TPartitionType::HASH_PARTITIONED => {
+                Ok(DataStreamPartitionType::HashPartitioned)
+            }
+            partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED => {
+                Ok(DataStreamPartitionType::BucketShuffleHashPartitioned)
+            }
+            other => Err(format!(
+                "unsupported DATA_STREAM_SINK partition type: {:?}",
+                other
+            )),
+        }
+    }
+
+    pub(crate) fn partition_type_requires_exprs(partition_type: DataStreamPartitionType) -> bool {
+        partition_type.requires_exprs()
     }
 
     pub(crate) fn try_new(
         dest_node_id: i32,
-        output_partition_type: partitions::TPartitionType,
+        output_partition_type: DataStreamPartitionType,
         output_exprs: Vec<ExprId>,
         output_partition_exprs: Vec<ExprId>,
         output_columns: Vec<i32>,
@@ -1127,15 +1166,7 @@ impl OperatorFactory for DataStreamSinkFactory {
         let be_number = 0i32;
 
         if driver_id == 0 {
-            let part_type = match self.input.output_partition_type {
-                partitions::TPartitionType::UNPARTITIONED => "UNPARTITIONED",
-                partitions::TPartitionType::RANDOM => "RANDOM",
-                partitions::TPartitionType::HASH_PARTITIONED => "HASH_PARTITIONED",
-                partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED => {
-                    "BUCKET_SHUFFLE_HASH_PARTITIONED"
-                }
-                _ => "UNKNOWN",
-            };
+            let part_type = self.input.output_partition_type.display_name();
             let dest_count = self.input.destinations.len();
             let dest_preview = self
                 .input
@@ -1162,13 +1193,7 @@ impl OperatorFactory for DataStreamSinkFactory {
         let mut init_error = self.init_error.clone();
         let arena = self.partition_arena.clone();
         let expr_ids = self.input.output_partition_exprs.clone();
-        if init_error.is_none()
-            && matches!(
-                self.input.output_partition_type,
-                partitions::TPartitionType::HASH_PARTITIONED
-                    | partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED
-            )
-        {
+        if init_error.is_none() && self.input.output_partition_type.requires_exprs() {
             let has_variant = expr_ids.iter().any(|id| {
                 arena
                     .data_type(*id)
@@ -1477,15 +1502,7 @@ impl DataStreamSinkOperator {
 
         let channel_num = self.destinations().len() as u128;
         let dest_id = self.input.dest_node_id;
-        let part_type = match self.input.output_partition_type {
-            partitions::TPartitionType::UNPARTITIONED => "UNPARTITIONED",
-            partitions::TPartitionType::RANDOM => "RANDOM",
-            partitions::TPartitionType::HASH_PARTITIONED => "HASH_PARTITIONED",
-            partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED => {
-                "BUCKET_SHUFFLE_HASH_PARTITIONED"
-            }
-            _ => "UNKNOWN",
-        };
+        let part_type = self.input.output_partition_type.display_name();
         if let Some(profile) = self.profiles.as_ref() {
             profile
                 .common
@@ -1531,7 +1548,7 @@ impl DataStreamSinkOperator {
         let n = dests.len();
 
         match self.input.output_partition_type {
-            partitions::TPartitionType::UNPARTITIONED => {
+            DataStreamPartitionType::Unpartitioned => {
                 // Broadcast to all destinations
                 let mut per_dest_chunks: Vec<Vec<Chunk>> = Vec::with_capacity(n);
                 for _ in 0..n {
@@ -1539,7 +1556,7 @@ impl DataStreamSinkOperator {
                 }
                 Ok(per_dest_chunks)
             }
-            partitions::TPartitionType::RANDOM => {
+            DataStreamPartitionType::Random => {
                 // Random partition: use row indices
                 let num_rows = chunk.len();
                 let mut partition_row_indices: Vec<Vec<u32>> = vec![Vec::new(); n];
@@ -1575,8 +1592,8 @@ impl DataStreamSinkOperator {
                 }
                 Ok(per_dest_chunks)
             }
-            partitions::TPartitionType::HASH_PARTITIONED
-            | partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED => {
+            DataStreamPartitionType::HashPartitioned
+            | DataStreamPartitionType::BucketShuffleHashPartitioned => {
                 if self.expr_ids.is_empty() {
                     return Err("HASH_PARTITIONED missing partition_exprs".to_string());
                 }
@@ -1584,7 +1601,7 @@ impl DataStreamSinkOperator {
                 // Use vectorized hash partition without row conversion
                 let use_crc32 = matches!(
                     self.input.output_partition_type,
-                    partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED
+                    DataStreamPartitionType::BucketShuffleHashPartitioned
                 );
 
                 let partition_chunks =
@@ -1602,10 +1619,6 @@ impl DataStreamSinkOperator {
                 }
                 Ok(per_dest_chunks)
             }
-            other => Err(format!(
-                "unsupported DATA_STREAM_SINK partition type: {:?}",
-                other
-            )),
         }
     }
 
@@ -1949,10 +1962,10 @@ impl ProcessorOperator for DataStreamSinkOperator {
         is_low_cardinality_exchange_dictionary(data_type)
             && matches!(
                 self.input.output_partition_type,
-                partitions::TPartitionType::UNPARTITIONED
-                    | partitions::TPartitionType::RANDOM
-                    | partitions::TPartitionType::HASH_PARTITIONED
-                    | partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED
+                DataStreamPartitionType::Unpartitioned
+                    | DataStreamPartitionType::Random
+                    | DataStreamPartitionType::HashPartitioned
+                    | DataStreamPartitionType::BucketShuffleHashPartitioned
             )
     }
 
@@ -2204,14 +2217,13 @@ mod tests {
     use arrow::record_batch::RecordBatchOptions;
 
     use crate::runtime::endpoint::RuntimeEndpoint;
-    use crate::thrift::types;
 
     fn make_test_operator() -> DataStreamSinkOperator {
         DataStreamSinkOperator {
             name: "DataStreamSink(test)".to_string(),
             input: DataStreamSinkFactoryInput::try_new(
                 1,
-                partitions::TPartitionType::UNPARTITIONED,
+                DataStreamPartitionType::Unpartitioned,
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -2309,7 +2321,7 @@ mod tests {
     #[test]
     fn data_stream_sink_accepts_dictionary_for_hash_partition_after_hash_support() {
         let mut op = make_test_operator();
-        op.input.output_partition_type = partitions::TPartitionType::HASH_PARTITIONED;
+        op.input.output_partition_type = DataStreamPartitionType::HashPartitioned;
         let utf8_dict = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
 
         assert!(op.accepts_encoded_column(SlotId::new(91), &utf8_dict));

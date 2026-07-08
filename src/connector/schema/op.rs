@@ -27,7 +27,10 @@ use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{ScanMorsel, ScanMorsels, ScanOp};
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::runtime::backend_id;
-use crate::thrift::types;
+#[cfg(feature = "compat")]
+type SchemaFeAddress = crate::thrift::types::TNetworkAddress;
+#[cfg(not(feature = "compat"))]
+type SchemaFeAddress = crate::runtime::endpoint::RuntimeEndpoint;
 
 use super::be_compaction_stats_store;
 use super::be_tablet_write_log_store;
@@ -49,7 +52,7 @@ pub(crate) struct SchemaScanOp {
     context: SchemaScanContext,
     output_chunk_schema: ChunkSchemaRef,
     should_scan: bool,
-    fe_addr: Option<types::TNetworkAddress>,
+    fe_addr: Option<SchemaFeAddress>,
 }
 
 impl SchemaScanOp {
@@ -58,7 +61,7 @@ impl SchemaScanOp {
         context: SchemaScanContext,
         output_chunk_schema: ChunkSchemaRef,
         should_scan: bool,
-        fe_addr: Option<types::TNetworkAddress>,
+        fe_addr: Option<SchemaFeAddress>,
     ) -> Self {
         Self {
             table,
@@ -697,6 +700,7 @@ mod tests {
             port: None,
             thread_id: None,
             user_ip: None,
+            #[cfg(feature = "compat")]
             current_user_ident: None,
             catalog_name: None,
             table_id: None,
@@ -713,6 +717,7 @@ mod tests {
             log_level: None,
             log_pattern: None,
             log_limit: None,
+            #[cfg(feature = "compat")]
             frontends: Vec::new(),
         }
     }

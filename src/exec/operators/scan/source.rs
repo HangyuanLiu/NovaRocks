@@ -301,32 +301,41 @@ impl ScanSourceOperator {
     }
 
     fn register_incremental_dispatch(&mut self, state: &RuntimeState) -> Result<(), String> {
-        if self.incremental_registered {
-            return Ok(());
-        }
-        if !self.scan.supports_incremental_scan_ranges() {
+        #[cfg(not(feature = "compat"))]
+        {
+            let _ = state;
             self.incremental_registered = true;
             return Ok(());
         }
-        let Some(finst_id) = state.fragment_instance_id() else {
+        #[cfg(feature = "compat")]
+        {
+            if self.incremental_registered {
+                return Ok(());
+            }
+            if !self.scan.supports_incremental_scan_ranges() {
+                self.incremental_registered = true;
+                return Ok(());
+            }
+            let Some(finst_id) = state.fragment_instance_id() else {
+                self.incremental_registered = true;
+                return Ok(());
+            };
+            let Some(node_id) = self.scan.node_id() else {
+                self.incremental_registered = true;
+                return Ok(());
+            };
+            let Some(dispatch) = self.current_dispatch()? else {
+                return Ok(());
+            };
+            crate::runtime::query_context::query_context_manager().register_incremental_scan_node(
+                finst_id,
+                node_id,
+                self.scan.clone(),
+                dispatch,
+            )?;
             self.incremental_registered = true;
-            return Ok(());
-        };
-        let Some(node_id) = self.scan.node_id() else {
-            self.incremental_registered = true;
-            return Ok(());
-        };
-        let Some(dispatch) = self.current_dispatch()? else {
-            return Ok(());
-        };
-        crate::runtime::query_context::query_context_manager().register_incremental_scan_node(
-            finst_id,
-            node_id,
-            self.scan.clone(),
-            dispatch,
-        )?;
-        self.incremental_registered = true;
-        Ok(())
+            Ok(())
+        }
     }
 
     fn max_io_tasks_for_scan(&self) -> Result<usize, String> {

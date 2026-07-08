@@ -279,6 +279,7 @@ impl RuntimeState {
         }
     }
 
+    #[cfg(feature = "compat")]
     pub(crate) fn add_tablet_commit_info(&self, info: crate::thrift::types::TTabletCommitInfo) {
         let Some(finst_id) = self.fragment_instance_id else {
             debug!(
@@ -297,6 +298,7 @@ impl RuntimeState {
         sink_commit::add_tablet_commit_info(finst_id, info);
     }
 
+    #[cfg(feature = "compat")]
     pub(crate) fn add_tablet_commit_infos(
         &self,
         infos: impl IntoIterator<Item = crate::thrift::types::TTabletCommitInfo>,
@@ -306,6 +308,7 @@ impl RuntimeState {
         }
     }
 
+    #[cfg(feature = "compat")]
     pub(crate) fn add_tablet_fail_info(&self, info: crate::thrift::types::TTabletFailInfo) {
         let Some(finst_id) = self.fragment_instance_id else {
             debug!(
@@ -324,6 +327,7 @@ impl RuntimeState {
         sink_commit::add_tablet_fail_info(finst_id, info);
     }
 
+    #[cfg(feature = "compat")]
     pub(crate) fn add_tablet_fail_infos(
         &self,
         infos: impl IntoIterator<Item = crate::thrift::types::TTabletFailInfo>,

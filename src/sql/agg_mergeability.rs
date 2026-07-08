@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn two_phase_functions_have_planning_layer_intermediate_type() {
-        use crate::sql::codegen::expr_compiler::infer_agg_function_types;
+        use crate::sql::codegen::agg_type_infer::infer_agg_function_types;
         use arrow::datatypes::DataType;
 
         // Every name the oracle calls TwoPhase must be inferrable with a defined

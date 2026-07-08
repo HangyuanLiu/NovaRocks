@@ -18,6 +18,7 @@
 use std::net::SocketAddr;
 
 use crate::common::types::UniqueId;
+#[cfg(feature = "compat")]
 use crate::thrift::types;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,10 +72,12 @@ impl RuntimeEndpoint {
         format!("{}:{}", self.host, self.port)
     }
 
+    #[cfg(feature = "compat")]
     pub(crate) fn to_network_address(&self) -> types::TNetworkAddress {
         types::TNetworkAddress::new(self.host.clone(), self.port)
     }
 
+    #[cfg(feature = "compat")]
     pub(crate) fn from_network_address(addr: &types::TNetworkAddress) -> Result<Self, String> {
         Self::new(addr.hostname.clone(), addr.port)
     }
@@ -185,6 +188,7 @@ mod tests {
         assert!(err.contains("must be in 1..=65535"), "{err}");
     }
 
+    #[cfg(feature = "compat")]
     #[test]
     fn roundtrips_network_address() {
         let endpoint = RuntimeEndpoint::parse("be-1.internal:8060").expect("endpoint");
@@ -195,6 +199,7 @@ mod tests {
         assert_eq!(roundtrip, endpoint);
     }
 
+    #[cfg(feature = "compat")]
     #[test]
     fn rejects_invalid_network_address() {
         let addr = types::TNetworkAddress::new("".to_string(), 8060);

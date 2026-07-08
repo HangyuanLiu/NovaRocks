@@ -19,76 +19,28 @@ use arrow::datatypes::{DataType, TimeUnit};
 use crate::proto::common::{PrimitiveType, ScalarType, TypeDesc, type_desc::Kind};
 use crate::service::grpc_client::proto::starrocks::{PScalarType, PTypeDesc, PTypeNode};
 
+use super::starrocks_primitive as sr_primitive;
+
 const TYPE_NODE_SCALAR: i32 = 0;
 
 pub(crate) fn arrow_type_to_proto_type_desc(data_type: &DataType) -> Option<PTypeDesc> {
     let (primitive, len, precision, scale) = match data_type {
-        DataType::Boolean => (
-            crate::thrift::types::TPrimitiveType::BOOLEAN.0,
-            None,
-            None,
-            None,
-        ),
-        DataType::Int8 => (
-            crate::thrift::types::TPrimitiveType::TINYINT.0,
-            None,
-            None,
-            None,
-        ),
-        DataType::Int16 => (
-            crate::thrift::types::TPrimitiveType::SMALLINT.0,
-            None,
-            None,
-            None,
-        ),
-        DataType::Int32 => (
-            crate::thrift::types::TPrimitiveType::INT.0,
-            None,
-            None,
-            None,
-        ),
-        DataType::Int64 => (
-            crate::thrift::types::TPrimitiveType::BIGINT.0,
-            None,
-            None,
-            None,
-        ),
-        DataType::Float32 => (
-            crate::thrift::types::TPrimitiveType::FLOAT.0,
-            None,
-            None,
-            None,
-        ),
-        DataType::Float64 => (
-            crate::thrift::types::TPrimitiveType::DOUBLE.0,
-            None,
-            None,
-            None,
-        ),
-        DataType::Date32 => (
-            crate::thrift::types::TPrimitiveType::DATE.0,
-            None,
-            None,
-            None,
-        ),
-        DataType::Timestamp(_, _) => (
-            crate::thrift::types::TPrimitiveType::DATETIME.0,
-            None,
-            None,
-            None,
-        ),
-        DataType::Utf8 => (
-            crate::thrift::types::TPrimitiveType::VARCHAR.0,
-            None,
-            None,
-            None,
-        ),
+        DataType::Boolean => (sr_primitive::BOOLEAN, None, None, None),
+        DataType::Int8 => (sr_primitive::TINYINT, None, None, None),
+        DataType::Int16 => (sr_primitive::SMALLINT, None, None, None),
+        DataType::Int32 => (sr_primitive::INT, None, None, None),
+        DataType::Int64 => (sr_primitive::BIGINT, None, None, None),
+        DataType::Float32 => (sr_primitive::FLOAT, None, None, None),
+        DataType::Float64 => (sr_primitive::DOUBLE, None, None, None),
+        DataType::Date32 => (sr_primitive::DATE, None, None, None),
+        DataType::Timestamp(_, _) => (sr_primitive::DATETIME, None, None, None),
+        DataType::Utf8 => (sr_primitive::VARCHAR, None, None, None),
         DataType::Decimal128(precision, scale) => {
             if !is_valid_decimal128(*precision, *scale) {
                 return None;
             }
             (
-                crate::thrift::types::TPrimitiveType::DECIMAL128.0,
+                sr_primitive::DECIMAL128,
                 None,
                 Some(i32::from(*precision)),
                 Some(i32::from(*scale)),
@@ -120,40 +72,28 @@ pub(crate) fn arrow_type_from_proto_type_desc(desc: &PTypeDesc) -> Option<DataTy
         return None;
     }
     let scalar = node.scalar_type.as_ref()?;
-    let primitive = crate::thrift::types::TPrimitiveType(scalar.r#type);
-    if primitive == crate::thrift::types::TPrimitiveType::BOOLEAN {
-        Some(DataType::Boolean)
-    } else if primitive == crate::thrift::types::TPrimitiveType::TINYINT {
-        Some(DataType::Int8)
-    } else if primitive == crate::thrift::types::TPrimitiveType::SMALLINT {
-        Some(DataType::Int16)
-    } else if primitive == crate::thrift::types::TPrimitiveType::INT {
-        Some(DataType::Int32)
-    } else if primitive == crate::thrift::types::TPrimitiveType::BIGINT {
-        Some(DataType::Int64)
-    } else if primitive == crate::thrift::types::TPrimitiveType::FLOAT {
-        Some(DataType::Float32)
-    } else if primitive == crate::thrift::types::TPrimitiveType::DOUBLE {
-        Some(DataType::Float64)
-    } else if primitive == crate::thrift::types::TPrimitiveType::DATE {
-        Some(DataType::Date32)
-    } else if primitive == crate::thrift::types::TPrimitiveType::DATETIME {
-        Some(DataType::Timestamp(TimeUnit::Microsecond, None))
-    } else if primitive == crate::thrift::types::TPrimitiveType::VARCHAR
-        || primitive == crate::thrift::types::TPrimitiveType::CHAR
-    {
-        Some(DataType::Utf8)
-    } else if primitive == crate::thrift::types::TPrimitiveType::DECIMAL128 {
-        let precision = scalar.precision?;
-        let scale = scalar.scale?;
-        if !(1..=38).contains(&precision) || scale < 0 || scale > precision {
-            return None;
+    match scalar.r#type {
+        sr_primitive::BOOLEAN => Some(DataType::Boolean),
+        sr_primitive::TINYINT => Some(DataType::Int8),
+        sr_primitive::SMALLINT => Some(DataType::Int16),
+        sr_primitive::INT => Some(DataType::Int32),
+        sr_primitive::BIGINT => Some(DataType::Int64),
+        sr_primitive::FLOAT => Some(DataType::Float32),
+        sr_primitive::DOUBLE => Some(DataType::Float64),
+        sr_primitive::DATE => Some(DataType::Date32),
+        sr_primitive::DATETIME => Some(DataType::Timestamp(TimeUnit::Microsecond, None)),
+        sr_primitive::VARCHAR | sr_primitive::CHAR => Some(DataType::Utf8),
+        sr_primitive::DECIMAL128 => {
+            let precision = scalar.precision?;
+            let scale = scalar.scale?;
+            if !(1..=38).contains(&precision) || scale < 0 || scale > precision {
+                return None;
+            }
+            let precision = u8::try_from(precision).ok()?;
+            let scale = i8::try_from(scale).ok()?;
+            Some(DataType::Decimal128(precision, scale))
         }
-        let precision = u8::try_from(precision).ok()?;
-        let scale = i8::try_from(scale).ok()?;
-        Some(DataType::Decimal128(precision, scale))
-    } else {
-        None
+        _ => None,
     }
 }
 
@@ -235,11 +175,10 @@ mod tests {
 
     use super::{
         TYPE_NODE_SCALAR, arrow_type_from_common_type_desc, arrow_type_from_proto_type_desc,
-        arrow_type_to_common_type_desc, arrow_type_to_proto_type_desc,
+        arrow_type_to_common_type_desc, arrow_type_to_proto_type_desc, sr_primitive,
     };
     use crate::proto::common::{PrimitiveType, type_desc::Kind};
     use crate::service::grpc_client::proto::starrocks::{PScalarType, PTypeDesc, PTypeNode};
-    use crate::thrift::types::TPrimitiveType;
 
     #[test]
     fn proto_type_desc_round_trips_supported_runtime_filter_types() {
@@ -317,7 +256,7 @@ mod tests {
         desc.types.push(PTypeNode {
             r#type: TYPE_NODE_SCALAR,
             scalar_type: Some(PScalarType {
-                r#type: TPrimitiveType::TINYINT.0,
+                r#type: sr_primitive::TINYINT,
                 len: None,
                 precision: None,
                 scale: None,
@@ -361,7 +300,7 @@ mod tests {
                 types: vec![PTypeNode {
                     r#type: TYPE_NODE_SCALAR,
                     scalar_type: Some(PScalarType {
-                        r#type: TPrimitiveType::DECIMAL128.0,
+                        r#type: sr_primitive::DECIMAL128,
                         len: None,
                         precision,
                         scale,

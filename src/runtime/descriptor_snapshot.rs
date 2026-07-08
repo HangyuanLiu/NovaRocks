@@ -20,7 +20,10 @@ use std::collections::HashMap;
 use arrow::datatypes::Field;
 
 use crate::common::ids::SlotId;
+use crate::exec::node::scan::HdfsScanFileFormat;
 use crate::exec::row_position::RowPositionDescriptor;
+use crate::exec::row_position::RowPositionType;
+use crate::formats::{FileFormatConfig, parquet::ParquetScanConfig};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DescriptorLogicalType {
@@ -231,6 +234,25 @@ impl DescriptorSnapshot {
             out.push(*slot_id);
         }
         out
+    }
+}
+
+pub(crate) fn is_iceberg_v3_row_position(row_position_type: RowPositionType) -> bool {
+    row_position_type == RowPositionType::Iceberg
+}
+
+#[allow(dead_code)]
+pub(crate) fn is_lake_row_position(row_position_type: RowPositionType) -> bool {
+    row_position_type == RowPositionType::Lake
+}
+
+pub(crate) fn lookup_file_format_config(
+    file_format: HdfsScanFileFormat,
+    parquet_cfg: ParquetScanConfig,
+) -> Result<FileFormatConfig, String> {
+    match file_format {
+        HdfsScanFileFormat::Parquet => Ok(FileFormatConfig::Parquet(parquet_cfg)),
+        other => Err(format!("lookup only supports PARQUET, got {:?}", other)),
     }
 }
 

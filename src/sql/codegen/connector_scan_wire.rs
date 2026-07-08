@@ -33,6 +33,7 @@ use crate::sql::catalog::{
 };
 #[cfg(feature = "compat")]
 use crate::thrift::{descriptors, internal_service};
+#[cfg(feature = "compat")]
 use crate::thrift::{exprs, partitions, plan_nodes, types};
 use arrow::datatypes::DataType;
 
@@ -48,10 +49,11 @@ pub(crate) struct ThriftScanContext {
     pub(crate) database: String,
     pub(crate) table: String,
     pub(crate) node_id: i32,
-    pub(crate) scan_tuple_id: types::TTupleId,
+    pub(crate) scan_tuple_id: i32,
+    #[cfg(feature = "compat")]
     pub(crate) conjuncts: Vec<exprs::TExpr>,
     pub(crate) min_max_predicates: Vec<MinMaxPredicate>,
-    pub(crate) change_op_slot: Option<types::TSlotId>,
+    pub(crate) change_op_slot: Option<i32>,
     pub(crate) cloud_properties: BTreeMap<String, String>,
     pub(crate) columns: Vec<ColumnDef>,
 }
@@ -65,6 +67,7 @@ pub(crate) struct ThriftScanPlan {
 
 #[derive(Clone, Debug)]
 pub(crate) struct NativeFileScanPlan {
+    #[cfg(feature = "compat")]
     pub(crate) node: Option<plan_nodes::TPlanNode>,
     pub(crate) scan_ranges: Vec<scan_range::ScanRangeParams>,
 }
@@ -130,8 +133,10 @@ fn iceberg_to_native_file_scan(
     validate_split_connectors(scan, splits)?;
     let scan = iceberg_scan_handle(scan)?;
     let scan_ranges = build_iceberg_native_scan_ranges(scan, splits, &ctx)?;
+    #[cfg(feature = "compat")]
     let node = build_iceberg_hdfs_scan_node(scan, &ctx);
     Ok(NativeFileScanPlan {
+        #[cfg(feature = "compat")]
         node: Some(node),
         scan_ranges,
     })
@@ -216,6 +221,7 @@ fn pruning_columns_for_scan(
         .collect()
 }
 
+#[cfg(feature = "compat")]
 fn build_iceberg_hdfs_scan_node(
     scan: &IcebergScanHandle,
     ctx: &ThriftScanContext,
@@ -282,7 +288,7 @@ fn build_iceberg_hdfs_scan_node(
 
 fn build_native_file_scan_range_params_for_file(
     file: &IcebergDataFileInfo,
-    change_op_slot: Option<types::TSlotId>,
+    change_op_slot: Option<i32>,
     columns: &[PruningColumn],
 ) -> Result<Vec<scan_range::ScanRangeParams>, String> {
     validate_iceberg_delete_apply_cost(&file.path, &file.delete_files)?;
@@ -459,7 +465,7 @@ fn decode_float_bound_for_type(bytes: &[u8], data_type: &DataType) -> Option<f64
 #[cfg(all(test, feature = "compat"))]
 fn build_hdfs_scan_range_params_for_file(
     file: &IcebergDataFileInfo,
-    change_op_slot: Option<types::TSlotId>,
+    change_op_slot: Option<i32>,
     columns: &[ColumnDef],
 ) -> Result<Vec<internal_service::TScanRangeParams>, String> {
     let pruning_columns = pruning_columns_from_column_order_for_test(columns)?;
@@ -545,7 +551,7 @@ pub(crate) fn build_native_file_scan_range_params(
     data_sequence_number: Option<i64>,
     ivm_change_op: Option<i8>,
     included_positions: Option<&Vec<i64>>,
-    change_op_slot: Option<types::TSlotId>,
+    change_op_slot: Option<i32>,
     delete_files: &[IcebergDeleteFileInfo],
     file_pruning_min_max_values: Option<BTreeMap<i32, scan_range::FilePruningMinMaxValue>>,
 ) -> Result<scan_range::ScanRangeParams, String> {
@@ -639,7 +645,7 @@ pub(crate) fn build_hdfs_scan_range_params(
     data_sequence_number: Option<i64>,
     ivm_change_op: Option<i8>,
     included_positions: Option<&Vec<i64>>,
-    change_op_slot: Option<types::TSlotId>,
+    change_op_slot: Option<i32>,
     delete_files: &[IcebergDeleteFileInfo],
     file_pruning_min_max_values: Option<BTreeMap<i32, scan_range::FilePruningMinMaxValue>>,
 ) -> Result<internal_service::TScanRangeParams, String> {

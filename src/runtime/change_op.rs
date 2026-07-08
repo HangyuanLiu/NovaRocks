@@ -15,9 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(feature = "compat")]
 use crate::common::ids::SlotId;
+#[cfg(feature = "compat")]
 use crate::thrift::plan_nodes;
 
+#[cfg(feature = "compat")]
 pub(crate) fn extract_change_op_from_hdfs_range_extended_columns(
     node_id: i32,
     hdfs_range: &plan_nodes::THdfsScanRange,
@@ -71,7 +74,7 @@ pub(crate) fn extract_change_op_from_hdfs_range_extended_columns(
     Ok(Some(value))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 mod tests {
     use std::collections::BTreeMap;
 

@@ -19,6 +19,7 @@ pub mod analytic;
 pub mod assert;
 pub mod change_event_expand;
 pub mod exchange_source;
+#[cfg(feature = "compat")]
 pub mod fetch;
 pub mod filter;
 pub mod iceberg_delta_scan;
@@ -48,6 +49,7 @@ use crate::exec::node::analytic::AnalyticNode;
 use crate::exec::node::assert::AssertNumRowsNode;
 use crate::exec::node::change_event_expand::ChangeEventExpandNode;
 use crate::exec::node::exchange_source::ExchangeSourceNode;
+#[cfg(feature = "compat")]
 use crate::exec::node::fetch::FetchNode;
 use crate::exec::node::filter::FilterNode;
 use crate::exec::node::join::{JoinNode, JoinType};
@@ -88,6 +90,7 @@ pub enum ExecNodeKind {
     ExchangeSource(ExchangeSourceNode),
     Scan(ScanNode),
     IcebergDeltaScan(IcebergDeltaScanNode),
+    #[cfg(feature = "compat")]
     Fetch(FetchNode),
     LookUp(LookUpNode),
     Aggregate(AggregateNode),
@@ -258,6 +261,7 @@ fn output_slots_for_node(node: &ExecNode) -> Option<HashSet<SlotId>> {
                 .copied()
                 .collect(),
         ),
+        #[cfg(feature = "compat")]
         ExecNodeKind::Fetch(fetch) => Some(
             fetch
                 .output_chunk_schema
@@ -455,6 +459,7 @@ fn push_down_local_runtime_filters_inner(
         ExecNodeKind::IcebergDeltaScan(_) => {
             // delta source is a leaf; runtime filters do not apply for A1
         }
+        #[cfg(feature = "compat")]
         ExecNodeKind::Fetch(FetchNode { input, .. }) => {
             let filtered = filter_specs_for_child(arena, inherited, input);
             push_down_local_runtime_filters_inner(input, arena, &filtered);

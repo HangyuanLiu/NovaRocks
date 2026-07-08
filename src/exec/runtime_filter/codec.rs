@@ -35,7 +35,7 @@ use crate::common::ids::SlotId;
 use super::{
     RuntimeBitsetFilter, RuntimeBloomFilter, RuntimeDecimalWidth, RuntimeEmptyFilter,
     RuntimeFilterType, RuntimeInFilter, RuntimeInFilterValues, RuntimeMembershipFilter,
-    RuntimeMinMaxFilter, SimdBlockFilter,
+    RuntimeMinMaxFilter, SimdBlockFilter, starrocks_primitive as sr_primitive,
 };
 
 const RF_VERSION_V2: u8 = 0x3;
@@ -46,6 +46,7 @@ const RF_TYPE_BITSET_FILTER: u8 = 3;
 const RF_TYPE_IN_FILTER: u8 = 4;
 
 type RuntimeInFilterWriter<'a> = Box<dyn FnMut(&mut Vec<u8>) + 'a>;
+type StarrocksPrimitiveCode = i32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Wire-level runtime filter type tags used by StarRocks compatibility codec.
@@ -57,48 +58,47 @@ pub(crate) enum StarrocksRuntimeFilterType {
 }
 
 fn runtime_type_from_starrocks_primitive(
-    primitive: crate::thrift::types::TPrimitiveType,
+    primitive: StarrocksPrimitiveCode,
     data_type: Option<&arrow::datatypes::DataType>,
 ) -> Result<RuntimeFilterType, String> {
-    use crate::thrift::types::TPrimitiveType as StarrocksPrimitive;
-    let runtime_type = if primitive == StarrocksPrimitive::BOOLEAN {
+    let runtime_type = if primitive == sr_primitive::BOOLEAN {
         RuntimeFilterType::Boolean
-    } else if primitive == StarrocksPrimitive::TINYINT {
+    } else if primitive == sr_primitive::TINYINT {
         RuntimeFilterType::Int8
-    } else if primitive == StarrocksPrimitive::SMALLINT {
+    } else if primitive == sr_primitive::SMALLINT {
         RuntimeFilterType::Int16
-    } else if primitive == StarrocksPrimitive::INT {
+    } else if primitive == sr_primitive::INT {
         RuntimeFilterType::Int32
-    } else if primitive == StarrocksPrimitive::BIGINT {
+    } else if primitive == sr_primitive::BIGINT {
         RuntimeFilterType::Int64
-    } else if primitive == StarrocksPrimitive::LARGEINT {
+    } else if primitive == sr_primitive::LARGEINT {
         RuntimeFilterType::LargeInt
-    } else if primitive == StarrocksPrimitive::FLOAT {
+    } else if primitive == sr_primitive::FLOAT {
         RuntimeFilterType::Float32
-    } else if primitive == StarrocksPrimitive::DOUBLE {
+    } else if primitive == sr_primitive::DOUBLE {
         RuntimeFilterType::Float64
-    } else if primitive == StarrocksPrimitive::DATE {
+    } else if primitive == sr_primitive::DATE {
         RuntimeFilterType::Date32
-    } else if primitive == StarrocksPrimitive::DATETIME {
+    } else if primitive == sr_primitive::DATETIME {
         RuntimeFilterType::TimestampMicros
-    } else if primitive == StarrocksPrimitive::TIME {
+    } else if primitive == sr_primitive::TIME {
         RuntimeFilterType::TimeMicros
-    } else if primitive == StarrocksPrimitive::VARCHAR
-        || primitive == StarrocksPrimitive::CHAR
-        || primitive == StarrocksPrimitive::JSON
-        || primitive == StarrocksPrimitive::HLL
-        || primitive == StarrocksPrimitive::OBJECT
-        || primitive == StarrocksPrimitive::PERCENTILE
-        || primitive == StarrocksPrimitive::FUNCTION
+    } else if primitive == sr_primitive::VARCHAR
+        || primitive == sr_primitive::CHAR
+        || primitive == sr_primitive::JSON
+        || primitive == sr_primitive::HLL
+        || primitive == sr_primitive::OBJECT
+        || primitive == sr_primitive::PERCENTILE
+        || primitive == sr_primitive::FUNCTION
     {
         RuntimeFilterType::Utf8
-    } else if primitive == StarrocksPrimitive::DECIMAL32 {
+    } else if primitive == sr_primitive::DECIMAL32 {
         decimal_runtime_type(RuntimeDecimalWidth::Decimal32, data_type)?
-    } else if primitive == StarrocksPrimitive::DECIMAL64 {
+    } else if primitive == sr_primitive::DECIMAL64 {
         decimal_runtime_type(RuntimeDecimalWidth::Decimal64, data_type)?
-    } else if primitive == StarrocksPrimitive::DECIMAL128
-        || primitive == StarrocksPrimitive::DECIMAL
-        || primitive == StarrocksPrimitive::DECIMALV2
+    } else if primitive == sr_primitive::DECIMAL128
+        || primitive == sr_primitive::DECIMAL
+        || primitive == sr_primitive::DECIMALV2
     {
         decimal_runtime_type(RuntimeDecimalWidth::Decimal128, data_type)?
     } else {
@@ -129,33 +129,32 @@ fn decimal_runtime_type(
 
 fn starrocks_primitive_from_runtime_type(
     runtime_type: RuntimeFilterType,
-) -> crate::thrift::types::TPrimitiveType {
-    use crate::thrift::types::TPrimitiveType;
+) -> StarrocksPrimitiveCode {
     match runtime_type {
-        RuntimeFilterType::Boolean => TPrimitiveType::BOOLEAN,
-        RuntimeFilterType::Int8 => TPrimitiveType::TINYINT,
-        RuntimeFilterType::Int16 => TPrimitiveType::SMALLINT,
-        RuntimeFilterType::Int32 => TPrimitiveType::INT,
-        RuntimeFilterType::Int64 => TPrimitiveType::BIGINT,
-        RuntimeFilterType::LargeInt => TPrimitiveType::LARGEINT,
-        RuntimeFilterType::Float32 => TPrimitiveType::FLOAT,
-        RuntimeFilterType::Float64 => TPrimitiveType::DOUBLE,
-        RuntimeFilterType::Date32 => TPrimitiveType::DATE,
-        RuntimeFilterType::TimestampMicros => TPrimitiveType::DATETIME,
-        RuntimeFilterType::TimeMicros => TPrimitiveType::TIME,
-        RuntimeFilterType::Utf8 => TPrimitiveType::VARCHAR,
+        RuntimeFilterType::Boolean => sr_primitive::BOOLEAN,
+        RuntimeFilterType::Int8 => sr_primitive::TINYINT,
+        RuntimeFilterType::Int16 => sr_primitive::SMALLINT,
+        RuntimeFilterType::Int32 => sr_primitive::INT,
+        RuntimeFilterType::Int64 => sr_primitive::BIGINT,
+        RuntimeFilterType::LargeInt => sr_primitive::LARGEINT,
+        RuntimeFilterType::Float32 => sr_primitive::FLOAT,
+        RuntimeFilterType::Float64 => sr_primitive::DOUBLE,
+        RuntimeFilterType::Date32 => sr_primitive::DATE,
+        RuntimeFilterType::TimestampMicros => sr_primitive::DATETIME,
+        RuntimeFilterType::TimeMicros => sr_primitive::TIME,
+        RuntimeFilterType::Utf8 => sr_primitive::VARCHAR,
         RuntimeFilterType::Decimal {
             width: RuntimeDecimalWidth::Decimal32,
             ..
-        } => TPrimitiveType::DECIMAL32,
+        } => sr_primitive::DECIMAL32,
         RuntimeFilterType::Decimal {
             width: RuntimeDecimalWidth::Decimal64,
             ..
-        } => TPrimitiveType::DECIMAL64,
+        } => sr_primitive::DECIMAL64,
         RuntimeFilterType::Decimal {
             width: RuntimeDecimalWidth::Decimal128,
             ..
-        } => TPrimitiveType::DECIMAL128,
+        } => sr_primitive::DECIMAL128,
     }
 }
 
@@ -221,85 +220,83 @@ pub(crate) fn decode_starrocks_in_filter(
     let ltype = read_i32_le(data, &mut offset)?;
     let element_count = read_u32_le(data, &mut offset)? as usize;
 
-    use crate::thrift::types;
-    let t = types::TPrimitiveType(ltype);
-    let values = if t == types::TPrimitiveType::BOOLEAN {
+    let values = if ltype == sr_primitive::BOOLEAN {
         let mut set = HashSet::new();
         for _ in 0..element_count {
             let v = read_u8(data, &mut offset)?;
             set.insert(v != 0);
         }
         RuntimeInFilterValues::Bool(set)
-    } else if t == types::TPrimitiveType::TINYINT {
+    } else if ltype == sr_primitive::TINYINT {
         let mut set = HashSet::new();
         for _ in 0..element_count {
             let v = read_i8(data, &mut offset)?;
             set.insert(v);
         }
         RuntimeInFilterValues::Int8(set)
-    } else if t == types::TPrimitiveType::SMALLINT {
+    } else if ltype == sr_primitive::SMALLINT {
         let mut set = HashSet::new();
         for _ in 0..element_count {
             let v = read_i16_le(data, &mut offset)?;
             set.insert(v);
         }
         RuntimeInFilterValues::Int16(set)
-    } else if t == types::TPrimitiveType::INT {
+    } else if ltype == sr_primitive::INT {
         let mut set = HashSet::new();
         for _ in 0..element_count {
             let v = read_i32_le(data, &mut offset)?;
             set.insert(v);
         }
         RuntimeInFilterValues::Int32(set)
-    } else if t == types::TPrimitiveType::BIGINT {
+    } else if ltype == sr_primitive::BIGINT {
         let mut set = HashSet::new();
         for _ in 0..element_count {
             let v = read_i64_le(data, &mut offset)?;
             set.insert(v);
         }
         RuntimeInFilterValues::Int64(set)
-    } else if t == types::TPrimitiveType::LARGEINT {
+    } else if ltype == sr_primitive::LARGEINT {
         let mut set = HashSet::new();
         for _ in 0..element_count {
             let v = read_i128_le(data, &mut offset)?;
             set.insert(v);
         }
         RuntimeInFilterValues::LargeInt(set)
-    } else if t == types::TPrimitiveType::FLOAT {
+    } else if ltype == sr_primitive::FLOAT {
         let mut set = HashSet::new();
         for _ in 0..element_count {
             let bits = read_u32_le(data, &mut offset)?;
             set.insert(bits);
         }
         RuntimeInFilterValues::Float32(set)
-    } else if t == types::TPrimitiveType::DOUBLE {
+    } else if ltype == sr_primitive::DOUBLE {
         let mut set = HashSet::new();
         for _ in 0..element_count {
             let bits = read_u64_le(data, &mut offset)?;
             set.insert(bits);
         }
         RuntimeInFilterValues::Float64(set)
-    } else if t == types::TPrimitiveType::DATE {
+    } else if ltype == sr_primitive::DATE {
         let mut set = HashSet::new();
         for _ in 0..element_count {
             let v = read_i32_le(data, &mut offset)?;
             set.insert(v);
         }
         RuntimeInFilterValues::Date32(set)
-    } else if t == types::TPrimitiveType::DATETIME || t == types::TPrimitiveType::TIME {
+    } else if ltype == sr_primitive::DATETIME || ltype == sr_primitive::TIME {
         let mut set = HashSet::new();
         for _ in 0..element_count {
             let v = read_i64_le(data, &mut offset)?;
             set.insert(v);
         }
         RuntimeInFilterValues::TimestampMicrosecond(set)
-    } else if t == types::TPrimitiveType::VARCHAR || t == types::TPrimitiveType::CHAR {
+    } else if ltype == sr_primitive::VARCHAR || ltype == sr_primitive::CHAR {
         let mut set = HashSet::new();
         for _ in 0..element_count {
             set.insert(read_varchar(data, &mut offset)?);
         }
         RuntimeInFilterValues::Utf8(set)
-    } else if t == types::TPrimitiveType::DECIMAL128 {
+    } else if ltype == sr_primitive::DECIMAL128 {
         let (precision, scale) = match data_type {
             Some(arrow::datatypes::DataType::Decimal128(p, s)) => (*p, *s),
             _ => {
@@ -319,8 +316,8 @@ pub(crate) fn decode_starrocks_in_filter(
         }
     } else {
         return Err(format!(
-            "unsupported runtime filter primitive type: {:?}",
-            t
+            "unsupported runtime filter primitive type: {}",
+            ltype
         ));
     };
 
@@ -329,13 +326,12 @@ pub(crate) fn decode_starrocks_in_filter(
 
 /// Encode a runtime IN filter into StarRocks-compatible wire payload.
 pub(crate) fn encode_starrocks_in_filter(filter: &RuntimeInFilter) -> Result<Vec<u8>, String> {
-    use crate::thrift::types;
-    let (t, count, mut write_values): (types::TPrimitiveType, usize, RuntimeInFilterWriter<'_>) =
+    let (t, count, mut write_values): (StarrocksPrimitiveCode, usize, RuntimeInFilterWriter<'_>) =
         match filter.values() {
             RuntimeInFilterValues::Bool(values) => {
                 let mut iter = values.iter().copied();
                 (
-                    types::TPrimitiveType::BOOLEAN,
+                    sr_primitive::BOOLEAN,
                     values.len(),
                     Box::new(move |buf| {
                         for v in iter.by_ref() {
@@ -347,7 +343,7 @@ pub(crate) fn encode_starrocks_in_filter(filter: &RuntimeInFilter) -> Result<Vec
             RuntimeInFilterValues::Int8(values) => {
                 let mut iter = values.iter().copied();
                 (
-                    types::TPrimitiveType::TINYINT,
+                    sr_primitive::TINYINT,
                     values.len(),
                     Box::new(move |buf| {
                         for v in iter.by_ref() {
@@ -359,7 +355,7 @@ pub(crate) fn encode_starrocks_in_filter(filter: &RuntimeInFilter) -> Result<Vec
             RuntimeInFilterValues::Int16(values) => {
                 let mut iter = values.iter().copied();
                 (
-                    types::TPrimitiveType::SMALLINT,
+                    sr_primitive::SMALLINT,
                     values.len(),
                     Box::new(move |buf| {
                         for v in iter.by_ref() {
@@ -371,7 +367,7 @@ pub(crate) fn encode_starrocks_in_filter(filter: &RuntimeInFilter) -> Result<Vec
             RuntimeInFilterValues::Int32(values) => {
                 let mut iter = values.iter().copied();
                 (
-                    types::TPrimitiveType::INT,
+                    sr_primitive::INT,
                     values.len(),
                     Box::new(move |buf| {
                         for v in iter.by_ref() {
@@ -383,7 +379,7 @@ pub(crate) fn encode_starrocks_in_filter(filter: &RuntimeInFilter) -> Result<Vec
             RuntimeInFilterValues::Int64(values) => {
                 let mut iter = values.iter().copied();
                 (
-                    types::TPrimitiveType::BIGINT,
+                    sr_primitive::BIGINT,
                     values.len(),
                     Box::new(move |buf| {
                         for v in iter.by_ref() {
@@ -395,7 +391,7 @@ pub(crate) fn encode_starrocks_in_filter(filter: &RuntimeInFilter) -> Result<Vec
             RuntimeInFilterValues::LargeInt(values) => {
                 let mut iter = values.iter().copied();
                 (
-                    types::TPrimitiveType::LARGEINT,
+                    sr_primitive::LARGEINT,
                     values.len(),
                     Box::new(move |buf| {
                         for v in iter.by_ref() {
@@ -407,7 +403,7 @@ pub(crate) fn encode_starrocks_in_filter(filter: &RuntimeInFilter) -> Result<Vec
             RuntimeInFilterValues::Float32(values) => {
                 let mut iter = values.iter().copied();
                 (
-                    types::TPrimitiveType::FLOAT,
+                    sr_primitive::FLOAT,
                     values.len(),
                     Box::new(move |buf| {
                         for v in iter.by_ref() {
@@ -419,7 +415,7 @@ pub(crate) fn encode_starrocks_in_filter(filter: &RuntimeInFilter) -> Result<Vec
             RuntimeInFilterValues::Float64(values) => {
                 let mut iter = values.iter().copied();
                 (
-                    types::TPrimitiveType::DOUBLE,
+                    sr_primitive::DOUBLE,
                     values.len(),
                     Box::new(move |buf| {
                         for v in iter.by_ref() {
@@ -431,7 +427,7 @@ pub(crate) fn encode_starrocks_in_filter(filter: &RuntimeInFilter) -> Result<Vec
             RuntimeInFilterValues::Date32(values) => {
                 let mut iter = values.iter().copied();
                 (
-                    types::TPrimitiveType::DATE,
+                    sr_primitive::DATE,
                     values.len(),
                     Box::new(move |buf| {
                         for v in iter.by_ref() {
@@ -443,7 +439,7 @@ pub(crate) fn encode_starrocks_in_filter(filter: &RuntimeInFilter) -> Result<Vec
             RuntimeInFilterValues::TimestampSecond(values) => {
                 let mut iter = values.iter().copied();
                 (
-                    types::TPrimitiveType::DATETIME,
+                    sr_primitive::DATETIME,
                     values.len(),
                     Box::new(move |buf| {
                         for v in iter.by_ref() {
@@ -456,7 +452,7 @@ pub(crate) fn encode_starrocks_in_filter(filter: &RuntimeInFilter) -> Result<Vec
             RuntimeInFilterValues::TimestampMillisecond(values) => {
                 let mut iter = values.iter().copied();
                 (
-                    types::TPrimitiveType::DATETIME,
+                    sr_primitive::DATETIME,
                     values.len(),
                     Box::new(move |buf| {
                         for v in iter.by_ref() {
@@ -469,7 +465,7 @@ pub(crate) fn encode_starrocks_in_filter(filter: &RuntimeInFilter) -> Result<Vec
             RuntimeInFilterValues::TimestampMicrosecond(values) => {
                 let mut iter = values.iter().copied();
                 (
-                    types::TPrimitiveType::DATETIME,
+                    sr_primitive::DATETIME,
                     values.len(),
                     Box::new(move |buf| {
                         for v in iter.by_ref() {
@@ -481,7 +477,7 @@ pub(crate) fn encode_starrocks_in_filter(filter: &RuntimeInFilter) -> Result<Vec
             RuntimeInFilterValues::TimestampNanosecond(values) => {
                 let mut iter = values.iter().copied();
                 (
-                    types::TPrimitiveType::DATETIME,
+                    sr_primitive::DATETIME,
                     values.len(),
                     Box::new(move |buf| {
                         for v in iter.by_ref() {
@@ -495,7 +491,7 @@ pub(crate) fn encode_starrocks_in_filter(filter: &RuntimeInFilter) -> Result<Vec
                 // SR VARCHAR in-filter: each value = int32 len (LE) + raw bytes (runtime_in_filter.h:224-231)
                 let mut iter = values.iter().cloned();
                 (
-                    types::TPrimitiveType::VARCHAR,
+                    sr_primitive::VARCHAR,
                     values.len(),
                     Box::new(move |buf| {
                         for v in iter.by_ref() {
@@ -509,7 +505,7 @@ pub(crate) fn encode_starrocks_in_filter(filter: &RuntimeInFilter) -> Result<Vec
                 // SR DECIMAL128: each value = 16B int128 LE; ltype tag carries no precision/scale (runtime_in_filter.h:233-236)
                 let mut iter = values.iter().copied();
                 (
-                    types::TPrimitiveType::DECIMAL128,
+                    sr_primitive::DECIMAL128,
                     values.len(),
                     Box::new(move |buf| {
                         for v in iter.by_ref() {
@@ -523,7 +519,7 @@ pub(crate) fn encode_starrocks_in_filter(filter: &RuntimeInFilter) -> Result<Vec
     let mut buf = Vec::with_capacity(1 + 1 + 4 + 4 + count.saturating_mul(16));
     buf.push(RF_VERSION_V3);
     buf.push(RF_TYPE_IN_FILTER);
-    buf.extend_from_slice(&t.0.to_le_bytes());
+    buf.extend_from_slice(&t.to_le_bytes());
     buf.extend_from_slice(&(count as u32).to_le_bytes());
     write_values(&mut buf);
     Ok(buf)
@@ -552,7 +548,6 @@ pub(crate) fn decode_starrocks_membership_filter(
         return Err("runtime filter type is IN_FILTER".to_string());
     }
     let primitive = read_i32_le(data, &mut offset)?;
-    let primitive = crate::thrift::types::TPrimitiveType(primitive);
     let ltype = runtime_type_from_starrocks_primitive(primitive, None)?;
 
     match rf_type {
@@ -624,7 +619,7 @@ pub(crate) fn encode_starrocks_bloom_filter(
     buf.push(RF_VERSION_V3);
     buf.push(RF_TYPE_BLOOM_FILTER);
     let primitive = starrocks_primitive_from_runtime_type(filter.ltype());
-    buf.extend_from_slice(&primitive.0.to_le_bytes());
+    buf.extend_from_slice(&primitive.to_le_bytes());
     buf.push(if filter.has_null() { 1 } else { 0 });
     buf.extend_from_slice(&filter.size().to_le_bytes());
     buf.extend_from_slice(&(0u64).to_le_bytes()); // num_partitions
@@ -647,7 +642,7 @@ pub(crate) fn encode_starrocks_bitset_filter(
     buf.push(RF_VERSION_V3);
     buf.push(RF_TYPE_BITSET_FILTER);
     let primitive = starrocks_primitive_from_runtime_type(filter.ltype());
-    buf.extend_from_slice(&primitive.0.to_le_bytes());
+    buf.extend_from_slice(&primitive.to_le_bytes());
     buf.push(if filter.has_null() { 1 } else { 0 });
     buf.extend_from_slice(&filter.size().to_le_bytes());
     buf.push(filter.join_mode() as u8);
@@ -672,7 +667,7 @@ pub(crate) fn encode_starrocks_empty_filter(
     buf.push(RF_VERSION_V3);
     buf.push(RF_TYPE_EMPTY_FILTER);
     let primitive = starrocks_primitive_from_runtime_type(filter.ltype());
-    buf.extend_from_slice(&primitive.0.to_le_bytes());
+    buf.extend_from_slice(&primitive.to_le_bytes());
     buf.push(if filter.has_null() { 1 } else { 0 });
     buf.extend_from_slice(&filter.size().to_le_bytes());
     buf.push(filter.join_mode() as u8);
@@ -956,7 +951,7 @@ mod tests {
     use super::{
         RF_TYPE_BITSET_FILTER, RF_TYPE_IN_FILTER, RF_VERSION_V3, decode_starrocks_in_filter,
         decode_starrocks_membership_filter, encode_starrocks_bitset_filter,
-        encode_starrocks_in_filter, runtime_type_from_starrocks_primitive,
+        encode_starrocks_in_filter, runtime_type_from_starrocks_primitive, sr_primitive,
     };
     use crate::common::ids::SlotId;
     use crate::exec::runtime_filter::min_max::MinMaxValue;
@@ -964,18 +959,17 @@ mod tests {
         RuntimeBitsetFilter, RuntimeDecimalWidth, RuntimeFilterType, RuntimeInFilter,
         RuntimeInFilterValues, RuntimeMembershipFilter, RuntimeMinMaxFilter,
     };
-    use crate::thrift::types::TPrimitiveType as StarrocksPrimitive;
 
     #[test]
     fn legacy_string_family_primitives_map_to_utf8_runtime_type() {
         for primitive in [
-            StarrocksPrimitive::VARCHAR,
-            StarrocksPrimitive::CHAR,
-            StarrocksPrimitive::JSON,
-            StarrocksPrimitive::HLL,
-            StarrocksPrimitive::OBJECT,
-            StarrocksPrimitive::PERCENTILE,
-            StarrocksPrimitive::FUNCTION,
+            sr_primitive::VARCHAR,
+            sr_primitive::CHAR,
+            sr_primitive::JSON,
+            sr_primitive::HLL,
+            sr_primitive::OBJECT,
+            sr_primitive::PERCENTILE,
+            sr_primitive::FUNCTION,
         ] {
             assert_eq!(
                 runtime_type_from_starrocks_primitive(primitive, None).unwrap(),
@@ -986,12 +980,11 @@ mod tests {
 
     #[test]
     fn unsupported_wire_primitives_still_error() {
-        let err = runtime_type_from_starrocks_primitive(StarrocksPrimitive::INVALID_TYPE, None)
-            .unwrap_err();
+        let err =
+            runtime_type_from_starrocks_primitive(sr_primitive::INVALID_TYPE, None).unwrap_err();
         assert!(err.contains("unsupported runtime filter primitive type"));
 
-        let err =
-            runtime_type_from_starrocks_primitive(StarrocksPrimitive::VARBINARY, None).unwrap_err();
+        let err = runtime_type_from_starrocks_primitive(sr_primitive::VARBINARY, None).unwrap_err();
         assert!(err.contains("unsupported runtime filter primitive type"));
     }
 
@@ -1102,7 +1095,7 @@ mod tests {
         assert_eq!(buf[1], RF_TYPE_IN_FILTER);
         assert_eq!(
             i32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]),
-            crate::thrift::types::TPrimitiveType::VARCHAR.0
+            sr_primitive::VARCHAR
         );
         assert_eq!(u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]), 1);
         // value: [int32 len=2 LE]['a','b']
@@ -1128,7 +1121,7 @@ mod tests {
         assert_eq!(buf[1], RF_TYPE_IN_FILTER);
         assert_eq!(
             i32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]),
-            crate::thrift::types::TPrimitiveType::DECIMAL128.0
+            sr_primitive::DECIMAL128
         );
         assert_eq!(u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]), 1);
         // value: 16B i128 LE = 7
@@ -1223,11 +1216,7 @@ mod tests {
         let mut payload = Vec::new();
         payload.push(RF_VERSION_V3);
         payload.push(RF_TYPE_BITSET_FILTER);
-        payload.extend_from_slice(
-            &crate::thrift::types::TPrimitiveType::DECIMAL128
-                .0
-                .to_le_bytes(),
-        );
+        payload.extend_from_slice(&sr_primitive::DECIMAL128.to_le_bytes());
         payload.push(0); // has_null
         payload.extend_from_slice(&0u64.to_le_bytes()); // size
         payload.push(0); // join_mode
@@ -1247,11 +1236,7 @@ mod tests {
         let mut payload = Vec::new();
         payload.push(RF_VERSION_V3);
         payload.push(RF_TYPE_BITSET_FILTER);
-        payload.extend_from_slice(
-            &crate::thrift::types::TPrimitiveType::LARGEINT
-                .0
-                .to_le_bytes(),
-        );
+        payload.extend_from_slice(&sr_primitive::LARGEINT.to_le_bytes());
         payload.push(0); // has_null
         payload.extend_from_slice(&0u64.to_le_bytes()); // size
         payload.push(0); // join_mode

@@ -5276,7 +5276,23 @@ const NIDL_E0_LEDGER_PATH: &str = "tests/nidl_noncompat_idl_ledger.txt";
 /// tracks the non-compat mainline. Milestones E2/E9 append entries here as
 /// modules are gated (e.g. "src/lower/compat").
 const NIDL_E0_COMPAT_SCOPE: &[&str] = &[
+    "src/connector/iceberg/file_pruning_wire.rs",
+    "src/connector/starrocks",
+    "src/connector/schema/fe_tables.rs",
+    "src/connector/schema/frontend.rs",
+    "src/connector/schema/load_tracking_logs.rs",
+    "src/connector/schema/loads.rs",
+    "src/formats/starrocks",
+    "src/exec/chunk/schema_thrift.rs",
+    "src/exec/node/fetch.rs",
+    "src/exec/operators/fetch_processor.rs",
     "src/lower/compat",
+    "src/lower/common/min_max.rs",
+    "src/runtime/descriptor_snapshot_thrift.rs",
+    "src/runtime/exec_params.rs",
+    "src/runtime/exec_params_compat.rs",
+    "src/runtime/sink_commit_wire.rs",
+    "src/runtime/write_coordinator_compat.rs",
     "src/service/backend_service.rs",
     "src/service/heartbeat_service.rs",
     "src/service/internal_service.rs",
@@ -5285,6 +5301,20 @@ const NIDL_E0_COMPAT_SCOPE: &[&str] = &[
     "src/service/stream_load_http.rs",
     "src/service/engine_ffi.rs",
     "src/service/compat.rs",
+    "src/service/disk_report.rs",
+    "src/service/exec_state_reporter.rs",
+    "src/service/exec_status_report.rs",
+    "src/service/fe_report_compat.rs",
+    "src/service/frontend_rpc.rs",
+    "src/service/stream_load_registry.rs",
+    "src/sql/codegen/iceberg_write_sink_wire.rs",
+    "src/sql/codegen/descriptors.rs",
+    "src/sql/codegen/expr_compiler.rs",
+    "src/sql/codegen/iceberg_change_stream_router_wire.rs",
+    "src/sql/codegen/ir/lowering.rs",
+    "src/sql/codegen/nodes.rs",
+    "src/sql/codegen/type_infer.rs",
+    "src/types/arrow_thrift.rs",
 ];
 
 fn nidl_e0_starrocks_idl_terms() -> &'static [&'static str] {
@@ -5848,6 +5878,15 @@ fn nidl_e9_noncompat_paths_do_not_import_lower_compat() {
         hits.is_empty(),
         "non-compat paths must not import lower::compat:\n{}",
         hits.join("\n")
+    );
+}
+
+#[test]
+fn nidl_e9_lower_compat_module_is_cfg_gated() {
+    let module_file = Path::new(manifest_dir()).join("src/lower/mod.rs");
+    assert!(
+        nidl_e9_module_has_compat_cfg(&module_file, "compat"),
+        "src/lower/mod.rs must gate lower::compat with #[cfg(feature = \"compat\")]"
     );
 }
 

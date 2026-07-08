@@ -29,7 +29,7 @@ use super::types::encode_type;
 use crate::proto::{common, plan};
 use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, TypedExpr};
 use crate::sql::catalog;
-use crate::sql::codegen::expr_compiler::infer_agg_function_types;
+use crate::sql::codegen::agg_type_infer::infer_agg_function_types;
 use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentStreamKind};
 use crate::sql::common::{ChangeStreamBranchKind, JoinKind};
 use crate::sql::parser::ast::SqlType;
@@ -2252,7 +2252,7 @@ fn encode_iceberg_schema_default_json(
         return Ok(Some(json.clone()));
     }
     literal
-        .map(crate::sql::codegen::descriptors::serialize_iceberg_literal_json)
+        .map(crate::sql::codegen::iceberg_literal_json::serialize_iceberg_literal_json)
         .transpose()
         .map_err(|err| format!("encode Iceberg schema {label} JSON: {err}"))
 }

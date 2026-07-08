@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+#[cfg(feature = "compat")]
 use crate::thrift::{plan_nodes, types};
 
 #[derive(Clone, Debug)]
@@ -28,6 +29,7 @@ pub(crate) struct SchemaScanContext {
     pub(crate) port: Option<i32>,
     pub(crate) thread_id: Option<i64>,
     pub(crate) user_ip: Option<String>,
+    #[cfg(feature = "compat")]
     pub(crate) current_user_ident: Option<types::TUserIdentity>,
     pub(crate) catalog_name: Option<String>,
     pub(crate) table_id: Option<i64>,
@@ -44,10 +46,12 @@ pub(crate) struct SchemaScanContext {
     pub(crate) log_level: Option<String>,
     pub(crate) log_pattern: Option<String>,
     pub(crate) log_limit: Option<i64>,
+    #[cfg(feature = "compat")]
     pub(crate) frontends: Vec<plan_nodes::TFrontend>,
 }
 
 impl SchemaScanContext {
+    #[cfg(feature = "compat")]
     pub(crate) fn from_thrift(node: &plan_nodes::TSchemaScanNode) -> Self {
         Self {
             table_name: node.table_name.trim().to_ascii_lowercase(),
@@ -59,6 +63,7 @@ impl SchemaScanContext {
             port: node.port.filter(|value| *value > 0),
             thread_id: node.thread_id.filter(|value| *value >= 0),
             user_ip: normalize_optional_string(node.user_ip.as_ref()),
+            #[cfg(feature = "compat")]
             current_user_ident: node.current_user_ident.clone(),
             catalog_name: normalize_optional_string(node.catalog_name.as_ref()),
             table_id: node.table_id.filter(|value| *value > 0),
@@ -78,6 +83,7 @@ impl SchemaScanContext {
                 .map(|value| value.to_ascii_uppercase()),
             log_pattern: normalize_optional_string(node.log_pattern.as_ref()),
             log_limit: node.log_limit.filter(|value| *value > 0),
+            #[cfg(feature = "compat")]
             frontends: node.frontends.clone().unwrap_or_default(),
         }
     }

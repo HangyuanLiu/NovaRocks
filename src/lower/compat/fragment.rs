@@ -200,7 +200,9 @@ fn lower_stream_partition_exprs(
     last_query_id: Option<&str>,
     fe_addr: Option<&types::TNetworkAddress>,
 ) -> Result<Vec<crate::exec::expr::ExprId>, String> {
-    if !DataStreamSinkFactoryInput::partition_type_requires_exprs(stream.output_partition.type_) {
+    let partition_type =
+        DataStreamSinkFactoryInput::partition_type_from_compat(stream.output_partition.type_)?;
+    if !DataStreamSinkFactoryInput::partition_type_requires_exprs(partition_type) {
         return Ok(Vec::new());
     }
     stream
@@ -227,9 +229,11 @@ fn data_stream_input_from_compat(
 ) -> Result<DataStreamSinkFactoryInput, String> {
     let partition_exprs =
         lower_stream_partition_exprs(stream, arena, layout, last_query_id, fe_addr)?;
+    let partition_type =
+        DataStreamSinkFactoryInput::partition_type_from_compat(stream.output_partition.type_)?;
     DataStreamSinkFactoryInput::try_new(
         stream.dest_node_id,
-        stream.output_partition.type_,
+        partition_type,
         Vec::new(),
         partition_exprs,
         stream.output_columns.clone().unwrap_or_default(),

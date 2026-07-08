@@ -32,6 +32,7 @@ mod assert_num_rows_processor;
 mod change_event_expand_processor;
 mod data_stream_sink;
 mod exchange_source;
+#[cfg(feature = "compat")]
 mod fetch_processor;
 mod filter_processor;
 pub(crate) mod hashjoin;
@@ -70,6 +71,7 @@ pub use assert_num_rows_processor::AssertNumRowsProcessorFactory;
 pub use change_event_expand_processor::ChangeEventExpandProcessorFactory;
 pub(crate) use data_stream_sink::{DataStreamSinkFactory, DataStreamSinkFactoryInput};
 pub use exchange_source::ExchangeSourceFactory;
+#[cfg(feature = "compat")]
 pub use fetch_processor::FetchProcessorFactory;
 pub(crate) use filter_processor::FilterEncodingPolicy;
 pub use filter_processor::FilterProcessorFactory;
