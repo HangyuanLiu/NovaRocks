@@ -3625,10 +3625,13 @@ mod tests {
         let native_sidecars = NativePlanSidecars {
             fragments_by_id: BTreeMap::from([(fragment.fragment_id, native_fragment)]),
         };
+        let fragment_schedule = fragment.scheduling_metadata();
         let build = MultiFragmentBuildResult {
             fragment_results: vec![fragment],
+            fragment_schedules: vec![fragment_schedule],
             root_fragment_id: 0,
             edges: Vec::new(),
+            lowered_edges: Vec::new(),
             boundary_schemas: Vec::new(),
             rf_plan: None,
         };
