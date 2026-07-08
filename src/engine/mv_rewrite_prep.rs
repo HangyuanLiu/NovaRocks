@@ -373,6 +373,47 @@ fn current_table_uuid(
     Ok(Some(loaded.table.metadata().uuid().to_string()))
 }
 
+/// Commit timestamps (ms) of the `pinned` snapshot and the current snapshot of a
+/// base table, read through the query's shared catalog view (same non-invalidating
+/// contract as `current_snapshot_id`). Either element is `None` if that snapshot is
+/// not resolvable (e.g. pinned expired, or no current snapshot). One catalog load.
+fn base_commit_ts_pair(
+    state: &Arc<StandaloneState>,
+    r: &crate::engine::mv::table_ref::IcebergTableRef,
+    pinned: i64,
+) -> Result<(Option<i64>, Option<i64>), String> {
+    let registry = state
+        .iceberg_catalogs
+        .read()
+        .expect("iceberg catalogs read lock");
+    let entry = registry.get(&r.catalog)?;
+    let loaded = crate::connector::iceberg::catalog::load_table(&entry, &r.namespace, &r.table)?;
+    let metadata = loaded.table.metadata();
+    let pinned_ms = metadata.snapshot_by_id(pinned).map(|s| s.timestamp_ms());
+    let current_ms = metadata.current_snapshot().map(|s| s.timestamp_ms());
+    Ok((pinned_ms, current_ms))
+}
+
+/// Load the target table's `query_rewrite_max_staleness_sec` property (seconds),
+/// through the shared catalog view. Missing target or property => 0 (strict).
+fn load_mv_staleness_property_sec(
+    state: &Arc<StandaloneState>,
+    def: &crate::meta::repository::mv::StoredMvDefinition,
+) -> Result<u64, String> {
+    let (Some(cat), Some(ns), Some(tbl)) =
+        (&def.target_catalog, &def.target_namespace, &def.target_table)
+    else {
+        return Ok(0);
+    };
+    let registry = state
+        .iceberg_catalogs
+        .read()
+        .expect("iceberg catalogs read lock");
+    let entry = registry.get(cat)?;
+    let loaded = crate::connector::iceberg::catalog::load_table(&entry, ns, tbl)?;
+    Ok(parse_mv_staleness_property_sec(loaded.table.metadata().properties()))
+}
+
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::DataType;
