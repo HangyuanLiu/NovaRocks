@@ -236,8 +236,10 @@ impl FragmentScheduler {
                 // single instance instead of N-1 empty instances that would
                 // duplicate output under distributed execution. Zero ranges (empty
                 // snapshot / fully pruned) fall back to one instance producing zero
-                // rows. Native coordination only sees Iceberg native scan ranges,
-                // so native_scan_ranges is the complete range carrier here.
+                // rows. Native scheduling metadata only carries Iceberg native
+                // scan ranges; compat thrift ranges, when present, are merged
+                // later by the coordinator per placement and are not part of
+                // this native fan-out formula.
                 let max_ranges = fr
                     .native_scan_ranges
                     .values()
