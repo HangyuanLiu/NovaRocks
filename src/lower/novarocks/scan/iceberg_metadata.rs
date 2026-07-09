@@ -29,7 +29,7 @@ use super::super::layout::{chunk_schema_from_output_columns, layout_from_output_
 use super::super::node::{LoweredNode, NodeLoweringContext};
 use super::common::{lower_scan_predicate, parse_scan_limit, scan_output_columns};
 
-pub(crate) fn lower_iceberg_metadata_scan(
+pub(super) fn lower_iceberg_metadata_scan(
     node: &plan::DistributedNode,
     scan: &plan::ScanNode,
     source: &plan::IcebergMetadataTable,
@@ -69,7 +69,7 @@ pub(crate) fn lower_iceberg_metadata_scan(
     })
 }
 
-pub(crate) fn decode_metadata_scan_ranges(
+fn decode_metadata_scan_ranges(
     ranges: &[novarocks::ScanRangeParams],
 ) -> Result<Vec<IcebergMetadataScanRange>, String> {
     if ranges.is_empty() {
@@ -106,7 +106,7 @@ pub(crate) fn decode_metadata_scan_ranges(
         .map(|ranges| ranges.into_iter().flatten().collect())
 }
 
-pub(crate) fn metadata_output_columns(
+fn metadata_output_columns(
     output_columns: &[common::OutputColumn],
 ) -> Result<Vec<IcebergMetadataOutputColumn>, String> {
     output_columns
@@ -127,7 +127,7 @@ pub(crate) fn metadata_output_columns(
         .collect()
 }
 
-pub(crate) fn metadata_table_type(value: i32) -> Result<IcebergMetadataTableType, String> {
+fn metadata_table_type(value: i32) -> Result<IcebergMetadataTableType, String> {
     match plan::IcebergMetadataTableType::try_from(value)
         .map_err(|_| format!("unknown Iceberg metadata table type {value}"))?
     {

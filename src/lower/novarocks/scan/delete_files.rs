@@ -24,7 +24,7 @@ use crate::exec::node::iceberg_delta_scan::{
 use crate::fs::object_store::ObjectStoreConfig;
 use crate::proto::plan;
 
-pub(crate) fn reject_native_delta_role_payload(
+pub(super) fn reject_native_delta_role_payload(
     file: &plan::IcebergDeltaSourceFile,
     role_name: &str,
     fields: &[&str],
@@ -47,7 +47,7 @@ pub(crate) fn reject_native_delta_role_payload(
     Ok(())
 }
 
-pub(crate) fn lower_position_delete_source_from_native(
+pub(super) fn lower_position_delete_source_from_native(
     delete: &plan::IcebergDeltaPositionDeleteSource,
 ) -> Result<PositionDeleteSourceData, String> {
     Ok(PositionDeleteSourceData {
@@ -60,7 +60,7 @@ pub(crate) fn lower_position_delete_source_from_native(
     })
 }
 
-pub(crate) fn lower_position_delete_format_from_native(
+fn lower_position_delete_format_from_native(
     format: i32,
 ) -> Result<PositionDeleteFileFormat, String> {
     match plan::IcebergDeltaPositionDeleteFileFormat::try_from(format).map_err(|_| {
@@ -76,7 +76,7 @@ pub(crate) fn lower_position_delete_format_from_native(
     }
 }
 
-pub(crate) fn lower_equality_delete_target_from_native(
+pub(super) fn lower_equality_delete_target_from_native(
     target: &plan::IcebergDeltaEqualityDeleteTarget,
 ) -> EqualityDeleteTargetData {
     EqualityDeleteTargetData {
@@ -87,7 +87,7 @@ pub(crate) fn lower_equality_delete_target_from_native(
     }
 }
 
-pub(crate) fn lower_delta_delete_side_payload_from_native(
+pub(super) fn lower_delta_delete_side_payload_from_native(
     payload: Option<&plan::IcebergDeltaDeleteSidePlan>,
 ) -> Result<Option<DeltaScanDeleteSidePayload>, String> {
     let Some(payload) = payload else {
@@ -112,7 +112,7 @@ pub(crate) fn lower_delta_delete_side_payload_from_native(
     }))
 }
 
-pub(crate) fn lower_novarocks_base_lineage_map(
+fn lower_novarocks_base_lineage_map(
     input: &HashMap<String, plan::IcebergDeltaBaseDataFileLineage>,
 ) -> HashMap<String, BaseDataFileLineage> {
     input
@@ -129,7 +129,7 @@ pub(crate) fn lower_novarocks_base_lineage_map(
         .collect()
 }
 
-pub(crate) fn lower_novarocks_delete_visibility_data_file(
+fn lower_novarocks_delete_visibility_data_file(
     file: &plan::IcebergDeltaDeleteVisibilityDataFile,
 ) -> Result<crate::connector::iceberg::changes::DeleteVisibilityDataFileDescriptor, String> {
     Ok(
@@ -147,7 +147,7 @@ pub(crate) fn lower_novarocks_delete_visibility_data_file(
     )
 }
 
-pub(crate) fn lower_novarocks_delete_visibility_delete_file(
+fn lower_novarocks_delete_visibility_delete_file(
     file: &plan::IcebergDeltaDeleteVisibilityDeleteFile,
 ) -> Result<crate::connector::iceberg::changes::DeleteVisibilityDeleteFileDescriptor, String> {
     Ok(
@@ -162,7 +162,7 @@ pub(crate) fn lower_novarocks_delete_visibility_delete_file(
     )
 }
 
-pub(crate) fn lower_novarocks_delete_file_format(
+fn lower_novarocks_delete_file_format(
     format: i32,
 ) -> Result<crate::connector::iceberg::changes::DeleteVisibilityDeleteFileFormat, String> {
     match plan::IcebergDeltaDeleteFileFormat::try_from(format)
@@ -180,7 +180,7 @@ pub(crate) fn lower_novarocks_delete_file_format(
     }
 }
 
-pub(crate) fn lower_novarocks_delete_file_content(
+fn lower_novarocks_delete_file_content(
     content: i32,
 ) -> Result<crate::connector::iceberg::changes::DeleteVisibilityDeleteFileContent, String> {
     match plan::IcebergDeltaDeleteFileContent::try_from(content)
@@ -198,7 +198,7 @@ pub(crate) fn lower_novarocks_delete_file_content(
     }
 }
 
-pub(crate) fn build_delta_delete_side_from_payload(
+pub(super) fn build_delta_delete_side_from_payload(
     payload: Option<DeltaScanDeleteSidePayload>,
     object_store_config: Option<&ObjectStoreConfig>,
 ) -> Result<Option<DeltaScanDeleteSide>, String> {

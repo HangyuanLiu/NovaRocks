@@ -20,12 +20,11 @@ use std::collections::HashMap;
 use arrow::datatypes::{DataType, Field};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-use super::schema::iceberg_schema_has_field;
 use crate::common::ids::SlotId;
 use crate::exec::row_position::IcebergVirtualSpec;
 use crate::proto::{common, plan};
 
-pub(crate) fn iceberg_virtual_count_column(column_id: u32) -> common::OutputColumn {
+pub(super) fn iceberg_virtual_count_column(column_id: u32) -> common::OutputColumn {
     common::OutputColumn {
         column_id,
         name: "___count___".to_string(),
@@ -43,7 +42,7 @@ pub(crate) fn iceberg_virtual_count_column(column_id: u32) -> common::OutputColu
     }
 }
 
-pub(crate) fn record_iceberg_virtual_column(
+pub(super) fn record_iceberg_virtual_column(
     table: &plan::IcebergTableInfo,
     col: &common::OutputColumn,
     spec: &mut IcebergVirtualSpec,
@@ -93,7 +92,7 @@ pub(crate) fn record_iceberg_virtual_column(
     Ok(false)
 }
 
-pub(crate) fn iceberg_virtual_projected_field(
+pub(super) fn iceberg_virtual_projected_field(
     table: &plan::IcebergTableInfo,
     col: &common::OutputColumn,
 ) -> Result<Option<Field>, String> {
@@ -161,7 +160,7 @@ pub(crate) fn iceberg_virtual_projected_field(
     Ok(None)
 }
 
-pub(crate) fn iceberg_virtual_field_with_field_id(
+fn iceberg_virtual_field_with_field_id(
     col: &common::OutputColumn,
     data_type: DataType,
     field_id: i32,
@@ -170,4 +169,11 @@ pub(crate) fn iceberg_virtual_field_with_field_id(
         PARQUET_FIELD_ID_META_KEY.to_string(),
         field_id.to_string(),
     )]))
+}
+
+fn iceberg_schema_has_field(table: &plan::IcebergTableInfo, name: &str) -> bool {
+    table
+        .schema
+        .as_ref()
+        .is_some_and(|schema| schema.fields.iter().any(|field| field.name == name))
 }

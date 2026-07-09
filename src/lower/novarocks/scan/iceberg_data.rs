@@ -32,7 +32,7 @@ use crate::formats::FileFormatConfig;
 use crate::formats::parquet::{ParquetReadCachePolicy, ParquetScanConfig};
 use crate::proto::plan;
 
-pub(crate) fn lower_iceberg_data_files_scan(
+pub(super) fn lower_iceberg_data_files_scan(
     node: &plan::DistributedNode,
     scan: &plan::ScanNode,
     source: &plan::IcebergDataFiles,

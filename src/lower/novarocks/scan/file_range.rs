@@ -26,7 +26,7 @@ use crate::fs::scan_context::FileScanRange;
 use crate::proto::{novarocks, plan};
 use crate::sql::catalog::IcebergColumnStats;
 
-pub(crate) fn decode_file_scan_ranges(
+pub(super) fn decode_file_scan_ranges(
     node_id: i32,
     table: &plan::IcebergTableInfo,
     ranges: &[novarocks::ScanRangeParams],

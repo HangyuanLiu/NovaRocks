@@ -35,7 +35,7 @@ use crate::exec::node::iceberg_delta_scan::{
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::plan;
 
-pub(crate) fn lower_iceberg_delta_table_scan(
+pub(super) fn lower_iceberg_delta_table_scan(
     node: &plan::DistributedNode,
     scan: &plan::ScanNode,
     source: &plan::IcebergDeltaTable,
@@ -126,7 +126,7 @@ pub(crate) fn lower_iceberg_delta_table_scan(
     })
 }
 
-pub(crate) fn lower_delta_source_files_from_native(
+fn lower_delta_source_files_from_native(
     files: &[plan::IcebergDeltaSourceFile],
 ) -> Result<Vec<DeltaSourceFile>, String> {
     files
@@ -135,7 +135,7 @@ pub(crate) fn lower_delta_source_files_from_native(
         .collect()
 }
 
-pub(crate) fn lower_delta_source_file_from_native(
+fn lower_delta_source_file_from_native(
     file: &plan::IcebergDeltaSourceFile,
 ) -> Result<DeltaSourceFile, String> {
     let role = match plan::IcebergDeltaSourceRole::try_from(file.role).map_err(|_| {

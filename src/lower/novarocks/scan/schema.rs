@@ -29,22 +29,7 @@ use crate::connector::iceberg::{
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::proto::{common, plan};
 
-pub(crate) fn iceberg_schema_field_id(table: &plan::IcebergTableInfo, name: &str) -> Option<i32> {
-    table
-        .schema
-        .as_ref()
-        .and_then(|schema| schema.fields.iter().find(|field| field.name == name))
-        .map(|field| field.field_id)
-}
-
-pub(crate) fn iceberg_schema_has_field(table: &plan::IcebergTableInfo, name: &str) -> bool {
-    table
-        .schema
-        .as_ref()
-        .is_some_and(|schema| schema.fields.iter().any(|field| field.name == name))
-}
-
-pub(crate) fn iceberg_chunk_schema_from_output_columns(
+pub(super) fn iceberg_chunk_schema_from_output_columns(
     table: &plan::IcebergTableInfo,
     output_columns: &[common::OutputColumn],
 ) -> Result<ChunkSchemaRef, String> {
@@ -55,7 +40,7 @@ pub(crate) fn iceberg_chunk_schema_from_output_columns(
     )
 }
 
-pub(crate) fn iceberg_chunk_schema_from_output_columns_with_variants(
+pub(super) fn iceberg_chunk_schema_from_output_columns_with_variants(
     table: &plan::IcebergTableInfo,
     output_columns: &[common::OutputColumn],
     variant_path_plan: &NativeVariantPathPlan,
@@ -72,7 +57,7 @@ pub(crate) fn iceberg_chunk_schema_from_output_columns_with_variants(
     ChunkSchema::try_ref_from_schema_and_slot_ids(arrow_schema.as_ref(), &slot_ids)
 }
 
-pub(crate) fn iceberg_arrow_schema_from_output_columns(
+pub(super) fn iceberg_arrow_schema_from_output_columns(
     table: &plan::IcebergTableInfo,
     output_columns: &[common::OutputColumn],
 ) -> Result<std::sync::Arc<Schema>, String> {
@@ -83,7 +68,7 @@ pub(crate) fn iceberg_arrow_schema_from_output_columns(
     )
 }
 
-pub(crate) fn iceberg_arrow_schema_from_output_columns_with_variants(
+fn iceberg_arrow_schema_from_output_columns_with_variants(
     table: &plan::IcebergTableInfo,
     output_columns: &[common::OutputColumn],
     variant_path_plan: &NativeVariantPathPlan,
@@ -122,7 +107,7 @@ pub(crate) fn iceberg_arrow_schema_from_output_columns_with_variants(
     Ok(std::sync::Arc::new(Schema::new(fields)))
 }
 
-pub(crate) fn iceberg_table_descriptor(
+fn iceberg_table_descriptor(
     table: &plan::IcebergTableInfo,
 ) -> Result<IcebergTableDescriptor, String> {
     let schema = table
@@ -145,7 +130,7 @@ pub(crate) fn iceberg_table_descriptor(
     })
 }
 
-pub(crate) fn iceberg_schema_field_descriptor(
+fn iceberg_schema_field_descriptor(
     field: &plan::IcebergSchemaFieldDef,
 ) -> IcebergSchemaFieldDescriptor {
     IcebergSchemaFieldDescriptor {

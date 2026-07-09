@@ -26,9 +26,7 @@ use super::schema::{
     iceberg_chunk_schema_from_output_columns,
     iceberg_chunk_schema_from_output_columns_with_variants,
 };
-use super::variant_path::{
-    ensure_native_variant_source_read_columns, parse_native_scan_variant_path_columns,
-};
+use super::variant_path::{NativeVariantPathPlan, parse_native_scan_variant_path_columns};
 use super::virtual_columns::{iceberg_virtual_count_column, record_iceberg_virtual_column};
 use crate::common::ids::SlotId;
 use crate::exec::chunk::ChunkSchemaRef;
@@ -40,28 +38,28 @@ use crate::formats::parquet::{ParquetSlotKind, VariantPathSpec};
 use crate::proto::{common, plan};
 
 #[derive(Clone, Debug)]
-pub(crate) struct ScanReadPlan {
-    pub(crate) output_layout: super::super::layout::Layout,
-    pub(crate) output_schema: ChunkSchemaRef,
-    pub(crate) read_layout: super::super::layout::Layout,
-    pub(crate) read_schema: ChunkSchemaRef,
-    pub(crate) parquet_schema: ChunkSchemaRef,
-    pub(crate) read_columns: Vec<String>,
-    pub(crate) read_slot_ids: Vec<SlotId>,
-    pub(crate) slot_kinds: Vec<ParquetSlotKind>,
-    pub(crate) variant_path_columns: Vec<VariantPathSpec>,
-    pub(crate) iceberg_virtual: IcebergVirtualSpec,
+pub(super) struct ScanReadPlan {
+    pub(super) output_layout: super::super::layout::Layout,
+    pub(super) output_schema: ChunkSchemaRef,
+    pub(super) read_layout: super::super::layout::Layout,
+    pub(super) read_schema: ChunkSchemaRef,
+    pub(super) parquet_schema: ChunkSchemaRef,
+    pub(super) read_columns: Vec<String>,
+    pub(super) read_slot_ids: Vec<SlotId>,
+    pub(super) slot_kinds: Vec<ParquetSlotKind>,
+    pub(super) variant_path_columns: Vec<VariantPathSpec>,
+    pub(super) iceberg_virtual: IcebergVirtualSpec,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PredicateColumnRef {
+struct PredicateColumnRef {
     column_id: u32,
     name: Option<String>,
     r#type: Option<common::TypeDesc>,
     nullable: bool,
 }
 
-pub(crate) fn scan_read_plan(
+pub(super) fn scan_read_plan(
     scan: &plan::ScanNode,
     table: &plan::IcebergTableInfo,
     output_columns: &[common::OutputColumn],
@@ -227,7 +225,44 @@ pub(crate) fn scan_read_plan(
     })
 }
 
-pub(crate) fn push_physical_read_column(
+#[allow(clippy::too_many_arguments)]
+fn ensure_native_variant_source_read_columns(
+    scan: &plan::ScanNode,
+    plan: &mut NativeVariantPathPlan,
+    physical_read_columns: &mut Vec<common::OutputColumn>,
+    read_names: &mut HashSet<String>,
+    read_slots: &mut HashSet<u32>,
+    scan_slots: &mut HashSet<u32>,
+    next_hidden_column_id: &mut u32,
+) -> Result<(), String> {
+    if plan.specs.is_empty() {
+        return Ok(());
+    }
+
+    let mut reserved_slots = scan_slots.clone();
+    reserved_slots.extend(plan.specs.iter().map(|spec| spec.source_slot_id.as_u32()));
+    reserved_slots.extend(plan.specs.iter().map(|spec| spec.output_slot_id.as_u32()));
+
+    for spec in &mut plan.specs {
+        if let Some(read_col) = physical_read_columns.iter().find(|col| {
+            SlotId::new(col.column_id) == spec.source_slot_id || col.name == spec.source_name
+        }) {
+            spec.source_read_slot_id = SlotId::new(read_col.column_id);
+            continue;
+        }
+
+        let hidden_id = allocate_hidden_column_id(next_hidden_column_id, &reserved_slots)?;
+        reserved_slots.insert(hidden_id);
+        scan_slots.insert(hidden_id);
+        let source_col = output_column_from_table_def(scan, &spec.source_name, hidden_id)?;
+        push_physical_read_column(physical_read_columns, read_names, read_slots, source_col)?;
+        spec.source_read_slot_id = SlotId::new(hidden_id);
+    }
+
+    Ok(())
+}
+
+fn push_physical_read_column(
     read_columns: &mut Vec<common::OutputColumn>,
     read_names: &mut HashSet<String>,
     read_slots: &mut HashSet<u32>,
@@ -250,7 +285,7 @@ pub(crate) fn push_physical_read_column(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn push_scan_column(
+fn push_scan_column(
     table: &plan::IcebergTableInfo,
     scan_columns: &mut Vec<common::OutputColumn>,
     scan_names: &mut HashSet<String>,
@@ -278,7 +313,7 @@ pub(crate) fn push_scan_column(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn ensure_virtual_only_scan_has_row_count_carrier(
+fn ensure_virtual_only_scan_has_row_count_carrier(
     scan_columns: &mut Vec<common::OutputColumn>,
     scan_names: &mut HashSet<String>,
     scan_slots: &mut HashSet<u32>,
@@ -309,7 +344,7 @@ pub(crate) fn ensure_virtual_only_scan_has_row_count_carrier(
     push_physical_read_column(physical_read_columns, read_names, read_slots, column)
 }
 
-pub(crate) fn parquet_slot_kind_from_native_column(
+fn parquet_slot_kind_from_native_column(
     column: &common::OutputColumn,
 ) -> Result<ParquetSlotKind, String> {
     let data_type = output_column_data_type(column)?;
@@ -320,10 +355,7 @@ pub(crate) fn parquet_slot_kind_from_native_column(
     }
 }
 
-pub(crate) fn allocate_hidden_column_id(
-    next: &mut u32,
-    used: &HashSet<u32>,
-) -> Result<u32, String> {
+fn allocate_hidden_column_id(next: &mut u32, used: &HashSet<u32>) -> Result<u32, String> {
     loop {
         let id = *next;
         *next = next
@@ -335,7 +367,7 @@ pub(crate) fn allocate_hidden_column_id(
     }
 }
 
-pub(crate) fn output_column_from_predicate_ref(
+fn output_column_from_predicate_ref(
     col: &PredicateColumnRef,
 ) -> Result<common::OutputColumn, String> {
     let name = col.name.clone().ok_or_else(|| {
@@ -353,7 +385,7 @@ pub(crate) fn output_column_from_predicate_ref(
     })
 }
 
-pub(crate) fn output_column_from_table_def(
+fn output_column_from_table_def(
     scan: &plan::ScanNode,
     name: &str,
     column_id: u32,
@@ -385,7 +417,7 @@ pub(crate) fn output_column_from_table_def(
     })
 }
 
-pub(crate) fn scan_predicate_column_refs(
+fn scan_predicate_column_refs(
     predicates: &[crate::proto::expr::Expr],
 ) -> Result<BTreeMap<u32, PredicateColumnRef>, String> {
     let mut refs = BTreeMap::new();
@@ -395,7 +427,7 @@ pub(crate) fn scan_predicate_column_refs(
     Ok(refs)
 }
 
-pub(crate) fn collect_predicate_column_refs(
+fn collect_predicate_column_refs(
     expr: &crate::proto::expr::Expr,
     refs: &mut BTreeMap<u32, PredicateColumnRef>,
 ) -> Result<(), String> {
@@ -467,7 +499,7 @@ pub(crate) fn collect_predicate_column_refs(
     Ok(())
 }
 
-pub(crate) fn collect_optional_box_expr(
+fn collect_optional_box_expr(
     expr: &Option<Box<crate::proto::expr::Expr>>,
     refs: &mut BTreeMap<u32, PredicateColumnRef>,
 ) -> Result<(), String> {
@@ -477,7 +509,7 @@ pub(crate) fn collect_optional_box_expr(
     Ok(())
 }
 
-pub(crate) fn collect_optional_expr(
+fn collect_optional_expr(
     expr: &Option<crate::proto::expr::Expr>,
     refs: &mut BTreeMap<u32, PredicateColumnRef>,
 ) -> Result<(), String> {
@@ -487,7 +519,7 @@ pub(crate) fn collect_optional_expr(
     Ok(())
 }
 
-pub(crate) fn collect_expr_list(
+fn collect_expr_list(
     exprs: &[crate::proto::expr::Expr],
     refs: &mut BTreeMap<u32, PredicateColumnRef>,
 ) -> Result<(), String> {
@@ -497,7 +529,7 @@ pub(crate) fn collect_expr_list(
     Ok(())
 }
 
-pub(crate) fn collect_sort_items(
+fn collect_sort_items(
     items: &[crate::proto::expr::SortItem],
     refs: &mut BTreeMap<u32, PredicateColumnRef>,
 ) -> Result<(), String> {
@@ -507,7 +539,7 @@ pub(crate) fn collect_sort_items(
     Ok(())
 }
 
-pub(crate) fn maybe_project_data_scan_output(
+pub(super) fn maybe_project_data_scan_output(
     node_id: i32,
     scan_lowered: LoweredNode,
     read_plan: ScanReadPlan,

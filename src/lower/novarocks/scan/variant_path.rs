@@ -20,21 +20,17 @@ use std::collections::{HashMap, HashSet};
 use arrow::datatypes::{DataType, Field};
 
 use super::common::{column_def_data_type, output_column_data_type};
-use super::read_plan::{
-    allocate_hidden_column_id, output_column_from_table_def, push_physical_read_column,
-};
-use super::schema::iceberg_schema_field_id;
 use crate::common::ids::SlotId;
 use crate::formats::parquet::VariantPathSpec;
 use crate::proto::{common, plan};
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct NativeVariantPathPlan {
-    pub(crate) specs: Vec<VariantPathSpec>,
-    pub(crate) output_slot_ids: HashSet<SlotId>,
+pub(super) struct NativeVariantPathPlan {
+    pub(super) specs: Vec<VariantPathSpec>,
+    pub(super) output_slot_ids: HashSet<SlotId>,
 }
 
-pub(crate) fn parse_native_scan_variant_path_columns(
+pub(super) fn parse_native_scan_variant_path_columns(
     scan: &plan::ScanNode,
     table: &plan::IcebergTableInfo,
     output_columns: &[common::OutputColumn],
@@ -170,44 +166,7 @@ pub(crate) fn parse_native_scan_variant_path_columns(
     Ok(plan)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn ensure_native_variant_source_read_columns(
-    scan: &plan::ScanNode,
-    plan: &mut NativeVariantPathPlan,
-    physical_read_columns: &mut Vec<common::OutputColumn>,
-    read_names: &mut HashSet<String>,
-    read_slots: &mut HashSet<u32>,
-    scan_slots: &mut HashSet<u32>,
-    next_hidden_column_id: &mut u32,
-) -> Result<(), String> {
-    if plan.specs.is_empty() {
-        return Ok(());
-    }
-
-    let mut reserved_slots = scan_slots.clone();
-    reserved_slots.extend(plan.specs.iter().map(|spec| spec.source_slot_id.as_u32()));
-    reserved_slots.extend(plan.specs.iter().map(|spec| spec.output_slot_id.as_u32()));
-
-    for spec in &mut plan.specs {
-        if let Some(read_col) = physical_read_columns.iter().find(|col| {
-            SlotId::new(col.column_id) == spec.source_slot_id || col.name == spec.source_name
-        }) {
-            spec.source_read_slot_id = SlotId::new(read_col.column_id);
-            continue;
-        }
-
-        let hidden_id = allocate_hidden_column_id(next_hidden_column_id, &reserved_slots)?;
-        reserved_slots.insert(hidden_id);
-        scan_slots.insert(hidden_id);
-        let source_col = output_column_from_table_def(scan, &spec.source_name, hidden_id)?;
-        push_physical_read_column(physical_read_columns, read_names, read_slots, source_col)?;
-        spec.source_read_slot_id = SlotId::new(hidden_id);
-    }
-
-    Ok(())
-}
-
-pub(crate) fn required_native_variant_path_string(
+fn required_native_variant_path_string(
     idx: usize,
     field_name: &str,
     value: &str,
@@ -219,7 +178,7 @@ pub(crate) fn required_native_variant_path_string(
         .map_or_else(|| Ok(value.trim().to_string()), Err)
 }
 
-pub(crate) fn validate_native_variant_path_column_path(
+fn validate_native_variant_path_column_path(
     idx: usize,
     canonical_path: &str,
 ) -> Result<(), String> {
@@ -244,9 +203,17 @@ pub(crate) fn validate_native_variant_path_column_path(
     Ok(())
 }
 
-pub(crate) fn is_supported_native_variant_path_requested_type(data_type: &DataType) -> bool {
+fn is_supported_native_variant_path_requested_type(data_type: &DataType) -> bool {
     matches!(
         data_type,
         DataType::Boolean | DataType::Int64 | DataType::Float64 | DataType::Utf8 | DataType::Date32
     )
+}
+
+fn iceberg_schema_field_id(table: &plan::IcebergTableInfo, name: &str) -> Option<i32> {
+    table
+        .schema
+        .as_ref()
+        .and_then(|schema| schema.fields.iter().find(|field| field.name == name))
+        .map(|field| field.field_id)
 }

@@ -25,7 +25,7 @@ use crate::fs::object_store::{ObjectStoreConfig, apply_object_store_runtime_defa
 use crate::fs::object_store_credentials::{ObjectStoreCredentials, ObjectStoreCredentialsSource};
 use crate::proto::{common, plan};
 
-pub(crate) fn scan_output_columns(
+pub(super) fn scan_output_columns(
     scan: &plan::ScanNode,
 ) -> Result<Vec<common::OutputColumn>, String> {
     if scan.columns.is_empty() {
@@ -55,7 +55,7 @@ pub(crate) fn scan_output_columns(
     Ok(output_columns)
 }
 
-pub(crate) fn column_def_data_type(column: &plan::ColumnDef) -> Result<DataType, String> {
+pub(super) fn column_def_data_type(column: &plan::ColumnDef) -> Result<DataType, String> {
     let desc = column
         .logical_type
         .as_ref()
@@ -64,7 +64,7 @@ pub(crate) fn column_def_data_type(column: &plan::ColumnDef) -> Result<DataType,
     super::super::decode_type(desc)
 }
 
-pub(crate) fn output_column_data_type(column: &common::OutputColumn) -> Result<DataType, String> {
+pub(super) fn output_column_data_type(column: &common::OutputColumn) -> Result<DataType, String> {
     let desc = column
         .r#type
         .as_ref()
@@ -72,7 +72,7 @@ pub(crate) fn output_column_data_type(column: &common::OutputColumn) -> Result<D
     super::super::decode_type(desc)
 }
 
-pub(crate) fn scan_batch_size(
+pub(super) fn scan_batch_size(
     query_options: Option<&crate::runtime::query_options::QueryOptions>,
 ) -> Result<usize, String> {
     let Some(value) = query_options.and_then(|opts| opts.batch_size) else {
@@ -87,7 +87,7 @@ pub(crate) fn scan_batch_size(
     Ok(batch_size)
 }
 
-pub(crate) fn lower_scan_predicate(
+pub(super) fn lower_scan_predicate(
     scan: &plan::ScanNode,
     arena: &mut ExprArena,
     layout: &super::super::layout::Layout,
@@ -104,7 +104,7 @@ pub(crate) fn lower_scan_predicate(
     Ok(predicate)
 }
 
-pub(crate) fn parse_scan_limit(limit: i64) -> Result<Option<usize>, String> {
+pub(super) fn parse_scan_limit(limit: i64) -> Result<Option<usize>, String> {
     if limit == -1 {
         Ok(None)
     } else if limit < 0 {
@@ -114,7 +114,7 @@ pub(crate) fn parse_scan_limit(limit: i64) -> Result<Option<usize>, String> {
     }
 }
 
-pub(crate) fn resolve_cloud_object_store_config(
+pub(super) fn resolve_cloud_object_store_config(
     cloud_properties: &HashMap<String, String>,
 ) -> Result<Option<ObjectStoreConfig>, String> {
     let props = cloud_properties
@@ -133,7 +133,7 @@ pub(crate) fn resolve_cloud_object_store_config(
     Ok(Some(cfg))
 }
 
-pub(crate) fn table_location_map(table: &plan::IcebergTableInfo) -> HashMap<i64, String> {
+pub(super) fn table_location_map(table: &plan::IcebergTableInfo) -> HashMap<i64, String> {
     let mut locations = HashMap::new();
     if !table.location.is_empty() {
         locations.insert(i64::from(table.schema_id), table.location.clone());

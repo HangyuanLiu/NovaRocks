@@ -4131,7 +4131,8 @@ fn nidl_d3l_native_mainline_thrift_usage_is_explicitly_allowlisted() {
         "src/lower/novarocks/scan",
         "src/lower/novarocks/sink",
     ] {
-        native_lowering_sources.extend(rs_files(&repo.join(dir)).into_iter().map(|path| rel(&path)));
+        native_lowering_sources
+            .extend(rs_files(&repo.join(dir)).into_iter().map(|path| rel(&path)));
     }
     for source in native_lowering_sources {
         let text = fs::read_to_string(repo.join(&source)).unwrap();
