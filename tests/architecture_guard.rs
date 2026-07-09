@@ -4124,7 +4124,7 @@ fn nidl_d3l_native_mainline_thrift_usage_is_explicitly_allowlisted() {
         "src/lower/novarocks/layout.rs",
         "src/lower/novarocks/node.rs",
         "src/lower/novarocks/scan.rs",
-        "src/lower/novarocks/sink.rs",
+        "src/lower/novarocks/sink/mod.rs",
     ] {
         let text = fs::read_to_string(repo.join(source)).unwrap();
         let text = rust_production_text_without_cfg_test(&text);
