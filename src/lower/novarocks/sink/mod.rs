@@ -17,6 +17,7 @@
 
 //! Native proto sink lowering.
 
+mod equality_delete;
 mod metadata;
 mod partition;
 mod position_delete;
@@ -24,26 +25,23 @@ mod position_delete;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::datatypes::{Field, Schema, SchemaRef};
-use iceberg::spec::TableMetadata;
-
 use super::decode_type;
 use super::expr::lower_proto_expr;
 use crate::common::ids::SlotId;
-use crate::connector::iceberg::commit::EqualityDeleteColumn;
 use crate::connector::iceberg::position_delete_descriptor::PositionDeleteExpectedBinding;
-use crate::connector::iceberg::schema::{
-    IcebergTableDescriptor, apply_field_id_recursive, build_full_output_schema,
-};
+use crate::connector::iceberg::schema::build_full_output_schema;
 use crate::connector::iceberg::sink_plan::{
     IcebergSinkFactoryInput, IcebergSinkMode, IcebergSinkPlan,
 };
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::proto::{common, expr, plan};
 
+use self::equality_delete::{
+    build_equality_delete_output_schema, validate_equality_delete_unpartitioned_target_metadata,
+};
 use self::metadata::{
-    arrow_field_id, iceberg_table_descriptor_from_native, iceberg_table_location,
-    map_native_compression, parse_target_table_metadata, resolve_native_sink_s3_config,
+    iceberg_table_descriptor_from_native, iceberg_table_location, map_native_compression,
+    parse_target_table_metadata, resolve_native_sink_s3_config,
     schema_has_reserved_row_lineage_columns, validate_iceberg_sink_file_format,
 };
 use self::partition::{
@@ -336,78 +334,4 @@ fn iceberg_sink_mode_from_native(value: i32) -> Result<IcebergSinkMode, String> 
             Err("native Iceberg write sink mode is unspecified".to_string())
         }
     }
-}
-
-fn validate_equality_delete_unpartitioned_target_metadata(
-    iceberg: &IcebergTableDescriptor,
-    target_partition_spec_id: i32,
-) -> Result<(), String> {
-    let Some(serialized) = iceberg.serialized_metadata.as_ref() else {
-        return Ok(());
-    };
-    let metadata = serde_json::from_str::<TableMetadata>(serialized)
-        .map_err(|e| format!("parse native Iceberg equality-delete target metadata failed: {e}"))?;
-    let spec = metadata
-        .partition_spec_by_id(target_partition_spec_id)
-        .ok_or_else(|| {
-            format!(
-                "native Iceberg equality-delete sink target partition spec id {target_partition_spec_id} not found"
-            )
-        })?;
-    if !spec.fields().is_empty() {
-        return Err(format!(
-            "native Iceberg equality-delete sink currently supports only unpartitioned tables; \
-            target partition spec id {target_partition_spec_id} has {} fields",
-            spec.fields().len()
-        ));
-    }
-    Ok(())
-}
-
-fn build_equality_delete_output_schema(
-    iceberg: &IcebergTableDescriptor,
-) -> Result<(SchemaRef, Vec<EqualityDeleteColumn>), String> {
-    let columns = &iceberg.columns;
-    if columns.is_empty() {
-        return Err("native Iceberg equality-delete sink requires equality columns".to_string());
-    }
-    let key_fields = iceberg
-        .equality_delete_schema
-        .as_ref()
-        .ok_or_else(|| {
-            "native Iceberg equality-delete sink requires projected key fields".to_string()
-        })?
-        .fields
-        .as_slice();
-    if key_fields.is_empty() {
-        return Err("native Iceberg equality-delete sink requires equality columns".to_string());
-    }
-    let mut fields = Vec::with_capacity(key_fields.len());
-    let mut equality_columns = Vec::with_capacity(key_fields.len());
-    for schema_field in key_fields {
-        let column = columns
-            .iter()
-            .find(|column| column.name == schema_field.name)
-            .ok_or_else(|| {
-                format!(
-                    "native Iceberg equality-delete column {} missing descriptor",
-                    schema_field.name
-                )
-            })?;
-        let field = Field::new(
-            column.name.clone(),
-            column.data_type.clone(),
-            column.nullable,
-        );
-        let field = apply_field_id_recursive(field, schema_field)?;
-        let field_id = arrow_field_id(&field)?;
-        equality_columns.push(EqualityDeleteColumn {
-            name: field.name().to_string(),
-            field_id,
-            data_type: field.data_type().clone(),
-            nullable: field.is_nullable(),
-        });
-        fields.push(field);
-    }
-    Ok((Arc::new(Schema::new(fields)), equality_columns))
 }
