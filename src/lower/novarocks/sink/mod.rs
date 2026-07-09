@@ -17,24 +17,22 @@
 
 //! Native proto sink lowering.
 
-use std::collections::{BTreeMap, HashMap};
+mod metadata;
+
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use iceberg::spec::TableMetadata;
-use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use parquet::basic::Compression;
 
 use super::decode_type;
 use super::expr::lower_proto_expr;
 use crate::common::ids::SlotId;
 use crate::connector::iceberg::commit::EqualityDeleteColumn;
-use crate::connector::iceberg::delete_file::IcebergFileFormat;
 use crate::connector::iceberg::position_delete_descriptor::{
     PositionDeleteDescriptorInput, PositionDeleteExpectedBinding, bind_position_delete_descriptor,
 };
 use crate::connector::iceberg::schema::{
-    IcebergSchemaDescriptor, IcebergSchemaFieldDescriptor, IcebergTableColumn,
     IcebergTableDescriptor, apply_field_id_recursive, build_full_output_schema,
 };
 use crate::connector::iceberg::sink::build_staged_file_io;
@@ -44,13 +42,14 @@ use crate::connector::iceberg::sink_plan::{
 };
 use crate::exec::expr::function::lookup_function;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
-use crate::exec::row_position::{
-    ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-    ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL,
-};
-use crate::fs::object_store_credentials::{ObjectStoreCredentials, ObjectStoreCredentialsSource};
 use crate::proto::{common, expr, plan};
 use crate::runtime::global_async_runtime::data_block_on;
+
+use self::metadata::{
+    arrow_field_id, iceberg_table_descriptor_from_native, iceberg_table_location,
+    map_native_compression, parse_target_table_metadata, resolve_native_sink_s3_config,
+    schema_has_reserved_row_lineage_columns, validate_iceberg_sink_file_format,
+};
 
 pub(crate) fn lower_iceberg_write_sink_factory_input(
     sink: &plan::IcebergWriteFragmentSink,
@@ -336,112 +335,6 @@ fn iceberg_sink_mode_from_native(value: i32) -> Result<IcebergSinkMode, String> 
     }
 }
 
-fn iceberg_table_descriptor_from_native(
-    table: &plan::IcebergTableInfo,
-    target_columns: &[plan::ColumnDef],
-    mode: IcebergSinkMode,
-) -> Result<IcebergTableDescriptor, String> {
-    let schema = table
-        .schema
-        .as_ref()
-        .ok_or_else(|| "native Iceberg write sink target schema missing".to_string())?;
-    let iceberg_schema = IcebergSchemaDescriptor {
-        fields: schema
-            .fields
-            .iter()
-            .map(iceberg_schema_field_descriptor_from_native)
-            .collect(),
-    };
-    let columns = target_columns
-        .iter()
-        .map(column_def_to_table_column)
-        .collect::<Result<Vec<_>, _>>()?;
-    let equality_delete_schema =
-        (mode == IcebergSinkMode::EqualityDeletes).then_some(IcebergSchemaDescriptor {
-            fields: iceberg_schema
-                .fields
-                .iter()
-                .filter(|field| columns.iter().any(|column| column.name == field.name))
-                .cloned()
-                .collect(),
-        });
-    Ok(IcebergTableDescriptor {
-        columns,
-        iceberg_schema: Some(iceberg_schema),
-        equality_delete_schema,
-        partition_info: Vec::new(),
-        current_snapshot_id: table.current_snapshot_id,
-        serialized_metadata: table.serialized_metadata.clone(),
-    })
-}
-
-fn iceberg_schema_field_descriptor_from_native(
-    field: &plan::IcebergSchemaFieldDef,
-) -> IcebergSchemaFieldDescriptor {
-    IcebergSchemaFieldDescriptor {
-        name: field.name.clone(),
-        field_id: Some(field.field_id),
-        children: field
-            .children
-            .iter()
-            .map(iceberg_schema_field_descriptor_from_native)
-            .collect(),
-        initial_default_json: field.initial_default_json.clone(),
-    }
-}
-
-fn column_def_to_table_column(column: &plan::ColumnDef) -> Result<IcebergTableColumn, String> {
-    let data_type = column
-        .data_type
-        .as_ref()
-        .ok_or_else(|| format!("native Iceberg column {} missing data_type", column.name))
-        .and_then(decode_type)?;
-    Ok(IcebergTableColumn {
-        name: column.name.clone(),
-        data_type,
-        nullable: column.nullable,
-    })
-}
-
-fn parse_target_table_metadata(
-    iceberg: &IcebergTableDescriptor,
-    mode: IcebergSinkMode,
-) -> Result<Option<TableMetadata>, String> {
-    let serialized = match mode {
-        IcebergSinkMode::PositionDeletes | IcebergSinkMode::DeletionVectors => {
-            Some(iceberg.serialized_metadata.as_ref().ok_or_else(|| {
-                format!(
-                    "native Iceberg {:?} sink requires serialized target table metadata",
-                    mode
-                )
-            })?)
-        }
-        IcebergSinkMode::Data | IcebergSinkMode::EqualityDeletes => {
-            iceberg.serialized_metadata.as_ref()
-        }
-    };
-    let Some(serialized) = serialized else {
-        return Ok(None);
-    };
-    serde_json::from_str::<TableMetadata>(serialized)
-        .map(Some)
-        .map_err(|e| {
-            format!(
-                "parse native Iceberg {:?} target metadata failed: {e}",
-                mode
-            )
-        })
-}
-
-fn iceberg_table_location(serialized_metadata: Option<&str>) -> Option<String> {
-    let serialized = serialized_metadata?;
-    let value = serde_json::from_str::<serde_json::Value>(serialized).ok()?;
-    value
-        .get("location")
-        .and_then(serde_json::Value::as_str)
-        .map(ToString::to_string)
-}
-
 fn partition_info_from_metadata(
     metadata: Option<&TableMetadata>,
     target_partition_spec_id: i32,
@@ -713,97 +606,6 @@ fn partition_source_field_ids_from_metadata(
                 })
         })
         .collect()
-}
-
-fn arrow_field_id(field: &Field) -> Result<i32, String> {
-    let raw = field
-        .metadata()
-        .get(PARQUET_FIELD_ID_META_KEY)
-        .ok_or_else(|| {
-            format!(
-                "native Iceberg sink field {} is missing parquet field id metadata",
-                field.name()
-            )
-        })?;
-    raw.parse::<i32>().map_err(|e| {
-        format!(
-            "native Iceberg sink field {} has invalid parquet field id {raw}: {e}",
-            field.name()
-        )
-    })
-}
-
-fn schema_has_reserved_row_lineage_columns(schema: &Schema) -> Result<bool, String> {
-    let mut has_row_id = false;
-    let mut has_last_updated = false;
-    for field in schema.fields() {
-        if field.name().eq_ignore_ascii_case(ICEBERG_ROW_ID_COL) {
-            has_row_id = matches!(arrow_field_id(field), Ok(ICEBERG_RESERVED_FIELD_ID_ROW_ID));
-        } else if field
-            .name()
-            .eq_ignore_ascii_case(ICEBERG_LAST_UPDATED_SEQ_COL)
-        {
-            has_last_updated = matches!(
-                arrow_field_id(field),
-                Ok(ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER)
-            );
-        }
-    }
-    Ok(has_row_id && has_last_updated)
-}
-
-fn resolve_native_sink_s3_config(
-    data_location: &str,
-    cloud_properties: &HashMap<String, String>,
-) -> Result<Option<IcebergSinkObjectStoreConfig>, String> {
-    if !crate::fs::access::is_object_store_location_parse_only(data_location)
-        .map_err(|e| format!("parse native Iceberg sink data_location {data_location}: {e}"))?
-    {
-        return Ok(None);
-    }
-    let (bucket, _data_root) = crate::fs::access::parse_object_store_path_parse_only(data_location)
-        .map_err(|e| {
-            format!("parse native Iceberg sink object-store data_location {data_location}: {e}")
-        })?;
-    if cloud_properties.is_empty() {
-        return Err(format!(
-            "native Iceberg sink object-store path requires cloud_properties: data_location={data_location}"
-        ));
-    }
-    let cloud_properties = cloud_properties
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let credentials = ObjectStoreCredentials::from_aws_s3_properties(
-        ObjectStoreCredentialsSource::IcebergSinkCloudProperties,
-        &cloud_properties,
-    )?;
-    Ok(Some(IcebergSinkObjectStoreConfig::from_credentials(
-        bucket,
-        credentials,
-    )))
-}
-
-fn validate_iceberg_sink_file_format(
-    file_format: &str,
-) -> Result<(IcebergFileFormat, String), String> {
-    if !file_format.eq_ignore_ascii_case("parquet") {
-        return Err(format!(
-            "native Iceberg sink does not support {file_format} files; only Parquet is supported"
-        ));
-    }
-    Ok((IcebergFileFormat::Parquet, file_format.to_string()))
-}
-
-fn map_native_compression(value: i32) -> Result<Compression, String> {
-    let compression = plan::IcebergWriteFileCompression::try_from(value)
-        .map_err(|_| format!("unknown native IcebergWriteFileCompression value {value}"))?;
-    match compression {
-        plan::IcebergWriteFileCompression::Snappy => Ok(Compression::SNAPPY),
-        plan::IcebergWriteFileCompression::Unspecified => {
-            Err("native Iceberg write file compression is unspecified".to_string())
-        }
-    }
 }
 
 fn build_position_delete_data_file_partition_index(
