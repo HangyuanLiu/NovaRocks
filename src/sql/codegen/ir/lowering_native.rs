@@ -32,7 +32,7 @@ use crate::sql::codegen::{
     FragmentSchedulingMetadata, FragmentStreamKind, MultiFragmentBuildResult, OutputColumn,
     RuntimeFilterPlanResult,
 };
-use crate::sql::planner::plan::{ExchangeFlavor, PhysicalPlanKind, PlanScanNode};
+use crate::sql::planner::plan::{ExchangeFlavor, PlanScanNode};
 use crate::sql::planner::{
     DataPartition, DistributedNode, DistributedNodeKind, DistributedPlan, PartitionKind,
     PlanFragment, PlannedRuntimeFilter,
