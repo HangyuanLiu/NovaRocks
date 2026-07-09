@@ -1,0 +1,147 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use crate::common::ids::SlotId;
+use crate::connector::ScanConfig;
+use crate::connector::iceberg::metadata::{
+    IcebergMetadataOutputColumn, IcebergMetadataScanConfig, IcebergMetadataScanRange,
+    IcebergMetadataTableType,
+};
+use crate::exec::expr::ExprArena;
+use crate::exec::node::{ExecNode, ExecNodeKind};
+use crate::proto::{common, novarocks, plan};
+
+use super::super::layout::{chunk_schema_from_output_columns, layout_from_output_columns};
+use super::super::node::{LoweredNode, NodeLoweringContext};
+use super::common::{lower_scan_predicate, parse_scan_limit, scan_output_columns};
+
+pub(super) fn lower_iceberg_metadata_scan(
+    node: &plan::DistributedNode,
+    scan: &plan::ScanNode,
+    source: &plan::IcebergMetadataTable,
+    ctx: &NodeLoweringContext,
+    arena: &mut ExprArena,
+) -> Result<LoweredNode, String> {
+    let output_columns = scan_output_columns(scan)?;
+    let layout = layout_from_output_columns(&output_columns)?;
+    let output_schema = chunk_schema_from_output_columns(&output_columns)?;
+    let metadata_table_type = metadata_table_type(source.metadata_table_type)?;
+    let ranges = decode_metadata_scan_ranges(ctx.scan_ranges(node.node_id)?)?;
+    let cfg = IcebergMetadataScanConfig {
+        metadata_table_type,
+        serialized_table: source.serialized_table.clone(),
+        serialized_predicate: source.metadata_payload.clone().unwrap_or_default(),
+        load_column_stats: false,
+        ranges,
+        batch_size: 4096,
+        output_columns: metadata_output_columns(&output_columns)?,
+        profile_label: Some(format!("native_scan_node_id={}", node.node_id)),
+    };
+    let predicate = lower_scan_predicate(scan, arena, &layout)?;
+    let scan_node = ctx
+        .connectors()?
+        .create_scan_node("iceberg", ScanConfig::IcebergMetadata(cfg))?
+        .with_node_id(node.node_id)
+        .with_output_chunk_schema(output_schema.clone())
+        .with_limit(parse_scan_limit(node.limit)?)
+        .with_conjunct_predicate(predicate)
+        .with_accept_empty_scan_ranges(true);
+    Ok(LoweredNode {
+        node: ExecNode {
+            kind: ExecNodeKind::Scan(scan_node),
+        },
+        layout,
+        output_schema,
+    })
+}
+
+fn decode_metadata_scan_ranges(
+    ranges: &[novarocks::ScanRangeParams],
+) -> Result<Vec<IcebergMetadataScanRange>, String> {
+    if ranges.is_empty() {
+        return Ok(vec![IcebergMetadataScanRange {
+            path: String::new(),
+            serialized_split: String::new(),
+        }]);
+    }
+    ranges
+        .iter()
+        .enumerate()
+        .map(|(idx, range)| {
+            if range.has_more.unwrap_or(false) {
+                return Err(format!(
+                    "IcebergMetadataTable range {idx} has_more is not supported by native lowering"
+                ));
+            }
+            if range.empty.unwrap_or(false) {
+                return Ok(None);
+            }
+            let Some(novarocks::scan_range::Kind::File(file)) =
+                range.range.as_ref().and_then(|range| range.kind.as_ref())
+            else {
+                return Err(format!(
+                    "IcebergMetadataTable range {idx} expected file range"
+                ));
+            };
+            Ok(Some(IcebergMetadataScanRange {
+                path: file.full_path.clone().unwrap_or_default(),
+                serialized_split: file.serialized_split.clone().unwrap_or_default(),
+            }))
+        })
+        .collect::<Result<Vec<_>, String>>()
+        .map(|ranges| ranges.into_iter().flatten().collect())
+}
+
+fn metadata_output_columns(
+    output_columns: &[common::OutputColumn],
+) -> Result<Vec<IcebergMetadataOutputColumn>, String> {
+    output_columns
+        .iter()
+        .map(|col| {
+            let data_type = col
+                .r#type
+                .as_ref()
+                .ok_or_else(|| format!("metadata output column {} type missing", col.name))
+                .and_then(super::super::decode_type)?;
+            Ok(IcebergMetadataOutputColumn {
+                name: col.name.clone(),
+                slot_id: SlotId::new(col.column_id),
+                data_type,
+                nullable: col.nullable,
+            })
+        })
+        .collect()
+}
+
+fn metadata_table_type(value: i32) -> Result<IcebergMetadataTableType, String> {
+    match plan::IcebergMetadataTableType::try_from(value)
+        .map_err(|_| format!("unknown Iceberg metadata table type {value}"))?
+    {
+        plan::IcebergMetadataTableType::Files => Ok(IcebergMetadataTableType::Files),
+        plan::IcebergMetadataTableType::Manifests => Ok(IcebergMetadataTableType::Manifests),
+        plan::IcebergMetadataTableType::LogicalIcebergMetadata => {
+            Ok(IcebergMetadataTableType::LogicalIcebergMetadata)
+        }
+        plan::IcebergMetadataTableType::Snapshots => Ok(IcebergMetadataTableType::Snapshots),
+        plan::IcebergMetadataTableType::History => Ok(IcebergMetadataTableType::History),
+        plan::IcebergMetadataTableType::Refs => Ok(IcebergMetadataTableType::Refs),
+        plan::IcebergMetadataTableType::Partitions => Ok(IcebergMetadataTableType::Partitions),
+        plan::IcebergMetadataTableType::Unspecified => {
+            Err("Iceberg metadata table type is unspecified".to_string())
+        }
+    }
+}
