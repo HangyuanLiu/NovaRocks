@@ -22,7 +22,9 @@ mod filter;
 mod generate_series;
 mod limit;
 mod project;
+mod sort;
 mod table_function;
+mod topn;
 mod values;
 
 use std::collections::{HashMap, HashSet};
@@ -225,8 +227,10 @@ fn lower_physical_node(
             filter::lower_filter_node(node, filter, children, arena)
         }
         plan::plan_node::Kind::Limit(limit) => limit::lower_limit_node(node, limit, children),
-        plan::plan_node::Kind::Sort(sort) => lower_sort_node(node, physical, sort, children, arena),
-        plan::plan_node::Kind::Topn(topn) => lower_topn_node(node, topn, children, arena),
+        plan::plan_node::Kind::Sort(sort) => {
+            sort::lower_sort_node(node, physical, sort, children, arena)
+        }
+        plan::plan_node::Kind::Topn(topn) => topn::lower_topn_node(node, topn, children, arena),
         plan::plan_node::Kind::SetOp(set_op) => {
             lower_set_op_node(node, physical, set_op, children, arena)
         }
@@ -266,169 +270,6 @@ fn lower_physical_node(
             lower_redistribute_node(physical, redistribute, children, arena)
         }
     }
-}
-
-fn lower_sort_node(
-    node: &plan::DistributedNode,
-    physical: &plan::PlanNode,
-    sort: &plan::SortNode,
-    mut children: Vec<LoweredNode>,
-    arena: &mut ExprArena,
-) -> Result<LoweredNode, String> {
-    check_exact_arity("SortNode", 1, children.len())?;
-    let child = children.pop().expect("child");
-    let output_columns = if sort.output_columns.is_empty() {
-        &physical.output_columns
-    } else {
-        &sort.output_columns
-    };
-    let order_by = lower_sort_items("SortNode", &sort.items, arena, &child.layout)?;
-    let limit = parse_distributed_limit(node.limit, "SortNode DistributedNode.limit")?;
-    let offset = parse_optional_nonnegative_i64(sort.offset, "SortNode.offset")?.unwrap_or(0);
-    let topn_type = parse_sort_topn_type(sort.topn_type)?;
-    let partition_exprs = sort
-        .analytic_partition_by
-        .iter()
-        .enumerate()
-        .map(|(idx, expr)| {
-            let expr = lower_proto_expr(expr, arena, &child.layout)
-                .map_err(|err| format!("SortNode analytic_partition_by[{idx}]: {err}"))?;
-            Ok(SortExpression {
-                expr,
-                asc: true,
-                nulls_first: true,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let partition_limit = sort.partition_limit.map(|value| value as usize);
-    let use_top_n = partition_limit.is_some();
-    if use_top_n && topn_type != SortTopNType::RowNumber && offset != 0 {
-        return Err(format!(
-            "SortNode node_id={} topn_type {:?} requires offset=0, got {}",
-            node.node_id, topn_type, offset
-        ));
-    }
-    let sort_node = ExecNode {
-        kind: ExecNodeKind::Sort(SortNode {
-            input: Box::new(child.node),
-            node_id: node.node_id,
-            use_top_n,
-            order_by,
-            limit,
-            offset,
-            topn_type,
-            max_buffered_rows: None,
-            max_buffered_bytes: None,
-            partition_exprs,
-            partition_limit,
-        }),
-    };
-    let sorted = LoweredNode {
-        node: sort_node,
-        layout: child.layout.clone(),
-        output_schema: child.output_schema.clone(),
-    };
-    if output_columns.is_empty() {
-        return Ok(sorted);
-    }
-
-    let layout = layout_from_output_columns(output_columns)?;
-    let output_schema = chunk_schema_from_output_columns(output_columns)?;
-    if layout.order() == child.layout.order() {
-        return Ok(LoweredNode {
-            node: sorted.node,
-            layout,
-            output_schema,
-        });
-    }
-
-    build_slot_projection("SortNode", sorted, output_columns, node.node_id, arena)
-}
-
-fn build_slot_projection(
-    label: &str,
-    input: LoweredNode,
-    output_columns: &[proto_common::OutputColumn],
-    node_id: i32,
-    arena: &mut ExprArena,
-) -> Result<LoweredNode, String> {
-    let layout = layout_from_output_columns(output_columns)?;
-    let output_schema = chunk_schema_from_output_columns(output_columns)?;
-    let expr_slot_schemas = slot_schemas_from_output_columns(output_columns)?;
-    let mut exprs = Vec::with_capacity(layout.order().len());
-    for slot in layout.order().iter().copied() {
-        if !input.layout.contains_slot(slot) {
-            return Err(format!(
-                "{label} output column id {} has no input slot",
-                slot.as_u32()
-            ));
-        }
-        exprs.push(arena.push(ExprNode::SlotId(slot)));
-    }
-
-    Ok(LoweredNode {
-        node: ExecNode {
-            kind: ExecNodeKind::Project(ProjectNode {
-                input: Box::new(input.node),
-                node_id,
-                is_subordinate: true,
-                exprs,
-                expr_slot_ids: layout.order().to_vec(),
-                expr_slot_schemas: Some(expr_slot_schemas),
-                output_indices: None,
-                output_chunk_schema: output_schema.clone(),
-            }),
-        },
-        layout,
-        output_schema,
-    })
-}
-
-fn lower_topn_node(
-    node: &plan::DistributedNode,
-    topn: &plan::TopNNode,
-    mut children: Vec<LoweredNode>,
-    arena: &mut ExprArena,
-) -> Result<LoweredNode, String> {
-    check_exact_arity("TopNNode", 1, children.len())?;
-    let child = children.pop().expect("child");
-    let payload_limit = parse_optional_nonnegative_i64(topn.limit, "TopNNode.limit")?;
-    let outer_limit = parse_distributed_limit(node.limit, "TopNNode DistributedNode.limit")?;
-    let limit = merge_limits("TopNNode", payload_limit, outer_limit)?;
-    if limit.is_none() {
-        return Err("TopNNode requires a non-negative limit".to_string());
-    }
-    let offset = parse_optional_nonnegative_i64(topn.offset, "TopNNode.offset")?.unwrap_or(0);
-    let phase = plan::TopNPhase::try_from(topn.phase)
-        .map_err(|_| format!("TopNNode unknown phase {}", topn.phase))?;
-    if phase == plan::TopNPhase::TopnPhaseUnspecified {
-        return Err("TopNNode phase is unspecified".to_string());
-    }
-    if topn.is_split && phase == plan::TopNPhase::TopnPhaseFinal {
-        return Err(
-            "TopNNode final split must be represented as ExchangeReceiver TopNSplit".to_string(),
-        );
-    }
-    let order_by = lower_sort_items("TopNNode", &topn.items, arena, &child.layout)?;
-    Ok(LoweredNode {
-        node: ExecNode {
-            kind: ExecNodeKind::Sort(SortNode {
-                input: Box::new(child.node),
-                node_id: node.node_id,
-                use_top_n: true,
-                order_by,
-                limit,
-                offset,
-                topn_type: SortTopNType::RowNumber,
-                max_buffered_rows: None,
-                max_buffered_bytes: None,
-                partition_exprs: Vec::new(),
-                partition_limit: None,
-            }),
-        },
-        layout: child.layout,
-        output_schema: child.output_schema,
-    })
 }
 
 fn lower_window_node(
@@ -583,7 +424,7 @@ fn sort_window_group_input(
             nulls_first: true,
         });
     }
-    order_by.extend(lower_sort_items(
+    order_by.extend(sort::lower_sort_items(
         &format!("WindowNode group {group_idx} sort"),
         &first.order_by,
         arena,
@@ -1071,46 +912,6 @@ fn validate_window_arg_matches_return(
     Ok(())
 }
 
-fn lower_sort_items(
-    node_kind: &str,
-    items: &[expr::SortItem],
-    arena: &mut ExprArena,
-    input_layout: &Layout,
-) -> Result<Vec<SortExpression>, String> {
-    items
-        .iter()
-        .enumerate()
-        .map(|(idx, item)| {
-            let expr = item
-                .expr
-                .as_ref()
-                .ok_or_else(|| format!("{node_kind} sort item {idx} expr missing"))?;
-            let expr = lower_proto_expr(expr, arena, input_layout)
-                .map_err(|err| format!("{node_kind} sort item {idx}: {err}"))?;
-            Ok(SortExpression {
-                expr,
-                asc: item.asc,
-                nulls_first: item.nulls_first,
-            })
-        })
-        .collect()
-}
-
-fn parse_sort_topn_type(value: Option<i32>) -> Result<SortTopNType, String> {
-    let Some(value) = value else {
-        return Ok(SortTopNType::RowNumber);
-    };
-    match plan::SortTopNType::try_from(value)
-        .map_err(|_| format!("SortNode unknown topn_type {value}"))?
-    {
-        plan::SortTopNType::SortTopnTypeUnspecified | plan::SortTopNType::SortTopnTypeRowNumber => {
-            Ok(SortTopNType::RowNumber)
-        }
-        plan::SortTopNType::SortTopnTypeRank => Ok(SortTopNType::Rank),
-        plan::SortTopNType::SortTopnTypeDenseRank => Ok(SortTopNType::DenseRank),
-    }
-}
-
 fn lower_exchange_receiver(
     node: &plan::DistributedNode,
     exchange: &plan::ExchangeReceiver,
@@ -1189,7 +990,7 @@ fn lower_exchange_receiver(
             }
         }
         plan::exchange_flavor::Kind::TopnSplit(topn) => {
-            let order_by = lower_sort_items(
+            let order_by = sort::lower_sort_items(
                 "ExchangeReceiver TopNSplit",
                 &topn.items,
                 arena,
@@ -1576,7 +1377,7 @@ fn lower_hash_aggregate_node(
     if visible_layout.order() == aggregate_node.layout.order() {
         return Ok(aggregate_node);
     }
-    build_slot_projection(
+    sort::build_slot_projection(
         "HashAggregateNode",
         aggregate_node,
         visible_output_columns,
@@ -2778,7 +2579,6 @@ mod tests {
     use crate::exec::node::ExecNodeKind;
     use crate::exec::node::assert::{AssertNumRowsMode, Assertion};
     use crate::exec::node::set_op::SetOpKind;
-    use crate::exec::node::sort::SortTopNType;
     use crate::proto::{common, expr, plan};
     use crate::runtime::exchange::ExchangeKey;
     use crate::sql::codegen::proto_encode::types::encode_type;
@@ -3090,137 +2890,6 @@ mod tests {
     fn lower(node: &plan::DistributedNode) -> super::LoweredNode {
         let mut arena = ExprArena::default();
         lower_proto_node(node, &mut arena, &NodeLoweringContext::default()).expect("lower node")
-    }
-
-    #[test]
-    fn lowers_sort_and_topn_shapes() {
-        let mut sort = physical_node(
-            20,
-            plan::plan_node::Kind::Sort(plan::SortNode {
-                items: vec![sort_item(1)],
-                analytic_partition_by: Vec::new(),
-                output_columns: vec![output_column(1, "id", DataType::Int64)],
-                offset: Some(2),
-                partition_limit: None,
-                topn_type: None,
-            }),
-            vec![output_column(1, "id", DataType::Int64)],
-            vec![one_col_values_node(10)],
-        );
-        sort.limit = 9;
-        let lowered_sort = lower(&sort);
-        let ExecNodeKind::Sort(sort) = lowered_sort.node.kind else {
-            panic!("expected Sort");
-        };
-        assert!(!sort.use_top_n);
-        assert_eq!(sort.limit, Some(9));
-        assert_eq!(sort.offset, 2);
-        assert_eq!(sort.order_by.len(), 1);
-
-        let topn = physical_node(
-            30,
-            plan::plan_node::Kind::Topn(plan::TopNNode {
-                items: vec![sort_item(1)],
-                limit: Some(3),
-                offset: Some(0),
-                phase: plan::TopNPhase::TopnPhaseFinal as i32,
-                is_split: false,
-            }),
-            Vec::new(),
-            vec![one_col_values_node(10)],
-        );
-        let lowered_topn = lower(&topn);
-        let ExecNodeKind::Sort(topn) = lowered_topn.node.kind else {
-            panic!("expected TopN as Sort");
-        };
-        assert!(topn.use_top_n);
-        assert_eq!(topn.limit, Some(3));
-        assert_eq!(topn.offset, 0);
-        assert_eq!(topn.topn_type, SortTopNType::RowNumber);
-    }
-
-    #[test]
-    fn lowers_sort_output_reorder_as_subordinate_project() {
-        let sort = physical_node(
-            20,
-            plan::plan_node::Kind::Sort(plan::SortNode {
-                items: vec![sort_item(1)],
-                analytic_partition_by: Vec::new(),
-                output_columns: vec![
-                    output_column(2, "b", DataType::Int64),
-                    output_column(1, "a", DataType::Int64),
-                ],
-                offset: None,
-                partition_limit: None,
-                topn_type: None,
-            }),
-            vec![
-                output_column(2, "b", DataType::Int64),
-                output_column(1, "a", DataType::Int64),
-            ],
-            vec![two_col_values_node(10)],
-        );
-
-        let lowered = lower(&sort);
-        let ExecNodeKind::Project(project) = lowered.node.kind else {
-            panic!("expected reorder project");
-        };
-        assert!(project.is_subordinate);
-        assert_eq!(project.node_id, 20);
-        assert_eq!(project.expr_slot_ids, vec![SlotId::new(2), SlotId::new(1)]);
-        assert_eq!(
-            project.output_chunk_schema.slot_ids(),
-            &[SlotId::new(2), SlotId::new(1)]
-        );
-        assert_eq!(lowered.layout.order(), &[SlotId::new(2), SlotId::new(1)]);
-        let ExecNodeKind::Sort(sort) = project.input.kind else {
-            panic!("expected Sort below reorder project");
-        };
-        assert_eq!(sort.order_by.len(), 1);
-        assert!(matches!(sort.input.kind, ExecNodeKind::Values(_)));
-    }
-
-    #[test]
-    fn lowers_partial_split_topn() {
-        let topn = physical_node(
-            30,
-            plan::plan_node::Kind::Topn(plan::TopNNode {
-                items: vec![sort_item(1)],
-                limit: Some(3),
-                offset: Some(0),
-                phase: plan::TopNPhase::TopnPhasePartial as i32,
-                is_split: true,
-            }),
-            Vec::new(),
-            vec![one_col_values_node(10)],
-        );
-        let lowered = lower(&topn);
-        let ExecNodeKind::Sort(topn) = lowered.node.kind else {
-            panic!("expected split TopN as Sort");
-        };
-        assert!(topn.use_top_n);
-        assert_eq!(topn.limit, Some(3));
-        assert_eq!(topn.offset, 0);
-    }
-
-    #[test]
-    fn rejects_final_split_topn_physical_node() {
-        let topn = physical_node(
-            30,
-            plan::plan_node::Kind::Topn(plan::TopNNode {
-                items: vec![sort_item(1)],
-                limit: Some(3),
-                offset: Some(0),
-                phase: plan::TopNPhase::TopnPhaseFinal as i32,
-                is_split: true,
-            }),
-            Vec::new(),
-            vec![one_col_values_node(10)],
-        );
-        let mut arena = ExprArena::default();
-        let err = lower_proto_node(&topn, &mut arena, &NodeLoweringContext::default()).unwrap_err();
-        assert!(err.contains("TopNNode final split"));
-        assert!(err.contains("ExchangeReceiver TopNSplit"));
     }
 
     #[test]
