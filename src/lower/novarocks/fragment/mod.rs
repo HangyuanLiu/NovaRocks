@@ -25,15 +25,15 @@ use std::time::Duration;
 use sink_factory::{prepare_result_buffer_for_native_sink, sink_factory_from_native};
 
 use super::expr::lower_proto_expr;
-use super::node::{lower_proto_node, NodeLoweringContext};
+use super::node::{NodeLoweringContext, lower_proto_node};
 use crate::common::config::debug_exec_node_output;
 use crate::common::types::UniqueId;
 use crate::exec::expr::ExprArena;
-use crate::exec::node::{push_down_local_runtime_filters, ExecPlan};
+use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
 use crate::exec::operators::DataStreamSinkFactoryInput;
 use crate::exec::pipeline::executor::execute_plan_with_pipeline;
 use crate::lower::common::fragment_runtime::{
-    apply_query_option_overrides, build_runtime_state, RuntimeStateInputs,
+    RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
 };
 use crate::runtime::fragment_output::FragmentOutput;
 use crate::runtime::mem_tracker::MemTracker;
