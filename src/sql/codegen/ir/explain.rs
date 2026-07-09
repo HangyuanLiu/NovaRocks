@@ -27,11 +27,11 @@ use crate::sql::explain::{
     ExplainLevel, PlanNodeExplainStage, format_assert_one_row_header, format_expr,
     format_project_item, format_sort_items, format_window_exprs,
 };
+use crate::sql::planner::ExchangeFlavor;
 use crate::sql::planner::plan::{
-    DistributedChangeEventExpandNode, ExchangeFlavor, PhysicalHashAggregateNode,
-    PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalSetOpNode,
-    PhysicalTopNNode, PlanAssertOneRowNode as DistributedAssertOneRowNode,
-    PlanFilterNode as DistributedFilterNode,
+    DistributedChangeEventExpandNode, PhysicalHashAggregateNode, PhysicalHashJoinNode,
+    PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalSetOpNode, PhysicalTopNNode,
+    PlanAssertOneRowNode as DistributedAssertOneRowNode, PlanFilterNode as DistributedFilterNode,
     PlanGenerateSeriesNode as DistributedGenerateSeriesNode,
     PlanProjectNode as DistributedProjectNode, PlanRepeatNode as DistributedRepeatNode,
     PlanScanNode as DistributedScanNode, PlanSetOpKind as SetOpKind,
@@ -1552,10 +1552,11 @@ mod tests {
     use crate::sql::optimizer::statistics::{
         ColumnStatistic, Confidence, CostEstimate, Statistics,
     };
+    use crate::sql::planner::ExchangeFlavor;
     use crate::sql::planner::optimizer_bridge::scalar::{
         intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items,
     };
-    use crate::sql::planner::plan::{AggregateCall, ExchangeFlavor};
+    use crate::sql::planner::plan::AggregateCall;
     use crate::sql::planner::{
         DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeReceiver, PhysicalPlanStats,
         PlannerBroadcastDecision, PlannerConfidence,

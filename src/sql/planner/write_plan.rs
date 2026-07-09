@@ -17,13 +17,12 @@
 
 use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind};
-use crate::sql::planner::plan::ExchangeFlavor;
 use crate::sql::planner::{
     ChangeStreamWriteDagSpec, DataPartition, DataSink, DistributedNode, DistributedNodeKind,
-    ExchangeReceiver, IcebergChangeStreamBranchRoute, IcebergChangeStreamRouterSink,
-    IcebergChangeStreamWriteTopology, IcebergChangeStreamWriterBranch, IcebergWriteFragmentSink,
-    IcebergWriteInputBinding, PartitionKind, PlanFragment,
-    PlannedIcebergChangeStreamDistributedPlan,
+    ExchangeFlavor, ExchangeReceiver, IcebergChangeStreamBranchRoute,
+    IcebergChangeStreamRouterSink, IcebergChangeStreamWriteTopology,
+    IcebergChangeStreamWriterBranch, IcebergWriteFragmentSink, IcebergWriteInputBinding,
+    PartitionKind, PlanFragment, PlannedIcebergChangeStreamDistributedPlan,
 };
 
 pub(crate) fn with_iceberg_write_sink(

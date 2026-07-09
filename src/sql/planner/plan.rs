@@ -26,7 +26,6 @@ use arrow::datatypes::DataType;
 
 use crate::sql::catalog::TableDef;
 
-use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
 pub(crate) use crate::sql::common::{ApplyKind, ChangeStreamBranchKind, ScanVariantColumn};
@@ -288,35 +287,6 @@ pub(crate) struct PhysicalTopNNode {
     pub offset: Option<i64>,
     pub phase: TopNPhase,
     pub is_split: bool,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub(crate) struct DistributedExchangeNode {
-    pub partition: crate::sql::planner::DataPartition,
-    pub source_fragment_id: u32,
-    pub output_columns: Vec<OutputColumn>,
-    pub output_qualifier: Option<String>,
-    pub flavor: ExchangeFlavor,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub(crate) enum ExchangeFlavor {
-    Distribution,
-    LimitOffset {
-        limit: Option<i64>,
-        offset: Option<i64>,
-    },
-    TopNSplit {
-        items: Vec<SortItem>,
-        limit: Option<i64>,
-        offset: Option<i64>,
-    },
-    CteMulticast {
-        cte_id: CteId,
-        receive_producer_column_ids: Vec<crate::sql::column_id::ColumnId>,
-    },
 }
 
 #[allow(dead_code)]

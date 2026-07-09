@@ -32,10 +32,10 @@ use crate::sql::codegen::{
     FragmentSchedulingMetadata, FragmentStreamKind, MultiFragmentBuildResult, OutputColumn,
     RuntimeFilterPlanResult,
 };
-use crate::sql::planner::plan::{ExchangeFlavor, PlanScanNode};
+use crate::sql::planner::plan::PlanScanNode;
 use crate::sql::planner::{
-    DataPartition, DistributedNode, DistributedNodeKind, DistributedPlan, PartitionKind,
-    PlanFragment, PlannedRuntimeFilter,
+    DataPartition, DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor,
+    PartitionKind, PlanFragment, PlannedRuntimeFilter,
 };
 
 pub(crate) fn lower_distributed_plan(
@@ -1108,9 +1108,10 @@ mod tests {
     use crate::sql::catalog::{CatalogProvider, TableDef};
     use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::ExchangeReceiver;
-    use crate::sql::planner::plan::{ExchangeFlavor, PhysicalPlanKind, PlanValuesNode};
-    use crate::sql::planner::{PhysicalPlanStats, PlannerConfidence};
+    use crate::sql::planner::plan::PlanValuesNode;
+    use crate::sql::planner::{
+        ExchangeFlavor, ExchangeReceiver, PhysicalPlanStats, PlannerConfidence,
+    };
 
     struct EmptyCatalog;
 
@@ -1155,10 +1156,10 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: stats(),
-            payload: DistributedPayload::Physical(PhysicalPlanKind::Values(PlanValuesNode {
+            payload: DistributedNodeKind::Values(PlanValuesNode {
                 rows: Vec::new(),
                 columns,
-            })),
+            }),
         }
     }
 
@@ -1190,7 +1191,7 @@ mod tests {
                 probe_runtime_filters: Vec::new(),
                 children: Vec::new(),
                 stats: stats(),
-                payload: DistributedPayload::Exchange(ExchangeReceiver {
+                payload: DistributedNodeKind::Exchange(ExchangeReceiver {
                     partition: DataPartition::unpartitioned(),
                     source_fragment_id: producer_fragment_id,
                     output_columns: columns.clone(),
@@ -1287,7 +1288,7 @@ mod tests {
                 probe_runtime_filters: Vec::new(),
                 children: Vec::new(),
                 stats: stats(),
-                payload: DistributedPayload::Exchange(ExchangeReceiver {
+                payload: DistributedNodeKind::Exchange(ExchangeReceiver {
                     partition: DataPartition::unpartitioned(),
                     source_fragment_id: producer_fragment_id,
                     output_columns: receive_columns.clone(),

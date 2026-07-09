@@ -34,8 +34,8 @@ use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentStreamKind};
 use crate::sql::common::{ChangeStreamBranchKind, JoinKind};
 use crate::sql::parser::ast::SqlType;
 use crate::sql::planner::plan::{
-    AggregateCall, ExchangeFlavor, PhysicalHashAggregateNode, PhysicalPlanKind,
-    PlanRowCountAssertion, PlanSetOpKind, RedistributeMode,
+    AggregateCall, PhysicalHashAggregateNode, PhysicalPlanKind, PlanRowCountAssertion,
+    PlanSetOpKind, RedistributeMode,
 };
 use crate::sql::planner::runtime_filter::{
     JoinExecutionMode, WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
@@ -45,8 +45,8 @@ use crate::sql::planner::write_sink::{
 };
 use crate::sql::planner::{
     AggMode, DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan,
-    ExchangeReceiver, HashSource, IcebergWriteInputBinding, JoinDistribution, PartitionKind,
-    PlanFragment, TopNPhase,
+    ExchangeFlavor, ExchangeReceiver, HashSource, IcebergWriteInputBinding, JoinDistribution,
+    PartitionKind, PlanFragment, TopNPhase,
 };
 
 pub(crate) struct NativePlanEncodeContext<'a> {

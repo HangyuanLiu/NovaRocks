@@ -33,11 +33,11 @@ use crate::sql::planner::optimizer_bridge::property::{
     ordering_spec_from_sort_items, window_ordering_spec,
 };
 use crate::sql::planner::plan::{
-    ExchangeFlavor, PhysicalPlanKind, PhysicalPlanNode, PhysicalSetOpNode, PlanProjectNode,
-    PlanScanNode, PlanSetOpKind, RedistributeMode, RedistributeNode,
+    PhysicalPlanKind, PhysicalPlanNode, PhysicalSetOpNode, PlanProjectNode, PlanScanNode,
+    PlanSetOpKind, RedistributeMode, RedistributeNode,
 };
 use crate::sql::planner::{
-    OrderingSpec, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent, TopNPhase,
+    ExchangeFlavor, OrderingSpec, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent, TopNPhase,
     WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
 };
 
@@ -1627,7 +1627,7 @@ mod tests {
     use crate::sql::planner::distributed_fragment::{DataSink, PartitionKind};
     use crate::sql::planner::distributed_node::DistributedNodeKind;
     use crate::sql::planner::plan::{
-        AggregateCall, DistributedChangeEventExpandNode, ExchangeFlavor, LogicalCTEAnchorNode,
+        AggregateCall, DistributedChangeEventExpandNode, LogicalCTEAnchorNode,
         LogicalCTEConsumeNode, LogicalCTEProduceNode, PhysicalHashAggregateNode,
         PhysicalHashJoinEqCondition, PhysicalHashJoinNode, PhysicalNestLoopJoinNode,
         PhysicalPlanKind, PhysicalPlanNode, PhysicalSetOpNode, PhysicalTopNNode,
@@ -1637,9 +1637,9 @@ mod tests {
         WindowExpr,
     };
     use crate::sql::planner::{
-        AggMode, AggregateOutputLayout, HashSource, JoinDistribution, JoinExecutionMode,
-        PhysicalPlanStats, PlannerConfidence, PlannerCostEstimate, RuntimeFilterBuildIntent,
-        RuntimeFilterProbeIntent, TopNPhase,
+        AggMode, AggregateOutputLayout, ExchangeFlavor, HashSource, JoinDistribution,
+        JoinExecutionMode, PhysicalPlanStats, PlannerConfidence, PlannerCostEstimate,
+        RuntimeFilterBuildIntent, RuntimeFilterProbeIntent, TopNPhase,
     };
 
     #[test]
@@ -2606,7 +2606,7 @@ mod tests {
         assert_column_ref(&exchange_receiver.partition.exprs[0], 1, "qualified_k");
         assert!(matches!(
             exchange_receiver.flavor,
-            crate::sql::planner::plan::ExchangeFlavor::Distribution
+            crate::sql::planner::ExchangeFlavor::Distribution
         ));
         assert_eq!(exchange_receiver.output_columns.len(), 1);
         assert_eq!(

@@ -15,14 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) use crate::sql::planner::ExchangeFlavor;
 pub(crate) use crate::sql::planner::ExchangeReceiver as DistributedExchangeNode;
 #[cfg(test)]
 pub(crate) use crate::sql::planner::plan::PhysicalHashJoinEqCondition;
 pub(crate) use crate::sql::planner::plan::{
-    DistributedChangeEventExpandNode, ExchangeFlavor,
-    PhysicalHashAggregateNode as DistributedHashAggregateNode, PhysicalHashAggregateNode,
-    PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalSetOpNode, PhysicalTopNNode,
-    PlanAssertOneRowNode as DistributedAssertOneRowNode, PlanFilterNode as DistributedFilterNode,
+    DistributedChangeEventExpandNode, PhysicalHashAggregateNode as DistributedHashAggregateNode,
+    PhysicalHashAggregateNode, PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalSetOpNode,
+    PhysicalTopNNode, PlanAssertOneRowNode as DistributedAssertOneRowNode,
+    PlanFilterNode as DistributedFilterNode,
     PlanGenerateSeriesNode as DistributedGenerateSeriesNode,
     PlanProjectNode as DistributedProjectNode, PlanRepeatNode as DistributedRepeatNode,
     PlanScanNode as DistributedScanNode, PlanSetOpKind as SetOpKind,

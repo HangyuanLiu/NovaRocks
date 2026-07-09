@@ -46,7 +46,8 @@ pub(crate) use distributed_fragment::{
     DataPartition, DataSink, DistributedPlan, PartitionKind, PlanFragment,
 };
 pub(crate) use distributed_node::{
-    DistributedNode, DistributedNodeKind, ExchangeReceiver, distributed_kind_to_physical,
+    DistributedNode, DistributedNodeKind, ExchangeFlavor, ExchangeReceiver,
+    distributed_kind_to_physical,
 };
 pub(crate) use distributed_plan_build::{
     build_distributed_plan, union_distinct_must_be_rewritten_error,

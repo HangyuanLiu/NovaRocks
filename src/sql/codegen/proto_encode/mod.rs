@@ -818,7 +818,7 @@ mod tests {
                     source_fragment_id: 0,
                     output_columns: output.clone(),
                     output_qualifier: Some("recv".to_string()),
-                    flavor: crate::sql::planner::plan::ExchangeFlavor::Distribution,
+                    flavor: crate::sql::planner::ExchangeFlavor::Distribution,
                 },
             ),
         };
@@ -950,7 +950,7 @@ mod tests {
                     source_fragment_id: 0,
                     output_columns: Vec::new(),
                     output_qualifier: None,
-                    flavor: crate::sql::planner::plan::ExchangeFlavor::Distribution,
+                    flavor: crate::sql::planner::ExchangeFlavor::Distribution,
                 },
             ),
         };
@@ -1054,7 +1054,7 @@ mod tests {
                     source_fragment_id: 0,
                     output_columns: Vec::new(),
                     output_qualifier: None,
-                    flavor: crate::sql::planner::plan::ExchangeFlavor::Distribution,
+                    flavor: crate::sql::planner::ExchangeFlavor::Distribution,
                 },
             ),
         };
@@ -1167,7 +1167,7 @@ mod tests {
                     source_fragment_id: 0,
                     output_columns: Vec::new(),
                     output_qualifier: None,
-                    flavor: crate::sql::planner::plan::ExchangeFlavor::Distribution,
+                    flavor: crate::sql::planner::ExchangeFlavor::Distribution,
                 },
             ),
         };
@@ -1249,7 +1249,7 @@ mod tests {
                     source_fragment_id: 0,
                     output_columns: Vec::new(),
                     output_qualifier: None,
-                    flavor: crate::sql::planner::plan::ExchangeFlavor::Distribution,
+                    flavor: crate::sql::planner::ExchangeFlavor::Distribution,
                 },
             ),
         };

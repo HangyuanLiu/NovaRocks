@@ -1991,7 +1991,7 @@ mod tests {
                         is_internal: false,
                     }],
                     output_qualifier: None,
-                    flavor: crate::sql::planner::plan::ExchangeFlavor::Distribution,
+                    flavor: crate::sql::planner::ExchangeFlavor::Distribution,
                 },
             ),
         };

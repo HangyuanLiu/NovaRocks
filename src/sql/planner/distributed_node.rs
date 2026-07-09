@@ -15,14 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::sql::analysis::OutputColumn;
+use crate::sql::analysis::cte::CteId;
+use crate::sql::analysis::{OutputColumn, SortItem};
 use crate::sql::codegen::FragmentId;
+use crate::sql::column_id::ColumnId;
 use crate::sql::planner::plan::{
-    DistributedChangeEventExpandNode, ExchangeFlavor, PhysicalHashAggregateNode,
-    PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalSetOpNode,
-    PhysicalTopNNode, PlanAssertOneRowNode, PlanFilterNode, PlanGenerateSeriesNode,
-    PlanProjectNode, PlanRepeatNode, PlanScanNode, PlanSetOpKind, PlanSortNode,
-    PlanTableFunctionNode, PlanValuesNode, PlanWindowNode,
+    DistributedChangeEventExpandNode, PhysicalHashAggregateNode, PhysicalHashJoinNode,
+    PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalSetOpNode, PhysicalTopNNode,
+    PlanAssertOneRowNode, PlanFilterNode, PlanGenerateSeriesNode, PlanProjectNode, PlanRepeatNode,
+    PlanScanNode, PlanSetOpKind, PlanSortNode, PlanTableFunctionNode, PlanValuesNode,
+    PlanWindowNode,
 };
 use crate::sql::planner::runtime_filter::{WiredRuntimeFilterBuild, WiredRuntimeFilterProbe};
 use crate::sql::planner::{DataPartition, PhysicalPlanStats};
@@ -35,6 +37,25 @@ pub(crate) struct ExchangeReceiver {
     pub output_columns: Vec<OutputColumn>,
     pub output_qualifier: Option<String>,
     pub flavor: ExchangeFlavor,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) enum ExchangeFlavor {
+    Distribution,
+    LimitOffset {
+        limit: Option<i64>,
+        offset: Option<i64>,
+    },
+    TopNSplit {
+        items: Vec<SortItem>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    },
+    CteMulticast {
+        cte_id: CteId,
+        receive_producer_column_ids: Vec<ColumnId>,
+    },
 }
 
 /// Distributed-stage legal node kinds.
