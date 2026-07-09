@@ -332,6 +332,8 @@ impl FragmentScheduler {
                 }
             }
 
+            assert_scan_fragment_instances_nonempty(fr, &instances)?;
+
             by_fragment.insert(fid, instances);
         }
 
@@ -610,6 +612,35 @@ fn live_backend_addr(live: &[LiveBackend], backend_idx: usize) -> Result<SocketA
         .ok_or_else(|| format!("backend index {backend_idx} missing from live snapshot"))
 }
 
+/// Defensive invariant for the range-derived instance count: a scan
+/// fragment must not produce a wholly-empty instance (all scan nodes
+/// empty). The instance-count formula guarantees this; the guard turns
+/// any regression into a loud error instead of silent duplicate/lost
+/// output. The zero-range fallback (fragment total = 0, a single
+/// zero-row instance) is the one legal exception.
+fn assert_scan_fragment_instances_nonempty(
+    fr: &FragmentSchedulingMetadata,
+    instances: &[FragmentInstancePlacement],
+) -> Result<(), String> {
+    if !fr.has_scan_nodes {
+        return Ok(());
+    }
+    let total: usize = fr.native_scan_ranges.values().map(Vec::len).sum();
+    if total == 0 {
+        return Ok(());
+    }
+    for inst in instances {
+        let has_any = inst.scan_ranges.values().any(|ranges| !ranges.is_empty());
+        if !has_any {
+            return Err(format!(
+                "scan fragment {} instance {} has no scan ranges while the fragment carries {} range(s); instance count must derive from range coverage",
+                fr.fragment_id, inst.instance_index, total
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -718,6 +749,26 @@ mod tests {
         }
     }
 
+    fn test_placement(
+        instance_index: usize,
+        scan_ranges: BTreeMap<i32, Vec<crate::runtime::scan_range::ScanRangeParams>>,
+    ) -> FragmentInstancePlacement {
+        FragmentInstancePlacement {
+            fragment_id: 0,
+            instance_index,
+            finst_id: UniqueId {
+                hi: 0,
+                lo: instance_index as i64,
+            },
+            backend_idx: 0,
+            endpoint: RuntimeEndpoint::from_socket_addr(be("10.0.0.1:9010")),
+            scan_ranges,
+            destinations: Vec::new(),
+            runtime_filter_prober_params: BTreeMap::new(),
+            per_exch_num_senders: BTreeMap::new(),
+        }
+    }
+
     fn fake_write_fragment(
         fid: FragmentId,
         scan_node_id: Option<i32>,
@@ -803,6 +854,33 @@ mod tests {
     // -----------------------------------------------------------------------
     // Tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn guard_rejects_whole_instance_empty_scan() {
+        let fr = fake_fragment(0, Some(1), 2);
+        let instances = vec![
+            test_placement(0, BTreeMap::from([(1, vec![scan_range_params(0)])])),
+            test_placement(1, BTreeMap::from([(1, vec![])])),
+        ];
+        let err = assert_scan_fragment_instances_nonempty(&fr, &instances)
+            .expect_err("whole-instance-empty must be rejected");
+        assert!(err.contains("no scan ranges"), "got: {err}");
+    }
+
+    #[test]
+    fn guard_allows_zero_range_fallback_and_node_local_empty() {
+        let fr0 = fake_fragment(0, Some(1), 0);
+        let insts0 = vec![test_placement(0, BTreeMap::from([(1, vec![])]))];
+        assert!(assert_scan_fragment_instances_nonempty(&fr0, &insts0).is_ok());
+
+        let mut fr1 = fake_fragment(0, Some(1), 1);
+        fr1.native_scan_ranges.insert(2, vec![scan_range_params(9)]);
+        let insts1 = vec![test_placement(
+            0,
+            BTreeMap::from([(1, vec![scan_range_params(0)]), (2, vec![])]),
+        )];
+        assert!(assert_scan_fragment_instances_nonempty(&fr1, &insts1).is_ok());
+    }
 
     mod live_filter_tests {
         use super::*;
@@ -1313,7 +1391,8 @@ mod tests {
         // NO instance is wholly empty.
         let scheduler = FragmentScheduler::new(three_backends());
         let mut fr = fake_fragment(0, Some(1), 3);
-        fr.native_scan_ranges.insert(2, vec![scan_range_params(100)]);
+        fr.native_scan_ranges
+            .insert(2, vec![scan_range_params(100)]);
         let fragments = vec![fr, fake_fragment(1, None, 0)];
         let edges = vec![fake_edge(0, 1, TestPartitionType::Unpartitioned, 10)];
         let plan = scheduler
