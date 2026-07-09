@@ -290,8 +290,13 @@ impl FragmentScheduler {
                     |instance_index| -> Result<FragmentInstancePlacement, String> {
                         let backend_idx = if count == 1 {
                             preferred_root_backend_idx
-                        } else {
+                        } else if count == n {
                             live[instance_index].0
+                        } else {
+                            // 1 < count < n: spread the short scan across backends from a
+                            // query-derived offset so many small scans don't all pile onto live[0].
+                            let start = (query_id.lo as usize) % n;
+                            live[(start + instance_index) % n].0
                         };
                         let addr = live_backend_addr(live, backend_idx)?;
                         // finst_id encoding: hi = query_id.hi, lo = (fragment_id << 16) | instance_index.
@@ -1383,6 +1388,23 @@ mod tests {
             3,
             "5 ranges on 3 BE -> 3 instances"
         );
+    }
+
+    #[test]
+    fn short_scan_spreads_across_backends_by_query_offset() {
+        // 2 ranges on 3 backends -> count=2 (1<count<n). query_id.lo=1 -> start=1
+        // -> instances land on live positions 1,2 (not 0,1), spreading load.
+        let scheduler = FragmentScheduler::new(three_backends());
+        let fragments = vec![fake_fragment(0, Some(1), 2), fake_fragment(1, None, 0)];
+        let edges = vec![fake_edge(0, 1, TestPartitionType::Unpartitioned, 10)];
+        let plan = scheduler
+            .assign(&fragments, &edges, make_query_id(1, 1))
+            .expect("assign");
+        let f0 = &plan.by_fragment[&0];
+        assert_eq!(f0.len(), 2);
+        let idxs: Vec<usize> = f0.iter().map(|i| i.backend_idx).collect();
+        assert_eq!(idxs, vec![1, 2], "start=lo%n=1 -> positions 1,2");
+        assert_ne!(idxs[0], idxs[1], "distinct backends, no parallelism loss");
     }
 
     #[test]
