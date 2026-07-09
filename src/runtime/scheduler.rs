@@ -1306,23 +1306,24 @@ mod tests {
     }
 
     #[test]
-    fn scan_preserves_empty_range_entry_for_each_instance() {
-        let backends = two_backends();
-        let scheduler = FragmentScheduler::new(backends);
+    fn scan_zero_range_falls_back_to_single_instance() {
+        // Empty snapshot / fully-pruned scan: 0 ranges on 2 backends.
+        // Root-fix: fall back to ONE instance (not N empty instances).
+        // That single instance keeps an (empty) entry for the scan node so
+        // the operator builds zero morsels -> zero rows.
+        let scheduler = FragmentScheduler::new(two_backends());
         let fragments = vec![fake_fragment(0, Some(7), 0), fake_fragment(1, None, 0)];
         let edges = vec![fake_edge(0, 1, TestPartitionType::Unpartitioned, 10)];
         let plan = scheduler
             .assign(&fragments, &edges, make_query_id(1, 0))
             .expect("assign");
         let f0 = &plan.by_fragment[&0];
-        assert_eq!(f0.len(), 2);
-        for inst in f0 {
-            let ranges = inst
-                .scan_ranges
-                .get(&7)
-                .expect("empty scan range entry is preserved");
-            assert!(ranges.is_empty());
-        }
+        assert_eq!(f0.len(), 1, "0 ranges -> single fallback instance");
+        let ranges = f0[0]
+            .scan_ranges
+            .get(&7)
+            .expect("empty scan-range entry preserved on the fallback instance");
+        assert!(ranges.is_empty(), "fallback instance carries zero ranges");
     }
 
     #[test]
