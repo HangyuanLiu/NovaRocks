@@ -4119,19 +4119,26 @@ fn nidl_d3l_native_mainline_thrift_usage_is_explicitly_allowlisted() {
         "native coordinator must not patch native sidecars from thrift-shaped payloads",
     );
 
-    for source in [
-        "src/lower/novarocks/fragment/mod.rs",
-        "src/lower/novarocks/fragment/sink_factory.rs",
+    let mut native_lowering_sources = [
         "src/lower/novarocks/layout.rs",
         "src/lower/novarocks/node.rs",
-        "src/lower/novarocks/scan.rs",
-        "src/lower/novarocks/sink/mod.rs",
+    ]
+    .into_iter()
+    .map(|source| source.to_string())
+    .collect::<Vec<_>>();
+    for dir in [
+        "src/lower/novarocks/fragment",
+        "src/lower/novarocks/scan",
+        "src/lower/novarocks/sink",
     ] {
-        let text = fs::read_to_string(repo.join(source)).unwrap();
+        native_lowering_sources.extend(rs_files(&repo.join(dir)).into_iter().map(|path| rel(&path)));
+    }
+    for source in native_lowering_sources {
+        let text = fs::read_to_string(repo.join(&source)).unwrap();
         let text = rust_production_text_without_cfg_test(&text);
         push_forbidden_terms(
             &mut violations,
-            source,
+            &source,
             &text,
             &[
                 "crate::thrift",
