@@ -73,10 +73,12 @@ cd "$WORKSPACE_ROOT"
 "${compose_args[@]}" exec -T spark /bin/bash -lc "mkdir -p '$tmp_dir'"
 {
   cat "$NOVAROCKS_SPARK_DEFAULTS"
-  for defaults_file in "${extra_defaults_files[@]}"; do
-    printf '\n'
-    cat "$defaults_file"
-  done
+  if [[ ${#extra_defaults_files[@]} -gt 0 ]]; then
+    for defaults_file in "${extra_defaults_files[@]}"; do
+      printf '\n'
+      cat "$defaults_file"
+    done
+  fi
 } | "${compose_args[@]}" exec -T spark /bin/bash -lc "cat > '$tmp_defaults'"
 "${compose_args[@]}" exec -T spark /bin/bash -lc "cat > '$tmp_sql'" < "$sql_file"
 "${compose_args[@]}" exec -T spark /bin/bash -lc "

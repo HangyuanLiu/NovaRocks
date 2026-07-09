@@ -23,8 +23,10 @@
 //!
 //! # Instance-count policy (StarRocks-style "instance follows upstream")
 //!
-//! - A **scan fragment** (contains FILE_SCAN_NODE, HDFS_SCAN_NODE, or
-//!   LAKE_SCAN_NODE) gets `N` instances, one per backend.
+//! - A **scan fragment** gets `max(1, min(N, max scan-node range count))`
+//!   instances. The count derives from scan-range coverage, so a virtual scan
+//!   with a single placeholder range runs once instead of once per backend, and
+//!   an empty-snapshot scan falls back to one zero-row instance.
 //! - A **non-scan fragment** gets `max(upstream_N)` over incoming
 //!   `HashPartitioned` / `BucketShuffleHashPartitioned` edges, or 1 if no such
 //!   edge exists.
@@ -35,9 +37,12 @@
 //!
 //! # Backend assignment
 //!
-//! - Multi-instance fragments: instance `i` lands on live backend slot `i`.
-//!   The stored `backend_idx` is the backend id from the live snapshot, which
-//!   may be sparse.
+//! - Full-fanout fragments: instance `i` lands on live backend slot `i`. The
+//!   stored `backend_idx` is the backend id from the live snapshot, which may
+//!   be sparse.
+//! - Short scan fragments (`1 < count < N`): instance placement starts from
+//!   `live[(query_id.lo as usize) % N]` and wraps, so many small scans do not
+//!   all pile onto live slot 0.
 //! - Single-instance fragments (including the root): `backend_idx =
 //!   live[(query_id.lo as usize) % N].0`.
 //!
@@ -230,8 +235,23 @@ impl FragmentScheduler {
             let count = if has_gather_input {
                 1
             } else if fr.has_scan_nodes {
-                // Scan fragment: one instance per backend.
-                n
+                // Scan fragment: instance count derives from scan-range coverage,
+                // not an unconditional per-backend fan-out. A virtual scan with a
+                // single placeholder range (Iceberg metadata/delta) collapses to a
+                // single instance instead of N-1 empty instances that would
+                // duplicate output under distributed execution. Zero ranges (empty
+                // snapshot / fully pruned) fall back to one instance producing zero
+                // rows. Native scheduling metadata only carries Iceberg native
+                // scan ranges; compat thrift ranges, when present, are merged
+                // later by the coordinator per placement and are not part of
+                // this native fan-out formula.
+                let max_ranges = fr
+                    .native_scan_ranges
+                    .values()
+                    .map(|ranges| ranges.len())
+                    .max()
+                    .unwrap_or(0);
+                max_ranges.clamp(1, n)
             } else {
                 // Non-scan: inherit max from upstream hash-partitioned edges.
                 let hash_max = incoming
@@ -275,8 +295,13 @@ impl FragmentScheduler {
                     |instance_index| -> Result<FragmentInstancePlacement, String> {
                         let backend_idx = if count == 1 {
                             preferred_root_backend_idx
-                        } else {
+                        } else if count == n {
                             live[instance_index].0
+                        } else {
+                            // 1 < count < n: spread the short scan across backends from a
+                            // query-derived offset so many small scans don't all pile onto live[0].
+                            let start = (query_id.lo as usize) % n;
+                            live[(start + instance_index) % n].0
                         };
                         let addr = live_backend_addr(live, backend_idx)?;
                         // finst_id encoding: hi = query_id.hi, lo = (fragment_id << 16) | instance_index.
@@ -318,6 +343,8 @@ impl FragmentScheduler {
                         .push(range.clone());
                 }
             }
+
+            assert_scan_fragment_instances_nonempty(fr, &instances)?;
 
             by_fragment.insert(fid, instances);
         }
@@ -597,6 +624,35 @@ fn live_backend_addr(live: &[LiveBackend], backend_idx: usize) -> Result<SocketA
         .ok_or_else(|| format!("backend index {backend_idx} missing from live snapshot"))
 }
 
+/// Defensive invariant for the range-derived instance count: a scan
+/// fragment must not produce a wholly-empty instance (all scan nodes
+/// empty). The instance-count formula guarantees this; the guard turns
+/// any regression into a loud error instead of silent duplicate/lost
+/// output. The zero-range fallback (fragment total = 0, a single
+/// zero-row instance) is the one legal exception.
+fn assert_scan_fragment_instances_nonempty(
+    fr: &FragmentSchedulingMetadata,
+    instances: &[FragmentInstancePlacement],
+) -> Result<(), String> {
+    if !fr.has_scan_nodes {
+        return Ok(());
+    }
+    let total: usize = fr.native_scan_ranges.values().map(Vec::len).sum();
+    if total == 0 {
+        return Ok(());
+    }
+    for inst in instances {
+        let has_any = inst.scan_ranges.values().any(|ranges| !ranges.is_empty());
+        if !has_any {
+            return Err(format!(
+                "scan fragment {} instance {} has no scan ranges while the fragment carries {} range(s); instance count must derive from range coverage",
+                fr.fragment_id, inst.instance_index, total
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -705,6 +761,26 @@ mod tests {
         }
     }
 
+    fn test_placement(
+        instance_index: usize,
+        scan_ranges: BTreeMap<i32, Vec<crate::runtime::scan_range::ScanRangeParams>>,
+    ) -> FragmentInstancePlacement {
+        FragmentInstancePlacement {
+            fragment_id: 0,
+            instance_index,
+            finst_id: UniqueId {
+                hi: 0,
+                lo: instance_index as i64,
+            },
+            backend_idx: 0,
+            endpoint: RuntimeEndpoint::from_socket_addr(be("10.0.0.1:9010")),
+            scan_ranges,
+            destinations: Vec::new(),
+            runtime_filter_prober_params: BTreeMap::new(),
+            per_exch_num_senders: BTreeMap::new(),
+        }
+    }
+
     fn fake_write_fragment(
         fid: FragmentId,
         scan_node_id: Option<i32>,
@@ -791,6 +867,33 @@ mod tests {
     // Tests
     // -----------------------------------------------------------------------
 
+    #[test]
+    fn guard_rejects_whole_instance_empty_scan() {
+        let fr = fake_fragment(0, Some(1), 2);
+        let instances = vec![
+            test_placement(0, BTreeMap::from([(1, vec![scan_range_params(0)])])),
+            test_placement(1, BTreeMap::from([(1, vec![])])),
+        ];
+        let err = assert_scan_fragment_instances_nonempty(&fr, &instances)
+            .expect_err("whole-instance-empty must be rejected");
+        assert!(err.contains("no scan ranges"), "got: {err}");
+    }
+
+    #[test]
+    fn guard_allows_zero_range_fallback_and_node_local_empty() {
+        let fr0 = fake_fragment(0, Some(1), 0);
+        let insts0 = vec![test_placement(0, BTreeMap::from([(1, vec![])]))];
+        assert!(assert_scan_fragment_instances_nonempty(&fr0, &insts0).is_ok());
+
+        let mut fr1 = fake_fragment(0, Some(1), 1);
+        fr1.native_scan_ranges.insert(2, vec![scan_range_params(9)]);
+        let insts1 = vec![test_placement(
+            0,
+            BTreeMap::from([(1, vec![scan_range_params(0)]), (2, vec![])]),
+        )];
+        assert!(assert_scan_fragment_instances_nonempty(&fr1, &insts1).is_ok());
+    }
+
     mod live_filter_tests {
         use super::*;
 
@@ -848,13 +951,13 @@ mod tests {
             .assign(&fragments, &edges, make_query_id(1, 1))
             .expect("assign");
         // A lone scan fragment is also the root, so the root override (1 instance)
-        // wins over the scan=N rule.
+        // wins over range-derived scan fanout.
         assert_eq!(plan.by_fragment[&0].len(), 1);
     }
 
     #[test]
-    fn scan_fragment_producer_gets_n_instances() {
-        // Non-root scan fragment with 3 backends should get 3 instances.
+    fn scan_fragment_with_backend_count_ranges_gets_full_fanout() {
+        // Non-root scan fragment with 3 ranges on 3 backends should get full fanout.
         let backends = three_backends();
         let scheduler = FragmentScheduler::new(backends);
         // F0=scan producer, F1=root consumer (UNPARTITIONED gather)
@@ -1180,7 +1283,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_instance_backend_idx_equals_instance_index() {
+    fn full_fanout_backend_idx_equals_instance_index() {
         let backends = three_backends();
         let scheduler = FragmentScheduler::new(backends);
         let fragments = vec![
@@ -1196,7 +1299,7 @@ mod tests {
         for inst in f0 {
             assert_eq!(
                 inst.backend_idx, inst.instance_index,
-                "multi-instance: backend_idx == instance_index"
+                "full-fanout: backend_idx == instance_index"
             );
         }
     }
@@ -1263,23 +1366,103 @@ mod tests {
     }
 
     #[test]
-    fn scan_preserves_empty_range_entry_for_each_instance() {
-        let backends = two_backends();
-        let scheduler = FragmentScheduler::new(backends);
+    fn scan_instance_count_derives_from_range_count() {
+        let scheduler = FragmentScheduler::new(three_backends());
+        // 1 range on 3 backends -> single instance (virtual-scan root-fix case)
+        let one = vec![fake_fragment(0, Some(1), 1), fake_fragment(1, None, 0)];
+        let edges = vec![fake_edge(0, 1, TestPartitionType::Unpartitioned, 10)];
+        let plan = scheduler
+            .assign(&one, &edges, make_query_id(1, 0))
+            .expect("assign");
+        assert_eq!(plan.by_fragment[&0].len(), 1, "1 range -> 1 instance");
+
+        // 2 ranges on 3 backends -> two instances (range < N)
+        let two = vec![fake_fragment(0, Some(1), 2), fake_fragment(1, None, 0)];
+        let plan = scheduler
+            .assign(&two, &edges, make_query_id(1, 0))
+            .expect("assign");
+        assert_eq!(plan.by_fragment[&0].len(), 2, "2 ranges -> 2 instances");
+
+        // 5 ranges on 3 backends -> capped at N=3 (range >= N, unchanged)
+        let many = vec![fake_fragment(0, Some(1), 5), fake_fragment(1, None, 0)];
+        let plan = scheduler
+            .assign(&many, &edges, make_query_id(1, 0))
+            .expect("assign");
+        assert_eq!(
+            plan.by_fragment[&0].len(),
+            3,
+            "5 ranges on 3 BE -> 3 instances"
+        );
+    }
+
+    #[test]
+    fn short_scan_spreads_across_backends_by_query_offset() {
+        // 2 ranges on 3 backends -> count=2 (1<count<n). query_id.lo=1 -> start=1
+        // -> instances land on live positions 1,2 (not 0,1), spreading load.
+        let scheduler = FragmentScheduler::new(three_backends());
+        let fragments = vec![fake_fragment(0, Some(1), 2), fake_fragment(1, None, 0)];
+        let edges = vec![fake_edge(0, 1, TestPartitionType::Unpartitioned, 10)];
+        let plan = scheduler
+            .assign(&fragments, &edges, make_query_id(1, 1))
+            .expect("assign");
+        let f0 = &plan.by_fragment[&0];
+        assert_eq!(f0.len(), 2);
+        let idxs: Vec<usize> = f0.iter().map(|i| i.backend_idx).collect();
+        assert_eq!(idxs, vec![1, 2], "start=lo%n=1 -> positions 1,2");
+        assert_ne!(idxs[0], idxs[1], "distinct backends, no parallelism loss");
+    }
+
+    #[test]
+    fn scan_instance_count_uses_max_over_scan_nodes_and_allows_node_local_empty() {
+        // node 1: 3 ranges, node 2: 1 range; 3 backends.
+        // count = min(3, max(3,1)) = 3. node 1 covers all 3 instances; node 2's
+        // single range lands only on instance 0 (node-local empty on 1,2), but
+        // NO instance is wholly empty.
+        let scheduler = FragmentScheduler::new(three_backends());
+        let mut fr = fake_fragment(0, Some(1), 3);
+        fr.native_scan_ranges
+            .insert(2, vec![scan_range_params(100)]);
+        let fragments = vec![fr, fake_fragment(1, None, 0)];
+        let edges = vec![fake_edge(0, 1, TestPartitionType::Unpartitioned, 10)];
+        let plan = scheduler
+            .assign(&fragments, &edges, make_query_id(1, 0))
+            .expect("assign");
+        let f0 = &plan.by_fragment[&0];
+        assert_eq!(f0.len(), 3, "count = max over scan nodes = 3");
+
+        // node 1 non-empty on every instance
+        for inst in f0 {
+            assert!(!inst.scan_ranges.get(&1).unwrap().is_empty());
+        }
+        // node 2 (1 range) only on instance 0
+        assert_eq!(f0[0].scan_ranges.get(&2).map(Vec::len), Some(1));
+        assert_eq!(f0[1].scan_ranges.get(&2).map(Vec::len), Some(0));
+        assert_eq!(f0[2].scan_ranges.get(&2).map(Vec::len), Some(0));
+        // invariant: no whole-instance-empty
+        for inst in f0 {
+            assert!(inst.scan_ranges.values().any(|r| !r.is_empty()));
+        }
+    }
+
+    #[test]
+    fn scan_zero_range_falls_back_to_single_instance() {
+        // Empty snapshot / fully-pruned scan: 0 ranges on 2 backends.
+        // Root-fix: fall back to ONE instance (not N empty instances).
+        // That single instance keeps an (empty) entry for the scan node so
+        // the operator builds zero morsels -> zero rows.
+        let scheduler = FragmentScheduler::new(two_backends());
         let fragments = vec![fake_fragment(0, Some(7), 0), fake_fragment(1, None, 0)];
         let edges = vec![fake_edge(0, 1, TestPartitionType::Unpartitioned, 10)];
         let plan = scheduler
             .assign(&fragments, &edges, make_query_id(1, 0))
             .expect("assign");
         let f0 = &plan.by_fragment[&0];
-        assert_eq!(f0.len(), 2);
-        for inst in f0 {
-            let ranges = inst
-                .scan_ranges
-                .get(&7)
-                .expect("empty scan range entry is preserved");
-            assert!(ranges.is_empty());
-        }
+        assert_eq!(f0.len(), 1, "0 ranges -> single fallback instance");
+        let ranges = f0[0]
+            .scan_ranges
+            .get(&7)
+            .expect("empty scan-range entry preserved on the fallback instance");
+        assert!(ranges.is_empty(), "fallback instance carries zero ranges");
     }
 
     #[test]

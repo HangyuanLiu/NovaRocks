@@ -72,12 +72,6 @@ pub(super) fn lower_iceberg_metadata_scan(
 fn decode_metadata_scan_ranges(
     ranges: &[novarocks::ScanRangeParams],
 ) -> Result<Vec<IcebergMetadataScanRange>, String> {
-    if ranges.is_empty() {
-        return Ok(vec![IcebergMetadataScanRange {
-            path: String::new(),
-            serialized_split: String::new(),
-        }]);
-    }
     ranges
         .iter()
         .enumerate()
@@ -143,5 +137,16 @@ fn metadata_table_type(value: i32) -> Result<IcebergMetadataTableType, String> {
         plan::IcebergMetadataTableType::Unspecified => {
             Err("Iceberg metadata table type is unspecified".to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_metadata_scan_ranges;
+
+    #[test]
+    fn metadata_scan_empty_ranges_decode_to_empty_no_synthetic_morsel() {
+        let decoded = decode_metadata_scan_ranges(&[]).expect("decode empty");
+        assert!(decoded.is_empty());
     }
 }
