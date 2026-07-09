@@ -18,6 +18,7 @@
 //! Proto node lowering placeholder.
 
 mod common;
+mod generate_series;
 mod values;
 
 use std::collections::{HashMap, HashSet};
@@ -56,7 +57,6 @@ use crate::exec::node::set_op::{SetOpKind, SetOpNode};
 use crate::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use crate::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSlot};
 use crate::exec::node::union_all::UnionAllNode;
-use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{common as proto_common, expr, novarocks, plan};
 use crate::runtime::exchange::ExchangeKey;
@@ -246,7 +246,7 @@ fn lower_physical_node(
         }
         plan::plan_node::Kind::Repeat(repeat) => lower_repeat_node(node, repeat, children),
         plan::plan_node::Kind::GenerateSeries(generate_series) => {
-            lower_generate_series_node(node, generate_series, children, arena)
+            generate_series::lower_generate_series_node(node, generate_series, children, arena)
         }
         plan::plan_node::Kind::TableFunction(table_function) => {
             lower_table_function_node(node, table_function, children, arena)
@@ -261,122 +261,6 @@ fn lower_physical_node(
         plan::plan_node::Kind::Redistribute(redistribute) => {
             lower_redistribute_node(physical, redistribute, children, arena)
         }
-    }
-}
-
-fn lower_generate_series_node(
-    node: &plan::DistributedNode,
-    generate_series: &plan::GenerateSeriesNode,
-    children: Vec<LoweredNode>,
-    arena: &mut ExprArena,
-) -> Result<LoweredNode, String> {
-    check_exact_arity("GenerateSeriesNode", 0, children.len())?;
-    if generate_series.step == 0 {
-        return Err("GenerateSeriesNode step must not be zero".to_string());
-    }
-
-    let param_slots = generate_series_param_slots(generate_series.output_column_id)?;
-    let param_columns = vec![
-        bigint_output_column(param_slots[0].as_u32(), "generate_series_start", false),
-        bigint_output_column(param_slots[1].as_u32(), "generate_series_end", false),
-        bigint_output_column(param_slots[2].as_u32(), "generate_series_step", false),
-    ];
-    let input_schema = chunk_schema_from_output_columns(&param_columns)?;
-    let rows = vec![plan::ExprList {
-        values: vec![
-            int64_literal_expr(generate_series.start),
-            int64_literal_expr(generate_series.end),
-            int64_literal_expr(generate_series.step),
-        ],
-    }];
-    let input_chunk = values::materialize_values_chunk(&rows, &param_columns, input_schema, arena)?;
-
-    let output_columns = vec![bigint_output_column(
-        generate_series.output_column_id,
-        if generate_series.column_name.is_empty() {
-            "generate_series"
-        } else {
-            &generate_series.column_name
-        },
-        false,
-    )];
-    let layout = layout_from_output_columns(&output_columns)?;
-    let output_schema = chunk_schema_from_output_columns(&output_columns)?;
-
-    Ok(LoweredNode {
-        node: ExecNode {
-            kind: ExecNodeKind::TableFunction(TableFunctionNode {
-                input: Box::new(ExecNode {
-                    kind: ExecNodeKind::Values(ValuesNode {
-                        chunk: input_chunk,
-                        node_id: node.node_id,
-                    }),
-                }),
-                node_id: node.node_id,
-                function_name: "generate_series".to_string(),
-                param_slots: param_slots.to_vec(),
-                outer_slots: Vec::new(),
-                fn_result_slots: vec![SlotId::new(generate_series.output_column_id)],
-                fn_result_required: true,
-                is_left_join: false,
-                param_types: vec![DataType::Int64, DataType::Int64, DataType::Int64],
-                ret_types: vec![DataType::Int64],
-                output_chunk_schema: output_schema.clone(),
-                output_slot_sources: vec![TableFunctionOutputSlot::Result { index: 0 }],
-            }),
-        },
-        layout,
-        output_schema,
-    })
-}
-
-fn generate_series_param_slots(output_column_id: u32) -> Result<[SlotId; 3], String> {
-    let mut slot = u32::MAX;
-    let mut slots = Vec::with_capacity(3);
-    while slots.len() < 3 {
-        if slot != output_column_id {
-            slots.push(SlotId::new(slot));
-        }
-        slot = slot
-            .checked_sub(1)
-            .ok_or_else(|| "GenerateSeriesNode could not allocate internal slots".to_string())?;
-    }
-    Ok([slots[0], slots[1], slots[2]])
-}
-
-fn bigint_output_column(column_id: u32, name: &str, nullable: bool) -> proto_common::OutputColumn {
-    proto_common::OutputColumn {
-        column_id,
-        name: name.to_string(),
-        r#type: Some(bigint_type_desc()),
-        nullable,
-        is_internal: false,
-    }
-}
-
-fn bigint_type_desc() -> proto_common::TypeDesc {
-    proto_common::TypeDesc {
-        kind: Some(proto_common::type_desc::Kind::Scalar(
-            proto_common::ScalarType {
-                r#type: proto_common::PrimitiveType::Bigint as i32,
-                len: None,
-                precision: None,
-                scale: None,
-                time_unit: None,
-            },
-        )),
-    }
-}
-
-fn int64_literal_expr(value: i64) -> expr::Expr {
-    expr::Expr {
-        r#type: Some(bigint_type_desc()),
-        nullable: false,
-        kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
-            value: Some(proto_common::LiteralValue {
-                value: Some(proto_common::literal_value::Value::IntValue(value)),
-            }),
-        })),
     }
 }
 
@@ -3479,7 +3363,6 @@ fn lower_row_count_assertion(value: i32) -> Result<Assertion, String> {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{Array, Int64Array};
     use arrow::datatypes::{DataType, Field};
 
     use super::{NodeLoweringContext, lower_proto_node};
@@ -3804,65 +3687,6 @@ mod tests {
     }
 
     #[test]
-    fn lowers_generate_series_to_table_function_exec_node() {
-        let node = physical_node(
-            20,
-            plan::plan_node::Kind::GenerateSeries(plan::GenerateSeriesNode {
-                start: 1,
-                end: 5,
-                step: 2,
-                column_name: "x".to_string(),
-                alias: Some("gs".to_string()),
-                output_column_id: 9,
-            }),
-            Vec::new(),
-            Vec::new(),
-        );
-
-        let lowered = lower(&node);
-        let ExecNodeKind::TableFunction(table_function) = lowered.node.kind else {
-            panic!("expected TableFunction");
-        };
-        assert_eq!(table_function.node_id, 20);
-        assert_eq!(table_function.function_name, "generate_series");
-        assert_eq!(table_function.param_slots.len(), 3);
-        assert!(table_function.outer_slots.is_empty());
-        assert_eq!(table_function.fn_result_slots, vec![SlotId::new(9)]);
-        assert!(table_function.fn_result_required);
-        assert!(!table_function.is_left_join);
-        assert_eq!(
-            table_function.param_types,
-            vec![DataType::Int64, DataType::Int64, DataType::Int64]
-        );
-        assert_eq!(table_function.ret_types, vec![DataType::Int64]);
-        assert_eq!(
-            table_function.output_chunk_schema.slot_ids(),
-            &[SlotId::new(9)]
-        );
-        assert_eq!(
-            table_function.output_chunk_schema.field(0).unwrap().name(),
-            "x"
-        );
-        assert_eq!(lowered.layout.order(), &[SlotId::new(9)]);
-        assert_eq!(lowered.output_schema.slot_ids(), &[SlotId::new(9)]);
-        assert!(matches!(
-            table_function.output_slot_sources.as_slice(),
-            [crate::exec::node::table_function::TableFunctionOutputSlot::Result { index: 0 }]
-        ));
-
-        let ExecNodeKind::Values(input) = table_function.input.kind else {
-            panic!("expected synthetic Values input");
-        };
-        assert_eq!(input.chunk.len(), 1);
-        assert_eq!(input.chunk.chunk_schema().slot_ids().len(), 3);
-        for (slot, expected) in table_function.param_slots.iter().zip([1, 5, 2]) {
-            let column = input.chunk.column_by_slot_id(*slot).expect("param column");
-            let values = column.as_any().downcast_ref::<Int64Array>().unwrap();
-            assert_eq!(values.value(0), expected);
-        }
-    }
-
-    #[test]
     fn lowers_native_table_function_with_outer_and_result_slots() {
         let array_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
         let child_columns = vec![
@@ -3959,47 +3783,6 @@ mod tests {
             ]
         );
         assert!(matches!(project.input.kind, ExecNodeKind::Values(_)));
-    }
-
-    #[test]
-    fn generate_series_rejects_zero_step_and_children() {
-        let zero_step = physical_node(
-            20,
-            plan::plan_node::Kind::GenerateSeries(plan::GenerateSeriesNode {
-                start: 1,
-                end: 5,
-                step: 0,
-                column_name: "x".to_string(),
-                alias: None,
-                output_column_id: 9,
-            }),
-            Vec::new(),
-            Vec::new(),
-        );
-        let mut arena = ExprArena::default();
-        let err =
-            lower_proto_node(&zero_step, &mut arena, &NodeLoweringContext::default()).unwrap_err();
-        assert!(err.contains("step must not be zero"), "{err}");
-
-        let with_child = physical_node(
-            21,
-            plan::plan_node::Kind::GenerateSeries(plan::GenerateSeriesNode {
-                start: 1,
-                end: 5,
-                step: 1,
-                column_name: "x".to_string(),
-                alias: None,
-                output_column_id: 9,
-            }),
-            Vec::new(),
-            vec![one_col_values_node(10)],
-        );
-        let err =
-            lower_proto_node(&with_child, &mut arena, &NodeLoweringContext::default()).unwrap_err();
-        assert!(
-            err.contains("GenerateSeriesNode expected 0 children"),
-            "{err}"
-        );
     }
 
     #[test]
