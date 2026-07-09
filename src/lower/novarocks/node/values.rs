@@ -32,7 +32,7 @@ use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{common as proto_common, plan};
 
-pub(crate) fn lower_values_node(
+pub(super) fn lower_values_node(
     node: &plan::DistributedNode,
     physical: &plan::PlanNode,
     values: &plan::ValuesNode,
@@ -60,7 +60,7 @@ pub(crate) fn lower_values_node(
     })
 }
 
-pub(crate) fn materialize_values_chunk(
+pub(super) fn materialize_values_chunk(
     rows: &[plan::ExprList],
     columns: &[proto_common::OutputColumn],
     output_schema: ChunkSchemaRef,

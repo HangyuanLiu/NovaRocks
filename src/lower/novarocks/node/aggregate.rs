@@ -19,8 +19,8 @@ use arrow::datatypes::{DataType, Field, Fields};
 
 use super::super::expr::lower_proto_expr;
 use super::super::layout::{chunk_schema_from_output_columns, layout_from_output_columns};
-use super::common::check_exact_arity;
-use super::{LoweredNode, sort};
+use super::LoweredNode;
+use super::common::{build_slot_projection, check_exact_arity};
 use crate::common::ids::SlotId;
 use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::aggregate::{AggFunction, AggOrderSpec, AggTypeSignature, AggregateNode};
@@ -178,7 +178,7 @@ pub(super) fn lower_hash_aggregate_node(
     if visible_layout.order() == aggregate_node.layout.order() {
         return Ok(aggregate_node);
     }
-    sort::build_slot_projection(
+    build_slot_projection(
         "HashAggregateNode",
         aggregate_node,
         visible_output_columns,

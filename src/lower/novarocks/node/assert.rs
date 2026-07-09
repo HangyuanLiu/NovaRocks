@@ -21,7 +21,7 @@ use crate::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode, Assertion}
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::plan;
 
-pub(crate) fn lower_assert_one_row_node(
+pub(super) fn lower_assert_one_row_node(
     node: &plan::DistributedNode,
     assert: &plan::AssertOneRowNode,
     mut children: Vec<LoweredNode>,

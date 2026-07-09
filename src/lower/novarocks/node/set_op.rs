@@ -29,7 +29,7 @@ use crate::exec::node::union_all::UnionAllNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{common as proto_common, plan};
 
-pub(crate) fn lower_set_op_node(
+pub(super) fn lower_set_op_node(
     node: &plan::DistributedNode,
     physical: &plan::PlanNode,
     set_op: &plan::SetOpNode,

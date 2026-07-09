@@ -23,7 +23,7 @@ use crate::exec::node::filter::FilterNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::plan;
 
-pub(crate) fn lower_filter_node(
+pub(super) fn lower_filter_node(
     node: &plan::DistributedNode,
     filter: &plan::FilterNode,
     mut children: Vec<LoweredNode>,

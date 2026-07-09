@@ -22,7 +22,7 @@ use super::common::check_exact_arity;
 use crate::exec::expr::ExprArena;
 use crate::proto::plan;
 
-pub(crate) fn lower_redistribute_node(
+pub(super) fn lower_redistribute_node(
     physical: &plan::PlanNode,
     redistribute: &plan::RedistributeNode,
     mut children: Vec<LoweredNode>,

@@ -32,7 +32,7 @@ use crate::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSl
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{common as proto_common, expr, plan};
 
-pub(crate) fn lower_table_function_node(
+pub(super) fn lower_table_function_node(
     node: &plan::DistributedNode,
     table_function: &plan::TableFunctionNode,
     mut children: Vec<LoweredNode>,

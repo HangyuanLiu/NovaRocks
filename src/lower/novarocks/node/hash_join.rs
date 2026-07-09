@@ -100,22 +100,24 @@ pub(super) fn lower_hash_join_node(
         .map_err(|err| format!("HashJoinNode other_condition: {err}"))?;
     let runtime_filters = lower_join_runtime_filters(
         join,
-        join_type,
-        if right_semi_physical_right_probe {
-            &right.layout
-        } else {
-            &left.layout
+        RuntimeFilterLoweringInput {
+            join_type,
+            probe_layout: if right_semi_physical_right_probe {
+                &right.layout
+            } else {
+                &left.layout
+            },
+            build_layout: if right_semi_physical_right_probe {
+                &left.layout
+            } else {
+                &right.layout
+            },
+            raw_probe_keys: &raw_probe_keys,
+            raw_build_keys: &raw_build_keys,
+            probe_keys: &probe_keys,
+            build_keys: &build_keys,
+            arena,
         },
-        if right_semi_physical_right_probe {
-            &left.layout
-        } else {
-            &right.layout
-        },
-        &raw_probe_keys,
-        &raw_build_keys,
-        &probe_keys,
-        &build_keys,
-        arena,
     )?;
 
     Ok(LoweredNode {
@@ -187,24 +189,28 @@ fn hash_join_distribution_mode(join: &plan::HashJoinNode) -> Result<JoinDistribu
     }
 }
 
+struct RuntimeFilterLoweringInput<'a> {
+    join_type: JoinType,
+    probe_layout: &'a Layout,
+    build_layout: &'a Layout,
+    raw_probe_keys: &'a [ExprId],
+    raw_build_keys: &'a [ExprId],
+    probe_keys: &'a [ExprId],
+    build_keys: &'a [ExprId],
+    arena: &'a mut ExprArena,
+}
+
 fn lower_join_runtime_filters(
     join: &plan::HashJoinNode,
-    join_type: JoinType,
-    probe_layout: &Layout,
-    build_layout: &Layout,
-    raw_probe_keys: &[ExprId],
-    raw_build_keys: &[ExprId],
-    probe_keys: &[ExprId],
-    build_keys: &[ExprId],
-    arena: &mut ExprArena,
+    input: RuntimeFilterLoweringInput<'_>,
 ) -> Result<Vec<JoinRuntimeFilterSpec>, String> {
-    if !is_runtime_filter_safe_join_type(join_type) {
+    if !is_runtime_filter_safe_join_type(input.join_type) {
         return Ok(Vec::new());
     }
     let mut runtime_filters = Vec::new();
     for rf in &join.build_runtime_filters {
         let expr_order = rf.expr_order as usize;
-        if expr_order >= probe_keys.len() || expr_order >= build_keys.len() {
+        if expr_order >= input.probe_keys.len() || expr_order >= input.build_keys.len() {
             return Err(format!(
                 "HashJoinNode runtime filter {} expr_order {} out of range",
                 rf.filter_id, expr_order
@@ -213,11 +219,11 @@ fn lower_join_runtime_filters(
         validate_runtime_filter_intent(
             rf,
             expr_order,
-            probe_layout,
-            build_layout,
-            raw_probe_keys[expr_order],
-            raw_build_keys[expr_order],
-            arena,
+            input.probe_layout,
+            input.build_layout,
+            input.raw_probe_keys[expr_order],
+            input.raw_build_keys[expr_order],
+            input.arena,
         )?;
         if join
             .eq_conditions
@@ -227,18 +233,20 @@ fn lower_join_runtime_filters(
         {
             continue;
         }
-        let build_data_type = arena
-            .data_type(build_keys[expr_order])
+        let build_data_type = input
+            .arena
+            .data_type(input.build_keys[expr_order])
             .ok_or_else(|| format!("runtime filter {} build key type missing", rf.filter_id))?
             .clone();
-        let Some(ExprNode::SlotId(probe_slot_id)) = arena.node(probe_keys[expr_order]) else {
+        let Some(ExprNode::SlotId(probe_slot_id)) = input.arena.node(input.probe_keys[expr_order])
+        else {
             continue;
         };
         runtime_filters.push(JoinRuntimeFilterSpec {
             filter_id: rf.filter_id,
             expr_order,
-            probe_expr_id: probe_keys[expr_order],
-            build_expr_id: build_keys[expr_order],
+            probe_expr_id: input.probe_keys[expr_order],
+            build_expr_id: input.build_keys[expr_order],
             probe_slot_id: *probe_slot_id,
             build_data_type,
             merge_nodes: Vec::new(),

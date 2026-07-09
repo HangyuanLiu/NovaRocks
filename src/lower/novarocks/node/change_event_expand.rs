@@ -32,7 +32,7 @@ use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::plan;
 use crate::sql::common::ChangeStreamBranchKind;
 
-pub(crate) fn lower_change_event_expand_node(
+pub(super) fn lower_change_event_expand_node(
     node: &plan::DistributedNode,
     physical: &plan::PlanNode,
     expand: &plan::ChangeEventExpandNode,

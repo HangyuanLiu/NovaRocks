@@ -30,7 +30,7 @@ use crate::exec::node::project::ProjectNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{common as proto_common, expr, plan};
 
-pub(crate) fn lower_project_node(
+pub(super) fn lower_project_node(
     node: &plan::DistributedNode,
     project: &plan::ProjectNode,
     mut children: Vec<LoweredNode>,

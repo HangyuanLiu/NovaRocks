@@ -17,10 +17,16 @@
 
 use std::collections::HashSet;
 
-use super::super::layout::{Layout, layout_from_output_columns};
+use super::super::layout::{
+    Layout, chunk_schema_from_output_columns, layout_from_output_columns,
+    slot_schemas_from_output_columns,
+};
+use super::LoweredNode;
 use crate::common::ids::SlotId;
-use crate::exec::node::ExecNodeKind;
+use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::join::JoinType;
+use crate::exec::node::project::ProjectNode;
+use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{common as proto_common, plan};
 
 pub(crate) fn unsupported<T>(kind: &str) -> Result<T, String> {
@@ -149,4 +155,43 @@ pub(crate) fn merge_limits(
         (Some(value), _) | (_, Some(value)) => Ok(Some(value)),
         (None, None) => Ok(None),
     }
+}
+
+pub(super) fn build_slot_projection(
+    label: &str,
+    input: LoweredNode,
+    output_columns: &[proto_common::OutputColumn],
+    node_id: i32,
+    arena: &mut ExprArena,
+) -> Result<LoweredNode, String> {
+    let layout = layout_from_output_columns(output_columns)?;
+    let output_schema = chunk_schema_from_output_columns(output_columns)?;
+    let expr_slot_schemas = slot_schemas_from_output_columns(output_columns)?;
+    let mut exprs = Vec::with_capacity(layout.order().len());
+    for slot in layout.order().iter().copied() {
+        if !input.layout.contains_slot(slot) {
+            return Err(format!(
+                "{label} output column id {} has no input slot",
+                slot.as_u32()
+            ));
+        }
+        exprs.push(arena.push(ExprNode::SlotId(slot)));
+    }
+
+    Ok(LoweredNode {
+        node: ExecNode {
+            kind: ExecNodeKind::Project(ProjectNode {
+                input: Box::new(input.node),
+                node_id,
+                is_subordinate: true,
+                exprs,
+                expr_slot_ids: layout.order().to_vec(),
+                expr_slot_schemas: Some(expr_slot_schemas),
+                output_indices: None,
+                output_chunk_schema: output_schema.clone(),
+            }),
+        },
+        layout,
+        output_schema,
+    })
 }

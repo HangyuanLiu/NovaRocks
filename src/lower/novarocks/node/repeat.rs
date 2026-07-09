@@ -29,7 +29,7 @@ use crate::exec::node::repeat::RepeatNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::plan;
 
-pub(crate) fn lower_repeat_node(
+pub(super) fn lower_repeat_node(
     node: &plan::DistributedNode,
     repeat: &plan::RepeatNode,
     mut children: Vec<LoweredNode>,

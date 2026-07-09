@@ -23,7 +23,7 @@ use crate::exec::node::limit::LimitNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::plan;
 
-pub(crate) fn lower_limit_node(
+pub(super) fn lower_limit_node(
     node: &plan::DistributedNode,
     limit_node: &plan::LimitNode,
     mut children: Vec<LoweredNode>,

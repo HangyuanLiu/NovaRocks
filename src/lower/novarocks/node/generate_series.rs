@@ -28,7 +28,7 @@ use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{common as proto_common, expr, plan};
 
-pub(crate) fn lower_generate_series_node(
+pub(super) fn lower_generate_series_node(
     node: &plan::DistributedNode,
     generate_series: &plan::GenerateSeriesNode,
     children: Vec<LoweredNode>,
