@@ -18,7 +18,9 @@
 //! Proto node lowering placeholder.
 
 mod common;
+mod filter;
 mod generate_series;
+mod limit;
 mod project;
 mod table_function;
 mod values;
@@ -49,7 +51,6 @@ use crate::exec::node::change_event_expand::{
     ChangeEventExpandNode, ChangeEventRuntimeOutputExpr, ChangeEventRuntimeSpec,
 };
 use crate::exec::node::exchange_source::ExchangeSourceNode;
-use crate::exec::node::filter::FilterNode;
 use crate::exec::node::join::{JoinDistributionMode, JoinNode, JoinRuntimeFilterSpec, JoinType};
 use crate::exec::node::limit::LimitNode;
 use crate::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
@@ -220,8 +221,10 @@ fn lower_physical_node(
         plan::plan_node::Kind::Project(project) => {
             project::lower_project_node(node, project, children, arena)
         }
-        plan::plan_node::Kind::Filter(filter) => lower_filter_node(node, filter, children, arena),
-        plan::plan_node::Kind::Limit(limit) => lower_limit_node(node, limit, children),
+        plan::plan_node::Kind::Filter(filter) => {
+            filter::lower_filter_node(node, filter, children, arena)
+        }
+        plan::plan_node::Kind::Limit(limit) => limit::lower_limit_node(node, limit, children),
         plan::plan_node::Kind::Sort(sort) => lower_sort_node(node, physical, sort, children, arena),
         plan::plan_node::Kind::Topn(topn) => lower_topn_node(node, topn, children, arena),
         plan::plan_node::Kind::SetOp(set_op) => {
@@ -263,59 +266,6 @@ fn lower_physical_node(
             lower_redistribute_node(physical, redistribute, children, arena)
         }
     }
-}
-
-fn lower_filter_node(
-    node: &plan::DistributedNode,
-    filter: &plan::FilterNode,
-    mut children: Vec<LoweredNode>,
-    arena: &mut ExprArena,
-) -> Result<LoweredNode, String> {
-    check_exact_arity("FilterNode", 1, children.len())?;
-    let child = children.pop().expect("child");
-    let predicate = filter
-        .predicate
-        .as_ref()
-        .ok_or_else(|| "FilterNode predicate missing".to_string())?;
-    let predicate = lower_proto_expr(predicate, arena, &child.layout)
-        .map_err(|err| format!("FilterNode predicate: {err}"))?;
-    Ok(LoweredNode {
-        node: ExecNode {
-            kind: ExecNodeKind::Filter(FilterNode {
-                input: Box::new(child.node),
-                node_id: node.node_id,
-                predicate,
-            }),
-        },
-        layout: child.layout,
-        output_schema: child.output_schema,
-    })
-}
-
-fn lower_limit_node(
-    node: &plan::DistributedNode,
-    limit_node: &plan::LimitNode,
-    mut children: Vec<LoweredNode>,
-) -> Result<LoweredNode, String> {
-    check_exact_arity("LimitNode", 1, children.len())?;
-    let child = children.pop().expect("child");
-    let payload_limit = parse_optional_nonnegative_i64(limit_node.limit, "LimitNode.limit")?;
-    let outer_limit = parse_distributed_limit(node.limit, "LimitNode DistributedNode.limit")?;
-    let limit = merge_limits("LimitNode", payload_limit, outer_limit)?;
-    let offset =
-        parse_optional_nonnegative_i64(limit_node.offset, "LimitNode.offset")?.unwrap_or(0);
-    Ok(LoweredNode {
-        node: ExecNode {
-            kind: ExecNodeKind::Limit(LimitNode {
-                input: Box::new(child.node),
-                node_id: node.node_id,
-                limit,
-                offset,
-            }),
-        },
-        layout: child.layout,
-        output_schema: child.output_schema,
-    })
 }
 
 fn lower_sort_node(
@@ -3140,37 +3090,6 @@ mod tests {
     fn lower(node: &plan::DistributedNode) -> super::LoweredNode {
         let mut arena = ExprArena::default();
         lower_proto_node(node, &mut arena, &NodeLoweringContext::default()).expect("lower node")
-    }
-
-    #[test]
-    fn lowers_filter_limit_shape() {
-        let filter = physical_node(
-            20,
-            plan::plan_node::Kind::Filter(plan::FilterNode {
-                predicate: Some(bool_literal(true)),
-            }),
-            Vec::new(),
-            vec![one_col_values_node(10)],
-        );
-        let limit = physical_node(
-            30,
-            plan::plan_node::Kind::Limit(plan::LimitNode {
-                limit: Some(5),
-                offset: Some(1),
-            }),
-            Vec::new(),
-            vec![filter],
-        );
-
-        let lowered = lower(&limit);
-        let ExecNodeKind::Limit(limit) = lowered.node.kind else {
-            panic!("expected Limit");
-        };
-        assert_eq!(limit.node_id, 30);
-        assert_eq!(limit.limit, Some(5));
-        assert_eq!(limit.offset, 1);
-        assert!(matches!(limit.input.kind, ExecNodeKind::Filter(_)));
-        assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
     }
 
     #[test]
