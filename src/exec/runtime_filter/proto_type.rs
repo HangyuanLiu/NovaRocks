@@ -17,12 +17,16 @@
 use arrow::datatypes::{DataType, TimeUnit};
 
 use crate::proto::common::{PrimitiveType, ScalarType, TypeDesc, type_desc::Kind};
+#[cfg(feature = "compat")]
 use crate::service::grpc_client::proto::starrocks::{PScalarType, PTypeDesc, PTypeNode};
 
+#[cfg(feature = "compat")]
 use super::starrocks_primitive as sr_primitive;
 
+#[cfg(feature = "compat")]
 const TYPE_NODE_SCALAR: i32 = 0;
 
+#[cfg(feature = "compat")]
 pub(crate) fn arrow_type_to_proto_type_desc(data_type: &DataType) -> Option<PTypeDesc> {
     let (primitive, len, precision, scale) = match data_type {
         DataType::Boolean => (sr_primitive::BOOLEAN, None, None, None),
@@ -63,6 +67,7 @@ pub(crate) fn arrow_type_to_proto_type_desc(data_type: &DataType) -> Option<PTyp
     })
 }
 
+#[cfg(feature = "compat")]
 pub(crate) fn arrow_type_from_proto_type_desc(desc: &PTypeDesc) -> Option<DataType> {
     if desc.types.len() != 1 {
         return None;
@@ -173,13 +178,17 @@ fn is_valid_decimal128(precision: u8, scale: i8) -> bool {
 mod tests {
     use arrow::datatypes::{DataType, TimeUnit};
 
+    #[cfg(feature = "compat")]
     use super::{
-        TYPE_NODE_SCALAR, arrow_type_from_common_type_desc, arrow_type_from_proto_type_desc,
-        arrow_type_to_common_type_desc, arrow_type_to_proto_type_desc, sr_primitive,
+        TYPE_NODE_SCALAR, arrow_type_from_proto_type_desc, arrow_type_to_proto_type_desc,
+        sr_primitive,
     };
+    use super::{arrow_type_from_common_type_desc, arrow_type_to_common_type_desc};
     use crate::proto::common::{PrimitiveType, type_desc::Kind};
+    #[cfg(feature = "compat")]
     use crate::service::grpc_client::proto::starrocks::{PScalarType, PTypeDesc, PTypeNode};
 
+    #[cfg(feature = "compat")]
     #[test]
     fn proto_type_desc_round_trips_supported_runtime_filter_types() {
         let cases = [
@@ -206,6 +215,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "compat")]
     #[test]
     fn unsupported_runtime_filter_type_has_no_proto_type_desc() {
         assert!(arrow_type_to_proto_type_desc(&DataType::Binary).is_none());
@@ -250,6 +260,7 @@ mod tests {
         assert!(arrow_type_to_common_type_desc(&DataType::Binary).is_none());
     }
 
+    #[cfg(feature = "compat")]
     #[test]
     fn proto_type_desc_with_trailing_nodes_is_rejected() {
         let mut desc = arrow_type_to_proto_type_desc(&DataType::Int32).expect("int proto type");
@@ -267,6 +278,7 @@ mod tests {
         assert!(arrow_type_from_proto_type_desc(&desc).is_none());
     }
 
+    #[cfg(feature = "compat")]
     #[test]
     fn invalid_decimal_arrow_type_has_no_proto_type_desc() {
         let cases = [
@@ -284,6 +296,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "compat")]
     #[test]
     fn invalid_decimal_proto_type_desc_is_rejected() {
         let cases = [

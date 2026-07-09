@@ -1,7 +1,5 @@
-# NIDL-E non-compat StarRocks-IDL ledger (milestone E0).
-# Production-code files in the non-compat compile graph that still
-# reference crate::thrift / crate::proto::starrocks / crate::proto::staros.
-# This is a debt list and must only shrink. After a milestone removes a
-# cluster's references, regenerate with:
-#   NOVA_WRITE_IDL_LEDGER=1 cargo test --test architecture_guard nidl_e0_noncompat
-# The end state (E10) is an empty list plus the build.rs/lib.rs gate.
+# NIDL-E non-compat StarRocks-IDL ledger.
+# E10 final state: this file is intentionally empty.
+# Non-compat production code must not reference crate::thrift,
+# crate::proto::starrocks, or crate::proto::staros.
+# build.rs / lib.rs generated-IDL gates are enforced by architecture_guard.
