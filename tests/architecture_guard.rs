@@ -4120,7 +4120,8 @@ fn nidl_d3l_native_mainline_thrift_usage_is_explicitly_allowlisted() {
     );
 
     for source in [
-        "src/lower/novarocks/fragment.rs",
+        "src/lower/novarocks/fragment/mod.rs",
+        "src/lower/novarocks/fragment/sink_factory.rs",
         "src/lower/novarocks/layout.rs",
         "src/lower/novarocks/node.rs",
         "src/lower/novarocks/scan.rs",
