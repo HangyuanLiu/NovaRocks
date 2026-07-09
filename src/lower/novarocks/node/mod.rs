@@ -23,6 +23,7 @@ mod filter;
 mod generate_series;
 mod limit;
 mod project;
+mod set_op;
 mod sort;
 mod table_function;
 mod topn;
@@ -36,10 +37,7 @@ use self::common::*;
 use arrow::datatypes::{DataType, Field, Fields};
 
 use super::expr::lower_proto_expr;
-use super::layout::{
-    Layout, chunk_schema_from_output_columns, layout_from_output_columns,
-    slot_schemas_from_output_columns,
-};
+use super::layout::{Layout, chunk_schema_from_output_columns, layout_from_output_columns};
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprNode};
@@ -51,10 +49,7 @@ use crate::exec::node::change_event_expand::{
 use crate::exec::node::join::{JoinDistributionMode, JoinNode, JoinRuntimeFilterSpec, JoinType};
 use crate::exec::node::limit::LimitNode;
 use crate::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
-use crate::exec::node::project::ProjectNode;
 use crate::exec::node::repeat::RepeatNode;
-use crate::exec::node::set_op::{SetOpKind, SetOpNode};
-use crate::exec::node::union_all::UnionAllNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{common as proto_common, novarocks, plan};
 use crate::runtime::exchange::ExchangeKey;
@@ -226,7 +221,7 @@ fn lower_physical_node(
         }
         plan::plan_node::Kind::Topn(topn) => topn::lower_topn_node(node, topn, children, arena),
         plan::plan_node::Kind::SetOp(set_op) => {
-            lower_set_op_node(node, physical, set_op, children, arena)
+            set_op::lower_set_op_node(node, physical, set_op, children, arena)
         }
         plan::plan_node::Kind::AssertOneRow(assert) => {
             lower_assert_one_row_node(node, assert, children)
@@ -264,210 +259,6 @@ fn lower_physical_node(
             lower_redistribute_node(physical, redistribute, children, arena)
         }
     }
-}
-
-fn lower_set_op_node(
-    node: &plan::DistributedNode,
-    physical: &plan::PlanNode,
-    set_op: &plan::SetOpNode,
-    children: Vec<LoweredNode>,
-    arena: &mut ExprArena,
-) -> Result<LoweredNode, String> {
-    check_min_arity("SetOpNode", 2, children.len())?;
-    let kind = plan::PlanSetOpKind::try_from(set_op.kind)
-        .map_err(|_| format!("SetOpNode unknown kind {}", set_op.kind))?;
-    let output_columns = if set_op.output_columns.is_empty() {
-        &physical.output_columns
-    } else {
-        &set_op.output_columns
-    };
-    let layout = layout_from_output_columns(output_columns)?;
-    let output_schema = chunk_schema_from_output_columns(output_columns)?;
-    let inputs = normalize_set_op_inputs(
-        node.node_id,
-        children,
-        &set_op.child_output_columns,
-        output_columns,
-        output_schema.clone(),
-        arena,
-    )?;
-    match kind {
-        plan::PlanSetOpKind::UnionAll => Ok(LoweredNode {
-            node: ExecNode {
-                kind: ExecNodeKind::UnionAll(UnionAllNode {
-                    inputs,
-                    node_id: node.node_id,
-                }),
-            },
-            layout,
-            output_schema,
-        }),
-        plan::PlanSetOpKind::Intersect => Ok(LoweredNode {
-            node: ExecNode {
-                kind: ExecNodeKind::SetOp(SetOpNode {
-                    kind: SetOpKind::Intersect,
-                    inputs,
-                    node_id: node.node_id,
-                    output_chunk_schema: output_schema.clone(),
-                }),
-            },
-            layout,
-            output_schema,
-        }),
-        plan::PlanSetOpKind::Except => Ok(LoweredNode {
-            node: ExecNode {
-                kind: ExecNodeKind::SetOp(SetOpNode {
-                    kind: SetOpKind::Except,
-                    inputs,
-                    node_id: node.node_id,
-                    output_chunk_schema: output_schema.clone(),
-                }),
-            },
-            layout,
-            output_schema,
-        }),
-        plan::PlanSetOpKind::UnionDistinct => unsupported("UnionDistinct"),
-        plan::PlanSetOpKind::Unspecified => Err("SetOpNode kind is unspecified".to_string()),
-    }
-}
-
-fn normalize_set_op_inputs(
-    node_id: i32,
-    children: Vec<LoweredNode>,
-    child_output_columns: &[plan::OutputColumnList],
-    output_columns: &[proto_common::OutputColumn],
-    output_schema: ChunkSchemaRef,
-    arena: &mut ExprArena,
-) -> Result<Vec<ExecNode>, String> {
-    if child_output_columns.is_empty() {
-        return normalize_set_op_inputs_by_position(
-            node_id,
-            children,
-            output_columns,
-            output_schema,
-            arena,
-        );
-    }
-    if child_output_columns.len() != children.len() {
-        return Err(format!(
-            "SetOpNode child_output_columns size mismatch: expected {}, got {}",
-            children.len(),
-            child_output_columns.len()
-        ));
-    }
-    let output_slots = slot_ids_from_columns(output_columns)?;
-    let output_slot_schemas = slot_schemas_from_output_columns(output_columns)?;
-    children
-        .into_iter()
-        .zip(child_output_columns.iter())
-        .enumerate()
-        .map(|(idx, (child, child_columns))| {
-            if child_columns.columns.len() != output_columns.len() {
-                return Err(format!(
-                    "SetOpNode child {idx} output width mismatch: expected {}, got {}",
-                    output_columns.len(),
-                    child_columns.columns.len()
-                ));
-            }
-            let expected_child_layout = layout_from_output_columns(&child_columns.columns)?;
-            if expected_child_layout.order() != child.layout.order() {
-                return Err(format!(
-                    "SetOpNode child {idx} output columns do not match child layout: columns={:?} layout={:?}",
-                    expected_child_layout.order(),
-                    child.layout.order()
-                ));
-            }
-            let exprs = child_columns
-                .columns
-                .iter()
-                .map(|col| {
-                    let slot = SlotId::new(col.column_id);
-                    let data_type = col
-                        .r#type
-                        .as_ref()
-                        .ok_or_else(|| {
-                            format!(
-                                "SetOpNode child {idx} column {} type missing",
-                                col.column_id
-                            )
-                        })
-                        .and_then(super::decode_type)?;
-                    Ok(arena.push_typed(ExprNode::SlotId(slot), data_type))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            Ok(ExecNode {
-                kind: ExecNodeKind::Project(ProjectNode {
-                    input: Box::new(child.node),
-                    node_id,
-                    is_subordinate: true,
-                    exprs,
-                    expr_slot_ids: output_slots.clone(),
-                    expr_slot_schemas: Some(output_slot_schemas.clone()),
-                    output_indices: None,
-                    output_chunk_schema: output_schema.clone(),
-                }),
-            })
-        })
-        .collect()
-}
-
-fn normalize_set_op_inputs_by_position(
-    node_id: i32,
-    children: Vec<LoweredNode>,
-    output_columns: &[proto_common::OutputColumn],
-    output_schema: ChunkSchemaRef,
-    arena: &mut ExprArena,
-) -> Result<Vec<ExecNode>, String> {
-    let output_slots = slot_ids_from_columns(output_columns)?;
-    let output_slot_schemas = slot_schemas_from_output_columns(output_columns)?;
-    children
-        .into_iter()
-        .enumerate()
-        .map(|(idx, child)| {
-            if child.layout.order().len() != output_slots.len() {
-                return Err(format!(
-                    "SetOpNode child {idx} width mismatch without child_output_columns: expected {}, got {}",
-                    output_slots.len(),
-                    child.layout.order().len()
-                ));
-            }
-            if child.layout.order() == output_slots.as_slice() {
-                return Ok(child.node);
-            }
-            let exprs = child
-                .layout
-                .order()
-                .iter()
-                .copied()
-                .map(|slot| {
-                    let data_type = child
-                        .output_schema
-                        .slot(slot)
-                        .ok_or_else(|| {
-                            format!(
-                                "SetOpNode child {idx} slot {} missing from child output schema",
-                                slot
-                            )
-                        })?
-                        .data_type()
-                        .clone();
-                    Ok(arena.push_typed(ExprNode::SlotId(slot), data_type))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            Ok(ExecNode {
-                kind: ExecNodeKind::Project(ProjectNode {
-                    input: Box::new(child.node),
-                    node_id,
-                    is_subordinate: true,
-                    exprs,
-                    expr_slot_ids: output_slots.clone(),
-                    expr_slot_schemas: Some(output_slot_schemas.clone()),
-                    output_indices: None,
-                    output_chunk_schema: output_schema.clone(),
-                }),
-            })
-        })
-        .collect()
 }
 
 fn lower_hash_aggregate_node(
@@ -1844,7 +1635,11 @@ mod tests {
         }
     }
 
-    fn output_column(column_id: u32, name: &str, data_type: DataType) -> common::OutputColumn {
+    pub(super) fn output_column(
+        column_id: u32,
+        name: &str,
+        data_type: DataType,
+    ) -> common::OutputColumn {
         output_column_with_nullable(column_id, name, data_type, true)
     }
 
@@ -1916,7 +1711,7 @@ mod tests {
         }
     }
 
-    fn physical_node(
+    pub(super) fn physical_node(
         node_id: i32,
         kind: plan::plan_node::Kind,
         output_columns: Vec<common::OutputColumn>,
@@ -1965,7 +1760,7 @@ mod tests {
         one_col_values_node_with(node_id, 1, "id", 10)
     }
 
-    fn one_col_values_node_with(
+    pub(super) fn one_col_values_node_with(
         node_id: i32,
         column_id: u32,
         name: &str,
@@ -2037,7 +1832,7 @@ mod tests {
         )
     }
 
-    fn lower(node: &plan::DistributedNode) -> super::LoweredNode {
+    pub(super) fn lower(node: &plan::DistributedNode) -> super::LoweredNode {
         let mut arena = ExprArena::default();
         lower_proto_node(node, &mut arena, &NodeLoweringContext::default()).expect("lower node")
     }
@@ -2174,39 +1969,6 @@ mod tests {
             }
             AssertNumRowsMode::Global { .. } => panic!("expected keyed assert"),
         }
-    }
-
-    #[test]
-    fn union_all_retags_child_slots_when_sidecar_is_missing() {
-        let output_columns = vec![output_column(1, "id", DataType::Int64)];
-        let union_all = physical_node(
-            60,
-            plan::plan_node::Kind::SetOp(plan::SetOpNode {
-                kind: plan::PlanSetOpKind::UnionAll as i32,
-                output_columns: output_columns.clone(),
-                child_output_columns: Vec::new(),
-            }),
-            output_columns,
-            vec![
-                one_col_values_node_with(10, 11, "lhs_id", 10),
-                one_col_values_node_with(11, 21, "rhs_id", 20),
-            ],
-        );
-        let lowered = lower(&union_all);
-        let ExecNodeKind::UnionAll(union) = lowered.node.kind else {
-            panic!("expected UnionAll");
-        };
-        assert_eq!(union.inputs.len(), 2);
-        for input in union.inputs {
-            let ExecNodeKind::Project(project) = input.kind else {
-                panic!("expected retagging Project");
-            };
-            assert!(project.is_subordinate);
-            assert_eq!(project.expr_slot_ids, vec![SlotId::new(1)]);
-            assert_eq!(project.output_chunk_schema.slot_ids(), &[SlotId::new(1)]);
-        }
-        assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
-        assert_eq!(lowered.output_schema.slot_ids(), &[SlotId::new(1)]);
     }
 
     #[test]
