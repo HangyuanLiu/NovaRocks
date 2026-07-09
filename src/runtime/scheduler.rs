@@ -1306,6 +1306,37 @@ mod tests {
     }
 
     #[test]
+    fn scan_instance_count_uses_max_over_scan_nodes_and_allows_node_local_empty() {
+        // node 1: 3 ranges, node 2: 1 range; 3 backends.
+        // count = min(3, max(3,1)) = 3. node 1 covers all 3 instances; node 2's
+        // single range lands only on instance 0 (node-local empty on 1,2), but
+        // NO instance is wholly empty.
+        let scheduler = FragmentScheduler::new(three_backends());
+        let mut fr = fake_fragment(0, Some(1), 3);
+        fr.native_scan_ranges.insert(2, vec![scan_range_params(100)]);
+        let fragments = vec![fr, fake_fragment(1, None, 0)];
+        let edges = vec![fake_edge(0, 1, TestPartitionType::Unpartitioned, 10)];
+        let plan = scheduler
+            .assign(&fragments, &edges, make_query_id(1, 0))
+            .expect("assign");
+        let f0 = &plan.by_fragment[&0];
+        assert_eq!(f0.len(), 3, "count = max over scan nodes = 3");
+
+        // node 1 non-empty on every instance
+        for inst in f0 {
+            assert!(!inst.scan_ranges.get(&1).unwrap().is_empty());
+        }
+        // node 2 (1 range) only on instance 0
+        assert_eq!(f0[0].scan_ranges.get(&2).map(Vec::len), Some(1));
+        assert_eq!(f0[1].scan_ranges.get(&2).map(Vec::len), Some(0));
+        assert_eq!(f0[2].scan_ranges.get(&2).map(Vec::len), Some(0));
+        // invariant: no whole-instance-empty
+        for inst in f0 {
+            assert!(inst.scan_ranges.values().any(|r| !r.is_empty()));
+        }
+    }
+
+    #[test]
     fn scan_zero_range_falls_back_to_single_instance() {
         // Empty snapshot / fully-pruned scan: 0 ranges on 2 backends.
         // Root-fix: fall back to ONE instance (not N empty instances).
