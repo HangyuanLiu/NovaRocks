@@ -18,6 +18,7 @@
 //! Proto node lowering placeholder.
 
 mod aggregate;
+mod assert;
 mod change_event_expand;
 mod common;
 mod exchange;
@@ -44,7 +45,6 @@ use self::common::*;
 use super::layout::Layout;
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprArena;
-use crate::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode, Assertion};
 use crate::exec::node::limit::LimitNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{novarocks, plan};
@@ -217,7 +217,7 @@ fn lower_physical_node(
             set_op::lower_set_op_node(node, physical, set_op, children, arena)
         }
         plan::plan_node::Kind::AssertOneRow(assert) => {
-            lower_assert_one_row_node(node, assert, children)
+            assert::lower_assert_one_row_node(node, assert, children)
         }
         plan::plan_node::Kind::Scan(scan) => {
             super::scan::lower_scan_node(node, physical, scan, ctx, arena)
@@ -253,102 +253,6 @@ fn lower_physical_node(
         plan::plan_node::Kind::Redistribute(redistribute) => {
             redistribute::lower_redistribute_node(physical, redistribute, children, arena)
         }
-    }
-}
-
-fn lower_assert_one_row_node(
-    node: &plan::DistributedNode,
-    assert: &plan::AssertOneRowNode,
-    mut children: Vec<LoweredNode>,
-) -> Result<LoweredNode, String> {
-    check_exact_arity("AssertOneRowNode", 1, children.len())?;
-    let child = children.pop().expect("child");
-    let desired_num_rows = parse_optional_nonnegative_i64(
-        assert.desired_num_rows,
-        "AssertOneRowNode.desired_num_rows",
-    )?
-    .or(Some(1));
-    let assertion = lower_row_count_assertion(assert.assertion)?;
-    let mode = if assert.group_key_column_ids.is_empty() {
-        if !assert.group_key_labels.is_empty() || assert.keyed_message_prefix.is_some() {
-            return Err(
-                "AssertOneRowNode group_key_column_ids is required when keyed metadata is present"
-                    .to_string(),
-            );
-        }
-        AssertNumRowsMode::Global {
-            desired_num_rows,
-            assertion,
-            subquery_string: Some(assert.subquery_text.clone()),
-        }
-    } else {
-        if desired_num_rows != Some(1) || !matches!(assertion, Assertion::Le) {
-            return Err(
-                "AssertOneRowNode keyed assertions only support desired_num_rows <= 1".to_string(),
-            );
-        }
-        if !assert.group_key_labels.is_empty()
-            && assert.group_key_labels.len() != assert.group_key_column_ids.len()
-        {
-            return Err(format!(
-                "AssertOneRowNode group_key_labels length mismatch: key_columns={} labels={}",
-                assert.group_key_column_ids.len(),
-                assert.group_key_labels.len()
-            ));
-        }
-        let key_slots = assert
-            .group_key_column_ids
-            .iter()
-            .map(|column_id| {
-                child
-                    .layout
-                    .resolve_column_id(*column_id)
-                    .map_err(|err| format!("AssertOneRowNode group key: {err}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let key_labels = if assert.group_key_labels.is_empty() {
-            assert
-                .group_key_column_ids
-                .iter()
-                .map(|column_id| format!("column_{column_id}"))
-                .collect()
-        } else {
-            assert.group_key_labels.clone()
-        };
-        AssertNumRowsMode::PerKeyAtMostOne {
-            key_slots,
-            key_labels,
-            message_prefix: assert
-                .keyed_message_prefix
-                .clone()
-                .unwrap_or_else(|| "assert_num_rows failed".to_string()),
-        }
-    };
-    Ok(LoweredNode {
-        node: ExecNode {
-            kind: ExecNodeKind::AssertNumRows(AssertNumRowsNode {
-                input: Box::new(child.node),
-                node_id: node.node_id,
-                mode,
-            }),
-        },
-        layout: child.layout,
-        output_schema: child.output_schema,
-    })
-}
-
-fn lower_row_count_assertion(value: i32) -> Result<Assertion, String> {
-    match value {
-        value if value == plan::RowCountAssertion::Unspecified as i32 => Ok(Assertion::Le),
-        value if value == plan::RowCountAssertion::Eq as i32 => Ok(Assertion::Eq),
-        value if value == plan::RowCountAssertion::Ne as i32 => Ok(Assertion::Ne),
-        value if value == plan::RowCountAssertion::Lt as i32 => Ok(Assertion::Lt),
-        value if value == plan::RowCountAssertion::Le as i32 => Ok(Assertion::Le),
-        value if value == plan::RowCountAssertion::Gt as i32 => Ok(Assertion::Gt),
-        value if value == plan::RowCountAssertion::Ge as i32 => Ok(Assertion::Ge),
-        other => Err(format!(
-            "AssertOneRowNode assertion {other} is not supported"
-        )),
     }
 }
 
@@ -684,39 +588,6 @@ mod tests {
                 assert_eq!(subquery_string.as_deref(), Some("select id from t"));
             }
             AssertNumRowsMode::PerKeyAtMostOne { .. } => panic!("expected global assert"),
-        }
-    }
-
-    #[test]
-    fn lowers_keyed_assert_num_rows_from_native_proto() {
-        let assert_node = physical_node(
-            70,
-            plan::plan_node::Kind::AssertOneRow(plan::AssertOneRowNode {
-                subquery_text: "DML change-stream matched row uniqueness".to_string(),
-                desired_num_rows: Some(1),
-                assertion: plan::RowCountAssertion::Le as i32,
-                group_key_column_ids: vec![1],
-                group_key_labels: vec!["_row_id".to_string()],
-                keyed_message_prefix: Some("MOR UPDATE matched target row".to_string()),
-            }),
-            Vec::new(),
-            vec![one_col_values_node(10)],
-        );
-        let lowered = lower(&assert_node);
-        let ExecNodeKind::AssertNumRows(assert) = lowered.node.kind else {
-            panic!("expected AssertNumRows");
-        };
-        match assert.mode {
-            AssertNumRowsMode::PerKeyAtMostOne {
-                key_slots,
-                key_labels,
-                message_prefix,
-            } => {
-                assert_eq!(key_slots, vec![SlotId::new(1)]);
-                assert_eq!(key_labels, vec!["_row_id".to_string()]);
-                assert_eq!(message_prefix, "MOR UPDATE matched target row");
-            }
-            AssertNumRowsMode::Global { .. } => panic!("expected keyed assert"),
         }
     }
 
