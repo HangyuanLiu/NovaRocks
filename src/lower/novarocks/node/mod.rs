@@ -17,10 +17,13 @@
 
 //! Proto node lowering placeholder.
 
+mod common;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use self::common::*;
 use arrow::array::{Array, ArrayRef};
 use arrow::compute::concat;
 use arrow::datatypes::{DataType, Field, Fields, Schema};
@@ -57,7 +60,7 @@ use crate::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSl
 use crate::exec::node::union_all::UnionAllNode;
 use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::proto::{common, expr, novarocks, plan};
+use crate::proto::{common as proto_common, expr, novarocks, plan};
 use crate::runtime::exchange::ExchangeKey;
 use crate::runtime::query_options::QueryOptions;
 use crate::sql::codegen::agg_type_infer::infer_agg_function_types;
@@ -263,54 +266,6 @@ fn lower_physical_node(
     }
 }
 
-fn unsupported<T>(kind: &str) -> Result<T, String> {
-    Err(format!(
-        "{kind} native proto node lowering is not implemented"
-    ))
-}
-
-fn exec_node_kind_label(kind: &ExecNodeKind) -> &'static str {
-    match kind {
-        ExecNodeKind::Scan(_) => "Scan",
-        ExecNodeKind::IcebergDeltaScan(_) => "IcebergDeltaScan",
-        ExecNodeKind::Project(_) => "Project",
-        ExecNodeKind::Filter(_) => "Filter",
-        ExecNodeKind::Aggregate(_) => "Aggregate",
-        ExecNodeKind::Join(_) => "Join",
-        ExecNodeKind::NestedLoopJoin(_) => "NestedLoopJoin",
-        ExecNodeKind::Sort(_) => "Sort",
-        ExecNodeKind::Limit(_) => "Limit",
-        ExecNodeKind::ExchangeSource(_) => "ExchangeSource",
-        ExecNodeKind::UnionAll(_) => "UnionAll",
-        ExecNodeKind::SetOp(_) => "SetOp",
-        ExecNodeKind::Values(_) => "Values",
-        ExecNodeKind::TableFunction(_) => "TableFunction",
-        ExecNodeKind::Repeat(_) => "Repeat",
-        ExecNodeKind::ChangeEventExpand(_) => "ChangeEventExpand",
-        ExecNodeKind::AssertNumRows(_) => "AssertNumRows",
-        ExecNodeKind::Analytic(_) => "Analytic",
-        #[cfg(feature = "compat")]
-        ExecNodeKind::Fetch(_) => "Fetch",
-        ExecNodeKind::LookUp(_) => "LookUp",
-    }
-}
-
-fn check_arity(kind: &str, expected: &str, actual: usize, ok: bool) -> Result<(), String> {
-    if ok {
-        Ok(())
-    } else {
-        Err(format!("{kind} expected {expected} children, got {actual}"))
-    }
-}
-
-fn check_exact_arity(kind: &str, expected: usize, actual: usize) -> Result<(), String> {
-    check_arity(kind, &expected.to_string(), actual, actual == expected)
-}
-
-fn check_min_arity(kind: &str, min: usize, actual: usize) -> Result<(), String> {
-    check_arity(kind, &format!(">={min}"), actual, actual >= min)
-}
-
 fn lower_values_node(
     node: &plan::DistributedNode,
     physical: &plan::PlanNode,
@@ -341,7 +296,7 @@ fn lower_values_node(
 
 fn materialize_values_chunk(
     rows: &[plan::ExprList],
-    columns: &[common::OutputColumn],
+    columns: &[proto_common::OutputColumn],
     output_schema: ChunkSchemaRef,
     arena: &mut ExprArena,
 ) -> Result<Chunk, String> {
@@ -513,8 +468,8 @@ fn generate_series_param_slots(output_column_id: u32) -> Result<[SlotId; 3], Str
     Ok([slots[0], slots[1], slots[2]])
 }
 
-fn bigint_output_column(column_id: u32, name: &str, nullable: bool) -> common::OutputColumn {
-    common::OutputColumn {
+fn bigint_output_column(column_id: u32, name: &str, nullable: bool) -> proto_common::OutputColumn {
+    proto_common::OutputColumn {
         column_id,
         name: name.to_string(),
         r#type: Some(bigint_type_desc()),
@@ -523,15 +478,17 @@ fn bigint_output_column(column_id: u32, name: &str, nullable: bool) -> common::O
     }
 }
 
-fn bigint_type_desc() -> common::TypeDesc {
-    common::TypeDesc {
-        kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
-            r#type: common::PrimitiveType::Bigint as i32,
-            len: None,
-            precision: None,
-            scale: None,
-            time_unit: None,
-        })),
+fn bigint_type_desc() -> proto_common::TypeDesc {
+    proto_common::TypeDesc {
+        kind: Some(proto_common::type_desc::Kind::Scalar(
+            proto_common::ScalarType {
+                r#type: proto_common::PrimitiveType::Bigint as i32,
+                len: None,
+                precision: None,
+                scale: None,
+                time_unit: None,
+            },
+        )),
     }
 }
 
@@ -540,8 +497,8 @@ fn int64_literal_expr(value: i64) -> expr::Expr {
         r#type: Some(bigint_type_desc()),
         nullable: false,
         kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
-            value: Some(common::LiteralValue {
-                value: Some(common::literal_value::Value::IntValue(value)),
+            value: Some(proto_common::LiteralValue {
+                value: Some(proto_common::literal_value::Value::IntValue(value)),
             }),
         })),
     }
@@ -842,7 +799,7 @@ fn table_function_param_schemas(
 
 fn table_function_param_slots(
     input_layout: &Layout,
-    output_columns: &[common::OutputColumn],
+    output_columns: &[proto_common::OutputColumn],
     args: &[expr::Expr],
 ) -> Result<Vec<SlotId>, String> {
     let mut used = input_layout
@@ -919,8 +876,8 @@ fn lower_project_node(
 
 struct ProjectOutputPlan {
     computed_item_indices: Vec<usize>,
-    computed_columns: Vec<common::OutputColumn>,
-    output_columns: Vec<common::OutputColumn>,
+    computed_columns: Vec<proto_common::OutputColumn>,
+    output_columns: Vec<proto_common::OutputColumn>,
     output_indices: Option<Vec<usize>>,
 }
 
@@ -989,7 +946,7 @@ fn project_output_plan(
             first_expr_index_by_column_id.insert(compute_column_id, computed_idx);
             used_compute_column_ids.insert(compute_column_id);
             computed_item_indices.push(item.item_index);
-            computed_columns.push(common::OutputColumn {
+            computed_columns.push(proto_common::OutputColumn {
                 column_id: compute_column_id,
                 name: item.output_name.clone(),
                 r#type: Some(item.r#type.clone()),
@@ -1008,7 +965,7 @@ fn project_output_plan(
                 &mut used_compute_column_ids,
             )?
         };
-        output_columns.push(common::OutputColumn {
+        output_columns.push(proto_common::OutputColumn {
             column_id: output_column_id,
             name: item.output_name.clone(),
             r#type: Some(item.r#type),
@@ -1059,7 +1016,7 @@ struct ProjectItemOutput {
     output_column_id: u32,
     can_reuse_input_slot: bool,
     output_name: String,
-    r#type: common::TypeDesc,
+    r#type: proto_common::TypeDesc,
     nullable: bool,
 }
 
@@ -1222,7 +1179,7 @@ fn lower_sort_node(
 fn build_slot_projection(
     label: &str,
     input: LoweredNode,
-    output_columns: &[common::OutputColumn],
+    output_columns: &[proto_common::OutputColumn],
     node_id: i32,
     arena: &mut ExprArena,
 ) -> Result<LoweredNode, String> {
@@ -2165,7 +2122,7 @@ fn normalize_set_op_inputs(
     node_id: i32,
     children: Vec<LoweredNode>,
     child_output_columns: &[plan::OutputColumnList],
-    output_columns: &[common::OutputColumn],
+    output_columns: &[proto_common::OutputColumn],
     output_schema: ChunkSchemaRef,
     arena: &mut ExprArena,
 ) -> Result<Vec<ExecNode>, String> {
@@ -2244,7 +2201,7 @@ fn normalize_set_op_inputs(
 fn normalize_set_op_inputs_by_position(
     node_id: i32,
     children: Vec<LoweredNode>,
-    output_columns: &[common::OutputColumn],
+    output_columns: &[proto_common::OutputColumn],
     output_schema: ChunkSchemaRef,
     arena: &mut ExprArena,
 ) -> Result<Vec<ExecNode>, String> {
@@ -2298,10 +2255,6 @@ fn normalize_set_op_inputs_by_position(
             })
         })
         .collect()
-}
-
-fn slot_ids_from_columns(cols: &[common::OutputColumn]) -> Result<Vec<SlotId>, String> {
-    Ok(layout_from_output_columns(cols)?.order().to_vec())
 }
 
 fn lower_hash_aggregate_node(
@@ -2464,9 +2417,9 @@ fn lower_hash_aggregate_node(
 }
 
 fn aggregate_output_columns_from_layout(
-    group_key_columns: &[common::OutputColumn],
-    aggregate_columns: &[common::OutputColumn],
-) -> Vec<common::OutputColumn> {
+    group_key_columns: &[proto_common::OutputColumn],
+    aggregate_columns: &[proto_common::OutputColumn],
+) -> Vec<proto_common::OutputColumn> {
     let mut columns = Vec::with_capacity(group_key_columns.len() + aggregate_columns.len());
     columns.extend_from_slice(group_key_columns);
     columns.extend_from_slice(aggregate_columns);
@@ -3166,24 +3119,6 @@ fn lower_nest_loop_join_node(
     })
 }
 
-fn proto_join_type(value: i32, node_kind: &str) -> Result<JoinType, String> {
-    match plan::JoinKind::try_from(value)
-        .map_err(|_| format!("{node_kind} unknown join_type {value}"))?
-    {
-        plan::JoinKind::Inner => Ok(JoinType::Inner),
-        plan::JoinKind::LeftOuter => Ok(JoinType::LeftOuter),
-        plan::JoinKind::RightOuter => Ok(JoinType::RightOuter),
-        plan::JoinKind::FullOuter => Ok(JoinType::FullOuter),
-        plan::JoinKind::LeftSemi => Ok(JoinType::LeftSemi),
-        plan::JoinKind::RightSemi => Ok(JoinType::RightSemi),
-        plan::JoinKind::LeftAnti => Ok(JoinType::LeftAnti),
-        plan::JoinKind::RightAnti => Ok(JoinType::RightAnti),
-        plan::JoinKind::NullAwareLeftAnti => Ok(JoinType::NullAwareLeftAnti),
-        plan::JoinKind::Cross => Err(format!("{node_kind} CROSS join requires NestLoopJoinNode")),
-        plan::JoinKind::Unspecified => Err(format!("{node_kind} join_type is unspecified")),
-    }
-}
-
 fn proto_nested_loop_join_type(value: i32, node_kind: &str) -> Result<NestedLoopJoinType, String> {
     match plan::JoinKind::try_from(value)
         .map_err(|_| format!("{node_kind} unknown join_type {value}"))?
@@ -3201,18 +3136,6 @@ fn proto_nested_loop_join_type(value: i32, node_kind: &str) -> Result<NestedLoop
         )),
         plan::JoinKind::Unspecified => Err(format!("{node_kind} join_type is unspecified")),
     }
-}
-
-fn concat_layouts(left: &Layout, right: &Layout) -> Result<Layout, String> {
-    let mut slots = Vec::with_capacity(left.order().len() + right.order().len());
-    let mut seen = HashSet::with_capacity(left.order().len() + right.order().len());
-    for slot in left.order().iter().chain(right.order().iter()).copied() {
-        if !seen.insert(slot) {
-            return Err(format!("duplicate slot id {} in joined layout", slot));
-        }
-        slots.push(slot);
-    }
-    Ok(Layout::for_slots(slots))
 }
 
 fn lower_repeat_node(
@@ -3673,45 +3596,6 @@ fn lower_row_count_assertion(value: i32) -> Result<Assertion, String> {
         other => Err(format!(
             "AssertOneRowNode assertion {other} is not supported"
         )),
-    }
-}
-
-fn parse_optional_nonnegative_i64(
-    value: Option<i64>,
-    label: &str,
-) -> Result<Option<usize>, String> {
-    value
-        .map(|value| {
-            if value < 0 {
-                Err(format!("{label} must be >= 0, got {value}"))
-            } else {
-                Ok(value as usize)
-            }
-        })
-        .transpose()
-}
-
-fn parse_distributed_limit(value: i64, label: &str) -> Result<Option<usize>, String> {
-    if value == -1 {
-        Ok(None)
-    } else if value < 0 {
-        Err(format!("{label} must be -1 or >= 0, got {value}"))
-    } else {
-        Ok(Some(value as usize))
-    }
-}
-
-fn merge_limits(
-    node_kind: &str,
-    payload_limit: Option<usize>,
-    outer_limit: Option<usize>,
-) -> Result<Option<usize>, String> {
-    match (payload_limit, outer_limit) {
-        (Some(left), Some(right)) if left != right => Err(format!(
-            "{node_kind} payload limit {left} conflicts with DistributedNode.limit {right}"
-        )),
-        (Some(value), _) | (_, Some(value)) => Ok(Some(value)),
-        (None, None) => Ok(None),
     }
 }
 
