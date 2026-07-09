@@ -1015,7 +1015,9 @@ fn target_exchange_for_edge<'a>(
         ));
     };
     match (&edge.edge_kind, &exchange.flavor) {
-        (FragmentEdgeKind::Stream, ExchangeFlavor::Distribution) => {}
+        (FragmentEdgeKind::Stream, ExchangeFlavor::Distribution)
+        | (FragmentEdgeKind::Stream, ExchangeFlavor::LimitOffset { .. })
+        | (FragmentEdgeKind::Stream, ExchangeFlavor::TopNSplit { .. }) => {}
         (
             FragmentEdgeKind::CteMulticast {
                 cte_id,
@@ -1159,6 +1161,92 @@ mod tests {
                 rows: Vec::new(),
                 columns,
             })),
+        }
+    }
+
+    fn stream_exchange_plan(flavor: ExchangeFlavor) -> DistributedPlan {
+        let columns = vec![output_col(1, "k")];
+        let producer_fragment_id = 1;
+        let consumer_fragment_id = 0;
+        let exchange_node_id = 20;
+        let producer_fragment = PlanFragment {
+            fragment_id: producer_fragment_id,
+            root: physical_values_node(producer_fragment_id, 10, columns.clone()),
+            data_partition: DataPartition::unpartitioned(),
+            output_partition: DataPartition::unpartitioned(),
+            sink: crate::sql::planner::DataSink::Noop,
+            output_exprs: None,
+            output_columns: columns.clone(),
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        };
+        let consumer_fragment = PlanFragment {
+            fragment_id: consumer_fragment_id,
+            root: DistributedNode {
+                node_id: exchange_node_id,
+                fragment_id: consumer_fragment_id,
+                tuple_ids: vec![exchange_node_id],
+                nullable_tuple_ids: Vec::new(),
+                limit: -1,
+                build_runtime_filters: Vec::new(),
+                probe_runtime_filters: Vec::new(),
+                children: Vec::new(),
+                stats: stats(),
+                payload: DistributedPayload::Exchange(ExchangeReceiver {
+                    partition: DataPartition::unpartitioned(),
+                    source_fragment_id: producer_fragment_id,
+                    output_columns: columns.clone(),
+                    output_qualifier: None,
+                    flavor,
+                }),
+            },
+            data_partition: DataPartition::unpartitioned(),
+            output_partition: DataPartition::unpartitioned(),
+            sink: crate::sql::planner::DataSink::Result,
+            output_exprs: None,
+            output_columns: columns,
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        };
+        DistributedPlan {
+            fragments: vec![producer_fragment, consumer_fragment],
+            root_fragment_id: consumer_fragment_id,
+            edges: vec![FragmentEdge {
+                source_fragment_id: producer_fragment_id,
+                target_fragment_id: consumer_fragment_id,
+                target_exchange_node_id: exchange_node_id,
+                output_partition: DataPartition::unpartitioned(),
+                stream_kind: FragmentStreamKind::Gather,
+                edge_kind: FragmentEdgeKind::Stream,
+                output_slot_ids: Vec::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn lower_distributed_plan_accepts_stream_limit_and_topn_exchange_flavors() {
+        let cases = vec![
+            (
+                "limit_offset",
+                ExchangeFlavor::LimitOffset {
+                    limit: Some(1),
+                    offset: Some(0),
+                },
+            ),
+            (
+                "topn_split",
+                ExchangeFlavor::TopNSplit {
+                    items: Vec::new(),
+                    limit: Some(1),
+                    offset: Some(0),
+                },
+            ),
+        ];
+
+        for (label, flavor) in cases {
+            let dp = stream_exchange_plan(flavor);
+            lower_distributed_plan(&dp, &EmptyCatalog, &ConnectorRegistry::new(), None)
+                .unwrap_or_else(|err| panic!("{label} stream exchange should lower: {err}"));
         }
     }
 
