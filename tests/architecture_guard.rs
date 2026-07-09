@@ -4119,15 +4119,13 @@ fn nidl_d3l_native_mainline_thrift_usage_is_explicitly_allowlisted() {
         "native coordinator must not patch native sidecars from thrift-shaped payloads",
     );
 
-    let mut native_lowering_sources = [
-        "src/lower/novarocks/layout.rs",
-        "src/lower/novarocks/node.rs",
-    ]
-    .into_iter()
-    .map(|source| source.to_string())
-    .collect::<Vec<_>>();
+    let mut native_lowering_sources = ["src/lower/novarocks/layout.rs"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
     for dir in [
         "src/lower/novarocks/fragment",
+        "src/lower/novarocks/node",
         "src/lower/novarocks/scan",
         "src/lower/novarocks/sink",
     ] {
