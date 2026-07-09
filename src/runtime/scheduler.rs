@@ -230,8 +230,21 @@ impl FragmentScheduler {
             let count = if has_gather_input {
                 1
             } else if fr.has_scan_nodes {
-                // Scan fragment: one instance per backend.
-                n
+                // Scan fragment: instance count derives from scan-range coverage,
+                // not an unconditional per-backend fan-out. A virtual scan with a
+                // single placeholder range (Iceberg metadata/delta) collapses to a
+                // single instance instead of N-1 empty instances that would
+                // duplicate output under distributed execution. Zero ranges (empty
+                // snapshot / fully pruned) fall back to one instance producing zero
+                // rows. Native coordination only sees Iceberg native scan ranges,
+                // so native_scan_ranges is the complete range carrier here.
+                let max_ranges = fr
+                    .native_scan_ranges
+                    .values()
+                    .map(|ranges| ranges.len())
+                    .max()
+                    .unwrap_or(0);
+                max_ranges.clamp(1, n)
             } else {
                 // Non-scan: inherit max from upstream hash-partitioned edges.
                 let hash_max = incoming
@@ -1260,6 +1273,36 @@ mod tests {
         assert_eq!(counts, vec![3, 2, 2], "round-robin 7 across 3: [3,2,2]");
         let total: usize = counts.iter().sum();
         assert_eq!(total, 7, "no ranges lost");
+    }
+
+    #[test]
+    fn scan_instance_count_derives_from_range_count() {
+        let scheduler = FragmentScheduler::new(three_backends());
+        // 1 range on 3 backends -> single instance (virtual-scan root-fix case)
+        let one = vec![fake_fragment(0, Some(1), 1), fake_fragment(1, None, 0)];
+        let edges = vec![fake_edge(0, 1, TestPartitionType::Unpartitioned, 10)];
+        let plan = scheduler
+            .assign(&one, &edges, make_query_id(1, 0))
+            .expect("assign");
+        assert_eq!(plan.by_fragment[&0].len(), 1, "1 range -> 1 instance");
+
+        // 2 ranges on 3 backends -> two instances (range < N)
+        let two = vec![fake_fragment(0, Some(1), 2), fake_fragment(1, None, 0)];
+        let plan = scheduler
+            .assign(&two, &edges, make_query_id(1, 0))
+            .expect("assign");
+        assert_eq!(plan.by_fragment[&0].len(), 2, "2 ranges -> 2 instances");
+
+        // 5 ranges on 3 backends -> capped at N=3 (range >= N, unchanged)
+        let many = vec![fake_fragment(0, Some(1), 5), fake_fragment(1, None, 0)];
+        let plan = scheduler
+            .assign(&many, &edges, make_query_id(1, 0))
+            .expect("assign");
+        assert_eq!(
+            plan.by_fragment[&0].len(),
+            3,
+            "5 ranges on 3 BE -> 3 instances"
+        );
     }
 
     #[test]
