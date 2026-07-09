@@ -23,8 +23,10 @@
 //!
 //! # Instance-count policy (StarRocks-style "instance follows upstream")
 //!
-//! - A **scan fragment** (contains FILE_SCAN_NODE, HDFS_SCAN_NODE, or
-//!   LAKE_SCAN_NODE) gets `N` instances, one per backend.
+//! - A **scan fragment** gets `max(1, min(N, max scan-node range count))`
+//!   instances. The count derives from scan-range coverage, so a virtual scan
+//!   with a single placeholder range runs once instead of once per backend, and
+//!   an empty-snapshot scan falls back to one zero-row instance.
 //! - A **non-scan fragment** gets `max(upstream_N)` over incoming
 //!   `HashPartitioned` / `BucketShuffleHashPartitioned` edges, or 1 if no such
 //!   edge exists.
@@ -35,9 +37,12 @@
 //!
 //! # Backend assignment
 //!
-//! - Multi-instance fragments: instance `i` lands on live backend slot `i`.
-//!   The stored `backend_idx` is the backend id from the live snapshot, which
-//!   may be sparse.
+//! - Full-fanout fragments: instance `i` lands on live backend slot `i`. The
+//!   stored `backend_idx` is the backend id from the live snapshot, which may
+//!   be sparse.
+//! - Short scan fragments (`1 < count < N`): instance placement starts from
+//!   `live[(query_id.lo as usize) % N]` and wraps, so many small scans do not
+//!   all pile onto live slot 0.
 //! - Single-instance fragments (including the root): `backend_idx =
 //!   live[(query_id.lo as usize) % N].0`.
 //!
@@ -946,13 +951,13 @@ mod tests {
             .assign(&fragments, &edges, make_query_id(1, 1))
             .expect("assign");
         // A lone scan fragment is also the root, so the root override (1 instance)
-        // wins over the scan=N rule.
+        // wins over range-derived scan fanout.
         assert_eq!(plan.by_fragment[&0].len(), 1);
     }
 
     #[test]
-    fn scan_fragment_producer_gets_n_instances() {
-        // Non-root scan fragment with 3 backends should get 3 instances.
+    fn scan_fragment_with_backend_count_ranges_gets_full_fanout() {
+        // Non-root scan fragment with 3 ranges on 3 backends should get full fanout.
         let backends = three_backends();
         let scheduler = FragmentScheduler::new(backends);
         // F0=scan producer, F1=root consumer (UNPARTITIONED gather)
@@ -1278,7 +1283,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_instance_backend_idx_equals_instance_index() {
+    fn full_fanout_backend_idx_equals_instance_index() {
         let backends = three_backends();
         let scheduler = FragmentScheduler::new(backends);
         let fragments = vec![
@@ -1294,7 +1299,7 @@ mod tests {
         for inst in f0 {
             assert_eq!(
                 inst.backend_idx, inst.instance_index,
-                "multi-instance: backend_idx == instance_index"
+                "full-fanout: backend_idx == instance_index"
             );
         }
     }
