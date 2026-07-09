@@ -37,13 +37,6 @@ pub(crate) struct ExchangeReceiver {
     pub flavor: ExchangeFlavor,
 }
 
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub(crate) enum DistributedPayload {
-    Physical(PhysicalPlanKind),
-    Exchange(ExchangeReceiver),
-}
-
 /// Distributed-stage legal node kinds.
 ///
 /// This shares leaf payload structs with `PhysicalPlanKind`, but excludes
@@ -175,7 +168,7 @@ pub(crate) struct DistributedNode {
     pub probe_runtime_filters: Vec<WiredRuntimeFilterProbe>,
     pub children: Vec<DistributedNode>,
     pub stats: PhysicalPlanStats,
-    pub payload: DistributedPayload,
+    pub payload: DistributedNodeKind,
 }
 
 #[cfg(test)]
@@ -183,7 +176,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::sql::planner::plan::{PhysicalPlanKind, PlanValuesNode};
+    use crate::sql::planner::plan::PlanValuesNode;
     use crate::sql::planner::{PhysicalPlanStats, PlannerConfidence};
 
     #[test]
@@ -204,13 +197,13 @@ mod tests {
                 cost_estimate: None,
                 broadcast_decision: None,
             },
-            payload: DistributedPayload::Physical(PhysicalPlanKind::Values(PlanValuesNode {
+            payload: DistributedNodeKind::Values(PlanValuesNode {
                 rows: vec![],
                 columns: vec![],
-            })),
+            }),
         };
 
-        assert!(matches!(node.payload, DistributedPayload::Physical(_)));
+        assert!(matches!(node.payload, DistributedNodeKind::Values(_)));
     }
 
     #[test]

@@ -841,9 +841,7 @@ fn inject_native_keyed_assert_before_expand_node(
 
     if !matches!(
         node.payload,
-        crate::sql::planner::DistributedPayload::Physical(
-            crate::sql::planner::plan::PhysicalPlanKind::ChangeEventExpand(_)
-        )
+        crate::sql::planner::DistributedNodeKind::ChangeEventExpand(_)
     ) {
         return Ok(());
     }
@@ -869,14 +867,12 @@ fn inject_native_keyed_assert_before_expand_node(
         probe_runtime_filters: vec![],
         children: vec![original_child],
         stats: node.stats.clone(),
-        payload: crate::sql::planner::DistributedPayload::Physical(
-            crate::sql::planner::plan::PhysicalPlanKind::AssertOneRow(
-                crate::sql::planner::plan::PlanAssertOneRowNode::per_key_at_most_one(
-                    "DML change-stream matched row uniqueness",
-                    vec![key_column_id],
-                    vec![keyed_assert.key_label.clone()],
-                    keyed_assert.message_prefix.clone(),
-                ),
+        payload: crate::sql::planner::DistributedNodeKind::AssertOneRow(
+            crate::sql::planner::plan::PlanAssertOneRowNode::per_key_at_most_one(
+                "DML change-stream matched row uniqueness",
+                vec![key_column_id],
+                vec![keyed_assert.key_label.clone()],
+                keyed_assert.message_prefix.clone(),
             ),
         ),
     };
@@ -914,9 +910,7 @@ fn find_native_key_column_id_from_change_event_assignment(
     expand_node: &crate::sql::planner::DistributedNode,
     keyed_assert: &DmlPreExpandKeyedAssert,
 ) -> Result<Option<crate::sql::column_id::ColumnId>, String> {
-    let crate::sql::planner::DistributedPayload::Physical(
-        crate::sql::planner::plan::PhysicalPlanKind::ChangeEventExpand(expand),
-    ) = &expand_node.payload
+    let crate::sql::planner::DistributedNodeKind::ChangeEventExpand(expand) = &expand_node.payload
     else {
         return Ok(None);
     };
@@ -1047,10 +1041,7 @@ fn find_output_column_id_by_name(
     node: &crate::sql::planner::DistributedNode,
     column_name: &str,
 ) -> Result<crate::sql::column_id::ColumnId, String> {
-    if let crate::sql::planner::DistributedPayload::Physical(
-        crate::sql::planner::plan::PhysicalPlanKind::Project(project),
-    ) = &node.payload
-    {
+    if let crate::sql::planner::DistributedNodeKind::Project(project) = &node.payload {
         let mut matches = project
             .items
             .iter()
@@ -1092,50 +1083,33 @@ fn native_node_output_columns(
     node: &crate::sql::planner::DistributedNode,
 ) -> Option<&[crate::sql::analysis::OutputColumn]> {
     match &node.payload {
-        crate::sql::planner::DistributedPayload::Exchange(exchange) => {
+        crate::sql::planner::DistributedNodeKind::Exchange(exchange) => {
             Some(&exchange.output_columns)
         }
-        crate::sql::planner::DistributedPayload::Physical(kind) => match kind {
-            crate::sql::planner::plan::PhysicalPlanKind::Scan(scan) => Some(&scan.columns),
-            crate::sql::planner::plan::PhysicalPlanKind::Sort(sort) => Some(&sort.output_columns),
-            crate::sql::planner::plan::PhysicalPlanKind::Values(values) => Some(&values.columns),
-            crate::sql::planner::plan::PhysicalPlanKind::Window(window) => {
-                Some(&window.output_columns)
-            }
-            crate::sql::planner::plan::PhysicalPlanKind::TableFunction(table_function) => {
-                Some(&table_function.output_columns)
-            }
-            crate::sql::planner::plan::PhysicalPlanKind::HashAggregate(aggregate) => {
-                Some(&aggregate.output_columns)
-            }
-            crate::sql::planner::plan::PhysicalPlanKind::SetOp(set_op) => {
-                Some(&set_op.output_columns)
-            }
-            crate::sql::planner::plan::PhysicalPlanKind::ChangeEventExpand(expand) => {
-                Some(&expand.output_columns)
-            }
-            crate::sql::planner::plan::PhysicalPlanKind::CTEProduce(produce) => {
-                Some(&produce.output_columns)
-            }
-            crate::sql::planner::plan::PhysicalPlanKind::CTEConsume(consume) => {
-                Some(&consume.output_columns)
-            }
-            crate::sql::planner::plan::PhysicalPlanKind::Redistribute(redistribute) => {
-                Some(&redistribute.output_columns)
-            }
-            crate::sql::planner::plan::PhysicalPlanKind::Filter(_)
-            | crate::sql::planner::plan::PhysicalPlanKind::Project(_)
-            | crate::sql::planner::plan::PhysicalPlanKind::Limit(_)
-            | crate::sql::planner::plan::PhysicalPlanKind::AssertOneRow(_)
-            | crate::sql::planner::plan::PhysicalPlanKind::TopN(_)
-            | crate::sql::planner::plan::PhysicalPlanKind::HashJoin(_)
-            | crate::sql::planner::plan::PhysicalPlanKind::NestLoopJoin(_)
-            | crate::sql::planner::plan::PhysicalPlanKind::Repeat(_)
-            | crate::sql::planner::plan::PhysicalPlanKind::GenerateSeries(_)
-            | crate::sql::planner::plan::PhysicalPlanKind::CTEAnchor(_) => {
-                node.children.first().and_then(native_node_output_columns)
-            }
-        },
+        crate::sql::planner::DistributedNodeKind::Scan(scan) => Some(&scan.columns),
+        crate::sql::planner::DistributedNodeKind::Sort(sort) => Some(&sort.output_columns),
+        crate::sql::planner::DistributedNodeKind::Values(values) => Some(&values.columns),
+        crate::sql::planner::DistributedNodeKind::Window(window) => Some(&window.output_columns),
+        crate::sql::planner::DistributedNodeKind::TableFunction(table_function) => {
+            Some(&table_function.output_columns)
+        }
+        crate::sql::planner::DistributedNodeKind::HashAggregate(aggregate) => {
+            Some(&aggregate.output_columns)
+        }
+        crate::sql::planner::DistributedNodeKind::SetOp(set_op) => Some(&set_op.output_columns),
+        crate::sql::planner::DistributedNodeKind::ChangeEventExpand(expand) => {
+            Some(&expand.output_columns)
+        }
+        crate::sql::planner::DistributedNodeKind::Filter(_)
+        | crate::sql::planner::DistributedNodeKind::Project(_)
+        | crate::sql::planner::DistributedNodeKind::AssertOneRow(_)
+        | crate::sql::planner::DistributedNodeKind::TopN(_)
+        | crate::sql::planner::DistributedNodeKind::HashJoin(_)
+        | crate::sql::planner::DistributedNodeKind::NestLoopJoin(_)
+        | crate::sql::planner::DistributedNodeKind::Repeat(_)
+        | crate::sql::planner::DistributedNodeKind::GenerateSeries(_) => {
+            node.children.first().and_then(native_node_output_columns)
+        }
     }
 }
 
@@ -1910,7 +1884,7 @@ mod tests {
             DistributedChangeEventExpandNode, PhysicalPlanKind, PlanValuesNode,
         };
         use crate::sql::planner::{
-            DataPartition, DataSink, DistributedNode, DistributedPayload, PhysicalPlanStats,
+            DataPartition, DataSink, DistributedNode, DistributedNodeKind, PhysicalPlanStats,
             PlanFragment, PlannerConfidence,
         };
 
@@ -1930,7 +1904,7 @@ mod tests {
                 cost_estimate: None,
                 broadcast_decision: None,
             },
-            payload: DistributedPayload::Physical(PhysicalPlanKind::Values(PlanValuesNode {
+            payload: DistributedNodeKind::Values(PlanValuesNode {
                 rows: Vec::new(),
                 columns: vec![crate::sql::analysis::OutputColumn {
                     column_id: crate::sql::column_id::ColumnId::new_for_test(1),
@@ -1939,7 +1913,7 @@ mod tests {
                     nullable: false,
                     is_internal: true,
                 }],
-            })),
+            }),
         };
         let expand = DistributedNode {
             node_id: 2,
@@ -1957,20 +1931,18 @@ mod tests {
                 cost_estimate: None,
                 broadcast_decision: None,
             },
-            payload: DistributedPayload::Physical(PhysicalPlanKind::ChangeEventExpand(
-                DistributedChangeEventExpandNode {
-                    events: Vec::new(),
-                    output_columns: vec![crate::sql::analysis::OutputColumn {
-                        column_id: crate::sql::column_id::ColumnId::new_for_test(1),
-                        name: "__nr_row_id".to_string(),
-                        data_type: arrow::datatypes::DataType::Int64,
-                        nullable: false,
-                        is_internal: true,
-                    }],
-                    change_op_column_id: crate::sql::column_id::ColumnId::new_for_test(2),
-                    data_route_column_id: Some(crate::sql::column_id::ColumnId::new_for_test(3)),
-                },
-            )),
+            payload: DistributedNodeKind::ChangeEventExpand(DistributedChangeEventExpandNode {
+                events: Vec::new(),
+                output_columns: vec![crate::sql::analysis::OutputColumn {
+                    column_id: crate::sql::column_id::ColumnId::new_for_test(1),
+                    name: "__nr_row_id".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                    is_internal: true,
+                }],
+                change_op_column_id: crate::sql::column_id::ColumnId::new_for_test(2),
+                data_route_column_id: Some(crate::sql::column_id::ColumnId::new_for_test(3)),
+            }),
         };
         crate::sql::planner::DistributedPlan {
             fragments: vec![PlanFragment {
@@ -2007,7 +1979,7 @@ mod tests {
                 cost_estimate: None,
                 broadcast_decision: None,
             },
-            payload: crate::sql::planner::DistributedPayload::Exchange(
+            payload: crate::sql::planner::DistributedNodeKind::Exchange(
                 crate::sql::planner::ExchangeReceiver {
                     partition: crate::sql::planner::DataPartition::unpartitioned(),
                     source_fragment_id: 0,
@@ -2065,7 +2037,7 @@ mod tests {
             node.node_id == node_id
                 && matches!(
                     node.payload,
-                    crate::sql::planner::DistributedPayload::Exchange(_)
+                    crate::sql::planner::DistributedNodeKind::Exchange(_)
                 )
                 || node
                     .children
@@ -2086,16 +2058,11 @@ mod tests {
             .expect("inject native keyed assert");
 
         let root = &plan.fragments[0].root;
-        let crate::sql::planner::DistributedPayload::Physical(
-            crate::sql::planner::plan::PhysicalPlanKind::ChangeEventExpand(_),
-        ) = &root.payload
-        else {
+        let crate::sql::planner::DistributedNodeKind::ChangeEventExpand(_) = &root.payload else {
             panic!("expected native ChangeEventExpand root");
         };
         let assert_node = &root.children[0];
-        let crate::sql::planner::DistributedPayload::Physical(
-            crate::sql::planner::plan::PhysicalPlanKind::AssertOneRow(assert),
-        ) = &assert_node.payload
+        let crate::sql::planner::DistributedNodeKind::AssertOneRow(assert) = &assert_node.payload
         else {
             panic!("expected native AssertOneRow below ChangeEventExpand");
         };
@@ -2110,9 +2077,7 @@ mod tests {
         );
         assert!(matches!(
             assert_node.children[0].payload,
-            crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::Values(_)
-            )
+            crate::sql::planner::DistributedNodeKind::Values(_)
         ));
     }
 

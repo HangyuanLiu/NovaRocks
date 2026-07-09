@@ -29,7 +29,7 @@ pub(crate) mod equiv;
 
 #[cfg(test)]
 pub(crate) use crate::sql::planner::{
-    DataPartition, DataSink, DistributedNode, DistributedPayload, DistributedPlan, PartitionKind,
+    DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, PartitionKind,
     PlanFragment,
 };
 pub(crate) use explain::{explain_distributed_plan, explain_distributed_plan_analyze};

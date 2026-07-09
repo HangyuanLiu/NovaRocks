@@ -721,13 +721,11 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
-            payload: crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::Values(
-                    crate::sql::planner::plan::PlanValuesNode {
-                        rows: vec![vec![int_expr(7)]],
-                        columns: output,
-                    },
-                ),
+            payload: crate::sql::planner::DistributedNodeKind::Values(
+                crate::sql::planner::plan::PlanValuesNode {
+                    rows: vec![vec![int_expr(7)]],
+                    columns: output,
+                },
             ),
         }
     }
@@ -810,7 +808,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
-            payload: crate::sql::planner::DistributedPayload::Exchange(
+            payload: crate::sql::planner::DistributedNodeKind::Exchange(
                 crate::sql::planner::ExchangeReceiver {
                     partition: crate::sql::planner::DataPartition::hash(vec![column_expr(
                         10,
@@ -912,19 +910,17 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
-            payload: crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::Scan(
-                    crate::sql::planner::plan::PlanScanNode {
-                        database: "db".to_string(),
-                        table: iceberg_scan_table_for_columns(&["v1", "s2", "array1"]),
-                        alias: None,
-                        columns: all_scan_columns,
-                        predicates: Vec::new(),
-                        required_columns: Some(vec!["s2".to_string(), "array1".to_string()]),
-                        variant_columns: Vec::new(),
-                        mv_rewritten_from: None,
-                    },
-                ),
+            payload: crate::sql::planner::DistributedNodeKind::Scan(
+                crate::sql::planner::plan::PlanScanNode {
+                    database: "db".to_string(),
+                    table: iceberg_scan_table_for_columns(&["v1", "s2", "array1"]),
+                    alias: None,
+                    columns: all_scan_columns,
+                    predicates: Vec::new(),
+                    required_columns: Some(vec!["s2".to_string(), "array1".to_string()]),
+                    variant_columns: Vec::new(),
+                    mv_rewritten_from: None,
+                },
             ),
         };
         let source = crate::sql::planner::PlanFragment {
@@ -948,7 +944,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
-            payload: crate::sql::planner::DistributedPayload::Exchange(
+            payload: crate::sql::planner::DistributedNodeKind::Exchange(
                 crate::sql::planner::ExchangeReceiver {
                     partition: crate::sql::planner::DataPartition::unpartitioned(),
                     source_fragment_id: 0,
@@ -1017,21 +1013,19 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: vec![values_distributed_node(0, 10, vec![group_column.clone()])],
             stats: physical_stats(),
-            payload: crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::HashAggregate(Box::new(
-                    crate::sql::planner::plan::PhysicalHashAggregateNode {
-                        mode: crate::sql::planner::AggMode::Local,
-                        group_by: vec![column_expr(2, "c1", DataType::Utf8)],
-                        aggregates: Vec::new(),
-                        is_merge: Vec::new(),
-                        output_layout: crate::sql::planner::AggregateOutputLayout::new(
-                            vec![group_column.clone()],
-                            Vec::new(),
-                        ),
-                        output_columns: Vec::new(),
-                    },
-                )),
-            ),
+            payload: crate::sql::planner::DistributedNodeKind::HashAggregate(Box::new(
+                crate::sql::planner::plan::PhysicalHashAggregateNode {
+                    mode: crate::sql::planner::AggMode::Local,
+                    group_by: vec![column_expr(2, "c1", DataType::Utf8)],
+                    aggregates: Vec::new(),
+                    is_merge: Vec::new(),
+                    output_layout: crate::sql::planner::AggregateOutputLayout::new(
+                        vec![group_column.clone()],
+                        Vec::new(),
+                    ),
+                    output_columns: Vec::new(),
+                },
+            )),
         };
         let source = crate::sql::planner::PlanFragment {
             fragment_id: 0,
@@ -1054,7 +1048,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
-            payload: crate::sql::planner::DistributedPayload::Exchange(
+            payload: crate::sql::planner::DistributedNodeKind::Exchange(
                 crate::sql::planner::ExchangeReceiver {
                     partition: crate::sql::planner::DataPartition::unpartitioned(),
                     source_fragment_id: 0,
@@ -1125,28 +1119,26 @@ mod tests {
                 vec![group_column.clone(), value_column.clone()],
             )],
             stats: physical_stats(),
-            payload: crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::HashAggregate(Box::new(
-                    crate::sql::planner::plan::PhysicalHashAggregateNode {
-                        mode: crate::sql::planner::AggMode::Local,
-                        group_by: vec![column_expr(2, "c0", DataType::Int64)],
-                        aggregates: vec![crate::sql::planner::plan::AggregateCall {
-                            name: "avg".to_string(),
-                            args: vec![column_expr(3, "c1", DataType::Int64)],
-                            distinct: false,
-                            result_type: DataType::Float64,
-                            order_by: Vec::new(),
-                            output_column_id: crate::sql::column_id::ColumnId::new_for_test(15),
-                        }],
-                        is_merge: vec![false],
-                        output_layout: crate::sql::planner::AggregateOutputLayout::new(
-                            vec![group_column.clone()],
-                            vec![avg_column.clone()],
-                        ),
-                        output_columns: Vec::new(),
-                    },
-                )),
-            ),
+            payload: crate::sql::planner::DistributedNodeKind::HashAggregate(Box::new(
+                crate::sql::planner::plan::PhysicalHashAggregateNode {
+                    mode: crate::sql::planner::AggMode::Local,
+                    group_by: vec![column_expr(2, "c0", DataType::Int64)],
+                    aggregates: vec![crate::sql::planner::plan::AggregateCall {
+                        name: "avg".to_string(),
+                        args: vec![column_expr(3, "c1", DataType::Int64)],
+                        distinct: false,
+                        result_type: DataType::Float64,
+                        order_by: Vec::new(),
+                        output_column_id: crate::sql::column_id::ColumnId::new_for_test(15),
+                    }],
+                    is_merge: vec![false],
+                    output_layout: crate::sql::planner::AggregateOutputLayout::new(
+                        vec![group_column.clone()],
+                        vec![avg_column.clone()],
+                    ),
+                    output_columns: Vec::new(),
+                },
+            )),
         };
         let source = crate::sql::planner::PlanFragment {
             fragment_id: 0,
@@ -1169,7 +1161,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
-            payload: crate::sql::planner::DistributedPayload::Exchange(
+            payload: crate::sql::planner::DistributedNodeKind::Exchange(
                 crate::sql::planner::ExchangeReceiver {
                     partition: crate::sql::planner::DataPartition::unpartitioned(),
                     source_fragment_id: 0,
@@ -1251,7 +1243,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
-            payload: crate::sql::planner::DistributedPayload::Exchange(
+            payload: crate::sql::planner::DistributedNodeKind::Exchange(
                 crate::sql::planner::ExchangeReceiver {
                     partition: crate::sql::planner::DataPartition::unpartitioned(),
                     source_fragment_id: 0,
@@ -1434,23 +1426,21 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
-            payload: crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::Scan(
-                    crate::sql::planner::plan::PlanScanNode {
-                        database: "db".to_string(),
-                        table,
-                        alias: None,
-                        columns: vec![planner_output_column(
-                            10,
-                            "amount",
-                            DataType::Decimal128(10, 2),
-                        )],
-                        predicates: Vec::new(),
-                        required_columns: None,
-                        variant_columns: Vec::new(),
-                        mv_rewritten_from: None,
-                    },
-                ),
+            payload: crate::sql::planner::DistributedNodeKind::Scan(
+                crate::sql::planner::plan::PlanScanNode {
+                    database: "db".to_string(),
+                    table,
+                    alias: None,
+                    columns: vec![planner_output_column(
+                        10,
+                        "amount",
+                        DataType::Decimal128(10, 2),
+                    )],
+                    predicates: Vec::new(),
+                    required_columns: None,
+                    variant_columns: Vec::new(),
+                    mv_rewritten_from: None,
+                },
             ),
         };
 
@@ -1533,19 +1523,17 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
-            payload: crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::Scan(
-                    crate::sql::planner::plan::PlanScanNode {
-                        database: "db".to_string(),
-                        table,
-                        alias: None,
-                        columns: vec![planner_output_column(10, "tags", list_type)],
-                        predicates: Vec::new(),
-                        required_columns: None,
-                        variant_columns: Vec::new(),
-                        mv_rewritten_from: None,
-                    },
-                ),
+            payload: crate::sql::planner::DistributedNodeKind::Scan(
+                crate::sql::planner::plan::PlanScanNode {
+                    database: "db".to_string(),
+                    table,
+                    alias: None,
+                    columns: vec![planner_output_column(10, "tags", list_type)],
+                    predicates: Vec::new(),
+                    required_columns: None,
+                    variant_columns: Vec::new(),
+                    mv_rewritten_from: None,
+                },
             ),
         };
 
@@ -1575,27 +1563,25 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
-            payload: crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::Scan(
-                    crate::sql::planner::plan::PlanScanNode {
-                        database: "db".to_string(),
-                        table: crate::sql::catalog::TableDef {
-                            name: "sr_table".to_string(),
-                            columns: Vec::new(),
-                            iceberg_row_lineage_metadata_columns: Vec::new(),
-                            source: crate::sql::catalog::ScanSource::StarRocks {
-                                db_id: 1,
-                                table_id: 2,
-                            },
-                        },
-                        alias: None,
+            payload: crate::sql::planner::DistributedNodeKind::Scan(
+                crate::sql::planner::plan::PlanScanNode {
+                    database: "db".to_string(),
+                    table: crate::sql::catalog::TableDef {
+                        name: "sr_table".to_string(),
                         columns: Vec::new(),
-                        predicates: Vec::new(),
-                        required_columns: None,
-                        variant_columns: Vec::new(),
-                        mv_rewritten_from: None,
+                        iceberg_row_lineage_metadata_columns: Vec::new(),
+                        source: crate::sql::catalog::ScanSource::StarRocks {
+                            db_id: 1,
+                            table_id: 2,
+                        },
                     },
-                ),
+                    alias: None,
+                    columns: Vec::new(),
+                    predicates: Vec::new(),
+                    required_columns: None,
+                    variant_columns: Vec::new(),
+                    mv_rewritten_from: None,
+                },
             ),
         };
 
