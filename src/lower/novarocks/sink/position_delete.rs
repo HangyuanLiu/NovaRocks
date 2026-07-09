@@ -88,7 +88,7 @@ pub(crate) fn build_position_delete_data_file_partition_index(
     })?
 }
 
-pub(crate) fn insert_position_delete_data_file_partition(
+fn insert_position_delete_data_file_partition(
     index: &mut HashMap<String, PositionDeleteDataFilePartition>,
     path: String,
     partition: PositionDeleteDataFilePartition,
@@ -115,7 +115,7 @@ pub(crate) fn insert_position_delete_data_file_partition(
     }
 }
 
-pub(crate) fn position_delete_descriptor_from_native(
+fn position_delete_descriptor_from_native(
     desc: Option<&plan::PositionDeleteDescriptorInput>,
 ) -> Result<PositionDeleteDescriptorInput, String> {
     let desc =
@@ -151,7 +151,7 @@ pub(crate) fn bind_position_delete_descriptor_from_native(
     bind_position_delete_descriptor(&desc, &expected).map_err(|err| err.to_bracketed_user_message())
 }
 
-pub(crate) fn position_delete_output_field_from_native(
+fn position_delete_output_field_from_native(
     label: &str,
     field: &plan::PositionDeleteOutputField,
 ) -> Result<crate::connector::iceberg::position_delete_descriptor::PositionDeleteOutputField, String>
@@ -173,7 +173,7 @@ pub(crate) fn position_delete_output_field_from_native(
     )
 }
 
-pub(crate) fn position_delete_partition_source_field_from_native(
+fn position_delete_partition_source_field_from_native(
     field: &plan::PositionDeletePartitionSourceField,
 ) -> Result<
     crate::connector::iceberg::position_delete_descriptor::PositionDeletePartitionSourceField,

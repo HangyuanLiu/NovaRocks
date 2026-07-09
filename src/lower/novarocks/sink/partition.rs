@@ -24,10 +24,12 @@ use crate::exec::expr::function::lookup_function;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use crate::proto::plan;
 
+type PartitionMetadataInfo = (Vec<String>, Vec<String>, Vec<String>);
+
 pub(crate) fn partition_info_from_metadata(
     metadata: Option<&TableMetadata>,
     target_partition_spec_id: i32,
-) -> Result<(Vec<String>, Vec<String>, Vec<String>), String> {
+) -> Result<PartitionMetadataInfo, String> {
     let Some(metadata) = metadata else {
         return Ok((Vec::new(), Vec::new(), Vec::new()));
     };
@@ -103,7 +105,7 @@ pub(crate) fn build_partition_exprs_from_output_exprs(
         .collect()
 }
 
-pub(crate) fn build_partition_expr_from_transform(
+fn build_partition_expr_from_transform(
     transform: &str,
     source_expr: ExprId,
     arena: &mut ExprArena,
@@ -175,7 +177,7 @@ pub(crate) fn build_partition_expr_from_transform(
     }
 }
 
-pub(crate) fn parse_transform_width(transform: &str, name: &str) -> Result<i64, String> {
+fn parse_transform_width(transform: &str, name: &str) -> Result<i64, String> {
     let prefix = format!("{name}[");
     let raw = transform
         .strip_prefix(&prefix)
@@ -192,7 +194,7 @@ pub(crate) fn parse_transform_width(transform: &str, name: &str) -> Result<i64, 
     Ok(width)
 }
 
-pub(crate) fn push_partition_transform_call(
+fn push_partition_transform_call(
     name: &str,
     args: Vec<ExprId>,
     data_type: DataType,

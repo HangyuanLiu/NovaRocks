@@ -75,7 +75,7 @@ pub(crate) fn iceberg_table_descriptor_from_native(
     })
 }
 
-pub(crate) fn iceberg_schema_field_descriptor_from_native(
+fn iceberg_schema_field_descriptor_from_native(
     field: &plan::IcebergSchemaFieldDef,
 ) -> IcebergSchemaFieldDescriptor {
     IcebergSchemaFieldDescriptor {
@@ -90,9 +90,7 @@ pub(crate) fn iceberg_schema_field_descriptor_from_native(
     }
 }
 
-pub(crate) fn column_def_to_table_column(
-    column: &plan::ColumnDef,
-) -> Result<IcebergTableColumn, String> {
+fn column_def_to_table_column(column: &plan::ColumnDef) -> Result<IcebergTableColumn, String> {
     let data_type = column
         .data_type
         .as_ref()
