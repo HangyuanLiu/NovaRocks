@@ -16,7 +16,8 @@
 // under the License.
 
 use crate::sql::analysis::*;
-use crate::sql::planner::plan::*;
+use crate::sql::planner::logical::*;
+use crate::sql::planner::payload::*;
 
 pub(crate) fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputColumn>, String> {
     match &plan.kind {
@@ -171,7 +172,7 @@ pub(super) fn adapt_plan_output_with_qualifier(
     }
 
     Ok(LogicalPlanNode::new(
-        LogicalPlanKind::Project(LogicalProjectNode {
+        LogicalPlanKind::Project(PlanProjectNode {
             items: items,
             output_qualifier: output_qualifier.map(str::to_string),
         }),

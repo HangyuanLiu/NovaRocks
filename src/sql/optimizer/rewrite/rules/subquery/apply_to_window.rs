@@ -547,6 +547,7 @@ mod tests {
     };
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
+    use crate::sql::common::ApplyKind;
     use crate::sql::optimizer::operator::Operator;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
@@ -555,11 +556,12 @@ mod tests {
     use crate::sql::optimizer::rewrite::rules::utils::{collect_column_id_refs, split_and};
     use crate::sql::optimizer::rewrite::tree_binder::bind_tree;
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::logical::{
+        LogicalAggregateNode, LogicalApplyNode, LogicalJoinNode, LogicalPlanKind, LogicalPlanNode,
+    };
     use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
-    use crate::sql::planner::plan::{
-        AggregateCall, ApplyKind, LogicalAggregateNode, LogicalApplyNode, LogicalFilterNode,
-        LogicalJoinNode, LogicalLimitNode, LogicalPlanKind, LogicalPlanNode, LogicalProjectNode,
-        LogicalScanNode,
+    use crate::sql::planner::payload::{
+        AggregateCall, PlanFilterNode, PlanLimitNode, PlanProjectNode, PlanScanNode,
     };
 
     fn check_preconditions(
@@ -574,7 +576,7 @@ mod tests {
             None,
         );
         let plan = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: where_pred.clone(),
             }),
             vec![apply_plan],
@@ -706,7 +708,7 @@ mod tests {
     /// Build `Scan(lineitem, table_id=1)` for the outer left side (first instance).
     fn make_outer_lineitem_scan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 database: "default".to_string(),
                 table: TableDef {
                     name: "lineitem".to_string(),
@@ -754,7 +756,7 @@ mod tests {
     /// Build `Scan(part, table_id=2)`.
     fn make_part_scan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 database: "default".to_string(),
                 table: TableDef {
                     name: "part".to_string(),
@@ -795,7 +797,7 @@ mod tests {
     /// Build inner `Scan(lineitem, table_id=1)` — second instance with INNER_ ColumnIds.
     fn make_inner_lineitem_scan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 database: "default".to_string(),
                 table: TableDef {
                     name: "lineitem".to_string(),
@@ -941,7 +943,7 @@ mod tests {
         );
 
         LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode { predicate: pred }),
+            LogicalPlanKind::Filter(PlanFilterNode { predicate: pred }),
             vec![apply],
             None,
         )
@@ -962,7 +964,7 @@ mod tests {
             col_ref_nullable(AVG_RESULT, "avg(l_quantity)", DataType::Float64),
         );
         let projected_right = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![
                     // passthrough: l_partkey
                     ProjectItem {
@@ -1019,7 +1021,7 @@ mod tests {
         );
         (
             LogicalPlanNode::new(
-                LogicalPlanKind::Filter(LogicalFilterNode { predicate: pred }),
+                LogicalPlanKind::Filter(PlanFilterNode { predicate: pred }),
                 vec![apply],
                 None,
             ),
@@ -1104,7 +1106,7 @@ mod tests {
     fn pattern_rejects_filter_over_non_apply_child() {
         let rule = ApplyToWindow;
         let filter_over_join = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     data_type: DataType::Boolean,
                     nullable: false,
@@ -1412,7 +1414,7 @@ mod tests {
         right: LogicalPlanNode,
     ) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode { predicate }),
+            LogicalPlanKind::Filter(PlanFilterNode { predicate }),
             vec![make_apply_plan(apply, left, right)],
             None,
         )
@@ -1566,7 +1568,7 @@ mod tests {
         let a = a_orig.clone();
         // Replace inner scan with one from table_id=99
         let foreign_scan = LogicalPlanNode::new(
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 database: "default".to_string(),
                 table: TableDef {
                     name: "other".to_string(),
@@ -1622,7 +1624,7 @@ mod tests {
         let (pred, a_orig, left, right) = extract_filter_apply(&plan);
         let a = a_orig.clone();
         let bad_left = LogicalPlanNode::new(
-            LogicalPlanKind::Limit(LogicalLimitNode {
+            LogicalPlanKind::Limit(PlanLimitNode {
                 limit: Some(10),
                 offset: None,
             }),
@@ -1657,7 +1659,7 @@ mod tests {
             nullable: false,
         };
         let inner_with_filter = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: residual_pred,
             }),
             vec![make_inner_lineitem_scan()],
@@ -1722,7 +1724,7 @@ mod tests {
             nullable: false,
         };
         let inner_with_filter = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: inner_residual,
             }),
             vec![make_inner_lineitem_scan()],
@@ -1899,7 +1901,7 @@ mod tests {
             between_conjunct.clone(),
         );
         let plan = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode { predicate: pred }),
+            LogicalPlanKind::Filter(PlanFilterNode { predicate: pred }),
             vec![apply],
             None,
         );
@@ -1957,7 +1959,7 @@ mod tests {
         );
         // Inner: Agg{group_by:[]}(Filter(corr_pred)(inner_scan))
         let inner_filter = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: inner_corr_pred,
             }),
             vec![make_inner_lineitem_scan()],
@@ -2029,7 +2031,7 @@ mod tests {
         );
 
         LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode { predicate: pred }),
+            LogicalPlanKind::Filter(PlanFilterNode { predicate: pred }),
             vec![apply],
             None,
         )

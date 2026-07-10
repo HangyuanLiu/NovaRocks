@@ -722,7 +722,7 @@ mod tests {
             children: Vec::new(),
             stats: physical_stats(),
             payload: crate::sql::planner::DistributedNodeKind::Values(
-                crate::sql::planner::plan::PlanValuesNode {
+                crate::sql::planner::payload::PlanValuesNode {
                     rows: vec![vec![int_expr(7)]],
                     columns: output,
                 },
@@ -911,7 +911,7 @@ mod tests {
             children: Vec::new(),
             stats: physical_stats(),
             payload: crate::sql::planner::DistributedNodeKind::Scan(
-                crate::sql::planner::plan::PlanScanNode {
+                crate::sql::planner::payload::PlanScanNode {
                     database: "db".to_string(),
                     table: iceberg_scan_table_for_columns(&["v1", "s2", "array1"]),
                     alias: None,
@@ -1123,7 +1123,7 @@ mod tests {
                 crate::sql::planner::plan::PhysicalHashAggregateNode {
                     mode: crate::sql::planner::AggMode::Local,
                     group_by: vec![column_expr(2, "c0", DataType::Int64)],
-                    aggregates: vec![crate::sql::planner::plan::AggregateCall {
+                    aggregates: vec![crate::sql::planner::payload::AggregateCall {
                         name: "avg".to_string(),
                         args: vec![column_expr(3, "c1", DataType::Int64)],
                         distinct: false,
@@ -1427,7 +1427,7 @@ mod tests {
             children: Vec::new(),
             stats: physical_stats(),
             payload: crate::sql::planner::DistributedNodeKind::Scan(
-                crate::sql::planner::plan::PlanScanNode {
+                crate::sql::planner::payload::PlanScanNode {
                     database: "db".to_string(),
                     table,
                     alias: None,
@@ -1524,7 +1524,7 @@ mod tests {
             children: Vec::new(),
             stats: physical_stats(),
             payload: crate::sql::planner::DistributedNodeKind::Scan(
-                crate::sql::planner::plan::PlanScanNode {
+                crate::sql::planner::payload::PlanScanNode {
                     database: "db".to_string(),
                     table,
                     alias: None,
@@ -1564,7 +1564,7 @@ mod tests {
             children: Vec::new(),
             stats: physical_stats(),
             payload: crate::sql::planner::DistributedNodeKind::Scan(
-                crate::sql::planner::plan::PlanScanNode {
+                crate::sql::planner::payload::PlanScanNode {
                     database: "db".to_string(),
                     table: crate::sql::catalog::TableDef {
                         name: "sr_table".to_string(),

@@ -25,18 +25,20 @@
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::ScalarArena;
+use crate::sql::planner::logical::{
+    LogicalAggregateNode, LogicalApplyNode, LogicalExceptNode, LogicalImvDeltaNode,
+    LogicalImvVersionNode, LogicalIntersectNode, LogicalJoinNode, LogicalPlanKind, LogicalPlanNode,
+    LogicalUnionNode,
+};
 use crate::sql::planner::optimizer_bridge::scalar::materialize;
 use crate::sql::planner::optimizer_bridge::scalar::{
     materialize_aggregate_call, materialize_exprs, materialize_project_items,
     materialize_sort_keys, materialize_window_exprs,
 };
-use crate::sql::planner::plan::{
-    LogicalAggregateNode, LogicalApplyNode, LogicalAssertOneRowNode, LogicalCTEAnchorNode,
-    LogicalCTEConsumeNode, LogicalCTEProduceNode, LogicalExceptNode, LogicalFilterNode,
-    LogicalGenerateSeriesNode, LogicalImvDeltaNode, LogicalImvVersionNode, LogicalIntersectNode,
-    LogicalJoinNode, LogicalLimitNode, LogicalPlanKind, LogicalPlanNode, LogicalProjectNode,
-    LogicalRepeatNode, LogicalScanNode, LogicalSortNode, LogicalTableFunctionNode,
-    LogicalUnionNode, LogicalValuesNode, LogicalWindowNode,
+use crate::sql::planner::payload::{
+    PlanAssertOneRowNode, PlanCTEAnchorNode, PlanCTEConsumeNode, PlanCTEProduceNode,
+    PlanFilterNode, PlanGenerateSeriesNode, PlanLimitNode, PlanProjectNode, PlanRepeatNode,
+    PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanValuesNode, PlanWindowNode,
 };
 
 /// Materialise an `OptExpr` subtree into a `LogicalPlanNode`, converting all
@@ -52,7 +54,7 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
         .collect();
 
     let kind = match &expr.op {
-        Operator::LogicalScan(op) => LogicalPlanKind::Scan(LogicalScanNode {
+        Operator::LogicalScan(op) => LogicalPlanKind::Scan(PlanScanNode {
             database: op.database.clone(),
             table: op.table.clone(),
             alias: op.alias.clone(),
@@ -63,11 +65,11 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
             mv_rewritten_from: None,
         }),
 
-        Operator::LogicalFilter(op) => LogicalPlanKind::Filter(LogicalFilterNode {
+        Operator::LogicalFilter(op) => LogicalPlanKind::Filter(PlanFilterNode {
             predicate: materialize(arena, op.predicate),
         }),
 
-        Operator::LogicalProject(op) => LogicalPlanKind::Project(LogicalProjectNode {
+        Operator::LogicalProject(op) => LogicalPlanKind::Project(PlanProjectNode {
             items: materialize_project_items(arena, &op.items),
             output_qualifier: op.output_qualifier.clone(),
         }),
@@ -95,7 +97,7 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
         Operator::LogicalSort(op) => {
             let items = materialize_sort_keys(arena, &op.items);
             let analytic_partition_by = materialize_exprs(arena, &op.analytic_partition_exprs);
-            LogicalPlanKind::Sort(LogicalSortNode {
+            LogicalPlanKind::Sort(PlanSortNode {
                 items,
                 analytic_partition_by,
                 output_columns: vec![],
@@ -105,7 +107,7 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
             })
         }
 
-        Operator::LogicalLimit(op) => LogicalPlanKind::Limit(LogicalLimitNode {
+        Operator::LogicalLimit(op) => LogicalPlanKind::Limit(PlanLimitNode {
             limit: op.limit,
             offset: op.offset,
         }),
@@ -116,7 +118,7 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
                 .iter()
                 .map(|row| materialize_exprs(arena, row))
                 .collect();
-            LogicalPlanKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(PlanValuesNode {
                 rows,
                 columns: op.columns.clone(),
             })
@@ -125,14 +127,14 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
         Operator::LogicalWindow(op) => {
             let window_exprs =
                 materialize_window_exprs(arena, &op.window_exprs, &op.output_columns);
-            LogicalPlanKind::Window(LogicalWindowNode {
+            LogicalPlanKind::Window(PlanWindowNode {
                 window_exprs,
                 output_columns: op.output_columns.clone(),
             })
         }
 
         Operator::LogicalAssertOneRow(op) => LogicalPlanKind::AssertOneRow(
-            LogicalAssertOneRowNode::global_at_most_one(op.subquery_text.clone()),
+            PlanAssertOneRowNode::global_at_most_one(op.subquery_text.clone()),
         ),
 
         Operator::LogicalApply(op) => LogicalPlanKind::Apply(LogicalApplyNode {
@@ -150,7 +152,7 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
 
         Operator::LogicalTableFunction(op) => {
             let args = materialize_exprs(arena, &op.args);
-            LogicalPlanKind::TableFunction(LogicalTableFunctionNode {
+            LogicalPlanKind::TableFunction(PlanTableFunctionNode {
                 function_name: op.function_name.clone(),
                 args,
                 output_columns: op.output_columns.clone(),
@@ -159,7 +161,7 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
             })
         }
 
-        Operator::LogicalCTEConsume(op) => LogicalPlanKind::CTEConsume(LogicalCTEConsumeNode {
+        Operator::LogicalCTEConsume(op) => LogicalPlanKind::CTEConsume(PlanCTEConsumeNode {
             cte_id: op.cte_id,
             alias: op.alias.clone(),
             output_columns: op.output_columns.clone(),
@@ -167,10 +169,10 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
         }),
 
         Operator::LogicalCTEAnchor(op) => {
-            LogicalPlanKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: op.cte_id })
+            LogicalPlanKind::CTEAnchor(PlanCTEAnchorNode { cte_id: op.cte_id })
         }
 
-        Operator::LogicalCTEProduce(op) => LogicalPlanKind::CTEProduce(LogicalCTEProduceNode {
+        Operator::LogicalCTEProduce(op) => LogicalPlanKind::CTEProduce(PlanCTEProduceNode {
             cte_id: op.cte_id,
             output_columns: op.output_columns.clone(),
         }),
@@ -189,7 +191,7 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
         }),
 
         Operator::LogicalGenerateSeries(op) => {
-            LogicalPlanKind::GenerateSeries(LogicalGenerateSeriesNode {
+            LogicalPlanKind::GenerateSeries(PlanGenerateSeriesNode {
                 start: op.start,
                 end: op.end,
                 step: op.step,
@@ -199,7 +201,7 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
             })
         }
 
-        Operator::LogicalRepeat(op) => LogicalPlanKind::Repeat(LogicalRepeatNode {
+        Operator::LogicalRepeat(op) => LogicalPlanKind::Repeat(PlanRepeatNode {
             repeat_column_ref_list: op.repeat_column_ref_list.clone(),
             repeat_column_ref_ids: op.repeat_column_ref_ids.clone(),
             grouping_ids: op.grouping_ids.clone(),

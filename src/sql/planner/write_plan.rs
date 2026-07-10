@@ -586,7 +586,7 @@ mod tests {
                     children: vec![],
                     stats: stats(),
                     payload: DistributedNodeKind::Values(
-                        crate::sql::planner::plan::PlanValuesNode {
+                        crate::sql::planner::payload::PlanValuesNode {
                             rows: vec![],
                             columns: output_columns.clone(),
                         },

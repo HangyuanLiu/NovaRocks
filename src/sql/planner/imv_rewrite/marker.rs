@@ -24,7 +24,6 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub(crate) use crate::sql::common::ImvVersionRef;
 use crate::sql::optimizer::operator::{ImvDeltaOp, Operator};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -32,7 +31,7 @@ use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::imv_rewrite::opt_expr_to_plan;
-use crate::sql::planner::plan::{LogicalPlanKind, LogicalPlanNode};
+use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
 
 /// Wraps the root of an IMV refresh plan in `ImvDelta { is_root: true }`.
 ///
@@ -190,12 +189,13 @@ fn collect_into(plan: &LogicalPlanNode, found: &mut Vec<&'static str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::common::ImvVersionRef;
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::logical::*;
     use crate::sql::planner::optimizer_bridge::plan::{
         logical_plan_to_opt_expr, opt_expr_to_logical_plan,
     };
-    use crate::sql::planner::plan::*;
-    use crate::sql::planner::plan::{LogicalPlanKind, LogicalPlanNode, LogicalValuesNode};
+    use crate::sql::planner::payload::*;
 
     #[test]
     fn wrap_rule_wraps_plain_root_once() {
@@ -260,7 +260,7 @@ mod tests {
 
     fn empty_values_plan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(PlanValuesNode {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -364,7 +364,7 @@ mod tests {
 
     #[test]
     fn plan_contains_imv_marker_true_for_nested_version() {
-        use crate::sql::planner::plan::LogicalLimitNode;
+        use crate::sql::planner::payload::PlanLimitNode;
         // Build Limit(Limit(ImvVersion(Values))). The marker is
         // deeply nested; the helper must recurse.
         let nested = LogicalPlanNode::new(
@@ -375,7 +375,7 @@ mod tests {
             None,
         );
         let inner = LogicalPlanNode::new(
-            LogicalPlanKind::Limit(LogicalLimitNode {
+            LogicalPlanKind::Limit(PlanLimitNode {
                 limit: None,
                 offset: None,
             }),
@@ -383,7 +383,7 @@ mod tests {
             None,
         );
         let outer = LogicalPlanNode::new(
-            LogicalPlanKind::Limit(LogicalLimitNode {
+            LogicalPlanKind::Limit(PlanLimitNode {
                 limit: None,
                 offset: None,
             }),

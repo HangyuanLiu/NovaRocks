@@ -620,7 +620,7 @@ mod tests {
     use crate::sql::planner::optimizer_bridge::scalar::{
         intern_aggregate_calls, intern_exprs, materialize_aggregate_calls,
     };
-    use crate::sql::planner::plan::AggregateCall;
+    use crate::sql::planner::payload::AggregateCall;
     use arrow::datatypes::DataType;
     use std::sync::Arc;
 

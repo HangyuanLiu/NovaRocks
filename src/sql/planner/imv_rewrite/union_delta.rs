@@ -29,10 +29,10 @@ use crate::sql::planner::imv_rewrite::join_delta::{
 };
 use crate::sql::planner::imv_rewrite::marker::plan_contains_imv_marker;
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
-use crate::sql::planner::plan::{
-    LogicalAggregateNode, LogicalImvDeltaNode, LogicalPlanKind, LogicalPlanNode,
-    LogicalProjectNode, LogicalUnionNode,
+use crate::sql::planner::logical::{
+    LogicalAggregateNode, LogicalImvDeltaNode, LogicalPlanKind, LogicalPlanNode, LogicalUnionNode,
 };
+use crate::sql::planner::payload::PlanProjectNode;
 use crate::{
     engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN,
     sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr},
@@ -404,7 +404,7 @@ fn normalize_top_level_union_branch_output(
     });
 
     LogicalPlanNode::new(
-        LogicalPlanKind::Project(LogicalProjectNode {
+        LogicalPlanKind::Project(PlanProjectNode {
             items,
             output_qualifier: None,
         }),
@@ -441,7 +441,8 @@ fn take_unary_child(children: &mut Vec<LogicalPlanNode>) -> LogicalPlanNode {
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::planner::plan::*;
+    use crate::sql::planner::logical::*;
+    use crate::sql::planner::payload::*;
     use std::collections::BTreeMap;
 
     use arrow::datatypes::DataType;
@@ -459,11 +460,11 @@ mod tests {
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
     use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
-    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
-    use crate::sql::planner::plan::{
-        LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanKind,
-        LogicalProjectNode, LogicalScanNode, LogicalUnionNode,
+    use crate::sql::planner::logical::{
+        LogicalAggregateNode, LogicalJoinNode, LogicalPlanKind, LogicalUnionNode,
     };
+    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
+    use crate::sql::planner::payload::{PlanFilterNode, PlanProjectNode, PlanScanNode};
 
     #[test]
     fn matches_root_delta_over_aggregate_over_source_union() {
@@ -783,7 +784,7 @@ mod tests {
     fn project_over_filter(name: &str, first_id: u32) -> LogicalPlanNode {
         let scan = scan(name, first_id);
         LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![
                     ProjectItem {
                         expr: col_expr(first_id, "k"),
@@ -824,7 +825,7 @@ mod tests {
 
     fn filter_over(input: LogicalPlanNode, column_id: u32, column: &str) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::BinaryOp {
                         left: Box::new(col_expr(column_id, column)),
@@ -873,7 +874,7 @@ mod tests {
     fn scan(name: &str, first_id: u32) -> LogicalPlanNode {
         let columns = vec![column_def("k"), column_def("v")];
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: name.to_string(),

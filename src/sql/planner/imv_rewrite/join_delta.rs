@@ -28,6 +28,7 @@ use crate::sql::analysis::{
 };
 use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::ImvVersionRef;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -44,16 +45,16 @@ use crate::sql::planner::imv_rewrite::join_refresh_descriptor::{
     JoinRefreshJoinKeyPair, JoinRefreshMode, JoinRefreshMvIdentity, JoinRefreshOutputMapping,
     JoinRefreshOutputSource,
 };
-use crate::sql::planner::imv_rewrite::marker::ImvVersionRef;
 use crate::sql::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
 use crate::sql::planner::imv_rewrite::target_locator::is_target_locator_join;
 use crate::sql::planner::imv_rewrite::{
     PlanRewriteResult, bridge_apply_result_mut, opt_expr_to_plan,
 };
-use crate::sql::planner::plan::{
+use crate::sql::planner::logical::{
     LogicalImvDeltaNode, LogicalImvVersionNode, LogicalJoinNode, LogicalPlanKind, LogicalPlanNode,
-    LogicalProjectNode, LogicalUnionNode,
+    LogicalUnionNode,
 };
+use crate::sql::planner::payload::PlanProjectNode;
 
 pub(crate) struct RewriteJoinDeltaRule;
 
@@ -1285,7 +1286,7 @@ pub(crate) fn normalize_branch_output(
 ) -> Result<LogicalPlanNode, String> {
     let input_columns = plan_output_columns(&input)?;
     Ok(LogicalPlanNode::new(
-        LogicalPlanKind::Project(LogicalProjectNode {
+        LogicalPlanKind::Project(PlanProjectNode {
             output_qualifier: None,
             items: normalize_branch_project_items(&input_columns, output_columns)?,
         }),
@@ -1517,7 +1518,8 @@ impl LogicalRewriteRule for UnsupportedJoinKindCheckRule {
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::planner::plan::*;
+    use crate::sql::planner::logical::*;
+    use crate::sql::planner::payload::*;
     use std::collections::BTreeMap;
 
     use arrow::datatypes::DataType;
@@ -1529,6 +1531,7 @@ mod tests {
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
+    use crate::sql::common::ImvVersionRef;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
@@ -1536,13 +1539,12 @@ mod tests {
         AggregateChangeStreamDescriptor, AggregateChangeStreamShape, ImvChangeStreamDescriptor,
         SignedStateAggregateProof, TargetStateProof,
     };
-    use crate::sql::planner::imv_rewrite::marker::ImvVersionRef;
     use crate::sql::planner::imv_rewrite::scan_binding::ImvVersionRole;
-    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
-    use crate::sql::planner::plan::{
+    use crate::sql::planner::logical::{
         LogicalAggregateNode, LogicalImvVersionNode, LogicalJoinNode, LogicalPlanKind,
-        LogicalProjectNode, LogicalScanNode,
     };
+    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
+    use crate::sql::planner::payload::{PlanProjectNode, PlanScanNode};
 
     #[test]
     fn supported_join_delta_kinds_are_inner_and_cross_only() {
@@ -2137,7 +2139,7 @@ mod tests {
 
     fn project_payload_only(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     expr: col_expr(1, "payload"),
                     output_name: "payload".to_string(),
@@ -2167,7 +2169,7 @@ mod tests {
             }),
             vec![
                 LogicalPlanNode::new(
-                    LogicalPlanKind::Values(LogicalValuesNode {
+                    LogicalPlanKind::Values(PlanValuesNode {
                         rows: Vec::new(),
                         columns: vec![payload.clone(), action.clone(), join_apply_key.clone()],
                     }),
@@ -2175,7 +2177,7 @@ mod tests {
                     None,
                 ),
                 LogicalPlanNode::new(
-                    LogicalPlanKind::Values(LogicalValuesNode {
+                    LogicalPlanKind::Values(PlanValuesNode {
                         rows: Vec::new(),
                         columns: vec![payload, action, join_apply_key],
                     }),
@@ -2193,7 +2195,7 @@ mod tests {
             _ => unreachable!(),
         };
         LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: columns
                     .into_iter()
                     .map(|column| ProjectItem {
@@ -2253,7 +2255,7 @@ mod tests {
             column_def(&format!("{name}_v")),
         ];
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: name.to_string(),

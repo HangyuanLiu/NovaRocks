@@ -27,12 +27,17 @@ use crate::sql::optimizer::physical_tree::{JoinExecutionDistribution, OptimizerP
 use crate::sql::optimizer::property::DistributionSpec;
 use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, DistinctValueCount};
-use crate::sql::planner::plan::*;
+use crate::sql::planner::payload::*;
+use crate::sql::planner::plan::{
+    DistributedChangeEventExpandNode, DistributedChangeEventOutputExpr, DistributedChangeEventSpec,
+    PhysicalHashAggregateNode, PhysicalHashJoinEqCondition, PhysicalHashJoinNode,
+    PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalPlanNode, PhysicalSetOpNode,
+    PhysicalTopNNode, PlanSetOpKind, RedistributeMode, RedistributeNode,
+};
 use crate::sql::planner::{
     AggMode, AggregateOutputLayout, HashSource, JoinDistribution, JoinExecutionMode,
-    PhysicalPlanKind, PhysicalPlanNode, PhysicalPlanStats, PlannerBroadcastDecision,
-    PlannerColumnStatistic, PlannerConfidence, PlannerCostEstimate, RedistributeMode,
-    RedistributeNode, TopNPhase,
+    PhysicalPlanStats, PlannerBroadcastDecision, PlannerColumnStatistic, PlannerConfidence,
+    PlannerCostEstimate, TopNPhase,
 };
 
 struct BridgeCtx<'a> {
@@ -256,19 +261,17 @@ impl BridgeCtx<'_> {
                     is_left_join: op.is_left_join,
                 }))
             }
-            Operator::PhysicalCTEAnchor(op) => {
-                Ok(PhysicalPlanKind::CTEAnchor(LogicalCTEAnchorNode {
-                    cte_id: op.cte_id,
-                }))
-            }
+            Operator::PhysicalCTEAnchor(op) => Ok(PhysicalPlanKind::CTEAnchor(PlanCTEAnchorNode {
+                cte_id: op.cte_id,
+            })),
             Operator::PhysicalCTEProduce(op) => {
-                Ok(PhysicalPlanKind::CTEProduce(LogicalCTEProduceNode {
+                Ok(PhysicalPlanKind::CTEProduce(PlanCTEProduceNode {
                     cte_id: op.cte_id,
                     output_columns: op.output_columns.clone(),
                 }))
             }
             Operator::PhysicalCTEConsume(op) => {
-                Ok(PhysicalPlanKind::CTEConsume(LogicalCTEConsumeNode {
+                Ok(PhysicalPlanKind::CTEConsume(PlanCTEConsumeNode {
                     cte_id: op.cte_id,
                     alias: op.alias.clone(),
                     output_columns: op.output_columns.clone(),
@@ -746,7 +749,7 @@ mod tests {
     };
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::{Confidence, CostEstimate, Statistics};
-    use crate::sql::planner::PhysicalPlanKind;
+    use crate::sql::planner::plan::PhysicalPlanKind;
     use std::sync::Arc;
 
     fn int_expr(v: i64) -> TypedExpr {

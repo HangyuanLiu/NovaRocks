@@ -31,7 +31,7 @@ use super::resolve::{ColumnBinding, ExprScope};
 use super::type_infer::{arithmetic_result_type_with_op, arrow_type_to_type_desc, wider_type};
 use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr, UnOp};
 use crate::sql::column_id::ColumnId;
-use crate::sql::planner::plan::AggregateCall;
+use crate::sql::planner::payload::AggregateCall;
 use crate::types::comparison_common_type;
 
 /// Shared counter used to allocate fresh slot ids for lambda parameters. The
@@ -3163,7 +3163,7 @@ mod tests {
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
     use crate::sql::codegen::resolve::{ColumnBinding, ExprScope};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::plan::AggregateCall;
+    use crate::sql::planner::payload::AggregateCall;
 
     #[test]
     fn infer_agg_decimal_uses_canonical_widening() {

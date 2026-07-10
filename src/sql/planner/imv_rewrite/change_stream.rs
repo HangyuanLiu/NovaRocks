@@ -35,9 +35,8 @@ use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
 use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
 use crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor;
 use crate::sql::planner::imv_rewrite::opt_expr_to_plan;
-use crate::sql::planner::plan::{
-    LogicalAggregateNode, LogicalPlanKind, LogicalPlanNode, LogicalProjectNode, LogicalScanNode,
-};
+use crate::sql::planner::logical::{LogicalAggregateNode, LogicalPlanKind, LogicalPlanNode};
+use crate::sql::planner::payload::{PlanProjectNode, PlanScanNode};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ImvChangeStreamDescriptor {
@@ -342,7 +341,7 @@ fn change_stream_union_output_column(plan: &LogicalPlanNode) -> Option<OutputCol
         .cloned()
 }
 
-fn change_stream_project_output_column(project: &LogicalProjectNode) -> Option<OutputColumn> {
+fn change_stream_project_output_column(project: &PlanProjectNode) -> Option<OutputColumn> {
     project
         .items
         .iter()
@@ -467,7 +466,7 @@ fn contains_branch_marker_values(plan: &LogicalPlanNode) -> bool {
 fn contains_target_state_scan(plan: &LogicalPlanNode) -> bool {
     matches!(
         &plan.kind,
-        LogicalPlanKind::Scan(LogicalScanNode {
+        LogicalPlanKind::Scan(PlanScanNode {
             table: TableDef {
                 source: ScanSource::IcebergMvTargetState(_),
                 ..
@@ -532,9 +531,11 @@ mod tests {
     };
     use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
     use crate::sql::planner::imv_rewrite::target_state::build_target_state_scan_source;
-    use crate::sql::planner::plan::{
-        AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanKind,
-        LogicalPlanNode, LogicalProjectNode, LogicalScanNode, LogicalUnionNode, LogicalValuesNode,
+    use crate::sql::planner::logical::{
+        LogicalAggregateNode, LogicalJoinNode, LogicalPlanKind, LogicalPlanNode, LogicalUnionNode,
+    };
+    use crate::sql::planner::payload::{
+        AggregateCall, PlanFilterNode, PlanProjectNode, PlanScanNode, PlanValuesNode,
     };
 
     fn output_column(id: u32, name: &str, data_type: DataType, is_internal: bool) -> OutputColumn {
@@ -549,7 +550,7 @@ mod tests {
 
     fn empty_values_plan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(PlanValuesNode {
                 rows: Vec::new(),
                 columns: Vec::new(),
             }),
@@ -567,7 +568,7 @@ mod tests {
             logical_type: None,
         }];
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: "mv_target".to_string(),
@@ -630,7 +631,7 @@ mod tests {
 
     fn branch_marker_values_plan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(PlanValuesNode {
                 rows: Vec::new(),
                 columns: vec![output_column(
                     30,
@@ -685,7 +686,7 @@ mod tests {
         assert!(descriptor.describes_aggregate_root(&union));
 
         let wrapped = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Bool(true)),
                     data_type: DataType::Boolean,
@@ -766,7 +767,7 @@ mod tests {
             None,
         );
         let filtered = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::FunctionCall {
                         name: "state_all_zero".to_string(),
@@ -781,7 +782,7 @@ mod tests {
             None,
         );
         let plan = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Int(1)),

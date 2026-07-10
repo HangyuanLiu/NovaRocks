@@ -22,7 +22,8 @@ use crate::sql::analysis::cte::CTERegistry;
 use crate::sql::analysis::*;
 use crate::sql::catalog::{CatalogProvider, ColumnDef, ScanSource, TableDef};
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
-use crate::sql::planner::plan::*;
+use crate::sql::planner::logical::*;
+use crate::sql::planner::payload::*;
 use arrow::datatypes::DataType;
 
 struct TestCatalog;
@@ -248,7 +249,7 @@ fn first_aggregate_node(plan: &LogicalPlanNode) -> Option<&LogicalAggregateNode>
 
 fn root_project_over_aggregate(
     plan: &LogicalPlanNode,
-) -> (&LogicalProjectNode, &LogicalAggregateNode) {
+) -> (&PlanProjectNode, &LogicalAggregateNode) {
     let LogicalPlanKind::Project(project) = &plan.kind else {
         panic!("expected Project root, got {plan:?}");
     };
@@ -263,11 +264,7 @@ fn root_project_over_aggregate(
 
 fn root_project_filter_aggregate(
     plan: &LogicalPlanNode,
-) -> (
-    &LogicalProjectNode,
-    &LogicalFilterNode,
-    &LogicalAggregateNode,
-) {
+) -> (&PlanProjectNode, &PlanFilterNode, &LogicalAggregateNode) {
     let LogicalPlanKind::Project(project) = &plan.kind else {
         panic!("expected Project root, got {plan:?}");
     };
@@ -284,8 +281,8 @@ fn root_project_filter_aggregate(
     (project, filter, aggregate)
 }
 
-fn first_repeat_node(plan: &LogicalPlanNode) -> (&LogicalPlanNode, &LogicalRepeatNode) {
-    fn visit(plan: &LogicalPlanNode) -> Option<(&LogicalPlanNode, &LogicalRepeatNode)> {
+fn first_repeat_node(plan: &LogicalPlanNode) -> (&LogicalPlanNode, &PlanRepeatNode) {
+    fn visit(plan: &LogicalPlanNode) -> Option<(&LogicalPlanNode, &PlanRepeatNode)> {
         match &plan.kind {
             LogicalPlanKind::Repeat(node) => Some((plan, node)),
             _ => plan.children.iter().find_map(visit),
@@ -385,7 +382,7 @@ fn planner_group_by_targets_ignore_aggregate_public_output_order() {
     );
 }
 
-fn root_project_over_window(plan: &LogicalPlanNode) -> (&LogicalProjectNode, &LogicalWindowNode) {
+fn root_project_over_window(plan: &LogicalPlanNode) -> (&PlanProjectNode, &PlanWindowNode) {
     let LogicalPlanKind::Project(project) = &plan.kind else {
         panic!("expected Project root, got {plan:?}");
     };
@@ -400,7 +397,7 @@ fn root_project_over_window(plan: &LogicalPlanNode) -> (&LogicalProjectNode, &Lo
 
 fn root_strip_sort_inner_project(
     plan: &LogicalPlanNode,
-) -> (&LogicalProjectNode, &LogicalSortNode, &LogicalProjectNode) {
+) -> (&PlanProjectNode, &PlanSortNode, &PlanProjectNode) {
     let LogicalPlanKind::Project(outer_proj) = &plan.kind else {
         panic!("expected outer strip Project, got {plan:?}");
     };
@@ -477,7 +474,7 @@ fn assert_window_expr_ids_are_real_unique_and_backed_by_output_columns(plan: &Lo
         );
         assert!(
             output_ids.contains(&w.output_column_id),
-            "WindowExpr {} output_column_id {} missing from LogicalWindowNode.output_columns",
+            "WindowExpr {} output_column_id {} missing from PlanWindowNode.output_columns",
             w.output_name,
             w.output_column_id
         );
@@ -552,7 +549,7 @@ fn contains_identity_project_adapter(
 fn adapt_plan_output_passthrough_when_outputs_match() {
     let source_id = ColumnId::new_for_test(10);
     let input = LogicalPlanNode::new(
-        LogicalPlanKind::Values(LogicalValuesNode {
+        LogicalPlanKind::Values(PlanValuesNode {
             rows: vec![],
             columns: vec![OutputColumn {
                 column_id: source_id,
@@ -582,7 +579,7 @@ fn adapt_plan_output_renames_and_rebinds_with_project() {
     let source_id = ColumnId::new_for_test(10);
     let target_id = ColumnId::new_for_test(20);
     let input = LogicalPlanNode::new(
-        LogicalPlanKind::Values(LogicalValuesNode {
+        LogicalPlanKind::Values(PlanValuesNode {
             rows: vec![],
             columns: vec![OutputColumn {
                 column_id: source_id,
@@ -625,7 +622,7 @@ fn adapt_plan_output_with_qualifier_preserves_cte_alias_lookup() {
     let source_id = ColumnId::new_for_test(10);
     let target_id = ColumnId::new_for_test(20);
     let input = LogicalPlanNode::new(
-        LogicalPlanKind::Values(LogicalValuesNode {
+        LogicalPlanKind::Values(PlanValuesNode {
             rows: vec![],
             columns: vec![OutputColumn {
                 column_id: source_id,
@@ -670,7 +667,7 @@ fn adapt_plan_output_with_qualifier_preserves_cte_alias_lookup() {
 fn adapt_plan_output_with_qualifier_inserts_project_when_outputs_match() {
     let source_id = ColumnId::new_for_test(10);
     let input = LogicalPlanNode::new(
-        LogicalPlanKind::Values(LogicalValuesNode {
+        LogicalPlanKind::Values(PlanValuesNode {
             rows: vec![],
             columns: vec![OutputColumn {
                 column_id: source_id,
@@ -716,7 +713,7 @@ fn adapt_plan_output_allows_nullable_widening() {
     let source_id = ColumnId::new_for_test(10);
     let target_id = ColumnId::new_for_test(20);
     let input = LogicalPlanNode::new(
-        LogicalPlanKind::Values(LogicalValuesNode {
+        LogicalPlanKind::Values(PlanValuesNode {
             rows: vec![],
             columns: vec![OutputColumn {
                 column_id: source_id,
@@ -749,7 +746,7 @@ fn adapt_plan_output_allows_nullable_widening() {
 #[test]
 fn adapt_plan_output_rejects_nullable_narrowing() {
     let input = LogicalPlanNode::new(
-        LogicalPlanKind::Values(LogicalValuesNode {
+        LogicalPlanKind::Values(PlanValuesNode {
             rows: vec![],
             columns: vec![OutputColumn {
                 column_id: ColumnId::new_for_test(10),
@@ -781,7 +778,7 @@ fn adapt_plan_output_rejects_nullable_narrowing() {
 #[test]
 fn adapt_plan_output_rejects_shape_mismatch() {
     let input = LogicalPlanNode::new(
-        LogicalPlanKind::Values(LogicalValuesNode {
+        LogicalPlanKind::Values(PlanValuesNode {
             rows: vec![],
             columns: vec![],
         }),
@@ -1330,7 +1327,7 @@ fn p2_window_output_columns_preserve_passthrough_input_ids() {
             .output_columns
             .iter()
             .any(|col| col.column_id == passthrough_id),
-        "LogicalWindowNode output_columns must expose child passthrough ColumnIds"
+        "PlanWindowNode output_columns must expose child passthrough ColumnIds"
     );
     let rn = window_expr_by_function_name(&window.window_exprs, "row_number");
     assert!(
@@ -1338,7 +1335,7 @@ fn p2_window_output_columns_preserve_passthrough_input_ids() {
             .output_columns
             .iter()
             .any(|col| col.column_id == rn.output_column_id),
-        "LogicalWindowNode output_columns must include window result ColumnIds"
+        "PlanWindowNode output_columns must include window result ColumnIds"
     );
 }
 
@@ -2105,7 +2102,7 @@ fn p2_values_output_uses_single_column_id() {
     assert_eq!(
         values.columns.len(),
         analyzer_output_columns.len(),
-        "LogicalValuesNode should expose the analyzer output columns"
+        "PlanValuesNode should expose the analyzer output columns"
     );
     for (value_column, analyzer_column) in values.columns.iter().zip(analyzer_output_columns.iter())
     {
@@ -2116,7 +2113,7 @@ fn p2_values_output_uses_single_column_id() {
         );
         assert_eq!(
             value_column.column_id, analyzer_column.column_id,
-            "LogicalValuesNode column id must reuse the analyzer query output id"
+            "PlanValuesNode column id must reuse the analyzer query output id"
         );
     }
 }
@@ -2169,7 +2166,7 @@ fn p2_base_scan_row_lineage_metadata_preserves_column_id_through_planner() {
         .columns
         .iter()
         .find(|col| col.name == "_row_id")
-        .expect("LogicalScanNode must expose _row_id metadata output");
+        .expect("PlanScanNode must expose _row_id metadata output");
     assert_ne!(row_id_output.column_id, ColumnId::UNSET);
 
     let ExprKind::ColumnRef { column_id, .. } = project.items[0].expr.kind else {
@@ -2177,11 +2174,11 @@ fn p2_base_scan_row_lineage_metadata_preserves_column_id_through_planner() {
     };
     assert_eq!(
         column_id, row_id_output.column_id,
-        "Project must read the _row_id ColumnId exposed by the LogicalScanNode"
+        "Project must read the _row_id ColumnId exposed by the PlanScanNode"
     );
     assert_eq!(
         project.items[0].output_column_id, row_id_output.column_id,
-        "visible _row_id output should preserve the LogicalScanNode metadata ColumnId"
+        "visible _row_id output should preserve the PlanScanNode metadata ColumnId"
     );
 }
 
@@ -2385,9 +2382,9 @@ fn apply_output_columns_extend_left_with_output_column() {
 
     use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::plan::{
-        ApplyKind, LogicalApplyNode, LogicalPlanKind, LogicalValuesNode,
-    };
+    use crate::sql::common::ApplyKind;
+    use crate::sql::planner::logical::{LogicalApplyNode, LogicalPlanKind};
+    use crate::sql::planner::payload::PlanValuesNode;
 
     let left_col = OutputColumn {
         column_id: ColumnId(11),
@@ -2426,7 +2423,7 @@ fn apply_output_columns_extend_left_with_output_column() {
         }),
         vec![
             LogicalPlanNode::new(
-                LogicalPlanKind::Values(LogicalValuesNode {
+                LogicalPlanKind::Values(PlanValuesNode {
                     rows: vec![],
                     columns: vec![left_col.clone()],
                 }),
@@ -2434,7 +2431,7 @@ fn apply_output_columns_extend_left_with_output_column() {
                 None,
             ),
             LogicalPlanNode::new(
-                LogicalPlanKind::Values(LogicalValuesNode {
+                LogicalPlanKind::Values(PlanValuesNode {
                     rows: vec![],
                     columns: vec![],
                 }),
@@ -2457,7 +2454,8 @@ fn assert_one_row_output_columns_pass_through() {
 
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::plan::{LogicalAssertOneRowNode, LogicalPlanKind, LogicalValuesNode};
+    use crate::sql::planner::logical::LogicalPlanKind;
+    use crate::sql::planner::payload::{PlanAssertOneRowNode, PlanValuesNode};
 
     let col = OutputColumn {
         column_id: ColumnId(21),
@@ -2467,9 +2465,9 @@ fn assert_one_row_output_columns_pass_through() {
         is_internal: false,
     };
     let plan = LogicalPlanNode::new(
-        LogicalPlanKind::AssertOneRow(LogicalAssertOneRowNode::global_at_most_one("select 1")),
+        LogicalPlanKind::AssertOneRow(PlanAssertOneRowNode::global_at_most_one("select 1")),
         vec![LogicalPlanNode::new(
-            LogicalPlanKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(PlanValuesNode {
                 rows: vec![],
                 columns: vec![col.clone()],
             }),
@@ -2530,7 +2528,7 @@ fn apply_where_spec_emits_apply_below_where_filter() {
     };
     assert_eq!(
         apply.kind,
-        crate::sql::planner::plan::ApplyKind::Scalar,
+        crate::sql::common::ApplyKind::Scalar,
         "Apply kind must be Scalar"
     );
     // Apply.left must be the FROM Scan.
@@ -2576,7 +2574,7 @@ fn apply_having_spec_emits_apply_above_aggregate() {
             apply_plan
         );
     };
-    assert_eq!(apply.kind, crate::sql::planner::plan::ApplyKind::Scalar);
+    assert_eq!(apply.kind, crate::sql::common::ApplyKind::Scalar);
     // Apply.left must be the Aggregate.
     assert!(
         matches!(&apply_plan.left().kind, LogicalPlanKind::Aggregate(_)),
@@ -2611,7 +2609,7 @@ fn apply_projection_spec_emits_apply_below_project() {
             apply_plan
         );
     };
-    assert_eq!(apply.kind, crate::sql::planner::plan::ApplyKind::Scalar);
+    assert_eq!(apply.kind, crate::sql::common::ApplyKind::Scalar);
     // Apply.left must be the FROM Scan.
     assert!(
         matches!(&apply_plan.left().kind, LogicalPlanKind::Scan(_)),
@@ -2727,7 +2725,7 @@ fn plan_exists_builds_apply_exists() {
     };
     assert_eq!(
         apply.kind,
-        crate::sql::planner::plan::ApplyKind::Exists { negated: false }
+        crate::sql::common::ApplyKind::Exists { negated: false }
     );
     assert_eq!(apply.correlation_column_ids, spec.correlation_column_ids);
     assert!(apply.use_semi_anti);
@@ -2747,7 +2745,7 @@ fn plan_not_in_builds_apply_in_negated() {
 
     assert_eq!(
         apply.kind,
-        crate::sql::planner::plan::ApplyKind::In { negated: true }
+        crate::sql::common::ApplyKind::In { negated: true }
     );
     assert!(apply.correlation_column_ids.is_empty());
     let expected_lhs = spec

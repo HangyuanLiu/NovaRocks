@@ -38,7 +38,7 @@ use crate::sql::planner::imv_rewrite::join_delta_shape::{
 };
 use crate::sql::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
-use crate::sql::planner::plan::{LogicalAggregateNode, LogicalPlanKind, LogicalPlanNode};
+use crate::sql::planner::logical::{LogicalAggregateNode, LogicalPlanKind, LogicalPlanNode};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -156,7 +156,7 @@ fn is_signed_state_aggregate(node: &LogicalAggregateNode) -> bool {
         })
 }
 
-fn is_hidden_retraction_count_call(call: &crate::sql::planner::plan::AggregateCall) -> bool {
+fn is_hidden_retraction_count_call(call: &crate::sql::planner::payload::AggregateCall) -> bool {
     call.name.eq_ignore_ascii_case("sum")
         && call.args.len() == 1
         && matches!(
@@ -759,7 +759,8 @@ fn subtree_has_version_scan(plan: &LogicalPlanNode) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::planner::plan::*;
+    use crate::sql::planner::logical::*;
+    use crate::sql::planner::payload::*;
 
     use arrow::datatypes::DataType;
 
@@ -777,13 +778,13 @@ mod tests {
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
+    use crate::sql::planner::logical::{
+        LogicalAggregateNode, LogicalJoinNode, LogicalPlanKind, LogicalPlanNode, LogicalUnionNode,
+    };
     use crate::sql::planner::optimizer_bridge::plan::{
         logical_plan_to_opt_expr, opt_expr_to_logical_plan,
     };
-    use crate::sql::planner::plan::{
-        LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanKind, LogicalPlanNode,
-        LogicalScanNode, LogicalUnionNode,
-    };
+    use crate::sql::planner::payload::{PlanFilterNode, PlanScanNode};
 
     fn build_ctx() -> RewriteContext {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::new());
@@ -798,8 +799,8 @@ mod tests {
         ctx
     }
 
-    fn delta_scan() -> LogicalScanNode {
-        LogicalScanNode {
+    fn delta_scan() -> PlanScanNode {
+        PlanScanNode {
             database: "db".to_string(),
             table: TableDef {
                 name: "b".to_string(),
@@ -843,7 +844,7 @@ mod tests {
         }
     }
 
-    fn version_scan() -> LogicalScanNode {
+    fn version_scan() -> PlanScanNode {
         let mut s = delta_scan();
         s.table.source = ScanSource::IcebergVersionTable {
             table: match &delta_scan().table.source {
@@ -855,7 +856,7 @@ mod tests {
         s
     }
 
-    fn starrocks_scan() -> LogicalScanNode {
+    fn starrocks_scan() -> PlanScanNode {
         let mut s = delta_scan();
         s.table.source = ScanSource::StarRocks {
             db_id: 0,
@@ -864,7 +865,7 @@ mod tests {
         s
     }
 
-    fn scan_plan(scan: LogicalScanNode) -> LogicalPlanNode {
+    fn scan_plan(scan: PlanScanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(LogicalPlanKind::Scan(scan), vec![], None)
     }
 
@@ -974,11 +975,11 @@ mod tests {
         assert!(!rule.matches(&expr, &ctx));
     }
 
-    use crate::sql::planner::plan::LogicalProjectNode;
+    use crate::sql::planner::payload::PlanProjectNode;
 
     fn project_over(input: LogicalPlanNode, projected_user_col_id: ColumnId) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::ColumnRef {
@@ -999,7 +1000,7 @@ mod tests {
         )
     }
 
-    fn delta_scan_with_action(action_id: ColumnId) -> LogicalScanNode {
+    fn delta_scan_with_action(action_id: ColumnId) -> PlanScanNode {
         let mut s = delta_scan();
         s.columns.push(ImvActionColumn::output_column(action_id));
         s
@@ -1009,7 +1010,7 @@ mod tests {
         let mut scan = delta_scan_with_action(action_id);
         scan.columns[0].column_id = user_col_id;
         LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![
                     ProjectItem {
                         expr: TypedExpr {
@@ -1081,7 +1082,7 @@ mod tests {
         let mut scan = delta_scan();
         scan.columns[0].column_id = user_col_id;
         LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::ColumnRef {
@@ -1114,7 +1115,7 @@ mod tests {
         let mut scan = version_scan();
         scan.columns[0].column_id = user_col_id;
         LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::ColumnRef {
@@ -1153,7 +1154,7 @@ mod tests {
         user_col_id: ColumnId,
     ) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![
                     ProjectItem {
                         expr: TypedExpr {
@@ -1229,7 +1230,7 @@ mod tests {
         let mut scan = delta_scan_with_action(action_id);
         scan.columns[0].column_id = user_col_id;
         LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![
                     ProjectItem {
                         expr: TypedExpr {
@@ -1431,7 +1432,7 @@ mod tests {
         let ctx = build_ctx();
         let action_id = ColumnId(100);
         let nested_delta_side = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Bool(true)),
                     data_type: DataType::Boolean,
@@ -1645,7 +1646,7 @@ mod tests {
             None,
         );
         let plan = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![
                     ProjectItem {
                         expr: TypedExpr {
@@ -1785,7 +1786,7 @@ mod tests {
         let mut ctx = build_ctx();
         let scan = scan_plan(delta_scan_with_action(ColumnId(100)));
         let filter = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Bool(true)),
                     data_type: DataType::Boolean,

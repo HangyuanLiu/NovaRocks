@@ -18,7 +18,8 @@
 use crate::sql::analysis::cte::CTERegistry;
 use crate::sql::analysis::*;
 use crate::sql::column_id::ColumnRefFactory;
-use crate::sql::planner::plan::*;
+use crate::sql::common::ApplyKind;
+use crate::sql::planner::logical::*;
 
 use super::output::plan_output_columns;
 use super::query::plan_scoped_query;

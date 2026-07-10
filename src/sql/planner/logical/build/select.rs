@@ -18,7 +18,8 @@
 use crate::sql::analysis::cte::CTERegistry;
 use crate::sql::analysis::*;
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
-use crate::sql::planner::plan::*;
+use crate::sql::planner::logical::*;
+use crate::sql::planner::payload::*;
 
 use super::aggregate::{
     collect_non_agg_column_refs, dedup_group_by_exprs, expr_column_id, prepare_repeat_input,
@@ -47,7 +48,7 @@ pub(super) fn plan_select_scoped(
     let mut current = match select.from.take() {
         Some(relation) => plan_relation_scoped(relation, cte_registry, factory)?,
         None => LogicalPlanNode::new(
-            LogicalPlanKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(PlanValuesNode {
                 rows: vec![vec![]],
                 columns: vec![],
             }),
@@ -76,7 +77,7 @@ pub(super) fn plan_select_scoped(
 
     if let Some(predicate) = select.filter.take() {
         current = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: predicate,
             }),
             vec![current],
@@ -93,7 +94,7 @@ pub(super) fn plan_select_scoped(
             factory,
         );
         current = LogicalPlanNode::new(
-            LogicalPlanKind::Repeat(LogicalRepeatNode {
+            LogicalPlanKind::Repeat(PlanRepeatNode {
                 repeat_column_ref_list: repeat_info.repeat_column_ref_list,
                 repeat_column_ref_ids: repeat_info.repeat_column_ref_ids,
                 grouping_ids: repeat_info.grouping_ids,
@@ -179,7 +180,7 @@ pub(super) fn plan_select_scoped(
 
         if let Some(having) = rewritten_having {
             current = LogicalPlanNode::new(
-                LogicalPlanKind::Filter(LogicalFilterNode { predicate: having }),
+                LogicalPlanKind::Filter(PlanFilterNode { predicate: having }),
                 vec![current],
                 None,
             );

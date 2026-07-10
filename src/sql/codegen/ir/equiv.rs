@@ -68,7 +68,7 @@ mod tests {
         intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items,
         intern_window_exprs,
     };
-    use crate::sql::planner::plan::{AggregateCall, WindowExpr};
+    use crate::sql::planner::payload::{AggregateCall, WindowExpr};
 
     #[test]
     fn scan_builds_ir_fragment_structure() {

@@ -44,9 +44,8 @@ use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
 use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
 use crate::sql::planner::imv_rewrite::column_alloc::allocate_imv_column;
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
-use crate::sql::planner::plan::{
-    LogicalJoinNode, LogicalPlanKind, LogicalPlanNode, LogicalProjectNode, LogicalScanNode,
-};
+use crate::sql::planner::logical::{LogicalJoinNode, LogicalPlanKind, LogicalPlanNode};
+use crate::sql::planner::payload::{PlanProjectNode, PlanScanNode};
 
 pub(crate) struct InjectTargetLocatorJoinRule {
     checked_root: AtomicBool,
@@ -291,7 +290,7 @@ fn build_target_locator_join(
         DataType::Int64,
     ));
     Ok(LogicalPlanNode::new(
-        LogicalPlanKind::Project(LogicalProjectNode {
+        LogicalPlanKind::Project(PlanProjectNode {
             items,
             output_qualifier: None,
         }),
@@ -403,7 +402,7 @@ fn build_target_locator_scan(
     ));
 
     LogicalPlanNode::new(
-        LogicalPlanKind::Scan(LogicalScanNode {
+        LogicalPlanKind::Scan(PlanScanNode {
             database: target.namespace.clone(),
             table: TableDef {
                 name: target.table.clone(),

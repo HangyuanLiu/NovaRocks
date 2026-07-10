@@ -476,7 +476,8 @@ fn ensure_exposes_columns(
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::planner::plan::*;
+    use crate::sql::planner::logical::*;
+    use crate::sql::planner::payload::*;
     use std::cell::RefCell;
     use std::collections::HashSet;
     use std::rc::Rc;
@@ -489,17 +490,18 @@ mod tests {
     };
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
+    use crate::sql::common::ApplyKind;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rules::subquery::bridge::opt_expr_to_plan;
     use crate::sql::optimizer::rewrite::rules::utils::collect_column_id_refs;
     use crate::sql::optimizer::rewrite::tree_binder::bind_tree;
     use crate::sql::optimizer::scalar::ScalarArena;
-    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
-    use crate::sql::planner::plan::{
-        AggregateCall, ApplyKind, LogicalAggregateNode, LogicalApplyNode, LogicalPlanKind,
-        LogicalPlanNode, LogicalScanNode, LogicalValuesNode,
+    use crate::sql::planner::logical::{
+        LogicalAggregateNode, LogicalApplyNode, LogicalPlanKind, LogicalPlanNode,
     };
+    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
+    use crate::sql::planner::payload::{AggregateCall, PlanScanNode, PlanValuesNode};
 
     // ---- Column ID constants --------------------------------------------------
     const T1_K: ColumnId = ColumnId(1); // left (outer) key column
@@ -561,7 +563,7 @@ mod tests {
 
     fn make_left_values() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(PlanValuesNode {
                 rows: vec![],
                 columns: vec![OutputColumn {
                     column_id: T1_K,
@@ -578,7 +580,7 @@ mod tests {
 
     fn make_t2_scan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 database: "default".to_string(),
                 table: TableDef {
                     name: "t2".to_string(),
@@ -749,7 +751,7 @@ mod tests {
 
         // Inner: Project(v2) over Scan — not provably ≤1 row.
         let inner = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     expr: col_ref(T2_V2, "v2", DataType::Int64),
                     output_name: "v2".to_string(),

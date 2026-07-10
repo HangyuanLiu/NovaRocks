@@ -33,9 +33,9 @@ use crate::sql::codegen::agg_type_infer::infer_agg_function_types;
 use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentStreamKind};
 use crate::sql::common::{ChangeStreamBranchKind, JoinKind};
 use crate::sql::parser::ast::SqlType;
+use crate::sql::planner::payload::{AggregateCall, PlanRowCountAssertion};
 use crate::sql::planner::plan::{
-    AggregateCall, PhysicalHashAggregateNode, PhysicalPlanKind, PlanRowCountAssertion,
-    PlanSetOpKind, RedistributeMode,
+    PhysicalHashAggregateNode, PhysicalPlanKind, PlanSetOpKind, RedistributeMode,
 };
 use crate::sql::planner::runtime_filter::{
     JoinExecutionMode, WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
@@ -1637,7 +1637,7 @@ fn encode_row_count_assertion(assertion: PlanRowCountAssertion) -> i32 {
 }
 
 fn encode_scan_node(
-    src: &crate::sql::planner::plan::PlanScanNode,
+    src: &crate::sql::planner::payload::PlanScanNode,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::ScanNode, String> {
     Ok(plan::ScanNode {
@@ -2914,7 +2914,7 @@ mod tests {
                 probe_runtime_filters: Vec::new(),
                 children: vec![exchange],
                 stats: stats(),
-                payload: DistributedNodeKind::Sort(crate::sql::planner::plan::PlanSortNode {
+                payload: DistributedNodeKind::Sort(crate::sql::planner::payload::PlanSortNode {
                     items: Vec::new(),
                     analytic_partition_by: Vec::new(),
                     output_columns: target_output_columns,
@@ -3066,16 +3066,18 @@ mod tests {
                     probe_runtime_filters: Vec::new(),
                     children: Vec::new(),
                     stats: stats(),
-                    payload: DistributedNodeKind::Scan(crate::sql::planner::plan::PlanScanNode {
-                        database: "db".to_string(),
-                        table: iceberg_delta_table_for_test(),
-                        alias: None,
-                        columns: output_columns.clone(),
-                        predicates: Vec::new(),
-                        required_columns: None,
-                        variant_columns: Vec::new(),
-                        mv_rewritten_from: None,
-                    }),
+                    payload: DistributedNodeKind::Scan(
+                        crate::sql::planner::payload::PlanScanNode {
+                            database: "db".to_string(),
+                            table: iceberg_delta_table_for_test(),
+                            alias: None,
+                            columns: output_columns.clone(),
+                            predicates: Vec::new(),
+                            required_columns: None,
+                            variant_columns: Vec::new(),
+                            mv_rewritten_from: None,
+                        },
+                    ),
                 },
                 data_partition: DataPartition::unpartitioned(),
                 output_partition: DataPartition::unpartitioned(),
@@ -3192,13 +3194,15 @@ mod tests {
                 probe_runtime_filters: Vec::new(),
                 children: Vec::new(),
                 stats: stats(),
-                payload: DistributedNodeKind::Values(crate::sql::planner::plan::PlanValuesNode {
-                    rows: Vec::new(),
-                    columns: child_columns,
-                }),
+                payload: DistributedNodeKind::Values(
+                    crate::sql::planner::payload::PlanValuesNode {
+                        rows: Vec::new(),
+                        columns: child_columns,
+                    },
+                ),
             }],
             stats: stats(),
-            payload: DistributedNodeKind::Project(crate::sql::planner::plan::PlanProjectNode {
+            payload: DistributedNodeKind::Project(crate::sql::planner::payload::PlanProjectNode {
                 items: vec![
                     crate::sql::analysis::ProjectItem {
                         expr: crate::sql::analysis::TypedExpr {
@@ -3284,13 +3288,15 @@ mod tests {
                 probe_runtime_filters: Vec::new(),
                 children: Vec::new(),
                 stats: stats(),
-                payload: DistributedNodeKind::Values(crate::sql::planner::plan::PlanValuesNode {
-                    rows: Vec::new(),
-                    columns: child_columns,
-                }),
+                payload: DistributedNodeKind::Values(
+                    crate::sql::planner::payload::PlanValuesNode {
+                        rows: Vec::new(),
+                        columns: child_columns,
+                    },
+                ),
             }],
             stats: stats(),
-            payload: DistributedNodeKind::Project(crate::sql::planner::plan::PlanProjectNode {
+            payload: DistributedNodeKind::Project(crate::sql::planner::payload::PlanProjectNode {
                 items: duplicate_output
                     .iter()
                     .map(|column| crate::sql::analysis::ProjectItem {
@@ -3386,7 +3392,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: vec![child],
             stats: stats(),
-            payload: DistributedNodeKind::Sort(crate::sql::planner::plan::PlanSortNode {
+            payload: DistributedNodeKind::Sort(crate::sql::planner::payload::PlanSortNode {
                 items: Vec::new(),
                 analytic_partition_by: Vec::new(),
                 output_columns: sort_output_columns,
@@ -3572,14 +3578,16 @@ mod tests {
                 probe_runtime_filters: Vec::new(),
                 children: Vec::new(),
                 stats: stats(),
-                payload: DistributedNodeKind::Values(crate::sql::planner::plan::PlanValuesNode {
-                    rows: Vec::new(),
-                    columns: vec![child_column.clone()],
-                }),
+                payload: DistributedNodeKind::Values(
+                    crate::sql::planner::payload::PlanValuesNode {
+                        rows: Vec::new(),
+                        columns: vec![child_column.clone()],
+                    },
+                ),
             }],
             stats: stats(),
             payload: DistributedNodeKind::AssertOneRow(
-                crate::sql::planner::plan::PlanAssertOneRowNode::global_at_most_one("select 1"),
+                crate::sql::planner::payload::PlanAssertOneRowNode::global_at_most_one("select 1"),
             ),
         };
 
@@ -3692,7 +3700,7 @@ mod tests {
                         children: Vec::new(),
                         stats: stats(),
                         payload: DistributedNodeKind::Values(
-                            crate::sql::planner::plan::PlanValuesNode {
+                            crate::sql::planner::payload::PlanValuesNode {
                                 rows: Vec::new(),
                                 columns: vec![actual_left.clone()],
                             },
@@ -3709,7 +3717,7 @@ mod tests {
                         children: Vec::new(),
                         stats: stats(),
                         payload: DistributedNodeKind::Values(
-                            crate::sql::planner::plan::PlanValuesNode {
+                            crate::sql::planner::payload::PlanValuesNode {
                                 rows: Vec::new(),
                                 columns: vec![actual_right.clone()],
                             },
@@ -4021,7 +4029,7 @@ mod tests {
                         children: Vec::new(),
                         stats: stats(),
                         payload: DistributedNodeKind::Values(
-                            crate::sql::planner::plan::PlanValuesNode {
+                            crate::sql::planner::payload::PlanValuesNode {
                                 rows: Vec::new(),
                                 columns: source_columns.clone(),
                             },
@@ -4099,7 +4107,7 @@ mod tests {
                         children: Vec::new(),
                         stats: stats(),
                         payload: DistributedNodeKind::Values(
-                            crate::sql::planner::plan::PlanValuesNode {
+                            crate::sql::planner::payload::PlanValuesNode {
                                 rows: Vec::new(),
                                 columns: source_columns.clone(),
                             },
@@ -4171,7 +4179,7 @@ mod tests {
                         children: Vec::new(),
                         stats: stats(),
                         payload: DistributedNodeKind::Values(
-                            crate::sql::planner::plan::PlanValuesNode {
+                            crate::sql::planner::payload::PlanValuesNode {
                                 rows: vec![Vec::new()],
                                 columns: Vec::new(),
                             },
@@ -4244,7 +4252,7 @@ mod tests {
                         children: Vec::new(),
                         stats: stats(),
                         payload: DistributedNodeKind::GenerateSeries(
-                            crate::sql::planner::plan::PlanGenerateSeriesNode {
+                            crate::sql::planner::payload::PlanGenerateSeriesNode {
                                 start: 1,
                                 end: 3,
                                 step: 1,
@@ -4324,7 +4332,7 @@ mod tests {
                     children: Vec::new(),
                     stats: stats(),
                     payload: DistributedNodeKind::Values(
-                        crate::sql::planner::plan::PlanValuesNode {
+                        crate::sql::planner::payload::PlanValuesNode {
                             rows: Vec::new(),
                             columns: output_columns.clone(),
                         },

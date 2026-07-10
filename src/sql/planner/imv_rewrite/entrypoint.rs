@@ -31,10 +31,11 @@ use crate::sql::optimizer::rewrite::trace::RewriteTrace;
 use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
 use crate::sql::planner::imv_rewrite::pipeline::build_imv_pipeline;
+use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
 use crate::sql::planner::optimizer_bridge::plan::{
     opt_expr_to_logical_plan, try_logical_plan_to_opt_expr,
 };
-use crate::sql::planner::plan::{AggregateCall, LogicalPlanKind, LogicalPlanNode, WindowExpr};
+use crate::sql::planner::payload::{AggregateCall, WindowExpr};
 
 pub(crate) struct ImvRewriteInput {
     pub plan: LogicalPlanNode,
@@ -385,6 +386,7 @@ mod tests {
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
+    use crate::sql::common::ImvVersionRef;
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -395,12 +397,15 @@ mod tests {
     use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
     use crate::sql::planner::imv_rewrite::annotation::ImvPartitionAnnotation;
     use crate::sql::planner::imv_rewrite::change_stream::AggregateChangeStreamShape;
-    use crate::sql::planner::imv_rewrite::marker::{ImvVersionRef, plan_contains_imv_marker};
+    use crate::sql::planner::imv_rewrite::marker::plan_contains_imv_marker;
     use crate::sql::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
-    use crate::sql::planner::plan::*;
-    use crate::sql::planner::plan::{
-        AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanKind,
-        LogicalPlanNode, LogicalProjectNode, LogicalScanNode, LogicalUnionNode, LogicalValuesNode,
+    use crate::sql::planner::logical::*;
+    use crate::sql::planner::logical::{
+        LogicalAggregateNode, LogicalJoinNode, LogicalPlanKind, LogicalPlanNode, LogicalUnionNode,
+    };
+    use crate::sql::planner::payload::*;
+    use crate::sql::planner::payload::{
+        AggregateCall, PlanFilterNode, PlanProjectNode, PlanScanNode, PlanValuesNode,
     };
     use arrow::datatypes::DataType;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
@@ -456,7 +461,7 @@ mod tests {
 
     fn empty_values_plan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(PlanValuesNode {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -478,7 +483,7 @@ mod tests {
             logical_type: None,
         };
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: "b".to_string(),
@@ -539,7 +544,7 @@ mod tests {
 
     fn project_filter_branch(first_id: u32) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     expr: column_ref(first_id, "k", DataType::Int64, false),
                     output_name: "k".to_string(),
@@ -548,7 +553,7 @@ mod tests {
                 output_qualifier: None,
             }),
             vec![LogicalPlanNode::new(
-                LogicalPlanKind::Filter(LogicalFilterNode {
+                LogicalPlanKind::Filter(PlanFilterNode {
                     predicate: TypedExpr {
                         kind: ExprKind::BinaryOp {
                             left: Box::new(column_ref(first_id, "k", DataType::Int64, false)),
@@ -582,7 +587,7 @@ mod tests {
         }
     }
 
-    fn project_output_names(project: &LogicalProjectNode) -> Vec<String> {
+    fn project_output_names(project: &PlanProjectNode) -> Vec<String> {
         project
             .items
             .iter()
@@ -609,7 +614,7 @@ mod tests {
         join_plan.left()
     }
 
-    fn find_delta_scan(plan: &LogicalPlanNode) -> Option<&LogicalScanNode> {
+    fn find_delta_scan(plan: &LogicalPlanNode) -> Option<&PlanScanNode> {
         match &plan.kind {
             LogicalPlanKind::Scan(scan)
                 if matches!(scan.table.source, ScanSource::IcebergDeltaTable { .. }) =>
@@ -756,7 +761,7 @@ mod tests {
             },
         ];
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: "b".to_string(),
@@ -1126,7 +1131,7 @@ mod tests {
             },
         ];
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: table.to_string(),
@@ -1179,7 +1184,7 @@ mod tests {
 
     fn project_all(input: LogicalPlanNode, first_id: u32) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![
                     ProjectItem {
                         expr: column_expr(first_id, "k", false),
@@ -1283,7 +1288,7 @@ mod tests {
             None,
         );
         LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![
                     ProjectItem {
                         expr: column_expr(1, "k", false),
@@ -1326,7 +1331,7 @@ mod tests {
             None,
         );
         let filter = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::BinaryOp {
                         left: Box::new(column_expr(1, "k", false)),
@@ -1353,7 +1358,7 @@ mod tests {
         };
         let left_scan = join_base_scan("l", 1, 22);
         let left_filter = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::BinaryOp {
                         left: Box::new(column_expr(1, "k", false)),
@@ -2166,7 +2171,7 @@ mod tests {
         // → propagate it into the Project → pass validation.
         let scan = iceberg_scan_plan();
         let project = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::ColumnRef {
@@ -2231,7 +2236,7 @@ mod tests {
     fn imv_pipeline_projection_filter_outputs_target_locator_metadata() {
         let scan = iceberg_scan_plan();
         let project = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     expr: column_ref(1, "k", DataType::Int64, false),
                     output_name: "k".to_string(),
@@ -2287,7 +2292,7 @@ mod tests {
     fn imv_pipeline_rejects_preexisting_locator_metadata_name_collision() {
         let scan = iceberg_scan_plan();
         let project = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![
                     ProjectItem {
                         expr: column_ref(1, "k", DataType::Int64, false),
@@ -2502,7 +2507,7 @@ mod tests {
         // matches and the slot stays None (P1 scope).
         let scan = iceberg_scan_plan();
         let project = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     expr: column_ref(1, "k", DataType::Int64, false),
                     output_name: "k".to_string(),
@@ -3372,7 +3377,7 @@ mod tests {
     fn contains_target_state_scan(plan: &LogicalPlanNode) -> bool {
         matches!(
             &plan.kind,
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 table: TableDef {
                     source: ScanSource::IcebergMvTargetState(_),
                     ..
@@ -3493,7 +3498,7 @@ mod tests {
         *column_id
     }
 
-    fn assert_project_scan_any_table(plan: &LogicalPlanNode) -> &LogicalScanNode {
+    fn assert_project_scan_any_table(plan: &LogicalPlanNode) -> &PlanScanNode {
         let LogicalPlanKind::Project(_) = &plan.kind else {
             panic!("expected Project");
         };

@@ -1510,6 +1510,51 @@ fn rust_lexically_sanitized(text: &str) -> String {
     String::from_utf8(output).expect("lexical sanitizer must preserve valid UTF-8 outside noise")
 }
 
+fn rust_sanitized_production_text(text: &str) -> String {
+    let sanitized = rust_lexically_sanitized(text);
+    rust_production_text_without_cfg_test(&sanitized)
+}
+
+fn rust_named_type_declaration_count(text: &str, name: &str) -> usize {
+    let production = rust_sanitized_production_text(text);
+    let identifiers = production
+        .split(|ch: char| !is_ident_char(ch))
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+
+    identifiers
+        .windows(2)
+        .filter(|tokens| matches!(tokens[0], "struct" | "enum" | "type") && tokens[1] == name)
+        .count()
+}
+
+fn rust_production_use_statements(text: &str) -> Vec<String> {
+    let production = rust_sanitized_production_text(text);
+    let mut statements = Vec::new();
+    let mut current = String::new();
+
+    for line in production.lines() {
+        let trimmed = line.trim();
+        if current.is_empty() {
+            let starts_use = trimmed.starts_with("use ")
+                || (trimmed.starts_with("pub") && trimmed.contains(" use "));
+            if !starts_use {
+                continue;
+            }
+        } else {
+            current.push(' ');
+        }
+        current.push_str(trimmed);
+
+        if trimmed.ends_with(';') {
+            statements.push(compact_line(&current));
+            current.clear();
+        }
+    }
+
+    statements
+}
+
 #[derive(Default)]
 struct RustStructuralLine {
     brace_delta: isize,
@@ -1804,6 +1849,22 @@ fn after_inner_attribute() {}
 }
 
 #[test]
+fn planner_ownership_guard_sanitizes_before_stripping_cfg_test() {
+    let source = r#"
+#[cfg(test)]
+mod tests {
+    const BRACE: &str = "}";
+    struct Hidden;
+}
+
+struct Visible;
+"#;
+
+    assert_eq!(rust_named_type_declaration_count(source, "Hidden"), 0);
+    assert_eq!(rust_named_type_declaration_count(source, "Visible"), 1);
+}
+
+#[test]
 fn planner_logical_builder_is_owned_by_logical_stage() {
     let repo = Path::new(manifest_dir());
     let expected_files = [
@@ -1845,6 +1906,229 @@ fn planner_logical_builder_is_owned_by_logical_stage() {
         "logical build module must expose exactly its seven owners and two stable entries:\n{}",
         surface_violations.join("\n")
     );
+}
+
+#[test]
+fn planner_logical_ir_and_payload_have_stage_owners() {
+    let repo = Path::new(manifest_dir());
+    let planner = repo.join("src/sql/planner");
+    let logical_node_path = planner.join("logical/node.rs");
+    let payload_path = planner.join("payload.rs");
+    let plan_path = planner.join("plan.rs");
+    let facade_path = planner.join("mod.rs");
+    let logical_mod_path = planner.join("logical/mod.rs");
+    let marker_path = planner.join("imv_rewrite/marker.rs");
+
+    for path in [&logical_node_path, &payload_path, &plan_path] {
+        assert!(path.is_file(), "missing planner IR owner: {}", rel(path));
+    }
+
+    let logical_only = [
+        "LogicalPlanNode",
+        "LogicalPlanKind",
+        "LogicalApplyNode",
+        "LogicalAggregateNode",
+        "LogicalJoinNode",
+        "LogicalUnionNode",
+        "LogicalIntersectNode",
+        "LogicalExceptNode",
+        "LogicalImvDeltaNode",
+        "LogicalImvVersionNode",
+    ];
+    let shared_payload = [
+        "PlanScanNode",
+        "PlanFilterNode",
+        "PlanProjectNode",
+        "PlanSortNode",
+        "PlanLimitNode",
+        "PlanValuesNode",
+        "PlanRepeatNode",
+        "PlanWindowNode",
+        "PlanGenerateSeriesNode",
+        "PlanTableFunctionNode",
+        "PlanRowCountAssertion",
+        "PlanAssertOneRowNode",
+        "PlanCTEAnchorNode",
+        "PlanCTEProduceNode",
+        "PlanCTEConsumeNode",
+        "WindowExpr",
+        "AggregateCall",
+    ];
+    let physical_only = [
+        "PhysicalTopNNode",
+        "PhysicalHashAggregateNode",
+        "PhysicalHashJoinNode",
+        "PhysicalHashJoinEqCondition",
+        "PhysicalNestLoopJoinNode",
+        "PlanSetOpKind",
+        "PhysicalSetOpNode",
+        "DistributedChangeEventExpandNode",
+        "DistributedChangeEventSpec",
+        "DistributedChangeEventOutputExpr",
+        "PhysicalPlanNode",
+        "PhysicalPlanKind",
+        "RedistributeNode",
+        "RedistributeMode",
+    ];
+    let retired_logical_payload = [
+        "LogicalAssertOneRowNode",
+        "LogicalRepeatNode",
+        "LogicalWindowNode",
+        "LogicalGenerateSeriesNode",
+        "LogicalTableFunctionNode",
+        "LogicalScanNode",
+        "LogicalValuesNode",
+        "LogicalFilterNode",
+        "LogicalProjectNode",
+        "LogicalSortNode",
+        "LogicalLimitNode",
+        "LogicalCTEAnchorNode",
+        "LogicalCTEProduceNode",
+        "LogicalCTEConsumeNode",
+    ];
+
+    let planner_sources = rs_files(&planner)
+        .into_iter()
+        .map(|path| {
+            let text = fs::read_to_string(&path).unwrap();
+            (path, text)
+        })
+        .collect::<Vec<_>>();
+
+    for (expected_owner, items) in [
+        (&logical_node_path, logical_only.as_slice()),
+        (&payload_path, shared_payload.as_slice()),
+        (&plan_path, physical_only.as_slice()),
+    ] {
+        for item in items {
+            let declarations = planner_sources
+                .iter()
+                .filter_map(|(path, text)| {
+                    let count = rust_named_type_declaration_count(text, item);
+                    (count > 0).then(|| format!("{} ({count})", rel(path)))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                declarations,
+                vec![format!("{} (1)", rel(expected_owner))],
+                "{item} must have exactly one declaration in its stage owner"
+            );
+        }
+    }
+
+    for item in retired_logical_payload {
+        let declarations = planner_sources
+            .iter()
+            .filter_map(|(path, text)| {
+                let count = rust_named_type_declaration_count(text, item);
+                (count > 0).then(|| format!("{} ({count})", rel(path)))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            declarations.is_empty(),
+            "retired logical payload {item} must not be declared: {declarations:?}"
+        );
+    }
+
+    let plan = fs::read_to_string(&plan_path).unwrap();
+    let plan_production = rust_sanitized_production_text(&plan);
+    let plan_identifiers = plan_production
+        .split(|ch: char| !is_ident_char(ch))
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    assert!(
+        !plan_identifiers
+            .iter()
+            .any(|token| token.starts_with("Logical")),
+        "physical staging owner must not reference Logical* production types"
+    );
+    let plan_uses = rust_production_use_statements(&plan);
+    assert!(
+        !plan_uses.iter().any(|statement| {
+            statement.contains("logical")
+                || (statement.starts_with("pub")
+                    && (statement.contains("payload") || statement.contains("sql::common")))
+        }),
+        "plan.rs must not import logical IR or re-export shared/common payload: {plan_uses:?}"
+    );
+
+    let payload = fs::read_to_string(&payload_path).unwrap();
+    let payload_production = compact_line(&rust_sanitized_production_text(&payload));
+    for forbidden in ["planner::logical", "planner::plan", "planner::distributed"] {
+        assert!(
+            !payload_production.contains(forbidden),
+            "payload.rs must not depend on stage owner {forbidden}"
+        );
+    }
+
+    let logical_node = fs::read_to_string(&logical_node_path).unwrap();
+    let logical_production = rust_sanitized_production_text(&logical_node);
+    let logical_identifiers = logical_production
+        .split(|ch: char| !is_ident_char(ch))
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    assert!(
+        !logical_identifiers.iter().any(|token| {
+            token.starts_with("Physical")
+                || token.starts_with("Redistribute")
+                || *token == "distributed"
+        }),
+        "logical/node.rs production must not depend on physical/distributed owners"
+    );
+    assert!(
+        !rust_production_use_statements(&logical_node)
+            .iter()
+            .any(|statement| statement.contains("planner::plan")),
+        "logical/node.rs production must not import planner::plan"
+    );
+
+    let facade = fs::read_to_string(&facade_path).unwrap();
+    assert!(has_non_comment_line(&facade, "pub(crate) mod payload;"));
+    let facade_uses = rust_production_use_statements(&facade);
+    let allowed_logical_build = "pub(crate)uselogical::build::{plan_output_columns,plan_query};";
+    assert!(
+        !facade_uses.iter().any(|statement| {
+            statement == "useplan::*;"
+                || (statement.contains("logical") && statement != allowed_logical_build)
+                || statement.contains("payload")
+        }),
+        "planner facade must not hide logical/shared IR owners: {facade_uses:?}"
+    );
+
+    let logical_mod = fs::read_to_string(&logical_mod_path).unwrap();
+    assert!(has_non_comment_line(&logical_mod, "mod node;"));
+    assert!(has_non_comment_line(
+        &logical_mod,
+        "pub(crate) use node::*;"
+    ));
+
+    let marker = fs::read_to_string(&marker_path).unwrap();
+    assert!(
+        !rust_production_use_statements(&marker)
+            .iter()
+            .any(|statement| statement.starts_with("pub") && statement.contains("ImvVersionRef")),
+        "imv_rewrite::marker must not re-export ImvVersionRef"
+    );
+
+    let mut checked = rs_files(&src_dir());
+    checked.extend(rs_files(&repo.join("tests")));
+    let legacy_logical_path = ["planner::plan::", "Logical"].concat();
+    for path in checked {
+        let text = fs::read_to_string(&path).unwrap();
+        let sanitized = rust_lexically_sanitized(&text);
+        assert!(
+            !sanitized.contains(&legacy_logical_path),
+            "legacy logical path remains in {}",
+            rel(&path)
+        );
+        for item in shared_payload {
+            assert!(
+                !sanitized.contains(&format!("planner::plan::{item}")),
+                "legacy shared payload path planner::plan::{item} remains in {}",
+                rel(&path)
+            );
+        }
+    }
 }
 
 #[test]

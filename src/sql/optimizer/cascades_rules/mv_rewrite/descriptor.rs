@@ -1059,10 +1059,8 @@ mod tests {
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::scalar::ScalarArena;
-    use crate::sql::planner::plan::{
-        AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalPlanKind, LogicalPlanNode,
-        LogicalScanNode, LogicalSortNode,
-    };
+    use crate::sql::planner::logical::{LogicalAggregateNode, LogicalPlanKind, LogicalPlanNode};
+    use crate::sql::planner::payload::{AggregateCall, PlanFilterNode, PlanScanNode, PlanSortNode};
     use arrow::datatypes::DataType;
 
     fn col(id: u32, name: &str) -> OutputColumn {
@@ -1117,8 +1115,8 @@ mod tests {
         }
     }
 
-    fn scan(cols: &[OutputColumn]) -> LogicalScanNode {
-        LogicalScanNode {
+    fn scan(cols: &[OutputColumn]) -> PlanScanNode {
+        PlanScanNode {
             database: "db".to_string(),
             table: TableDef {
                 name: "t".to_string(),
@@ -1149,7 +1147,7 @@ mod tests {
     }
 
     /// A scan over a named table (the shared `scan()` helper hardcodes "t").
-    fn scan_named(table_name: &str, cols: &[OutputColumn]) -> LogicalScanNode {
+    fn scan_named(table_name: &str, cols: &[OutputColumn]) -> PlanScanNode {
         let mut s = scan(cols);
         s.table.name = table_name.to_string();
         s
@@ -1171,7 +1169,7 @@ mod tests {
         on: Option<TypedExpr>,
     ) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Join(crate::sql::planner::plan::LogicalJoinNode {
+            LogicalPlanKind::Join(crate::sql::planner::logical::LogicalJoinNode {
                 join_type: kind,
                 condition: on,
             }),
@@ -1361,7 +1359,7 @@ mod tests {
         let b = col(2, "b");
         let c = col(3, "c");
         let driving = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: cmp(col_ref(&a), crate::sql::analysis::BinOp::Ge, int_lit(5)),
             }),
             vec![scan_plan_named("t1", &[a.clone(), b.clone()])],
@@ -1496,7 +1494,7 @@ mod tests {
         let a = col(1, "a");
         let b = col(2, "b");
         let plan = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: cmp(col_ref(&a), crate::sql::analysis::BinOp::Ge, int_lit(5)),
             }),
             vec![scan_plan(&[a.clone(), b.clone()])],
@@ -1514,7 +1512,7 @@ mod tests {
         let a = col(1, "a");
         let b = col(2, "b");
         let plan = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: cmp(col_ref(&a), crate::sql::analysis::BinOp::Ge, int_lit(5)),
             }),
             vec![scan_plan(&[a.clone(), b.clone()])],
@@ -1564,7 +1562,7 @@ mod tests {
         // Any node outside {Scan, Filter, Project, Aggregate} must yield Err.
         let a = col(1, "a");
         let plan = LogicalPlanNode::new(
-            LogicalPlanKind::Sort(LogicalSortNode {
+            LogicalPlanKind::Sort(PlanSortNode {
                 items: vec![],
                 analytic_partition_by: vec![],
                 output_columns: vec![],
@@ -1597,7 +1595,7 @@ mod tests {
         let a = col(1, "a");
         let b = col(2, "b");
         let plan = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: cmp(col_ref(&a), crate::sql::analysis::BinOp::Ge, int_lit(5)),
             }),
             vec![scan_plan(&[a.clone(), b.clone()])],
@@ -1666,7 +1664,7 @@ mod tests {
         let b = col(2, "b");
         let c = col(3, "c");
         let driving = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: cmp(col_ref(&a), crate::sql::analysis::BinOp::Ge, int_lit(5)),
             }),
             vec![scan_plan_named("t1", &[a.clone(), b.clone()])],

@@ -477,7 +477,8 @@ mod typed_legacy {
     use super::{JoinSide, QualifiedRef};
     use crate::sql::analysis::{BinOp, ExprKind, TypedExpr};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::plan::*;
+    use crate::sql::planner::logical::*;
+    use crate::sql::planner::payload::*;
 
     #[derive(Debug)]
     pub(crate) struct JoinEquiKey {
@@ -853,7 +854,8 @@ mod column_id_helper_tests {
     use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::plan::*;
+    use crate::sql::planner::logical::*;
+    use crate::sql::planner::payload::*;
     use arrow::datatypes::DataType;
 
     // -----------------------------------------------------------------------
@@ -979,7 +981,7 @@ mod column_id_helper_tests {
             },
         };
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 database: "default".to_string(),
                 table: table,
                 alias: None,
@@ -1090,7 +1092,7 @@ mod column_id_helper_tests {
         };
 
         let plan = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![passthrough_item, computed_item],
                 output_qualifier: None,
             }),
@@ -1131,7 +1133,7 @@ mod column_id_helper_tests {
         };
 
         let plan = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![real_item, unset_item],
                 output_qualifier: None,
             }),
@@ -1145,11 +1147,11 @@ mod column_id_helper_tests {
 
     #[test]
     fn generate_series_output_id_is_collected() {
-        use crate::sql::planner::plan::LogicalGenerateSeriesNode;
+        use crate::sql::planner::payload::PlanGenerateSeriesNode;
 
         let output_id = ColumnId::new_for_test(88);
         let plan = LogicalPlanNode::new(
-            LogicalPlanKind::GenerateSeries(LogicalGenerateSeriesNode {
+            LogicalPlanKind::GenerateSeries(PlanGenerateSeriesNode {
                 start: 1,
                 end: 3,
                 step: 1,
@@ -1198,7 +1200,7 @@ mod column_id_helper_tests {
             })
             .collect();
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 database: "default".to_string(),
                 table: TableDef {
                     name: table.to_string(),
@@ -1451,7 +1453,7 @@ mod column_id_helper_tests {
         output_id: u32,
     ) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::ColumnRef {
@@ -1468,7 +1470,7 @@ mod column_id_helper_tests {
                 output_qualifier: None,
             }),
             vec![LogicalPlanNode::new(
-                LogicalPlanKind::Values(LogicalValuesNode {
+                LogicalPlanKind::Values(PlanValuesNode {
                     rows: vec![],
                     columns: vec![OutputColumn {
                         column_id: ColumnId::new_for_test(source_id),

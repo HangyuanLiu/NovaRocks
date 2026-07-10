@@ -166,7 +166,8 @@ fn apply_expr(expr: OptExpr, arena: &mut ScalarArena) -> Result<Option<OptExpr>,
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::planner::plan::*;
+    use crate::sql::planner::logical::*;
+    use crate::sql::planner::payload::*;
     use std::cell::RefCell;
     use std::collections::HashSet;
     use std::rc::Rc;
@@ -179,16 +180,15 @@ mod tests {
     };
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::common::ApplyKind;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rules::subquery::bridge::opt_expr_to_plan;
     use crate::sql::optimizer::rewrite::rules::utils::split_and;
     use crate::sql::optimizer::rewrite::tree_binder::bind_tree;
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::logical::{LogicalApplyNode, LogicalJoinNode, LogicalPlanKind};
     use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
-    use crate::sql::planner::plan::{
-        ApplyKind, LogicalApplyNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanKind,
-        LogicalProjectNode, LogicalScanNode,
-    };
+    use crate::sql::planner::payload::{PlanFilterNode, PlanProjectNode, PlanScanNode};
 
     const OUTER_A: ColumnId = ColumnId(1);
     const OUTER_K: ColumnId = ColumnId(2);
@@ -230,7 +230,7 @@ mod tests {
 
     fn scan(table: &str, columns: Vec<OutputColumn>) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 database: "default".to_string(),
                 table: table_def(table),
                 alias: None,
@@ -319,12 +319,12 @@ mod tests {
         }
 
         LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: items,
                 output_qualifier: None,
             }),
             vec![LogicalPlanNode::new(
-                LogicalPlanKind::Filter(LogicalFilterNode {
+                LogicalPlanKind::Filter(PlanFilterNode {
                     predicate: correlation_predicate(predicate_nullable),
                 }),
                 vec![inner_scan(inner_b_nullable, inner_k_nullable)],

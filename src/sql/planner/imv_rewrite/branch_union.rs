@@ -30,7 +30,7 @@ use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
 use crate::sql::planner::imv_rewrite::column_alloc::allocate_imv_output_column;
 use crate::sql::planner::imv_rewrite::marker::plan_contains_imv_marker;
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
-use crate::sql::planner::plan::{
+use crate::sql::planner::logical::{
     LogicalAggregateNode, LogicalImvDeltaNode, LogicalPlanKind, LogicalPlanNode, LogicalUnionNode,
 };
 
@@ -327,7 +327,8 @@ fn plan_kind(plan: &LogicalPlanNode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::planner::plan::*;
+    use crate::sql::planner::logical::*;
+    use crate::sql::planner::payload::*;
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -357,10 +358,12 @@ mod tests {
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
+    use crate::sql::planner::logical::{
+        LogicalAggregateNode, LogicalJoinNode, LogicalPlanKind, LogicalPlanNode, LogicalUnionNode,
+    };
     use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
-    use crate::sql::planner::plan::{
-        AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanKind,
-        LogicalPlanNode, LogicalProjectNode, LogicalScanNode, LogicalUnionNode,
+    use crate::sql::planner::payload::{
+        AggregateCall, PlanFilterNode, PlanProjectNode, PlanScanNode,
     };
 
     #[test]
@@ -816,7 +819,7 @@ mod tests {
     fn contains_target_state_scan(plan: &LogicalPlanNode) -> bool {
         matches!(
             &plan.kind,
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 table: TableDef {
                     source: ScanSource::IcebergMvTargetState(_),
                     ..
@@ -1163,7 +1166,7 @@ mod tests {
 
     fn project_over_aggregate(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![
                     ProjectItem {
                         expr: col_expr(1, "region"),
@@ -1186,7 +1189,7 @@ mod tests {
     fn scan(name: &str, first_id: u32) -> LogicalPlanNode {
         let columns = vec![column_def("region"), column_def("amount")];
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: name.to_string(),
@@ -1227,7 +1230,7 @@ mod tests {
 
     fn project_over_filter(name: &str, first_id: u32) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![
                     ProjectItem {
                         expr: col_expr(first_id, "region"),
@@ -1249,7 +1252,7 @@ mod tests {
 
     fn filter_over(input: LogicalPlanNode, column_id: u32, column: &str) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::BinaryOp {
                         left: Box::new(col_expr(column_id, column)),

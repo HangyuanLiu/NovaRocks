@@ -18,7 +18,8 @@
 use crate::sql::analysis::*;
 use crate::sql::codegen::helpers::typed_expr_display_name;
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
-use crate::sql::planner::plan::*;
+use crate::sql::planner::logical::*;
+use crate::sql::planner::payload::*;
 
 /// Extract ColumnId from a TypedExpr, or allocate a new one from the factory.
 pub(super) fn expr_column_id(
@@ -159,7 +160,7 @@ pub(super) fn prepare_repeat_input(
         .collect();
 
     *current = LogicalPlanNode::new(
-        LogicalPlanKind::Project(LogicalProjectNode {
+        LogicalPlanKind::Project(PlanProjectNode {
             items: project_items,
             output_qualifier: None,
         }),

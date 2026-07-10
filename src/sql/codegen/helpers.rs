@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::sql::analysis::{self as query_ir, BinOp, ExprKind, TypedExpr};
-use crate::sql::planner::plan::{AggregateCall, WindowExpr};
+use crate::sql::planner::payload::{AggregateCall, WindowExpr};
 #[cfg(feature = "compat")]
 use crate::thrift::plan_nodes;
 
@@ -569,7 +569,7 @@ mod tests {
         typed_expr_display_name,
     };
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
-    use crate::sql::planner::plan::AggregateCall;
+    use crate::sql::planner::payload::AggregateCall;
 
     fn col(name: &str) -> TypedExpr {
         TypedExpr {

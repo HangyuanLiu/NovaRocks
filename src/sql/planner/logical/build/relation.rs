@@ -19,7 +19,8 @@ use crate::sql::analysis::cte::CTERegistry;
 use crate::sql::analysis::*;
 use crate::sql::catalog::{IcebergDataFileInfo, IcebergDeleteFileContent};
 use crate::sql::column_id::ColumnRefFactory;
-use crate::sql::planner::plan::*;
+use crate::sql::planner::logical::*;
+use crate::sql::planner::payload::*;
 
 use super::output::adapt_plan_output_with_qualifier;
 use super::query::plan_scoped_query;
@@ -85,7 +86,7 @@ pub(super) fn plan_relation_scoped(
                 });
             }
             Ok(LogicalPlanNode::new(
-                LogicalPlanKind::Scan(LogicalScanNode {
+                LogicalPlanKind::Scan(PlanScanNode {
                     database: scan.database,
                     table: scan.table,
                     alias: scan.alias,
@@ -132,7 +133,7 @@ pub(super) fn plan_relation_scoped(
                     }
                     let left = plan_relation_scoped(left, cte_registry, factory)?;
                     Ok(LogicalPlanNode::new(
-                        LogicalPlanKind::TableFunction(LogicalTableFunctionNode {
+                        LogicalPlanKind::TableFunction(PlanTableFunctionNode {
                             function_name: "unnest".to_string(),
                             args: unnest.args,
                             output_columns: unnest.output_columns,
@@ -158,7 +159,7 @@ pub(super) fn plan_relation_scoped(
             }
         }
         Relation::GenerateSeries(gs) => Ok(LogicalPlanNode::new(
-            LogicalPlanKind::GenerateSeries(LogicalGenerateSeriesNode {
+            LogicalPlanKind::GenerateSeries(PlanGenerateSeriesNode {
                 start: gs.start,
                 end: gs.end,
                 step: gs.step,
@@ -176,7 +177,7 @@ pub(super) fn plan_relation_scoped(
             output_columns,
             producer_column_ids,
         } => Ok(LogicalPlanNode::new(
-            LogicalPlanKind::CTEConsume(LogicalCTEConsumeNode {
+            LogicalPlanKind::CTEConsume(PlanCTEConsumeNode {
                 cte_id: cte_id,
                 alias: alias,
                 output_columns: output_columns,
@@ -288,7 +289,7 @@ fn plan_iceberg_metadata_scan(
         },
     };
     Ok(LogicalPlanNode::new(
-        LogicalPlanKind::Scan(LogicalScanNode {
+        LogicalPlanKind::Scan(PlanScanNode {
             database: rel.database,
             table: synthetic_table,
             alias: rel.alias,
@@ -503,7 +504,7 @@ fn plan_iceberg_delta_scan(
         },
     };
     Ok(LogicalPlanNode::new(
-        LogicalPlanKind::Scan(LogicalScanNode {
+        LogicalPlanKind::Scan(PlanScanNode {
             database: rel.namespace,
             table: synthetic_table,
             alias: rel.alias,
@@ -602,7 +603,7 @@ pub(super) fn plan_values(
 ) -> Result<LogicalPlanNode, String> {
     let columns = values.output_columns;
     Ok(LogicalPlanNode::new(
-        LogicalPlanKind::Values(LogicalValuesNode {
+        LogicalPlanKind::Values(PlanValuesNode {
             rows: values.rows,
             columns: columns,
         }),

@@ -28,7 +28,7 @@
 pub(crate) fn opt_expr_to_plan(
     expr: crate::sql::optimizer::opt_expr::OptExpr,
     ctx: &crate::sql::optimizer::rewrite::context::RewriteContext,
-) -> crate::sql::planner::plan::LogicalPlanNode {
+) -> crate::sql::planner::logical::LogicalPlanNode {
     let arena = ctx.scalar_arena();
     crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(expr, &arena.borrow())
 }
@@ -38,7 +38,7 @@ pub(crate) fn opt_expr_to_plan(
 /// variant so closures can work with plan-level types directly.
 pub(crate) enum PlanRewriteResult {
     Unchanged,
-    Changed(crate::sql::planner::plan::LogicalPlanNode),
+    Changed(crate::sql::planner::logical::LogicalPlanNode),
     Rejected(crate::sql::optimizer::rewrite::result::RewriteDiagnostic),
 }
 
@@ -56,7 +56,7 @@ pub(crate) fn bridge_apply_result<F>(
 ) -> Result<crate::sql::optimizer::rewrite::result::RewriteResult, String>
 where
     F: FnOnce(
-        crate::sql::planner::plan::LogicalPlanNode,
+        crate::sql::planner::logical::LogicalPlanNode,
         &crate::sql::optimizer::rewrite::context::RewriteContext,
     ) -> Result<PlanRewriteResult, String>,
 {
@@ -91,7 +91,7 @@ pub(crate) fn bridge_apply_result_mut<F>(
 ) -> Result<crate::sql::optimizer::rewrite::result::RewriteResult, String>
 where
     F: FnOnce(
-        crate::sql::planner::plan::LogicalPlanNode,
+        crate::sql::planner::logical::LogicalPlanNode,
         &mut crate::sql::optimizer::rewrite::context::RewriteContext,
     ) -> Result<PlanRewriteResult, String>,
 {

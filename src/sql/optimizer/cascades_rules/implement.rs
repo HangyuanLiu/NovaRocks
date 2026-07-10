@@ -796,8 +796,8 @@ impl Rule for TopNToPhysical {
 #[cfg(test)]
 #[allow(dead_code)]
 fn split_window_exprs_by_signature(
-    exprs: &[crate::sql::planner::plan::WindowExpr],
-) -> Vec<Vec<crate::sql::planner::plan::WindowExpr>> {
+    exprs: &[crate::sql::planner::payload::WindowExpr],
+) -> Vec<Vec<crate::sql::planner::payload::WindowExpr>> {
     let index_groups = crate::sql::codegen::helpers::group_win_exprs_by_sig(exprs);
     index_groups
         .into_iter()
@@ -811,7 +811,7 @@ fn split_window_exprs_by_signature(
 #[cfg(test)]
 #[allow(dead_code)]
 fn sort_items_for_window(
-    win: &crate::sql::planner::plan::WindowExpr,
+    win: &crate::sql::planner::payload::WindowExpr,
 ) -> Vec<crate::sql::analysis::SortItem> {
     let mut items = Vec::new();
     for expr in &win.partition_by {
@@ -1895,7 +1895,7 @@ mod window_split_tests {
     use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::optimizer_bridge::scalar::intern_window_exprs;
-    use crate::sql::planner::plan::WindowExpr;
+    use crate::sql::planner::payload::WindowExpr;
     use arrow::datatypes::DataType;
 
     fn window_output_id(name: &str) -> ColumnId {
@@ -2079,7 +2079,7 @@ mod two_phase_agg_tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::{MExpr, Memo};
     use crate::sql::planner::optimizer_bridge::scalar::{intern_aggregate_calls, intern_exprs};
-    use crate::sql::planner::plan::AggregateCall;
+    use crate::sql::planner::payload::AggregateCall;
     use arrow::datatypes::DataType;
 
     fn test_col_id(name: &str) -> ColumnId {

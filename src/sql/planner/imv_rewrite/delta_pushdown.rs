@@ -32,7 +32,7 @@ use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result};
-use crate::sql::planner::plan::{LogicalImvDeltaNode, LogicalPlanKind, LogicalPlanNode};
+use crate::sql::planner::logical::{LogicalImvDeltaNode, LogicalPlanKind, LogicalPlanNode};
 
 pub(crate) struct PushDeltaThroughUnaryRule;
 
@@ -127,7 +127,7 @@ fn apply_plan(plan: LogicalPlanNode) -> Result<PlanRewriteResult, String> {
             // Project items are row-local and the delta only marks each row's
             // change action (carried through by action-column propagation).
             // Window calls cannot appear here because the planner extracts
-            // them into a dedicated LogicalWindowNode.
+            // them into a dedicated PlanWindowNode.
             let inner = LogicalPlanNode::new(
                 LogicalPlanKind::ImvDelta(LogicalImvDeltaNode {
                     is_root: false,
@@ -167,7 +167,8 @@ fn apply_plan(plan: LogicalPlanNode) -> Result<PlanRewriteResult, String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::planner::plan::*;
+    use crate::sql::planner::logical::*;
+    use crate::sql::planner::payload::*;
     use std::collections::BTreeMap;
 
     use arrow::datatypes::DataType;
@@ -185,13 +186,13 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::logical::{
+        LogicalAggregateNode, LogicalJoinNode, LogicalPlanKind, LogicalUnionNode,
+    };
     use crate::sql::planner::optimizer_bridge::plan::{
         logical_plan_to_opt_expr, opt_expr_to_logical_plan,
     };
-    use crate::sql::planner::plan::{
-        LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanKind,
-        LogicalProjectNode, LogicalScanNode, LogicalUnionNode,
-    };
+    use crate::sql::planner::payload::{PlanFilterNode, PlanProjectNode, PlanScanNode};
 
     fn ctx_with_arena() -> (RewriteContext, Rc<RefCell<ScalarArena>>) {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
@@ -211,7 +212,7 @@ mod tests {
             logical_type: None,
         };
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: "b".to_string(),
@@ -267,7 +268,7 @@ mod tests {
 
     fn project_over(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::ColumnRef {
@@ -290,7 +291,7 @@ mod tests {
 
     fn filter_over(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Bool(true)),
                     data_type: DataType::Boolean,

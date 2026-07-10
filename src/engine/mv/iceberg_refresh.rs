@@ -11643,7 +11643,7 @@ fn plan_canonical_select_for_imv(
     ctx: &IcebergMvRefreshContext,
 ) -> Result<
     (
-        crate::sql::planner::plan::LogicalPlanNode,
+        crate::sql::planner::logical::LogicalPlanNode,
         crate::sql::column_id::ColumnRefFactory,
     ),
     RefreshError,
@@ -11678,9 +11678,9 @@ fn plan_canonical_select_for_imv(
 }
 
 pub(crate) fn normalize_imv_rewrite_root_project(
-    plan: crate::sql::planner::plan::LogicalPlanNode,
-) -> crate::sql::planner::plan::LogicalPlanNode {
-    use crate::sql::planner::plan::{LogicalPlanKind, LogicalPlanNode};
+    plan: crate::sql::planner::logical::LogicalPlanNode,
+) -> crate::sql::planner::logical::LogicalPlanNode {
+    use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
 
     let LogicalPlanNode {
         kind,
@@ -12062,11 +12062,12 @@ mod aggregate_refresh_rewrite_validation_tests {
         SignedStateAggregateProof, TargetStateProof,
     };
     use crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome;
-    use crate::sql::planner::plan::{LogicalPlanKind, LogicalPlanNode, LogicalValuesNode};
+    use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
+    use crate::sql::planner::payload::PlanValuesNode;
 
     fn empty_values_plan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(PlanValuesNode {
                 rows: Vec::new(),
                 columns: Vec::new(),
             }),
@@ -12700,7 +12701,7 @@ fn select_join_incremental_refresh_route(
 }
 
 struct JoinRefreshLogicalPlan {
-    plan: crate::sql::planner::plan::LogicalPlanNode,
+    plan: crate::sql::planner::logical::LogicalPlanNode,
     factory: crate::sql::column_id::ColumnRefFactory,
     change_stream:
         Option<crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor>,
@@ -12803,7 +12804,7 @@ fn build_join_full_refresh_logical_plan(
 }
 
 struct JoinFullRefreshApplyInput {
-    plan: crate::sql::planner::plan::LogicalPlanNode,
+    plan: crate::sql::planner::logical::LogicalPlanNode,
     payload_columns: Vec<OutputColumn>,
     left_row_id_column: OutputColumn,
     right_row_id_column: OutputColumn,
@@ -12812,17 +12813,17 @@ struct JoinFullRefreshApplyInput {
 }
 
 fn build_join_full_refresh_apply_input(
-    plan: crate::sql::planner::plan::LogicalPlanNode,
+    plan: crate::sql::planner::logical::LogicalPlanNode,
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
     left_ref: &IcebergTableRef,
     right_ref: &IcebergTableRef,
 ) -> Result<JoinFullRefreshApplyInput, String> {
-    let crate::sql::planner::plan::LogicalPlanNode {
+    let crate::sql::planner::logical::LogicalPlanNode {
         kind,
         mut children,
         required_output_columns: _,
     } = plan;
-    let crate::sql::planner::plan::LogicalPlanKind::Project(mut project) = kind else {
+    let crate::sql::planner::logical::LogicalPlanKind::Project(mut project) = kind else {
         return Err("join full refresh logical route requires a root Project".to_string());
     };
     if children.len() != 1 {
@@ -12861,8 +12862,8 @@ fn build_join_full_refresh_apply_input(
     project
         .items
         .push(project_item_for_column(&right_row_id_column));
-    let plan = crate::sql::planner::plan::LogicalPlanNode::new(
-        crate::sql::planner::plan::LogicalPlanKind::Project(project),
+    let plan = crate::sql::planner::logical::LogicalPlanNode::new(
+        crate::sql::planner::logical::LogicalPlanKind::Project(project),
         vec![input],
         None,
     );
@@ -12908,7 +12909,7 @@ struct JoinFullRefreshBaseScan {
 }
 
 fn find_join_full_refresh_base_scan(
-    plan: &crate::sql::planner::plan::LogicalPlanNode,
+    plan: &crate::sql::planner::logical::LogicalPlanNode,
     base_ref: &IcebergTableRef,
     role: &str,
 ) -> Result<JoinFullRefreshBaseScan, String> {
@@ -12928,11 +12929,11 @@ fn find_join_full_refresh_base_scan(
 }
 
 fn collect_join_full_refresh_base_scans(
-    plan: &crate::sql::planner::plan::LogicalPlanNode,
+    plan: &crate::sql::planner::logical::LogicalPlanNode,
     base_ref: &IcebergTableRef,
     scans: &mut Vec<JoinFullRefreshBaseScan>,
 ) {
-    if let crate::sql::planner::plan::LogicalPlanKind::Scan(scan) = &plan.kind
+    if let crate::sql::planner::logical::LogicalPlanKind::Scan(scan) = &plan.kind
         && let Some(table) = iceberg_scan_table_info(&scan.table.source)
         && table.catalog.eq_ignore_ascii_case(&base_ref.catalog)
         && table.namespace.eq_ignore_ascii_case(&base_ref.namespace)
@@ -13355,7 +13356,7 @@ struct JoinCoalesceLocatorColumnIds {
 
 fn allocate_join_coalesce_locator_column_ids(
     factory: &mut crate::sql::column_id::ColumnRefFactory,
-    plan: &crate::sql::planner::plan::LogicalPlanNode,
+    plan: &crate::sql::planner::logical::LogicalPlanNode,
 ) -> Result<JoinCoalesceLocatorColumnIds, String> {
     reserve_factory_for_logical_plan(factory, plan)?;
     Ok(JoinCoalesceLocatorColumnIds {
@@ -13404,7 +13405,7 @@ fn allocate_join_coalesce_locator_column_ids(
 
 fn reserve_factory_for_logical_plan(
     factory: &mut crate::sql::column_id::ColumnRefFactory,
-    plan: &crate::sql::planner::plan::LogicalPlanNode,
+    plan: &crate::sql::planner::logical::LogicalPlanNode,
 ) -> Result<(), String> {
     let max_id = max_logical_plan_output_column_id(plan)?;
     factory.reserve_until(max_id.saturating_add(1));
@@ -13412,7 +13413,7 @@ fn reserve_factory_for_logical_plan(
 }
 
 fn max_logical_plan_output_column_id(
-    plan: &crate::sql::planner::plan::LogicalPlanNode,
+    plan: &crate::sql::planner::logical::LogicalPlanNode,
 ) -> Result<u32, String> {
     let mut max_id = crate::sql::planner::plan_output_columns(plan)?
         .iter()
@@ -16068,8 +16069,9 @@ mod tests {
     use crate::engine::mv::apply_key::ApplyKeyValueType;
     use crate::engine::mv::refresh_property::PartitionPruningPolicy;
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::logical::*;
     use crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr;
-    use crate::sql::planner::plan::*;
+    use crate::sql::planner::payload::*;
     use arrow::array::{BinaryArray, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow::record_batch::RecordBatch;
@@ -16135,7 +16137,7 @@ mod tests {
             is_internal: false,
         };
         let child = LogicalPlanNode::new(
-            LogicalPlanKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(PlanValuesNode {
                 rows: Vec::new(),
                 columns: vec![group_output.clone()],
             }),
@@ -16160,7 +16162,7 @@ mod tests {
             None,
         );
         let root = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![
                     ProjectItem {
                         expr: column_ref_expr(&group_output),
@@ -16269,7 +16271,7 @@ mod tests {
     fn normalization_project_over_aggregate(project_items: Vec<ProjectItem>) -> LogicalPlanNode {
         let (g1, g2, sum_output) = normalization_aggregate_outputs();
         let child = LogicalPlanNode::new(
-            LogicalPlanKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(PlanValuesNode {
                 rows: Vec::new(),
                 columns: vec![g1.clone(), g2.clone()],
             }),
@@ -16294,7 +16296,7 @@ mod tests {
             None,
         );
         LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: project_items,
                 output_qualifier: None,
             }),
@@ -16346,9 +16348,9 @@ mod tests {
             nullable: false,
             is_internal: false,
         };
-        let child = crate::sql::planner::plan::LogicalPlanNode::new(
-            crate::sql::planner::plan::LogicalPlanKind::Values(
-                crate::sql::planner::plan::LogicalValuesNode {
+        let child = crate::sql::planner::logical::LogicalPlanNode::new(
+            crate::sql::planner::logical::LogicalPlanKind::Values(
+                crate::sql::planner::payload::PlanValuesNode {
                     rows: Vec::new(),
                     columns: vec![child_output.clone()],
                 },
@@ -16356,9 +16358,9 @@ mod tests {
             Vec::new(),
             None,
         );
-        let plan = crate::sql::planner::plan::LogicalPlanNode::new(
-            crate::sql::planner::plan::LogicalPlanKind::Project(
-                crate::sql::planner::plan::LogicalProjectNode {
+        let plan = crate::sql::planner::logical::LogicalPlanNode::new(
+            crate::sql::planner::logical::LogicalPlanKind::Project(
+                crate::sql::planner::payload::PlanProjectNode {
                     items: vec![crate::sql::analysis::ProjectItem {
                         expr: crate::sql::analysis::TypedExpr {
                             kind: crate::sql::analysis::ExprKind::ColumnRef {
@@ -18043,13 +18045,13 @@ mod tests {
 
     fn join_coalesce_factory_test_branch_union(
         desc: &crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor,
-    ) -> crate::sql::planner::plan::LogicalPlanNode {
+    ) -> crate::sql::planner::logical::LogicalPlanNode {
         let mut output_columns = desc.payload_columns.clone();
         output_columns.push(desc.action_column.clone());
         output_columns.push(desc.join_apply_key_column.clone());
-        let branch = crate::sql::planner::plan::LogicalPlanNode::new(
-            crate::sql::planner::plan::LogicalPlanKind::Values(
-                crate::sql::planner::plan::LogicalValuesNode {
+        let branch = crate::sql::planner::logical::LogicalPlanNode::new(
+            crate::sql::planner::logical::LogicalPlanKind::Values(
+                crate::sql::planner::payload::PlanValuesNode {
                     rows: Vec::new(),
                     columns: output_columns.clone(),
                 },
@@ -18057,9 +18059,9 @@ mod tests {
             Vec::new(),
             None,
         );
-        crate::sql::planner::plan::LogicalPlanNode::new(
-            crate::sql::planner::plan::LogicalPlanKind::Union(
-                crate::sql::planner::plan::LogicalUnionNode {
+        crate::sql::planner::logical::LogicalPlanNode::new(
+            crate::sql::planner::logical::LogicalPlanKind::Union(
+                crate::sql::planner::logical::LogicalUnionNode {
                     all: true,
                     output_columns,
                 },
@@ -18070,7 +18072,7 @@ mod tests {
     }
 
     fn collect_join_coalesce_factory_watch_columns(
-        plan: &crate::sql::planner::plan::LogicalPlanNode,
+        plan: &crate::sql::planner::logical::LogicalPlanNode,
         min_id: ColumnId,
     ) -> Vec<OutputColumn> {
         let mut columns = Vec::new();
@@ -18079,12 +18081,12 @@ mod tests {
     }
 
     fn collect_join_coalesce_factory_watch_columns_inner(
-        plan: &crate::sql::planner::plan::LogicalPlanNode,
+        plan: &crate::sql::planner::logical::LogicalPlanNode,
         min_id: ColumnId,
         columns: &mut Vec<OutputColumn>,
     ) {
         match &plan.kind {
-            crate::sql::planner::plan::LogicalPlanKind::Project(project) => {
+            crate::sql::planner::logical::LogicalPlanKind::Project(project) => {
                 columns.extend(project.items.iter().filter_map(|item| {
                     is_join_coalesce_factory_locator_output(&item.output_name).then(|| {
                         OutputColumn {
@@ -18097,7 +18099,7 @@ mod tests {
                     })
                 }));
             }
-            crate::sql::planner::plan::LogicalPlanKind::Aggregate(aggregate) => {
+            crate::sql::planner::logical::LogicalPlanKind::Aggregate(aggregate) => {
                 columns.extend(
                     aggregate
                         .output_columns
@@ -18109,7 +18111,7 @@ mod tests {
                         .cloned(),
                 );
             }
-            crate::sql::planner::plan::LogicalPlanKind::Scan(scan) => {
+            crate::sql::planner::logical::LogicalPlanKind::Scan(scan) => {
                 columns.extend(
                     scan.columns
                         .iter()

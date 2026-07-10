@@ -23,7 +23,7 @@ use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, ProjectItem};
 use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
-use crate::sql::planner::plan::{LogicalPlanKind, LogicalPlanNode};
+use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum JoinDeltaOrientation {
@@ -286,7 +286,8 @@ fn is_supported_marker_input(plan: &LogicalPlanNode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::planner::plan::*;
+    use crate::sql::planner::logical::*;
+    use crate::sql::planner::payload::*;
     use arrow::datatypes::DataType;
 
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
@@ -294,7 +295,8 @@ mod tests {
         ColumnDef, IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, TableDef,
     };
     use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::plan::{LogicalPlanKind, LogicalProjectNode, LogicalScanNode};
+    use crate::sql::planner::logical::LogicalPlanKind;
+    use crate::sql::planner::payload::{PlanProjectNode, PlanScanNode};
 
     fn table_info(table: &str) -> IcebergTableInfo {
         IcebergTableInfo {
@@ -313,7 +315,7 @@ mod tests {
 
     fn scan(table: &str, column_id: ColumnId, source: ScanSource) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: table.to_string(),
@@ -454,7 +456,7 @@ mod tests {
 
     fn project_with_items(input: LogicalPlanNode, items: Vec<ProjectItem>) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: items,
                 output_qualifier: None,
             }),

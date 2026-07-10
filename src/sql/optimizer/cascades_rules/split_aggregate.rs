@@ -291,7 +291,7 @@ mod tests {
     use crate::sql::optimizer::operator::{AggStage, LogicalAggregateOp, ValuesOp};
     use crate::sql::planner::optimizer_bridge::scalar::materialize;
     use crate::sql::planner::optimizer_bridge::scalar::{intern_aggregate_calls, intern_exprs};
-    use crate::sql::planner::plan::AggregateCall;
+    use crate::sql::planner::payload::AggregateCall;
     use arrow::datatypes::DataType;
 
     fn output_column(id: u32, name: &str) -> OutputColumn {

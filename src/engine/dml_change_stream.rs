@@ -868,7 +868,7 @@ fn inject_native_keyed_assert_before_expand_node(
         children: vec![original_child],
         stats: node.stats.clone(),
         payload: crate::sql::planner::DistributedNodeKind::AssertOneRow(
-            crate::sql::planner::plan::PlanAssertOneRowNode::per_key_at_most_one(
+            crate::sql::planner::payload::PlanAssertOneRowNode::per_key_at_most_one(
                 "DML change-stream matched row uniqueness",
                 vec![key_column_id],
                 vec![keyed_assert.key_label.clone()],
@@ -1880,9 +1880,8 @@ mod tests {
     }
 
     fn native_change_event_expand_plan_for_test() -> crate::sql::planner::DistributedPlan {
-        use crate::sql::planner::plan::{
-            DistributedChangeEventExpandNode, PhysicalPlanKind, PlanValuesNode,
-        };
+        use crate::sql::planner::payload::PlanValuesNode;
+        use crate::sql::planner::plan::{DistributedChangeEventExpandNode, PhysicalPlanKind};
         use crate::sql::planner::{
             DataPartition, DataSink, DistributedNode, DistributedNodeKind, PhysicalPlanStats,
             PlanFragment, PlannerConfidence,
