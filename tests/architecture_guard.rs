@@ -1560,9 +1560,16 @@ fn rust_use_tokens(text: &str) -> Vec<String> {
     tokens
 }
 
-fn rust_expand_use_tree(tokens: &[String], prefix: &[String], paths: &mut Vec<Vec<String>>) {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RustUsePath {
+    segments: Vec<String>,
+    alias: Option<String>,
+}
+
+fn rust_expand_use_tree(tokens: &[String], prefix: &[String], paths: &mut Vec<RustUsePath>) {
     let mut path = prefix.to_vec();
     let mut index = 0usize;
+    let mut imports_group_prefix = false;
 
     while index < tokens.len() {
         match tokens[index].as_str() {
@@ -1584,17 +1591,36 @@ fn rust_expand_use_tree(tokens: &[String], prefix: &[String], paths: &mut Vec<Ve
             }
             "*" => {
                 path.push("*".to_string());
-                paths.push(path);
+                paths.push(RustUsePath {
+                    segments: path,
+                    alias: None,
+                });
                 return;
             }
             "as" => {
-                if path.len() > prefix.len() {
-                    paths.push(path);
+                if path.len() > prefix.len() || imports_group_prefix {
+                    let alias = tokens
+                        .get(index + 1)
+                        .filter(|token| token.chars().all(is_ident_char))
+                        .cloned();
+                    paths.push(RustUsePath {
+                        segments: path,
+                        alias,
+                    });
                 }
                 return;
             }
             "}" => return,
             token if token.chars().all(is_ident_char) => {
+                if token == "self"
+                    && !prefix.is_empty()
+                    && path == prefix
+                    && tokens.get(index + 1).is_none_or(|next| next == "as")
+                {
+                    imports_group_prefix = true;
+                    index += 1;
+                    continue;
+                }
                 path.push(token.to_string());
                 index += 1;
             }
@@ -1602,12 +1628,15 @@ fn rust_expand_use_tree(tokens: &[String], prefix: &[String], paths: &mut Vec<Ve
         }
     }
 
-    if path.len() > prefix.len() {
-        paths.push(path);
+    if path.len() > prefix.len() || imports_group_prefix {
+        paths.push(RustUsePath {
+            segments: path,
+            alias: None,
+        });
     }
 }
 
-fn rust_expand_use_list(tokens: &[String], prefix: &[String], paths: &mut Vec<Vec<String>>) {
+fn rust_expand_use_list(tokens: &[String], prefix: &[String], paths: &mut Vec<RustUsePath>) {
     let mut depth = 0usize;
     let mut start = 0usize;
 
@@ -1628,10 +1657,41 @@ fn rust_expand_use_list(tokens: &[String], prefix: &[String], paths: &mut Vec<Ve
     }
 }
 
+fn rust_resolve_use_path(
+    path: &[String],
+    aliases: &BTreeMap<String, Vec<String>>,
+    resolving: &mut BTreeSet<String>,
+    depth: usize,
+) -> Option<Vec<String>> {
+    if depth > aliases.len() {
+        return None;
+    }
+
+    let Some(owner_index) = path
+        .iter()
+        .position(|segment| segment != "self" && segment != "super")
+    else {
+        return Some(path.to_vec());
+    };
+    let owner = &path[owner_index];
+    let Some(target) = aliases.get(owner) else {
+        return Some(path.to_vec());
+    };
+    if !resolving.insert(owner.clone()) {
+        return None;
+    }
+
+    let resolved = rust_resolve_use_path(target, aliases, resolving, depth + 1);
+    resolving.remove(owner);
+    let mut resolved = resolved?;
+    resolved.extend_from_slice(&path[owner_index + 1..]);
+    Some(resolved)
+}
+
 fn rust_production_use_statements(text: &str) -> Vec<String> {
     let production = rust_sanitized_production_text(text);
     let tokens = rust_use_tokens(&production);
-    let mut imports = Vec::new();
+    let mut raw_imports = Vec::<(String, RustUsePath)>::new();
     let mut index = 0usize;
 
     while index < tokens.len() {
@@ -1676,15 +1736,32 @@ fn rust_production_use_statements(text: &str) -> Vec<String> {
 
         let mut paths = Vec::new();
         rust_expand_use_list(&tokens[tree_start..cursor], &[], &mut paths);
-        imports.extend(
-            paths
-                .into_iter()
-                .map(|path| format!("{visibility}|{}", path.join("::"))),
-        );
+        raw_imports.extend(paths.into_iter().map(|path| (visibility.clone(), path)));
         index = cursor + 1;
     }
 
-    imports
+    let aliases = raw_imports
+        .iter()
+        .filter_map(|(_, path)| {
+            path.alias
+                .as_ref()
+                .filter(|alias| alias.as_str() != "_")
+                .map(|alias| (alias.clone(), path.segments.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    raw_imports
+        .into_iter()
+        .map(|(visibility, path)| {
+            let resolved = rust_resolve_use_path(&path.segments, &aliases, &mut BTreeSet::new(), 0)
+                .unwrap_or(path.segments);
+            let alias = path
+                .alias
+                .map(|alias| format!(" as {alias}"))
+                .unwrap_or_default();
+            format!("{visibility}|{}{alias}", resolved.join("::"))
+        })
+        .collect()
 }
 
 fn rust_use_visibility(import: &str) -> &str {
@@ -1695,10 +1772,13 @@ fn rust_use_visibility(import: &str) -> &str {
 }
 
 fn rust_use_path(import: &str) -> &str {
-    import
+    let path = import
         .split_once('|')
         .map(|(_, path)| path)
-        .unwrap_or(import)
+        .unwrap_or(import);
+    path.split_once(" as ")
+        .map(|(path, _)| path)
+        .unwrap_or(path)
 }
 
 fn rust_use_is_public(import: &str) -> bool {
@@ -2087,7 +2167,7 @@ use self::plan::*;
         vec![
             "private|crate::sql::planner::plan::PlanScanNode",
             "private|crate::sql::planner::plan::PlanFilterNode",
-            "private|crate::sql::planner::plan::PlanProjectNode",
+            "private|crate::sql::planner::plan::PlanProjectNode as Project",
             "private|crate::sql::planner::plan::PlanSortNode",
             "private|crate::sql::planner::plan::PlanLimitNode",
             "private|crate::sql::planner::payload::PlanValuesNode",
@@ -2095,6 +2175,96 @@ use self::plan::*;
             "private|super::distributed::*",
             "private|self::plan::*",
         ]
+    );
+}
+
+#[test]
+fn planner_ownership_use_parser_resolves_module_alias_chains() {
+    let source = r#"
+use crate::sql::planner::payload as shared;
+pub(crate) use self::shared::PlanScanNode;
+use crate::sql::planner as p;
+use p::plan as legacy;
+use self::legacy::*;
+use crate::sql::planner::{self as grouped, plan::PhysicalPlanKind};
+use grouped::plan::*;
+"#;
+
+    assert_eq!(
+        rust_production_use_statements(source),
+        vec![
+            "private|crate::sql::planner::payload as shared",
+            "pub(crate)|crate::sql::planner::payload::PlanScanNode",
+            "private|crate::sql::planner as p",
+            "private|crate::sql::planner::plan as legacy",
+            "private|crate::sql::planner::plan::*",
+            "private|crate::sql::planner as grouped",
+            "private|crate::sql::planner::plan::PhysicalPlanKind",
+            "private|crate::sql::planner::plan::*",
+        ]
+    );
+}
+
+#[test]
+fn planner_ownership_policy_rejects_module_alias_bypasses() {
+    let plan_imports = rust_production_use_statements(
+        r#"
+use crate::sql::planner::payload as shared;
+pub(crate) use self::shared::PlanScanNode;
+"#,
+    );
+    assert!(plan_imports.iter().any(|import| {
+        rust_use_imports_stage(import, "logical")
+            || (rust_use_is_public(import)
+                && (rust_use_imports_stage(import, "payload")
+                    || rust_use_imports_sql_common(import)))
+    }));
+
+    for source in [
+        r#"
+use crate::sql::planner::plan as legacy;
+use self::legacy::*;
+"#,
+        r#"
+use crate::sql::planner as p;
+use p::plan::*;
+"#,
+    ] {
+        let imports = rust_production_use_statements(source);
+        assert!(imports.iter().any(|import| {
+            rust_use_imports_stage(import, "plan") && rust_use_leaf(import) == "*"
+        }));
+    }
+}
+
+#[test]
+fn planner_ownership_use_parser_stops_on_alias_cycles() {
+    let source = r#"
+use self::b as a;
+use self::a as b;
+use self::a::PlanScanNode;
+"#;
+
+    assert_eq!(
+        rust_production_use_statements(source),
+        vec![
+            "private|self::b as a",
+            "private|self::a as b",
+            "private|self::a::PlanScanNode",
+        ]
+    );
+}
+
+#[test]
+fn planner_ownership_use_parser_resolves_relative_module_alias_target() {
+    let source = r#"
+use super as parent;
+use parent::plan::*;
+"#;
+
+    assert_eq!(
+        rust_production_use_statements(source),
+        vec!["private|super as parent", "private|super::plan::*",]
     );
 }
 
