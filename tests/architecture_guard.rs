@@ -155,6 +155,24 @@ fn module_declarations(text: &str) -> BTreeSet<String> {
         .collect()
 }
 
+fn planner_namespace_module_declarations(text: &str) -> BTreeSet<String> {
+    let mut declarations = module_declarations(text);
+    declarations.extend(rust_inline_module_declarations(text));
+    declarations
+}
+
+fn rust_inline_module_declarations(text: &str) -> BTreeSet<String> {
+    let production = rust_sanitized_production_text(text);
+    let tokens = rust_use_tokens(&production);
+    tokens
+        .windows(3)
+        .filter_map(|tokens| {
+            (tokens[0] == "mod" && tokens[1].chars().all(is_ident_char) && tokens[2] == "{")
+                .then(|| tokens[1].clone())
+        })
+        .collect()
+}
+
 fn has_module_declaration(text: &str, module: &str) -> bool {
     module_declarations(text).contains(module)
 }
@@ -1195,6 +1213,67 @@ pub(crate) mod chunk;
             "proto_contract".to_string(),
             "tests".to_string()
         ])
+    );
+}
+
+#[test]
+fn planner_namespace_inline_module_breaks_external_exact_set() {
+    let source = r#"
+mod fragment;
+mod node;
+mod compatibility {}
+"#;
+    let expected = BTreeSet::from(["fragment".to_string(), "node".to_string()]);
+    let actual = planner_namespace_module_declarations(source);
+
+    assert_ne!(
+        actual, expected,
+        "inline compatibility module must break the distributed exact module set"
+    );
+}
+
+#[test]
+fn planner_namespace_inline_module_parser_covers_forms_and_nested_scope() {
+    let source = r#"
+mod plain {}
+pub(crate) mod crate_visible {}
+#[allow(dead_code)]
+mod attributed {}
+mod outer {
+    pub(super) mod nested {}
+}
+"#;
+
+    assert_eq!(
+        planner_namespace_module_declarations(source),
+        BTreeSet::from([
+            "attributed".to_string(),
+            "crate_visible".to_string(),
+            "nested".to_string(),
+            "outer".to_string(),
+            "plain".to_string(),
+        ])
+    );
+}
+
+#[test]
+fn planner_namespace_inline_module_parser_ignores_noise_and_cfg_test() {
+    let source = r###"
+mod fragment;
+mod node;
+// mod comment_fake {}
+/* pub(crate) mod block_fake {} */
+const TEXT: &str = "mod string_fake {}";
+const RAW: &str = r#"mod raw_fake {}"#;
+#[cfg(test)]
+mod tests {
+    mod test_nested_fake {}
+}
+"###;
+
+    assert_eq!(
+        planner_namespace_module_declarations(source),
+        BTreeSet::from(["fragment".to_string(), "node".to_string()])
     );
 }
 
@@ -3743,7 +3822,7 @@ fn planner_distributed_core_has_stage_namespace() {
     }
 
     assert_eq!(
-        module_declarations(&distributed_mod),
+        planner_namespace_module_declarations(&distributed_mod),
         BTreeSet::from(["fragment".to_string(), "node".to_string()]),
         "distributed/mod.rs must declare exactly fragment and node"
     );
