@@ -1,11 +1,11 @@
 //! Planner-side runtime-filter placement pass (RFP-1).
 //!
 //! Runs on the single `PhysicalPlanNode` tree produced by the optimizer->planner
-//! bridge, BEFORE `build_distributed_plan` fragments it. Annotates hash joins
-//! with build-side `RuntimeFilterBuildIntent`s and pushes matching
-//! probe-side `RuntimeFilterProbeIntent`s. Behavior is a byte-for-byte port of
-//! the retired optimizer-side pass -- do not "improve" placement here; changes
-//! belong in the RF baseline / producer arcs.
+//! bridge, BEFORE `distributed::build::build_distributed_plan` fragments it.
+//! Annotates hash joins with build-side `RuntimeFilterBuildIntent`s and pushes
+//! matching probe-side `RuntimeFilterProbeIntent`s. Behavior is a byte-for-byte
+//! port of the retired optimizer-side pass -- do not "improve" placement here;
+//! changes belong in the RF baseline / producer arcs.
 
 use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::column_id::ColumnId;

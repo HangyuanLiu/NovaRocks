@@ -1130,23 +1130,62 @@ fn build_distributed_plan_hash_redistribute_creates_exchange_edge() {
 
 #[test]
 fn fragment_cut_seam_preserves_exchange_topology_before_rf_wire() {
-    let scan = scan_node(1, "k");
+    let filter_id = 91;
+    let probe_expr = column_ref_expr(1, "l_k", DataType::Int64, false);
+    let build_expr = column_ref_expr(2, "r_k", DataType::Int64, false);
+    let mut left_scan = scan_node(1, "l_k");
+    left_scan.probe_runtime_filters = vec![RuntimeFilterProbeIntent {
+        filter_id,
+        probe_expr: probe_expr.clone(),
+    }];
     let redistribute = PhysicalPlanNode {
         kind: PhysicalPlanKind::Redistribute(RedistributeNode {
             mode: RedistributeMode::Hash {
                 cols: vec![ColumnId::new_for_test(1)],
                 source: HashSource::ShuffleJoin,
             },
-            partition_exprs: vec![column_ref_expr(1, "qualified_k", DataType::Int64, false)],
-            output_columns: scan.output_columns.clone(),
+            partition_exprs: vec![probe_expr.clone()],
+            output_columns: left_scan.output_columns.clone(),
         }),
-        children: vec![scan],
-        output_columns: vec![output_col(1, "k", DataType::Int64, false)],
+        children: vec![left_scan],
+        output_columns: vec![output_col(1, "l_k", DataType::Int64, false)],
+        stats: stats(),
+        probe_runtime_filters: vec![],
+    };
+    let right_scan = scan_node(2, "r_k");
+    let join = PhysicalPlanNode {
+        kind: PhysicalPlanKind::HashJoin(Box::new(PhysicalHashJoinNode {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![PhysicalHashJoinEqCondition {
+                left: probe_expr.clone(),
+                right: build_expr.clone(),
+                null_safe: false,
+            }],
+            other_condition: None,
+            distribution: JoinDistribution::Shuffle,
+            execution_mode: Some(JoinExecutionMode::Partitioned),
+            build_runtime_filters: vec![RuntimeFilterBuildIntent {
+                filter_id,
+                build_expr,
+                probe_expr,
+                expr_order: 0,
+                execution_mode: JoinExecutionMode::Partitioned,
+            }],
+            output_columns: vec![
+                output_col(1, "l_k", DataType::Int64, false),
+                output_col(2, "r_k", DataType::Int64, false),
+            ],
+        })),
+        children: vec![redistribute, right_scan],
+        output_columns: vec![
+            output_col(1, "l_k", DataType::Int64, false),
+            output_col(2, "r_k", DataType::Int64, false),
+        ],
         stats: stats(),
         probe_runtime_filters: vec![],
     };
 
-    let cut = cut(&redistribute).expect("cut Redistribute topology");
+    let cut = cut(&join).expect("cut HashJoin and Redistribute topology");
 
     assert_eq!(cut.plan.root_fragment_id, 0);
     assert_eq!(cut.plan.fragments.len(), 2);
@@ -1158,14 +1197,30 @@ fn fragment_cut_seam_preserves_exchange_topology_before_rf_wire() {
     assert_eq!(edge.target_fragment_id, 0);
     assert_eq!(edge.target_exchange_node_id, 2);
     assert_eq!(edge.stream_kind, FragmentStreamKind::Partitioned);
+    let root = &cut.plan.fragments[1].root;
+    assert!(matches!(root.payload, DistributedNodeKind::HashJoin(_)));
     assert!(matches!(
-        cut.plan.fragments[1].root.payload,
+        root.children[0].payload,
         DistributedNodeKind::Exchange(_)
     ));
-    assert!(cut.plan.fragments.iter().all(|fragment| {
-        fragment.root.build_runtime_filters.is_empty()
-            && fragment.root.probe_runtime_filters.is_empty()
-    }));
+
+    assert_eq!(cut.bindings.builds.len(), 1);
+    assert_eq!(cut.bindings.builds[0].intent.filter_id, filter_id);
+    assert_eq!(cut.bindings.builds[0].fragment_id, 0);
+    assert_eq!(cut.bindings.probes.len(), 1);
+    assert_eq!(cut.bindings.probes[0].intent.filter_id, filter_id);
+    assert_eq!(cut.bindings.probes[0].fragment_id, 1);
+
+    fn assert_runtime_filters_unwired(node: &DistributedNode) {
+        assert!(node.build_runtime_filters.is_empty());
+        assert!(node.probe_runtime_filters.is_empty());
+        for child in &node.children {
+            assert_runtime_filters_unwired(child);
+        }
+    }
+    for fragment in &cut.plan.fragments {
+        assert_runtime_filters_unwired(&fragment.root);
+    }
 }
 
 #[test]

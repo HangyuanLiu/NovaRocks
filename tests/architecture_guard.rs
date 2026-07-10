@@ -2543,6 +2543,63 @@ fn distributed_build_surface_violations_in(source_rel: &str, text: &str) -> Vec<
         .collect()
 }
 
+fn top_level_production_function_name(item: &str) -> Option<String> {
+    let tokens = rust_use_tokens(item);
+    tokens
+        .windows(2)
+        .find(|tokens| tokens[0] == "fn")
+        .map(|tokens| tokens[1].clone())
+}
+
+fn top_level_production_function_is_pub_crate(item: &str) -> bool {
+    let tokens = rust_use_tokens(item);
+    let Some(function_index) = tokens.iter().position(|token| token == "fn") else {
+        return false;
+    };
+    tokens[..function_index].windows(4).any(|window| {
+        window[0] == "pub" && window[1] == "(" && window[2] == "crate" && window[3] == ")"
+    })
+}
+
+fn distributed_build_mod_surface_violations(text: &str) -> Vec<String> {
+    let functions = top_level_production_functions(text);
+    let mut names = functions
+        .iter()
+        .filter_map(|function| top_level_production_function_name(function))
+        .collect::<Vec<_>>();
+    names.sort();
+    let mut violations = Vec::new();
+    let expected = vec![
+        "build_distributed_plan".to_string(),
+        "union_distinct_must_be_rewritten_error".to_string(),
+    ];
+    if names != expected || names.len() != functions.len() {
+        violations.push(format!(
+            "top-level production functions must be exactly {expected:?}, got {names:?}: {functions:?}"
+        ));
+    }
+    for function in &functions {
+        if !top_level_production_function_is_pub_crate(function) {
+            violations.push(format!(
+                "top-level build function must use pub(crate) visibility: {function}"
+            ));
+        }
+    }
+    violations
+}
+
+fn rust_canonical_path_is_distributed_build_namespace(canonical: &[String]) -> bool {
+    canonical.len() >= 5 && canonical[..5] == ["crate", "sql", "planner", "distributed", "build"]
+}
+
+fn planner_root_distributed_build_surface_violations(text: &str) -> Vec<String> {
+    rust_production_canonical_paths(text, "src/sql/planner/mod.rs")
+        .into_iter()
+        .filter(|path| rust_canonical_path_is_distributed_build_namespace(path))
+        .map(|path| path.join("::"))
+        .collect()
+}
+
 #[test]
 fn distributed_build_surface_detector_covers_paths_aliases_scopes_and_noise() {
     for source in [
@@ -2571,6 +2628,76 @@ mod tests {
     assert!(
         distributed_build_surface_violations_in("src/sql/codegen/ir/explain.rs", noise).is_empty(),
         "comments, strings, and cfg(test) items must be ignored"
+    );
+}
+
+#[test]
+fn distributed_build_mod_surface_detector_rejects_extra_and_non_crate_functions() {
+    let valid = r#"
+mod fragment_cut;
+mod lowering;
+mod runtime_filter_wire;
+
+pub(crate) fn build_distributed_plan() {}
+pub(crate) fn union_distinct_must_be_rewritten_error() {}
+
+#[cfg(test)]
+fn test_only_helper() {}
+"#;
+    assert!(
+        distributed_build_mod_surface_violations(valid).is_empty(),
+        "exact build surface must be accepted"
+    );
+
+    for invalid in [
+        format!("{valid}\nfn extra_private_helper() {{}}"),
+        format!("{valid}\npub(crate) fn extra_public_helper() {{}}"),
+        valid.replacen(
+            "pub(crate) fn build_distributed_plan",
+            "fn build_distributed_plan",
+            1,
+        ),
+        valid.replacen(
+            "pub(crate) fn union_distinct_must_be_rewritten_error",
+            "pub(super) fn union_distinct_must_be_rewritten_error",
+            1,
+        ),
+    ] {
+        assert!(
+            !distributed_build_mod_surface_violations(&invalid).is_empty(),
+            "extra function or non-pub(crate) entry must be rejected: {invalid}"
+        );
+    }
+}
+
+#[test]
+fn planner_root_distributed_build_surface_detector_rejects_forwarding_paths() {
+    for source in [
+        "use crate::sql::planner::distributed::{build};",
+        "use crate::sql::planner::distributed::build as builder;\npub(crate) fn forward() { builder::build_distributed_plan(); }",
+        "pub(crate) fn forward() { crate::sql::planner::distributed::build::build_distributed_plan(); }",
+        "pub(crate) fn forward() { distributed::build::build_distributed_plan(); }",
+        "mod facade { pub(crate) fn forward() { super::distributed::build::build_distributed_plan(); } }",
+        "use self::distributed::build::build_distributed_plan as inner;\npub(crate) fn differently_named_wrapper() { inner(); }",
+    ] {
+        assert!(
+            !planner_root_distributed_build_surface_violations(source).is_empty(),
+            "planner-root import/call/forwarder must be rejected: {source}"
+        );
+    }
+
+    let noise = r###"
+// distributed::build::build_distributed_plan();
+const TEXT: &str = "crate::sql::planner::distributed::build";
+#[cfg(test)]
+mod tests {
+    use super::distributed::build::build_distributed_plan;
+}
+pub(crate) use logical::build::{plan_output_columns, plan_query};
+"###;
+    assert!(
+        planner_root_distributed_build_surface_violations(noise).is_empty(),
+        "comments, strings, cfg(test), and unrelated paths must be ignored"
     );
 }
 
@@ -4421,6 +4548,12 @@ fn planner_distributed_build_has_pass_owners() {
     );
 
     let build_mod = fs::read_to_string(&mod_path).unwrap();
+    let build_surface_violations = distributed_build_mod_surface_violations(&build_mod);
+    assert!(
+        build_surface_violations.is_empty(),
+        "distributed/build/mod.rs function surface must stay closed:\n{}",
+        build_surface_violations.join("\n")
+    );
     assert_eq!(
         planner_namespace_module_declarations(&build_mod),
         BTreeSet::from([
@@ -4448,12 +4581,29 @@ fn planner_distributed_build_has_pass_owners() {
         "build_distributed_plan",
         "union_distinct_must_be_rewritten_error",
     ] {
+        let declarations = rs_files(&planner)
+            .into_iter()
+            .filter_map(|path| {
+                let text = fs::read_to_string(&path).unwrap();
+                let count = rust_named_function_declaration_count(&text, function);
+                (count > 0).then(|| format!("{} ({count})", rel(&path)))
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            rust_named_function_declaration_count(&build_mod, function),
-            1,
-            "build/mod.rs must uniquely own {function}"
+            declarations,
+            vec![format!("{} (1)", rel(&mod_path))],
+            "{function} must be declared exactly once across planner production sources"
         );
     }
+    let planner_mod_path = planner.join("mod.rs");
+    let planner_mod = fs::read_to_string(&planner_mod_path).unwrap();
+    let planner_root_build_violations =
+        planner_root_distributed_build_surface_violations(&planner_mod);
+    assert!(
+        planner_root_build_violations.is_empty(),
+        "planner/mod.rs must not import, call, or forward distributed::build:\n{}",
+        planner_root_build_violations.join("\n")
+    );
     assert!(
         !rust_use_tokens(&rust_sanitized_production_text(&build_mod))
             .windows(2)
