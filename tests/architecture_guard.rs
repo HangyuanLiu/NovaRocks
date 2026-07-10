@@ -177,6 +177,14 @@ fn has_module_declaration(text: &str, module: &str) -> bool {
     module_declarations(text).contains(module)
 }
 
+fn runtime_filter_lifecycle_source_files(src: &Path) -> Vec<PathBuf> {
+    rs_files(src)
+}
+
+fn planner_root_declares_runtime_filter(text: &str) -> bool {
+    rust_module_item_declarations(text).contains("runtime_filter")
+}
+
 fn non_test_line_hits<F>(path: &Path, mut predicate: F) -> Vec<(usize, String)>
 where
     F: FnMut(&str) -> bool,
@@ -1316,6 +1324,67 @@ mod inline_path {}
             "split_external".to_string(),
             "super_external".to_string(),
         ])
+    );
+}
+
+#[test]
+fn planner_runtime_filter_source_inventory_covers_entire_src_tree() {
+    let root = std::env::temp_dir().join(format!(
+        "planner_runtime_filter_source_inventory_{}",
+        std::process::id()
+    ));
+    fs::remove_dir_all(&root).ok();
+    for relative in [
+        "src/sql/planner/physical/runtime_filter.rs",
+        "src/sql/codegen/runtime_filter.rs",
+        "src/runtime/runtime_filter_duplicate.rs",
+    ] {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "pub(crate) struct PlannedRuntimeFilter;").unwrap();
+    }
+
+    let actual = runtime_filter_lifecycle_source_files(&root.join("src"))
+        .into_iter()
+        .map(|path| path.strip_prefix(&root).unwrap().display().to_string())
+        .collect::<BTreeSet<_>>();
+    fs::remove_dir_all(&root).ok();
+
+    assert_eq!(
+        actual,
+        BTreeSet::from([
+            "src/runtime/runtime_filter_duplicate.rs".to_string(),
+            "src/sql/codegen/runtime_filter.rs".to_string(),
+            "src/sql/planner/physical/runtime_filter.rs".to_string(),
+        ]),
+        "runtime-filter type uniqueness must inspect every Rust source file"
+    );
+}
+
+#[test]
+fn planner_runtime_filter_root_module_detector_covers_rust_item_forms_and_noise() {
+    for source in [
+        "#[allow(dead_code)]\npub(crate) mod\nruntime_filter;",
+        "pub(crate)\nmod\nruntime_filter;",
+        "#[allow(dead_code)]\nmod runtime_filter {}",
+    ] {
+        assert!(
+            planner_root_declares_runtime_filter(source),
+            "active root runtime_filter module item must be detected: {source}"
+        );
+    }
+
+    let noise = r###"
+// mod runtime_filter;
+/* mod runtime_filter {} */
+const TEXT: &str = "mod runtime_filter;";
+const RAW: &str = r#"mod runtime_filter {}"#;
+#[cfg(test)]
+mod runtime_filter;
+"###;
+    assert!(
+        !planner_root_declares_runtime_filter(noise),
+        "comments, strings, and cfg(test) module items must be ignored"
     );
 }
 
@@ -4127,9 +4196,8 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
         "root RF lifecycle owner src/sql/planner/runtime_filter.rs must be deleted"
     );
 
-    let lifecycle_sources = rs_files(&planner)
+    let lifecycle_sources = runtime_filter_lifecycle_source_files(&src_dir())
         .into_iter()
-        .chain(rs_files(&repo.join("src/sql/codegen")))
         .map(|path| {
             let text = fs::read_to_string(&path).unwrap();
             (path, text)
@@ -4189,7 +4257,7 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
 
     let planner_mod = fs::read_to_string(planner.join("mod.rs")).unwrap();
     assert!(
-        !has_module_declaration(&planner_mod, "runtime_filter"),
+        !planner_root_declares_runtime_filter(&planner_mod),
         "planner/mod.rs must not declare the deleted root runtime_filter owner"
     );
     let planner_uses = rust_production_use_statements(&planner_mod);
@@ -9434,8 +9502,8 @@ fn nidl_e3_planner_ir_uses_native_partition_and_runtime_filter_types() {
     for source in [
         "src/sql/planner/distributed/fragment.rs",
         "src/sql/planner/distributed/node.rs",
+        "src/sql/planner/distributed/runtime_filter.rs",
         "src/sql/planner/distributed_plan_build.rs",
-        "src/sql/planner/runtime_filter.rs",
         "src/sql/planner/write_plan.rs",
         "src/sql/planner/physical/mod.rs",
         "src/sql/planner/physical/node.rs",
@@ -9443,6 +9511,7 @@ fn nidl_e3_planner_ir_uses_native_partition_and_runtime_filter_types() {
         "src/sql/planner/physical/runtime_filter_placement.rs",
         "src/sql/planner/physical/stats.rs",
         "src/sql/planner/physical/vocab.rs",
+        "src/sql/codegen/runtime_filter.rs",
     ] {
         let text = fs::read_to_string(repo.join(source)).unwrap();
         let text = rust_production_text_without_cfg_test(&text);
@@ -9457,7 +9526,7 @@ fn nidl_e3_planner_ir_uses_native_partition_and_runtime_filter_types() {
                 "TDataPartition",
                 "TRuntimeFilterDescription",
             ],
-            "planner-owned DistributedPlan IR must use native partition and runtime-filter types",
+            "planner/codegen stage IR must use native partition and runtime-filter types",
         );
     }
 
