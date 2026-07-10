@@ -28,6 +28,9 @@ use crate::sql::explain::{
     ExplainLevel, PlanNodeExplainStage, format_assert_one_row_header, format_expr,
     format_project_item, format_sort_items, format_window_exprs,
 };
+use crate::sql::planner::distributed::runtime_filter::{
+    WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
+};
 use crate::sql::planner::distributed::{
     DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor, ExchangeReceiver,
     PartitionKind, PlanFragment,
@@ -47,7 +50,6 @@ use crate::sql::planner::physical::{
     PhysicalPlanStats, PhysicalSetOpNode, PhysicalTopNNode, PlanSetOpKind as SetOpKind,
     PlannerBroadcastDecision, PlannerConfidence, PlannerCostEstimate, TopNPhase,
 };
-use crate::sql::planner::{WiredRuntimeFilterBuild, WiredRuntimeFilterProbe};
 
 pub(crate) fn explain_distributed_plan(dp: &DistributedPlan, level: ExplainLevel) -> Vec<String> {
     explain_distributed_plan_inner(dp, level, None, None)

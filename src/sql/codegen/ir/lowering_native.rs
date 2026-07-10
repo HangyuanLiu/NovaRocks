@@ -27,11 +27,11 @@ use crate::sql::codegen::boundary_schema::{
     BoundaryKind, BoundarySchemaReport, output_columns_to_boundary_columns,
 };
 use crate::sql::codegen::connector_scan_wire::{ThriftScanContext, to_native_file_scan};
+use crate::sql::codegen::runtime_filter::PlannedRuntimeFilter;
 use crate::sql::codegen::{
     FragmentBuildResult, FragmentOutputKind, FragmentSchedulingMetadata, MultiFragmentBuildResult,
     OutputColumn, RuntimeFilterPlanResult,
 };
-use crate::sql::planner::PlannedRuntimeFilter;
 use crate::sql::planner::distributed::{
     DataPartition, DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor,
     FragmentEdgeKind, FragmentId, FragmentStreamKind, PartitionKind, PlanFragment,

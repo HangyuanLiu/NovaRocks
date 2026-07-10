@@ -22,6 +22,9 @@ use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::codegen::helpers::group_win_exprs_by_sig;
 use crate::sql::column_id::ColumnId;
+use crate::sql::planner::distributed::runtime_filter::{
+    WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
+};
 use crate::sql::planner::distributed::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor,
     ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind, PlanFragment,
@@ -33,13 +36,12 @@ use crate::sql::planner::optimizer_bridge::property::{
 use crate::sql::planner::ordering::OrderingSpec;
 use crate::sql::planner::payload::PlanProjectNode;
 use crate::sql::planner::physical::TopNPhase;
+use crate::sql::planner::physical::runtime_filter::{
+    RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
+};
 use crate::sql::planner::physical::{
     PhysicalPlanKind, PhysicalPlanNode, PhysicalSetOpNode, PlanSetOpKind, RedistributeMode,
     RedistributeNode,
-};
-use crate::sql::planner::{
-    RuntimeFilterBuildIntent, RuntimeFilterProbeIntent, WiredRuntimeFilterBuild,
-    WiredRuntimeFilterProbe,
 };
 
 pub(crate) fn build_distributed_plan(plan: &PhysicalPlanNode) -> Result<DistributedPlan, String> {
@@ -1262,6 +1264,9 @@ mod tests {
         PlanRepeatNode, PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanValuesNode,
         PlanWindowNode, WindowExpr,
     };
+    use crate::sql::planner::physical::runtime_filter::{
+        RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
+    };
     use crate::sql::planner::physical::{
         AggMode, AggregateOutputLayout, HashSource, JoinDistribution, JoinExecutionMode,
         PhysicalPlanStats, PlannerConfidence, PlannerCostEstimate, TopNPhase,
@@ -1271,7 +1276,6 @@ mod tests {
         PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalPlanNode,
         PhysicalSetOpNode, PhysicalTopNNode, PlanSetOpKind, RedistributeMode, RedistributeNode,
     };
-    use crate::sql::planner::{RuntimeFilterBuildIntent, RuntimeFilterProbeIntent};
 
     #[test]
     fn build_distributed_plan_values_shapes_root_fragment() {

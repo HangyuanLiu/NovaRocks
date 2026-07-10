@@ -3450,6 +3450,10 @@ fn planner_physical_stage_has_single_namespace() {
     let physical_stats = planner.join("physical/stats.rs");
     let physical_runtime_filter = planner.join("physical/runtime_filter.rs");
     let ordering = planner.join("ordering.rs");
+    assert!(
+        !planner.join("runtime_filter.rs").exists(),
+        "root RF lifecycle owner src/sql/planner/runtime_filter.rs must be deleted"
+    );
     let planner_sources = rs_files(&planner)
         .into_iter()
         .map(|path| {
@@ -3498,7 +3502,14 @@ fn planner_physical_stage_has_single_namespace() {
                 "PhysicalPlanStats",
             ][..],
         ),
-        (&physical_runtime_filter, &["JoinExecutionMode"][..]),
+        (
+            &physical_runtime_filter,
+            &[
+                "JoinExecutionMode",
+                "RuntimeFilterBuildIntent",
+                "RuntimeFilterProbeIntent",
+            ][..],
+        ),
         (&ordering, &["SortKey", "OrderingSpec"][..]),
     ] {
         for item in items {
@@ -3599,6 +3610,7 @@ fn planner_physical_stage_has_single_namespace() {
         "plan",
         "physical_vocab",
         "stats",
+        "runtime_filter",
         "runtime_filter_placement",
     ] {
         assert!(
@@ -3640,6 +3652,8 @@ fn planner_physical_stage_has_single_namespace() {
         "PlannerBroadcastDecision",
         "PhysicalPlanStats",
         "JoinExecutionMode",
+        "RuntimeFilterBuildIntent",
+        "RuntimeFilterProbeIntent",
         "SortKey",
         "OrderingSpec",
     ]);
@@ -3707,39 +3721,6 @@ fn planner_physical_stage_has_single_namespace() {
             rel(&path)
         );
     }
-
-    let root_runtime_filter_path = planner.join("runtime_filter.rs");
-    let root_runtime_filter = fs::read_to_string(&root_runtime_filter_path).unwrap();
-    assert_eq!(
-        rust_named_type_declaration_count(&root_runtime_filter, "JoinExecutionMode"),
-        0,
-        "JoinExecutionMode must move to the physical RF owner"
-    );
-    for item in [
-        "RuntimeFilterBuildIntent",
-        "RuntimeFilterProbeIntent",
-        "WiredRuntimeFilterBuild",
-        "WiredRuntimeFilterProbe",
-        "PlannedRuntimeFilter",
-    ] {
-        let declarations = planner_sources
-            .iter()
-            .filter_map(|(path, text)| {
-                let count = rust_named_type_declaration_count(text, item);
-                (count > 0).then(|| format!("{} ({count})", rel(path)))
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            declarations,
-            vec![format!("{} (1)", rel(&root_runtime_filter_path))],
-            "{item} must remain uniquely declared in the root RF lifecycle owner"
-        );
-    }
-    assert!(
-        rust_production_use_statements(&root_runtime_filter)
-            .contains(&"private|crate::sql::planner::physical::JoinExecutionMode".to_string()),
-        "root runtime_filter.rs must explicitly import physical JoinExecutionMode"
-    );
 }
 
 #[test]
@@ -3750,6 +3731,7 @@ fn planner_distributed_core_has_stage_namespace() {
         "distributed/mod.rs",
         "distributed/node.rs",
         "distributed/fragment.rs",
+        "distributed/runtime_filter.rs",
     ] {
         let path = planner.join(relative);
         assert!(
@@ -3865,10 +3847,18 @@ fn planner_distributed_core_has_stage_namespace() {
 
     assert_eq!(
         planner_namespace_module_declarations(&distributed_mod),
-        BTreeSet::from(["fragment".to_string(), "node".to_string()]),
-        "distributed/mod.rs must declare exactly fragment and node"
+        BTreeSet::from([
+            "fragment".to_string(),
+            "node".to_string(),
+            "runtime_filter".to_string(),
+        ]),
+        "distributed/mod.rs must declare exactly fragment, node, and runtime_filter"
     );
-    for declaration in ["mod fragment;", "mod node;"] {
+    for declaration in [
+        "mod fragment;",
+        "mod node;",
+        "pub(crate) mod runtime_filter;",
+    ] {
         assert!(
             has_non_comment_line(&distributed_mod, declaration),
             "distributed/mod.rs must contain `{declaration}`"
@@ -4114,6 +4104,125 @@ fn planner_distributed_core_has_stage_namespace() {
             .any(|import| rust_use_imports_stage(import, "codegen")),
         "distributed node owner must not import codegen: {:?}",
         rust_production_use_statements(&node)
+    );
+}
+
+#[test]
+fn planner_runtime_filter_lifecycle_has_stage_owners() {
+    let repo = Path::new(manifest_dir());
+    let planner = repo.join("src/sql/planner");
+    let physical_owner = planner.join("physical/runtime_filter.rs");
+    let distributed_owner = planner.join("distributed/runtime_filter.rs");
+    let codegen_owner = repo.join("src/sql/codegen/runtime_filter.rs");
+
+    for owner in [&codegen_owner, &distributed_owner, &physical_owner] {
+        assert!(
+            owner.is_file(),
+            "missing runtime-filter stage owner: {}",
+            rel(owner)
+        );
+    }
+    assert!(
+        !planner.join("runtime_filter.rs").exists(),
+        "root RF lifecycle owner src/sql/planner/runtime_filter.rs must be deleted"
+    );
+
+    let lifecycle_sources = rs_files(&planner)
+        .into_iter()
+        .chain(rs_files(&repo.join("src/sql/codegen")))
+        .map(|path| {
+            let text = fs::read_to_string(&path).unwrap();
+            (path, text)
+        })
+        .collect::<Vec<_>>();
+    for (owner, items) in [
+        (
+            &physical_owner,
+            &["RuntimeFilterBuildIntent", "RuntimeFilterProbeIntent"][..],
+        ),
+        (
+            &distributed_owner,
+            &["WiredRuntimeFilterBuild", "WiredRuntimeFilterProbe"][..],
+        ),
+        (&codegen_owner, &["PlannedRuntimeFilter"][..]),
+    ] {
+        for item in items {
+            let declarations = lifecycle_sources
+                .iter()
+                .filter_map(|(path, text)| {
+                    let count = rust_named_type_declaration_count(text, item);
+                    (count > 0).then(|| format!("{} ({count})", rel(path)))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                declarations,
+                vec![format!("{} (1)", rel(owner))],
+                "{item} must have exactly one declaration in its runtime-filter stage owner"
+            );
+        }
+    }
+
+    let lifecycle_items = BTreeSet::from([
+        "RuntimeFilterBuildIntent",
+        "RuntimeFilterProbeIntent",
+        "WiredRuntimeFilterBuild",
+        "WiredRuntimeFilterProbe",
+        "PlannedRuntimeFilter",
+    ]);
+    for path in rs_files(&src_dir()) {
+        let relative = rel(&path);
+        let text = fs::read_to_string(&path).unwrap();
+        for canonical in rust_production_canonical_paths(&text, &relative) {
+            let legacy_root_item = canonical.len() >= 4
+                && canonical[..3] == ["crate", "sql", "planner"]
+                && lifecycle_items.contains(canonical[3].as_str());
+            let legacy_root_owner = canonical.len() >= 4
+                && canonical[..4] == ["crate", "sql", "planner", "runtime_filter"];
+            assert!(
+                !legacy_root_item && !legacy_root_owner,
+                "legacy planner runtime-filter owner path remains in {}: {}",
+                relative,
+                canonical.join("::")
+            );
+        }
+    }
+
+    let planner_mod = fs::read_to_string(planner.join("mod.rs")).unwrap();
+    assert!(
+        !has_module_declaration(&planner_mod, "runtime_filter"),
+        "planner/mod.rs must not declare the deleted root runtime_filter owner"
+    );
+    let planner_uses = rust_production_use_statements(&planner_mod);
+    assert!(
+        !planner_uses.iter().any(|import| {
+            rust_use_path(import)
+                .split("::")
+                .last()
+                .is_some_and(|item| lifecycle_items.contains(item))
+        }),
+        "planner/mod.rs must not flat re-export runtime-filter lifecycle types: {planner_uses:?}"
+    );
+
+    let distributed_mod = fs::read_to_string(planner.join("distributed/mod.rs")).unwrap();
+    assert!(
+        has_non_comment_line(&distributed_mod, "pub(crate) mod runtime_filter;"),
+        "distributed/mod.rs must expose the runtime_filter owner module"
+    );
+    let distributed_uses = rust_production_use_statements(&distributed_mod);
+    assert!(
+        !distributed_uses.iter().any(|import| {
+            matches!(
+                rust_use_path(import).split("::").last(),
+                Some("WiredRuntimeFilterBuild" | "WiredRuntimeFilterProbe")
+            )
+        }),
+        "distributed/mod.rs must not flat re-export Wired runtime-filter types: {distributed_uses:?}"
+    );
+
+    let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/mod.rs")).unwrap();
+    assert!(
+        has_non_comment_line(&codegen_mod, "pub(crate) mod runtime_filter;"),
+        "codegen/mod.rs must declare its Planned runtime-filter owner"
     );
 }
 

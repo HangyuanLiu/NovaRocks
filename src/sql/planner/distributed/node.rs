@@ -18,6 +18,9 @@
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{OutputColumn, SortItem};
 use crate::sql::column_id::ColumnId;
+use crate::sql::planner::distributed::runtime_filter::{
+    WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
+};
 use crate::sql::planner::payload::{
     PlanAssertOneRowNode, PlanFilterNode, PlanGenerateSeriesNode, PlanProjectNode, PlanRepeatNode,
     PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanValuesNode, PlanWindowNode,
@@ -27,7 +30,6 @@ use crate::sql::planner::physical::{
     DistributedChangeEventExpandNode, PhysicalHashAggregateNode, PhysicalHashJoinNode,
     PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalSetOpNode, PhysicalTopNNode, PlanSetOpKind,
 };
-use crate::sql::planner::runtime_filter::{WiredRuntimeFilterBuild, WiredRuntimeFilterProbe};
 
 use super::fragment::{DataPartition, FragmentId};
 

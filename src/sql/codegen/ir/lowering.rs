@@ -52,6 +52,7 @@ use crate::sql::codegen::iceberg_write_sink_wire::add_iceberg_sink_target_table_
 use crate::sql::codegen::iceberg_write_sink_wire::build_iceberg_write_sink_thrift;
 use crate::sql::codegen::nodes;
 use crate::sql::codegen::resolve::{ColumnBinding, ExprScope, ResolvedTable};
+use crate::sql::codegen::runtime_filter::PlannedRuntimeFilter;
 use crate::sql::codegen::runtime_filter_lowering::{
     RfProbeTarget, local_rf_waiting_sets, remap_rf_expr_order,
     rf_build_expr_matches_join_build_expr, rf_pipeline_dop,
@@ -63,6 +64,7 @@ use crate::sql::codegen::{
 };
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::ChangeStreamBranchKind;
+use crate::sql::planner::distributed::runtime_filter::WiredRuntimeFilterBuild;
 use crate::sql::planner::distributed::{ExchangeFlavor, ExchangeReceiver, FragmentId};
 use crate::sql::planner::optimizer_bridge::property::{
     ordering_spec_from_sort_items, window_ordering_spec,
@@ -70,7 +72,6 @@ use crate::sql::planner::optimizer_bridge::property::{
 use crate::sql::planner::ordering::OrderingSpec;
 use crate::sql::planner::payload::{AggregateCall, WindowExpr};
 use crate::sql::planner::physical::{AggMode, JoinDistribution, JoinExecutionMode, TopNPhase};
-use crate::sql::planner::{PlannedRuntimeFilter, WiredRuntimeFilterBuild};
 use crate::thrift::data_sinks;
 use crate::thrift::exprs;
 use crate::thrift::partitions;
@@ -5928,7 +5929,7 @@ mod tests {
     };
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::Statistics;
-    use crate::sql::planner::WiredRuntimeFilterBuild;
+    use crate::sql::planner::distributed::runtime_filter::WiredRuntimeFilterBuild;
     use crate::sql::planner::distributed::{
         DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan,
         ExchangeFlavor, ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,

@@ -33,6 +33,9 @@ use crate::sql::codegen::agg_type_infer::infer_agg_function_types;
 use crate::sql::common::{ChangeStreamBranchKind, JoinKind};
 use crate::sql::parser::ast::SqlType;
 use crate::sql::planner::IcebergWriteInputBinding;
+use crate::sql::planner::distributed::runtime_filter::{
+    WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
+};
 use crate::sql::planner::distributed::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor,
     ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentStreamKind, PartitionKind,
@@ -43,7 +46,6 @@ use crate::sql::planner::physical::{
     AggMode, HashSource, JoinDistribution, JoinExecutionMode, PhysicalHashAggregateNode,
     PhysicalPlanKind, PlanSetOpKind, RedistributeMode, TopNPhase,
 };
-use crate::sql::planner::runtime_filter::{WiredRuntimeFilterBuild, WiredRuntimeFilterProbe};
 use crate::sql::planner::write_sink::{
     IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
 };

@@ -25,11 +25,13 @@ use crate::sql::planner::payload::{
     PlanFilterNode, PlanGenerateSeriesNode, PlanLimitNode, PlanProjectNode, PlanRepeatNode,
     PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanValuesNode, PlanWindowNode,
 };
+use crate::sql::planner::physical::runtime_filter::{
+    RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
+};
 use crate::sql::planner::physical::{
     AggMode, AggregateOutputLayout, HashSource, JoinDistribution, JoinExecutionMode,
     PhysicalPlanStats, TopNPhase,
 };
-use crate::sql::planner::runtime_filter::{RuntimeFilterBuildIntent, RuntimeFilterProbeIntent};
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
