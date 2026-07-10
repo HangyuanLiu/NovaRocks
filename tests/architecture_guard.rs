@@ -1528,31 +1528,212 @@ fn rust_named_type_declaration_count(text: &str, name: &str) -> usize {
         .count()
 }
 
-fn rust_production_use_statements(text: &str) -> Vec<String> {
-    let production = rust_sanitized_production_text(text);
-    let mut statements = Vec::new();
-    let mut current = String::new();
+fn rust_use_tokens(text: &str) -> Vec<String> {
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut index = 0usize;
 
-    for line in production.lines() {
-        let trimmed = line.trim();
-        if current.is_empty() {
-            let starts_use = trimmed.starts_with("use ")
-                || (trimmed.starts_with("pub") && trimmed.contains(" use "));
-            if !starts_use {
-                continue;
-            }
-        } else {
-            current.push(' ');
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch.is_whitespace() {
+            index += 1;
+            continue;
         }
-        current.push_str(trimmed);
+        if is_ident_char(ch) {
+            let start = index;
+            index += 1;
+            while index < chars.len() && is_ident_char(chars[index]) {
+                index += 1;
+            }
+            tokens.push(chars[start..index].iter().collect());
+            continue;
+        }
+        if ch == ':' && chars.get(index + 1) == Some(&':') {
+            tokens.push("::".to_string());
+            index += 2;
+            continue;
+        }
+        tokens.push(ch.to_string());
+        index += 1;
+    }
 
-        if trimmed.ends_with(';') {
-            statements.push(compact_line(&current));
-            current.clear();
+    tokens
+}
+
+fn rust_expand_use_tree(tokens: &[String], prefix: &[String], paths: &mut Vec<Vec<String>>) {
+    let mut path = prefix.to_vec();
+    let mut index = 0usize;
+
+    while index < tokens.len() {
+        match tokens[index].as_str() {
+            "::" | "," => index += 1,
+            "{" => {
+                let mut depth = 1usize;
+                let mut close = index + 1;
+                while close < tokens.len() && depth > 0 {
+                    match tokens[close].as_str() {
+                        "{" => depth += 1,
+                        "}" => depth -= 1,
+                        _ => {}
+                    }
+                    close += 1;
+                }
+                let inner_end = close.saturating_sub(1);
+                rust_expand_use_list(&tokens[index + 1..inner_end], &path, paths);
+                return;
+            }
+            "*" => {
+                path.push("*".to_string());
+                paths.push(path);
+                return;
+            }
+            "as" => {
+                if path.len() > prefix.len() {
+                    paths.push(path);
+                }
+                return;
+            }
+            "}" => return,
+            token if token.chars().all(is_ident_char) => {
+                path.push(token.to_string());
+                index += 1;
+            }
+            _ => index += 1,
         }
     }
 
-    statements
+    if path.len() > prefix.len() {
+        paths.push(path);
+    }
+}
+
+fn rust_expand_use_list(tokens: &[String], prefix: &[String], paths: &mut Vec<Vec<String>>) {
+    let mut depth = 0usize;
+    let mut start = 0usize;
+
+    for index in 0..=tokens.len() {
+        let at_separator = index == tokens.len() || (tokens[index] == "," && depth == 0);
+        if at_separator {
+            if start < index {
+                rust_expand_use_tree(&tokens[start..index], prefix, paths);
+            }
+            start = index + 1;
+            continue;
+        }
+        match tokens[index].as_str() {
+            "{" => depth += 1,
+            "}" => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+}
+
+fn rust_production_use_statements(text: &str) -> Vec<String> {
+    let production = rust_sanitized_production_text(text);
+    let tokens = rust_use_tokens(&production);
+    let mut imports = Vec::new();
+    let mut index = 0usize;
+
+    while index < tokens.len() {
+        let mut visibility = "private".to_string();
+        let mut cursor = index;
+
+        if tokens[cursor] == "pub" {
+            visibility = "pub".to_string();
+            cursor += 1;
+            if tokens.get(cursor).is_some_and(|token| token == "(") {
+                let mut depth = 1usize;
+                let inner_start = cursor + 1;
+                cursor += 1;
+                while cursor < tokens.len() && depth > 0 {
+                    match tokens[cursor].as_str() {
+                        "(" => depth += 1,
+                        ")" => depth -= 1,
+                        _ => {}
+                    }
+                    cursor += 1;
+                }
+                let inner_end = cursor.saturating_sub(1);
+                visibility = format!("pub({})", tokens[inner_start..inner_end].join(""));
+            }
+            if tokens.get(cursor).is_none_or(|token| token != "use") {
+                index += 1;
+                continue;
+            }
+        } else if tokens[cursor] != "use" {
+            index += 1;
+            continue;
+        }
+
+        cursor += 1;
+        let tree_start = cursor;
+        while cursor < tokens.len() && tokens[cursor] != ";" {
+            cursor += 1;
+        }
+        if cursor == tokens.len() {
+            break;
+        }
+
+        let mut paths = Vec::new();
+        rust_expand_use_list(&tokens[tree_start..cursor], &[], &mut paths);
+        imports.extend(
+            paths
+                .into_iter()
+                .map(|path| format!("{visibility}|{}", path.join("::"))),
+        );
+        index = cursor + 1;
+    }
+
+    imports
+}
+
+fn rust_use_visibility(import: &str) -> &str {
+    import
+        .split_once('|')
+        .map(|(visibility, _)| visibility)
+        .unwrap_or("private")
+}
+
+fn rust_use_path(import: &str) -> &str {
+    import
+        .split_once('|')
+        .map(|(_, path)| path)
+        .unwrap_or(import)
+}
+
+fn rust_use_is_public(import: &str) -> bool {
+    rust_use_visibility(import) != "private"
+}
+
+fn rust_use_imports_stage(import: &str, stage: &str) -> bool {
+    let segments = rust_use_path(import).split("::").collect::<Vec<_>>();
+    if segments.windows(2).any(|pair| pair == ["planner", stage]) {
+        return true;
+    }
+
+    let relative = segments
+        .iter()
+        .skip_while(|segment| **segment == "self" || **segment == "super")
+        .copied()
+        .collect::<Vec<_>>();
+    relative.first() == Some(&stage)
+}
+
+fn rust_use_imports_sql_common(import: &str) -> bool {
+    let segments = rust_use_path(import).split("::").collect::<Vec<_>>();
+    if segments.windows(2).any(|pair| pair == ["sql", "common"]) {
+        return true;
+    }
+    segments
+        .iter()
+        .skip_while(|segment| **segment == "self" || **segment == "super")
+        .copied()
+        .next()
+        == Some("common")
+}
+
+fn rust_use_leaf(import: &str) -> &str {
+    rust_use_path(import).rsplit("::").next().unwrap_or("")
 }
 
 #[derive(Default)]
@@ -1865,6 +2046,76 @@ struct Visible;
 }
 
 #[test]
+fn planner_ownership_use_parser_preserves_visibility() {
+    let source = r#"
+use private_owner::PrivateItem;
+pub use public_owner::PublicItem;
+pub(crate) use crate_owner::CrateItem;
+pub(crate)
+use split_crate_owner::SplitCrateItem;
+pub(in crate::sql)
+use split_in_owner::SplitInItem;
+"#;
+
+    assert_eq!(
+        rust_production_use_statements(source),
+        vec![
+            "private|private_owner::PrivateItem",
+            "pub|public_owner::PublicItem",
+            "pub(crate)|crate_owner::CrateItem",
+            "pub(crate)|split_crate_owner::SplitCrateItem",
+            "pub(incrate::sql)|split_in_owner::SplitInItem",
+        ]
+    );
+}
+
+#[test]
+fn planner_ownership_use_parser_expands_grouped_and_relative_trees() {
+    let source = r#"
+use crate::sql::planner::plan::PlanScanNode;
+use crate::sql::planner::plan::{PlanFilterNode, PlanProjectNode as Project};
+use crate::sql::planner::{
+    plan::{PlanSortNode, PlanLimitNode},
+    payload::PlanValuesNode,
+};
+use super::{logical::LogicalPlanNode, distributed::*};
+use self::plan::*;
+"#;
+
+    assert_eq!(
+        rust_production_use_statements(source),
+        vec![
+            "private|crate::sql::planner::plan::PlanScanNode",
+            "private|crate::sql::planner::plan::PlanFilterNode",
+            "private|crate::sql::planner::plan::PlanProjectNode",
+            "private|crate::sql::planner::plan::PlanSortNode",
+            "private|crate::sql::planner::plan::PlanLimitNode",
+            "private|crate::sql::planner::payload::PlanValuesNode",
+            "private|super::logical::LogicalPlanNode",
+            "private|super::distributed::*",
+            "private|self::plan::*",
+        ]
+    );
+}
+
+#[test]
+fn planner_logical_module_use_surface_is_closed() {
+    let expected = vec!["pub(crate)|node::*"];
+    assert_eq!(
+        rust_production_use_statements("pub(crate) use node::*;"),
+        expected
+    );
+
+    for source in [
+        "pub(crate) use node::*;\npub(crate) use crate::sql::planner::payload::*;",
+        "pub(crate) use node::*;\nuse super::plan::*;",
+        "pub(crate) use node::*;\nuse crate::sql::planner::{logical::*, payload::*};",
+    ] {
+        assert_ne!(rust_production_use_statements(source), expected);
+    }
+}
+
+#[test]
 fn planner_logical_builder_is_owned_by_logical_stage() {
     let repo = Path::new(manifest_dir());
     let expected_files = [
@@ -2044,15 +2295,25 @@ fn planner_logical_ir_and_payload_have_stage_owners() {
     );
     let plan_uses = rust_production_use_statements(&plan);
     assert!(
-        !plan_uses.iter().any(|statement| {
-            statement.contains("logical")
-                || (statement.starts_with("pub")
-                    && (statement.contains("payload") || statement.contains("sql::common")))
+        !plan_uses.iter().any(|import| {
+            rust_use_imports_stage(import, "logical")
+                || (rust_use_is_public(import)
+                    && (rust_use_imports_stage(import, "payload")
+                        || rust_use_imports_sql_common(import)))
         }),
         "plan.rs must not import logical IR or re-export shared/common payload: {plan_uses:?}"
     );
 
     let payload = fs::read_to_string(&payload_path).unwrap();
+    let payload_uses = rust_production_use_statements(&payload);
+    assert!(
+        !payload_uses.iter().any(|import| {
+            ["logical", "plan", "distributed"]
+                .into_iter()
+                .any(|stage| rust_use_imports_stage(import, stage))
+        }),
+        "payload.rs must not import stage owners: {payload_uses:?}"
+    );
     let payload_production = compact_line(&rust_sanitized_production_text(&payload));
     for forbidden in ["planner::logical", "planner::plan", "planner::distributed"] {
         assert!(
@@ -2072,42 +2333,57 @@ fn planner_logical_ir_and_payload_have_stage_owners() {
             token.starts_with("Physical")
                 || token.starts_with("Redistribute")
                 || *token == "distributed"
+                || *token == "PlanSetOpKind"
         }),
         "logical/node.rs production must not depend on physical/distributed owners"
     );
+    let logical_uses = rust_production_use_statements(&logical_node);
     assert!(
-        !rust_production_use_statements(&logical_node)
-            .iter()
-            .any(|statement| statement.contains("planner::plan")),
-        "logical/node.rs production must not import planner::plan"
+        !logical_uses.iter().any(|import| {
+            ["plan", "physical", "distributed"]
+                .into_iter()
+                .any(|stage| rust_use_imports_stage(import, stage))
+        }),
+        "logical/node.rs production must not import physical/distributed owners: {logical_uses:?}"
     );
 
     let facade = fs::read_to_string(&facade_path).unwrap();
     assert!(has_non_comment_line(&facade, "pub(crate) mod payload;"));
     let facade_uses = rust_production_use_statements(&facade);
-    let allowed_logical_build = "pub(crate)uselogical::build::{plan_output_columns,plan_query};";
-    assert!(
-        !facade_uses.iter().any(|statement| {
-            statement == "useplan::*;"
-                || (statement.contains("logical") && statement != allowed_logical_build)
-                || statement.contains("payload")
-        }),
+    let actual_ir_surface = facade_uses
+        .iter()
+        .filter(|import| {
+            ["logical", "payload", "plan"]
+                .into_iter()
+                .any(|stage| rust_use_imports_stage(import, stage))
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let expected_ir_surface = BTreeSet::from([
+        "pub(crate)|logical::build::plan_output_columns".to_string(),
+        "pub(crate)|logical::build::plan_query".to_string(),
+    ]);
+    assert_eq!(
+        actual_ir_surface, expected_ir_surface,
         "planner facade must not hide logical/shared IR owners: {facade_uses:?}"
     );
 
     let logical_mod = fs::read_to_string(&logical_mod_path).unwrap();
     assert!(has_non_comment_line(&logical_mod, "mod node;"));
-    assert!(has_non_comment_line(
-        &logical_mod,
-        "pub(crate) use node::*;"
-    ));
+    let logical_mod_uses = rust_production_use_statements(&logical_mod);
+    assert_eq!(
+        logical_mod_uses,
+        vec!["pub(crate)|node::*"],
+        "logical module use surface must only re-export node::*"
+    );
 
     let marker = fs::read_to_string(&marker_path).unwrap();
+    let marker_uses = rust_production_use_statements(&marker);
     assert!(
-        !rust_production_use_statements(&marker)
-            .iter()
-            .any(|statement| statement.starts_with("pub") && statement.contains("ImvVersionRef")),
-        "imv_rewrite::marker must not re-export ImvVersionRef"
+        !marker_uses.iter().any(|import| {
+            rust_use_is_public(import) && rust_use_leaf(import) == "ImvVersionRef"
+        }),
+        "imv_rewrite::marker must not re-export ImvVersionRef: {marker_uses:?}"
     );
 
     let mut checked = rs_files(&src_dir());
@@ -2116,15 +2392,40 @@ fn planner_logical_ir_and_payload_have_stage_owners() {
     for path in checked {
         let text = fs::read_to_string(&path).unwrap();
         let sanitized = rust_lexically_sanitized(&text);
+        let imports = rust_production_use_statements(&text);
         assert!(
             !sanitized.contains(&legacy_logical_path),
             "legacy logical path remains in {}",
             rel(&path)
         );
+        for import in &imports {
+            if !rust_use_imports_stage(import, "plan") {
+                continue;
+            }
+            let leaf = rust_use_leaf(import);
+            assert_ne!(
+                leaf,
+                "*",
+                "legacy planner::plan wildcard import remains in {}: {import}",
+                rel(&path)
+            );
+            assert!(
+                !leaf.starts_with("Logical"),
+                "legacy logical import remains in {}: {import}",
+                rel(&path)
+            );
+        }
         for item in shared_payload {
             assert!(
                 !sanitized.contains(&format!("planner::plan::{item}")),
                 "legacy shared payload path planner::plan::{item} remains in {}",
+                rel(&path)
+            );
+            assert!(
+                !imports.iter().any(|import| {
+                    rust_use_imports_stage(import, "plan") && rust_use_leaf(import) == item
+                }),
+                "legacy shared payload import planner::plan::{item} remains in {}",
                 rel(&path)
             );
         }
