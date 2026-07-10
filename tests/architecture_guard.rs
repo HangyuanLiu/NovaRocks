@@ -4707,6 +4707,44 @@ fn nidl_d3k_native_dynamic_sink_partition_does_not_roundtrip_thrift_partition() 
 }
 
 #[test]
+fn nfe_0_novarocks_generated_execution_has_no_plan_wire_selector() {
+    let repo = Path::new(manifest_dir());
+    let mut violations = Vec::new();
+
+    let app_config = fs::read_to_string(repo.join("src/common/app_config.rs")).unwrap();
+    push_forbidden_terms(
+        &mut violations,
+        "src/common/app_config.rs",
+        &app_config,
+        &[
+            "PlanWireFormat",
+            "pub plan_wire_format:",
+            "fn default_plan_wire_format(",
+        ],
+        "NovaRocks config must not expose the retired plan-wire selector",
+    );
+
+    let coordinator = fs::read_to_string(repo.join("src/runtime/coordinator.rs")).unwrap();
+    push_forbidden_terms(
+        &mut violations,
+        "src/runtime/coordinator.rs",
+        &coordinator,
+        &[
+            "PlanWireFormat",
+            "current_plan_wire_format",
+            "FragmentSubmission::thrift_only",
+        ],
+        "NovaRocks-generated execution must always use the native plan wire",
+    );
+
+    assert!(
+        violations.is_empty(),
+        "NFE-0 plan-wire selector guard failed:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
 fn nidl_d3l_native_mainline_thrift_usage_is_explicitly_allowlisted() {
     let repo = Path::new(manifest_dir());
     let mut violations = Vec::new();

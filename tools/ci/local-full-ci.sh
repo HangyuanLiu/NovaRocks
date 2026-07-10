@@ -40,9 +40,9 @@ CI_RUNTIME_PREPARED="false"
 NOVA_CI_CARGO_PROFILE="${NOVA_CI_CARGO_PROFILE:-dev-opt}"
 SQL_CLUSTER_MODE="${SQL_CLUSTER_MODE:-all-in-one}"
 SQL_CLUSTER_SIZE="${SQL_CLUSTER_SIZE:-1}"
-NOVA_CI_PROTO_CORE="${NOVA_CI_PROTO_CORE:-1}"
-NOVA_CI_PROTO_FULL="${NOVA_CI_PROTO_FULL:-0}"
-NOVA_CI_PROTO_REQUIRED="${NOVA_CI_PROTO_REQUIRED:-0}"
+NOVA_CI_NATIVE_CROSS_PROCESS_CORE="${NOVA_CI_NATIVE_CROSS_PROCESS_CORE:-1}"
+NOVA_CI_NATIVE_CROSS_PROCESS_FULL="${NOVA_CI_NATIVE_CROSS_PROCESS_FULL:-0}"
+NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED="${NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED:-0}"
 
 usage() {
   cat <<'EOF'
@@ -55,11 +55,10 @@ Rust tests are executed with --test-threads=1 for the same reason.
 Cargo build/test/run stages use NOVA_CI_CARGO_PROFILE, defaulting to dev-opt.
 Clippy runs in warning-only mode until the repository has a clean strict-clippy
 baseline.
-Default SQL suite runs use the sql-test runner's default plan wire format
-(proto after NIDL-5 M3). The explicit proto matrix is retained as a focused
-cross-process required check for NIDL-5 regressions. Set NOVA_CI_PROTO_CORE=0
-to disable it, NOVA_CI_PROTO_FULL=1 to run the stable full-suite proto matrix,
-and NOVA_CI_PROTO_REQUIRED=1 to make proto failures fail CI.
+The native 1FE+3BE cross-process matrix is retained as focused distributed
+execution coverage. Set NOVA_CI_NATIVE_CROSS_PROCESS_CORE=0 to disable it,
+NOVA_CI_NATIVE_CROSS_PROCESS_FULL=1 to run the stable full-suite matrix, and
+NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED=1 to make its failures fail CI.
 
 Options:
   --all-discovered      Run every suite discovered from sql-tests/*/sql.
@@ -295,9 +294,9 @@ prepare_runtime() {
     echo "NOVAROCKS_ICEBERG_REST_URI=$NOVAROCKS_ICEBERG_REST_URI"
     echo "NOVAROCKS_SPARK_DEFAULTS=${NOVAROCKS_SPARK_DEFAULTS:-}"
     echo "NOVA_CI_CARGO_PROFILE=$NOVA_CI_CARGO_PROFILE"
-    echo "NOVA_CI_PROTO_CORE=$NOVA_CI_PROTO_CORE"
-    echo "NOVA_CI_PROTO_FULL=$NOVA_CI_PROTO_FULL"
-    echo "NOVA_CI_PROTO_REQUIRED=$NOVA_CI_PROTO_REQUIRED"
+    echo "NOVA_CI_NATIVE_CROSS_PROCESS_CORE=$NOVA_CI_NATIVE_CROSS_PROCESS_CORE"
+    echo "NOVA_CI_NATIVE_CROSS_PROCESS_FULL=$NOVA_CI_NATIVE_CROSS_PROCESS_FULL"
+    echo "NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED=$NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED"
   } >"$log_path" 2>&1
   code=$?
   duration=$(($(ci_epoch) - start))
@@ -557,23 +556,18 @@ ci_suite_cluster_size() {
   esac
 }
 
-ci_proto_enabled() {
-  [ "$NOVA_CI_PROTO_CORE" = "1" ] || [ "$NOVA_CI_PROTO_FULL" = "1" ]
+ci_native_cross_process_enabled() {
+  [ "$NOVA_CI_NATIVE_CROSS_PROCESS_CORE" = "1" ] || [ "$NOVA_CI_NATIVE_CROSS_PROCESS_FULL" = "1" ]
 }
 
-ci_proto_suite_cluster_mode() {
+ci_native_cross_process_suite_cluster_mode() {
   local suite="$1"
   printf "cross-process\n"
 }
 
-ci_proto_suite_cluster_size() {
+ci_native_cross_process_suite_cluster_size() {
   local suite="$1"
   printf "3\n"
-}
-
-ci_proto_runner_extra_args() {
-  local suite="$1"
-  printf "%s\n" "--plan-wire-format proto"
 }
 
 ci_classify_sql_log() {
@@ -830,32 +824,32 @@ run_sql_suites() {
   fi
 }
 
-stop_server_for_proto_stage() {
-  local log_path="$CI_RUN_DIR/server-stop-for-proto.log"
+stop_server_for_native_cross_process_stage() {
+  local log_path="$CI_RUN_DIR/server-stop-for-native-cross-process.log"
   local start
   local code
   local duration
 
   start="$(ci_epoch)"
   {
-    echo "Stopping standalone-server before proto cross-process SQL suites."
+    echo "Stopping standalone-server before native cross-process SQL suites."
     ci_stop_standalone_server
   } >"$log_path" 2>&1
   code=$?
   duration=$(($(ci_epoch) - start))
 
   if [ "$code" -ne 0 ]; then
-    ci_record_stage "standalone-server stop for proto" "FAIL" "$duration" "$log_path"
-    ci_mark_failure_tail "standalone-server stop for proto failed" "$log_path"
+    ci_record_stage "standalone-server stop for native cross-process" "FAIL" "$duration" "$log_path"
+    ci_mark_failure_tail "standalone-server stop for native cross-process failed" "$log_path"
     ci_render_summary "FAIL"
     exit "$code"
   fi
 
-  ci_record_stage "standalone-server stop for proto" "PASS" "$duration" "$log_path"
+  ci_record_stage "standalone-server stop for native cross-process" "PASS" "$duration" "$log_path"
   ci_render_summary "RUNNING"
 }
 
-run_proto_sql_suites() {
+run_native_cross_process_sql_suites() {
   local failed=0
   local suite
   local log_path
@@ -866,50 +860,46 @@ run_proto_sql_suites() {
   local novarocks_bin
   local suite_cluster_mode
   local suite_cluster_size
-  local proto_args
-  local -a proto_extra_args
-  local -a proto_suites
+  local -a native_cross_process_suites
   local suites_output
 
-  if ! ci_proto_enabled; then
+  if ! ci_native_cross_process_enabled; then
     return 0
   fi
 
-  mkdir -p "$CI_RUN_DIR/sql-proto"
+  mkdir -p "$CI_RUN_DIR/sql-native-cross-process"
   novarocks_bin="$REPO_ROOT/$(ci_novarocks_binary_path "$NOVA_CI_CARGO_PROFILE")"
 
-  if ! suites_output="$(ci_proto_suites)"; then
-    echo "error: failed to resolve proto SQL suites" >&2
+  if ! suites_output="$(ci_native_cross_process_suites)"; then
+    echo "error: failed to resolve native cross-process SQL suites" >&2
     exit 2
   fi
 
-  proto_suites=()
+  native_cross_process_suites=()
   while IFS= read -r suite; do
     [ -n "$suite" ] || continue
     if ! ci_suite_exists "$REPO_ROOT" "$suite"; then
-      echo "error: proto SQL suite does not exist: $suite" >&2
+      echo "error: native cross-process SQL suite does not exist: $suite" >&2
       exit 2
     fi
-    proto_suites+=("$suite")
+    native_cross_process_suites+=("$suite")
   done <<<"$suites_output"
 
-  if [ "${#proto_suites[@]}" -eq 0 ]; then
-    echo "error: no proto SQL suites selected" >&2
+  if [ "${#native_cross_process_suites[@]}" -eq 0 ]; then
+    echo "error: no native cross-process SQL suites selected" >&2
     exit 2
   fi
 
   if [ "$SQL_CLUSTER_MODE" = "all-in-one" ]; then
-    stop_server_for_proto_stage
+    stop_server_for_native_cross_process_stage
   fi
 
-  for suite in "${proto_suites[@]}"; do
-    log_path="$CI_RUN_DIR/sql-proto/${suite}.log"
+  for suite in "${native_cross_process_suites[@]}"; do
+    log_path="$CI_RUN_DIR/sql-native-cross-process/${suite}.log"
     start="$(ci_epoch)"
     query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-60}"
-    suite_cluster_mode="$(ci_proto_suite_cluster_mode "$suite")"
-    suite_cluster_size="$(ci_proto_suite_cluster_size "$suite")"
-    proto_args="$(ci_proto_runner_extra_args "$suite")"
-    read -r -a proto_extra_args <<<"$proto_args"
+    suite_cluster_mode="$(ci_native_cross_process_suite_cluster_mode "$suite")"
+    suite_cluster_size="$(ci_native_cross_process_suite_cluster_size "$suite")"
     case "$suite" in
       tpc-ds|tpc-h)
         query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-180}"
@@ -932,29 +922,28 @@ run_proto_sql_suites() {
         --query-timeout "$query_timeout" \
         --cluster-mode "$suite_cluster_mode" \
         --cluster-size "$suite_cluster_size" \
-        "${proto_extra_args[@]}" \
         -j 1
     code=$?
     duration=$(($(ci_epoch) - start))
 
     if [ "$code" -eq 0 ]; then
-      ci_record_sql_suite "proto:$suite" "PASS" "$duration" "$log_path"
+      ci_record_sql_suite "native-cross-process:$suite" "PASS" "$duration" "$log_path"
     else
       failed=1
       ci_classify_sql_log "$suite" "$log_path" "false" >/dev/null || true
-      if [ "$NOVA_CI_PROTO_REQUIRED" = "1" ]; then
-        ci_record_sql_suite "proto:$suite" "FAIL" "$duration" "$log_path"
+      if [ "$NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED" = "1" ]; then
+        ci_record_sql_suite "native-cross-process:$suite" "FAIL" "$duration" "$log_path"
         if [ -z "$CI_FAILURE_TAIL" ]; then
-          ci_mark_failure_tail "proto SQL suite failed: $suite" "$log_path"
+          ci_mark_failure_tail "native cross-process SQL suite failed: $suite" "$log_path"
         fi
       else
-        ci_record_sql_suite "proto:$suite" "DISCOVERY_FAIL" "$duration" "$log_path"
+        ci_record_sql_suite "native-cross-process:$suite" "DISCOVERY_FAIL" "$duration" "$log_path"
       fi
     fi
     ci_render_summary "RUNNING"
   done
 
-  if [ "$failed" -ne 0 ] && [ "$NOVA_CI_PROTO_REQUIRED" = "1" ]; then
+  if [ "$failed" -ne 0 ] && [ "$NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED" = "1" ]; then
     ci_render_summary "FAIL"
     exit 1
   fi
@@ -1043,7 +1032,7 @@ main() {
     ci_render_summary "RUNNING"
   fi
   run_sql_suites
-  run_proto_sql_suites
+  run_native_cross_process_sql_suites
 
   ci_render_summary "PASS"
   echo "PASS: $CI_SUMMARY"

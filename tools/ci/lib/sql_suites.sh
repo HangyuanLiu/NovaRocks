@@ -57,17 +57,17 @@ ci_tier_suites() {
   esac
 }
 
-ci_proto_core_suites() {
+ci_native_cross_process_core_suites() {
   printf "%s\n" join filter sort aggregate cte subquery iceberg-rest runtime-filter-distributed
 }
 
-ci_proto_suites() {
-  if [ "${NOVA_CI_PROTO_FULL:-0}" = "1" ]; then
+ci_native_cross_process_suites() {
+  if [ "${NOVA_CI_NATIVE_CROSS_PROCESS_FULL:-0}" = "1" ]; then
     ci_tier_suites full "$STABLE_SUITES_FILE"
     return $?
   fi
 
-  ci_proto_core_suites
+  ci_native_cross_process_core_suites
 }
 
 ci_discover_sql_suites() {

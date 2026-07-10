@@ -90,11 +90,6 @@ enum RecordFrom {
     Reference,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub(crate) enum PlanWireFormatArg {
-    Proto,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaseStatus {
     Pass,
@@ -285,10 +280,6 @@ struct Cli {
 
     #[arg(long, value_enum, default_value_t = ClusterMode::AllInOne)]
     cluster_mode: ClusterMode,
-
-    /// FE plan wire format for the cross-process cluster. Proto is the only pure-mode format.
-    #[arg(long, value_enum, default_value_t = PlanWireFormatArg::Proto)]
-    plan_wire_format: PlanWireFormatArg,
 
     /// Number of BE processes to launch in cross-process cluster mode (>= 1).
     /// All-in-one mode requires cluster_size = 1.
@@ -2374,7 +2365,6 @@ fn run() -> Result<i32> {
         cli.cluster_size,
         &base_dir,
         &runner_config,
-        cli.plan_wire_format,
     )?;
 
     // Resolve global connection params
@@ -2921,9 +2911,9 @@ mod tests {
     use crate::runner::{is_transient_iceberg_commit_error, parse_selector_list};
     use crate::types::{QueryMeta, ResultSet, SqlCase, SqlStep};
     use crate::{
-        Cli, PlanWireFormatArg, annotate_failure_with_engine_error_code,
-        evaluate_expected_error_branch, expected_engine_error_code_diff_result,
-        expected_engine_error_code_result, validate_fault_injection_jobs,
+        Cli, annotate_failure_with_engine_error_code, evaluate_expected_error_branch,
+        expected_engine_error_code_diff_result, expected_engine_error_code_result,
+        validate_fault_injection_jobs,
     };
     use clap::Parser;
     use regex::Regex;
@@ -3182,14 +3172,13 @@ mod tests {
     }
 
     #[test]
-    fn help_includes_only_proto_plan_wire_format_option() {
+    fn help_excludes_retired_wire_selector_option() {
         let help = <crate::Cli as clap::CommandFactory>::command()
             .render_long_help()
             .to_string();
+        let retired_option = ["--plan", "wire", "format"].join("-");
 
-        assert!(help.contains("--plan-wire-format <PLAN_WIRE_FORMAT>"));
-        assert!(help.contains("proto"));
-        assert!(!help.contains("thrift"));
+        assert!(!help.contains(&retired_option));
     }
 
     #[test]
@@ -3199,30 +3188,18 @@ mod tests {
     }
 
     #[test]
-    fn cli_plan_wire_format_defaults_to_proto() {
-        let cli = crate::Cli::parse_from(["sql-tests", "--suite", "ssb"]);
-        assert_eq!(cli.plan_wire_format, PlanWireFormatArg::Proto);
-    }
-
-    #[test]
-    fn cli_plan_wire_format_accepts_proto() {
-        let cli =
-            crate::Cli::parse_from(["sql-tests", "--suite", "ssb", "--plan-wire-format", "proto"]);
-        assert_eq!(cli.plan_wire_format, PlanWireFormatArg::Proto);
-    }
-
-    #[test]
-    fn cli_plan_wire_format_rejects_thrift_escape_hatch() {
+    fn cli_rejects_retired_wire_selector_option() {
+        let retired_option = ["--plan", "wire", "format"].join("-");
         let err = crate::Cli::try_parse_from([
             "sql-tests",
             "--suite",
             "ssb",
-            "--plan-wire-format",
-            "thrift",
+            retired_option.as_str(),
+            "proto",
         ])
-        .expect_err("runner must reject the thrift plan-wire escape hatch");
+        .expect_err("runner must reject the retired wire selector option");
 
-        assert!(err.to_string().contains("thrift"), "{err}");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]
@@ -3313,7 +3290,6 @@ enable_path_style_access = true
             ClusterProcessRole::Fe,
             0,
             &runtime,
-            PlanWireFormatArg::Proto,
         )
         .expect("render fe config");
         let be = render_cross_process_config(
@@ -3321,7 +3297,6 @@ enable_path_style_access = true
             ClusterProcessRole::Be,
             0,
             &runtime,
-            PlanWireFormatArg::Proto,
         )
         .expect("render be config");
 

@@ -42,7 +42,6 @@ use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::common::app_config::PlanWireFormat;
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
@@ -135,19 +134,6 @@ pub(crate) fn prepare_native_plan_sidecars(
     Ok(NativePlanSidecars { fragments_by_id })
 }
 
-pub(crate) fn prepare_native_plan_sidecars_for_current_wire_format(
-    native_plan: &crate::sql::planner::DistributedPlan,
-    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
-) -> Result<Option<NativePlanSidecars>, String> {
-    match current_plan_wire_format() {
-        #[cfg(feature = "compat")]
-        PlanWireFormat::Thrift => Ok(None),
-        PlanWireFormat::Proto => {
-            prepare_native_plan_sidecars(native_plan, mv_refresh_ctx).map(Some)
-        }
-    }
-}
-
 /// Coordinates multi-fragment query execution across one or more backends.
 ///
 /// Drives all fragment wiring from [`FragmentScheduler`] placements and submits
@@ -235,9 +221,7 @@ impl ExecutionCoordinator {
         let query_options = self.query_options;
         let dispatcher = self.dispatcher;
         let scheduler = self.scheduler;
-        let plan_wire_format = current_plan_wire_format();
-        let native_fragments_by_id =
-            native_fragment_sidecars(plan_wire_format, native_sidecars.as_ref())?;
+        let native_fragments_by_id = native_fragment_sidecars(native_sidecars.as_ref())?;
         // ---------------------------------------------------------------
         // 1. Allocate query id and run the scheduler.
         // ---------------------------------------------------------------
@@ -509,7 +493,6 @@ impl ExecutionCoordinator {
                 ));
             }
             ensure_native_sidecar_sink_supported(
-                plan_wire_format,
                 fragment_id,
                 is_root,
                 is_terminal_write,
@@ -537,34 +520,8 @@ impl ExecutionCoordinator {
                         .map(exec_destination_from_runtime)
                         .collect();
                     (output_sink, compat_partition, Some(exec_destinations))
-                } else if let Some((router_group_id, branch_edges)) = router_edges {
-                    #[cfg(not(feature = "compat"))]
-                    {
-                        let _ = router_group_id;
-                        let _ = branch_edges;
-                    }
-                    let output_sink = match plan_wire_format {
-                        #[cfg(feature = "compat")]
-                        PlanWireFormat::Thrift => {
-                            let template = fr
-                                .output_sink
-                                .iceberg_change_stream_router_sink
-                                .as_ref()
-                                .ok_or_else(|| {
-                                    format!(
-                                        "fragment {fragment_id} is router source for group {router_group_id} \
-                                         but output sink is missing ICEBERG_CHANGE_STREAM_ROUTER_SINK payload"
-                                    )
-                                })?;
-                            wrap_iceberg_change_stream_router_sink(
-                                template,
-                                branch_edges,
-                                &compat_edge_sidecars,
-                                &plan.by_fragment,
-                            )?
-                        }
-                        PlanWireFormat::Proto => fr.output_sink.clone(),
-                    };
+                } else if router_edges.is_some() {
+                    let output_sink = fr.output_sink.clone();
                     // Router branches carry their own destinations in the sink payload.
                     (output_sink, unpartitioned_partition(), None)
                 } else if is_terminal_write {
@@ -697,84 +654,66 @@ impl ExecutionCoordinator {
                     });
                 }
 
-                let submission = match plan_wire_format {
-                    #[cfg(feature = "compat")]
-                    PlanWireFormat::Thrift => FragmentSubmission::thrift_only(params),
-                    PlanWireFormat::Proto => {
-                        let mut native_fragment =
-                            native_fragments_by_id.get(&fragment_id).cloned().ok_or_else(
-                                || {
-                                    format!(
-                                        "native plan sidecar missing fragment {fragment_id} while plan_wire_format=proto"
-                                    )
-                                },
-                            )?;
-                        if !is_root && !is_terminal_write && stream_edge.is_none() {
-                            if let Some((router_group_id, branch_edges)) = router_edges {
-                                patch_native_iceberg_change_stream_router_sink(
-                                    &mut native_fragment,
-                                    fragment_id,
-                                    *router_group_id,
-                                    branch_edges,
-                                    &plan.by_fragment,
-                                )?;
-                            } else if let Some(cte_id) = schedule.cte_id {
-                                let consumers =
-                                    cte_consumers.get(&cte_id).cloned().unwrap_or_default();
-                                patch_native_cte_multicast_sink(
-                                    &mut native_fragment,
-                                    fragment_id,
-                                    cte_id,
-                                    &consumers,
-                                    &consumer_dests,
-                                )?;
-                            }
-                        }
-                        #[cfg(feature = "compat")]
-                        params.params.as_ref().ok_or_else(|| {
-                            format!(
-                                "fragment {fragment_id} missing exec params while plan_wire_format=proto"
-                            )
-                        })?;
-                        #[cfg(feature = "compat")]
-                        let typed_result_sink = params.novarocks_typed_result_sink.unwrap_or(false);
-                        #[cfg(not(feature = "compat"))]
-                        let typed_result_sink = is_root && needs_fragment_status_report;
-                        let native_rf_builder_number = runtime_filter_builder_number_for_instance(
-                            rf_plan.as_ref(),
-                            &instance_counts,
-                        );
-                        let native_rf_max_size = if rf_plan.is_some() {
-                            16_i64 * 1024 * 1024
-                        } else {
-                            0
-                        };
-                        let native_instance_params =
-                            crate::sql::codegen::proto_encode::instance::encode_instance_params(
-                                &query_id,
-                                placement,
-                                query_options.as_ref(),
-                                &placement.runtime_filter_prober_params,
-                                &native_rf_builder_number,
-                                native_rf_max_size,
-                                placement.instance_index as i32,
-                                fragment_report_endpoint.as_ref(),
-                                typed_result_sink,
-                            )?;
-                        #[cfg(feature = "compat")]
-                        {
-                            FragmentSubmission::with_native(
-                                params,
-                                native_fragment,
-                                native_instance_params,
-                            )
-                        }
-                        #[cfg(not(feature = "compat"))]
-                        {
-                            FragmentSubmission::with_native(native_fragment, native_instance_params)
-                        }
+                let mut native_fragment = native_fragments_by_id
+                    .get(&fragment_id)
+                    .cloned()
+                    .ok_or_else(|| format!("native plan sidecar missing fragment {fragment_id}"))?;
+                if !is_root && !is_terminal_write && stream_edge.is_none() {
+                    if let Some((router_group_id, branch_edges)) = router_edges {
+                        patch_native_iceberg_change_stream_router_sink(
+                            &mut native_fragment,
+                            fragment_id,
+                            *router_group_id,
+                            branch_edges,
+                            &plan.by_fragment,
+                        )?;
+                    } else if let Some(cte_id) = schedule.cte_id {
+                        let consumers = cte_consumers.get(&cte_id).cloned().unwrap_or_default();
+                        patch_native_cte_multicast_sink(
+                            &mut native_fragment,
+                            fragment_id,
+                            cte_id,
+                            &consumers,
+                            &consumer_dests,
+                        )?;
                     }
+                }
+                #[cfg(feature = "compat")]
+                params.params.as_ref().ok_or_else(|| {
+                    format!("fragment {fragment_id} missing exec params for native submission")
+                })?;
+                #[cfg(feature = "compat")]
+                let typed_result_sink = params.novarocks_typed_result_sink.unwrap_or(false);
+                #[cfg(not(feature = "compat"))]
+                let typed_result_sink = is_root && needs_fragment_status_report;
+                let native_rf_builder_number =
+                    runtime_filter_builder_number_for_instance(rf_plan.as_ref(), &instance_counts);
+                let native_rf_max_size = if rf_plan.is_some() {
+                    16_i64 * 1024 * 1024
+                } else {
+                    0
                 };
+                let native_instance_params =
+                    crate::sql::codegen::proto_encode::instance::encode_instance_params(
+                        &query_id,
+                        placement,
+                        query_options.as_ref(),
+                        &placement.runtime_filter_prober_params,
+                        &native_rf_builder_number,
+                        native_rf_max_size,
+                        placement.instance_index as i32,
+                        fragment_report_endpoint.as_ref(),
+                        typed_result_sink,
+                    )?;
+                #[cfg(feature = "compat")]
+                let submission = FragmentSubmission::with_native(
+                    params,
+                    native_fragment,
+                    native_instance_params,
+                );
+                #[cfg(not(feature = "compat"))]
+                let submission =
+                    FragmentSubmission::with_native(native_fragment, native_instance_params);
 
                 submissions_by_fragment
                     .entry(fragment_id)
@@ -1603,14 +1542,7 @@ fn local_coordinator_report_endpoint() -> Result<crate::runtime::endpoint::Runti
     crate::runtime::endpoint::RuntimeEndpoint::new(host, port as i32)
 }
 
-fn current_plan_wire_format() -> PlanWireFormat {
-    crate::novarocks_config::config()
-        .map(|cfg| cfg.runtime.plan_wire_format)
-        .unwrap_or(PlanWireFormat::Proto)
-}
-
 fn ensure_native_sidecar_sink_supported(
-    wire_format: PlanWireFormat,
     fragment_id: FragmentId,
     is_root: bool,
     is_terminal_write: bool,
@@ -1618,37 +1550,24 @@ fn ensure_native_sidecar_sink_supported(
     has_router_edges: bool,
     has_cte_id: bool,
 ) -> Result<(), String> {
-    if wire_format != PlanWireFormat::Proto
-        || is_root
-        || is_terminal_write
-        || has_stream_edge
-        || has_router_edges
-        || has_cte_id
-    {
+    if is_root || is_terminal_write || has_stream_edge || has_router_edges || has_cte_id {
         return Ok(());
     }
 
     let dynamic_sink = "dynamic fragment sink";
     Err(format!(
-        "plan_wire_format=proto cannot encode {dynamic_sink} for fragment {fragment_id}; \
-         the native sink contract must carry dynamic destinations before this fragment can use proto submission"
+        "native submission cannot encode {dynamic_sink} for fragment {fragment_id}; \
+         the native sink contract must carry dynamic destinations before this fragment can be submitted"
     ))
 }
 
 fn native_fragment_sidecars(
-    wire_format: PlanWireFormat,
     native_sidecars: Option<&NativePlanSidecars>,
 ) -> Result<BTreeMap<FragmentId, crate::proto::plan::PlanFragment>, String> {
-    match wire_format {
-        #[cfg(feature = "compat")]
-        PlanWireFormat::Thrift => Ok(BTreeMap::new()),
-        PlanWireFormat::Proto => {
-            let native_sidecars = native_sidecars.ok_or_else(|| {
-                "plan_wire_format=proto requires native sidecars encoded from a native DistributedPlan, but this execution path only supplied thrift fragments".to_string()
-            })?;
-            Ok(native_sidecars.fragments_by_id.clone())
-        }
-    }
+    let native_sidecars = native_sidecars.ok_or_else(|| {
+        "native execution requires sidecars encoded from a native DistributedPlan".to_string()
+    })?;
+    Ok(native_sidecars.fragments_by_id.clone())
 }
 
 fn validate_fragment_schedule_payloads(
@@ -2665,6 +2584,37 @@ fn notify_write_commit_wait_observer(commit_error: &str) {
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+mod native_contract_tests {
+    use super::*;
+
+    #[test]
+    fn native_fragment_sidecars_requires_native_sidecars() {
+        let err = native_fragment_sidecars(None)
+            .expect_err("native execution must require native sidecars");
+
+        assert!(
+            err.contains("native DistributedPlan") || err.contains("native sidecar"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn native_sidecar_sink_support_allows_dynamic_stream_sink() {
+        ensure_native_sidecar_sink_supported(7, false, false, true, false, false)
+            .expect("native execution carries DATA_STREAM_SINK sidecars");
+    }
+
+    #[test]
+    fn native_sidecar_sink_support_allows_router_and_cte_sinks() {
+        ensure_native_sidecar_sink_supported(8, false, false, false, true, false)
+            .expect("native execution patches ICEBERG_CHANGE_STREAM_ROUTER_SINK sidecars");
+
+        ensure_native_sidecar_sink_supported(9, false, false, false, false, true)
+            .expect("native execution patches MULTI_CAST_DATA_STREAM_SINK sidecars");
+    }
+}
+
 #[cfg(all(test, feature = "compat"))]
 mod tests {
     use std::sync::Arc;
@@ -2688,34 +2638,6 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use arrow::record_batch::RecordBatch;
 
-    #[cfg(feature = "compat")]
-    #[test]
-    fn native_fragment_sidecars_thrift_allows_missing_native_sidecars() {
-        let sidecars = native_fragment_sidecars(PlanWireFormat::Thrift, None)
-            .expect("thrift mode must not require native sidecars");
-
-        assert!(sidecars.is_empty());
-        let empty_sidecars = NativePlanSidecars {
-            fragments_by_id: BTreeMap::new(),
-        };
-        let sidecars = native_fragment_sidecars(PlanWireFormat::Thrift, Some(&empty_sidecars))
-            .expect("thrift mode must allow empty native sidecars");
-
-        assert!(sidecars.is_empty());
-    }
-
-    #[test]
-    fn native_fragment_sidecars_proto_requires_native_sidecars() {
-        let err = native_fragment_sidecars(PlanWireFormat::Proto, None)
-            .expect_err("proto mode must require native sidecars");
-
-        assert!(err.contains("plan_wire_format=proto"), "{err}");
-        assert!(
-            err.contains("native DistributedPlan") || err.contains("native sidecar"),
-            "{err}"
-        );
-    }
-
     #[test]
     fn fragment_schedule_payload_validation_rejects_id_mismatch() {
         let fragment_results = vec![fragment_for_scan_range_merge_test(BTreeMap::new())];
@@ -2735,60 +2657,6 @@ mod tests {
 
         assert!(err.contains("native fragment_schedules ids {7}"), "{err}");
         assert!(err.contains("compat fragment_results ids {0}"), "{err}");
-    }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn native_sidecar_sink_support_allows_thrift_dynamic_stream_sink() {
-        ensure_native_sidecar_sink_supported(
-            PlanWireFormat::Thrift,
-            7,
-            false,
-            false,
-            true,
-            false,
-            false,
-        )
-        .expect("thrift mode owns dynamic sink wiring");
-    }
-
-    #[test]
-    fn native_sidecar_sink_support_allows_proto_dynamic_stream_sink() {
-        ensure_native_sidecar_sink_supported(
-            PlanWireFormat::Proto,
-            7,
-            false,
-            false,
-            true,
-            false,
-            false,
-        )
-        .expect("proto mode carries native DATA_STREAM_SINK sidecars");
-    }
-
-    #[test]
-    fn native_sidecar_sink_support_allows_proto_router_and_cte_sinks() {
-        ensure_native_sidecar_sink_supported(
-            PlanWireFormat::Proto,
-            8,
-            false,
-            false,
-            false,
-            true,
-            false,
-        )
-        .expect("proto mode patches native ICEBERG_CHANGE_STREAM_ROUTER_SINK sidecars");
-
-        ensure_native_sidecar_sink_supported(
-            PlanWireFormat::Proto,
-            9,
-            false,
-            false,
-            false,
-            false,
-            true,
-        )
-        .expect("proto mode patches native MULTI_CAST_DATA_STREAM_SINK sidecars");
     }
 
     #[test]
@@ -4152,13 +4020,18 @@ mod tests {
     // Original regression tests
     // -----------------------------------------------------------------------
 
-    /// Wrap a list of params as single-backend submissions (backend_idx=0).
+    /// Wrap params as native submissions for low-level submit/fetch loop tests.
     fn single_backend(
         params: Vec<crate::thrift::internal_service::TExecPlanFragmentParams>,
     ) -> Vec<(usize, FragmentSubmission)> {
         params
             .into_iter()
-            .map(|p| (0usize, FragmentSubmission::thrift_only(p)))
+            .map(|p| {
+                (
+                    0usize,
+                    FragmentSubmission::with_native(p, Default::default(), Default::default()),
+                )
+            })
             .collect()
     }
 

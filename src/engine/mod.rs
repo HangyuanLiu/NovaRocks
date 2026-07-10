@@ -2757,10 +2757,9 @@ fn explain_analyze_query(
     let query_opts =
         crate::engine::query_options_wire::standalone_query_options_to_runtime(&query_opts);
     let native_dp = refresh_native_sidecar_plan_with_lowered_edges(&dp, &build_result.edges, None)?;
-    let native_sidecars =
-        crate::runtime::coordinator::prepare_native_plan_sidecars_for_current_wire_format(
-            &native_dp, None,
-        )?;
+    let native_sidecars = Some(crate::runtime::coordinator::prepare_native_plan_sidecars(
+        &native_dp, None,
+    )?);
     let outcome =
         crate::runtime::coordinator::ExecutionCoordinator::new_with_optional_native_plan_sidecars(
             build_result,
@@ -3150,10 +3149,9 @@ pub(crate) fn execute_query_as_iceberg_write(
     )?;
     let (dispatcher, scheduler) = coordinated_execution_services()?;
     let native_dp = refresh_native_sidecar_plan_with_lowered_edges(&dp, &build_result.edges, None)?;
-    let native_sidecars =
-        crate::runtime::coordinator::prepare_native_plan_sidecars_for_current_wire_format(
-            &native_dp, None,
-        )?;
+    let native_sidecars = Some(crate::runtime::coordinator::prepare_native_plan_sidecars(
+        &native_dp, None,
+    )?);
     crate::runtime::coordinator::ExecutionCoordinator::new_with_optional_native_plan_sidecars(
         build_result,
         native_sidecars,
@@ -3353,11 +3351,10 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_native_pla
     if let Some(mutate_native_plan) = native_plan_mutation {
         mutate_native_plan(&mut native_distributed_plan)?;
     }
-    let native_sidecars =
-        crate::runtime::coordinator::prepare_native_plan_sidecars_for_current_wire_format(
-            &native_distributed_plan,
-            mv_refresh_ctx,
-        )?;
+    let native_sidecars = Some(crate::runtime::coordinator::prepare_native_plan_sidecars(
+        &native_distributed_plan,
+        mv_refresh_ctx,
+    )?);
     let commit_plan =
         crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan::from_topology(
             &topology,
@@ -3768,11 +3765,10 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     )?;
     let native_dp =
         refresh_native_sidecar_plan_with_lowered_edges(&dp, &build_result.edges, mv_refresh_ctx)?;
-    let native_sidecars =
-        crate::runtime::coordinator::prepare_native_plan_sidecars_for_current_wire_format(
-            &native_dp,
-            mv_refresh_ctx,
-        )?;
+    let native_sidecars = Some(crate::runtime::coordinator::prepare_native_plan_sidecars(
+        &native_dp,
+        mv_refresh_ctx,
+    )?);
     let (dispatcher, scheduler) = coordinated_execution_services()?;
     crate::runtime::coordinator::ExecutionCoordinator::new_with_optional_native_plan_sidecars(
         build_result,
@@ -3838,11 +3834,10 @@ pub(crate) fn execute_logical_plan_with_options(
     )?;
     let native_dp =
         refresh_native_sidecar_plan_with_lowered_edges(&dp, &build_result.edges, mv_refresh_ctx)?;
-    let native_sidecars =
-        crate::runtime::coordinator::prepare_native_plan_sidecars_for_current_wire_format(
-            &native_dp,
-            mv_refresh_ctx,
-        )?;
+    let native_sidecars = Some(crate::runtime::coordinator::prepare_native_plan_sidecars(
+        &native_dp,
+        mv_refresh_ctx,
+    )?);
     let (dispatcher, scheduler) = coordinated_execution_services()?;
     crate::runtime::coordinator::ExecutionCoordinator::new_with_optional_native_plan_sidecars(
         build_result,
