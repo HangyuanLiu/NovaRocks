@@ -27,17 +27,17 @@ use crate::sql::planner::distributed_fragment::{
     DataPartition, DataSink, DistributedPlan, PlanFragment,
 };
 use crate::sql::planner::distributed_node::{
-    DistributedNode, DistributedPayload, ExchangeReceiver,
+    DistributedNode, DistributedNodeKind, ExchangeReceiver, distributed_kind_from_physical,
 };
 use crate::sql::planner::optimizer_bridge::property::{
     ordering_spec_from_sort_items, window_ordering_spec,
 };
 use crate::sql::planner::plan::{
-    ExchangeFlavor, PhysicalPlanKind, PhysicalPlanNode, PhysicalSetOpNode, PlanProjectNode,
-    PlanScanNode, PlanSetOpKind, RedistributeMode, RedistributeNode,
+    PhysicalPlanKind, PhysicalPlanNode, PhysicalSetOpNode, PlanProjectNode, PlanScanNode,
+    PlanSetOpKind, RedistributeMode, RedistributeNode,
 };
 use crate::sql::planner::{
-    OrderingSpec, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent, TopNPhase,
+    ExchangeFlavor, OrderingSpec, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent, TopNPhase,
     WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
 };
 
@@ -152,27 +152,25 @@ impl DistributedPlanBuilder {
                 expect_child_count(node, 0)?;
                 let tuple_id = self.alloc_tuple();
                 let node_id = self.alloc_node();
-                Ok(self.make_node(node, fragment_id, node_id, vec![tuple_id], Vec::new()))
+                self.make_node(node, fragment_id, node_id, vec![tuple_id], Vec::new())
             }
             PhysicalPlanKind::Scan(_) => {
                 expect_child_count(node, 0)?;
                 let node_id = self.alloc_node();
                 let tuple_id = self.alloc_tuple();
-                Ok(self.make_node(node, fragment_id, node_id, vec![tuple_id], Vec::new()))
+                self.make_node(node, fragment_id, node_id, vec![tuple_id], Vec::new())
             }
             PhysicalPlanKind::Project(_) => {
                 expect_child_count(node, 1)?;
                 let child = self.visit(&node.children[0])?;
                 let node_id = self.alloc_node();
                 let tuple_id = self.alloc_tuple();
-                Ok(self.make_node(node, fragment_id, node_id, vec![tuple_id], vec![child]))
+                self.make_node(node, fragment_id, node_id, vec![tuple_id], vec![child])
             }
             PhysicalPlanKind::Filter(filter) => {
                 expect_child_count(node, 1)?;
                 let mut child = self.visit(&node.children[0])?;
-                if let DistributedPayload::Physical(PhysicalPlanKind::Scan(scan)) =
-                    &mut child.payload
-                {
+                if let DistributedNodeKind::Scan(scan) = &mut child.payload {
                     let folded_predicates = split_and_conjuncts_typed(&filter.predicate)
                         .into_iter()
                         .cloned()
@@ -189,7 +187,7 @@ impl DistributedPlanBuilder {
                 } else {
                     let node_id = self.alloc_node();
                     let tuple_ids = child.tuple_ids.clone();
-                    Ok(self.make_node(node, fragment_id, node_id, tuple_ids, vec![child]))
+                    self.make_node(node, fragment_id, node_id, tuple_ids, vec![child])
                 }
             }
             PhysicalPlanKind::Sort(_) => {
@@ -197,14 +195,14 @@ impl DistributedPlanBuilder {
                 let child = self.visit(&node.children[0])?;
                 let node_id = self.alloc_node();
                 let tuple_ids = child.tuple_ids.clone();
-                Ok(self.make_node(node, fragment_id, node_id, tuple_ids, vec![child]))
+                self.make_node(node, fragment_id, node_id, tuple_ids, vec![child])
             }
             PhysicalPlanKind::HashAggregate(_) => {
                 expect_child_count(node, 1)?;
                 let child = self.visit(&node.children[0])?;
                 let tuple_id = self.alloc_tuple();
                 let node_id = self.alloc_node();
-                Ok(self.make_node(node, fragment_id, node_id, vec![tuple_id], vec![child]))
+                self.make_node(node, fragment_id, node_id, vec![tuple_id], vec![child])
             }
             PhysicalPlanKind::HashJoin(_) => {
                 expect_child_count(node, 2)?;
@@ -213,7 +211,7 @@ impl DistributedPlanBuilder {
                 let node_id = self.alloc_node();
                 let mut tuple_ids = left.tuple_ids.clone();
                 tuple_ids.extend(right.tuple_ids.iter().copied());
-                Ok(self.make_node(node, fragment_id, node_id, tuple_ids, vec![left, right]))
+                self.make_node(node, fragment_id, node_id, tuple_ids, vec![left, right])
             }
             PhysicalPlanKind::NestLoopJoin(_) => {
                 expect_child_count(node, 2)?;
@@ -222,14 +220,14 @@ impl DistributedPlanBuilder {
                 let node_id = self.alloc_node();
                 let mut tuple_ids = left.tuple_ids.clone();
                 tuple_ids.extend(right.tuple_ids.iter().copied());
-                Ok(self.make_node(node, fragment_id, node_id, tuple_ids, vec![left, right]))
+                self.make_node(node, fragment_id, node_id, tuple_ids, vec![left, right])
             }
             PhysicalPlanKind::AssertOneRow(_) => {
                 expect_child_count(node, 1)?;
                 let child = self.visit(&node.children[0])?;
                 let node_id = self.alloc_node();
                 let tuple_ids = child.tuple_ids.clone();
-                Ok(self.make_node(node, fragment_id, node_id, tuple_ids, vec![child]))
+                self.make_node(node, fragment_id, node_id, tuple_ids, vec![child])
             }
             PhysicalPlanKind::Repeat(repeat) => {
                 expect_child_count(node, 1)?;
@@ -242,14 +240,14 @@ impl DistributedPlanBuilder {
                 }
                 let mut payload = repeat.clone();
                 payload.virtual_tuple_id = Some(virtual_tuple_id);
-                Ok(self.make_node_with_payload(
+                self.make_node_with_payload(
                     node,
                     fragment_id,
                     node_id,
                     tuple_ids,
                     vec![child],
                     PhysicalPlanKind::Repeat(payload),
-                ))
+                )
             }
             PhysicalPlanKind::Window(window) => {
                 expect_child_count(node, 1)?;
@@ -296,21 +294,21 @@ impl DistributedPlanBuilder {
                 let node_id = first_node_id.ok_or_else(|| {
                     "build_distributed_plan: PhysicalWindow produced no thrift node".to_string()
                 })?;
-                Ok(self.make_node_with_payload(
+                self.make_node_with_payload(
                     node,
                     fragment_id,
                     node_id,
                     tuple_ids,
                     vec![child],
                     PhysicalPlanKind::Window(window.clone()),
-                ))
+                )
             }
             PhysicalPlanKind::ChangeEventExpand(_) => {
                 expect_child_count(node, 1)?;
                 let child = self.visit(&node.children[0])?;
                 let tuple_id = self.alloc_tuple();
                 let node_id = self.alloc_node();
-                Ok(self.make_node(node, fragment_id, node_id, vec![tuple_id], vec![child]))
+                self.make_node(node, fragment_id, node_id, vec![tuple_id], vec![child])
             }
             PhysicalPlanKind::GenerateSeries(_) => {
                 expect_child_count(node, 0)?;
@@ -318,7 +316,7 @@ impl DistributedPlanBuilder {
                 let _ = self.alloc_node();
                 let tuple_id = self.alloc_tuple();
                 let node_id = self.alloc_node();
-                Ok(self.make_node(node, fragment_id, node_id, vec![tuple_id], Vec::new()))
+                self.make_node(node, fragment_id, node_id, vec![tuple_id], Vec::new())
             }
             PhysicalPlanKind::TableFunction(_) => {
                 expect_child_count(node, 1)?;
@@ -327,7 +325,7 @@ impl DistributedPlanBuilder {
                 let _ = self.alloc_node();
                 let tuple_id = self.alloc_tuple();
                 let node_id = self.alloc_node();
-                Ok(self.make_node(node, fragment_id, node_id, vec![tuple_id], vec![child]))
+                self.make_node(node, fragment_id, node_id, vec![tuple_id], vec![child])
             }
             PhysicalPlanKind::Redistribute(redistribute) => {
                 self.visit_redistribute(node, redistribute)
@@ -357,7 +355,7 @@ impl DistributedPlanBuilder {
         node_id: i32,
         tuple_ids: Vec<i32>,
         children: Vec<DistributedNode>,
-    ) -> DistributedNode {
+    ) -> Result<DistributedNode, String> {
         self.make_node_with_payload(
             node,
             fragment_id,
@@ -376,9 +374,9 @@ impl DistributedPlanBuilder {
         tuple_ids: Vec<i32>,
         children: Vec<DistributedNode>,
         payload: PhysicalPlanKind,
-    ) -> DistributedNode {
+    ) -> Result<DistributedNode, String> {
         self.record_runtime_filter_intents(node, node_id, fragment_id, &payload);
-        DistributedNode {
+        Ok(DistributedNode {
             node_id,
             fragment_id,
             tuple_ids,
@@ -388,8 +386,8 @@ impl DistributedPlanBuilder {
             probe_runtime_filters: Vec::new(),
             children,
             stats: node.stats.clone(),
-            payload: DistributedPayload::Physical(payload),
-        }
+            payload: distributed_kind_from_physical(payload)?,
+        })
     }
 
     fn record_runtime_filter_intents(
@@ -444,7 +442,7 @@ impl DistributedPlanBuilder {
         let output_columns = set_op_payload_output_columns(node, set_op);
         let tuple_id = self.alloc_tuple();
         let node_id = self.alloc_node();
-        Ok(self.make_node_with_payload(
+        self.make_node_with_payload(
             node,
             fragment_id,
             node_id,
@@ -455,7 +453,7 @@ impl DistributedPlanBuilder {
                 output_columns,
                 child_output_columns: set_op.child_output_columns.clone(),
             }),
-        ))
+        )
     }
 
     fn visit_redistribute(
@@ -508,10 +506,10 @@ impl DistributedPlanBuilder {
         child.limit = limit.limit.unwrap_or(-1);
         child.stats = limit_stats_with_child_cost(&node.stats, &child.stats);
         match &mut child.payload {
-            DistributedPayload::Physical(PhysicalPlanKind::Sort(sort)) => {
+            DistributedNodeKind::Sort(sort) => {
                 sort.offset = limit.offset;
             }
-            DistributedPayload::Physical(PhysicalPlanKind::TopN(topn)) => {
+            DistributedNodeKind::TopN(topn) => {
                 topn.limit = limit.limit;
                 topn.offset = limit.offset;
             }
@@ -553,7 +551,7 @@ impl DistributedPlanBuilder {
                 let tuple_ids = child.tuple_ids.clone();
                 let fragment_id = self.current_fragment_id()?;
                 let mut topn_node =
-                    self.make_node(node, fragment_id, node_id, tuple_ids, vec![child]);
+                    self.make_node(node, fragment_id, node_id, tuple_ids, vec![child])?;
                 topn_node.limit = topn.limit.unwrap_or(-1);
                 Ok(topn_node)
             }
@@ -629,7 +627,7 @@ impl DistributedPlanBuilder {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: exchange_stats,
-            payload: DistributedPayload::Exchange(ExchangeReceiver {
+            payload: DistributedNodeKind::Exchange(ExchangeReceiver {
                 partition: output_partition,
                 source_fragment_id: child_fragment_id,
                 output_columns: exchange_output_columns,
@@ -734,7 +732,7 @@ impl DistributedPlanBuilder {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: synthetic_exchange_stats(&node.stats),
-            payload: DistributedPayload::Exchange(ExchangeReceiver {
+            payload: DistributedNodeKind::Exchange(ExchangeReceiver {
                 partition: DataPartition::unpartitioned(),
                 source_fragment_id: cte_fragment_id,
                 output_columns: exchange_output_columns,
@@ -756,10 +754,10 @@ impl DistributedPlanBuilder {
             probe_runtime_filters: Vec::new(),
             children: vec![exchange],
             stats: node.stats.clone(),
-            payload: DistributedPayload::Physical(PhysicalPlanKind::Project(PlanProjectNode {
+            payload: DistributedNodeKind::Project(PlanProjectNode {
                 items: project_items,
                 output_qualifier: Some(consume.alias.clone()),
-            })),
+            }),
         })
     }
 }
@@ -820,22 +818,18 @@ fn cte_consume_remap_project_items(
 
 fn distributed_node_ordering(node: &DistributedNode) -> OrderingSpec {
     match &node.payload {
-        DistributedPayload::Physical(PhysicalPlanKind::Sort(sort)) => {
-            ordering_spec_from_sort_items(&sort.items)
-        }
-        DistributedPayload::Physical(PhysicalPlanKind::TopN(topn)) => {
-            ordering_spec_from_sort_items(&topn.items)
-        }
-        DistributedPayload::Exchange(exchange) => match &exchange.flavor {
+        DistributedNodeKind::Sort(sort) => ordering_spec_from_sort_items(&sort.items),
+        DistributedNodeKind::TopN(topn) => ordering_spec_from_sort_items(&topn.items),
+        DistributedNodeKind::Exchange(exchange) => match &exchange.flavor {
             ExchangeFlavor::TopNSplit { items, .. } => ordering_spec_from_sort_items(items),
             _ => OrderingSpec::Any,
         },
-        DistributedPayload::Physical(PhysicalPlanKind::AssertOneRow(_)) => node
+        DistributedNodeKind::AssertOneRow(_) => node
             .children
             .first()
             .map(distributed_node_ordering)
             .unwrap_or(OrderingSpec::Any),
-        DistributedPayload::Physical(PhysicalPlanKind::Window(window)) => {
+        DistributedNodeKind::Window(window) => {
             let mut current_ordering = node
                 .children
                 .first()
@@ -1476,7 +1470,7 @@ fn collect_cte_exchange_nodes_inner(
     node: &DistributedNode,
     nodes: &mut Vec<(CteId, i32, Vec<ColumnId>)>,
 ) {
-    if let DistributedPayload::Exchange(exchange) = &node.payload
+    if let DistributedNodeKind::Exchange(exchange) = &node.payload
         && let ExchangeFlavor::CteMulticast {
             cte_id,
             receive_producer_column_ids,
@@ -1631,9 +1625,9 @@ mod tests {
     use crate::sql::codegen::{FragmentEdgeKind, FragmentStreamKind};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed_fragment::{DataSink, PartitionKind};
-    use crate::sql::planner::distributed_node::DistributedPayload;
+    use crate::sql::planner::distributed_node::DistributedNodeKind;
     use crate::sql::planner::plan::{
-        AggregateCall, DistributedChangeEventExpandNode, ExchangeFlavor, LogicalCTEAnchorNode,
+        AggregateCall, DistributedChangeEventExpandNode, LogicalCTEAnchorNode,
         LogicalCTEConsumeNode, LogicalCTEProduceNode, PhysicalHashAggregateNode,
         PhysicalHashJoinEqCondition, PhysicalHashJoinNode, PhysicalNestLoopJoinNode,
         PhysicalPlanKind, PhysicalPlanNode, PhysicalSetOpNode, PhysicalTopNNode,
@@ -1643,9 +1637,9 @@ mod tests {
         WindowExpr,
     };
     use crate::sql::planner::{
-        AggMode, AggregateOutputLayout, HashSource, JoinDistribution, JoinExecutionMode,
-        PhysicalPlanStats, PlannerConfidence, PlannerCostEstimate, RuntimeFilterBuildIntent,
-        RuntimeFilterProbeIntent, TopNPhase,
+        AggMode, AggregateOutputLayout, ExchangeFlavor, HashSource, JoinDistribution,
+        JoinExecutionMode, PhysicalPlanStats, PlannerConfidence, PlannerCostEstimate,
+        RuntimeFilterBuildIntent, RuntimeFilterProbeIntent, TopNPhase,
     };
 
     #[test]
@@ -1691,7 +1685,7 @@ mod tests {
 
         assert!(matches!(
             &fragment.root.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::Values(_))
+            DistributedNodeKind::Values(_)
         ));
         assert_eq!(fragment.root.node_id, 1);
         assert_eq!(fragment.root.tuple_ids, vec![1]);
@@ -1738,19 +1732,13 @@ mod tests {
 
         assert_eq!(dp.fragments.len(), 1);
         let root = &dp.fragments[0].root;
-        assert!(matches!(
-            &root.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::Project(_))
-        ));
+        assert!(matches!(&root.payload, DistributedNodeKind::Project(_)));
         assert_eq!(root.node_id, 2);
         assert_eq!(root.tuple_ids, vec![2]);
         assert_eq!(root.children.len(), 1);
 
         let child = &root.children[0];
-        assert!(matches!(
-            &child.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::Scan(_))
-        ));
+        assert!(matches!(&child.payload, DistributedNodeKind::Scan(_)));
         assert_eq!(child.node_id, 1);
         assert_eq!(child.tuple_ids, vec![1]);
     }
@@ -1805,16 +1793,13 @@ mod tests {
         let dp = build_distributed_plan(&project).expect("build_distributed_plan");
 
         let root = &dp.fragments[0].root;
-        assert!(matches!(
-            &root.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::Project(_))
-        ));
+        assert!(matches!(&root.payload, DistributedNodeKind::Project(_)));
         assert_eq!(root.node_id, 2);
         assert_eq!(root.tuple_ids, vec![2]);
         assert_eq!(root.children.len(), 1);
         let child = &root.children[0];
         let scan = match &child.payload {
-            DistributedPayload::Physical(PhysicalPlanKind::Scan(scan)) => scan,
+            DistributedNodeKind::Scan(scan) => scan,
             other => panic!("expected folded Scan child, got {other:?}"),
         };
         assert_eq!(child.node_id, 1);
@@ -1861,7 +1846,7 @@ mod tests {
         let dp = build_distributed_plan(&filter).expect("build_distributed_plan");
 
         let scan = match &dp.fragments[0].root.payload {
-            DistributedPayload::Physical(PhysicalPlanKind::Scan(scan)) => scan,
+            DistributedNodeKind::Scan(scan) => scan,
             other => panic!("expected folded Scan root, got {other:?}"),
         };
         assert_eq!(
@@ -1918,7 +1903,7 @@ mod tests {
 
         let root = &dp.fragments[0].root;
         let root_filter = match &root.payload {
-            DistributedPayload::Physical(PhysicalPlanKind::Filter(filter)) => filter,
+            DistributedNodeKind::Filter(filter) => filter,
             other => panic!("expected Filter root, got {other:?}"),
         };
         assert_cmp_expr(&root_filter.predicate, 2, "k_alias", BinOp::Gt, 10);
@@ -1928,10 +1913,7 @@ mod tests {
         assert_eq!(root.children.len(), 1);
 
         let child = &root.children[0];
-        assert!(matches!(
-            &child.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::Project(_))
-        ));
+        assert!(matches!(&child.payload, DistributedNodeKind::Project(_)));
         assert_eq!(child.node_id, 2);
         assert_eq!(child.tuple_ids, vec![2]);
     }
@@ -1957,17 +1939,14 @@ mod tests {
         let dp = build_distributed_plan(&sort).expect("build_distributed_plan");
 
         let root = &dp.fragments[0].root;
-        assert!(matches!(
-            &root.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::Sort(_))
-        ));
+        assert!(matches!(&root.payload, DistributedNodeKind::Sort(_)));
         assert_eq!(root.node_id, 2);
         assert_eq!(root.tuple_ids, vec![1]);
         assert_eq!(root.children.len(), 1);
         assert_eq!(root.children[0].node_id, 1);
         assert!(matches!(
             &root.children[0].payload,
-            DistributedPayload::Physical(PhysicalPlanKind::Scan(_))
+            DistributedNodeKind::Scan(_)
         ));
     }
 
@@ -1994,7 +1973,7 @@ mod tests {
         let root = &dp.fragments[0].root;
         assert!(matches!(
             &root.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::HashAggregate(_))
+            DistributedNodeKind::HashAggregate(_)
         ));
         assert_eq!(root.node_id, 2);
         assert_eq!(root.tuple_ids, vec![2]);
@@ -2029,10 +2008,7 @@ mod tests {
         let dp = build_distributed_plan(&join).expect("build_distributed_plan");
 
         let root = &dp.fragments[0].root;
-        assert!(matches!(
-            &root.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::HashJoin(_))
-        ));
+        assert!(matches!(&root.payload, DistributedNodeKind::HashJoin(_)));
         assert_eq!(root.node_id, 3);
         assert_eq!(root.tuple_ids, vec![1, 2]);
         assert_eq!(root.children.len(), 2);
@@ -2156,7 +2132,7 @@ mod tests {
         assert_eq!(join_node.fragment_id, dp.root_fragment_id);
         assert!(matches!(
             &join_node.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::HashJoin(_))
+            DistributedNodeKind::HashJoin(_)
         ));
         assert_eq!(join_node.build_runtime_filters.len(), 1);
         let build = &join_node.build_runtime_filters[0];
@@ -2176,10 +2152,7 @@ mod tests {
             join_node.fragment_id
         );
         let probe_scan = &probe_project.children[0];
-        assert!(matches!(
-            &probe_scan.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::Scan(_))
-        ));
+        assert!(matches!(&probe_scan.payload, DistributedNodeKind::Scan(_)));
         assert_eq!(probe_scan.probe_runtime_filters.len(), 1);
         let probe = &probe_scan.probe_runtime_filters[0];
         assert_eq!(probe.filter_id, filter_id);
@@ -2248,10 +2221,7 @@ mod tests {
             vec![join_node.fragment_id]
         );
         let scan = &join_node.children[0];
-        assert!(matches!(
-            &scan.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::Scan(_))
-        ));
+        assert!(matches!(&scan.payload, DistributedNodeKind::Scan(_)));
         assert_eq!(scan.probe_runtime_filters.len(), 1);
         assert_eq!(scan.probe_runtime_filters[0].filter_id, filter_id);
         assert_eq!(
@@ -2287,7 +2257,7 @@ mod tests {
         let root = &dp.fragments[0].root;
         assert!(matches!(
             &root.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::NestLoopJoin(_))
+            DistributedNodeKind::NestLoopJoin(_)
         ));
         assert_eq!(root.node_id, 3);
         assert_eq!(root.tuple_ids, vec![1, 2]);
@@ -2313,7 +2283,7 @@ mod tests {
         let root = &dp.fragments[0].root;
         assert!(matches!(
             &root.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::AssertOneRow(_))
+            DistributedNodeKind::AssertOneRow(_)
         ));
         assert_eq!(root.node_id, 2);
         assert_eq!(root.tuple_ids, vec![1]);
@@ -2347,7 +2317,7 @@ mod tests {
         let root = &dp.fragments[0].root;
         assert!(matches!(
             &root.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::ChangeEventExpand(_))
+            DistributedNodeKind::ChangeEventExpand(_)
         ));
         assert_eq!(root.node_id, 2);
         assert_eq!(root.tuple_ids, vec![2]);
@@ -2369,7 +2339,7 @@ mod tests {
 
         let root = &dp.fragments[0].root;
         let repeat = match &root.payload {
-            DistributedPayload::Physical(PhysicalPlanKind::Repeat(repeat)) => repeat,
+            DistributedNodeKind::Repeat(repeat) => repeat,
             other => panic!("expected Repeat root, got {other:?}"),
         };
         assert_eq!(root.node_id, 2);
@@ -2389,7 +2359,7 @@ mod tests {
 
         let root = &dp.fragments[0].root;
         let repeat = match &root.payload {
-            DistributedPayload::Physical(PhysicalPlanKind::Repeat(repeat)) => repeat,
+            DistributedNodeKind::Repeat(repeat) => repeat,
             other => panic!("expected Repeat root, got {other:?}"),
         };
         assert_eq!(root.node_id, 2);
@@ -2420,7 +2390,7 @@ mod tests {
         let root = &dp.fragments[0].root;
         assert!(matches!(
             &root.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::GenerateSeries(_))
+            DistributedNodeKind::GenerateSeries(_)
         ));
         assert_eq!(root.node_id, 2);
         assert_eq!(root.tuple_ids, vec![2]);
@@ -2450,7 +2420,7 @@ mod tests {
         let root = &dp.fragments[0].root;
         assert!(matches!(
             &root.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::TableFunction(_))
+            DistributedNodeKind::TableFunction(_)
         ));
         assert_eq!(root.node_id, 3);
         assert_eq!(root.tuple_ids, vec![3]);
@@ -2478,10 +2448,7 @@ mod tests {
         let dp = build_distributed_plan(&window).expect("build_distributed_plan");
 
         let root = &dp.fragments[0].root;
-        assert!(matches!(
-            &root.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::Window(_))
-        ));
+        assert!(matches!(&root.payload, DistributedNodeKind::Window(_)));
         assert_eq!(root.node_id, 2);
         assert_eq!(root.tuple_ids, vec![1, 3]);
         assert_eq!(root.children.len(), 1);
@@ -2543,18 +2510,12 @@ mod tests {
         let dp = build_distributed_plan(&project).expect("build_distributed_plan");
 
         let root = &dp.fragments[0].root;
-        assert!(matches!(
-            &root.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::Project(_))
-        ));
+        assert!(matches!(&root.payload, DistributedNodeKind::Project(_)));
         assert_eq!(root.node_id, 6);
         assert_eq!(root.tuple_ids, vec![6]);
         assert_eq!(root.children.len(), 1);
         let window = &root.children[0];
-        assert!(matches!(
-            &window.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::Window(_))
-        ));
+        assert!(matches!(&window.payload, DistributedNodeKind::Window(_)));
         assert_eq!(window.node_id, 2);
         assert_eq!(window.tuple_ids, vec![1, 3, 5]);
         assert_eq!(window.children.len(), 1);
@@ -2626,16 +2587,13 @@ mod tests {
         assert_eq!(dp.edges.len(), 1);
 
         let root = &dp.fragments[1].root;
-        assert!(matches!(
-            &root.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::Project(_))
-        ));
+        assert!(matches!(&root.payload, DistributedNodeKind::Project(_)));
         assert_eq!(root.fragment_id, 0);
         assert_eq!(root.children.len(), 1);
 
         let exchange = &root.children[0];
         let exchange_receiver = match &exchange.payload {
-            DistributedPayload::Exchange(exchange_receiver) => exchange_receiver,
+            DistributedNodeKind::Exchange(exchange_receiver) => exchange_receiver,
             other => panic!("expected Exchange child, got {other:?}"),
         };
         assert_eq!(exchange.fragment_id, 0);
@@ -2648,7 +2606,7 @@ mod tests {
         assert_column_ref(&exchange_receiver.partition.exprs[0], 1, "qualified_k");
         assert!(matches!(
             exchange_receiver.flavor,
-            crate::sql::planner::plan::ExchangeFlavor::Distribution
+            crate::sql::planner::ExchangeFlavor::Distribution
         ));
         assert_eq!(exchange_receiver.output_columns.len(), 1);
         assert_eq!(
@@ -2685,10 +2643,8 @@ mod tests {
         assert_eq!(edge.output_partition.exprs.len(), 1);
         assert!(matches!(
             &child_fragment.root.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::Scan(_))
+            DistributedNodeKind::Scan(_)
         ));
-        assert_no_physical_redistribute(&dp.fragments[1].root);
-        assert_no_physical_redistribute(&child_fragment.root);
     }
 
     #[test]
@@ -2721,7 +2677,7 @@ mod tests {
 
         let root = &dp.fragments[1].root;
         let receiver = match &root.payload {
-            DistributedPayload::Exchange(receiver) => receiver,
+            DistributedNodeKind::Exchange(receiver) => receiver,
             other => panic!("expected Exchange root, got {other:?}"),
         };
         assert_eq!(
@@ -2786,7 +2742,7 @@ mod tests {
 
         let root = &dp.fragments[1].root;
         let receiver = match &root.payload {
-            DistributedPayload::Exchange(receiver) => receiver,
+            DistributedNodeKind::Exchange(receiver) => receiver,
             other => panic!("expected Exchange root, got {other:?}"),
         };
         assert_eq!(
@@ -2907,7 +2863,7 @@ mod tests {
 
         assert_eq!(dp.edges[0].output_slot_ids, vec![1, 4]);
         let receiver = match &dp.fragments[1].root.payload {
-            DistributedPayload::Exchange(receiver) => receiver,
+            DistributedNodeKind::Exchange(receiver) => receiver,
             other => panic!("expected Exchange root, got {other:?}"),
         };
         assert_eq!(
@@ -3002,7 +2958,7 @@ mod tests {
         assert_eq!(dp.edges[0].output_slot_ids, vec![9, 10, 12]);
         assert_eq!(dp.edges[1].output_slot_ids, vec![1, 10]);
         let receiver = match &dp.fragments[2].root.payload {
-            DistributedPayload::Exchange(receiver) => receiver,
+            DistributedNodeKind::Exchange(receiver) => receiver,
             other => panic!("expected Exchange root, got {other:?}"),
         };
         assert_eq!(
@@ -3070,7 +3026,7 @@ mod tests {
 
         assert_eq!(dp.edges[0].output_slot_ids, vec![1, 3]);
         let receiver = match &dp.fragments[1].root.payload {
-            DistributedPayload::Exchange(receiver) => receiver,
+            DistributedNodeKind::Exchange(receiver) => receiver,
             other => panic!("expected Exchange root, got {other:?}"),
         };
         assert_eq!(
@@ -3140,7 +3096,7 @@ mod tests {
 
         assert_eq!(dp.edges[0].output_slot_ids, vec![20]);
         let receiver = match &dp.fragments[1].root.payload {
-            DistributedPayload::Exchange(receiver) => receiver,
+            DistributedNodeKind::Exchange(receiver) => receiver,
             other => panic!("expected Exchange root, got {other:?}"),
         };
         assert_eq!(receiver.output_columns.len(), 1);
@@ -3222,7 +3178,7 @@ mod tests {
         let root = &dp.fragments[1].root;
         let exchange = &root.children[0];
         let exchange_receiver = match &exchange.payload {
-            DistributedPayload::Exchange(exchange_receiver) => exchange_receiver,
+            DistributedNodeKind::Exchange(exchange_receiver) => exchange_receiver,
             other => panic!("expected Exchange child, got {other:?}"),
         };
         assert!(matches!(
@@ -3236,8 +3192,6 @@ mod tests {
             dp.edges[0].output_partition.kind,
             PartitionKind::Unpartitioned
         ));
-        assert_no_physical_redistribute(root);
-        assert_no_physical_redistribute(&dp.fragments[0].root);
     }
 
     #[test]
@@ -3260,11 +3214,7 @@ mod tests {
         assert_eq!(dp.fragments.len(), 1);
         assert!(dp.edges.is_empty());
         let root = &dp.fragments[0].root;
-        assert!(matches!(
-            &root.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::Scan(_))
-        ));
-        assert_no_physical_redistribute(root);
+        assert!(matches!(&root.payload, DistributedNodeKind::Scan(_)));
     }
 
     #[test]
@@ -3327,7 +3277,7 @@ mod tests {
         assert!(produce_fragment.cte_exchange_nodes.is_empty());
         assert!(matches!(
             &produce_fragment.root.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::Scan(_))
+            DistributedNodeKind::Scan(_)
         ));
 
         let root_fragment = dp
@@ -3340,7 +3290,7 @@ mod tests {
 
         let project = &root_fragment.root;
         let project_payload = match &project.payload {
-            DistributedPayload::Physical(PhysicalPlanKind::Project(project)) => project,
+            DistributedNodeKind::Project(project) => project,
             other => panic!("expected CTE consume remap Project root, got {other:?}"),
         };
         assert_eq!(
@@ -3361,7 +3311,7 @@ mod tests {
 
         let exchange = project.children.first().expect("project exchange child");
         let receiver = match &exchange.payload {
-            DistributedPayload::Exchange(receiver) => receiver,
+            DistributedNodeKind::Exchange(receiver) => receiver,
             other => panic!("expected CTE consume Exchange child, got {other:?}"),
         };
         assert_eq!(exchange.fragment_id, dp.root_fragment_id);
@@ -3489,9 +3439,7 @@ mod tests {
             .expect("root fragment");
 
         let project = &root_fragment.root;
-        let DistributedPayload::Physical(PhysicalPlanKind::Project(project_payload)) =
-            &project.payload
-        else {
+        let DistributedNodeKind::Project(project_payload) = &project.payload else {
             panic!("expected CTE consume remap Project root");
         };
         assert_eq!(
@@ -3523,7 +3471,7 @@ mod tests {
 
         let exchange = project.children.first().expect("project exchange child");
         let receiver = match &exchange.payload {
-            DistributedPayload::Exchange(receiver) => receiver,
+            DistributedNodeKind::Exchange(receiver) => receiver,
             other => panic!("expected CTE consume Exchange child, got {other:?}"),
         };
         assert_eq!(receiver.source_fragment_id, produce_fragment.fragment_id);
@@ -3771,7 +3719,7 @@ mod tests {
             .expect("root fragment");
         let exchange = &root_fragment.root;
         let receiver = match &exchange.payload {
-            DistributedPayload::Exchange(receiver) => receiver,
+            DistributedNodeKind::Exchange(receiver) => receiver,
             other => panic!("expected LimitOffset Exchange root, got {other:?}"),
         };
         assert_eq!(exchange.limit, 5);
@@ -3823,7 +3771,7 @@ mod tests {
         ));
         assert!(matches!(
             &child_fragment.root.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::Scan(_))
+            DistributedNodeKind::Scan(_)
         ));
         assert_eq!(exchange.tuple_ids, child_fragment.root.tuple_ids);
     }
@@ -3858,7 +3806,7 @@ mod tests {
             .expect("root fragment");
         let exchange = &root_fragment.root;
         let receiver = match &exchange.payload {
-            DistributedPayload::Exchange(receiver) => receiver,
+            DistributedNodeKind::Exchange(receiver) => receiver,
             other => panic!("expected TopNSplit Exchange root, got {other:?}"),
         };
         assert_eq!(exchange.limit, 10);
@@ -3951,7 +3899,7 @@ mod tests {
         assert!(dp.edges.is_empty());
         let root = &dp.fragments[0].root;
         let sort = match &root.payload {
-            DistributedPayload::Physical(PhysicalPlanKind::Sort(sort)) => sort,
+            DistributedNodeKind::Sort(sort) => sort,
             other => panic!("expected Sort root, got {other:?}"),
         };
         assert_eq!(root.limit, 7);
@@ -3997,7 +3945,7 @@ mod tests {
         assert!(dp.edges.is_empty());
         let root = &dp.fragments[0].root;
         let topn = match &root.payload {
-            DistributedPayload::Physical(PhysicalPlanKind::TopN(topn)) => topn,
+            DistributedNodeKind::TopN(topn) => topn,
             other => panic!("expected TopN root, got {other:?}"),
         };
         assert_eq!(root.limit, 7);
@@ -4033,10 +3981,7 @@ mod tests {
         assert_eq!(root.node_id, 2);
         assert_eq!(root.tuple_ids, vec![1]);
         assert_eq!(root.stats.output_row_count, 3.0);
-        assert!(matches!(
-            &root.payload,
-            DistributedPayload::Physical(PhysicalPlanKind::TopN(_))
-        ));
+        assert!(matches!(&root.payload, DistributedNodeKind::TopN(_)));
     }
 
     #[test]
@@ -4107,7 +4052,7 @@ mod tests {
         assert!(dp.edges.is_empty());
         let root = &dp.fragments[0].root;
         let union_all = match &root.payload {
-            DistributedPayload::Physical(PhysicalPlanKind::SetOp(set_op)) => set_op,
+            DistributedNodeKind::SetOp(set_op) => set_op,
             other => panic!("expected SetOp root, got {other:?}"),
         };
         assert_eq!(union_all.kind, PlanSetOpKind::UnionAll);
@@ -4124,11 +4069,11 @@ mod tests {
         assert_eq!(root.children[1].fragment_id, dp.root_fragment_id);
         assert!(matches!(
             &root.children[0].payload,
-            DistributedPayload::Physical(PhysicalPlanKind::Values(_))
+            DistributedNodeKind::Values(_)
         ));
         assert!(matches!(
             &root.children[1].payload,
-            DistributedPayload::Physical(PhysicalPlanKind::Values(_))
+            DistributedNodeKind::Values(_)
         ));
     }
 
@@ -4155,7 +4100,7 @@ mod tests {
         assert!(dp.edges.is_empty());
         let root = &dp.fragments[0].root;
         let intersect = match &root.payload {
-            DistributedPayload::Physical(PhysicalPlanKind::SetOp(set_op)) => set_op,
+            DistributedNodeKind::SetOp(set_op) => set_op,
             other => panic!("expected SetOp root, got {other:?}"),
         };
         assert_eq!(intersect.kind, PlanSetOpKind::Intersect);
@@ -4509,21 +4454,6 @@ mod tests {
                 assert_eq!(column, expected_column);
             }
             other => panic!("expected ColumnRef, got {other:?}"),
-        }
-    }
-
-    fn assert_no_physical_redistribute(
-        node: &crate::sql::planner::distributed_node::DistributedNode,
-    ) {
-        assert!(
-            !matches!(
-                node.payload,
-                DistributedPayload::Physical(PhysicalPlanKind::Redistribute(_))
-            ),
-            "DistributedPayload::Physical(Redistribute) must not be emitted"
-        );
-        for child in &node.children {
-            assert_no_physical_redistribute(child);
         }
     }
 }

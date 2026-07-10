@@ -32,10 +32,10 @@ use crate::sql::codegen::{
     FragmentSchedulingMetadata, FragmentStreamKind, MultiFragmentBuildResult, OutputColumn,
     RuntimeFilterPlanResult,
 };
-use crate::sql::planner::plan::{ExchangeFlavor, PhysicalPlanKind, PlanScanNode};
+use crate::sql::planner::plan::PlanScanNode;
 use crate::sql::planner::{
-    DataPartition, DistributedNode, DistributedPayload, DistributedPlan, PartitionKind,
-    PlanFragment, PlannedRuntimeFilter,
+    DataPartition, DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor,
+    PartitionKind, PlanFragment, PlannedRuntimeFilter,
 };
 
 pub(crate) fn lower_distributed_plan(
@@ -161,7 +161,7 @@ fn refresh_distributed_node_scan_tables_for_native(
     node: &mut DistributedNode,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
 ) -> Result<(), String> {
-    if let DistributedPayload::Physical(PhysicalPlanKind::Scan(scan)) = &mut node.payload {
+    if let DistributedNodeKind::Scan(scan) = &mut node.payload {
         let refresh_only_source = is_refresh_only_scan_source(&scan.table.source);
         let native_projected_names = native_refresh_scan_projected_names(&scan.table.source);
         let refreshed_table = refresh_scan_table_for_codegen(mv_refresh_ctx, &scan.table)?;
@@ -459,7 +459,7 @@ fn collect_native_scan_ranges(
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
     out: &mut BTreeMap<i32, Vec<scan_range::ScanRangeParams>>,
 ) -> Result<(), String> {
-    if let DistributedPayload::Physical(PhysicalPlanKind::Scan(scan)) = &node.payload {
+    if let DistributedNodeKind::Scan(scan) = &node.payload {
         let ranges = native_scan_ranges_for_scan(node.node_id, scan, connectors, mv_refresh_ctx)?;
         out.insert(node.node_id, ranges);
     }
@@ -1008,7 +1008,7 @@ fn target_exchange_for_edge<'a>(
             edge.target_exchange_node_id, edge.target_fragment_id
         )
     })?;
-    let DistributedPayload::Exchange(exchange) = &exchange.payload else {
+    let DistributedNodeKind::Exchange(exchange) = &exchange.payload else {
         return Err(format!(
             "lower_distributed_plan edge target_exchange_node_id={} in target fragment id={} must target Exchange",
             edge.target_exchange_node_id, edge.target_fragment_id
@@ -1071,10 +1071,8 @@ fn find_exchange_node(node: &DistributedNode, node_id: i32) -> Option<&Distribut
 }
 
 fn distributed_node_has_scan(node: &DistributedNode) -> bool {
-    matches!(
-        node.payload,
-        DistributedPayload::Physical(PhysicalPlanKind::Scan(_))
-    ) || node.children.iter().any(distributed_node_has_scan)
+    matches!(node.payload, DistributedNodeKind::Scan(_))
+        || node.children.iter().any(distributed_node_has_scan)
 }
 
 fn fragment_output_kind(sink: &crate::sql::planner::DataSink) -> FragmentOutputKind {
@@ -1110,9 +1108,10 @@ mod tests {
     use crate::sql::catalog::{CatalogProvider, TableDef};
     use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::ExchangeReceiver;
-    use crate::sql::planner::plan::{ExchangeFlavor, PhysicalPlanKind, PlanValuesNode};
-    use crate::sql::planner::{PhysicalPlanStats, PlannerConfidence};
+    use crate::sql::planner::plan::PlanValuesNode;
+    use crate::sql::planner::{
+        ExchangeFlavor, ExchangeReceiver, PhysicalPlanStats, PlannerConfidence,
+    };
 
     struct EmptyCatalog;
 
@@ -1157,10 +1156,10 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: stats(),
-            payload: DistributedPayload::Physical(PhysicalPlanKind::Values(PlanValuesNode {
+            payload: DistributedNodeKind::Values(PlanValuesNode {
                 rows: Vec::new(),
                 columns,
-            })),
+            }),
         }
     }
 
@@ -1192,7 +1191,7 @@ mod tests {
                 probe_runtime_filters: Vec::new(),
                 children: Vec::new(),
                 stats: stats(),
-                payload: DistributedPayload::Exchange(ExchangeReceiver {
+                payload: DistributedNodeKind::Exchange(ExchangeReceiver {
                     partition: DataPartition::unpartitioned(),
                     source_fragment_id: producer_fragment_id,
                     output_columns: columns.clone(),
@@ -1289,7 +1288,7 @@ mod tests {
                 probe_runtime_filters: Vec::new(),
                 children: Vec::new(),
                 stats: stats(),
-                payload: DistributedPayload::Exchange(ExchangeReceiver {
+                payload: DistributedNodeKind::Exchange(ExchangeReceiver {
                     partition: DataPartition::unpartitioned(),
                     source_fragment_id: producer_fragment_id,
                     output_columns: receive_columns.clone(),

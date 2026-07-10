@@ -27,11 +27,11 @@ use crate::sql::explain::{
     ExplainLevel, PlanNodeExplainStage, format_assert_one_row_header, format_expr,
     format_project_item, format_sort_items, format_window_exprs,
 };
+use crate::sql::planner::ExchangeFlavor;
 use crate::sql::planner::plan::{
-    DistributedChangeEventExpandNode, ExchangeFlavor, PhysicalHashAggregateNode,
-    PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalSetOpNode,
-    PhysicalTopNNode, PlanAssertOneRowNode as DistributedAssertOneRowNode,
-    PlanFilterNode as DistributedFilterNode,
+    DistributedChangeEventExpandNode, PhysicalHashAggregateNode, PhysicalHashJoinNode,
+    PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalSetOpNode, PhysicalTopNNode,
+    PlanAssertOneRowNode as DistributedAssertOneRowNode, PlanFilterNode as DistributedFilterNode,
     PlanGenerateSeriesNode as DistributedGenerateSeriesNode,
     PlanProjectNode as DistributedProjectNode, PlanRepeatNode as DistributedRepeatNode,
     PlanScanNode as DistributedScanNode, PlanSetOpKind as SetOpKind,
@@ -43,7 +43,7 @@ use crate::sql::planner::stats::{
     DEFAULT_CPU_COST_WEIGHT, DEFAULT_MEMORY_COST_WEIGHT, DEFAULT_NETWORK_COST_WEIGHT, MAX_ROW_COUNT,
 };
 use crate::sql::planner::{
-    AggMode, DistributedNode, DistributedPayload, DistributedPlan, ExchangeReceiver,
+    AggMode, DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeReceiver,
     JoinDistribution, JoinExecutionMode, PartitionKind, PhysicalPlanStats, PlanFragment,
     PlannerBroadcastDecision, PlannerConfidence, PlannerCostEstimate, TopNPhase,
     WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
@@ -252,71 +252,71 @@ fn format_distributed_node(
     );
 
     match &node.payload {
-        DistributedPayload::Physical(PhysicalPlanKind::Scan(scan)) => {
+        DistributedNodeKind::Scan(scan) => {
             format_scan_node(node, scan, level, &pad, &costs_suffix, &stats_suffix, out);
         }
-        DistributedPayload::Physical(PhysicalPlanKind::Project(project)) => {
+        DistributedNodeKind::Project(project) => {
             format_project_node(node, project, &pad, &costs_suffix, &stats_suffix, out);
             push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
             format_children(node, level, indent, actuals, out);
         }
-        DistributedPayload::Physical(PhysicalPlanKind::Filter(filter)) => {
+        DistributedNodeKind::Filter(filter) => {
             format_filter_node(node, filter, &pad, &costs_suffix, &stats_suffix, out);
             push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
             format_children(node, level, indent, actuals, out);
         }
-        DistributedPayload::Physical(PhysicalPlanKind::HashJoin(join)) => {
+        DistributedNodeKind::HashJoin(join) => {
             format_hash_join_node(node, join, level, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, level, indent, actuals, out);
         }
-        DistributedPayload::Physical(PhysicalPlanKind::NestLoopJoin(join)) => {
+        DistributedNodeKind::NestLoopJoin(join) => {
             format_nest_loop_join_node(node, join, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, level, indent, actuals, out);
         }
-        DistributedPayload::Physical(PhysicalPlanKind::HashAggregate(agg)) => {
+        DistributedNodeKind::HashAggregate(agg) => {
             format_hash_aggregate_node(node, agg, &pad, &costs_suffix, &stats_suffix, out);
             push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
             format_children(node, level, indent, actuals, out);
         }
-        DistributedPayload::Physical(PhysicalPlanKind::Sort(sort)) => {
+        DistributedNodeKind::Sort(sort) => {
             format_sort_node(node, sort, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, level, indent, actuals, out);
         }
-        DistributedPayload::Physical(PhysicalPlanKind::TopN(topn)) => {
+        DistributedNodeKind::TopN(topn) => {
             format_topn_node(node, topn, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, level, indent, actuals, out);
         }
-        DistributedPayload::Exchange(exchange) => {
+        DistributedNodeKind::Exchange(exchange) => {
             format_exchange_node(node, exchange, &pad, &costs_suffix, &stats_suffix, out);
         }
-        DistributedPayload::Physical(PhysicalPlanKind::Values(values)) => {
+        DistributedNodeKind::Values(values) => {
             format_values_node(node, values, &pad, &costs_suffix, &stats_suffix, out);
             push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
         }
-        DistributedPayload::Physical(PhysicalPlanKind::AssertOneRow(assert)) => {
+        DistributedNodeKind::AssertOneRow(assert) => {
             format_assert_one_row_node(node, assert, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, level, indent, actuals, out);
         }
-        DistributedPayload::Physical(PhysicalPlanKind::Repeat(repeat)) => {
+        DistributedNodeKind::Repeat(repeat) => {
             format_repeat_node(node, repeat, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, level, indent, actuals, out);
         }
-        DistributedPayload::Physical(PhysicalPlanKind::ChangeEventExpand(expand)) => {
+        DistributedNodeKind::ChangeEventExpand(expand) => {
             format_change_event_expand_node(node, expand, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, level, indent, actuals, out);
         }
-        DistributedPayload::Physical(PhysicalPlanKind::SetOp(set_op)) => {
+        DistributedNodeKind::SetOp(set_op) => {
             format_set_op_node(node, set_op, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, level, indent, actuals, out);
         }
-        DistributedPayload::Physical(PhysicalPlanKind::Window(window)) => {
+        DistributedNodeKind::Window(window) => {
             format_window_node(node, window, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, level, indent, actuals, out);
         }
-        DistributedPayload::Physical(PhysicalPlanKind::GenerateSeries(generate)) => {
+        DistributedNodeKind::GenerateSeries(generate) => {
             format_generate_series_node(node, generate, &pad, &costs_suffix, &stats_suffix, out);
         }
-        DistributedPayload::Physical(PhysicalPlanKind::TableFunction(table_function)) => {
+        DistributedNodeKind::TableFunction(table_function) => {
             format_table_function_node(
                 node,
                 table_function,
@@ -326,19 +326,6 @@ fn format_distributed_node(
                 out,
             );
             format_children(node, level, indent, actuals, out);
-        }
-        DistributedPayload::Physical(
-            PhysicalPlanKind::Limit(_)
-            | PhysicalPlanKind::CTEAnchor(_)
-            | PhysicalPlanKind::CTEProduce(_)
-            | PhysicalPlanKind::CTEConsume(_)
-            | PhysicalPlanKind::Redistribute(_),
-        ) => {
-            out.push(format!(
-                "{pad}{}UNLOWERABLE PHYSICAL {}{costs_suffix}{stats_suffix}",
-                node_prefix(node),
-                physical_kind_name(&node.payload)
-            ));
         }
     }
 }
@@ -359,37 +346,32 @@ fn node_prefix(node: &DistributedNode) -> String {
     format!("{}:", node.node_id)
 }
 
-fn physical_payload(node: &DistributedNode) -> Option<&PhysicalPlanKind> {
+fn physical_payload(node: &DistributedNode) -> Option<PhysicalPlanKind> {
     match &node.payload {
-        DistributedPayload::Physical(kind) => Some(kind),
-        DistributedPayload::Exchange(_) => None,
+        DistributedNodeKind::Exchange(_) => None,
+        kind => Some(crate::sql::planner::distributed_kind_to_physical(kind)),
     }
 }
 
-fn physical_kind_name(payload: &DistributedPayload) -> &'static str {
+fn physical_kind_name(payload: &DistributedNodeKind) -> &'static str {
     match payload {
-        DistributedPayload::Physical(PhysicalPlanKind::Scan(_)) => "Scan",
-        DistributedPayload::Physical(PhysicalPlanKind::Filter(_)) => "Filter",
-        DistributedPayload::Physical(PhysicalPlanKind::Project(_)) => "Project",
-        DistributedPayload::Physical(PhysicalPlanKind::Sort(_)) => "Sort",
-        DistributedPayload::Physical(PhysicalPlanKind::Limit(_)) => "Limit",
-        DistributedPayload::Physical(PhysicalPlanKind::Values(_)) => "Values",
-        DistributedPayload::Physical(PhysicalPlanKind::Repeat(_)) => "Repeat",
-        DistributedPayload::Physical(PhysicalPlanKind::Window(_)) => "Window",
-        DistributedPayload::Physical(PhysicalPlanKind::GenerateSeries(_)) => "GenerateSeries",
-        DistributedPayload::Physical(PhysicalPlanKind::TableFunction(_)) => "TableFunction",
-        DistributedPayload::Physical(PhysicalPlanKind::AssertOneRow(_)) => "AssertOneRow",
-        DistributedPayload::Physical(PhysicalPlanKind::TopN(_)) => "TopN",
-        DistributedPayload::Physical(PhysicalPlanKind::HashAggregate(_)) => "HashAggregate",
-        DistributedPayload::Physical(PhysicalPlanKind::HashJoin(_)) => "HashJoin",
-        DistributedPayload::Physical(PhysicalPlanKind::NestLoopJoin(_)) => "NestLoopJoin",
-        DistributedPayload::Physical(PhysicalPlanKind::SetOp(_)) => "SetOp",
-        DistributedPayload::Physical(PhysicalPlanKind::ChangeEventExpand(_)) => "ChangeEventExpand",
-        DistributedPayload::Physical(PhysicalPlanKind::CTEAnchor(_)) => "CTEAnchor",
-        DistributedPayload::Physical(PhysicalPlanKind::CTEProduce(_)) => "CTEProduce",
-        DistributedPayload::Physical(PhysicalPlanKind::CTEConsume(_)) => "CTEConsume",
-        DistributedPayload::Physical(PhysicalPlanKind::Redistribute(_)) => "Redistribute",
-        DistributedPayload::Exchange(_) => "Exchange",
+        DistributedNodeKind::Scan(_) => "Scan",
+        DistributedNodeKind::Filter(_) => "Filter",
+        DistributedNodeKind::Project(_) => "Project",
+        DistributedNodeKind::Sort(_) => "Sort",
+        DistributedNodeKind::Values(_) => "Values",
+        DistributedNodeKind::Repeat(_) => "Repeat",
+        DistributedNodeKind::Window(_) => "Window",
+        DistributedNodeKind::GenerateSeries(_) => "GenerateSeries",
+        DistributedNodeKind::TableFunction(_) => "TableFunction",
+        DistributedNodeKind::AssertOneRow(_) => "AssertOneRow",
+        DistributedNodeKind::TopN(_) => "TopN",
+        DistributedNodeKind::HashAggregate(_) => "HashAggregate",
+        DistributedNodeKind::HashJoin(_) => "HashJoin",
+        DistributedNodeKind::NestLoopJoin(_) => "NestLoopJoin",
+        DistributedNodeKind::SetOp(_) => "SetOp",
+        DistributedNodeKind::ChangeEventExpand(_) => "ChangeEventExpand",
+        DistributedNodeKind::Exchange(_) => "Exchange",
     }
 }
 
@@ -403,7 +385,7 @@ fn format_scan_node(
     out: &mut Vec<String>,
 ) {
     let header = format_distributed_shared_plan_node_header(
-        physical_payload(node).expect("Scan is a physical explain node"),
+        &physical_payload(node).expect("Scan is a physical explain node"),
         PlanNodeExplainStage::Distributed,
     )
     .expect("Scan is a shared explain node");
@@ -557,7 +539,7 @@ fn format_project_node(
     out: &mut Vec<String>,
 ) {
     let header = format_distributed_shared_plan_node_header(
-        physical_payload(node).expect("Project is a physical explain node"),
+        &physical_payload(node).expect("Project is a physical explain node"),
         PlanNodeExplainStage::Distributed,
     )
     .expect("Project is a shared explain node");
@@ -576,7 +558,7 @@ fn format_filter_node(
     out: &mut Vec<String>,
 ) {
     let header = format_distributed_shared_plan_node_header(
-        physical_payload(node).expect("Filter is a physical explain node"),
+        &physical_payload(node).expect("Filter is a physical explain node"),
         PlanNodeExplainStage::Distributed,
     )
     .expect("Filter is a shared explain node");
@@ -585,7 +567,7 @@ fn format_filter_node(
         node_prefix(node)
     ));
     for line in format_distributed_shared_plan_node_detail_lines(
-        physical_payload(node).expect("Filter is a physical explain node"),
+        &physical_payload(node).expect("Filter is a physical explain node"),
         PlanNodeExplainStage::Distributed,
     ) {
         out.push(format!("{pad}  {line}"));
@@ -700,7 +682,7 @@ fn format_sort_node(
     out: &mut Vec<String>,
 ) {
     let body = format_distributed_shared_plan_node_header(
-        physical_payload(node).expect("Sort is a physical explain node"),
+        &physical_payload(node).expect("Sort is a physical explain node"),
         PlanNodeExplainStage::Distributed,
     )
     .expect("Sort is a shared explain node");
@@ -772,7 +754,7 @@ fn format_values_node(
     out: &mut Vec<String>,
 ) {
     let body = format_distributed_shared_plan_node_header(
-        physical_payload(node).expect("Values is a physical explain node"),
+        &physical_payload(node).expect("Values is a physical explain node"),
         PlanNodeExplainStage::Distributed,
     )
     .expect("Values is a shared explain node");
@@ -791,7 +773,7 @@ fn format_assert_one_row_node(
     out: &mut Vec<String>,
 ) {
     let body = format_distributed_shared_plan_node_header(
-        physical_payload(node).expect("AssertOneRow is a physical explain node"),
+        &physical_payload(node).expect("AssertOneRow is a physical explain node"),
         PlanNodeExplainStage::Distributed,
     )
     .expect("AssertOneRow is a shared explain node");
@@ -810,7 +792,7 @@ fn format_repeat_node(
     out: &mut Vec<String>,
 ) {
     let body = format_distributed_shared_plan_node_header(
-        physical_payload(node).expect("Repeat is a physical explain node"),
+        &physical_payload(node).expect("Repeat is a physical explain node"),
         PlanNodeExplainStage::Distributed,
     )
     .expect("Repeat is a shared explain node");
@@ -829,7 +811,7 @@ fn format_change_event_expand_node(
     out: &mut Vec<String>,
 ) {
     let body = format_distributed_shared_plan_node_header(
-        physical_payload(node).expect("ChangeEventExpand is a physical explain node"),
+        &physical_payload(node).expect("ChangeEventExpand is a physical explain node"),
         PlanNodeExplainStage::Distributed,
     )
     .expect("ChangeEventExpand is a shared explain node");
@@ -851,7 +833,7 @@ fn column_display_lookup(node: &DistributedNode) -> ColumnDisplayLookup {
 }
 
 fn collect_column_displays(node: &DistributedNode, lookup: &mut ColumnDisplayLookup) {
-    if let DistributedPayload::Physical(PhysicalPlanKind::Scan(scan)) = &node.payload {
+    if let DistributedNodeKind::Scan(scan) = &node.payload {
         for column in &scan.columns {
             let display = (scan.alias.clone(), column.name.clone());
             lookup
@@ -914,7 +896,7 @@ fn format_window_node(
     out: &mut Vec<String>,
 ) {
     let header = format_distributed_shared_plan_node_header(
-        physical_payload(node).expect("Window is a physical explain node"),
+        &physical_payload(node).expect("Window is a physical explain node"),
         PlanNodeExplainStage::Distributed,
     )
     .expect("Window is a shared explain node");
@@ -933,7 +915,7 @@ fn format_generate_series_node(
     out: &mut Vec<String>,
 ) {
     let body = format_distributed_shared_plan_node_header(
-        physical_payload(node).expect("GenerateSeries is a physical explain node"),
+        &physical_payload(node).expect("GenerateSeries is a physical explain node"),
         PlanNodeExplainStage::Distributed,
     )
     .expect("GenerateSeries is a shared explain node");
@@ -952,7 +934,7 @@ fn format_table_function_node(
     out: &mut Vec<String>,
 ) {
     let body = format_distributed_shared_plan_node_header(
-        physical_payload(node).expect("TableFunction is a physical explain node"),
+        &physical_payload(node).expect("TableFunction is a physical explain node"),
         PlanNodeExplainStage::Distributed,
     )
     .expect("TableFunction is a shared explain node");
@@ -1570,12 +1552,13 @@ mod tests {
     use crate::sql::optimizer::statistics::{
         ColumnStatistic, Confidence, CostEstimate, Statistics,
     };
+    use crate::sql::planner::ExchangeFlavor;
     use crate::sql::planner::optimizer_bridge::scalar::{
         intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items,
     };
-    use crate::sql::planner::plan::{AggregateCall, ExchangeFlavor};
+    use crate::sql::planner::plan::AggregateCall;
     use crate::sql::planner::{
-        DistributedNode, DistributedPayload, DistributedPlan, ExchangeReceiver, PhysicalPlanStats,
+        DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeReceiver, PhysicalPlanStats,
         PlannerBroadcastDecision, PlannerConfidence,
     };
 
@@ -1659,22 +1642,19 @@ mod tests {
             .expect("root fragment")
             .root;
 
-        let DistributedPayload::Physical(root_kind) = &root.payload else {
-            panic!("root should be physical");
-        };
+        let root_kind = crate::sql::planner::distributed_kind_to_physical(&root.payload);
         assert_eq!(
             format_distributed_shared_plan_node_header(
-                root_kind,
+                &root_kind,
                 PlanNodeExplainStage::Distributed
             ),
             Some("PROJECT [t.k AS k]".to_string())
         );
-        let DistributedPayload::Physical(scan_kind) = &root.children[0].payload else {
-            panic!("child should be physical");
-        };
+        let scan_kind =
+            crate::sql::planner::distributed_kind_to_physical(&root.children[0].payload);
         assert_eq!(
             format_distributed_shared_plan_node_header(
-                scan_kind,
+                &scan_kind,
                 PlanNodeExplainStage::Distributed
             ),
             Some("SCAN test_db.t (alias=t)".to_string())
@@ -1709,7 +1689,7 @@ mod tests {
                 cost_estimate: None,
                 broadcast_decision: None,
             },
-            payload: DistributedPayload::Exchange(ExchangeReceiver {
+            payload: DistributedNodeKind::Exchange(ExchangeReceiver {
                 partition: crate::sql::planner::DataPartition::unpartitioned(),
                 source_fragment_id: 0,
                 output_columns: vec![],

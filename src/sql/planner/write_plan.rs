@@ -17,13 +17,12 @@
 
 use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind};
-use crate::sql::planner::plan::ExchangeFlavor;
 use crate::sql::planner::{
-    ChangeStreamWriteDagSpec, DataPartition, DataSink, DistributedNode, DistributedPayload,
-    ExchangeReceiver, IcebergChangeStreamBranchRoute, IcebergChangeStreamRouterSink,
-    IcebergChangeStreamWriteTopology, IcebergChangeStreamWriterBranch, IcebergWriteFragmentSink,
-    IcebergWriteInputBinding, PartitionKind, PlanFragment,
-    PlannedIcebergChangeStreamDistributedPlan,
+    ChangeStreamWriteDagSpec, DataPartition, DataSink, DistributedNode, DistributedNodeKind,
+    ExchangeFlavor, ExchangeReceiver, IcebergChangeStreamBranchRoute,
+    IcebergChangeStreamRouterSink, IcebergChangeStreamWriteTopology,
+    IcebergChangeStreamWriterBranch, IcebergWriteFragmentSink, IcebergWriteInputBinding,
+    PartitionKind, PlanFragment, PlannedIcebergChangeStreamDistributedPlan,
 };
 
 pub(crate) fn with_iceberg_write_sink(
@@ -194,7 +193,7 @@ pub(crate) fn with_iceberg_change_stream_write(
                 probe_runtime_filters: Vec::new(),
                 children: Vec::new(),
                 stats: source_fragment.root.stats.clone(),
-                payload: DistributedPayload::Exchange(ExchangeReceiver {
+                payload: DistributedNodeKind::Exchange(ExchangeReceiver {
                     partition: output_partition.clone(),
                     source_fragment_id: root_fragment_id,
                     output_columns: writer_columns.clone(),
@@ -392,7 +391,7 @@ mod tests {
     use crate::sql::common::ChangeStreamBranchKind;
     use crate::sql::planner::{
         ChangeStreamWriteBranchSpec, ChangeStreamWriteDagSpec, DataPartition, DataSink,
-        DistributedNode, DistributedPayload, DistributedPlan, IcebergWriteFragmentSink,
+        DistributedNode, DistributedNodeKind, DistributedPlan, IcebergWriteFragmentSink,
         IcebergWriteInputBinding, PlanFragment,
     };
     use crate::sql::planner::{PhysicalPlanStats, PlannerConfidence};
@@ -586,13 +585,11 @@ mod tests {
                     probe_runtime_filters: vec![],
                     children: vec![],
                     stats: stats(),
-                    payload: DistributedPayload::Physical(
-                        crate::sql::planner::plan::PhysicalPlanKind::Values(
-                            crate::sql::planner::plan::PlanValuesNode {
-                                rows: vec![],
-                                columns: output_columns.clone(),
-                            },
-                        ),
+                    payload: DistributedNodeKind::Values(
+                        crate::sql::planner::plan::PlanValuesNode {
+                            rows: vec![],
+                            columns: output_columns.clone(),
+                        },
                     ),
                 },
                 data_partition: DataPartition::unpartitioned(),

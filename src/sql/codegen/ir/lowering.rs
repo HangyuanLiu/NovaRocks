@@ -247,10 +247,7 @@ fn refresh_distributed_node_scan_tables_for_native(
     node: &mut crate::sql::planner::DistributedNode,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
 ) -> Result<(), String> {
-    if let crate::sql::planner::DistributedPayload::Physical(
-        crate::sql::planner::plan::PhysicalPlanKind::Scan(scan),
-    ) = &mut node.payload
-    {
+    if let crate::sql::planner::DistributedNodeKind::Scan(scan) = &mut node.payload {
         let refresh_only_source = is_refresh_only_scan_source(&scan.table.source);
         let native_projected_names = native_refresh_scan_projected_names(&scan.table.source);
         let refreshed_table = refresh_scan_table_for_codegen(mv_refresh_ctx, &scan.table)?;
@@ -657,7 +654,7 @@ fn validate_edge_target_node(
         )
         })?;
 
-    let crate::sql::planner::DistributedPayload::Exchange(exchange) = &target_node.payload else {
+    let crate::sql::planner::DistributedNodeKind::Exchange(exchange) = &target_node.payload else {
         return Err(format!(
             "lower_distributed_plan edge target_exchange_node_id={} in target fragment id={} must target Exchange",
             edge.target_exchange_node_id, target_fragment.fragment_id
@@ -1375,7 +1372,7 @@ fn target_exchange_for_edge<'a>(
                 edge.target_exchange_node_id, target_fragment.fragment_id
             )
         })?;
-    let crate::sql::planner::DistributedPayload::Exchange(exchange) = &target_node.payload else {
+    let crate::sql::planner::DistributedNodeKind::Exchange(exchange) = &target_node.payload else {
         return Err(format!(
             "lower_distributed_plan edge target_exchange_node_id={} in target fragment id={} must target Exchange",
             edge.target_exchange_node_id, target_fragment.fragment_id
@@ -1989,68 +1986,56 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         node: &crate::sql::planner::DistributedNode,
     ) -> Result<LoweredDistributedNode, String> {
         let mut lowered = match &node.payload {
-            crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::Scan(scan),
-            ) => self.lower_scan_node(node, scan)?,
-            crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::Project(project),
-            ) => self.lower_project_node(node, project)?,
-            crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::Filter(filter),
-            ) => self.lower_filter_node(node, filter)?,
-            crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::Sort(sort),
-            ) => self.lower_sort_node(node, sort)?,
-            crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::TopN(topn),
-            ) => self.lower_topn_node(node, topn)?,
-            crate::sql::planner::DistributedPayload::Exchange(exchange) => {
+            crate::sql::planner::DistributedNodeKind::Scan(scan) => {
+                self.lower_scan_node(node, scan)?
+            }
+            crate::sql::planner::DistributedNodeKind::Project(project) => {
+                self.lower_project_node(node, project)?
+            }
+            crate::sql::planner::DistributedNodeKind::Filter(filter) => {
+                self.lower_filter_node(node, filter)?
+            }
+            crate::sql::planner::DistributedNodeKind::Sort(sort) => {
+                self.lower_sort_node(node, sort)?
+            }
+            crate::sql::planner::DistributedNodeKind::TopN(topn) => {
+                self.lower_topn_node(node, topn)?
+            }
+            crate::sql::planner::DistributedNodeKind::Exchange(exchange) => {
                 self.lower_exchange_node(node, exchange)?
             }
-            crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::HashAggregate(agg),
-            ) => self.lower_hash_aggregate_node(node, agg.as_ref())?,
-            crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::HashJoin(hash_join),
-            ) => self.lower_hash_join_node(node, hash_join.as_ref())?,
-            crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::NestLoopJoin(nest_loop),
-            ) => self.lower_nest_loop_join_node(node, nest_loop)?,
-            crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::Values(values),
-            ) => self.lower_values_node(node, values)?,
-            crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::AssertOneRow(assert_one_row),
-            ) => self.lower_assert_one_row_node(node, assert_one_row)?,
-            crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::Repeat(repeat),
-            ) => self.lower_repeat_node(node, repeat)?,
-            crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::ChangeEventExpand(expand),
-            ) => self.lower_change_event_expand_node(node, expand)?,
-            crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::SetOp(set_op),
-            ) => self.lower_set_op_node(node, set_op)?,
-            crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::Window(window),
-            ) => self.lower_window_node(node, window)?,
-            crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::GenerateSeries(generate_series),
-            ) => self.lower_generate_series_node(node, generate_series)?,
-            crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::TableFunction(table_function),
-            ) => self.lower_table_function_node(node, table_function)?,
-            crate::sql::planner::DistributedPayload::Physical(
-                crate::sql::planner::plan::PhysicalPlanKind::Limit(_)
-                | crate::sql::planner::plan::PhysicalPlanKind::CTEAnchor(_)
-                | crate::sql::planner::plan::PhysicalPlanKind::CTEProduce(_)
-                | crate::sql::planner::plan::PhysicalPlanKind::CTEConsume(_)
-                | crate::sql::planner::plan::PhysicalPlanKind::Redistribute(_),
-            ) => {
-                return Err(format!(
-                    "lower_distributed_plan node_id={} received non-lowerable physical payload",
-                    node.node_id
-                ));
+            crate::sql::planner::DistributedNodeKind::HashAggregate(agg) => {
+                self.lower_hash_aggregate_node(node, agg.as_ref())?
+            }
+            crate::sql::planner::DistributedNodeKind::HashJoin(hash_join) => {
+                self.lower_hash_join_node(node, hash_join.as_ref())?
+            }
+            crate::sql::planner::DistributedNodeKind::NestLoopJoin(nest_loop) => {
+                self.lower_nest_loop_join_node(node, nest_loop)?
+            }
+            crate::sql::planner::DistributedNodeKind::Values(values) => {
+                self.lower_values_node(node, values)?
+            }
+            crate::sql::planner::DistributedNodeKind::AssertOneRow(assert_one_row) => {
+                self.lower_assert_one_row_node(node, assert_one_row)?
+            }
+            crate::sql::planner::DistributedNodeKind::Repeat(repeat) => {
+                self.lower_repeat_node(node, repeat)?
+            }
+            crate::sql::planner::DistributedNodeKind::ChangeEventExpand(expand) => {
+                self.lower_change_event_expand_node(node, expand)?
+            }
+            crate::sql::planner::DistributedNodeKind::SetOp(set_op) => {
+                self.lower_set_op_node(node, set_op)?
+            }
+            crate::sql::planner::DistributedNodeKind::Window(window) => {
+                self.lower_window_node(node, window)?
+            }
+            crate::sql::planner::DistributedNodeKind::GenerateSeries(generate_series) => {
+                self.lower_generate_series_node(node, generate_series)?
+            }
+            crate::sql::planner::DistributedNodeKind::TableFunction(table_function) => {
+                self.lower_table_function_node(node, table_function)?
             }
         };
         if let Some(root) = lowered.plan_nodes.first_mut() {
@@ -5900,7 +5885,7 @@ mod tests {
         PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalSetOpNode, SetOpKind,
     };
     use crate::sql::codegen::ir::{
-        DataPartition, DataSink, DistributedNode, DistributedPayload, DistributedPlan,
+        DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan,
         PartitionKind, PlanFragment,
     };
     use crate::sql::codegen::resolve::{ColumnBinding, ExprScope};
@@ -6153,31 +6138,19 @@ mod tests {
             probe_runtime_filters: vec![],
             children: vec![left, right],
             stats: distributed_stats(),
-            payload: DistributedPayload::Physical(PhysicalPlanKind::HashJoin(Box::new(
-                PhysicalHashJoinNode {
-                    join_type: JoinKind::Inner,
-                    eq_conditions: vec![PhysicalHashJoinEqCondition {
-                        left: qualified_column_ref(
-                            ColumnId::new_for_test(1),
-                            "l",
-                            "left_id",
-                            false,
-                        ),
-                        right: qualified_column_ref(
-                            ColumnId::new_for_test(8),
-                            "r",
-                            "right_id",
-                            false,
-                        ),
-                        null_safe: false,
-                    }],
-                    other_condition: None,
-                    distribution: JoinDistribution::Broadcast,
-                    execution_mode: Some(JoinExecutionMode::Broadcast),
-                    build_runtime_filters: Vec::new(),
-                    output_columns: vec![stale_col],
-                },
-            ))),
+            payload: DistributedNodeKind::HashJoin(Box::new(PhysicalHashJoinNode {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: qualified_column_ref(ColumnId::new_for_test(1), "l", "left_id", false),
+                    right: qualified_column_ref(ColumnId::new_for_test(8), "r", "right_id", false),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+                execution_mode: Some(JoinExecutionMode::Broadcast),
+                build_runtime_filters: Vec::new(),
+                output_columns: vec![stale_col],
+            })),
         };
         let dp = DistributedPlan {
             fragments: vec![PlanFragment {
@@ -6638,9 +6611,7 @@ mod tests {
             probe_runtime_filters: vec![],
             children: vec![child],
             stats: distributed_stats(),
-            payload: DistributedPayload::Physical(PhysicalPlanKind::HashAggregate(Box::new(
-                op.clone(),
-            ))),
+            payload: DistributedNodeKind::HashAggregate(Box::new(op.clone())),
         };
 
         let lowered = {
@@ -7204,7 +7175,7 @@ mod tests {
         let catalog = DummyCatalog;
         let connectors = ConnectorRegistry::new();
         let mut dp = distributed_values_multi_fragment_plan();
-        let DistributedPayload::Exchange(exchange) = &mut dp.fragments[1].root.payload else {
+        let DistributedNodeKind::Exchange(exchange) = &mut dp.fragments[1].root.payload else {
             panic!("root fragment should be exchange");
         };
         exchange.partition =
@@ -7266,7 +7237,7 @@ mod tests {
         ];
         let exchange_columns = vec![source_columns[0].clone(), source_columns[1].clone()];
         let mut exchange = distributed_exchange_node(20, 1, 10, 0);
-        let DistributedPayload::Exchange(exchange_payload) = &mut exchange.payload else {
+        let DistributedNodeKind::Exchange(exchange_payload) = &mut exchange.payload else {
             panic!("expected exchange node");
         };
         exchange_payload.output_columns = exchange_columns;
@@ -7686,7 +7657,7 @@ mod tests {
         );
 
         let mut mismatched_source = distributed_values_multi_fragment_plan();
-        let DistributedPayload::Exchange(exchange) =
+        let DistributedNodeKind::Exchange(exchange) =
             &mut mismatched_source.fragments[1].root.payload
         else {
             panic!("root should be exchange");
@@ -7723,11 +7694,11 @@ mod tests {
             probe_runtime_filters: vec![],
             children: vec![],
             stats: distributed_stats(),
-            payload: DistributedPayload::Physical(PhysicalPlanKind::SetOp(PhysicalSetOpNode {
+            payload: DistributedNodeKind::SetOp(PhysicalSetOpNode {
                 kind: SetOpKind::UnionAll,
                 output_columns: output_columns.clone(),
                 child_output_columns: vec![],
-            })),
+            }),
         };
         let root = DistributedNode {
             node_id: 10,
@@ -7739,11 +7710,11 @@ mod tests {
             probe_runtime_filters: vec![],
             children: vec![malformed_child],
             stats: distributed_stats(),
-            payload: DistributedPayload::Physical(PhysicalPlanKind::SetOp(PhysicalSetOpNode {
+            payload: DistributedNodeKind::SetOp(PhysicalSetOpNode {
                 kind: SetOpKind::UnionDistinct,
                 output_columns: output_columns.clone(),
                 child_output_columns: vec![output_columns.clone()],
-            })),
+            }),
         };
         let dp = DistributedPlan {
             fragments: vec![PlanFragment {
@@ -7830,26 +7801,19 @@ mod tests {
             probe_runtime_filters: vec![],
             children: vec![left, right],
             stats: distributed_stats(),
-            payload: DistributedPayload::Physical(PhysicalPlanKind::HashJoin(Box::new(
-                PhysicalHashJoinNode {
-                    join_type: JoinKind::Inner,
-                    eq_conditions: vec![PhysicalHashJoinEqCondition {
-                        left: qualified_column_ref(ColumnId::new_for_test(1), "l", "left_k", false),
-                        right: qualified_column_ref(
-                            ColumnId::new_for_test(3),
-                            "r",
-                            "right_k",
-                            false,
-                        ),
-                        null_safe: false,
-                    }],
-                    other_condition: None,
-                    distribution: JoinDistribution::Shuffle,
-                    execution_mode: Some(JoinExecutionMode::Partitioned),
-                    build_runtime_filters: Vec::new(),
-                    output_columns: output_columns.clone(),
-                },
-            ))),
+            payload: DistributedNodeKind::HashJoin(Box::new(PhysicalHashJoinNode {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: qualified_column_ref(ColumnId::new_for_test(1), "l", "left_k", false),
+                    right: qualified_column_ref(ColumnId::new_for_test(3), "r", "right_k", false),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Shuffle,
+                execution_mode: Some(JoinExecutionMode::Partitioned),
+                build_runtime_filters: Vec::new(),
+                output_columns: output_columns.clone(),
+            })),
         };
         let exchange = DistributedNode {
             node_id: 20,
@@ -7861,7 +7825,7 @@ mod tests {
             probe_runtime_filters: vec![],
             children: vec![],
             stats: distributed_stats(),
-            payload: DistributedPayload::Exchange(DistributedExchangeNode {
+            payload: DistributedNodeKind::Exchange(DistributedExchangeNode {
                 partition: crate::sql::planner::DataPartition::unpartitioned(),
                 source_fragment_id: 0,
                 output_columns: output_columns.clone(),
@@ -8148,12 +8112,10 @@ mod tests {
             probe_runtime_filters: vec![],
             children: vec![],
             stats: distributed_stats(),
-            payload: DistributedPayload::Physical(PhysicalPlanKind::Values(
-                DistributedValuesNode {
-                    rows: vec![],
-                    columns,
-                },
-            )),
+            payload: DistributedNodeKind::Values(DistributedValuesNode {
+                rows: vec![],
+                columns,
+            }),
         }
     }
 
@@ -8173,7 +8135,7 @@ mod tests {
             probe_runtime_filters: vec![],
             children: vec![],
             stats: distributed_stats(),
-            payload: DistributedPayload::Exchange(DistributedExchangeNode {
+            payload: DistributedNodeKind::Exchange(DistributedExchangeNode {
                 partition: crate::sql::planner::DataPartition::unpartitioned(),
                 source_fragment_id,
                 output_columns: Vec::new(),

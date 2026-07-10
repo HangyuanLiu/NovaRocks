@@ -34,8 +34,8 @@ use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentStreamKind};
 use crate::sql::common::{ChangeStreamBranchKind, JoinKind};
 use crate::sql::parser::ast::SqlType;
 use crate::sql::planner::plan::{
-    AggregateCall, ExchangeFlavor, PhysicalHashAggregateNode, PhysicalPlanKind,
-    PlanRowCountAssertion, PlanSetOpKind, RedistributeMode,
+    AggregateCall, PhysicalHashAggregateNode, PhysicalPlanKind, PlanRowCountAssertion,
+    PlanSetOpKind, RedistributeMode,
 };
 use crate::sql::planner::runtime_filter::{
     JoinExecutionMode, WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
@@ -44,9 +44,9 @@ use crate::sql::planner::write_sink::{
     IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
 };
 use crate::sql::planner::{
-    AggMode, DataPartition, DataSink, DistributedNode, DistributedPayload, DistributedPlan,
-    ExchangeReceiver, HashSource, IcebergWriteInputBinding, JoinDistribution, PartitionKind,
-    PlanFragment, TopNPhase,
+    AggMode, DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan,
+    ExchangeFlavor, ExchangeReceiver, HashSource, IcebergWriteInputBinding, JoinDistribution,
+    PartitionKind, PlanFragment, TopNPhase,
 };
 
 pub(crate) struct NativePlanEncodeContext<'a> {
@@ -858,11 +858,12 @@ fn encode_node_with_context(
         .map(|child| encode_node_with_context(child, ctx))
         .collect::<Result<Vec<_>, _>>()?;
     let payload = match &src.payload {
-        DistributedPayload::Physical(physical) => {
-            plan::distributed_node::Payload::Physical(encode_physical_node(physical, ctx)?)
-        }
-        DistributedPayload::Exchange(exchange) => {
+        DistributedNodeKind::Exchange(exchange) => {
             plan::distributed_node::Payload::Exchange(encode_exchange_receiver(exchange)?)
+        }
+        other => {
+            let physical = crate::sql::planner::distributed_kind_to_physical(other);
+            plan::distributed_node::Payload::Physical(encode_physical_node(&physical, ctx)?)
         }
     };
     let mut node = plan::DistributedNode {
@@ -2893,7 +2894,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: stats(),
-            payload: DistributedPayload::Exchange(ExchangeReceiver {
+            payload: DistributedNodeKind::Exchange(ExchangeReceiver {
                 partition: DataPartition::unpartitioned(),
                 source_fragment_id: 1,
                 output_columns: target_output_columns.clone(),
@@ -2913,16 +2914,14 @@ mod tests {
                 probe_runtime_filters: Vec::new(),
                 children: vec![exchange],
                 stats: stats(),
-                payload: DistributedPayload::Physical(PhysicalPlanKind::Sort(
-                    crate::sql::planner::plan::PlanSortNode {
-                        items: Vec::new(),
-                        analytic_partition_by: Vec::new(),
-                        output_columns: target_output_columns,
-                        offset: None,
-                        partition_limit: None,
-                        topn_type: None,
-                    },
-                )),
+                payload: DistributedNodeKind::Sort(crate::sql::planner::plan::PlanSortNode {
+                    items: Vec::new(),
+                    analytic_partition_by: Vec::new(),
+                    output_columns: target_output_columns,
+                    offset: None,
+                    partition_limit: None,
+                    topn_type: None,
+                }),
             },
             data_partition: DataPartition::unpartitioned(),
             output_partition: DataPartition::unpartitioned(),
@@ -3067,18 +3066,16 @@ mod tests {
                     probe_runtime_filters: Vec::new(),
                     children: Vec::new(),
                     stats: stats(),
-                    payload: DistributedPayload::Physical(PhysicalPlanKind::Scan(
-                        crate::sql::planner::plan::PlanScanNode {
-                            database: "db".to_string(),
-                            table: iceberg_delta_table_for_test(),
-                            alias: None,
-                            columns: output_columns.clone(),
-                            predicates: Vec::new(),
-                            required_columns: None,
-                            variant_columns: Vec::new(),
-                            mv_rewritten_from: None,
-                        },
-                    )),
+                    payload: DistributedNodeKind::Scan(crate::sql::planner::plan::PlanScanNode {
+                        database: "db".to_string(),
+                        table: iceberg_delta_table_for_test(),
+                        alias: None,
+                        columns: output_columns.clone(),
+                        predicates: Vec::new(),
+                        required_columns: None,
+                        variant_columns: Vec::new(),
+                        mv_rewritten_from: None,
+                    }),
                 },
                 data_partition: DataPartition::unpartitioned(),
                 output_partition: DataPartition::unpartitioned(),
@@ -3195,47 +3192,43 @@ mod tests {
                 probe_runtime_filters: Vec::new(),
                 children: Vec::new(),
                 stats: stats(),
-                payload: DistributedPayload::Physical(PhysicalPlanKind::Values(
-                    crate::sql::planner::plan::PlanValuesNode {
-                        rows: Vec::new(),
-                        columns: child_columns,
-                    },
-                )),
+                payload: DistributedNodeKind::Values(crate::sql::planner::plan::PlanValuesNode {
+                    rows: Vec::new(),
+                    columns: child_columns,
+                }),
             }],
             stats: stats(),
-            payload: DistributedPayload::Physical(PhysicalPlanKind::Project(
-                crate::sql::planner::plan::PlanProjectNode {
-                    items: vec![
-                        crate::sql::analysis::ProjectItem {
-                            expr: crate::sql::analysis::TypedExpr {
-                                kind: crate::sql::analysis::ExprKind::ColumnRef {
-                                    column_id: ColumnId::new_for_test(1),
-                                    qualifier: None,
-                                    column: "c1".to_string(),
-                                },
-                                data_type: DataType::Int64,
-                                nullable: false,
+            payload: DistributedNodeKind::Project(crate::sql::planner::plan::PlanProjectNode {
+                items: vec![
+                    crate::sql::analysis::ProjectItem {
+                        expr: crate::sql::analysis::TypedExpr {
+                            kind: crate::sql::analysis::ExprKind::ColumnRef {
+                                column_id: ColumnId::new_for_test(1),
+                                qualifier: None,
+                                column: "c1".to_string(),
                             },
-                            output_name: "c1".to_string(),
-                            output_column_id: ColumnId::new_for_test(1),
+                            data_type: DataType::Int64,
+                            nullable: false,
                         },
-                        crate::sql::analysis::ProjectItem {
-                            expr: crate::sql::analysis::TypedExpr {
-                                kind: crate::sql::analysis::ExprKind::ColumnRef {
-                                    column_id: ColumnId::new_for_test(1),
-                                    qualifier: None,
-                                    column: "c1".to_string(),
-                                },
-                                data_type: DataType::Int64,
-                                nullable: false,
+                        output_name: "c1".to_string(),
+                        output_column_id: ColumnId::new_for_test(1),
+                    },
+                    crate::sql::analysis::ProjectItem {
+                        expr: crate::sql::analysis::TypedExpr {
+                            kind: crate::sql::analysis::ExprKind::ColumnRef {
+                                column_id: ColumnId::new_for_test(1),
+                                qualifier: None,
+                                column: "c1".to_string(),
                             },
-                            output_name: "c1".to_string(),
-                            output_column_id: ColumnId::new_for_test(1),
+                            data_type: DataType::Int64,
+                            nullable: false,
                         },
-                    ],
-                    output_qualifier: None,
-                },
-            )),
+                        output_name: "c1".to_string(),
+                        output_column_id: ColumnId::new_for_test(1),
+                    },
+                ],
+                output_qualifier: None,
+            }),
         };
         let encoded = encode_node(&duplicate_project).expect("encode node");
 
@@ -3291,35 +3284,31 @@ mod tests {
                 probe_runtime_filters: Vec::new(),
                 children: Vec::new(),
                 stats: stats(),
-                payload: DistributedPayload::Physical(PhysicalPlanKind::Values(
-                    crate::sql::planner::plan::PlanValuesNode {
-                        rows: Vec::new(),
-                        columns: child_columns,
-                    },
-                )),
+                payload: DistributedNodeKind::Values(crate::sql::planner::plan::PlanValuesNode {
+                    rows: Vec::new(),
+                    columns: child_columns,
+                }),
             }],
             stats: stats(),
-            payload: DistributedPayload::Physical(PhysicalPlanKind::Project(
-                crate::sql::planner::plan::PlanProjectNode {
-                    items: duplicate_output
-                        .iter()
-                        .map(|column| crate::sql::analysis::ProjectItem {
-                            expr: crate::sql::analysis::TypedExpr {
-                                kind: crate::sql::analysis::ExprKind::ColumnRef {
-                                    column_id: column.column_id,
-                                    qualifier: None,
-                                    column: column.name.clone(),
-                                },
-                                data_type: column.data_type.clone(),
-                                nullable: column.nullable,
+            payload: DistributedNodeKind::Project(crate::sql::planner::plan::PlanProjectNode {
+                items: duplicate_output
+                    .iter()
+                    .map(|column| crate::sql::analysis::ProjectItem {
+                        expr: crate::sql::analysis::TypedExpr {
+                            kind: crate::sql::analysis::ExprKind::ColumnRef {
+                                column_id: column.column_id,
+                                qualifier: None,
+                                column: column.name.clone(),
                             },
-                            output_name: column.name.clone(),
-                            output_column_id: column.column_id,
-                        })
-                        .collect(),
-                    output_qualifier: None,
-                },
-            )),
+                            data_type: column.data_type.clone(),
+                            nullable: column.nullable,
+                        },
+                        output_name: column.name.clone(),
+                        output_column_id: column.column_id,
+                    })
+                    .collect(),
+                output_qualifier: None,
+            }),
         };
         PlanFragment {
             fragment_id: 0,
@@ -3397,16 +3386,14 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: vec![child],
             stats: stats(),
-            payload: DistributedPayload::Physical(PhysicalPlanKind::Sort(
-                crate::sql::planner::plan::PlanSortNode {
-                    items: Vec::new(),
-                    analytic_partition_by: Vec::new(),
-                    output_columns: sort_output_columns,
-                    offset: None,
-                    partition_limit: None,
-                    topn_type: None,
-                },
-            )),
+            payload: DistributedNodeKind::Sort(crate::sql::planner::plan::PlanSortNode {
+                items: Vec::new(),
+                analytic_partition_by: Vec::new(),
+                output_columns: sort_output_columns,
+                offset: None,
+                partition_limit: None,
+                topn_type: None,
+            }),
         };
 
         let encoded = encode_plan_fragment(&fragment).expect("encode sort fragment");
@@ -3457,15 +3444,13 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: vec![child],
             stats: stats(),
-            payload: DistributedPayload::Physical(PhysicalPlanKind::TopN(
-                crate::sql::planner::plan::PhysicalTopNNode {
-                    items: Vec::new(),
-                    limit: Some(10),
-                    offset: None,
-                    phase: TopNPhase::Final,
-                    is_split: false,
-                },
-            )),
+            payload: DistributedNodeKind::TopN(crate::sql::planner::plan::PhysicalTopNNode {
+                items: Vec::new(),
+                limit: Some(10),
+                offset: None,
+                phase: TopNPhase::Final,
+                is_split: false,
+            }),
         };
 
         let encoded = encode_plan_fragment(&fragment).expect("encode topn fragment");
@@ -3504,7 +3489,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: stats(),
-            payload: DistributedPayload::Physical(PhysicalPlanKind::HashJoin(Box::new(
+            payload: DistributedNodeKind::HashJoin(Box::new(
                 crate::sql::planner::plan::PhysicalHashJoinNode {
                     join_type: JoinKind::Inner,
                     eq_conditions: Vec::new(),
@@ -3514,7 +3499,7 @@ mod tests {
                     build_runtime_filters: Vec::new(),
                     output_columns: output_columns.clone(),
                 },
-            ))),
+            )),
         };
 
         let encoded = encode_node(&join).expect("encode hash join");
@@ -3545,13 +3530,13 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: stats(),
-            payload: DistributedPayload::Physical(PhysicalPlanKind::NestLoopJoin(
+            payload: DistributedNodeKind::NestLoopJoin(
                 crate::sql::planner::plan::PhysicalNestLoopJoinNode {
                     join_type: JoinKind::Inner,
                     condition: None,
                     output_columns: output_columns.clone(),
                 },
-            )),
+            ),
         };
 
         let encoded = encode_node(&join).expect("encode nest loop join");
@@ -3587,17 +3572,15 @@ mod tests {
                 probe_runtime_filters: Vec::new(),
                 children: Vec::new(),
                 stats: stats(),
-                payload: DistributedPayload::Physical(PhysicalPlanKind::Values(
-                    crate::sql::planner::plan::PlanValuesNode {
-                        rows: Vec::new(),
-                        columns: vec![child_column.clone()],
-                    },
-                )),
+                payload: DistributedNodeKind::Values(crate::sql::planner::plan::PlanValuesNode {
+                    rows: Vec::new(),
+                    columns: vec![child_column.clone()],
+                }),
             }],
             stats: stats(),
-            payload: DistributedPayload::Physical(PhysicalPlanKind::AssertOneRow(
+            payload: DistributedNodeKind::AssertOneRow(
                 crate::sql::planner::plan::PlanAssertOneRowNode::global_at_most_one("select 1"),
-            )),
+            ),
         };
 
         let encoded = encode_node(&node).expect("encode assert one row");
@@ -3708,12 +3691,12 @@ mod tests {
                         probe_runtime_filters: Vec::new(),
                         children: Vec::new(),
                         stats: stats(),
-                        payload: DistributedPayload::Physical(PhysicalPlanKind::Values(
+                        payload: DistributedNodeKind::Values(
                             crate::sql::planner::plan::PlanValuesNode {
                                 rows: Vec::new(),
                                 columns: vec![actual_left.clone()],
                             },
-                        )),
+                        ),
                     },
                     DistributedNode {
                         node_id: 12,
@@ -3725,16 +3708,16 @@ mod tests {
                         probe_runtime_filters: Vec::new(),
                         children: Vec::new(),
                         stats: stats(),
-                        payload: DistributedPayload::Physical(PhysicalPlanKind::Values(
+                        payload: DistributedNodeKind::Values(
                             crate::sql::planner::plan::PlanValuesNode {
                                 rows: Vec::new(),
                                 columns: vec![actual_right.clone()],
                             },
-                        )),
+                        ),
                     },
                 ],
                 stats: stats(),
-                payload: DistributedPayload::Physical(PhysicalPlanKind::HashJoin(Box::new(
+                payload: DistributedNodeKind::HashJoin(Box::new(
                     crate::sql::planner::plan::PhysicalHashJoinNode {
                         join_type: JoinKind::Inner,
                         eq_conditions: Vec::new(),
@@ -3744,7 +3727,7 @@ mod tests {
                         build_runtime_filters: Vec::new(),
                         output_columns: stale_source_columns.clone(),
                     },
-                ))),
+                )),
             },
             data_partition: DataPartition::unpartitioned(),
             output_partition: DataPartition::unpartitioned(),
@@ -3766,7 +3749,7 @@ mod tests {
                 probe_runtime_filters: Vec::new(),
                 children: Vec::new(),
                 stats: stats(),
-                payload: DistributedPayload::Exchange(ExchangeReceiver {
+                payload: DistributedNodeKind::Exchange(ExchangeReceiver {
                     partition: DataPartition::unpartitioned(),
                     source_fragment_id: 1,
                     output_columns: receiver_columns,
@@ -3981,19 +3964,17 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: vec![child.clone(), child],
             stats: stats(),
-            payload: DistributedPayload::Physical(PhysicalPlanKind::SetOp(
-                crate::sql::planner::plan::PhysicalSetOpNode {
-                    kind: PlanSetOpKind::UnionAll,
-                    output_columns: vec![
-                        output_column(10, "c1", DataType::Int64),
-                        output_column(11, "c1", DataType::Int64),
-                    ],
-                    child_output_columns: vec![
-                        duplicate_child_output_columns.clone(),
-                        duplicate_child_output_columns,
-                    ],
-                },
-            )),
+            payload: DistributedNodeKind::SetOp(crate::sql::planner::plan::PhysicalSetOpNode {
+                kind: PlanSetOpKind::UnionAll,
+                output_columns: vec![
+                    output_column(10, "c1", DataType::Int64),
+                    output_column(11, "c1", DataType::Int64),
+                ],
+                child_output_columns: vec![
+                    duplicate_child_output_columns.clone(),
+                    duplicate_child_output_columns,
+                ],
+            }),
         };
 
         let encoded = encode_node(&set_op).expect("encode set op");
@@ -4039,12 +4020,12 @@ mod tests {
                         probe_runtime_filters: Vec::new(),
                         children: Vec::new(),
                         stats: stats(),
-                        payload: DistributedPayload::Physical(PhysicalPlanKind::Values(
+                        payload: DistributedNodeKind::Values(
                             crate::sql::planner::plan::PlanValuesNode {
                                 rows: Vec::new(),
                                 columns: source_columns.clone(),
                             },
-                        )),
+                        ),
                     },
                     data_partition: DataPartition::unpartitioned(),
                     output_partition: DataPartition::unpartitioned(),
@@ -4066,7 +4047,7 @@ mod tests {
                         probe_runtime_filters: Vec::new(),
                         children: Vec::new(),
                         stats: stats(),
-                        payload: DistributedPayload::Exchange(ExchangeReceiver {
+                        payload: DistributedNodeKind::Exchange(ExchangeReceiver {
                             partition: DataPartition::unpartitioned(),
                             source_fragment_id: 1,
                             output_columns: receiver_columns,
@@ -4117,12 +4098,12 @@ mod tests {
                         probe_runtime_filters: Vec::new(),
                         children: Vec::new(),
                         stats: stats(),
-                        payload: DistributedPayload::Physical(PhysicalPlanKind::Values(
+                        payload: DistributedNodeKind::Values(
                             crate::sql::planner::plan::PlanValuesNode {
                                 rows: Vec::new(),
                                 columns: source_columns.clone(),
                             },
-                        )),
+                        ),
                     },
                     data_partition: DataPartition::unpartitioned(),
                     output_partition: DataPartition::unpartitioned(),
@@ -4144,7 +4125,7 @@ mod tests {
                         probe_runtime_filters: Vec::new(),
                         children: Vec::new(),
                         stats: stats(),
-                        payload: DistributedPayload::Exchange(ExchangeReceiver {
+                        payload: DistributedNodeKind::Exchange(ExchangeReceiver {
                             partition: DataPartition::unpartitioned(),
                             source_fragment_id: 1,
                             output_columns: receiver_columns,
@@ -4189,12 +4170,12 @@ mod tests {
                         probe_runtime_filters: Vec::new(),
                         children: Vec::new(),
                         stats: stats(),
-                        payload: DistributedPayload::Physical(PhysicalPlanKind::Values(
+                        payload: DistributedNodeKind::Values(
                             crate::sql::planner::plan::PlanValuesNode {
                                 rows: vec![Vec::new()],
                                 columns: Vec::new(),
                             },
-                        )),
+                        ),
                     },
                     data_partition: DataPartition::unpartitioned(),
                     output_partition: DataPartition::unpartitioned(),
@@ -4216,7 +4197,7 @@ mod tests {
                         probe_runtime_filters: Vec::new(),
                         children: Vec::new(),
                         stats: stats(),
-                        payload: DistributedPayload::Exchange(ExchangeReceiver {
+                        payload: DistributedNodeKind::Exchange(ExchangeReceiver {
                             partition: DataPartition::unpartitioned(),
                             source_fragment_id: 1,
                             output_columns: Vec::new(),
@@ -4262,7 +4243,7 @@ mod tests {
                         probe_runtime_filters: Vec::new(),
                         children: Vec::new(),
                         stats: stats(),
-                        payload: DistributedPayload::Physical(PhysicalPlanKind::GenerateSeries(
+                        payload: DistributedNodeKind::GenerateSeries(
                             crate::sql::planner::plan::PlanGenerateSeriesNode {
                                 start: 1,
                                 end: 3,
@@ -4271,7 +4252,7 @@ mod tests {
                                 alias: None,
                                 output_column_id: ColumnId::new_for_test(7),
                             },
-                        )),
+                        ),
                     },
                     data_partition: DataPartition::unpartitioned(),
                     output_partition: DataPartition::unpartitioned(),
@@ -4293,7 +4274,7 @@ mod tests {
                         probe_runtime_filters: Vec::new(),
                         children: Vec::new(),
                         stats: stats(),
-                        payload: DistributedPayload::Exchange(ExchangeReceiver {
+                        payload: DistributedNodeKind::Exchange(ExchangeReceiver {
                             partition: DataPartition::unpartitioned(),
                             source_fragment_id: 1,
                             output_columns,
@@ -4342,12 +4323,12 @@ mod tests {
                     probe_runtime_filters: Vec::new(),
                     children: Vec::new(),
                     stats: stats(),
-                    payload: DistributedPayload::Physical(PhysicalPlanKind::Values(
+                    payload: DistributedNodeKind::Values(
                         crate::sql::planner::plan::PlanValuesNode {
                             rows: Vec::new(),
                             columns: output_columns.clone(),
                         },
-                    )),
+                    ),
                 },
                 data_partition: DataPartition::unpartitioned(),
                 output_partition: DataPartition::unpartitioned(),
