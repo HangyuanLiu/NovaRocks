@@ -30,9 +30,14 @@ use crate::proto::{common, plan};
 use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, TypedExpr};
 use crate::sql::catalog;
 use crate::sql::codegen::agg_type_infer::infer_agg_function_types;
-use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentStreamKind};
 use crate::sql::common::{ChangeStreamBranchKind, JoinKind};
 use crate::sql::parser::ast::SqlType;
+use crate::sql::planner::IcebergWriteInputBinding;
+use crate::sql::planner::distributed::{
+    DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor,
+    ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentStreamKind, PartitionKind,
+    PlanFragment,
+};
 use crate::sql::planner::payload::{AggregateCall, PlanRowCountAssertion};
 use crate::sql::planner::physical::{
     AggMode, HashSource, JoinDistribution, JoinExecutionMode, PhysicalHashAggregateNode,
@@ -41,10 +46,6 @@ use crate::sql::planner::physical::{
 use crate::sql::planner::runtime_filter::{WiredRuntimeFilterBuild, WiredRuntimeFilterProbe};
 use crate::sql::planner::write_sink::{
     IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
-};
-use crate::sql::planner::{
-    DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor,
-    ExchangeReceiver, IcebergWriteInputBinding, PartitionKind, PlanFragment,
 };
 
 pub(crate) struct NativePlanEncodeContext<'a> {
@@ -860,7 +861,7 @@ fn encode_node_with_context(
             plan::distributed_node::Payload::Exchange(encode_exchange_receiver(exchange)?)
         }
         other => {
-            let physical = crate::sql::planner::distributed_kind_to_physical(other);
+            let physical = crate::sql::planner::distributed::distributed_kind_to_physical(other);
             plan::distributed_node::Payload::Physical(encode_physical_node(&physical, ctx)?)
         }
     };
@@ -2708,10 +2709,9 @@ mod tests {
     use crate::proto::expr::expr;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
+    use crate::sql::planner::distributed::DataPartition;
     use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
-    use crate::sql::planner::{
-        DataPartition, IcebergChangeStreamBranchRoute, IcebergChangeStreamRouterSink,
-    };
+    use crate::sql::planner::{IcebergChangeStreamBranchRoute, IcebergChangeStreamRouterSink};
 
     #[test]
     fn change_stream_router_encoder_materializes_partition_exprs() {

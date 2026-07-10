@@ -28,7 +28,10 @@ use crate::sql::explain::{
     ExplainLevel, PlanNodeExplainStage, format_assert_one_row_header, format_expr,
     format_project_item, format_sort_items, format_window_exprs,
 };
-use crate::sql::planner::ExchangeFlavor;
+use crate::sql::planner::distributed::{
+    DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor, ExchangeReceiver,
+    PartitionKind, PlanFragment,
+};
 use crate::sql::planner::payload::{
     PlanAssertOneRowNode as DistributedAssertOneRowNode, PlanFilterNode as DistributedFilterNode,
     PlanGenerateSeriesNode as DistributedGenerateSeriesNode,
@@ -44,10 +47,7 @@ use crate::sql::planner::physical::{
     PhysicalPlanStats, PhysicalSetOpNode, PhysicalTopNNode, PlanSetOpKind as SetOpKind,
     PlannerBroadcastDecision, PlannerConfidence, PlannerCostEstimate, TopNPhase,
 };
-use crate::sql::planner::{
-    DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeReceiver, PartitionKind,
-    PlanFragment, WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
-};
+use crate::sql::planner::{WiredRuntimeFilterBuild, WiredRuntimeFilterProbe};
 
 pub(crate) fn explain_distributed_plan(dp: &DistributedPlan, level: ExplainLevel) -> Vec<String> {
     explain_distributed_plan_inner(dp, level, None, None)
@@ -349,7 +349,7 @@ fn node_prefix(node: &DistributedNode) -> String {
 fn physical_payload(node: &DistributedNode) -> Option<PhysicalPlanKind> {
     match &node.payload {
         DistributedNodeKind::Exchange(_) => None,
-        kind => Some(crate::sql::planner::distributed_kind_to_physical(kind)),
+        kind => Some(crate::sql::planner::distributed::distributed_kind_to_physical(kind)),
     }
 }
 
@@ -1552,16 +1552,15 @@ mod tests {
     use crate::sql::optimizer::statistics::{
         ColumnStatistic, Confidence, CostEstimate, Statistics,
     };
-    use crate::sql::planner::ExchangeFlavor;
+    use crate::sql::planner::distributed::{
+        DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor, ExchangeReceiver,
+    };
     use crate::sql::planner::optimizer_bridge::scalar::{
         intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items,
     };
     use crate::sql::planner::payload::AggregateCall;
     use crate::sql::planner::physical::{
         PhysicalPlanStats, PlannerBroadcastDecision, PlannerConfidence,
-    };
-    use crate::sql::planner::{
-        DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeReceiver,
     };
 
     fn build_distributed_plan(plan: &OptimizerPhysicalNode) -> Result<DistributedPlan, String> {
@@ -1646,7 +1645,8 @@ mod tests {
             .expect("root fragment")
             .root;
 
-        let root_kind = crate::sql::planner::distributed_kind_to_physical(&root.payload);
+        let root_kind =
+            crate::sql::planner::distributed::distributed_kind_to_physical(&root.payload);
         assert_eq!(
             format_distributed_shared_plan_node_header(
                 &root_kind,
@@ -1654,8 +1654,9 @@ mod tests {
             ),
             Some("PROJECT [t.k AS k]".to_string())
         );
-        let scan_kind =
-            crate::sql::planner::distributed_kind_to_physical(&root.children[0].payload);
+        let scan_kind = crate::sql::planner::distributed::distributed_kind_to_physical(
+            &root.children[0].payload,
+        );
         assert_eq!(
             format_distributed_shared_plan_node_header(
                 &scan_kind,
@@ -1694,7 +1695,7 @@ mod tests {
                 broadcast_decision: None,
             },
             payload: DistributedNodeKind::Exchange(ExchangeReceiver {
-                partition: crate::sql::planner::DataPartition::unpartitioned(),
+                partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
                 source_fragment_id: 0,
                 output_columns: vec![],
                 output_qualifier: None,

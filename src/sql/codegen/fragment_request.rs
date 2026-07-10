@@ -18,7 +18,7 @@
 use crate::connector::ConnectorRegistry;
 use crate::engine::mv::refresh_context::IcebergMvRefreshContext;
 use crate::sql::catalog::CatalogProvider;
-use crate::sql::planner::DistributedPlan;
+use crate::sql::planner::distributed::DistributedPlan;
 
 pub(crate) struct FragmentBuildRequest<'a> {
     pub distributed_plan: &'a DistributedPlan,

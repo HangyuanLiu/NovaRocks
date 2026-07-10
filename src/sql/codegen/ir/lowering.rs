@@ -58,11 +58,12 @@ use crate::sql::codegen::runtime_filter_lowering::{
 };
 use crate::sql::codegen::type_infer;
 use crate::sql::codegen::{
-    FragmentBuildResult, FragmentId, FragmentOutputKind, LoweredFragmentEdge,
-    MultiFragmentBuildResult, OutputColumn,
+    FragmentBuildResult, FragmentOutputKind, LoweredFragmentEdge, MultiFragmentBuildResult,
+    OutputColumn,
 };
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::ChangeStreamBranchKind;
+use crate::sql::planner::distributed::{ExchangeFlavor, ExchangeReceiver, FragmentId};
 use crate::sql::planner::optimizer_bridge::property::{
     ordering_spec_from_sort_items, window_ordering_spec,
 };
@@ -78,7 +79,7 @@ use crate::thrift::types;
 use crate::types::arrow_thrift::thrift_desc_to_arrow_type as arrow_type_from_desc;
 
 pub(crate) fn lower_distributed_plan(
-    dp: &crate::sql::planner::DistributedPlan,
+    dp: &crate::sql::planner::distributed::DistributedPlan,
     catalog: &dyn CatalogProvider,
     connectors: &crate::connector::ConnectorRegistry,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
@@ -220,21 +221,23 @@ fn lowered_plan_has_scan_nodes(nodes: &[plan_nodes::TPlanNode]) -> bool {
     })
 }
 
-fn fragment_output_kind(sink: &crate::sql::planner::DataSink) -> FragmentOutputKind {
+fn fragment_output_kind(sink: &crate::sql::planner::distributed::DataSink) -> FragmentOutputKind {
     match sink {
-        crate::sql::planner::DataSink::Result => FragmentOutputKind::Result,
-        crate::sql::planner::DataSink::IcebergWrite(_) => FragmentOutputKind::TerminalWrite,
-        crate::sql::planner::DataSink::Noop
-        | crate::sql::planner::DataSink::IcebergChangeStreamRouter(_) => {
+        crate::sql::planner::distributed::DataSink::Result => FragmentOutputKind::Result,
+        crate::sql::planner::distributed::DataSink::IcebergWrite(_) => {
+            FragmentOutputKind::TerminalWrite
+        }
+        crate::sql::planner::distributed::DataSink::Noop
+        | crate::sql::planner::distributed::DataSink::IcebergChangeStreamRouter(_) => {
             FragmentOutputKind::NonTerminal
         }
     }
 }
 
 pub(crate) fn refresh_distributed_plan_for_native_sidecar(
-    dp: &crate::sql::planner::DistributedPlan,
+    dp: &crate::sql::planner::distributed::DistributedPlan,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
-) -> Result<crate::sql::planner::DistributedPlan, String> {
+) -> Result<crate::sql::planner::distributed::DistributedPlan, String> {
     let mut out = dp.clone();
     for fragment in &mut out.fragments {
         refresh_distributed_node_scan_tables_for_native(&mut fragment.root, mv_refresh_ctx)?;
@@ -243,10 +246,10 @@ pub(crate) fn refresh_distributed_plan_for_native_sidecar(
 }
 
 fn refresh_distributed_node_scan_tables_for_native(
-    node: &mut crate::sql::planner::DistributedNode,
+    node: &mut crate::sql::planner::distributed::DistributedNode,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
 ) -> Result<(), String> {
-    if let crate::sql::planner::DistributedNodeKind::Scan(scan) = &mut node.payload {
+    if let crate::sql::planner::distributed::DistributedNodeKind::Scan(scan) = &mut node.payload {
         let refresh_only_source = is_refresh_only_scan_source(&scan.table.source);
         let native_projected_names = native_refresh_scan_projected_names(&scan.table.source);
         let refreshed_table = refresh_scan_table_for_codegen(mv_refresh_ctx, &scan.table)?;
@@ -336,7 +339,10 @@ fn merge_required_columns_with_projected(
 }
 
 fn apply_local_rf_waiting_sets(
-    lowered_fragments: &mut [(crate::sql::planner::PlanFragment, LoweredDistributedNode)],
+    lowered_fragments: &mut [(
+        crate::sql::planner::distributed::PlanFragment,
+        LoweredDistributedNode,
+    )],
     local_rf_waits: &HashMap<i32, Vec<i32>>,
 ) {
     if local_rf_waits.is_empty() {
@@ -380,8 +386,8 @@ fn empty_exec_params_without_compat_scan_ranges()
 }
 
 fn validate_distributed_plan(
-    dp: &crate::sql::planner::DistributedPlan,
-) -> Result<Vec<&crate::sql::planner::PlanFragment>, String> {
+    dp: &crate::sql::planner::distributed::DistributedPlan,
+) -> Result<Vec<&crate::sql::planner::distributed::PlanFragment>, String> {
     if dp.fragments.is_empty() {
         return Err("lower_distributed_plan requires at least one fragment".to_string());
     }
@@ -414,9 +420,9 @@ fn validate_distributed_plan(
         if fragment.fragment_id == dp.root_fragment_id {
             if !matches!(
                 fragment.sink,
-                crate::sql::planner::DataSink::Result
-                    | crate::sql::planner::DataSink::IcebergWrite(_)
-                    | crate::sql::planner::DataSink::IcebergChangeStreamRouter(_)
+                crate::sql::planner::distributed::DataSink::Result
+                    | crate::sql::planner::distributed::DataSink::IcebergWrite(_)
+                    | crate::sql::planner::distributed::DataSink::IcebergChangeStreamRouter(_)
             ) {
                 return Err(format!(
                     "lower_distributed_plan root fragment id={} must use result, Iceberg write, or Iceberg change-stream router sink",
@@ -427,8 +433,8 @@ fn validate_distributed_plan(
         } else {
             if !matches!(
                 fragment.sink,
-                crate::sql::planner::DataSink::Noop
-                    | crate::sql::planner::DataSink::IcebergWrite(_)
+                crate::sql::planner::distributed::DataSink::Noop
+                    | crate::sql::planner::distributed::DataSink::IcebergWrite(_)
             ) {
                 return Err(format!(
                     "lower_distributed_plan non-root fragment id={} must use noop or Iceberg write sink",
@@ -458,7 +464,7 @@ fn validate_distributed_plan(
 
 fn validate_node_fragment_ownership(
     fragment_id: FragmentId,
-    node: &crate::sql::planner::DistributedNode,
+    node: &crate::sql::planner::distributed::DistributedNode,
 ) -> Result<(), String> {
     if node.fragment_id != fragment_id {
         return Err(format!(
@@ -473,8 +479,8 @@ fn validate_node_fragment_ownership(
 }
 
 fn topological_fragment_order(
-    dp: &crate::sql::planner::DistributedPlan,
-    fragments_by_id: &BTreeMap<FragmentId, &crate::sql::planner::PlanFragment>,
+    dp: &crate::sql::planner::distributed::DistributedPlan,
+    fragments_by_id: &BTreeMap<FragmentId, &crate::sql::planner::distributed::PlanFragment>,
     input_index_by_id: &BTreeMap<FragmentId, usize>,
 ) -> Result<Vec<FragmentId>, String> {
     let mut adjacency: BTreeMap<FragmentId, Vec<FragmentId>> = fragments_by_id
@@ -584,7 +590,7 @@ fn topological_fragment_order(
 
 fn validate_non_root_connectivity(
     root_fragment_id: FragmentId,
-    fragments_by_id: &BTreeMap<FragmentId, &crate::sql::planner::PlanFragment>,
+    fragments_by_id: &BTreeMap<FragmentId, &crate::sql::planner::distributed::PlanFragment>,
     adjacency: &BTreeMap<FragmentId, Vec<FragmentId>>,
     reverse_adjacency: &BTreeMap<FragmentId, Vec<FragmentId>>,
     router_target_ids: &BTreeSet<FragmentId>,
@@ -634,16 +640,16 @@ fn validate_non_root_connectivity(
     Ok(())
 }
 
-fn is_router_edge(edge: &crate::sql::codegen::FragmentEdge) -> bool {
+fn is_router_edge(edge: &crate::sql::planner::distributed::FragmentEdge) -> bool {
     matches!(
         edge.edge_kind,
-        crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter { .. }
+        crate::sql::planner::distributed::FragmentEdgeKind::IcebergChangeStreamRouter { .. }
     )
 }
 
 fn validate_edge_target_node(
-    target_fragment: &crate::sql::planner::PlanFragment,
-    edge: &crate::sql::codegen::FragmentEdge,
+    target_fragment: &crate::sql::planner::distributed::PlanFragment,
+    edge: &crate::sql::planner::distributed::FragmentEdge,
 ) -> Result<(), String> {
     let target_node = find_node_by_id(&target_fragment.root, edge.target_exchange_node_id)
         .ok_or_else(|| {
@@ -653,7 +659,9 @@ fn validate_edge_target_node(
         )
         })?;
 
-    let crate::sql::planner::DistributedNodeKind::Exchange(exchange) = &target_node.payload else {
+    let crate::sql::planner::distributed::DistributedNodeKind::Exchange(exchange) =
+        &target_node.payload
+    else {
         return Err(format!(
             "lower_distributed_plan edge target_exchange_node_id={} in target fragment id={} must target Exchange",
             edge.target_exchange_node_id, target_fragment.fragment_id
@@ -662,16 +670,16 @@ fn validate_edge_target_node(
 
     match (&edge.edge_kind, &exchange.flavor) {
         (
-            crate::sql::codegen::FragmentEdgeKind::Stream,
-            super::kind::ExchangeFlavor::Distribution,
+            crate::sql::planner::distributed::FragmentEdgeKind::Stream,
+            ExchangeFlavor::Distribution,
         )
         | (
-            crate::sql::codegen::FragmentEdgeKind::Stream,
-            super::kind::ExchangeFlavor::LimitOffset { .. },
+            crate::sql::planner::distributed::FragmentEdgeKind::Stream,
+            ExchangeFlavor::LimitOffset { .. },
         )
         | (
-            crate::sql::codegen::FragmentEdgeKind::Stream,
-            super::kind::ExchangeFlavor::TopNSplit { .. },
+            crate::sql::planner::distributed::FragmentEdgeKind::Stream,
+            ExchangeFlavor::TopNSplit { .. },
         ) => {
             if edge.source_fragment_id != exchange.source_fragment_id {
                 return Err(format!(
@@ -685,11 +693,11 @@ fn validate_edge_target_node(
             Ok(())
         }
         (
-            crate::sql::codegen::FragmentEdgeKind::CteMulticast {
+            crate::sql::planner::distributed::FragmentEdgeKind::CteMulticast {
                 cte_id,
                 receive_producer_column_ids,
             },
-            super::kind::ExchangeFlavor::CteMulticast {
+            ExchangeFlavor::CteMulticast {
                 cte_id: exchange_cte_id,
                 receive_producer_column_ids: exchange_receive_producer_column_ids,
             },
@@ -724,8 +732,10 @@ fn validate_edge_target_node(
             Ok(())
         }
         (
-            crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter { .. },
-            super::kind::ExchangeFlavor::Distribution,
+            crate::sql::planner::distributed::FragmentEdgeKind::IcebergChangeStreamRouter {
+                ..
+            },
+            ExchangeFlavor::Distribution,
         ) => {
             if edge.source_fragment_id != exchange.source_fragment_id {
                 return Err(format!(
@@ -738,27 +748,32 @@ fn validate_edge_target_node(
             }
             Ok(())
         }
-        (crate::sql::codegen::FragmentEdgeKind::Stream, _) => Err(format!(
+        (crate::sql::planner::distributed::FragmentEdgeKind::Stream, _) => Err(format!(
             "lower_distributed_plan stream edge target_exchange_node_id={} in target fragment id={} must target stream Exchange",
             edge.target_exchange_node_id, target_fragment.fragment_id
         )),
-        (crate::sql::codegen::FragmentEdgeKind::CteMulticast { .. }, _) => Err(format!(
-            "lower_distributed_plan CTE multicast edge target_exchange_node_id={} in target fragment id={} must target Exchange(CteMulticast)",
-            edge.target_exchange_node_id, target_fragment.fragment_id
-        )),
-        (crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter { .. }, _) => {
+        (crate::sql::planner::distributed::FragmentEdgeKind::CteMulticast { .. }, _) => {
             Err(format!(
-                "lower_distributed_plan Iceberg change-stream router edge target_exchange_node_id={} in target fragment id={} must target Exchange(Distribution)",
+                "lower_distributed_plan CTE multicast edge target_exchange_node_id={} in target fragment id={} must target Exchange(CteMulticast)",
                 edge.target_exchange_node_id, target_fragment.fragment_id
             ))
         }
+        (
+            crate::sql::planner::distributed::FragmentEdgeKind::IcebergChangeStreamRouter {
+                ..
+            },
+            _,
+        ) => Err(format!(
+            "lower_distributed_plan Iceberg change-stream router edge target_exchange_node_id={} in target fragment id={} must target Exchange(Distribution)",
+            edge.target_exchange_node_id, target_fragment.fragment_id
+        )),
     }
 }
 
 fn find_node_by_id(
-    node: &crate::sql::planner::DistributedNode,
+    node: &crate::sql::planner::distributed::DistributedNode,
     node_id: i32,
-) -> Option<&crate::sql::planner::DistributedNode> {
+) -> Option<&crate::sql::planner::distributed::DistributedNode> {
     if node.node_id == node_id {
         return Some(node);
     }
@@ -769,11 +784,11 @@ fn find_node_by_id(
 
 fn ensure_unpartitioned(
     label: &str,
-    partition: &crate::sql::planner::DataPartition,
+    partition: &crate::sql::planner::distributed::DataPartition,
 ) -> Result<(), String> {
     if !matches!(
         partition.kind,
-        crate::sql::planner::PartitionKind::Unpartitioned
+        crate::sql::planner::distributed::PartitionKind::Unpartitioned
     ) || !partition.exprs.is_empty()
     {
         return Err(format!(
@@ -794,10 +809,10 @@ fn unpartitioned_compat_partition_placeholder() -> partitions::TDataPartition {
 }
 
 fn lower_fragment_edges(
-    dp: &crate::sql::planner::DistributedPlan,
+    dp: &crate::sql::planner::distributed::DistributedPlan,
     state: &mut OwnedLoweringState<'_>,
 ) -> Result<Vec<LoweredFragmentEdge>, String> {
-    let fragments_by_id: BTreeMap<FragmentId, &crate::sql::planner::PlanFragment> = dp
+    let fragments_by_id: BTreeMap<FragmentId, &crate::sql::planner::distributed::PlanFragment> = dp
         .fragments
         .iter()
         .map(|fragment| (fragment.fragment_id, fragment))
@@ -808,8 +823,8 @@ fn lower_fragment_edges(
         let mut lowered_edge = edge.clone();
         let compat_partition;
         match edge.edge_kind {
-            crate::sql::codegen::FragmentEdgeKind::Stream
-            | crate::sql::codegen::FragmentEdgeKind::CteMulticast { .. } => {
+            crate::sql::planner::distributed::FragmentEdgeKind::Stream
+            | crate::sql::planner::distributed::FragmentEdgeKind::CteMulticast { .. } => {
                 let exchange = target_exchange_for_edge(&fragments_by_id, edge)?;
                 if state
                     .lowered_fragment_output(edge.source_fragment_id)
@@ -834,7 +849,7 @@ fn lower_fragment_edges(
                 )?;
                 if matches!(
                     edge.edge_kind,
-                    crate::sql::codegen::FragmentEdgeKind::CteMulticast { .. }
+                    crate::sql::planner::distributed::FragmentEdgeKind::CteMulticast { .. }
                 ) {
                     lowered_edge.output_slot_ids = lower_cte_receive_output_slot_ids(
                         exchange,
@@ -851,7 +866,9 @@ fn lower_fragment_edges(
                     )?;
                 }
             }
-            crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter { .. } => {
+            crate::sql::planner::distributed::FragmentEdgeKind::IcebergChangeStreamRouter {
+                ..
+            } => {
                 if state
                     .lowered_fragment_output(edge.source_fragment_id)
                     .is_none()
@@ -919,11 +936,11 @@ fn lower_fragment_edges(
 }
 
 fn native_exchange_output_partition(
-    exchange: &super::kind::DistributedExchangeNode,
-) -> Result<crate::sql::planner::DataPartition, String> {
+    exchange: &ExchangeReceiver,
+) -> Result<crate::sql::planner::distributed::DataPartition, String> {
     if matches!(
         exchange.partition.kind,
-        crate::sql::planner::PartitionKind::Hash
+        crate::sql::planner::distributed::PartitionKind::Hash
     ) && exchange.partition.exprs.is_empty()
     {
         return Err(
@@ -933,20 +950,22 @@ fn native_exchange_output_partition(
     Ok(exchange.partition.clone())
 }
 
-fn exchange_partition_type(
-    exchange: &super::kind::DistributedExchangeNode,
-) -> partitions::TPartitionType {
+fn exchange_partition_type(exchange: &ExchangeReceiver) -> partitions::TPartitionType {
     match exchange.partition.kind {
-        crate::sql::planner::PartitionKind::Unpartitioned => {
+        crate::sql::planner::distributed::PartitionKind::Unpartitioned => {
             partitions::TPartitionType::UNPARTITIONED
         }
-        crate::sql::planner::PartitionKind::Random => partitions::TPartitionType::RANDOM,
-        crate::sql::planner::PartitionKind::Hash => partitions::TPartitionType::HASH_PARTITIONED,
+        crate::sql::planner::distributed::PartitionKind::Random => {
+            partitions::TPartitionType::RANDOM
+        }
+        crate::sql::planner::distributed::PartitionKind::Hash => {
+            partitions::TPartitionType::HASH_PARTITIONED
+        }
     }
 }
 
 fn lower_exchange_compat_partition(
-    exchange: &super::kind::DistributedExchangeNode,
+    exchange: &ExchangeReceiver,
     source_scope: &ExprScope,
     slot_allocator: expr_compiler::SlotAllocator,
 ) -> Result<partitions::TDataPartition, String> {
@@ -976,10 +995,10 @@ fn lower_exchange_compat_partition(
 }
 
 fn router_route_for_edge<'a>(
-    dp: &'a crate::sql::planner::DistributedPlan,
-    edge: &crate::sql::codegen::FragmentEdge,
+    dp: &'a crate::sql::planner::distributed::DistributedPlan,
+    edge: &crate::sql::planner::distributed::FragmentEdge,
 ) -> Result<&'a crate::sql::planner::IcebergChangeStreamBranchRoute, String> {
-    let crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter {
+    let crate::sql::planner::distributed::FragmentEdgeKind::IcebergChangeStreamRouter {
         router_group_id,
         branch_id,
         branch_kind,
@@ -997,7 +1016,8 @@ fn router_route_for_edge<'a>(
                 edge.source_fragment_id
             )
         })?;
-    let crate::sql::planner::DataSink::IcebergChangeStreamRouter(router) = &source_fragment.sink
+    let crate::sql::planner::distributed::DataSink::IcebergChangeStreamRouter(router) =
+        &source_fragment.sink
     else {
         return Err(format!(
             "lower_distributed_plan router edge source fragment id={} does not use Iceberg change-stream router sink",
@@ -1028,12 +1048,12 @@ fn router_route_for_edge<'a>(
 }
 
 fn lower_cte_receive_output_slot_ids(
-    exchange: &super::kind::DistributedExchangeNode,
+    exchange: &ExchangeReceiver,
     source_scope: &ExprScope,
     source_output_columns: &[AnalysisOutputColumn],
     edge_label: &str,
 ) -> Result<Vec<i32>, String> {
-    let super::kind::ExchangeFlavor::CteMulticast {
+    let ExchangeFlavor::CteMulticast {
         cte_id,
         receive_producer_column_ids,
     } = &exchange.flavor
@@ -1086,7 +1106,7 @@ fn lower_cte_receive_output_slot_ids(
 }
 
 fn lower_stream_edge_output_slot_ids(
-    edge: &crate::sql::codegen::FragmentEdge,
+    edge: &crate::sql::planner::distributed::FragmentEdge,
     source_scope: &ExprScope,
     source_output_columns: &[AnalysisOutputColumn],
 ) -> Result<Vec<i32>, String> {
@@ -1171,8 +1191,8 @@ fn lower_stream_edge_output_slot_ids(
 }
 
 fn lower_stream_edge_output_slot_ids_for_exchange(
-    edge: &crate::sql::codegen::FragmentEdge,
-    exchange: &super::kind::DistributedExchangeNode,
+    edge: &crate::sql::planner::distributed::FragmentEdge,
+    exchange: &ExchangeReceiver,
     source_scope: &ExprScope,
     source_output_columns: &[AnalysisOutputColumn],
 ) -> Result<Vec<i32>, String> {
@@ -1291,9 +1311,9 @@ fn widen_join_output_scopes(
 }
 
 fn edge_boundary_schemas(
-    dp: &crate::sql::planner::DistributedPlan,
+    dp: &crate::sql::planner::distributed::DistributedPlan,
 ) -> Result<Vec<BoundarySchemaReport>, String> {
-    let fragments_by_id: BTreeMap<FragmentId, &crate::sql::planner::PlanFragment> = dp
+    let fragments_by_id: BTreeMap<FragmentId, &crate::sql::planner::distributed::PlanFragment> = dp
         .fragments
         .iter()
         .map(|fragment| (fragment.fragment_id, fragment))
@@ -1316,23 +1336,23 @@ fn edge_boundary_schemas(
         }
         let exchange = target_exchange_for_edge(&fragments_by_id, edge)?;
         let edge_output_columns = match edge.edge_kind {
-            crate::sql::codegen::FragmentEdgeKind::CteMulticast { .. } => {
+            crate::sql::planner::distributed::FragmentEdgeKind::CteMulticast { .. } => {
                 if exchange.output_columns.is_empty() {
                     &source.output_columns
                 } else {
                     &exchange.output_columns
                 }
             }
-            crate::sql::codegen::FragmentEdgeKind::Stream => {
+            crate::sql::planner::distributed::FragmentEdgeKind::Stream => {
                 if exchange.output_columns.is_empty() {
                     &source.output_columns
                 } else {
                     &exchange.output_columns
                 }
             }
-            crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter { .. } => {
-                &exchange.output_columns
-            }
+            crate::sql::planner::distributed::FragmentEdgeKind::IcebergChangeStreamRouter {
+                ..
+            } => &exchange.output_columns,
         };
         let output_columns = output_columns_for_boundary(edge_output_columns);
         let columns = output_columns_to_boundary_columns(&output_columns);
@@ -1353,9 +1373,9 @@ fn edge_boundary_schemas(
 }
 
 fn target_exchange_for_edge<'a>(
-    fragments_by_id: &'a BTreeMap<FragmentId, &crate::sql::planner::PlanFragment>,
-    edge: &crate::sql::codegen::FragmentEdge,
-) -> Result<&'a super::kind::DistributedExchangeNode, String> {
+    fragments_by_id: &'a BTreeMap<FragmentId, &crate::sql::planner::distributed::PlanFragment>,
+    edge: &crate::sql::planner::distributed::FragmentEdge,
+) -> Result<&'a ExchangeReceiver, String> {
     let target_fragment = fragments_by_id
         .get(&edge.target_fragment_id)
         .ok_or_else(|| {
@@ -1371,7 +1391,9 @@ fn target_exchange_for_edge<'a>(
                 edge.target_exchange_node_id, target_fragment.fragment_id
             )
         })?;
-    let crate::sql::planner::DistributedNodeKind::Exchange(exchange) = &target_node.payload else {
+    let crate::sql::planner::distributed::DistributedNodeKind::Exchange(exchange) =
+        &target_node.payload
+    else {
         return Err(format!(
             "lower_distributed_plan edge target_exchange_node_id={} in target fragment id={} must target Exchange",
             edge.target_exchange_node_id, target_fragment.fragment_id
@@ -1379,23 +1401,23 @@ fn target_exchange_for_edge<'a>(
     };
     match (&edge.edge_kind, &exchange.flavor) {
         (
-            crate::sql::codegen::FragmentEdgeKind::Stream,
-            super::kind::ExchangeFlavor::Distribution,
+            crate::sql::planner::distributed::FragmentEdgeKind::Stream,
+            ExchangeFlavor::Distribution,
         )
         | (
-            crate::sql::codegen::FragmentEdgeKind::Stream,
-            super::kind::ExchangeFlavor::LimitOffset { .. },
+            crate::sql::planner::distributed::FragmentEdgeKind::Stream,
+            ExchangeFlavor::LimitOffset { .. },
         )
         | (
-            crate::sql::codegen::FragmentEdgeKind::Stream,
-            super::kind::ExchangeFlavor::TopNSplit { .. },
+            crate::sql::planner::distributed::FragmentEdgeKind::Stream,
+            ExchangeFlavor::TopNSplit { .. },
         ) => Ok(exchange),
         (
-            crate::sql::codegen::FragmentEdgeKind::CteMulticast {
+            crate::sql::planner::distributed::FragmentEdgeKind::CteMulticast {
                 cte_id,
                 receive_producer_column_ids,
             },
-            super::kind::ExchangeFlavor::CteMulticast {
+            ExchangeFlavor::CteMulticast {
                 cte_id: exchange_cte_id,
                 receive_producer_column_ids: exchange_receive_producer_column_ids,
             },
@@ -1411,23 +1433,30 @@ fn target_exchange_for_edge<'a>(
             Ok(exchange)
         }
         (
-            crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter { .. },
-            super::kind::ExchangeFlavor::Distribution,
+            crate::sql::planner::distributed::FragmentEdgeKind::IcebergChangeStreamRouter {
+                ..
+            },
+            ExchangeFlavor::Distribution,
         ) => Ok(exchange),
-        (crate::sql::codegen::FragmentEdgeKind::Stream, _) => Err(format!(
+        (crate::sql::planner::distributed::FragmentEdgeKind::Stream, _) => Err(format!(
             "lower_distributed_plan stream edge target_exchange_node_id={} in target fragment id={} must target stream Exchange",
             edge.target_exchange_node_id, target_fragment.fragment_id
         )),
-        (crate::sql::codegen::FragmentEdgeKind::CteMulticast { .. }, _) => Err(format!(
-            "lower_distributed_plan CTE multicast edge target_exchange_node_id={} in target fragment id={} must target Exchange(CteMulticast)",
-            edge.target_exchange_node_id, target_fragment.fragment_id
-        )),
-        (crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter { .. }, _) => {
+        (crate::sql::planner::distributed::FragmentEdgeKind::CteMulticast { .. }, _) => {
             Err(format!(
-                "lower_distributed_plan Iceberg change-stream router edge target_exchange_node_id={} in target fragment id={} must target Exchange(Distribution)",
+                "lower_distributed_plan CTE multicast edge target_exchange_node_id={} in target fragment id={} must target Exchange(CteMulticast)",
                 edge.target_exchange_node_id, target_fragment.fragment_id
             ))
         }
+        (
+            crate::sql::planner::distributed::FragmentEdgeKind::IcebergChangeStreamRouter {
+                ..
+            },
+            _,
+        ) => Err(format!(
+            "lower_distributed_plan Iceberg change-stream router edge target_exchange_node_id={} in target fragment id={} must target Exchange(Distribution)",
+            edge.target_exchange_node_id, target_fragment.fragment_id
+        )),
     }
 }
 
@@ -1603,8 +1632,11 @@ pub(crate) struct OwnedLoweringState<'a> {
     rf_build_side_filters: HashMap<FragmentId, Vec<i32>>,
     rf_probe_side_filters: HashMap<FragmentId, Vec<(i32, i32)>>,
     lowered_fragment_outputs: HashMap<FragmentId, LoweredFragmentOutput>,
-    fragments_by_id: HashMap<FragmentId, crate::sql::planner::PlanFragment>,
-    lowered_fragments: Vec<(crate::sql::planner::PlanFragment, LoweredDistributedNode)>,
+    fragments_by_id: HashMap<FragmentId, crate::sql::planner::distributed::PlanFragment>,
+    lowered_fragments: Vec<(
+        crate::sql::planner::distributed::PlanFragment,
+        LoweredDistributedNode,
+    )>,
     lowering_fragments: BTreeSet<FragmentId>,
 }
 
@@ -1622,7 +1654,7 @@ impl<'a> OwnedLoweringState<'a> {
         connectors: &'a crate::connector::ConnectorRegistry,
         mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
         _root_fragment_id: FragmentId,
-        fragments: &[crate::sql::planner::PlanFragment],
+        fragments: &[crate::sql::planner::distributed::PlanFragment],
     ) -> Self {
         Self {
             connectors,
@@ -1982,60 +2014,60 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_node(
         &mut self,
-        node: &crate::sql::planner::DistributedNode,
+        node: &crate::sql::planner::distributed::DistributedNode,
     ) -> Result<LoweredDistributedNode, String> {
         let mut lowered = match &node.payload {
-            crate::sql::planner::DistributedNodeKind::Scan(scan) => {
+            crate::sql::planner::distributed::DistributedNodeKind::Scan(scan) => {
                 self.lower_scan_node(node, scan)?
             }
-            crate::sql::planner::DistributedNodeKind::Project(project) => {
+            crate::sql::planner::distributed::DistributedNodeKind::Project(project) => {
                 self.lower_project_node(node, project)?
             }
-            crate::sql::planner::DistributedNodeKind::Filter(filter) => {
+            crate::sql::planner::distributed::DistributedNodeKind::Filter(filter) => {
                 self.lower_filter_node(node, filter)?
             }
-            crate::sql::planner::DistributedNodeKind::Sort(sort) => {
+            crate::sql::planner::distributed::DistributedNodeKind::Sort(sort) => {
                 self.lower_sort_node(node, sort)?
             }
-            crate::sql::planner::DistributedNodeKind::TopN(topn) => {
+            crate::sql::planner::distributed::DistributedNodeKind::TopN(topn) => {
                 self.lower_topn_node(node, topn)?
             }
-            crate::sql::planner::DistributedNodeKind::Exchange(exchange) => {
+            crate::sql::planner::distributed::DistributedNodeKind::Exchange(exchange) => {
                 self.lower_exchange_node(node, exchange)?
             }
-            crate::sql::planner::DistributedNodeKind::HashAggregate(agg) => {
+            crate::sql::planner::distributed::DistributedNodeKind::HashAggregate(agg) => {
                 self.lower_hash_aggregate_node(node, agg.as_ref())?
             }
-            crate::sql::planner::DistributedNodeKind::HashJoin(hash_join) => {
+            crate::sql::planner::distributed::DistributedNodeKind::HashJoin(hash_join) => {
                 self.lower_hash_join_node(node, hash_join.as_ref())?
             }
-            crate::sql::planner::DistributedNodeKind::NestLoopJoin(nest_loop) => {
+            crate::sql::planner::distributed::DistributedNodeKind::NestLoopJoin(nest_loop) => {
                 self.lower_nest_loop_join_node(node, nest_loop)?
             }
-            crate::sql::planner::DistributedNodeKind::Values(values) => {
+            crate::sql::planner::distributed::DistributedNodeKind::Values(values) => {
                 self.lower_values_node(node, values)?
             }
-            crate::sql::planner::DistributedNodeKind::AssertOneRow(assert_one_row) => {
+            crate::sql::planner::distributed::DistributedNodeKind::AssertOneRow(assert_one_row) => {
                 self.lower_assert_one_row_node(node, assert_one_row)?
             }
-            crate::sql::planner::DistributedNodeKind::Repeat(repeat) => {
+            crate::sql::planner::distributed::DistributedNodeKind::Repeat(repeat) => {
                 self.lower_repeat_node(node, repeat)?
             }
-            crate::sql::planner::DistributedNodeKind::ChangeEventExpand(expand) => {
+            crate::sql::planner::distributed::DistributedNodeKind::ChangeEventExpand(expand) => {
                 self.lower_change_event_expand_node(node, expand)?
             }
-            crate::sql::planner::DistributedNodeKind::SetOp(set_op) => {
+            crate::sql::planner::distributed::DistributedNodeKind::SetOp(set_op) => {
                 self.lower_set_op_node(node, set_op)?
             }
-            crate::sql::planner::DistributedNodeKind::Window(window) => {
+            crate::sql::planner::distributed::DistributedNodeKind::Window(window) => {
                 self.lower_window_node(node, window)?
             }
-            crate::sql::planner::DistributedNodeKind::GenerateSeries(generate_series) => {
-                self.lower_generate_series_node(node, generate_series)?
-            }
-            crate::sql::planner::DistributedNodeKind::TableFunction(table_function) => {
-                self.lower_table_function_node(node, table_function)?
-            }
+            crate::sql::planner::distributed::DistributedNodeKind::GenerateSeries(
+                generate_series,
+            ) => self.lower_generate_series_node(node, generate_series)?,
+            crate::sql::planner::distributed::DistributedNodeKind::TableFunction(
+                table_function,
+            ) => self.lower_table_function_node(node, table_function)?,
         };
         if let Some(root) = lowered.plan_nodes.first_mut() {
             root.limit = node.limit;
@@ -2046,7 +2078,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_scan_node(
         &mut self,
-        node: &crate::sql::planner::DistributedNode,
+        node: &crate::sql::planner::distributed::DistributedNode,
         scan: &super::kind::DistributedScanNode,
     ) -> Result<LoweredDistributedNode, String> {
         if !node.children.is_empty() {
@@ -2075,7 +2107,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_project_node(
         &mut self,
-        node: &crate::sql::planner::DistributedNode,
+        node: &crate::sql::planner::distributed::DistributedNode,
         project: &super::kind::DistributedProjectNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -2102,7 +2134,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_filter_node(
         &mut self,
-        node: &crate::sql::planner::DistributedNode,
+        node: &crate::sql::planner::distributed::DistributedNode,
         filter: &super::kind::DistributedFilterNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -2151,7 +2183,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_sort_node(
         &mut self,
-        node: &crate::sql::planner::DistributedNode,
+        node: &crate::sql::planner::distributed::DistributedNode,
         sort: &super::kind::DistributedSortNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -2183,7 +2215,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_topn_node(
         &mut self,
-        node: &crate::sql::planner::DistributedNode,
+        node: &crate::sql::planner::distributed::DistributedNode,
         topn: &super::kind::PhysicalTopNNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -2209,8 +2241,8 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_exchange_node(
         &mut self,
-        node: &crate::sql::planner::DistributedNode,
-        exchange: &super::kind::DistributedExchangeNode,
+        node: &crate::sql::planner::distributed::DistributedNode,
+        exchange: &ExchangeReceiver,
     ) -> Result<LoweredDistributedNode, String> {
         if !node.children.is_empty() {
             return Err(format!(
@@ -2221,7 +2253,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         }
         let partition_type = exchange_partition_type(exchange);
         match &exchange.flavor {
-            super::kind::ExchangeFlavor::Distribution => {
+            ExchangeFlavor::Distribution => {
                 if exchange.output_columns.is_empty() {
                     let source = self.lower_stream_exchange_source(node, exchange)?;
                     Ok(LoweredDistributedNode {
@@ -2279,7 +2311,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     })
                 }
             }
-            super::kind::ExchangeFlavor::LimitOffset { limit, offset } => {
+            ExchangeFlavor::LimitOffset { limit, offset } => {
                 let source = self.lower_stream_exchange_source(node, exchange)?;
                 Ok(LoweredDistributedNode {
                     plan_nodes: vec![nodes::build_limit_exchange_node(
@@ -2295,7 +2327,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     ordering: OrderingSpec::Any,
                 })
             }
-            super::kind::ExchangeFlavor::TopNSplit {
+            ExchangeFlavor::TopNSplit {
                 items,
                 limit,
                 offset,
@@ -2327,7 +2359,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     ordering: ordering_spec_from_sort_items(items),
                 })
             }
-            super::kind::ExchangeFlavor::CteMulticast { .. } => {
+            ExchangeFlavor::CteMulticast { .. } => {
                 if self
                     .state
                     .lowered_fragment_output(exchange.source_fragment_id)
@@ -2361,7 +2393,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_hash_aggregate_node(
         &mut self,
-        node: &crate::sql::planner::DistributedNode,
+        node: &crate::sql::planner::distributed::DistributedNode,
         agg: &super::kind::PhysicalHashAggregateNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -2388,7 +2420,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_hash_join_node(
         &mut self,
-        node: &crate::sql::planner::DistributedNode,
+        node: &crate::sql::planner::distributed::DistributedNode,
         hash_join: &super::kind::PhysicalHashJoinNode,
     ) -> Result<LoweredDistributedNode, String> {
         let (left_node, right_node) = binary_children(node, "HashJoin")?;
@@ -2442,7 +2474,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_nest_loop_join_node(
         &mut self,
-        node: &crate::sql::planner::DistributedNode,
+        node: &crate::sql::planner::distributed::DistributedNode,
         nest_loop: &super::kind::PhysicalNestLoopJoinNode,
     ) -> Result<LoweredDistributedNode, String> {
         let (left_node, right_node) = binary_children(node, "NestLoopJoin")?;
@@ -2494,7 +2526,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_values_node(
         &mut self,
-        node: &crate::sql::planner::DistributedNode,
+        node: &crate::sql::planner::distributed::DistributedNode,
         values: &super::kind::DistributedValuesNode,
     ) -> Result<LoweredDistributedNode, String> {
         if !node.children.is_empty() {
@@ -2517,7 +2549,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_assert_one_row_node(
         &mut self,
-        node: &crate::sql::planner::DistributedNode,
+        node: &crate::sql::planner::distributed::DistributedNode,
         assert_one_row: &super::kind::DistributedAssertOneRowNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -2543,7 +2575,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_repeat_node(
         &mut self,
-        node: &crate::sql::planner::DistributedNode,
+        node: &crate::sql::planner::distributed::DistributedNode,
         repeat: &super::kind::DistributedRepeatNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -2578,7 +2610,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_change_event_expand_node(
         &mut self,
-        node: &crate::sql::planner::DistributedNode,
+        node: &crate::sql::planner::distributed::DistributedNode,
         expand: &super::kind::DistributedChangeEventExpandNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -2605,7 +2637,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_set_op_node(
         &mut self,
-        node: &crate::sql::planner::DistributedNode,
+        node: &crate::sql::planner::distributed::DistributedNode,
         set_op: &super::kind::PhysicalSetOpNode,
     ) -> Result<LoweredDistributedNode, String> {
         if matches!(set_op.kind, super::kind::SetOpKind::UnionDistinct) {
@@ -2652,7 +2684,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_window_node(
         &mut self,
-        node: &crate::sql::planner::DistributedNode,
+        node: &crate::sql::planner::distributed::DistributedNode,
         window: &super::kind::DistributedWindowNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -2683,7 +2715,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_generate_series_node(
         &mut self,
-        node: &crate::sql::planner::DistributedNode,
+        node: &crate::sql::planner::distributed::DistributedNode,
         generate_series: &super::kind::DistributedGenerateSeriesNode,
     ) -> Result<LoweredDistributedNode, String> {
         if !node.children.is_empty() {
@@ -2713,7 +2745,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_table_function_node(
         &mut self,
-        node: &crate::sql::planner::DistributedNode,
+        node: &crate::sql::planner::distributed::DistributedNode,
         table_function: &super::kind::DistributedTableFunctionNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -2740,8 +2772,8 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_stream_exchange_source(
         &mut self,
-        node: &crate::sql::planner::DistributedNode,
-        exchange: &super::kind::DistributedExchangeNode,
+        node: &crate::sql::planner::distributed::DistributedNode,
+        exchange: &ExchangeReceiver,
     ) -> Result<LoweredFragmentOutput, String> {
         if self
             .state
@@ -3105,7 +3137,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn probe_runtime_filter_descs_for_plan_node(
         &mut self,
-        node: &crate::sql::planner::DistributedNode,
+        node: &crate::sql::planner::distributed::DistributedNode,
         scope: &ExprScope,
         thrift_node_id: i32,
     ) -> Result<Vec<crate::thrift::runtime_filter::TRuntimeFilterDescription>, String> {
@@ -3135,7 +3167,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn record_probe_targets(
         &mut self,
-        node: &crate::sql::planner::DistributedNode,
+        node: &crate::sql::planner::distributed::DistributedNode,
         result: &LoweredDistributedNode,
     ) {
         if node.probe_runtime_filters.is_empty() {
@@ -5407,7 +5439,7 @@ fn rf_layout_for_join_execution_mode(
 }
 
 fn first_tuple_id(
-    node: &crate::sql::planner::DistributedNode,
+    node: &crate::sql::planner::distributed::DistributedNode,
     operator_name: &str,
 ) -> Result<i32, String> {
     node.tuple_ids.first().copied().ok_or_else(|| {
@@ -5419,12 +5451,12 @@ fn first_tuple_id(
 }
 
 fn binary_children<'a>(
-    node: &'a crate::sql::planner::DistributedNode,
+    node: &'a crate::sql::planner::distributed::DistributedNode,
     operator_name: &str,
 ) -> Result<
     (
-        &'a crate::sql::planner::DistributedNode,
-        &'a crate::sql::planner::DistributedNode,
+        &'a crate::sql::planner::distributed::DistributedNode,
+        &'a crate::sql::planner::distributed::DistributedNode,
     ),
     String,
 > {
@@ -5520,7 +5552,7 @@ fn project_node_output_columns(
 
 fn lower_fragment_sink(
     state: &mut OwnedLoweringState<'_>,
-    fragment: &crate::sql::planner::PlanFragment,
+    fragment: &crate::sql::planner::distributed::PlanFragment,
     scope: &ExprScope,
     output_columns: &[AnalysisOutputColumn],
 ) -> Result<
@@ -5533,13 +5565,15 @@ fn lower_fragment_sink(
 > {
     let boundary_columns = output_columns_for_boundary(output_columns);
     match &fragment.sink {
-        crate::sql::planner::DataSink::Result => Ok((
+        crate::sql::planner::distributed::DataSink::Result => Ok((
             build_result_sink(),
             result_output_exprs_for_columns(scope, output_columns)?,
             boundary_columns,
         )),
-        crate::sql::planner::DataSink::Noop => Ok((build_noop_sink(), None, boundary_columns)),
-        crate::sql::planner::DataSink::IcebergWrite(sink) => {
+        crate::sql::planner::distributed::DataSink::Noop => {
+            Ok((build_noop_sink(), None, boundary_columns))
+        }
+        crate::sql::planner::distributed::DataSink::IcebergWrite(sink) => {
             add_iceberg_sink_target_table_to_desc_builder(
                 &mut state.desc_builder,
                 &sink.descriptor_database,
@@ -5573,7 +5607,7 @@ fn lower_fragment_sink(
             let output_sink = build_noop_sink();
             Ok((output_sink, output_exprs, output_columns))
         }
-        crate::sql::planner::DataSink::IcebergChangeStreamRouter(sink) => {
+        crate::sql::planner::distributed::DataSink::IcebergChangeStreamRouter(sink) => {
             #[cfg(feature = "compat")]
             let output_sink = build_router_sink_thrift(sink, scope, output_columns)?;
             #[cfg(not(feature = "compat"))]
@@ -5879,19 +5913,12 @@ mod tests {
     use crate::sql::codegen::expr_compiler::infer_agg_function_types;
     use crate::sql::codegen::fragment_builder::PlanFragmentBuilder;
     use crate::sql::codegen::ir::kind::{
-        DistributedExchangeNode, DistributedValuesNode, ExchangeFlavor,
-        PhysicalHashAggregateNode as DistributedHashAggregateNode, PhysicalHashJoinEqCondition,
-        PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalSetOpNode, SetOpKind,
-    };
-    use crate::sql::codegen::ir::{
-        DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan,
-        PartitionKind, PlanFragment,
+        DistributedValuesNode, PhysicalHashAggregateNode as DistributedHashAggregateNode,
+        PhysicalHashJoinEqCondition, PhysicalHashJoinNode, PhysicalNestLoopJoinNode,
+        PhysicalSetOpNode, SetOpKind,
     };
     use crate::sql::codegen::resolve::{ColumnBinding, ExprScope};
-    use crate::sql::codegen::{
-        FragmentBuildRequest, FragmentEdge, FragmentEdgeKind, FragmentOutputKind,
-        FragmentStreamKind, MultiFragmentBuildResult,
-    };
+    use crate::sql::codegen::{FragmentBuildRequest, FragmentOutputKind, MultiFragmentBuildResult};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
         CTEAnchorOp, CTEConsumeOp, CTEProduceOp, Operator, ProjectOp, ScanOp, ValuesOp,
@@ -5902,6 +5929,11 @@ mod tests {
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::Statistics;
     use crate::sql::planner::WiredRuntimeFilterBuild;
+    use crate::sql::planner::distributed::{
+        DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan,
+        ExchangeFlavor, ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
+        PartitionKind, PlanFragment,
+    };
     use crate::sql::planner::optimizer_bridge::scalar::intern_project_items;
     use crate::sql::planner::payload::{AggregateCall, PlanScanNode};
     use crate::sql::planner::physical::PhysicalPlanKind;
@@ -7078,8 +7110,8 @@ mod tests {
                 nullable: false,
             },
         );
-        let exchange = DistributedExchangeNode {
-            partition: crate::sql::planner::DataPartition::unpartitioned(),
+        let exchange = ExchangeReceiver {
+            partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
             source_fragment_id: 0,
             output_columns: vec![output_col(13, "total", DataType::Int64, false)],
             output_qualifier: None,
@@ -7449,7 +7481,7 @@ mod tests {
         assert_eq!(edge.stream_kind, FragmentStreamKind::Partitioned);
         assert!(matches!(
             edge.output_partition.kind,
-            crate::sql::planner::PartitionKind::Hash
+            crate::sql::planner::distributed::PartitionKind::Hash
         ));
         assert_eq!(edge.output_partition.exprs.len(), 1);
         let ExprKind::ColumnRef {
@@ -7826,8 +7858,8 @@ mod tests {
             probe_runtime_filters: vec![],
             children: vec![],
             stats: distributed_stats(),
-            payload: DistributedNodeKind::Exchange(DistributedExchangeNode {
-                partition: crate::sql::planner::DataPartition::unpartitioned(),
+            payload: DistributedNodeKind::Exchange(ExchangeReceiver {
+                partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
                 source_fragment_id: 0,
                 output_columns: output_columns.clone(),
                 output_qualifier: None,
@@ -7925,7 +7957,7 @@ mod tests {
             source_fragment_id,
             target_fragment_id,
             target_exchange_node_id,
-            output_partition: crate::sql::planner::DataPartition::unpartitioned(),
+            output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
             stream_kind: FragmentStreamKind::Gather,
             edge_kind: FragmentEdgeKind::Stream,
             output_slot_ids: Vec::new(),
@@ -8136,8 +8168,8 @@ mod tests {
             probe_runtime_filters: vec![],
             children: vec![],
             stats: distributed_stats(),
-            payload: DistributedNodeKind::Exchange(DistributedExchangeNode {
-                partition: crate::sql::planner::DataPartition::unpartitioned(),
+            payload: DistributedNodeKind::Exchange(ExchangeReceiver {
+                partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
                 source_fragment_id,
                 output_columns: Vec::new(),
                 output_qualifier: None,

@@ -3175,7 +3175,7 @@ enum ChangeStreamWriteEntrypoint {
 struct ChangeStreamWriteBuildObservation {
     entrypoint: ChangeStreamWriteEntrypoint,
     branch_kinds: Vec<crate::sql::common::ChangeStreamBranchKind>,
-    writer_fragment_ids: Vec<Option<crate::sql::codegen::FragmentId>>,
+    writer_fragment_ids: Vec<Option<crate::sql::planner::distributed::FragmentId>>,
 }
 
 #[cfg(test)]
@@ -3282,8 +3282,9 @@ pub(crate) struct PlannedIcebergChangeStreamWrite {
     pub(crate) topology: crate::sql::planner::IcebergChangeStreamWriteTopology,
 }
 
-type ChangeStreamNativePlanMutation<'a> =
-    Box<dyn FnOnce(&mut crate::sql::planner::DistributedPlan) -> Result<(), String> + 'a>;
+type ChangeStreamNativePlanMutation<'a> = Box<
+    dyn FnOnce(&mut crate::sql::planner::distributed::DistributedPlan) -> Result<(), String> + 'a,
+>;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
@@ -3884,10 +3885,10 @@ fn coordinated_execution_services() -> Result<
 }
 
 fn refresh_native_sidecar_plan_with_lowered_edges(
-    dp: &crate::sql::planner::DistributedPlan,
-    lowered_edges: &[crate::sql::codegen::FragmentEdge],
+    dp: &crate::sql::planner::distributed::DistributedPlan,
+    lowered_edges: &[crate::sql::planner::distributed::FragmentEdge],
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
-) -> Result<crate::sql::planner::DistributedPlan, String> {
+) -> Result<crate::sql::planner::distributed::DistributedPlan, String> {
     let mut native_dp =
         crate::sql::codegen::ir::refresh_distributed_plan_for_native_sidecar(dp, mv_refresh_ctx)?;
     native_dp.edges = lowered_edges.to_vec();
@@ -6436,7 +6437,7 @@ mysql_port = 47892
         assert!(build.edges.iter().any(|edge| {
             matches!(
                 edge.edge_kind,
-                crate::sql::codegen::FragmentEdgeKind::Stream
+                crate::sql::planner::distributed::FragmentEdgeKind::Stream
             )
         }));
     }

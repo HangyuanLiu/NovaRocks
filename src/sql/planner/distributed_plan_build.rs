@@ -21,13 +21,11 @@ use std::collections::{HashMap, HashSet};
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::codegen::helpers::group_win_exprs_by_sig;
-use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind};
 use crate::sql::column_id::ColumnId;
-use crate::sql::planner::distributed_fragment::{
-    DataPartition, DataSink, DistributedPlan, PlanFragment,
-};
-use crate::sql::planner::distributed_node::{
-    DistributedNode, DistributedNodeKind, ExchangeReceiver, distributed_kind_from_physical,
+use crate::sql::planner::distributed::{
+    DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor,
+    ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind, PlanFragment,
+    distributed_kind_from_physical,
 };
 use crate::sql::planner::optimizer_bridge::property::{
     ordering_spec_from_sort_items, window_ordering_spec,
@@ -40,7 +38,7 @@ use crate::sql::planner::physical::{
     RedistributeNode,
 };
 use crate::sql::planner::{
-    ExchangeFlavor, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent, WiredRuntimeFilterBuild,
+    RuntimeFilterBuildIntent, RuntimeFilterProbeIntent, WiredRuntimeFilterBuild,
     WiredRuntimeFilterProbe,
 };
 
@@ -1490,10 +1488,11 @@ mod tests {
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
     };
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
-    use crate::sql::codegen::{FragmentEdgeKind, FragmentStreamKind};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::distributed_fragment::{DataSink, PartitionKind};
-    use crate::sql::planner::distributed_node::DistributedNodeKind;
+    use crate::sql::planner::distributed::{
+        DataSink, DistributedNodeKind, ExchangeFlavor, FragmentEdgeKind, FragmentStreamKind,
+        PartitionKind,
+    };
     use crate::sql::planner::payload::{
         AggregateCall, PlanAssertOneRowNode, PlanCTEAnchorNode, PlanCTEConsumeNode,
         PlanCTEProduceNode, PlanFilterNode, PlanGenerateSeriesNode, PlanLimitNode, PlanProjectNode,
@@ -1509,7 +1508,7 @@ mod tests {
         PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalPlanNode,
         PhysicalSetOpNode, PhysicalTopNNode, PlanSetOpKind, RedistributeMode, RedistributeNode,
     };
-    use crate::sql::planner::{ExchangeFlavor, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent};
+    use crate::sql::planner::{RuntimeFilterBuildIntent, RuntimeFilterProbeIntent};
 
     #[test]
     fn build_distributed_plan_values_shapes_root_fragment() {
@@ -2423,7 +2422,7 @@ mod tests {
         assert_column_ref(&exchange_receiver.partition.exprs[0], 1, "qualified_k");
         assert!(matches!(
             exchange_receiver.flavor,
-            crate::sql::planner::ExchangeFlavor::Distribution
+            crate::sql::planner::distributed::ExchangeFlavor::Distribution
         ));
         assert_eq!(exchange_receiver.output_columns.len(), 1);
         assert_eq!(

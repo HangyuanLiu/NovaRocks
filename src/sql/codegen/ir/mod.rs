@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Compatibility exports for the planner-owned DistributedPlan Bridge 2 IR.
+//! Lowering and explain support for the planner-owned DistributedPlan Bridge 2 IR.
 
 pub(crate) mod explain;
 pub(crate) mod kind;
@@ -27,11 +27,6 @@ mod lowering_native;
 #[cfg(all(test, feature = "compat"))]
 pub(crate) mod equiv;
 
-#[cfg(test)]
-pub(crate) use crate::sql::planner::{
-    DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, PartitionKind,
-    PlanFragment,
-};
 pub(crate) use explain::{explain_distributed_plan, explain_distributed_plan_analyze};
 #[cfg(feature = "compat")]
 pub(crate) use lowering::{lower_distributed_plan, refresh_distributed_plan_for_native_sidecar};
@@ -47,8 +42,8 @@ mod tests {
     #[test]
     fn bridge2_owner_modules_are_split_into_files() {
         for module_file in [
-            "distributed_fragment.rs",
-            "distributed_node.rs",
+            "distributed/fragment.rs",
+            "distributed/node.rs",
             "distributed_plan_build.rs",
         ] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -47,8 +47,7 @@ mod tests {
     };
     use crate::sql::codegen::fragment_builder::PlanFragmentBuilder;
     use crate::sql::codegen::{
-        FragmentBuildRequest, FragmentBuildResult, FragmentEdgeKind, FragmentId,
-        MultiFragmentBuildResult,
+        FragmentBuildRequest, FragmentBuildResult, MultiFragmentBuildResult,
     };
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
@@ -64,6 +63,7 @@ mod tests {
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::Statistics;
+    use crate::sql::planner::distributed::{FragmentEdgeKind, FragmentId};
     use crate::sql::planner::optimizer_bridge::scalar::{
         intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items,
         intern_window_exprs,
@@ -789,7 +789,7 @@ mod tests {
     fn fragment_by_id<'a>(
         case_name: &str,
         result: &'a MultiFragmentBuildResult,
-        fragment_id: crate::sql::codegen::FragmentId,
+        fragment_id: crate::sql::planner::distributed::FragmentId,
     ) -> &'a FragmentBuildResult {
         result
             .fragment_results

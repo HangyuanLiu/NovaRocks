@@ -63,8 +63,7 @@ use crate::thrift::plan_nodes;
 
 use super::analysis::cte::CteId;
 use super::column_id::ColumnId;
-
-pub(crate) type FragmentId = u32;
+use crate::sql::planner::distributed::{FragmentEdge, FragmentId};
 
 pub(crate) use fragment_request::FragmentBuildRequest;
 
@@ -79,21 +78,6 @@ pub(crate) struct OutputColumn {
     pub nullable: bool,
 }
 
-/// Result of emitting a multi-fragment plan.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum FragmentEdgeKind {
-    Stream,
-    CteMulticast {
-        cte_id: CteId,
-        receive_producer_column_ids: Vec<ColumnId>,
-    },
-    IcebergChangeStreamRouter {
-        router_group_id: i32,
-        branch_id: i32,
-        branch_kind: crate::sql::common::ChangeStreamBranchKind,
-    },
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FragmentOutputKind {
     Result,
@@ -105,25 +89,6 @@ impl FragmentOutputKind {
     pub(crate) fn is_terminal_write(self) -> bool {
         matches!(self, FragmentOutputKind::TerminalWrite)
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FragmentStreamKind {
-    Gather,
-    Broadcast,
-    Partitioned,
-    Other,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct FragmentEdge {
-    pub source_fragment_id: FragmentId,
-    pub target_fragment_id: FragmentId,
-    pub target_exchange_node_id: i32,
-    pub output_partition: crate::sql::planner::DataPartition,
-    pub stream_kind: FragmentStreamKind,
-    pub edge_kind: FragmentEdgeKind,
-    pub output_slot_ids: Vec<i32>,
 }
 
 #[derive(Clone, Debug)]

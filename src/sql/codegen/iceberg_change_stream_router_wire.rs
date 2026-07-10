@@ -22,7 +22,7 @@ use crate::sql::codegen::expr_compiler;
 use crate::sql::codegen::resolve::{ColumnBinding, ExprScope};
 #[cfg(feature = "compat")]
 use crate::sql::common::ChangeStreamBranchKind;
-use crate::sql::planner::{DataPartition, PartitionKind};
+use crate::sql::planner::distributed::{DataPartition, PartitionKind};
 #[cfg(feature = "compat")]
 use crate::thrift::data_sinks;
 #[cfg(feature = "compat")]

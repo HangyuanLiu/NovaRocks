@@ -16,19 +16,21 @@
 // under the License.
 
 use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
-use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind};
+use crate::sql::planner::distributed::{
+    DataPartition, DataSink, DistributedNode, DistributedNodeKind, ExchangeFlavor,
+    ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind,
+    PartitionKind, PlanFragment,
+};
 use crate::sql::planner::{
-    ChangeStreamWriteDagSpec, DataPartition, DataSink, DistributedNode, DistributedNodeKind,
-    ExchangeFlavor, ExchangeReceiver, IcebergChangeStreamBranchRoute,
-    IcebergChangeStreamRouterSink, IcebergChangeStreamWriteTopology,
-    IcebergChangeStreamWriterBranch, IcebergWriteFragmentSink, IcebergWriteInputBinding,
-    PartitionKind, PlanFragment, PlannedIcebergChangeStreamDistributedPlan,
+    ChangeStreamWriteDagSpec, IcebergChangeStreamBranchRoute, IcebergChangeStreamRouterSink,
+    IcebergChangeStreamWriteTopology, IcebergChangeStreamWriterBranch, IcebergWriteFragmentSink,
+    IcebergWriteInputBinding, PlannedIcebergChangeStreamDistributedPlan,
 };
 
 pub(crate) fn with_iceberg_write_sink(
-    mut plan: crate::sql::planner::DistributedPlan,
+    mut plan: crate::sql::planner::distributed::DistributedPlan,
     sink: crate::sql::planner::IcebergWriteFragmentSink,
-) -> Result<crate::sql::planner::DistributedPlan, String> {
+) -> Result<crate::sql::planner::distributed::DistributedPlan, String> {
     let root_fragment_id = plan.root_fragment_id;
     let root = plan
         .fragments
@@ -37,19 +39,22 @@ pub(crate) fn with_iceberg_write_sink(
         .ok_or_else(|| {
             format!("Iceberg write sink cannot find root fragment id={root_fragment_id}")
         })?;
-    if !matches!(root.sink, crate::sql::planner::DataSink::Result) {
+    if !matches!(
+        root.sink,
+        crate::sql::planner::distributed::DataSink::Result
+    ) {
         return Err(format!(
             "Iceberg write sink expected root fragment id={} to use result sink",
             root.fragment_id
         ));
     }
     validate_iceberg_sink_arity(root, &sink)?;
-    root.sink = crate::sql::planner::DataSink::IcebergWrite(sink);
+    root.sink = crate::sql::planner::distributed::DataSink::IcebergWrite(sink);
     Ok(plan)
 }
 
 fn validate_iceberg_sink_arity(
-    fragment: &crate::sql::planner::PlanFragment,
+    fragment: &crate::sql::planner::distributed::PlanFragment,
     sink: &crate::sql::planner::IcebergWriteFragmentSink,
 ) -> Result<(), String> {
     let input_count = match &sink.input {
@@ -86,7 +91,7 @@ fn validate_iceberg_sink_output_ordinals(
 }
 
 pub(crate) fn with_iceberg_change_stream_write(
-    mut plan: crate::sql::planner::DistributedPlan,
+    mut plan: crate::sql::planner::distributed::DistributedPlan,
     descriptor_database: &str,
     dag: ChangeStreamWriteDagSpec,
 ) -> Result<PlannedIcebergChangeStreamDistributedPlan, String> {
@@ -260,7 +265,7 @@ pub(crate) fn with_iceberg_change_stream_write(
     })
 }
 
-fn next_fragment_id(plan: &crate::sql::planner::DistributedPlan) -> FragmentId {
+fn next_fragment_id(plan: &crate::sql::planner::distributed::DistributedPlan) -> FragmentId {
     plan.fragments
         .iter()
         .map(|fragment| fragment.fragment_id)
@@ -269,7 +274,7 @@ fn next_fragment_id(plan: &crate::sql::planner::DistributedPlan) -> FragmentId {
         + 1
 }
 
-fn next_node_id(plan: &crate::sql::planner::DistributedPlan) -> i32 {
+fn next_node_id(plan: &crate::sql::planner::distributed::DistributedPlan) -> i32 {
     plan.fragments
         .iter()
         .flat_map(|fragment| node_ids(&fragment.root))
@@ -278,7 +283,7 @@ fn next_node_id(plan: &crate::sql::planner::DistributedPlan) -> i32 {
         + 1
 }
 
-fn next_tuple_id(plan: &crate::sql::planner::DistributedPlan) -> i32 {
+fn next_tuple_id(plan: &crate::sql::planner::distributed::DistributedPlan) -> i32 {
     plan.fragments
         .iter()
         .flat_map(|fragment| node_tuple_ids(&fragment.root))
@@ -389,11 +394,14 @@ mod tests {
     use crate::sql::analysis::{ExprKind, OutputColumn};
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::ChangeStreamBranchKind;
+    use crate::sql::planner::distributed::{
+        DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan,
+        PlanFragment,
+    };
     use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
     use crate::sql::planner::{
-        ChangeStreamWriteBranchSpec, ChangeStreamWriteDagSpec, DataPartition, DataSink,
-        DistributedNode, DistributedNodeKind, DistributedPlan, IcebergWriteFragmentSink,
-        IcebergWriteInputBinding, PlanFragment,
+        ChangeStreamWriteBranchSpec, ChangeStreamWriteDagSpec, IcebergWriteFragmentSink,
+        IcebergWriteInputBinding,
     };
 
     use super::{with_iceberg_change_stream_write, with_iceberg_write_sink};
@@ -490,11 +498,11 @@ mod tests {
         assert_eq!(first_edge.target_fragment_id, 1);
         assert_eq!(
             first_edge.stream_kind,
-            crate::sql::codegen::FragmentStreamKind::Partitioned
+            crate::sql::planner::distributed::FragmentStreamKind::Partitioned
         );
         assert!(matches!(
             first_edge.output_partition.kind,
-            crate::sql::planner::PartitionKind::Hash
+            crate::sql::planner::distributed::PartitionKind::Hash
         ));
         let [partition_expr] = first_edge.output_partition.exprs.as_slice() else {
             panic!("expected native hash partition expr");
@@ -509,7 +517,7 @@ mod tests {
         assert_eq!(column, "delete_id");
         assert!(matches!(
             first_edge.edge_kind,
-            crate::sql::codegen::FragmentEdgeKind::IcebergChangeStreamRouter {
+            crate::sql::planner::distributed::FragmentEdgeKind::IcebergChangeStreamRouter {
                 branch_kind: ChangeStreamBranchKind::DeleteDv,
                 ..
             }

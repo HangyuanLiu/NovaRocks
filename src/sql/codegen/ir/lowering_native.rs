@@ -28,15 +28,15 @@ use crate::sql::codegen::boundary_schema::{
 };
 use crate::sql::codegen::connector_scan_wire::{ThriftScanContext, to_native_file_scan};
 use crate::sql::codegen::{
-    FragmentBuildResult, FragmentEdgeKind, FragmentId, FragmentOutputKind,
-    FragmentSchedulingMetadata, FragmentStreamKind, MultiFragmentBuildResult, OutputColumn,
-    RuntimeFilterPlanResult,
+    FragmentBuildResult, FragmentOutputKind, FragmentSchedulingMetadata, MultiFragmentBuildResult,
+    OutputColumn, RuntimeFilterPlanResult,
+};
+use crate::sql::planner::PlannedRuntimeFilter;
+use crate::sql::planner::distributed::{
+    DataPartition, DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor,
+    FragmentEdgeKind, FragmentId, FragmentStreamKind, PartitionKind, PlanFragment,
 };
 use crate::sql::planner::payload::PlanScanNode;
-use crate::sql::planner::{
-    DataPartition, DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor,
-    PartitionKind, PlanFragment, PlannedRuntimeFilter,
-};
 
 pub(crate) fn lower_distributed_plan(
     dp: &DistributedPlan,
@@ -919,9 +919,9 @@ fn validate_distributed_plan(dp: &DistributedPlan) -> Result<(), String> {
         if fragment.fragment_id == dp.root_fragment_id {
             if !matches!(
                 fragment.sink,
-                crate::sql::planner::DataSink::Result
-                    | crate::sql::planner::DataSink::IcebergWrite(_)
-                    | crate::sql::planner::DataSink::IcebergChangeStreamRouter(_)
+                crate::sql::planner::distributed::DataSink::Result
+                    | crate::sql::planner::distributed::DataSink::IcebergWrite(_)
+                    | crate::sql::planner::distributed::DataSink::IcebergChangeStreamRouter(_)
             ) {
                 return Err(format!(
                     "lower_distributed_plan root fragment id={} must use result, Iceberg write, or Iceberg change-stream router sink",
@@ -931,7 +931,8 @@ fn validate_distributed_plan(dp: &DistributedPlan) -> Result<(), String> {
             ensure_unpartitioned("root output_partition", &fragment.output_partition)?;
         } else if !matches!(
             fragment.sink,
-            crate::sql::planner::DataSink::Noop | crate::sql::planner::DataSink::IcebergWrite(_)
+            crate::sql::planner::distributed::DataSink::Noop
+                | crate::sql::planner::distributed::DataSink::IcebergWrite(_)
         ) {
             return Err(format!(
                 "lower_distributed_plan non-root fragment id={} must use noop or Iceberg write sink",
@@ -992,8 +993,8 @@ fn ensure_unpartitioned(label: &str, partition: &DataPartition) -> Result<(), St
 
 fn target_exchange_for_edge<'a>(
     fragments_by_id: &BTreeMap<FragmentId, &'a PlanFragment>,
-    edge: &crate::sql::codegen::FragmentEdge,
-) -> Result<&'a crate::sql::planner::ExchangeReceiver, String> {
+    edge: &crate::sql::planner::distributed::FragmentEdge,
+) -> Result<&'a crate::sql::planner::distributed::ExchangeReceiver, String> {
     let target = fragments_by_id
         .get(&edge.target_fragment_id)
         .ok_or_else(|| {
@@ -1075,12 +1076,14 @@ fn distributed_node_has_scan(node: &DistributedNode) -> bool {
         || node.children.iter().any(distributed_node_has_scan)
 }
 
-fn fragment_output_kind(sink: &crate::sql::planner::DataSink) -> FragmentOutputKind {
+fn fragment_output_kind(sink: &crate::sql::planner::distributed::DataSink) -> FragmentOutputKind {
     match sink {
-        crate::sql::planner::DataSink::Result => FragmentOutputKind::Result,
-        crate::sql::planner::DataSink::IcebergWrite(_) => FragmentOutputKind::TerminalWrite,
-        crate::sql::planner::DataSink::Noop
-        | crate::sql::planner::DataSink::IcebergChangeStreamRouter(_) => {
+        crate::sql::planner::distributed::DataSink::Result => FragmentOutputKind::Result,
+        crate::sql::planner::distributed::DataSink::IcebergWrite(_) => {
+            FragmentOutputKind::TerminalWrite
+        }
+        crate::sql::planner::distributed::DataSink::Noop
+        | crate::sql::planner::distributed::DataSink::IcebergChangeStreamRouter(_) => {
             FragmentOutputKind::NonTerminal
         }
     }
@@ -1106,11 +1109,12 @@ mod tests {
     use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
     use crate::sql::analysis::cte::CteId;
     use crate::sql::catalog::{CatalogProvider, TableDef};
-    use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::planner::distributed::{
+        ExchangeFlavor, ExchangeReceiver, FragmentEdge, FragmentEdgeKind,
+    };
     use crate::sql::planner::payload::PlanValuesNode;
     use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
-    use crate::sql::planner::{ExchangeFlavor, ExchangeReceiver};
 
     struct EmptyCatalog;
 
@@ -1172,7 +1176,7 @@ mod tests {
             root: physical_values_node(producer_fragment_id, 10, columns.clone()),
             data_partition: DataPartition::unpartitioned(),
             output_partition: DataPartition::unpartitioned(),
-            sink: crate::sql::planner::DataSink::Noop,
+            sink: crate::sql::planner::distributed::DataSink::Noop,
             output_exprs: None,
             output_columns: columns.clone(),
             cte_id: None,
@@ -1200,7 +1204,7 @@ mod tests {
             },
             data_partition: DataPartition::unpartitioned(),
             output_partition: DataPartition::unpartitioned(),
-            sink: crate::sql::planner::DataSink::Result,
+            sink: crate::sql::planner::distributed::DataSink::Result,
             output_exprs: None,
             output_columns: columns,
             cte_id: None,
@@ -1269,7 +1273,7 @@ mod tests {
             root: physical_values_node(producer_fragment_id, 10, producer_columns.clone()),
             data_partition: DataPartition::unpartitioned(),
             output_partition: DataPartition::unpartitioned(),
-            sink: crate::sql::planner::DataSink::Noop,
+            sink: crate::sql::planner::distributed::DataSink::Noop,
             output_exprs: None,
             output_columns: producer_columns,
             cte_id: Some(cte_id),
@@ -1300,7 +1304,7 @@ mod tests {
             },
             data_partition: DataPartition::unpartitioned(),
             output_partition: DataPartition::unpartitioned(),
-            sink: crate::sql::planner::DataSink::Result,
+            sink: crate::sql::planner::distributed::DataSink::Result,
             output_exprs: None,
             output_columns: receive_columns,
             cte_id: None,

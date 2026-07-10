@@ -23,8 +23,7 @@
 //! codegen lowers them to Thrift.
 
 pub(crate) mod change_stream_write;
-mod distributed_fragment;
-mod distributed_node;
+pub(crate) mod distributed;
 mod distributed_plan_build;
 pub(crate) mod imv_rewrite;
 pub(crate) mod logical;
@@ -40,13 +39,6 @@ pub(crate) use change_stream_write::{
     ChangeStreamWriteBranchSpec, ChangeStreamWriteDagSpec, IcebergChangeStreamBranchRoute,
     IcebergChangeStreamRouterSink, IcebergChangeStreamWriteTopology,
     IcebergChangeStreamWriterBranch, PlannedIcebergChangeStreamDistributedPlan,
-};
-pub(crate) use distributed_fragment::{
-    DataPartition, DataSink, DistributedPlan, PartitionKind, PlanFragment,
-};
-pub(crate) use distributed_node::{
-    DistributedNode, DistributedNodeKind, ExchangeFlavor, ExchangeReceiver,
-    distributed_kind_to_physical,
 };
 pub(crate) use distributed_plan_build::{
     build_distributed_plan, union_distinct_must_be_rewritten_error,
@@ -65,7 +57,8 @@ pub(crate) use write_sink::{
 
 #[cfg(test)]
 mod bridge2_export_tests {
-    use super::{DistributedNode, DistributedPlan, build_distributed_plan};
+    use super::build_distributed_plan;
+    use crate::sql::planner::distributed::{DistributedNode, DistributedPlan};
     use crate::sql::planner::physical::PhysicalPlanNode;
 
     #[test]

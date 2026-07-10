@@ -62,11 +62,10 @@ use crate::runtime::endpoint::{
     FragmentDestination, RuntimeEndpoint, RuntimeFilterProberDestination,
 };
 use crate::runtime::scan_range::ScanRangeParams;
-use crate::sql::codegen::{
-    FragmentEdge, FragmentEdgeKind, FragmentId, FragmentSchedulingMetadata, FragmentStreamKind,
-    RuntimeFilterPlanResult,
+use crate::sql::codegen::{FragmentSchedulingMetadata, RuntimeFilterPlanResult};
+use crate::sql::planner::distributed::{
+    FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind, PartitionKind,
 };
-use crate::sql::planner::PartitionKind;
 
 type LiveBackend = (usize, SocketAddr);
 
@@ -666,11 +665,10 @@ mod tests {
     use std::str::FromStr;
 
     use crate::sql::codegen::RuntimeFilterPlanResult;
-    use crate::sql::codegen::{
-        FragmentEdge, FragmentEdgeKind, FragmentOutputKind, FragmentSchedulingMetadata,
-        FragmentStreamKind,
+    use crate::sql::codegen::{FragmentOutputKind, FragmentSchedulingMetadata};
+    use crate::sql::planner::distributed::{
+        DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind, PartitionKind,
     };
-    use crate::sql::planner::{DataPartition, PartitionKind};
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum TestPartitionType {

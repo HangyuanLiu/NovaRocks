@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) use crate::sql::planner::ExchangeFlavor;
-pub(crate) use crate::sql::planner::ExchangeReceiver as DistributedExchangeNode;
 pub(crate) use crate::sql::planner::payload::{
     PlanAssertOneRowNode as DistributedAssertOneRowNode, PlanFilterNode as DistributedFilterNode,
     PlanGenerateSeriesNode as DistributedGenerateSeriesNode,

@@ -48,7 +48,7 @@ pub(crate) struct IcebergChangeStreamRouterSink {
 pub(crate) struct IcebergChangeStreamBranchRoute {
     pub(crate) branch_id: i32,
     pub(crate) branch_kind: ChangeStreamBranchKind,
-    pub(crate) target_fragment_id: crate::sql::codegen::FragmentId,
+    pub(crate) target_fragment_id: crate::sql::planner::distributed::FragmentId,
     pub(crate) target_exchange_node_id: i32,
     pub(crate) output_ordinals: Vec<usize>,
     pub(crate) output_partition_ordinals: Vec<usize>,
@@ -63,13 +63,13 @@ pub(crate) struct IcebergChangeStreamWriteTopology {
 pub(crate) struct IcebergChangeStreamWriterBranch {
     pub(crate) branch_id: i32,
     pub(crate) branch_kind: ChangeStreamBranchKind,
-    pub(crate) writer_fragment_id: crate::sql::codegen::FragmentId,
+    pub(crate) writer_fragment_id: crate::sql::planner::distributed::FragmentId,
     pub(crate) sink_spec: IcebergWriteSinkSpec,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct PlannedIcebergChangeStreamDistributedPlan {
-    pub(crate) distributed_plan: crate::sql::planner::DistributedPlan,
+    pub(crate) distributed_plan: crate::sql::planner::distributed::DistributedPlan,
     pub(crate) topology: IcebergChangeStreamWriteTopology,
 }
 
