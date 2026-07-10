@@ -1223,6 +1223,116 @@ fn planner_distributed_and_codegen_do_not_import_optimizer() {
     );
 }
 
+fn logical_build_surface_violations(text: &str) -> Vec<String> {
+    let expected_modules = [
+        "aggregate",
+        "output",
+        "query",
+        "relation",
+        "select",
+        "subquery",
+        "tests",
+        "window",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<BTreeSet<_>>();
+    let actual_modules = module_declarations(text);
+    let mut violations = Vec::new();
+
+    for missing in expected_modules.difference(&actual_modules) {
+        violations.push(format!(
+            "missing logical build module declaration: {missing}"
+        ));
+    }
+    for extra in actual_modules.difference(&expected_modules) {
+        violations.push(format!(
+            "unexpected logical build module declaration: {extra}"
+        ));
+    }
+    if !has_cfg_test_mod_tests(text) {
+        violations.push("logical build tests module must stay behind #[cfg(test)]".to_string());
+    }
+
+    let expected_public_surface = [
+        "pub(crate) use output::plan_output_columns;".to_string(),
+        "pub(crate) use query::plan_query;".to_string(),
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let actual_public_surface = non_comment_trimmed_lines(text)
+        .into_iter()
+        .filter(|line| line.starts_with("pub ") || line.starts_with("pub("))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+
+    for missing in expected_public_surface.difference(&actual_public_surface) {
+        violations.push(format!("missing logical build public surface: {missing}"));
+    }
+    for extra in actual_public_surface.difference(&expected_public_surface) {
+        violations.push(format!("unexpected logical build public surface: {extra}"));
+    }
+
+    violations
+}
+
+fn top_level_production_functions(text: &str) -> Vec<String> {
+    rust_production_text_without_cfg_test(text)
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let first = line.chars().next()?;
+            if first.is_whitespace() {
+                return None;
+            }
+            let trimmed = line.trim();
+            let is_function = [
+                "fn ",
+                "async fn ",
+                "pub fn ",
+                "pub async fn ",
+                "pub(crate) fn ",
+                "pub(crate) async fn ",
+                "pub(super) fn ",
+                "pub(super) async fn ",
+            ]
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix))
+                || (trimmed.starts_with("pub(in ")
+                    && (trimmed.contains(") fn ") || trimmed.contains(") async fn ")));
+            is_function.then(|| format!("{}: {}", index + 1, trimmed))
+        })
+        .collect()
+}
+
+#[test]
+fn planner_logical_builder_surface_detector_rejects_extra_reexport() {
+    let with_extra_reexport = r#"
+mod aggregate;
+mod output;
+mod query;
+mod relation;
+mod select;
+mod subquery;
+mod window;
+
+pub(crate) use output::plan_output_columns;
+pub(crate) use query::plan_query;
+pub(crate) use relation::plan_values;
+
+#[cfg(test)]
+mod tests;
+"#;
+
+    let violations = logical_build_surface_violations(with_extra_reexport);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("pub(crate) use relation::plan_values;")),
+        "extra logical build re-export must be rejected: {violations:?}"
+    );
+}
+
 #[test]
 fn planner_logical_builder_is_owned_by_logical_stage() {
     let repo = Path::new(manifest_dir());
@@ -1246,35 +1356,25 @@ fn planner_logical_builder_is_owned_by_logical_stage() {
     }
 
     let facade = fs::read_to_string(repo.join("src/sql/planner/mod.rs")).unwrap();
-    for forbidden in [
-        "fn plan_scoped_query(",
-        "fn plan_select_scoped(",
-        "fn plan_relation_scoped(",
-        "mod tests {",
-    ] {
-        assert!(
-            !facade.contains(forbidden),
-            "planner facade still owns logical builder implementation: {forbidden}"
-        );
-    }
-    assert!(facade.contains("pub(crate) mod logical;"));
-    assert!(facade.contains("pub(crate) use logical::build::{plan_output_columns, plan_query};"));
+    let root_functions = top_level_production_functions(&facade);
+    assert!(
+        root_functions.is_empty(),
+        "planner facade must not own top-level production functions:\n{}",
+        root_functions.join("\n")
+    );
+    assert!(has_non_comment_line(&facade, "pub(crate) mod logical;"));
+    assert!(has_non_comment_line(
+        &facade,
+        "pub(crate) use logical::build::{plan_output_columns, plan_query};"
+    ));
 
     let build_mod = fs::read_to_string(repo.join("src/sql/planner/logical/build/mod.rs")).unwrap();
-    assert!(build_mod.contains("pub(crate) use output::plan_output_columns;"));
-    assert!(build_mod.contains("pub(crate) use query::plan_query;"));
-    for private_helper in [
-        "plan_scoped_query",
-        "plan_select_scoped",
-        "plan_relation_scoped",
-        "wrap_scalar_applies",
-        "typed_expr_semantically_eq",
-    ] {
-        assert!(
-            !build_mod.contains(private_helper),
-            "builder-private helper leaked from logical::build: {private_helper}"
-        );
-    }
+    let surface_violations = logical_build_surface_violations(&build_mod);
+    assert!(
+        surface_violations.is_empty(),
+        "logical build module must expose exactly its seven owners and two stable entries:\n{}",
+        surface_violations.join("\n")
+    );
 }
 
 #[test]

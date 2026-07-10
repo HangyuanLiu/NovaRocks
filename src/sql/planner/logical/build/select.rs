@@ -230,7 +230,7 @@ pub(super) fn plan_select_scoped(
 
 /// Build a deduplication Aggregate for SELECT DISTINCT.
 /// Uses all projection columns as GROUP BY keys with no aggregate functions.
-pub(super) fn build_distinct(
+fn build_distinct(
     input: LogicalPlanNode,
     projection: &[ProjectItem],
     factory: &mut ColumnRefFactory,

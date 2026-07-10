@@ -536,9 +536,10 @@ fn contains_identity_project_adapter(
                         ExprKind::ColumnRef { column_id, column, .. }
                             if column == source_column && item.output_column_id == *column_id
                     )
-            }) || plan.children.iter().any(|child| {
-                contains_identity_project_adapter(child, source_column, output_name)
-            })
+            }) || plan
+                .children
+                .iter()
+                .any(|child| contains_identity_project_adapter(child, source_column, output_name))
         }
         _ => plan
             .children
