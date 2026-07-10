@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
-use crate::sql::codegen::helpers::{group_win_exprs_by_sig, split_and_conjuncts_typed};
+use crate::sql::codegen::helpers::group_win_exprs_by_sig;
 use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind};
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed_fragment::{
@@ -167,28 +167,12 @@ impl DistributedPlanBuilder {
                 let tuple_id = self.alloc_tuple();
                 self.make_node(node, fragment_id, node_id, vec![tuple_id], vec![child])
             }
-            PhysicalPlanKind::Filter(filter) => {
+            PhysicalPlanKind::Filter(_) => {
                 expect_child_count(node, 1)?;
-                let mut child = self.visit(&node.children[0])?;
-                if let DistributedNodeKind::Scan(scan) = &mut child.payload {
-                    let folded_predicates = split_and_conjuncts_typed(&filter.predicate)
-                        .into_iter()
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    merge_scan_required_columns_for_predicates(scan, &folded_predicates)?;
-                    scan.predicates.extend(folded_predicates);
-                    child.stats = node.stats.clone();
-                    self.record_probe_runtime_filter_intents(
-                        child.node_id,
-                        child.fragment_id,
-                        &node.probe_runtime_filters,
-                    );
-                    Ok(child)
-                } else {
-                    let node_id = self.alloc_node();
-                    let tuple_ids = child.tuple_ids.clone();
-                    self.make_node(node, fragment_id, node_id, tuple_ids, vec![child])
-                }
+                let child = self.visit(&node.children[0])?;
+                let node_id = self.alloc_node();
+                let tuple_ids = child.tuple_ids.clone();
+                self.make_node(node, fragment_id, node_id, tuple_ids, vec![child])
             }
             PhysicalPlanKind::Sort(_) => {
                 expect_child_count(node, 1)?;
@@ -1202,125 +1186,6 @@ fn output_slot_ids_for_exchange(output_columns: &[OutputColumn]) -> Result<Vec<i
         .collect()
 }
 
-fn merge_scan_required_columns_for_predicates(
-    scan: &mut PlanScanNode,
-    predicates: &[TypedExpr],
-) -> Result<(), String> {
-    let Some(required_columns) = scan.required_columns.as_mut() else {
-        return Ok(());
-    };
-    let mut existing = required_columns
-        .iter()
-        .map(|name| name.to_lowercase())
-        .collect::<HashSet<_>>();
-    let columns_by_id = scan
-        .columns
-        .iter()
-        .map(|column| (column.column_id, column.name.clone()))
-        .collect::<HashMap<_, _>>();
-
-    let mut predicate_column_ids = Vec::new();
-    for predicate in predicates {
-        collect_typed_expr_column_ids(predicate, &mut predicate_column_ids);
-    }
-    for column_id in predicate_column_ids {
-        let Some(name) = columns_by_id.get(&column_id) else {
-            return Err(format!(
-                "build_distributed_plan: folded Scan predicate references unknown column id {}",
-                column_id.0
-            ));
-        };
-        if existing.insert(name.to_lowercase()) {
-            required_columns.push(name.clone());
-        }
-    }
-    Ok(())
-}
-
-fn collect_typed_expr_column_ids(expr: &TypedExpr, out: &mut Vec<ColumnId>) {
-    match &expr.kind {
-        ExprKind::ColumnRef { column_id, .. } => {
-            if *column_id != ColumnId::UNSET && !out.contains(column_id) {
-                out.push(*column_id);
-            }
-        }
-        ExprKind::LambdaParamRef { .. }
-        | ExprKind::Literal(_)
-        | ExprKind::SubqueryPlaceholder { .. } => {}
-        ExprKind::BinaryOp { left, right, .. } => {
-            collect_typed_expr_column_ids(left, out);
-            collect_typed_expr_column_ids(right, out);
-        }
-        ExprKind::UnaryOp { expr, .. }
-        | ExprKind::Cast { expr, .. }
-        | ExprKind::IsNull { expr, .. }
-        | ExprKind::IsTruthValue { expr, .. }
-        | ExprKind::Nested(expr) => collect_typed_expr_column_ids(expr, out),
-        ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
-            for arg in args {
-                collect_typed_expr_column_ids(arg, out);
-            }
-            if let ExprKind::AggregateCall { order_by, .. } = &expr.kind {
-                for item in order_by {
-                    collect_typed_expr_column_ids(&item.expr, out);
-                }
-            }
-        }
-        ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
-            collect_typed_expr_column_ids(body, out);
-        }
-        ExprKind::InList { expr, list, .. } => {
-            collect_typed_expr_column_ids(expr, out);
-            for item in list {
-                collect_typed_expr_column_ids(item, out);
-            }
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            collect_typed_expr_column_ids(expr, out);
-            collect_typed_expr_column_ids(low, out);
-            collect_typed_expr_column_ids(high, out);
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            collect_typed_expr_column_ids(expr, out);
-            collect_typed_expr_column_ids(pattern, out);
-        }
-        ExprKind::Case {
-            operand,
-            when_then,
-            else_expr,
-        } => {
-            if let Some(operand) = operand {
-                collect_typed_expr_column_ids(operand, out);
-            }
-            for (when, then) in when_then {
-                collect_typed_expr_column_ids(when, out);
-                collect_typed_expr_column_ids(then, out);
-            }
-            if let Some(else_expr) = else_expr {
-                collect_typed_expr_column_ids(else_expr, out);
-            }
-        }
-        ExprKind::WindowCall {
-            args,
-            partition_by,
-            order_by,
-            ..
-        } => {
-            for arg in args {
-                collect_typed_expr_column_ids(arg, out);
-            }
-            for item in partition_by {
-                collect_typed_expr_column_ids(item, out);
-            }
-            for item in order_by {
-                collect_typed_expr_column_ids(&item.expr, out);
-            }
-        }
-    }
-}
-
 fn data_partition_for_redistribute_node(
     redistribute: &RedistributeNode,
 ) -> Result<DataPartition, String> {
@@ -1744,75 +1609,7 @@ mod tests {
     }
 
     #[test]
-    fn build_distributed_plan_folds_filter_predicate_into_scan() {
-        let scan_columns = vec![output_col(1, "k", DataType::Int64, false)];
-        let project_columns = vec![output_col(2, "k_alias", DataType::Int64, false)];
-        let scan = PhysicalPlanNode {
-            kind: PhysicalPlanKind::Scan(PlanScanNode {
-                database: "db".to_string(),
-                table: table_def(),
-                alias: Some("t".to_string()),
-                columns: scan_columns.clone(),
-                predicates: vec![bool_lit(true)],
-                required_columns: None,
-                variant_columns: vec![],
-                mv_rewritten_from: None,
-            }),
-            children: vec![],
-            output_columns: scan_columns.clone(),
-            stats: stats_with_row_count(100.0),
-            probe_runtime_filters: vec![],
-        };
-        let filter = PhysicalPlanNode {
-            kind: PhysicalPlanKind::Filter(PlanFilterNode {
-                predicate: and_expr(
-                    cmp_expr(1, "k", BinOp::Gt, 10),
-                    cmp_expr(1, "k", BinOp::Lt, 20),
-                ),
-            }),
-            children: vec![scan],
-            output_columns: scan_columns,
-            stats: stats_with_row_count(5.0),
-            probe_runtime_filters: vec![],
-        };
-        let project = PhysicalPlanNode {
-            kind: PhysicalPlanKind::Project(PlanProjectNode {
-                items: vec![ProjectItem {
-                    expr: column_ref_expr(1, "k", DataType::Int64, false),
-                    output_name: "k_alias".to_string(),
-                    output_column_id: ColumnId::new_for_test(2),
-                }],
-                output_qualifier: None,
-            }),
-            children: vec![filter],
-            output_columns: project_columns,
-            stats: stats_with_row_count(5.0),
-            probe_runtime_filters: vec![],
-        };
-
-        let dp = build_distributed_plan(&project).expect("build_distributed_plan");
-
-        let root = &dp.fragments[0].root;
-        assert!(matches!(&root.payload, DistributedNodeKind::Project(_)));
-        assert_eq!(root.node_id, 2);
-        assert_eq!(root.tuple_ids, vec![2]);
-        assert_eq!(root.children.len(), 1);
-        let child = &root.children[0];
-        let scan = match &child.payload {
-            DistributedNodeKind::Scan(scan) => scan,
-            other => panic!("expected folded Scan child, got {other:?}"),
-        };
-        assert_eq!(child.node_id, 1);
-        assert_eq!(child.tuple_ids, vec![1]);
-        assert_eq!(scan.predicates.len(), 3);
-        assert_bool_lit(&scan.predicates[0], true);
-        assert_cmp_expr(&scan.predicates[1], 1, "k", BinOp::Gt, 10);
-        assert_cmp_expr(&scan.predicates[2], 1, "k", BinOp::Lt, 20);
-        assert_eq!(child.stats.output_row_count, 5.0);
-    }
-
-    #[test]
-    fn build_distributed_plan_folded_filter_extends_scan_required_columns() {
+    fn build_distributed_plan_preserves_filter_over_scan_without_mutating_scan() {
         let scan_columns = vec![
             output_col(1, "k", DataType::Int64, false),
             output_col(2, "predicate_only", DataType::Int64, false),
@@ -1820,11 +1617,11 @@ mod tests {
         let scan = PhysicalPlanNode {
             kind: PhysicalPlanKind::Scan(PlanScanNode {
                 database: "db".to_string(),
-                table: table_def(),
+                table: table_def_with_columns(&scan_columns),
                 alias: Some("t".to_string()),
                 columns: scan_columns.clone(),
-                predicates: vec![],
-                required_columns: Some(vec!["k".to_string()]),
+                predicates: vec![bool_lit(true)],
+                required_columns: Some(vec!["k".to_string(), "predicate_only".to_string()]),
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),
@@ -1845,10 +1642,23 @@ mod tests {
 
         let dp = build_distributed_plan(&filter).expect("build_distributed_plan");
 
-        let scan = match &dp.fragments[0].root.payload {
-            DistributedNodeKind::Scan(scan) => scan,
-            other => panic!("expected folded Scan root, got {other:?}"),
+        let root = &dp.fragments[0].root;
+        let root_filter = match &root.payload {
+            DistributedNodeKind::Filter(filter) => filter,
+            other => panic!("expected Filter root, got {other:?}"),
         };
+        assert_cmp_expr(&root_filter.predicate, 2, "predicate_only", BinOp::Gt, 10);
+        assert_eq!(root.node_id, 2);
+        assert_eq!(root.tuple_ids, vec![1]);
+        assert_eq!(root.stats.output_row_count, 5.0);
+        assert_eq!(root.children.len(), 1);
+
+        let scan = match &root.children[0].payload {
+            DistributedNodeKind::Scan(scan) => scan,
+            other => panic!("expected Scan child, got {other:?}"),
+        };
+        assert_eq!(scan.predicates.len(), 1);
+        assert_bool_lit(&scan.predicates[0], true);
         assert_eq!(
             scan.required_columns.as_ref(),
             Some(&vec!["k".to_string(), "predicate_only".to_string()])
@@ -2161,7 +1971,7 @@ mod tests {
     }
 
     #[test]
-    fn build_distributed_plan_preserves_folded_filter_runtime_filter_probe() {
+    fn build_distributed_plan_keeps_runtime_filter_probe_on_filter() {
         let filter_id = 78;
         let probe_expr = column_ref_expr(1, "l_k", DataType::Int64, false);
         let build_expr = column_ref_expr(2, "r_k", DataType::Int64, false);
@@ -2220,14 +2030,17 @@ mod tests {
             join_node.build_runtime_filters[0].target_fragment_ids,
             vec![join_node.fragment_id]
         );
-        let scan = &join_node.children[0];
-        assert!(matches!(&scan.payload, DistributedNodeKind::Scan(_)));
-        assert_eq!(scan.probe_runtime_filters.len(), 1);
-        assert_eq!(scan.probe_runtime_filters[0].filter_id, filter_id);
+        let filter = &join_node.children[0];
+        assert!(matches!(&filter.payload, DistributedNodeKind::Filter(_)));
+        assert_eq!(filter.probe_runtime_filters.len(), 1);
+        assert_eq!(filter.probe_runtime_filters[0].filter_id, filter_id);
         assert_eq!(
-            scan.probe_runtime_filters[0].source_fragment_id,
+            filter.probe_runtime_filters[0].source_fragment_id,
             join_node.fragment_id
         );
+        let scan = &filter.children[0];
+        assert!(matches!(&scan.payload, DistributedNodeKind::Scan(_)));
+        assert!(scan.probe_runtime_filters.is_empty());
     }
 
     #[test]
