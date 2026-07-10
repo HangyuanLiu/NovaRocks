@@ -21,6 +21,7 @@ use crate::sql::codegen::scalar_materialize::{
     materialize, materialize_aggregate_calls, materialize_exprs, materialize_project_items,
     materialize_sort_keys, materialize_window_exprs,
 };
+use crate::sql::column_id::ColumnId;
 use crate::sql::common::{JoinKind, OutputColumn};
 use crate::sql::optimizer::operator::{Operator, PhysicalDistributionOp};
 use crate::sql::optimizer::physical_tree::{JoinExecutionDistribution, OptimizerPhysicalNode};
@@ -314,6 +315,12 @@ fn physical_node_output_columns(node: &OptimizerPhysicalNode) -> Vec<OutputColum
     }
 }
 
+/// Returns the columns physically produced by an optimizer node. Bridge 2a
+/// stores this contract in fragment-cut owner nodes so distributed planning
+/// can consume it without walking the physical subtree again.
+///
+/// Aggregate completeness comes from `AggregateOutputLayout`, not from the
+/// aggregate's planner-visible output projection.
 fn physical_node_materialized_output_columns(node: &OptimizerPhysicalNode) -> Vec<OutputColumn> {
     match &node.op {
         Operator::PhysicalHashAggregate(aggregate) => aggregate.output_layout.full_output_columns(),
@@ -321,6 +328,9 @@ fn physical_node_materialized_output_columns(node: &OptimizerPhysicalNode) -> Ve
     }
 }
 
+/// Materializes the child producer contract onto the distribution boundary.
+/// The enclosing `PhysicalPlanNode::output_columns` is the source layout;
+/// `RedistributeNode::output_columns` remains the requested exchange order.
 fn physical_distribution_output_columns(node: &OptimizerPhysicalNode) -> Vec<OutputColumn> {
     node.children
         .first()
@@ -426,10 +436,23 @@ fn scan_materialized_output_columns(
         .iter()
         .map(|name| name.to_ascii_lowercase())
         .collect();
+    let variant_ids: std::collections::HashSet<ColumnId> = scan
+        .variant_columns
+        .iter()
+        .map(|column| column.synthetic_column_id)
+        .collect();
     let output_columns: Vec<_> = scan
         .columns
         .iter()
-        .filter(|column| required.contains(&column.name.to_ascii_lowercase()))
+        .filter(|column| {
+            required.contains(&column.name.to_ascii_lowercase())
+                || variant_ids.contains(&column.column_id)
+                || !scan
+                    .table
+                    .columns
+                    .iter()
+                    .any(|table_column| table_column.name.eq_ignore_ascii_case(&column.name))
+        })
         .cloned()
         .collect();
     if output_columns.is_empty() {
@@ -741,7 +764,7 @@ mod tests {
     use crate::sql::optimizer::operator::{
         AggMode, AggregateOutputLayout, ChangeEventExpandOp, ChangeEventOutputExpr,
         ChangeEventSpec, JoinDistribution, Operator, PhysicalDistributionOp,
-        PhysicalHashAggregateOp, PhysicalHashJoinOp, ScanOp, UnionOp, ValuesOp,
+        PhysicalHashAggregateOp, PhysicalHashJoinOp, ScanOp, ScanVariantColumn, UnionOp, ValuesOp,
     };
     use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
     use crate::sql::optimizer::property::{
@@ -905,6 +928,52 @@ mod tests {
 
         assert!(matches!(physical.kind, PhysicalPlanKind::Scan(_)));
         assert_output_columns_eq(&physical.output_columns, &[output_column(2, "s")]);
+    }
+
+    #[test]
+    fn physical_scan_materialized_outputs_keep_variant_and_extended_columns() {
+        let payload = output_column(1, "payload");
+        let synthetic = OutputColumn {
+            column_id: ColumnId::new_for_test(101),
+            name: "__variant_payload_0".to_string(),
+            data_type: arrow::datatypes::DataType::Utf8,
+            nullable: true,
+            is_internal: true,
+        };
+        let extended = OutputColumn {
+            column_id: ColumnId::new_for_test(102),
+            name: "_row_id".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            is_internal: true,
+        };
+        let table_columns = vec![payload.clone()];
+        let scan_columns = vec![payload.clone(), synthetic.clone(), extended.clone()];
+        let mut node = base_node(Operator::PhysicalScan(ScanOp {
+            database: "db".to_string(),
+            table: table_def(&table_columns),
+            alias: None,
+            stats_ref: None,
+            columns: scan_columns.clone(),
+            predicates: vec![],
+            required_columns: Some(vec!["payload".to_string()]),
+            variant_columns: vec![ScanVariantColumn {
+                source_column_id: payload.column_id,
+                source_column: payload.name.clone(),
+                synthetic_column_id: synthetic.column_id,
+                synthetic_column: synthetic.name.clone(),
+                canonical_path: "$.k".to_string(),
+                requested_type: arrow::datatypes::DataType::Utf8,
+                strict: true,
+            }],
+            mv_rewritten_from: None,
+        }));
+        node.output_columns = scan_columns;
+        let node = attach_arena(node, Arc::new(ScalarArena::new()));
+
+        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+
+        assert_output_columns_eq(&physical.output_columns, &[payload, synthetic, extended]);
     }
 
     #[test]
@@ -1307,6 +1376,48 @@ mod tests {
         let expected = &[left_a, left_b, right_c];
         assert_output_columns_eq(&join.output_columns, expected);
         assert_output_columns_eq(&physical.output_columns, expected);
+    }
+
+    #[test]
+    fn physical_outer_join_outputs_widen_nullable_side() {
+        let left_column = output_column(1, "left_k");
+        let right_column = output_column(2, "right_k");
+        let convert = |join_type| {
+            let mut left = raw_values_node();
+            left.output_columns = vec![left_column.clone()];
+            let mut right = raw_values_node();
+            right.output_columns = vec![right_column.clone()];
+            let mut node = base_node(Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type,
+                eq_conditions: vec![],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }));
+            node.output_columns = vec![left_column.clone(), right_column.clone()];
+            node.children = vec![left, right];
+            let node = attach_arena(node, Arc::new(ScalarArena::new()));
+            optimizer_physical_to_plan(&node).expect("bridge should convert")
+        };
+
+        let left_outer = convert(JoinKind::LeftOuter);
+        assert!(!left_outer.output_columns[0].nullable);
+        assert!(left_outer.output_columns[1].nullable);
+
+        let right_outer = convert(JoinKind::RightOuter);
+        assert!(right_outer.output_columns[0].nullable);
+        assert!(!right_outer.output_columns[1].nullable);
+
+        let full_outer = convert(JoinKind::FullOuter);
+        assert!(full_outer.output_columns[0].nullable);
+        assert!(full_outer.output_columns[1].nullable);
+        assert_eq!(
+            full_outer.output_columns[0].column_id,
+            left_column.column_id
+        );
+        assert_eq!(
+            full_outer.output_columns[1].column_id,
+            right_column.column_id
+        );
     }
 
     #[test]

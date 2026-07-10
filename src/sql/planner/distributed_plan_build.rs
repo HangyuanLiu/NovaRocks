@@ -19,7 +19,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::sql::analysis::cte::CteId;
-use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
+use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::codegen::helpers::group_win_exprs_by_sig;
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::{
@@ -31,7 +31,7 @@ use crate::sql::planner::optimizer_bridge::property::{
     ordering_spec_from_sort_items, window_ordering_spec,
 };
 use crate::sql::planner::ordering::OrderingSpec;
-use crate::sql::planner::payload::{PlanProjectNode, PlanScanNode};
+use crate::sql::planner::payload::PlanProjectNode;
 use crate::sql::planner::physical::TopNPhase;
 use crate::sql::planner::physical::{
     PhysicalPlanKind, PhysicalPlanNode, PhysicalSetOpNode, PlanSetOpKind, RedistributeMode,
@@ -453,11 +453,12 @@ impl DistributedPlanBuilder {
 
         self.emit_stream_exchange(
             child_plan,
+            node.output_columns.clone(),
             output_partition,
             stream_kind,
             ExchangeFlavor::Distribution,
             -1,
-            stream_exchange_output_columns(child_plan, &redistribute.output_columns),
+            redistribute.output_columns.clone(),
             None,
             node.stats.clone(),
         )
@@ -474,6 +475,7 @@ impl DistributedPlanBuilder {
         if offset > 0 && !limit_child_can_apply_offset_locally(child_plan) {
             return self.emit_stream_exchange(
                 child_plan,
+                node.output_columns.clone(),
                 DataPartition::unpartitioned(),
                 FragmentStreamKind::Gather,
                 ExchangeFlavor::LimitOffset {
@@ -518,6 +520,7 @@ impl DistributedPlanBuilder {
         match (topn.phase, topn.is_split) {
             (TopNPhase::Final, true) => self.emit_stream_exchange(
                 child_plan,
+                node.output_columns.clone(),
                 DataPartition::unpartitioned(),
                 FragmentStreamKind::Gather,
                 ExchangeFlavor::TopNSplit {
@@ -547,25 +550,22 @@ impl DistributedPlanBuilder {
     fn emit_stream_exchange(
         &mut self,
         child_plan: &PhysicalPlanNode,
+        source_output_columns: Vec<OutputColumn>,
         output_partition: DataPartition,
         stream_kind: FragmentStreamKind,
         flavor: ExchangeFlavor,
         limit: i64,
-        exchange_output_columns: Vec<OutputColumn>,
+        requested_output_columns: Vec<OutputColumn>,
         output_qualifier: Option<String>,
         exchange_stats: crate::sql::planner::physical::PhysicalPlanStats,
     ) -> Result<DistributedNode, String> {
         let parent_fragment_id = self.current_fragment_id()?;
-        let source_output_columns = stream_exchange_source_output_columns(child_plan);
-        let exchange_output_columns = if exchange_output_columns.is_empty()
+        let exchange_output_columns = if requested_output_columns.is_empty()
             && matches!(&flavor, ExchangeFlavor::Distribution)
         {
             source_output_columns.clone()
         } else {
-            normalize_stream_exchange_output_columns(
-                exchange_output_columns,
-                &source_output_columns,
-            )
+            stream_exchange_output_columns(&source_output_columns, &requested_output_columns)
         };
         let child_fragment_id = self.alloc_fragment_id();
         self.fragment_stack.push(child_fragment_id);
@@ -863,22 +863,20 @@ fn set_op_payload_output_columns(
 }
 
 fn stream_exchange_output_columns(
-    child_plan: &PhysicalPlanNode,
+    source_output_columns: &[OutputColumn],
     requested_output_columns: &[OutputColumn],
 ) -> Vec<OutputColumn> {
     if requested_output_columns.is_empty() {
         return Vec::new();
     }
-
-    let actual_output_columns = stream_exchange_source_output_columns(child_plan);
-    if actual_output_columns.is_empty() {
+    if source_output_columns.is_empty() {
         return requested_output_columns.to_vec();
     }
 
     let requested_projected =
-        produced_exchange_output_columns(requested_output_columns, &actual_output_columns);
+        produced_exchange_output_columns(requested_output_columns, source_output_columns);
     if requested_projected.is_empty() {
-        dedup_output_columns(actual_output_columns)
+        dedup_output_columns(source_output_columns.to_vec())
     } else {
         requested_projected
     }
@@ -890,204 +888,6 @@ fn dedup_output_columns(columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
         .into_iter()
         .filter(|column| seen.insert(column.column_id))
         .collect()
-}
-
-fn stream_exchange_source_output_columns(plan: &PhysicalPlanNode) -> Vec<OutputColumn> {
-    match &plan.kind {
-        PhysicalPlanKind::Scan(scan) => scan_materialized_output_columns(scan, plan),
-        PhysicalPlanKind::Values(values) => values.columns.clone(),
-        PhysicalPlanKind::Project(project) => project_items_output_columns(&project.items),
-        PhysicalPlanKind::Sort(sort) => {
-            if sort.output_columns.is_empty() {
-                stream_exchange_source_output_columns(&plan.children[0])
-            } else {
-                let child_output_columns = plan
-                    .children
-                    .first()
-                    .map(stream_exchange_source_output_columns)
-                    .unwrap_or_default();
-                projected_source_output_columns(&sort.output_columns, &child_output_columns)
-            }
-        }
-        PhysicalPlanKind::Filter(_) => plan
-            .children
-            .first()
-            .map(stream_exchange_source_output_columns)
-            .unwrap_or_else(|| plan.output_columns.clone()),
-        PhysicalPlanKind::Limit(_)
-        | PhysicalPlanKind::TopN(_)
-        | PhysicalPlanKind::AssertOneRow(_)
-        | PhysicalPlanKind::Redistribute(_) => {
-            let child_output_columns = plan
-                .children
-                .first()
-                .map(stream_exchange_source_output_columns)
-                .unwrap_or_default();
-            projected_source_output_columns(&plan.output_columns, &child_output_columns)
-        }
-        PhysicalPlanKind::Repeat(_) => plan.output_columns.clone(),
-        PhysicalPlanKind::Window(window) => window.output_columns.clone(),
-        PhysicalPlanKind::GenerateSeries(generate_series) => vec![OutputColumn {
-            column_id: generate_series.output_column_id,
-            name: generate_series.column_name.clone(),
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
-            is_internal: false,
-        }],
-        PhysicalPlanKind::TableFunction(table_function) => table_function.output_columns.clone(),
-        PhysicalPlanKind::HashAggregate(aggregate) => aggregate.output_layout.full_output_columns(),
-        PhysicalPlanKind::HashJoin(join) => {
-            if join.output_columns.is_empty() {
-                join_source_output_columns(join.join_type, &plan.children)
-            } else {
-                join_requested_source_output_columns(
-                    join.join_type,
-                    &plan.children,
-                    &join.output_columns,
-                )
-            }
-        }
-        PhysicalPlanKind::NestLoopJoin(join) => {
-            if join.output_columns.is_empty() {
-                join_source_output_columns(join.join_type, &plan.children)
-            } else {
-                join_requested_source_output_columns(
-                    join.join_type,
-                    &plan.children,
-                    &join.output_columns,
-                )
-            }
-        }
-        PhysicalPlanKind::SetOp(set_op) => set_op_payload_output_columns(plan, set_op),
-        PhysicalPlanKind::ChangeEventExpand(expand) => expand.output_columns.clone(),
-        PhysicalPlanKind::CTEAnchor(_) => plan.output_columns.clone(),
-        PhysicalPlanKind::CTEProduce(produce) => produce.output_columns.clone(),
-        PhysicalPlanKind::CTEConsume(consume) => consume.output_columns.clone(),
-    }
-}
-
-fn projected_source_output_columns(
-    requested: &[OutputColumn],
-    source_output_columns: &[OutputColumn],
-) -> Vec<OutputColumn> {
-    if requested.is_empty() {
-        source_output_columns.to_vec()
-    } else {
-        produced_exchange_output_columns(requested, source_output_columns)
-    }
-}
-
-fn project_items_output_columns(items: &[ProjectItem]) -> Vec<OutputColumn> {
-    items
-        .iter()
-        .map(|item| OutputColumn {
-            column_id: item.output_column_id,
-            name: item.output_name.clone(),
-            data_type: item.expr.data_type.clone(),
-            nullable: item.expr.nullable,
-            is_internal: false,
-        })
-        .collect()
-}
-
-fn join_source_output_columns(
-    join_type: JoinKind,
-    children: &[PhysicalPlanNode],
-) -> Vec<OutputColumn> {
-    match join_type {
-        JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => children
-            .first()
-            .map(stream_exchange_source_output_columns)
-            .unwrap_or_default(),
-        JoinKind::RightSemi | JoinKind::RightAnti => children
-            .get(1)
-            .map(stream_exchange_source_output_columns)
-            .unwrap_or_default(),
-        JoinKind::Inner | JoinKind::Cross => {
-            let mut columns = children
-                .first()
-                .map(stream_exchange_source_output_columns)
-                .unwrap_or_default();
-            if let Some(right) = children.get(1) {
-                columns.extend(stream_exchange_source_output_columns(right));
-            }
-            columns
-        }
-        JoinKind::LeftOuter => {
-            let mut columns = children
-                .first()
-                .map(stream_exchange_source_output_columns)
-                .unwrap_or_default();
-            if let Some(right) = children.get(1) {
-                columns.extend(nullable_output_columns(
-                    stream_exchange_source_output_columns(right),
-                ));
-            }
-            columns
-        }
-        JoinKind::RightOuter => {
-            let mut columns = children
-                .first()
-                .map(stream_exchange_source_output_columns)
-                .map(nullable_output_columns)
-                .unwrap_or_default();
-            if let Some(right) = children.get(1) {
-                columns.extend(stream_exchange_source_output_columns(right));
-            }
-            columns
-        }
-        JoinKind::FullOuter => {
-            let mut columns = children
-                .first()
-                .map(stream_exchange_source_output_columns)
-                .map(nullable_output_columns)
-                .unwrap_or_default();
-            if let Some(right) = children.get(1) {
-                columns.extend(nullable_output_columns(
-                    stream_exchange_source_output_columns(right),
-                ));
-            }
-            columns
-        }
-    }
-}
-
-fn join_requested_source_output_columns(
-    join_type: JoinKind,
-    children: &[PhysicalPlanNode],
-    requested: &[OutputColumn],
-) -> Vec<OutputColumn> {
-    let produced = join_source_output_columns(join_type, children);
-    projected_source_output_columns(requested, &produced)
-}
-
-fn nullable_output_columns(mut columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
-    for column in &mut columns {
-        column.nullable = true;
-    }
-    columns
-}
-
-fn normalize_stream_exchange_output_columns(
-    requested: Vec<OutputColumn>,
-    source_output_columns: &[OutputColumn],
-) -> Vec<OutputColumn> {
-    if requested.is_empty() {
-        return requested;
-    }
-
-    let source_ids = source_output_columns
-        .iter()
-        .map(|column| column.column_id)
-        .collect::<HashSet<_>>();
-    if requested
-        .iter()
-        .all(|column| source_ids.contains(&column.column_id))
-    {
-        requested
-    } else {
-        source_output_columns.to_vec()
-    }
 }
 
 fn produced_exchange_output_columns(
@@ -1110,44 +910,6 @@ fn produced_exchange_output_columns(
         })
         .cloned()
         .collect()
-}
-
-fn scan_materialized_output_columns(
-    scan: &PlanScanNode,
-    plan: &PhysicalPlanNode,
-) -> Vec<OutputColumn> {
-    let Some(required_columns) = scan.required_columns.as_ref() else {
-        return scan.columns.clone();
-    };
-    let required: HashSet<String> = required_columns
-        .iter()
-        .map(|column| column.to_lowercase())
-        .collect();
-    let variant_ids: HashSet<ColumnId> = scan
-        .variant_columns
-        .iter()
-        .map(|column| column.synthetic_column_id)
-        .collect();
-
-    let projected: Vec<OutputColumn> = scan
-        .columns
-        .iter()
-        .filter(|column| {
-            required.contains(&column.name.to_lowercase())
-                || variant_ids.contains(&column.column_id)
-                || !scan
-                    .table
-                    .columns
-                    .iter()
-                    .any(|table_column| table_column.name.eq_ignore_ascii_case(&column.name))
-        })
-        .cloned()
-        .collect();
-    if projected.is_empty() {
-        plan.output_columns.clone()
-    } else {
-        projected
-    }
 }
 
 pub(crate) fn union_distinct_must_be_rewritten_error() -> &'static str {
@@ -1481,7 +1243,8 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::{
-        build_distributed_plan, join_source_output_columns, union_distinct_must_be_rewritten_error,
+        build_distributed_plan, stream_exchange_output_columns,
+        union_distinct_must_be_rewritten_error,
     };
     use crate::sql::analysis::cte::CteId;
     use crate::sql::analysis::{
@@ -1832,28 +1595,29 @@ mod tests {
     }
 
     #[test]
-    fn join_source_output_columns_widens_outer_nullable_side() {
-        let left_col = output_col(1, "l_k", DataType::Int64, false);
-        let right_col = output_col(2, "r_k", DataType::Int64, false);
-        let children = vec![
-            values_node(vec![left_col.clone()]),
-            values_node(vec![right_col.clone()]),
-        ];
+    fn stream_exchange_output_columns_uses_source_metadata_for_requested_ids() {
+        let source = vec![output_col(20, "avg(v)", DataType::Utf8, true)];
+        let requested = vec![output_col(20, "avg(v)", DataType::Float64, true)];
 
-        let left_outer = join_source_output_columns(JoinKind::LeftOuter, &children);
-        assert_eq!(left_outer.len(), 2);
-        assert!(!left_outer[0].nullable);
-        assert!(left_outer[1].nullable);
+        let output = stream_exchange_output_columns(&source, &requested);
 
-        let right_outer = join_source_output_columns(JoinKind::RightOuter, &children);
-        assert_eq!(right_outer.len(), 2);
-        assert!(right_outer[0].nullable);
-        assert!(!right_outer[1].nullable);
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].column_id, ColumnId::new_for_test(20));
+        assert_eq!(output[0].data_type, DataType::Utf8);
+    }
 
-        let full_outer = join_source_output_columns(JoinKind::FullOuter, &children);
-        assert_eq!(full_outer.len(), 2);
-        assert!(full_outer[0].nullable);
-        assert!(full_outer[1].nullable);
+    #[test]
+    fn stream_exchange_output_columns_falls_back_to_requested_when_source_is_empty() {
+        let requested = vec![output_col(20, "avg(v)", DataType::Float64, true)];
+
+        let output = stream_exchange_output_columns(&[], &requested);
+
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].column_id, requested[0].column_id);
+        assert_eq!(output[0].name, requested[0].name);
+        assert_eq!(output[0].data_type, requested[0].data_type);
+        assert_eq!(output[0].nullable, requested[0].nullable);
+        assert_eq!(output[0].is_internal, requested[0].is_internal);
     }
 
     #[test]
@@ -2481,7 +2245,7 @@ mod tests {
                 output_columns: exchange_columns.clone(),
             }),
             children: vec![scan],
-            output_columns: exchange_columns.clone(),
+            output_columns: source_columns.clone(),
             stats: stats(),
             probe_runtime_filters: vec![],
         };
@@ -2546,7 +2310,7 @@ mod tests {
                 output_columns: exchange_columns.clone(),
             }),
             children: vec![filter],
-            output_columns: exchange_columns,
+            output_columns: source_columns.clone(),
             stats: stats(),
             probe_runtime_filters: vec![],
         };
@@ -2594,6 +2358,11 @@ mod tests {
             scan.required_columns =
                 Some(vec!["c0".to_string(), "c1".to_string(), "c3".to_string()]);
         }
+        let materialized_scan_columns = vec![
+            source_columns[0].clone(),
+            source_columns[1].clone(),
+            source_columns[3].clone(),
+        ];
         let redistribute = PhysicalPlanNode {
             kind: PhysicalPlanKind::Redistribute(RedistributeNode {
                 mode: RedistributeMode::Broadcast,
@@ -2601,7 +2370,7 @@ mod tests {
                 output_columns: source_columns.clone(),
             }),
             children: vec![scan],
-            output_columns: source_columns,
+            output_columns: materialized_scan_columns,
             stats: stats(),
             probe_runtime_filters: vec![],
         };
@@ -2666,11 +2435,7 @@ mod tests {
                 output_columns: join_output_columns,
             }),
             children: vec![join],
-            output_columns: vec![
-                output_col(1, "l_c0", DataType::Int64, false),
-                output_col(3, "l_c2", DataType::Utf8, true),
-                output_col(4, "r_c0", DataType::Int64, false),
-            ],
+            output_columns: vec![left_columns[0].clone(), right_columns[0].clone()],
             stats: stats(),
             probe_runtime_filters: vec![],
         };
@@ -2728,7 +2493,11 @@ mod tests {
                 output_columns: right_columns.clone(),
             }),
             children: vec![right],
-            output_columns: right_columns.clone(),
+            output_columns: vec![
+                right_columns[0].clone(),
+                right_columns[1].clone(),
+                right_columns[3].clone(),
+            ],
             stats: stats(),
             probe_runtime_filters: vec![],
         };
@@ -2759,11 +2528,7 @@ mod tests {
                 output_columns: join_output_columns,
             }),
             children: vec![join],
-            output_columns: vec![
-                left_columns[0].clone(),
-                right_columns[1].clone(),
-                right_columns[2].clone(),
-            ],
+            output_columns: vec![left_columns[0].clone(), right_columns[1].clone()],
             stats: stats(),
             probe_runtime_filters: vec![],
         };
@@ -2818,7 +2583,7 @@ mod tests {
                 output_qualifier: None,
             }),
             children: vec![scan],
-            output_columns: stale_node_output_columns.clone(),
+            output_columns: project_output_columns.clone(),
             stats: stats(),
             probe_runtime_filters: vec![],
         };
@@ -2829,11 +2594,7 @@ mod tests {
                 output_columns: stale_node_output_columns,
             }),
             children: vec![project],
-            output_columns: vec![
-                scan_columns[0].clone(),
-                scan_columns[1].clone(),
-                scan_columns[2].clone(),
-            ],
+            output_columns: project_output_columns.clone(),
             stats: stats(),
             probe_runtime_filters: vec![],
         };
@@ -2903,7 +2664,7 @@ mod tests {
                 output_columns: vec![final_avg],
             }),
             children: vec![aggregate],
-            output_columns: vec![output_col(20, "avg(v)", DataType::Float64, true)],
+            output_columns: vec![local_avg_state.clone()],
             stats: stats(),
             probe_runtime_filters: vec![],
         };
