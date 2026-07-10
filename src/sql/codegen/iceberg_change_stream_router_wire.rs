@@ -16,13 +16,11 @@
 // under the License.
 
 use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
-use crate::sql::analysis::{ExprKind, TypedExpr};
 #[cfg(feature = "compat")]
 use crate::sql::codegen::expr_compiler;
 use crate::sql::codegen::resolve::{ColumnBinding, ExprScope};
 #[cfg(feature = "compat")]
 use crate::sql::common::ChangeStreamBranchKind;
-use crate::sql::planner::distributed::{DataPartition, PartitionKind};
 #[cfg(feature = "compat")]
 use crate::thrift::data_sinks;
 #[cfg(feature = "compat")]
@@ -144,39 +142,6 @@ pub(in crate::sql::codegen) fn compat_output_partition_for_ordinals(
         None::<Vec<partitions::TRangePartition>>,
         None::<Vec<partitions::TBucketProperty>>,
     ))
-}
-
-pub(in crate::sql::codegen) fn native_output_partition_for_ordinals(
-    output_columns: &[AnalysisOutputColumn],
-    ordinals: &[usize],
-    label: &str,
-) -> Result<DataPartition, String> {
-    if ordinals.is_empty() {
-        return Ok(DataPartition::unpartitioned());
-    }
-
-    let exprs = ordinals
-        .iter()
-        .copied()
-        .map(|ordinal| {
-            output_columns
-                .get(ordinal)
-                .ok_or_else(|| format!("{label} ordinal {ordinal} is out of range"))
-                .map(|column| TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        column_id: column.column_id,
-                        qualifier: None,
-                        column: column.name.clone(),
-                    },
-                    data_type: column.data_type.clone(),
-                    nullable: column.nullable,
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(DataPartition {
-        kind: PartitionKind::Hash,
-        exprs,
-    })
 }
 
 pub(in crate::sql::codegen) fn output_slot_ids_for_ordinals(

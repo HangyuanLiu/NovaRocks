@@ -18,22 +18,19 @@
 //! Lowering and explain support for the planner-owned DistributedPlan Bridge 2 IR.
 
 pub(crate) mod explain;
+pub(crate) mod fragment_build;
 pub(crate) mod kind;
 #[cfg(feature = "compat")]
 pub(crate) mod lowering;
-#[cfg(not(feature = "compat"))]
-mod lowering_native;
 
 #[cfg(all(test, feature = "compat"))]
 pub(crate) mod equiv;
 
 pub(crate) use explain::{explain_distributed_plan, explain_distributed_plan_analyze};
-#[cfg(feature = "compat")]
-pub(crate) use lowering::{lower_distributed_plan, refresh_distributed_plan_for_native_sidecar};
 #[cfg(not(feature = "compat"))]
-pub(crate) use lowering_native::{
-    lower_distributed_plan, refresh_distributed_plan_for_native_sidecar,
-};
+pub(crate) use fragment_build::lower_distributed_plan;
+#[cfg(feature = "compat")]
+pub(crate) use lowering::lower_distributed_plan;
 
 fn validate_global_node_ids(
     plan: &crate::sql::planner::distributed::DistributedPlan,
@@ -116,18 +113,21 @@ mod tests {
     fn distributed_plan_rejects_duplicate_node_id_across_fragments() {
         let fragments = [0, 1]
             .into_iter()
-            .map(|fragment_id| crate::sql::planner::distributed::PlanFragment {
-                fragment_id,
-                root: values_node(fragment_id, 7),
-                data_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
-                output_partition:
-                    crate::sql::planner::distributed::DataPartition::unpartitioned(),
-                sink: crate::sql::planner::distributed::DataSink::Noop,
-                output_exprs: None,
-                output_columns: Vec::new(),
-                cte_id: None,
-                cte_exchange_nodes: Vec::new(),
-            })
+            .map(
+                |fragment_id| crate::sql::planner::distributed::PlanFragment {
+                    fragment_id,
+                    root: values_node(fragment_id, 7),
+                    data_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(
+                    ),
+                    output_partition:
+                        crate::sql::planner::distributed::DataPartition::unpartitioned(),
+                    sink: crate::sql::planner::distributed::DataSink::Noop,
+                    output_exprs: None,
+                    output_columns: Vec::new(),
+                    cte_id: None,
+                    cte_exchange_nodes: Vec::new(),
+                },
+            )
             .collect();
         let plan = crate::sql::planner::distributed::DistributedPlan {
             fragments,

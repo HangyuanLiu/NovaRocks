@@ -303,7 +303,7 @@ fn attach_stream_sinks(
         fragment.sink = Some(plan::DataSink {
             kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
                 dest_node_id: edge.target_exchange_node_id,
-                output_partition: Some(encode_data_partition(&source.output_partition)?),
+                output_partition: Some(encode_data_partition(&edge.output_partition)?),
                 output_columns: stream_output_slot_ids,
                 limit: None,
             })),
@@ -426,6 +426,12 @@ fn encoded_node_output_columns(
                 }])
             }
             Some(plan::plan_node::Kind::Scan(scan)) => encoded_scan_output_columns(scan),
+            Some(plan::plan_node::Kind::TableFunction(table_function)) => {
+                let mut columns =
+                    encoded_unary_passthrough_output_columns(node, "native table function output")?;
+                columns.extend(table_function.output_columns.clone());
+                Ok(columns)
+            }
             Some(plan::plan_node::Kind::Values(values)) if values.columns.is_empty() => {
                 Ok(Vec::new())
             }

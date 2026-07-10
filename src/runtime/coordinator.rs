@@ -94,11 +94,6 @@ pub(crate) struct CoordinatedQueryResult {
     pub(crate) fragment_profiles: Vec<RuntimeProfileTree>,
 }
 
-pub(crate) struct NativePlanSidecars {
-    pub(crate) fragments_by_id:
-        std::collections::BTreeMap<FragmentId, crate::proto::plan::PlanFragment>,
-}
-
 #[derive(Clone)]
 #[cfg(feature = "compat")]
 struct CompatCteConsumer {
@@ -116,33 +111,6 @@ struct CompatEdgeSidecar {
     output_slot_ids: Vec<i32>,
 }
 
-pub(crate) fn prepare_native_plan_sidecars(
-    native_plan: &crate::sql::planner::distributed::DistributedPlan,
-    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
-    starrocks_scan_sources: &BTreeMap<
-        i32,
-        crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor,
-    >,
-) -> Result<NativePlanSidecars, String> {
-    let encoded = crate::sql::codegen::proto_encode::plan::encode_distributed_plan_with_context(
-        native_plan,
-        crate::sql::codegen::proto_encode::plan::NativePlanEncodeContext {
-            mv_refresh_ctx,
-            starrocks_scan_sources: Some(starrocks_scan_sources),
-        },
-    )?;
-    let mut fragments_by_id = BTreeMap::new();
-    for fragment in encoded.fragments {
-        if fragments_by_id
-            .insert(fragment.fragment_id, fragment)
-            .is_some()
-        {
-            return Err("native DistributedPlan encoded duplicate fragment ids".to_string());
-        }
-    }
-    Ok(NativePlanSidecars { fragments_by_id })
-}
-
 /// Coordinates multi-fragment query execution across one or more backends.
 ///
 /// Drives all fragment wiring from [`FragmentScheduler`] placements and submits
@@ -150,7 +118,6 @@ pub(crate) fn prepare_native_plan_sidecars(
 /// polling the dispatcher for the root fragment's chunks.
 pub(crate) struct ExecutionCoordinator {
     build_result: MultiFragmentBuildResult,
-    native_sidecars: Option<NativePlanSidecars>,
     dispatcher: Arc<dyn FragmentDispatcher>,
     scheduler: Arc<FragmentScheduler>,
     query_options: Option<QueryOptions>,
@@ -165,39 +132,6 @@ impl ExecutionCoordinator {
     ) -> Self {
         Self {
             build_result,
-            native_sidecars: None,
-            dispatcher,
-            scheduler,
-            query_options,
-        }
-    }
-
-    pub(crate) fn new_with_native_plan_sidecars(
-        build_result: MultiFragmentBuildResult,
-        native_sidecars: NativePlanSidecars,
-        dispatcher: Arc<dyn FragmentDispatcher>,
-        scheduler: Arc<FragmentScheduler>,
-        query_options: Option<QueryOptions>,
-    ) -> Self {
-        Self::new_with_optional_native_plan_sidecars(
-            build_result,
-            Some(native_sidecars),
-            dispatcher,
-            scheduler,
-            query_options,
-        )
-    }
-
-    pub(crate) fn new_with_optional_native_plan_sidecars(
-        build_result: MultiFragmentBuildResult,
-        native_sidecars: Option<NativePlanSidecars>,
-        dispatcher: Arc<dyn FragmentDispatcher>,
-        scheduler: Arc<FragmentScheduler>,
-        query_options: Option<QueryOptions>,
-    ) -> Self {
-        Self {
-            build_result,
-            native_sidecars,
             dispatcher,
             scheduler,
             query_options,
@@ -219,19 +153,18 @@ impl ExecutionCoordinator {
         let MultiFragmentBuildResult {
             mut fragment_results,
             fragment_schedules,
-            native_starrocks_scan_sources: _,
+            native_fragments,
             root_fragment_id,
             edges,
             #[cfg(feature = "compat")]
             lowered_edges,
-            boundary_schemas: _,
+            boundary_schemas,
             rf_plan,
         } = self.build_result;
-        let native_sidecars = self.native_sidecars;
         let query_options = self.query_options;
         let dispatcher = self.dispatcher;
         let scheduler = self.scheduler;
-        let native_fragments_by_id = native_fragment_sidecars(native_sidecars.as_ref())?;
+        let native_fragments_by_id = native_fragments;
         // ---------------------------------------------------------------
         // 1. Allocate query id and run the scheduler.
         // ---------------------------------------------------------------
@@ -270,7 +203,13 @@ impl ExecutionCoordinator {
             );
         }
 
-        validate_fragment_schedule_payloads(&fragment_results, &fragment_schedules)?;
+        validate_fragment_schedule_payloads(
+            &fragment_results,
+            &fragment_schedules,
+            &native_fragments_by_id,
+            root_fragment_id,
+            &boundary_schemas,
+        )?;
         let live = scheduler.live_backend_entries().to_vec();
         let mut plan =
             scheduler.assign_with_live(&fragment_schedules, &edges, query_id.clone(), &live)?;
@@ -502,7 +441,7 @@ impl ExecutionCoordinator {
                      stream fan-out is not supported in standalone coordinator"
                 ));
             }
-            ensure_native_sidecar_sink_supported(
+            ensure_native_fragment_sink_supported(
                 fragment_id,
                 is_root,
                 is_terminal_write,
@@ -674,7 +613,9 @@ impl ExecutionCoordinator {
                 let mut native_fragment = native_fragments_by_id
                     .get(&fragment_id)
                     .cloned()
-                    .ok_or_else(|| format!("native plan sidecar missing fragment {fragment_id}"))?;
+                    .ok_or_else(|| {
+                        format!("native fragment build missing fragment {fragment_id}")
+                    })?;
                 if !is_root && !is_terminal_write && stream_edge.is_none() {
                     if let Some((router_group_id, branch_edges)) = router_edges {
                         patch_native_iceberg_change_stream_router_sink(
@@ -1760,7 +1701,7 @@ fn local_coordinator_report_endpoint() -> Result<crate::runtime::endpoint::Runti
     crate::runtime::endpoint::RuntimeEndpoint::new(host, port as i32)
 }
 
-fn ensure_native_sidecar_sink_supported(
+fn ensure_native_fragment_sink_supported(
     fragment_id: FragmentId,
     is_root: bool,
     is_terminal_write: bool,
@@ -1779,28 +1720,94 @@ fn ensure_native_sidecar_sink_supported(
     ))
 }
 
-fn native_fragment_sidecars(
-    native_sidecars: Option<&NativePlanSidecars>,
-) -> Result<BTreeMap<FragmentId, crate::proto::plan::PlanFragment>, String> {
-    let native_sidecars = native_sidecars.ok_or_else(|| {
-        "native execution requires sidecars encoded from a native DistributedPlan".to_string()
-    })?;
-    Ok(native_sidecars.fragments_by_id.clone())
-}
-
 fn validate_fragment_schedule_payloads(
     fragment_results: &[crate::sql::codegen::FragmentBuildResult],
     fragment_schedules: &[crate::sql::codegen::FragmentSchedulingMetadata],
+    native_fragments: &BTreeMap<FragmentId, crate::proto::plan::PlanFragment>,
+    root_fragment_id: FragmentId,
+    boundary_schemas: &[crate::sql::codegen::boundary_schema::BoundarySchemaReport],
 ) -> Result<(), String> {
     let result_ids: BTreeSet<FragmentId> =
         fragment_results.iter().map(|fr| fr.fragment_id).collect();
     let schedule_ids: BTreeSet<FragmentId> =
         fragment_schedules.iter().map(|fr| fr.fragment_id).collect();
+    let native_ids: BTreeSet<FragmentId> = native_fragments.keys().copied().collect();
+    if result_ids.len() != fragment_results.len() {
+        return Err("compat fragment_results contain duplicate fragment ids".to_string());
+    }
+    if schedule_ids.len() != fragment_schedules.len() {
+        return Err("native fragment_schedules contain duplicate fragment ids".to_string());
+    }
+    if !native_ids.contains(&root_fragment_id) {
+        return Err(format!(
+            "native fragment build is missing root fragment id={root_fragment_id}"
+        ));
+    }
     if result_ids != schedule_ids {
         return Err(format!(
             "native fragment_schedules ids {:?} do not match compat fragment_results ids {:?}",
             schedule_ids, result_ids
         ));
+    }
+    if native_ids != schedule_ids {
+        return Err(format!(
+            "native fragment ids {:?} do not match fragment_schedules ids {:?}",
+            native_ids, schedule_ids
+        ));
+    }
+    for fragment in fragment_results {
+        let schedule = fragment_schedules
+            .iter()
+            .find(|schedule| schedule.fragment_id == fragment.fragment_id)
+            .expect("fragment and schedule ids were validated above");
+        let carrier_schedule = fragment.scheduling_metadata();
+        let scan_ranges_match = carrier_schedule.native_scan_ranges.len()
+            == schedule.native_scan_ranges.len()
+            && carrier_schedule
+                .native_scan_ranges
+                .iter()
+                .all(|(node_id, ranges)| {
+                    schedule
+                        .native_scan_ranges
+                        .get(node_id)
+                        .is_some_and(|scheduled| scheduled.len() == ranges.len())
+                });
+        let output_columns_match = carrier_schedule.output_columns.len()
+            == schedule.output_columns.len()
+            && carrier_schedule
+                .output_columns
+                .iter()
+                .zip(&schedule.output_columns)
+                .all(|(carrier, scheduled)| {
+                    carrier.name == scheduled.name
+                        && carrier.data_type == scheduled.data_type
+                        && carrier.nullable == scheduled.nullable
+                });
+        if carrier_schedule.has_scan_nodes != schedule.has_scan_nodes
+            || carrier_schedule.output_kind != schedule.output_kind
+            || !scan_ranges_match
+            || !output_columns_match
+            || carrier_schedule.boundary_schemas != schedule.boundary_schemas
+            || carrier_schedule.cte_id != schedule.cte_id
+            || carrier_schedule.cte_exchange_nodes != schedule.cte_exchange_nodes
+        {
+            return Err(format!(
+                "compat fragment carrier metadata does not match native schedule for fragment id={}",
+                fragment.fragment_id
+            ));
+        }
+    }
+    for (index, boundary) in boundary_schemas.iter().enumerate() {
+        if let Some(fragment_id) = boundary.fragment_id {
+            let fragment_id = FragmentId::try_from(fragment_id).map_err(|_| {
+                format!("boundary schema {index} has negative fragment id={fragment_id}")
+            })?;
+            if !schedule_ids.contains(&fragment_id) {
+                return Err(format!(
+                    "boundary schema {index} references missing fragment id={fragment_id}"
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1820,7 +1827,7 @@ fn patch_native_iceberg_change_stream_router_sink(
         _ => {
             return Err(format!(
                 "fragment {fragment_id} is router source for group {router_group_id} but native \
-                 sidecar is missing ICEBERG_CHANGE_STREAM_ROUTER_SINK"
+                 fragment payload is missing ICEBERG_CHANGE_STREAM_ROUTER_SINK"
             ));
         }
     };
@@ -2807,29 +2814,18 @@ mod native_contract_tests {
     use super::*;
 
     #[test]
-    fn native_fragment_sidecars_requires_native_sidecars() {
-        let err = native_fragment_sidecars(None)
-            .expect_err("native execution must require native sidecars");
-
-        assert!(
-            err.contains("native DistributedPlan") || err.contains("native sidecar"),
-            "{err}"
-        );
+    fn native_fragment_sink_support_allows_dynamic_stream_sink() {
+        ensure_native_fragment_sink_supported(7, false, false, true, false, false)
+            .expect("native execution carries a DATA_STREAM_SINK fragment payload");
     }
 
     #[test]
-    fn native_sidecar_sink_support_allows_dynamic_stream_sink() {
-        ensure_native_sidecar_sink_supported(7, false, false, true, false, false)
-            .expect("native execution carries DATA_STREAM_SINK sidecars");
-    }
+    fn native_fragment_sink_support_allows_router_and_cte_sinks() {
+        ensure_native_fragment_sink_supported(8, false, false, false, true, false)
+            .expect("native execution patches ICEBERG_CHANGE_STREAM_ROUTER_SINK fragments");
 
-    #[test]
-    fn native_sidecar_sink_support_allows_router_and_cte_sinks() {
-        ensure_native_sidecar_sink_supported(8, false, false, false, true, false)
-            .expect("native execution patches ICEBERG_CHANGE_STREAM_ROUTER_SINK sidecars");
-
-        ensure_native_sidecar_sink_supported(9, false, false, false, false, true)
-            .expect("native execution patches MULTI_CAST_DATA_STREAM_SINK sidecars");
+        ensure_native_fragment_sink_supported(9, false, false, false, false, true)
+            .expect("native execution patches MULTI_CAST_DATA_STREAM_SINK fragments");
     }
 }
 
@@ -2857,117 +2853,6 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use arrow::record_batch::RecordBatch;
 
-    #[cfg(feature = "compat")]
-    #[test]
-    fn native_sidecar_encoding_consumes_planned_starrocks_source_descriptor() {
-        let output = crate::sql::analysis::OutputColumn {
-            column_id: crate::sql::column_id::ColumnId::new_for_test(1),
-            name: "id".to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
-            is_internal: false,
-        };
-        let root = crate::sql::planner::distributed::DistributedNode {
-            node_id: 7,
-            fragment_id: 0,
-            tuple_ids: Vec::new(),
-            nullable_tuple_ids: Vec::new(),
-            limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
-            children: Vec::new(),
-            stats: crate::sql::planner::physical::PhysicalPlanStats {
-                output_row_count: 0.0,
-                row_count_confidence: crate::sql::planner::physical::PlannerConfidence::Fallback,
-                column_statistics: std::collections::HashMap::new(),
-                cost_estimate: None,
-                broadcast_decision: None,
-            },
-            payload: crate::sql::planner::distributed::DistributedNodeKind::Scan(
-                crate::sql::planner::payload::PlanScanNode {
-                    database: "analytics".to_string(),
-                    table: crate::sql::catalog::TableDef {
-                        name: "orders".to_string(),
-                        columns: vec![crate::sql::catalog::ColumnDef {
-                            name: "id".to_string(),
-                            data_type: DataType::Int64,
-                            nullable: false,
-                            write_default: None,
-                            logical_type: None,
-                        }],
-                        iceberg_row_lineage_metadata_columns: Vec::new(),
-                        source: crate::sql::catalog::ScanSource::StarRocks {
-                            db_id: 10,
-                            table_id: 20,
-                        },
-                    },
-                    alias: None,
-                    columns: vec![output.clone()],
-                    predicates: Vec::new(),
-                    required_columns: None,
-                    variant_columns: Vec::new(),
-                    mv_rewritten_from: None,
-                },
-            ),
-        };
-        let plan = crate::sql::planner::distributed::DistributedPlan {
-            fragments: vec![crate::sql::planner::distributed::PlanFragment {
-                fragment_id: 0,
-                root,
-                data_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
-                output_partition:
-                    crate::sql::planner::distributed::DataPartition::unpartitioned(),
-                sink: crate::sql::planner::distributed::DataSink::Result,
-                output_exprs: None,
-                output_columns: vec![output],
-                cte_id: None,
-                cte_exchange_nodes: Vec::new(),
-            }],
-            root_fragment_id: 0,
-            edges: Vec::new(),
-        };
-        let descriptors = BTreeMap::from([(
-            7,
-            crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor {
-                catalog_name: "default_catalog".to_string(),
-                db_id: 10,
-                table_id: 20,
-                schema_id: 30,
-                storage_columns: vec![
-                    crate::sql::codegen::proto_encode::plan::StarRocksStorageColumnDescriptor {
-                        name: "id".to_string(),
-                        unique_id: 0,
-                        default_value: None,
-                    },
-                ],
-                tablet_schema: crate::sql::codegen::proto_encode::plan::test_starrocks_tablet_schema_descriptor_for_column(30, "id", 0, None),
-            },
-        )]);
-
-        let sidecars = prepare_native_plan_sidecars(&plan, None, &descriptors)
-            .expect("planned StarRocks source must feed native sidecar encoding");
-        let fragment = &sidecars.fragments_by_id[&0];
-        let source = fragment
-            .root
-            .as_ref()
-            .and_then(|root| root.payload.as_ref())
-            .and_then(|payload| match payload {
-                crate::proto::plan::distributed_node::Payload::Physical(node) => node.kind.as_ref(),
-                _ => None,
-            })
-            .and_then(|kind| match kind {
-                crate::proto::plan::plan_node::Kind::Scan(scan) => scan.table.as_ref(),
-                _ => None,
-            })
-            .and_then(|table| table.source.as_ref())
-            .and_then(|source| source.kind.as_ref())
-            .expect("encoded StarRocks source");
-        assert!(matches!(
-            source,
-            crate::proto::plan::scan_source::Kind::StarrocksTable(_)
-        ));
-    }
-
     #[test]
     fn fragment_schedule_payload_validation_rejects_id_mismatch() {
         let fragment_results = vec![fragment_for_scan_range_merge_test(BTreeMap::new())];
@@ -2982,8 +2867,21 @@ mod tests {
             cte_exchange_nodes: Vec::new(),
         }];
 
-        let err = validate_fragment_schedule_payloads(&fragment_results, &fragment_schedules)
-            .expect_err("mismatched native schedules must be rejected");
+        let native_fragments = BTreeMap::from([(
+            7,
+            crate::proto::plan::PlanFragment {
+                fragment_id: 7,
+                ..Default::default()
+            },
+        )]);
+        let err = validate_fragment_schedule_payloads(
+            &fragment_results,
+            &fragment_schedules,
+            &native_fragments,
+            7,
+            &[],
+        )
+        .expect_err("mismatched native schedules must be rejected");
 
         assert!(err.contains("native fragment_schedules ids {7}"), "{err}");
         assert!(err.contains("compat fragment_results ids {0}"), "{err}");
@@ -4026,14 +3924,12 @@ mod tests {
             ..Default::default()
         };
         native_fragment.output_columns = Vec::new();
-        let native_sidecars = NativePlanSidecars {
-            fragments_by_id: BTreeMap::from([(fragment.fragment_id, native_fragment)]),
-        };
+        let native_fragments = BTreeMap::from([(fragment.fragment_id, native_fragment)]);
         let fragment_schedule = fragment.scheduling_metadata();
         let build = MultiFragmentBuildResult {
             fragment_results: vec![fragment],
             fragment_schedules: vec![fragment_schedule],
-            native_starrocks_scan_sources: BTreeMap::new(),
+            native_fragments,
             root_fragment_id: 0,
             edges: Vec::new(),
             lowered_edges: Vec::new(),
@@ -4045,14 +3941,8 @@ mod tests {
             "127.0.0.1:19010".parse().expect("backend addr"),
         ]));
 
-        let result = ExecutionCoordinator::new_with_native_plan_sidecars(
-            build,
-            native_sidecars,
-            dispatcher.clone(),
-            scheduler,
-            None,
-        )
-        .execute_with_write_outcome();
+        let result = ExecutionCoordinator::new(build, dispatcher.clone(), scheduler, None)
+            .execute_with_write_outcome();
 
         assert!(
             result.is_ok(),
@@ -4091,14 +3981,12 @@ mod tests {
             }),
             ..Default::default()
         };
-        let native_sidecars = NativePlanSidecars {
-            fragments_by_id: BTreeMap::from([(fragment.fragment_id, native_fragment)]),
-        };
+        let native_fragments = BTreeMap::from([(fragment.fragment_id, native_fragment)]);
         let fragment_schedule = fragment.scheduling_metadata();
         let build = MultiFragmentBuildResult {
             fragment_results: vec![fragment],
             fragment_schedules: vec![fragment_schedule],
-            native_starrocks_scan_sources: BTreeMap::new(),
+            native_fragments,
             root_fragment_id: 0,
             edges: Vec::new(),
             lowered_edges: Vec::new(),
@@ -4110,14 +3998,8 @@ mod tests {
             "127.0.0.1:19010".parse().expect("backend addr"),
         ]));
 
-        let result = ExecutionCoordinator::new_with_native_plan_sidecars(
-            build,
-            native_sidecars,
-            dispatcher.clone(),
-            scheduler,
-            None,
-        )
-        .execute_with_write_outcome();
+        let result = ExecutionCoordinator::new(build, dispatcher.clone(), scheduler, None)
+            .execute_with_write_outcome();
 
         assert!(
             result.is_ok(),
@@ -4127,7 +4009,7 @@ mod tests {
     }
 
     #[test]
-    fn proto_coordinator_submits_native_router_sidecar_with_noop_compat_carrier() {
+    fn proto_coordinator_submits_native_router_fragment_with_noop_compat_carrier() {
         use crate::proto::plan as native_plan;
         use crate::sql::codegen::FragmentOutputKind;
         use crate::sql::common::ChangeStreamBranchKind;
@@ -4212,12 +4094,10 @@ mod tests {
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
         };
-        let native_sidecars = NativePlanSidecars {
-            fragments_by_id: BTreeMap::from([
-                (root_fragment.fragment_id, native_root),
-                (router_fragment.fragment_id, native_router),
-            ]),
-        };
+        let native_fragments = BTreeMap::from([
+            (root_fragment.fragment_id, native_root),
+            (router_fragment.fragment_id, native_router),
+        ]);
         let fragment_schedules = vec![
             root_fragment.scheduling_metadata(),
             router_fragment.scheduling_metadata(),
@@ -4225,7 +4105,7 @@ mod tests {
         let build = MultiFragmentBuildResult {
             fragment_results: vec![root_fragment, router_fragment],
             fragment_schedules,
-            native_starrocks_scan_sources: BTreeMap::new(),
+            native_fragments,
             root_fragment_id: 0,
             edges: vec![edge.clone()],
             lowered_edges: vec![LoweredFragmentEdge {
@@ -4240,14 +4120,8 @@ mod tests {
             "127.0.0.1:19010".parse().expect("backend addr"),
         ]));
 
-        let result = ExecutionCoordinator::new_with_native_plan_sidecars(
-            build,
-            native_sidecars,
-            dispatcher.clone(),
-            scheduler,
-            None,
-        )
-        .execute_with_write_outcome();
+        let result = ExecutionCoordinator::new(build, dispatcher.clone(), scheduler, None)
+            .execute_with_write_outcome();
 
         assert!(
             result.is_ok(),

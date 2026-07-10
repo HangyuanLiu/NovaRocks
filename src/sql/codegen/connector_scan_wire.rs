@@ -76,7 +76,6 @@ pub(crate) struct NativeFileScanPlan {
 #[derive(Clone, Debug)]
 pub(crate) struct NativeStarRocksScanPlan {
     pub(crate) scan_ranges: Vec<scan_range::ScanRangeParams>,
-    pub(crate) source: crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor,
 }
 
 #[cfg(feature = "compat")]
@@ -120,28 +119,7 @@ pub(crate) fn to_native_starrocks_scan(
     splits: &[Split],
 ) -> Result<NativeStarRocksScanPlan, String> {
     validate_split_connectors(scan, splits)?;
-    let handle = starrocks_scan_handle(scan)?;
-    let native_source = handle.native_source();
-    let source = crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor {
-        catalog_name: native_source.catalog_name,
-        db_id: native_source.db_id,
-        table_id: native_source.table_id,
-        schema_id: native_source.schema_id,
-        storage_columns: native_source
-            .storage_columns
-            .into_iter()
-            .map(|column| {
-                crate::sql::codegen::proto_encode::plan::StarRocksStorageColumnDescriptor {
-                    name: column.name,
-                    unique_id: column.unique_id,
-                    default_value: column.default_value,
-                }
-            })
-            .collect(),
-        tablet_schema: crate::sql::codegen::proto_encode::plan::starrocks_tablet_schema_descriptor(
-            native_source.tablet_schema,
-        ),
-    };
+    starrocks_scan_handle(scan)?;
     let mut tablets = std::collections::HashSet::new();
     let mut scan_ranges = Vec::with_capacity(splits.len());
     for split in splits {
@@ -158,10 +136,7 @@ pub(crate) fn to_native_starrocks_scan(
             split.version,
         )?);
     }
-    Ok(NativeStarRocksScanPlan {
-        scan_ranges,
-        source,
-    })
+    Ok(NativeStarRocksScanPlan { scan_ranges })
 }
 
 #[cfg(feature = "compat")]

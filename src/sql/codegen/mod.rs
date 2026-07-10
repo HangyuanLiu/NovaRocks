@@ -120,10 +120,7 @@ pub(crate) struct MultiFragmentBuildResult {
     /// Per-fragment build results.
     pub fragment_results: Vec<FragmentBuildResult>,
     pub fragment_schedules: Vec<FragmentSchedulingMetadata>,
-    /// Temporary input to the native sidecar encoder. Task 2 removes this with
-    /// the sidecar carrier once native fragments become the canonical build product.
-    pub native_starrocks_scan_sources:
-        std::collections::BTreeMap<i32, proto_encode::plan::StarRocksScanSourceDescriptor>,
+    pub native_fragments: std::collections::BTreeMap<FragmentId, crate::proto::plan::PlanFragment>,
     /// Which fragment is the root (result sink).
     pub root_fragment_id: FragmentId,
     /// Fragment-to-fragment data edges.
@@ -134,16 +131,6 @@ pub(crate) struct MultiFragmentBuildResult {
     pub boundary_schemas: Vec<boundary_schema::BoundarySchemaReport>,
     /// Runtime filter planning result (populated for standalone mode).
     pub rf_plan: Option<RuntimeFilterPlanResult>,
-}
-
-impl MultiFragmentBuildResult {
-    pub(crate) fn refresh_fragment_schedules(&mut self) {
-        self.fragment_schedules = self
-            .fragment_results
-            .iter()
-            .map(FragmentBuildResult::scheduling_metadata)
-            .collect();
-    }
 }
 
 /// Result of lowering runtime-filter annotations to execution wiring.

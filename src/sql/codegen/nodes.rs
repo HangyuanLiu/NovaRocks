@@ -639,9 +639,6 @@ pub(crate) fn build_exec_params_multi_with_refresh_context(
 pub(crate) struct ScanRangeBuildResult {
     pub(crate) fragment_exec_params: FragmentExecParams,
     #[cfg(feature = "compat")]
-    starrocks_scan_sources:
-        BTreeMap<i32, crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor>,
-    #[cfg(feature = "compat")]
     compat_scan_ranges: BTreeMap<i32, Vec<internal_service::TScanRangeParams>>,
 }
 
@@ -650,14 +647,6 @@ impl ScanRangeBuildResult {
         &self,
     ) -> &BTreeMap<i32, Vec<crate::runtime::scan_range::ScanRangeParams>> {
         self.fragment_exec_params.per_node_scan_ranges()
-    }
-
-    #[cfg(feature = "compat")]
-    pub(crate) fn starrocks_scan_sources(
-        &self,
-    ) -> &BTreeMap<i32, crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor>
-    {
-        &self.starrocks_scan_sources
     }
 
     #[cfg(feature = "compat")]
@@ -682,8 +671,6 @@ pub(crate) fn build_scan_ranges_multi_with_refresh_context(
     #[cfg(feature = "compat")]
     let mut per_node_scan_ranges = BTreeMap::new();
     let mut native_scan_ranges = BTreeMap::new();
-    #[cfg(feature = "compat")]
-    let mut starrocks_scan_sources = BTreeMap::new();
 
     for planned in scan_tables {
         let scan_node_id = planned.scan_node_id;
@@ -712,14 +699,6 @@ pub(crate) fn build_scan_ranges_multi_with_refresh_context(
                     build_starrocks_scan_ranges_from_planned_scan(planner.as_ref(), planned)?;
                 per_node_scan_ranges.insert(scan_node_id, ranges);
                 native_scan_ranges.insert(scan_node_id, native.scan_ranges);
-                if starrocks_scan_sources
-                    .insert(scan_node_id, native.source)
-                    .is_some()
-                {
-                    return Err(format!(
-                        "duplicate StarRocks scan node_id={scan_node_id} while building native source descriptors"
-                    ));
-                }
                 continue;
             }
             #[cfg(not(feature = "compat"))]
@@ -836,8 +815,6 @@ pub(crate) fn build_scan_ranges_multi_with_refresh_context(
 
     Ok(ScanRangeBuildResult {
         fragment_exec_params,
-        #[cfg(feature = "compat")]
-        starrocks_scan_sources,
         #[cfg(feature = "compat")]
         compat_scan_ranges: per_node_scan_ranges,
     })
@@ -1810,12 +1787,6 @@ mod compat_tests {
             (native.tablet_id, native.partition_id, native.version),
             (300, 100, 7)
         );
-        let source = &build.starrocks_scan_sources()[&3];
-        assert_eq!(
-            (source.db_id, source.table_id, source.schema_id),
-            (10, 20, 30)
-        );
-        assert_eq!(source.storage_columns[0].unique_id, 0);
     }
 
     #[test]

@@ -14723,11 +14723,8 @@ fn execute_imv_change_stream_write(
         return Ok(result);
     }
     let commit_plan = planned.commit_plan.clone();
-    let result = crate::engine::execute_planned_iceberg_change_stream_write(
-        planned.build_result,
-        planned.native_sidecars,
-        None,
-    )?;
+    let result =
+        crate::engine::execute_planned_iceberg_change_stream_write(planned.build_result, None)?;
     if let Some(abort) = result.write_abort.as_ref() {
         return Err(abort.reason.clone());
     }

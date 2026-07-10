@@ -21,10 +21,12 @@ use std::rc::Rc;
 
 use arrow::datatypes::DataType;
 
+use super::fragment_build::native_output_partition_for_ordinals;
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn as AnalysisOutputColumn, TypedExpr,
 };
 use crate::sql::catalog::{CatalogProvider, ScanSource, TableDef};
+#[cfg(test)]
 use crate::sql::codegen::boundary_schema::{
     BoundaryKind, BoundarySchemaReport, output_columns_to_boundary_columns,
 };
@@ -40,12 +42,10 @@ use crate::sql::codegen::helpers::{
     join_kind_to_op, split_and_conjuncts_typed, typed_expr_display_name,
     typed_expr_display_name_without_qualifiers,
 };
+use crate::sql::codegen::iceberg_change_stream_router_wire::output_slot_ids_for_ordinals;
 #[cfg(feature = "compat")]
 use crate::sql::codegen::iceberg_change_stream_router_wire::{
     build_router_sink_thrift, compat_output_partition_for_ordinals,
-};
-use crate::sql::codegen::iceberg_change_stream_router_wire::{
-    native_output_partition_for_ordinals, output_slot_ids_for_ordinals,
 };
 use crate::sql::codegen::iceberg_write_sink_wire::add_iceberg_sink_target_table_to_desc_builder;
 #[cfg(feature = "compat")]
@@ -85,7 +85,12 @@ pub(crate) fn lower_distributed_plan(
     connectors: &crate::connector::ConnectorRegistry,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
 ) -> Result<MultiFragmentBuildResult, String> {
-    let _ = catalog;
+    let native = super::fragment_build::build_native_fragment_payload(
+        dp,
+        catalog,
+        connectors,
+        mv_refresh_ctx,
+    )?;
     validate_distributed_plan(dp)?;
 
     let mut state = OwnedLoweringState::new_with_fragments(
@@ -98,10 +103,6 @@ pub(crate) fn lower_distributed_plan(
     state.fragment_stack.clear();
 
     let lowered_edges = lower_fragment_edges(dp, &mut state)?;
-    let edges = lowered_edges
-        .iter()
-        .map(|lowered| lowered.edge.clone())
-        .collect();
     let rf_builds = state.rf_build_targets.clone();
     let rf_probes: Vec<(i32, i32, FragmentId)> = state
         .rf_probe_targets
@@ -150,6 +151,11 @@ pub(crate) fn lower_distributed_plan(
     let exec_params = scan_range_build.to_compat_exec_params()?;
     #[cfg(not(feature = "compat"))]
     let exec_params = empty_exec_params_without_compat_scan_ranges();
+    let native_scan_ranges_by_fragment = native
+        .fragment_schedules
+        .iter()
+        .map(|schedule| (schedule.fragment_id, schedule.native_scan_ranges.clone()))
+        .collect::<BTreeMap<_, _>>();
 
     let mut fragment_results = Vec::with_capacity(prepared_fragments.len());
     for (fragment, lowered, output_sink, output_exprs, output_columns, root_node_id) in
@@ -162,6 +168,20 @@ pub(crate) fn lower_distributed_plan(
             root_node_id,
             &output_columns,
         )];
+        let scheduled_native_scan_ranges = native_scan_ranges_by_fragment
+            .get(&fragment.fragment_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut native_scan_ranges = scan_range_build.native_scan_ranges().clone();
+        native_scan_ranges.retain(|node_id, _| scheduled_native_scan_ranges.contains_key(node_id));
+        #[cfg(feature = "compat")]
+        let mut fragment_exec_params = exec_params.clone();
+        #[cfg(feature = "compat")]
+        fragment_exec_params
+            .per_node_scan_ranges
+            .retain(|node_id, _| scheduled_native_scan_ranges.contains_key(node_id));
+        #[cfg(not(feature = "compat"))]
+        let fragment_exec_params = exec_params.clone();
 
         fragment_results.push(FragmentBuildResult {
             fragment_id: fragment.fragment_id,
@@ -169,8 +189,8 @@ pub(crate) fn lower_distributed_plan(
             output_kind,
             plan: plan_nodes::TPlan::new(lowered.plan_nodes),
             desc_tbl: desc_tbl.clone(),
-            exec_params: exec_params.clone(),
-            native_scan_ranges: scan_range_build.native_scan_ranges().clone(),
+            exec_params: fragment_exec_params,
+            native_scan_ranges,
             output_sink,
             output_exprs,
             output_columns,
@@ -182,33 +202,15 @@ pub(crate) fn lower_distributed_plan(
         });
     }
 
-    let mut boundary_schemas = Vec::new();
-    for fragment in &fragment_results {
-        boundary_schemas.extend(fragment.boundary_schemas.clone());
-    }
-    boundary_schemas.extend(edge_boundary_schemas(dp)?);
-    let fragment_schedules = fragment_results
-        .iter()
-        .map(FragmentBuildResult::scheduling_metadata)
-        .collect();
-
     Ok(MultiFragmentBuildResult {
         fragment_results,
-        fragment_schedules,
-        native_starrocks_scan_sources: scan_range_build.starrocks_scan_sources().clone(),
-        root_fragment_id: dp.root_fragment_id,
-        edges,
+        fragment_schedules: native.fragment_schedules,
+        native_fragments: native.native_fragments,
+        root_fragment_id: native.root_fragment_id,
+        edges: native.edges,
         lowered_edges,
-        boundary_schemas,
-        rf_plan: if state.rf_all_filters.is_empty() {
-            None
-        } else {
-            Some(crate::sql::codegen::RuntimeFilterPlanResult {
-                all_filters: state.rf_all_filters,
-                build_side_filters: state.rf_build_side_filters,
-                probe_side_filters: state.rf_probe_side_filters,
-            })
-        },
+        boundary_schemas: native.boundary_schemas,
+        rf_plan: native.rf_plan,
     })
 }
 
@@ -234,110 +236,6 @@ fn fragment_output_kind(sink: &crate::sql::planner::distributed::DataSink) -> Fr
             FragmentOutputKind::NonTerminal
         }
     }
-}
-
-pub(crate) fn refresh_distributed_plan_for_native_sidecar(
-    dp: &crate::sql::planner::distributed::DistributedPlan,
-    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
-) -> Result<crate::sql::planner::distributed::DistributedPlan, String> {
-    let mut out = dp.clone();
-    for fragment in &mut out.fragments {
-        refresh_distributed_node_scan_tables_for_native(&mut fragment.root, mv_refresh_ctx)?;
-    }
-    Ok(out)
-}
-
-fn refresh_distributed_node_scan_tables_for_native(
-    node: &mut crate::sql::planner::distributed::DistributedNode,
-    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
-) -> Result<(), String> {
-    if let crate::sql::planner::distributed::DistributedNodeKind::Scan(scan) = &mut node.payload {
-        let refresh_only_source = is_refresh_only_scan_source(&scan.table.source);
-        let native_projected_names = native_refresh_scan_projected_names(&scan.table.source);
-        let refreshed_table = refresh_scan_table_for_codegen(mv_refresh_ctx, &scan.table)?;
-        if let Some(projected_names) = native_projected_names {
-            scan.required_columns = Some(merge_required_columns_with_projected(
-                scan.required_columns.take(),
-                &projected_names,
-            ));
-        } else if refresh_only_source {
-            scan.columns = scan_output_columns_for_refreshed_table(scan, &refreshed_table);
-        }
-        scan.table = refreshed_table;
-    }
-    for child in &mut node.children {
-        refresh_distributed_node_scan_tables_for_native(child, mv_refresh_ctx)?;
-    }
-    Ok(())
-}
-
-fn is_refresh_only_scan_source(source: &ScanSource) -> bool {
-    matches!(
-        source,
-        ScanSource::IcebergVersionTable { .. }
-            | ScanSource::IcebergMvTargetState(_)
-            | ScanSource::IcebergMvTargetLocator(_)
-    )
-}
-
-fn native_refresh_scan_projected_names(source: &ScanSource) -> Option<Vec<String>> {
-    match source {
-        ScanSource::IcebergMvTargetState(scan) => {
-            Some(nodes::projected_target_state_column_names(scan))
-        }
-        ScanSource::IcebergMvTargetLocator(scan) => {
-            Some(nodes::projected_target_locator_column_names(scan))
-        }
-        _ => None,
-    }
-}
-
-fn scan_output_columns_for_refreshed_table(
-    scan: &crate::sql::planner::payload::PlanScanNode,
-    table: &TableDef,
-) -> Vec<AnalysisOutputColumn> {
-    let mut out = Vec::new();
-    for column in table
-        .columns
-        .iter()
-        .chain(table.iceberg_row_lineage_metadata_columns.iter())
-    {
-        if let Some(output_column) = scan
-            .columns
-            .iter()
-            .find(|candidate| candidate.name.eq_ignore_ascii_case(&column.name))
-        {
-            out.push(output_column.clone());
-        }
-    }
-    for variant_column in &scan.variant_columns {
-        if let Some(output_column) = scan
-            .columns
-            .iter()
-            .find(|column| column.column_id == variant_column.synthetic_column_id)
-        {
-            out.push(output_column.clone());
-        }
-    }
-    out
-}
-
-fn merge_required_columns_with_projected(
-    existing: Option<Vec<String>>,
-    projected_names: &[String],
-) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut seen = BTreeSet::new();
-    for name in projected_names
-        .iter()
-        .cloned()
-        .chain(existing.unwrap_or_default())
-    {
-        if seen.insert(name.to_lowercase()) {
-            out.push(name);
-        }
-    }
-    out
 }
 
 fn apply_local_rf_waiting_sets(
@@ -1316,6 +1214,7 @@ fn widen_join_output_scopes(
     }
 }
 
+#[cfg(test)]
 fn edge_boundary_schemas(
     dp: &crate::sql::planner::distributed::DistributedPlan,
 ) -> Result<Vec<BoundarySchemaReport>, String> {
@@ -2566,8 +2465,12 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             ));
         }
         let child = self.lower_node(&node.children[0])?;
-        let plan_node =
-            self.lower_assert_one_row(node.node_id, assert_one_row, &child.tuple_ids)?;
+        let plan_node = self.lower_assert_one_row(
+            node.node_id,
+            assert_one_row,
+            &child.tuple_ids,
+            &child.scope,
+        )?;
         let mut plan_nodes = vec![plan_node];
         plan_nodes.extend(child.plan_nodes);
         Ok(LoweredDistributedNode {
@@ -4811,21 +4714,38 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         assert_node_id: i32,
         op: &super::kind::DistributedAssertOneRowNode,
         child_tuple_ids: &[i32],
+        child_scope: &ExprScope,
     ) -> Result<plan_nodes::TPlanNode, String> {
         if op.desired_num_rows != Some(1)
             || !matches!(
                 op.assertion,
                 crate::sql::planner::payload::PlanRowCountAssertion::Le
             )
-            || !op.group_key_column_ids.is_empty()
-            || !op.group_key_labels.is_empty()
-            || op.keyed_message_prefix.is_some()
         {
-            return Err(
-                "thrift IR lowering only supports global AssertOneRow <= 1; keyed or non-default assertions require native lowering or a dedicated patch"
-                    .to_string(),
-            );
+            return Err("thrift IR lowering only supports AssertOneRow <= 1".to_string());
         }
+        if op.group_key_column_ids.len() != op.group_key_labels.len() {
+            return Err(format!(
+                "AssertOneRow node {assert_node_id} has {} group-key columns but {} labels",
+                op.group_key_column_ids.len(),
+                op.group_key_labels.len()
+            ));
+        }
+        let group_key_slots = op
+            .group_key_column_ids
+            .iter()
+            .map(|column_id| {
+                child_scope
+                    .resolve_by_id(*column_id)
+                    .map(|binding| binding.slot_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "AssertOneRow node {assert_node_id} cannot resolve group-key ColumnId({}) in child scope",
+                            column_id.0
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut plan_node = nodes::default_plan_node();
         plan_node.node_id = assert_node_id;
         plan_node.node_type = plan_nodes::TPlanNodeType::ASSERT_NUM_ROWS_NODE;
@@ -4838,9 +4758,10 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             desired_num_rows: Some(1),
             subquery_string: Some(op.subquery_text.clone()),
             assertion: Some(plan_nodes::TAssertion::LE),
-            group_key_slots: None,
-            group_key_labels: None,
-            keyed_message_prefix: None,
+            group_key_slots: (!group_key_slots.is_empty()).then_some(group_key_slots),
+            group_key_labels: (!op.group_key_labels.is_empty())
+                .then_some(op.group_key_labels.clone()),
+            keyed_message_prefix: op.keyed_message_prefix.clone(),
         });
         Ok(plan_node)
     }
@@ -6209,7 +6130,7 @@ mod tests {
                 output_partition: DataPartition::unpartitioned(),
                 sink: DataSink::Result,
                 output_exprs: None,
-                output_columns: vec![right_col],
+                output_columns: vec![left_col, right_col],
                 cte_id: None,
                 cte_exchange_nodes: Vec::new(),
             }],
@@ -6227,8 +6148,9 @@ mod tests {
             .iter()
             .find(|fragment| fragment.fragment_id == result.root_fragment_id)
             .expect("root fragment");
-        assert_eq!(root.output_columns.len(), 1);
-        assert_eq!(root.output_columns[0].name, "right_id");
+        assert_eq!(root.output_columns.len(), 2);
+        assert_eq!(root.output_columns[0].name, "left_id");
+        assert_eq!(root.output_columns[1].name, "right_id");
     }
 
     #[test]
@@ -6270,10 +6192,11 @@ mod tests {
             },
             partition_constraint: IcebergMvTargetStatePartitionConstraint::Unpartitioned,
         };
-        let projected_names = super::native_refresh_scan_projected_names(
-            &ScanSource::IcebergMvTargetState(source_scan.clone()),
-        )
-        .expect("target-state projected names");
+        let projected_names =
+            crate::sql::codegen::ir::fragment_build::native_refresh_scan_projected_names(
+                &ScanSource::IcebergMvTargetState(source_scan.clone()),
+            )
+            .expect("target-state projected names");
         let table = TableDef {
             name: "mv".to_string(),
             columns: vec![
@@ -6374,10 +6297,11 @@ mod tests {
                 "__agg_state_c",
             ]
         );
-        let required = super::merge_required_columns_with_projected(
-            scan.required_columns.clone(),
-            &projected_names,
-        );
+        let required =
+            crate::sql::codegen::ir::fragment_build::merge_required_columns_with_projected(
+                scan.required_columns.clone(),
+                &projected_names,
+            );
         assert_eq!(
             required,
             &[
@@ -7098,7 +7022,13 @@ mod tests {
             .find(|slot| slot.col_name.as_deref() == Some("c"))
             .and_then(|slot| slot.id)
             .expect("producer column c slot id");
-        assert_eq!(edge.output_slot_ids, vec![expected_p2_slot_id]);
+        assert_eq!(edge.output_slot_ids, vec![p2.column_id.0 as i32]);
+        let compat_edge = result
+            .lowered_edges
+            .iter()
+            .find(|lowered| lowered.edge.target_exchange_node_id == edge.target_exchange_node_id)
+            .expect("compat CTE edge");
+        assert_eq!(compat_edge.edge.output_slot_ids, vec![expected_p2_slot_id]);
     }
 
     #[test]
@@ -7219,6 +7149,68 @@ mod tests {
         );
         assert_eq!(result.boundary_schemas[3].columns.len(), 1);
         assert_eq!(result.boundary_schemas[3].columns[0].name, "child_k");
+    }
+
+    #[test]
+    fn compat_multi_fragment_scan_ranges_are_owned_only_by_the_scan_fragment() {
+        let catalog = DummyCatalog;
+        let connectors = ConnectorRegistry::new();
+        let mut dp = distributed_project_scan_plan();
+        let mut scan_fragment = dp.fragments.remove(0);
+        let output_columns = scan_fragment.output_columns.clone();
+        scan_fragment.sink = DataSink::Noop;
+        scan_fragment.output_partition = DataPartition::unpartitioned();
+        let root_fragment_id = 1;
+        let exchange_node_id = 20;
+        let root_fragment = PlanFragment {
+            fragment_id: root_fragment_id,
+            root: DistributedNode {
+                node_id: exchange_node_id,
+                fragment_id: root_fragment_id,
+                tuple_ids: vec![exchange_node_id],
+                nullable_tuple_ids: Vec::new(),
+                limit: -1,
+                build_runtime_filters: Vec::new(),
+                probe_runtime_filters: Vec::new(),
+                children: Vec::new(),
+                stats: distributed_stats(),
+                payload: DistributedNodeKind::Exchange(DistributedExchangeNode {
+                    partition: DataPartition::unpartitioned(),
+                    source_fragment_id: scan_fragment.fragment_id,
+                    output_columns: output_columns.clone(),
+                    output_qualifier: None,
+                    flavor: ExchangeFlavor::Distribution,
+                }),
+            },
+            data_partition: DataPartition::unpartitioned(),
+            output_partition: DataPartition::unpartitioned(),
+            sink: DataSink::Result,
+            output_exprs: None,
+            output_columns,
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        };
+        dp.fragments = vec![scan_fragment, root_fragment];
+        dp.root_fragment_id = root_fragment_id;
+        dp.edges = vec![fragment_edge(0, root_fragment_id, exchange_node_id)];
+
+        let result = super::lower_distributed_plan(&dp, &catalog, &connectors, None)
+            .expect("multi-fragment scan lower");
+        let scan = result
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == 0)
+            .expect("scan fragment");
+        let root = result
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == root_fragment_id)
+            .expect("root fragment");
+
+        assert!(!scan.native_scan_ranges.is_empty());
+        assert!(!scan.exec_params.per_node_scan_ranges.is_empty());
+        assert!(root.native_scan_ranges.is_empty());
+        assert!(root.exec_params.per_node_scan_ranges.is_empty());
     }
 
     #[test]
@@ -7728,7 +7720,10 @@ mod tests {
         let mut cyclic = distributed_values_multi_fragment_plan();
         cyclic.fragments[0].root = distributed_exchange_node(10, 0, 10, 1);
         cyclic.edges.push(fragment_edge(1, 0, 10));
-        assert_lowering_err(&cyclic, "cycle in DistributedPlan fragment edges");
+        assert_lowering_err(
+            &cyclic,
+            "native stream edge source fragment 1 must have a NOOP sink",
+        );
 
         let mut disconnected_noop = distributed_values_multi_fragment_plan();
         disconnected_noop.edges.clear();

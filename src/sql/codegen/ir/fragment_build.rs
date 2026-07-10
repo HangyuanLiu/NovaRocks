@@ -30,31 +30,75 @@ use crate::sql::codegen::boundary_schema::{
 };
 use crate::sql::codegen::connector_scan_wire::{ThriftScanContext, to_native_file_scan};
 use crate::sql::codegen::runtime_filter::PlannedRuntimeFilter;
+#[cfg(not(feature = "compat"))]
+use crate::sql::codegen::{FragmentBuildResult, MultiFragmentBuildResult};
 use crate::sql::codegen::{
-    FragmentBuildResult, FragmentOutputKind, FragmentSchedulingMetadata, MultiFragmentBuildResult,
-    OutputColumn, RuntimeFilterPlanResult,
+    FragmentOutputKind, FragmentSchedulingMetadata, OutputColumn, RuntimeFilterPlanResult,
 };
+use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::{
     DataPartition, DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor,
     FragmentEdgeKind, FragmentId, FragmentStreamKind, PartitionKind, PlanFragment,
 };
 use crate::sql::planner::payload::PlanScanNode;
 
+#[cfg(not(feature = "compat"))]
 pub(crate) fn lower_distributed_plan(
     dp: &DistributedPlan,
     catalog: &dyn crate::sql::catalog::CatalogProvider,
     connectors: &crate::connector::ConnectorRegistry,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
 ) -> Result<MultiFragmentBuildResult, String> {
+    let native = build_native_fragment_payload(dp, catalog, connectors, mv_refresh_ctx)?;
+    let fragment_results = native
+        .fragment_schedules
+        .iter()
+        .map(|schedule| FragmentBuildResult {
+            fragment_id: schedule.fragment_id,
+            has_scan_nodes: schedule.has_scan_nodes,
+            output_kind: schedule.output_kind,
+            native_scan_ranges: schedule.native_scan_ranges.clone(),
+            output_columns: schedule.output_columns.clone(),
+            boundary_schemas: schedule.boundary_schemas.clone(),
+            cte_id: schedule.cte_id,
+            cte_exchange_nodes: schedule.cte_exchange_nodes.clone(),
+        })
+        .collect();
+
+    Ok(MultiFragmentBuildResult {
+        fragment_results,
+        fragment_schedules: native.fragment_schedules,
+        native_fragments: native.native_fragments,
+        root_fragment_id: native.root_fragment_id,
+        edges: native.edges,
+        boundary_schemas: native.boundary_schemas,
+        rf_plan: native.rf_plan,
+    })
+}
+
+pub(crate) struct NativeFragmentBuildPayload {
+    pub(crate) fragment_schedules: Vec<FragmentSchedulingMetadata>,
+    pub(crate) native_fragments: BTreeMap<FragmentId, crate::proto::plan::PlanFragment>,
+    pub(crate) root_fragment_id: FragmentId,
+    pub(crate) edges: Vec<crate::sql::codegen::FragmentEdge>,
+    pub(crate) boundary_schemas: Vec<BoundarySchemaReport>,
+    pub(crate) rf_plan: Option<RuntimeFilterPlanResult>,
+}
+
+pub(crate) fn build_native_fragment_payload(
+    dp: &DistributedPlan,
+    catalog: &dyn crate::sql::catalog::CatalogProvider,
+    connectors: &crate::connector::ConnectorRegistry,
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+) -> Result<NativeFragmentBuildPayload, String> {
     let _ = catalog;
     validate_distributed_plan(dp)?;
 
-    let mut refreshed = refresh_distributed_plan_for_native_sidecar(dp, mv_refresh_ctx)?;
-    lower_native_cte_multicast_edge_output_slot_ids(&mut refreshed)?;
+    let mut refreshed = refresh_distributed_plan_for_fragment_build(dp, mv_refresh_ctx)?;
+    lower_native_fragment_edges(&mut refreshed)?;
     let native_scan_planning = build_native_scan_ranges(&refreshed, connectors, mv_refresh_ctx)?;
     let native_scan_ranges = &native_scan_planning.scan_ranges;
 
-    let mut fragment_results = Vec::with_capacity(refreshed.fragments.len());
     let mut fragment_schedules = Vec::with_capacity(refreshed.fragments.len());
     for fragment in &refreshed.fragments {
         let output_columns = fragment
@@ -74,16 +118,6 @@ pub(crate) fn lower_distributed_plan(
             .cloned()
             .unwrap_or_default();
 
-        let result = FragmentBuildResult {
-            fragment_id: fragment.fragment_id,
-            has_scan_nodes,
-            output_kind,
-            native_scan_ranges: native_scan_ranges.clone(),
-            output_columns: output_columns.clone(),
-            boundary_schemas: boundary_schemas.clone(),
-            cte_id: fragment.cte_id,
-            cte_exchange_nodes: fragment.cte_exchange_nodes.clone(),
-        };
         fragment_schedules.push(FragmentSchedulingMetadata {
             fragment_id: fragment.fragment_id,
             has_scan_nodes,
@@ -94,19 +128,39 @@ pub(crate) fn lower_distributed_plan(
             cte_id: fragment.cte_id,
             cte_exchange_nodes: fragment.cte_exchange_nodes.clone(),
         });
-        fragment_results.push(result);
     }
 
-    let mut boundary_schemas = fragment_results
+    let mut boundary_schemas = fragment_schedules
         .iter()
         .flat_map(|fragment| fragment.boundary_schemas.clone())
         .collect::<Vec<_>>();
     boundary_schemas.extend(edge_boundary_schemas(&refreshed)?);
 
-    Ok(MultiFragmentBuildResult {
-        fragment_results,
+    let encoded = crate::sql::codegen::proto_encode::plan::encode_distributed_plan_with_context(
+        &refreshed,
+        crate::sql::codegen::proto_encode::plan::NativePlanEncodeContext {
+            mv_refresh_ctx,
+            starrocks_scan_sources: Some(&native_scan_planning.starrocks_scan_sources),
+        },
+    )?;
+    let mut native_fragments = BTreeMap::new();
+    for fragment in encoded.fragments {
+        let fragment_id = fragment.fragment_id;
+        if native_fragments.insert(fragment_id, fragment).is_some() {
+            return Err(format!(
+                "native fragment build encoded duplicate fragment id={fragment_id}"
+            ));
+        }
+    }
+    validate_native_fragment_ownership(
+        &native_fragments,
+        &fragment_schedules,
+        refreshed.root_fragment_id,
+    )?;
+
+    Ok(NativeFragmentBuildPayload {
         fragment_schedules,
-        native_starrocks_scan_sources: native_scan_planning.starrocks_scan_sources,
+        native_fragments,
         root_fragment_id: refreshed.root_fragment_id,
         edges: refreshed.edges.clone(),
         boundary_schemas,
@@ -114,7 +168,33 @@ pub(crate) fn lower_distributed_plan(
     })
 }
 
-pub(crate) fn refresh_distributed_plan_for_native_sidecar(
+fn validate_native_fragment_ownership(
+    native_fragments: &BTreeMap<FragmentId, crate::proto::plan::PlanFragment>,
+    fragment_schedules: &[FragmentSchedulingMetadata],
+    root_fragment_id: FragmentId,
+) -> Result<(), String> {
+    let native_ids = native_fragments.keys().copied().collect::<BTreeSet<_>>();
+    let schedule_ids = fragment_schedules
+        .iter()
+        .map(|schedule| schedule.fragment_id)
+        .collect::<BTreeSet<_>>();
+    if schedule_ids.len() != fragment_schedules.len() {
+        return Err("native fragment build produced duplicate schedule fragment ids".to_string());
+    }
+    if !native_ids.contains(&root_fragment_id) {
+        return Err(format!(
+            "native fragment build is missing root fragment id={root_fragment_id}"
+        ));
+    }
+    if native_ids != schedule_ids {
+        return Err(format!(
+            "native fragment ids {native_ids:?} do not match schedule ids {schedule_ids:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn refresh_distributed_plan_for_fragment_build(
     dp: &DistributedPlan,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
 ) -> Result<DistributedPlan, String> {
@@ -125,40 +205,227 @@ pub(crate) fn refresh_distributed_plan_for_native_sidecar(
     Ok(out)
 }
 
-fn lower_native_cte_multicast_edge_output_slot_ids(dp: &mut DistributedPlan) -> Result<(), String> {
+fn lower_native_fragment_edges(dp: &mut DistributedPlan) -> Result<(), String> {
     let fragments_by_id: BTreeMap<FragmentId, &PlanFragment> = dp
         .fragments
         .iter()
         .map(|fragment| (fragment.fragment_id, fragment))
         .collect();
+    let mut stream_source_partitions = BTreeMap::new();
+    let mut router_target_partitions = BTreeMap::new();
     for edge in &mut dp.edges {
-        let FragmentEdgeKind::CteMulticast {
-            cte_id,
-            receive_producer_column_ids,
-        } = &edge.edge_kind
-        else {
-            continue;
-        };
         let exchange = target_exchange_for_edge(&fragments_by_id, edge)?;
-        if receive_producer_column_ids.len() != exchange.output_columns.len() {
-            return Err(format!(
-                "lower_distributed_plan CTE multicast receive/output arity mismatch for cte_id={}",
-                cte_id
-            ));
-        }
-        edge.output_slot_ids = receive_producer_column_ids
-            .iter()
-            .map(|column_id| {
-                i32::try_from(column_id.0).map_err(|_| {
+        match &edge.edge_kind {
+            FragmentEdgeKind::Stream => {
+                let source = fragments_by_id
+                    .get(&edge.source_fragment_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "lower_distributed_plan edge references missing source fragment id={}",
+                            edge.source_fragment_id
+                        )
+                    })?;
+                let output_columns = if exchange.output_columns.is_empty() {
+                    &source.output_columns
+                } else {
+                    &exchange.output_columns
+                };
+                edge.output_partition = exchange.partition.clone();
+                edge.stream_kind = fragment_stream_kind(&edge.output_partition);
+                edge.output_slot_ids = native_output_column_ids(output_columns, "stream edge")?;
+                if stream_source_partitions
+                    .insert(edge.source_fragment_id, edge.output_partition.clone())
+                    .is_some()
+                {
+                    return Err(format!(
+                        "lower_distributed_plan stream source fragment id={} has multiple outgoing stream edges",
+                        edge.source_fragment_id
+                    ));
+                }
+            }
+            FragmentEdgeKind::CteMulticast {
+                cte_id,
+                receive_producer_column_ids,
+            } => {
+                if receive_producer_column_ids.len() != exchange.output_columns.len() {
+                    return Err(format!(
+                        "lower_distributed_plan CTE multicast receive/output arity mismatch for cte_id={}",
+                        cte_id
+                    ));
+                }
+                edge.output_partition = exchange.partition.clone();
+                edge.stream_kind = fragment_stream_kind(&edge.output_partition);
+                edge.output_slot_ids = receive_producer_column_ids
+                    .iter()
+                    .map(|column_id| native_output_column_id(*column_id, "CTE multicast edge"))
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
+            FragmentEdgeKind::IcebergChangeStreamRouter {
+                router_group_id,
+                branch_id,
+                branch_kind,
+            } => {
+                let source = fragments_by_id.get(&edge.source_fragment_id).ok_or_else(|| {
                     format!(
-                        "native CTE multicast producer column {} cannot convert to output slot id",
-                        column_id.0
+                        "lower_distributed_plan router edge references missing source fragment id={}",
+                        edge.source_fragment_id
                     )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+                })?;
+                let crate::sql::planner::distributed::DataSink::IcebergChangeStreamRouter(router) =
+                    &source.sink
+                else {
+                    return Err(format!(
+                        "lower_distributed_plan router edge source fragment id={} does not use Iceberg change-stream router sink",
+                        edge.source_fragment_id
+                    ));
+                };
+                let route = router
+                    .branches
+                    .iter()
+                    .find(|route| {
+                        router.group_id == *router_group_id
+                            && route.branch_id == *branch_id
+                            && route.branch_kind == *branch_kind
+                            && route.target_fragment_id == edge.target_fragment_id
+                            && route.target_exchange_node_id == edge.target_exchange_node_id
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "lower_distributed_plan router edge source={} group={} branch_id={} branch_kind={:?} has no matching planner route",
+                            edge.source_fragment_id, router_group_id, branch_id, branch_kind
+                        )
+                    })?;
+                edge.output_slot_ids = route
+                    .output_ordinals
+                    .iter()
+                    .map(|ordinal| {
+                        source.output_columns.get(*ordinal).ok_or_else(|| {
+                            format!(
+                                "native router edge output ordinal {ordinal} is out of range for fragment {}",
+                                edge.source_fragment_id
+                            )
+                        })
+                    })
+                    .map(|column| {
+                        column.and_then(|column| {
+                            native_output_column_id(column.column_id, "router edge")
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                edge.output_partition = native_output_partition_for_ordinals(
+                    &source.output_columns,
+                    &route.output_partition_ordinals,
+                    &format!("branch {:?} partition", route.branch_kind),
+                )?;
+                edge.stream_kind = fragment_stream_kind(&edge.output_partition);
+                let target = (edge.target_fragment_id, edge.target_exchange_node_id);
+                if let Some(existing) = router_target_partitions.get(&target)
+                    && !native_partitions_equal(existing, &edge.output_partition)?
+                {
+                    return Err(format!(
+                        "lower_distributed_plan router edges have conflicting partitions for target Exchange node_id={} in fragment id={}",
+                        edge.target_exchange_node_id, edge.target_fragment_id
+                    ));
+                }
+                router_target_partitions.insert(target, edge.output_partition.clone());
+            }
+        }
+    }
+    drop(fragments_by_id);
+    for (fragment_id, output_partition) in stream_source_partitions {
+        let source = dp
+            .fragments
+            .iter_mut()
+            .find(|fragment| fragment.fragment_id == fragment_id)
+            .ok_or_else(|| {
+                format!(
+                    "lower_distributed_plan edge references missing source fragment id={fragment_id}"
+                )
+            })?;
+        source.output_partition = output_partition;
+    }
+    for ((fragment_id, exchange_node_id), output_partition) in router_target_partitions {
+        let target = dp
+            .fragments
+            .iter_mut()
+            .find(|fragment| fragment.fragment_id == fragment_id)
+            .ok_or_else(|| {
+                format!(
+                    "lower_distributed_plan router edge references missing target fragment id={fragment_id}"
+                )
+            })?;
+        let exchange = find_exchange_node_mut(&mut target.root, exchange_node_id).ok_or_else(|| {
+            format!(
+                "lower_distributed_plan router edge target_exchange_node_id={exchange_node_id} not found in target fragment id={fragment_id}"
+            )
+        })?;
+        let DistributedNodeKind::Exchange(exchange) = &mut exchange.payload else {
+            return Err(format!(
+                "lower_distributed_plan router edge target_exchange_node_id={exchange_node_id} in target fragment id={fragment_id} must target Exchange"
+            ));
+        };
+        exchange.partition = output_partition;
     }
     Ok(())
+}
+
+fn native_partitions_equal(left: &DataPartition, right: &DataPartition) -> Result<bool, String> {
+    Ok(
+        crate::sql::codegen::proto_encode::plan::encode_data_partition(left)?
+            == crate::sql::codegen::proto_encode::plan::encode_data_partition(right)?,
+    )
+}
+
+fn native_output_column_ids(
+    columns: &[AnalysisOutputColumn],
+    context: &str,
+) -> Result<Vec<i32>, String> {
+    columns
+        .iter()
+        .map(|column| native_output_column_id(column.column_id, context))
+        .collect()
+}
+
+pub(super) fn native_output_partition_for_ordinals(
+    output_columns: &[AnalysisOutputColumn],
+    ordinals: &[usize],
+    label: &str,
+) -> Result<DataPartition, String> {
+    if ordinals.is_empty() {
+        return Ok(DataPartition::unpartitioned());
+    }
+
+    let exprs = ordinals
+        .iter()
+        .copied()
+        .map(|ordinal| {
+            output_columns
+                .get(ordinal)
+                .ok_or_else(|| format!("{label} ordinal {ordinal} is out of range"))
+                .map(|column| crate::sql::analysis::TypedExpr {
+                    kind: crate::sql::analysis::ExprKind::ColumnRef {
+                        column_id: column.column_id,
+                        qualifier: None,
+                        column: column.name.clone(),
+                    },
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(DataPartition {
+        kind: PartitionKind::Hash,
+        exprs,
+    })
+}
+
+fn native_output_column_id(column_id: ColumnId, context: &str) -> Result<i32, String> {
+    i32::try_from(column_id.0).map_err(|_| {
+        format!(
+            "native {context} column {} cannot convert to output slot id",
+            column_id.0
+        )
+    })
 }
 
 fn refresh_distributed_node_scan_tables_for_native(
@@ -194,7 +461,7 @@ fn is_refresh_only_scan_source(source: &ScanSource) -> bool {
     )
 }
 
-fn native_refresh_scan_projected_names(source: &ScanSource) -> Option<Vec<String>> {
+pub(super) fn native_refresh_scan_projected_names(source: &ScanSource) -> Option<Vec<String>> {
     match source {
         ScanSource::IcebergMvTargetState(scan) => Some(projected_target_state_column_names(scan)),
         ScanSource::IcebergMvTargetLocator(scan) => {
@@ -234,7 +501,7 @@ fn scan_output_columns_for_refreshed_table(
     out
 }
 
-fn merge_required_columns_with_projected(
+pub(super) fn merge_required_columns_with_projected(
     existing: Option<Vec<String>>,
     projected_names: &[String],
 ) -> Vec<String> {
@@ -1035,7 +1302,7 @@ fn collect_runtime_filter_builds(
     }
 }
 
-fn validate_distributed_plan(dp: &DistributedPlan) -> Result<(), String> {
+pub(super) fn validate_distributed_plan(dp: &DistributedPlan) -> Result<(), String> {
     super::validate_global_node_ids(dp)?;
     if dp.fragments.is_empty() {
         return Err("lower_distributed_plan requires at least one fragment".to_string());
@@ -1163,6 +1430,17 @@ fn target_exchange_for_edge<'a>(
             edge.target_exchange_node_id, edge.target_fragment_id
         ));
     };
+    if edge.source_fragment_id != exchange.source_fragment_id {
+        return Err(format!(
+            "lower_distributed_plan {} edge source_fragment_id={} does not match Exchange source_fragment_id={} for target_exchange_node_id={} in target fragment id={}",
+            fragment_edge_kind_label(&edge.edge_kind),
+            edge.source_fragment_id,
+            exchange.source_fragment_id,
+            edge.target_exchange_node_id,
+            edge.target_fragment_id
+        ));
+    }
+    validate_exchange_partition(&exchange.partition)?;
     match (&edge.edge_kind, &exchange.flavor) {
         (FragmentEdgeKind::Stream, ExchangeFlavor::Distribution)
         | (FragmentEdgeKind::Stream, ExchangeFlavor::LimitOffset { .. })
@@ -1207,6 +1485,23 @@ fn target_exchange_for_edge<'a>(
     Ok(exchange)
 }
 
+fn fragment_edge_kind_label(edge_kind: &FragmentEdgeKind) -> &'static str {
+    match edge_kind {
+        FragmentEdgeKind::Stream => "stream",
+        FragmentEdgeKind::CteMulticast { .. } => "CTE multicast",
+        FragmentEdgeKind::IcebergChangeStreamRouter { .. } => "Iceberg change-stream router",
+    }
+}
+
+fn validate_exchange_partition(partition: &DataPartition) -> Result<(), String> {
+    if matches!(partition.kind, PartitionKind::Hash) && partition.exprs.is_empty() {
+        return Err(
+            "DistributedPlan HASH Exchange has no native partition expressions".to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn find_exchange_node(node: &DistributedNode, node_id: i32) -> Option<&DistributedNode> {
     if node.node_id == node_id {
         return Some(node);
@@ -1217,6 +1512,18 @@ fn find_exchange_node(node: &DistributedNode, node_id: i32) -> Option<&Distribut
         }
     }
     None
+}
+
+fn find_exchange_node_mut(
+    node: &mut DistributedNode,
+    node_id: i32,
+) -> Option<&mut DistributedNode> {
+    if node.node_id == node_id {
+        return Some(node);
+    }
+    node.children
+        .iter_mut()
+        .find_map(|child| find_exchange_node_mut(child, node_id))
 }
 
 fn distributed_node_has_scan(node: &DistributedNode) -> bool {
@@ -1237,7 +1544,6 @@ fn fragment_output_kind(sink: &crate::sql::planner::distributed::DataSink) -> Fr
     }
 }
 
-#[allow(dead_code)]
 fn fragment_stream_kind(partition: &DataPartition) -> FragmentStreamKind {
     match partition.kind {
         PartitionKind::Unpartitioned => FragmentStreamKind::Gather,
@@ -1254,8 +1560,8 @@ mod tests {
 
     use super::*;
     use crate::connector::ConnectorRegistry;
-    use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
     use crate::sql::analysis::cte::CteId;
+    use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, TypedExpr};
     use crate::sql::catalog::{CatalogProvider, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed::{
@@ -1289,6 +1595,18 @@ mod tests {
             data_type: DataType::Int64,
             nullable: false,
             is_internal: false,
+        }
+    }
+
+    fn column_ref(id: u32, name: &str) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::new_for_test(id),
+                qualifier: Some("t".to_string()),
+                column: name.to_string(),
+            },
+            data_type: DataType::Int64,
+            nullable: false,
         }
     }
 
@@ -1395,9 +1713,353 @@ mod tests {
 
         for (label, flavor) in cases {
             let dp = stream_exchange_plan(flavor);
-            lower_distributed_plan(&dp, &EmptyCatalog, &ConnectorRegistry::new(), None)
+            build_native_fragment_payload(&dp, &EmptyCatalog, &ConnectorRegistry::new(), None)
                 .unwrap_or_else(|err| panic!("{label} stream exchange should lower: {err}"));
         }
+    }
+
+    #[test]
+    fn stream_edge_normalization_keeps_schedule_sink_and_receiver_partition_consistent() {
+        let mut dp = stream_exchange_plan(ExchangeFlavor::Distribution);
+        dp.fragments[0].output_partition = DataPartition {
+            kind: PartitionKind::Random,
+            exprs: Vec::new(),
+        };
+        let expected_partition = DataPartition {
+            kind: PartitionKind::Hash,
+            exprs: vec![column_ref(1, "k")],
+        };
+        let DistributedNodeKind::Exchange(exchange) = &mut dp.fragments[1].root.payload else {
+            panic!("consumer must be an exchange");
+        };
+        exchange.partition = expected_partition.clone();
+
+        let result =
+            build_native_fragment_payload(&dp, &EmptyCatalog, &ConnectorRegistry::new(), None)
+                .expect("native fragment build");
+
+        assert!(matches!(
+            result.edges[0].output_partition.kind,
+            PartitionKind::Hash
+        ));
+        assert_eq!(result.edges[0].output_partition.exprs.len(), 1);
+        assert_eq!(result.edges[0].stream_kind, FragmentStreamKind::Partitioned);
+        let source = result.native_fragments.get(&1).expect("source fragment");
+        let source_partition = source
+            .output_partition
+            .as_ref()
+            .expect("source output partition");
+        assert_eq!(
+            source_partition.kind,
+            crate::proto::plan::PartitionKind::Hash as i32
+        );
+        assert_eq!(source_partition.exprs.len(), 1);
+        let sink_partition = match source
+            .sink
+            .as_ref()
+            .and_then(|sink| sink.kind.as_ref())
+            .expect("source stream sink")
+        {
+            crate::proto::plan::data_sink::Kind::DataStream(sink) => sink
+                .output_partition
+                .as_ref()
+                .expect("stream sink output partition"),
+            other => panic!("expected stream sink, got {other:?}"),
+        };
+        let canonical_edge_partition =
+            crate::sql::codegen::proto_encode::plan::encode_data_partition(
+                &result.edges[0].output_partition,
+            )
+            .expect("encode canonical edge partition");
+        assert_eq!(sink_partition, &canonical_edge_partition);
+        assert_eq!(source_partition, &canonical_edge_partition);
+
+        let target = result.native_fragments.get(&0).expect("target fragment");
+        let receiver = match target
+            .root
+            .as_ref()
+            .and_then(|root| root.payload.as_ref())
+            .expect("target exchange receiver")
+        {
+            crate::proto::plan::distributed_node::Payload::Exchange(exchange) => exchange,
+            other => panic!("expected exchange receiver, got {other:?}"),
+        };
+        assert_eq!(
+            receiver.partition_type,
+            crate::proto::plan::PartitionKind::Hash as i32
+        );
+        assert_eq!(receiver.partition_exprs.len(), 1);
+    }
+
+    #[test]
+    fn router_edge_rebuilds_partition_and_stream_kind_from_route_ordinals() {
+        let output_columns = vec![
+            output_col(1, "op"),
+            output_col(2, "route"),
+            output_col(3, "delete_id"),
+        ];
+        let dp = DistributedPlan {
+            fragments: vec![PlanFragment {
+                fragment_id: 0,
+                root: physical_values_node(0, 10, output_columns.clone()),
+                data_partition: DataPartition::unpartitioned(),
+                output_partition: DataPartition::unpartitioned(),
+                sink: crate::sql::planner::distributed::DataSink::Result,
+                output_exprs: None,
+                output_columns,
+                cte_id: None,
+                cte_exchange_nodes: Vec::new(),
+            }],
+            root_fragment_id: 0,
+            edges: Vec::new(),
+        };
+        let mut branch =
+            crate::sql::planner::ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![2]);
+        branch.output_partition_ordinals = vec![2];
+        branch.sink_spec.iceberg.serialized_metadata =
+            Some(crate::sql::planner::write_sink::test_support::unpartitioned_metadata_json());
+        let dag =
+            crate::sql::planner::ChangeStreamWriteDagSpec::for_test(Some(0), None, vec![branch]);
+        let mut planned = crate::sql::planner::with_iceberg_change_stream_write(dp, "test_db", dag)
+            .expect("plan change-stream write")
+            .distributed_plan;
+        planned.edges[0].output_partition = DataPartition::unpartitioned();
+        planned.edges[0].stream_kind = FragmentStreamKind::Gather;
+        let target_fragment_id = planned.edges[0].target_fragment_id;
+        let target_exchange_node_id = planned.edges[0].target_exchange_node_id;
+        let target = planned
+            .fragments
+            .iter_mut()
+            .find(|fragment| fragment.fragment_id == target_fragment_id)
+            .expect("router target fragment");
+        assert_eq!(target.root.node_id, target_exchange_node_id);
+        let DistributedNodeKind::Exchange(exchange) = &mut target.root.payload else {
+            panic!("router target must be Exchange");
+        };
+        exchange.partition = DataPartition::unpartitioned();
+
+        let result =
+            build_native_fragment_payload(&planned, &EmptyCatalog, &ConnectorRegistry::new(), None)
+                .expect("native fragment build");
+
+        let edge = &result.edges[0];
+        assert!(matches!(edge.output_partition.kind, PartitionKind::Hash));
+        assert_eq!(edge.output_partition.exprs.len(), 1);
+        let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &edge.output_partition.exprs[0].kind
+        else {
+            panic!("expected router HASH partition column ref");
+        };
+        assert_eq!(*column_id, ColumnId::new_for_test(3));
+        assert_eq!(column, "delete_id");
+        assert_eq!(edge.stream_kind, FragmentStreamKind::Partitioned);
+        let source = result
+            .native_fragments
+            .get(&edge.source_fragment_id)
+            .expect("router source fragment");
+        let route_partition = match source
+            .sink
+            .as_ref()
+            .and_then(|sink| sink.kind.as_ref())
+            .expect("router sink")
+        {
+            crate::proto::plan::data_sink::Kind::IcebergChangeStreamRouter(router) => router
+                .branches[0]
+                .output_partition
+                .as_ref()
+                .expect("router route partition"),
+            other => panic!("expected router sink, got {other:?}"),
+        };
+        assert_eq!(
+            route_partition.kind,
+            crate::proto::plan::PartitionKind::Hash as i32
+        );
+        assert_eq!(route_partition.exprs.len(), 1);
+
+        let target = result
+            .native_fragments
+            .get(&edge.target_fragment_id)
+            .expect("router target fragment");
+        let receiver = match target
+            .root
+            .as_ref()
+            .and_then(|root| root.payload.as_ref())
+            .expect("router target exchange receiver")
+        {
+            crate::proto::plan::distributed_node::Payload::Exchange(exchange) => exchange,
+            other => panic!("expected router exchange receiver, got {other:?}"),
+        };
+        assert_eq!(receiver.partition_type, route_partition.kind);
+        assert_eq!(receiver.partition_exprs, route_partition.exprs);
+    }
+
+    #[test]
+    fn router_edges_reject_conflicting_partitions_for_the_same_receiver() {
+        let output_columns = vec![
+            output_col(1, "op"),
+            output_col(2, "route"),
+            output_col(3, "delete_id"),
+        ];
+        let dp = DistributedPlan {
+            fragments: vec![PlanFragment {
+                fragment_id: 0,
+                root: physical_values_node(0, 10, output_columns.clone()),
+                data_partition: DataPartition::unpartitioned(),
+                output_partition: DataPartition::unpartitioned(),
+                sink: crate::sql::planner::distributed::DataSink::Result,
+                output_exprs: None,
+                output_columns,
+                cte_id: None,
+                cte_exchange_nodes: Vec::new(),
+            }],
+            root_fragment_id: 0,
+            edges: Vec::new(),
+        };
+        let mut branch =
+            crate::sql::planner::ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![2]);
+        branch.output_partition_ordinals = vec![2];
+        branch.sink_spec.iceberg.serialized_metadata =
+            Some(crate::sql::planner::write_sink::test_support::unpartitioned_metadata_json());
+        let dag =
+            crate::sql::planner::ChangeStreamWriteDagSpec::for_test(Some(0), None, vec![branch]);
+        let mut planned = crate::sql::planner::with_iceberg_change_stream_write(dp, "test_db", dag)
+            .expect("plan change-stream write")
+            .distributed_plan;
+
+        let first_edge = planned.edges[0].clone();
+        let source = planned
+            .fragments
+            .iter_mut()
+            .find(|fragment| fragment.fragment_id == first_edge.source_fragment_id)
+            .expect("router source fragment");
+        let crate::sql::planner::distributed::DataSink::IcebergChangeStreamRouter(router) =
+            &mut source.sink
+        else {
+            panic!("source must use router sink");
+        };
+        let mut second_route = router.branches[0].clone();
+        second_route.branch_id = 99;
+        second_route.output_ordinals = vec![1];
+        second_route.output_partition_ordinals = vec![1];
+        router.branches.push(second_route);
+        let mut second_edge = first_edge;
+        second_edge.edge_kind = FragmentEdgeKind::IcebergChangeStreamRouter {
+            router_group_id: router.group_id,
+            branch_id: 99,
+            branch_kind: router.branches[1].branch_kind,
+        };
+        planned.edges.push(second_edge);
+
+        let err = match build_native_fragment_payload(
+            &planned,
+            &EmptyCatalog,
+            &ConnectorRegistry::new(),
+            None,
+        ) {
+            Ok(_) => panic!("one receiver cannot have conflicting route partitions"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("conflicting partitions for target Exchange"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn shared_edge_validation_rejects_source_mismatch_and_empty_hash_partition() {
+        let mut source_mismatch = stream_exchange_plan(ExchangeFlavor::Distribution);
+        let DistributedNodeKind::Exchange(exchange) =
+            &mut source_mismatch.fragments[1].root.payload
+        else {
+            panic!("consumer must be an exchange");
+        };
+        exchange.source_fragment_id = 42;
+        let err = validate_distributed_plan(&source_mismatch)
+            .expect_err("edge and exchange source mismatch must fail");
+        assert!(
+            err.contains(
+                "stream edge source_fragment_id=1 does not match Exchange source_fragment_id=42"
+            ),
+            "{err}"
+        );
+
+        let mut empty_hash = stream_exchange_plan(ExchangeFlavor::Distribution);
+        let DistributedNodeKind::Exchange(exchange) = &mut empty_hash.fragments[1].root.payload
+        else {
+            panic!("consumer must be an exchange");
+        };
+        exchange.partition = DataPartition {
+            kind: PartitionKind::Hash,
+            exprs: Vec::new(),
+        };
+        let err = validate_distributed_plan(&empty_hash)
+            .expect_err("empty HASH exchange partition must fail");
+        assert!(
+            err.contains("DistributedPlan HASH Exchange has no native partition expressions"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn lower_distributed_plan_owns_native_fragments_matching_schedules_and_root() {
+        let dp = stream_exchange_plan(ExchangeFlavor::LimitOffset {
+            limit: Some(1),
+            offset: Some(0),
+        });
+
+        let result =
+            build_native_fragment_payload(&dp, &EmptyCatalog, &ConnectorRegistry::new(), None)
+                .expect("native fragment build");
+        let fragment_ids = result
+            .native_fragments
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let schedule_ids = result
+            .fragment_schedules
+            .iter()
+            .map(|schedule| schedule.fragment_id)
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(fragment_ids, schedule_ids);
+        assert!(fragment_ids.contains(&result.root_fragment_id));
+    }
+
+    #[test]
+    fn native_fragment_ownership_rejects_missing_fragment_and_root() {
+        let dp = stream_exchange_plan(ExchangeFlavor::LimitOffset {
+            limit: Some(1),
+            offset: Some(0),
+        });
+        let mut result =
+            build_native_fragment_payload(&dp, &EmptyCatalog, &ConnectorRegistry::new(), None)
+                .expect("native fragment build");
+
+        result.native_fragments.remove(&1);
+        let err = validate_native_fragment_ownership(
+            &result.native_fragments,
+            &result.fragment_schedules,
+            result.root_fragment_id,
+        )
+        .expect_err("missing scheduled fragment must be rejected");
+        assert!(err.contains("native fragment ids"), "{err}");
+
+        result.native_fragments.insert(
+            1,
+            crate::proto::plan::PlanFragment {
+                fragment_id: 1,
+                ..Default::default()
+            },
+        );
+        result.native_fragments.remove(&result.root_fragment_id);
+        let err = validate_native_fragment_ownership(
+            &result.native_fragments,
+            &result.fragment_schedules,
+            result.root_fragment_id,
+        )
+        .expect_err("missing root fragment must be rejected");
+        assert!(err.contains("root fragment"), "{err}");
     }
 
     #[test]
@@ -1479,9 +2141,15 @@ mod tests {
             }],
         };
 
-        let result = lower_distributed_plan(&dp, &EmptyCatalog, &ConnectorRegistry::new(), None)
-            .expect("native lower plan");
+        let result =
+            build_native_fragment_payload(&dp, &EmptyCatalog, &ConnectorRegistry::new(), None)
+                .expect("native lower plan");
 
         assert_eq!(result.edges[0].output_slot_ids, vec![1, 3]);
+        let native_consumer = result
+            .native_fragments
+            .get(&consumer_fragment_id)
+            .expect("encoded native consumer");
+        assert_eq!(native_consumer.cte_exchange_nodes[0].column_ids, vec![1, 3]);
     }
 }

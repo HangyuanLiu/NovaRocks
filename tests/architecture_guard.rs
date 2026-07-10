@@ -9865,6 +9865,45 @@ fn nfe_0_novarocks_generated_execution_has_no_plan_wire_selector() {
 }
 
 #[test]
+fn nfe_1_task_2_native_fragment_build_owns_submission_payload() {
+    let repo = Path::new(manifest_dir());
+    let mut violations = Vec::new();
+
+    let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/mod.rs")).unwrap();
+    if !codegen_mod.contains("pub native_fragments:")
+        || !codegen_mod.contains("BTreeMap<FragmentId, crate::proto::plan::PlanFragment>")
+    {
+        violations.push(
+            "src/sql/codegen/mod.rs: MultiFragmentBuildResult must own required native fragments"
+                .to_string(),
+        );
+    }
+
+    for rel in ["src/engine/mod.rs", "src/runtime/coordinator.rs"] {
+        let text = fs::read_to_string(repo.join(rel)).unwrap();
+        push_forbidden_terms(
+            &mut violations,
+            rel,
+            &text,
+            &[
+                "NativePlanSidecars",
+                "prepare_native_plan_sidecars",
+                "new_with_native_plan_sidecars",
+                "new_with_optional_native_plan_sidecars",
+                "refresh_native_sidecar_plan_with_lowered_edges",
+            ],
+            "Task 2 requires the build result to be the only native fragment owner",
+        );
+    }
+
+    assert!(
+        violations.is_empty(),
+        "NFE-1 Task 2 native fragment ownership guard failed:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
 fn nidl_d3l_native_mainline_thrift_usage_is_explicitly_allowlisted() {
     let repo = Path::new(manifest_dir());
     let mut violations = Vec::new();
