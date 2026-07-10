@@ -101,59 +101,93 @@ if [ "$(ci_suite_cluster_size optimizer)" != "1" ]; then
   exit 1
 fi
 
-proto_core_suites="$(ci_proto_core_suites)"
-expected_proto_core_suites="$(printf "%s\n" join filter sort aggregate cte subquery iceberg-rest runtime-filter-distributed)"
-if [ "$proto_core_suites" != "$expected_proto_core_suites" ]; then
-  echo "proto core suites do not match the NIDL-5 M1 matrix" >&2
-  printf "expected:\n%s\nactual:\n%s\n" "$expected_proto_core_suites" "$proto_core_suites" >&2
+native_cross_process_core_suites="$(ci_native_cross_process_core_suites)"
+expected_native_cross_process_core_suites="$(printf "%s\n" join filter sort aggregate cte subquery iceberg-rest runtime-filter-distributed)"
+if [ "$native_cross_process_core_suites" != "$expected_native_cross_process_core_suites" ]; then
+  echo "native cross-process core suites do not match the required matrix" >&2
+  printf "expected:\n%s\nactual:\n%s\n" "$expected_native_cross_process_core_suites" "$native_cross_process_core_suites" >&2
   exit 1
 fi
 
-if ! ci_proto_enabled; then
-  echo "proto core matrix should be enabled by default" >&2
+if ! ci_native_cross_process_enabled; then
+  echo "native cross-process core matrix should be enabled by default" >&2
   exit 1
 fi
 
-if [ "$(ci_proto_suites | tr '\n' ' ')" != "$(printf "%s " join filter sort aggregate cte subquery iceberg-rest runtime-filter-distributed)" ]; then
-  echo "default proto matrix should use the core suites" >&2
+if [ "$(ci_native_cross_process_suites | tr '\n' ' ')" != "$(printf "%s " join filter sort aggregate cte subquery iceberg-rest runtime-filter-distributed)" ]; then
+  echo "default native cross-process matrix should use the core suites" >&2
   exit 1
 fi
 
-NOVA_CI_PROTO_CORE="0"
-NOVA_CI_PROTO_FULL="0"
-if ci_proto_enabled; then
-  echo "explicit NOVA_CI_PROTO_CORE=0 should disable proto when full proto is off" >&2
+NOVA_CI_NATIVE_CROSS_PROCESS_CORE="0"
+NOVA_CI_NATIVE_CROSS_PROCESS_FULL="0"
+if ci_native_cross_process_enabled; then
+  echo "explicit NOVA_CI_NATIVE_CROSS_PROCESS_CORE=0 should disable the native cross-process matrix when full coverage is off" >&2
   exit 1
 fi
 
-NOVA_CI_PROTO_FULL="1"
-if ! ci_proto_enabled; then
-  echo "NOVA_CI_PROTO_FULL=1 should enable proto even when core proto is off" >&2
+NOVA_CI_NATIVE_CROSS_PROCESS_FULL="1"
+if ! ci_native_cross_process_enabled; then
+  echo "NOVA_CI_NATIVE_CROSS_PROCESS_FULL=1 should enable the matrix even when core coverage is off" >&2
   exit 1
 fi
-if ! ci_proto_suites | grep -qx "optimizer-dist"; then
-  echo "proto full matrix should include stable full suites" >&2
+if ! ci_native_cross_process_suites | grep -qx "optimizer-dist"; then
+  echo "native cross-process full matrix should include stable full suites" >&2
   exit 1
 fi
 
 SQL_CLUSTER_MODE="all-in-one"
 SQL_CLUSTER_SIZE="1"
-if [ "$(ci_proto_suite_cluster_mode join)" != "cross-process" ]; then
-  echo "proto suites must force cross-process cluster mode" >&2
+if [ "$(ci_native_cross_process_suite_cluster_mode join)" != "cross-process" ]; then
+  echo "native cross-process suites must force cross-process cluster mode" >&2
   exit 1
 fi
-if [ "$(ci_proto_suite_cluster_size join)" != "3" ]; then
-  echo "proto suites must force a 3-BE cluster" >&2
-  exit 1
-fi
-
-proto_args="$(ci_proto_runner_extra_args join)"
-if ! grep -q -- "--plan-wire-format proto" <<<"$proto_args"; then
-  echo "proto runner args must include --plan-wire-format proto" >&2
+if [ "$(ci_native_cross_process_suite_cluster_size join)" != "3" ]; then
+  echo "native cross-process suites must force a 3-BE cluster" >&2
   exit 1
 fi
 
 local_full_ci_text="$(cat "$REPO_ROOT/tools/ci/local-full-ci.sh")"
+if ! grep -q 'stop_server_for_native_cross_process_stage' <<<"$local_full_ci_text"; then
+  echo "local-full-ci must use the native cross-process stop-stage name" >&2
+  exit 1
+fi
+if ! grep -q 'run_native_cross_process_sql_suites' <<<"$local_full_ci_text"; then
+  echo "local-full-ci must use the native cross-process runner name" >&2
+  exit 1
+fi
+if ! grep -q 'sql-native-cross-process' <<<"$local_full_ci_text"; then
+  echo "native cross-process logs must use the sql-native-cross-process directory" >&2
+  exit 1
+fi
+if ! grep -q 'native-cross-process:$suite' <<<"$local_full_ci_text"; then
+  echo "native cross-process suite status keys must use native-cross-process:<suite>" >&2
+  exit 1
+fi
+if ! grep -q 'standalone-server stop for native cross-process' <<<"$local_full_ci_text"; then
+  echo "native cross-process stop stage must use the native cross-process stage name" >&2
+  exit 1
+fi
+if ! grep -q 'native 1FE+3BE cross-process' <<<"$local_full_ci_text"; then
+  echo "local-full-ci help must describe native 1FE+3BE cross-process coverage" >&2
+  exit 1
+fi
+if ! grep -q 'NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED' <<<"$local_full_ci_text"; then
+  echo "native cross-process required failures must be controlled by the renamed env" >&2
+  exit 1
+fi
+if ! grep -q -- '--cluster-mode "$suite_cluster_mode"' <<<"$local_full_ci_text" \
+  || ! grep -q -- '--cluster-size "$suite_cluster_size"' <<<"$local_full_ci_text"; then
+  echo "native cross-process suites must pass cluster mode and cluster size explicitly" >&2
+  exit 1
+fi
+
+retired_plan_wire_flag="--plan-wire""-format"
+retired_proto_env="NOVA_CI_""PROTO_"
+if rg -n -- "$retired_plan_wire_flag|$retired_proto_env" "$REPO_ROOT/tools/ci" >/dev/null; then
+  echo "tools/ci must not contain the retired plan-wire flag or retired Proto matrix variables" >&2
+  exit 1
+fi
 if ! grep -q 'run_fail_fast_stage "cargo clippy compat"' <<<"$local_full_ci_text"; then
   echo "local-full-ci must run a compat clippy stage" >&2
   exit 1
