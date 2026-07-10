@@ -458,7 +458,7 @@ fn remap_select_alias_refs(
     }
 }
 
-pub(super) fn rewrite_project_output_refs_to_item_expr(
+fn rewrite_project_output_refs_to_item_expr(
     expr: &TypedExpr,
     project_items: &[ProjectItem],
 ) -> TypedExpr {

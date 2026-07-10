@@ -23,7 +23,6 @@ use crate::sql::planner::OrderingSpec;
 use crate::sql::planner::optimizer_bridge::property::ordering_spec_from_sort_items;
 use crate::sql::planner::plan::*;
 
-use super::aggregate::typed_expr_semantically_eq;
 use super::output::plan_output_columns;
 
 /// Check if an expression contains any WindowCall.

@@ -18,10 +18,6 @@
 use super::aggregate::*;
 use super::output::*;
 use super::query::*;
-use super::relation::*;
-use super::select::*;
-use super::subquery::*;
-use super::window::*;
 use crate::sql::analysis::cte::CTERegistry;
 use crate::sql::analysis::*;
 use crate::sql::catalog::{CatalogProvider, ColumnDef, ScanSource, TableDef};
@@ -540,10 +536,9 @@ fn contains_identity_project_adapter(
                         ExprKind::ColumnRef { column_id, column, .. }
                             if column == source_column && item.output_column_id == *column_id
                     )
-            }) || plan
-                .children
-                .iter()
-                .any(|child| contains_identity_project_adapter(child, source_column, output_name))
+            }) || plan.children.iter().any(|child| {
+                contains_identity_project_adapter(child, source_column, output_name)
+            })
         }
         _ => plan
             .children

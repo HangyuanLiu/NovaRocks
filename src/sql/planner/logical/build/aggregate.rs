@@ -20,8 +20,6 @@ use crate::sql::codegen::helpers::typed_expr_display_name;
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use crate::sql::planner::plan::*;
 
-use super::query::rewrite_project_output_refs_to_item_expr;
-
 /// Extract ColumnId from a TypedExpr, or allocate a new one from the factory.
 pub(super) fn expr_column_id(
     expr: &TypedExpr,
@@ -831,7 +829,7 @@ fn aggregate_call_matches(
             .all(|(left, right)| sort_item_semantically_eq(left, right))
 }
 
-pub(super) fn typed_expr_semantically_eq(left: &TypedExpr, right: &TypedExpr) -> bool {
+fn typed_expr_semantically_eq(left: &TypedExpr, right: &TypedExpr) -> bool {
     match (&left.kind, &right.kind) {
         (
             ExprKind::ColumnRef {
