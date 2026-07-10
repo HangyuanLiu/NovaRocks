@@ -1838,6 +1838,56 @@ fn rust_use_imports_sql_common(import: &str) -> bool {
         == Some("common")
 }
 
+fn rust_source_module_segments(source_rel: &str) -> Option<Vec<String>> {
+    let path = Path::new(source_rel);
+    if path.extension().is_none_or(|extension| extension != "rs") {
+        return None;
+    }
+    let components = path
+        .components()
+        .map(|component| component.as_os_str().to_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()?;
+    if components
+        .first()
+        .is_none_or(|component| component != "src")
+    {
+        return None;
+    }
+
+    let file = components.last()?;
+    let stem = file.strip_suffix(".rs")?;
+    let mut module = vec!["crate".to_string()];
+    module.extend(components[1..components.len() - 1].iter().cloned());
+    if !matches!(stem, "lib" | "main" | "mod") {
+        module.push(stem.to_string());
+    }
+    Some(module)
+}
+
+fn rust_canonical_use_segments(import: &str, source_rel: &str) -> Option<Vec<String>> {
+    let path = rust_use_path(import).split("::").collect::<Vec<_>>();
+    let mut index = 0usize;
+    let mut canonical = if path.first() == Some(&"crate") {
+        index = 1;
+        vec!["crate".to_string()]
+    } else {
+        rust_source_module_segments(source_rel)?
+    };
+
+    while path.get(index) == Some(&"self") {
+        index += 1;
+    }
+    while path.get(index) == Some(&"super") {
+        if canonical.len() == 1 {
+            return None;
+        }
+        canonical.pop();
+        index += 1;
+    }
+    canonical.extend(path[index..].iter().map(|segment| (*segment).to_string()));
+    Some(canonical)
+}
+
 fn rust_use_imports_legacy_planner_owner(import: &str, source_rel: &str) -> bool {
     let legacy_owners = [
         "plan",
@@ -1845,25 +1895,12 @@ fn rust_use_imports_legacy_planner_owner(import: &str, source_rel: &str) -> bool
         "stats",
         "runtime_filter_placement",
     ];
-    let segments = rust_use_path(import).split("::").collect::<Vec<_>>();
-    if legacy_owners
-        .iter()
-        .any(|owner| segments.windows(2).any(|pair| pair == ["planner", *owner]))
-    {
-        return true;
-    }
-
-    if !source_rel.starts_with("src/sql/planner/")
-        || source_rel.starts_with("src/sql/planner/physical/")
-    {
+    let Some(canonical) = rust_canonical_use_segments(import, source_rel) else {
         return false;
-    }
-    let relative_owner = segments
-        .iter()
-        .skip_while(|segment| **segment == "self" || **segment == "super")
-        .copied()
-        .next();
-    legacy_owners.contains(&relative_owner.unwrap_or_default())
+    };
+    canonical.len() >= 4
+        && canonical[..3] == ["crate", "sql", "planner"]
+        && legacy_owners.contains(&canonical[3].as_str())
 }
 
 fn rust_use_leaf(import: &str) -> &str {
@@ -2424,6 +2461,54 @@ fn planner_physical_legacy_owner_detector_distinguishes_sibling_and_unrelated_pa
         "private|super::stats::PhysicalPlanStats",
         "src/sql/planner/distributed_node.rs",
     ));
+    assert!(!rust_use_imports_legacy_planner_owner(
+        "private|super::stats::PhysicalPlanStats",
+        "src/sql/planner/optimizer_bridge/foo.rs",
+    ));
+    assert!(rust_use_imports_legacy_planner_owner(
+        "private|super::super::stats::PhysicalPlanStats",
+        "src/sql/planner/physical/node.rs",
+    ));
+    assert!(!rust_use_imports_legacy_planner_owner(
+        "private|super::super::stats::PhysicalPlanStats",
+        "src/sql/planner/physical/nested/foo.rs",
+    ));
+    assert!(rust_use_imports_legacy_planner_owner(
+        "private|super::super::super::stats::PhysicalPlanStats",
+        "src/sql/planner/physical/nested/foo.rs",
+    ));
+    assert!(rust_use_imports_legacy_planner_owner(
+        "private|stats::*",
+        "src/sql/planner/mod.rs",
+    ));
+    assert!(!rust_use_imports_legacy_planner_owner(
+        "private|stats::*",
+        "src/sql/planner/physical/mod.rs",
+    ));
+
+    let allowed_alias_chain = rust_production_use_statements(
+        "use super::{super::{stats as stage_stats}};\n\
+         use stage_stats as stats_owner;\n\
+         use stats_owner::*;",
+    );
+    assert!(
+        !allowed_alias_chain.iter().any(|import| {
+            rust_use_imports_legacy_planner_owner(import, "src/sql/planner/physical/nested/foo.rs")
+        }),
+        "physical sibling stats alias chain must remain allowed: {allowed_alias_chain:?}"
+    );
+
+    let forbidden_alias_chain = rust_production_use_statements(
+        "use super::{super::{super::{stats as root_stats}}};\n\
+         use root_stats as stats_owner;\n\
+         use stats_owner::*;",
+    );
+    assert!(
+        forbidden_alias_chain.iter().any(|import| {
+            rust_use_imports_legacy_planner_owner(import, "src/sql/planner/physical/nested/foo.rs")
+        }),
+        "planner-root stats alias chain must be rejected: {forbidden_alias_chain:?}"
+    );
 }
 
 #[test]
