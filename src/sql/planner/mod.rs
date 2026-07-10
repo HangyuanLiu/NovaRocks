@@ -30,6 +30,7 @@ pub(crate) mod imv_rewrite;
 pub(crate) mod logical;
 pub(crate) mod optimizer_bridge;
 mod ordering;
+pub(crate) mod payload;
 mod physical_vocab;
 pub(crate) mod plan;
 pub(crate) mod runtime_filter;
@@ -74,8 +75,6 @@ pub(crate) use write_sink::{
     IcebergWriteFragmentSink, IcebergWriteInputBinding, IcebergWriteSinkMode, IcebergWriteSinkSpec,
     synthetic_iceberg_write_table_id,
 };
-
-use plan::*;
 
 #[cfg(test)]
 mod bridge2_export_tests {

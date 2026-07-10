@@ -2995,7 +2995,7 @@ pub(crate) fn execute_query_with_catalog_mgr(
 
 pub(crate) type IcebergWriteRootDistributionResolver = Box<
     dyn FnOnce(
-        &crate::sql::planner::plan::LogicalPlanNode,
+        &crate::sql::planner::logical::LogicalPlanNode,
     ) -> Result<Option<crate::sql::optimizer::property::DistributionSpec>, String>,
 >;
 
@@ -3631,7 +3631,7 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
 }
 
 pub(crate) fn plan_logical_for_iceberg_change_stream_refresh(
-    logical: crate::sql::planner::plan::LogicalPlanNode,
+    logical: crate::sql::planner::logical::LogicalPlanNode,
     factory: crate::sql::column_id::ColumnRefFactory,
     connectors: &crate::connector::ConnectorRegistry,
 ) -> Result<PlannedIcebergChangeStreamRefreshQuery, String> {
@@ -3784,7 +3784,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_logical_plan_with_options(
-    logical: crate::sql::planner::plan::LogicalPlanNode,
+    logical: crate::sql::planner::logical::LogicalPlanNode,
     factory: crate::sql::column_id::ColumnRefFactory,
     codegen_catalog: &InMemoryCatalog,
     connectors: &crate::connector::ConnectorRegistry,

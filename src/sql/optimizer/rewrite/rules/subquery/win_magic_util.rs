@@ -252,14 +252,13 @@ mod tests {
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::scalar::{self, ScalarArena};
+    use crate::sql::planner::logical::{LogicalJoinNode, LogicalPlanKind, LogicalPlanNode};
     use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
-    use crate::sql::planner::plan::{
-        LogicalJoinNode, LogicalPlanKind, LogicalPlanNode, LogicalScanNode,
-    };
+    use crate::sql::planner::payload::PlanScanNode;
 
     fn make_scan(table_id: i64, cols: Vec<(ColumnId, &str)>) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 database: "default".to_string(),
                 table: TableDef {
                     name: format!("t{table_id}"),
@@ -350,7 +349,7 @@ mod tests {
     // -----------------------------------------------------------------
     #[test]
     fn table_identity_from_starrocks_scan() {
-        let scan_node = LogicalScanNode {
+        let scan_node = PlanScanNode {
             database: "default".to_string(),
             table: TableDef {
                 name: "t".to_string(),

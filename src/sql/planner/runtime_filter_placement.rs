@@ -723,10 +723,11 @@ mod tests {
         SessionOptimizerSettings, with_session_optimizer_settings,
     };
     use crate::sql::planner::JoinExecutionMode;
+    use crate::sql::planner::payload::{PlanProjectNode, PlanValuesNode};
     use crate::sql::planner::physical_vocab::{HashSource, JoinDistribution};
     use crate::sql::planner::plan::{
-        PhysicalHashJoinEqCondition, PhysicalHashJoinNode, PhysicalPlanKind, PlanProjectNode,
-        PlanValuesNode, RedistributeMode, RedistributeNode,
+        PhysicalHashJoinEqCondition, PhysicalHashJoinNode, PhysicalPlanKind, RedistributeMode,
+        RedistributeNode,
     };
     use crate::sql::planner::{PhysicalPlanStats, PlannerColumnStatistic, PlannerConfidence};
     use arrow::datatypes::DataType;

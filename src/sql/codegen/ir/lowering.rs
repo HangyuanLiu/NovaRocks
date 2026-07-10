@@ -66,7 +66,7 @@ use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::planner::optimizer_bridge::property::{
     ordering_spec_from_sort_items, window_ordering_spec,
 };
-use crate::sql::planner::plan::{AggregateCall, WindowExpr};
+use crate::sql::planner::payload::{AggregateCall, WindowExpr};
 use crate::sql::planner::{
     AggMode, JoinDistribution, JoinExecutionMode, OrderingSpec, PlannedRuntimeFilter, TopNPhase,
     WiredRuntimeFilterBuild,
@@ -289,7 +289,7 @@ fn native_refresh_scan_projected_names(source: &ScanSource) -> Option<Vec<String
 }
 
 fn scan_output_columns_for_refreshed_table(
-    scan: &crate::sql::planner::plan::PlanScanNode,
+    scan: &crate::sql::planner::payload::PlanScanNode,
     table: &TableDef,
 ) -> Vec<AnalysisOutputColumn> {
     let mut out = Vec::new();
@@ -4769,7 +4769,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         if op.desired_num_rows != Some(1)
             || !matches!(
                 op.assertion,
-                crate::sql::planner::plan::PlanRowCountAssertion::Le
+                crate::sql::planner::payload::PlanRowCountAssertion::Le
             )
             || !op.group_key_column_ids.is_empty()
             || !op.group_key_labels.is_empty()
@@ -5903,7 +5903,8 @@ mod tests {
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::Statistics;
     use crate::sql::planner::optimizer_bridge::scalar::intern_project_items;
-    use crate::sql::planner::plan::{AggregateCall, PhysicalPlanKind, PlanScanNode};
+    use crate::sql::planner::payload::{AggregateCall, PlanScanNode};
+    use crate::sql::planner::plan::PhysicalPlanKind;
     use crate::sql::planner::{
         AggMode, AggregateOutputLayout, JoinDistribution, JoinExecutionMode, PhysicalPlanStats,
         PlannerConfidence, WiredRuntimeFilterBuild,

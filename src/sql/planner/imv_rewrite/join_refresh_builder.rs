@@ -27,10 +27,10 @@ use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use crate::sql::planner::imv_rewrite::join_refresh_descriptor::{
     JoinRefreshDescriptor, JoinRefreshMode, JoinRefreshOutputMapping, JoinRefreshOutputSource,
 };
-use crate::sql::planner::plan::{
-    AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanKind,
-    LogicalPlanNode, LogicalProjectNode, LogicalScanNode,
+use crate::sql::planner::logical::{
+    LogicalAggregateNode, LogicalJoinNode, LogicalPlanKind, LogicalPlanNode,
 };
+use crate::sql::planner::payload::{AggregateCall, PlanFilterNode, PlanProjectNode, PlanScanNode};
 
 pub(crate) fn build_join_apply_key_project(
     input: LogicalPlanNode,
@@ -101,7 +101,7 @@ fn build_join_apply_key_project_with_action(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(LogicalPlanNode::new(
-        LogicalPlanKind::Project(LogicalProjectNode {
+        LogicalPlanKind::Project(PlanProjectNode {
             items,
             output_qualifier: None,
         }),
@@ -380,7 +380,7 @@ fn build_payload_coalesce_assert_filter(
         "join delta per-payload net change exceeds 1",
     );
     LogicalPlanNode::new(
-        LogicalPlanKind::Filter(LogicalFilterNode {
+        LogicalPlanKind::Filter(PlanFilterNode {
             predicate: binary(net_ne_zero, BinOp::And, payload_assert),
         }),
         vec![aggregate],
@@ -444,7 +444,7 @@ fn build_key_shape_assert_join(
         "join delta multiple pending payloads for key",
     );
     let checked_key_shape = LogicalPlanNode::new(
-        LogicalPlanKind::Filter(LogicalFilterNode {
+        LogicalPlanKind::Filter(PlanFilterNode {
             predicate: shape_guard,
         }),
         vec![key_shape],
@@ -615,7 +615,7 @@ fn build_target_locator_scan(
         ),
     ];
     LogicalPlanNode::new(
-        LogicalPlanKind::Scan(LogicalScanNode {
+        LogicalPlanKind::Scan(PlanScanNode {
             database: desc.mv_identity.database.clone(),
             table: TableDef {
                 name: desc.mv_identity.name.clone(),
@@ -668,7 +668,7 @@ fn build_locator_assert_filter(
         )),
     );
     LogicalPlanNode::new(
-        LogicalPlanKind::Filter(LogicalFilterNode {
+        LogicalPlanKind::Filter(PlanFilterNode {
             predicate: assert_true_call(
                 binary(insert_or_noop, BinOp::Or, locator_present),
                 "join delta DELETE row missing target locator",
@@ -745,7 +745,7 @@ fn build_final_coalesce_project(
         output_column_id: locator_last_updated_seq_column_id,
     });
     Ok(LogicalPlanNode::new(
-        LogicalPlanKind::Project(LogicalProjectNode {
+        LogicalPlanKind::Project(PlanProjectNode {
             items,
             output_qualifier: None,
         }),
@@ -1171,12 +1171,11 @@ mod tests {
         JoinRefreshJoinKeyPair, JoinRefreshMode, JoinRefreshMvIdentity, JoinRefreshOutputMapping,
         JoinRefreshOutputSource,
     };
+    use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode, LogicalUnionNode};
     use crate::sql::planner::optimizer_bridge::plan::{
         logical_plan_to_opt_expr, opt_expr_to_logical_plan,
     };
-    use crate::sql::planner::plan::{
-        LogicalPlanKind, LogicalPlanNode, LogicalUnionNode, LogicalValuesNode,
-    };
+    use crate::sql::planner::payload::PlanValuesNode;
 
     #[test]
     fn apply_key_project_uses_output_mappings_and_validates_sources() {
@@ -1919,7 +1918,7 @@ mod tests {
 
     fn test_values_plan(columns: Vec<OutputColumn>) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(PlanValuesNode {
                 rows: Vec::new(),
                 columns,
             }),

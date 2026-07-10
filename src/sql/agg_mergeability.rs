@@ -25,7 +25,7 @@
 
 use crate::sql::optimizer::operator::ScalarAggregateSpec;
 #[cfg(test)]
-use crate::sql::planner::plan::AggregateCall;
+use crate::sql::planner::payload::AggregateCall;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AggMergeability {

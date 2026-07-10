@@ -34,7 +34,7 @@ use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
-use crate::sql::planner::plan::{LogicalPlanKind, LogicalPlanNode};
+use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
 
 pub(crate) struct ImvRowIdColumn;
 
@@ -144,7 +144,8 @@ impl LogicalRewriteRule for InjectRowIdRule {
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::planner::plan::*;
+    use crate::sql::planner::logical::*;
+    use crate::sql::planner::payload::*;
 
     use arrow::datatypes::DataType;
 
@@ -163,8 +164,9 @@ mod tests {
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
+    use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
     use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
-    use crate::sql::planner::plan::{LogicalPlanKind, LogicalPlanNode, LogicalScanNode};
+    use crate::sql::planner::payload::PlanScanNode;
 
     fn build_ctx() -> RewriteContext {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::new());
@@ -179,8 +181,8 @@ mod tests {
         ctx
     }
 
-    fn delta_scan() -> LogicalScanNode {
-        LogicalScanNode {
+    fn delta_scan() -> PlanScanNode {
+        PlanScanNode {
             database: "db".to_string(),
             table: TableDef {
                 name: "b".to_string(),
@@ -224,7 +226,7 @@ mod tests {
         }
     }
 
-    fn version_scan() -> LogicalScanNode {
+    fn version_scan() -> PlanScanNode {
         let mut scan = delta_scan();
         let ScanSource::IcebergDeltaTable { table, .. } = scan.table.source else {
             unreachable!("delta_scan must use IcebergDeltaTable")
@@ -236,7 +238,7 @@ mod tests {
         scan
     }
 
-    fn scan_plan(scan: LogicalScanNode) -> LogicalPlanNode {
+    fn scan_plan(scan: PlanScanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(LogicalPlanKind::Scan(scan), vec![], None)
     }
 

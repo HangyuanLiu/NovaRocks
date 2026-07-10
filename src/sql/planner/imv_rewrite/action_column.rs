@@ -48,7 +48,8 @@ use crate::sql::planner::imv_rewrite::join_delta_shape::{
 use crate::sql::planner::imv_rewrite::opt_expr_to_plan;
 use crate::sql::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
 use crate::sql::planner::imv_rewrite::target_locator::is_target_locator_join;
-use crate::sql::planner::plan::{LogicalPlanKind, LogicalPlanNode, LogicalScanNode};
+use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
+use crate::sql::planner::payload::PlanScanNode;
 
 pub(crate) struct ImvActionColumn;
 
@@ -310,7 +311,7 @@ fn validate_signed_delta_input(plan: &LogicalPlanNode) -> Result<(), String> {
     }
 }
 
-fn validate_scan(scan: &LogicalScanNode) -> Result<(), String> {
+fn validate_scan(scan: &PlanScanNode) -> Result<(), String> {
     let fqn = match &scan.table.source {
         ScanSource::IcebergDeltaTable { table, .. }
         | ScanSource::IcebergVersionTable { table, .. } => {
@@ -429,8 +430,10 @@ mod tests {
         AggregateChangeStreamDescriptor, AggregateChangeStreamShape, ImvChangeStreamDescriptor,
         SignedStateAggregateProof, TargetStateProof,
     };
-    use crate::sql::planner::plan::*;
-    use crate::sql::planner::plan::{LogicalPlanKind, LogicalProjectNode, LogicalUnionNode};
+    use crate::sql::planner::logical::*;
+    use crate::sql::planner::logical::{LogicalPlanKind, LogicalUnionNode};
+    use crate::sql::planner::payload::PlanProjectNode;
+    use crate::sql::planner::payload::*;
 
     #[test]
     fn output_column_has_expected_shape() {
@@ -476,8 +479,8 @@ mod tests {
 
     // ── Validation tests (V1-V5) ────────────────────────────────────────────
 
-    fn delta_scan_with(action: Option<OutputColumn>) -> LogicalScanNode {
-        let mut scan = LogicalScanNode {
+    fn delta_scan_with(action: Option<OutputColumn>) -> PlanScanNode {
+        let mut scan = PlanScanNode {
             database: "db".to_string(),
             table: TableDef {
                 name: "b".to_string(),
@@ -525,7 +528,7 @@ mod tests {
         scan
     }
 
-    fn scan_plan(scan: LogicalScanNode) -> LogicalPlanNode {
+    fn scan_plan(scan: PlanScanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(LogicalPlanKind::Scan(scan), vec![], None)
     }
 
@@ -537,7 +540,7 @@ mod tests {
         scan.columns
             .push(ImvRowIdColumn::output_column(ColumnId(101)));
         let project = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![
                     ProjectItem {
                         expr: TypedExpr {
@@ -643,7 +646,7 @@ mod tests {
         scan.columns
             .push(ImvRowIdColumn::output_column(ColumnId(101)));
         let project = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::ColumnRef {
@@ -666,7 +669,7 @@ mod tests {
         assert!(err.contains("dropped at Project"), "got: {err}");
     }
 
-    fn version_scan_with_action() -> LogicalScanNode {
+    fn version_scan_with_action() -> PlanScanNode {
         let mut scan = delta_scan_with(Some(ImvActionColumn::output_column(ColumnId(100))));
         // Re-point the source to a version scan while keeping the (illegal) action column.
         let table = match &scan.table.source {
@@ -690,7 +693,7 @@ mod tests {
 
     #[test]
     fn validation_rejects_aggregate_above_delta() {
-        use crate::sql::planner::plan::LogicalAggregateNode;
+        use crate::sql::planner::logical::LogicalAggregateNode;
         let scan = scan_plan(delta_scan_with(Some(ImvActionColumn::output_column(
             ColumnId(100),
         ))));
@@ -715,7 +718,7 @@ mod tests {
     #[test]
     fn validation_rejects_join_above_delta() {
         use crate::sql::analysis::JoinKind;
-        use crate::sql::planner::plan::LogicalJoinNode;
+        use crate::sql::planner::logical::LogicalJoinNode;
         let left = scan_plan(delta_scan_with(Some(ImvActionColumn::output_column(
             ColumnId(100),
         ))));
@@ -787,7 +790,7 @@ mod tests {
         scan.columns[0].column_id = user_col_id;
         scan.columns.push(ImvRowIdColumn::output_column(row_id));
         LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![
                     column_ref_item(user_col_id, "k", DataType::Int64, false, "k", user_col_id),
                     column_ref_item(
@@ -822,7 +825,7 @@ mod tests {
         scan.columns[0].column_id = user_col_id;
         scan.columns.push(ImvRowIdColumn::output_column(row_id));
         LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![
                     column_ref_item(user_col_id, "k", DataType::Int64, false, "k", user_col_id),
                     column_ref_item(
@@ -867,7 +870,7 @@ mod tests {
 
     fn root_project_with_apply_key(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![
                     column_ref_item(ColumnId(1), "k", DataType::Int64, false, "k", ColumnId(1)),
                     column_ref_item(
@@ -912,7 +915,7 @@ mod tests {
     // ── V6 / V7 failing tests (RED phase) ───────────────────────────────────
 
     /// Helper: delta scan with both a valid action column and `_row_id`.
-    fn delta_scan_with_action_and_row_id() -> LogicalScanNode {
+    fn delta_scan_with_action_and_row_id() -> PlanScanNode {
         let mut scan = delta_scan_with(Some(ImvActionColumn::output_column(ColumnId(100))));
         scan.columns
             .push(ImvRowIdColumn::output_column(ColumnId(101)));
@@ -923,7 +926,7 @@ mod tests {
         // Project carries k + __change_op + _row_id but NOT __nova_base_row_id.
         let scan = delta_scan_with_action_and_row_id();
         LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![
                     ProjectItem {
                         expr: TypedExpr {

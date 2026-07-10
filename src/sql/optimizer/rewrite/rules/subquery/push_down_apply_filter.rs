@@ -269,7 +269,8 @@ fn peel_corr_filter(
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::planner::plan::*;
+    use crate::sql::planner::logical::*;
+    use crate::sql::planner::payload::*;
     use std::cell::RefCell;
     use std::collections::HashSet;
     use std::rc::Rc;
@@ -282,14 +283,17 @@ mod tests {
     };
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::common::ApplyKind;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rules::subquery::bridge::opt_expr_to_plan;
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::logical::{
+        LogicalAggregateNode, LogicalApplyNode, LogicalPlanKind, LogicalPlanNode,
+    };
     use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
-    use crate::sql::planner::plan::{
-        AggregateCall, ApplyKind, LogicalAggregateNode, LogicalApplyNode, LogicalFilterNode,
-        LogicalPlanKind, LogicalPlanNode, LogicalScanNode, LogicalValuesNode,
+    use crate::sql::planner::payload::{
+        AggregateCall, PlanFilterNode, PlanScanNode, PlanValuesNode,
     };
 
     // ---- Column ID constants -------------------------------------------------
@@ -374,7 +378,7 @@ mod tests {
 
     fn make_t2_scan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 database: "default".to_string(),
                 table: TableDef {
                     name: "t2".to_string(),
@@ -430,7 +434,7 @@ mod tests {
         let combined_pred = and_expr(corr_pred, residual_pred);
 
         let filter = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: combined_pred,
             }),
             vec![make_t2_scan()],
@@ -438,7 +442,7 @@ mod tests {
         );
 
         LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     expr: col_ref(T2_V2, "v2", DataType::Int64),
                     output_name: "v2".to_string(),
@@ -453,7 +457,7 @@ mod tests {
 
     fn correlated_nonagg_apply() -> LogicalPlanNode {
         let outer_values = LogicalPlanNode::new(
-            LogicalPlanKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(PlanValuesNode {
                 rows: vec![],
                 columns: vec![OutputColumn {
                     column_id: OUTER_K,
@@ -598,7 +602,7 @@ mod tests {
         );
 
         let filter = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: corr_pred,
             }),
             vec![make_t2_scan()],
@@ -606,7 +610,7 @@ mod tests {
         );
 
         let inner = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     expr: col_ref(T2_V2, "v2", DataType::Int64),
                     output_name: "v2".to_string(),
@@ -639,7 +643,7 @@ mod tests {
             }),
             vec![
                 LogicalPlanNode::new(
-                    LogicalPlanKind::Values(LogicalValuesNode {
+                    LogicalPlanKind::Values(PlanValuesNode {
                         rows: vec![],
                         columns: vec![OutputColumn {
                             column_id: OUTER_K,
@@ -706,7 +710,7 @@ mod tests {
             col_ref(OUTER_K, "k", DataType::Int64),
         );
         let filter = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: corr_pred,
             }),
             vec![make_t2_scan()],
@@ -757,7 +761,7 @@ mod tests {
             }),
             vec![
                 LogicalPlanNode::new(
-                    LogicalPlanKind::Values(LogicalValuesNode {
+                    LogicalPlanKind::Values(PlanValuesNode {
                         rows: vec![],
                         columns: vec![],
                     }),
@@ -809,7 +813,7 @@ mod tests {
             }),
             vec![
                 LogicalPlanNode::new(
-                    LogicalPlanKind::Values(LogicalValuesNode {
+                    LogicalPlanKind::Values(PlanValuesNode {
                         rows: vec![],
                         columns: vec![],
                     }),
@@ -817,7 +821,7 @@ mod tests {
                     None,
                 ),
                 LogicalPlanNode::new(
-                    LogicalPlanKind::Values(LogicalValuesNode {
+                    LogicalPlanKind::Values(PlanValuesNode {
                         rows: vec![],
                         columns: vec![],
                     }),

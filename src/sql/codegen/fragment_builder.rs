@@ -287,7 +287,7 @@ mod tests {
     use crate::sql::planner::optimizer_bridge::scalar::{
         intern_exprs, intern_project_items, intern_sort_items, intern_window_exprs,
     };
-    use crate::sql::planner::plan::WindowExpr;
+    use crate::sql::planner::payload::WindowExpr;
     use crate::sql::planner::{
         ChangeStreamWriteBranchSpec, ChangeStreamWriteDagSpec, IcebergWriteFragmentSink,
         IcebergWriteInputBinding, IcebergWriteSinkSpec, PartitionKind,

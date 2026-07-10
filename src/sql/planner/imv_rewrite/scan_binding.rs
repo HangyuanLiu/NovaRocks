@@ -33,7 +33,8 @@ use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal}
 use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
 use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
-use crate::sql::planner::plan::{LogicalPlanKind, LogicalPlanNode, LogicalScanNode};
+use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
+use crate::sql::planner::payload::PlanScanNode;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ImvSnapshotWindow {
@@ -126,9 +127,9 @@ impl LogicalRewriteRule for BindIcebergScanRule {
 }
 
 fn bind_delta_scan(
-    mut scan: LogicalScanNode,
+    mut scan: PlanScanNode,
     mv_ctx: &IcebergMvRewriteContext,
-) -> Result<LogicalScanNode, String> {
+) -> Result<PlanScanNode, String> {
     let table = iceberg_table_info_from_source(&scan.table.source)?.clone();
     let window = resolve_snapshot_window(mv_ctx, &table)?;
     scan.table.source = ScanSource::IcebergDeltaTable {
@@ -140,10 +141,10 @@ fn bind_delta_scan(
 }
 
 fn bind_version_scan(
-    mut scan: LogicalScanNode,
+    mut scan: PlanScanNode,
     mv_ctx: &IcebergMvRewriteContext,
     role: ImvVersionRole,
-) -> Result<LogicalScanNode, String> {
+) -> Result<PlanScanNode, String> {
     let table = iceberg_table_info_from_source(&scan.table.source)?.clone();
     let window = resolve_snapshot_window(mv_ctx, &table)?;
     let snapshot_id = match role {
@@ -236,7 +237,8 @@ fn find_base_ref<'a>(
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::planner::plan::*;
+    use crate::sql::planner::logical::*;
+    use crate::sql::planner::payload::*;
     use std::collections::BTreeMap;
 
     use arrow::datatypes::DataType;
@@ -273,7 +275,7 @@ mod tests {
         }
     }
 
-    fn iceberg_scan(uuid: Option<&str>) -> LogicalScanNode {
+    fn iceberg_scan(uuid: Option<&str>) -> PlanScanNode {
         let column = ColumnDef {
             name: "k".to_string(),
             data_type: DataType::Int64,
@@ -281,7 +283,7 @@ mod tests {
             write_default: None,
             logical_type: None,
         };
-        LogicalScanNode {
+        PlanScanNode {
             database: "db".to_string(),
             table: TableDef {
                 name: "b".to_string(),

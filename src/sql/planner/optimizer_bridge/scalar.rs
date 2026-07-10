@@ -30,7 +30,7 @@ use crate::sql::optimizer::operator::{
 use crate::sql::optimizer::scalar::{
     ColumnDisplay, HashableLiteral, ScalarArena, ScalarId, ScalarNode, SortKey,
 };
-use crate::sql::planner::plan::{AggregateCall, WindowExpr};
+use crate::sql::planner::payload::{AggregateCall, WindowExpr};
 
 pub(crate) fn intern_exprs(arena: &mut ScalarArena, exprs: &[TypedExpr]) -> Vec<ScalarId> {
     exprs.iter().map(|expr| intern_typed(arena, expr)).collect()

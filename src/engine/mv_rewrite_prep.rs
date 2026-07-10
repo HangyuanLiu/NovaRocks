@@ -30,7 +30,7 @@ use crate::sql::column_id::ColumnRefFactory;
 use crate::sql::optimizer::cascades_rules::mv_rewrite::{
     MvRewriteCandidate, descriptor::SpjgDescriptor,
 };
-use crate::sql::planner::plan::LogicalPlanNode;
+use crate::sql::planner::logical::LogicalPlanNode;
 
 use super::StandaloneState;
 use super::query_stats::{QueryStatsPlan, QueryStatsProviders};
@@ -267,7 +267,7 @@ fn rewrite_candidate_display_name(target_table: &str) -> String {
 /// the plan. Mirrors query-stats collector scan-source coverage.
 fn collect_iceberg_fqns(plan: &LogicalPlanNode, out: &mut Vec<String>) {
     match &plan.kind {
-        crate::sql::planner::plan::LogicalPlanKind::Scan(s) => {
+        crate::sql::planner::logical::LogicalPlanKind::Scan(s) => {
             if let ScanSource::IcebergDataFiles { table, .. } = &s.table.source {
                 let fqn = format!("{}.{}.{}", table.catalog, table.namespace, table.table);
                 if !out.contains(&fqn) {
@@ -275,8 +275,8 @@ fn collect_iceberg_fqns(plan: &LogicalPlanNode, out: &mut Vec<String>) {
                 }
             }
         }
-        crate::sql::planner::plan::LogicalPlanKind::ImvDelta(_)
-        | crate::sql::planner::plan::LogicalPlanKind::ImvVersion(_) => {
+        crate::sql::planner::logical::LogicalPlanKind::ImvDelta(_)
+        | crate::sql::planner::logical::LogicalPlanKind::ImvVersion(_) => {
             // IMV markers never appear on the standalone query path; ignore.
         }
         _ => {}

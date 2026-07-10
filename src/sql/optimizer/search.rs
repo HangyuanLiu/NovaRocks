@@ -1874,7 +1874,7 @@ mod cascaded_derivation_tests {
             children: vec![g_sj, g_small],
         });
 
-        let window_expr = crate::sql::planner::plan::WindowExpr {
+        let window_expr = crate::sql::planner::payload::WindowExpr {
             name: "max".into(),
             args: vec![],
             partition_by: vec![col(10)],

@@ -17,16 +17,18 @@
 
 pub(crate) use crate::sql::planner::ExchangeFlavor;
 pub(crate) use crate::sql::planner::ExchangeReceiver as DistributedExchangeNode;
+pub(crate) use crate::sql::planner::payload::{
+    PlanAssertOneRowNode as DistributedAssertOneRowNode, PlanFilterNode as DistributedFilterNode,
+    PlanGenerateSeriesNode as DistributedGenerateSeriesNode,
+    PlanProjectNode as DistributedProjectNode, PlanRepeatNode as DistributedRepeatNode,
+    PlanScanNode as DistributedScanNode, PlanSortNode as DistributedSortNode,
+    PlanTableFunctionNode as DistributedTableFunctionNode, PlanValuesNode as DistributedValuesNode,
+    PlanWindowNode as DistributedWindowNode,
+};
 #[cfg(test)]
 pub(crate) use crate::sql::planner::plan::PhysicalHashJoinEqCondition;
 pub(crate) use crate::sql::planner::plan::{
     DistributedChangeEventExpandNode, PhysicalHashAggregateNode as DistributedHashAggregateNode,
     PhysicalHashAggregateNode, PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalSetOpNode,
-    PhysicalTopNNode, PlanAssertOneRowNode as DistributedAssertOneRowNode,
-    PlanFilterNode as DistributedFilterNode,
-    PlanGenerateSeriesNode as DistributedGenerateSeriesNode,
-    PlanProjectNode as DistributedProjectNode, PlanRepeatNode as DistributedRepeatNode,
-    PlanScanNode as DistributedScanNode, PlanSetOpKind as SetOpKind,
-    PlanSortNode as DistributedSortNode, PlanTableFunctionNode as DistributedTableFunctionNode,
-    PlanValuesNode as DistributedValuesNode, PlanWindowNode as DistributedWindowNode,
+    PhysicalTopNNode, PlanSetOpKind as SetOpKind,
 };

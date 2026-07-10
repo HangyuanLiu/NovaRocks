@@ -23,9 +23,9 @@ use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, ProjectItem, SortItem, TypedExpr, UnOp,
 };
 use crate::sql::catalog::ScanSource;
-use crate::sql::planner::plan::{
-    ApplyKind, LogicalPlanKind, LogicalPlanNode, PlanAssertOneRowNode, PlanRowCountAssertion,
-};
+use crate::sql::common::ApplyKind;
+use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
+use crate::sql::planner::payload::{PlanAssertOneRowNode, PlanRowCountAssertion};
 
 /// Detail level for EXPLAIN output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -406,7 +406,7 @@ pub(crate) fn format_sort_items(items: &[SortItem]) -> Vec<String> {
 }
 
 pub(crate) fn format_window_exprs(
-    exprs: &[crate::sql::planner::plan::WindowExpr],
+    exprs: &[crate::sql::planner::payload::WindowExpr],
     stage: PlanNodeExplainStage,
 ) -> Vec<String> {
     exprs
@@ -641,15 +641,16 @@ mod tests {
         TableDef,
     };
     use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::plan::{
-        ApplyKind, LogicalApplyNode, LogicalAssertOneRowNode, LogicalFilterNode, LogicalPlanKind,
-        LogicalPlanNode, LogicalProjectNode, LogicalScanNode, LogicalValuesNode, LogicalWindowNode,
-        WindowExpr,
+    use crate::sql::common::ApplyKind;
+    use crate::sql::planner::logical::{LogicalApplyNode, LogicalPlanKind, LogicalPlanNode};
+    use crate::sql::planner::payload::{
+        PlanAssertOneRowNode, PlanFilterNode, PlanProjectNode, PlanScanNode, PlanValuesNode,
+        PlanWindowNode, WindowExpr,
     };
 
     fn empty_values_for_test() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(PlanValuesNode {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -707,7 +708,7 @@ mod tests {
 
     fn scan_plan_with_source(table_name: &str, source: ScanSource) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: table_name.to_string(),
@@ -823,7 +824,7 @@ mod tests {
             vec![
                 empty_values_for_test(),
                 LogicalPlanNode::new(
-                    LogicalPlanKind::AssertOneRow(LogicalAssertOneRowNode::global_at_most_one(
+                    LogicalPlanKind::AssertOneRow(PlanAssertOneRowNode::global_at_most_one(
                         "select 1",
                     )),
                     vec![empty_values_for_test()],
@@ -847,12 +848,12 @@ mod tests {
 
     #[test]
     fn shared_plan_node_header_formats_unified_pass_through_nodes() {
-        let values = LogicalPlanKind::Values(LogicalValuesNode {
+        let values = LogicalPlanKind::Values(PlanValuesNode {
             rows: vec![vec![], vec![]],
             columns: vec![],
         });
         let assert =
-            LogicalPlanKind::AssertOneRow(LogicalAssertOneRowNode::global_at_most_one("select 1"));
+            LogicalPlanKind::AssertOneRow(PlanAssertOneRowNode::global_at_most_one("select 1"));
 
         assert_eq!(
             format_shared_plan_node_header(&values, PlanNodeExplainStage::Logical),
@@ -871,7 +872,7 @@ mod tests {
             Some("ASSERT NUM ROWS (<= 1)".to_string())
         );
 
-        let keyed = LogicalPlanKind::AssertOneRow(LogicalAssertOneRowNode::per_key_at_most_one(
+        let keyed = LogicalPlanKind::AssertOneRow(PlanAssertOneRowNode::per_key_at_most_one(
             "DML change-stream matched row uniqueness",
             vec![crate::sql::column_id::ColumnId::new_for_test(7)],
             vec!["_row_id".to_string()],
@@ -887,7 +888,7 @@ mod tests {
     fn shared_logical_formatter_path_covers_scan_filter_project_and_window() {
         let scan_columns = vec![output_column(1, "k", DataType::Int64, false)];
         let scan = LogicalPlanNode::new(
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 database: "test_db".to_string(),
                 table: test_table_def(),
                 alias: Some("t".to_string()),
@@ -910,12 +911,12 @@ mod tests {
             nullable: false,
         };
         let filter = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode { predicate }),
+            LogicalPlanKind::Filter(PlanFilterNode { predicate }),
             vec![scan],
             None,
         );
         let project = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     expr: column_expr(1, Some("t"), "k"),
                     output_name: "k".to_string(),
@@ -927,7 +928,7 @@ mod tests {
             None,
         );
         let window = LogicalPlanNode::new(
-            LogicalPlanKind::Window(LogicalWindowNode {
+            LogicalPlanKind::Window(PlanWindowNode {
                 window_exprs: vec![WindowExpr {
                     name: "row_number".to_string(),
                     args: vec![],

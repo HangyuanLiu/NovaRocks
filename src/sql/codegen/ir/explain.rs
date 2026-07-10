@@ -23,21 +23,24 @@ use crate::runtime::profile_correlate::{ActualMetrics, DistributedProfileSummary
 use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
 use crate::sql::catalog::{ScanSource, TableDef};
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::ScanVariantColumn;
 use crate::sql::explain::{
     ExplainLevel, PlanNodeExplainStage, format_assert_one_row_header, format_expr,
     format_project_item, format_sort_items, format_window_exprs,
 };
 use crate::sql::planner::ExchangeFlavor;
-use crate::sql::planner::plan::{
-    DistributedChangeEventExpandNode, PhysicalHashAggregateNode, PhysicalHashJoinNode,
-    PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalSetOpNode, PhysicalTopNNode,
+use crate::sql::planner::payload::{
     PlanAssertOneRowNode as DistributedAssertOneRowNode, PlanFilterNode as DistributedFilterNode,
     PlanGenerateSeriesNode as DistributedGenerateSeriesNode,
     PlanProjectNode as DistributedProjectNode, PlanRepeatNode as DistributedRepeatNode,
-    PlanScanNode as DistributedScanNode, PlanSetOpKind as SetOpKind,
-    PlanSortNode as DistributedSortNode, PlanTableFunctionNode as DistributedTableFunctionNode,
-    PlanValuesNode as DistributedValuesNode, PlanWindowNode as DistributedWindowNode,
-    ScanVariantColumn,
+    PlanScanNode as DistributedScanNode, PlanSortNode as DistributedSortNode,
+    PlanTableFunctionNode as DistributedTableFunctionNode, PlanValuesNode as DistributedValuesNode,
+    PlanWindowNode as DistributedWindowNode,
+};
+use crate::sql::planner::plan::{
+    DistributedChangeEventExpandNode, PhysicalHashAggregateNode, PhysicalHashJoinNode,
+    PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalSetOpNode, PhysicalTopNNode,
+    PlanSetOpKind as SetOpKind,
 };
 use crate::sql::planner::stats::{
     DEFAULT_CPU_COST_WEIGHT, DEFAULT_MEMORY_COST_WEIGHT, DEFAULT_NETWORK_COST_WEIGHT, MAX_ROW_COUNT,
@@ -1556,7 +1559,7 @@ mod tests {
     use crate::sql::planner::optimizer_bridge::scalar::{
         intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items,
     };
-    use crate::sql::planner::plan::AggregateCall;
+    use crate::sql::planner::payload::AggregateCall;
     use crate::sql::planner::{
         DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeReceiver, PhysicalPlanStats,
         PlannerBroadcastDecision, PlannerConfidence,

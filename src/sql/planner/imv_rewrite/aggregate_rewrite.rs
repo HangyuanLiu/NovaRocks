@@ -42,9 +42,11 @@ use crate::sql::planner::imv_rewrite::column_alloc::{
 use crate::sql::planner::imv_rewrite::marker::plan_contains_imv_marker;
 use crate::sql::planner::imv_rewrite::target_state::build_target_state_scan_source;
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
-use crate::sql::planner::plan::{
-    AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalImvDeltaNode, LogicalJoinNode,
-    LogicalPlanKind, LogicalPlanNode, LogicalProjectNode, LogicalScanNode, LogicalValuesNode,
+use crate::sql::planner::logical::{
+    LogicalAggregateNode, LogicalImvDeltaNode, LogicalJoinNode, LogicalPlanKind, LogicalPlanNode,
+};
+use crate::sql::planner::payload::{
+    AggregateCall, PlanFilterNode, PlanProjectNode, PlanScanNode, PlanValuesNode,
 };
 use crate::sql::planner::plan_output_columns as planner_plan_output_columns;
 
@@ -259,7 +261,7 @@ fn target_state_old_scan(
     let required_columns =
         target_state_required_column_names(&target_columns, &locator_metadata_columns);
     Ok(LogicalPlanNode::new(
-        LogicalPlanKind::Scan(LogicalScanNode {
+        LogicalPlanKind::Scan(PlanScanNode {
             database: target.namespace.clone(),
             table: TableDef {
                 name: target.table.clone(),
@@ -435,14 +437,14 @@ fn branch_scoped_old_input(
     };
     let old_outputs = plan_output_columns(&old_scan)?;
     let filtered = LogicalPlanNode::new(
-        LogicalPlanKind::Filter(LogicalFilterNode {
+        LogicalPlanKind::Filter(PlanFilterNode {
             predicate: branch_scope_predicate(&scope, &old_outputs)?,
         }),
         vec![old_scan],
         None,
     );
     Ok(LogicalPlanNode::new(
-        LogicalPlanKind::Project(LogicalProjectNode {
+        LogicalPlanKind::Project(PlanProjectNode {
             items: aggregate_old_state_passthrough_items(layout, &old_outputs)?,
             output_qualifier: None,
         }),
@@ -534,7 +536,7 @@ fn build_relational_aggregate_change_stream(
         },
     );
     let filtered = LogicalPlanNode::new(
-        LogicalPlanKind::Filter(LogicalFilterNode {
+        LogicalPlanKind::Filter(PlanFilterNode {
             predicate: bool_or(delete_predicate, insert_predicate),
         }),
         vec![expanded],
@@ -561,7 +563,7 @@ fn change_branch_column(ctx: &RewriteContext) -> Result<OutputColumn, String> {
 
 fn change_branch_values(column: OutputColumn) -> LogicalPlanNode {
     LogicalPlanNode::new(
-        LogicalPlanKind::Values(LogicalValuesNode {
+        LogicalPlanKind::Values(PlanValuesNode {
             rows: vec![
                 vec![tinyint_literal(CHANGE_BRANCH_DELETE)],
                 vec![tinyint_literal(CHANGE_BRANCH_INSERT)],
@@ -668,7 +670,7 @@ fn delta_state_with_row_id(
     }
 
     Ok(LogicalPlanNode::new(
-        LogicalPlanKind::Project(LogicalProjectNode {
+        LogicalPlanKind::Project(PlanProjectNode {
             items,
             output_qualifier: None,
         }),
@@ -795,7 +797,7 @@ fn aggregate_change_stream_project(
     }
 
     Ok(LogicalPlanNode::new(
-        LogicalPlanKind::Project(LogicalProjectNode {
+        LogicalPlanKind::Project(PlanProjectNode {
             items,
             output_qualifier: None,
         }),
@@ -1653,7 +1655,7 @@ fn signed_aggregate(
         aggregate_required_output_columns,
     );
     Ok(LogicalPlanNode::new(
-        LogicalPlanKind::Project(LogicalProjectNode {
+        LogicalPlanKind::Project(PlanProjectNode {
             items: project_items,
             output_qualifier: None,
         }),
@@ -2193,7 +2195,8 @@ fn string_literal(value: &str) -> TypedExpr {
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::planner::plan::*;
+    use crate::sql::planner::logical::*;
+    use crate::sql::planner::payload::*;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::rc::Rc;
@@ -2216,16 +2219,17 @@ mod tests {
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
+    use crate::sql::common::ImvVersionRef;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
-    use crate::sql::planner::imv_rewrite::marker::ImvVersionRef;
+    use crate::sql::planner::logical::{
+        LogicalAggregateNode, LogicalImvDeltaNode, LogicalPlanKind,
+    };
     use crate::sql::planner::optimizer_bridge::plan::{
         logical_plan_to_opt_expr, opt_expr_to_logical_plan,
     };
-    use crate::sql::planner::plan::{
-        AggregateCall, LogicalAggregateNode, LogicalImvDeltaNode, LogicalPlanKind, LogicalScanNode,
-    };
+    use crate::sql::planner::payload::{AggregateCall, PlanScanNode};
 
     #[test]
     fn signed_state_function_maps_supported_aggregates() {
@@ -2570,7 +2574,7 @@ mod tests {
             },
         ];
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: "b".to_string(),
@@ -2720,7 +2724,7 @@ mod tests {
         plan
     }
 
-    fn aggregate_change_stream_project(plan: &LogicalPlanNode) -> &LogicalProjectNode {
+    fn aggregate_change_stream_project(plan: &LogicalPlanNode) -> &PlanProjectNode {
         let LogicalPlanKind::Project(project) = &plan.kind else {
             panic!(
                 "expected aggregate change-stream Project, got {:?}",
@@ -2733,7 +2737,7 @@ mod tests {
         project
     }
 
-    fn aggregate_change_stream_filter(plan: &LogicalPlanNode) -> &LogicalFilterNode {
+    fn aggregate_change_stream_filter(plan: &LogicalPlanNode) -> &PlanFilterNode {
         let project = aggregate_change_stream_project(plan);
         let _ = project;
         let filter_plan = plan.unary_input();
@@ -2750,7 +2754,7 @@ mod tests {
         opt_expr_to_logical_plan(opt, arena)
     }
 
-    fn find_target_state_scan(plan: &LogicalPlanNode) -> &LogicalScanNode {
+    fn find_target_state_scan(plan: &LogicalPlanNode) -> &PlanScanNode {
         if let LogicalPlanKind::Scan(scan) = &plan.kind
             && matches!(&scan.table.source, ScanSource::IcebergMvTargetState(_))
         {
@@ -2771,7 +2775,7 @@ mod tests {
     fn contains_target_state_scan(plan: &LogicalPlanNode) -> bool {
         matches!(
             &plan.kind,
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 table: TableDef {
                     source: ScanSource::IcebergMvTargetState(_),
                     ..
@@ -2817,7 +2821,7 @@ mod tests {
 
     fn find_branch_scoped_old_input(
         plan: &LogicalPlanNode,
-    ) -> (&LogicalProjectNode, &LogicalFilterNode, &LogicalScanNode) {
+    ) -> (&PlanProjectNode, &PlanFilterNode, &PlanScanNode) {
         if let LogicalPlanKind::Project(project) = &plan.kind {
             let filter_plan = plan.unary_input();
             if let LogicalPlanKind::Filter(filter) = &filter_plan.kind
@@ -2848,7 +2852,7 @@ mod tests {
                     LogicalPlanKind::Filter(_)
                 ) && matches!(
                     &plan.unary_input().unary_input().kind,
-                    LogicalPlanKind::Scan(LogicalScanNode {
+                    LogicalPlanKind::Scan(PlanScanNode {
                         table: TableDef {
                             source: ScanSource::IcebergMvTargetState(_),
                             ..

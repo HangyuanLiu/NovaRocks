@@ -19,12 +19,13 @@ use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{OutputColumn, SortItem};
 use crate::sql::codegen::FragmentId;
 use crate::sql::column_id::ColumnId;
+use crate::sql::planner::payload::{
+    PlanAssertOneRowNode, PlanFilterNode, PlanGenerateSeriesNode, PlanProjectNode, PlanRepeatNode,
+    PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanValuesNode, PlanWindowNode,
+};
 use crate::sql::planner::plan::{
     DistributedChangeEventExpandNode, PhysicalHashAggregateNode, PhysicalHashJoinNode,
-    PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalSetOpNode, PhysicalTopNNode,
-    PlanAssertOneRowNode, PlanFilterNode, PlanGenerateSeriesNode, PlanProjectNode, PlanRepeatNode,
-    PlanScanNode, PlanSetOpKind, PlanSortNode, PlanTableFunctionNode, PlanValuesNode,
-    PlanWindowNode,
+    PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalSetOpNode, PhysicalTopNNode, PlanSetOpKind,
 };
 use crate::sql::planner::runtime_filter::{WiredRuntimeFilterBuild, WiredRuntimeFilterProbe};
 use crate::sql::planner::{DataPartition, PhysicalPlanStats};
@@ -197,7 +198,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::sql::planner::plan::PlanValuesNode;
+    use crate::sql::planner::payload::PlanValuesNode;
     use crate::sql::planner::{PhysicalPlanStats, PlannerConfidence};
 
     #[test]

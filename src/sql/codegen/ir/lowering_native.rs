@@ -32,7 +32,7 @@ use crate::sql::codegen::{
     FragmentSchedulingMetadata, FragmentStreamKind, MultiFragmentBuildResult, OutputColumn,
     RuntimeFilterPlanResult,
 };
-use crate::sql::planner::plan::PlanScanNode;
+use crate::sql::planner::payload::PlanScanNode;
 use crate::sql::planner::{
     DataPartition, DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor,
     PartitionKind, PlanFragment, PlannedRuntimeFilter,
@@ -1108,7 +1108,7 @@ mod tests {
     use crate::sql::catalog::{CatalogProvider, TableDef};
     use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::plan::PlanValuesNode;
+    use crate::sql::planner::payload::PlanValuesNode;
     use crate::sql::planner::{
         ExchangeFlavor, ExchangeReceiver, PhysicalPlanStats, PlannerConfidence,
     };

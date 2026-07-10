@@ -20,8 +20,9 @@ use arrow::datatypes::DataType;
 use crate::sql::analysis::*;
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use crate::sql::planner::OrderingSpec;
+use crate::sql::planner::logical::*;
 use crate::sql::planner::optimizer_bridge::property::ordering_spec_from_sort_items;
-use crate::sql::planner::plan::*;
+use crate::sql::planner::payload::*;
 
 use super::output::plan_output_columns;
 
@@ -68,7 +69,7 @@ pub(super) fn build_window_and_project(
             input
         } else {
             LogicalPlanNode::new(
-                LogicalPlanKind::Sort(LogicalSortNode {
+                LogicalPlanKind::Sort(PlanSortNode {
                     items: sort_items,
                     analytic_partition_by: analytic_partition_by,
                     output_columns: vec![],
@@ -82,7 +83,7 @@ pub(super) fn build_window_and_project(
         };
 
         let windowed = LogicalPlanNode::new(
-            LogicalPlanKind::Window(LogicalWindowNode {
+            LogicalPlanKind::Window(PlanWindowNode {
                 window_exprs: window_exprs,
                 output_columns: output_columns,
             }),
@@ -90,7 +91,7 @@ pub(super) fn build_window_and_project(
             None,
         );
         Ok(LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: rewritten_items,
                 output_qualifier: None,
             }),
@@ -99,7 +100,7 @@ pub(super) fn build_window_and_project(
         ))
     } else if !project_items.is_empty() {
         Ok(LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: project_items,
                 output_qualifier: None,
             }),
@@ -151,7 +152,7 @@ fn logical_plan_satisfies_window_ordering(
     }
 }
 
-fn project_preserves_column_identity(project: &LogicalProjectNode) -> bool {
+fn project_preserves_column_identity(project: &PlanProjectNode) -> bool {
     project.items.iter().all(|item| {
         matches!(
             &item.expr.kind,
@@ -161,7 +162,7 @@ fn project_preserves_column_identity(project: &LogicalProjectNode) -> bool {
 }
 
 fn logical_sort_satisfies_window_ordering(
-    sort: &LogicalSortNode,
+    sort: &PlanSortNode,
     required_items: &[SortItem],
     partition_by: &[TypedExpr],
 ) -> bool {

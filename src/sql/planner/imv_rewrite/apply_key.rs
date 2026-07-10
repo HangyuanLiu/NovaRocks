@@ -40,7 +40,8 @@ use crate::sql::planner::imv_rewrite::action_propagation::{
 use crate::sql::planner::imv_rewrite::join_delta_shape::is_supported_join_delta_union;
 use crate::sql::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
-use crate::sql::planner::plan::{LogicalPlanKind, LogicalPlanNode, LogicalProjectNode};
+use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
+use crate::sql::planner::payload::PlanProjectNode;
 
 pub(crate) struct InjectApplyKeyProjectRule {
     checked_root: AtomicBool,
@@ -212,7 +213,7 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
                         required_output_columns,
                     );
                     Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
-                        LogicalPlanKind::Project(LogicalProjectNode {
+                        LogicalPlanKind::Project(PlanProjectNode {
                             items,
                             output_qualifier: None,
                         }),
@@ -278,9 +279,8 @@ mod tests {
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
     use crate::sql::optimizer::scalar::ScalarArena;
-    use crate::sql::planner::plan::{
-        LogicalFilterNode, LogicalPlanKind, LogicalPlanNode, LogicalProjectNode, LogicalScanNode,
-    };
+    use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
+    use crate::sql::planner::payload::{PlanFilterNode, PlanProjectNode, PlanScanNode};
 
     fn build_ctx() -> RewriteContext {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::new());
@@ -295,8 +295,8 @@ mod tests {
         ctx
     }
 
-    fn delta_scan_with_row_id(row_id: ColumnId) -> LogicalScanNode {
-        LogicalScanNode {
+    fn delta_scan_with_row_id(row_id: ColumnId) -> PlanScanNode {
+        PlanScanNode {
             database: "db".to_string(),
             table: TableDef {
                 name: "b".to_string(),
@@ -343,10 +343,10 @@ mod tests {
         }
     }
 
-    fn project_root(scan: LogicalScanNode, row_id: ColumnId) -> LogicalPlanNode {
+    fn project_root(scan: PlanScanNode, row_id: ColumnId) -> LogicalPlanNode {
         // Project carrying user col k + propagated _row_id (as Task 3 would leave it).
         LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![
                     ProjectItem {
                         expr: TypedExpr {
@@ -440,7 +440,7 @@ mod tests {
         let rule = InjectApplyKeyProjectRule::new();
         let mut ctx = build_ctx();
         let plan = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Bool(true)),
                     data_type: DataType::Boolean,

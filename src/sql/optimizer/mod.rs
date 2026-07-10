@@ -668,10 +668,11 @@ mod is_known_rule_name_tests {
         use std::collections::HashMap;
 
         use crate::sql::column_id::ColumnRefFactory;
-        use crate::sql::planner::plan::{LogicalPlanKind, LogicalPlanNode, LogicalValuesNode};
+        use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
+        use crate::sql::planner::payload::PlanValuesNode;
 
         let plan = LogicalPlanNode::new(
-            LogicalPlanKind::Values(LogicalValuesNode {
+            LogicalPlanKind::Values(PlanValuesNode {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -1012,12 +1013,11 @@ mod is_known_rule_name_tests {
         BaseColumnStatistics, BaseTableStatistics, QueryStatsSnapshot, StatValue, StatsRef,
         StatsSource,
     };
+    use crate::sql::planner::logical::{LogicalAggregateNode, LogicalPlanKind, LogicalPlanNode};
     use crate::sql::planner::optimizer_bridge::plan::{
         logical_plan_to_opt_expr, opt_expr_to_logical_plan, try_logical_plan_to_opt_expr,
     };
-    use crate::sql::planner::plan::{
-        AggregateCall, LogicalAggregateNode, LogicalPlanKind, LogicalPlanNode, LogicalScanNode,
-    };
+    use crate::sql::planner::payload::{AggregateCall, PlanScanNode};
 
     fn optimize_logical(
         plan: LogicalPlanNode,
@@ -1436,7 +1436,7 @@ mod is_known_rule_name_tests {
             is_internal: false,
         };
         let scan = LogicalPlanNode::new(
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 database: "db".to_string(),
                 table: table,
                 alias: None,
@@ -1549,14 +1549,13 @@ mod is_known_rule_name_tests {
         use std::collections::HashMap;
 
         use crate::sql::column_id::ColumnRefFactory;
-        use crate::sql::planner::plan::{
-            LogicalAssertOneRowNode, LogicalPlanKind, LogicalPlanNode, LogicalValuesNode,
-        };
+        use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
+        use crate::sql::planner::payload::{PlanAssertOneRowNode, PlanValuesNode};
 
         let plan = LogicalPlanNode::new(
-            LogicalPlanKind::AssertOneRow(LogicalAssertOneRowNode::global_at_most_one("select 1")),
+            LogicalPlanKind::AssertOneRow(PlanAssertOneRowNode::global_at_most_one("select 1")),
             vec![LogicalPlanNode::new(
-                LogicalPlanKind::Values(LogicalValuesNode {
+                LogicalPlanKind::Values(PlanValuesNode {
                     rows: vec![],
                     columns: vec![],
                 }),
@@ -1580,13 +1579,13 @@ mod is_known_rule_name_tests {
 
         use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
         use crate::sql::column_id::{ColumnId, ColumnRefFactory};
-        use crate::sql::planner::plan::{
-            ApplyKind, LogicalApplyNode, LogicalPlanKind, LogicalPlanNode, LogicalValuesNode,
-        };
+        use crate::sql::common::ApplyKind;
+        use crate::sql::planner::logical::{LogicalApplyNode, LogicalPlanKind, LogicalPlanNode};
+        use crate::sql::planner::payload::PlanValuesNode;
 
         let values = || {
             LogicalPlanNode::new(
-                LogicalPlanKind::Values(LogicalValuesNode {
+                LogicalPlanKind::Values(PlanValuesNode {
                     rows: vec![],
                     columns: vec![],
                 }),
@@ -1661,7 +1660,7 @@ mod is_known_rule_name_tests {
         use crate::sql::catalog::{CatalogProvider, ColumnDef, ScanSource, TableDef};
         use crate::sql::column_id::ColumnRefFactory;
         use crate::sql::optimizer::property::DistributionSpec;
-        use crate::sql::planner::plan::LogicalPlanKind;
+        use crate::sql::planner::logical::LogicalPlanKind;
 
         struct MinimalCatalog;
         impl CatalogProvider for MinimalCatalog {
@@ -1791,9 +1790,9 @@ mod is_known_rule_name_tests {
         }
 
         fn logical_has_rank_partition_topn_sort(
-            plan: &crate::sql::planner::plan::LogicalPlanNode,
+            plan: &crate::sql::planner::logical::LogicalPlanNode,
         ) -> bool {
-            if let crate::sql::planner::plan::LogicalPlanKind::Sort(sort) = &plan.kind
+            if let crate::sql::planner::logical::LogicalPlanKind::Sort(sort) = &plan.kind
                 && sort.partition_limit == Some(2)
                 && sort.topn_type == Some(SortTopNType::Rank)
             {

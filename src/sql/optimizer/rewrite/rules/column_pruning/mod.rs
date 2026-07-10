@@ -114,7 +114,8 @@ pub(crate) fn keep_at_least_one(
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::planner::plan::*;
+    use crate::sql::planner::logical::*;
+    use crate::sql::planner::payload::*;
     // Pipeline-level integration tests that verify the Phase-1 (TagRequiredColumns)
     // + Phase-2 (v2 Prune* rules) combination sets `Scan.required_columns` correctly.
     //
@@ -136,10 +137,11 @@ mod tests {
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::logical::*;
     use crate::sql::planner::optimizer_bridge::plan::{
         logical_plan_to_opt_expr, opt_expr_to_logical_plan,
     };
-    use crate::sql::planner::plan::*;
+    use crate::sql::planner::payload::*;
 
     // -----------------------------------------------------------------------
     // Helper builders
@@ -188,7 +190,7 @@ mod tests {
             },
         };
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(LogicalScanNode {
+            LogicalPlanKind::Scan(PlanScanNode {
                 database: "default".to_string(),
                 table: table,
                 alias: None,
@@ -223,7 +225,7 @@ mod tests {
         opt_expr_to_logical_plan(opt_result, &arena)
     }
 
-    fn extract_scan(plan: &LogicalPlanNode) -> &LogicalScanNode {
+    fn extract_scan(plan: &LogicalPlanNode) -> &PlanScanNode {
         // Walk down through Project/Filter/Aggregate to reach the Scan leaf.
         match &plan.kind {
             LogicalPlanKind::Scan(s) => s,
@@ -279,7 +281,7 @@ mod tests {
 
         let scan = make_scan(&[(id_a, "a"), (id_b, "b"), (id_c, "c")]);
         let project = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     expr: col_ref(id_a, "a"),
                     output_name: "a".to_string(),
@@ -316,7 +318,7 @@ mod tests {
 
         let scan = make_scan(&[(id_a, "a"), (id_b, "b"), (id_c, "c")]);
         let filter = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::BinaryOp {
                         left: Box::new(col_ref(id_b, "b")),
@@ -335,7 +337,7 @@ mod tests {
             None,
         );
         let project = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     expr: col_ref(id_a, "a"),
                     output_name: "a".to_string(),
@@ -423,7 +425,7 @@ mod tests {
         // a non-None parent_needed to tag_aggregate. tag_aggregate then passes
         // only the selected group-key dependency {b@2} to the Scan.
         let proj = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     output_column_id: ColumnId::new_for_test(901),
                     output_name: "b".to_string(),

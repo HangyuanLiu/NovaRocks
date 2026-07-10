@@ -18,7 +18,8 @@
 use crate::sql::analysis::cte::CTERegistry;
 use crate::sql::analysis::*;
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
-use crate::sql::planner::plan::*;
+use crate::sql::planner::logical::*;
+use crate::sql::planner::payload::*;
 
 use super::aggregate::{
     collect_aggregates, ensure_aggregate_output_columns, planner_aggregate_group_by_targets,
@@ -90,7 +91,7 @@ pub(super) fn plan_scoped_query(
         let produce_input = plan_scoped_query(entry.resolved_query.clone(), cte_registry, factory)?;
         let produce_input = adapt_plan_output(produce_input, &entry.output_columns)?;
         let produce = LogicalPlanNode::new(
-            LogicalPlanKind::CTEProduce(LogicalCTEProduceNode {
+            LogicalPlanKind::CTEProduce(PlanCTEProduceNode {
                 cte_id: entry.id,
                 output_columns: entry.output_columns.clone(),
             }),
@@ -98,7 +99,7 @@ pub(super) fn plan_scoped_query(
             None,
         );
         root = LogicalPlanNode::new(
-            LogicalPlanKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: entry.id }),
+            LogicalPlanKind::CTEAnchor(PlanCTEAnchorNode { cte_id: entry.id }),
             vec![produce, root],
             None,
         );
@@ -256,7 +257,7 @@ fn apply_query_modifiers(
 
             // Sort with extended scope
             body_plan = LogicalPlanNode::new(
-                LogicalPlanKind::Sort(LogicalSortNode {
+                LogicalPlanKind::Sort(PlanSortNode {
                     items: sort_items,
                     // Top-level ORDER BY — no analytic partition.
                     analytic_partition_by: Vec::new(),
@@ -318,7 +319,7 @@ fn apply_query_modifiers(
             });
         } else {
             body_plan = LogicalPlanNode::new(
-                LogicalPlanKind::Sort(LogicalSortNode {
+                LogicalPlanKind::Sort(PlanSortNode {
                     items: sort_items,
                     // Top-level ORDER BY — no analytic partition.
                     analytic_partition_by: Vec::new(),
@@ -336,7 +337,7 @@ fn apply_query_modifiers(
     // Wrap with Limit if LIMIT/OFFSET is present.
     if limit.is_some() || offset.is_some() {
         body_plan = LogicalPlanNode::new(
-            LogicalPlanKind::Limit(LogicalLimitNode {
+            LogicalPlanKind::Limit(PlanLimitNode {
                 limit: limit,
                 offset: offset,
             }),
@@ -347,7 +348,7 @@ fn apply_query_modifiers(
 
     if let Some(items) = final_projection {
         body_plan = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: items,
                 output_qualifier: None,
             }),

@@ -1236,8 +1236,9 @@ mod tests {
     use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec};
     use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
     use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, CostEstimate};
+    use crate::sql::planner::logical::*;
     use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
-    use crate::sql::planner::plan::*;
+    use crate::sql::planner::payload::*;
     use std::collections::HashMap;
 
     fn stats(rows: f64, avg_size: f64) -> Statistics {

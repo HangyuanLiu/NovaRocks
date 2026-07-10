@@ -21,7 +21,8 @@ pub(crate) use rule::VariantPathPushdownRule;
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::planner::plan::*;
+    use crate::sql::planner::logical::*;
+    use crate::sql::planner::payload::*;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::rc::Rc;
@@ -39,12 +40,11 @@ mod tests {
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::tree::rewrite_with_rule;
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
     use crate::sql::planner::optimizer_bridge::plan::{
         logical_plan_to_opt_expr, opt_expr_to_logical_plan,
     };
-    use crate::sql::planner::plan::{
-        LogicalFilterNode, LogicalPlanKind, LogicalPlanNode, LogicalProjectNode, LogicalScanNode,
-    };
+    use crate::sql::planner::payload::{PlanFilterNode, PlanProjectNode, PlanScanNode};
 
     fn add_column(
         factory: &Rc<RefCell<ColumnRefFactory>>,
@@ -120,7 +120,7 @@ mod tests {
         let source_column = add_column(factory, "v", source_type.clone(), true, false);
         (
             LogicalPlanNode::new(
-                LogicalPlanKind::Scan(LogicalScanNode {
+                LogicalPlanKind::Scan(PlanScanNode {
                     database: "db".to_string(),
                     table: table_def(source, source_type),
                     alias: None,
@@ -229,7 +229,7 @@ mod tests {
         (opt_expr_to_logical_plan(opt_result, &arena), changed)
     }
 
-    fn scan_from_plan(plan: &LogicalPlanNode) -> &LogicalScanNode {
+    fn scan_from_plan(plan: &LogicalPlanNode) -> &PlanScanNode {
         match &plan.kind {
             LogicalPlanKind::Scan(scan) => scan,
             LogicalPlanKind::Filter(_) | LogicalPlanKind::Project(_) => {
@@ -270,7 +270,7 @@ mod tests {
         let (scan, source_column) =
             scan_with_source(&factory, iceberg_source(), DataType::LargeBinary);
         let plan = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: equality_with_ten(variant_get(
                     "variant_get",
                     &source_column,
@@ -325,7 +325,7 @@ mod tests {
             scan_with_source(&factory, iceberg_source(), DataType::LargeBinary);
         let project_output = add_column(&factory, "a", DataType::Int64, true, false).column_id;
         let plan = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     expr: variant_get("variant_get", &source_column, "$.a", "bigint"),
                     output_name: "a".to_string(),
@@ -360,14 +360,14 @@ mod tests {
         let (scan, source_column) =
             scan_with_source(&factory, iceberg_source(), DataType::LargeBinary);
         let filter = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: bool_literal(true),
             }),
             vec![scan],
             None,
         );
         let plan = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     expr: variant_get("variant_get", &source_column, "$.a", "bigint"),
                     output_name: "a".to_string(),
@@ -398,7 +398,7 @@ mod tests {
         };
         scan_node.predicates.push(bool_literal(true));
         let plan = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     expr: variant_get("variant_get", &source_column, "$.a", "bigint"),
                     output_name: "a".to_string(),
@@ -425,7 +425,7 @@ mod tests {
         let (scan, source_column) =
             scan_with_source(&factory, iceberg_source(), DataType::LargeBinary);
         let filter = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: equality_with_ten(variant_get(
                     "variant_get",
                     &source_column,
@@ -438,7 +438,7 @@ mod tests {
         );
         let project_output = add_column(&factory, "a", DataType::Int64, true, false).column_id;
         let plan = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     expr: variant_get("variant_get", &source_column, "$.a", "bigint"),
                     output_name: "a".to_string(),
@@ -475,7 +475,7 @@ mod tests {
         let (scan, source_column) =
             scan_with_source(&factory, iceberg_source(), DataType::LargeBinary);
         let filter = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(LogicalFilterNode {
+            LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: equality_with_ten(variant_get(
                     "variant_get",
                     &source_column,
@@ -487,7 +487,7 @@ mod tests {
             None,
         );
         let plan = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     expr: variant_get("variant_get", &source_column, "$.a", "bigint"),
                     output_name: "a".to_string(),
@@ -525,7 +525,7 @@ mod tests {
         let (scan, source_column) =
             scan_with_source(&factory, iceberg_source(), DataType::LargeBinary);
         let plan = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     expr: variant_get("try_variant_get", &source_column, "$.a", "bigint"),
                     output_name: "a".to_string(),
@@ -666,7 +666,7 @@ mod tests {
         let (scan, source_column) =
             scan_with_source(&factory, iceberg_source(), DataType::LargeBinary);
         let plan = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     expr: variant_get("variant_get", &source_column, "$", "bigint"),
                     output_name: "root_path".to_string(),
@@ -698,7 +698,7 @@ mod tests {
         let (scan, source_column) =
             scan_with_source(&factory, iceberg_source(), DataType::LargeBinary);
         let plan = LogicalPlanNode::new(
-            LogicalPlanKind::Project(LogicalProjectNode {
+            LogicalPlanKind::Project(PlanProjectNode {
                 items: vec![ProjectItem {
                     expr: variant_get("variant_get", &source_column, "", "bigint"),
                     output_name: "empty_path".to_string(),
@@ -790,7 +790,7 @@ mod tests {
                 _ => unreachable!(),
             };
             let plan = LogicalPlanNode::new(
-                LogicalPlanKind::Project(LogicalProjectNode {
+                LogicalPlanKind::Project(PlanProjectNode {
                     items: vec![ProjectItem {
                         expr,
                         output_name: name.to_string(),

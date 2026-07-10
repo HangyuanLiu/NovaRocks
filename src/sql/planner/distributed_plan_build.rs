@@ -32,9 +32,10 @@ use crate::sql::planner::distributed_node::{
 use crate::sql::planner::optimizer_bridge::property::{
     ordering_spec_from_sort_items, window_ordering_spec,
 };
+use crate::sql::planner::payload::{PlanProjectNode, PlanScanNode};
 use crate::sql::planner::plan::{
-    PhysicalPlanKind, PhysicalPlanNode, PhysicalSetOpNode, PlanProjectNode, PlanScanNode,
-    PlanSetOpKind, RedistributeMode, RedistributeNode,
+    PhysicalPlanKind, PhysicalPlanNode, PhysicalSetOpNode, PlanSetOpKind, RedistributeMode,
+    RedistributeNode,
 };
 use crate::sql::planner::{
     ExchangeFlavor, OrderingSpec, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent, TopNPhase,
@@ -465,7 +466,7 @@ impl DistributedPlanBuilder {
     fn visit_limit(
         &mut self,
         node: &PhysicalPlanNode,
-        limit: &crate::sql::planner::plan::PlanLimitNode,
+        limit: &crate::sql::planner::payload::PlanLimitNode,
     ) -> Result<DistributedNode, String> {
         expect_child_count(node, 1)?;
         let child_plan = &node.children[0];
@@ -624,7 +625,7 @@ impl DistributedPlanBuilder {
     fn visit_cte_anchor(
         &mut self,
         node: &PhysicalPlanNode,
-        _anchor: &crate::sql::planner::plan::LogicalCTEAnchorNode,
+        _anchor: &crate::sql::planner::payload::PlanCTEAnchorNode,
     ) -> Result<DistributedNode, String> {
         expect_child_count(node, 2)?;
         let produce = &node.children[0];
@@ -640,7 +641,7 @@ impl DistributedPlanBuilder {
     fn visit_cte_produce(
         &mut self,
         node: &PhysicalPlanNode,
-        produce: &crate::sql::planner::plan::LogicalCTEProduceNode,
+        produce: &crate::sql::planner::payload::PlanCTEProduceNode,
     ) -> Result<(), String> {
         expect_child_count(node, 1)?;
         let child_plan = &node.children[0];
@@ -670,7 +671,7 @@ impl DistributedPlanBuilder {
     fn visit_cte_consume(
         &mut self,
         node: &PhysicalPlanNode,
-        consume: &crate::sql::planner::plan::LogicalCTEConsumeNode,
+        consume: &crate::sql::planner::payload::PlanCTEConsumeNode,
     ) -> Result<DistributedNode, String> {
         expect_child_count(node, 0)?;
         let cte_frag_idx = self
@@ -747,7 +748,7 @@ impl DistributedPlanBuilder {
 }
 
 fn cte_consume_exchange_output_columns(
-    consume: &crate::sql::planner::plan::LogicalCTEConsumeNode,
+    consume: &crate::sql::planner::payload::PlanCTEConsumeNode,
     producer_output_columns: &[OutputColumn],
 ) -> Result<Vec<OutputColumn>, String> {
     let columns_by_id = producer_output_columns
@@ -770,7 +771,7 @@ fn cte_consume_exchange_output_columns(
 }
 
 fn cte_consume_remap_project_items(
-    consume: &crate::sql::planner::plan::LogicalCTEConsumeNode,
+    consume: &crate::sql::planner::payload::PlanCTEConsumeNode,
     exchange_output_columns: &[OutputColumn],
 ) -> Result<Vec<ProjectItem>, String> {
     if consume.output_columns.len() != exchange_output_columns.len() {
@@ -1273,7 +1274,7 @@ fn stream_kind_for_redistribute_mode(mode: &RedistributeMode) -> FragmentStreamK
 }
 
 fn validate_cte_consume_mapping(
-    consume: &crate::sql::planner::plan::LogicalCTEConsumeNode,
+    consume: &crate::sql::planner::payload::PlanCTEConsumeNode,
 ) -> Result<(), String> {
     if consume.output_columns.len() != consume.producer_column_ids.len() {
         return Err(format!(
@@ -1491,15 +1492,16 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed_fragment::{DataSink, PartitionKind};
     use crate::sql::planner::distributed_node::DistributedNodeKind;
+    use crate::sql::planner::payload::{
+        AggregateCall, PlanAssertOneRowNode, PlanCTEAnchorNode, PlanCTEConsumeNode,
+        PlanCTEProduceNode, PlanFilterNode, PlanGenerateSeriesNode, PlanLimitNode, PlanProjectNode,
+        PlanRepeatNode, PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanValuesNode,
+        PlanWindowNode, WindowExpr,
+    };
     use crate::sql::planner::plan::{
-        AggregateCall, DistributedChangeEventExpandNode, LogicalCTEAnchorNode,
-        LogicalCTEConsumeNode, LogicalCTEProduceNode, PhysicalHashAggregateNode,
-        PhysicalHashJoinEqCondition, PhysicalHashJoinNode, PhysicalNestLoopJoinNode,
-        PhysicalPlanKind, PhysicalPlanNode, PhysicalSetOpNode, PhysicalTopNNode,
-        PlanAssertOneRowNode, PlanFilterNode, PlanGenerateSeriesNode, PlanLimitNode,
-        PlanProjectNode, PlanRepeatNode, PlanScanNode, PlanSetOpKind, PlanSortNode,
-        PlanTableFunctionNode, PlanValuesNode, PlanWindowNode, RedistributeMode, RedistributeNode,
-        WindowExpr,
+        DistributedChangeEventExpandNode, PhysicalHashAggregateNode, PhysicalHashJoinEqCondition,
+        PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalPlanNode,
+        PhysicalSetOpNode, PhysicalTopNNode, PlanSetOpKind, RedistributeMode, RedistributeNode,
     };
     use crate::sql::planner::{
         AggMode, AggregateOutputLayout, ExchangeFlavor, HashSource, JoinDistribution,
@@ -3037,7 +3039,7 @@ mod tests {
         let consumer_columns = vec![output_col(2, "c_k", DataType::Int64, false)];
         let scan = scan_node_with_columns(producer_columns.clone());
         let produce = PhysicalPlanNode {
-            kind: PhysicalPlanKind::CTEProduce(LogicalCTEProduceNode {
+            kind: PhysicalPlanKind::CTEProduce(PlanCTEProduceNode {
                 cte_id,
                 output_columns: producer_columns.clone(),
             }),
@@ -3047,7 +3049,7 @@ mod tests {
             probe_runtime_filters: vec![],
         };
         let consume = PhysicalPlanNode {
-            kind: PhysicalPlanKind::CTEConsume(LogicalCTEConsumeNode {
+            kind: PhysicalPlanKind::CTEConsume(PlanCTEConsumeNode {
                 cte_id,
                 alias: "cte_alias".to_string(),
                 output_columns: consumer_columns.clone(),
@@ -3059,7 +3061,7 @@ mod tests {
             probe_runtime_filters: vec![],
         };
         let anchor = PhysicalPlanNode {
-            kind: PhysicalPlanKind::CTEAnchor(LogicalCTEAnchorNode { cte_id }),
+            kind: PhysicalPlanKind::CTEAnchor(PlanCTEAnchorNode { cte_id }),
             children: vec![produce, consume],
             output_columns: consumer_columns.clone(),
             stats: stats(),
@@ -3207,7 +3209,7 @@ mod tests {
         ];
         let scan = scan_node_with_columns(producer_columns.clone());
         let produce = PhysicalPlanNode {
-            kind: PhysicalPlanKind::CTEProduce(LogicalCTEProduceNode {
+            kind: PhysicalPlanKind::CTEProduce(PlanCTEProduceNode {
                 cte_id,
                 output_columns: producer_columns.clone(),
             }),
@@ -3217,7 +3219,7 @@ mod tests {
             probe_runtime_filters: vec![],
         };
         let consume = PhysicalPlanNode {
-            kind: PhysicalPlanKind::CTEConsume(LogicalCTEConsumeNode {
+            kind: PhysicalPlanKind::CTEConsume(PlanCTEConsumeNode {
                 cte_id,
                 alias: "cte_alias".to_string(),
                 output_columns: consumer_columns.clone(),
@@ -3232,7 +3234,7 @@ mod tests {
             probe_runtime_filters: vec![],
         };
         let anchor = PhysicalPlanNode {
-            kind: PhysicalPlanKind::CTEAnchor(LogicalCTEAnchorNode { cte_id }),
+            kind: PhysicalPlanKind::CTEAnchor(PlanCTEAnchorNode { cte_id }),
             children: vec![produce, consume],
             output_columns: consumer_columns.clone(),
             stats: stats(),
@@ -3338,7 +3340,7 @@ mod tests {
             probe_runtime_filters: vec![],
         };
         let produce = PhysicalPlanNode {
-            kind: PhysicalPlanKind::CTEProduce(LogicalCTEProduceNode {
+            kind: PhysicalPlanKind::CTEProduce(PlanCTEProduceNode {
                 cte_id,
                 output_columns: vec![output_col(1, "k", DataType::Int64, false)],
             }),
@@ -3367,7 +3369,7 @@ mod tests {
         let scan = scan_node(1, "k");
         let consume = cte_consume_node(cte_id, 2, vec![ColumnId::new_for_test(1)]);
         let anchor = PhysicalPlanNode {
-            kind: PhysicalPlanKind::CTEAnchor(LogicalCTEAnchorNode { cte_id }),
+            kind: PhysicalPlanKind::CTEAnchor(PlanCTEAnchorNode { cte_id }),
             children: vec![scan, consume],
             output_columns: vec![output_col(2, "c_k", DataType::Int64, false)],
             stats: stats(),
@@ -3402,7 +3404,7 @@ mod tests {
         let produce = cte_produce_node(cte_id, producer_columns.clone(), scan_node(1, "p_k"));
         let bad_arity_consume = cte_consume_node(cte_id, 2, vec![]);
         let anchor = PhysicalPlanNode {
-            kind: PhysicalPlanKind::CTEAnchor(LogicalCTEAnchorNode { cte_id }),
+            kind: PhysicalPlanKind::CTEAnchor(PlanCTEAnchorNode { cte_id }),
             children: vec![produce.clone(), bad_arity_consume],
             output_columns: vec![output_col(2, "c_k", DataType::Int64, false)],
             stats: stats(),
@@ -3417,7 +3419,7 @@ mod tests {
         );
 
         let duplicate_output_consume = PhysicalPlanNode {
-            kind: PhysicalPlanKind::CTEConsume(LogicalCTEConsumeNode {
+            kind: PhysicalPlanKind::CTEConsume(PlanCTEConsumeNode {
                 cte_id,
                 alias: "cte_alias".to_string(),
                 output_columns: vec![
@@ -3435,7 +3437,7 @@ mod tests {
             probe_runtime_filters: vec![],
         };
         let anchor = PhysicalPlanNode {
-            kind: PhysicalPlanKind::CTEAnchor(LogicalCTEAnchorNode { cte_id }),
+            kind: PhysicalPlanKind::CTEAnchor(PlanCTEAnchorNode { cte_id }),
             children: vec![produce, duplicate_output_consume],
             output_columns: vec![output_col(2, "c_k", DataType::Int64, false)],
             stats: stats(),
@@ -3480,7 +3482,7 @@ mod tests {
             probe_runtime_filters: vec![],
         };
         let anchor = PhysicalPlanNode {
-            kind: PhysicalPlanKind::CTEAnchor(LogicalCTEAnchorNode { cte_id }),
+            kind: PhysicalPlanKind::CTEAnchor(PlanCTEAnchorNode { cte_id }),
             children: vec![produce, join],
             output_columns: vec![
                 output_col(2, "c_k", DataType::Int64, false),
@@ -4063,7 +4065,7 @@ mod tests {
         child: PhysicalPlanNode,
     ) -> PhysicalPlanNode {
         PhysicalPlanNode {
-            kind: PhysicalPlanKind::CTEProduce(LogicalCTEProduceNode {
+            kind: PhysicalPlanKind::CTEProduce(PlanCTEProduceNode {
                 cte_id,
                 output_columns: output_columns.clone(),
             }),
@@ -4081,7 +4083,7 @@ mod tests {
     ) -> PhysicalPlanNode {
         let output_columns = vec![output_col(output_column_id, "c_k", DataType::Int64, false)];
         PhysicalPlanNode {
-            kind: PhysicalPlanKind::CTEConsume(LogicalCTEConsumeNode {
+            kind: PhysicalPlanKind::CTEConsume(PlanCTEConsumeNode {
                 cte_id,
                 alias: "cte_alias".to_string(),
                 output_columns: output_columns.clone(),

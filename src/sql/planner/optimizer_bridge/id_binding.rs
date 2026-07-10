@@ -655,7 +655,7 @@ mod tests {
     use crate::sql::planner::optimizer_bridge::scalar::{
         intern_aggregate_calls, intern_exprs, intern_project_items,
     };
-    use crate::sql::planner::plan::AggregateCall;
+    use crate::sql::planner::payload::AggregateCall;
 
     fn int_col(column_id: ColumnId, name: &str) -> OutputColumn {
         OutputColumn {
