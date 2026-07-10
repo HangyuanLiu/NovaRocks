@@ -1276,33 +1276,89 @@ fn logical_build_surface_violations(text: &str) -> Vec<String> {
     violations
 }
 
-fn top_level_production_functions(text: &str) -> Vec<String> {
-    rust_production_text_without_cfg_test(text)
-        .lines()
-        .enumerate()
-        .filter_map(|(index, line)| {
-            let first = line.chars().next()?;
-            if first.is_whitespace() {
-                return None;
+fn is_rust_function_item_header(header: &str) -> bool {
+    let mut rest = header.trim();
+    while let Some(after_open) = rest.strip_prefix("#[") {
+        let Some(close) = after_open.find(']') else {
+            return false;
+        };
+        rest = after_open[close + 1..].trim_start();
+    }
+
+    if let Some(after_pub) = rest.strip_prefix("pub ") {
+        rest = after_pub.trim_start();
+    } else if let Some(after_open) = rest.strip_prefix("pub(") {
+        let Some(close) = after_open.find(')') else {
+            return false;
+        };
+        rest = after_open[close + 1..].trim_start();
+    }
+
+    loop {
+        if let Some(after) = rest.strip_prefix("const ") {
+            rest = after.trim_start();
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("async ") {
+            rest = after.trim_start();
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("unsafe ") {
+            rest = after.trim_start();
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("extern ") {
+            rest = after.trim_start();
+            if let Some(after_quote) = rest.strip_prefix('"') {
+                let Some(close) = after_quote.find('"') else {
+                    return false;
+                };
+                rest = after_quote[close + 1..].trim_start();
             }
-            let trimmed = line.trim();
-            let is_function = [
-                "fn ",
-                "async fn ",
-                "pub fn ",
-                "pub async fn ",
-                "pub(crate) fn ",
-                "pub(crate) async fn ",
-                "pub(super) fn ",
-                "pub(super) async fn ",
-            ]
-            .iter()
-            .any(|prefix| trimmed.starts_with(prefix))
-                || (trimmed.starts_with("pub(in ")
-                    && (trimmed.contains(") fn ") || trimmed.contains(") async fn ")));
-            is_function.then(|| format!("{}: {}", index + 1, trimmed))
-        })
-        .collect()
+            continue;
+        }
+        break;
+    }
+
+    rest.starts_with("fn ")
+}
+
+fn top_level_production_functions(text: &str) -> Vec<String> {
+    let production = rust_production_text_without_cfg_test(text);
+    let mut functions = Vec::new();
+    let mut header = String::new();
+    let mut header_start = 0usize;
+    let mut header_is_function = false;
+    let mut brace_depth = 0isize;
+
+    for (index, line) in production.lines().enumerate() {
+        let trimmed = line.trim();
+        if brace_depth == 0 && !is_comment_or_blank(line) && !trimmed.starts_with("#[") {
+            if header.is_empty() {
+                header_start = index + 1;
+            } else {
+                header.push(' ');
+            }
+            header.push_str(trimmed);
+
+            if !header_is_function && is_rust_function_item_header(&header) {
+                functions.push(format!("{}: {}", header_start, header));
+                header_is_function = true;
+            }
+
+            if trimmed.ends_with(';') || line.contains('{') {
+                header.clear();
+                header_is_function = false;
+            }
+        }
+
+        brace_depth += brace_delta(line);
+        if brace_depth < 0 {
+            brace_depth = 0;
+        }
+    }
+
+    functions
 }
 
 #[test]
@@ -1331,6 +1387,51 @@ mod tests;
             .any(|violation| violation.contains("pub(crate) use relation::plan_values;")),
         "extra logical build re-export must be rejected: {violations:?}"
     );
+}
+
+#[test]
+fn planner_root_function_detector_covers_visibility_and_qualifiers() {
+    let function_items = [
+        ("private", "fn private() {}"),
+        ("pub", "pub fn public() {}"),
+        ("pub(crate) async", "pub(crate) async fn crate_async() {}"),
+        (
+            "pub(super) unsafe",
+            "pub(super) unsafe fn parent_unsafe() {}",
+        ),
+        ("pub(self) const", "pub(self) const fn self_const() {}"),
+        (
+            "pub(in) const unsafe extern",
+            "pub(in crate) const unsafe extern \"C\" fn restricted() {}",
+        ),
+        ("private extern", "extern \"C\" fn private_extern() {}"),
+        (
+            "multiline qualifiers",
+            "pub(crate)\nconst fn multiline() {}",
+        ),
+        ("attribute", "#[inline]\npub fn attributed() {}"),
+    ];
+
+    for (label, source) in function_items {
+        let hits = top_level_production_functions(source);
+        assert_eq!(hits.len(), 1, "{label} must be detected: {hits:?}");
+    }
+
+    for source in [
+        "type Handler = fn();",
+        "const HANDLER: fn() = private;",
+        "mod child { fn nested() {} }",
+        "extern \"C\" { fn declared(); }",
+    ] {
+        let hits = top_level_production_functions(source);
+        assert!(
+            hits.is_empty(),
+            "non-function item must not be flagged: {hits:?}"
+        );
+    }
+
+    let cfg_test = "#[cfg(test)]\nfn test_only() {}";
+    assert!(top_level_production_functions(cfg_test).is_empty());
 }
 
 #[test]
