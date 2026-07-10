@@ -1743,6 +1743,20 @@ fn rust_named_function_declaration_count(text: &str, name: &str) -> usize {
         .count()
 }
 
+fn rust_named_declaration_owners(
+    sources: &[(String, String)],
+    name: &str,
+    declaration_count: fn(&str, &str) -> usize,
+) -> Vec<String> {
+    sources
+        .iter()
+        .filter_map(|(path, text)| {
+            let count = declaration_count(text, name);
+            (count > 0).then(|| format!("{path} ({count})"))
+        })
+        .collect()
+}
+
 fn rust_named_const_declaration_count(text: &str, name: &str) -> usize {
     let production = rust_sanitized_production_text(text);
     let identifiers = production
@@ -2668,6 +2682,50 @@ fn test_only_helper() {}
             "extra function or non-pub(crate) entry must be rejected: {invalid}"
         );
     }
+}
+
+#[test]
+fn distributed_build_owner_detector_includes_non_owner_planner_duplicates() {
+    let sources = vec![
+        (
+            "src/sql/planner/distributed/build/lowering.rs".to_string(),
+            "struct NodeIdAllocator; fn lower_fragment_local_node() {}".to_string(),
+        ),
+        (
+            "src/sql/planner/physical/node.rs".to_string(),
+            "struct NodeIdAllocator; fn lower_fragment_local_node() {}".to_string(),
+        ),
+        (
+            "src/sql/planner/logical/node.rs".to_string(),
+            "#[cfg(test)] struct NodeIdAllocator; #[cfg(test)] fn lower_fragment_local_node() {}"
+                .to_string(),
+        ),
+    ];
+
+    assert_eq!(
+        rust_named_declaration_owners(
+            &sources,
+            "NodeIdAllocator",
+            rust_named_type_declaration_count,
+        ),
+        vec![
+            "src/sql/planner/distributed/build/lowering.rs (1)",
+            "src/sql/planner/physical/node.rs (1)",
+        ],
+        "type duplicates outside the concern owner must be visible"
+    );
+    assert_eq!(
+        rust_named_declaration_owners(
+            &sources,
+            "lower_fragment_local_node",
+            rust_named_function_declaration_count,
+        ),
+        vec![
+            "src/sql/planner/distributed/build/lowering.rs (1)",
+            "src/sql/planner/physical/node.rs (1)",
+        ],
+        "function duplicates outside the concern owner must be visible"
+    );
 }
 
 #[test]
@@ -4628,6 +4686,10 @@ fn planner_distributed_build_has_pass_owners() {
             fs::read_to_string(&runtime_filter_wire_path).unwrap(),
         ),
     ];
+    let planner_sources = rs_files(&planner)
+        .into_iter()
+        .map(|path| (rel(&path), fs::read_to_string(path).unwrap()))
+        .collect::<Vec<_>>();
     for (name, owner) in [
         ("FragmentCutBuilder", &fragment_cut_path),
         ("NodeIdAllocator", &lowering_path),
@@ -4635,13 +4697,11 @@ fn planner_distributed_build_has_pass_owners() {
         ("RuntimeFilterBuildBinding", &runtime_filter_wire_path),
         ("RuntimeFilterProbeBinding", &runtime_filter_wire_path),
     ] {
-        let declarations = owners
-            .iter()
-            .filter_map(|(path, text)| {
-                let count = rust_named_type_declaration_count(text, name);
-                (count > 0).then(|| format!("{} ({count})", rel(path)))
-            })
-            .collect::<Vec<_>>();
+        let declarations = rust_named_declaration_owners(
+            &planner_sources,
+            name,
+            rust_named_type_declaration_count,
+        );
         assert_eq!(
             declarations,
             vec![format!("{} (1)", rel(owner))],
@@ -4657,13 +4717,11 @@ fn planner_distributed_build_has_pass_owners() {
         ("wire", &runtime_filter_wire_path),
         ("attach_runtime_filters", &runtime_filter_wire_path),
     ] {
-        let declarations = owners
-            .iter()
-            .filter_map(|(path, text)| {
-                let count = rust_named_function_declaration_count(text, name);
-                (count > 0).then(|| format!("{} ({count})", rel(path)))
-            })
-            .collect::<Vec<_>>();
+        let declarations = rust_named_declaration_owners(
+            &planner_sources,
+            name,
+            rust_named_function_declaration_count,
+        );
         assert_eq!(
             declarations,
             vec![format!("{} (1)", rel(owner))],
