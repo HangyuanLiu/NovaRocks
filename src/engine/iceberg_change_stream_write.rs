@@ -25,9 +25,9 @@ use crate::engine::write_transaction::{
 };
 use crate::runtime::coordinator::CoordinatedQueryResult;
 use crate::runtime::write_coordinator::WriteCommitInput;
-use crate::sql::codegen::FragmentId;
 use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::optimizer::OptimizerPhysicalNode;
+use crate::sql::planner::distributed::FragmentId;
 use crate::sql::planner::{ChangeStreamWriteDagSpec, IcebergChangeStreamWriteTopology};
 
 pub(crate) fn writer_fragment_id_from_finst_lo(finst_lo: i64) -> i32 {

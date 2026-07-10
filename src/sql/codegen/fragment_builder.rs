@@ -24,11 +24,11 @@
 
 use std::collections::HashMap;
 
-use crate::sql::codegen::FragmentId;
 use crate::sql::codegen::boundary_schema::{
     BoundaryKind, BoundarySchemaReport, output_columns_to_boundary_columns,
 };
 use crate::sql::codegen::{FragmentBuildRequest, MultiFragmentBuildResult, OutputColumn};
+use crate::sql::planner::distributed::FragmentId;
 #[cfg(feature = "compat")]
 use crate::thrift::data_sinks;
 
@@ -269,7 +269,7 @@ mod tests {
         IcebergTableInfo, PhysicalTableLayout, ScanSource, StarRocksTabletRef, TableDef,
     };
     use crate::sql::codegen::runtime_filter_lowering::remap_rf_expr_order;
-    use crate::sql::codegen::{FragmentEdgeKind, fallback_audit, nodes};
+    use crate::sql::codegen::{fallback_audit, nodes};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer;
     use crate::sql::optimizer::operator::{
@@ -283,6 +283,7 @@ mod tests {
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::Statistics;
+    use crate::sql::planner::distributed::{FragmentEdgeKind, PartitionKind};
     use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use crate::sql::planner::optimizer_bridge::scalar::{
         intern_exprs, intern_project_items, intern_sort_items, intern_window_exprs,
@@ -290,8 +291,8 @@ mod tests {
     use crate::sql::planner::payload::WindowExpr;
     use crate::sql::planner::{
         ChangeStreamWriteBranchSpec, ChangeStreamWriteDagSpec, IcebergWriteFragmentSink,
-        IcebergWriteInputBinding, IcebergWriteSinkSpec, PartitionKind,
-        with_iceberg_change_stream_write, with_iceberg_write_sink,
+        IcebergWriteInputBinding, IcebergWriteSinkSpec, with_iceberg_change_stream_write,
+        with_iceberg_write_sink,
     };
     use crate::thrift::{exprs, plan_nodes};
 
@@ -2125,11 +2126,11 @@ mod tests {
         assert_eq!(build.edges.len(), 1);
         assert!(matches!(
             build.edges[0].edge_kind,
-            crate::sql::codegen::FragmentEdgeKind::Stream
+            crate::sql::planner::distributed::FragmentEdgeKind::Stream
         ));
         assert_eq!(
             build.edges[0].stream_kind,
-            crate::sql::codegen::FragmentStreamKind::Gather
+            crate::sql::planner::distributed::FragmentStreamKind::Gather
         );
 
         let root = build
@@ -2335,11 +2336,11 @@ mod tests {
         assert_eq!(build.edges.len(), 1);
         assert!(matches!(
             build.edges[0].edge_kind,
-            crate::sql::codegen::FragmentEdgeKind::Stream
+            crate::sql::planner::distributed::FragmentEdgeKind::Stream
         ));
         assert_eq!(
             build.edges[0].stream_kind,
-            crate::sql::codegen::FragmentStreamKind::Broadcast
+            crate::sql::planner::distributed::FragmentStreamKind::Broadcast
         );
         assert!(matches!(
             build.edges[0].output_partition.kind,
@@ -2714,7 +2715,10 @@ mod tests {
         assert!(build.edges.iter().any(|e| {
             e.target_fragment_id == outer_gather_frag_id
                 && e.source_fragment_id != outer_gather_frag_id
-                && matches!(e.edge_kind, crate::sql::codegen::FragmentEdgeKind::Stream)
+                && matches!(
+                    e.edge_kind,
+                    crate::sql::planner::distributed::FragmentEdgeKind::Stream
+                )
         }));
     }
 
@@ -2746,7 +2750,7 @@ mod tests {
         let edge = build.edges.first().expect("stream edge");
         assert_eq!(
             edge.stream_kind,
-            crate::sql::codegen::FragmentStreamKind::Partitioned
+            crate::sql::planner::distributed::FragmentStreamKind::Partitioned
         );
         assert!(matches!(edge.output_partition.kind, PartitionKind::Hash));
         assert_eq!(edge.output_partition.exprs.len(), 1);
@@ -3407,7 +3411,7 @@ mod tests {
         let edge = build.edges.first().expect("hash stream edge");
         assert_eq!(
             edge.stream_kind,
-            crate::sql::codegen::FragmentStreamKind::Partitioned
+            crate::sql::planner::distributed::FragmentStreamKind::Partitioned
         );
         assert!(matches!(edge.output_partition.kind, PartitionKind::Hash));
         assert_eq!(edge.output_partition.exprs.len(), 1);

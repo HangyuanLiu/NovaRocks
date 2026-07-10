@@ -1201,9 +1201,8 @@ pub(crate) mod chunk;
 #[test]
 fn planner_distributed_and_codegen_do_not_import_optimizer() {
     let mut checked = vec![
-        src_dir().join("sql/planner/plan.rs"),
-        src_dir().join("sql/planner/distributed_fragment.rs"),
-        src_dir().join("sql/planner/distributed_node.rs"),
+        src_dir().join("sql/planner/distributed/fragment.rs"),
+        src_dir().join("sql/planner/distributed/node.rs"),
         src_dir().join("sql/planner/distributed_plan_build.rs"),
     ];
     checked.extend(rs_files(&src_dir().join("sql/codegen")));
@@ -1525,6 +1524,19 @@ fn rust_named_type_declaration_count(text: &str, name: &str) -> usize {
     identifiers
         .windows(2)
         .filter(|tokens| matches!(tokens[0], "struct" | "enum" | "type") && tokens[1] == name)
+        .count()
+}
+
+fn rust_named_function_declaration_count(text: &str, name: &str) -> usize {
+    let production = rust_sanitized_production_text(text);
+    let identifiers = production
+        .split(|ch: char| !is_ident_char(ch))
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+
+    identifiers
+        .windows(2)
+        .filter(|tokens| tokens[0] == "fn" && tokens[1] == name)
         .count()
 }
 
@@ -2082,6 +2094,64 @@ fn rust_canonical_path_is_legacy_planner_owner(canonical: &[String]) -> bool {
     canonical.len() >= 4
         && canonical[..3] == ["crate", "sql", "planner"]
         && legacy_owners.contains(&canonical[3].as_str())
+}
+
+fn rust_canonical_path_is_legacy_distributed_owner(canonical: &[String]) -> bool {
+    canonical.len() >= 4
+        && canonical[..3] == ["crate", "sql", "planner"]
+        && matches!(
+            canonical[3].as_str(),
+            "distributed_node" | "distributed_fragment"
+        )
+}
+
+fn rust_canonical_path_is_planner_root_distributed_core(canonical: &[String]) -> bool {
+    let distributed_core = [
+        "DataPartition",
+        "DataSink",
+        "DistributedNode",
+        "DistributedNodeKind",
+        "DistributedPlan",
+        "ExchangeFlavor",
+        "ExchangeReceiver",
+        "FragmentEdge",
+        "FragmentEdgeKind",
+        "FragmentId",
+        "FragmentStreamKind",
+        "PartitionKind",
+        "PlanFragment",
+        "distributed_kind_from_physical",
+        "distributed_kind_to_physical",
+    ];
+    canonical.len() == 4
+        && canonical[..3] == ["crate", "sql", "planner"]
+        && distributed_core.contains(&canonical[3].as_str())
+}
+
+fn rust_canonical_path_is_codegen_edge_topology(canonical: &[String]) -> bool {
+    let edge_topology = [
+        "FragmentEdge",
+        "FragmentEdgeKind",
+        "FragmentId",
+        "FragmentStreamKind",
+    ];
+    canonical.len() == 4
+        && canonical[..3] == ["crate", "sql", "codegen"]
+        && edge_topology.contains(&canonical[3].as_str())
+}
+
+fn rust_scoped_use_violates_distributed_owner(
+    import: &RustScopedUseStatement,
+    source_rel: &str,
+) -> bool {
+    let Some(canonical) =
+        rust_canonical_use_segments_in_scope(&import.import, source_rel, &import.inline_modules)
+    else {
+        return false;
+    };
+    rust_canonical_path_is_legacy_distributed_owner(&canonical)
+        || rust_canonical_path_is_planner_root_distributed_core(&canonical)
+        || rust_canonical_path_is_codegen_edge_topology(&canonical)
 }
 
 fn rust_use_imports_legacy_planner_owner(import: &str, source_rel: &str) -> bool {
@@ -2768,6 +2838,43 @@ mod nested {
 }
 
 #[test]
+fn planner_distributed_owner_detector_covers_paths_aliases_scopes_and_tests() {
+    let source_rel = "src/sql/planner/distributed/node.rs";
+    for source in [
+        "use crate::sql::planner::DistributedPlan;",
+        "use crate::sql::planner::{DataPartition, DistributedPlan};",
+        "use crate::sql::planner as planner_root; use planner_root::DistributedPlan;",
+        "use super::super::distributed_node::DistributedNode;",
+        "mod nested { use super::super::super::distributed_fragment::DataPartition; }",
+        "use crate::sql::codegen::{FragmentEdge, FragmentId};",
+    ] {
+        let imports = rust_production_scoped_use_statements(source);
+        assert!(
+            imports
+                .iter()
+                .any(|import| rust_scoped_use_violates_distributed_owner(import, source_rel)),
+            "distributed owner bypass must be rejected: {source}\n{imports:?}"
+        );
+    }
+
+    for source in [
+        "use super::fragment::DataPartition;",
+        "use crate::sql::planner::distributed::{DataPartition, DistributedPlan};",
+        "use crate::proto::plan::distributed_node::Node;",
+        "mod nested { use super::super::fragment::DataPartition; }",
+        "#[cfg(test)] mod tests { use crate::sql::planner::DistributedPlan; }",
+    ] {
+        let imports = rust_production_scoped_use_statements(source);
+        assert!(
+            !imports
+                .iter()
+                .any(|import| rust_scoped_use_violates_distributed_owner(import, source_rel)),
+            "stage-owned, unrelated, or test-only path must remain allowed: {source}\n{imports:?}"
+        );
+    }
+}
+
+#[test]
 fn planner_logical_builder_is_owned_by_logical_stage() {
     let repo = Path::new(manifest_dir());
     let expected_files = [
@@ -3139,6 +3246,338 @@ fn planner_physical_stage_has_single_namespace() {
         rust_production_use_statements(&root_runtime_filter)
             .contains(&"private|crate::sql::planner::physical::JoinExecutionMode".to_string()),
         "root runtime_filter.rs must explicitly import physical JoinExecutionMode"
+    );
+}
+
+#[test]
+fn planner_distributed_core_has_stage_namespace() {
+    let repo = Path::new(manifest_dir());
+    let planner = repo.join("src/sql/planner");
+    for relative in [
+        "distributed/mod.rs",
+        "distributed/node.rs",
+        "distributed/fragment.rs",
+    ] {
+        let path = planner.join(relative);
+        assert!(
+            path.is_file(),
+            "missing distributed stage owner: {}",
+            rel(&path)
+        );
+    }
+    for relative in ["distributed_node.rs", "distributed_fragment.rs"] {
+        let path = planner.join(relative);
+        assert!(
+            !path.exists(),
+            "legacy distributed stage owner must be deleted: {}",
+            rel(&path)
+        );
+    }
+    assert!(
+        planner.join("distributed_plan_build.rs").is_file(),
+        "root distributed_plan_build.rs must remain until PDB-2 M2c"
+    );
+
+    let fragment_path = planner.join("distributed/fragment.rs");
+    let node_path = planner.join("distributed/node.rs");
+    let mod_path = planner.join("distributed/mod.rs");
+    let fragment = fs::read_to_string(&fragment_path).unwrap();
+    let node = fs::read_to_string(&node_path).unwrap();
+    let distributed_mod = fs::read_to_string(&mod_path).unwrap();
+    let planner_sources = rs_files(&planner)
+        .into_iter()
+        .map(|path| {
+            let text = fs::read_to_string(&path).unwrap();
+            (path, text)
+        })
+        .collect::<Vec<_>>();
+
+    for (owner, items) in [
+        (
+            &fragment_path,
+            &[
+                "PartitionKind",
+                "DataPartition",
+                "DataSink",
+                "PlanFragment",
+                "DistributedPlan",
+                "FragmentId",
+                "FragmentEdgeKind",
+                "FragmentStreamKind",
+                "FragmentEdge",
+            ][..],
+        ),
+        (
+            &node_path,
+            &[
+                "ExchangeReceiver",
+                "ExchangeFlavor",
+                "DistributedNodeKind",
+                "DistributedNode",
+            ][..],
+        ),
+    ] {
+        for item in items {
+            let declarations = planner_sources
+                .iter()
+                .filter_map(|(path, text)| {
+                    let count = rust_named_type_declaration_count(text, item);
+                    (count > 0).then(|| format!("{} ({count})", rel(path)))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                declarations,
+                vec![format!("{} (1)", rel(owner))],
+                "{item} must have exactly one declaration in its distributed owner"
+            );
+        }
+    }
+    for function in [
+        "distributed_kind_from_physical",
+        "distributed_kind_to_physical",
+    ] {
+        let declarations = planner_sources
+            .iter()
+            .filter_map(|(path, text)| {
+                let count = rust_named_function_declaration_count(text, function);
+                (count > 0).then(|| format!("{} ({count})", rel(path)))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            declarations,
+            vec![format!("{} (1)", rel(&node_path))],
+            "{function} must be uniquely declared in distributed/node.rs"
+        );
+    }
+
+    for item in [
+        "FragmentId",
+        "FragmentEdgeKind",
+        "FragmentStreamKind",
+        "FragmentEdge",
+    ] {
+        let declarations = rs_files(&repo.join("src/sql/codegen"))
+            .into_iter()
+            .filter_map(|path| {
+                let text = fs::read_to_string(&path).unwrap();
+                let count = rust_named_type_declaration_count(&text, item);
+                (count > 0).then(|| format!("{} ({count})", rel(&path)))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            declarations.is_empty(),
+            "codegen must not own distributed edge topology type {item}: {declarations:?}"
+        );
+    }
+
+    assert_eq!(
+        module_declarations(&distributed_mod),
+        BTreeSet::from(["fragment".to_string(), "node".to_string()]),
+        "distributed/mod.rs must declare exactly fragment and node"
+    );
+    for declaration in ["mod fragment;", "mod node;"] {
+        assert!(
+            has_non_comment_line(&distributed_mod, declaration),
+            "distributed/mod.rs must contain `{declaration}`"
+        );
+    }
+    assert_eq!(
+        rust_production_use_statements(&distributed_mod)
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "pub(crate)|fragment::DataPartition".to_string(),
+            "pub(crate)|fragment::DataSink".to_string(),
+            "pub(crate)|fragment::DistributedPlan".to_string(),
+            "pub(crate)|fragment::FragmentEdge".to_string(),
+            "pub(crate)|fragment::FragmentEdgeKind".to_string(),
+            "pub(crate)|fragment::FragmentId".to_string(),
+            "pub(crate)|fragment::FragmentStreamKind".to_string(),
+            "pub(crate)|fragment::PartitionKind".to_string(),
+            "pub(crate)|fragment::PlanFragment".to_string(),
+            "pub(crate)|node::DistributedNode".to_string(),
+            "pub(crate)|node::DistributedNodeKind".to_string(),
+            "pub(crate)|node::ExchangeFlavor".to_string(),
+            "pub(crate)|node::ExchangeReceiver".to_string(),
+            "pub(crate)|node::distributed_kind_from_physical".to_string(),
+            "pub(crate)|node::distributed_kind_to_physical".to_string(),
+        ]),
+        "distributed/mod.rs must expose exactly the distributed core surface"
+    );
+
+    let facade_path = planner.join("mod.rs");
+    let facade = fs::read_to_string(&facade_path).unwrap();
+    assert!(has_non_comment_line(&facade, "pub(crate) mod distributed;"));
+    assert!(!has_module_declaration(&facade, "distributed_node"));
+    assert!(!has_module_declaration(&facade, "distributed_fragment"));
+    assert!(has_module_declaration(&facade, "distributed_plan_build"));
+    let facade_uses = rust_production_use_statements(&facade);
+    assert!(
+        facade_uses
+            .contains(&"pub(crate)|distributed_plan_build::build_distributed_plan".to_string())
+            && facade_uses.contains(
+                &"pub(crate)|distributed_plan_build::union_distinct_must_be_rewritten_error"
+                    .to_string()
+            ),
+        "planner facade must retain the two root distributed builder entries: {facade_uses:?}"
+    );
+    assert!(
+        !facade_uses
+            .iter()
+            .any(|import| rust_use_imports_stage(import, "distributed")),
+        "planner facade must not flatten distributed core items: {facade_uses:?}"
+    );
+
+    let distributed_core = [
+        "DataPartition",
+        "DataSink",
+        "DistributedNode",
+        "DistributedNodeKind",
+        "DistributedPlan",
+        "ExchangeFlavor",
+        "ExchangeReceiver",
+        "FragmentEdge",
+        "FragmentEdgeKind",
+        "FragmentId",
+        "FragmentStreamKind",
+        "PartitionKind",
+        "PlanFragment",
+        "distributed_kind_from_physical",
+        "distributed_kind_to_physical",
+    ];
+    let codegen_edge_topology = [
+        "FragmentEdge",
+        "FragmentEdgeKind",
+        "FragmentId",
+        "FragmentStreamKind",
+    ];
+    for path in rs_files(&src_dir()) {
+        let text = fs::read_to_string(&path).unwrap();
+        let production = rust_sanitized_production_text(&text);
+        let compact = compact_line(&production);
+        let scoped_imports = rust_production_scoped_use_statements(&text);
+        for import in &scoped_imports {
+            assert!(
+                !rust_scoped_use_violates_distributed_owner(import, &rel(&path)),
+                "distributed owner bypass remains in {}: {import:?}",
+                rel(&path)
+            );
+            if rel(&path).starts_with("src/sql/codegen/") && rust_use_is_public(&import.import) {
+                let canonical = rust_canonical_use_segments_in_scope(
+                    &import.import,
+                    &rel(&path),
+                    &import.inline_modules,
+                )
+                .unwrap_or_default();
+                assert!(
+                    !canonical.starts_with(&[
+                        "crate".to_string(),
+                        "sql".to_string(),
+                        "planner".to_string(),
+                        "distributed".to_string(),
+                    ]),
+                    "codegen must consume distributed core directly, not re-export it in {}: {import:?}",
+                    rel(&path)
+                );
+            }
+        }
+        assert!(
+            !compact.contains("crate::sql::planner::distributed_node")
+                && !compact.contains("crate::sql::planner::distributed_fragment"),
+            "legacy distributed owner path remains in {}",
+            rel(&path)
+        );
+        for item in distributed_core {
+            assert!(
+                !compact.contains(&format!("crate::sql::planner::{item}")),
+                "fully-qualified planner root distributed path remains in {}: {item}",
+                rel(&path)
+            );
+        }
+        for item in codegen_edge_topology {
+            assert!(
+                !compact.contains(&format!("crate::sql::codegen::{item}")),
+                "fully-qualified codegen edge topology path remains in {}: {item}",
+                rel(&path)
+            );
+        }
+    }
+
+    for path in rs_files(&planner.join("distributed")) {
+        let text = fs::read_to_string(&path).unwrap();
+        let production = rust_sanitized_production_text(&text);
+        let compact = compact_line(&production);
+        let scoped_imports = rust_production_scoped_use_statements(&text);
+        for import in &scoped_imports {
+            let canonical = rust_canonical_use_segments_in_scope(
+                &import.import,
+                &rel(&path),
+                &import.inline_modules,
+            )
+            .unwrap_or_default();
+            assert!(
+                !(canonical.starts_with(&[
+                    "crate".to_string(),
+                    "sql".to_string(),
+                    "optimizer".to_string(),
+                ]) || canonical.starts_with(&[
+                    "crate".to_string(),
+                    "sql".to_string(),
+                    "codegen".to_string(),
+                ]) || canonical.starts_with(&[
+                    "crate".to_string(),
+                    "sql".to_string(),
+                    "planner".to_string(),
+                    "logical".to_string(),
+                    "build".to_string(),
+                ])),
+                "distributed production has forbidden stage dependency in {}: {import:?}",
+                rel(&path)
+            );
+        }
+        assert!(
+            !compact.contains("crate::sql::optimizer")
+                && !compact.contains("crate::sql::codegen")
+                && !compact.contains("crate::sql::planner::logical::build"),
+            "distributed production has forbidden fully-qualified dependency in {}",
+            rel(&path)
+        );
+    }
+    for stage in ["physical", "logical"] {
+        for path in rs_files(&planner.join(stage)) {
+            let text = fs::read_to_string(&path).unwrap();
+            let production = rust_sanitized_production_text(&text);
+            let imports = rust_production_use_statements(&text);
+            assert!(
+                !imports
+                    .iter()
+                    .any(|import| rust_use_imports_stage(import, "distributed"))
+                    && !compact_line(&production).contains("planner::distributed"),
+                "{stage} production must not import distributed owner in {}: {imports:?}",
+                rel(&path)
+            );
+        }
+    }
+
+    assert!(
+        nidl_e4_struct_has_code_line(&fragment, "pub(crate) struct FragmentEdge {", |line| {
+            compact_line(line) == "puboutput_partition:DataPartition,"
+        }),
+        "distributed FragmentEdge must carry native DataPartition output_partition"
+    );
+    assert!(
+        !rust_production_use_statements(&fragment)
+            .iter()
+            .any(|import| rust_use_imports_stage(import, "codegen")),
+        "distributed fragment owner must not import codegen: {:?}",
+        rust_production_use_statements(&fragment)
+    );
+    assert!(
+        !rust_production_use_statements(&node)
+            .iter()
+            .any(|import| rust_use_imports_stage(import, "codegen")),
+        "distributed node owner must not import codegen: {:?}",
+        rust_production_use_statements(&node)
     );
 }
 
@@ -3520,7 +3959,7 @@ fn build_distributed_plan_signature_is_planner_typed() {
 
 #[test]
 fn distributed_plan_node_has_no_optimizer_payloads() {
-    let file = src_dir().join("sql/planner/distributed_node.rs");
+    let file = src_dir().join("sql/planner/distributed/node.rs");
     let violations = non_test_optimizer_refs(&file)
         .into_iter()
         .map(|(line, text)| format!("{}:{}: {}", rel(&file), line, text))
@@ -6258,15 +6697,17 @@ fn nidl_d3k_native_dynamic_sink_partition_does_not_roundtrip_thrift_partition() 
         }
     }
 
-    let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/mod.rs")).unwrap();
-    if !codegen_mod.contains("pub output_partition: crate::sql::planner::DataPartition") {
+    let fragment =
+        fs::read_to_string(repo.join("src/sql/planner/distributed/fragment.rs")).unwrap();
+    if !fragment.contains("pub output_partition: DataPartition") {
         violations.push(
-            "src/sql/codegen/mod.rs: FragmentEdge must carry native output_partition".to_string(),
+            "src/sql/planner/distributed/fragment.rs: FragmentEdge must carry native output_partition"
+                .to_string(),
         );
     }
-    if codegen_mod.contains("pub compat_output_partition: partitions::TDataPartition") {
+    if fragment.contains("pub compat_output_partition: partitions::TDataPartition") {
         violations.push(
-            "src/sql/codegen/mod.rs: FragmentEdge must no longer carry compat TDataPartition in planner IR"
+            "src/sql/planner/distributed/fragment.rs: FragmentEdge must no longer carry compat TDataPartition in planner IR"
                 .to_string(),
         );
     }
@@ -8333,8 +8774,8 @@ fn nidl_e3_planner_ir_uses_native_partition_and_runtime_filter_types() {
     let mut violations = Vec::new();
 
     for source in [
-        "src/sql/planner/distributed_fragment.rs",
-        "src/sql/planner/distributed_node.rs",
+        "src/sql/planner/distributed/fragment.rs",
+        "src/sql/planner/distributed/node.rs",
         "src/sql/planner/distributed_plan_build.rs",
         "src/sql/planner/runtime_filter.rs",
         "src/sql/planner/write_plan.rs",

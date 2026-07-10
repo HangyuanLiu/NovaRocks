@@ -707,11 +707,11 @@ mod tests {
     }
 
     fn values_distributed_node(
-        fragment_id: crate::sql::codegen::FragmentId,
+        fragment_id: crate::sql::planner::distributed::FragmentId,
         node_id: i32,
         output: Vec<crate::sql::analysis::OutputColumn>,
-    ) -> crate::sql::planner::DistributedNode {
-        crate::sql::planner::DistributedNode {
+    ) -> crate::sql::planner::distributed::DistributedNode {
+        crate::sql::planner::distributed::DistributedNode {
             node_id,
             fragment_id,
             tuple_ids: vec![node_id],
@@ -721,7 +721,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
-            payload: crate::sql::planner::DistributedNodeKind::Values(
+            payload: crate::sql::planner::distributed::DistributedNodeKind::Values(
                 crate::sql::planner::payload::PlanValuesNode {
                     rows: vec![vec![int_expr(7)]],
                     columns: output,
@@ -784,21 +784,21 @@ mod tests {
     #[test]
     fn distributed_plan_encoder_round_trips_fragments_edges_partitions_and_exchange() {
         let output = vec![planner_output_column(10, "v", DataType::Int64)];
-        let source = crate::sql::planner::PlanFragment {
+        let source = crate::sql::planner::distributed::PlanFragment {
             fragment_id: 0,
             root: values_distributed_node(0, 11, output.clone()),
-            data_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            output_partition: crate::sql::planner::DataPartition {
-                kind: crate::sql::planner::PartitionKind::Hash,
+            data_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+            output_partition: crate::sql::planner::distributed::DataPartition {
+                kind: crate::sql::planner::distributed::PartitionKind::Hash,
                 exprs: vec![column_expr(10, "v", DataType::Int64)],
             },
-            sink: crate::sql::planner::DataSink::Noop,
+            sink: crate::sql::planner::distributed::DataSink::Noop,
             output_exprs: None,
             output_columns: output.clone(),
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
         };
-        let receiver = crate::sql::planner::DistributedNode {
+        let receiver = crate::sql::planner::distributed::DistributedNode {
             node_id: 42,
             fragment_id: 1,
             tuple_ids: vec![42],
@@ -808,44 +808,42 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
-            payload: crate::sql::planner::DistributedNodeKind::Exchange(
-                crate::sql::planner::ExchangeReceiver {
-                    partition: crate::sql::planner::DataPartition::hash(vec![column_expr(
-                        10,
-                        "v",
-                        DataType::Int64,
-                    )]),
+            payload: crate::sql::planner::distributed::DistributedNodeKind::Exchange(
+                crate::sql::planner::distributed::ExchangeReceiver {
+                    partition: crate::sql::planner::distributed::DataPartition::hash(vec![
+                        column_expr(10, "v", DataType::Int64),
+                    ]),
                     source_fragment_id: 0,
                     output_columns: output.clone(),
                     output_qualifier: Some("recv".to_string()),
-                    flavor: crate::sql::planner::ExchangeFlavor::Distribution,
+                    flavor: crate::sql::planner::distributed::ExchangeFlavor::Distribution,
                 },
             ),
         };
-        let target = crate::sql::planner::PlanFragment {
+        let target = crate::sql::planner::distributed::PlanFragment {
             fragment_id: 1,
             root: receiver,
-            data_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            output_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            sink: crate::sql::planner::DataSink::Result,
+            data_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+            output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+            sink: crate::sql::planner::distributed::DataSink::Result,
             output_exprs: Some(vec![column_expr(10, "v", DataType::Int64)]),
             output_columns: output,
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
         };
-        let plan = crate::sql::planner::DistributedPlan {
+        let plan = crate::sql::planner::distributed::DistributedPlan {
             fragments: vec![source, target],
             root_fragment_id: 1,
-            edges: vec![crate::sql::codegen::FragmentEdge {
+            edges: vec![crate::sql::planner::distributed::FragmentEdge {
                 source_fragment_id: 0,
                 target_fragment_id: 1,
                 target_exchange_node_id: 42,
-                output_partition: crate::sql::planner::DataPartition {
-                    kind: crate::sql::planner::PartitionKind::Hash,
+                output_partition: crate::sql::planner::distributed::DataPartition {
+                    kind: crate::sql::planner::distributed::PartitionKind::Hash,
                     exprs: vec![column_expr(10, "v", DataType::Int64)],
                 },
-                stream_kind: crate::sql::codegen::FragmentStreamKind::Partitioned,
-                edge_kind: crate::sql::codegen::FragmentEdgeKind::Stream,
+                stream_kind: crate::sql::planner::distributed::FragmentStreamKind::Partitioned,
+                edge_kind: crate::sql::planner::distributed::FragmentEdgeKind::Stream,
                 output_slot_ids: vec![10],
             }],
         };
@@ -900,7 +898,7 @@ mod tests {
             planner_output_column(3, "array1", DataType::Int64),
         ];
         let stream_columns = vec![all_scan_columns[1].clone(), all_scan_columns[2].clone()];
-        let source_root = crate::sql::planner::DistributedNode {
+        let source_root = crate::sql::planner::distributed::DistributedNode {
             node_id: 11,
             fragment_id: 0,
             tuple_ids: vec![11],
@@ -910,7 +908,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
-            payload: crate::sql::planner::DistributedNodeKind::Scan(
+            payload: crate::sql::planner::distributed::DistributedNodeKind::Scan(
                 crate::sql::planner::payload::PlanScanNode {
                     database: "db".to_string(),
                     table: iceberg_scan_table_for_columns(&["v1", "s2", "array1"]),
@@ -923,18 +921,18 @@ mod tests {
                 },
             ),
         };
-        let source = crate::sql::planner::PlanFragment {
+        let source = crate::sql::planner::distributed::PlanFragment {
             fragment_id: 0,
             root: source_root,
-            data_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            output_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            sink: crate::sql::planner::DataSink::Noop,
+            data_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+            output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+            sink: crate::sql::planner::distributed::DataSink::Noop,
             output_exprs: None,
             output_columns: stream_columns.clone(),
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
         };
-        let receiver = crate::sql::planner::DistributedNode {
+        let receiver = crate::sql::planner::distributed::DistributedNode {
             node_id: 42,
             fragment_id: 1,
             tuple_ids: vec![42],
@@ -944,37 +942,37 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
-            payload: crate::sql::planner::DistributedNodeKind::Exchange(
-                crate::sql::planner::ExchangeReceiver {
-                    partition: crate::sql::planner::DataPartition::unpartitioned(),
+            payload: crate::sql::planner::distributed::DistributedNodeKind::Exchange(
+                crate::sql::planner::distributed::ExchangeReceiver {
+                    partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
                     source_fragment_id: 0,
                     output_columns: Vec::new(),
                     output_qualifier: None,
-                    flavor: crate::sql::planner::ExchangeFlavor::Distribution,
+                    flavor: crate::sql::planner::distributed::ExchangeFlavor::Distribution,
                 },
             ),
         };
-        let target = crate::sql::planner::PlanFragment {
+        let target = crate::sql::planner::distributed::PlanFragment {
             fragment_id: 1,
             root: receiver,
-            data_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            output_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            sink: crate::sql::planner::DataSink::Result,
+            data_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+            output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+            sink: crate::sql::planner::distributed::DataSink::Result,
             output_exprs: None,
             output_columns: Vec::new(),
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
         };
-        let plan = crate::sql::planner::DistributedPlan {
+        let plan = crate::sql::planner::distributed::DistributedPlan {
             fragments: vec![source, target],
             root_fragment_id: 1,
-            edges: vec![crate::sql::codegen::FragmentEdge {
+            edges: vec![crate::sql::planner::distributed::FragmentEdge {
                 source_fragment_id: 0,
                 target_fragment_id: 1,
                 target_exchange_node_id: 42,
-                output_partition: crate::sql::planner::DataPartition::unpartitioned(),
-                stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
-                edge_kind: crate::sql::codegen::FragmentEdgeKind::Stream,
+                output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+                stream_kind: crate::sql::planner::distributed::FragmentStreamKind::Gather,
+                edge_kind: crate::sql::planner::distributed::FragmentEdgeKind::Stream,
                 output_slot_ids: vec![2, 3],
             }],
         };
@@ -1003,7 +1001,7 @@ mod tests {
     #[test]
     fn stream_edge_patches_exchange_columns_from_aggregate_layout_when_fragment_output_is_empty() {
         let group_column = planner_output_column(2, "c1", DataType::Utf8);
-        let source_root = crate::sql::planner::DistributedNode {
+        let source_root = crate::sql::planner::distributed::DistributedNode {
             node_id: 11,
             fragment_id: 0,
             tuple_ids: vec![11],
@@ -1013,8 +1011,8 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: vec![values_distributed_node(0, 10, vec![group_column.clone()])],
             stats: physical_stats(),
-            payload: crate::sql::planner::DistributedNodeKind::HashAggregate(Box::new(
-                crate::sql::planner::physical::PhysicalHashAggregateNode {
+            payload: crate::sql::planner::distributed::DistributedNodeKind::HashAggregate(
+                Box::new(crate::sql::planner::physical::PhysicalHashAggregateNode {
                     mode: crate::sql::planner::physical::AggMode::Local,
                     group_by: vec![column_expr(2, "c1", DataType::Utf8)],
                     aggregates: Vec::new(),
@@ -1024,21 +1022,21 @@ mod tests {
                         Vec::new(),
                     ),
                     output_columns: Vec::new(),
-                },
-            )),
+                }),
+            ),
         };
-        let source = crate::sql::planner::PlanFragment {
+        let source = crate::sql::planner::distributed::PlanFragment {
             fragment_id: 0,
             root: source_root,
-            data_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            output_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            sink: crate::sql::planner::DataSink::Noop,
+            data_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+            output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+            sink: crate::sql::planner::distributed::DataSink::Noop,
             output_exprs: None,
             output_columns: Vec::new(),
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
         };
-        let receiver = crate::sql::planner::DistributedNode {
+        let receiver = crate::sql::planner::distributed::DistributedNode {
             node_id: 42,
             fragment_id: 1,
             tuple_ids: vec![42],
@@ -1048,37 +1046,37 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
-            payload: crate::sql::planner::DistributedNodeKind::Exchange(
-                crate::sql::planner::ExchangeReceiver {
-                    partition: crate::sql::planner::DataPartition::unpartitioned(),
+            payload: crate::sql::planner::distributed::DistributedNodeKind::Exchange(
+                crate::sql::planner::distributed::ExchangeReceiver {
+                    partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
                     source_fragment_id: 0,
                     output_columns: Vec::new(),
                     output_qualifier: None,
-                    flavor: crate::sql::planner::ExchangeFlavor::Distribution,
+                    flavor: crate::sql::planner::distributed::ExchangeFlavor::Distribution,
                 },
             ),
         };
-        let target = crate::sql::planner::PlanFragment {
+        let target = crate::sql::planner::distributed::PlanFragment {
             fragment_id: 1,
             root: receiver,
-            data_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            output_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            sink: crate::sql::planner::DataSink::Result,
+            data_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+            output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+            sink: crate::sql::planner::distributed::DataSink::Result,
             output_exprs: None,
             output_columns: Vec::new(),
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
         };
-        let plan = crate::sql::planner::DistributedPlan {
+        let plan = crate::sql::planner::distributed::DistributedPlan {
             fragments: vec![source, target],
             root_fragment_id: 1,
-            edges: vec![crate::sql::codegen::FragmentEdge {
+            edges: vec![crate::sql::planner::distributed::FragmentEdge {
                 source_fragment_id: 0,
                 target_fragment_id: 1,
                 target_exchange_node_id: 42,
-                output_partition: crate::sql::planner::DataPartition::unpartitioned(),
-                stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
-                edge_kind: crate::sql::codegen::FragmentEdgeKind::Stream,
+                output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+                stream_kind: crate::sql::planner::distributed::FragmentStreamKind::Gather,
+                edge_kind: crate::sql::planner::distributed::FragmentEdgeKind::Stream,
                 output_slot_ids: vec![2],
             }],
         };
@@ -1105,7 +1103,7 @@ mod tests {
         let group_column = planner_output_column(2, "c0", DataType::Int64);
         let value_column = planner_output_column(3, "c1", DataType::Int64);
         let avg_column = planner_output_column(15, "avg(c1)", DataType::Float64);
-        let source_root = crate::sql::planner::DistributedNode {
+        let source_root = crate::sql::planner::distributed::DistributedNode {
             node_id: 11,
             fragment_id: 0,
             tuple_ids: vec![11],
@@ -1119,8 +1117,8 @@ mod tests {
                 vec![group_column.clone(), value_column.clone()],
             )],
             stats: physical_stats(),
-            payload: crate::sql::planner::DistributedNodeKind::HashAggregate(Box::new(
-                crate::sql::planner::physical::PhysicalHashAggregateNode {
+            payload: crate::sql::planner::distributed::DistributedNodeKind::HashAggregate(
+                Box::new(crate::sql::planner::physical::PhysicalHashAggregateNode {
                     mode: crate::sql::planner::physical::AggMode::Local,
                     group_by: vec![column_expr(2, "c0", DataType::Int64)],
                     aggregates: vec![crate::sql::planner::payload::AggregateCall {
@@ -1137,21 +1135,21 @@ mod tests {
                         vec![avg_column.clone()],
                     ),
                     output_columns: Vec::new(),
-                },
-            )),
+                }),
+            ),
         };
-        let source = crate::sql::planner::PlanFragment {
+        let source = crate::sql::planner::distributed::PlanFragment {
             fragment_id: 0,
             root: source_root,
-            data_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            output_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            sink: crate::sql::planner::DataSink::Noop,
+            data_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+            output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+            sink: crate::sql::planner::distributed::DataSink::Noop,
             output_exprs: None,
             output_columns: vec![group_column.clone(), avg_column],
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
         };
-        let receiver = crate::sql::planner::DistributedNode {
+        let receiver = crate::sql::planner::distributed::DistributedNode {
             node_id: 42,
             fragment_id: 1,
             tuple_ids: vec![42],
@@ -1161,37 +1159,37 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
-            payload: crate::sql::planner::DistributedNodeKind::Exchange(
-                crate::sql::planner::ExchangeReceiver {
-                    partition: crate::sql::planner::DataPartition::unpartitioned(),
+            payload: crate::sql::planner::distributed::DistributedNodeKind::Exchange(
+                crate::sql::planner::distributed::ExchangeReceiver {
+                    partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
                     source_fragment_id: 0,
                     output_columns: Vec::new(),
                     output_qualifier: None,
-                    flavor: crate::sql::planner::ExchangeFlavor::Distribution,
+                    flavor: crate::sql::planner::distributed::ExchangeFlavor::Distribution,
                 },
             ),
         };
-        let target = crate::sql::planner::PlanFragment {
+        let target = crate::sql::planner::distributed::PlanFragment {
             fragment_id: 1,
             root: receiver,
-            data_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            output_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            sink: crate::sql::planner::DataSink::Result,
+            data_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+            output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+            sink: crate::sql::planner::distributed::DataSink::Result,
             output_exprs: None,
             output_columns: Vec::new(),
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
         };
-        let plan = crate::sql::planner::DistributedPlan {
+        let plan = crate::sql::planner::distributed::DistributedPlan {
             fragments: vec![source, target],
             root_fragment_id: 1,
-            edges: vec![crate::sql::codegen::FragmentEdge {
+            edges: vec![crate::sql::planner::distributed::FragmentEdge {
                 source_fragment_id: 0,
                 target_fragment_id: 1,
                 target_exchange_node_id: 42,
-                output_partition: crate::sql::planner::DataPartition::unpartitioned(),
-                stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
-                edge_kind: crate::sql::codegen::FragmentEdgeKind::Stream,
+                output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+                stream_kind: crate::sql::planner::distributed::FragmentStreamKind::Gather,
+                edge_kind: crate::sql::planner::distributed::FragmentEdgeKind::Stream,
                 output_slot_ids: vec![2, 15],
             }],
         };
@@ -1222,18 +1220,18 @@ mod tests {
 
     #[test]
     fn stream_edge_allows_zero_column_source_when_no_slots_are_requested() {
-        let source = crate::sql::planner::PlanFragment {
+        let source = crate::sql::planner::distributed::PlanFragment {
             fragment_id: 0,
             root: values_distributed_node(0, 10, Vec::new()),
-            data_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            output_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            sink: crate::sql::planner::DataSink::Noop,
+            data_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+            output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+            sink: crate::sql::planner::distributed::DataSink::Noop,
             output_exprs: None,
             output_columns: Vec::new(),
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
         };
-        let receiver = crate::sql::planner::DistributedNode {
+        let receiver = crate::sql::planner::distributed::DistributedNode {
             node_id: 42,
             fragment_id: 1,
             tuple_ids: vec![42],
@@ -1243,37 +1241,37 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
-            payload: crate::sql::planner::DistributedNodeKind::Exchange(
-                crate::sql::planner::ExchangeReceiver {
-                    partition: crate::sql::planner::DataPartition::unpartitioned(),
+            payload: crate::sql::planner::distributed::DistributedNodeKind::Exchange(
+                crate::sql::planner::distributed::ExchangeReceiver {
+                    partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
                     source_fragment_id: 0,
                     output_columns: Vec::new(),
                     output_qualifier: None,
-                    flavor: crate::sql::planner::ExchangeFlavor::Distribution,
+                    flavor: crate::sql::planner::distributed::ExchangeFlavor::Distribution,
                 },
             ),
         };
-        let target = crate::sql::planner::PlanFragment {
+        let target = crate::sql::planner::distributed::PlanFragment {
             fragment_id: 1,
             root: receiver,
-            data_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            output_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            sink: crate::sql::planner::DataSink::Result,
+            data_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+            output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+            sink: crate::sql::planner::distributed::DataSink::Result,
             output_exprs: None,
             output_columns: Vec::new(),
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
         };
-        let plan = crate::sql::planner::DistributedPlan {
+        let plan = crate::sql::planner::distributed::DistributedPlan {
             fragments: vec![source, target],
             root_fragment_id: 1,
-            edges: vec![crate::sql::codegen::FragmentEdge {
+            edges: vec![crate::sql::planner::distributed::FragmentEdge {
                 source_fragment_id: 0,
                 target_fragment_id: 1,
                 target_exchange_node_id: 42,
-                output_partition: crate::sql::planner::DataPartition::unpartitioned(),
-                stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
-                edge_kind: crate::sql::codegen::FragmentEdgeKind::Stream,
+                output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+                stream_kind: crate::sql::planner::distributed::FragmentStreamKind::Gather,
+                edge_kind: crate::sql::planner::distributed::FragmentEdgeKind::Stream,
                 output_slot_ids: Vec::new(),
             }],
         };
@@ -1318,12 +1316,12 @@ mod tests {
             planner_output_column(7, "g0", DataType::Int64),
             planner_output_column(7, "g1", DataType::Int64),
         ];
-        let fragment = crate::sql::planner::PlanFragment {
+        let fragment = crate::sql::planner::distributed::PlanFragment {
             fragment_id: 0,
             root: values_distributed_node(0, 11, repeated_input.clone()),
-            data_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            output_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            sink: crate::sql::planner::DataSink::IcebergWrite(
+            data_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+            output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+            sink: crate::sql::planner::distributed::DataSink::IcebergWrite(
                 crate::sql::planner::IcebergWriteFragmentSink {
                     descriptor_database: "db".to_string(),
                     spec: sink_spec,
@@ -1416,7 +1414,7 @@ mod tests {
                 binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
             },
         };
-        let scan = crate::sql::planner::DistributedNode {
+        let scan = crate::sql::planner::distributed::DistributedNode {
             node_id: 7,
             fragment_id: 0,
             tuple_ids: Vec::new(),
@@ -1426,7 +1424,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
-            payload: crate::sql::planner::DistributedNodeKind::Scan(
+            payload: crate::sql::planner::distributed::DistributedNodeKind::Scan(
                 crate::sql::planner::payload::PlanScanNode {
                     database: "db".to_string(),
                     table,
@@ -1513,7 +1511,7 @@ mod tests {
                 binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
             },
         };
-        let scan = crate::sql::planner::DistributedNode {
+        let scan = crate::sql::planner::distributed::DistributedNode {
             node_id: 7,
             fragment_id: 0,
             tuple_ids: Vec::new(),
@@ -1523,7 +1521,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
-            payload: crate::sql::planner::DistributedNodeKind::Scan(
+            payload: crate::sql::planner::distributed::DistributedNodeKind::Scan(
                 crate::sql::planner::payload::PlanScanNode {
                     database: "db".to_string(),
                     table,
@@ -1553,7 +1551,7 @@ mod tests {
 
     #[test]
     fn native_plan_encoder_rejects_starrocks_scan_source() {
-        let scan = crate::sql::planner::DistributedNode {
+        let scan = crate::sql::planner::distributed::DistributedNode {
             node_id: 7,
             fragment_id: 0,
             tuple_ids: Vec::new(),
@@ -1563,7 +1561,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
-            payload: crate::sql::planner::DistributedNodeKind::Scan(
+            payload: crate::sql::planner::distributed::DistributedNodeKind::Scan(
                 crate::sql::planner::payload::PlanScanNode {
                     database: "db".to_string(),
                     table: crate::sql::catalog::TableDef {

@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::sql::optimizer::OptimizerPhysicalNode;
-use crate::sql::planner::DistributedPlan;
+use crate::sql::planner::distributed::DistributedPlan;
 
 use super::id_binding::verify_optimizer_id_binding;
 use super::physical::optimizer_physical_to_plan;
@@ -45,7 +45,7 @@ mod tests {
     };
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::Statistics;
-    use crate::sql::planner::DistributedNode;
+    use crate::sql::planner::distributed::DistributedNode;
     use crate::sql::planner::optimizer_bridge::scalar::{intern_project_items, intern_typed};
     use arrow::datatypes::DataType;
     use std::sync::Arc;

@@ -17,7 +17,7 @@
 // under the License.
 
 use crate::sql::analysis::TypedExpr;
-use crate::sql::codegen::FragmentId;
+use crate::sql::planner::distributed::FragmentId;
 use crate::sql::planner::physical::JoinExecutionMode;
 
 #[derive(Clone, Debug)]

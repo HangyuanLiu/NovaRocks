@@ -17,10 +17,11 @@
 
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{OutputColumn, TypedExpr};
-use crate::sql::codegen::FragmentId;
 use crate::sql::column_id::ColumnId;
 
-use super::distributed_node::DistributedNode;
+use super::node::DistributedNode;
+
+pub(crate) type FragmentId = u32;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum PartitionKind {
@@ -99,9 +100,43 @@ pub(crate) struct PlanFragment {
     pub cte_exchange_nodes: Vec<(CteId, i32, Vec<ColumnId>)>,
 }
 
+/// Result of emitting a multi-fragment plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FragmentEdgeKind {
+    Stream,
+    CteMulticast {
+        cte_id: CteId,
+        receive_producer_column_ids: Vec<ColumnId>,
+    },
+    IcebergChangeStreamRouter {
+        router_group_id: i32,
+        branch_id: i32,
+        branch_kind: crate::sql::common::ChangeStreamBranchKind,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FragmentStreamKind {
+    Gather,
+    Broadcast,
+    Partitioned,
+    Other,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FragmentEdge {
+    pub source_fragment_id: FragmentId,
+    pub target_fragment_id: FragmentId,
+    pub target_exchange_node_id: i32,
+    pub output_partition: DataPartition,
+    pub stream_kind: FragmentStreamKind,
+    pub edge_kind: FragmentEdgeKind,
+    pub output_slot_ids: Vec<i32>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct DistributedPlan {
     pub fragments: Vec<PlanFragment>,
     pub root_fragment_id: FragmentId,
-    pub edges: Vec<crate::sql::codegen::FragmentEdge>,
+    pub edges: Vec<FragmentEdge>,
 }

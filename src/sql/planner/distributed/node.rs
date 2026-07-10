@@ -17,9 +17,7 @@
 
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{OutputColumn, SortItem};
-use crate::sql::codegen::FragmentId;
 use crate::sql::column_id::ColumnId;
-use crate::sql::planner::DataPartition;
 use crate::sql::planner::payload::{
     PlanAssertOneRowNode, PlanFilterNode, PlanGenerateSeriesNode, PlanProjectNode, PlanRepeatNode,
     PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanValuesNode, PlanWindowNode,
@@ -30,6 +28,8 @@ use crate::sql::planner::physical::{
     PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalSetOpNode, PhysicalTopNNode, PlanSetOpKind,
 };
 use crate::sql::planner::runtime_filter::{WiredRuntimeFilterBuild, WiredRuntimeFilterProbe};
+
+use super::fragment::{DataPartition, FragmentId};
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]

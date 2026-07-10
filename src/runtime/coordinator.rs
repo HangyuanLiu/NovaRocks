@@ -65,11 +65,11 @@ use crate::runtime::write_coordinator::{
 use crate::sql::analysis::cte::CteId;
 #[cfg(feature = "compat")]
 use crate::sql::codegen::LoweredFragmentEdge;
-use crate::sql::codegen::{
-    FragmentEdge, FragmentEdgeKind, FragmentId, MultiFragmentBuildResult, RuntimeFilterPlanResult,
-};
+use crate::sql::codegen::{MultiFragmentBuildResult, RuntimeFilterPlanResult};
 use crate::sql::column_id::ColumnId;
-use crate::sql::planner::{DataPartition, PartitionKind};
+use crate::sql::planner::distributed::{
+    DataPartition, FragmentEdge, FragmentEdgeKind, FragmentId, PartitionKind,
+};
 #[cfg(feature = "compat")]
 use crate::thrift::data_sinks;
 #[cfg(feature = "compat")]
@@ -115,7 +115,7 @@ struct CompatEdgeSidecar {
 }
 
 pub(crate) fn prepare_native_plan_sidecars(
-    native_plan: &crate::sql::planner::DistributedPlan,
+    native_plan: &crate::sql::planner::distributed::DistributedPlan,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
 ) -> Result<NativePlanSidecars, String> {
     let encoded = crate::sql::codegen::proto_encode::plan::encode_distributed_plan_with_context(
@@ -3392,8 +3392,8 @@ mod tests {
             source_fragment_id,
             target_fragment_id,
             target_exchange_node_id,
-            output_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
+            output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+            stream_kind: crate::sql::planner::distributed::FragmentStreamKind::Gather,
             edge_kind: FragmentEdgeKind::Stream,
             output_slot_ids: Vec::new(),
         }
@@ -3411,8 +3411,8 @@ mod tests {
             source_fragment_id,
             target_fragment_id,
             target_exchange_node_id,
-            output_partition: crate::sql::planner::DataPartition::unpartitioned(),
-            stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
+            output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+            stream_kind: crate::sql::planner::distributed::FragmentStreamKind::Gather,
             edge_kind: FragmentEdgeKind::IcebergChangeStreamRouter {
                 router_group_id,
                 branch_id,

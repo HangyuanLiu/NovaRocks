@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::sql::analysis::{ExprKind, TypedExpr};
-use crate::sql::codegen::FragmentId;
 use crate::sql::column_id::ColumnId;
+use crate::sql::planner::distributed::FragmentId;
 #[cfg(feature = "compat")]
 use crate::thrift::exprs;
 
