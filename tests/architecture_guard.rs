@@ -1657,12 +1657,12 @@ fn rust_expand_use_list(tokens: &[String], prefix: &[String], paths: &mut Vec<Ru
     }
 }
 
-fn rust_resolve_use_path(
+fn rust_resolve_use_paths(
     path: &[String],
-    aliases: &BTreeMap<String, Vec<String>>,
+    aliases: &BTreeMap<String, Vec<Vec<String>>>,
     resolving: &mut BTreeSet<String>,
     depth: usize,
-) -> Option<Vec<String>> {
+) -> Option<Vec<Vec<String>>> {
     if depth > aliases.len() {
         return None;
     }
@@ -1671,21 +1671,29 @@ fn rust_resolve_use_path(
         .iter()
         .position(|segment| segment != "self" && segment != "super")
     else {
-        return Some(path.to_vec());
+        return Some(vec![path.to_vec()]);
     };
     let owner = &path[owner_index];
-    let Some(target) = aliases.get(owner) else {
-        return Some(path.to_vec());
+    let Some(targets) = aliases.get(owner) else {
+        return Some(vec![path.to_vec()]);
     };
     if !resolving.insert(owner.clone()) {
         return None;
     }
 
-    let resolved = rust_resolve_use_path(target, aliases, resolving, depth + 1);
+    let mut resolved = BTreeSet::new();
+    for target in targets {
+        let Some(target_paths) = rust_resolve_use_paths(target, aliases, resolving, depth + 1)
+        else {
+            continue;
+        };
+        for mut target_path in target_paths {
+            target_path.extend_from_slice(&path[owner_index + 1..]);
+            resolved.insert(target_path);
+        }
+    }
     resolving.remove(owner);
-    let mut resolved = resolved?;
-    resolved.extend_from_slice(&path[owner_index + 1..]);
-    Some(resolved)
+    (!resolved.is_empty()).then(|| resolved.into_iter().collect())
 }
 
 fn rust_production_use_statements(text: &str) -> Vec<String> {
@@ -1740,26 +1748,31 @@ fn rust_production_use_statements(text: &str) -> Vec<String> {
         index = cursor + 1;
     }
 
-    let aliases = raw_imports
-        .iter()
-        .filter_map(|(_, path)| {
-            path.alias
-                .as_ref()
-                .filter(|alias| alias.as_str() != "_")
-                .map(|alias| (alias.clone(), path.segments.clone()))
-        })
-        .collect::<BTreeMap<_, _>>();
+    let mut aliases = BTreeMap::<String, Vec<Vec<String>>>::new();
+    for (_, path) in &raw_imports {
+        let Some(alias) = path.alias.as_ref().filter(|alias| alias.as_str() != "_") else {
+            continue;
+        };
+        let targets = aliases.entry(alias.clone()).or_default();
+        if !targets.contains(&path.segments) {
+            targets.push(path.segments.clone());
+        }
+    }
 
     raw_imports
         .into_iter()
-        .map(|(visibility, path)| {
-            let resolved = rust_resolve_use_path(&path.segments, &aliases, &mut BTreeSet::new(), 0)
-                .unwrap_or(path.segments);
+        .flat_map(|(visibility, path)| {
+            let resolved =
+                rust_resolve_use_paths(&path.segments, &aliases, &mut BTreeSet::new(), 0)
+                    .unwrap_or_else(|| vec![path.segments]);
             let alias = path
                 .alias
                 .map(|alias| format!(" as {alias}"))
                 .unwrap_or_default();
-            format!("{visibility}|{}{alias}", resolved.join("::"))
+            resolved
+                .into_iter()
+                .map(|resolved| format!("{visibility}|{}{alias}", resolved.join("::")))
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -2269,6 +2282,65 @@ use parent::plan::*;
 }
 
 #[test]
+fn planner_ownership_use_parser_conservatively_expands_cross_scope_alias_reuse() {
+    let sources = [
+        r#"
+mod legacy_scope {
+    use crate::sql::planner::plan as owner;
+    use owner::*;
+    use owner as stage;
+    use stage::*;
+}
+mod shared_scope {
+    use crate::sql::planner::payload as owner;
+}
+"#,
+        r#"
+mod shared_scope {
+    use crate::sql::planner::payload as owner;
+}
+mod legacy_scope {
+    use crate::sql::planner::plan as owner;
+    use owner::*;
+    use owner as stage;
+    use stage::*;
+}
+"#,
+    ];
+
+    let actual = sources
+        .into_iter()
+        .map(|source| {
+            let imports = rust_production_use_statements(source);
+            let plan_wildcards = imports
+                .iter()
+                .filter(|import| rust_use_path(import) == "crate::sql::planner::plan::*")
+                .count();
+            let payload_wildcards = imports
+                .iter()
+                .filter(|import| rust_use_path(import) == "crate::sql::planner::payload::*")
+                .count();
+            let stage_targets = imports
+                .iter()
+                .filter(|import| import.ends_with(" as stage"))
+                .map(|import| rust_use_path(import).to_string())
+                .collect::<BTreeSet<_>>();
+            (plan_wildcards, payload_wildcards, stage_targets)
+        })
+        .collect::<Vec<_>>();
+    let expected_targets = BTreeSet::from([
+        "crate::sql::planner::payload".to_string(),
+        "crate::sql::planner::plan".to_string(),
+    ]);
+
+    assert_eq!(
+        actual,
+        vec![(2, 2, expected_targets.clone()), (2, 2, expected_targets),],
+        "the boundary guard conservatively expands every cross-scope alias target; this may restrict legal same-name alias reuse, but a forbidden owner must never be missed"
+    );
+}
+
+#[test]
 fn planner_logical_module_use_surface_is_closed() {
     let expected = vec!["pub(crate)|node::*"];
     assert_eq!(
@@ -2471,7 +2543,7 @@ fn planner_logical_ir_and_payload_have_stage_owners() {
                     && (rust_use_imports_stage(import, "payload")
                         || rust_use_imports_sql_common(import)))
         }),
-        "plan.rs must not import logical IR or re-export shared/common payload: {plan_uses:?}"
+        "plan.rs must not import logical IR or re-export shared/common payload; the boundary guard conservatively expands aliases across lexical scopes and may restrict legal same-name reuse to avoid false negatives: {plan_uses:?}"
     );
 
     let payload = fs::read_to_string(&payload_path).unwrap();
@@ -2576,7 +2648,7 @@ fn planner_logical_ir_and_payload_have_stage_owners() {
             assert_ne!(
                 leaf,
                 "*",
-                "legacy planner::plan wildcard import remains in {}: {import}",
+                "legacy planner::plan wildcard import remains after conservative cross-scope alias expansion in {}: {import}",
                 rel(&path)
             );
             assert!(
