@@ -156,19 +156,19 @@ fn module_declarations(text: &str) -> BTreeSet<String> {
 }
 
 fn planner_namespace_module_declarations(text: &str) -> BTreeSet<String> {
-    let mut declarations = module_declarations(text);
-    declarations.extend(rust_inline_module_declarations(text));
-    declarations
+    rust_module_item_declarations(text)
 }
 
-fn rust_inline_module_declarations(text: &str) -> BTreeSet<String> {
+fn rust_module_item_declarations(text: &str) -> BTreeSet<String> {
     let production = rust_sanitized_production_text(text);
     let tokens = rust_use_tokens(&production);
     tokens
         .windows(3)
         .filter_map(|tokens| {
-            (tokens[0] == "mod" && tokens[1].chars().all(is_ident_char) && tokens[2] == "{")
-                .then(|| tokens[1].clone())
+            (tokens[0] == "mod"
+                && tokens[1].chars().all(is_ident_char)
+                && matches!(tokens[2].as_str(), ";" | "{"))
+            .then(|| tokens[1].clone())
         })
         .collect()
 }
@@ -1274,6 +1274,48 @@ mod tests {
     assert_eq!(
         planner_namespace_module_declarations(source),
         BTreeSet::from(["fragment".to_string(), "node".to_string()])
+    );
+}
+
+#[test]
+fn planner_namespace_module_item_parser_covers_visibility_attributes_and_layout() {
+    let source = r#"
+mod private_external;
+pub mod public_external;
+pub(crate) mod crate_external;
+pub(super) mod super_external;
+pub(self) mod self_external;
+pub(in crate::sql::planner) mod path_external;
+pub(crate)
+mod split_external;
+#[allow(dead_code)]
+pub(self) mod attributed_external;
+#[path = "compatibility.rs"]
+pub(in crate::sql)
+mod path_attributed_external;
+
+mod inline_private {}
+pub(self) mod inline_self {}
+pub(in crate::sql)
+mod inline_path {}
+"#;
+
+    assert_eq!(
+        planner_namespace_module_declarations(source),
+        BTreeSet::from([
+            "attributed_external".to_string(),
+            "crate_external".to_string(),
+            "inline_path".to_string(),
+            "inline_private".to_string(),
+            "inline_self".to_string(),
+            "path_attributed_external".to_string(),
+            "path_external".to_string(),
+            "private_external".to_string(),
+            "public_external".to_string(),
+            "self_external".to_string(),
+            "split_external".to_string(),
+            "super_external".to_string(),
+        ])
     );
 }
 
