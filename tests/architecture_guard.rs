@@ -54,6 +54,240 @@ fn rs_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+#[derive(Debug)]
+struct RustExternalModuleItem {
+    attributes: Vec<String>,
+    name: String,
+}
+
+#[derive(Clone, Debug)]
+struct RustSourceToken {
+    text: String,
+    start: usize,
+    end: usize,
+}
+
+fn rust_source_tokens(text: &str) -> Vec<RustSourceToken> {
+    let sanitized = rust_lexically_sanitized(text);
+    let bytes = sanitized.as_bytes();
+    let mut tokens = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        if bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_' {
+            index += 1;
+            while bytes
+                .get(index)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            {
+                index += 1;
+            }
+        } else if bytes[index] == b':' && bytes.get(index + 1) == Some(&b':') {
+            index += 2;
+        } else {
+            index += 1;
+        }
+        tokens.push(RustSourceToken {
+            text: sanitized[start..index].to_string(),
+            start,
+            end: index,
+        });
+    }
+    tokens
+}
+
+fn rust_matching_token(
+    tokens: &[RustSourceToken],
+    open: usize,
+    left: &str,
+    right: &str,
+) -> Option<usize> {
+    (tokens.get(open)?.text == left).then_some(())?;
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(open) {
+        if token.text == left {
+            depth += 1;
+        } else if token.text == right {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+fn rust_external_module_items(text: &str) -> Vec<RustExternalModuleItem> {
+    let tokens = rust_source_tokens(text);
+    let mut items = Vec::new();
+    let mut start = 0usize;
+    while start < tokens.len() {
+        let mut cursor = start;
+        let mut attributes = Vec::new();
+        while tokens.get(cursor).is_some_and(|token| token.text == "#")
+            && tokens
+                .get(cursor + 1)
+                .is_some_and(|token| token.text == "[")
+        {
+            let Some(close) = rust_matching_token(&tokens, cursor + 1, "[", "]") else {
+                break;
+            };
+            attributes.push(text[tokens[cursor].start..tokens[close].end].to_string());
+            cursor = close + 1;
+        }
+
+        if tokens.get(cursor).is_some_and(|token| token.text == "pub") {
+            cursor += 1;
+            if tokens.get(cursor).is_some_and(|token| token.text == "(") {
+                let Some(close) = rust_matching_token(&tokens, cursor, "(", ")") else {
+                    start += 1;
+                    continue;
+                };
+                cursor = close + 1;
+            }
+        }
+        let is_external = tokens.get(cursor).is_some_and(|token| token.text == "mod")
+            && tokens
+                .get(cursor + 1)
+                .is_some_and(|token| token.text.chars().all(is_ident_char))
+            && tokens
+                .get(cursor + 2)
+                .is_some_and(|token| token.text == ";");
+        if is_external {
+            items.push(RustExternalModuleItem {
+                attributes,
+                name: tokens[cursor + 1].text.clone(),
+            });
+            start = cursor + 3;
+        } else {
+            start += 1;
+        }
+    }
+    items
+}
+
+fn cfg_predicate_requires_test(tokens: &[String], start: usize) -> Option<(bool, usize)> {
+    let owner = tokens.get(start)?;
+    if owner == "test" {
+        return Some((true, start + 1));
+    }
+    if !matches!(owner.as_str(), "all" | "any" | "not")
+        || tokens.get(start + 1).is_none_or(|token| token != "(")
+    {
+        let mut cursor = start + 1;
+        while tokens
+            .get(cursor)
+            .is_some_and(|token| !matches!(token.as_str(), "," | ")"))
+        {
+            cursor += 1;
+        }
+        return Some((false, cursor));
+    }
+
+    let mut children = Vec::new();
+    let mut cursor = start + 2;
+    while tokens.get(cursor).is_some_and(|token| token != ")") {
+        let (requires_test, next) = cfg_predicate_requires_test(tokens, cursor)?;
+        children.push(requires_test);
+        cursor = next;
+        if tokens.get(cursor).is_some_and(|token| token == ",") {
+            cursor += 1;
+        }
+    }
+    let end = (tokens.get(cursor)? == ")").then_some(cursor + 1)?;
+    let requires_test = match owner.as_str() {
+        "all" => children.into_iter().any(|child| child),
+        "any" => !children.is_empty() && children.into_iter().all(|child| child),
+        "not" => false,
+        _ => unreachable!(),
+    };
+    Some((requires_test, end))
+}
+
+fn cfg_attribute_requires_test(attribute: &str) -> bool {
+    let tokens = rust_use_tokens(&rust_lexically_sanitized(attribute));
+    let Some(cfg) = tokens.iter().position(|token| token == "cfg") else {
+        return false;
+    };
+    if tokens.get(cfg + 1).is_none_or(|token| token != "(") {
+        return false;
+    }
+    cfg_predicate_requires_test(&tokens, cfg + 2).is_some_and(|(required, _)| required)
+}
+
+fn path_attribute_value(attribute: &str) -> Option<String> {
+    let tokens = rust_use_tokens(&rust_lexically_sanitized(attribute));
+    let body = tokens
+        .iter()
+        .position(|token| token == "[")
+        .and_then(|open| tokens.get(open + 1..))?;
+    if body.first().is_none_or(|token| token != "path")
+        || body.get(1).is_none_or(|token| token != "=")
+    {
+        return None;
+    }
+    let equals = attribute.find('=')?;
+    let value = attribute[equals + 1..].trim();
+    let value = value.strip_suffix(']')?.trim();
+    let value = value.strip_prefix('"')?.strip_suffix('"')?;
+    Some(value.to_string())
+}
+
+fn production_rs_files(root: &Path) -> Vec<PathBuf> {
+    let files = rs_files(root);
+    let mut excluded = BTreeSet::<PathBuf>::new();
+    for parent in &files {
+        let text = fs::read_to_string(parent).unwrap_or_default();
+        for item in rust_external_module_items(&text) {
+            if !item
+                .attributes
+                .iter()
+                .any(|attribute| cfg_attribute_requires_test(attribute))
+            {
+                continue;
+            }
+            let parent_dir = parent.parent().unwrap_or(root);
+            let targets = if let Some(explicit) = item
+                .attributes
+                .iter()
+                .find_map(|attribute| path_attribute_value(attribute))
+            {
+                vec![parent_dir.join(explicit)]
+            } else {
+                vec![
+                    parent_dir.join(format!("{}.rs", item.name)),
+                    parent_dir.join(&item.name).join("mod.rs"),
+                ]
+            };
+            for target in targets {
+                if target.is_file() {
+                    excluded.insert(target.clone());
+                    if target.file_name().is_some_and(|name| name == "mod.rs") {
+                        if let Some(directory) = target.parent() {
+                            excluded.insert(directory.to_path_buf());
+                        }
+                    } else {
+                        excluded.insert(target.with_extension(""));
+                    }
+                }
+            }
+        }
+    }
+
+    files
+        .into_iter()
+        .filter(|path| {
+            !excluded.iter().any(|excluded| {
+                path == excluded || (excluded.is_dir() && path.starts_with(excluded))
+            })
+        })
+        .collect()
+}
+
 fn rel(path: &Path) -> String {
     path.strip_prefix(manifest_dir())
         .unwrap_or(path)
@@ -1390,15 +1624,8 @@ mod runtime_filter;
 
 #[test]
 fn planner_distributed_and_codegen_do_not_import_optimizer() {
-    let mut checked = vec![
-        src_dir().join("sql/planner/distributed/fragment.rs"),
-        src_dir().join("sql/planner/distributed/node.rs"),
-        src_dir().join("sql/planner/distributed/build/mod.rs"),
-        src_dir().join("sql/planner/distributed/build/lowering.rs"),
-        src_dir().join("sql/planner/distributed/build/fragment_cut.rs"),
-        src_dir().join("sql/planner/distributed/build/runtime_filter_wire.rs"),
-    ];
-    checked.extend(rs_files(&src_dir().join("sql/codegen")));
+    let mut checked = production_rs_files(&src_dir().join("sql/planner/distributed"));
+    checked.extend(production_rs_files(&src_dir().join("sql/codegen")));
 
     let mut violations = Vec::new();
     for file in &checked {
@@ -1422,6 +1649,68 @@ fn planner_distributed_and_codegen_do_not_import_optimizer() {
         "planner distributed/codegen production paths must not reference optimizer types; \
          optimizer_bridge/** is the conversion boundary. Violations:\n{}",
         violations.join("\n")
+    );
+}
+
+#[test]
+fn planner_stage_first_boundaries_are_closed() {
+    let planner = src_dir().join("sql/planner");
+    let root_files = fs::read_dir(&planner)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file() && path.extension().is_some_and(|extension| extension == "rs")
+        })
+        .filter_map(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        root_files,
+        BTreeSet::from([
+            "mod.rs".to_string(),
+            "ordering.rs".to_string(),
+            "payload.rs".to_string(),
+        ]),
+        "planner root Rust files must remain the exact stage-first facade and neutral owners"
+    );
+
+    let facade = fs::read_to_string(planner.join("mod.rs")).unwrap();
+    let root_violations = planner_root_surface_violations_in(&facade);
+    assert!(
+        root_violations.is_empty(),
+        "planner root production surface must stay exact:\n{}",
+        root_violations.join("\n")
+    );
+
+    let mut path_attribute_violations = Vec::new();
+    let mut dependency_violations = Vec::new();
+    for file in production_rs_files(&planner) {
+        let source_rel = rel(&file);
+        let text = fs::read_to_string(&file).unwrap();
+        path_attribute_violations.extend(
+            planner_path_module_attribute_violations_in(&text)
+                .into_iter()
+                .map(|violation| format!("{source_rel}: {violation}")),
+        );
+        dependency_violations.extend(
+            planner_stage_first_dependency_violations_in(&source_rel, &text)
+                .into_iter()
+                .map(|violation| format!("{source_rel}: {violation}")),
+        );
+    }
+    assert!(
+        path_attribute_violations.is_empty(),
+        "planner production modules must not bypass physical source ownership with path attributes:\n{}",
+        path_attribute_violations.join("\n")
+    );
+    assert!(
+        dependency_violations.is_empty(),
+        "planner stage-first dependency policy violations:\n{}",
+        dependency_violations.join("\n")
     );
 }
 
@@ -1715,6 +2004,54 @@ fn rust_lexically_sanitized(text: &str) -> String {
 fn rust_sanitized_production_text(text: &str) -> String {
     let sanitized = rust_lexically_sanitized(text);
     rust_production_text_without_cfg_test(&sanitized)
+}
+
+fn planner_root_surface_violations_in(text: &str) -> Vec<String> {
+    const EXPECTED: &str = r#"
+pub(crate) mod distributed;
+pub(crate) mod imv_rewrite;
+pub(crate) mod logical;
+pub(crate) mod optimizer_bridge;
+pub(crate) mod ordering;
+pub(crate) mod payload;
+pub(crate) mod physical;
+pub(crate) use logical::build::{plan_output_columns, plan_query};
+"#;
+
+    let actual = rust_use_tokens(&rust_sanitized_production_text(text));
+    let expected = rust_use_tokens(EXPECTED);
+    if actual == expected {
+        Vec::new()
+    } else {
+        vec![format!(
+            "planner root production tokens differ; expected {expected:?}, actual {actual:?}"
+        )]
+    }
+}
+
+fn planner_path_module_attribute_violations_in(text: &str) -> Vec<String> {
+    fn affects_module_path(attribute: &str) -> bool {
+        let tokens = rust_use_tokens(&rust_lexically_sanitized(attribute));
+        let Some(open) = tokens.iter().position(|token| token == "[") else {
+            return false;
+        };
+        match tokens.get(open + 1).map(String::as_str) {
+            Some("path") => true,
+            Some("cfg_attr") => tokens.iter().skip(open + 2).any(|token| token == "path"),
+            _ => false,
+        }
+    }
+
+    let production = rust_sanitized_production_text(text);
+    rust_external_module_items(&production)
+        .into_iter()
+        .flat_map(|item| {
+            item.attributes
+                .into_iter()
+                .filter(|attribute| affects_module_path(attribute))
+                .map(move |attribute| format!("module {} has {attribute}", item.name))
+        })
+        .collect()
 }
 
 fn rust_named_type_declaration_count(text: &str, name: &str) -> usize {
@@ -2517,6 +2854,76 @@ fn rust_production_canonical_paths(text: &str, source_rel: &str) -> Vec<Vec<Stri
     canonical.into_iter().collect()
 }
 
+fn planner_stage_first_dependency_violations_in(source_rel: &str, text: &str) -> Vec<String> {
+    fn starts_with(path: &[String], prefix: &[&str]) -> bool {
+        path.len() >= prefix.len()
+            && path
+                .iter()
+                .zip(prefix)
+                .all(|(segment, expected)| segment == expected)
+    }
+
+    let logical = source_rel.starts_with("src/sql/planner/logical/");
+    let physical = source_rel.starts_with("src/sql/planner/physical/");
+    let distributed = source_rel.starts_with("src/sql/planner/distributed/");
+    let neutral = matches!(
+        source_rel,
+        "src/sql/planner/payload.rs" | "src/sql/planner/ordering.rs"
+    );
+    if !logical && !physical && !distributed && !neutral {
+        return Vec::new();
+    }
+
+    rust_production_canonical_paths(text, source_rel)
+        .into_iter()
+        .filter(|path| {
+            let planner_logical = starts_with(path, &["crate", "sql", "planner", "logical"]);
+            let planner_logical_build =
+                starts_with(path, &["crate", "sql", "planner", "logical", "build"]);
+            let planner_bridge =
+                starts_with(path, &["crate", "sql", "planner", "optimizer_bridge"]);
+            let planner_bridge_property = starts_with(
+                path,
+                &["crate", "sql", "planner", "optimizer_bridge", "property"],
+            );
+            let planner_physical = starts_with(path, &["crate", "sql", "planner", "physical"]);
+            let planner_distributed =
+                starts_with(path, &["crate", "sql", "planner", "distributed"]);
+            let optimizer = starts_with(path, &["crate", "sql", "optimizer"]);
+            let optimizer_options = starts_with(path, &["crate", "sql", "optimizer", "options"]);
+            let codegen = starts_with(path, &["crate", "sql", "codegen"]);
+            let codegen_helpers = starts_with(path, &["crate", "sql", "codegen", "helpers"]);
+
+            if logical {
+                planner_physical
+                    || planner_distributed
+                    || optimizer
+                    || (planner_bridge && !planner_bridge_property)
+                    || (codegen && !codegen_helpers)
+            } else if physical {
+                planner_logical
+                    || planner_distributed
+                    || (optimizer && !optimizer_options)
+                    || codegen
+                    || planner_bridge
+            } else if distributed {
+                planner_logical_build
+                    || optimizer
+                    || codegen
+                    || (planner_bridge && !planner_bridge_property)
+            } else {
+                planner_logical
+                    || planner_bridge
+                    || planner_physical
+                    || planner_distributed
+                    || optimizer
+                    || codegen
+            }
+        })
+        .map(|path| path.join("::"))
+        .collect()
+}
+
 fn rust_canonical_path_is_legacy_planner_owner(canonical: &[String]) -> bool {
     let legacy_owners = [
         "plan",
@@ -3012,6 +3419,87 @@ mod tests;
             .iter()
             .any(|violation| violation.contains("pub(crate) use relation::plan_values;")),
         "extra logical build re-export must be rejected: {violations:?}"
+    );
+}
+
+#[test]
+fn planner_stage_first_root_surface_detector_rejects_drift() {
+    let valid = r#"
+//! Planner facade.
+pub(crate) mod distributed;
+pub(crate) mod imv_rewrite;
+pub(crate) mod logical;
+pub(crate) mod optimizer_bridge;
+pub(crate) mod ordering;
+pub(crate) mod payload;
+pub(crate) mod physical;
+pub(crate) use logical::build::{plan_output_columns, plan_query};
+
+#[cfg(test)]
+fn test_helper() {}
+"#;
+    assert!(
+        planner_root_surface_violations_in(valid).is_empty(),
+        "the exact planner root surface must be accepted"
+    );
+
+    let invalid = [
+        format!("{valid}\nmod extra;"),
+        valid.replace("pub(crate) mod physical;", "mod physical;"),
+        valid.replace("pub(crate) mod physical;", "pub(super) mod physical;"),
+        format!("{valid}\npub(crate) use physical::PhysicalPlanNode;"),
+        format!("{valid}\npub(crate) use distributed::DistributedPlan;"),
+        format!("{valid}\npub(crate) fn plan() {{}}"),
+        format!("{valid}\npub(crate) struct Wrapper;"),
+        format!("{valid}\npub(crate) enum Kind {{ One }}"),
+        format!("{valid}\npub(crate) type Alias = ();"),
+        format!("{valid}\npub(crate) const VALUE: usize = 1;"),
+        format!("{valid}\npub(crate) trait Marker {{}}"),
+        format!("{valid}\nimpl Marker for Wrapper {{}}"),
+        valid.replace(
+            "pub(crate) mod physical;",
+            "#[path = \"physical.rs\"] pub(crate) mod physical;",
+        ),
+    ];
+    for source in invalid {
+        assert!(
+            !planner_root_surface_violations_in(&source).is_empty(),
+            "planner root drift must be rejected: {source}"
+        );
+    }
+}
+
+#[test]
+fn planner_path_module_attribute_detector_rejects_bypasses() {
+    let invalid = [
+        "#[path = \"legacy.rs\"] mod legacy;",
+        "#[path = \"legacy.rs\"] pub(crate)\nmod legacy;",
+        "mod stage { #[cfg_attr(feature = \"compat\", path = \"legacy.rs\")] mod legacy; }",
+        "#[cfg_attr(any(feature = \"a\", feature = \"b\"), allow(dead_code), path = \"legacy.rs\")] pub(super) mod legacy;",
+    ];
+    for source in invalid {
+        let violations = planner_path_module_attribute_violations_in(source);
+        assert!(
+            !violations.is_empty(),
+            "path-affecting production module attribute must be rejected: {source}"
+        );
+    }
+
+    let valid = r###"
+mod ordinary;
+#[cfg(test)]
+#[path = "test_fixture.rs"]
+mod test_fixture;
+#[cfg_attr(feature = "compat", doc = "path = fake.rs")]
+mod documented;
+// #[path = "comment.rs"] mod comment;
+const TEXT: &str = "#[path = fake.rs] mod string_fake;";
+const RAW: &str = r#"#[cfg_attr(x, path = fake.rs)] mod raw_fake;"#;
+"###;
+    let violations = planner_path_module_attribute_violations_in(valid);
+    assert!(
+        violations.is_empty(),
+        "ordinary modules, cfg-test items, and lexical noise must be accepted: {violations:?}"
     );
 }
 
@@ -3830,6 +4318,190 @@ mod sibling {
         }),
         "test-only and lexical noise paths must remain ignored: {paths:?}"
     );
+}
+
+#[test]
+fn planner_stage_first_dependency_detector_covers_bypasses() {
+    let invalid = [
+        (
+            "src/sql/planner/logical/node.rs",
+            "use crate::sql::planner::{physical::Node, distributed::Plan};",
+        ),
+        (
+            "src/sql/planner/logical/node.rs",
+            "use crate::sql::planner as p; use p::physical as stage; type Leak = stage::Node;",
+        ),
+        (
+            "src/sql/planner/logical/node.rs",
+            "type Leak = crate::sql::optimizer::Optimizer;",
+        ),
+        (
+            "src/sql/planner/logical/node.rs",
+            "mod nested { type Leak = super::super::super::distributed::Plan; }",
+        ),
+        (
+            "src/sql/planner/logical/node.rs",
+            "use crate::sql::planner::optimizer_bridge::physical::Bridge;",
+        ),
+        (
+            "src/sql/planner/logical/node.rs",
+            "use crate::sql::codegen::proto_encode::Encoder;",
+        ),
+        (
+            "src/sql/planner/physical/node.rs",
+            "use crate::sql::planner::{logical::Node, distributed::Plan};",
+        ),
+        (
+            "src/sql/planner/physical/node.rs",
+            "type Leak = crate::sql::codegen::FragmentBuildResult;",
+        ),
+        (
+            "src/sql/planner/physical/node.rs",
+            "use crate::sql::planner::optimizer_bridge::property::Ordering;",
+        ),
+        (
+            "src/sql/planner/physical/node.rs",
+            "use crate::sql::optimizer::operator::Operator;",
+        ),
+        (
+            "src/sql/planner/distributed/build/lowering.rs",
+            "use crate::sql::planner::logical::build::plan_query;",
+        ),
+        (
+            "src/sql/planner/distributed/build/lowering.rs",
+            "type Leak = crate::sql::optimizer::Optimizer;",
+        ),
+        (
+            "src/sql/planner/distributed/build/lowering.rs",
+            "use crate::sql::codegen::FragmentBuildResult;",
+        ),
+        (
+            "src/sql/planner/distributed/build/lowering.rs",
+            "use crate::sql::planner::optimizer_bridge::distributed::Bridge;",
+        ),
+        (
+            "src/sql/planner/payload.rs",
+            "use crate::sql::planner::{logical::Node, optimizer_bridge::Bridge, physical::Physical, distributed::Plan};",
+        ),
+        (
+            "src/sql/planner/ordering.rs",
+            "use crate::sql::{optimizer::Optimizer, codegen::Codegen};",
+        ),
+    ];
+    for (source_rel, source) in invalid {
+        let violations = planner_stage_first_dependency_violations_in(source_rel, source);
+        assert!(
+            !violations.is_empty(),
+            "forbidden stage dependency must be rejected: {source_rel}\n{source}"
+        );
+    }
+
+    let valid = [
+        (
+            "src/sql/planner/logical/node.rs",
+            "use crate::sql::planner::{payload::Payload, ordering::Ordering, optimizer_bridge::property::Property}; use crate::sql::codegen::helpers::display_name;",
+        ),
+        (
+            "src/sql/planner/physical/node.rs",
+            "use crate::sql::planner::payload::Payload; use crate::sql::optimizer::options::OptimizerOptions;",
+        ),
+        (
+            "src/sql/planner/distributed/build/lowering.rs",
+            "use crate::sql::planner::{physical::Physical, payload::Payload, optimizer_bridge::property::Property, logical::node::LogicalNode};",
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            "use crate::sql::planner::distributed::DistributedPlan;",
+        ),
+        (
+            "src/sql/planner/optimizer_bridge/distributed.rs",
+            "use crate::sql::{optimizer::Optimizer, planner::{logical::Node, physical::Physical, distributed::Plan}};",
+        ),
+        (
+            "src/sql/planner/imv_rewrite/entrypoint.rs",
+            "use crate::sql::{optimizer::Optimizer, codegen::Codegen}; use crate::sql::planner::{logical::Node, physical::Physical, distributed::Plan};",
+        ),
+        (
+            "src/sql/planner/logical/node.rs",
+            r###"
+#[cfg(test)]
+mod tests { use crate::sql::optimizer::Optimizer; }
+// crate::sql::planner::physical::Physical
+const TEXT: &str = "crate::sql::planner::distributed::Plan";
+const RAW: &str = r#"crate::sql::codegen::Codegen"#;
+"###,
+        ),
+    ];
+    for (source_rel, source) in valid {
+        let violations = planner_stage_first_dependency_violations_in(source_rel, source);
+        assert!(
+            violations.is_empty(),
+            "approved dependency must remain valid: {source_rel}\n{source}\n{violations:?}"
+        );
+    }
+}
+
+#[test]
+fn planner_production_source_collection_excludes_external_test_modules() {
+    let root = std::env::temp_dir().join(format!(
+        "planner_production_source_collection_{}",
+        std::process::id()
+    ));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(root.join("tests")).unwrap();
+    fs::create_dir_all(root.join("fixtures")).unwrap();
+    fs::write(
+        root.join("mod.rs"),
+        r#"
+mod production;
+#[cfg(test)]
+mod tests;
+#[cfg(all(test, feature = "compat"))]
+pub(crate) mod equiv;
+#[cfg(test)]
+#[path = "fixtures/custom.rs"]
+mod custom_test;
+#[cfg(any(test, feature = "production"))]
+mod any_cfg;
+#[cfg(not(test))]
+mod non_test;
+"#,
+    )
+    .unwrap();
+    let forbidden = "use crate::sql::planner::physical::PhysicalPlanNode;\n";
+    fs::write(root.join("production.rs"), forbidden).unwrap();
+    fs::write(root.join("tests/mod.rs"), forbidden).unwrap();
+    fs::write(root.join("tests/nested.rs"), forbidden).unwrap();
+    fs::write(root.join("equiv.rs"), forbidden).unwrap();
+    fs::write(root.join("fixtures/custom.rs"), forbidden).unwrap();
+    fs::write(root.join("any_cfg.rs"), forbidden).unwrap();
+    fs::write(root.join("non_test.rs"), forbidden).unwrap();
+
+    let collected = production_rs_files(&root);
+    let relative = collected
+        .iter()
+        .map(|path| path.strip_prefix(&root).unwrap().display().to_string())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        relative,
+        BTreeSet::from([
+            "any_cfg.rs".to_string(),
+            "mod.rs".to_string(),
+            "non_test.rs".to_string(),
+            "production.rs".to_string(),
+        ]),
+        "only cfg predicates that require test may exclude external modules"
+    );
+    let production = fs::read_to_string(root.join("production.rs")).unwrap();
+    assert!(
+        !planner_stage_first_dependency_violations_in(
+            "src/sql/planner/logical/production.rs",
+            &production,
+        )
+        .is_empty(),
+        "the same forbidden dependency in a production sibling must still fail"
+    );
+    fs::remove_dir_all(&root).ok();
 }
 
 #[test]
