@@ -18,24 +18,20 @@
 
 //! Distributed-stage runtime-filter wiring.
 
-use crate::sql::analysis::TypedExpr;
 use crate::sql::planner::distributed::FragmentId;
-use crate::sql::planner::physical::JoinExecutionMode;
+use crate::sql::planner::physical::runtime_filter::{
+    RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct WiredRuntimeFilterBuild {
-    pub filter_id: i32,
-    pub build_expr: TypedExpr,
-    pub probe_expr: TypedExpr,
-    pub expr_order: usize,
-    pub execution_mode: JoinExecutionMode,
+    pub intent: RuntimeFilterBuildIntent,
     pub source_fragment_id: FragmentId,
     pub target_fragment_ids: Vec<FragmentId>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct WiredRuntimeFilterProbe {
-    pub filter_id: i32,
-    pub probe_expr: TypedExpr,
+    pub intent: RuntimeFilterProbeIntent,
     pub source_fragment_id: FragmentId,
 }

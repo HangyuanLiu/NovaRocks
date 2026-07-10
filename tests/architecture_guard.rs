@@ -4292,6 +4292,60 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
         has_non_comment_line(&codegen_mod, "pub(crate) mod runtime_filter;"),
         "codegen/mod.rs must declare its Planned runtime-filter owner"
     );
+
+    let distributed_text = fs::read_to_string(&distributed_owner).unwrap();
+    for (wired, intent_type) in [
+        ("WiredRuntimeFilterBuild", "RuntimeFilterBuildIntent"),
+        ("WiredRuntimeFilterProbe", "RuntimeFilterProbeIntent"),
+    ] {
+        let header = format!("pub(crate) struct {wired} {{");
+        let fields = nidl_e4_struct_code_span(&distributed_text, &header)
+            .unwrap_or_else(|| panic!("missing distributed runtime-filter struct {wired}"))
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect::<Vec<_>>();
+        assert!(
+            fields
+                .iter()
+                .any(|line| line == &format!("pub intent: {intent_type},")),
+            "{wired} must compose its physical intent: {fields:?}"
+        );
+        for duplicated in [
+            "filter_id",
+            "build_expr",
+            "probe_expr",
+            "expr_order",
+            "execution_mode",
+        ] {
+            assert!(
+                !fields
+                    .iter()
+                    .any(|line| line.starts_with(&format!("pub {duplicated}:"))),
+                "{wired} must not redeclare physical intent field {duplicated}: {fields:?}"
+            );
+        }
+    }
+
+    let builder_path = planner.join("distributed_plan_build.rs");
+    let builder_text = fs::read_to_string(&builder_path).unwrap();
+    assert!(
+        nidl_e4_function_signature_contains(
+            &builder_text,
+            "wire_runtime_filters",
+            "build_bindings: Vec<RuntimeFilterBuildBinding>"
+        ) && nidl_e4_function_signature_contains(
+            &builder_text,
+            "wire_runtime_filters",
+            "probe_bindings: Vec<RuntimeFilterProbeBinding>"
+        ),
+        "wire_runtime_filters must consume owned runtime-filter binding Vecs"
+    );
+    let builder_production = rust_sanitized_production_text(&builder_text);
+    assert!(
+        builder_production.contains("for build in build_bindings {")
+            && builder_production.contains("for probe in probe_bindings {"),
+        "wire_runtime_filters must consume both owned binding Vecs"
+    );
 }
 
 #[test]

@@ -3148,14 +3148,16 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         let mut descs = Vec::with_capacity(node.probe_runtime_filters.len());
         for probe in &node.probe_runtime_filters {
             let mut compiler = ExprCompiler::new(self.state.slot_allocator(), scope);
-            let probe_texpr = compiler.compile_typed(&probe.probe_expr).map_err(|err| {
+            let probe_texpr = compiler
+                .compile_typed(&probe.intent.probe_expr)
+                .map_err(|err| {
                 format!(
                     "failed to lower runtime filter probe expression for scan node_id={} filter_id={}: {}",
-                    node.node_id, probe.filter_id, err
+                    node.node_id, probe.intent.filter_id, err
                 )
             })?;
             descs.push(crate::thrift::runtime_filter::TRuntimeFilterDescription {
-                filter_id: Some(probe.filter_id),
+                filter_id: Some(probe.intent.filter_id),
                 plan_node_id_to_target_expr: Some(BTreeMap::from([(thrift_node_id, probe_texpr)])),
                 filter_type: Some(
                     crate::thrift::runtime_filter::TRuntimeFilterBuildType::JOIN_FILTER,
@@ -3183,12 +3185,12 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         };
         for probe in &node.probe_runtime_filters {
             let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &result.scope);
-            let Ok(probe_texpr) = compiler.compile_typed(&probe.probe_expr) else {
+            let Ok(probe_texpr) = compiler.compile_typed(&probe.intent.probe_expr) else {
                 continue;
             };
             self.state
                 .rf_probe_targets()
-                .entry(probe.filter_id)
+                .entry(probe.intent.filter_id)
                 .or_default()
                 .push(RfProbeTarget {
                     thrift_node_id,
@@ -3220,9 +3222,9 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             Vec::with_capacity(build_runtime_filters.len());
 
         for rf in build_runtime_filters {
-            let filter_id = rf.filter_id;
+            let filter_id = rf.intent.filter_id;
             let Some(post_demote_expr_order) =
-                remap_rf_expr_order(surviving_eq_origin, rf.expr_order)
+                remap_rf_expr_order(surviving_eq_origin, rf.intent.expr_order)
             else {
                 continue;
             };
@@ -3232,21 +3234,25 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             let Some(eq_key_exprs) = surviving_eq_key_exprs.get(post_demote_expr_order) else {
                 continue;
             };
-            let build_scope =
-                if rf_build_expr_matches_join_build_expr(&rf.build_expr, &eq_key_exprs.right) {
-                    build_scope
-                } else if rf_build_expr_matches_join_build_expr(&rf.build_expr, &eq_key_exprs.left)
-                {
-                    left_scope
-                } else {
-                    tracing::debug!(
-                        "skip runtime filter {filter_id}: build expr does not match either join key"
-                    );
-                    continue;
-                };
+            let build_scope = if rf_build_expr_matches_join_build_expr(
+                &rf.intent.build_expr,
+                &eq_key_exprs.right,
+            ) {
+                build_scope
+            } else if rf_build_expr_matches_join_build_expr(
+                &rf.intent.build_expr,
+                &eq_key_exprs.left,
+            ) {
+                left_scope
+            } else {
+                tracing::debug!(
+                    "skip runtime filter {filter_id}: build expr does not match either join key"
+                );
+                continue;
+            };
 
             let build_texpr = match ExprCompiler::new(self.state.slot_allocator(), build_scope)
-                .compile_typed(&rf.build_expr)
+                .compile_typed(&rf.intent.build_expr)
             {
                 Ok(t) => t,
                 Err(err) => {
@@ -3270,7 +3276,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             let has_remote_targets = probe_targets.iter().any(|t| t.fragment_id != join_fragment);
 
             let (build_join_mode, local_layout, global_layout) =
-                rf_layout_for_join_execution_mode(rf.execution_mode);
+                rf_layout_for_join_execution_mode(rf.intent.execution_mode);
 
             let layout = runtime_filter::TRuntimeFilterLayout::new(
                 filter_id,
@@ -3324,7 +3330,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     build_plan_node_id: join_node_id,
                     probe_target_node_ids,
                     has_remote_targets,
-                    execution_mode: rf.execution_mode,
+                    execution_mode: rf.intent.execution_mode,
                     expr_order: post_demote_expr_order as i32,
                 },
             );
@@ -5938,6 +5944,7 @@ mod tests {
     use crate::sql::planner::optimizer_bridge::scalar::intern_project_items;
     use crate::sql::planner::payload::{AggregateCall, PlanScanNode};
     use crate::sql::planner::physical::PhysicalPlanKind;
+    use crate::sql::planner::physical::runtime_filter::RuntimeFilterBuildIntent;
     use crate::sql::planner::physical::{
         AggMode, AggregateOutputLayout, JoinDistribution, JoinExecutionMode, PhysicalPlanStats,
         PlannerConfidence,
@@ -6949,11 +6956,13 @@ mod tests {
             output_columns: Vec::new(),
         };
         let runtime_filter = WiredRuntimeFilterBuild {
-            filter_id: 17,
-            build_expr: left_key,
-            probe_expr: right_key,
-            expr_order: 0,
-            execution_mode: JoinExecutionMode::Broadcast,
+            intent: RuntimeFilterBuildIntent {
+                filter_id: 17,
+                build_expr: left_key,
+                probe_expr: right_key,
+                expr_order: 0,
+                execution_mode: JoinExecutionMode::Broadcast,
+            },
             source_fragment_id: 0,
             target_fragment_ids: vec![0],
         };

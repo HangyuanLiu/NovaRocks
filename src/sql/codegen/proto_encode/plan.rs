@@ -1859,11 +1859,11 @@ fn encode_wired_runtime_filter_build(
     src: &WiredRuntimeFilterBuild,
 ) -> Result<plan::RuntimeFilterBuild, String> {
     Ok(plan::RuntimeFilterBuild {
-        filter_id: src.filter_id,
-        build_expr: Some(encode_expr(&src.build_expr)?),
-        probe_expr: Some(encode_expr(&src.probe_expr)?),
-        expr_order: usize_to_u32(src.expr_order)?,
-        execution_mode: encode_join_execution_mode(src.execution_mode),
+        filter_id: src.intent.filter_id,
+        build_expr: Some(encode_expr(&src.intent.build_expr)?),
+        probe_expr: Some(encode_expr(&src.intent.probe_expr)?),
+        expr_order: usize_to_u32(src.intent.expr_order)?,
+        execution_mode: encode_join_execution_mode(src.intent.execution_mode),
         source_fragment_id: src.source_fragment_id,
         target_fragment_ids: src.target_fragment_ids.clone(),
     })
@@ -1873,8 +1873,8 @@ fn encode_wired_runtime_filter_probe(
     src: &WiredRuntimeFilterProbe,
 ) -> Result<plan::RuntimeFilterProbe, String> {
     Ok(plan::RuntimeFilterProbe {
-        filter_id: src.filter_id,
-        probe_expr: Some(encode_expr(&src.probe_expr)?),
+        filter_id: src.intent.filter_id,
+        probe_expr: Some(encode_expr(&src.intent.probe_expr)?),
         source_fragment_id: src.source_fragment_id,
     })
 }

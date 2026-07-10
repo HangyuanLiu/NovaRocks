@@ -1278,8 +1278,8 @@ fn push_build_rf_lines(
     for rf in filters {
         out.push(format!(
             "{pad}  - filter_id = {}, build_expr = ({})",
-            rf.filter_id,
-            format_expr(&rf.build_expr),
+            rf.intent.filter_id,
+            format_expr(&rf.intent.build_expr),
         ));
     }
 }
@@ -1297,8 +1297,8 @@ fn push_probe_rf_lines(
     for rf in filters {
         out.push(format!(
             "{pad}    - filter_id = {}, probe_expr = ({})",
-            rf.filter_id,
-            format_expr(&rf.probe_expr),
+            rf.intent.filter_id,
+            format_expr(&rf.intent.probe_expr),
         ));
     }
 }
