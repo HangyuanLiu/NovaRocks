@@ -1276,13 +1276,49 @@ fn logical_build_surface_violations(text: &str) -> Vec<String> {
     violations
 }
 
-fn is_rust_function_item_header(header: &str) -> bool {
+fn rust_attribute_group_end(text: &str) -> Option<usize> {
+    if !text.starts_with("#[") {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    for (index, ch) in text.char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn rust_header_has_cfg_test_attribute(header: &str) -> bool {
     let mut rest = header.trim();
-    while let Some(after_open) = rest.strip_prefix("#[") {
-        let Some(close) = after_open.find(']') else {
+    while rest.starts_with("#[") {
+        let Some(end) = rust_attribute_group_end(rest) else {
             return false;
         };
-        rest = after_open[close + 1..].trim_start();
+        let attribute = compact_line(&rest[..end]);
+        if is_cfg_test_attr(&attribute) {
+            return true;
+        }
+        rest = rest[end..].trim_start();
+    }
+    false
+}
+
+fn is_rust_function_item_header(header: &str) -> bool {
+    let mut rest = header.trim();
+    while rest.starts_with("#[") {
+        let Some(end) = rust_attribute_group_end(rest) else {
+            return false;
+        };
+        rest = rest[end..].trim_start();
     }
 
     if let Some(after_pub) = rest.strip_prefix("pub ") {
@@ -1323,17 +1359,208 @@ fn is_rust_function_item_header(header: &str) -> bool {
     rest.starts_with("fn ")
 }
 
+fn rust_char_literal_end(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let first = *bytes.get(start + 1)?;
+    let mut cursor = start + 1;
+
+    if first == b'\\' {
+        cursor += 1;
+        match *bytes.get(cursor)? {
+            b'u' if bytes.get(cursor + 1) == Some(&b'{') => {
+                cursor += 2;
+                while bytes.get(cursor) != Some(&b'}') {
+                    cursor += 1;
+                }
+                cursor += 1;
+            }
+            b'x' => cursor += 3,
+            _ => cursor += 1,
+        }
+    } else {
+        let ch = text.get(cursor..)?.chars().next()?;
+        cursor += ch.len_utf8();
+    }
+
+    (bytes.get(cursor) == Some(&b'\'')).then_some(cursor)
+}
+
+fn rust_raw_string_open(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    if bytes.get(start) != Some(&b'r') {
+        return None;
+    }
+    let mut cursor = start + 1;
+    while bytes.get(cursor) == Some(&b'#') {
+        cursor += 1;
+    }
+    (bytes.get(cursor) == Some(&b'"')).then_some((cursor - start - 1, cursor - start + 1))
+}
+
+#[derive(Clone, Copy)]
+enum RustLexicalState {
+    Code,
+    LineComment,
+    BlockComment(usize),
+    String { escaped: bool },
+    RawString { hashes: usize },
+}
+
+fn rust_lexically_sanitized(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut state = RustLexicalState::Code;
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        match state {
+            RustLexicalState::Code => {
+                if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
+                    output.extend_from_slice(b"  ");
+                    index += 2;
+                    state = RustLexicalState::LineComment;
+                } else if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+                    output.extend_from_slice(b"  ");
+                    index += 2;
+                    state = RustLexicalState::BlockComment(1);
+                } else if let Some((hashes, opening_len)) = rust_raw_string_open(bytes, index) {
+                    output.extend(std::iter::repeat_n(b' ', opening_len));
+                    index += opening_len;
+                    state = RustLexicalState::RawString { hashes };
+                } else if bytes[index] == b'"' {
+                    output.push(b' ');
+                    index += 1;
+                    state = RustLexicalState::String { escaped: false };
+                } else if bytes[index] == b'\''
+                    && let Some(end) = rust_char_literal_end(text, index)
+                {
+                    output.extend(std::iter::repeat_n(b' ', end - index + 1));
+                    index = end + 1;
+                } else {
+                    output.push(bytes[index]);
+                    index += 1;
+                }
+            }
+            RustLexicalState::LineComment => {
+                if bytes[index] == b'\n' {
+                    output.push(b'\n');
+                    state = RustLexicalState::Code;
+                } else {
+                    output.push(b' ');
+                }
+                index += 1;
+            }
+            RustLexicalState::BlockComment(depth) => {
+                if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+                    output.extend_from_slice(b"  ");
+                    index += 2;
+                    state = RustLexicalState::BlockComment(depth + 1);
+                } else if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                    output.extend_from_slice(b"  ");
+                    index += 2;
+                    state = if depth == 1 {
+                        RustLexicalState::Code
+                    } else {
+                        RustLexicalState::BlockComment(depth - 1)
+                    };
+                } else {
+                    output.push(if bytes[index] == b'\n' { b'\n' } else { b' ' });
+                    index += 1;
+                }
+            }
+            RustLexicalState::String { escaped } => {
+                let byte = bytes[index];
+                output.push(if byte == b'\n' { b'\n' } else { b' ' });
+                index += 1;
+                state = if escaped {
+                    RustLexicalState::String { escaped: false }
+                } else if byte == b'\\' {
+                    RustLexicalState::String { escaped: true }
+                } else if byte == b'"' {
+                    RustLexicalState::Code
+                } else {
+                    RustLexicalState::String { escaped: false }
+                };
+            }
+            RustLexicalState::RawString { hashes } => {
+                let closes = bytes[index] == b'"'
+                    && bytes
+                        .get(index + 1..index + 1 + hashes)
+                        .is_some_and(|suffix| suffix.iter().all(|byte| *byte == b'#'));
+                if closes {
+                    output.extend(std::iter::repeat_n(b' ', hashes + 1));
+                    index += hashes + 1;
+                    state = RustLexicalState::Code;
+                } else {
+                    output.push(if bytes[index] == b'\n' { b'\n' } else { b' ' });
+                    index += 1;
+                }
+            }
+        }
+    }
+
+    String::from_utf8(output).expect("lexical sanitizer must preserve valid UTF-8 outside noise")
+}
+
+#[derive(Default)]
+struct RustStructuralLine {
+    brace_delta: isize,
+    has_open_brace: bool,
+    ends_with_semicolon: bool,
+}
+
+fn rust_structural_line(line: &str, attribute_depth: &mut usize) -> RustStructuralLine {
+    let bytes = line.as_bytes();
+    let mut structure = RustStructuralLine::default();
+    let mut last_code_byte = None;
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        if *attribute_depth > 0 {
+            match bytes[index] {
+                b'[' => *attribute_depth += 1,
+                b']' => *attribute_depth -= 1,
+                _ => {}
+            }
+            index += 1;
+            continue;
+        }
+        if bytes[index] == b'#' && bytes.get(index + 1) == Some(&b'[') {
+            *attribute_depth = 1;
+            index += 2;
+            continue;
+        }
+
+        match bytes[index] {
+            b'{' => {
+                structure.brace_delta += 1;
+                structure.has_open_brace = true;
+            }
+            b'}' => structure.brace_delta -= 1,
+            _ => {}
+        }
+        if !bytes[index].is_ascii_whitespace() {
+            last_code_byte = Some(bytes[index]);
+        }
+        index += 1;
+    }
+
+    structure.ends_with_semicolon = last_code_byte == Some(b';');
+    structure
+}
+
 fn top_level_production_functions(text: &str) -> Vec<String> {
-    let production = rust_production_text_without_cfg_test(text);
+    let production = rust_lexically_sanitized(text);
     let mut functions = Vec::new();
     let mut header = String::new();
     let mut header_start = 0usize;
     let mut header_is_function = false;
     let mut brace_depth = 0isize;
+    let mut attribute_depth = 0usize;
 
     for (index, line) in production.lines().enumerate() {
         let trimmed = line.trim();
-        if brace_depth == 0 && !is_comment_or_blank(line) && !trimmed.starts_with("#[") {
+        let structure = rust_structural_line(line, &mut attribute_depth);
+        if brace_depth == 0 && !trimmed.is_empty() {
             if header.is_empty() {
                 header_start = index + 1;
             } else {
@@ -1342,17 +1569,19 @@ fn top_level_production_functions(text: &str) -> Vec<String> {
             header.push_str(trimmed);
 
             if !header_is_function && is_rust_function_item_header(&header) {
-                functions.push(format!("{}: {}", header_start, header));
+                if !rust_header_has_cfg_test_attribute(&header) {
+                    functions.push(format!("{}: {}", header_start, header));
+                }
                 header_is_function = true;
             }
 
-            if trimmed.ends_with(';') || line.contains('{') {
+            if attribute_depth == 0 && (structure.ends_with_semicolon || structure.has_open_brace) {
                 header.clear();
                 header_is_function = false;
             }
         }
 
-        brace_depth += brace_delta(line);
+        brace_depth += structure.brace_delta;
         if brace_depth < 0 {
             brace_depth = 0;
         }
@@ -1432,6 +1661,85 @@ fn planner_root_function_detector_covers_visibility_and_qualifiers() {
 
     let cfg_test = "#[cfg(test)]\nfn test_only() {}";
     assert!(top_level_production_functions(cfg_test).is_empty());
+}
+
+#[test]
+fn planner_root_function_detector_ignores_braces_in_lexical_noise() {
+    let cases = [
+        ("const string", "const TEXT: &str = \"{\";\nfn real() {}"),
+        (
+            "ordinary string",
+            "static TEXT: &str = \"{\";\nfn real() {}",
+        ),
+        ("byte string", "const BYTES: &[u8] = b\"{\";\nfn real() {}"),
+        (
+            "raw string",
+            "const RAW: &str = r###\"{\"###;\nfn real() {}",
+        ),
+        ("char", "const OPEN: char = '{';\nfn real() {}"),
+        ("line comment", "// {\nfn real() {}"),
+        ("block comment", "/* { */\nfn real() {}"),
+    ];
+
+    for (label, source) in cases {
+        let hits = top_level_production_functions(source);
+        assert_eq!(hits.len(), 1, "{label} must not hide real fn: {hits:?}");
+        assert!(hits[0].contains("fn real"), "{label}: {hits:?}");
+    }
+}
+
+#[test]
+fn planner_root_function_detector_ignores_fake_functions_in_comments() {
+    let source = r#"
+/*
+fn fake_block() {}
+*/
+// fn fake_line() {}
+"#;
+
+    let hits = top_level_production_functions(source);
+    assert!(
+        hits.is_empty(),
+        "functions in comments must not be flagged: {hits:?}"
+    );
+}
+
+#[test]
+fn planner_root_function_detector_handles_multiline_attributes() {
+    let source = r#"
+#[allow(
+    dead_code,
+    clippy::missing_safety_doc,
+)]
+pub unsafe fn attributed() {}
+"#;
+
+    let hits = top_level_production_functions(source);
+    assert_eq!(
+        hits.len(),
+        1,
+        "multiline attribute must preserve fn: {hits:?}"
+    );
+    assert!(hits[0].contains("fn attributed"), "{hits:?}");
+}
+
+#[test]
+fn planner_root_function_detector_excludes_cfg_test_with_multiline_attribute() {
+    let source = r#"
+#[cfg(
+    test
+)]
+#[allow(
+    dead_code,
+)]
+fn test_only() {}
+
+fn production() {}
+"#;
+
+    let hits = top_level_production_functions(source);
+    assert_eq!(hits.len(), 1, "only production fn must remain: {hits:?}");
+    assert!(hits[0].contains("fn production"), "{hits:?}");
 }
 
 #[test]
