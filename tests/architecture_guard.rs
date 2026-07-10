@@ -1276,10 +1276,18 @@ fn logical_build_surface_violations(text: &str) -> Vec<String> {
     violations
 }
 
-fn rust_attribute_group_end(text: &str) -> Option<usize> {
-    if !text.starts_with("#[") {
+fn rust_attribute_open_len(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'#') {
         return None;
     }
+    if bytes.get(start + 1) == Some(&b'[') {
+        return Some(2);
+    }
+    (bytes.get(start + 1) == Some(&b'!') && bytes.get(start + 2) == Some(&b'[')).then_some(3)
+}
+
+fn rust_attribute_group_end(text: &str) -> Option<usize> {
+    rust_attribute_open_len(text.as_bytes(), 0)?;
 
     let mut depth = 0usize;
     for (index, ch) in text.char_indices() {
@@ -1299,12 +1307,13 @@ fn rust_attribute_group_end(text: &str) -> Option<usize> {
 
 fn rust_header_has_cfg_test_attribute(header: &str) -> bool {
     let mut rest = header.trim();
-    while rest.starts_with("#[") {
+    while rust_attribute_open_len(rest.as_bytes(), 0).is_some() {
+        let is_outer = rest.starts_with("#[");
         let Some(end) = rust_attribute_group_end(rest) else {
             return false;
         };
         let attribute = compact_line(&rest[..end]);
-        if is_cfg_test_attr(&attribute) {
+        if is_outer && is_cfg_test_attr(&attribute) {
             return true;
         }
         rest = rest[end..].trim_start();
@@ -1314,7 +1323,7 @@ fn rust_header_has_cfg_test_attribute(header: &str) -> bool {
 
 fn is_rust_function_item_header(header: &str) -> bool {
     let mut rest = header.trim();
-    while rest.starts_with("#[") {
+    while rust_attribute_open_len(rest.as_bytes(), 0).is_some() {
         let Some(end) = rust_attribute_group_end(rest) else {
             return false;
         };
@@ -1524,9 +1533,9 @@ fn rust_structural_line(line: &str, attribute_depth: &mut usize) -> RustStructur
             index += 1;
             continue;
         }
-        if bytes[index] == b'#' && bytes.get(index + 1) == Some(&b'[') {
+        if let Some(open_len) = rust_attribute_open_len(bytes, index) {
             *attribute_depth = 1;
-            index += 2;
+            index += open_len;
             continue;
         }
 
@@ -1639,6 +1648,7 @@ fn planner_root_function_detector_covers_visibility_and_qualifiers() {
             "pub(crate)\nconst fn multiline() {}",
         ),
         ("attribute", "#[inline]\npub fn attributed() {}"),
+        ("lifetime", "fn with_lifetime<'a>() {}"),
     ];
 
     for (label, source) in function_items {
@@ -1679,6 +1689,17 @@ fn planner_root_function_detector_ignores_braces_in_lexical_noise() {
         ("char", "const OPEN: char = '{';\nfn real() {}"),
         ("line comment", "// {\nfn real() {}"),
         ("block comment", "/* { */\nfn real() {}"),
+        ("nested block comment", "/* { /* } */ { */\nfn real() {}"),
+        ("byte char", "const OPEN: u8 = b'{';\nfn real() {}"),
+        (
+            "raw byte string",
+            "const RAW: &[u8] = br###\"{\"###;\nfn real() {}",
+        ),
+        (
+            "escaped quote and backslash",
+            r#"const TEXT: &str = "\"{\\}";
+fn real() {}"#,
+        ),
     ];
 
     for (label, source) in cases {
@@ -1740,6 +1761,46 @@ fn production() {}
     let hits = top_level_production_functions(source);
     assert_eq!(hits.len(), 1, "only production fn must remain: {hits:?}");
     assert!(hits[0].contains("fn production"), "{hits:?}");
+}
+
+#[test]
+fn planner_root_function_detector_handles_inner_attributes() {
+    let source = "#![allow(dead_code)]\nfn leaked() {}";
+
+    let hits = top_level_production_functions(source);
+    assert_eq!(hits.len(), 1, "inner attribute must preserve fn: {hits:?}");
+    assert!(hits[0].contains("fn leaked"), "{hits:?}");
+}
+
+#[test]
+fn planner_root_function_detector_treats_inner_cfg_test_conservatively() {
+    let source = "#![cfg(test)]\nfn conservatively_production() {}";
+
+    let hits = top_level_production_functions(source);
+    assert_eq!(
+        hits.len(),
+        1,
+        "module cfg(test) must not suppress production guard: {hits:?}"
+    );
+    assert!(hits[0].contains("fn conservatively_production"), "{hits:?}");
+}
+
+#[test]
+fn planner_root_function_detector_ignores_inner_attribute_structure() {
+    let source = r#"
+#![guard(
+    { dead_code }
+)]
+fn after_inner_attribute() {}
+"#;
+
+    let hits = top_level_production_functions(source);
+    assert_eq!(
+        hits.len(),
+        1,
+        "inner attribute tokens must not change brace depth: {hits:?}"
+    );
+    assert!(hits[0].contains("fn after_inner_attribute"), "{hits:?}");
 }
 
 #[test]
