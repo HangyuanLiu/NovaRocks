@@ -1224,6 +1224,60 @@ fn planner_distributed_and_codegen_do_not_import_optimizer() {
 }
 
 #[test]
+fn planner_logical_builder_is_owned_by_logical_stage() {
+    let repo = Path::new(manifest_dir());
+    let expected_files = [
+        "src/sql/planner/logical/mod.rs",
+        "src/sql/planner/logical/build/mod.rs",
+        "src/sql/planner/logical/build/query.rs",
+        "src/sql/planner/logical/build/select.rs",
+        "src/sql/planner/logical/build/subquery.rs",
+        "src/sql/planner/logical/build/aggregate.rs",
+        "src/sql/planner/logical/build/window.rs",
+        "src/sql/planner/logical/build/relation.rs",
+        "src/sql/planner/logical/build/output.rs",
+        "src/sql/planner/logical/build/tests.rs",
+    ];
+    for path in expected_files {
+        assert!(
+            repo.join(path).is_file(),
+            "missing logical builder owner: {path}"
+        );
+    }
+
+    let facade = fs::read_to_string(repo.join("src/sql/planner/mod.rs")).unwrap();
+    for forbidden in [
+        "fn plan_scoped_query(",
+        "fn plan_select_scoped(",
+        "fn plan_relation_scoped(",
+        "mod tests {",
+    ] {
+        assert!(
+            !facade.contains(forbidden),
+            "planner facade still owns logical builder implementation: {forbidden}"
+        );
+    }
+    assert!(facade.contains("pub(crate) mod logical;"));
+    assert!(facade.contains("pub(crate) use logical::build::{plan_output_columns, plan_query};"));
+
+    let build_mod = fs::read_to_string(repo.join("src/sql/planner/logical/build/mod.rs")).unwrap();
+    assert!(build_mod.contains("pub(crate) use output::plan_output_columns;"));
+    assert!(build_mod.contains("pub(crate) use query::plan_query;"));
+    for private_helper in [
+        "plan_scoped_query",
+        "plan_select_scoped",
+        "plan_relation_scoped",
+        "wrap_scalar_applies",
+        "typed_expr_semantically_eq",
+    ] {
+        assert!(
+            !build_mod.contains(private_helper),
+            "builder-private helper leaked from logical::build: {private_helper}"
+        );
+    }
+}
+
+#[test]
 fn optimizer_bridge_is_the_only_allowlisted_converter() {
     let bridge = src_dir().join("sql/planner/optimizer_bridge/physical.rs");
     assert!(bridge.exists(), "Bridge 2a must exist at {}", rel(&bridge));
