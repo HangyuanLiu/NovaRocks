@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn iceberg_write_sink_domain_module_has_no_thrift_wire_types() {
-        let source = include_str!("write_sink.rs");
+        let source = include_str!("sink.rs");
         for pattern in [
             concat!("crate::", "thrift"),
             concat!("TType", "Desc"),

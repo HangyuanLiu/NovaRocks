@@ -28,7 +28,9 @@ use crate::runtime::write_coordinator::WriteCommitInput;
 use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::optimizer::OptimizerPhysicalNode;
 use crate::sql::planner::distributed::FragmentId;
-use crate::sql::planner::{ChangeStreamWriteDagSpec, IcebergChangeStreamWriteTopology};
+use crate::sql::planner::distributed::write::change_stream::{
+    ChangeStreamWriteDagSpec, IcebergChangeStreamWriteTopology,
+};
 
 pub(crate) fn writer_fragment_id_from_finst_lo(finst_lo: i64) -> i32 {
     (finst_lo >> 16) as i32
@@ -567,16 +569,17 @@ mod tests {
 
     fn topology_for_test(
         branches: Vec<(i32, ChangeStreamBranchKind, FragmentId)>,
-    ) -> crate::sql::planner::IcebergChangeStreamWriteTopology {
-        crate::sql::planner::IcebergChangeStreamWriteTopology {
+    ) -> crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamWriteTopology
+    {
+        crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamWriteTopology {
             writer_branches: branches
                 .into_iter()
                 .map(|(branch_id, branch_kind, writer_fragment_id)| {
-                    crate::sql::planner::IcebergChangeStreamWriterBranch {
+                    crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamWriterBranch {
                         branch_id,
                         branch_kind,
                         writer_fragment_id,
-                        sink_spec: crate::sql::planner::write_sink::test_support::simple_sink_spec(
+                        sink_spec: crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec(
                         ),
                     }
                 })

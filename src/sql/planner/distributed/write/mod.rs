@@ -15,16 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod fragment;
-mod node;
-pub(crate) mod runtime_filter;
-pub(crate) mod write;
-
-pub(crate) use fragment::{
-    DataPartition, DataSink, DistributedPlan, FragmentEdge, FragmentEdgeKind, FragmentId,
-    FragmentStreamKind, PartitionKind, PlanFragment,
-};
-pub(crate) use node::{
-    DistributedNode, DistributedNodeKind, ExchangeFlavor, ExchangeReceiver,
-    distributed_kind_from_physical, distributed_kind_to_physical,
-};
+pub(crate) mod change_stream;
+pub(crate) mod plan;
+pub(crate) mod sink;

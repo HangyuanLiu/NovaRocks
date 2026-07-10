@@ -49,7 +49,7 @@ pub(in crate::sql::codegen) fn branch_kind_to_thrift(
 
 #[cfg(feature = "compat")]
 pub(in crate::sql::codegen) fn build_router_sink_thrift(
-    sink: &crate::sql::planner::IcebergChangeStreamRouterSink,
+    sink: &crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamRouterSink,
     scope: &ExprScope,
     output_columns: &[AnalysisOutputColumn],
 ) -> Result<data_sinks::TDataSink, String> {

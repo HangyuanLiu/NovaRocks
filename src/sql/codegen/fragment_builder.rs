@@ -283,17 +283,21 @@ mod tests {
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::Statistics;
+    use crate::sql::planner::distributed::write::change_stream::{
+        ChangeStreamWriteBranchSpec, ChangeStreamWriteDagSpec,
+    };
+    use crate::sql::planner::distributed::write::plan::{
+        with_iceberg_change_stream_write, with_iceberg_write_sink,
+    };
+    use crate::sql::planner::distributed::write::sink::{
+        IcebergWriteFragmentSink, IcebergWriteInputBinding, IcebergWriteSinkSpec,
+    };
     use crate::sql::planner::distributed::{FragmentEdgeKind, PartitionKind};
     use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use crate::sql::planner::optimizer_bridge::scalar::{
         intern_exprs, intern_project_items, intern_sort_items, intern_window_exprs,
     };
     use crate::sql::planner::payload::WindowExpr;
-    use crate::sql::planner::{
-        ChangeStreamWriteBranchSpec, ChangeStreamWriteDagSpec, IcebergWriteFragmentSink,
-        IcebergWriteInputBinding, IcebergWriteSinkSpec, with_iceberg_change_stream_write,
-        with_iceberg_write_sink,
-    };
     use crate::thrift::{exprs, plan_nodes};
 
     fn build_fragments_from_optimizer_for_test(
@@ -3116,9 +3120,10 @@ mod tests {
     fn fragment_build_request_with_iceberg_sink_attaches_partition_metadata() {
         let plan = values_plan_for_test(vec![output_col_for_test(1, "id", DataType::Int32, false)]);
         let connectors = crate::connector::ConnectorRegistry::new();
-        let mut spec = crate::sql::planner::write_sink::test_support::simple_sink_spec();
+        let mut spec =
+            crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec();
         spec.iceberg.serialized_metadata = Some(
-            crate::sql::planner::write_sink::test_support::single_bucket_partition_metadata_json(),
+            crate::sql::planner::distributed::write::sink::test_support::single_bucket_partition_metadata_json(),
         );
 
         let build = build_fragments_with_iceberg_sink_from_optimizer_for_database_for_test(
@@ -3192,9 +3197,10 @@ mod tests {
     fn fragment_build_request_with_iceberg_sink_sets_root_output_sink() {
         let plan = values_plan_for_test(vec![output_col_for_test(1, "id", DataType::Int32, false)]);
         let connectors = crate::connector::ConnectorRegistry::new();
-        let mut spec = crate::sql::planner::write_sink::test_support::simple_sink_spec();
+        let mut spec =
+            crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec();
         spec.iceberg.serialized_metadata = Some(
-            crate::sql::planner::write_sink::test_support::single_bucket_partition_metadata_json(),
+            crate::sql::planner::distributed::write::sink::test_support::single_bucket_partition_metadata_json(),
         );
 
         let build = build_fragments_with_iceberg_sink_from_optimizer_for_database_for_test(
@@ -3268,10 +3274,12 @@ mod tests {
     fn fragment_build_request_with_iceberg_sink_preserves_delete_sink_mode() {
         let plan = values_plan_for_test(vec![output_col_for_test(1, "id", DataType::Int32, false)]);
         let connectors = crate::connector::ConnectorRegistry::new();
-        let mut spec = crate::sql::planner::write_sink::test_support::simple_sink_spec();
-        spec.mode = crate::sql::planner::write_sink::IcebergWriteSinkMode::PositionDeletes;
+        let mut spec =
+            crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec();
+        spec.mode =
+            crate::sql::planner::distributed::write::sink::IcebergWriteSinkMode::PositionDeletes;
         spec.iceberg.serialized_metadata = Some(
-            crate::sql::planner::write_sink::test_support::single_bucket_partition_metadata_json(),
+            crate::sql::planner::distributed::write::sink::test_support::single_bucket_partition_metadata_json(),
         );
 
         let build = build_fragments_with_iceberg_sink_from_optimizer_for_database_for_test(
@@ -3300,10 +3308,12 @@ mod tests {
     fn fragment_build_request_with_iceberg_sink_preserves_equality_delete_schema() {
         let plan = values_plan_for_test(vec![output_col_for_test(1, "id", DataType::Int32, false)]);
         let connectors = crate::connector::ConnectorRegistry::new();
-        let mut spec = crate::sql::planner::write_sink::test_support::simple_sink_spec();
-        spec.mode = crate::sql::planner::write_sink::IcebergWriteSinkMode::EqualityDeletes;
+        let mut spec =
+            crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec();
+        spec.mode =
+            crate::sql::planner::distributed::write::sink::IcebergWriteSinkMode::EqualityDeletes;
         spec.iceberg.serialized_metadata =
-            Some(crate::sql::planner::write_sink::test_support::unpartitioned_metadata_json());
+            Some(crate::sql::planner::distributed::write::sink::test_support::unpartitioned_metadata_json());
 
         let build = build_fragments_with_iceberg_sink_from_optimizer_for_database_for_test(
             &plan,
@@ -3365,10 +3375,12 @@ mod tests {
         );
 
         let connectors = crate::connector::ConnectorRegistry::new();
-        let mut spec = crate::sql::planner::write_sink::test_support::simple_sink_spec();
-        spec.mode = crate::sql::planner::write_sink::IcebergWriteSinkMode::DeletionVectors;
+        let mut spec =
+            crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec();
+        spec.mode =
+            crate::sql::planner::distributed::write::sink::IcebergWriteSinkMode::DeletionVectors;
         spec.iceberg.serialized_metadata = Some(
-            crate::sql::planner::write_sink::test_support::single_bucket_partition_metadata_json(),
+            crate::sql::planner::distributed::write::sink::test_support::single_bucket_partition_metadata_json(),
         );
         let target_columns = vec![
             ColumnDef {

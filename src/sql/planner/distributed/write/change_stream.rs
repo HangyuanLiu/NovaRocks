@@ -18,7 +18,9 @@
 use std::collections::BTreeSet;
 
 use crate::sql::common::ChangeStreamBranchKind;
-use crate::sql::planner::write_sink::IcebergWriteSinkSpec;
+
+use super::super::FragmentId;
+use super::sink::IcebergWriteSinkSpec;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ChangeStreamWriteBranchSpec {
@@ -48,7 +50,7 @@ pub(crate) struct IcebergChangeStreamRouterSink {
 pub(crate) struct IcebergChangeStreamBranchRoute {
     pub(crate) branch_id: i32,
     pub(crate) branch_kind: ChangeStreamBranchKind,
-    pub(crate) target_fragment_id: crate::sql::planner::distributed::FragmentId,
+    pub(crate) target_fragment_id: FragmentId,
     pub(crate) target_exchange_node_id: i32,
     pub(crate) output_ordinals: Vec<usize>,
     pub(crate) output_partition_ordinals: Vec<usize>,
@@ -63,14 +65,8 @@ pub(crate) struct IcebergChangeStreamWriteTopology {
 pub(crate) struct IcebergChangeStreamWriterBranch {
     pub(crate) branch_id: i32,
     pub(crate) branch_kind: ChangeStreamBranchKind,
-    pub(crate) writer_fragment_id: crate::sql::planner::distributed::FragmentId,
+    pub(crate) writer_fragment_id: FragmentId,
     pub(crate) sink_spec: IcebergWriteSinkSpec,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PlannedIcebergChangeStreamDistributedPlan {
-    pub(crate) distributed_plan: crate::sql::planner::distributed::DistributedPlan,
-    pub(crate) topology: IcebergChangeStreamWriteTopology,
 }
 
 impl ChangeStreamWriteBranchSpec {
@@ -80,20 +76,13 @@ impl ChangeStreamWriteBranchSpec {
         branch_kind: ChangeStreamBranchKind,
         stream_output_ordinals: Vec<usize>,
     ) -> Self {
-        let mut sink_spec = crate::sql::planner::write_sink::test_support::simple_sink_spec();
-        sink_spec.iceberg.serialized_metadata = Some(
-            crate::sql::planner::write_sink::test_support::single_bucket_partition_metadata_json(),
-        );
+        let mut sink_spec = super::sink::test_support::simple_sink_spec();
+        sink_spec.iceberg.serialized_metadata =
+            Some(super::sink::test_support::single_bucket_partition_metadata_json());
         sink_spec.mode = match branch_kind {
-            ChangeStreamBranchKind::DeleteDv => {
-                crate::sql::planner::write_sink::IcebergWriteSinkMode::DeletionVectors
-            }
-            ChangeStreamBranchKind::ReuseData => {
-                crate::sql::planner::write_sink::IcebergWriteSinkMode::RowLineageData
-            }
-            ChangeStreamBranchKind::FreshData => {
-                crate::sql::planner::write_sink::IcebergWriteSinkMode::Data
-            }
+            ChangeStreamBranchKind::DeleteDv => super::sink::IcebergWriteSinkMode::DeletionVectors,
+            ChangeStreamBranchKind::ReuseData => super::sink::IcebergWriteSinkMode::RowLineageData,
+            ChangeStreamBranchKind::FreshData => super::sink::IcebergWriteSinkMode::Data,
         };
         Self {
             branch_id,

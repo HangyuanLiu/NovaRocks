@@ -32,9 +32,12 @@ use crate::sql::catalog;
 use crate::sql::codegen::agg_type_infer::infer_agg_function_types;
 use crate::sql::common::{ChangeStreamBranchKind, JoinKind};
 use crate::sql::parser::ast::SqlType;
-use crate::sql::planner::IcebergWriteInputBinding;
 use crate::sql::planner::distributed::runtime_filter::{
     WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
+};
+use crate::sql::planner::distributed::write::sink::IcebergWriteInputBinding;
+use crate::sql::planner::distributed::write::sink::{
+    IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
 };
 use crate::sql::planner::distributed::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor,
@@ -45,9 +48,6 @@ use crate::sql::planner::payload::{AggregateCall, PlanRowCountAssertion};
 use crate::sql::planner::physical::{
     AggMode, HashSource, JoinDistribution, JoinExecutionMode, PhysicalHashAggregateNode,
     PhysicalPlanKind, PlanSetOpKind, RedistributeMode, TopNPhase,
-};
-use crate::sql::planner::write_sink::{
-    IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
 };
 
 pub(crate) struct NativePlanEncodeContext<'a> {
@@ -1779,7 +1779,7 @@ fn encode_data_sink(
 }
 
 fn encode_change_stream_branch_partition(
-    branch: &crate::sql::planner::IcebergChangeStreamBranchRoute,
+    branch: &crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamBranchRoute,
     fragment_output_columns: &[AnalysisOutputColumn],
 ) -> Result<plan::DataPartition, String> {
     if branch.output_partition_ordinals.is_empty() {
@@ -2712,8 +2712,10 @@ mod tests {
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed::DataPartition;
+    use crate::sql::planner::distributed::write::change_stream::{
+        IcebergChangeStreamBranchRoute, IcebergChangeStreamRouterSink,
+    };
     use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
-    use crate::sql::planner::{IcebergChangeStreamBranchRoute, IcebergChangeStreamRouterSink};
 
     #[test]
     fn change_stream_router_encoder_materializes_partition_exprs() {

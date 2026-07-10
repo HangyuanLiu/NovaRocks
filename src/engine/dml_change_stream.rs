@@ -25,9 +25,10 @@ use crate::runtime::coordinator::CoordinatedQueryResult;
 use crate::sql::analysis::OutputColumn;
 use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::optimizer::OptimizerPhysicalNode;
-use crate::sql::planner::{
-    ChangeStreamWriteBranchSpec, ChangeStreamWriteDagSpec, IcebergWriteSinkSpec,
+use crate::sql::planner::distributed::write::change_stream::{
+    ChangeStreamWriteBranchSpec, ChangeStreamWriteDagSpec,
 };
+use crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec;
 
 pub(crate) const DML_CHANGE_STREAM_DATA_ROUTE_COLUMN: &str = "__change_data_route";
 
@@ -1303,16 +1304,20 @@ mod tests {
     }
 
     fn sink_specs_for_partitioned_target() -> DmlChangeStreamWriteBranchSinkSpecs {
-        let mut delete_dv = crate::sql::planner::write_sink::test_support::simple_sink_spec();
-        delete_dv.mode = crate::sql::planner::write_sink::IcebergWriteSinkMode::DeletionVectors;
+        let mut delete_dv =
+            crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec();
+        delete_dv.mode =
+            crate::sql::planner::distributed::write::sink::IcebergWriteSinkMode::DeletionVectors;
         delete_dv.target_columns = vec![
             column(crate::exec::row_position::ICEBERG_FILE_PATH_COL),
             column(crate::exec::row_position::ICEBERG_ROW_POS_COL),
             column("region"),
         ];
 
-        let mut reuse_data = crate::sql::planner::write_sink::test_support::simple_sink_spec();
-        reuse_data.mode = crate::sql::planner::write_sink::IcebergWriteSinkMode::RowLineageData;
+        let mut reuse_data =
+            crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec();
+        reuse_data.mode =
+            crate::sql::planner::distributed::write::sink::IcebergWriteSinkMode::RowLineageData;
         reuse_data.target_columns = vec![
             column("id"),
             column("region"),
@@ -1320,8 +1325,9 @@ mod tests {
             column(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL),
         ];
 
-        let mut fresh_data = crate::sql::planner::write_sink::test_support::simple_sink_spec();
-        fresh_data.mode = crate::sql::planner::write_sink::IcebergWriteSinkMode::Data;
+        let mut fresh_data =
+            crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec();
+        fresh_data.mode = crate::sql::planner::distributed::write::sink::IcebergWriteSinkMode::Data;
         fresh_data.target_columns = vec![column("id"), column("region")];
 
         DmlChangeStreamWriteBranchSinkSpecs {
@@ -1340,7 +1346,7 @@ mod tests {
     }
 
     fn branch_kinds(
-        dag: &crate::sql::planner::ChangeStreamWriteDagSpec,
+        dag: &crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
     ) -> Vec<ChangeStreamBranchKind> {
         dag.branches
             .iter()
@@ -1400,12 +1406,11 @@ mod tests {
     }
 
     fn execution_test_plan() -> DmlChangeStreamWritePlan {
-        let mut branch =
-            crate::sql::planner::ChangeStreamWriteBranchSpec::reuse_data_for_test(vec![2]);
+        let mut branch = crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteBranchSpec::reuse_data_for_test(vec![2]);
         branch.output_partition_ordinals = Vec::new();
         DmlChangeStreamWritePlan {
             producer: physical_values_plan_for_execution_test(),
-            dag: crate::sql::planner::ChangeStreamWriteDagSpec::for_test(
+            dag: crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec::for_test(
                 Some(0),
                 Some(1),
                 vec![branch],
@@ -2015,10 +2020,10 @@ mod tests {
                 data_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
                 output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
                 sink: crate::sql::planner::distributed::DataSink::IcebergWrite(
-                    crate::sql::planner::IcebergWriteFragmentSink {
+                    crate::sql::planner::distributed::write::sink::IcebergWriteFragmentSink {
                         descriptor_database: "default".to_string(),
-                        spec: crate::sql::planner::write_sink::test_support::simple_sink_spec(),
-                        input: crate::sql::planner::IcebergWriteInputBinding::RootOutputByOrdinal,
+                        spec: crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec(),
+                        input: crate::sql::planner::distributed::write::sink::IcebergWriteInputBinding::RootOutputByOrdinal,
                     },
                 ),
                 output_exprs: None,
