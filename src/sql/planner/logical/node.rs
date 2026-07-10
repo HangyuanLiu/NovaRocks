@@ -243,8 +243,8 @@ impl LogicalPlanNode {
 #[cfg(test)]
 mod plan_tests {
     use super::*;
-    use crate::sql::planner::TopNPhase;
-    use crate::sql::planner::plan::{PhysicalPlanKind, PhysicalTopNNode};
+    use crate::sql::planner::physical::TopNPhase;
+    use crate::sql::planner::physical::{PhysicalPlanKind, PhysicalTopNNode};
 
     fn empty_values_for_test() -> LogicalPlanNode {
         LogicalPlanNode::new(

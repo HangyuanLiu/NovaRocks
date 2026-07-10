@@ -34,19 +34,17 @@ use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentStreamKind};
 use crate::sql::common::{ChangeStreamBranchKind, JoinKind};
 use crate::sql::parser::ast::SqlType;
 use crate::sql::planner::payload::{AggregateCall, PlanRowCountAssertion};
-use crate::sql::planner::plan::{
-    PhysicalHashAggregateNode, PhysicalPlanKind, PlanSetOpKind, RedistributeMode,
+use crate::sql::planner::physical::{
+    AggMode, HashSource, JoinDistribution, JoinExecutionMode, PhysicalHashAggregateNode,
+    PhysicalPlanKind, PlanSetOpKind, RedistributeMode, TopNPhase,
 };
-use crate::sql::planner::runtime_filter::{
-    JoinExecutionMode, WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
-};
+use crate::sql::planner::runtime_filter::{WiredRuntimeFilterBuild, WiredRuntimeFilterProbe};
 use crate::sql::planner::write_sink::{
     IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
 };
 use crate::sql::planner::{
-    AggMode, DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan,
-    ExchangeFlavor, ExchangeReceiver, HashSource, IcebergWriteInputBinding, JoinDistribution,
-    PartitionKind, PlanFragment, TopNPhase,
+    DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor,
+    ExchangeReceiver, IcebergWriteInputBinding, PartitionKind, PlanFragment,
 };
 
 pub(crate) struct NativePlanEncodeContext<'a> {
@@ -2710,9 +2708,9 @@ mod tests {
     use crate::proto::expr::expr;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
+    use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
     use crate::sql::planner::{
         DataPartition, IcebergChangeStreamBranchRoute, IcebergChangeStreamRouterSink,
-        PhysicalPlanStats, PlannerConfidence,
     };
 
     #[test]
@@ -3450,7 +3448,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: vec![child],
             stats: stats(),
-            payload: DistributedNodeKind::TopN(crate::sql::planner::plan::PhysicalTopNNode {
+            payload: DistributedNodeKind::TopN(crate::sql::planner::physical::PhysicalTopNNode {
                 items: Vec::new(),
                 limit: Some(10),
                 offset: None,
@@ -3496,7 +3494,7 @@ mod tests {
             children: Vec::new(),
             stats: stats(),
             payload: DistributedNodeKind::HashJoin(Box::new(
-                crate::sql::planner::plan::PhysicalHashJoinNode {
+                crate::sql::planner::physical::PhysicalHashJoinNode {
                     join_type: JoinKind::Inner,
                     eq_conditions: Vec::new(),
                     other_condition: None,
@@ -3537,7 +3535,7 @@ mod tests {
             children: Vec::new(),
             stats: stats(),
             payload: DistributedNodeKind::NestLoopJoin(
-                crate::sql::planner::plan::PhysicalNestLoopJoinNode {
+                crate::sql::planner::physical::PhysicalNestLoopJoinNode {
                     join_type: JoinKind::Inner,
                     condition: None,
                     output_columns: output_columns.clone(),
@@ -3726,7 +3724,7 @@ mod tests {
                 ],
                 stats: stats(),
                 payload: DistributedNodeKind::HashJoin(Box::new(
-                    crate::sql::planner::plan::PhysicalHashJoinNode {
+                    crate::sql::planner::physical::PhysicalHashJoinNode {
                         join_type: JoinKind::Inner,
                         eq_conditions: Vec::new(),
                         other_condition: None,
@@ -3972,7 +3970,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
             children: vec![child.clone(), child],
             stats: stats(),
-            payload: DistributedNodeKind::SetOp(crate::sql::planner::plan::PhysicalSetOpNode {
+            payload: DistributedNodeKind::SetOp(crate::sql::planner::physical::PhysicalSetOpNode {
                 kind: PlanSetOpKind::UnionAll,
                 output_columns: vec![
                     output_column(10, "c1", DataType::Int64),

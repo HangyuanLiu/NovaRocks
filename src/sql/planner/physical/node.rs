@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Physical planner IR staging owner pending migration to `physical/node.rs`.
+//! Planner-owned physical plan nodes.
 
 use crate::sql::analysis::{JoinKind, OutputColumn, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
@@ -25,7 +25,11 @@ use crate::sql::planner::payload::{
     PlanFilterNode, PlanGenerateSeriesNode, PlanLimitNode, PlanProjectNode, PlanRepeatNode,
     PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanValuesNode, PlanWindowNode,
 };
-use crate::sql::planner::{AggMode, AggregateOutputLayout, JoinDistribution, TopNPhase};
+use crate::sql::planner::physical::{
+    AggMode, AggregateOutputLayout, HashSource, JoinDistribution, JoinExecutionMode,
+    PhysicalPlanStats, TopNPhase,
+};
+use crate::sql::planner::runtime_filter::{RuntimeFilterBuildIntent, RuntimeFilterProbeIntent};
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -55,8 +59,8 @@ pub(crate) struct PhysicalHashJoinNode {
     pub eq_conditions: Vec<PhysicalHashJoinEqCondition>,
     pub other_condition: Option<TypedExpr>,
     pub distribution: JoinDistribution,
-    pub execution_mode: Option<crate::sql::planner::JoinExecutionMode>,
-    pub build_runtime_filters: Vec<crate::sql::planner::RuntimeFilterBuildIntent>,
+    pub execution_mode: Option<JoinExecutionMode>,
+    pub build_runtime_filters: Vec<RuntimeFilterBuildIntent>,
     pub output_columns: Vec<OutputColumn>,
 }
 
@@ -123,8 +127,8 @@ pub(crate) struct PhysicalPlanNode {
     pub kind: PhysicalPlanKind,
     pub children: Vec<PhysicalPlanNode>,
     pub output_columns: Vec<OutputColumn>,
-    pub stats: crate::sql::planner::PhysicalPlanStats,
-    pub probe_runtime_filters: Vec<crate::sql::planner::RuntimeFilterProbeIntent>,
+    pub stats: PhysicalPlanStats,
+    pub probe_runtime_filters: Vec<RuntimeFilterProbeIntent>,
 }
 
 #[allow(dead_code)]
@@ -196,7 +200,7 @@ pub(crate) enum RedistributeMode {
     Gather,
     Hash {
         cols: Vec<ColumnId>,
-        source: crate::sql::planner::HashSource,
+        source: HashSource,
     },
     Broadcast,
 }

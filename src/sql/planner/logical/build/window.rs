@@ -19,9 +19,9 @@ use arrow::datatypes::DataType;
 
 use crate::sql::analysis::*;
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
-use crate::sql::planner::OrderingSpec;
 use crate::sql::planner::logical::*;
 use crate::sql::planner::optimizer_bridge::property::ordering_spec_from_sort_items;
+use crate::sql::planner::ordering::OrderingSpec;
 use crate::sql::planner::payload::*;
 
 use super::output::plan_output_columns;

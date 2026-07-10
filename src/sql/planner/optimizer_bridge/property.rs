@@ -19,7 +19,7 @@
 
 use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
-use crate::sql::planner::{OrderingSpec, SortKey};
+use crate::sql::planner::ordering::{OrderingSpec, SortKey};
 
 pub(crate) fn typed_expr_to_column_id(expr: &TypedExpr) -> Option<ColumnId> {
     match &expr.kind {

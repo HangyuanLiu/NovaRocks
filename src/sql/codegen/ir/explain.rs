@@ -37,19 +37,16 @@ use crate::sql::planner::payload::{
     PlanTableFunctionNode as DistributedTableFunctionNode, PlanValuesNode as DistributedValuesNode,
     PlanWindowNode as DistributedWindowNode,
 };
-use crate::sql::planner::plan::{
-    DistributedChangeEventExpandNode, PhysicalHashAggregateNode, PhysicalHashJoinNode,
-    PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalSetOpNode, PhysicalTopNNode,
-    PlanSetOpKind as SetOpKind,
-};
-use crate::sql::planner::stats::{
-    DEFAULT_CPU_COST_WEIGHT, DEFAULT_MEMORY_COST_WEIGHT, DEFAULT_NETWORK_COST_WEIGHT, MAX_ROW_COUNT,
+use crate::sql::planner::physical::{
+    AggMode, DEFAULT_CPU_COST_WEIGHT, DEFAULT_MEMORY_COST_WEIGHT, DEFAULT_NETWORK_COST_WEIGHT,
+    DistributedChangeEventExpandNode, JoinDistribution, JoinExecutionMode, MAX_ROW_COUNT,
+    PhysicalHashAggregateNode, PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalPlanKind,
+    PhysicalPlanStats, PhysicalSetOpNode, PhysicalTopNNode, PlanSetOpKind as SetOpKind,
+    PlannerBroadcastDecision, PlannerConfidence, PlannerCostEstimate, TopNPhase,
 };
 use crate::sql::planner::{
-    AggMode, DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeReceiver,
-    JoinDistribution, JoinExecutionMode, PartitionKind, PhysicalPlanStats, PlanFragment,
-    PlannerBroadcastDecision, PlannerConfidence, PlannerCostEstimate, TopNPhase,
-    WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
+    DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeReceiver, PartitionKind,
+    PlanFragment, WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
 };
 
 pub(crate) fn explain_distributed_plan(dp: &DistributedPlan, level: ExplainLevel) -> Vec<String> {
@@ -1560,9 +1557,11 @@ mod tests {
         intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items,
     };
     use crate::sql::planner::payload::AggregateCall;
+    use crate::sql::planner::physical::{
+        PhysicalPlanStats, PlannerBroadcastDecision, PlannerConfidence,
+    };
     use crate::sql::planner::{
-        DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeReceiver, PhysicalPlanStats,
-        PlannerBroadcastDecision, PlannerConfidence,
+        DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeReceiver,
     };
 
     fn build_distributed_plan(plan: &OptimizerPhysicalNode) -> Result<DistributedPlan, String> {
@@ -1570,7 +1569,9 @@ mod tests {
         prepare_bridge2_test_props(&mut plan);
         let mut physical =
             crate::sql::planner::optimizer_bridge::physical::optimizer_physical_to_plan(&plan)?;
-        crate::sql::planner::runtime_filter_placement::place_runtime_filters(&mut physical);
+        crate::sql::planner::physical::runtime_filter_placement::place_runtime_filters(
+            &mut physical,
+        );
         crate::sql::planner::build_distributed_plan(&physical)
     }
 

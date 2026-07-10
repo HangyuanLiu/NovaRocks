@@ -1528,6 +1528,19 @@ fn rust_named_type_declaration_count(text: &str, name: &str) -> usize {
         .count()
 }
 
+fn rust_named_const_declaration_count(text: &str, name: &str) -> usize {
+    let production = rust_sanitized_production_text(text);
+    let identifiers = production
+        .split(|ch: char| !is_ident_char(ch))
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+
+    identifiers
+        .windows(2)
+        .filter(|tokens| tokens[0] == "const" && tokens[1] == name)
+        .count()
+}
+
 fn rust_use_tokens(text: &str) -> Vec<String> {
     let chars = text.chars().collect::<Vec<_>>();
     let mut tokens = Vec::new();
@@ -1696,13 +1709,50 @@ fn rust_resolve_use_paths(
     (!resolved.is_empty()).then(|| resolved.into_iter().collect())
 }
 
-fn rust_production_use_statements(text: &str) -> Vec<String> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RustRawUseStatement {
+    visibility: String,
+    path: RustUsePath,
+    inline_modules: Vec<String>,
+}
+
+fn rust_raw_production_use_statements(text: &str) -> Vec<RustRawUseStatement> {
     let production = rust_sanitized_production_text(text);
     let tokens = rust_use_tokens(&production);
-    let mut raw_imports = Vec::<(String, RustUsePath)>::new();
+    let inline_module_openings = (0..tokens.len().saturating_sub(2))
+        .filter_map(|index| {
+            (tokens[index] == "mod"
+                && tokens[index + 1].chars().all(is_ident_char)
+                && tokens[index + 2] == "{")
+                .then(|| (index + 2, tokens[index + 1].clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut raw_imports = Vec::new();
+    let mut inline_modules = Vec::<(usize, String)>::new();
+    let mut brace_depth = 0usize;
     let mut index = 0usize;
 
     while index < tokens.len() {
+        if tokens[index] == "{" {
+            brace_depth += 1;
+            if let Some(module) = inline_module_openings.get(&index) {
+                inline_modules.push((brace_depth, module.clone()));
+            }
+            index += 1;
+            continue;
+        }
+        if tokens[index] == "}" {
+            if inline_modules
+                .last()
+                .is_some_and(|(depth, _)| *depth == brace_depth)
+            {
+                inline_modules.pop();
+            }
+            brace_depth = brace_depth.saturating_sub(1);
+            index += 1;
+            continue;
+        }
+
         let mut visibility = "private".to_string();
         let mut cursor = index;
 
@@ -1744,12 +1794,27 @@ fn rust_production_use_statements(text: &str) -> Vec<String> {
 
         let mut paths = Vec::new();
         rust_expand_use_list(&tokens[tree_start..cursor], &[], &mut paths);
-        raw_imports.extend(paths.into_iter().map(|path| (visibility.clone(), path)));
+        let scope = inline_modules
+            .iter()
+            .map(|(_, module)| module.clone())
+            .collect::<Vec<_>>();
+        raw_imports.extend(paths.into_iter().map(|path| RustRawUseStatement {
+            visibility: visibility.clone(),
+            path,
+            inline_modules: scope.clone(),
+        }));
         index = cursor + 1;
     }
 
+    raw_imports
+}
+
+fn rust_production_use_statements(text: &str) -> Vec<String> {
+    let raw_imports = rust_raw_production_use_statements(text);
+
     let mut aliases = BTreeMap::<String, Vec<Vec<String>>>::new();
-    for (_, path) in &raw_imports {
+    for raw in &raw_imports {
+        let path = &raw.path;
         let Some(alias) = path.alias.as_ref().filter(|alias| alias.as_str() != "_") else {
             continue;
         };
@@ -1761,7 +1826,9 @@ fn rust_production_use_statements(text: &str) -> Vec<String> {
 
     raw_imports
         .into_iter()
-        .flat_map(|(visibility, path)| {
+        .flat_map(|raw| {
+            let visibility = raw.visibility;
+            let path = raw.path;
             let resolved =
                 rust_resolve_use_paths(&path.segments, &aliases, &mut BTreeSet::new(), 0)
                     .unwrap_or_else(|| vec![path.segments]);
@@ -1772,6 +1839,125 @@ fn rust_production_use_statements(text: &str) -> Vec<String> {
             resolved
                 .into_iter()
                 .map(|resolved| format!("{visibility}|{}{alias}", resolved.join("::")))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RustScopedUsePath {
+    segments: Vec<String>,
+    inline_modules: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RustScopedUseStatement {
+    import: String,
+    inline_modules: Vec<String>,
+}
+
+fn rust_resolve_scoped_use_paths(
+    path: &[String],
+    inline_modules: &[String],
+    aliases: &BTreeMap<String, Vec<RustScopedUsePath>>,
+    resolving: &mut BTreeSet<String>,
+    depth: usize,
+) -> Option<Vec<RustScopedUsePath>> {
+    if depth > aliases.len() {
+        return None;
+    }
+
+    let Some(owner_index) = path
+        .iter()
+        .position(|segment| segment != "self" && segment != "super")
+    else {
+        return Some(vec![RustScopedUsePath {
+            segments: path.to_vec(),
+            inline_modules: inline_modules.to_vec(),
+        }]);
+    };
+    let owner = &path[owner_index];
+    let Some(targets) = aliases.get(owner) else {
+        return Some(vec![RustScopedUsePath {
+            segments: path.to_vec(),
+            inline_modules: inline_modules.to_vec(),
+        }]);
+    };
+    if !resolving.insert(owner.clone()) {
+        return None;
+    }
+
+    let mut resolved = BTreeSet::new();
+    for target in targets {
+        let Some(target_paths) = rust_resolve_scoped_use_paths(
+            &target.segments,
+            &target.inline_modules,
+            aliases,
+            resolving,
+            depth + 1,
+        ) else {
+            continue;
+        };
+        for mut target_path in target_paths {
+            target_path
+                .segments
+                .extend_from_slice(&path[owner_index + 1..]);
+            resolved.insert(target_path);
+        }
+    }
+    resolving.remove(owner);
+    (!resolved.is_empty()).then(|| resolved.into_iter().collect())
+}
+
+fn rust_production_scoped_use_statements(text: &str) -> Vec<RustScopedUseStatement> {
+    let raw_imports = rust_raw_production_use_statements(text);
+    let mut aliases = BTreeMap::<String, Vec<RustScopedUsePath>>::new();
+    for raw in &raw_imports {
+        let Some(alias) = raw
+            .path
+            .alias
+            .as_ref()
+            .filter(|alias| alias.as_str() != "_")
+        else {
+            continue;
+        };
+        let target = RustScopedUsePath {
+            segments: raw.path.segments.clone(),
+            inline_modules: raw.inline_modules.clone(),
+        };
+        let targets = aliases.entry(alias.clone()).or_default();
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+
+    raw_imports
+        .into_iter()
+        .flat_map(|raw| {
+            let resolved = rust_resolve_scoped_use_paths(
+                &raw.path.segments,
+                &raw.inline_modules,
+                &aliases,
+                &mut BTreeSet::new(),
+                0,
+            )
+            .unwrap_or_else(|| {
+                vec![RustScopedUsePath {
+                    segments: raw.path.segments.clone(),
+                    inline_modules: raw.inline_modules.clone(),
+                }]
+            });
+            let alias = raw
+                .path
+                .alias
+                .map(|alias| format!(" as {alias}"))
+                .unwrap_or_default();
+            resolved
+                .into_iter()
+                .map(|resolved| RustScopedUseStatement {
+                    import: format!("{}|{}{alias}", raw.visibility, resolved.segments.join("::")),
+                    inline_modules: resolved.inline_modules,
+                })
                 .collect::<Vec<_>>()
         })
         .collect()
@@ -1823,6 +2009,98 @@ fn rust_use_imports_sql_common(import: &str) -> bool {
         .copied()
         .next()
         == Some("common")
+}
+
+fn rust_source_module_segments(source_rel: &str) -> Option<Vec<String>> {
+    let path = Path::new(source_rel);
+    if path.extension().is_none_or(|extension| extension != "rs") {
+        return None;
+    }
+    let components = path
+        .components()
+        .map(|component| component.as_os_str().to_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()?;
+    if components
+        .first()
+        .is_none_or(|component| component != "src")
+    {
+        return None;
+    }
+
+    let file = components.last()?;
+    let stem = file.strip_suffix(".rs")?;
+    let mut module = vec!["crate".to_string()];
+    module.extend(components[1..components.len() - 1].iter().cloned());
+    let crate_root = components.len() == 2 && matches!(stem, "lib" | "main");
+    if stem != "mod" && !crate_root {
+        module.push(stem.to_string());
+    }
+    Some(module)
+}
+
+fn rust_canonical_use_segments_in_scope(
+    import: &str,
+    source_rel: &str,
+    inline_modules: &[String],
+) -> Option<Vec<String>> {
+    let path = rust_use_path(import).split("::").collect::<Vec<_>>();
+    let mut index = 0usize;
+    let mut canonical = if path.first() == Some(&"crate") {
+        index = 1;
+        vec!["crate".to_string()]
+    } else {
+        let mut module = rust_source_module_segments(source_rel)?;
+        module.extend(inline_modules.iter().cloned());
+        module
+    };
+
+    while path.get(index) == Some(&"self") {
+        index += 1;
+    }
+    while path.get(index) == Some(&"super") {
+        if canonical.len() == 1 {
+            return None;
+        }
+        canonical.pop();
+        index += 1;
+    }
+    canonical.extend(path[index..].iter().map(|segment| (*segment).to_string()));
+    Some(canonical)
+}
+
+fn rust_canonical_use_segments(import: &str, source_rel: &str) -> Option<Vec<String>> {
+    rust_canonical_use_segments_in_scope(import, source_rel, &[])
+}
+
+fn rust_canonical_path_is_legacy_planner_owner(canonical: &[String]) -> bool {
+    let legacy_owners = [
+        "plan",
+        "physical_vocab",
+        "stats",
+        "runtime_filter_placement",
+    ];
+    canonical.len() >= 4
+        && canonical[..3] == ["crate", "sql", "planner"]
+        && legacy_owners.contains(&canonical[3].as_str())
+}
+
+fn rust_use_imports_legacy_planner_owner(import: &str, source_rel: &str) -> bool {
+    let Some(canonical) = rust_canonical_use_segments(import, source_rel) else {
+        return false;
+    };
+    rust_canonical_path_is_legacy_planner_owner(&canonical)
+}
+
+fn rust_scoped_use_imports_legacy_planner_owner(
+    import: &RustScopedUseStatement,
+    source_rel: &str,
+) -> bool {
+    let Some(canonical) =
+        rust_canonical_use_segments_in_scope(&import.import, source_rel, &import.inline_modules)
+    else {
+        return false;
+    };
+    rust_canonical_path_is_legacy_planner_owner(&canonical)
 }
 
 fn rust_use_leaf(import: &str) -> &str {
@@ -2358,6 +2636,138 @@ fn planner_logical_module_use_surface_is_closed() {
 }
 
 #[test]
+fn planner_physical_legacy_owner_detector_distinguishes_sibling_and_unrelated_paths() {
+    assert!(!rust_use_imports_legacy_planner_owner(
+        "private|crate::proto::plan::plan_node::Kind",
+        "src/sql/codegen/proto_encode/plan.rs",
+    ));
+    assert!(rust_use_imports_legacy_planner_owner(
+        "private|crate::sql::planner::plan::PhysicalPlanNode",
+        "src/sql/codegen/ir/explain.rs",
+    ));
+    assert!(!rust_use_imports_legacy_planner_owner(
+        "pub(crate)|stats::*",
+        "src/sql/planner/physical/mod.rs",
+    ));
+    assert!(!rust_use_imports_legacy_planner_owner(
+        "private|super::stats::PhysicalPlanStats",
+        "src/sql/planner/physical/node.rs",
+    ));
+    assert!(rust_use_imports_legacy_planner_owner(
+        "private|crate::sql::planner::stats::PhysicalPlanStats",
+        "src/sql/planner/physical/node.rs",
+    ));
+    assert!(rust_use_imports_legacy_planner_owner(
+        "private|super::stats::PhysicalPlanStats",
+        "src/sql/planner/distributed_node.rs",
+    ));
+    assert!(!rust_use_imports_legacy_planner_owner(
+        "private|super::stats::PhysicalPlanStats",
+        "src/sql/planner/optimizer_bridge/foo.rs",
+    ));
+    assert!(rust_use_imports_legacy_planner_owner(
+        "private|super::super::stats::PhysicalPlanStats",
+        "src/sql/planner/physical/node.rs",
+    ));
+    assert!(!rust_use_imports_legacy_planner_owner(
+        "private|super::super::stats::PhysicalPlanStats",
+        "src/sql/planner/physical/nested/foo.rs",
+    ));
+    assert!(rust_use_imports_legacy_planner_owner(
+        "private|super::super::super::stats::PhysicalPlanStats",
+        "src/sql/planner/physical/nested/foo.rs",
+    ));
+    assert!(rust_use_imports_legacy_planner_owner(
+        "private|stats::*",
+        "src/sql/planner/mod.rs",
+    ));
+    assert!(!rust_use_imports_legacy_planner_owner(
+        "private|stats::*",
+        "src/sql/planner/physical/mod.rs",
+    ));
+
+    let allowed_alias_chain = rust_production_use_statements(
+        "use super::{super::{stats as stage_stats}};\n\
+         use stage_stats as stats_owner;\n\
+         use stats_owner::*;",
+    );
+    assert!(
+        !allowed_alias_chain.iter().any(|import| {
+            rust_use_imports_legacy_planner_owner(import, "src/sql/planner/physical/nested/foo.rs")
+        }),
+        "physical sibling stats alias chain must remain allowed: {allowed_alias_chain:?}"
+    );
+
+    let forbidden_alias_chain = rust_production_use_statements(
+        "use super::{super::{super::{stats as root_stats}}};\n\
+         use root_stats as stats_owner;\n\
+         use stats_owner::*;",
+    );
+    assert!(
+        forbidden_alias_chain.iter().any(|import| {
+            rust_use_imports_legacy_planner_owner(import, "src/sql/planner/physical/nested/foo.rs")
+        }),
+        "planner-root stats alias chain must be rejected: {forbidden_alias_chain:?}"
+    );
+}
+
+#[test]
+fn planner_physical_legacy_owner_detector_tracks_inline_module_scope() {
+    let source_rel = "src/sql/planner/physical/node.rs";
+    let allowed =
+        rust_production_scoped_use_statements("mod nested { use super::super::stats::X; }");
+    assert_eq!(allowed.len(), 1, "{allowed:?}");
+    assert_eq!(allowed[0].inline_modules, vec!["nested"]);
+    assert!(
+        !allowed
+            .iter()
+            .any(|import| { rust_scoped_use_imports_legacy_planner_owner(import, source_rel) }),
+        "inline nested module must resolve two super segments to physical::stats: {allowed:?}"
+    );
+
+    let forbidden =
+        rust_production_scoped_use_statements("mod nested { use super::super::super::stats::X; }");
+    assert!(
+        forbidden
+            .iter()
+            .any(|import| { rust_scoped_use_imports_legacy_planner_owner(import, source_rel) }),
+        "inline nested module must resolve three super segments to planner::stats: {forbidden:?}"
+    );
+
+    let allowed_alias_chain = rust_production_scoped_use_statements(
+        r#"
+mod nested {
+    use super::{super::{stats as stage_stats}};
+    use stage_stats as stats_owner;
+    use stats_owner::X;
+}
+"#,
+    );
+    assert!(
+        !allowed_alias_chain
+            .iter()
+            .any(|import| { rust_scoped_use_imports_legacy_planner_owner(import, source_rel) }),
+        "grouped alias targets must resolve relative to their inline declaration scope: {allowed_alias_chain:?}"
+    );
+
+    let forbidden_alias_chain = rust_production_scoped_use_statements(
+        r#"
+mod nested {
+    use super::{super::{super::{stats as root_stats}}};
+    use root_stats as stats_owner;
+    use stats_owner::X;
+}
+"#,
+    );
+    assert!(
+        forbidden_alias_chain
+            .iter()
+            .any(|import| { rust_scoped_use_imports_legacy_planner_owner(import, source_rel) }),
+        "grouped alias targets that reach planner::stats must be rejected: {forbidden_alias_chain:?}"
+    );
+}
+
+#[test]
 fn planner_logical_builder_is_owned_by_logical_stage() {
     let repo = Path::new(manifest_dir());
     let expected_files = [
@@ -2402,19 +2812,354 @@ fn planner_logical_builder_is_owned_by_logical_stage() {
 }
 
 #[test]
+fn planner_physical_stage_has_single_namespace() {
+    let repo = Path::new(manifest_dir());
+    let planner = repo.join("src/sql/planner");
+    let expected_files = [
+        "physical/mod.rs",
+        "physical/node.rs",
+        "physical/vocab.rs",
+        "physical/stats.rs",
+        "physical/runtime_filter.rs",
+        "physical/runtime_filter_placement.rs",
+    ];
+    for relative in expected_files {
+        let path = planner.join(relative);
+        assert!(
+            path.is_file(),
+            "missing physical stage owner: {}",
+            rel(&path)
+        );
+    }
+    for relative in [
+        "plan.rs",
+        "physical_vocab.rs",
+        "stats.rs",
+        "runtime_filter_placement.rs",
+    ] {
+        let path = planner.join(relative);
+        assert!(
+            !path.exists(),
+            "legacy physical stage owner must be deleted: {}",
+            rel(&path)
+        );
+    }
+
+    let physical_node = planner.join("physical/node.rs");
+    let physical_vocab = planner.join("physical/vocab.rs");
+    let physical_stats = planner.join("physical/stats.rs");
+    let physical_runtime_filter = planner.join("physical/runtime_filter.rs");
+    let ordering = planner.join("ordering.rs");
+    let planner_sources = rs_files(&planner)
+        .into_iter()
+        .map(|path| {
+            let text = fs::read_to_string(&path).unwrap();
+            (path, text)
+        })
+        .collect::<Vec<_>>();
+
+    for (owner, items) in [
+        (
+            &physical_node,
+            &[
+                "PhysicalTopNNode",
+                "PhysicalHashAggregateNode",
+                "PhysicalHashJoinNode",
+                "PhysicalHashJoinEqCondition",
+                "PhysicalNestLoopJoinNode",
+                "PlanSetOpKind",
+                "PhysicalSetOpNode",
+                "DistributedChangeEventExpandNode",
+                "DistributedChangeEventSpec",
+                "DistributedChangeEventOutputExpr",
+                "PhysicalPlanNode",
+                "PhysicalPlanKind",
+                "RedistributeNode",
+                "RedistributeMode",
+            ][..],
+        ),
+        (
+            &physical_vocab,
+            &[
+                "AggMode",
+                "TopNPhase",
+                "JoinDistribution",
+                "HashSource",
+                "AggregateOutputLayout",
+            ][..],
+        ),
+        (
+            &physical_stats,
+            &[
+                "PlannerConfidence",
+                "PlannerColumnStatistic",
+                "PlannerCostEstimate",
+                "PlannerBroadcastDecision",
+                "PhysicalPlanStats",
+            ][..],
+        ),
+        (&physical_runtime_filter, &["JoinExecutionMode"][..]),
+        (&ordering, &["SortKey", "OrderingSpec"][..]),
+    ] {
+        for item in items {
+            let declarations = planner_sources
+                .iter()
+                .filter_map(|(path, text)| {
+                    let count = rust_named_type_declaration_count(text, item);
+                    (count > 0).then(|| format!("{} ({count})", rel(path)))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                declarations,
+                vec![format!("{} (1)", rel(owner))],
+                "{item} must have exactly one declaration in its physical/neutral owner"
+            );
+        }
+    }
+
+    for constant in [
+        "DEFAULT_CPU_COST_WEIGHT",
+        "DEFAULT_MEMORY_COST_WEIGHT",
+        "DEFAULT_NETWORK_COST_WEIGHT",
+        "MAX_ROW_COUNT",
+    ] {
+        let declarations = planner_sources
+            .iter()
+            .filter_map(|(path, text)| {
+                let count = rust_named_const_declaration_count(text, constant);
+                (count > 0).then(|| format!("{} ({count})", rel(path)))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            declarations,
+            vec![format!("{} (1)", rel(&physical_stats))],
+            "{constant} must have exactly one declaration in its physical stats owner"
+        );
+    }
+
+    let physical_mod_path = planner.join("physical/mod.rs");
+    let physical_mod = fs::read_to_string(&physical_mod_path).unwrap();
+    assert_eq!(
+        module_declarations(&physical_mod),
+        BTreeSet::from([
+            "node".to_string(),
+            "runtime_filter".to_string(),
+            "runtime_filter_placement".to_string(),
+            "stats".to_string(),
+            "vocab".to_string(),
+        ]),
+        "physical/mod.rs must declare exactly the five physical owners"
+    );
+    for declaration in [
+        "mod node;",
+        "pub(crate) mod runtime_filter;",
+        "pub(crate) mod runtime_filter_placement;",
+        "mod stats;",
+        "mod vocab;",
+    ] {
+        assert!(
+            has_non_comment_line(&physical_mod, declaration),
+            "physical/mod.rs must contain `{declaration}`"
+        );
+    }
+    assert_eq!(
+        rust_production_use_statements(&physical_mod)
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "pub(crate)|node::*".to_string(),
+            "pub(crate)|runtime_filter::JoinExecutionMode".to_string(),
+            "pub(crate)|stats::DEFAULT_CPU_COST_WEIGHT".to_string(),
+            "pub(crate)|stats::DEFAULT_MEMORY_COST_WEIGHT".to_string(),
+            "pub(crate)|stats::DEFAULT_NETWORK_COST_WEIGHT".to_string(),
+            "pub(crate)|stats::MAX_ROW_COUNT".to_string(),
+            "pub(crate)|stats::PhysicalPlanStats".to_string(),
+            "pub(crate)|stats::PlannerBroadcastDecision".to_string(),
+            "pub(crate)|stats::PlannerColumnStatistic".to_string(),
+            "pub(crate)|stats::PlannerConfidence".to_string(),
+            "pub(crate)|stats::PlannerCostEstimate".to_string(),
+            "pub(crate)|vocab::AggMode".to_string(),
+            "pub(crate)|vocab::AggregateOutputLayout".to_string(),
+            "pub(crate)|vocab::HashSource".to_string(),
+            "pub(crate)|vocab::JoinDistribution".to_string(),
+            "pub(crate)|vocab::TopNPhase".to_string(),
+        ]),
+        "physical/mod.rs must expose only the physical stage surface"
+    );
+
+    let facade_path = planner.join("mod.rs");
+    let facade = fs::read_to_string(&facade_path).unwrap();
+    for declaration in ["pub(crate) mod physical;", "pub(crate) mod ordering;"] {
+        assert!(
+            has_non_comment_line(&facade, declaration),
+            "planner facade must contain `{declaration}`"
+        );
+    }
+    for legacy_module in [
+        "plan",
+        "physical_vocab",
+        "stats",
+        "runtime_filter_placement",
+    ] {
+        assert!(
+            !has_module_declaration(&facade, legacy_module),
+            "planner facade must not declare legacy physical module `{legacy_module}`"
+        );
+    }
+    let facade_uses = rust_production_use_statements(&facade);
+    assert!(
+        !facade_uses.iter().any(|import| {
+            rust_use_imports_stage(import, "physical") || rust_use_imports_stage(import, "ordering")
+        }),
+        "planner facade must not import or re-export physical/ordering items: {facade_uses:?}"
+    );
+
+    let physical_and_ordering_items = BTreeSet::from([
+        "PhysicalTopNNode",
+        "PhysicalHashAggregateNode",
+        "PhysicalHashJoinNode",
+        "PhysicalHashJoinEqCondition",
+        "PhysicalNestLoopJoinNode",
+        "PlanSetOpKind",
+        "PhysicalSetOpNode",
+        "DistributedChangeEventExpandNode",
+        "DistributedChangeEventSpec",
+        "DistributedChangeEventOutputExpr",
+        "PhysicalPlanNode",
+        "PhysicalPlanKind",
+        "RedistributeNode",
+        "RedistributeMode",
+        "AggMode",
+        "TopNPhase",
+        "JoinDistribution",
+        "HashSource",
+        "AggregateOutputLayout",
+        "PlannerConfidence",
+        "PlannerColumnStatistic",
+        "PlannerCostEstimate",
+        "PlannerBroadcastDecision",
+        "PhysicalPlanStats",
+        "JoinExecutionMode",
+        "SortKey",
+        "OrderingSpec",
+    ]);
+    for path in rs_files(&src_dir()) {
+        let text = fs::read_to_string(&path).unwrap();
+        let production = rust_sanitized_production_text(&text);
+        let compact = compact_line(&production);
+        let imports = rust_production_use_statements(&text);
+        let scoped_imports = rust_production_scoped_use_statements(&text);
+        for import in &scoped_imports {
+            assert!(
+                !rust_scoped_use_imports_legacy_planner_owner(import, &rel(&path)),
+                "legacy physical owner import remains in {}: {import:?}",
+                rel(&path)
+            );
+        }
+        for import in &imports {
+            let import_segments = rust_use_path(import).split("::").collect::<Vec<_>>();
+            let imports_planner_root = import_segments.last().is_some_and(|leaf| {
+                physical_and_ordering_items.contains(leaf)
+                    && import_segments
+                        .iter()
+                        .rposition(|segment| *segment == "planner")
+                        == Some(import_segments.len() - 2)
+            });
+            assert!(
+                !imports_planner_root,
+                "planner root must not flatten physical/ordering owner in {}: {import}",
+                rel(&path)
+            );
+        }
+        for item in &physical_and_ordering_items {
+            assert!(
+                !compact.contains(&format!("crate::sql::planner::{item}")),
+                "fully-qualified planner root physical/ordering path remains in {}: {item}",
+                rel(&path)
+            );
+        }
+    }
+
+    for path in rs_files(&planner.join("physical")) {
+        let text = fs::read_to_string(&path).unwrap();
+        let production = rust_sanitized_production_text(&text);
+        let imports = rust_production_use_statements(&text);
+        assert!(
+            !imports.iter().any(|import| {
+                rust_use_imports_stage(import, "logical")
+                    || rust_use_imports_stage(import, "distributed")
+            }) && !compact_line(&production).contains("planner::logical")
+                && !compact_line(&production).contains("planner::distributed"),
+            "physical production must not import logical/distributed owners in {}: {imports:?}",
+            rel(&path)
+        );
+    }
+    for path in rs_files(&planner.join("logical")) {
+        let text = fs::read_to_string(&path).unwrap();
+        let production = rust_sanitized_production_text(&text);
+        let imports = rust_production_use_statements(&text);
+        assert!(
+            !imports
+                .iter()
+                .any(|import| rust_use_imports_stage(import, "physical"))
+                && !compact_line(&production).contains("planner::physical"),
+            "logical production must not import physical owner in {}: {imports:?}",
+            rel(&path)
+        );
+    }
+
+    let root_runtime_filter_path = planner.join("runtime_filter.rs");
+    let root_runtime_filter = fs::read_to_string(&root_runtime_filter_path).unwrap();
+    assert_eq!(
+        rust_named_type_declaration_count(&root_runtime_filter, "JoinExecutionMode"),
+        0,
+        "JoinExecutionMode must move to the physical RF owner"
+    );
+    for item in [
+        "RuntimeFilterBuildIntent",
+        "RuntimeFilterProbeIntent",
+        "WiredRuntimeFilterBuild",
+        "WiredRuntimeFilterProbe",
+        "PlannedRuntimeFilter",
+    ] {
+        let declarations = planner_sources
+            .iter()
+            .filter_map(|(path, text)| {
+                let count = rust_named_type_declaration_count(text, item);
+                (count > 0).then(|| format!("{} ({count})", rel(path)))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            declarations,
+            vec![format!("{} (1)", rel(&root_runtime_filter_path))],
+            "{item} must remain uniquely declared in the root RF lifecycle owner"
+        );
+    }
+    assert!(
+        rust_production_use_statements(&root_runtime_filter)
+            .contains(&"private|crate::sql::planner::physical::JoinExecutionMode".to_string()),
+        "root runtime_filter.rs must explicitly import physical JoinExecutionMode"
+    );
+}
+
+#[test]
 fn planner_logical_ir_and_payload_have_stage_owners() {
     let repo = Path::new(manifest_dir());
     let planner = repo.join("src/sql/planner");
     let logical_node_path = planner.join("logical/node.rs");
     let payload_path = planner.join("payload.rs");
-    let plan_path = planner.join("plan.rs");
+    let physical_node_path = planner.join("physical/node.rs");
     let facade_path = planner.join("mod.rs");
     let logical_mod_path = planner.join("logical/mod.rs");
     let marker_path = planner.join("imv_rewrite/marker.rs");
 
-    for path in [&logical_node_path, &payload_path, &plan_path] {
+    for path in [&logical_node_path, &payload_path, &physical_node_path] {
         assert!(path.is_file(), "missing planner IR owner: {}", rel(path));
     }
+    assert!(
+        !planner.join("plan.rs").exists(),
+        "legacy physical IR owner src/sql/planner/plan.rs must be deleted"
+    );
 
     let logical_only = [
         "LogicalPlanNode",
@@ -2491,7 +3236,7 @@ fn planner_logical_ir_and_payload_have_stage_owners() {
     for (expected_owner, items) in [
         (&logical_node_path, logical_only.as_slice()),
         (&payload_path, shared_payload.as_slice()),
-        (&plan_path, physical_only.as_slice()),
+        (&physical_node_path, physical_only.as_slice()),
     ] {
         for item in items {
             let declarations = planner_sources
@@ -2523,7 +3268,7 @@ fn planner_logical_ir_and_payload_have_stage_owners() {
         );
     }
 
-    let plan = fs::read_to_string(&plan_path).unwrap();
+    let plan = fs::read_to_string(&physical_node_path).unwrap();
     let plan_production = rust_sanitized_production_text(&plan);
     let plan_identifiers = plan_production
         .split(|ch: char| !is_ident_char(ch))
@@ -2543,7 +3288,7 @@ fn planner_logical_ir_and_payload_have_stage_owners() {
                     && (rust_use_imports_stage(import, "payload")
                         || rust_use_imports_sql_common(import)))
         }),
-        "plan.rs must not import logical IR or re-export shared/common payload; the boundary guard conservatively expands aliases across lexical scopes and may restrict legal same-name reuse to avoid false negatives: {plan_uses:?}"
+        "physical/node.rs must not import logical IR or re-export shared/common payload; the boundary guard conservatively expands aliases across lexical scopes and may restrict legal same-name reuse to avoid false negatives: {plan_uses:?}"
     );
 
     let payload = fs::read_to_string(&payload_path).unwrap();
@@ -2595,7 +3340,7 @@ fn planner_logical_ir_and_payload_have_stage_owners() {
     let actual_ir_surface = facade_uses
         .iter()
         .filter(|import| {
-            ["logical", "payload", "plan"]
+            ["logical", "payload", "physical"]
                 .into_iter()
                 .any(|stage| rust_use_imports_stage(import, stage))
         })
@@ -7593,7 +8338,12 @@ fn nidl_e3_planner_ir_uses_native_partition_and_runtime_filter_types() {
         "src/sql/planner/distributed_plan_build.rs",
         "src/sql/planner/runtime_filter.rs",
         "src/sql/planner/write_plan.rs",
-        "src/sql/planner/plan.rs",
+        "src/sql/planner/physical/mod.rs",
+        "src/sql/planner/physical/node.rs",
+        "src/sql/planner/physical/runtime_filter.rs",
+        "src/sql/planner/physical/runtime_filter_placement.rs",
+        "src/sql/planner/physical/stats.rs",
+        "src/sql/planner/physical/vocab.rs",
     ] {
         let text = fs::read_to_string(repo.join(source)).unwrap();
         let text = rust_production_text_without_cfg_test(&text);
