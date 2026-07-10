@@ -28,16 +28,16 @@ use crate::sql::optimizer::property::DistributionSpec;
 use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, DistinctValueCount};
 use crate::sql::planner::payload::*;
-use crate::sql::planner::plan::{
+use crate::sql::planner::physical::{
+    AggMode, AggregateOutputLayout, HashSource, JoinDistribution, JoinExecutionMode,
+    PhysicalPlanStats, PlannerBroadcastDecision, PlannerColumnStatistic, PlannerConfidence,
+    PlannerCostEstimate, TopNPhase,
+};
+use crate::sql::planner::physical::{
     DistributedChangeEventExpandNode, DistributedChangeEventOutputExpr, DistributedChangeEventSpec,
     PhysicalHashAggregateNode, PhysicalHashJoinEqCondition, PhysicalHashJoinNode,
     PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalPlanNode, PhysicalSetOpNode,
     PhysicalTopNNode, PlanSetOpKind, RedistributeMode, RedistributeNode,
-};
-use crate::sql::planner::{
-    AggMode, AggregateOutputLayout, HashSource, JoinDistribution, JoinExecutionMode,
-    PhysicalPlanStats, PlannerBroadcastDecision, PlannerColumnStatistic, PlannerConfidence,
-    PlannerCostEstimate, TopNPhase,
 };
 
 struct BridgeCtx<'a> {
@@ -749,7 +749,7 @@ mod tests {
     };
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::{Confidence, CostEstimate, Statistics};
-    use crate::sql::planner::plan::PhysicalPlanKind;
+    use crate::sql::planner::physical::PhysicalPlanKind;
     use std::sync::Arc;
 
     fn int_expr(v: i64) -> TypedExpr {

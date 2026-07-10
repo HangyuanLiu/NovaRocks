@@ -66,11 +66,10 @@ use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::planner::optimizer_bridge::property::{
     ordering_spec_from_sort_items, window_ordering_spec,
 };
+use crate::sql::planner::ordering::OrderingSpec;
 use crate::sql::planner::payload::{AggregateCall, WindowExpr};
-use crate::sql::planner::{
-    AggMode, JoinDistribution, JoinExecutionMode, OrderingSpec, PlannedRuntimeFilter, TopNPhase,
-    WiredRuntimeFilterBuild,
-};
+use crate::sql::planner::physical::{AggMode, JoinDistribution, JoinExecutionMode, TopNPhase};
+use crate::sql::planner::{PlannedRuntimeFilter, WiredRuntimeFilterBuild};
 use crate::thrift::data_sinks;
 use crate::thrift::exprs;
 use crate::thrift::partitions;
@@ -5902,12 +5901,13 @@ mod tests {
     };
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::Statistics;
+    use crate::sql::planner::WiredRuntimeFilterBuild;
     use crate::sql::planner::optimizer_bridge::scalar::intern_project_items;
     use crate::sql::planner::payload::{AggregateCall, PlanScanNode};
-    use crate::sql::planner::plan::PhysicalPlanKind;
-    use crate::sql::planner::{
+    use crate::sql::planner::physical::PhysicalPlanKind;
+    use crate::sql::planner::physical::{
         AggMode, AggregateOutputLayout, JoinDistribution, JoinExecutionMode, PhysicalPlanStats,
-        PlannerConfidence, WiredRuntimeFilterBuild,
+        PlannerConfidence,
     };
     use crate::thrift::plan_nodes::TPlanNodeType;
     use crate::types::arrow_thrift::thrift_desc_to_arrow_type as arrow_type_from_desc;

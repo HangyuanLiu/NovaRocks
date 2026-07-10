@@ -696,10 +696,10 @@ mod tests {
         }
     }
 
-    fn physical_stats() -> crate::sql::planner::PhysicalPlanStats {
-        crate::sql::planner::PhysicalPlanStats {
+    fn physical_stats() -> crate::sql::planner::physical::PhysicalPlanStats {
+        crate::sql::planner::physical::PhysicalPlanStats {
             output_row_count: 0.0,
-            row_count_confidence: crate::sql::planner::PlannerConfidence::Fallback,
+            row_count_confidence: crate::sql::planner::physical::PlannerConfidence::Fallback,
             column_statistics: std::collections::HashMap::new(),
             cost_estimate: None,
             broadcast_decision: None,
@@ -1014,12 +1014,12 @@ mod tests {
             children: vec![values_distributed_node(0, 10, vec![group_column.clone()])],
             stats: physical_stats(),
             payload: crate::sql::planner::DistributedNodeKind::HashAggregate(Box::new(
-                crate::sql::planner::plan::PhysicalHashAggregateNode {
-                    mode: crate::sql::planner::AggMode::Local,
+                crate::sql::planner::physical::PhysicalHashAggregateNode {
+                    mode: crate::sql::planner::physical::AggMode::Local,
                     group_by: vec![column_expr(2, "c1", DataType::Utf8)],
                     aggregates: Vec::new(),
                     is_merge: Vec::new(),
-                    output_layout: crate::sql::planner::AggregateOutputLayout::new(
+                    output_layout: crate::sql::planner::physical::AggregateOutputLayout::new(
                         vec![group_column.clone()],
                         Vec::new(),
                     ),
@@ -1120,8 +1120,8 @@ mod tests {
             )],
             stats: physical_stats(),
             payload: crate::sql::planner::DistributedNodeKind::HashAggregate(Box::new(
-                crate::sql::planner::plan::PhysicalHashAggregateNode {
-                    mode: crate::sql::planner::AggMode::Local,
+                crate::sql::planner::physical::PhysicalHashAggregateNode {
+                    mode: crate::sql::planner::physical::AggMode::Local,
                     group_by: vec![column_expr(2, "c0", DataType::Int64)],
                     aggregates: vec![crate::sql::planner::payload::AggregateCall {
                         name: "avg".to_string(),
@@ -1132,7 +1132,7 @@ mod tests {
                         output_column_id: crate::sql::column_id::ColumnId::new_for_test(15),
                     }],
                     is_merge: vec![false],
-                    output_layout: crate::sql::planner::AggregateOutputLayout::new(
+                    output_layout: crate::sql::planner::physical::AggregateOutputLayout::new(
                         vec![group_column.clone()],
                         vec![avg_column.clone()],
                     ),
@@ -1595,7 +1595,7 @@ mod tests {
     fn physical_plan_encoder_variant_guard_tracks_rust_enum_not_proto_arms() {
         assert_eq!(
             plan::encoded_physical_variant_names_for_test(),
-            crate::sql::planner::plan::PhysicalPlanKind::variant_names_for_test()
+            crate::sql::planner::physical::PhysicalPlanKind::variant_names_for_test()
         );
         assert!(
             !plan::encoded_physical_variant_names_for_test().contains(&"Decode"),

@@ -26,8 +26,8 @@ pub(crate) use crate::sql::planner::payload::{
     PlanWindowNode as DistributedWindowNode,
 };
 #[cfg(test)]
-pub(crate) use crate::sql::planner::plan::PhysicalHashJoinEqCondition;
-pub(crate) use crate::sql::planner::plan::{
+pub(crate) use crate::sql::planner::physical::PhysicalHashJoinEqCondition;
+pub(crate) use crate::sql::planner::physical::{
     DistributedChangeEventExpandNode, PhysicalHashAggregateNode as DistributedHashAggregateNode,
     PhysicalHashAggregateNode, PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalSetOpNode,
     PhysicalTopNNode, PlanSetOpKind as SetOpKind,

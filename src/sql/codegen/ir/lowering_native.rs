@@ -1109,9 +1109,8 @@ mod tests {
     use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::payload::PlanValuesNode;
-    use crate::sql::planner::{
-        ExchangeFlavor, ExchangeReceiver, PhysicalPlanStats, PlannerConfidence,
-    };
+    use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
+    use crate::sql::planner::{ExchangeFlavor, ExchangeReceiver};
 
     struct EmptyCatalog;
 

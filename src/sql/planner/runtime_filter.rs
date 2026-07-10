@@ -18,13 +18,7 @@
 
 use crate::sql::analysis::TypedExpr;
 use crate::sql::codegen::FragmentId;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum JoinExecutionMode {
-    Broadcast,
-    Partitioned,
-    Colocate,
-}
+use crate::sql::planner::physical::JoinExecutionMode;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeFilterBuildIntent {

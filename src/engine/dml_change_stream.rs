@@ -1881,10 +1881,12 @@ mod tests {
 
     fn native_change_event_expand_plan_for_test() -> crate::sql::planner::DistributedPlan {
         use crate::sql::planner::payload::PlanValuesNode;
-        use crate::sql::planner::plan::{DistributedChangeEventExpandNode, PhysicalPlanKind};
+        use crate::sql::planner::physical::{
+            DistributedChangeEventExpandNode, PhysicalPlanKind, PhysicalPlanStats,
+            PlannerConfidence,
+        };
         use crate::sql::planner::{
-            DataPartition, DataSink, DistributedNode, DistributedNodeKind, PhysicalPlanStats,
-            PlanFragment, PlannerConfidence,
+            DataPartition, DataSink, DistributedNode, DistributedNodeKind, PlanFragment,
         };
 
         let child = DistributedNode {
@@ -1971,9 +1973,9 @@ mod tests {
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
             children: Vec::new(),
-            stats: crate::sql::planner::PhysicalPlanStats {
+            stats: crate::sql::planner::physical::PhysicalPlanStats {
                 output_row_count: 1.0,
-                row_count_confidence: crate::sql::planner::PlannerConfidence::Exact,
+                row_count_confidence: crate::sql::planner::physical::PlannerConfidence::Exact,
                 column_statistics: Default::default(),
                 cost_estimate: None,
                 broadcast_decision: None,

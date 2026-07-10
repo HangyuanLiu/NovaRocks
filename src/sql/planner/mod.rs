@@ -29,13 +29,10 @@ mod distributed_plan_build;
 pub(crate) mod imv_rewrite;
 pub(crate) mod logical;
 pub(crate) mod optimizer_bridge;
-mod ordering;
+pub(crate) mod ordering;
 pub(crate) mod payload;
-mod physical_vocab;
-pub(crate) mod plan;
+pub(crate) mod physical;
 pub(crate) mod runtime_filter;
-pub(crate) mod runtime_filter_placement;
-pub(crate) mod stats;
 pub(crate) mod write_plan;
 pub(crate) mod write_sink;
 
@@ -55,21 +52,11 @@ pub(crate) use distributed_plan_build::{
     build_distributed_plan, union_distinct_must_be_rewritten_error,
 };
 pub(crate) use logical::build::{plan_output_columns, plan_query};
-#[allow(unused_imports)]
-pub(crate) use ordering::{OrderingSpec, SortKey};
-#[allow(unused_imports)]
-pub(crate) use physical_vocab::{
-    AggMode, AggregateOutputLayout, HashSource, JoinDistribution, TopNPhase,
-};
 pub(crate) use runtime_filter::{
-    JoinExecutionMode, PlannedRuntimeFilter, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
+    PlannedRuntimeFilter, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
 };
 #[allow(unused_imports)]
 pub(crate) use runtime_filter::{WiredRuntimeFilterBuild, WiredRuntimeFilterProbe};
-pub(crate) use stats::{
-    PhysicalPlanStats, PlannerBroadcastDecision, PlannerColumnStatistic, PlannerConfidence,
-    PlannerCostEstimate,
-};
 pub(crate) use write_plan::{with_iceberg_change_stream_write, with_iceberg_write_sink};
 pub(crate) use write_sink::{
     IcebergWriteFragmentSink, IcebergWriteInputBinding, IcebergWriteSinkMode, IcebergWriteSinkSpec,
@@ -79,7 +66,7 @@ pub(crate) use write_sink::{
 #[cfg(test)]
 mod bridge2_export_tests {
     use super::{DistributedNode, DistributedPlan, build_distributed_plan};
-    use crate::sql::planner::plan::PhysicalPlanNode;
+    use crate::sql::planner::physical::PhysicalPlanNode;
 
     #[test]
     fn planner_exports_bridge2_distributed_plan_api() {

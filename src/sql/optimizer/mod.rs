@@ -302,7 +302,7 @@ fn optimize_with_root_property(
     // runtime-filter annotations. CSE and pure physical/scalar rewrites may
     // remain optimizer-side, but runtime-filter placement depends on the
     // distributed topology and therefore lives in
-    // planner::runtime_filter_placement after the optimizer->planner bridge.
+    // planner::physical::runtime_filter_placement after the optimizer->planner bridge.
     // Do not add downstream execution annotations to optimizer output here.
 
     // 12. Common-subexpression elimination (materializes repeats as Project columns).
@@ -404,7 +404,7 @@ pub(crate) fn is_known_rule_name(name: &str) -> bool {
             .iter()
             .any(|r| r.name() == name)
         || rewrite::registry::is_known_rewrite_rule_name(name)
-        || name == crate::sql::planner::runtime_filter_placement::RUNTIME_FILTER_RULE
+        || name == crate::sql::planner::physical::runtime_filter_placement::RUNTIME_FILTER_RULE
         || name == cse_pass::CSE_RULE
         || name == cascades_rules::mv_rewrite::RULE_NAME
 }

@@ -389,12 +389,12 @@ mod tests {
     use crate::sql::analysis::{ExprKind, OutputColumn};
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::ChangeStreamBranchKind;
+    use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
     use crate::sql::planner::{
         ChangeStreamWriteBranchSpec, ChangeStreamWriteDagSpec, DataPartition, DataSink,
         DistributedNode, DistributedNodeKind, DistributedPlan, IcebergWriteFragmentSink,
         IcebergWriteInputBinding, PlanFragment,
     };
-    use crate::sql::planner::{PhysicalPlanStats, PlannerConfidence};
 
     use super::{with_iceberg_change_stream_write, with_iceberg_write_sink};
 

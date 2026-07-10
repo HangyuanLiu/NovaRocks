@@ -19,16 +19,17 @@ use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{OutputColumn, SortItem};
 use crate::sql::codegen::FragmentId;
 use crate::sql::column_id::ColumnId;
+use crate::sql::planner::DataPartition;
 use crate::sql::planner::payload::{
     PlanAssertOneRowNode, PlanFilterNode, PlanGenerateSeriesNode, PlanProjectNode, PlanRepeatNode,
     PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanValuesNode, PlanWindowNode,
 };
-use crate::sql::planner::plan::{
+use crate::sql::planner::physical::PhysicalPlanStats;
+use crate::sql::planner::physical::{
     DistributedChangeEventExpandNode, PhysicalHashAggregateNode, PhysicalHashJoinNode,
     PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalSetOpNode, PhysicalTopNNode, PlanSetOpKind,
 };
 use crate::sql::planner::runtime_filter::{WiredRuntimeFilterBuild, WiredRuntimeFilterProbe};
-use crate::sql::planner::{DataPartition, PhysicalPlanStats};
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -199,7 +200,7 @@ mod tests {
 
     use super::*;
     use crate::sql::planner::payload::PlanValuesNode;
-    use crate::sql::planner::{PhysicalPlanStats, PlannerConfidence};
+    use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 
     #[test]
     fn distributed_node_can_wrap_physical_values_payload() {
@@ -232,7 +233,7 @@ mod tests {
     fn distributed_node_kind_covers_distributable_physical_subset() {
         use std::collections::BTreeSet;
         let physical: BTreeSet<&str> =
-            crate::sql::planner::plan::PhysicalPlanKind::variant_names_for_test()
+            crate::sql::planner::physical::PhysicalPlanKind::variant_names_for_test()
                 .iter()
                 .copied()
                 .collect();

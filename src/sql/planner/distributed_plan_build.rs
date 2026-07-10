@@ -32,14 +32,16 @@ use crate::sql::planner::distributed_node::{
 use crate::sql::planner::optimizer_bridge::property::{
     ordering_spec_from_sort_items, window_ordering_spec,
 };
+use crate::sql::planner::ordering::OrderingSpec;
 use crate::sql::planner::payload::{PlanProjectNode, PlanScanNode};
-use crate::sql::planner::plan::{
+use crate::sql::planner::physical::TopNPhase;
+use crate::sql::planner::physical::{
     PhysicalPlanKind, PhysicalPlanNode, PhysicalSetOpNode, PlanSetOpKind, RedistributeMode,
     RedistributeNode,
 };
 use crate::sql::planner::{
-    ExchangeFlavor, OrderingSpec, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent, TopNPhase,
-    WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
+    ExchangeFlavor, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent, WiredRuntimeFilterBuild,
+    WiredRuntimeFilterProbe,
 };
 
 pub(crate) fn build_distributed_plan(plan: &PhysicalPlanNode) -> Result<DistributedPlan, String> {
@@ -511,7 +513,7 @@ impl DistributedPlanBuilder {
     fn visit_topn(
         &mut self,
         node: &PhysicalPlanNode,
-        topn: &crate::sql::planner::plan::PhysicalTopNNode,
+        topn: &crate::sql::planner::physical::PhysicalTopNNode,
     ) -> Result<DistributedNode, String> {
         expect_child_count(node, 1)?;
         let child_plan = &node.children[0];
@@ -553,7 +555,7 @@ impl DistributedPlanBuilder {
         limit: i64,
         exchange_output_columns: Vec<OutputColumn>,
         output_qualifier: Option<String>,
-        exchange_stats: crate::sql::planner::PhysicalPlanStats,
+        exchange_stats: crate::sql::planner::physical::PhysicalPlanStats,
     ) -> Result<DistributedNode, String> {
         let parent_fragment_id = self.current_fragment_id()?;
         let source_output_columns = stream_exchange_source_output_columns(child_plan);
@@ -1295,9 +1297,9 @@ fn validate_cte_consume_mapping(
 }
 
 fn synthetic_exchange_stats(
-    stats: &crate::sql::planner::PhysicalPlanStats,
-) -> crate::sql::planner::PhysicalPlanStats {
-    crate::sql::planner::PhysicalPlanStats {
+    stats: &crate::sql::planner::physical::PhysicalPlanStats,
+) -> crate::sql::planner::physical::PhysicalPlanStats {
+    crate::sql::planner::physical::PhysicalPlanStats {
         output_row_count: stats.output_row_count,
         row_count_confidence: stats.row_count_confidence,
         column_statistics: stats.column_statistics.clone(),
@@ -1307,10 +1309,10 @@ fn synthetic_exchange_stats(
 }
 
 fn limit_stats_with_child_cost(
-    limit_stats: &crate::sql::planner::PhysicalPlanStats,
-    child_stats: &crate::sql::planner::PhysicalPlanStats,
-) -> crate::sql::planner::PhysicalPlanStats {
-    crate::sql::planner::PhysicalPlanStats {
+    limit_stats: &crate::sql::planner::physical::PhysicalPlanStats,
+    child_stats: &crate::sql::planner::physical::PhysicalPlanStats,
+) -> crate::sql::planner::physical::PhysicalPlanStats {
+    crate::sql::planner::physical::PhysicalPlanStats {
         output_row_count: limit_stats.output_row_count,
         row_count_confidence: limit_stats.row_count_confidence,
         column_statistics: limit_stats.column_statistics.clone(),
@@ -1498,16 +1500,16 @@ mod tests {
         PlanRepeatNode, PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanValuesNode,
         PlanWindowNode, WindowExpr,
     };
-    use crate::sql::planner::plan::{
+    use crate::sql::planner::physical::{
+        AggMode, AggregateOutputLayout, HashSource, JoinDistribution, JoinExecutionMode,
+        PhysicalPlanStats, PlannerConfidence, PlannerCostEstimate, TopNPhase,
+    };
+    use crate::sql::planner::physical::{
         DistributedChangeEventExpandNode, PhysicalHashAggregateNode, PhysicalHashJoinEqCondition,
         PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalPlanNode,
         PhysicalSetOpNode, PhysicalTopNNode, PlanSetOpKind, RedistributeMode, RedistributeNode,
     };
-    use crate::sql::planner::{
-        AggMode, AggregateOutputLayout, ExchangeFlavor, HashSource, JoinDistribution,
-        JoinExecutionMode, PhysicalPlanStats, PlannerConfidence, PlannerCostEstimate,
-        RuntimeFilterBuildIntent, RuntimeFilterProbeIntent, TopNPhase,
-    };
+    use crate::sql::planner::{ExchangeFlavor, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent};
 
     #[test]
     fn build_distributed_plan_values_shapes_root_fragment() {
@@ -3979,7 +3981,7 @@ mod tests {
                 memory_cost: 2.0,
                 network_cost: 3.0,
             }),
-            broadcast_decision: Some(crate::sql::planner::PlannerBroadcastDecision {
+            broadcast_decision: Some(crate::sql::planner::physical::PlannerBroadcastDecision {
                 feasible: true,
                 forced: false,
                 build_bytes: 10.0,

@@ -11,14 +11,11 @@ use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::JoinKind;
 use crate::sql::optimizer::options::current_session_optimizer_settings;
-use crate::sql::planner::physical_vocab::JoinDistribution;
-use crate::sql::planner::plan::{
-    PhysicalHashJoinEqCondition, PhysicalHashJoinNode, PhysicalPlanKind, PhysicalPlanNode,
-    RedistributeMode,
+use crate::sql::planner::physical::{
+    JoinDistribution, JoinExecutionMode, PhysicalHashJoinEqCondition, PhysicalHashJoinNode,
+    PhysicalPlanKind, PhysicalPlanNode, PhysicalPlanStats, RedistributeMode,
 };
-use crate::sql::planner::{
-    JoinExecutionMode, PhysicalPlanStats, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
-};
+use crate::sql::planner::runtime_filter::{RuntimeFilterBuildIntent, RuntimeFilterProbeIntent};
 use std::collections::HashSet;
 
 /// Rule name recognized by `SET disable_optimizer_rules='RuntimeFilterPushDown'`.
@@ -722,14 +719,12 @@ mod tests {
     use crate::sql::optimizer::options::{
         SessionOptimizerSettings, with_session_optimizer_settings,
     };
-    use crate::sql::planner::JoinExecutionMode;
     use crate::sql::planner::payload::{PlanProjectNode, PlanValuesNode};
-    use crate::sql::planner::physical_vocab::{HashSource, JoinDistribution};
-    use crate::sql::planner::plan::{
-        PhysicalHashJoinEqCondition, PhysicalHashJoinNode, PhysicalPlanKind, RedistributeMode,
-        RedistributeNode,
+    use crate::sql::planner::physical::{
+        HashSource, JoinDistribution, JoinExecutionMode, PhysicalHashJoinEqCondition,
+        PhysicalHashJoinNode, PhysicalPlanKind, PhysicalPlanStats, PlannerColumnStatistic,
+        PlannerConfidence, RedistributeMode, RedistributeNode,
     };
-    use crate::sql::planner::{PhysicalPlanStats, PlannerColumnStatistic, PlannerConfidence};
     use arrow::datatypes::DataType;
     use std::collections::HashMap;
 
