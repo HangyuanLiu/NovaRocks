@@ -1212,6 +1212,16 @@ fn planner_distributed_and_codegen_do_not_import_optimizer() {
         for (line, text) in non_test_optimizer_refs(file) {
             violations.push(format!("{}:{}: {}", rel(file), line, text));
         }
+        let text = fs::read_to_string(file).unwrap();
+        for path in rust_production_canonical_paths(&text, &rel(file)) {
+            if path.starts_with(&[
+                "crate".to_string(),
+                "sql".to_string(),
+                "optimizer".to_string(),
+            ]) {
+                violations.push(format!("{}: {}", rel(file), path.join("::")));
+            }
+        }
     }
 
     assert!(
@@ -1975,6 +1985,187 @@ fn rust_production_scoped_use_statements(text: &str) -> Vec<RustScopedUseStateme
         .collect()
 }
 
+type RustScopedAliases = BTreeMap<(Vec<String>, String), Vec<RustScopedUsePath>>;
+
+fn rust_production_scoped_aliases(text: &str) -> RustScopedAliases {
+    let mut aliases = RustScopedAliases::new();
+    for raw in rust_raw_production_use_statements(text) {
+        let local_name = match raw.path.alias.as_deref() {
+            Some("_") => None,
+            Some(alias) => Some(alias.to_string()),
+            None => raw
+                .path
+                .segments
+                .last()
+                .filter(|leaf| !matches!(leaf.as_str(), "*" | "crate" | "self" | "super"))
+                .cloned(),
+        };
+        let Some(local_name) = local_name else {
+            continue;
+        };
+        let target = RustScopedUsePath {
+            segments: raw.path.segments,
+            inline_modules: raw.inline_modules.clone(),
+        };
+        let targets = aliases.entry((raw.inline_modules, local_name)).or_default();
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    aliases
+}
+
+fn rust_scoped_alias_key(
+    path: &[String],
+    inline_modules: &[String],
+) -> Option<(usize, (Vec<String>, String))> {
+    if path.first().is_some_and(|segment| segment == "crate") {
+        return None;
+    }
+
+    let mut scope = inline_modules.to_vec();
+    let mut owner_index = 0usize;
+    while path
+        .get(owner_index)
+        .is_some_and(|segment| segment == "self")
+    {
+        owner_index += 1;
+    }
+    while path
+        .get(owner_index)
+        .is_some_and(|segment| segment == "super")
+    {
+        scope.pop()?;
+        owner_index += 1;
+    }
+    let owner = path.get(owner_index)?;
+    Some((owner_index, (scope, owner.clone())))
+}
+
+fn rust_resolve_scoped_paths(
+    path: &[String],
+    inline_modules: &[String],
+    aliases: &RustScopedAliases,
+    resolving: &mut BTreeSet<(Vec<String>, String)>,
+    depth: usize,
+) -> Option<Vec<RustScopedUsePath>> {
+    if depth > aliases.len() {
+        return None;
+    }
+
+    let Some((owner_index, alias_key)) = rust_scoped_alias_key(path, inline_modules) else {
+        return Some(vec![RustScopedUsePath {
+            segments: path.to_vec(),
+            inline_modules: inline_modules.to_vec(),
+        }]);
+    };
+    let Some(targets) = aliases.get(&alias_key) else {
+        return Some(vec![RustScopedUsePath {
+            segments: path.to_vec(),
+            inline_modules: inline_modules.to_vec(),
+        }]);
+    };
+    if !resolving.insert(alias_key.clone()) {
+        return None;
+    }
+
+    let mut resolved = BTreeSet::new();
+    for target in targets {
+        let Some(target_paths) = rust_resolve_scoped_paths(
+            &target.segments,
+            &target.inline_modules,
+            aliases,
+            resolving,
+            depth + 1,
+        ) else {
+            continue;
+        };
+        for mut target_path in target_paths {
+            target_path
+                .segments
+                .extend_from_slice(&path[owner_index + 1..]);
+            resolved.insert(target_path);
+        }
+    }
+    resolving.remove(&alias_key);
+    (!resolved.is_empty()).then(|| resolved.into_iter().collect())
+}
+
+fn rust_raw_production_non_use_paths(text: &str) -> Vec<RustScopedUsePath> {
+    let production = rust_sanitized_production_text(text);
+    let tokens = rust_use_tokens(&production);
+    let inline_module_openings = (0..tokens.len().saturating_sub(2))
+        .filter_map(|index| {
+            (tokens[index] == "mod"
+                && tokens[index + 1].chars().all(is_ident_char)
+                && tokens[index + 2] == "{")
+                .then(|| (index + 2, tokens[index + 1].clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut paths = Vec::new();
+    let mut inline_modules = Vec::<(usize, String)>::new();
+    let mut brace_depth = 0usize;
+    let mut index = 0usize;
+
+    while index < tokens.len() {
+        if tokens[index] == "{" {
+            brace_depth += 1;
+            if let Some(module) = inline_module_openings.get(&index) {
+                inline_modules.push((brace_depth, module.clone()));
+            }
+            index += 1;
+            continue;
+        }
+        if tokens[index] == "}" {
+            if inline_modules
+                .last()
+                .is_some_and(|(depth, _)| *depth == brace_depth)
+            {
+                inline_modules.pop();
+            }
+            brace_depth = brace_depth.saturating_sub(1);
+            index += 1;
+            continue;
+        }
+        if tokens[index] == "use" {
+            while index < tokens.len() && tokens[index] != ";" {
+                index += 1;
+            }
+            index += usize::from(index < tokens.len());
+            continue;
+        }
+        if !tokens[index].chars().all(is_ident_char)
+            || tokens.get(index + 1).is_none_or(|token| token != "::")
+        {
+            index += 1;
+            continue;
+        }
+
+        let mut segments = vec![tokens[index].clone()];
+        let mut cursor = index + 1;
+        while tokens.get(cursor).is_some_and(|token| token == "::")
+            && tokens
+                .get(cursor + 1)
+                .is_some_and(|token| token.chars().all(is_ident_char))
+        {
+            segments.push(tokens[cursor + 1].clone());
+            cursor += 2;
+        }
+        if segments.len() > 1 {
+            paths.push(RustScopedUsePath {
+                segments,
+                inline_modules: inline_modules
+                    .iter()
+                    .map(|(_, module)| module.clone())
+                    .collect(),
+            });
+        }
+        index = cursor;
+    }
+
+    paths
+}
+
 fn rust_use_visibility(import: &str) -> &str {
     import
         .split_once('|')
@@ -2055,9 +2246,20 @@ fn rust_canonical_use_segments_in_scope(
     source_rel: &str,
     inline_modules: &[String],
 ) -> Option<Vec<String>> {
-    let path = rust_use_path(import).split("::").collect::<Vec<_>>();
+    let path = rust_use_path(import)
+        .split("::")
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    rust_canonical_path_segments_in_scope(&path, source_rel, inline_modules)
+}
+
+fn rust_canonical_path_segments_in_scope(
+    path: &[String],
+    source_rel: &str,
+    inline_modules: &[String],
+) -> Option<Vec<String>> {
     let mut index = 0usize;
-    let mut canonical = if path.first() == Some(&"crate") {
+    let mut canonical = if path.first().is_some_and(|segment| segment == "crate") {
         index = 1;
         vec!["crate".to_string()]
     } else {
@@ -2066,22 +2268,46 @@ fn rust_canonical_use_segments_in_scope(
         module
     };
 
-    while path.get(index) == Some(&"self") {
+    while path.get(index).is_some_and(|segment| segment == "self") {
         index += 1;
     }
-    while path.get(index) == Some(&"super") {
+    while path.get(index).is_some_and(|segment| segment == "super") {
         if canonical.len() == 1 {
             return None;
         }
         canonical.pop();
         index += 1;
     }
-    canonical.extend(path[index..].iter().map(|segment| (*segment).to_string()));
+    canonical.extend_from_slice(&path[index..]);
     Some(canonical)
 }
 
 fn rust_canonical_use_segments(import: &str, source_rel: &str) -> Option<Vec<String>> {
     rust_canonical_use_segments_in_scope(import, source_rel, &[])
+}
+
+fn rust_production_canonical_paths(text: &str, source_rel: &str) -> Vec<Vec<String>> {
+    let mut canonical = rust_production_scoped_use_statements(text)
+        .into_iter()
+        .filter_map(|import| {
+            rust_canonical_use_segments_in_scope(&import.import, source_rel, &import.inline_modules)
+        })
+        .collect::<BTreeSet<_>>();
+    let aliases = rust_production_scoped_aliases(text);
+    for path in rust_raw_production_non_use_paths(text) {
+        let resolved = rust_resolve_scoped_paths(
+            &path.segments,
+            &path.inline_modules,
+            &aliases,
+            &mut BTreeSet::new(),
+            0,
+        )
+        .unwrap_or_else(|| vec![path]);
+        canonical.extend(resolved.into_iter().filter_map(|path| {
+            rust_canonical_path_segments_in_scope(&path.segments, source_rel, &path.inline_modules)
+        }));
+    }
+    canonical.into_iter().collect()
 }
 
 fn rust_canonical_path_is_legacy_planner_owner(canonical: &[String]) -> bool {
@@ -2875,6 +3101,152 @@ fn planner_distributed_owner_detector_covers_paths_aliases_scopes_and_tests() {
 }
 
 #[test]
+fn planner_guard_tracks_alias_qualified_non_use_paths() {
+    let source_rel = "src/sql/planner/distributed/node.rs";
+    for (source, forbidden) in [
+        (
+            r#"
+use crate::sql as sql_root;
+type TypeLeak = sql_root::planner::DistributedPlan;
+fn expression_leak(node: &sql_root::planner::DistributedNodeKind) {
+    let _ = sql_root::planner::distributed_kind_to_physical(node);
+}
+use sql_root::planner as planner_root;
+type ChainedLeak = planner_root::DistributedPlan;
+"#,
+            rust_canonical_path_is_planner_root_distributed_core as fn(&[String]) -> bool,
+        ),
+        (
+            r#"
+use crate::sql::codegen as old_edge_owner;
+type TypeLeak = old_edge_owner::FragmentEdge;
+fn expression_leak() {
+    let _ = old_edge_owner::FragmentId(7);
+}
+"#,
+            rust_canonical_path_is_codegen_edge_topology as fn(&[String]) -> bool,
+        ),
+    ] {
+        let paths = rust_production_canonical_paths(source, source_rel);
+        assert!(
+            paths.iter().any(|path| forbidden(path)),
+            "alias-qualified type/expression path must be rejected: {source}\n{paths:?}"
+        );
+    }
+
+    for source in [
+        r#"
+use crate::sql as sql_root;
+type Leak = sql_root::optimizer::OptimizerPhysicalNode;
+"#,
+        r#"
+use crate::sql::codegen as codegen_owner;
+type Leak = codegen_owner::FragmentBuildResult;
+"#,
+        r#"
+use crate::sql::planner as planner_root;
+type Leak = planner_root::logical::build::LogicalPlanBuilder;
+"#,
+    ] {
+        let paths = rust_production_canonical_paths(source, source_rel);
+        assert!(
+            paths.iter().any(|path| {
+                path.starts_with(&[
+                    "crate".to_string(),
+                    "sql".to_string(),
+                    "optimizer".to_string(),
+                ]) || path.starts_with(&[
+                    "crate".to_string(),
+                    "sql".to_string(),
+                    "codegen".to_string(),
+                ]) || path.starts_with(&[
+                    "crate".to_string(),
+                    "sql".to_string(),
+                    "planner".to_string(),
+                    "logical".to_string(),
+                    "build".to_string(),
+                ])
+            }),
+            "distributed alias-qualified stage dependency must be rejected: {source}\n{paths:?}"
+        );
+    }
+}
+
+#[test]
+fn planner_guard_tracks_relative_and_inline_module_non_use_paths() {
+    let source_rel = "src/sql/planner/distributed/node.rs";
+    for source in [
+        "type Leak = super::super::super::optimizer::OptimizerPhysicalNode;",
+        r#"
+mod nested {
+    type Leak = super::super::super::super::optimizer::OptimizerPhysicalNode;
+}
+"#,
+        r#"
+use crate::proto as owner;
+type Allowed = owner::plan::DistributedNode;
+mod nested {
+    use crate::sql as owner;
+    type Leak = owner::optimizer::OptimizerPhysicalNode;
+}
+"#,
+    ] {
+        let paths = rust_production_canonical_paths(source, source_rel);
+        assert!(
+            paths.iter().any(|path| path.starts_with(&[
+                "crate".to_string(),
+                "sql".to_string(),
+                "optimizer".to_string(),
+            ])),
+            "relative or inline-scope optimizer path must be rejected: {source}\n{paths:?}"
+        );
+    }
+}
+
+#[test]
+fn planner_guard_non_use_path_detector_ignores_cfg_test_and_lexical_noise() {
+    let source_rel = "src/sql/planner/distributed/node.rs";
+    let source = r###"
+#[cfg(test)]
+mod tests {
+    use crate::sql as sql_root;
+    type AliasLeak = sql_root::optimizer::OptimizerPhysicalNode;
+    type RelativeLeak = super::super::super::super::optimizer::OptimizerPhysicalNode;
+}
+
+// type CommentLeak = crate::sql::planner::DistributedPlan;
+const TEXT: &str = "crate::sql::codegen::FragmentEdge";
+const RAW: &str = r#"crate::sql::optimizer::OptimizerPhysicalNode"#;
+use crate::proto as owner;
+type Allowed = owner::plan::DistributedNode;
+use crate::sql as _;
+mod sql {
+    pub mod optimizer {
+        pub struct Allowed;
+    }
+}
+type UnderscoreImportMustNotBindSql = sql::optimizer::Allowed;
+mod sibling {
+    use crate::proto as owner;
+    type ScopedAllowed = owner::plan::DistributedNode;
+}
+"###;
+    let paths = rust_production_canonical_paths(source, source_rel);
+    assert!(
+        !paths.iter().any(|path| {
+            rust_canonical_path_is_planner_root_distributed_core(path)
+                || rust_canonical_path_is_codegen_edge_topology(path)
+                || path.starts_with(&[
+                    "crate".to_string(),
+                    "sql".to_string(),
+                    "optimizer".to_string(),
+                ])
+        }),
+        "test-only and lexical noise paths must remain ignored: {paths:?}"
+    );
+}
+
+#[test]
 fn planner_logical_builder_is_owned_by_logical_stage() {
     let repo = Path::new(manifest_dir());
     let expected_files = [
@@ -3455,6 +3827,7 @@ fn planner_distributed_core_has_stage_namespace() {
         let text = fs::read_to_string(&path).unwrap();
         let production = rust_sanitized_production_text(&text);
         let compact = compact_line(&production);
+        let canonical_paths = rust_production_canonical_paths(&text, &rel(&path));
         let scoped_imports = rust_production_scoped_use_statements(&text);
         for import in &scoped_imports {
             assert!(
@@ -3480,6 +3853,16 @@ fn planner_distributed_core_has_stage_namespace() {
                     rel(&path)
                 );
             }
+        }
+        for canonical in &canonical_paths {
+            assert!(
+                !(rust_canonical_path_is_legacy_distributed_owner(canonical)
+                    || rust_canonical_path_is_planner_root_distributed_core(canonical)
+                    || rust_canonical_path_is_codegen_edge_topology(canonical)),
+                "distributed owner bypass remains in {}: {}",
+                rel(&path),
+                canonical.join("::")
+            );
         }
         assert!(
             !compact.contains("crate::sql::planner::distributed_node")
@@ -3507,6 +3890,7 @@ fn planner_distributed_core_has_stage_namespace() {
         let text = fs::read_to_string(&path).unwrap();
         let production = rust_sanitized_production_text(&text);
         let compact = compact_line(&production);
+        let canonical_paths = rust_production_canonical_paths(&text, &rel(&path));
         let scoped_imports = rust_production_scoped_use_statements(&text);
         for import in &scoped_imports {
             let canonical = rust_canonical_use_segments_in_scope(
@@ -3542,17 +3926,48 @@ fn planner_distributed_core_has_stage_namespace() {
             "distributed production has forbidden fully-qualified dependency in {}",
             rel(&path)
         );
+        for canonical in &canonical_paths {
+            assert!(
+                !(canonical.starts_with(&[
+                    "crate".to_string(),
+                    "sql".to_string(),
+                    "optimizer".to_string(),
+                ]) || canonical.starts_with(&[
+                    "crate".to_string(),
+                    "sql".to_string(),
+                    "codegen".to_string(),
+                ]) || canonical.starts_with(&[
+                    "crate".to_string(),
+                    "sql".to_string(),
+                    "planner".to_string(),
+                    "logical".to_string(),
+                    "build".to_string(),
+                ])),
+                "distributed production has forbidden stage path in {}: {}",
+                rel(&path),
+                canonical.join("::")
+            );
+        }
     }
     for stage in ["physical", "logical"] {
         for path in rs_files(&planner.join(stage)) {
             let text = fs::read_to_string(&path).unwrap();
             let production = rust_sanitized_production_text(&text);
             let imports = rust_production_use_statements(&text);
+            let canonical_paths = rust_production_canonical_paths(&text, &rel(&path));
             assert!(
                 !imports
                     .iter()
                     .any(|import| rust_use_imports_stage(import, "distributed"))
-                    && !compact_line(&production).contains("planner::distributed"),
+                    && !compact_line(&production).contains("planner::distributed")
+                    && !canonical_paths.iter().any(|path| {
+                        path.starts_with(&[
+                            "crate".to_string(),
+                            "sql".to_string(),
+                            "planner".to_string(),
+                            "distributed".to_string(),
+                        ])
+                    }),
                 "{stage} production must not import distributed owner in {}: {imports:?}",
                 rel(&path)
             );
@@ -3960,10 +4375,23 @@ fn build_distributed_plan_signature_is_planner_typed() {
 #[test]
 fn distributed_plan_node_has_no_optimizer_payloads() {
     let file = src_dir().join("sql/planner/distributed/node.rs");
-    let violations = non_test_optimizer_refs(&file)
+    let mut violations = non_test_optimizer_refs(&file)
         .into_iter()
         .map(|(line, text)| format!("{}:{}: {}", rel(&file), line, text))
         .collect::<Vec<_>>();
+    let text = fs::read_to_string(&file).unwrap();
+    violations.extend(
+        rust_production_canonical_paths(&text, &rel(&file))
+            .into_iter()
+            .filter(|path| {
+                path.starts_with(&[
+                    "crate".to_string(),
+                    "sql".to_string(),
+                    "optimizer".to_string(),
+                ])
+            })
+            .map(|path| format!("{}: {}", rel(&file), path.join("::"))),
+    );
 
     assert!(
         violations.is_empty(),
