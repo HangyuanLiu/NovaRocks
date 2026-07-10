@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
@@ -297,14 +297,31 @@ impl NovaRocksConfig {
     pub fn load_from_file(path: &Path) -> Result<Self> {
         let s = std::fs::read_to_string(path)
             .with_context(|| format!("read config file: {}", path.display()))?;
-        let cfg: NovaRocksConfig =
+        let value: toml::Value =
             toml::from_str(&s).with_context(|| format!("parse toml: {}", path.display()))?;
+        reject_removed_plan_wire_format(&value)?;
+        let cfg: NovaRocksConfig = value
+            .try_into()
+            .with_context(|| format!("parse toml: {}", path.display()))?;
         Ok(cfg)
     }
 
     pub fn jdbc_config(&self) -> Option<&JdbcConfig> {
         self.jdbc.as_ref()
     }
+}
+
+fn reject_removed_plan_wire_format(value: &toml::Value) -> Result<()> {
+    let has_removed_key = value
+        .get("runtime")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|runtime| runtime.contains_key("plan_wire_format"));
+    if has_removed_key {
+        bail!(
+            "runtime.plan_wire_format has been removed; NovaRocks-generated plans always use native Proto"
+        );
+    }
+    Ok(())
 }
 
 impl Default for NovaRocksConfig {
@@ -612,18 +629,8 @@ impl StandaloneServerConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PlanWireFormat {
-    #[cfg(feature = "compat")]
-    Thrift,
-    Proto,
-}
-
 #[derive(Clone, Deserialize)]
 pub struct RuntimeConfig {
-    #[serde(default = "default_plan_wire_format")]
-    pub plan_wire_format: PlanWireFormat,
     #[serde(default = "default_exchange_wait_ms")]
     pub exchange_wait_ms: u64,
     #[serde(default = "default_exchange_max_transmit_batched_bytes")]
@@ -858,10 +865,6 @@ fn default_exchange_io_max_inflight_bytes() -> usize {
     64 * 1024 * 1024
 }
 
-fn default_plan_wire_format() -> PlanWireFormat {
-    PlanWireFormat::Proto
-}
-
 fn default_mem_limit() -> String {
     DEFAULT_MEM_LIMIT_SPEC.to_string()
 }
@@ -1049,7 +1052,6 @@ fn default_object_storage_retry_log_first_n() -> u32 {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            plan_wire_format: default_plan_wire_format(),
             exchange_wait_ms: default_exchange_wait_ms(),
             exchange_max_transmit_batched_bytes: default_exchange_max_transmit_batched_bytes(),
             exchange_io_threads: default_exchange_io_threads(),
@@ -1551,9 +1553,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        DEFAULT_MEM_LIMIT_SPEC, MetadataProviderConfig, NovaRocksConfig, PlanWireFormat,
-        RuntimeConfig, StandaloneObjectStoreConfig, StandaloneServerConfig,
-        StandaloneStarRocksTableConfig,
+        DEFAULT_MEM_LIMIT_SPEC, MetadataProviderConfig, NovaRocksConfig, RuntimeConfig,
+        StandaloneObjectStoreConfig, StandaloneServerConfig, StandaloneStarRocksTableConfig,
     };
 
     #[test]
@@ -2037,61 +2038,38 @@ olap_sink_max_tablet_write_chunk_bytes = 67108864
         );
     }
 
-    #[test]
-    fn test_runtime_plan_wire_format_defaults_to_proto() {
-        let cfg: NovaRocksConfig = toml::from_str(
-            r#"
-[runtime]
-"#,
+    fn assert_removed_plan_wire_format_is_rejected(value: &str) {
+        let path = std::env::temp_dir().join(format!(
+            "novarocks-removed-plan-wire-format-{}-{value}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            format!("[runtime]\nplan_wire_format = \"{value}\"\n"),
         )
-        .expect("parse config");
-        assert_eq!(cfg.runtime.plan_wire_format, PlanWireFormat::Proto);
+        .expect("write config fixture");
+
+        let result = NovaRocksConfig::load_from_file(&path);
+        std::fs::remove_file(&path).expect("remove config fixture");
+        let err = match result {
+            Ok(_) => panic!("removed runtime.plan_wire_format={value} must be rejected"),
+            Err(err) => err,
+        };
+
         assert_eq!(
-            RuntimeConfig::default().plan_wire_format,
-            PlanWireFormat::Proto
+            err.to_string(),
+            "runtime.plan_wire_format has been removed; NovaRocks-generated plans always use native Proto"
         );
     }
 
     #[test]
-    fn test_runtime_plan_wire_format_can_be_proto() {
-        let cfg: NovaRocksConfig = toml::from_str(
-            r#"
-[runtime]
-plan_wire_format = "proto"
-"#,
-        )
-        .expect("parse config");
-        assert_eq!(cfg.runtime.plan_wire_format, PlanWireFormat::Proto);
+    fn test_load_from_file_rejects_removed_proto_plan_wire_format() {
+        assert_removed_plan_wire_format_is_rejected("proto");
     }
 
-    #[cfg(not(feature = "compat"))]
     #[test]
-    fn test_runtime_plan_wire_format_rejects_thrift_in_pure_mode() {
-        let err = match toml::from_str::<NovaRocksConfig>(
-            r#"
-[runtime]
-plan_wire_format = "thrift"
-"#,
-        ) {
-            Ok(_) => panic!("pure mode must reject the thrift plan-wire escape hatch"),
-            Err(err) => err,
-        };
-
-        assert!(err.to_string().contains("plan_wire_format"), "{err}");
-    }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn test_runtime_plan_wire_format_accepts_thrift_with_compat() {
-        let cfg: NovaRocksConfig = toml::from_str(
-            r#"
-[runtime]
-plan_wire_format = "thrift"
-"#,
-        )
-        .expect("compat mode must parse the thrift plan-wire escape hatch");
-
-        assert_eq!(cfg.runtime.plan_wire_format, PlanWireFormat::Thrift);
+    fn test_load_from_file_rejects_removed_thrift_plan_wire_format() {
+        assert_removed_plan_wire_format_is_rejected("thrift");
     }
 
     #[test]
