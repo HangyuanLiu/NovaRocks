@@ -1223,6 +1223,630 @@ fn planner_distributed_and_codegen_do_not_import_optimizer() {
     );
 }
 
+fn logical_build_surface_violations(text: &str) -> Vec<String> {
+    let expected_modules = [
+        "aggregate",
+        "output",
+        "query",
+        "relation",
+        "select",
+        "subquery",
+        "tests",
+        "window",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<BTreeSet<_>>();
+    let actual_modules = module_declarations(text);
+    let mut violations = Vec::new();
+
+    for missing in expected_modules.difference(&actual_modules) {
+        violations.push(format!(
+            "missing logical build module declaration: {missing}"
+        ));
+    }
+    for extra in actual_modules.difference(&expected_modules) {
+        violations.push(format!(
+            "unexpected logical build module declaration: {extra}"
+        ));
+    }
+    if !has_cfg_test_mod_tests(text) {
+        violations.push("logical build tests module must stay behind #[cfg(test)]".to_string());
+    }
+
+    let expected_public_surface = [
+        "pub(crate) use output::plan_output_columns;".to_string(),
+        "pub(crate) use query::plan_query;".to_string(),
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let actual_public_surface = non_comment_trimmed_lines(text)
+        .into_iter()
+        .filter(|line| line.starts_with("pub ") || line.starts_with("pub("))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+
+    for missing in expected_public_surface.difference(&actual_public_surface) {
+        violations.push(format!("missing logical build public surface: {missing}"));
+    }
+    for extra in actual_public_surface.difference(&expected_public_surface) {
+        violations.push(format!("unexpected logical build public surface: {extra}"));
+    }
+
+    violations
+}
+
+fn rust_attribute_open_len(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'#') {
+        return None;
+    }
+    if bytes.get(start + 1) == Some(&b'[') {
+        return Some(2);
+    }
+    (bytes.get(start + 1) == Some(&b'!') && bytes.get(start + 2) == Some(&b'[')).then_some(3)
+}
+
+fn rust_attribute_group_end(text: &str) -> Option<usize> {
+    rust_attribute_open_len(text.as_bytes(), 0)?;
+
+    let mut depth = 0usize;
+    for (index, ch) in text.char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn rust_header_has_cfg_test_attribute(header: &str) -> bool {
+    let mut rest = header.trim();
+    while rust_attribute_open_len(rest.as_bytes(), 0).is_some() {
+        let is_outer = rest.starts_with("#[");
+        let Some(end) = rust_attribute_group_end(rest) else {
+            return false;
+        };
+        let attribute = compact_line(&rest[..end]);
+        if is_outer && is_cfg_test_attr(&attribute) {
+            return true;
+        }
+        rest = rest[end..].trim_start();
+    }
+    false
+}
+
+fn is_rust_function_item_header(header: &str) -> bool {
+    let mut rest = header.trim();
+    while rust_attribute_open_len(rest.as_bytes(), 0).is_some() {
+        let Some(end) = rust_attribute_group_end(rest) else {
+            return false;
+        };
+        rest = rest[end..].trim_start();
+    }
+
+    if let Some(after_pub) = rest.strip_prefix("pub ") {
+        rest = after_pub.trim_start();
+    } else if let Some(after_open) = rest.strip_prefix("pub(") {
+        let Some(close) = after_open.find(')') else {
+            return false;
+        };
+        rest = after_open[close + 1..].trim_start();
+    }
+
+    loop {
+        if let Some(after) = rest.strip_prefix("const ") {
+            rest = after.trim_start();
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("async ") {
+            rest = after.trim_start();
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("unsafe ") {
+            rest = after.trim_start();
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("extern ") {
+            rest = after.trim_start();
+            if let Some(after_quote) = rest.strip_prefix('"') {
+                let Some(close) = after_quote.find('"') else {
+                    return false;
+                };
+                rest = after_quote[close + 1..].trim_start();
+            }
+            continue;
+        }
+        break;
+    }
+
+    rest.starts_with("fn ")
+}
+
+fn rust_char_literal_end(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let first = *bytes.get(start + 1)?;
+    let mut cursor = start + 1;
+
+    if first == b'\\' {
+        cursor += 1;
+        match *bytes.get(cursor)? {
+            b'u' if bytes.get(cursor + 1) == Some(&b'{') => {
+                cursor += 2;
+                while bytes.get(cursor) != Some(&b'}') {
+                    cursor += 1;
+                }
+                cursor += 1;
+            }
+            b'x' => cursor += 3,
+            _ => cursor += 1,
+        }
+    } else {
+        let ch = text.get(cursor..)?.chars().next()?;
+        cursor += ch.len_utf8();
+    }
+
+    (bytes.get(cursor) == Some(&b'\'')).then_some(cursor)
+}
+
+fn rust_raw_string_open(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    if bytes.get(start) != Some(&b'r') {
+        return None;
+    }
+    let mut cursor = start + 1;
+    while bytes.get(cursor) == Some(&b'#') {
+        cursor += 1;
+    }
+    (bytes.get(cursor) == Some(&b'"')).then_some((cursor - start - 1, cursor - start + 1))
+}
+
+#[derive(Clone, Copy)]
+enum RustLexicalState {
+    Code,
+    LineComment,
+    BlockComment(usize),
+    String { escaped: bool },
+    RawString { hashes: usize },
+}
+
+fn rust_lexically_sanitized(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut state = RustLexicalState::Code;
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        match state {
+            RustLexicalState::Code => {
+                if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
+                    output.extend_from_slice(b"  ");
+                    index += 2;
+                    state = RustLexicalState::LineComment;
+                } else if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+                    output.extend_from_slice(b"  ");
+                    index += 2;
+                    state = RustLexicalState::BlockComment(1);
+                } else if let Some((hashes, opening_len)) = rust_raw_string_open(bytes, index) {
+                    output.extend(std::iter::repeat_n(b' ', opening_len));
+                    index += opening_len;
+                    state = RustLexicalState::RawString { hashes };
+                } else if bytes[index] == b'"' {
+                    output.push(b' ');
+                    index += 1;
+                    state = RustLexicalState::String { escaped: false };
+                } else if bytes[index] == b'\''
+                    && let Some(end) = rust_char_literal_end(text, index)
+                {
+                    output.extend(std::iter::repeat_n(b' ', end - index + 1));
+                    index = end + 1;
+                } else {
+                    output.push(bytes[index]);
+                    index += 1;
+                }
+            }
+            RustLexicalState::LineComment => {
+                if bytes[index] == b'\n' {
+                    output.push(b'\n');
+                    state = RustLexicalState::Code;
+                } else {
+                    output.push(b' ');
+                }
+                index += 1;
+            }
+            RustLexicalState::BlockComment(depth) => {
+                if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+                    output.extend_from_slice(b"  ");
+                    index += 2;
+                    state = RustLexicalState::BlockComment(depth + 1);
+                } else if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                    output.extend_from_slice(b"  ");
+                    index += 2;
+                    state = if depth == 1 {
+                        RustLexicalState::Code
+                    } else {
+                        RustLexicalState::BlockComment(depth - 1)
+                    };
+                } else {
+                    output.push(if bytes[index] == b'\n' { b'\n' } else { b' ' });
+                    index += 1;
+                }
+            }
+            RustLexicalState::String { escaped } => {
+                let byte = bytes[index];
+                output.push(if byte == b'\n' { b'\n' } else { b' ' });
+                index += 1;
+                state = if escaped {
+                    RustLexicalState::String { escaped: false }
+                } else if byte == b'\\' {
+                    RustLexicalState::String { escaped: true }
+                } else if byte == b'"' {
+                    RustLexicalState::Code
+                } else {
+                    RustLexicalState::String { escaped: false }
+                };
+            }
+            RustLexicalState::RawString { hashes } => {
+                let closes = bytes[index] == b'"'
+                    && bytes
+                        .get(index + 1..index + 1 + hashes)
+                        .is_some_and(|suffix| suffix.iter().all(|byte| *byte == b'#'));
+                if closes {
+                    output.extend(std::iter::repeat_n(b' ', hashes + 1));
+                    index += hashes + 1;
+                    state = RustLexicalState::Code;
+                } else {
+                    output.push(if bytes[index] == b'\n' { b'\n' } else { b' ' });
+                    index += 1;
+                }
+            }
+        }
+    }
+
+    String::from_utf8(output).expect("lexical sanitizer must preserve valid UTF-8 outside noise")
+}
+
+#[derive(Default)]
+struct RustStructuralLine {
+    brace_delta: isize,
+    has_open_brace: bool,
+    ends_with_semicolon: bool,
+}
+
+fn rust_structural_line(line: &str, attribute_depth: &mut usize) -> RustStructuralLine {
+    let bytes = line.as_bytes();
+    let mut structure = RustStructuralLine::default();
+    let mut last_code_byte = None;
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        if *attribute_depth > 0 {
+            match bytes[index] {
+                b'[' => *attribute_depth += 1,
+                b']' => *attribute_depth -= 1,
+                _ => {}
+            }
+            index += 1;
+            continue;
+        }
+        if let Some(open_len) = rust_attribute_open_len(bytes, index) {
+            *attribute_depth = 1;
+            index += open_len;
+            continue;
+        }
+
+        match bytes[index] {
+            b'{' => {
+                structure.brace_delta += 1;
+                structure.has_open_brace = true;
+            }
+            b'}' => structure.brace_delta -= 1,
+            _ => {}
+        }
+        if !bytes[index].is_ascii_whitespace() {
+            last_code_byte = Some(bytes[index]);
+        }
+        index += 1;
+    }
+
+    structure.ends_with_semicolon = last_code_byte == Some(b';');
+    structure
+}
+
+fn top_level_production_functions(text: &str) -> Vec<String> {
+    let production = rust_lexically_sanitized(text);
+    let mut functions = Vec::new();
+    let mut header = String::new();
+    let mut header_start = 0usize;
+    let mut header_is_function = false;
+    let mut brace_depth = 0isize;
+    let mut attribute_depth = 0usize;
+
+    for (index, line) in production.lines().enumerate() {
+        let trimmed = line.trim();
+        let structure = rust_structural_line(line, &mut attribute_depth);
+        if brace_depth == 0 && !trimmed.is_empty() {
+            if header.is_empty() {
+                header_start = index + 1;
+            } else {
+                header.push(' ');
+            }
+            header.push_str(trimmed);
+
+            if !header_is_function && is_rust_function_item_header(&header) {
+                if !rust_header_has_cfg_test_attribute(&header) {
+                    functions.push(format!("{}: {}", header_start, header));
+                }
+                header_is_function = true;
+            }
+
+            if attribute_depth == 0 && (structure.ends_with_semicolon || structure.has_open_brace) {
+                header.clear();
+                header_is_function = false;
+            }
+        }
+
+        brace_depth += structure.brace_delta;
+        if brace_depth < 0 {
+            brace_depth = 0;
+        }
+    }
+
+    functions
+}
+
+#[test]
+fn planner_logical_builder_surface_detector_rejects_extra_reexport() {
+    let with_extra_reexport = r#"
+mod aggregate;
+mod output;
+mod query;
+mod relation;
+mod select;
+mod subquery;
+mod window;
+
+pub(crate) use output::plan_output_columns;
+pub(crate) use query::plan_query;
+pub(crate) use relation::plan_values;
+
+#[cfg(test)]
+mod tests;
+"#;
+
+    let violations = logical_build_surface_violations(with_extra_reexport);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("pub(crate) use relation::plan_values;")),
+        "extra logical build re-export must be rejected: {violations:?}"
+    );
+}
+
+#[test]
+fn planner_root_function_detector_covers_visibility_and_qualifiers() {
+    let function_items = [
+        ("private", "fn private() {}"),
+        ("pub", "pub fn public() {}"),
+        ("pub(crate) async", "pub(crate) async fn crate_async() {}"),
+        (
+            "pub(super) unsafe",
+            "pub(super) unsafe fn parent_unsafe() {}",
+        ),
+        ("pub(self) const", "pub(self) const fn self_const() {}"),
+        (
+            "pub(in) const unsafe extern",
+            "pub(in crate) const unsafe extern \"C\" fn restricted() {}",
+        ),
+        ("private extern", "extern \"C\" fn private_extern() {}"),
+        (
+            "multiline qualifiers",
+            "pub(crate)\nconst fn multiline() {}",
+        ),
+        ("attribute", "#[inline]\npub fn attributed() {}"),
+        ("lifetime", "fn with_lifetime<'a>() {}"),
+    ];
+
+    for (label, source) in function_items {
+        let hits = top_level_production_functions(source);
+        assert_eq!(hits.len(), 1, "{label} must be detected: {hits:?}");
+    }
+
+    for source in [
+        "type Handler = fn();",
+        "const HANDLER: fn() = private;",
+        "mod child { fn nested() {} }",
+        "extern \"C\" { fn declared(); }",
+    ] {
+        let hits = top_level_production_functions(source);
+        assert!(
+            hits.is_empty(),
+            "non-function item must not be flagged: {hits:?}"
+        );
+    }
+
+    let cfg_test = "#[cfg(test)]\nfn test_only() {}";
+    assert!(top_level_production_functions(cfg_test).is_empty());
+}
+
+#[test]
+fn planner_root_function_detector_ignores_braces_in_lexical_noise() {
+    let cases = [
+        ("const string", "const TEXT: &str = \"{\";\nfn real() {}"),
+        (
+            "ordinary string",
+            "static TEXT: &str = \"{\";\nfn real() {}",
+        ),
+        ("byte string", "const BYTES: &[u8] = b\"{\";\nfn real() {}"),
+        (
+            "raw string",
+            "const RAW: &str = r###\"{\"###;\nfn real() {}",
+        ),
+        ("char", "const OPEN: char = '{';\nfn real() {}"),
+        ("line comment", "// {\nfn real() {}"),
+        ("block comment", "/* { */\nfn real() {}"),
+        ("nested block comment", "/* { /* } */ { */\nfn real() {}"),
+        ("byte char", "const OPEN: u8 = b'{';\nfn real() {}"),
+        (
+            "raw byte string",
+            "const RAW: &[u8] = br###\"{\"###;\nfn real() {}",
+        ),
+        (
+            "escaped quote and backslash",
+            r#"const TEXT: &str = "\"{\\}";
+fn real() {}"#,
+        ),
+    ];
+
+    for (label, source) in cases {
+        let hits = top_level_production_functions(source);
+        assert_eq!(hits.len(), 1, "{label} must not hide real fn: {hits:?}");
+        assert!(hits[0].contains("fn real"), "{label}: {hits:?}");
+    }
+}
+
+#[test]
+fn planner_root_function_detector_ignores_fake_functions_in_comments() {
+    let source = r#"
+/*
+fn fake_block() {}
+*/
+// fn fake_line() {}
+"#;
+
+    let hits = top_level_production_functions(source);
+    assert!(
+        hits.is_empty(),
+        "functions in comments must not be flagged: {hits:?}"
+    );
+}
+
+#[test]
+fn planner_root_function_detector_handles_multiline_attributes() {
+    let source = r#"
+#[allow(
+    dead_code,
+    clippy::missing_safety_doc,
+)]
+pub unsafe fn attributed() {}
+"#;
+
+    let hits = top_level_production_functions(source);
+    assert_eq!(
+        hits.len(),
+        1,
+        "multiline attribute must preserve fn: {hits:?}"
+    );
+    assert!(hits[0].contains("fn attributed"), "{hits:?}");
+}
+
+#[test]
+fn planner_root_function_detector_excludes_cfg_test_with_multiline_attribute() {
+    let source = r#"
+#[cfg(
+    test
+)]
+#[allow(
+    dead_code,
+)]
+fn test_only() {}
+
+fn production() {}
+"#;
+
+    let hits = top_level_production_functions(source);
+    assert_eq!(hits.len(), 1, "only production fn must remain: {hits:?}");
+    assert!(hits[0].contains("fn production"), "{hits:?}");
+}
+
+#[test]
+fn planner_root_function_detector_handles_inner_attributes() {
+    let source = "#![allow(dead_code)]\nfn leaked() {}";
+
+    let hits = top_level_production_functions(source);
+    assert_eq!(hits.len(), 1, "inner attribute must preserve fn: {hits:?}");
+    assert!(hits[0].contains("fn leaked"), "{hits:?}");
+}
+
+#[test]
+fn planner_root_function_detector_treats_inner_cfg_test_conservatively() {
+    let source = "#![cfg(test)]\nfn conservatively_production() {}";
+
+    let hits = top_level_production_functions(source);
+    assert_eq!(
+        hits.len(),
+        1,
+        "module cfg(test) must not suppress production guard: {hits:?}"
+    );
+    assert!(hits[0].contains("fn conservatively_production"), "{hits:?}");
+}
+
+#[test]
+fn planner_root_function_detector_ignores_inner_attribute_structure() {
+    let source = r#"
+#![guard(
+    { dead_code }
+)]
+fn after_inner_attribute() {}
+"#;
+
+    let hits = top_level_production_functions(source);
+    assert_eq!(
+        hits.len(),
+        1,
+        "inner attribute tokens must not change brace depth: {hits:?}"
+    );
+    assert!(hits[0].contains("fn after_inner_attribute"), "{hits:?}");
+}
+
+#[test]
+fn planner_logical_builder_is_owned_by_logical_stage() {
+    let repo = Path::new(manifest_dir());
+    let expected_files = [
+        "src/sql/planner/logical/mod.rs",
+        "src/sql/planner/logical/build/mod.rs",
+        "src/sql/planner/logical/build/query.rs",
+        "src/sql/planner/logical/build/select.rs",
+        "src/sql/planner/logical/build/subquery.rs",
+        "src/sql/planner/logical/build/aggregate.rs",
+        "src/sql/planner/logical/build/window.rs",
+        "src/sql/planner/logical/build/relation.rs",
+        "src/sql/planner/logical/build/output.rs",
+        "src/sql/planner/logical/build/tests.rs",
+    ];
+    for path in expected_files {
+        assert!(
+            repo.join(path).is_file(),
+            "missing logical builder owner: {path}"
+        );
+    }
+
+    let facade = fs::read_to_string(repo.join("src/sql/planner/mod.rs")).unwrap();
+    let root_functions = top_level_production_functions(&facade);
+    assert!(
+        root_functions.is_empty(),
+        "planner facade must not own top-level production functions:\n{}",
+        root_functions.join("\n")
+    );
+    assert!(has_non_comment_line(&facade, "pub(crate) mod logical;"));
+    assert!(has_non_comment_line(
+        &facade,
+        "pub(crate) use logical::build::{plan_output_columns, plan_query};"
+    ));
+
+    let build_mod = fs::read_to_string(repo.join("src/sql/planner/logical/build/mod.rs")).unwrap();
+    let surface_violations = logical_build_surface_violations(&build_mod);
+    assert!(
+        surface_violations.is_empty(),
+        "logical build module must expose exactly its seven owners and two stable entries:\n{}",
+        surface_violations.join("\n")
+    );
+}
+
 #[test]
 fn optimizer_bridge_is_the_only_allowlisted_converter() {
     let bridge = src_dir().join("sql/planner/optimizer_bridge/physical.rs");
