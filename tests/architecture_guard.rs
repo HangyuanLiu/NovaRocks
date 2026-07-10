@@ -1709,13 +1709,50 @@ fn rust_resolve_use_paths(
     (!resolved.is_empty()).then(|| resolved.into_iter().collect())
 }
 
-fn rust_production_use_statements(text: &str) -> Vec<String> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RustRawUseStatement {
+    visibility: String,
+    path: RustUsePath,
+    inline_modules: Vec<String>,
+}
+
+fn rust_raw_production_use_statements(text: &str) -> Vec<RustRawUseStatement> {
     let production = rust_sanitized_production_text(text);
     let tokens = rust_use_tokens(&production);
-    let mut raw_imports = Vec::<(String, RustUsePath)>::new();
+    let inline_module_openings = (0..tokens.len().saturating_sub(2))
+        .filter_map(|index| {
+            (tokens[index] == "mod"
+                && tokens[index + 1].chars().all(is_ident_char)
+                && tokens[index + 2] == "{")
+                .then(|| (index + 2, tokens[index + 1].clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut raw_imports = Vec::new();
+    let mut inline_modules = Vec::<(usize, String)>::new();
+    let mut brace_depth = 0usize;
     let mut index = 0usize;
 
     while index < tokens.len() {
+        if tokens[index] == "{" {
+            brace_depth += 1;
+            if let Some(module) = inline_module_openings.get(&index) {
+                inline_modules.push((brace_depth, module.clone()));
+            }
+            index += 1;
+            continue;
+        }
+        if tokens[index] == "}" {
+            if inline_modules
+                .last()
+                .is_some_and(|(depth, _)| *depth == brace_depth)
+            {
+                inline_modules.pop();
+            }
+            brace_depth = brace_depth.saturating_sub(1);
+            index += 1;
+            continue;
+        }
+
         let mut visibility = "private".to_string();
         let mut cursor = index;
 
@@ -1757,12 +1794,27 @@ fn rust_production_use_statements(text: &str) -> Vec<String> {
 
         let mut paths = Vec::new();
         rust_expand_use_list(&tokens[tree_start..cursor], &[], &mut paths);
-        raw_imports.extend(paths.into_iter().map(|path| (visibility.clone(), path)));
+        let scope = inline_modules
+            .iter()
+            .map(|(_, module)| module.clone())
+            .collect::<Vec<_>>();
+        raw_imports.extend(paths.into_iter().map(|path| RustRawUseStatement {
+            visibility: visibility.clone(),
+            path,
+            inline_modules: scope.clone(),
+        }));
         index = cursor + 1;
     }
 
+    raw_imports
+}
+
+fn rust_production_use_statements(text: &str) -> Vec<String> {
+    let raw_imports = rust_raw_production_use_statements(text);
+
     let mut aliases = BTreeMap::<String, Vec<Vec<String>>>::new();
-    for (_, path) in &raw_imports {
+    for raw in &raw_imports {
+        let path = &raw.path;
         let Some(alias) = path.alias.as_ref().filter(|alias| alias.as_str() != "_") else {
             continue;
         };
@@ -1774,7 +1826,9 @@ fn rust_production_use_statements(text: &str) -> Vec<String> {
 
     raw_imports
         .into_iter()
-        .flat_map(|(visibility, path)| {
+        .flat_map(|raw| {
+            let visibility = raw.visibility;
+            let path = raw.path;
             let resolved =
                 rust_resolve_use_paths(&path.segments, &aliases, &mut BTreeSet::new(), 0)
                     .unwrap_or_else(|| vec![path.segments]);
@@ -1785,6 +1839,125 @@ fn rust_production_use_statements(text: &str) -> Vec<String> {
             resolved
                 .into_iter()
                 .map(|resolved| format!("{visibility}|{}{alias}", resolved.join("::")))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RustScopedUsePath {
+    segments: Vec<String>,
+    inline_modules: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RustScopedUseStatement {
+    import: String,
+    inline_modules: Vec<String>,
+}
+
+fn rust_resolve_scoped_use_paths(
+    path: &[String],
+    inline_modules: &[String],
+    aliases: &BTreeMap<String, Vec<RustScopedUsePath>>,
+    resolving: &mut BTreeSet<String>,
+    depth: usize,
+) -> Option<Vec<RustScopedUsePath>> {
+    if depth > aliases.len() {
+        return None;
+    }
+
+    let Some(owner_index) = path
+        .iter()
+        .position(|segment| segment != "self" && segment != "super")
+    else {
+        return Some(vec![RustScopedUsePath {
+            segments: path.to_vec(),
+            inline_modules: inline_modules.to_vec(),
+        }]);
+    };
+    let owner = &path[owner_index];
+    let Some(targets) = aliases.get(owner) else {
+        return Some(vec![RustScopedUsePath {
+            segments: path.to_vec(),
+            inline_modules: inline_modules.to_vec(),
+        }]);
+    };
+    if !resolving.insert(owner.clone()) {
+        return None;
+    }
+
+    let mut resolved = BTreeSet::new();
+    for target in targets {
+        let Some(target_paths) = rust_resolve_scoped_use_paths(
+            &target.segments,
+            &target.inline_modules,
+            aliases,
+            resolving,
+            depth + 1,
+        ) else {
+            continue;
+        };
+        for mut target_path in target_paths {
+            target_path
+                .segments
+                .extend_from_slice(&path[owner_index + 1..]);
+            resolved.insert(target_path);
+        }
+    }
+    resolving.remove(owner);
+    (!resolved.is_empty()).then(|| resolved.into_iter().collect())
+}
+
+fn rust_production_scoped_use_statements(text: &str) -> Vec<RustScopedUseStatement> {
+    let raw_imports = rust_raw_production_use_statements(text);
+    let mut aliases = BTreeMap::<String, Vec<RustScopedUsePath>>::new();
+    for raw in &raw_imports {
+        let Some(alias) = raw
+            .path
+            .alias
+            .as_ref()
+            .filter(|alias| alias.as_str() != "_")
+        else {
+            continue;
+        };
+        let target = RustScopedUsePath {
+            segments: raw.path.segments.clone(),
+            inline_modules: raw.inline_modules.clone(),
+        };
+        let targets = aliases.entry(alias.clone()).or_default();
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+
+    raw_imports
+        .into_iter()
+        .flat_map(|raw| {
+            let resolved = rust_resolve_scoped_use_paths(
+                &raw.path.segments,
+                &raw.inline_modules,
+                &aliases,
+                &mut BTreeSet::new(),
+                0,
+            )
+            .unwrap_or_else(|| {
+                vec![RustScopedUsePath {
+                    segments: raw.path.segments.clone(),
+                    inline_modules: raw.inline_modules.clone(),
+                }]
+            });
+            let alias = raw
+                .path
+                .alias
+                .map(|alias| format!(" as {alias}"))
+                .unwrap_or_default();
+            resolved
+                .into_iter()
+                .map(|resolved| RustScopedUseStatement {
+                    import: format!("{}|{}{alias}", raw.visibility, resolved.segments.join("::")),
+                    inline_modules: resolved.inline_modules,
+                })
                 .collect::<Vec<_>>()
         })
         .collect()
@@ -1858,20 +2031,27 @@ fn rust_source_module_segments(source_rel: &str) -> Option<Vec<String>> {
     let stem = file.strip_suffix(".rs")?;
     let mut module = vec!["crate".to_string()];
     module.extend(components[1..components.len() - 1].iter().cloned());
-    if !matches!(stem, "lib" | "main" | "mod") {
+    let crate_root = components.len() == 2 && matches!(stem, "lib" | "main");
+    if stem != "mod" && !crate_root {
         module.push(stem.to_string());
     }
     Some(module)
 }
 
-fn rust_canonical_use_segments(import: &str, source_rel: &str) -> Option<Vec<String>> {
+fn rust_canonical_use_segments_in_scope(
+    import: &str,
+    source_rel: &str,
+    inline_modules: &[String],
+) -> Option<Vec<String>> {
     let path = rust_use_path(import).split("::").collect::<Vec<_>>();
     let mut index = 0usize;
     let mut canonical = if path.first() == Some(&"crate") {
         index = 1;
         vec!["crate".to_string()]
     } else {
-        rust_source_module_segments(source_rel)?
+        let mut module = rust_source_module_segments(source_rel)?;
+        module.extend(inline_modules.iter().cloned());
+        module
     };
 
     while path.get(index) == Some(&"self") {
@@ -1888,19 +2068,39 @@ fn rust_canonical_use_segments(import: &str, source_rel: &str) -> Option<Vec<Str
     Some(canonical)
 }
 
-fn rust_use_imports_legacy_planner_owner(import: &str, source_rel: &str) -> bool {
+fn rust_canonical_use_segments(import: &str, source_rel: &str) -> Option<Vec<String>> {
+    rust_canonical_use_segments_in_scope(import, source_rel, &[])
+}
+
+fn rust_canonical_path_is_legacy_planner_owner(canonical: &[String]) -> bool {
     let legacy_owners = [
         "plan",
         "physical_vocab",
         "stats",
         "runtime_filter_placement",
     ];
-    let Some(canonical) = rust_canonical_use_segments(import, source_rel) else {
-        return false;
-    };
     canonical.len() >= 4
         && canonical[..3] == ["crate", "sql", "planner"]
         && legacy_owners.contains(&canonical[3].as_str())
+}
+
+fn rust_use_imports_legacy_planner_owner(import: &str, source_rel: &str) -> bool {
+    let Some(canonical) = rust_canonical_use_segments(import, source_rel) else {
+        return false;
+    };
+    rust_canonical_path_is_legacy_planner_owner(&canonical)
+}
+
+fn rust_scoped_use_imports_legacy_planner_owner(
+    import: &RustScopedUseStatement,
+    source_rel: &str,
+) -> bool {
+    let Some(canonical) =
+        rust_canonical_use_segments_in_scope(&import.import, source_rel, &import.inline_modules)
+    else {
+        return false;
+    };
+    rust_canonical_path_is_legacy_planner_owner(&canonical)
 }
 
 fn rust_use_leaf(import: &str) -> &str {
@@ -2512,6 +2712,62 @@ fn planner_physical_legacy_owner_detector_distinguishes_sibling_and_unrelated_pa
 }
 
 #[test]
+fn planner_physical_legacy_owner_detector_tracks_inline_module_scope() {
+    let source_rel = "src/sql/planner/physical/node.rs";
+    let allowed =
+        rust_production_scoped_use_statements("mod nested { use super::super::stats::X; }");
+    assert_eq!(allowed.len(), 1, "{allowed:?}");
+    assert_eq!(allowed[0].inline_modules, vec!["nested"]);
+    assert!(
+        !allowed
+            .iter()
+            .any(|import| { rust_scoped_use_imports_legacy_planner_owner(import, source_rel) }),
+        "inline nested module must resolve two super segments to physical::stats: {allowed:?}"
+    );
+
+    let forbidden =
+        rust_production_scoped_use_statements("mod nested { use super::super::super::stats::X; }");
+    assert!(
+        forbidden
+            .iter()
+            .any(|import| { rust_scoped_use_imports_legacy_planner_owner(import, source_rel) }),
+        "inline nested module must resolve three super segments to planner::stats: {forbidden:?}"
+    );
+
+    let allowed_alias_chain = rust_production_scoped_use_statements(
+        r#"
+mod nested {
+    use super::{super::{stats as stage_stats}};
+    use stage_stats as stats_owner;
+    use stats_owner::X;
+}
+"#,
+    );
+    assert!(
+        !allowed_alias_chain
+            .iter()
+            .any(|import| { rust_scoped_use_imports_legacy_planner_owner(import, source_rel) }),
+        "grouped alias targets must resolve relative to their inline declaration scope: {allowed_alias_chain:?}"
+    );
+
+    let forbidden_alias_chain = rust_production_scoped_use_statements(
+        r#"
+mod nested {
+    use super::{super::{super::{stats as root_stats}}};
+    use root_stats as stats_owner;
+    use stats_owner::X;
+}
+"#,
+    );
+    assert!(
+        forbidden_alias_chain
+            .iter()
+            .any(|import| { rust_scoped_use_imports_legacy_planner_owner(import, source_rel) }),
+        "grouped alias targets that reach planner::stats must be rejected: {forbidden_alias_chain:?}"
+    );
+}
+
+#[test]
 fn planner_logical_builder_is_owned_by_logical_stage() {
     let repo = Path::new(manifest_dir());
     let expected_files = [
@@ -2792,12 +3048,15 @@ fn planner_physical_stage_has_single_namespace() {
         let production = rust_sanitized_production_text(&text);
         let compact = compact_line(&production);
         let imports = rust_production_use_statements(&text);
-        for import in &imports {
+        let scoped_imports = rust_production_scoped_use_statements(&text);
+        for import in &scoped_imports {
             assert!(
-                !rust_use_imports_legacy_planner_owner(import, &rel(&path)),
-                "legacy physical owner import remains in {}: {import}",
+                !rust_scoped_use_imports_legacy_planner_owner(import, &rel(&path)),
+                "legacy physical owner import remains in {}: {import:?}",
                 rel(&path)
             );
+        }
+        for import in &imports {
             let import_segments = rust_use_path(import).split("::").collect::<Vec<_>>();
             let imports_planner_root = import_segments.last().is_some_and(|leaf| {
                 physical_and_ordering_items.contains(leaf)
