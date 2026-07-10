@@ -44,7 +44,10 @@ mod tests {
         for module_file in [
             "distributed/fragment.rs",
             "distributed/node.rs",
-            "distributed_plan_build.rs",
+            "distributed/build/fragment_cut.rs",
+            "distributed/build/lowering.rs",
+            "distributed/build/mod.rs",
+            "distributed/build/runtime_filter_wire.rs",
         ] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("src/sql/planner")

@@ -27,7 +27,7 @@ pub(crate) fn optimizer_physical_to_distributed_plan(
     verify_optimizer_id_binding(plan)?;
     let mut physical = optimizer_physical_to_plan(plan)?;
     crate::sql::planner::physical::runtime_filter_placement::place_runtime_filters(&mut physical);
-    crate::sql::planner::build_distributed_plan(&physical)
+    crate::sql::planner::distributed::build::build_distributed_plan(&physical)
 }
 
 #[cfg(test)]

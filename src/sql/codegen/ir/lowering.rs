@@ -2645,7 +2645,10 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         set_op: &super::kind::PhysicalSetOpNode,
     ) -> Result<LoweredDistributedNode, String> {
         if matches!(set_op.kind, super::kind::SetOpKind::UnionDistinct) {
-            return Err(crate::sql::planner::union_distinct_must_be_rewritten_error().to_string());
+            return Err(
+                crate::sql::planner::distributed::build::union_distinct_must_be_rewritten_error()
+                    .to_string(),
+            );
         }
         if node.children.is_empty() {
             return Err("DistributedPlan SetOp has no inputs".to_string());
@@ -5217,7 +5220,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             super::kind::SetOpKind::UnionAll => plan_nodes::TPlanNodeType::UNION_NODE,
             super::kind::SetOpKind::UnionDistinct => unreachable!(
                 "{}",
-                crate::sql::planner::union_distinct_must_be_rewritten_error()
+                crate::sql::planner::distributed::build::union_distinct_must_be_rewritten_error()
             ),
             super::kind::SetOpKind::Intersect => plan_nodes::TPlanNodeType::INTERSECT_NODE,
             super::kind::SetOpKind::Except => plan_nodes::TPlanNodeType::EXCEPT_NODE,
@@ -5232,7 +5235,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             }
             super::kind::SetOpKind::UnionDistinct => unreachable!(
                 "{}",
-                crate::sql::planner::union_distinct_must_be_rewritten_error()
+                crate::sql::planner::distributed::build::union_distinct_must_be_rewritten_error()
             ),
             super::kind::SetOpKind::Intersect => {
                 plan_node.intersect_node = Some(plan_nodes::TIntersectNode {
@@ -7786,7 +7789,7 @@ mod tests {
 
         assert_lowering_err(
             &dp,
-            crate::sql::planner::union_distinct_must_be_rewritten_error(),
+            crate::sql::planner::distributed::build::union_distinct_must_be_rewritten_error(),
         );
     }
 

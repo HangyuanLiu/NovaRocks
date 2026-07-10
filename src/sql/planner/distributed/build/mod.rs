@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -15,18 +16,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Planner — converts analyzed SQL into logical plans and distributed Bridge 2 IR.
-//!
-//! This is a structural transformation that builds a relational algebra tree
-//! from the analyzed query IR. It also owns Bridge 2, which materializes
-//! physical optimizer plans into planner-side distributed plan fragments before
-//! codegen lowers them to Thrift.
+mod fragment_cut;
+mod lowering;
+mod runtime_filter_wire;
 
-pub(crate) mod distributed;
-pub(crate) mod imv_rewrite;
-pub(crate) mod logical;
-pub(crate) mod optimizer_bridge;
-pub(crate) mod ordering;
-pub(crate) mod payload;
-pub(crate) mod physical;
-pub(crate) use logical::build::{plan_output_columns, plan_query};
+use crate::sql::planner::distributed::DistributedPlan;
+use crate::sql::planner::physical::PhysicalPlanNode;
+
+pub(crate) fn build_distributed_plan(plan: &PhysicalPlanNode) -> Result<DistributedPlan, String> {
+    let mut cut = fragment_cut::cut(plan)?;
+    runtime_filter_wire::wire(&mut cut.plan.fragments, cut.bindings);
+    Ok(cut.plan)
+}
+
+pub(crate) fn union_distinct_must_be_rewritten_error() -> &'static str {
+    "UNION DISTINCT must be rewritten by UnionDistinctToAggregate before distributed build"
+}
+
+#[cfg(test)]
+mod tests;

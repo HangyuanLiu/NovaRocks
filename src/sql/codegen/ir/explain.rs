@@ -877,7 +877,7 @@ fn format_set_op_node(
         SetOpKind::UnionDistinct => {
             unreachable!(
                 "{}",
-                crate::sql::planner::union_distinct_must_be_rewritten_error()
+                crate::sql::planner::distributed::build::union_distinct_must_be_rewritten_error()
             )
         }
         SetOpKind::Intersect => "INTERSECT",
@@ -1573,7 +1573,7 @@ mod tests {
         crate::sql::planner::physical::runtime_filter_placement::place_runtime_filters(
             &mut physical,
         );
-        crate::sql::planner::build_distributed_plan(&physical)
+        crate::sql::planner::distributed::build::build_distributed_plan(&physical)
     }
 
     fn prepare_bridge2_test_props(node: &mut OptimizerPhysicalNode) {

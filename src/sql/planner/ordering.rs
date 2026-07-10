@@ -18,7 +18,7 @@
 //! Planner-owned ordering vocabulary and satisfaction reasoning.
 //!
 //! Mirrors the optimizer's `property::{OrderingSpec, SortKey}` but lives in the
-//! planner so that `distributed_plan_build` / codegen / `planner::mod` can reason
+//! planner so that `distributed::build` / codegen / `planner::mod` can reason
 //! about ordering without importing `crate::sql::optimizer::*`. The optimizer
 //! keeps its own copy; `optimizer_bridge` converts at the boundary.
 
