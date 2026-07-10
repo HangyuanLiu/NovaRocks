@@ -24,7 +24,7 @@
 //! - Does not support DECIMALV2.
 //! - Does not support VARIANT.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, hash_map::Entry};
 
 use arrow::datatypes::{DataType, Field, Fields, SchemaRef, TimeUnit};
 
@@ -342,6 +342,8 @@ pub struct StarRocksNativeSegmentPlan {
     pub footer_num_rows: u32,
     pub projected_schemas: Vec<StarRocksNativeSchemaColumnPlan>,
     pub source_column_missing_by_output: Vec<bool>,
+    pub group_key_schemas: Vec<StarRocksNativeSchemaColumnPlan>,
+    pub delete_predicate_schemas: HashMap<u32, StarRocksNativeSchemaColumnPlan>,
 }
 
 #[derive(Clone, Debug)]
@@ -424,8 +426,15 @@ struct SchemaColumnLookup<'a> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StarRocksPhysicalColumnBinding {
+    AuthoritativeUniqueId(u32),
+    LegacyName,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StarRocksOutputColumnHint {
     pub schema_unique_id: Option<u32>,
+    pub physical_binding: StarRocksPhysicalColumnBinding,
     pub fallback_default_literal: Option<String>,
 }
 
@@ -438,6 +447,7 @@ pub fn build_native_read_plan(
     let output_column_hints = vec![
         StarRocksOutputColumnHint {
             schema_unique_id: None,
+            physical_binding: StarRocksPhysicalColumnBinding::LegacyName,
             fallback_default_literal: None,
         };
         output_schema.fields().len()
@@ -493,6 +503,7 @@ pub fn build_native_read_plan_with_output_hints(
         output_column_hints,
         &current_lookup,
         source_tablet_schema,
+        false,
     )?;
     let group_key_columns = build_group_key_columns_plan(
         snapshot.tablet_id,
@@ -547,6 +558,7 @@ pub fn build_native_read_plan_with_output_hints(
             output_column_hints,
             &current_lookup,
             segment_source_schema,
+            true,
         )?;
         if segment_projected_columns.len() != projected_columns.len() {
             let global_columns = projected_columns
@@ -639,6 +651,19 @@ pub fn build_native_read_plan_with_output_hints(
             projected_schemas.push(segment_projected.schema.clone());
             source_column_missing_by_output.push(segment_projected.source_column_missing);
         }
+        let group_key_schemas = build_segment_group_key_schemas(
+            snapshot,
+            &group_key_columns,
+            &current_lookup,
+            segment_source_schema,
+        )?;
+        let delete_predicate_schemas = build_segment_delete_predicate_schemas(
+            snapshot,
+            &delete_predicates,
+            &current_lookup,
+            segment_source_schema,
+            segment.rowset_version,
+        )?;
         estimated_rows = estimated_rows.saturating_add(u64::from(footer_num_rows));
         segments.push(StarRocksNativeSegmentPlan {
             index: idx,
@@ -652,6 +677,8 @@ pub fn build_native_read_plan_with_output_hints(
             footer_num_rows,
             projected_schemas,
             source_column_missing_by_output,
+            group_key_schemas,
+            delete_predicate_schemas,
         });
     }
 
@@ -720,27 +747,46 @@ fn build_schema_column_lookup<'a>(
 
 fn build_source_schema_lookup<'a>(
     source_schema: Option<&'a TabletSchemaPb>,
-) -> SchemaColumnLookup<'a> {
+) -> Result<SchemaColumnLookup<'a>, String> {
     let mut by_name = HashMap::<String, &'a ColumnPb>::new();
     let mut by_unique_id = HashMap::<u32, &'a ColumnPb>::new();
     if let Some(source_schema) = source_schema {
         for col in &source_schema.column {
+            if let Ok(unique_id) = u32::try_from(col.unique_id) {
+                match by_unique_id.entry(unique_id) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(col);
+                    }
+                    Entry::Occupied(_) => {
+                        return Err(format!(
+                            "duplicated historical tablet schema column unique_id: unique_id={unique_id}"
+                        ));
+                    }
+                }
+            }
             let Some(name) = col.name.as_deref().map(str::trim) else {
                 continue;
             };
             if name.is_empty() {
                 continue;
             }
-            by_name.insert(normalize_column_name(name), col);
-            if let Ok(unique_id) = u32::try_from(col.unique_id) {
-                by_unique_id.insert(unique_id, col);
+            let normalized_name = normalize_column_name(name);
+            match by_name.entry(normalized_name.clone()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(col);
+                }
+                Entry::Occupied(_) => {
+                    return Err(format!(
+                        "duplicated historical tablet schema column name: column_name={normalized_name}"
+                    ));
+                }
             }
         }
     }
-    SchemaColumnLookup {
+    Ok(SchemaColumnLookup {
         by_name,
         by_unique_id,
-    }
+    })
 }
 
 fn build_projected_columns(
@@ -749,8 +795,9 @@ fn build_projected_columns(
     output_column_hints: &[StarRocksOutputColumnHint],
     current_lookup: &SchemaColumnLookup<'_>,
     source_tablet_schema: Option<&TabletSchemaPb>,
+    use_segment_physical_schema: bool,
 ) -> Result<Vec<StarRocksNativeColumnPlan>, String> {
-    let source_lookup = build_source_schema_lookup(source_tablet_schema);
+    let source_lookup = build_source_schema_lookup(source_tablet_schema)?;
     let mut projected_columns = Vec::with_capacity(output_schema.fields().len());
     for (idx, field) in output_schema.fields().iter().enumerate() {
         let output_name = field.name().trim();
@@ -762,50 +809,75 @@ fn build_projected_columns(
             )
         })?;
         let output_field_unique_id = output_hint.schema_unique_id;
-        let schema_col_from_unique_id = output_field_unique_id
+        let lookup_unique_id = match output_hint.physical_binding {
+            StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(unique_id) => Some(unique_id),
+            StarRocksPhysicalColumnBinding::LegacyName => output_field_unique_id,
+        };
+        let schema_col_from_unique_id = lookup_unique_id
             .and_then(|unique_id| current_lookup.by_unique_id.get(&unique_id).copied());
         let schema_col_from_name = current_lookup.by_name.get(&normalized_name).copied();
-        let source_schema_col_from_name = source_lookup.by_name.get(&normalized_name).copied();
-        let source_schema_col_from_unique_id = output_field_unique_id
+        let source_schema_col_from_unique_id = lookup_unique_id
             .and_then(|unique_id| source_lookup.by_unique_id.get(&unique_id).copied());
-        let source_schema_col = source_schema_col_from_unique_id.or(source_schema_col_from_name);
-        let flat_json_base = if schema_col_from_name.is_none() {
+        let source_schema_col_from_name = source_lookup.by_name.get(&normalized_name).copied();
+        let source_schema_col = match output_hint.physical_binding {
+            StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(_) => {
+                source_schema_col_from_unique_id
+            }
+            StarRocksPhysicalColumnBinding::LegacyName => {
+                source_schema_col_from_unique_id.or(source_schema_col_from_name)
+            }
+        };
+        let flat_json_base = if schema_col_from_name.is_none()
+            && matches!(
+                output_hint.physical_binding,
+                StarRocksPhysicalColumnBinding::LegacyName
+            ) {
             try_build_flat_json_projection(output_name, &current_lookup.by_name)
         } else {
             None
         };
         let has_flat_json_base = flat_json_base.is_some();
-        let schema_col = if has_flat_json_base {
-            None
-        } else if let Some(schema_col) = schema_col_from_unique_id {
-            Some((schema_col, source_schema_col))
-        } else if let Some(schema_col) = schema_col_from_name {
-            if let Some(expected_unique_id) = output_field_unique_id {
-                let name_col_unique_id = u32::try_from(schema_col.unique_id).map_err(|_| {
-                    format!(
-                        "invalid column unique_id in tablet schema while matching output column hint: tablet_id={}, version={}, output_field={}, unique_id={}",
-                        snapshot.tablet_id, snapshot.version, output_name, schema_col.unique_id
-                    )
-                })?;
-                if name_col_unique_id == expected_unique_id {
+        let schema_col = match output_hint.physical_binding {
+            StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(_) => schema_col_from_unique_id
+                .map(|schema_col| (schema_col, source_schema_col_from_unique_id)),
+            StarRocksPhysicalColumnBinding::LegacyName => {
+                if has_flat_json_base {
+                    None
+                } else if let Some(schema_col) = schema_col_from_unique_id {
                     Some((schema_col, source_schema_col))
+                } else if let Some(schema_col) = schema_col_from_name {
+                    if let Some(expected_unique_id) = output_field_unique_id {
+                        let name_col_unique_id =
+                            u32::try_from(schema_col.unique_id).map_err(|_| {
+                                format!(
+                                    "invalid column unique_id in tablet schema while matching output column hint: tablet_id={}, version={}, output_field={}, unique_id={}",
+                                    snapshot.tablet_id,
+                                    snapshot.version,
+                                    output_name,
+                                    schema_col.unique_id
+                                )
+                            })?;
+                        if name_col_unique_id == expected_unique_id {
+                            Some((schema_col, source_schema_col))
+                        } else {
+                            let source_name_unique_id = source_schema_col_from_name
+                                .and_then(|col| u32::try_from(col.unique_id).ok());
+                            source_name_unique_id
+                                .filter(|source_unique_id| *source_unique_id == name_col_unique_id)
+                                .map(|_| (schema_col, source_schema_col_from_name))
+                        }
+                    } else {
+                        Some((schema_col, source_schema_col))
+                    }
                 } else {
-                    let source_name_unique_id = source_schema_col_from_name
-                        .and_then(|col| u32::try_from(col.unique_id).ok());
-                    // FE rewrite output slots may carry non-physical unique ids. When the
-                    // current schema and the physical source schema agree on the named column,
-                    // bind by the real column instead of synthesizing a missing output column.
-                    source_name_unique_id
-                        .filter(|source_unique_id| *source_unique_id == name_col_unique_id)
-                        .map(|_| (schema_col, source_schema_col_from_name))
+                    None
                 }
-            } else {
-                Some((schema_col, source_schema_col))
             }
-        } else {
-            None
         };
-        let allow_flat_json_fallback = output_field_unique_id.is_none();
+        let allow_flat_json_fallback = matches!(
+            output_hint.physical_binding,
+            StarRocksPhysicalColumnBinding::LegacyName
+        );
         let (
             schema,
             schema_unique_id,
@@ -814,15 +886,20 @@ fn build_projected_columns(
             fallback_default_literal,
             fallback_is_nullable,
         ) = if let Some((schema_col, source_schema_col)) = schema_col {
-            let schema = build_schema_column_plan(
+            let authoritative_binding = matches!(
+                output_hint.physical_binding,
+                StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(_)
+            );
+            let schema = build_projected_schema_column_plan(
                 snapshot.tablet_id,
                 snapshot.version,
                 output_name,
                 schema_col,
                 source_schema_col,
-                None,
-                source_schema_col.is_some(),
                 field.data_type(),
+                field.is_nullable(),
+                authoritative_binding,
+                use_segment_physical_schema,
             )?;
             let schema_unique_id = schema.unique_id.ok_or_else(|| {
                 format!(
@@ -831,17 +908,28 @@ fn build_projected_columns(
                 )
             })?;
             {
-                let dv = schema_col
-                    .default_value
-                    .as_ref()
-                    .map(|raw| String::from_utf8_lossy(raw).to_string());
+                let dv = if authoritative_binding {
+                    schema_col
+                        .default_value
+                        .as_ref()
+                        .map(|raw| String::from_utf8_lossy(raw).to_string())
+                } else {
+                    schema_col
+                        .default_value
+                        .as_ref()
+                        .map(|raw| String::from_utf8_lossy(raw).to_string())
+                };
                 (
                     schema,
                     schema_unique_id,
                     None,
                     false,
                     dv,
-                    schema_col.is_nullable.unwrap_or(field.is_nullable()),
+                    if authoritative_binding {
+                        schema_col.is_nullable.unwrap_or(false)
+                    } else {
+                        schema_col.is_nullable.unwrap_or(field.is_nullable())
+                    },
                 )
             }
         } else if allow_flat_json_fallback || has_flat_json_base {
@@ -999,19 +1087,488 @@ fn build_projected_columns(
     Ok(projected_columns)
 }
 
+fn build_projected_schema_column_plan(
+    tablet_id: i64,
+    version: i64,
+    output_name: &str,
+    current_schema_col: &ColumnPb,
+    source_schema_col: Option<&ColumnPb>,
+    output_arrow_type: &DataType,
+    output_is_nullable: bool,
+    authoritative_binding: bool,
+    use_segment_physical_schema: bool,
+) -> Result<StarRocksNativeSchemaColumnPlan, String> {
+    if !authoritative_binding {
+        return build_schema_column_plan(
+            tablet_id,
+            version,
+            output_name,
+            current_schema_col,
+            source_schema_col,
+            None,
+            source_schema_col.is_some(),
+            output_arrow_type,
+        );
+    }
+
+    validate_authoritative_current_schema_nullability(
+        tablet_id,
+        version,
+        output_name,
+        current_schema_col,
+        output_arrow_type,
+        output_is_nullable,
+    )?;
+
+    if use_segment_physical_schema {
+        return build_segment_physical_schema_column_plan(
+            tablet_id,
+            version,
+            output_name,
+            current_schema_col,
+            source_schema_col,
+            None,
+            source_schema_col.is_some(),
+            output_arrow_type,
+        );
+    }
+
+    if source_schema_column_matches_output_arrow_type(current_schema_col, output_arrow_type) {
+        return build_schema_column_plan(
+            tablet_id,
+            version,
+            output_name,
+            current_schema_col,
+            source_schema_col,
+            None,
+            source_schema_col.is_some(),
+            output_arrow_type,
+        );
+    }
+
+    validate_physical_schema_to_output_type(current_schema_col, output_arrow_type)?;
+    if !current_schema_col.children_columns.is_empty() {
+        return Err(format!(
+            "scalar schema column should not have children in rust native starrocks reader: tablet_id={}, version={}, output_field={}, schema_type={}, schema_children={}",
+            tablet_id,
+            version,
+            output_name,
+            current_schema_col.r#type,
+            current_schema_col.children_columns.len()
+        ));
+    }
+    let (schema_type, precision, scale) =
+        synthetic_schema_type_from_output_arrow_type(output_arrow_type).ok_or_else(|| {
+            format!(
+                "unsupported authoritative output field type in rust native starrocks reader: tablet_id={}, version={}, output_field={}, output_type={:?}",
+                tablet_id, version, output_name, output_arrow_type
+            )
+        })?;
+    Ok(StarRocksNativeSchemaColumnPlan {
+        unique_id: u32::try_from(current_schema_col.unique_id).ok(),
+        source_index: None,
+        source_lookup_attempted: false,
+        schema_type,
+        is_nullable: output_is_nullable,
+        is_key: current_schema_col.is_key.unwrap_or(false),
+        aggregation: normalize_aggregation(current_schema_col.aggregation.as_deref()),
+        precision,
+        scale,
+        children: Vec::new(),
+    })
+}
+
+fn validate_authoritative_current_schema_nullability(
+    tablet_id: i64,
+    version: i64,
+    output_path: &str,
+    current_schema_col: &ColumnPb,
+    output_arrow_type: &DataType,
+    output_is_nullable: bool,
+) -> Result<(), String> {
+    if let Some(current_is_nullable) = current_schema_col.is_nullable
+        && current_is_nullable != output_is_nullable
+    {
+        return Err(format!(
+            "authoritative current schema nullability does not match output: tablet_id={tablet_id}, version={version}, output_field={output_path}, current_nullable={current_is_nullable}, output_nullable={output_is_nullable}"
+        ));
+    }
+
+    match output_arrow_type {
+        DataType::List(item_field) if current_schema_col.children_columns.len() == 1 => {
+            validate_authoritative_current_schema_nullability(
+                tablet_id,
+                version,
+                &format!("{output_path}.item"),
+                &current_schema_col.children_columns[0],
+                item_field.data_type(),
+                item_field.is_nullable(),
+            )?;
+        }
+        DataType::Map(entries_field, _) => {
+            if let DataType::Struct(entry_fields) = entries_field.data_type()
+                && current_schema_col.children_columns.len() == 2
+                && entry_fields.len() == 2
+            {
+                for (idx, child_name) in ["key", "value"].into_iter().enumerate() {
+                    validate_authoritative_current_schema_nullability(
+                        tablet_id,
+                        version,
+                        &format!("{output_path}.{child_name}"),
+                        &current_schema_col.children_columns[idx],
+                        entry_fields[idx].data_type(),
+                        entry_fields[idx].is_nullable(),
+                    )?;
+                }
+            }
+        }
+        DataType::Struct(fields) if current_schema_col.children_columns.len() == fields.len() => {
+            for (field, current_child) in fields
+                .iter()
+                .zip(current_schema_col.children_columns.iter())
+            {
+                validate_authoritative_current_schema_nullability(
+                    tablet_id,
+                    version,
+                    &format!("{output_path}.{}", field.name()),
+                    current_child,
+                    field.data_type(),
+                    field.is_nullable(),
+                )?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn build_segment_physical_schema_column_plan(
+    tablet_id: i64,
+    version: i64,
+    output_path: &str,
+    current_schema_col: &ColumnPb,
+    physical_schema_col: Option<&ColumnPb>,
+    physical_source_index: Option<usize>,
+    source_lookup_attempted: bool,
+    output_arrow_type: &DataType,
+) -> Result<StarRocksNativeSchemaColumnPlan, String> {
+    if source_lookup_attempted && physical_schema_col.is_none() {
+        return build_schema_column_plan(
+            tablet_id,
+            version,
+            output_path,
+            current_schema_col,
+            None,
+            physical_source_index,
+            true,
+            output_arrow_type,
+        );
+    }
+
+    let physical_schema_col = physical_schema_col.unwrap_or(current_schema_col);
+    let physical_schema_type = SupportedSchemaType::parse(&physical_schema_col.r#type).ok_or_else(
+        || {
+            format!(
+                "unsupported physical schema type for rust native starrocks reader: tablet_id={}, version={}, output_field={}, schema_type={}, supported=[{}]",
+                tablet_id,
+                version,
+                output_path,
+                physical_schema_col.r#type,
+                SUPPORTED_SCHEMA_TYPES.join(",")
+            )
+        },
+    )?;
+
+    let mut children = Vec::new();
+    match output_arrow_type {
+        DataType::List(item_field) => {
+            if physical_schema_type != SupportedSchemaType::Array {
+                return Err(format!(
+                    "unsupported StarRocks schema evolution: physical_type={}, output_type={:?}; supported=same type or signed integer widening",
+                    physical_schema_col.r#type.trim().to_ascii_uppercase(),
+                    output_arrow_type
+                ));
+            }
+            if current_schema_col.children_columns.len() != 1 {
+                return Err(format!(
+                    "ARRAY current schema child count mismatch in rust native starrocks reader: tablet_id={}, version={}, output_field={}, schema_children={}, expected=1",
+                    tablet_id,
+                    version,
+                    output_path,
+                    current_schema_col.children_columns.len()
+                ));
+            }
+            if physical_schema_col.children_columns.len() != 1 {
+                return Err(format!(
+                    "ARRAY physical schema child count mismatch in rust native starrocks reader: tablet_id={}, version={}, output_field={}, schema_children={}, expected=1",
+                    tablet_id,
+                    version,
+                    output_path,
+                    physical_schema_col.children_columns.len()
+                ));
+            }
+            children.push(build_segment_physical_schema_column_plan(
+                tablet_id,
+                version,
+                &format!("{output_path}.item"),
+                &current_schema_col.children_columns[0],
+                Some(&physical_schema_col.children_columns[0]),
+                Some(0),
+                true,
+                item_field.data_type(),
+            )?);
+        }
+        DataType::Map(entries_field, _) => {
+            if physical_schema_type != SupportedSchemaType::Map {
+                return Err(format!(
+                    "unsupported StarRocks schema evolution: physical_type={}, output_type={:?}; supported=same type or signed integer widening",
+                    physical_schema_col.r#type.trim().to_ascii_uppercase(),
+                    output_arrow_type
+                ));
+            }
+            let DataType::Struct(entry_fields) = entries_field.data_type() else {
+                return Err(format!(
+                    "MAP entries type mismatch in rust native starrocks reader: tablet_id={}, version={}, output_field={}, entries_type={:?}, expected=Struct(key,value)",
+                    tablet_id,
+                    version,
+                    output_path,
+                    entries_field.data_type()
+                ));
+            };
+            if entry_fields.len() != 2 {
+                return Err(format!(
+                    "MAP entries field count mismatch in rust native starrocks reader: tablet_id={}, version={}, output_field={}, entries_fields={}, expected=2",
+                    tablet_id,
+                    version,
+                    output_path,
+                    entry_fields.len()
+                ));
+            }
+            if current_schema_col.children_columns.len() != 2 {
+                return Err(format!(
+                    "MAP current schema child count mismatch in rust native starrocks reader: tablet_id={}, version={}, output_field={}, schema_children={}, expected=2",
+                    tablet_id,
+                    version,
+                    output_path,
+                    current_schema_col.children_columns.len()
+                ));
+            }
+            if physical_schema_col.children_columns.len() != 2 {
+                return Err(format!(
+                    "MAP physical schema child count mismatch in rust native starrocks reader: tablet_id={}, version={}, output_field={}, schema_children={}, expected=2",
+                    tablet_id,
+                    version,
+                    output_path,
+                    physical_schema_col.children_columns.len()
+                ));
+            }
+            for (idx, child_name) in ["key", "value"].into_iter().enumerate() {
+                children.push(build_segment_physical_schema_column_plan(
+                    tablet_id,
+                    version,
+                    &format!("{output_path}.{child_name}"),
+                    &current_schema_col.children_columns[idx],
+                    Some(&physical_schema_col.children_columns[idx]),
+                    Some(idx),
+                    true,
+                    entry_fields[idx].data_type(),
+                )?);
+            }
+        }
+        DataType::Struct(struct_fields) => {
+            if physical_schema_type != SupportedSchemaType::Struct {
+                return Err(format!(
+                    "unsupported StarRocks schema evolution: physical_type={}, output_type={:?}; supported=same type or signed integer widening",
+                    physical_schema_col.r#type.trim().to_ascii_uppercase(),
+                    output_arrow_type
+                ));
+            }
+            if current_schema_col.children_columns.len() != struct_fields.len() {
+                return Err(format!(
+                    "STRUCT current schema child count mismatch in rust native starrocks reader: tablet_id={}, version={}, output_field={}, schema_children={}, output_fields={}",
+                    tablet_id,
+                    version,
+                    output_path,
+                    current_schema_col.children_columns.len(),
+                    struct_fields.len()
+                ));
+            }
+            let physical_children = align_struct_physical_children_for_schema_evolution(
+                physical_schema_col,
+                &current_schema_col.children_columns,
+                struct_fields,
+            )?;
+            for (idx, (field, current_child)) in struct_fields
+                .iter()
+                .zip(current_schema_col.children_columns.iter())
+                .enumerate()
+            {
+                if let Some(current_child_name) = current_child.name.as_deref()
+                    && normalize_column_name(current_child_name)
+                        != normalize_column_name(field.name())
+                {
+                    return Err(format!(
+                        "STRUCT field name mismatch in rust native starrocks reader: tablet_id={}, version={}, output_field={}, field_index={}, schema_field_name={}, output_field_name={}",
+                        tablet_id,
+                        version,
+                        output_path,
+                        idx,
+                        current_child_name,
+                        field.name()
+                    ));
+                }
+                let (source_index, physical_child) = physical_children[idx];
+                children.push(build_segment_physical_schema_column_plan(
+                    tablet_id,
+                    version,
+                    &format!("{output_path}.{}", field.name()),
+                    current_child,
+                    physical_child,
+                    source_index,
+                    true,
+                    field.data_type(),
+                )?);
+            }
+        }
+        _ => {
+            if !physical_schema_col.children_columns.is_empty() {
+                return Err(format!(
+                    "scalar physical schema column should not have children in rust native starrocks reader: tablet_id={}, version={}, output_field={}, schema_type={}, schema_children={}",
+                    tablet_id,
+                    version,
+                    output_path,
+                    physical_schema_col.r#type,
+                    physical_schema_col.children_columns.len()
+                ));
+            }
+            let physical_arrow_type =
+                validate_physical_schema_to_output_type(physical_schema_col, output_arrow_type)?;
+            return build_schema_column_plan(
+                tablet_id,
+                version,
+                output_path,
+                physical_schema_col,
+                None,
+                physical_source_index,
+                source_lookup_attempted,
+                &physical_arrow_type,
+            );
+        }
+    }
+
+    Ok(StarRocksNativeSchemaColumnPlan {
+        unique_id: u32::try_from(current_schema_col.unique_id).ok(),
+        source_index: physical_source_index,
+        source_lookup_attempted,
+        schema_type: physical_schema_type.as_str().to_string(),
+        is_nullable: physical_schema_col.is_nullable.unwrap_or(true),
+        is_key: current_schema_col
+            .is_key
+            .or(physical_schema_col.is_key)
+            .unwrap_or(false),
+        aggregation: normalize_aggregation(current_schema_col.aggregation.as_deref())
+            .or_else(|| normalize_aggregation(physical_schema_col.aggregation.as_deref())),
+        precision: None,
+        scale: None,
+        children,
+    })
+}
+
+pub(crate) fn validate_physical_schema_to_output_type(
+    physical_schema_col: &ColumnPb,
+    output_arrow_type: &DataType,
+) -> Result<DataType, String> {
+    if source_schema_column_matches_output_arrow_type(physical_schema_col, output_arrow_type) {
+        return Ok(output_arrow_type.clone());
+    }
+    let physical_type = SupportedSchemaType::parse(&physical_schema_col.r#type);
+    if let Some(physical_arrow_type) = physical_type.and_then(signed_integer_schema_arrow_type)
+        && validate_same_type_or_signed_integer_widening(&physical_arrow_type, output_arrow_type)
+            .is_ok()
+    {
+        return Ok(physical_arrow_type);
+    }
+    Err(format!(
+        "unsupported StarRocks schema evolution: physical_type={}, output_type={:?}; supported=same type or signed integer widening",
+        physical_schema_col.r#type.trim().to_ascii_uppercase(),
+        output_arrow_type
+    ))
+}
+
+fn signed_integer_arrow_rank(data_type: &DataType) -> Option<u8> {
+    match data_type {
+        DataType::Int8 => Some(0),
+        DataType::Int16 => Some(1),
+        DataType::Int32 => Some(2),
+        DataType::Int64 => Some(3),
+        _ => None,
+    }
+}
+
+pub(crate) fn validate_same_type_or_signed_integer_widening(
+    physical_type: &DataType,
+    output_type: &DataType,
+) -> Result<(), String> {
+    if physical_type == output_type {
+        return Ok(());
+    }
+    if signed_integer_arrow_rank(physical_type)
+        .zip(signed_integer_arrow_rank(output_type))
+        .is_some_and(|(physical_rank, output_rank)| physical_rank < output_rank)
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "unsupported StarRocks schema evolution: physical_type={:?}, output_type={:?}; supported=same type or signed integer widening",
+        physical_type, output_type
+    ))
+}
+
+fn signed_integer_schema_arrow_type(schema_type: SupportedSchemaType) -> Option<DataType> {
+    match schema_type {
+        SupportedSchemaType::TinyInt => Some(DataType::Int8),
+        SupportedSchemaType::SmallInt => Some(DataType::Int16),
+        SupportedSchemaType::Int => Some(DataType::Int32),
+        SupportedSchemaType::BigInt => Some(DataType::Int64),
+        _ => None,
+    }
+}
+
 fn resolve_segment_source_schema<'a>(
     snapshot: &'a StarRocksTabletSnapshot,
     segment: &StarRocksSegmentFile,
     fallback_source_schema: Option<&'a TabletSchemaPb>,
 ) -> Result<Option<&'a TabletSchemaPb>, String> {
-    let Some(schema_id) = segment.schema_id.filter(|id| *id > 0) else {
-        return Ok(fallback_source_schema);
+    let schema_id = match segment.schema_id {
+        None => return Ok(fallback_source_schema),
+        Some(schema_id) if schema_id <= 0 => {
+            return Err(format!(
+                "segment rowset schema id must be positive when present: tablet_id={}, version={}, segment_path={}, rowset_version={}, schema_id={}",
+                snapshot.tablet_id,
+                snapshot.version,
+                segment.path,
+                segment.rowset_version,
+                schema_id
+            ));
+        }
+        Some(schema_id) => schema_id,
     };
     if let Some(schema) = snapshot.historical_schemas.get(&schema_id) {
+        if schema.id != Some(schema_id) {
+            return Err(format!(
+                "segment rowset resolved tablet schema id mismatch: tablet_id={}, version={}, segment_path={}, rowset_version={}, schema_id={}, resolved_schema_id={:?}",
+                snapshot.tablet_id,
+                snapshot.version,
+                segment.path,
+                segment.rowset_version,
+                schema_id,
+                schema.id
+            ));
+        }
         return Ok(Some(schema));
     }
-    if fallback_source_schema.is_some_and(|schema| schema.id == Some(schema_id)) {
-        return Ok(fallback_source_schema);
+    if snapshot.tablet_schema.id == Some(schema_id) {
+        return Ok(Some(&snapshot.tablet_schema));
     }
     Err(format!(
         "segment rowset schema id is missing from snapshot historical schemas: tablet_id={}, version={}, segment_path={}, rowset_version={}, schema_id={}",
@@ -1040,13 +1597,14 @@ fn build_missing_output_schema_column_plan(
             snapshot.tablet_id, snapshot.version, output_name
         )
     })?;
-    if schema_unique_id == 0 {
+    if let StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(unique_id) =
+        output_hint.physical_binding
+    {
         return Err(format!(
-            "invalid output column unique_id hint (zero): tablet_id={}, version={}, output_field={}",
+            "authoritative output column is missing from current tablet schema: tablet_id={}, version={}, output_field={}, unique_id={unique_id}",
             snapshot.tablet_id, snapshot.version, output_name
         ));
     }
-
     let fallback_default_literal = output_hint.fallback_default_literal.clone();
     let fallback_is_nullable = output_field.is_nullable();
     if fallback_default_literal.is_none() && !fallback_is_nullable {
@@ -1223,6 +1781,143 @@ fn build_group_key_columns_plan(
     Ok(out)
 }
 
+fn build_segment_group_key_schemas(
+    snapshot: &StarRocksTabletSnapshot,
+    group_keys: &[StarRocksNativeGroupKeyColumnPlan],
+    current_lookup: &SchemaColumnLookup<'_>,
+    segment_source_schema: Option<&TabletSchemaPb>,
+) -> Result<Vec<StarRocksNativeSchemaColumnPlan>, String> {
+    group_keys
+        .iter()
+        .map(|key| {
+            let current_column = current_lookup
+                .by_unique_id
+                .get(&key.schema_unique_id)
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "current group key column is missing by unique_id: tablet_id={}, version={}, column_name={}, unique_id={}",
+                        snapshot.tablet_id,
+                        snapshot.version,
+                        key.output_name,
+                        key.schema_unique_id
+                    )
+                })?;
+            let output_type = infer_group_key_arrow_type(
+                snapshot.tablet_id,
+                snapshot.version,
+                &key.output_name,
+                current_column,
+            )?;
+            build_segment_auxiliary_schema_column(
+                snapshot,
+                &key.output_name,
+                key.schema_unique_id,
+                current_column,
+                segment_source_schema,
+                &output_type,
+            )
+        })
+        .collect()
+}
+
+fn build_segment_delete_predicate_schemas(
+    snapshot: &StarRocksTabletSnapshot,
+    delete_predicates: &[StarRocksDeletePredicatePlan],
+    current_lookup: &SchemaColumnLookup<'_>,
+    segment_source_schema: Option<&TabletSchemaPb>,
+    rowset_version: i64,
+) -> Result<HashMap<u32, StarRocksNativeSchemaColumnPlan>, String> {
+    let mut schemas = HashMap::new();
+    for predicate in delete_predicates
+        .iter()
+        .filter(|predicate| delete_predicate_applies_to_segment(predicate.version, rowset_version))
+    {
+        for term in &predicate.terms {
+            if schemas.contains_key(&term.schema_unique_id) {
+                continue;
+            }
+            let current_column = current_lookup
+                .by_unique_id
+                .get(&term.schema_unique_id)
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "current delete predicate column is missing by unique_id: tablet_id={}, version={}, column_name={}, unique_id={}",
+                        snapshot.tablet_id,
+                        snapshot.version,
+                        term.column_name,
+                        term.schema_unique_id
+                    )
+                })?;
+            let output_type = infer_group_key_arrow_type(
+                snapshot.tablet_id,
+                snapshot.version,
+                &term.column_name,
+                current_column,
+            )?;
+            let schema = build_segment_auxiliary_schema_column(
+                snapshot,
+                &term.column_name,
+                term.schema_unique_id,
+                current_column,
+                segment_source_schema,
+                &output_type,
+            )?;
+            schemas.insert(term.schema_unique_id, schema);
+        }
+    }
+    Ok(schemas)
+}
+
+pub(crate) fn delete_predicate_applies_to_segment(
+    predicate_version: i64,
+    rowset_version: i64,
+) -> bool {
+    predicate_version >= rowset_version
+}
+
+fn build_segment_auxiliary_schema_column(
+    snapshot: &StarRocksTabletSnapshot,
+    output_name: &str,
+    schema_unique_id: u32,
+    current_column: &ColumnPb,
+    segment_source_schema: Option<&TabletSchemaPb>,
+    output_type: &DataType,
+) -> Result<StarRocksNativeSchemaColumnPlan, String> {
+    let source_column = segment_source_schema
+        .map(|schema| {
+            schema
+                .column
+                .iter()
+                .find(|column| {
+                    u32::try_from(column.unique_id).ok() == Some(schema_unique_id)
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "historical segment schema is missing required column unique_id: tablet_id={}, version={}, output_field={}, unique_id={}, schema_id={:?}",
+                        snapshot.tablet_id,
+                        snapshot.version,
+                        output_name,
+                        schema_unique_id,
+                        schema.id
+                    )
+                })
+        })
+        .transpose()?;
+    build_projected_schema_column_plan(
+        snapshot.tablet_id,
+        snapshot.version,
+        output_name,
+        current_column,
+        source_column,
+        output_type,
+        current_column.is_nullable.unwrap_or(true),
+        true,
+        true,
+    )
+}
+
 fn infer_group_key_arrow_type(
     tablet_id: i64,
     version: i64,
@@ -1346,10 +2041,32 @@ fn normalize_column_name(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
 
-fn positive_schema_column_unique_id(column: &ColumnPb) -> Option<u32> {
-    u32::try_from(column.unique_id)
-        .ok()
-        .filter(|unique_id| *unique_id > 0)
+fn nonnegative_schema_column_unique_id(column: &ColumnPb) -> Option<u32> {
+    u32::try_from(column.unique_id).ok()
+}
+
+fn collect_struct_children_by_unique_id<'a>(
+    children: &'a [ColumnPb],
+    schema_role: &str,
+) -> Result<HashMap<u32, (usize, &'a ColumnPb)>, String> {
+    let mut children_by_unique_id = HashMap::new();
+    for (idx, child_col) in children.iter().enumerate() {
+        let Some(unique_id) = nonnegative_schema_column_unique_id(child_col) else {
+            continue;
+        };
+        match children_by_unique_id.entry(unique_id) {
+            Entry::Vacant(entry) => {
+                entry.insert((idx, child_col));
+            }
+            Entry::Occupied(_) => {
+                return Err(format!(
+                    "duplicated STRUCT child unique_id: schema_role={}, unique_id={}",
+                    schema_role, unique_id
+                ));
+            }
+        }
+    }
+    Ok(children_by_unique_id)
 }
 
 fn source_schema_column_matches_output_arrow_type(
@@ -1387,25 +2104,23 @@ fn align_struct_source_children<'a>(
     source_schema_col: Option<&'a ColumnPb>,
     current_children: &[ColumnPb],
     output_fields: &Fields,
-) -> Vec<(Option<usize>, Option<&'a ColumnPb>, bool)> {
+) -> Result<Vec<(Option<usize>, Option<&'a ColumnPb>, bool)>, String> {
+    collect_struct_children_by_unique_id(current_children, "current")?;
     let lookup_attempted = source_schema_col.is_some();
     let Some(source_col) = source_schema_col else {
-        return vec![(None, None, false); current_children.len()];
+        return Ok(vec![(None, None, false); current_children.len()]);
     };
 
-    let mut source_children_by_unique_id = HashMap::new();
-    for (idx, child_col) in source_col.children_columns.iter().enumerate() {
-        if let Some(unique_id) = positive_schema_column_unique_id(child_col) {
-            source_children_by_unique_id.insert(unique_id, (idx, child_col));
-        }
-    }
+    let source_children_by_unique_id =
+        collect_struct_children_by_unique_id(&source_col.children_columns, "historical")?;
 
     let mut matched_source_indexes = vec![false; source_col.children_columns.len()];
     let mut next_source_name_idx = 0usize;
     let mut aligned = Vec::with_capacity(current_children.len());
 
     for (field, child_schema_col) in output_fields.iter().zip(current_children.iter()) {
-        let matched = if let Some(unique_id) = positive_schema_column_unique_id(child_schema_col) {
+        let matched = if let Some(unique_id) = nonnegative_schema_column_unique_id(child_schema_col)
+        {
             source_children_by_unique_id
                 .get(&unique_id)
                 .copied()
@@ -1460,7 +2175,67 @@ fn align_struct_source_children<'a>(
         }
     }
 
-    aligned
+    Ok(aligned)
+}
+
+fn align_struct_physical_children_for_schema_evolution<'a>(
+    physical_schema_col: &'a ColumnPb,
+    current_children: &[ColumnPb],
+    output_fields: &Fields,
+) -> Result<Vec<(Option<usize>, Option<&'a ColumnPb>)>, String> {
+    collect_struct_children_by_unique_id(current_children, "current")?;
+    let physical_children_by_unique_id =
+        collect_struct_children_by_unique_id(&physical_schema_col.children_columns, "historical")?;
+
+    let mut matched_physical_indexes = vec![false; physical_schema_col.children_columns.len()];
+    let mut next_physical_name_idx = 0usize;
+    let mut aligned = Vec::with_capacity(current_children.len());
+    for (field, current_child) in output_fields.iter().zip(current_children.iter()) {
+        let matched = if let Some(unique_id) = nonnegative_schema_column_unique_id(current_child) {
+            physical_children_by_unique_id.get(&unique_id).copied()
+        } else {
+            let current_name = current_child
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| field.name());
+            let normalized_current_name = normalize_column_name(current_name);
+            let mut found = None;
+            for (source_idx, (matched, physical_child)) in matched_physical_indexes
+                .iter()
+                .zip(physical_schema_col.children_columns.iter())
+                .enumerate()
+                .skip(next_physical_name_idx)
+            {
+                if *matched {
+                    continue;
+                }
+                let Some(physical_name) = physical_child
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                else {
+                    continue;
+                };
+                if normalize_column_name(physical_name) == normalized_current_name {
+                    found = Some((source_idx, physical_child));
+                    break;
+                }
+            }
+            found
+        };
+
+        if let Some((source_idx, physical_child)) = matched {
+            matched_physical_indexes[source_idx] = true;
+            next_physical_name_idx = next_physical_name_idx.max(source_idx.saturating_add(1));
+            aligned.push((Some(source_idx), Some(physical_child)));
+        } else {
+            aligned.push((None, None));
+        }
+    }
+    Ok(aligned)
 }
 
 fn infer_missing_source_schema_type(output_arrow_type: &DataType) -> Option<&'static str> {
@@ -2037,7 +2812,7 @@ fn build_schema_column_plan(
                 source_schema_col,
                 &schema_col.children_columns,
                 struct_fields,
-            );
+            )?;
             for (idx, (field, child_schema_col)) in struct_fields
                 .iter()
                 .zip(schema_col.children_columns.iter())
@@ -2278,6 +3053,129 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use std::sync::Arc;
 
+    fn provenance_snapshot(current_schema_id: i64) -> StarRocksTabletSnapshot {
+        StarRocksTabletSnapshot {
+            tablet_id: 10,
+            version: 20,
+            metadata_path: "meta/path".to_string(),
+            tablet_schema: TabletSchemaPb {
+                id: Some(current_schema_id),
+                ..Default::default()
+            },
+            historical_schemas: std::collections::BTreeMap::new(),
+            total_num_rows: 0,
+            rowset_count: 1,
+            segment_files: Vec::new(),
+            delete_predicates: Vec::new(),
+            delvec_meta: Default::default(),
+        }
+    }
+
+    fn provenance_segment(schema_id: Option<i64>) -> StarRocksSegmentFile {
+        StarRocksSegmentFile {
+            name: "segment.dat".to_string(),
+            relative_path: "data/segment.dat".to_string(),
+            path: "/tmp/segment.dat".to_string(),
+            rowset_version: 7,
+            schema_id,
+            segment_id: Some(0),
+            bundle_file_offset: None,
+            segment_size: None,
+        }
+    }
+
+    #[test]
+    fn schema_provenance_segment_positive_id_does_not_use_pre_refresh_fallback() {
+        let snapshot = provenance_snapshot(30);
+        let fallback = TabletSchemaPb {
+            id: Some(29),
+            ..Default::default()
+        };
+
+        let err = resolve_segment_source_schema(
+            &snapshot,
+            &provenance_segment(Some(29)),
+            Some(&fallback),
+        )
+        .expect_err("positive schema ID must not resolve through the pre-refresh fallback");
+
+        assert!(err.contains("schema_id=29"), "{err}");
+    }
+
+    #[test]
+    fn schema_provenance_segment_rejects_nonpositive_ids() {
+        let snapshot = provenance_snapshot(30);
+        let fallback = TabletSchemaPb {
+            id: Some(29),
+            ..Default::default()
+        };
+
+        for schema_id in [0, -1] {
+            let err = resolve_segment_source_schema(
+                &snapshot,
+                &provenance_segment(Some(schema_id)),
+                Some(&fallback),
+            )
+            .expect_err("explicit nonpositive schema ID must fail");
+            assert!(
+                err.contains("segment rowset schema id must be positive")
+                    && err.contains(&format!("schema_id={schema_id}")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_provenance_segment_rejects_historical_embedded_id_mismatch() {
+        let mut snapshot = provenance_snapshot(30);
+        snapshot.historical_schemas.insert(
+            29,
+            TabletSchemaPb {
+                id: Some(28),
+                ..Default::default()
+            },
+        );
+
+        let err = resolve_segment_source_schema(&snapshot, &provenance_segment(Some(29)), None)
+            .expect_err("historical map key and embedded schema ID must agree");
+
+        assert!(
+            err.contains("resolved tablet schema id mismatch")
+                && err.contains("schema_id=29")
+                && err.contains("resolved_schema_id=Some(28)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn schema_provenance_segment_accepts_positive_refreshed_current_id() {
+        let snapshot = provenance_snapshot(30);
+        let fallback = TabletSchemaPb {
+            id: Some(29),
+            ..Default::default()
+        };
+
+        let resolved = resolve_segment_source_schema(
+            &snapshot,
+            &provenance_segment(Some(30)),
+            Some(&fallback),
+        )
+        .expect("positive refreshed-current schema ID must resolve")
+        .expect("current schema");
+
+        assert!(std::ptr::eq(resolved, &snapshot.tablet_schema));
+    }
+
+    #[test]
+    fn schema_provenance_segment_rejects_unknown_positive_id() {
+        let snapshot = provenance_snapshot(30);
+
+        let err = resolve_segment_source_schema(&snapshot, &provenance_segment(Some(999)), None)
+            .expect_err("unknown positive schema ID must fail");
+
+        assert!(err.contains("schema_id=999"), "{err}");
+    }
+
     #[test]
     fn build_read_plan_success() {
         let snapshot = build_snapshot();
@@ -2382,6 +3280,93 @@ mod tests {
     }
 
     #[test]
+    fn segment_delete_predicate_schema_uses_historical_physical_type() {
+        let mut snapshot = build_snapshot_with_columns(vec![build_column(11, "v", "BIGINT")]);
+        snapshot.historical_schemas.insert(
+            900,
+            TabletSchemaPb {
+                id: Some(900),
+                keys_type: snapshot.tablet_schema.keys_type,
+                column: vec![build_column(11, "v", "INT")],
+                ..Default::default()
+            },
+        );
+        snapshot.segment_files[0].schema_id = Some(900);
+        snapshot.segment_files[1].schema_id = snapshot.tablet_schema.id;
+        snapshot.delete_predicates = vec![StarRocksDeletePredicateRaw {
+            version: 30,
+            sub_predicates: vec!["v=7".to_string()],
+            in_predicates: Vec::new(),
+            binary_predicates: Vec::new(),
+            is_null_predicates: Vec::new(),
+        }];
+        let output_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+
+        let plan = build_native_read_plan(
+            &snapshot,
+            &[build_footer(10, &[11]), build_footer(20, &[11])],
+            &output_schema,
+            None,
+        )
+        .expect("historical delete predicate widening must build a read plan");
+
+        assert_eq!(plan.delete_predicates[0].terms[0].schema_type, "BIGINT");
+        assert_eq!(
+            plan.segments[0]
+                .delete_predicate_schemas
+                .get(&11)
+                .expect("historical delete schema")
+                .schema_type,
+            "INT"
+        );
+        assert_eq!(
+            plan.segments[1]
+                .delete_predicate_schemas
+                .get(&11)
+                .expect("current delete schema")
+                .schema_type,
+            "BIGINT"
+        );
+    }
+
+    #[test]
+    fn segment_skips_physical_schema_for_inapplicable_delete_predicate() {
+        let mut snapshot = build_snapshot_with_columns(vec![
+            build_column(11, "dropped", "BIGINT"),
+            build_column(12, "v", "BIGINT"),
+        ]);
+        snapshot.historical_schemas.insert(
+            900,
+            TabletSchemaPb {
+                id: Some(900),
+                keys_type: snapshot.tablet_schema.keys_type,
+                column: vec![build_column(12, "v", "BIGINT")],
+                ..Default::default()
+            },
+        );
+        snapshot.segment_files[0].schema_id = Some(900);
+        snapshot.delete_predicates = vec![StarRocksDeletePredicateRaw {
+            version: 3,
+            sub_predicates: vec!["dropped=7".to_string()],
+            in_predicates: Vec::new(),
+            binary_predicates: Vec::new(),
+            is_null_predicates: Vec::new(),
+        }];
+        let output_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+
+        let plan = build_native_read_plan(
+            &snapshot,
+            &[build_footer(10, &[12]), build_footer(20, &[11, 12])],
+            &output_schema,
+            None,
+        )
+        .expect("inapplicable delete predicates must not require a physical segment column");
+
+        assert!(plan.segments[0].delete_predicate_schemas.is_empty());
+        assert!(plan.segments[1].delete_predicate_schemas.is_empty());
+    }
+
+    #[test]
     fn reject_delete_predicate_when_column_not_found_in_schema() {
         let mut snapshot = build_snapshot();
         snapshot.delete_predicates = vec![StarRocksDeletePredicateRaw {
@@ -2459,6 +3444,7 @@ mod tests {
         let output_schema = Arc::new(Schema::new(vec![Field::new("j.a", DataType::Utf8, true)]));
         let output_hints = vec![StarRocksOutputColumnHint {
             schema_unique_id: Some(2),
+            physical_binding: StarRocksPhysicalColumnBinding::LegacyName,
             fallback_default_literal: None,
         }];
 
@@ -2492,6 +3478,7 @@ mod tests {
         let output_schema = Arc::new(Schema::new(vec![Field::new("j.a", DataType::Utf8, true)]));
         let output_hints = vec![StarRocksOutputColumnHint {
             schema_unique_id: Some(20),
+            physical_binding: StarRocksPhysicalColumnBinding::LegacyName,
             fallback_default_literal: None,
         }];
 
@@ -2700,6 +3687,53 @@ mod tests {
     }
 
     #[test]
+    fn segment_group_key_schemas_follow_historical_physical_type_for_agg_and_unique() {
+        for keys_type in [KeysType::AggKeys, KeysType::UniqueKeys] {
+            let mut current_key = build_column(1, "k", "BIGINT");
+            current_key.is_key = Some(true);
+            let mut current_value = build_column(2, "v", "BIGINT");
+            current_value.is_key = Some(false);
+            if keys_type == KeysType::AggKeys {
+                current_value.aggregation = Some("SUM".to_string());
+            }
+            let mut snapshot = build_snapshot_with_columns(vec![current_key, current_value]);
+            snapshot.tablet_schema.keys_type = Some(keys_type as i32);
+
+            let mut historical_key = build_column(1, "k", "INT");
+            historical_key.is_key = Some(true);
+            let mut historical_value = build_column(2, "v", "BIGINT");
+            historical_value.is_key = Some(false);
+            if keys_type == KeysType::AggKeys {
+                historical_value.aggregation = Some("SUM".to_string());
+            }
+            snapshot.historical_schemas.insert(
+                900,
+                TabletSchemaPb {
+                    id: Some(900),
+                    keys_type: Some(keys_type as i32),
+                    column: vec![historical_key, historical_value],
+                    ..Default::default()
+                },
+            );
+            snapshot.segment_files[0].schema_id = Some(900);
+            snapshot.segment_files[1].schema_id = snapshot.tablet_schema.id;
+
+            let output_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+            let plan = build_native_read_plan(
+                &snapshot,
+                &[build_footer(10, &[1, 2]), build_footer(20, &[1, 2])],
+                &output_schema,
+                None,
+            )
+            .expect("historical group key widening must build a read plan");
+
+            assert_eq!(plan.group_key_columns[0].schema.schema_type, "BIGINT");
+            assert_eq!(plan.segments[0].group_key_schemas[0].schema_type, "INT");
+            assert_eq!(plan.segments[1].group_key_schemas[0].schema_type, "BIGINT");
+        }
+    }
+
+    #[test]
     fn build_read_plan_supports_text_and_binary_schema_types() {
         let snapshot = build_snapshot_with_columns(vec![
             build_column(1, "c_char", "CHAR"),
@@ -2866,12 +3900,13 @@ mod tests {
     }
 
     #[test]
-    fn allow_missing_output_column_with_hint_default() {
+    fn allow_missing_output_column_with_legacy_hint_default() {
         let snapshot = build_snapshot_with_columns(vec![build_column(1, "c1", "BIGINT")]);
         let footers = vec![build_footer(10, &[1]), build_footer(20, &[1])];
         let output_schema = Arc::new(Schema::new(vec![Field::new("c2", DataType::Int64, false)]));
         let output_hints = vec![StarRocksOutputColumnHint {
-            schema_unique_id: Some(2),
+            schema_unique_id: Some(0),
+            physical_binding: StarRocksPhysicalColumnBinding::LegacyName,
             fallback_default_literal: Some("7".to_string()),
         }];
         let plan = build_native_read_plan_with_output_hints(
@@ -2883,7 +3918,7 @@ mod tests {
         )
         .expect("build read plan");
         assert_eq!(plan.projected_columns.len(), 1);
-        assert_eq!(plan.projected_columns[0].schema_unique_id, 2);
+        assert_eq!(plan.projected_columns[0].schema_unique_id, 0);
         assert_eq!(
             plan.projected_columns[0]
                 .fallback_default_literal
@@ -2893,7 +3928,283 @@ mod tests {
     }
 
     #[test]
-    fn prefer_output_field_unique_id_hint_over_name_match() {
+    fn authoritative_unique_id_does_not_bind_same_named_old_segment_column() {
+        let mut old_flag = build_column(11, "flag", "BOOLEAN");
+        old_flag.default_value = Some(b"true".to_vec());
+        old_flag.is_nullable = Some(false);
+        let source_schema = TabletSchemaPb {
+            column: vec![old_flag],
+            ..Default::default()
+        };
+        let mut current_flag = build_column(12, "flag", "BOOLEAN");
+        current_flag.default_value = Some(b"false".to_vec());
+        current_flag.is_nullable = Some(false);
+        let snapshot = build_snapshot_with_columns(vec![current_flag]);
+        let footers = vec![build_footer(10, &[11]), build_footer(20, &[11])];
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "flag",
+            DataType::Boolean,
+            false,
+        )]));
+        let output_hints = vec![StarRocksOutputColumnHint {
+            schema_unique_id: Some(12),
+            physical_binding: StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(12),
+            fallback_default_literal: Some("false".to_string()),
+        }];
+
+        let plan = build_native_read_plan_with_output_hints(
+            &snapshot,
+            &footers,
+            &output_schema,
+            &output_hints,
+            Some(&source_schema),
+        )
+        .expect("new authoritative column must be backfilled");
+
+        assert_eq!(plan.projected_columns[0].schema_unique_id, 12);
+        assert_eq!(plan.projected_columns[0].schema.source_index, None);
+        assert_eq!(
+            plan.projected_columns[0]
+                .fallback_default_literal
+                .as_deref(),
+            Some("false")
+        );
+    }
+
+    #[test]
+    fn authoritative_unique_id_binds_renamed_old_segment_column() {
+        let snapshot = build_snapshot_with_columns(vec![build_column(11, "old_flag", "BOOLEAN")]);
+        let footers = vec![build_footer(10, &[11]), build_footer(20, &[11])];
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "new_flag",
+            DataType::Boolean,
+            false,
+        )]));
+        let output_hints = vec![StarRocksOutputColumnHint {
+            schema_unique_id: Some(11),
+            physical_binding: StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(11),
+            fallback_default_literal: None,
+        }];
+
+        let plan = build_native_read_plan_with_output_hints(
+            &snapshot,
+            &footers,
+            &output_schema,
+            &output_hints,
+            Some(&snapshot.tablet_schema),
+        )
+        .expect("renamed authoritative column must bind to its old physical name");
+
+        assert_eq!(plan.projected_columns[0].schema_unique_id, 11);
+        assert_eq!(plan.projected_columns[0].schema.unique_id, Some(11));
+        assert!(plan.projected_columns[0].schema.source_lookup_attempted);
+        assert!(!plan.projected_columns[0].source_column_missing);
+        assert_eq!(plan.segments[0].projected_schemas[0].unique_id, Some(11));
+        assert!(plan.segments[0].projected_schemas[0].source_lookup_attempted);
+        assert!(!plan.segments[0].source_column_missing_by_output[0]);
+    }
+
+    #[test]
+    fn authoritative_segment_fallback_uses_current_schema_default() {
+        let mut column = build_column(11, "flag", "BOOLEAN");
+        column.default_value = Some(b"true".to_vec());
+        column.is_nullable = Some(false);
+        let mut snapshot = build_snapshot_with_columns(vec![column]);
+        snapshot.historical_schemas.insert(
+            900,
+            TabletSchemaPb {
+                id: Some(900),
+                keys_type: snapshot.tablet_schema.keys_type,
+                column: vec![build_column(12, "old_flag", "BOOLEAN")],
+                ..Default::default()
+            },
+        );
+        snapshot.segment_files.truncate(1);
+        snapshot.segment_files[0].schema_id = Some(900);
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "flag",
+            DataType::Boolean,
+            false,
+        )]));
+        let output_hints = vec![StarRocksOutputColumnHint {
+            schema_unique_id: Some(11),
+            physical_binding: StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(11),
+            fallback_default_literal: None,
+        }];
+
+        let plan = build_native_read_plan_with_output_hints(
+            &snapshot,
+            &[build_footer(10, &[12])],
+            &output_schema,
+            &output_hints,
+            None,
+        )
+        .expect("missing historical column must use the current schema default");
+
+        assert_eq!(
+            plan.projected_columns[0]
+                .fallback_default_literal
+                .as_deref(),
+            Some("true")
+        );
+        assert!(!plan.projected_columns[0].fallback_is_nullable);
+    }
+
+    #[test]
+    fn native_segment_rejects_missing_non_nullable_authoritative_column_without_current_default() {
+        let mut current_flag = build_column(12, "flag", "BOOLEAN");
+        current_flag.is_nullable = Some(false);
+        let mut snapshot = build_snapshot_with_columns(vec![current_flag]);
+        snapshot.historical_schemas.insert(
+            900,
+            TabletSchemaPb {
+                id: Some(900),
+                keys_type: snapshot.tablet_schema.keys_type,
+                column: vec![build_column(11, "old_flag", "BOOLEAN")],
+                ..Default::default()
+            },
+        );
+        snapshot.segment_files.truncate(1);
+        snapshot.segment_files[0].schema_id = Some(900);
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "flag",
+            DataType::Boolean,
+            false,
+        )]));
+        let output_hints = vec![StarRocksOutputColumnHint {
+            schema_unique_id: Some(12),
+            physical_binding: StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(12),
+            fallback_default_literal: None,
+        }];
+
+        let err = build_native_read_plan_with_output_hints(
+            &snapshot,
+            &[build_footer(10, &[11])],
+            &output_schema,
+            &output_hints,
+            None,
+        )
+        .expect_err("missing non-nullable current column without default must fail fast");
+
+        assert!(err.contains("cannot be backfilled"), "{err}");
+        assert!(err.contains("unique_id=12"), "{err}");
+    }
+
+    #[test]
+    fn native_segment_rejects_nullable_output_for_non_nullable_current_missing_column() {
+        let mut current_flag = build_column(12, "flag", "BOOLEAN");
+        current_flag.is_nullable = Some(false);
+        let mut snapshot = build_snapshot_with_columns(vec![current_flag]);
+        snapshot.historical_schemas.insert(
+            900,
+            TabletSchemaPb {
+                id: Some(900),
+                keys_type: snapshot.tablet_schema.keys_type,
+                column: vec![build_column(11, "old_flag", "BOOLEAN")],
+                ..Default::default()
+            },
+        );
+        snapshot.segment_files.truncate(1);
+        snapshot.segment_files[0].schema_id = Some(900);
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "flag",
+            DataType::Boolean,
+            true,
+        )]));
+        let output_hints = vec![StarRocksOutputColumnHint {
+            schema_unique_id: Some(12),
+            physical_binding: StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(12),
+            fallback_default_literal: None,
+        }];
+
+        let err = build_native_read_plan_with_output_hints(
+            &snapshot,
+            &[build_footer(10, &[11])],
+            &output_schema,
+            &output_hints,
+            None,
+        )
+        .expect_err("output nullability must not make a non-nullable current column backfillable");
+
+        assert!(
+            err.contains("authoritative current schema nullability does not match output")
+                && err.contains("current_nullable=false")
+                && err.contains("output_nullable=true"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn native_segment_rejects_non_nullable_output_for_nullable_current_column() {
+        let mut current_flag = build_column(12, "flag", "BOOLEAN");
+        current_flag.is_nullable = Some(true);
+        let snapshot = build_snapshot_with_columns(vec![current_flag]);
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "flag",
+            DataType::Boolean,
+            false,
+        )]));
+        let output_hints = vec![StarRocksOutputColumnHint {
+            schema_unique_id: Some(12),
+            physical_binding: StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(12),
+            fallback_default_literal: None,
+        }];
+
+        let err = build_native_read_plan_with_output_hints(
+            &snapshot,
+            &[build_footer(10, &[12]), build_footer(20, &[12])],
+            &output_schema,
+            &output_hints,
+            None,
+        )
+        .expect_err("nullable current metadata must not be narrowed by the output field");
+
+        assert!(
+            err.contains("authoritative current schema nullability does not match output")
+                && err.contains("current_nullable=true")
+                && err.contains("output_nullable=false"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn native_segment_rejects_nested_current_output_nullability_drift() {
+        let mut current_value = build_column(12, "value", "INT");
+        current_value.is_nullable = Some(true);
+        let mut current_struct = build_struct_column(11, "s", vec![current_value]);
+        current_struct.is_nullable = Some(false);
+        let snapshot = build_snapshot_with_columns(vec![current_struct]);
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(vec![Field::new("value", DataType::Int32, false)].into()),
+            false,
+        )]));
+        let output_hints = vec![StarRocksOutputColumnHint {
+            schema_unique_id: Some(11),
+            physical_binding: StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(11),
+            fallback_default_literal: None,
+        }];
+
+        let err = build_native_read_plan_with_output_hints(
+            &snapshot,
+            &[build_footer(10, &[11]), build_footer(20, &[11])],
+            &output_schema,
+            &output_hints,
+            None,
+        )
+        .expect_err("nested current/output nullability drift must fail at the plan boundary");
+
+        assert!(
+            err.contains("authoritative current schema nullability does not match output")
+                && err.contains("output_field=s.value")
+                && err.contains("current_nullable=true")
+                && err.contains("output_nullable=false"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn authoritative_unique_id_rejects_stale_hint_default_when_current_schema_is_missing() {
         let snapshot = build_snapshot_with_columns(vec![
             build_column(1, "k1", "BIGINT"),
             build_column(2, "v0", "INT"),
@@ -2902,19 +4213,22 @@ mod tests {
         let output_schema = Arc::new(Schema::new(vec![Field::new("v0", DataType::Utf8, true)]));
         let output_hints = vec![StarRocksOutputColumnHint {
             schema_unique_id: Some(4),
-            fallback_default_literal: None,
+            physical_binding: StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(4),
+            fallback_default_literal: Some("stale".to_string()),
         }];
-        let plan = build_native_read_plan_with_output_hints(
+        let err = build_native_read_plan_with_output_hints(
             &snapshot,
             &footers,
             &output_schema,
             &output_hints,
             None,
         )
-        .expect("build read plan");
-        assert_eq!(plan.projected_columns.len(), 1);
-        assert_eq!(plan.projected_columns[0].schema_unique_id, 4);
-        assert_eq!(plan.projected_columns[0].schema_type, "VARCHAR");
+        .expect_err("stale hint default must not replace missing authoritative current metadata");
+        assert!(
+            err.contains("authoritative output column is missing from current tablet schema")
+                && err.contains("unique_id=4"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2953,10 +4267,12 @@ mod tests {
         let output_hints = vec![
             StarRocksOutputColumnHint {
                 schema_unique_id: Some(1),
+                physical_binding: StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(1),
                 fallback_default_literal: None,
             },
             StarRocksOutputColumnHint {
                 schema_unique_id: Some(2),
+                physical_binding: StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(2),
                 fallback_default_literal: None,
             },
         ];
@@ -3012,10 +4328,12 @@ mod tests {
         let output_hints = vec![
             StarRocksOutputColumnHint {
                 schema_unique_id: Some(1),
+                physical_binding: StarRocksPhysicalColumnBinding::LegacyName,
                 fallback_default_literal: None,
             },
             StarRocksOutputColumnHint {
                 schema_unique_id: Some(28),
+                physical_binding: StarRocksPhysicalColumnBinding::LegacyName,
                 fallback_default_literal: None,
             },
         ];
@@ -3248,11 +4566,568 @@ mod tests {
         assert_eq!(current_segment_schema.children[1].source_index, Some(1));
     }
 
+    #[test]
+    fn authoritative_hint_reads_historical_int_as_current_bigint() {
+        let mut snapshot = build_snapshot_with_columns(vec![build_column(11, "v", "BIGINT")]);
+        snapshot.historical_schemas.insert(
+            900,
+            TabletSchemaPb {
+                id: Some(900),
+                keys_type: Some(KeysType::DupKeys as i32),
+                column: vec![build_column(11, "v", "INT")],
+                ..Default::default()
+            },
+        );
+        snapshot.segment_files[0].schema_id = Some(900);
+        snapshot.segment_files[1].schema_id = snapshot.tablet_schema.id;
+        let output_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let output_hints = vec![StarRocksOutputColumnHint {
+            schema_unique_id: Some(11),
+            physical_binding: StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(11),
+            fallback_default_literal: None,
+        }];
+
+        let plan = build_native_read_plan_with_output_hints(
+            &snapshot,
+            &[build_footer(10, &[11]), build_footer(20, &[11])],
+            &output_schema,
+            &output_hints,
+            None,
+        )
+        .expect("safe signed integer widening must build a native read plan");
+
+        assert_eq!(plan.projected_columns[0].schema_type, "BIGINT");
+        assert_eq!(
+            plan.segments[0].projected_schemas[0].schema_type, "INT",
+            "historical segment must retain its physical decode type"
+        );
+        assert_eq!(plan.segments[1].projected_schemas[0].schema_type, "BIGINT");
+    }
+
+    #[test]
+    fn authoritative_hint_rejects_duplicate_historical_top_level_unique_id_zero() {
+        let mut snapshot = build_snapshot_with_columns(vec![build_column(0, "new_v", "BIGINT")]);
+        snapshot.historical_schemas.insert(
+            900,
+            TabletSchemaPb {
+                id: Some(900),
+                keys_type: Some(KeysType::DupKeys as i32),
+                column: vec![
+                    build_column(0, "old_v", "INT"),
+                    build_column(0, "shadow_v", "INT"),
+                ],
+                ..Default::default()
+            },
+        );
+        snapshot.segment_files[0].schema_id = Some(900);
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "new_v",
+            DataType::Int64,
+            false,
+        )]));
+        let output_hints = vec![StarRocksOutputColumnHint {
+            schema_unique_id: Some(0),
+            physical_binding: StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(0),
+            fallback_default_literal: None,
+        }];
+
+        let err = build_native_read_plan_with_output_hints(
+            &snapshot,
+            &[build_footer(10, &[0]), build_footer(20, &[0])],
+            &output_schema,
+            &output_hints,
+            None,
+        )
+        .expect_err("duplicate historical top-level UID0 must fail before lookup overwrite");
+
+        assert!(
+            err.contains("duplicated historical tablet schema column unique_id")
+                && err.contains("unique_id=0"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn authoritative_hint_rejects_duplicate_historical_top_level_normalized_name() {
+        let mut snapshot = build_snapshot_with_columns(vec![build_column(0, "v", "INT")]);
+        snapshot.historical_schemas.insert(
+            900,
+            TabletSchemaPb {
+                id: Some(900),
+                keys_type: Some(KeysType::DupKeys as i32),
+                column: vec![build_column(0, "V", "INT"), build_column(1, " v ", "INT")],
+                ..Default::default()
+            },
+        );
+        snapshot.segment_files[0].schema_id = Some(900);
+        let output_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let output_hints = vec![StarRocksOutputColumnHint {
+            schema_unique_id: Some(0),
+            physical_binding: StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(0),
+            fallback_default_literal: None,
+        }];
+
+        let err = build_native_read_plan_with_output_hints(
+            &snapshot,
+            &[build_footer(10, &[0]), build_footer(20, &[0])],
+            &output_schema,
+            &output_hints,
+            None,
+        )
+        .expect_err("duplicate normalized historical top-level names must fail before overwrite");
+
+        assert!(
+            err.contains("duplicated historical tablet schema column name")
+                && err.contains("column_name=v"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn authoritative_hint_uses_current_output_type_when_snapshot_schema_is_old() {
+        let snapshot = build_snapshot_with_columns(vec![build_column(11, "v", "INT")]);
+        let output_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let output_hints = vec![StarRocksOutputColumnHint {
+            schema_unique_id: Some(11),
+            physical_binding: StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(11),
+            fallback_default_literal: None,
+        }];
+
+        let plan = build_native_read_plan_with_output_hints(
+            &snapshot,
+            &[build_footer(10, &[11]), build_footer(20, &[11])],
+            &output_schema,
+            &output_hints,
+            Some(&snapshot.tablet_schema),
+        )
+        .expect("authoritative native output metadata must not require FE schema refresh");
+
+        assert_eq!(plan.projected_columns[0].schema_type, "BIGINT");
+        assert_eq!(plan.segments[0].projected_schemas[0].schema_type, "INT");
+    }
+
+    #[test]
+    fn authoritative_hint_rejects_historical_bigint_to_current_int() {
+        let mut snapshot = build_snapshot_with_columns(vec![build_column(11, "v", "INT")]);
+        snapshot.historical_schemas.insert(
+            900,
+            TabletSchemaPb {
+                id: Some(900),
+                keys_type: Some(KeysType::DupKeys as i32),
+                column: vec![build_column(11, "v", "BIGINT")],
+                ..Default::default()
+            },
+        );
+        snapshot.segment_files[0].schema_id = Some(900);
+        let output_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let output_hints = vec![StarRocksOutputColumnHint {
+            schema_unique_id: Some(11),
+            physical_binding: StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(11),
+            fallback_default_literal: None,
+        }];
+
+        let err = build_native_read_plan_with_output_hints(
+            &snapshot,
+            &[build_footer(10, &[11]), build_footer(20, &[11])],
+            &output_schema,
+            &output_hints,
+            None,
+        )
+        .expect_err("signed integer narrowing must fail fast");
+
+        assert!(
+            err.contains("unsupported StarRocks schema evolution")
+                && err.contains("physical_type=BIGINT")
+                && err.contains("output_type=Int32"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn authoritative_hint_rejects_historical_varchar_to_current_bigint() {
+        let mut snapshot = build_snapshot_with_columns(vec![build_column(11, "v", "BIGINT")]);
+        snapshot.historical_schemas.insert(
+            900,
+            TabletSchemaPb {
+                id: Some(900),
+                keys_type: Some(KeysType::DupKeys as i32),
+                column: vec![build_column(11, "v", "VARCHAR")],
+                ..Default::default()
+            },
+        );
+        snapshot.segment_files[0].schema_id = Some(900);
+        let output_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let output_hints = vec![StarRocksOutputColumnHint {
+            schema_unique_id: Some(11),
+            physical_binding: StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(11),
+            fallback_default_literal: None,
+        }];
+
+        let err = build_native_read_plan_with_output_hints(
+            &snapshot,
+            &[build_footer(10, &[11]), build_footer(20, &[11])],
+            &output_schema,
+            &output_hints,
+            None,
+        )
+        .expect_err("cross-family schema evolution must fail fast");
+
+        assert!(
+            err.contains("unsupported StarRocks schema evolution")
+                && err.contains("physical_type=VARCHAR")
+                && err.contains("output_type=Int64"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn authoritative_hint_rejects_nested_historical_bigint_to_current_int() {
+        let current_struct = build_struct_column(11, "s", vec![build_column(12, "value", "INT")]);
+        let historical_struct =
+            build_struct_column(11, "s", vec![build_column(12, "value", "BIGINT")]);
+        let mut snapshot = build_snapshot_with_columns(vec![current_struct]);
+        snapshot.historical_schemas.insert(
+            900,
+            TabletSchemaPb {
+                id: Some(900),
+                keys_type: Some(KeysType::DupKeys as i32),
+                column: vec![historical_struct],
+                ..Default::default()
+            },
+        );
+        snapshot.segment_files[0].schema_id = Some(900);
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(vec![Field::new("value", DataType::Int32, false)].into()),
+            false,
+        )]));
+        let output_hints = vec![StarRocksOutputColumnHint {
+            schema_unique_id: Some(11),
+            physical_binding: StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(11),
+            fallback_default_literal: None,
+        }];
+
+        let err = build_native_read_plan_with_output_hints(
+            &snapshot,
+            &[build_footer(10, &[11]), build_footer(20, &[11])],
+            &output_schema,
+            &output_hints,
+            None,
+        )
+        .expect_err("nested signed integer narrowing must fail at the plan boundary");
+
+        assert!(
+            err.contains("unsupported StarRocks schema evolution")
+                && err.contains("physical_type=BIGINT")
+                && err.contains("output_type=Int32"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn authoritative_hint_rejects_nested_historical_varchar_to_current_int() {
+        let current_struct = build_struct_column(11, "s", vec![build_column(12, "value", "INT")]);
+        let historical_struct =
+            build_struct_column(11, "s", vec![build_column(12, "value", "VARCHAR")]);
+        let mut snapshot = build_snapshot_with_columns(vec![current_struct]);
+        snapshot.historical_schemas.insert(
+            900,
+            TabletSchemaPb {
+                id: Some(900),
+                keys_type: Some(KeysType::DupKeys as i32),
+                column: vec![historical_struct],
+                ..Default::default()
+            },
+        );
+        snapshot.segment_files[0].schema_id = Some(900);
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(vec![Field::new("value", DataType::Int32, false)].into()),
+            false,
+        )]));
+        let output_hints = vec![StarRocksOutputColumnHint {
+            schema_unique_id: Some(11),
+            physical_binding: StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(11),
+            fallback_default_literal: None,
+        }];
+
+        let err = build_native_read_plan_with_output_hints(
+            &snapshot,
+            &[build_footer(10, &[11]), build_footer(20, &[11])],
+            &output_schema,
+            &output_hints,
+            None,
+        )
+        .expect_err("nested cross-family evolution must fail at the plan boundary");
+
+        assert!(
+            err.contains("unsupported StarRocks schema evolution")
+                && err.contains("physical_type=VARCHAR")
+                && err.contains("output_type=Int32"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn authoritative_hint_preserves_nested_struct_child_unique_id_zero() {
+        let plan = build_authoritative_nested_evolution_plan(
+            build_struct_column(
+                11,
+                "c",
+                vec![build_struct_column(
+                    0,
+                    "nested",
+                    vec![build_column(13, "value", "BIGINT")],
+                )],
+            ),
+            build_struct_column(
+                11,
+                "c",
+                vec![build_struct_column(
+                    0,
+                    "nested",
+                    vec![build_column(13, "value", "INT")],
+                )],
+            ),
+            DataType::Struct(
+                vec![Field::new(
+                    "nested",
+                    DataType::Struct(vec![Field::new("value", DataType::Int64, true)].into()),
+                    true,
+                )]
+                .into(),
+            ),
+        )
+        .expect("nested complex STRUCT child UID0 with signed integer widening must build");
+
+        assert_eq!(
+            plan.segments[0].projected_schemas[0].children[0].unique_id,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn authoritative_hint_binds_renamed_nested_struct_child_unique_id_zero() {
+        let plan = build_authoritative_nested_evolution_plan(
+            build_struct_column(11, "c", vec![build_column(0, "new_name", "BIGINT")]),
+            build_struct_column(11, "c", vec![build_column(0, "old_name", "INT")]),
+            DataType::Struct(vec![Field::new("new_name", DataType::Int64, true)].into()),
+        )
+        .expect("renamed STRUCT child UID0 must bind historical INT by authoritative identity");
+
+        let child = &plan.segments[0].projected_schemas[0].children[0];
+        assert_eq!(child.unique_id, Some(0));
+        assert_eq!(child.source_index, Some(0));
+        assert_eq!(child.schema_type, "INT");
+    }
+
+    #[test]
+    fn authoritative_hint_rejects_duplicate_historical_struct_child_unique_id_zero() {
+        let err = build_authoritative_nested_evolution_plan(
+            build_struct_column(11, "c", vec![build_column(0, "new_name", "BIGINT")]),
+            build_struct_column(
+                11,
+                "c",
+                vec![
+                    build_column(0, "old_name", "INT"),
+                    build_column(0, "another_old_name", "INT"),
+                ],
+            ),
+            DataType::Struct(vec![Field::new("new_name", DataType::Int64, true)].into()),
+        )
+        .expect_err("duplicate historical STRUCT child UID0 must be rejected");
+
+        assert!(
+            err.contains("duplicated STRUCT child unique_id")
+                && err.contains("schema_role=historical")
+                && err.contains("unique_id=0"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn authoritative_hint_rejects_duplicate_current_struct_child_unique_id_zero() {
+        let err = build_authoritative_nested_evolution_plan(
+            build_struct_column(
+                11,
+                "c",
+                vec![
+                    build_column(0, "new_name", "BIGINT"),
+                    build_column(0, "another_new_name", "BIGINT"),
+                ],
+            ),
+            build_struct_column(
+                11,
+                "c",
+                vec![
+                    build_column(0, "old_name", "INT"),
+                    build_column(1, "another_old_name", "INT"),
+                ],
+            ),
+            DataType::Struct(
+                vec![
+                    Field::new("new_name", DataType::Int64, true),
+                    Field::new("another_new_name", DataType::Int64, true),
+                ]
+                .into(),
+            ),
+        )
+        .expect_err("duplicate current STRUCT child UID0 must be rejected");
+
+        assert!(
+            err.contains("duplicated STRUCT child unique_id")
+                && err.contains("schema_role=current")
+                && err.contains("unique_id=0"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn authoritative_hint_preserves_nested_array_physical_int_for_current_bigint() {
+        let plan = build_authoritative_nested_evolution_plan(
+            build_array_column(11, "c", build_column(12, "item", "BIGINT")),
+            build_array_column(11, "c", build_column(12, "item", "INT")),
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+        )
+        .expect("nested ARRAY signed integer widening must build");
+
+        assert_eq!(
+            plan.segments[0].projected_schemas[0].children[0].schema_type,
+            "INT"
+        );
+    }
+
+    #[test]
+    fn authoritative_hint_rejects_nested_array_cross_family_evolution() {
+        let err = build_authoritative_nested_evolution_plan(
+            build_array_column(11, "c", build_column(12, "item", "INT")),
+            build_array_column(11, "c", build_column(12, "item", "VARCHAR")),
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+        )
+        .expect_err("nested ARRAY cross-family evolution must fail at the plan boundary");
+
+        assert!(
+            err.contains("unsupported StarRocks schema evolution")
+                && err.contains("physical_type=VARCHAR")
+                && err.contains("output_type=Int32"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn authoritative_hint_preserves_nested_map_physical_int_for_current_bigint() {
+        let plan = build_authoritative_nested_evolution_plan(
+            build_map_column(
+                11,
+                "c",
+                build_column(12, "key", "INT"),
+                build_column(13, "value", "BIGINT"),
+            ),
+            build_map_column(
+                11,
+                "c",
+                build_column(12, "key", "INT"),
+                build_column(13, "value", "INT"),
+            ),
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("key", DataType::Int32, false),
+                            Field::new("value", DataType::Int64, true),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+        )
+        .expect("nested MAP signed integer widening must build");
+
+        assert_eq!(
+            plan.segments[0].projected_schemas[0].children[1].schema_type,
+            "INT"
+        );
+    }
+
+    #[test]
+    fn authoritative_hint_rejects_nested_map_cross_family_evolution() {
+        let err = build_authoritative_nested_evolution_plan(
+            build_map_column(
+                11,
+                "c",
+                build_column(12, "key", "INT"),
+                build_column(13, "value", "INT"),
+            ),
+            build_map_column(
+                11,
+                "c",
+                build_column(12, "key", "INT"),
+                build_column(13, "value", "VARCHAR"),
+            ),
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("key", DataType::Int32, false),
+                            Field::new("value", DataType::Int32, true),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+        )
+        .expect_err("nested MAP cross-family evolution must fail at the plan boundary");
+
+        assert!(
+            err.contains("unsupported StarRocks schema evolution")
+                && err.contains("physical_type=VARCHAR")
+                && err.contains("output_type=Int32"),
+            "err={err}"
+        );
+    }
+
     fn build_snapshot() -> StarRocksTabletSnapshot {
         build_snapshot_with_columns(vec![
             build_column(1, "c1", "BIGINT"),
             build_column(2, "c2", "BIGINT"),
         ])
+    }
+
+    fn build_authoritative_nested_evolution_plan(
+        current_column: ColumnPb,
+        historical_column: ColumnPb,
+        output_data_type: DataType,
+    ) -> Result<StarRocksNativeReadPlan, String> {
+        let mut snapshot = build_snapshot_with_columns(vec![current_column]);
+        snapshot.historical_schemas.insert(
+            900,
+            TabletSchemaPb {
+                id: Some(900),
+                keys_type: Some(KeysType::DupKeys as i32),
+                column: vec![historical_column],
+                ..Default::default()
+            },
+        );
+        snapshot.segment_files[0].schema_id = Some(900);
+        let output_schema = Arc::new(Schema::new(vec![Field::new("c", output_data_type, true)]));
+        let output_hints = vec![StarRocksOutputColumnHint {
+            schema_unique_id: Some(11),
+            physical_binding: StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(11),
+            fallback_default_literal: None,
+        }];
+        build_native_read_plan_with_output_hints(
+            &snapshot,
+            &[build_footer(10, &[11]), build_footer(20, &[11])],
+            &output_schema,
+            &output_hints,
+            None,
+        )
     }
 
     fn build_snapshot_with_columns(columns: Vec<ColumnPb>) -> StarRocksTabletSnapshot {

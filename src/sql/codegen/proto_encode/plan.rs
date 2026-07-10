@@ -16,7 +16,7 @@
 // under the License.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -53,6 +53,158 @@ use crate::sql::planner::physical::{
 pub(crate) struct NativePlanEncodeContext<'a> {
     pub(crate) mv_refresh_ctx:
         Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+    pub(crate) starrocks_scan_sources: Option<&'a BTreeMap<i32, StarRocksScanSourceDescriptor>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StarRocksStorageColumnDescriptor {
+    pub(crate) name: String,
+    pub(crate) unique_id: i32,
+    pub(crate) default_value: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(feature = "compat"), allow(dead_code))]
+pub(crate) enum StarRocksKeysTypeDescriptor {
+    Duplicate,
+    Unique,
+    Aggregate,
+    Primary,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StarRocksColumnSchemaDescriptor {
+    pub(crate) unique_id: i32,
+    pub(crate) name: Option<String>,
+    pub(crate) physical_type: String,
+    pub(crate) is_key: bool,
+    pub(crate) aggregation: Option<String>,
+    pub(crate) nullable: bool,
+    pub(crate) default_value: Option<String>,
+    pub(crate) precision: Option<i32>,
+    pub(crate) scale: Option<i32>,
+    pub(crate) visible: bool,
+    pub(crate) children: Vec<StarRocksColumnSchemaDescriptor>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StarRocksTabletSchemaDescriptor {
+    pub(crate) schema_id: i64,
+    pub(crate) keys_type: StarRocksKeysTypeDescriptor,
+    pub(crate) num_short_key_columns: Option<i32>,
+    pub(crate) sort_key_idxes: Vec<u32>,
+    pub(crate) sort_key_unique_ids: Vec<u32>,
+    pub(crate) columns: Vec<StarRocksColumnSchemaDescriptor>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StarRocksScanSourceDescriptor {
+    pub(crate) catalog_name: String,
+    pub(crate) db_id: i64,
+    pub(crate) table_id: i64,
+    pub(crate) schema_id: i64,
+    pub(crate) storage_columns: Vec<StarRocksStorageColumnDescriptor>,
+    pub(crate) tablet_schema: StarRocksTabletSchemaDescriptor,
+}
+
+#[cfg(test)]
+pub(crate) fn test_starrocks_tablet_schema_descriptor(
+    schema_id: i64,
+    columns: &[StarRocksStorageColumnDescriptor],
+) -> StarRocksTabletSchemaDescriptor {
+    StarRocksTabletSchemaDescriptor {
+        schema_id,
+        keys_type: StarRocksKeysTypeDescriptor::Duplicate,
+        num_short_key_columns: Some(1.min(columns.len()) as i32),
+        sort_key_idxes: if columns.is_empty() { vec![] } else { vec![0] },
+        sort_key_unique_ids: columns
+            .first()
+            .map(|column| column.unique_id as u32)
+            .into_iter()
+            .collect(),
+        columns: columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| StarRocksColumnSchemaDescriptor {
+                unique_id: column.unique_id,
+                name: Some(column.name.clone()),
+                physical_type: "BIGINT".to_string(),
+                is_key: index == 0,
+                aggregation: None,
+                nullable: true,
+                default_value: column.default_value.clone(),
+                precision: None,
+                scale: None,
+                visible: true,
+                children: vec![],
+            })
+            .collect(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_starrocks_tablet_schema_descriptor_for_column(
+    schema_id: i64,
+    name: &str,
+    unique_id: i32,
+    default_value: Option<&str>,
+) -> StarRocksTabletSchemaDescriptor {
+    test_starrocks_tablet_schema_descriptor(
+        schema_id,
+        &[StarRocksStorageColumnDescriptor {
+            name: name.to_string(),
+            unique_id,
+            default_value: default_value.map(str::to_string),
+        }],
+    )
+}
+
+#[cfg(feature = "compat")]
+pub(crate) fn starrocks_tablet_schema_descriptor(
+    schema: crate::connector::starrocks::table::scan_planner::StarRocksNativeTabletSchema,
+) -> StarRocksTabletSchemaDescriptor {
+    use crate::connector::starrocks::table::scan_planner::StarRocksNativeKeysType;
+
+    StarRocksTabletSchemaDescriptor {
+        schema_id: schema.schema_id,
+        keys_type: match schema.keys_type {
+            StarRocksNativeKeysType::Duplicate => StarRocksKeysTypeDescriptor::Duplicate,
+            StarRocksNativeKeysType::Unique => StarRocksKeysTypeDescriptor::Unique,
+            StarRocksNativeKeysType::Aggregate => StarRocksKeysTypeDescriptor::Aggregate,
+            StarRocksNativeKeysType::Primary => StarRocksKeysTypeDescriptor::Primary,
+        },
+        num_short_key_columns: schema.num_short_key_columns,
+        sort_key_idxes: schema.sort_key_idxes,
+        sort_key_unique_ids: schema.sort_key_unique_ids,
+        columns: schema
+            .columns
+            .into_iter()
+            .map(starrocks_column_schema_descriptor)
+            .collect(),
+    }
+}
+
+#[cfg(feature = "compat")]
+fn starrocks_column_schema_descriptor(
+    column: crate::connector::starrocks::table::scan_planner::StarRocksNativeColumnSchema,
+) -> StarRocksColumnSchemaDescriptor {
+    StarRocksColumnSchemaDescriptor {
+        unique_id: column.unique_id,
+        name: column.name,
+        physical_type: column.physical_type,
+        is_key: column.is_key,
+        aggregation: column.aggregation,
+        nullable: column.nullable,
+        default_value: column.default_value,
+        precision: column.precision,
+        scale: column.scale,
+        visible: column.visible,
+        children: column
+            .children
+            .into_iter()
+            .map(starrocks_column_schema_descriptor)
+            .collect(),
+    }
 }
 
 pub(crate) fn encode_distributed_plan(
@@ -62,6 +214,7 @@ pub(crate) fn encode_distributed_plan(
         src,
         NativePlanEncodeContext {
             mv_refresh_ctx: None,
+            starrocks_scan_sources: None,
         },
     )
 }
@@ -679,6 +832,7 @@ pub(crate) fn encode_plan_fragment(src: &PlanFragment) -> Result<plan::PlanFragm
         src,
         &NativePlanEncodeContext {
             mv_refresh_ctx: None,
+            starrocks_scan_sources: None,
         },
     )
 }
@@ -845,11 +999,12 @@ pub(crate) fn encode_node(src: &DistributedNode) -> Result<plan::DistributedNode
         src,
         &NativePlanEncodeContext {
             mv_refresh_ctx: None,
+            starrocks_scan_sources: None,
         },
     )
 }
 
-fn encode_node_with_context(
+pub(crate) fn encode_node_with_context(
     src: &DistributedNode,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::DistributedNode, String> {
@@ -864,7 +1019,11 @@ fn encode_node_with_context(
         }
         other => {
             let physical = crate::sql::planner::distributed::distributed_kind_to_physical(other);
-            plan::distributed_node::Payload::Physical(encode_physical_node(&physical, ctx)?)
+            plan::distributed_node::Payload::Physical(encode_physical_node(
+                &physical,
+                src.node_id,
+                ctx,
+            )?)
         }
     };
     let mut node = plan::DistributedNode {
@@ -1185,6 +1344,7 @@ pub(super) fn encoded_physical_variant_names_for_test() -> &'static [&'static st
 
 fn encode_physical_node(
     src: &PhysicalPlanKind,
+    node_id: i32,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::PlanNode, String> {
     use plan::plan_node::Kind;
@@ -1192,7 +1352,7 @@ fn encode_physical_node(
     let (output_columns, kind) = match src {
         PhysicalPlanKind::Scan(node) => (
             encode_output_columns(&node.columns)?,
-            Kind::Scan(encode_scan_node(node, ctx)?),
+            Kind::Scan(encode_scan_node(node, node_id, ctx)?),
         ),
         PhysicalPlanKind::Filter(node) => (
             Vec::new(),
@@ -1639,11 +1799,16 @@ fn encode_row_count_assertion(assertion: PlanRowCountAssertion) -> i32 {
 
 fn encode_scan_node(
     src: &crate::sql::planner::payload::PlanScanNode,
+    node_id: i32,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::ScanNode, String> {
     Ok(plan::ScanNode {
         database: src.database.clone(),
-        table: Some(encode_table_def_with_context(&src.table, ctx)?),
+        table: Some(encode_table_def_with_context(
+            &src.table,
+            Some(node_id),
+            ctx,
+        )?),
         alias: src.alias.clone(),
         columns: encode_output_columns(&src.columns)?,
         predicates: encode_exprs(&src.predicates)?,
@@ -1882,14 +2047,17 @@ fn encode_wired_runtime_filter_probe(
 fn encode_table_def(src: &catalog::TableDef) -> Result<plan::TableDef, String> {
     encode_table_def_with_context(
         src,
+        None,
         &NativePlanEncodeContext {
             mv_refresh_ctx: None,
+            starrocks_scan_sources: None,
         },
     )
 }
 
 fn encode_table_def_with_context(
     src: &catalog::TableDef,
+    scan_node_id: Option<i32>,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::TableDef, String> {
     Ok(plan::TableDef {
@@ -1904,7 +2072,7 @@ fn encode_table_def_with_context(
             .iter()
             .map(encode_column_def)
             .collect::<Result<Vec<_>, _>>()?,
-        source: Some(encode_scan_source(&src.source, ctx)?),
+        source: Some(encode_scan_source(&src.source, scan_node_id, ctx)?),
     })
 }
 
@@ -2052,6 +2220,7 @@ fn arrow_field_id(field: &Field) -> Result<i32, String> {
 
 fn encode_scan_source(
     src: &catalog::ScanSource,
+    scan_node_id: Option<i32>,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::ScanSource, String> {
     use plan::scan_source::Kind;
@@ -2059,9 +2228,36 @@ fn encode_scan_source(
     Ok(plan::ScanSource {
         kind: Some(match src {
             catalog::ScanSource::StarRocks { db_id, table_id } => {
-                return Err(format!(
-                    "StarRocks scan source (db_id={db_id}, table_id={table_id}) is compat-only; native plan encoding does not support it"
-                ));
+                let node_id = scan_node_id.ok_or_else(|| {
+                    "StarRocks table source is only valid on a native ScanNode".to_string()
+                })?;
+                let descriptor = ctx
+                    .starrocks_scan_sources
+                    .and_then(|sources| sources.get(&node_id))
+                    .ok_or_else(|| {
+                        format!(
+                            "StarRocks ScanNode node_id={node_id} missing native source descriptor"
+                        )
+                    })?;
+                validate_starrocks_source_descriptor(node_id, *db_id, *table_id, descriptor)?;
+                Kind::StarrocksTable(plan::StarRocksTableSource {
+                    catalog_name: descriptor.catalog_name.clone(),
+                    db_id: descriptor.db_id,
+                    table_id: descriptor.table_id,
+                    schema_id: descriptor.schema_id,
+                    storage_columns: descriptor
+                        .storage_columns
+                        .iter()
+                        .map(|column| plan::StarRocksColumnStorageMeta {
+                            name: column.name.clone(),
+                            unique_id: column.unique_id,
+                            default_value: column.default_value.clone(),
+                        })
+                        .collect(),
+                    current_schema: Some(encode_starrocks_tablet_schema(
+                        &descriptor.tablet_schema,
+                    )),
+                })
             }
             catalog::ScanSource::IcebergDataFiles {
                 table,
@@ -2169,6 +2365,295 @@ fn encode_scan_source(
             }
         }),
     })
+}
+
+fn encode_starrocks_tablet_schema(
+    schema: &StarRocksTabletSchemaDescriptor,
+) -> plan::StarRocksTabletSchema {
+    plan::StarRocksTabletSchema {
+        schema_id: schema.schema_id,
+        keys_type: match schema.keys_type {
+            StarRocksKeysTypeDescriptor::Duplicate => {
+                plan::StarRocksKeysType::StarrocksKeysTypeDuplicate as i32
+            }
+            StarRocksKeysTypeDescriptor::Unique => {
+                plan::StarRocksKeysType::StarrocksKeysTypeUnique as i32
+            }
+            StarRocksKeysTypeDescriptor::Aggregate => {
+                plan::StarRocksKeysType::StarrocksKeysTypeAggregate as i32
+            }
+            StarRocksKeysTypeDescriptor::Primary => {
+                plan::StarRocksKeysType::StarrocksKeysTypePrimary as i32
+            }
+        },
+        num_short_key_columns: schema.num_short_key_columns,
+        sort_key_idxes: schema.sort_key_idxes.clone(),
+        sort_key_unique_ids: schema.sort_key_unique_ids.clone(),
+        columns: schema
+            .columns
+            .iter()
+            .map(encode_starrocks_column_schema)
+            .collect(),
+    }
+}
+
+fn encode_starrocks_column_schema(
+    column: &StarRocksColumnSchemaDescriptor,
+) -> plan::StarRocksColumnSchema {
+    plan::StarRocksColumnSchema {
+        unique_id: column.unique_id,
+        name: column.name.clone(),
+        physical_type: column.physical_type.clone(),
+        is_key: Some(column.is_key),
+        aggregation: column.aggregation.clone(),
+        nullable: Some(column.nullable),
+        default_value: column.default_value.clone(),
+        precision: column.precision,
+        scale: column.scale,
+        visible: Some(column.visible),
+        children: column
+            .children
+            .iter()
+            .map(encode_starrocks_column_schema)
+            .collect(),
+    }
+}
+
+fn validate_starrocks_source_descriptor(
+    node_id: i32,
+    expected_db_id: i64,
+    expected_table_id: i64,
+    descriptor: &StarRocksScanSourceDescriptor,
+) -> Result<(), String> {
+    if descriptor.db_id != expected_db_id || descriptor.table_id != expected_table_id {
+        return Err(format!(
+            "StarRocks ScanNode node_id={node_id} native source identity mismatch: plan=({expected_db_id}, {expected_table_id}) descriptor=({}, {})",
+            descriptor.db_id, descriptor.table_id
+        ));
+    }
+    if descriptor.catalog_name.trim().is_empty() {
+        return Err(format!(
+            "StarRocks ScanNode node_id={node_id} native source catalog_name must not be empty"
+        ));
+    }
+    for (field, value) in [
+        ("db_id", descriptor.db_id),
+        ("table_id", descriptor.table_id),
+        ("schema_id", descriptor.schema_id),
+    ] {
+        if value <= 0 {
+            return Err(format!(
+                "StarRocks ScanNode node_id={node_id} native source {field} must be positive, got {value}"
+            ));
+        }
+    }
+    if descriptor.tablet_schema.schema_id != descriptor.schema_id {
+        return Err(format!(
+            "StarRocks ScanNode node_id={node_id} native current schema id mismatch: source_schema_id={} current_schema_id={}",
+            descriptor.schema_id, descriptor.tablet_schema.schema_id
+        ));
+    }
+    if descriptor.tablet_schema.columns.is_empty() {
+        return Err(format!(
+            "StarRocks ScanNode node_id={node_id} native current schema columns must not be empty"
+        ));
+    }
+    let mut current_names = HashSet::new();
+    let mut current_unique_ids = HashSet::new();
+    for column in &descriptor.tablet_schema.columns {
+        let name = column.name.as_deref().unwrap_or_default().trim();
+        if !current_names.insert(name.to_ascii_lowercase()) {
+            return Err(format!(
+                "StarRocks ScanNode node_id={node_id} native current schema contains duplicate column name {name}"
+            ));
+        }
+        if !current_unique_ids.insert(column.unique_id) {
+            return Err(format!(
+                "StarRocks ScanNode node_id={node_id} native current schema contains duplicate unique_id {}",
+                column.unique_id
+            ));
+        }
+    }
+    if let Some(count) = descriptor.tablet_schema.num_short_key_columns
+        && (count < 0 || count as usize > descriptor.tablet_schema.columns.len())
+    {
+        return Err(format!(
+            "StarRocks ScanNode node_id={node_id} native current schema num_short_key_columns out of range: {count}"
+        ));
+    }
+    for unique_id in &descriptor.tablet_schema.sort_key_unique_ids {
+        if !current_unique_ids.contains(&(*unique_id as i32)) {
+            return Err(format!(
+                "StarRocks ScanNode node_id={node_id} native current schema sort_key_unique_ids references unknown unique_id {unique_id}"
+            ));
+        }
+    }
+    if descriptor
+        .tablet_schema
+        .sort_key_idxes
+        .iter()
+        .any(|index| *index as usize >= descriptor.tablet_schema.columns.len())
+    {
+        return Err(format!(
+            "StarRocks ScanNode node_id={node_id} native current schema sort_key_idxes contains out-of-range index"
+        ));
+    }
+    if !descriptor.tablet_schema.sort_key_idxes.is_empty()
+        && !descriptor.tablet_schema.sort_key_unique_ids.is_empty()
+        && (descriptor.tablet_schema.sort_key_idxes.len()
+            != descriptor.tablet_schema.sort_key_unique_ids.len()
+            || descriptor
+                .tablet_schema
+                .sort_key_idxes
+                .iter()
+                .zip(&descriptor.tablet_schema.sort_key_unique_ids)
+                .any(|(index, unique_id)| {
+                    descriptor.tablet_schema.columns[*index as usize].unique_id != *unique_id as i32
+                }))
+    {
+        return Err(format!(
+            "StarRocks ScanNode node_id={node_id} native current schema sort key indexes and unique ids are inconsistent"
+        ));
+    }
+    for column in &descriptor.tablet_schema.columns {
+        validate_starrocks_schema_column(node_id, column, true)?;
+    }
+    if descriptor.storage_columns.is_empty() {
+        return Err(format!(
+            "StarRocks ScanNode node_id={node_id} native source storage_columns must not be empty"
+        ));
+    }
+    let mut names = HashSet::new();
+    let mut unique_ids = HashSet::new();
+    for column in &descriptor.storage_columns {
+        let name = column.name.trim();
+        if name.is_empty() {
+            return Err(format!(
+                "StarRocks ScanNode node_id={node_id} storage column name must not be empty"
+            ));
+        }
+        if column.unique_id < 0 {
+            return Err(format!(
+                "StarRocks ScanNode node_id={node_id} storage column {name} unique_id must be non-negative, got {}",
+                column.unique_id
+            ));
+        }
+        if !names.insert(name.to_ascii_lowercase()) {
+            return Err(format!(
+                "StarRocks ScanNode node_id={node_id} storage columns contain duplicate name {name}"
+            ));
+        }
+        if !unique_ids.insert(column.unique_id) {
+            return Err(format!(
+                "StarRocks ScanNode node_id={node_id} storage columns contain duplicate unique_id {}",
+                column.unique_id
+            ));
+        }
+    }
+    let current_visible_columns = descriptor
+        .tablet_schema
+        .columns
+        .iter()
+        .filter(|column| column.visible)
+        .map(|column| {
+            (
+                column
+                    .name
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+                column.unique_id,
+                column.default_value.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let storage_columns = descriptor
+        .storage_columns
+        .iter()
+        .map(|column| {
+            (
+                column.name.to_ascii_lowercase(),
+                column.unique_id,
+                column.default_value.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if current_visible_columns != storage_columns {
+        return Err(format!(
+            "StarRocks ScanNode node_id={node_id} native storage_columns do not match current schema visible columns"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_starrocks_schema_column(
+    node_id: i32,
+    column: &StarRocksColumnSchemaDescriptor,
+    top_level: bool,
+) -> Result<(), String> {
+    let name = column.name.as_deref().map(str::trim).unwrap_or_default();
+    if top_level && name.is_empty() {
+        return Err(format!(
+            "StarRocks ScanNode node_id={node_id} current schema top-level column name must not be empty"
+        ));
+    }
+    if top_level && column.unique_id < 0 {
+        return Err(format!(
+            "StarRocks ScanNode node_id={node_id} current schema column {name} unique_id must be non-negative"
+        ));
+    }
+    let physical_type = column.physical_type.trim().to_ascii_uppercase();
+    if physical_type.is_empty() {
+        return Err(format!(
+            "StarRocks ScanNode node_id={node_id} current schema column {name} physical_type must not be empty"
+        ));
+    }
+    let expected_children = match physical_type.as_str() {
+        "ARRAY" => Some(1),
+        "MAP" => Some(2),
+        "STRUCT" => None,
+        _ => Some(0),
+    };
+    if let Some(expected) = expected_children
+        && column.children.len() != expected
+    {
+        return Err(format!(
+            "StarRocks ScanNode node_id={node_id} current schema column {name} type {physical_type} requires {expected} children, got {}",
+            column.children.len()
+        ));
+    }
+    if physical_type == "STRUCT" && column.children.is_empty() {
+        return Err(format!(
+            "StarRocks ScanNode node_id={node_id} current schema column {name} STRUCT requires at least one child"
+        ));
+    }
+    if physical_type == "STRUCT" {
+        let mut child_names = HashSet::new();
+        let mut positive_child_ids = HashSet::new();
+        for child in &column.children {
+            let child_name = child.name.as_deref().map(str::trim).unwrap_or_default();
+            if child_name.is_empty() {
+                return Err(format!(
+                    "StarRocks ScanNode node_id={node_id} current schema STRUCT column {name} child name must not be empty"
+                ));
+            }
+            if !child_names.insert(child_name.to_ascii_lowercase()) {
+                return Err(format!(
+                    "StarRocks ScanNode node_id={node_id} current schema STRUCT column {name} contains duplicate child name {child_name}"
+                ));
+            }
+            if child.unique_id >= 0 && !positive_child_ids.insert(child.unique_id) {
+                return Err(format!(
+                    "StarRocks ScanNode node_id={node_id} current schema STRUCT column {name} contains duplicate positive child unique_id {}",
+                    child.unique_id
+                ));
+            }
+        }
+    }
+    for child in &column.children {
+        validate_starrocks_schema_column(node_id, child, false)?;
+    }
+    Ok(())
 }
 
 fn encode_mv_target_state_row_filter(
@@ -3045,6 +3530,7 @@ mod tests {
             &plan,
             plan::NativePlanEncodeContext {
                 mv_refresh_ctx: None,
+                starrocks_scan_sources: None,
             },
         )
         .expect_err("Iceberg delta native sidecar must require MV refresh context");

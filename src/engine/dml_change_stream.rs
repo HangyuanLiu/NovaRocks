@@ -770,21 +770,39 @@ pub(crate) fn plan_dml_change_stream_write(
         &mut plan.dag,
         None,
         native_keyed_assert.map(|keyed_assert| {
-            Box::new(move |native_plan: &mut crate::sql::planner::distributed::DistributedPlan| {
-                inject_dml_pre_expand_keyed_assert_into_native_plan(native_plan, &keyed_assert)
-            })
+            Box::new(
+                move |native_plan: &mut crate::sql::planner::distributed::DistributedPlan,
+                      starrocks_scan_sources: &mut BTreeMap<
+                    i32,
+                    crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor,
+                >| {
+                    inject_dml_pre_expand_keyed_assert_into_native_plan_with_scan_sources(
+                        native_plan,
+                        &keyed_assert,
+                        starrocks_scan_sources,
+                    )
+                },
+            )
                 as Box<
-                    dyn FnOnce(&mut crate::sql::planner::distributed::DistributedPlan) -> Result<(), String>,
+                    dyn FnOnce(
+                        &mut crate::sql::planner::distributed::DistributedPlan,
+                        &mut BTreeMap<
+                            i32,
+                            crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor,
+                        >,
+                    ) -> Result<(), String>,
                 >
         }),
     )?;
     let crate::engine::PlannedIcebergChangeStreamWrite {
-        mut build_result,
+        build_result,
         native_sidecars,
         commit_plan,
         #[cfg(test)]
         topology,
     } = planned;
+    #[cfg(feature = "compat")]
+    let mut build_result = build_result;
     #[cfg(feature = "compat")]
     inject_dml_pre_expand_keyed_assert(&mut build_result, plan.pre_expand_keyed_assert.as_ref())?;
     Ok(crate::engine::PlannedIcebergChangeStreamWrite {
@@ -800,6 +818,32 @@ pub(crate) fn inject_dml_pre_expand_keyed_assert_into_native_plan(
     plan: &mut crate::sql::planner::distributed::DistributedPlan,
     keyed_assert: &DmlPreExpandKeyedAssert,
 ) -> Result<(), String> {
+    inject_dml_pre_expand_keyed_assert_into_native_plan_with_remap(plan, keyed_assert).map(drop)
+}
+
+fn inject_dml_pre_expand_keyed_assert_into_native_plan_with_scan_sources(
+    plan: &mut crate::sql::planner::distributed::DistributedPlan,
+    keyed_assert: &DmlPreExpandKeyedAssert,
+    starrocks_scan_sources: &mut BTreeMap<
+        i32,
+        crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor,
+    >,
+) -> Result<(), String> {
+    let node_id_map =
+        inject_dml_pre_expand_keyed_assert_into_native_plan_with_remap(plan, keyed_assert)?;
+    #[cfg(feature = "compat")]
+    if let Some(node_id_map) = node_id_map.as_ref() {
+        remap_native_starrocks_scan_sources(starrocks_scan_sources, node_id_map)?;
+    }
+    #[cfg(not(feature = "compat"))]
+    let _ = (node_id_map, starrocks_scan_sources);
+    Ok(())
+}
+
+fn inject_dml_pre_expand_keyed_assert_into_native_plan_with_remap(
+    plan: &mut crate::sql::planner::distributed::DistributedPlan,
+    keyed_assert: &DmlPreExpandKeyedAssert,
+) -> Result<Option<HashMap<i32, i32>>, String> {
     let mut next_node_id = next_native_node_id(plan);
     let mut expand_count = 0usize;
     for fragment in &mut plan.fragments {
@@ -821,8 +865,9 @@ pub(crate) fn inject_dml_pre_expand_keyed_assert_into_native_plan(
     // aligned with ExchangeReceiver node ids. Compat builds still renumber the
     // native sidecar to match the separately renumbered thrift build result.
     #[cfg(feature = "compat")]
-    renumber_native_plan_node_ids_preserving_preorder(plan)?;
-    Ok(())
+    return renumber_native_plan_node_ids_preserving_preorder(plan).map(Some);
+    #[cfg(not(feature = "compat"))]
+    Ok(None)
 }
 
 fn inject_native_keyed_assert_before_expand_node(
@@ -976,7 +1021,7 @@ fn native_node_ids(node: &crate::sql::planner::distributed::DistributedNode) -> 
 
 fn renumber_native_plan_node_ids_preserving_preorder(
     plan: &mut crate::sql::planner::distributed::DistributedPlan,
-) -> Result<(), String> {
+) -> Result<HashMap<i32, i32>, String> {
     let mut next_node_id = 1;
     let mut node_id_map = HashMap::new();
     for fragment in &mut plan.fragments {
@@ -987,6 +1032,31 @@ fn renumber_native_plan_node_ids_preserving_preorder(
         )?;
     }
     remap_native_plan_node_references(plan, &node_id_map)?;
+    Ok(node_id_map)
+}
+
+#[cfg(feature = "compat")]
+fn remap_native_starrocks_scan_sources(
+    starrocks_scan_sources: &mut BTreeMap<
+        i32,
+        crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor,
+    >,
+    node_id_map: &HashMap<i32, i32>,
+) -> Result<(), String> {
+    let mut remapped = BTreeMap::new();
+    for (&old_node_id, source) in starrocks_scan_sources.iter() {
+        let new_node_id = node_id_map.get(&old_node_id).copied().ok_or_else(|| {
+            format!(
+                "DML change-stream keyed assert cannot remap native StarRocks scan source for unknown native node id {old_node_id}"
+            )
+        })?;
+        if remapped.insert(new_node_id, source.clone()).is_some() {
+            return Err(format!(
+                "DML change-stream keyed assert remapped multiple native StarRocks scan sources to node id {new_node_id}"
+            ));
+        }
+    }
+    *starrocks_scan_sources = remapped;
     Ok(())
 }
 
@@ -1249,6 +1319,244 @@ fn output_ordinal_by_name(
         OutputBindingKind::Internal | OutputBindingKind::UserVisible => {}
     }
     Ok(ordinal)
+}
+
+#[cfg(test)]
+mod native_scan_source_tests {
+    use super::*;
+
+    use arrow::datatypes::DataType;
+
+    fn output_column() -> crate::sql::analysis::OutputColumn {
+        crate::sql::analysis::OutputColumn {
+            column_id: crate::sql::column_id::ColumnId::new_for_test(1),
+            name: "__nr_row_id".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            is_internal: true,
+        }
+    }
+
+    fn physical_stats() -> crate::sql::planner::physical::PhysicalPlanStats {
+        crate::sql::planner::physical::PhysicalPlanStats {
+            output_row_count: 1.0,
+            row_count_confidence: crate::sql::planner::physical::PlannerConfidence::Exact,
+            column_statistics: Default::default(),
+            cost_estimate: None,
+            broadcast_decision: None,
+        }
+    }
+
+    fn starrocks_scan_change_event_plan() -> crate::sql::planner::distributed::DistributedPlan {
+        use crate::sql::planner::distributed::{
+            DataPartition, DataSink, DistributedNode, DistributedNodeKind, PlanFragment,
+        };
+        use crate::sql::planner::payload::PlanScanNode;
+        use crate::sql::planner::physical::DistributedChangeEventExpandNode;
+
+        let output = output_column();
+        let scan = DistributedNode {
+            node_id: 7,
+            fragment_id: 0,
+            tuple_ids: vec![1],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            stats: physical_stats(),
+            payload: DistributedNodeKind::Scan(PlanScanNode {
+                database: "analytics".to_string(),
+                table: crate::sql::catalog::TableDef {
+                    name: "orders".to_string(),
+                    columns: vec![crate::sql::catalog::ColumnDef {
+                        name: "__nr_row_id".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        write_default: None,
+                        logical_type: None,
+                    }],
+                    iceberg_row_lineage_metadata_columns: Vec::new(),
+                    source: crate::sql::catalog::ScanSource::StarRocks {
+                        db_id: 10,
+                        table_id: 20,
+                    },
+                },
+                alias: None,
+                columns: vec![output.clone()],
+                predicates: Vec::new(),
+                required_columns: None,
+                variant_columns: Vec::new(),
+                mv_rewritten_from: None,
+            }),
+        };
+        let expand = DistributedNode {
+            node_id: 20,
+            fragment_id: 0,
+            tuple_ids: vec![1],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: vec![scan],
+            stats: physical_stats(),
+            payload: DistributedNodeKind::ChangeEventExpand(DistributedChangeEventExpandNode {
+                events: Vec::new(),
+                output_columns: vec![output.clone()],
+                change_op_column_id: crate::sql::column_id::ColumnId::new_for_test(2),
+                data_route_column_id: Some(crate::sql::column_id::ColumnId::new_for_test(3)),
+            }),
+        };
+        crate::sql::planner::distributed::DistributedPlan {
+            fragments: vec![PlanFragment {
+                fragment_id: 0,
+                root: expand,
+                data_partition: DataPartition::unpartitioned(),
+                output_partition: DataPartition::unpartitioned(),
+                sink: DataSink::Result,
+                output_exprs: None,
+                output_columns: vec![output],
+                cte_id: None,
+                cte_exchange_nodes: Vec::new(),
+            }],
+            root_fragment_id: 0,
+            edges: Vec::new(),
+        }
+    }
+
+    fn keyed_assert() -> DmlPreExpandKeyedAssert {
+        DmlPreExpandKeyedAssert {
+            key_column_name: "__nr_row_id".to_string(),
+            key_label: "_row_id".to_string(),
+            message_prefix: "MOR UPDATE matched target row".to_string(),
+        }
+    }
+
+    fn source_descriptor() -> crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor
+    {
+        crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor {
+            catalog_name: "default_catalog".to_string(),
+            db_id: 10,
+            table_id: 20,
+            schema_id: 30,
+            storage_columns: vec![
+                crate::sql::codegen::proto_encode::plan::StarRocksStorageColumnDescriptor {
+                    name: "__nr_row_id".to_string(),
+                    unique_id: 11,
+                    default_value: None,
+                },
+            ],
+            tablet_schema: crate::sql::codegen::proto_encode::plan::test_starrocks_tablet_schema_descriptor_for_column(30, "__nr_row_id", 11, None),
+        }
+    }
+
+    fn encoded_starrocks_scan(
+        node: &crate::proto::plan::DistributedNode,
+    ) -> Option<(i32, &crate::proto::plan::StarRocksTableSource)> {
+        let source = node
+            .payload
+            .as_ref()
+            .and_then(|payload| match payload {
+                crate::proto::plan::distributed_node::Payload::Physical(physical) => {
+                    physical.kind.as_ref()
+                }
+                _ => None,
+            })
+            .and_then(|kind| match kind {
+                crate::proto::plan::plan_node::Kind::Scan(scan) => scan.table.as_ref(),
+                _ => None,
+            })
+            .and_then(|table| table.source.as_ref())
+            .and_then(|source| source.kind.as_ref())
+            .and_then(|kind| match kind {
+                crate::proto::plan::scan_source::Kind::StarrocksTable(source) => Some(source),
+                _ => None,
+            });
+        if let Some(source) = source {
+            return Some((node.node_id, source));
+        }
+        node.children.iter().find_map(encoded_starrocks_scan)
+    }
+
+    #[test]
+    fn keyed_assert_remaps_native_starrocks_source_before_sidecar_encoding() {
+        let mut plan = starrocks_scan_change_event_plan();
+        let descriptor = source_descriptor();
+        let mut sources = BTreeMap::from([(7, descriptor.clone())]);
+
+        inject_dml_pre_expand_keyed_assert_into_native_plan_with_scan_sources(
+            &mut plan,
+            &keyed_assert(),
+            &mut sources,
+        )
+        .expect("inject keyed assert and remap native StarRocks scan source");
+
+        let scan_node_id = plan.fragments[0].root.children[0].children[0].node_id;
+        #[cfg(feature = "compat")]
+        assert_ne!(
+            scan_node_id, 7,
+            "compat renumber must change the scan node id"
+        );
+        #[cfg(not(feature = "compat"))]
+        assert_eq!(
+            scan_node_id, 7,
+            "proto-only mutation keeps existing node ids"
+        );
+        assert_eq!(sources.get(&scan_node_id), Some(&descriptor));
+
+        let sidecars =
+            crate::runtime::coordinator::prepare_native_plan_sidecars(&plan, None, &sources)
+                .expect("encode native sidecar after keyed-assert mutation");
+        let encoded_root = sidecars.fragments_by_id[&0]
+            .root
+            .as_ref()
+            .expect("encoded root");
+        let (encoded_scan_node_id, encoded_source) =
+            encoded_starrocks_scan(encoded_root).expect("encoded StarRocks scan source");
+        assert_eq!(encoded_scan_node_id, scan_node_id);
+        assert_eq!(encoded_source.catalog_name, descriptor.catalog_name);
+        assert_eq!(encoded_source.db_id, descriptor.db_id);
+        assert_eq!(encoded_source.table_id, descriptor.table_id);
+        assert_eq!(encoded_source.schema_id, descriptor.schema_id);
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn native_starrocks_source_remap_rejects_unknown_node_id() {
+        let mut sources = BTreeMap::from([(7, source_descriptor())]);
+        let original_sources = sources.clone();
+        let node_id_map = HashMap::from([(20, 1)]);
+
+        let err = remap_native_starrocks_scan_sources(&mut sources, &node_id_map)
+            .expect_err("source keyed by an unknown node id must fail");
+
+        assert!(err.contains("unknown native node id 7"), "{err}");
+        assert_eq!(
+            sources, original_sources,
+            "failed remap must preserve the source carrier"
+        );
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn native_starrocks_source_remap_rejects_duplicate_target_node_id() {
+        let descriptor = source_descriptor();
+        let mut sources = BTreeMap::from([(7, descriptor.clone()), (8, descriptor)]);
+        let original_sources = sources.clone();
+        let node_id_map = HashMap::from([(7, 1), (8, 1)]);
+
+        let err = remap_native_starrocks_scan_sources(&mut sources, &node_id_map)
+            .expect_err("multiple sources remapped to one node id must fail");
+
+        assert!(
+            err.contains("multiple native StarRocks scan sources to node id 1"),
+            "{err}"
+        );
+        assert_eq!(
+            sources, original_sources,
+            "failed remap must preserve the source carrier"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "compat"))]
@@ -1562,6 +1870,7 @@ mod tests {
         crate::sql::codegen::MultiFragmentBuildResult {
             fragment_results,
             fragment_schedules,
+            native_starrocks_scan_sources: std::collections::BTreeMap::new(),
             root_fragment_id: 0,
             edges: Vec::new(),
             lowered_edges: Vec::new(),

@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(feature = "compat")]
+use std::collections::HashSet;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use arrow::datatypes::DataType;
@@ -49,7 +51,8 @@ pub(crate) fn lower_distributed_plan(
 
     let mut refreshed = refresh_distributed_plan_for_native_sidecar(dp, mv_refresh_ctx)?;
     lower_native_cte_multicast_edge_output_slot_ids(&mut refreshed)?;
-    let native_scan_ranges = build_native_scan_ranges(&refreshed, connectors, mv_refresh_ctx)?;
+    let native_scan_planning = build_native_scan_ranges(&refreshed, connectors, mv_refresh_ctx)?;
+    let native_scan_ranges = &native_scan_planning.scan_ranges;
 
     let mut fragment_results = Vec::with_capacity(refreshed.fragments.len());
     let mut fragment_schedules = Vec::with_capacity(refreshed.fragments.len());
@@ -103,6 +106,7 @@ pub(crate) fn lower_distributed_plan(
     Ok(MultiFragmentBuildResult {
         fragment_results,
         fragment_schedules,
+        native_starrocks_scan_sources: native_scan_planning.starrocks_scan_sources,
         root_fragment_id: refreshed.root_fragment_id,
         edges: refreshed.edges.clone(),
         boundary_schemas,
@@ -432,12 +436,20 @@ fn reorder_refresh_table_columns_by_projected_names(
     Ok(())
 }
 
+#[derive(Clone, Debug, Default)]
+struct NativeScanPlanningResult {
+    scan_ranges: BTreeMap<FragmentId, BTreeMap<i32, Vec<scan_range::ScanRangeParams>>>,
+    starrocks_scan_sources:
+        BTreeMap<i32, crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor>,
+}
+
 fn build_native_scan_ranges(
     dp: &DistributedPlan,
     connectors: &crate::connector::ConnectorRegistry,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
-) -> Result<BTreeMap<FragmentId, BTreeMap<i32, Vec<scan_range::ScanRangeParams>>>, String> {
+) -> Result<NativeScanPlanningResult, String> {
     let mut out = BTreeMap::new();
+    let mut starrocks_scan_sources = BTreeMap::new();
     for fragment in &dp.fragments {
         let mut per_node = BTreeMap::new();
         collect_native_scan_ranges(
@@ -446,10 +458,14 @@ fn build_native_scan_ranges(
             connectors,
             mv_refresh_ctx,
             &mut per_node,
+            &mut starrocks_scan_sources,
         )?;
         out.insert(fragment.fragment_id, per_node);
     }
-    Ok(out)
+    Ok(NativeScanPlanningResult {
+        scan_ranges: out,
+        starrocks_scan_sources,
+    })
 }
 
 fn collect_native_scan_ranges(
@@ -458,14 +474,36 @@ fn collect_native_scan_ranges(
     connectors: &crate::connector::ConnectorRegistry,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
     out: &mut BTreeMap<i32, Vec<scan_range::ScanRangeParams>>,
+    starrocks_scan_sources: &mut BTreeMap<
+        i32,
+        crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor,
+    >,
 ) -> Result<(), String> {
     if let DistributedNodeKind::Scan(scan) = &node.payload {
-        let ranges = native_scan_ranges_for_scan(node.node_id, scan, connectors, mv_refresh_ctx)?;
+        let (ranges, starrocks_source) =
+            native_scan_ranges_for_scan(node.node_id, scan, connectors, mv_refresh_ctx)?;
         out.insert(node.node_id, ranges);
+        if let Some(source) = starrocks_source
+            && starrocks_scan_sources
+                .insert(node.node_id, source)
+                .is_some()
+        {
+            return Err(format!(
+                "native scan planning duplicate StarRocks scan node_id={}",
+                node.node_id
+            ));
+        }
     }
     for child in &node.children {
         if child.fragment_id == fragment_id {
-            collect_native_scan_ranges(fragment_id, child, connectors, mv_refresh_ctx, out)?;
+            collect_native_scan_ranges(
+                fragment_id,
+                child,
+                connectors,
+                mv_refresh_ctx,
+                out,
+                starrocks_scan_sources,
+            )?;
         }
     }
     Ok(())
@@ -476,17 +514,32 @@ fn native_scan_ranges_for_scan(
     scan: &PlanScanNode,
     connectors: &crate::connector::ConnectorRegistry,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
-) -> Result<Vec<scan_range::ScanRangeParams>, String> {
+) -> Result<
+    (
+        Vec<scan_range::ScanRangeParams>,
+        Option<crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor>,
+    ),
+    String,
+> {
     match &scan.table.source {
         ScanSource::StarRocks { .. } => {
-            Err("StarRocks scan ranges require feature compat".to_string())
+            #[cfg(feature = "compat")]
+            {
+                let planned = plan_starrocks_scan_node(scan_node_id, scan, connectors)?;
+                Ok((planned.ranges, Some(planned.source)))
+            }
+            #[cfg(not(feature = "compat"))]
+            {
+                Err("StarRocks native scan planning requires feature compat".to_string())
+            }
         }
         ScanSource::IcebergDataFiles { .. } => {
             build_iceberg_scan_ranges_from_source(scan_node_id, scan, &scan.table.source, None)
                 .and_then(|handle| plan_iceberg_scan_ranges(connectors, scan_node_id, scan, handle))
+                .map(|ranges| (ranges, None))
         }
         ScanSource::IcebergMetadataTable { .. } | ScanSource::IcebergDeltaTable { .. } => {
-            Ok(vec![build_iceberg_metadata_scan_range_params()])
+            Ok((vec![build_iceberg_metadata_scan_range_params()], None))
         }
         ScanSource::IcebergVersionTable { table, snapshot_id } => {
             let refresh_ctx = mv_refresh_ctx
@@ -494,6 +547,7 @@ fn native_scan_ranges_for_scan(
             let source = refresh_ctx.version_scan_source(table, *snapshot_id)?;
             let handle = build_iceberg_scan_ranges_from_source(scan_node_id, scan, &source, None)?;
             plan_iceberg_scan_ranges(connectors, scan_node_id, scan, handle)
+                .map(|ranges| (ranges, None))
         }
         ScanSource::IcebergMvTargetState(target_scan) => {
             let refresh_ctx = mv_refresh_ctx.ok_or_else(|| {
@@ -508,6 +562,7 @@ fn native_scan_ranges_for_scan(
                 Some(projected_target_state_column_names(target_scan)),
             )?;
             plan_iceberg_scan_ranges(connectors, scan_node_id, scan, handle)
+                .map(|ranges| (ranges, None))
         }
         ScanSource::IcebergMvTargetLocator(target_scan) => {
             let refresh_ctx = mv_refresh_ctx.ok_or_else(|| {
@@ -522,8 +577,100 @@ fn native_scan_ranges_for_scan(
                 Some(projected_target_locator_column_names(target_scan)),
             )?;
             plan_iceberg_scan_ranges(connectors, scan_node_id, scan, handle)
+                .map(|ranges| (ranges, None))
         }
     }
+}
+
+#[cfg(feature = "compat")]
+#[derive(Clone, Debug)]
+struct PlannedNativeStarRocksScan {
+    ranges: Vec<scan_range::ScanRangeParams>,
+    source: crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor,
+}
+
+#[cfg(feature = "compat")]
+fn plan_starrocks_scan_node(
+    scan_node_id: i32,
+    scan: &PlanScanNode,
+    connectors: &crate::connector::ConnectorRegistry,
+) -> Result<PlannedNativeStarRocksScan, String> {
+    use crate::connector::starrocks::table::scan_planner::{
+        StarRocksTableScanPlanner, starrocks_scan_handle, starrocks_split,
+    };
+
+    let ScanSource::StarRocks { db_id, table_id } = &scan.table.source else {
+        return Err(format!(
+            "native StarRocks scan planning node_id={scan_node_id} received non-StarRocks source"
+        ));
+    };
+    for (field, value) in [("db_id", *db_id), ("table_id", *table_id)] {
+        if value <= 0 {
+            return Err(format!(
+                "StarRocks ScanNode node_id={scan_node_id} {field} must be positive, got {value}"
+            ));
+        }
+    }
+    let planner = connectors.scan_planner("starrocks")?;
+    let table_handle = StarRocksTableScanPlanner::table_handle_from_source(
+        &scan.database,
+        &scan.table.name,
+        *db_id,
+        *table_id,
+    );
+    let scan_handle = planner.begin_scan(table_handle, BeginScanContext::default())?;
+    let handle = starrocks_scan_handle(&scan_handle)?;
+    if handle.table.db_id != *db_id || handle.table.table_id != *table_id {
+        return Err(format!(
+            "StarRocks ScanNode node_id={scan_node_id} planned scan handle identity mismatch: source=({db_id}, {table_id}) handle=({}, {})",
+            handle.table.db_id, handle.table.table_id
+        ));
+    }
+    let native_source = handle.native_source();
+    let source = crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor {
+        catalog_name: native_source.catalog_name,
+        db_id: native_source.db_id,
+        table_id: native_source.table_id,
+        schema_id: native_source.schema_id,
+        storage_columns: native_source
+            .storage_columns
+            .into_iter()
+            .map(|column| {
+                crate::sql::codegen::proto_encode::plan::StarRocksStorageColumnDescriptor {
+                    name: column.name,
+                    unique_id: column.unique_id,
+                    default_value: column.default_value,
+                }
+            })
+            .collect(),
+        tablet_schema: crate::sql::codegen::proto_encode::plan::starrocks_tablet_schema_descriptor(
+            native_source.tablet_schema,
+        ),
+    };
+    let splits = planner.plan_splits(&scan_handle, SplitPlanningContext::default())?;
+    if splits.is_empty() {
+        return Err(format!(
+            "StarRocks table {}.{} has no selected tablet splits",
+            scan.database, scan.table.name
+        ));
+    }
+    let mut tablets = HashSet::new();
+    let mut ranges = Vec::with_capacity(splits.len());
+    for split in &splits {
+        let split = starrocks_split(split)?;
+        if !tablets.insert(split.tablet_id) {
+            return Err(format!(
+                "StarRocks ScanNode node_id={scan_node_id} has duplicate tablet_id={}",
+                split.tablet_id
+            ));
+        }
+        ranges.push(scan_range::ScanRangeParams::starrocks_tablet(
+            split.tablet_id,
+            split.partition_id,
+            split.version,
+        )?);
+    }
+    Ok(PlannedNativeStarRocksScan { ranges, source })
 }
 
 fn build_iceberg_scan_ranges_from_source(
@@ -889,6 +1036,7 @@ fn collect_runtime_filter_builds(
 }
 
 fn validate_distributed_plan(dp: &DistributedPlan) -> Result<(), String> {
+    super::validate_global_node_ids(dp)?;
     if dp.fragments.is_empty() {
         return Err("lower_distributed_plan requires at least one fragment".to_string());
     }

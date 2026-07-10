@@ -47,3 +47,5 @@ pub(crate) use catalog::{
 };
 pub(crate) use config::StarRocksTableConfig;
 pub(crate) use scan_planner::StarRocksTableScanPlanner;
+
+pub(crate) const INTERNAL_CATALOG_NAME: &str = "default_catalog";

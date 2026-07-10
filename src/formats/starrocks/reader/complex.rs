@@ -41,6 +41,9 @@ use super::column_decode::decode_column_values_by_total_rows;
 use super::column_state::{OutputColumnData, OutputColumnKind};
 use super::constants::{LOGICAL_TYPE_INT, LOGICAL_TYPE_TINYINT};
 use super::page::DecodedPageValuePayload;
+use super::record_batch::{
+    cast_signed_integer_widening_to_output, segment_physical_decode_data_type,
+};
 use super::schema_map::{
     decimal_output_meta_from_arrow_type, expected_logical_type_from_schema_type,
     is_char_schema_type,
@@ -76,16 +79,30 @@ fn decode_column_array_inner(
     output_name: &str,
     expected_rows: usize,
 ) -> Result<ArrayRef, String> {
-    if let Some(kind) = OutputColumnKind::from_arrow_type(output_data_type) {
-        return decode_scalar_array(
+    if OutputColumnKind::from_arrow_type(output_data_type).is_some() {
+        let physical_data_type =
+            segment_physical_decode_data_type(schema, output_data_type, segment_path, output_name)?;
+        let physical_kind = OutputColumnKind::from_arrow_type(&physical_data_type).ok_or_else(|| {
+            format!(
+                "unsupported physical scalar output type in native starrocks reader: segment={}, output_column={}, physical_type={:?}, output_type={:?}",
+                segment_path, output_name, physical_data_type, output_data_type
+            )
+        })?;
+        let physical_array = decode_scalar_array(
             segment_path,
             segment_bytes,
             column_meta,
             schema,
-            kind,
-            output_data_type,
+            physical_kind,
+            &physical_data_type,
             output_name,
             expected_rows,
+        )?;
+        return cast_signed_integer_widening_to_output(
+            physical_array,
+            output_data_type,
+            segment_path,
+            output_name,
         );
     }
 

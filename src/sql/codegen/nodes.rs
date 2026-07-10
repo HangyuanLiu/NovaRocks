@@ -25,9 +25,9 @@ use crate::lower::compat::expr::parse_min_max_conjuncts_with_column_resolver;
 use crate::runtime::fragment_exec_params::FragmentExecParams;
 #[cfg(feature = "compat")]
 use crate::runtime::fragment_exec_params::compat_exec_params_from_parts;
-#[cfg(feature = "compat")]
-use crate::sql::codegen::connector_scan_wire::to_thrift_scan;
 use crate::sql::codegen::connector_scan_wire::{ThriftScanContext, to_native_file_scan};
+#[cfg(feature = "compat")]
+use crate::sql::codegen::connector_scan_wire::{to_native_starrocks_scan, to_thrift_scan};
 use crate::thrift::exprs;
 #[cfg(feature = "compat")]
 use crate::thrift::internal_service;
@@ -639,6 +639,9 @@ pub(crate) fn build_exec_params_multi_with_refresh_context(
 pub(crate) struct ScanRangeBuildResult {
     pub(crate) fragment_exec_params: FragmentExecParams,
     #[cfg(feature = "compat")]
+    starrocks_scan_sources:
+        BTreeMap<i32, crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor>,
+    #[cfg(feature = "compat")]
     compat_scan_ranges: BTreeMap<i32, Vec<internal_service::TScanRangeParams>>,
 }
 
@@ -647,6 +650,14 @@ impl ScanRangeBuildResult {
         &self,
     ) -> &BTreeMap<i32, Vec<crate::runtime::scan_range::ScanRangeParams>> {
         self.fragment_exec_params.per_node_scan_ranges()
+    }
+
+    #[cfg(feature = "compat")]
+    pub(crate) fn starrocks_scan_sources(
+        &self,
+    ) -> &BTreeMap<i32, crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor>
+    {
+        &self.starrocks_scan_sources
     }
 
     #[cfg(feature = "compat")]
@@ -671,6 +682,8 @@ pub(crate) fn build_scan_ranges_multi_with_refresh_context(
     #[cfg(feature = "compat")]
     let mut per_node_scan_ranges = BTreeMap::new();
     let mut native_scan_ranges = BTreeMap::new();
+    #[cfg(feature = "compat")]
+    let mut starrocks_scan_sources = BTreeMap::new();
 
     for planned in scan_tables {
         let scan_node_id = planned.scan_node_id;
@@ -682,15 +695,31 @@ pub(crate) fn build_scan_ranges_multi_with_refresh_context(
             #[cfg(feature = "compat")]
             {
                 let planner = connectors.scan_planner("starrocks")?;
-                let ranges =
-                    build_starrocks_scan_ranges_from_planned_scan(planner.as_ref(), planned)?;
-                if ranges.is_empty() {
+                let planned_scan = resolved.planned_scan.as_ref().ok_or_else(|| {
+                    format!(
+                        "StarRocks table {}.{} reached scan-range builder without planned connector scan",
+                        resolved.database, resolved.table.name
+                    )
+                })?;
+                let native = to_native_starrocks_scan(&planned_scan.scan, &planned_scan.splits)?;
+                if native.scan_ranges.is_empty() {
                     return Err(format!(
                         "StarRocks table {}.{} has no selected tablet splits",
                         resolved.database, resolved.table.name
                     ));
                 }
+                let ranges =
+                    build_starrocks_scan_ranges_from_planned_scan(planner.as_ref(), planned)?;
                 per_node_scan_ranges.insert(scan_node_id, ranges);
+                native_scan_ranges.insert(scan_node_id, native.scan_ranges);
+                if starrocks_scan_sources
+                    .insert(scan_node_id, native.source)
+                    .is_some()
+                {
+                    return Err(format!(
+                        "duplicate StarRocks scan node_id={scan_node_id} while building native source descriptors"
+                    ));
+                }
                 continue;
             }
             #[cfg(not(feature = "compat"))]
@@ -807,6 +836,8 @@ pub(crate) fn build_scan_ranges_multi_with_refresh_context(
 
     Ok(ScanRangeBuildResult {
         fragment_exec_params,
+        #[cfg(feature = "compat")]
+        starrocks_scan_sources,
         #[cfg(feature = "compat")]
         compat_scan_ranges: per_node_scan_ranges,
     })
@@ -1264,7 +1295,9 @@ mod tests {
             None,
         )
         .expect("native scan range");
-        let crate::runtime::scan_range::ScanRange::File(file) = native.range;
+        let crate::runtime::scan_range::ScanRange::File(file) = native.range else {
+            panic!("expected native file scan range");
+        };
         assert_eq!(
             file.ivm_change_op,
             Some(crate::exec::change_op::CHANGE_OP_DELETE)
@@ -1609,6 +1642,14 @@ mod compat_tests {
                         table_id: 20,
                     },
                     schema_id: 30,
+                    storage_columns: vec![
+                        crate::connector::starrocks::table::scan_planner::StarRocksStorageColumn {
+                            name: "id".to_string(),
+                            unique_id: 0,
+                            default_value: None,
+                        },
+                    ],
+                    tablet_schema: crate::connector::starrocks::table::scan_planner::test_native_tablet_schema_for_column(30, "id", 0, None),
                 },
             ),
             splits: vec![Split::new(
@@ -1706,6 +1747,14 @@ mod compat_tests {
                         table_id: 20,
                     },
                     schema_id: 30,
+                    storage_columns: vec![
+                        crate::connector::starrocks::table::scan_planner::StarRocksStorageColumn {
+                            name: "id".to_string(),
+                            unique_id: 0,
+                            default_value: None,
+                        },
+                    ],
+                    tablet_schema: crate::connector::starrocks::table::scan_planner::test_native_tablet_schema_for_column(30, "id", 0, None),
                 },
             ),
             splits: vec![Split::new(
@@ -1747,6 +1796,26 @@ mod compat_tests {
         assert_eq!(internal.catalog_name.as_deref(), Some("default_catalog"));
         assert_eq!(internal.db_name, "analytics");
         assert_eq!(internal.table_name.as_deref(), Some("orders"));
+
+        let build =
+            super::build_scan_ranges_multi_with_refresh_context(&registry, &[planned], None)
+                .expect("build compat and native StarRocks scan ranges from one planned scan");
+        let native = &build.native_scan_ranges()[&3];
+        assert_eq!(native.len(), 1);
+        let crate::runtime::scan_range::ScanRange::StarRocksTablet(native) = &native[0].range
+        else {
+            panic!("expected native StarRocks tablet range");
+        };
+        assert_eq!(
+            (native.tablet_id, native.partition_id, native.version),
+            (300, 100, 7)
+        );
+        let source = &build.starrocks_scan_sources()[&3];
+        assert_eq!(
+            (source.db_id, source.table_id, source.schema_id),
+            (10, 20, 30)
+        );
+        assert_eq!(source.storage_columns[0].unique_id, 0);
     }
 
     #[test]

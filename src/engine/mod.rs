@@ -2758,7 +2758,9 @@ fn explain_analyze_query(
         crate::engine::query_options_wire::standalone_query_options_to_runtime(&query_opts);
     let native_dp = refresh_native_sidecar_plan_with_lowered_edges(&dp, &build_result.edges, None)?;
     let native_sidecars = Some(crate::runtime::coordinator::prepare_native_plan_sidecars(
-        &native_dp, None,
+        &native_dp,
+        None,
+        &build_result.native_starrocks_scan_sources,
     )?);
     let outcome =
         crate::runtime::coordinator::ExecutionCoordinator::new_with_optional_native_plan_sidecars(
@@ -3150,7 +3152,9 @@ pub(crate) fn execute_query_as_iceberg_write(
     let (dispatcher, scheduler) = coordinated_execution_services()?;
     let native_dp = refresh_native_sidecar_plan_with_lowered_edges(&dp, &build_result.edges, None)?;
     let native_sidecars = Some(crate::runtime::coordinator::prepare_native_plan_sidecars(
-        &native_dp, None,
+        &native_dp,
+        None,
+        &build_result.native_starrocks_scan_sources,
     )?);
     crate::runtime::coordinator::ExecutionCoordinator::new_with_optional_native_plan_sidecars(
         build_result,
@@ -3284,7 +3288,14 @@ pub(crate) struct PlannedIcebergChangeStreamWrite {
 }
 
 type ChangeStreamNativePlanMutation<'a> = Box<
-    dyn FnOnce(&mut crate::sql::planner::distributed::DistributedPlan) -> Result<(), String> + 'a,
+    dyn FnOnce(
+            &mut crate::sql::planner::distributed::DistributedPlan,
+            &mut std::collections::BTreeMap<
+                i32,
+                crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor,
+            >,
+        ) -> Result<(), String>
+        + 'a,
 >;
 
 #[allow(clippy::too_many_arguments)]
@@ -3340,7 +3351,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_native_pla
         )?;
     let distributed_plan = planned_dp.distributed_plan;
     let topology = planned_dp.topology;
-    let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
+    let mut build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
         crate::sql::codegen::FragmentBuildRequest::result(
             &distributed_plan,
             &catalog_snapshot,
@@ -3355,11 +3366,15 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_native_pla
         )?;
     native_distributed_plan.edges = build_result.edges.clone();
     if let Some(mutate_native_plan) = native_plan_mutation {
-        mutate_native_plan(&mut native_distributed_plan)?;
+        mutate_native_plan(
+            &mut native_distributed_plan,
+            &mut build_result.native_starrocks_scan_sources,
+        )?;
     }
     let native_sidecars = Some(crate::runtime::coordinator::prepare_native_plan_sidecars(
         &native_distributed_plan,
         mv_refresh_ctx,
+        &build_result.native_starrocks_scan_sources,
     )?);
     let commit_plan =
         crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan::from_topology(
@@ -3774,6 +3789,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     let native_sidecars = Some(crate::runtime::coordinator::prepare_native_plan_sidecars(
         &native_dp,
         mv_refresh_ctx,
+        &build_result.native_starrocks_scan_sources,
     )?);
     let (dispatcher, scheduler) = coordinated_execution_services()?;
     crate::runtime::coordinator::ExecutionCoordinator::new_with_optional_native_plan_sidecars(
@@ -3843,6 +3859,7 @@ pub(crate) fn execute_logical_plan_with_options(
     let native_sidecars = Some(crate::runtime::coordinator::prepare_native_plan_sidecars(
         &native_dp,
         mv_refresh_ctx,
+        &build_result.native_starrocks_scan_sources,
     )?);
     let (dispatcher, scheduler) = coordinated_execution_services()?;
     crate::runtime::coordinator::ExecutionCoordinator::new_with_optional_native_plan_sidecars(
@@ -5583,6 +5600,14 @@ mysql_port = 47892
                     StarRocksScanHandle {
                         table: inner,
                         schema_id: self.schema_id,
+                        storage_columns: vec![
+                            crate::connector::starrocks::table::scan_planner::StarRocksStorageColumn {
+                                name: "id".to_string(),
+                                unique_id: 1,
+                                default_value: None,
+                            },
+                        ],
+                        tablet_schema: crate::connector::starrocks::table::scan_planner::test_native_tablet_schema_for_column(self.schema_id, "id", 1, None),
                     },
                 ))
             }

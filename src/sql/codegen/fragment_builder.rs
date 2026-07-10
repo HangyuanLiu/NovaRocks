@@ -836,6 +836,14 @@ mod tests {
                 crate::connector::starrocks::table::scan_planner::StarRocksScanHandle {
                     table: inner,
                     schema_id: self.schema_id,
+                    storage_columns: vec![
+                        crate::connector::starrocks::table::scan_planner::StarRocksStorageColumn {
+                            name: "id".to_string(),
+                            unique_id: 1,
+                            default_value: None,
+                        },
+                    ],
+                    tablet_schema: crate::connector::starrocks::table::scan_planner::test_native_tablet_schema_for_column(self.schema_id, "id", 1, None),
                 },
             ))
         }
@@ -1852,6 +1860,9 @@ mod tests {
     ) -> &crate::runtime::scan_range::FileScanRange {
         match &range.range {
             crate::runtime::scan_range::ScanRange::File(file) => file,
+            crate::runtime::scan_range::ScanRange::StarRocksTablet(_) => {
+                panic!("expected native file scan range")
+            }
         }
     }
 

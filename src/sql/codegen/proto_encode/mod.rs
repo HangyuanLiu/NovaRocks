@@ -1551,7 +1551,121 @@ mod tests {
     }
 
     #[test]
-    fn native_plan_encoder_rejects_starrocks_scan_source() {
+    fn native_plan_encoder_maps_starrocks_scan_source_descriptor() {
+        use std::collections::BTreeMap;
+
+        let scan = crate::sql::planner::distributed::DistributedNode {
+            node_id: 7,
+            fragment_id: 0,
+            tuple_ids: Vec::new(),
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            stats: physical_stats(),
+            payload: crate::sql::planner::distributed::DistributedNodeKind::Scan(
+                crate::sql::planner::payload::PlanScanNode {
+                    database: "db".to_string(),
+                    table: crate::sql::catalog::TableDef {
+                        name: "sr_table".to_string(),
+                        columns: Vec::new(),
+                        iceberg_row_lineage_metadata_columns: Vec::new(),
+                        source: crate::sql::catalog::ScanSource::StarRocks {
+                            db_id: 1,
+                            table_id: 2,
+                        },
+                    },
+                    alias: None,
+                    columns: vec![planner_output_column(10, "id", DataType::Int64)],
+                    predicates: Vec::new(),
+                    required_columns: None,
+                    variant_columns: Vec::new(),
+                    mv_rewritten_from: None,
+                },
+            ),
+        };
+
+        let descriptors = BTreeMap::from([(
+            7,
+            plan::StarRocksScanSourceDescriptor {
+                catalog_name: "default_catalog".to_string(),
+                db_id: 1,
+                table_id: 2,
+                schema_id: 3,
+                storage_columns: vec![plan::StarRocksStorageColumnDescriptor {
+                    name: "id".to_string(),
+                    unique_id: 11,
+                    default_value: Some("42".to_string()),
+                }],
+                tablet_schema: plan::test_starrocks_tablet_schema_descriptor_for_column(
+                    3,
+                    "id",
+                    11,
+                    Some("42"),
+                ),
+            },
+        )]);
+
+        let encoded = plan::encode_node_with_context(
+            &scan,
+            &plan::NativePlanEncodeContext {
+                mv_refresh_ctx: None,
+                starrocks_scan_sources: Some(&descriptors),
+            },
+        )
+        .expect("encode StarRocks native scan source");
+        let Some(crate::proto::plan::distributed_node::Payload::Physical(physical)) =
+            encoded.payload.as_ref()
+        else {
+            panic!("expected physical node");
+        };
+        let Some(crate::proto::plan::plan_node::Kind::Scan(scan)) = physical.kind.as_ref() else {
+            panic!("expected scan node");
+        };
+        let source = scan
+            .table
+            .as_ref()
+            .and_then(|table| table.source.as_ref())
+            .and_then(|source| source.kind.as_ref())
+            .expect("StarRocks source");
+        let crate::proto::plan::scan_source::Kind::StarrocksTable(source) = source else {
+            panic!("expected StarRocks table source, got {source:?}");
+        };
+        assert_eq!(source.catalog_name, "default_catalog");
+        assert_eq!((source.db_id, source.table_id, source.schema_id), (1, 2, 3));
+        assert_eq!(source.storage_columns.len(), 1);
+        assert_eq!(source.storage_columns[0].name, "id");
+        assert_eq!(source.storage_columns[0].unique_id, 11);
+        assert_eq!(
+            source.storage_columns[0].default_value.as_deref(),
+            Some("42")
+        );
+        let current_schema = source
+            .current_schema
+            .as_ref()
+            .expect("full current tablet schema");
+        assert_eq!(current_schema.schema_id, 3);
+        assert_eq!(
+            current_schema.keys_type,
+            crate::proto::plan::StarRocksKeysType::StarrocksKeysTypeDuplicate as i32
+        );
+        assert_eq!(current_schema.sort_key_idxes, vec![0]);
+        assert_eq!(current_schema.sort_key_unique_ids, vec![11]);
+        assert_eq!(current_schema.columns.len(), 1);
+        assert_eq!(current_schema.columns[0].name.as_deref(), Some("id"));
+        assert_eq!(current_schema.columns[0].physical_type, "BIGINT");
+        assert_eq!(current_schema.columns[0].is_key, Some(true));
+        assert_eq!(current_schema.columns[0].nullable, Some(true));
+        assert_eq!(current_schema.columns[0].visible, Some(true));
+        assert_eq!(
+            current_schema.columns[0].default_value.as_deref(),
+            Some("42")
+        );
+    }
+
+    #[test]
+    fn native_plan_encoder_rejects_missing_or_mismatched_starrocks_descriptor() {
         let scan = crate::sql::planner::distributed::DistributedNode {
             node_id: 7,
             fragment_id: 0,
@@ -1584,10 +1698,130 @@ mod tests {
             ),
         };
 
-        let err = plan::encode_node(&scan).expect_err("StarRocks native scan must fail fast");
+        let err = plan::encode_node(&scan)
+            .expect_err("StarRocks scan without a builder descriptor must fail");
+        assert!(err.contains("missing native source descriptor"), "{err}");
 
-        assert!(err.contains("StarRocks"), "{err}");
-        assert!(err.contains("native"), "{err}");
+        let descriptors = std::collections::BTreeMap::from([(
+            7,
+            plan::StarRocksScanSourceDescriptor {
+                catalog_name: "default_catalog".to_string(),
+                db_id: 1,
+                table_id: 99,
+                schema_id: 3,
+                storage_columns: Vec::new(),
+                tablet_schema: plan::test_starrocks_tablet_schema_descriptor(3, &[]),
+            },
+        )]);
+        let err = plan::encode_node_with_context(
+            &scan,
+            &plan::NativePlanEncodeContext {
+                mv_refresh_ctx: None,
+                starrocks_scan_sources: Some(&descriptors),
+            },
+        )
+        .expect_err("mismatched builder descriptor must fail");
+        assert!(err.contains("identity mismatch"), "{err}");
+    }
+
+    #[test]
+    fn native_plan_encoder_rejects_invalid_starrocks_source_fields() {
+        let scan = crate::sql::planner::distributed::DistributedNode {
+            node_id: 7,
+            fragment_id: 0,
+            tuple_ids: Vec::new(),
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            stats: physical_stats(),
+            payload: crate::sql::planner::distributed::DistributedNodeKind::Scan(
+                crate::sql::planner::payload::PlanScanNode {
+                    database: "db".to_string(),
+                    table: crate::sql::catalog::TableDef {
+                        name: "sr_table".to_string(),
+                        columns: Vec::new(),
+                        iceberg_row_lineage_metadata_columns: Vec::new(),
+                        source: crate::sql::catalog::ScanSource::StarRocks {
+                            db_id: 1,
+                            table_id: 2,
+                        },
+                    },
+                    alias: None,
+                    columns: Vec::new(),
+                    predicates: Vec::new(),
+                    required_columns: None,
+                    variant_columns: Vec::new(),
+                    mv_rewritten_from: None,
+                },
+            ),
+        };
+        let valid_column = plan::StarRocksStorageColumnDescriptor {
+            name: "id".to_string(),
+            unique_id: 11,
+            default_value: None,
+        };
+        let invalid = [
+            (
+                plan::StarRocksScanSourceDescriptor {
+                    catalog_name: String::new(),
+                    db_id: 1,
+                    table_id: 2,
+                    schema_id: 3,
+                    storage_columns: vec![valid_column.clone()],
+                    tablet_schema: plan::test_starrocks_tablet_schema_descriptor_for_column(
+                        3, "id", 11, None,
+                    ),
+                },
+                "catalog_name",
+            ),
+            (
+                plan::StarRocksScanSourceDescriptor {
+                    catalog_name: "default_catalog".to_string(),
+                    db_id: 1,
+                    table_id: 2,
+                    schema_id: 0,
+                    storage_columns: vec![valid_column.clone()],
+                    tablet_schema: plan::test_starrocks_tablet_schema_descriptor_for_column(
+                        0, "id", 11, None,
+                    ),
+                },
+                "schema_id must be positive",
+            ),
+            (
+                plan::StarRocksScanSourceDescriptor {
+                    catalog_name: "default_catalog".to_string(),
+                    db_id: 1,
+                    table_id: 2,
+                    schema_id: 3,
+                    storage_columns: vec![
+                        valid_column.clone(),
+                        plan::StarRocksStorageColumnDescriptor {
+                            name: "flag".to_string(),
+                            unique_id: 11,
+                            default_value: None,
+                        },
+                    ],
+                    tablet_schema: plan::test_starrocks_tablet_schema_descriptor_for_column(
+                        3, "id", 11, None,
+                    ),
+                },
+                "duplicate unique_id 11",
+            ),
+        ];
+        for (descriptor, expected) in invalid {
+            let descriptors = std::collections::BTreeMap::from([(7, descriptor)]);
+            let err = plan::encode_node_with_context(
+                &scan,
+                &plan::NativePlanEncodeContext {
+                    mv_refresh_ctx: None,
+                    starrocks_scan_sources: Some(&descriptors),
+                },
+            )
+            .expect_err("invalid StarRocks source must fail");
+            assert!(err.contains(expected), "{err}");
+        }
     }
 
     #[test]
@@ -1742,7 +1976,10 @@ mod tests {
             .range
             .as_ref()
             .and_then(|range| range.kind.as_ref())
-            .expect("scan range kind");
+            .expect("scan range kind")
+        else {
+            panic!("expected native file scan range");
+        };
         assert_eq!(file.file_format, "PARQUET");
         assert_eq!(file.full_path.as_deref(), Some("s3://bucket/data.parquet"));
         assert_eq!(file.included_positions, vec![3, 5, 8]);
@@ -1780,5 +2017,54 @@ mod tests {
         assert_eq!(opts.datacache_sharing_work_period, 10);
         assert_eq!(opts.enable_join_runtime_bitset_filter, Some(false));
         assert_eq!(opts.global_runtime_filter_build_max_size, 1 << 19);
+    }
+
+    #[test]
+    fn instance_params_encoder_maps_starrocks_tablet_range() {
+        use std::collections::BTreeMap;
+
+        let placement = crate::runtime::scheduler::FragmentInstancePlacement {
+            fragment_id: 0,
+            instance_index: 0,
+            finst_id: crate::common::types::UniqueId { hi: 1, lo: 2 },
+            backend_idx: 0,
+            endpoint: crate::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 8060)
+                .expect("endpoint"),
+            scan_ranges: BTreeMap::from([(
+                11,
+                vec![
+                    crate::runtime::scan_range::ScanRangeParams::starrocks_tablet(300, 100, 7)
+                        .expect("StarRocks tablet range"),
+                ],
+            )]),
+            destinations: Vec::new(),
+            runtime_filter_prober_params: BTreeMap::new(),
+            per_exch_num_senders: BTreeMap::new(),
+        };
+
+        let encoded = instance::encode_instance_params(
+            &crate::common::types::UniqueId { hi: 100, lo: 200 },
+            &placement,
+            None,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            1024,
+            0,
+            None,
+            false,
+        )
+        .expect("encode instance params");
+        let range = encoded.per_node_scan_ranges[&11].ranges[0]
+            .range
+            .as_ref()
+            .and_then(|range| range.kind.as_ref())
+            .expect("range kind");
+        let crate::proto::novarocks::scan_range::Kind::StarrocksTablet(range) = range else {
+            panic!("expected StarRocks tablet range, got {range:?}");
+        };
+        assert_eq!(
+            (range.tablet_id, range.partition_id, range.version),
+            (300, 100, 7)
+        );
     }
 }

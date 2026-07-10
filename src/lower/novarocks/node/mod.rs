@@ -43,6 +43,7 @@ use std::sync::Arc;
 use self::common::*;
 
 use super::layout::Layout;
+use crate::common::types::UniqueId;
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::limit::LimitNode;
@@ -64,6 +65,7 @@ pub(crate) struct NodeLoweringContext {
     scan_ranges: HashMap<i32, Vec<novarocks::ScanRangeParams>>,
     query_options: Option<QueryOptions>,
     connectors: Option<Arc<crate::connector::ConnectorRegistry>>,
+    query_id: Option<UniqueId>,
     fragment_instance_hi: i64,
     fragment_instance_lo: i64,
 }
@@ -107,6 +109,12 @@ impl NodeLoweringContext {
         self
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn with_query_id(mut self, query_id: UniqueId) -> Self {
+        self.query_id = Some(query_id);
+        self
+    }
+
     pub(crate) fn scan_ranges(
         &self,
         node_id: i32,
@@ -119,6 +127,11 @@ impl NodeLoweringContext {
 
     pub(crate) fn query_options(&self) -> Option<&QueryOptions> {
         self.query_options.as_ref()
+    }
+
+    #[cfg(feature = "compat")]
+    pub(crate) fn query_id(&self) -> Option<UniqueId> {
+        self.query_id
     }
 
     pub(crate) fn connectors(&self) -> Result<&crate::connector::ConnectorRegistry, String> {

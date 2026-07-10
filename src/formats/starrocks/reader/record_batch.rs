@@ -38,7 +38,7 @@ use arrow::array::{
     Int16Builder, Int32Array, Int32Builder, Int64Array, Int64Builder, StringArray, StringBuilder,
     TimestampMicrosecondArray, UInt32Array, new_empty_array, new_null_array,
 };
-use arrow::compute::{concat, take};
+use arrow::compute::{cast, concat, take};
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
@@ -52,7 +52,8 @@ use crate::connector::{MinMaxPredicate, MinMaxPredicateValue};
 use crate::formats::starrocks::plan::{
     StarRocksDeletePredicateOpPlan, StarRocksFlatJsonProjectionPlan, StarRocksNativeColumnPlan,
     StarRocksNativeReadPlan, StarRocksNativeSchemaColumnPlan, StarRocksNativeSegmentPlan,
-    StarRocksTableModelPlan,
+    StarRocksTableModelPlan, delete_predicate_applies_to_segment,
+    validate_same_type_or_signed_integer_widening,
 };
 use crate::formats::starrocks::segment::{
     StarRocksSegmentColumnMeta, StarRocksSegmentFooter, StarRocksZoneMapMeta,
@@ -360,12 +361,18 @@ pub(super) fn build_dup_record_batch(
                         segment_rows,
                     )?
                 } else {
+                    let physical_decode_type = segment_physical_decode_data_type(
+                        segment_schema,
+                        output_field.data_type(),
+                        &segment.path,
+                        &projected.output_name,
+                    )?;
                     decode_column_array_for_selected_rows(
                         &segment.path,
                         &segment_bytes,
                         column_meta,
                         segment_schema,
-                        output_field.data_type(),
+                        &physical_decode_type,
                         &projected.output_name,
                         &selected_ranges,
                         full_segment_selected,
@@ -402,6 +409,12 @@ pub(super) fn build_dup_record_batch(
                     projected.output_name
                 ));
             };
+            array = cast_signed_integer_widening_to_output(
+                array,
+                output_field.data_type(),
+                &segment.path,
+                &projected.output_name,
+            )?;
             per_output_segment_arrays[projected.output_index].push(array);
         }
     }
@@ -450,6 +463,67 @@ pub(super) fn build_dup_record_batch(
 
     RecordBatch::try_new(output_schema.clone(), arrays)
         .map_err(|e| format!("build native starrocks record batch failed: {e}"))
+}
+
+pub(super) fn segment_physical_decode_data_type(
+    segment_schema: &StarRocksNativeSchemaColumnPlan,
+    output_data_type: &DataType,
+    segment_path: &str,
+    output_name: &str,
+) -> Result<DataType, String> {
+    let physical_data_type = match segment_schema
+        .schema_type
+        .trim()
+        .to_ascii_uppercase()
+        .as_str()
+    {
+        "TINYINT" => DataType::Int8,
+        "SMALLINT" => DataType::Int16,
+        "INT" => DataType::Int32,
+        "BIGINT" => DataType::Int64,
+        _ => return Ok(output_data_type.clone()),
+    };
+    validate_same_type_or_signed_integer_widening(&physical_data_type, output_data_type).map_err(
+        |_| {
+            format!(
+                "unsupported StarRocks schema evolution in native segment reader: segment={}, output_column={}, physical_type={:?}, output_type={:?}; supported=same type or signed integer widening",
+                segment_path, output_name, physical_data_type, output_data_type
+            )
+        },
+    )?;
+    Ok(physical_data_type)
+}
+
+pub(super) fn cast_signed_integer_widening_to_output(
+    array: ArrayRef,
+    output_data_type: &DataType,
+    segment_path: &str,
+    output_name: &str,
+) -> Result<ArrayRef, String> {
+    if array.data_type() == output_data_type {
+        return Ok(array);
+    }
+    validate_same_type_or_signed_integer_widening(array.data_type(), output_data_type).map_err(
+        |_| {
+            format!(
+                "unsupported StarRocks schema evolution after native segment decode: segment={}, output_column={}, physical_type={:?}, output_type={:?}; supported=same type or signed integer widening",
+                segment_path,
+                output_name,
+                array.data_type(),
+                output_data_type
+            )
+        },
+    )?;
+    cast(array.as_ref(), output_data_type).map_err(|e| {
+        format!(
+            "cast widened native segment column failed: segment={}, output_column={}, physical_type={:?}, output_type={:?}, error={}",
+            segment_path,
+            output_name,
+            array.data_type(),
+            output_data_type,
+            e
+        )
+    })
 }
 
 fn build_missing_projected_array(
@@ -1173,7 +1247,7 @@ fn build_delete_keep_mask_for_segment(
     let applicable = plan
         .delete_predicates
         .iter()
-        .filter(|pred| pred.version >= segment.rowset_version)
+        .filter(|pred| delete_predicate_applies_to_segment(pred.version, segment.rowset_version))
         .collect::<Vec<_>>();
     if applicable.is_empty() {
         return Ok(None);
@@ -1198,28 +1272,38 @@ fn build_delete_keep_mask_for_segment(
                     )
                 })?;
             let output_data_type = delete_predicate_output_data_type(term)?;
-            let schema = StarRocksNativeSchemaColumnPlan {
-                unique_id: Some(term.schema_unique_id),
-                source_index: None,
-                source_lookup_attempted: false,
-                schema_type: term.schema_type.clone(),
-                is_nullable: true,
-                is_key: true,
-                aggregation: None,
-                precision: term.precision,
-                scale: term.scale,
-                children: Vec::new(),
-            };
-            let array = decode_column_array_for_selected_rows(
+            let physical_schema = segment
+                .delete_predicate_schemas
+                .get(&term.schema_unique_id)
+                .ok_or_else(|| {
+                    format!(
+                        "segment physical delete predicate schema is missing: segment={}, unique_id={}, column_name={}",
+                        segment_path, term.schema_unique_id, term.column_name
+                    )
+                })?;
+            let output_name = format!("__delete_predicate_col_{}", term.column_name);
+            let physical_decode_type = segment_physical_decode_data_type(
+                physical_schema,
+                &output_data_type,
+                segment_path,
+                &output_name,
+            )?;
+            let physical_array = decode_column_array_for_selected_rows(
                 segment_path,
                 segment_bytes,
                 column_meta,
-                &schema,
-                &output_data_type,
-                &format!("__delete_predicate_col_{}", term.column_name),
+                physical_schema,
+                &physical_decode_type,
+                &output_name,
                 selected_ranges,
                 full_segment_selected,
                 segment_rows,
+            )?;
+            let array = cast_signed_integer_widening_to_output(
+                physical_array,
+                &output_data_type,
+                segment_path,
+                &output_name,
             )?;
             if array.len() != selected_rows {
                 return Err(format!(
@@ -2881,9 +2965,686 @@ fn overlap_local_ranges(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::formats::starrocks::plan::StarRocksNativeSchemaColumnPlan;
-    use arrow::array::{Int64Array, StringArray};
+    use crate::formats::starrocks::metadata::{
+        StarRocksDeletePredicateRaw, StarRocksSegmentFile, StarRocksTabletSnapshot,
+    };
+    use crate::formats::starrocks::plan::{
+        StarRocksNativeSchemaColumnPlan, StarRocksOutputColumnHint, StarRocksPhysicalColumnBinding,
+        build_native_read_plan_with_output_hints,
+    };
+    use crate::formats::starrocks::segment::decode_segment_footer;
+    use crate::formats::starrocks::writer::build_starrocks_native_segment_bytes;
+    use crate::service::grpc_client::proto::starrocks::{ColumnPb, KeysType, TabletSchemaPb};
+    use arrow::array::{Int32Array, Int64Array, StringArray, StructArray};
+    use arrow::datatypes::{Field, Schema};
+    use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
+
+    #[test]
+    fn native_segment_decodes_historical_int_then_widens_to_current_bigint() {
+        let temp_dir = tempfile::tempdir().expect("create native segment temp dir");
+        let old_schema = TabletSchemaPb {
+            id: Some(900),
+            keys_type: Some(KeysType::DupKeys as i32),
+            column: vec![ColumnPb {
+                unique_id: 11,
+                name: Some("v".to_string()),
+                r#type: "INT".to_string(),
+                is_key: Some(true),
+                is_nullable: Some(false),
+                ..Default::default()
+            }],
+            num_short_key_columns: Some(1),
+            sort_key_idxes: vec![0],
+            sort_key_unique_ids: vec![11],
+            ..Default::default()
+        };
+        let input_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let input = RecordBatch::try_new(
+            input_schema,
+            vec![Arc::new(Int32Array::from(vec![-1, i32::MAX]))],
+        )
+        .expect("build historical INT batch");
+        let segment_bytes = build_starrocks_native_segment_bytes(&input, &old_schema)
+            .expect("encode historical INT segment");
+        let segment_name = "historical-int.dat";
+        let segment_path = temp_dir.path().join(segment_name);
+        std::fs::write(&segment_path, &segment_bytes).expect("write historical INT segment");
+        let footer = decode_segment_footer(segment_name, &segment_bytes)
+            .expect("decode historical INT footer");
+
+        let current_schema = TabletSchemaPb {
+            id: Some(1000),
+            keys_type: Some(KeysType::DupKeys as i32),
+            column: vec![ColumnPb {
+                unique_id: 11,
+                name: Some("v".to_string()),
+                r#type: "BIGINT".to_string(),
+                is_key: Some(true),
+                is_nullable: Some(false),
+                ..Default::default()
+            }],
+            num_short_key_columns: Some(1),
+            sort_key_idxes: vec![0],
+            sort_key_unique_ids: vec![11],
+            ..Default::default()
+        };
+        let snapshot = StarRocksTabletSnapshot {
+            tablet_id: 10,
+            version: 20,
+            metadata_path: temp_dir.path().join("meta").display().to_string(),
+            tablet_schema: current_schema,
+            historical_schemas: std::collections::BTreeMap::from([(900, old_schema)]),
+            total_num_rows: 2,
+            rowset_count: 1,
+            segment_files: vec![StarRocksSegmentFile {
+                name: segment_name.to_string(),
+                relative_path: format!(
+                    "{}/{}",
+                    temp_dir
+                        .path()
+                        .file_name()
+                        .expect("temp dir name")
+                        .to_string_lossy(),
+                    segment_name
+                ),
+                path: segment_path.display().to_string(),
+                rowset_version: 1,
+                schema_id: Some(900),
+                segment_id: Some(0),
+                bundle_file_offset: Some(0),
+                segment_size: Some(segment_bytes.len() as u64),
+            }],
+            delete_predicates: Vec::new(),
+            delvec_meta: Default::default(),
+        };
+        let output_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let hints = vec![StarRocksOutputColumnHint {
+            schema_unique_id: Some(11),
+            physical_binding: StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(11),
+            fallback_default_literal: None,
+        }];
+        let plan = build_native_read_plan_with_output_hints(
+            &snapshot,
+            std::slice::from_ref(&footer),
+            &output_schema,
+            &hints,
+            None,
+        )
+        .expect("build current BIGINT plan over historical INT segment");
+
+        let result = build_native_record_batch(
+            &plan,
+            &[footer],
+            temp_dir.path().to_str().expect("UTF-8 temp path"),
+            None,
+            &output_schema,
+            &[],
+        )
+        .expect("decode historical INT and widen to current BIGINT");
+
+        assert_eq!(result.schema(), output_schema);
+        let values = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("current BIGINT output");
+        assert_eq!(values.values(), &[-1_i64, i64::from(i32::MAX)]);
+    }
+
+    #[test]
+    fn native_segment_decodes_nested_historical_int_then_widens_to_current_bigint() {
+        let temp_dir = tempfile::tempdir().expect("create nested native segment temp dir");
+        let historical_schema = TabletSchemaPb {
+            id: Some(900),
+            keys_type: Some(KeysType::DupKeys as i32),
+            column: vec![ColumnPb {
+                unique_id: 11,
+                name: Some("s".to_string()),
+                r#type: "STRUCT".to_string(),
+                is_nullable: Some(false),
+                children_columns: vec![ColumnPb {
+                    unique_id: 12,
+                    name: Some("value".to_string()),
+                    r#type: "INT".to_string(),
+                    is_nullable: Some(false),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            num_short_key_columns: Some(0),
+            ..Default::default()
+        };
+        let historical_struct_fields: arrow::datatypes::Fields =
+            vec![Field::new("value", DataType::Int32, false)].into();
+        let historical_struct = Arc::new(StructArray::new(
+            historical_struct_fields.clone(),
+            vec![Arc::new(Int32Array::from(vec![-1, i32::MAX]))],
+            None,
+        ));
+        let input_schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(historical_struct_fields),
+            false,
+        )]));
+        let input = RecordBatch::try_new(input_schema, vec![historical_struct])
+            .expect("build historical STRUCT<INT> batch");
+        let segment_bytes = build_starrocks_native_segment_bytes(&input, &historical_schema)
+            .expect("encode historical STRUCT<INT> segment");
+        let segment_name = "historical-struct-int.dat";
+        let segment_path = temp_dir.path().join(segment_name);
+        std::fs::write(&segment_path, &segment_bytes)
+            .expect("write historical STRUCT<INT> segment");
+        let footer = decode_segment_footer(segment_name, &segment_bytes)
+            .expect("decode historical STRUCT<INT> footer");
+
+        let current_schema = TabletSchemaPb {
+            id: Some(1000),
+            keys_type: Some(KeysType::DupKeys as i32),
+            column: vec![ColumnPb {
+                unique_id: 11,
+                name: Some("s".to_string()),
+                r#type: "STRUCT".to_string(),
+                is_nullable: Some(false),
+                children_columns: vec![ColumnPb {
+                    unique_id: 12,
+                    name: Some("value".to_string()),
+                    r#type: "BIGINT".to_string(),
+                    is_nullable: Some(false),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            num_short_key_columns: Some(0),
+            ..Default::default()
+        };
+        let snapshot = StarRocksTabletSnapshot {
+            tablet_id: 10,
+            version: 20,
+            metadata_path: temp_dir.path().join("meta").display().to_string(),
+            tablet_schema: current_schema,
+            historical_schemas: std::collections::BTreeMap::from([(900, historical_schema)]),
+            total_num_rows: 2,
+            rowset_count: 1,
+            segment_files: vec![StarRocksSegmentFile {
+                name: segment_name.to_string(),
+                relative_path: format!(
+                    "{}/{}",
+                    temp_dir
+                        .path()
+                        .file_name()
+                        .expect("temp dir name")
+                        .to_string_lossy(),
+                    segment_name
+                ),
+                path: segment_path.display().to_string(),
+                rowset_version: 1,
+                schema_id: Some(900),
+                segment_id: Some(0),
+                bundle_file_offset: Some(0),
+                segment_size: Some(segment_bytes.len() as u64),
+            }],
+            delete_predicates: Vec::new(),
+            delvec_meta: Default::default(),
+        };
+        let current_struct_fields: arrow::datatypes::Fields =
+            vec![Field::new("value", DataType::Int64, false)].into();
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(current_struct_fields),
+            false,
+        )]));
+        let hints = vec![StarRocksOutputColumnHint {
+            schema_unique_id: Some(11),
+            physical_binding: StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(11),
+            fallback_default_literal: None,
+        }];
+        let plan = build_native_read_plan_with_output_hints(
+            &snapshot,
+            std::slice::from_ref(&footer),
+            &output_schema,
+            &hints,
+            None,
+        )
+        .expect("build current STRUCT<BIGINT> plan over historical STRUCT<INT> segment");
+
+        let result = build_native_record_batch(
+            &plan,
+            &[footer],
+            temp_dir.path().to_str().expect("UTF-8 temp path"),
+            None,
+            &output_schema,
+            &[],
+        )
+        .expect("decode historical STRUCT<INT> and widen child to current BIGINT");
+
+        assert_eq!(result.schema(), output_schema);
+        let values = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("current STRUCT<BIGINT> output");
+        let child = values
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("current BIGINT child output");
+        assert_eq!(child.values(), &[-1_i64, i64::from(i32::MAX)]);
+    }
+
+    #[test]
+    fn native_segment_binds_renamed_nested_uid_zero_and_widens_historical_int_to_bigint() {
+        let temp_dir = tempfile::tempdir().expect("create nested UID0 native segment temp dir");
+        let historical_schema = TabletSchemaPb {
+            id: Some(900),
+            keys_type: Some(KeysType::DupKeys as i32),
+            column: vec![ColumnPb {
+                unique_id: 11,
+                name: Some("s".to_string()),
+                r#type: "STRUCT".to_string(),
+                is_nullable: Some(false),
+                children_columns: vec![ColumnPb {
+                    unique_id: 0,
+                    name: Some("old_name".to_string()),
+                    r#type: "INT".to_string(),
+                    is_nullable: Some(false),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            num_short_key_columns: Some(0),
+            ..Default::default()
+        };
+        let historical_struct_fields: arrow::datatypes::Fields =
+            vec![Field::new("old_name", DataType::Int32, false)].into();
+        let historical_struct = Arc::new(StructArray::new(
+            historical_struct_fields.clone(),
+            vec![Arc::new(Int32Array::from(vec![-1, i32::MAX]))],
+            None,
+        ));
+        let input_schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(historical_struct_fields),
+            false,
+        )]));
+        let input = RecordBatch::try_new(input_schema, vec![historical_struct])
+            .expect("build historical renamed STRUCT<INT> batch");
+        let segment_bytes = build_starrocks_native_segment_bytes(&input, &historical_schema)
+            .expect("encode historical renamed STRUCT<INT> segment");
+        let segment_name = "historical-renamed-struct-uid-zero-int.dat";
+        let segment_path = temp_dir.path().join(segment_name);
+        std::fs::write(&segment_path, &segment_bytes)
+            .expect("write historical renamed STRUCT<INT> segment");
+        let footer = decode_segment_footer(segment_name, &segment_bytes)
+            .expect("decode historical renamed STRUCT<INT> footer");
+
+        let current_schema = TabletSchemaPb {
+            id: Some(1000),
+            keys_type: Some(KeysType::DupKeys as i32),
+            column: vec![ColumnPb {
+                unique_id: 11,
+                name: Some("s".to_string()),
+                r#type: "STRUCT".to_string(),
+                is_nullable: Some(false),
+                children_columns: vec![ColumnPb {
+                    unique_id: 0,
+                    name: Some("new_name".to_string()),
+                    r#type: "BIGINT".to_string(),
+                    is_nullable: Some(false),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            num_short_key_columns: Some(0),
+            ..Default::default()
+        };
+        let snapshot = StarRocksTabletSnapshot {
+            tablet_id: 10,
+            version: 20,
+            metadata_path: temp_dir.path().join("meta").display().to_string(),
+            tablet_schema: current_schema,
+            historical_schemas: std::collections::BTreeMap::from([(900, historical_schema)]),
+            total_num_rows: 2,
+            rowset_count: 1,
+            segment_files: vec![StarRocksSegmentFile {
+                name: segment_name.to_string(),
+                relative_path: format!(
+                    "{}/{}",
+                    temp_dir
+                        .path()
+                        .file_name()
+                        .expect("temp dir name")
+                        .to_string_lossy(),
+                    segment_name
+                ),
+                path: segment_path.display().to_string(),
+                rowset_version: 1,
+                schema_id: Some(900),
+                segment_id: Some(0),
+                bundle_file_offset: Some(0),
+                segment_size: Some(segment_bytes.len() as u64),
+            }],
+            delete_predicates: Vec::new(),
+            delvec_meta: Default::default(),
+        };
+        let current_struct_fields: arrow::datatypes::Fields =
+            vec![Field::new("new_name", DataType::Int64, false)].into();
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(current_struct_fields),
+            false,
+        )]));
+        let hints = vec![StarRocksOutputColumnHint {
+            schema_unique_id: Some(11),
+            physical_binding: StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(11),
+            fallback_default_literal: None,
+        }];
+        let plan = build_native_read_plan_with_output_hints(
+            &snapshot,
+            std::slice::from_ref(&footer),
+            &output_schema,
+            &hints,
+            None,
+        )
+        .expect("build current renamed STRUCT<BIGINT> plan over historical UID0 STRUCT<INT>");
+
+        let result = build_native_record_batch(
+            &plan,
+            &[footer],
+            temp_dir.path().to_str().expect("UTF-8 temp path"),
+            None,
+            &output_schema,
+            &[],
+        )
+        .expect("bind renamed child UID0 and widen historical INT to current BIGINT");
+
+        assert_eq!(result.schema(), output_schema);
+        let values = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("current renamed STRUCT<BIGINT> output");
+        let child = values
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("current renamed BIGINT child output");
+        assert_eq!(child.values(), &[-1_i64, i64::from(i32::MAX)]);
+    }
+
+    #[test]
+    fn delete_predicate_decodes_historical_int_before_current_bigint_evaluation() {
+        for keys_type in [
+            KeysType::DupKeys,
+            KeysType::PrimaryKeys,
+            KeysType::AggKeys,
+            KeysType::UniqueKeys,
+        ] {
+            let temp_dir = tempfile::tempdir().expect("create delete predicate temp dir");
+            let historical_schema = TabletSchemaPb {
+                id: Some(900),
+                keys_type: Some(keys_type as i32),
+                column: vec![ColumnPb {
+                    unique_id: 11,
+                    name: Some("v".to_string()),
+                    r#type: "INT".to_string(),
+                    is_key: Some(true),
+                    is_nullable: Some(false),
+                    ..Default::default()
+                }],
+                num_short_key_columns: Some(1),
+                sort_key_idxes: vec![0],
+                sort_key_unique_ids: vec![11],
+                ..Default::default()
+            };
+            let input_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+            let input = RecordBatch::try_new(
+                input_schema,
+                vec![Arc::new(Int32Array::from(vec![-1, 7, 8]))],
+            )
+            .expect("historical INT delete batch");
+            let segment_bytes = build_starrocks_native_segment_bytes(&input, &historical_schema)
+                .expect("encode historical delete segment");
+            let segment_name = format!("historical-delete-int-{keys_type:?}.dat");
+            let segment_path = temp_dir.path().join(&segment_name);
+            std::fs::write(&segment_path, &segment_bytes).expect("write delete segment");
+            let footer = decode_segment_footer(&segment_name, &segment_bytes)
+                .expect("decode delete segment footer");
+            let current_schema = TabletSchemaPb {
+                id: Some(1000),
+                keys_type: Some(keys_type as i32),
+                column: vec![ColumnPb {
+                    unique_id: 11,
+                    name: Some("v".to_string()),
+                    r#type: "BIGINT".to_string(),
+                    is_key: Some(true),
+                    is_nullable: Some(false),
+                    ..Default::default()
+                }],
+                num_short_key_columns: Some(1),
+                sort_key_idxes: vec![0],
+                sort_key_unique_ids: vec![11],
+                ..Default::default()
+            };
+            let snapshot = StarRocksTabletSnapshot {
+                tablet_id: 10,
+                version: 20,
+                metadata_path: temp_dir.path().join("meta").display().to_string(),
+                tablet_schema: current_schema,
+                historical_schemas: std::collections::BTreeMap::from([(900, historical_schema)]),
+                total_num_rows: 3,
+                rowset_count: 1,
+                segment_files: vec![StarRocksSegmentFile {
+                    name: segment_name.clone(),
+                    relative_path: format!(
+                        "{}/{}",
+                        temp_dir
+                            .path()
+                            .file_name()
+                            .expect("temp dir name")
+                            .to_string_lossy(),
+                        segment_name
+                    ),
+                    path: segment_path.display().to_string(),
+                    rowset_version: 1,
+                    schema_id: Some(900),
+                    segment_id: Some(0),
+                    bundle_file_offset: Some(0),
+                    segment_size: Some(segment_bytes.len() as u64),
+                }],
+                delete_predicates: vec![StarRocksDeletePredicateRaw {
+                    version: 3,
+                    sub_predicates: vec!["v=7".to_string()],
+                    in_predicates: Vec::new(),
+                    binary_predicates: Vec::new(),
+                    is_null_predicates: Vec::new(),
+                }],
+                delvec_meta: Default::default(),
+            };
+            let output_schema =
+                Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+            let hints = vec![StarRocksOutputColumnHint {
+                schema_unique_id: Some(11),
+                physical_binding: StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(11),
+                fallback_default_literal: None,
+            }];
+            let plan = build_native_read_plan_with_output_hints(
+                &snapshot,
+                std::slice::from_ref(&footer),
+                &output_schema,
+                &hints,
+                None,
+            )
+            .expect("build historical delete predicate plan");
+
+            let result = build_native_record_batch(
+                &plan,
+                &[footer],
+                temp_dir.path().to_str().expect("UTF-8 temp path"),
+                None,
+                &output_schema,
+                &[],
+            )
+            .expect("decode historical INT before evaluating current BIGINT delete term");
+
+            let values = result
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("current BIGINT output");
+            assert_eq!(values.values(), &[-1_i64, 8_i64], "{keys_type:?}");
+        }
+    }
+
+    #[test]
+    fn hidden_group_key_decodes_historical_int_for_agg_and_unique_models() {
+        for (keys_type, expected_values) in [
+            (KeysType::AggKeys, vec![30_i64, 5_i64]),
+            (KeysType::UniqueKeys, vec![20_i64, 5_i64]),
+        ] {
+            let temp_dir = tempfile::tempdir().expect("create hidden group key temp dir");
+            let mut historical_value = ColumnPb {
+                unique_id: 2,
+                name: Some("v".to_string()),
+                r#type: "BIGINT".to_string(),
+                is_key: Some(false),
+                is_nullable: Some(false),
+                ..Default::default()
+            };
+            if keys_type == KeysType::AggKeys {
+                historical_value.aggregation = Some("SUM".to_string());
+            }
+            let historical_schema = TabletSchemaPb {
+                id: Some(900),
+                keys_type: Some(keys_type as i32),
+                column: vec![
+                    ColumnPb {
+                        unique_id: 1,
+                        name: Some("k".to_string()),
+                        r#type: "INT".to_string(),
+                        is_key: Some(true),
+                        is_nullable: Some(false),
+                        ..Default::default()
+                    },
+                    historical_value,
+                ],
+                num_short_key_columns: Some(1),
+                sort_key_idxes: vec![0],
+                sort_key_unique_ids: vec![1],
+                ..Default::default()
+            };
+            let input_schema = Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int32, false),
+                Field::new("v", DataType::Int64, false),
+            ]));
+            let input = RecordBatch::try_new(
+                input_schema,
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 1, 2])),
+                    Arc::new(Int64Array::from(vec![10_i64, 20_i64, 5_i64])),
+                ],
+            )
+            .expect("historical hidden group key batch");
+            let segment_bytes = build_starrocks_native_segment_bytes(&input, &historical_schema)
+                .expect("encode hidden group key segment");
+            let segment_name = format!("historical-hidden-key-{keys_type:?}.dat");
+            let segment_path = temp_dir.path().join(&segment_name);
+            std::fs::write(&segment_path, &segment_bytes).expect("write hidden key segment");
+            let footer = decode_segment_footer(&segment_name, &segment_bytes)
+                .expect("decode hidden key segment footer");
+            let mut current_value = ColumnPb {
+                unique_id: 2,
+                name: Some("v".to_string()),
+                r#type: "BIGINT".to_string(),
+                is_key: Some(false),
+                is_nullable: Some(false),
+                ..Default::default()
+            };
+            if keys_type == KeysType::AggKeys {
+                current_value.aggregation = Some("SUM".to_string());
+            }
+            let current_schema = TabletSchemaPb {
+                id: Some(1000),
+                keys_type: Some(keys_type as i32),
+                column: vec![
+                    ColumnPb {
+                        unique_id: 1,
+                        name: Some("k".to_string()),
+                        r#type: "BIGINT".to_string(),
+                        is_key: Some(true),
+                        is_nullable: Some(false),
+                        ..Default::default()
+                    },
+                    current_value,
+                ],
+                num_short_key_columns: Some(1),
+                sort_key_idxes: vec![0],
+                sort_key_unique_ids: vec![1],
+                ..Default::default()
+            };
+            let snapshot = StarRocksTabletSnapshot {
+                tablet_id: 10,
+                version: 20,
+                metadata_path: temp_dir.path().join("meta").display().to_string(),
+                tablet_schema: current_schema,
+                historical_schemas: std::collections::BTreeMap::from([(900, historical_schema)]),
+                total_num_rows: 3,
+                rowset_count: 1,
+                segment_files: vec![StarRocksSegmentFile {
+                    name: segment_name.clone(),
+                    relative_path: format!(
+                        "{}/{}",
+                        temp_dir
+                            .path()
+                            .file_name()
+                            .expect("temp dir name")
+                            .to_string_lossy(),
+                        segment_name
+                    ),
+                    path: segment_path.display().to_string(),
+                    rowset_version: 1,
+                    schema_id: Some(900),
+                    segment_id: Some(0),
+                    bundle_file_offset: Some(0),
+                    segment_size: Some(segment_bytes.len() as u64),
+                }],
+                delete_predicates: Vec::new(),
+                delvec_meta: Default::default(),
+            };
+            let output_schema =
+                Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+            let hints = vec![StarRocksOutputColumnHint {
+                schema_unique_id: Some(2),
+                physical_binding: StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(2),
+                fallback_default_literal: None,
+            }];
+            let plan = build_native_read_plan_with_output_hints(
+                &snapshot,
+                std::slice::from_ref(&footer),
+                &output_schema,
+                &hints,
+                None,
+            )
+            .expect("build hidden historical group key plan");
+
+            let result = build_native_record_batch(
+                &plan,
+                &[footer],
+                temp_dir.path().to_str().expect("UTF-8 temp path"),
+                None,
+                &output_schema,
+                &[],
+            )
+            .expect("decode and widen hidden historical group key");
+
+            let values = result
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("BIGINT aggregate output");
+            assert_eq!(values.values(), expected_values.as_slice());
+        }
+    }
 
     #[test]
     fn normalize_delete_value_trims_quotes() {

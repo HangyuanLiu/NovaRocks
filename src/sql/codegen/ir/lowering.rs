@@ -195,6 +195,7 @@ pub(crate) fn lower_distributed_plan(
     Ok(MultiFragmentBuildResult {
         fragment_results,
         fragment_schedules,
+        native_starrocks_scan_sources: scan_range_build.starrocks_scan_sources().clone(),
         root_fragment_id: dp.root_fragment_id,
         edges,
         lowered_edges,
@@ -389,6 +390,7 @@ fn empty_exec_params_without_compat_scan_ranges()
 fn validate_distributed_plan(
     dp: &crate::sql::planner::distributed::DistributedPlan,
 ) -> Result<Vec<&crate::sql::planner::distributed::PlanFragment>, String> {
+    super::validate_global_node_ids(dp)?;
     if dp.fragments.is_empty() {
         return Err("lower_distributed_plan requires at least one fragment".to_string());
     }

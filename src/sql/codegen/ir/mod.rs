@@ -35,9 +35,65 @@ pub(crate) use lowering_native::{
     lower_distributed_plan, refresh_distributed_plan_for_native_sidecar,
 };
 
+fn validate_global_node_ids(
+    plan: &crate::sql::planner::distributed::DistributedPlan,
+) -> Result<(), String> {
+    fn visit(
+        node: &crate::sql::planner::distributed::DistributedNode,
+        fragment_id: crate::sql::codegen::FragmentId,
+        owners: &mut std::collections::HashMap<i32, crate::sql::codegen::FragmentId>,
+    ) -> Result<(), String> {
+        if let Some(previous_fragment_id) = owners.insert(node.node_id, fragment_id) {
+            return Err(format!(
+                "DistributedPlan contains duplicate node_id={} in fragments {} and {}",
+                node.node_id, previous_fragment_id, fragment_id
+            ));
+        }
+        for child in &node.children {
+            visit(child, fragment_id, owners)?;
+        }
+        Ok(())
+    }
+
+    let mut owners = std::collections::HashMap::new();
+    for fragment in &plan.fragments {
+        visit(&fragment.root, fragment.fragment_id, &mut owners)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+
+    fn values_node(
+        fragment_id: u32,
+        node_id: i32,
+    ) -> crate::sql::planner::distributed::DistributedNode {
+        crate::sql::planner::distributed::DistributedNode {
+            node_id,
+            fragment_id,
+            tuple_ids: Vec::new(),
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            stats: crate::sql::planner::physical::PhysicalPlanStats {
+                output_row_count: 0.0,
+                row_count_confidence: crate::sql::planner::physical::PlannerConfidence::Fallback,
+                column_statistics: std::collections::HashMap::new(),
+                cost_estimate: None,
+                broadcast_decision: None,
+            },
+            payload: crate::sql::planner::distributed::DistributedNodeKind::Values(
+                crate::sql::planner::payload::PlanValuesNode {
+                    rows: Vec::new(),
+                    columns: Vec::new(),
+                },
+            ),
+        }
+    }
 
     #[test]
     fn bridge2_owner_modules_are_split_into_files() {
@@ -54,5 +110,34 @@ mod tests {
                 .join(module_file);
             assert!(path.is_file(), "{} should exist", path.display());
         }
+    }
+
+    #[test]
+    fn distributed_plan_rejects_duplicate_node_id_across_fragments() {
+        let fragments = [0, 1]
+            .into_iter()
+            .map(|fragment_id| crate::sql::planner::distributed::PlanFragment {
+                fragment_id,
+                root: values_node(fragment_id, 7),
+                data_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+                output_partition:
+                    crate::sql::planner::distributed::DataPartition::unpartitioned(),
+                sink: crate::sql::planner::distributed::DataSink::Noop,
+                output_exprs: None,
+                output_columns: Vec::new(),
+                cte_id: None,
+                cte_exchange_nodes: Vec::new(),
+            })
+            .collect();
+        let plan = crate::sql::planner::distributed::DistributedPlan {
+            fragments,
+            root_fragment_id: 0,
+            edges: Vec::new(),
+        };
+
+        let err = super::validate_global_node_ids(&plan)
+            .expect_err("node ids are global descriptor keys and must be unique");
+        assert!(err.contains("duplicate node_id=7"), "{err}");
+        assert!(err.contains("fragments 0 and 1"), "{err}");
     }
 }

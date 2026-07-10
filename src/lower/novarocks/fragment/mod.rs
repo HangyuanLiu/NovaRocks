@@ -107,7 +107,11 @@ pub(crate) fn execute_fragment_native(
         instance_params,
         query_options.clone(),
         fragment_instance_id,
-    )?;
+    )?
+    .with_query_id(UniqueId {
+        hi: query_id.hi,
+        lo: query_id.lo,
+    });
     let lowered = {
         let _lower_timer = profiler.as_ref().map(|p| p.scoped_timer("LowerPlanTime"));
         lower_proto_node(root, &mut arena, &ctx)?

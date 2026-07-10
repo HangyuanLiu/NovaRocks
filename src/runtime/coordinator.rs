@@ -34,6 +34,8 @@
 //! instance per fragment and this path reproduces the prior single-instance
 //! wiring exactly.
 
+#[cfg(feature = "compat")]
+use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -117,10 +119,17 @@ struct CompatEdgeSidecar {
 pub(crate) fn prepare_native_plan_sidecars(
     native_plan: &crate::sql::planner::distributed::DistributedPlan,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+    starrocks_scan_sources: &BTreeMap<
+        i32,
+        crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor,
+    >,
 ) -> Result<NativePlanSidecars, String> {
     let encoded = crate::sql::codegen::proto_encode::plan::encode_distributed_plan_with_context(
         native_plan,
-        crate::sql::codegen::proto_encode::plan::NativePlanEncodeContext { mv_refresh_ctx },
+        crate::sql::codegen::proto_encode::plan::NativePlanEncodeContext {
+            mv_refresh_ctx,
+            starrocks_scan_sources: Some(starrocks_scan_sources),
+        },
     )?;
     let mut fragments_by_id = BTreeMap::new();
     for fragment in encoded.fragments {
@@ -210,6 +219,7 @@ impl ExecutionCoordinator {
         let MultiFragmentBuildResult {
             mut fragment_results,
             fragment_schedules,
+            native_starrocks_scan_sources: _,
             root_fragment_id,
             edges,
             #[cfg(feature = "compat")]
@@ -501,6 +511,9 @@ impl ExecutionCoordinator {
                 schedule.cte_id.is_some(),
             )?;
 
+            #[cfg(feature = "compat")]
+            let compat_starrocks_carrier_index = build_compat_starrocks_carrier_index(fr)?;
+
             for placement in placements {
                 #[cfg(feature = "compat")]
                 // Build the output sink for this fragment class.
@@ -611,8 +624,12 @@ impl ExecutionCoordinator {
                     let mut exec_params = fr.exec_params.clone();
                     exec_params.query_id = unique_id_to_thrift(query_id);
                     exec_params.fragment_instance_id = unique_id_to_thrift(placement.finst_id);
-                    exec_params.per_node_scan_ranges =
-                        compat_scan_ranges_for_placement(fr, placement, placements.len())?;
+                    exec_params.per_node_scan_ranges = compat_scan_ranges_for_placement(
+                        fr,
+                        placement,
+                        placements.len(),
+                        &compat_starrocks_carrier_index,
+                    )?;
                     exec_params.per_exch_num_senders = placement.per_exch_num_senders.clone();
                     exec_params.destinations = exec_destinations;
                     if let Some(rf) = rf_plan.as_ref() {
@@ -1345,15 +1362,216 @@ fn wrap_iceberg_change_stream_router_sink(
 }
 
 #[cfg(feature = "compat")]
+#[derive(Clone, Debug)]
+struct CompatStarRocksCarrier {
+    params: crate::thrift::internal_service::TScanRangeParams,
+    partition_id: i64,
+    version: i64,
+}
+
+#[cfg(feature = "compat")]
+#[derive(Clone, Debug, Default)]
+struct CompatStarRocksCarrierIndex {
+    by_node: HashMap<i32, HashMap<i64, CompatStarRocksCarrier>>,
+}
+
+#[cfg(feature = "compat")]
+fn build_compat_starrocks_carrier_index(
+    fragment: &crate::sql::codegen::FragmentBuildResult,
+) -> Result<CompatStarRocksCarrierIndex, String> {
+    let mut native_by_node = HashMap::new();
+    for (node_id, native_ranges) in &fragment.native_scan_ranges {
+        let mut native_tablets = HashMap::new();
+        let mut has_file_range = false;
+        for params in native_ranges {
+            match &params.range {
+                crate::runtime::scan_range::ScanRange::File(_) => has_file_range = true,
+                crate::runtime::scan_range::ScanRange::StarRocksTablet(tablet) => {
+                    if native_tablets
+                        .insert(tablet.tablet_id, (tablet.partition_id, tablet.version))
+                        .is_some()
+                    {
+                        return Err(format!(
+                            "duplicate native StarRocks scan range for node_id={node_id} tablet_id={}",
+                            tablet.tablet_id
+                        ));
+                    }
+                }
+            }
+        }
+        if native_tablets.is_empty() {
+            continue;
+        }
+        if has_file_range {
+            return Err(format!(
+                "mixed native File and StarRocks scan ranges for node_id={node_id}"
+            ));
+        }
+        native_by_node.insert(*node_id, native_tablets);
+    }
+
+    let mut legacy_by_node = HashMap::new();
+    for (node_id, legacy_ranges) in &fragment.exec_params.per_node_scan_ranges {
+        let Some(_) = native_by_node.get(node_id) else {
+            if let Some(legacy) = legacy_ranges
+                .iter()
+                .find_map(|params| params.scan_range.internal_scan_range.as_ref())
+            {
+                return Err(format!(
+                    "extra legacy StarRocks scan range carrier for node_id={node_id} tablet_id={}",
+                    legacy.tablet_id
+                ));
+            }
+            continue;
+        };
+        let mut legacy_tablets = HashMap::new();
+        for params in legacy_ranges {
+            let legacy = params
+                .scan_range
+                .internal_scan_range
+                .as_ref()
+                .ok_or_else(|| {
+                    format!(
+                        "legacy StarRocks scan range carrier is not internal for node_id={node_id}"
+                    )
+                })?;
+            let version = legacy.version.parse::<i64>().map_err(|_| {
+                format!(
+                    "legacy StarRocks scan range carrier for node_id={node_id} tablet_id={} has invalid version `{}`",
+                    legacy.tablet_id, legacy.version
+                )
+            })?;
+            let partition_id = legacy.partition_id.ok_or_else(|| {
+                format!(
+                    "legacy StarRocks scan range carrier for node_id={node_id} tablet_id={} is missing partition_id",
+                    legacy.tablet_id
+                )
+            })?;
+            if legacy_tablets
+                .insert(
+                    legacy.tablet_id,
+                    CompatStarRocksCarrier {
+                        params: params.clone(),
+                        partition_id,
+                        version,
+                    },
+                )
+                .is_some()
+            {
+                return Err(format!(
+                    "duplicate legacy StarRocks scan range carrier for node_id={node_id} tablet_id={}",
+                    legacy.tablet_id
+                ));
+            }
+        }
+        legacy_by_node.insert(*node_id, legacy_tablets);
+    }
+
+    let mut by_node = HashMap::with_capacity(native_by_node.len());
+    let mut reconciliation_errors = Vec::new();
+    for (node_id, native_tablets) in native_by_node {
+        let legacy_tablets = legacy_by_node.remove(&node_id).unwrap_or_default();
+        for (tablet_id, (native_partition_id, native_version)) in &native_tablets {
+            match legacy_tablets.get(tablet_id) {
+                Some(legacy)
+                    if legacy.partition_id != *native_partition_id
+                        || legacy.version != *native_version =>
+                {
+                    reconciliation_errors.push((
+                        node_id,
+                        *tablet_id,
+                        1_u8,
+                        format!(
+                            "legacy StarRocks scan range carrier identity mismatch for node_id={node_id}: native=({tablet_id}, {native_partition_id}, {native_version}) legacy=({tablet_id}, {}, {})",
+                            legacy.partition_id, legacy.version
+                        ),
+                    ));
+                }
+                Some(_) => {}
+                None => reconciliation_errors.push((
+                    node_id,
+                    *tablet_id,
+                    0_u8,
+                    format!(
+                        "missing legacy StarRocks scan range carrier for node_id={node_id} tablet_id={tablet_id}"
+                    ),
+                )),
+            }
+        }
+        for tablet_id in legacy_tablets.keys() {
+            if !native_tablets.contains_key(tablet_id) {
+                reconciliation_errors.push((
+                    node_id,
+                    *tablet_id,
+                    2_u8,
+                    format!(
+                        "extra legacy StarRocks scan range carrier for node_id={node_id} tablet_id={tablet_id}"
+                    ),
+                ));
+            }
+        }
+        by_node.insert(node_id, legacy_tablets);
+    }
+    debug_assert!(legacy_by_node.is_empty());
+    if !reconciliation_errors.is_empty() {
+        reconciliation_errors
+            .sort_unstable_by_key(|(node_id, tablet_id, kind, _)| (*node_id, *tablet_id, *kind));
+        return Err(reconciliation_errors
+            .into_iter()
+            .map(|(_, _, _, message)| message)
+            .collect::<Vec<_>>()
+            .join("; "));
+    }
+    Ok(CompatStarRocksCarrierIndex { by_node })
+}
+
+#[cfg(feature = "compat")]
 fn compat_scan_ranges_for_placement(
     fragment: &crate::sql::codegen::FragmentBuildResult,
     placement: &FragmentInstancePlacement,
     placement_count: usize,
+    starrocks_carriers: &CompatStarRocksCarrierIndex,
 ) -> Result<BTreeMap<i32, Vec<crate::thrift::internal_service::TScanRangeParams>>, String> {
-    let mut assigned =
-        crate::runtime::scan_range::thrift_scan_range_map_from_native(&placement.scan_ranges)?;
-
     let compat_ranges = &fragment.exec_params.per_node_scan_ranges;
+    let mut assigned = BTreeMap::new();
+    for (node_id, native_ranges) in &placement.scan_ranges {
+        let mut selected = Vec::with_capacity(native_ranges.len());
+        for native in native_ranges {
+            match &native.range {
+                crate::runtime::scan_range::ScanRange::File(_) => selected.push(
+                    crate::runtime::scan_range::thrift_scan_range_params_from_native(native)?,
+                ),
+                crate::runtime::scan_range::ScanRange::StarRocksTablet(tablet) => {
+                    let carrier = starrocks_carriers
+                        .by_node
+                        .get(node_id)
+                        .and_then(|carriers| carriers.get(&tablet.tablet_id))
+                        .ok_or_else(|| {
+                            format!(
+                                "native StarRocks placement has no validated legacy carrier for node_id={node_id} tablet_id={}",
+                                tablet.tablet_id
+                            )
+                        })?;
+                    if carrier.partition_id != tablet.partition_id
+                        || carrier.version != tablet.version
+                    {
+                        return Err(format!(
+                            "native StarRocks placement identity mismatch for node_id={node_id}: placement=({}, {}, {}) carrier=({}, {}, {})",
+                            tablet.tablet_id,
+                            tablet.partition_id,
+                            tablet.version,
+                            tablet.tablet_id,
+                            carrier.partition_id,
+                            carrier.version
+                        ));
+                    }
+                    selected.push(carrier.params.clone());
+                }
+            }
+        }
+        assigned.insert(*node_id, selected);
+    }
+
     if compat_ranges.is_empty() {
         return Ok(assigned);
     }
@@ -2617,6 +2835,7 @@ mod native_contract_tests {
 
 #[cfg(all(test, feature = "compat"))]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2637,6 +2856,117 @@ mod tests {
     };
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use arrow::record_batch::RecordBatch;
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn native_sidecar_encoding_consumes_planned_starrocks_source_descriptor() {
+        let output = crate::sql::analysis::OutputColumn {
+            column_id: crate::sql::column_id::ColumnId::new_for_test(1),
+            name: "id".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        };
+        let root = crate::sql::planner::distributed::DistributedNode {
+            node_id: 7,
+            fragment_id: 0,
+            tuple_ids: Vec::new(),
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            stats: crate::sql::planner::physical::PhysicalPlanStats {
+                output_row_count: 0.0,
+                row_count_confidence: crate::sql::planner::physical::PlannerConfidence::Fallback,
+                column_statistics: std::collections::HashMap::new(),
+                cost_estimate: None,
+                broadcast_decision: None,
+            },
+            payload: crate::sql::planner::distributed::DistributedNodeKind::Scan(
+                crate::sql::planner::payload::PlanScanNode {
+                    database: "analytics".to_string(),
+                    table: crate::sql::catalog::TableDef {
+                        name: "orders".to_string(),
+                        columns: vec![crate::sql::catalog::ColumnDef {
+                            name: "id".to_string(),
+                            data_type: DataType::Int64,
+                            nullable: false,
+                            write_default: None,
+                            logical_type: None,
+                        }],
+                        iceberg_row_lineage_metadata_columns: Vec::new(),
+                        source: crate::sql::catalog::ScanSource::StarRocks {
+                            db_id: 10,
+                            table_id: 20,
+                        },
+                    },
+                    alias: None,
+                    columns: vec![output.clone()],
+                    predicates: Vec::new(),
+                    required_columns: None,
+                    variant_columns: Vec::new(),
+                    mv_rewritten_from: None,
+                },
+            ),
+        };
+        let plan = crate::sql::planner::distributed::DistributedPlan {
+            fragments: vec![crate::sql::planner::distributed::PlanFragment {
+                fragment_id: 0,
+                root,
+                data_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+                output_partition:
+                    crate::sql::planner::distributed::DataPartition::unpartitioned(),
+                sink: crate::sql::planner::distributed::DataSink::Result,
+                output_exprs: None,
+                output_columns: vec![output],
+                cte_id: None,
+                cte_exchange_nodes: Vec::new(),
+            }],
+            root_fragment_id: 0,
+            edges: Vec::new(),
+        };
+        let descriptors = BTreeMap::from([(
+            7,
+            crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor {
+                catalog_name: "default_catalog".to_string(),
+                db_id: 10,
+                table_id: 20,
+                schema_id: 30,
+                storage_columns: vec![
+                    crate::sql::codegen::proto_encode::plan::StarRocksStorageColumnDescriptor {
+                        name: "id".to_string(),
+                        unique_id: 0,
+                        default_value: None,
+                    },
+                ],
+                tablet_schema: crate::sql::codegen::proto_encode::plan::test_starrocks_tablet_schema_descriptor_for_column(30, "id", 0, None),
+            },
+        )]);
+
+        let sidecars = prepare_native_plan_sidecars(&plan, None, &descriptors)
+            .expect("planned StarRocks source must feed native sidecar encoding");
+        let fragment = &sidecars.fragments_by_id[&0];
+        let source = fragment
+            .root
+            .as_ref()
+            .and_then(|root| root.payload.as_ref())
+            .and_then(|payload| match payload {
+                crate::proto::plan::distributed_node::Payload::Physical(node) => node.kind.as_ref(),
+                _ => None,
+            })
+            .and_then(|kind| match kind {
+                crate::proto::plan::plan_node::Kind::Scan(scan) => scan.table.as_ref(),
+                _ => None,
+            })
+            .and_then(|table| table.source.as_ref())
+            .and_then(|source| source.kind.as_ref())
+            .expect("encoded StarRocks source");
+        assert!(matches!(
+            source,
+            crate::proto::plan::scan_source::Kind::StarrocksTable(_)
+        ));
+    }
 
     #[test]
     fn fragment_schedule_payload_validation_rejects_id_mismatch() {
@@ -3582,6 +3912,59 @@ mod tests {
         )
     }
 
+    fn native_starrocks_scan_range_for_test(
+        tablet_id: i64,
+        partition_id: i64,
+        version: i64,
+    ) -> crate::runtime::scan_range::ScanRangeParams {
+        crate::runtime::scan_range::ScanRangeParams::starrocks_tablet(
+            tablet_id,
+            partition_id,
+            version,
+        )
+        .expect("valid native StarRocks tablet range")
+    }
+
+    fn compat_starrocks_scan_range_for_test(
+        tablet_id: i64,
+        partition_id: i64,
+        version: i64,
+    ) -> crate::thrift::internal_service::TScanRangeParams {
+        let internal = crate::thrift::plan_nodes::TInternalScanRange::new(
+            Vec::new(),
+            "30".to_string(),
+            version.to_string(),
+            version.to_string(),
+            tablet_id,
+            "analytics".to_string(),
+            None::<Vec<crate::thrift::plan_nodes::TKeyRange>>,
+            None::<String>,
+            Some("orders".to_string()),
+            Some(partition_id),
+            None::<i64>,
+            Some(true),
+            None::<i32>,
+            Some(false),
+            Some(false),
+            None::<i64>,
+            Some("default_catalog".to_string()),
+        );
+        crate::thrift::internal_service::TScanRangeParams::new(
+            crate::thrift::plan_nodes::TScanRange::new(
+                Some(internal),
+                None::<Vec<u8>>,
+                None::<crate::thrift::plan_nodes::TBrokerScanRange>,
+                None::<crate::thrift::plan_nodes::TEsScanRange>,
+                None::<crate::thrift::plan_nodes::THdfsScanRange>,
+                None::<crate::thrift::plan_nodes::TBinlogScanRange>,
+                None::<crate::thrift::plan_nodes::TBenchmarkScanRange>,
+            ),
+            None::<i32>,
+            Some(false),
+            Some(false),
+        )
+    }
+
     fn fragment_for_scan_range_merge_test(
         compat_ranges: BTreeMap<i32, Vec<crate::thrift::internal_service::TScanRangeParams>>,
     ) -> crate::sql::codegen::FragmentBuildResult {
@@ -3650,6 +4033,7 @@ mod tests {
         let build = MultiFragmentBuildResult {
             fragment_results: vec![fragment],
             fragment_schedules: vec![fragment_schedule],
+            native_starrocks_scan_sources: BTreeMap::new(),
             root_fragment_id: 0,
             edges: Vec::new(),
             lowered_edges: Vec::new(),
@@ -3673,6 +4057,71 @@ mod tests {
         assert!(
             result.is_ok(),
             "coordinator rejected native scan ranges: {result:?}"
+        );
+        assert_eq!(dispatcher.submitted_count(), 1);
+    }
+
+    #[test]
+    fn proto_coordinator_submits_starrocks_with_matching_legacy_carrier() {
+        let mut fragment = fragment_for_scan_range_merge_test(BTreeMap::from([(
+            10,
+            vec![compat_starrocks_scan_range_for_test(300, 100, 7)],
+        )]));
+        fragment
+            .native_scan_ranges
+            .insert(10, vec![native_starrocks_scan_range_for_test(300, 100, 7)]);
+        let native_fragment = crate::proto::plan::PlanFragment {
+            fragment_id: fragment.fragment_id,
+            root: Some(crate::proto::plan::DistributedNode {
+                node_id: 10,
+                fragment_id: fragment.fragment_id,
+                limit: -1,
+                payload: Some(crate::proto::plan::distributed_node::Payload::Physical(
+                    crate::proto::plan::PlanNode {
+                        kind: Some(crate::proto::plan::plan_node::Kind::Values(
+                            crate::proto::plan::ValuesNode::default(),
+                        )),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }),
+            sink: Some(crate::proto::plan::DataSink {
+                kind: Some(crate::proto::plan::data_sink::Kind::Result(true)),
+            }),
+            ..Default::default()
+        };
+        let native_sidecars = NativePlanSidecars {
+            fragments_by_id: BTreeMap::from([(fragment.fragment_id, native_fragment)]),
+        };
+        let fragment_schedule = fragment.scheduling_metadata();
+        let build = MultiFragmentBuildResult {
+            fragment_results: vec![fragment],
+            fragment_schedules: vec![fragment_schedule],
+            native_starrocks_scan_sources: BTreeMap::new(),
+            root_fragment_id: 0,
+            edges: Vec::new(),
+            lowered_edges: Vec::new(),
+            boundary_schemas: Vec::new(),
+            rf_plan: None,
+        };
+        let dispatcher = MockDispatcher::new();
+        let scheduler = Arc::new(FragmentScheduler::new(vec![
+            "127.0.0.1:19010".parse().expect("backend addr"),
+        ]));
+
+        let result = ExecutionCoordinator::new_with_native_plan_sidecars(
+            build,
+            native_sidecars,
+            dispatcher.clone(),
+            scheduler,
+            None,
+        )
+        .execute_with_write_outcome();
+
+        assert!(
+            result.is_ok(),
+            "coordinator rejected native StarRocks scan with matching carrier: {result:?}"
         );
         assert_eq!(dispatcher.submitted_count(), 1);
     }
@@ -3776,6 +4225,7 @@ mod tests {
         let build = MultiFragmentBuildResult {
             fragment_results: vec![root_fragment, router_fragment],
             fragment_schedules,
+            native_starrocks_scan_sources: BTreeMap::new(),
             root_fragment_id: 0,
             edges: vec![edge.clone()],
             lowered_edges: vec![LoweredFragmentEdge {
@@ -3847,7 +4297,9 @@ mod tests {
             .scan_ranges
             .insert(10, vec![native_file_scan_range_for_test(101)]);
 
-        let merged = compat_scan_ranges_for_placement(&fragment, &placement, 2)
+        let carrier_index = build_compat_starrocks_carrier_index(&fragment)
+            .expect("no StarRocks carriers for native File range");
+        let merged = compat_scan_ranges_for_placement(&fragment, &placement, 2, &carrier_index)
             .expect("merge native and compat scan ranges");
 
         assert_eq!(
@@ -3866,6 +4318,289 @@ mod tests {
             vec![202],
             "compat-only scan range key must still be assigned round-robin"
         );
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn compat_scan_ranges_for_placement_selects_matching_starrocks_carrier() {
+        let mut fragment = fragment_for_scan_range_merge_test(BTreeMap::from([(
+            10,
+            vec![
+                compat_starrocks_scan_range_for_test(300, 100, 7),
+                compat_starrocks_scan_range_for_test(301, 101, 8),
+            ],
+        )]));
+        fragment.native_scan_ranges.insert(
+            10,
+            vec![
+                native_starrocks_scan_range_for_test(300, 100, 7),
+                native_starrocks_scan_range_for_test(301, 101, 8),
+            ],
+        );
+        let mut placement = fake_placement(0, 1, 200, "10.0.0.20");
+        placement
+            .scan_ranges
+            .insert(10, vec![native_starrocks_scan_range_for_test(301, 101, 8)]);
+
+        let carrier_index = build_compat_starrocks_carrier_index(&fragment)
+            .expect("validated StarRocks carrier index");
+        let selected = compat_scan_ranges_for_placement(&fragment, &placement, 2, &carrier_index)
+            .expect("matching legacy StarRocks carrier");
+        let internal = selected[&10][0]
+            .scan_range
+            .internal_scan_range
+            .as_ref()
+            .expect("legacy internal scan range");
+        assert_eq!(internal.tablet_id, 301);
+        assert_eq!(internal.partition_id, Some(101));
+        assert_eq!(internal.version, "8");
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn compat_scan_ranges_for_placement_rejects_missing_starrocks_carrier() {
+        let mut fragment = fragment_for_scan_range_merge_test(BTreeMap::from([(
+            10,
+            vec![compat_starrocks_scan_range_for_test(300, 100, 7)],
+        )]));
+        fragment
+            .native_scan_ranges
+            .insert(10, vec![native_starrocks_scan_range_for_test(999, 100, 7)]);
+
+        let err = build_compat_starrocks_carrier_index(&fragment)
+            .expect_err("missing legacy StarRocks carrier must fail");
+        assert!(
+            err.contains(
+                "missing legacy StarRocks scan range carrier for node_id=10 tablet_id=999"
+            ),
+            "{err}"
+        );
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn compat_scan_ranges_for_placement_rejects_duplicate_starrocks_carrier() {
+        let carrier = compat_starrocks_scan_range_for_test(300, 100, 7);
+        let mut fragment = fragment_for_scan_range_merge_test(BTreeMap::from([(
+            10,
+            vec![carrier.clone(), carrier],
+        )]));
+        fragment
+            .native_scan_ranges
+            .insert(10, vec![native_starrocks_scan_range_for_test(300, 100, 7)]);
+
+        let err = build_compat_starrocks_carrier_index(&fragment)
+            .expect_err("duplicate legacy StarRocks carrier must fail");
+        assert!(
+            err.contains(
+                "duplicate legacy StarRocks scan range carrier for node_id=10 tablet_id=300"
+            ),
+            "{err}"
+        );
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn compat_scan_ranges_for_placement_rejects_starrocks_identity_mismatch() {
+        let mut fragment = fragment_for_scan_range_merge_test(BTreeMap::from([(
+            10,
+            vec![compat_starrocks_scan_range_for_test(300, 999, 7)],
+        )]));
+        fragment
+            .native_scan_ranges
+            .insert(10, vec![native_starrocks_scan_range_for_test(300, 100, 7)]);
+
+        let err = build_compat_starrocks_carrier_index(&fragment)
+            .expect_err("mismatched legacy StarRocks carrier must fail");
+        assert!(
+            err.contains(
+                "legacy StarRocks scan range carrier identity mismatch for node_id=10: native=(300, 100, 7) legacy=(300, 999, 7)"
+            ),
+            "{err}"
+        );
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn compat_scan_ranges_for_placement_rejects_extra_legacy_starrocks_carrier() {
+        let mut fragment = fragment_for_scan_range_merge_test(BTreeMap::from([(
+            10,
+            vec![
+                compat_starrocks_scan_range_for_test(300, 100, 7),
+                compat_starrocks_scan_range_for_test(301, 101, 8),
+            ],
+        )]));
+        fragment
+            .native_scan_ranges
+            .insert(10, vec![native_starrocks_scan_range_for_test(300, 100, 7)]);
+        let err = build_compat_starrocks_carrier_index(&fragment)
+            .expect_err("extra legacy StarRocks carrier must fail");
+        assert!(
+            err.contains("extra legacy StarRocks scan range carrier for node_id=10 tablet_id=301"),
+            "{err}"
+        );
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn compat_starrocks_carrier_index_rejects_legacy_only_node() {
+        let fragment = fragment_for_scan_range_merge_test(BTreeMap::from([(
+            10,
+            vec![compat_starrocks_scan_range_for_test(300, 100, 7)],
+        )]));
+
+        let err = build_compat_starrocks_carrier_index(&fragment)
+            .expect_err("legacy-only StarRocks carrier must fail");
+        assert!(
+            err.contains("extra legacy StarRocks scan range carrier for node_id=10 tablet_id=300"),
+            "{err}"
+        );
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn compat_starrocks_carrier_index_reports_accounting_errors_in_tablet_order() {
+        let mut fragment = fragment_for_scan_range_merge_test(BTreeMap::from([
+            (10, vec![compat_starrocks_scan_range_for_test(301, 101, 8)]),
+            (11, vec![compat_starrocks_scan_range_for_test(401, 201, 18)]),
+        ]));
+        fragment.native_scan_ranges.insert(
+            10,
+            vec![
+                native_starrocks_scan_range_for_test(302, 102, 9),
+                native_starrocks_scan_range_for_test(300, 100, 7),
+            ],
+        );
+        fragment
+            .native_scan_ranges
+            .insert(11, vec![native_starrocks_scan_range_for_test(400, 200, 17)]);
+
+        let err = build_compat_starrocks_carrier_index(&fragment)
+            .expect_err("carrier accounting mismatch must fail");
+        assert_eq!(
+            err,
+            "missing legacy StarRocks scan range carrier for node_id=10 tablet_id=300; extra legacy StarRocks scan range carrier for node_id=10 tablet_id=301; missing legacy StarRocks scan range carrier for node_id=10 tablet_id=302; missing legacy StarRocks scan range carrier for node_id=11 tablet_id=400; extra legacy StarRocks scan range carrier for node_id=11 tablet_id=401"
+        );
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn compat_starrocks_carrier_index_rejects_duplicate_native_tablet() {
+        let mut fragment = fragment_for_scan_range_merge_test(BTreeMap::from([(
+            10,
+            vec![compat_starrocks_scan_range_for_test(300, 100, 7)],
+        )]));
+        fragment.native_scan_ranges.insert(
+            10,
+            vec![
+                native_starrocks_scan_range_for_test(300, 100, 7),
+                native_starrocks_scan_range_for_test(300, 100, 7),
+            ],
+        );
+
+        let err = build_compat_starrocks_carrier_index(&fragment)
+            .expect_err("duplicate native StarRocks tablet must fail");
+        assert!(
+            err.contains("duplicate native StarRocks scan range for node_id=10 tablet_id=300"),
+            "{err}"
+        );
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn compat_starrocks_carrier_index_rejects_non_internal_legacy_range() {
+        let mut fragment = fragment_for_scan_range_merge_test(BTreeMap::from([(
+            10,
+            vec![compat_scan_range_for_test(999)],
+        )]));
+        fragment
+            .native_scan_ranges
+            .insert(10, vec![native_starrocks_scan_range_for_test(300, 100, 7)]);
+
+        let err = build_compat_starrocks_carrier_index(&fragment)
+            .expect_err("non-internal legacy StarRocks range must fail");
+        assert!(
+            err.contains("legacy StarRocks scan range carrier is not internal for node_id=10"),
+            "{err}"
+        );
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn compat_starrocks_carrier_index_rejects_invalid_legacy_version() {
+        let mut carrier = compat_starrocks_scan_range_for_test(300, 100, 7);
+        carrier
+            .scan_range
+            .internal_scan_range
+            .as_mut()
+            .expect("internal carrier")
+            .version = "invalid".to_string();
+        let mut fragment =
+            fragment_for_scan_range_merge_test(BTreeMap::from([(10, vec![carrier])]));
+        fragment
+            .native_scan_ranges
+            .insert(10, vec![native_starrocks_scan_range_for_test(300, 100, 7)]);
+
+        let err = build_compat_starrocks_carrier_index(&fragment)
+            .expect_err("invalid legacy StarRocks version must fail");
+        assert!(
+            err.contains(
+                "legacy StarRocks scan range carrier for node_id=10 tablet_id=300 has invalid version `invalid`"
+            ),
+            "{err}"
+        );
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn compat_starrocks_carrier_index_is_reused_across_placements() {
+        let mut fragment = fragment_for_scan_range_merge_test(BTreeMap::from([(
+            10,
+            vec![
+                compat_starrocks_scan_range_for_test(300, 100, 7),
+                compat_starrocks_scan_range_for_test(301, 101, 8),
+            ],
+        )]));
+        fragment.native_scan_ranges.insert(
+            10,
+            vec![
+                native_starrocks_scan_range_for_test(300, 100, 7),
+                native_starrocks_scan_range_for_test(301, 101, 8),
+            ],
+        );
+        let index = build_compat_starrocks_carrier_index(&fragment)
+            .expect("build one fragment-level StarRocks carrier index");
+        let _: &std::collections::HashMap<
+            i32,
+            std::collections::HashMap<i64, CompatStarRocksCarrier>,
+        > = &index.by_node;
+        assert_eq!(index.by_node[&10].len(), 2);
+
+        for (instance_index, tablet_id, partition_id, version) in
+            [(0, 300, 100, 7), (1, 301, 101, 8)]
+        {
+            let mut placement =
+                fake_placement(0, instance_index, 200 + instance_index as i64, "10.0.0.20");
+            placement.scan_ranges.insert(
+                10,
+                vec![native_starrocks_scan_range_for_test(
+                    tablet_id,
+                    partition_id,
+                    version,
+                )],
+            );
+            let selected = compat_scan_ranges_for_placement(&fragment, &placement, 2, &index)
+                .expect("reuse fragment-level carrier index");
+            assert_eq!(
+                selected[&10][0]
+                    .scan_range
+                    .internal_scan_range
+                    .as_ref()
+                    .expect("internal carrier")
+                    .tablet_id,
+                tablet_id
+            );
+        }
     }
 
     fn fake_destination(

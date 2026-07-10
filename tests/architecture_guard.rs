@@ -9959,10 +9959,7 @@ fn nidl_d3l_native_mainline_thrift_usage_is_explicitly_allowlisted() {
         ),
         (
             "src/runtime/scan_range.rs",
-            &[
-                "thrift_scan_range_params_from_native",
-                "thrift_scan_range_map_from_native",
-            ][..],
+            &["thrift_scan_range_params_from_native"][..],
         ),
         (
             "src/runtime/query_options.rs",
@@ -9983,6 +9980,14 @@ fn nidl_d3l_native_mainline_thrift_usage_is_explicitly_allowlisted() {
                 ));
             }
         }
+    }
+    let scan_range = fs::read_to_string(repo.join("src/runtime/scan_range.rs")).unwrap();
+    let scan_range = rust_production_text_without_cfg_test(&scan_range);
+    if scan_range.contains("thrift_scan_range_map_from_native") {
+        violations.push(
+            "src/runtime/scan_range.rs: retired bulk native-to-Thrift scan-range projection must remain absent"
+                .to_string(),
+        );
     }
 
     assert!(

@@ -120,6 +120,10 @@ pub(crate) struct MultiFragmentBuildResult {
     /// Per-fragment build results.
     pub fragment_results: Vec<FragmentBuildResult>,
     pub fragment_schedules: Vec<FragmentSchedulingMetadata>,
+    /// Temporary input to the native sidecar encoder. Task 2 removes this with
+    /// the sidecar carrier once native fragments become the canonical build product.
+    pub native_starrocks_scan_sources:
+        std::collections::BTreeMap<i32, proto_encode::plan::StarRocksScanSourceDescriptor>,
     /// Which fragment is the root (result sink).
     pub root_fragment_id: FragmentId,
     /// Fragment-to-fragment data edges.
