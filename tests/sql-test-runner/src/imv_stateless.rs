@@ -66,7 +66,6 @@
 
 #![allow(dead_code)]
 
-use crate::PlanWireFormatArg;
 use crate::cluster::CrossProcessServerHandle;
 use crate::results::compare_result_sets;
 use crate::session::MysqlSession;
@@ -145,7 +144,6 @@ pub(crate) struct ImvStatelessL2Report {
 pub(crate) fn run_imv_stateless_l2_case(
     repo_root: &Path,
     runner_config: &RunnerConfig,
-    plan_wire_format: PlanWireFormatArg,
     case: &ImvStatelessL2Case,
 ) -> Result<ImvStatelessL2Report> {
     let suffix = unique_suffix();
@@ -160,7 +158,6 @@ pub(crate) fn run_imv_stateless_l2_case(
         case.cluster_size,
         repo_root,
         runner_config,
-        plan_wire_format,
     )
     .context("launch cluster A for L2 statelessness case")?;
     let conn = connection_config(&cluster_a)?;
@@ -192,7 +189,6 @@ pub(crate) fn run_imv_stateless_l2_case(
         repo_root,
         runner_config,
         fresh_metadata_path_str,
-        plan_wire_format,
     )
     .context("launch cluster B (fresh [metadata].path) for L2 statelessness case")?;
     let conn = connection_config(&cluster_b)?;
@@ -474,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn l2_case_threads_plan_wire_format_to_both_cluster_launches() {
+    fn l2_case_has_no_wire_selector_parameter_or_launch_argument() {
         let source = include_str!("imv_stateless.rs");
         let fn_start = source
             .find("pub(crate) fn run_imv_stateless_l2_case(")
@@ -484,21 +480,13 @@ mod tests {
             .expect("run_setup_sql follows l2 case")
             + fn_start];
 
+        let retired_type = ["Plan", "Wire", "Format", "Arg"].concat();
+        let retired_parameter = ["plan", "wire", "format"].join("_");
+
+        assert!(!fn_body.contains(&retired_type), "L2 harness signature must be native-only");
         assert!(
-            fn_body.contains("plan_wire_format: PlanWireFormatArg"),
-            "L2 harness entrypoint must receive the plan wire format dimension"
-        );
-        assert!(
-            fn_body.contains("runner_config,\n        plan_wire_format,"),
-            "cluster A launch must use the caller's plan wire format"
-        );
-        assert!(
-            fn_body.contains("fresh_metadata_path_str,\n        plan_wire_format,"),
-            "cluster B metadata-override launch must use the caller's plan wire format"
-        );
-        assert!(
-            !fn_body.contains("PlanWireFormatArg::Thrift"),
-            "L2 harness must not hardcode thrift for either cluster"
+            !fn_body.contains(&retired_parameter),
+            "L2 cluster launches must not receive a wire selector"
         );
     }
 
