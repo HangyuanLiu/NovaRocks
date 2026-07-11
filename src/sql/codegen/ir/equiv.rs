@@ -575,9 +575,10 @@ mod tests {
     fn iceberg_sink_builds_ir_fragment_structure() {
         let mut plan = values_plan_for_columns(vec![output_col(1, "id", DataType::Int32, false)]);
         let connectors = ConnectorRegistry::new();
-        let mut sink_spec = crate::sql::planner::write_sink::test_support::simple_sink_spec();
+        let mut sink_spec =
+            crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec();
         sink_spec.iceberg.serialized_metadata = Some(
-            crate::sql::planner::write_sink::test_support::single_bucket_partition_metadata_json(),
+            crate::sql::planner::distributed::write::sink::test_support::single_bucket_partition_metadata_json(),
         );
         let catalog = DummyCatalog;
         prepare_bridge2_test_props(&mut plan);
@@ -585,12 +586,12 @@ mod tests {
             &plan,
         )
         .expect("build DistributedPlan");
-        let dp = crate::sql::planner::with_iceberg_write_sink(
+        let dp = crate::sql::planner::distributed::write::plan::with_iceberg_write_sink(
             dp,
-            crate::sql::planner::IcebergWriteFragmentSink {
+            crate::sql::planner::distributed::write::sink::IcebergWriteFragmentSink {
                 descriptor_database: "test_db".to_string(),
                 spec: sink_spec,
-                input: crate::sql::planner::IcebergWriteInputBinding::RootOutputByOrdinal,
+                input: crate::sql::planner::distributed::write::sink::IcebergWriteInputBinding::RootOutputByOrdinal,
             },
         )
         .expect("plan iceberg write sink");

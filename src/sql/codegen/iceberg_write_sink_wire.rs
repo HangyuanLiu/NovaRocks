@@ -28,8 +28,8 @@ use crate::connector::iceberg::position_delete_descriptor::{
 use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo};
 use crate::sql::codegen::descriptors::DescriptorTableBuilder;
 #[cfg(feature = "compat")]
-use crate::sql::planner::write_sink::IcebergWriteFileCompression;
-use crate::sql::planner::write_sink::{
+use crate::sql::planner::distributed::write::sink::IcebergWriteFileCompression;
+use crate::sql::planner::distributed::write::sink::{
     IcebergWriteSinkMode, IcebergWriteSinkSpec, transform_to_sink_string,
 };
 #[cfg(feature = "compat")]
@@ -422,7 +422,7 @@ mod tests {
         PositionDeleteDescriptorInput, PositionDeleteOutputField,
         PositionDeletePartitionSourceField,
     };
-    use crate::sql::planner::write_sink::{
+    use crate::sql::planner::distributed::write::sink::{
         IcebergWriteSinkMode, test_support, transform_to_sink_string,
     };
 

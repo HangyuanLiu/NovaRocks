@@ -1293,7 +1293,8 @@ mod tests {
 
     #[test]
     fn iceberg_write_fragment_uses_sink_output_contract_for_duplicate_input_columns() {
-        let mut sink_spec = crate::sql::planner::write_sink::test_support::simple_sink_spec();
+        let mut sink_spec =
+            crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec();
         sink_spec.target_columns = vec![
             crate::sql::catalog::ColumnDef {
                 name: "c0".to_string(),
@@ -1322,10 +1323,10 @@ mod tests {
             data_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
             output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
             sink: crate::sql::planner::distributed::DataSink::IcebergWrite(
-                crate::sql::planner::IcebergWriteFragmentSink {
+                crate::sql::planner::distributed::write::sink::IcebergWriteFragmentSink {
                     descriptor_database: "db".to_string(),
                     spec: sink_spec,
-                    input: crate::sql::planner::IcebergWriteInputBinding::RootOutputByOrdinal,
+                    input: crate::sql::planner::distributed::write::sink::IcebergWriteInputBinding::RootOutputByOrdinal,
                 },
             ),
             output_exprs: None,

@@ -69,7 +69,7 @@ use crate::sql::catalog::{
     ScanSource, TableDef,
 };
 use crate::sql::parser::ast::{InsertSource, Literal, SqlType};
-use crate::sql::planner::write_sink::{
+use crate::sql::planner::distributed::write::sink::{
     IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
     synthetic_iceberg_write_table_id, transform_to_sink_string,
 };

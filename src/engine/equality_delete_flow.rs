@@ -46,7 +46,7 @@ use crate::runtime::coordinator::CoordinatedQueryResult;
 use crate::runtime::write_coordinator::WriteCommitInput;
 use crate::sql::catalog::ColumnDef;
 use crate::sql::parser::ast::Literal;
-use crate::sql::planner::write_sink::{IcebergWriteSinkMode, IcebergWriteSinkSpec};
+use crate::sql::planner::distributed::write::sink::{IcebergWriteSinkMode, IcebergWriteSinkSpec};
 
 pub(crate) fn execute_add_equality_delete_statement(
     state: &Arc<StandaloneState>,

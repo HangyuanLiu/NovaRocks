@@ -2556,6 +2556,73 @@ fn rust_canonical_path_is_codegen_edge_topology(canonical: &[String]) -> bool {
         && edge_topology.contains(&canonical[3].as_str())
 }
 
+fn rust_canonical_path_is_legacy_distributed_write_owner(canonical: &[String]) -> bool {
+    canonical.len() >= 4
+        && canonical[..3] == ["crate", "sql", "planner"]
+        && matches!(
+            canonical[3].as_str(),
+            "write_plan" | "write_sink" | "change_stream_write"
+        )
+}
+
+fn rust_canonical_path_is_planner_root_distributed_write_item(canonical: &[String]) -> bool {
+    let write_items = [
+        "IcebergWriteSinkSpec",
+        "IcebergWriteSinkMode",
+        "IcebergWriteFileCompression",
+        "IcebergWriteFragmentSink",
+        "IcebergWriteInputBinding",
+        "ChangeStreamWriteBranchSpec",
+        "ChangeStreamWriteDagSpec",
+        "IcebergChangeStreamRouterSink",
+        "IcebergChangeStreamBranchRoute",
+        "IcebergChangeStreamWriteTopology",
+        "IcebergChangeStreamWriterBranch",
+        "PlannedIcebergChangeStreamDistributedPlan",
+        "with_iceberg_write_sink",
+        "with_iceberg_change_stream_write",
+        "synthetic_iceberg_write_table_id",
+        "transform_to_sink_string",
+    ];
+    canonical.len() == 4
+        && canonical[..3] == ["crate", "sql", "planner"]
+        && write_items.contains(&canonical[3].as_str())
+}
+
+fn rust_canonical_path_is_forbidden_distributed_write_dependency(canonical: &[String]) -> bool {
+    canonical.starts_with(&["crate".to_string(), "engine".to_string()])
+        || canonical.starts_with(&[
+            "crate".to_string(),
+            "sql".to_string(),
+            "optimizer".to_string(),
+        ])
+        || canonical.starts_with(&[
+            "crate".to_string(),
+            "sql".to_string(),
+            "codegen".to_string(),
+        ])
+        || canonical.starts_with(&[
+            "crate".to_string(),
+            "sql".to_string(),
+            "planner".to_string(),
+            "logical".to_string(),
+            "build".to_string(),
+        ])
+}
+
+fn rust_scoped_use_violates_distributed_write_owner(
+    import: &RustScopedUseStatement,
+    source_rel: &str,
+) -> bool {
+    let Some(canonical) =
+        rust_canonical_use_segments_in_scope(&import.import, source_rel, &import.inline_modules)
+    else {
+        return false;
+    };
+    rust_canonical_path_is_legacy_distributed_write_owner(&canonical)
+        || rust_canonical_path_is_planner_root_distributed_write_item(&canonical)
+}
+
 fn rust_scoped_use_violates_distributed_owner(
     import: &RustScopedUseStatement,
     source_rel: &str,
@@ -3291,6 +3358,97 @@ fn planner_distributed_owner_detector_covers_paths_aliases_scopes_and_tests() {
 }
 
 #[test]
+fn planner_distributed_write_owner_detector_covers_paths_aliases_scopes_and_tests() {
+    let source_rel = "src/sql/planner/distributed/write/plan.rs";
+    for source in [
+        "use crate::sql::planner::{write_sink::IcebergWriteSinkSpec, IcebergWriteFragmentSink};",
+        concat!(
+            "use crate::sql::planner::",
+            "write_plan as plan_owner; use plan_owner::with_iceberg_write_sink;"
+        ),
+        "use super::super::super::write_sink::IcebergWriteInputBinding;",
+        concat!(
+            "type Leak = crate::sql::planner::",
+            "write_sink::IcebergWriteSinkMode;"
+        ),
+        concat!(
+            "mod nested { use crate::sql::planner::",
+            "change_stream_write::ChangeStreamWriteDagSpec; }"
+        ),
+    ] {
+        let imports = rust_production_scoped_use_statements(source);
+        let paths = rust_production_canonical_paths(source, source_rel);
+        assert!(
+            imports.iter().any(|import| {
+                rust_scoped_use_violates_distributed_write_owner(import, source_rel)
+            }) || paths.iter().any(|path| {
+                rust_canonical_path_is_legacy_distributed_write_owner(path)
+                    || rust_canonical_path_is_planner_root_distributed_write_item(path)
+            }),
+            "distributed write owner bypass must be rejected: {source}\n{imports:?}\n{paths:?}"
+        );
+    }
+
+    for source in [
+        "use super::sink::IcebergWriteSinkSpec;",
+        "use crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec;",
+        concat!(
+            "#[cfg(test)] mod tests { use crate::sql::planner::",
+            "write_sink::IcebergWriteSinkSpec; }"
+        ),
+        concat!(
+            "#[cfg(test)] type TestOnly = crate::sql::planner::",
+            "IcebergWriteFragmentSink;"
+        ),
+    ] {
+        let imports = rust_production_scoped_use_statements(source);
+        let paths = rust_production_canonical_paths(source, source_rel);
+        assert!(
+            !imports.iter().any(|import| {
+                rust_scoped_use_violates_distributed_write_owner(import, source_rel)
+            }) && !paths.iter().any(|path| {
+                rust_canonical_path_is_legacy_distributed_write_owner(path)
+                    || rust_canonical_path_is_planner_root_distributed_write_item(path)
+            }),
+            "stage-owned or test-only write path must remain allowed: {source}\n{imports:?}\n{paths:?}"
+        );
+    }
+}
+
+#[test]
+fn planner_distributed_write_dependency_detector_covers_aliases_and_fully_qualified_paths() {
+    let source_rel = "src/sql/planner/distributed/write/plan.rs";
+    for source in [
+        "use crate::engine::StandaloneNovaRocks;",
+        "use crate::sql::{optimizer::Optimizer, codegen::FragmentBuildResult};",
+        "use crate::sql as sql_root; type Leak = sql_root::planner::logical::build::LogicalPlanBuilder;",
+        "type Leak = crate::engine::StandaloneSession;",
+    ] {
+        let paths = rust_production_canonical_paths(source, source_rel);
+        assert!(
+            paths
+                .iter()
+                .any(|path| rust_canonical_path_is_forbidden_distributed_write_dependency(path)),
+            "forbidden write dependency must be rejected: {source}\n{paths:?}"
+        );
+    }
+
+    let cfg_test = r#"
+#[cfg(test)]
+mod tests {
+    use crate::engine::StandaloneNovaRocks;
+    type Leak = crate::sql::codegen::FragmentBuildResult;
+}
+"#;
+    assert!(
+        !rust_production_canonical_paths(cfg_test, source_rel)
+            .iter()
+            .any(|path| rust_canonical_path_is_forbidden_distributed_write_dependency(path)),
+        "cfg(test) dependency noise must be ignored"
+    );
+}
+
+#[test]
 fn planner_guard_tracks_alias_qualified_non_use_paths() {
     let source_rel = "src/sql/planner/distributed/node.rs";
     for (source, forbidden) in [
@@ -3920,13 +4078,15 @@ fn planner_distributed_core_has_stage_namespace() {
             "fragment".to_string(),
             "node".to_string(),
             "runtime_filter".to_string(),
+            "write".to_string(),
         ]),
-        "distributed/mod.rs must declare exactly fragment, node, and runtime_filter"
+        "distributed/mod.rs must declare exactly fragment, node, runtime_filter, and write"
     );
     for declaration in [
         "mod fragment;",
         "mod node;",
         "pub(crate) mod runtime_filter;",
+        "pub(crate) mod write;",
     ] {
         assert!(
             has_non_comment_line(&distributed_mod, declaration),
@@ -4174,6 +4334,236 @@ fn planner_distributed_core_has_stage_namespace() {
         "distributed node owner must not import codegen: {:?}",
         rust_production_use_statements(&node)
     );
+}
+
+#[test]
+fn planner_distributed_write_surface_has_stage_namespace() {
+    let repo = Path::new(manifest_dir());
+    let planner = repo.join("src/sql/planner");
+    let distributed = planner.join("distributed");
+    let write = distributed.join("write");
+    let distributed_mod_path = distributed.join("mod.rs");
+    let write_mod_path = write.join("mod.rs");
+    let plan_path = write.join("plan.rs");
+    let sink_path = write.join("sink.rs");
+    let change_stream_path = write.join("change_stream.rs");
+
+    for path in [&write_mod_path, &plan_path, &sink_path, &change_stream_path] {
+        assert!(
+            path.is_file(),
+            "missing distributed write owner: {}",
+            rel(path)
+        );
+    }
+    for legacy in ["write_plan.rs", "write_sink.rs", "change_stream_write.rs"] {
+        let path = planner.join(legacy);
+        assert!(
+            !path.exists(),
+            "legacy distributed write owner must be deleted: {}",
+            rel(&path)
+        );
+    }
+
+    let distributed_mod = fs::read_to_string(&distributed_mod_path).unwrap();
+    assert_eq!(
+        planner_namespace_module_declarations(&distributed_mod),
+        BTreeSet::from([
+            "fragment".to_string(),
+            "node".to_string(),
+            "runtime_filter".to_string(),
+            "write".to_string(),
+        ]),
+        "distributed/mod.rs must declare exactly fragment, node, runtime_filter, and write"
+    );
+    assert!(
+        has_non_comment_line(&distributed_mod, "pub(crate) mod write;"),
+        "distributed write namespace must use pub(crate) visibility"
+    );
+
+    let write_mod = fs::read_to_string(&write_mod_path).unwrap();
+    assert_eq!(
+        planner_namespace_module_declarations(&write_mod),
+        BTreeSet::from([
+            "change_stream".to_string(),
+            "plan".to_string(),
+            "sink".to_string(),
+        ]),
+        "distributed/write/mod.rs must declare exactly change_stream, plan, and sink"
+    );
+    for declaration in [
+        "pub(crate) mod change_stream;",
+        "pub(crate) mod plan;",
+        "pub(crate) mod sink;",
+    ] {
+        assert!(
+            has_non_comment_line(&write_mod, declaration),
+            "distributed/write/mod.rs must contain `{declaration}`"
+        );
+    }
+    assert_eq!(
+        rust_use_tokens(&rust_sanitized_production_text(&write_mod)),
+        [
+            "pub",
+            "(",
+            "crate",
+            ")",
+            "mod",
+            "change_stream",
+            ";",
+            "pub",
+            "(",
+            "crate",
+            ")",
+            "mod",
+            "plan",
+            ";",
+            "pub",
+            "(",
+            "crate",
+            ")",
+            "mod",
+            "sink",
+            ";",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>(),
+        "distributed/write/mod.rs production surface must contain only three pub(crate) module declarations"
+    );
+
+    let all_sources = rs_files(&src_dir())
+        .into_iter()
+        .map(|path| {
+            let text = fs::read_to_string(&path).unwrap();
+            (path, text)
+        })
+        .collect::<Vec<_>>();
+    let planner_sources = rs_files(&planner)
+        .into_iter()
+        .map(|path| {
+            let text = fs::read_to_string(&path).unwrap();
+            (path, text)
+        })
+        .collect::<Vec<_>>();
+    for (owner, items) in [
+        (
+            &sink_path,
+            &[
+                "IcebergWriteSinkSpec",
+                "IcebergWriteSinkMode",
+                "IcebergWriteFileCompression",
+                "IcebergWriteFragmentSink",
+                "IcebergWriteInputBinding",
+            ][..],
+        ),
+        (
+            &change_stream_path,
+            &[
+                "ChangeStreamWriteBranchSpec",
+                "ChangeStreamWriteDagSpec",
+                "IcebergChangeStreamRouterSink",
+                "IcebergChangeStreamBranchRoute",
+                "IcebergChangeStreamWriteTopology",
+                "IcebergChangeStreamWriterBranch",
+            ][..],
+        ),
+        (
+            &plan_path,
+            &["PlannedIcebergChangeStreamDistributedPlan"][..],
+        ),
+    ] {
+        for item in items {
+            let declarations = planner_sources
+                .iter()
+                .filter_map(|(path, text)| {
+                    let count = rust_named_type_declaration_count(text, item);
+                    (count > 0).then(|| format!("{} ({count})", rel(path)))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                declarations,
+                vec![format!("{} (1)", rel(owner))],
+                "{item} must have exactly one declaration in its distributed write owner"
+            );
+        }
+    }
+    for (owner, functions) in [
+        (
+            &plan_path,
+            &[
+                "with_iceberg_write_sink",
+                "with_iceberg_change_stream_write",
+            ][..],
+        ),
+        (
+            &sink_path,
+            &[
+                "synthetic_iceberg_write_table_id",
+                "transform_to_sink_string",
+            ][..],
+        ),
+        (&change_stream_path, &["validate_branch_set"][..]),
+    ] {
+        for function in functions {
+            let declarations = planner_sources
+                .iter()
+                .filter_map(|(path, text)| {
+                    let count = rust_named_function_declaration_count(text, function);
+                    (count > 0).then(|| format!("{} ({count})", rel(path)))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                declarations,
+                vec![format!("{} (1)", rel(owner))],
+                "{function} must have exactly one declaration in its distributed write owner"
+            );
+        }
+    }
+
+    let planner_mod_path = planner.join("mod.rs");
+    let planner_mod = fs::read_to_string(&planner_mod_path).unwrap();
+    for legacy in ["write_plan", "write_sink", "change_stream_write"] {
+        assert!(
+            !has_module_declaration(&planner_mod, legacy),
+            "planner facade must not declare legacy write module {legacy}"
+        );
+    }
+    assert!(
+        !planner_mod.contains("write_export_tests"),
+        "planner facade write_export_tests must be deleted"
+    );
+
+    for (path, text) in &all_sources {
+        let source_rel = rel(path);
+        let imports = rust_production_scoped_use_statements(text);
+        let canonical_paths = rust_production_canonical_paths(text, &source_rel);
+        for import in &imports {
+            assert!(
+                !rust_scoped_use_violates_distributed_write_owner(import, &source_rel),
+                "distributed write owner bypass remains in {source_rel}: {import:?}"
+            );
+        }
+        for canonical in &canonical_paths {
+            assert!(
+                !(rust_canonical_path_is_legacy_distributed_write_owner(canonical)
+                    || rust_canonical_path_is_planner_root_distributed_write_item(canonical)),
+                "distributed write owner bypass remains in {source_rel}: {}",
+                canonical.join("::")
+            );
+        }
+    }
+
+    for path in rs_files(&write) {
+        let text = fs::read_to_string(&path).unwrap();
+        let source_rel = rel(&path);
+        for canonical in rust_production_canonical_paths(&text, &source_rel) {
+            assert!(
+                !rust_canonical_path_is_forbidden_distributed_write_dependency(&canonical),
+                "distributed write production has forbidden dependency in {source_rel}: {}",
+                canonical.join("::")
+            );
+        }
+    }
 }
 
 #[test]
@@ -9557,8 +9947,10 @@ fn nidl_e3_planner_ir_uses_native_partition_and_runtime_filter_types() {
         "src/sql/planner/distributed/fragment.rs",
         "src/sql/planner/distributed/node.rs",
         "src/sql/planner/distributed/runtime_filter.rs",
+        "src/sql/planner/distributed/write/change_stream.rs",
+        "src/sql/planner/distributed/write/plan.rs",
+        "src/sql/planner/distributed/write/sink.rs",
         "src/sql/planner/distributed_plan_build.rs",
-        "src/sql/planner/write_plan.rs",
         "src/sql/planner/physical/mod.rs",
         "src/sql/planner/physical/node.rs",
         "src/sql/planner/physical/runtime_filter.rs",

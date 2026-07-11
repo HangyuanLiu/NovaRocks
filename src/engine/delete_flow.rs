@@ -61,7 +61,7 @@ use crate::runtime::write_coordinator::WriteCommitInput;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::catalog::ColumnDef;
 use crate::sql::parser::ast::{DeleteStmt, ObjectName};
-use crate::sql::planner::write_sink::{IcebergWriteSinkMode, IcebergWriteSinkSpec};
+use crate::sql::planner::distributed::write::sink::{IcebergWriteSinkMode, IcebergWriteSinkSpec};
 
 pub(crate) fn execute_delete_statement(
     state: &Arc<StandaloneState>,

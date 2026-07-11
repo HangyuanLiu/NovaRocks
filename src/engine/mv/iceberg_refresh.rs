@@ -15014,7 +15014,8 @@ fn iceberg_change_stream_write_dag_for_imv_refresh(
     refresh_plan: &ImvRefreshPlannedChangeStream<'_>,
     target_ref: &str,
     data_route_output_ordinal: Option<usize>,
-) -> Result<crate::sql::planner::ChangeStreamWriteDagSpec, String> {
+) -> Result<crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec, String>
+{
     let branches = build_imv_change_stream_branches(
         target,
         resolved,
@@ -15024,11 +15025,13 @@ fn iceberg_change_stream_write_dag_for_imv_refresh(
         &refresh_plan.producer_branches,
         target_ref,
     )?;
-    Ok(crate::sql::planner::ChangeStreamWriteDagSpec {
-        change_op_output_ordinal: Some(imv_change_op_output_ordinal(refresh_plan)?),
-        data_route_output_ordinal,
-        branches,
-    })
+    Ok(
+        crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec {
+            change_op_output_ordinal: Some(imv_change_op_output_ordinal(refresh_plan)?),
+            data_route_output_ordinal,
+            branches,
+        },
+    )
 }
 
 fn imv_change_op_output_ordinal(
@@ -15087,9 +15090,13 @@ fn build_imv_change_stream_branches(
     output_columns: &[OutputColumn],
     producer_branches: &[ImvChangeStreamProducerBranch],
     target_ref: &str,
-) -> Result<Vec<crate::sql::planner::ChangeStreamWriteBranchSpec>, String> {
+) -> Result<
+    Vec<crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteBranchSpec>,
+    String,
+> {
     use crate::sql::common::ChangeStreamBranchKind;
-    use crate::sql::planner::{ChangeStreamWriteBranchSpec, IcebergWriteSinkMode};
+    use crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteBranchSpec;
+    use crate::sql::planner::distributed::write::sink::IcebergWriteSinkMode;
 
     producer_branches
         .iter()
@@ -15262,9 +15269,9 @@ enum ImvBranchShape {
 #[cfg(test)]
 fn build_imv_change_stream_branches_for_test(
     shape: ImvBranchShape,
-) -> Vec<crate::sql::planner::ChangeStreamWriteBranchSpec> {
+) -> Vec<crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteBranchSpec> {
     use crate::sql::common::ChangeStreamBranchKind;
-    use crate::sql::planner::ChangeStreamWriteBranchSpec;
+    use crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteBranchSpec;
     match shape {
         ImvBranchShape::DeleteAndReuse => vec![
             ChangeStreamWriteBranchSpec::for_test(0, ChangeStreamBranchKind::DeleteDv, Vec::new()),

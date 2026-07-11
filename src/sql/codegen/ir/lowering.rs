@@ -998,7 +998,10 @@ fn lower_exchange_compat_partition(
 fn router_route_for_edge<'a>(
     dp: &'a crate::sql::planner::distributed::DistributedPlan,
     edge: &crate::sql::planner::distributed::FragmentEdge,
-) -> Result<&'a crate::sql::planner::IcebergChangeStreamBranchRoute, String> {
+) -> Result<
+    &'a crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamBranchRoute,
+    String,
+> {
     let crate::sql::planner::distributed::FragmentEdgeKind::IcebergChangeStreamRouter {
         router_group_id,
         branch_id,
@@ -5628,13 +5631,13 @@ fn lower_fragment_sink(
 
 fn iceberg_sink_columns_for_input(
     output_columns: &[AnalysisOutputColumn],
-    input: &crate::sql::planner::IcebergWriteInputBinding,
+    input: &crate::sql::planner::distributed::write::sink::IcebergWriteInputBinding,
 ) -> Result<Vec<AnalysisOutputColumn>, String> {
     match input {
-        crate::sql::planner::IcebergWriteInputBinding::RootOutputByOrdinal => {
+        crate::sql::planner::distributed::write::sink::IcebergWriteInputBinding::RootOutputByOrdinal => {
             Ok(output_columns.to_vec())
         }
-        crate::sql::planner::IcebergWriteInputBinding::OutputOrdinals(ordinals) => ordinals
+        crate::sql::planner::distributed::write::sink::IcebergWriteInputBinding::OutputOrdinals(ordinals) => ordinals
             .iter()
             .copied()
             .map(|ordinal| {
@@ -7350,15 +7353,16 @@ mod tests {
         let catalog = DummyCatalog;
         let connectors = ConnectorRegistry::new();
         let mut dp = distributed_project_scan_plan();
-        let mut sink_spec = crate::sql::planner::write_sink::test_support::simple_sink_spec();
+        let mut sink_spec =
+            crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec();
         sink_spec.iceberg.serialized_metadata = Some(
-            crate::sql::planner::write_sink::test_support::single_bucket_partition_metadata_json(),
+            crate::sql::planner::distributed::write::sink::test_support::single_bucket_partition_metadata_json(),
         );
         dp.fragments[0].sink =
-            DataSink::IcebergWrite(crate::sql::planner::IcebergWriteFragmentSink {
+            DataSink::IcebergWrite(crate::sql::planner::distributed::write::sink::IcebergWriteFragmentSink {
                 descriptor_database: "test_db".to_string(),
                 spec: sink_spec,
-                input: crate::sql::planner::IcebergWriteInputBinding::RootOutputByOrdinal,
+                input: crate::sql::planner::distributed::write::sink::IcebergWriteInputBinding::RootOutputByOrdinal,
             });
 
         let result = super::lower_distributed_plan(&dp, &catalog, &connectors, None)
@@ -7425,14 +7429,19 @@ mod tests {
             root_fragment_id: 0,
             edges: Vec::new(),
         };
-        let mut branch =
-            crate::sql::planner::ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![2]);
+        let mut branch = crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![2]);
         branch.output_partition_ordinals = vec![2];
         branch.sink_spec.iceberg.serialized_metadata =
-            Some(crate::sql::planner::write_sink::test_support::unpartitioned_metadata_json());
-        let dag =
-            crate::sql::planner::ChangeStreamWriteDagSpec::for_test(Some(0), None, vec![branch]);
-        let planned = crate::sql::planner::with_iceberg_change_stream_write(dp, "test_db", dag)
+            Some(crate::sql::planner::distributed::write::sink::test_support::unpartitioned_metadata_json());
+        let dag = crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec::for_test(
+            Some(0),
+            None,
+            vec![branch],
+        );
+        let planned =
+            crate::sql::planner::distributed::write::plan::with_iceberg_change_stream_write(
+                dp, "test_db", dag,
+            )
             .expect("plan change-stream write");
 
         let result =

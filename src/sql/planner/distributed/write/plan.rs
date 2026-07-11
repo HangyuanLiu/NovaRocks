@@ -15,22 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::change_stream::{
+    ChangeStreamWriteDagSpec, IcebergChangeStreamBranchRoute, IcebergChangeStreamRouterSink,
+    IcebergChangeStreamWriteTopology, IcebergChangeStreamWriterBranch,
+};
+use super::sink::{
+    IcebergWriteFragmentSink, IcebergWriteInputBinding, synthetic_iceberg_write_table_id,
+};
 use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::planner::distributed::{
-    DataPartition, DataSink, DistributedNode, DistributedNodeKind, ExchangeFlavor,
+    DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor,
     ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind,
     PartitionKind, PlanFragment,
 };
-use crate::sql::planner::{
-    ChangeStreamWriteDagSpec, IcebergChangeStreamBranchRoute, IcebergChangeStreamRouterSink,
-    IcebergChangeStreamWriteTopology, IcebergChangeStreamWriterBranch, IcebergWriteFragmentSink,
-    IcebergWriteInputBinding, PlannedIcebergChangeStreamDistributedPlan,
-};
+
+#[derive(Clone, Debug)]
+pub(crate) struct PlannedIcebergChangeStreamDistributedPlan {
+    pub(crate) distributed_plan: DistributedPlan,
+    pub(crate) topology: IcebergChangeStreamWriteTopology,
+}
 
 pub(crate) fn with_iceberg_write_sink(
-    mut plan: crate::sql::planner::distributed::DistributedPlan,
-    sink: crate::sql::planner::IcebergWriteFragmentSink,
-) -> Result<crate::sql::planner::distributed::DistributedPlan, String> {
+    mut plan: DistributedPlan,
+    sink: IcebergWriteFragmentSink,
+) -> Result<DistributedPlan, String> {
     let root_fragment_id = plan.root_fragment_id;
     let root = plan
         .fragments
@@ -55,13 +63,11 @@ pub(crate) fn with_iceberg_write_sink(
 
 fn validate_iceberg_sink_arity(
     fragment: &crate::sql::planner::distributed::PlanFragment,
-    sink: &crate::sql::planner::IcebergWriteFragmentSink,
+    sink: &IcebergWriteFragmentSink,
 ) -> Result<(), String> {
     let input_count = match &sink.input {
-        crate::sql::planner::IcebergWriteInputBinding::RootOutputByOrdinal => {
-            fragment.output_columns.len()
-        }
-        crate::sql::planner::IcebergWriteInputBinding::OutputOrdinals(ordinals) => {
+        IcebergWriteInputBinding::RootOutputByOrdinal => fragment.output_columns.len(),
+        IcebergWriteInputBinding::OutputOrdinals(ordinals) => {
             validate_iceberg_sink_output_ordinals(&fragment.output_columns, ordinals)?;
             ordinals.len()
         }
@@ -91,7 +97,7 @@ fn validate_iceberg_sink_output_ordinals(
 }
 
 pub(crate) fn with_iceberg_change_stream_write(
-    mut plan: crate::sql::planner::distributed::DistributedPlan,
+    mut plan: DistributedPlan,
     descriptor_database: &str,
     dag: ChangeStreamWriteDagSpec,
 ) -> Result<PlannedIcebergChangeStreamDistributedPlan, String> {
@@ -156,7 +162,7 @@ pub(crate) fn with_iceberg_change_stream_write(
         let table_id_offset = i64::try_from(branch_index).map_err(|_| {
             "Iceberg change-stream branch index overflow while assigning sink table ids".to_string()
         })?;
-        sink_spec.target_table_id = crate::sql::planner::synthetic_iceberg_write_table_id()
+        sink_spec.target_table_id = synthetic_iceberg_write_table_id()
             .checked_sub(table_id_offset)
             .ok_or_else(|| "Iceberg change-stream synthetic sink table id underflow".to_string())?;
 
@@ -265,7 +271,7 @@ pub(crate) fn with_iceberg_change_stream_write(
     })
 }
 
-fn next_fragment_id(plan: &crate::sql::planner::distributed::DistributedPlan) -> FragmentId {
+fn next_fragment_id(plan: &DistributedPlan) -> FragmentId {
     plan.fragments
         .iter()
         .map(|fragment| fragment.fragment_id)
@@ -274,7 +280,7 @@ fn next_fragment_id(plan: &crate::sql::planner::distributed::DistributedPlan) ->
         + 1
 }
 
-fn next_node_id(plan: &crate::sql::planner::distributed::DistributedPlan) -> i32 {
+fn next_node_id(plan: &DistributedPlan) -> i32 {
     plan.fragments
         .iter()
         .flat_map(|fragment| node_ids(&fragment.root))
@@ -283,7 +289,7 @@ fn next_node_id(plan: &crate::sql::planner::distributed::DistributedPlan) -> i32
         + 1
 }
 
-fn next_tuple_id(plan: &crate::sql::planner::distributed::DistributedPlan) -> i32 {
+fn next_tuple_id(plan: &DistributedPlan) -> i32 {
     plan.fragments
         .iter()
         .flat_map(|fragment| node_tuple_ids(&fragment.root))
@@ -391,6 +397,10 @@ fn stream_kind_for_data_partition(partition: &DataPartition) -> FragmentStreamKi
 mod tests {
     use arrow::datatypes::DataType;
 
+    use super::super::change_stream::{ChangeStreamWriteBranchSpec, ChangeStreamWriteDagSpec};
+    use super::super::sink::{
+        IcebergWriteFragmentSink, IcebergWriteInputBinding, synthetic_iceberg_write_table_id,
+    };
     use crate::sql::analysis::{ExprKind, OutputColumn};
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::ChangeStreamBranchKind;
@@ -399,10 +409,6 @@ mod tests {
         PlanFragment,
     };
     use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
-    use crate::sql::planner::{
-        ChangeStreamWriteBranchSpec, ChangeStreamWriteDagSpec, IcebergWriteFragmentSink,
-        IcebergWriteInputBinding,
-    };
 
     use super::{with_iceberg_change_stream_write, with_iceberg_write_sink};
 
@@ -411,7 +417,7 @@ mod tests {
         let plan = single_fragment_plan_for_test();
         let sink = IcebergWriteFragmentSink {
             descriptor_database: "test_db".to_string(),
-            spec: crate::sql::planner::write_sink::test_support::simple_sink_spec(),
+            spec: super::super::sink::test_support::simple_sink_spec(),
             input: IcebergWriteInputBinding::RootOutputByOrdinal,
         };
 
@@ -433,7 +439,7 @@ mod tests {
         ]);
         let sink = IcebergWriteFragmentSink {
             descriptor_database: "test_db".to_string(),
-            spec: crate::sql::planner::write_sink::test_support::simple_sink_spec(),
+            spec: super::super::sink::test_support::simple_sink_spec(),
             input: IcebergWriteInputBinding::OutputOrdinals(vec![0, 1]),
         };
 
@@ -449,7 +455,7 @@ mod tests {
         let plan = single_fragment_plan_for_test();
         let sink = IcebergWriteFragmentSink {
             descriptor_database: "test_db".to_string(),
-            spec: crate::sql::planner::write_sink::test_support::simple_sink_spec(),
+            spec: super::super::sink::test_support::simple_sink_spec(),
             input: IcebergWriteInputBinding::OutputOrdinals(vec![7]),
         };
 
@@ -537,13 +543,13 @@ mod tests {
             planned.topology.writer_branches[0]
                 .sink_spec
                 .target_table_id,
-            crate::sql::planner::synthetic_iceberg_write_table_id()
+            synthetic_iceberg_write_table_id()
         );
         assert_eq!(
             planned.topology.writer_branches[1]
                 .sink_spec
                 .target_table_id,
-            crate::sql::planner::synthetic_iceberg_write_table_id() - 1
+            synthetic_iceberg_write_table_id() - 1
         );
     }
 

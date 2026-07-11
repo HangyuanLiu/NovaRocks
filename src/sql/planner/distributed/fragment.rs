@@ -83,8 +83,8 @@ impl DataPartition {
 pub(crate) enum DataSink {
     Result,
     Noop,
-    IcebergWrite(crate::sql::planner::IcebergWriteFragmentSink),
-    IcebergChangeStreamRouter(crate::sql::planner::IcebergChangeStreamRouterSink),
+    IcebergWrite(super::write::sink::IcebergWriteFragmentSink),
+    IcebergChangeStreamRouter(super::write::change_stream::IcebergChangeStreamRouterSink),
 }
 
 #[derive(Clone, Debug)]
