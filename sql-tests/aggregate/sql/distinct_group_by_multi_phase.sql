@@ -34,13 +34,27 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t_dg VALUES
+INSERT INTO ${case_db}.t_dg
+VALUES
     (1, 100, 10), (1, 100, 20), (1, 200, 30),
     (2, 100, 40), (2, 300, 50), (2, 300, 60),
     (3, 400, 70);
 
 -- query 4
+-- @skip_result_check=true
+-- Force this case through SplitDistinctAgg's distributed multi-phase path.
+SET disable_optimizer_rules = 'AggToHashAgg';
+
+-- query 5
+-- @explain_contains=HASH AGGREGATE (LOCAL,
+-- @explain_contains=HASH AGGREGATE (DISTINCT_GLOBAL,
+-- @explain_contains=HASH AGGREGATE (GLOBAL,
+-- @explain_contains=HASH EXCHANGE
 SELECT g, count(distinct x) AS dc, sum(a) AS sa
 FROM ${case_db}.t_dg
 GROUP BY g
 ORDER BY g;
+
+-- query 6
+-- @skip_result_check=true
+SET disable_optimizer_rules = '';
