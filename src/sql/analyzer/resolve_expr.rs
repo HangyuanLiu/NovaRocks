@@ -4669,9 +4669,8 @@ fn narrow_int_literals_in_typed_expr(expr: TypedExpr) -> TypedExpr {
     }
 }
 
-/// Render an Arrow `DataType` as the StarRocks-style type name used by
-/// `typeof()`. Mirrors the codegen-level helper in `expr_compiler` so the
-/// analyzer can fold `typeof(<expr>)` into a string literal directly.
+/// Render an Arrow `DataType` as the StarRocks-style type name used when the
+/// analyzer folds `typeof(<expr>)` into a string literal.
 fn arrow_type_to_starrocks_name(dt: &DataType) -> String {
     match dt {
         DataType::Boolean => "boolean".to_string(),

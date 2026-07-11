@@ -61,9 +61,9 @@ fn is_varchar_castable_scalar(data_type: &DataType) -> bool {
 /// Both the small and large Arrow string/binary layouts are valid VARCHAR/
 /// VARBINARY carriers in NovaRocks. In particular, Iceberg-backed binary
 /// columns are materialized as `LargeBinary` by the Parquet read path, and the
-/// standalone codegen maps `LargeUtf8` back to VARCHAR (see
-/// `src/sql/codegen/type_infer.rs`). Matching only `Utf8 | Binary` here would
-/// reject those Iceberg-sourced arguments.
+/// native type encoder maps `LargeUtf8` back to VARCHAR (see
+/// `src/sql/codegen/proto_encode/types.rs`). Matching only `Utf8 | Binary`
+/// here would reject those Iceberg-sourced arguments.
 fn is_varchar_or_binary_type(data_type: &DataType) -> bool {
     matches!(
         data_type,

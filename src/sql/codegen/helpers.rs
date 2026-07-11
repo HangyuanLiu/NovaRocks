@@ -286,7 +286,7 @@ fn canonical_agg_display_name(name: &str) -> &str {
     }
 }
 
-/// Build aggregate display name from components (used by expr_compiler for scope lookup).
+/// Build aggregate display names for native logical aggregate construction and expression display.
 pub(crate) fn agg_call_display_name_from_parts(
     name: &str,
     args: &[TypedExpr],
