@@ -2756,19 +2756,13 @@ fn explain_analyze_query(
     let execution_start = std::time::Instant::now();
     let query_opts =
         crate::engine::query_options_wire::standalone_query_options_to_runtime(&query_opts);
-    let native_dp = refresh_native_sidecar_plan_with_lowered_edges(&dp, &build_result.edges, None)?;
-    let native_sidecars = Some(crate::runtime::coordinator::prepare_native_plan_sidecars(
-        &native_dp, None,
-    )?);
-    let outcome =
-        crate::runtime::coordinator::ExecutionCoordinator::new_with_optional_native_plan_sidecars(
-            build_result,
-            native_sidecars,
-            dispatcher,
-            scheduler,
-            Some(query_opts),
-        )
-        .execute_with_profile_outcome()?;
+    let outcome = crate::runtime::coordinator::ExecutionCoordinator::new(
+        build_result,
+        dispatcher,
+        scheduler,
+        Some(query_opts),
+    )
+    .execute_with_profile_outcome()?;
     let execution_elapsed = execution_start.elapsed();
     if let Some(abort) = outcome.write_abort.as_ref() {
         return Err(abort.reason.clone());
@@ -3148,13 +3142,8 @@ pub(crate) fn execute_query_as_iceberg_write(
         ),
     )?;
     let (dispatcher, scheduler) = coordinated_execution_services()?;
-    let native_dp = refresh_native_sidecar_plan_with_lowered_edges(&dp, &build_result.edges, None)?;
-    let native_sidecars = Some(crate::runtime::coordinator::prepare_native_plan_sidecars(
-        &native_dp, None,
-    )?);
-    crate::runtime::coordinator::ExecutionCoordinator::new_with_optional_native_plan_sidecars(
+    crate::runtime::coordinator::ExecutionCoordinator::new(
         build_result,
-        native_sidecars,
         dispatcher,
         scheduler,
         crate::engine::query_options_wire::standalone_query_options_to_optional_runtime(
@@ -3275,7 +3264,6 @@ pub(crate) fn observe_change_stream_write_build_for_test(
 
 pub(crate) struct PlannedIcebergChangeStreamWrite {
     pub(crate) build_result: crate::sql::codegen::MultiFragmentBuildResult,
-    pub(crate) native_sidecars: Option<crate::runtime::coordinator::NativePlanSidecars>,
     pub(crate) commit_plan:
         crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan,
     #[cfg(test)]
@@ -3338,8 +3326,11 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_native_pla
             current_database,
             dag.clone(),
         )?;
-    let distributed_plan = planned_dp.distributed_plan;
+    let mut distributed_plan = planned_dp.distributed_plan;
     let topology = planned_dp.topology;
+    if let Some(mutate_native_plan) = native_plan_mutation {
+        mutate_native_plan(&mut distributed_plan)?;
+    }
     let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
         crate::sql::codegen::FragmentBuildRequest::result(
             &distributed_plan,
@@ -3348,26 +3339,12 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_native_pla
             mv_refresh_ctx,
         ),
     )?;
-    let mut native_distributed_plan =
-        crate::sql::codegen::ir::refresh_distributed_plan_for_native_sidecar(
-            &distributed_plan,
-            mv_refresh_ctx,
-        )?;
-    native_distributed_plan.edges = build_result.edges.clone();
-    if let Some(mutate_native_plan) = native_plan_mutation {
-        mutate_native_plan(&mut native_distributed_plan)?;
-    }
-    let native_sidecars = Some(crate::runtime::coordinator::prepare_native_plan_sidecars(
-        &native_distributed_plan,
-        mv_refresh_ctx,
-    )?);
     let commit_plan =
         crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan::from_topology(
             &topology,
         )?;
     Ok(PlannedIcebergChangeStreamWrite {
         build_result,
-        native_sidecars,
         commit_plan,
         #[cfg(test)]
         topology,
@@ -3376,7 +3353,6 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_native_pla
 
 pub(crate) fn execute_planned_iceberg_change_stream_write(
     build_result: crate::sql::codegen::MultiFragmentBuildResult,
-    native_sidecars: Option<crate::runtime::coordinator::NativePlanSidecars>,
     query_opts: Option<StandaloneQueryOptions>,
 ) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
     let (dispatcher, scheduler) = coordinated_execution_services()?;
@@ -3384,23 +3360,12 @@ pub(crate) fn execute_planned_iceberg_change_stream_write(
         crate::engine::query_options_wire::standalone_query_options_to_optional_runtime(
             query_opts.as_ref(),
         );
-    match native_sidecars {
-        Some(native_sidecars) => {
-            crate::runtime::coordinator::ExecutionCoordinator::new_with_native_plan_sidecars(
-                build_result,
-                native_sidecars,
-                dispatcher,
-                scheduler,
-                query_options,
-            )
-        }
-        None => crate::runtime::coordinator::ExecutionCoordinator::new(
-            build_result,
-            dispatcher,
-            scheduler,
-            query_options,
-        ),
-    }
+    crate::runtime::coordinator::ExecutionCoordinator::new(
+        build_result,
+        dispatcher,
+        scheduler,
+        query_options,
+    )
     .execute_with_write_outcome()
 }
 
@@ -3426,11 +3391,7 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
     if let Some(result) = observe_change_stream_write_build_for_test(&planned.topology) {
         return Ok(result);
     }
-    execute_planned_iceberg_change_stream_write(
-        planned.build_result,
-        planned.native_sidecars,
-        query_opts,
-    )
+    execute_planned_iceberg_change_stream_write(planned.build_result, query_opts)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3769,16 +3730,9 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
             mv_refresh_ctx,
         ),
     )?;
-    let native_dp =
-        refresh_native_sidecar_plan_with_lowered_edges(&dp, &build_result.edges, mv_refresh_ctx)?;
-    let native_sidecars = Some(crate::runtime::coordinator::prepare_native_plan_sidecars(
-        &native_dp,
-        mv_refresh_ctx,
-    )?);
     let (dispatcher, scheduler) = coordinated_execution_services()?;
-    crate::runtime::coordinator::ExecutionCoordinator::new_with_optional_native_plan_sidecars(
+    crate::runtime::coordinator::ExecutionCoordinator::new(
         build_result,
-        native_sidecars,
         dispatcher,
         scheduler,
         crate::engine::query_options_wire::standalone_query_options_to_optional_runtime(
@@ -3838,16 +3792,9 @@ pub(crate) fn execute_logical_plan_with_options(
             mv_refresh_ctx,
         ),
     )?;
-    let native_dp =
-        refresh_native_sidecar_plan_with_lowered_edges(&dp, &build_result.edges, mv_refresh_ctx)?;
-    let native_sidecars = Some(crate::runtime::coordinator::prepare_native_plan_sidecars(
-        &native_dp,
-        mv_refresh_ctx,
-    )?);
     let (dispatcher, scheduler) = coordinated_execution_services()?;
-    crate::runtime::coordinator::ExecutionCoordinator::new_with_optional_native_plan_sidecars(
+    crate::runtime::coordinator::ExecutionCoordinator::new(
         build_result,
-        native_sidecars,
         dispatcher,
         scheduler,
         crate::engine::query_options_wire::standalone_query_options_to_optional_runtime(
@@ -3887,17 +3834,6 @@ fn coordinated_execution_services() -> Result<
         }
     };
     Ok((dispatcher, scheduler))
-}
-
-fn refresh_native_sidecar_plan_with_lowered_edges(
-    dp: &crate::sql::planner::distributed::DistributedPlan,
-    lowered_edges: &[crate::sql::planner::distributed::FragmentEdge],
-    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
-) -> Result<crate::sql::planner::distributed::DistributedPlan, String> {
-    let mut native_dp =
-        crate::sql::codegen::ir::refresh_distributed_plan_for_native_sidecar(dp, mv_refresh_ctx)?;
-    native_dp.edges = lowered_edges.to_vec();
-    Ok(native_dp)
 }
 
 /// Select a `FragmentDispatcher` implementation based on the effective cluster role.
@@ -5583,6 +5519,14 @@ mysql_port = 47892
                     StarRocksScanHandle {
                         table: inner,
                         schema_id: self.schema_id,
+                        storage_columns: vec![
+                            crate::connector::starrocks::table::scan_planner::StarRocksStorageColumn {
+                                name: "id".to_string(),
+                                unique_id: 1,
+                                default_value: None,
+                            },
+                        ],
+                        tablet_schema: crate::connector::starrocks::table::scan_planner::test_native_tablet_schema_for_column(self.schema_id, "id", 1, None),
                     },
                 ))
             }
@@ -6370,8 +6314,8 @@ mysql_port = 47892
     }
 
     /// OQ-5 Task 6: codegen must lower the runtime-filter annotations the
-    /// planner-side placement pass attaches to a hash join into thrift
-    /// `TRuntimeFilterDescription`s on the join node, AND assemble a
+    /// planner-side placement pass attaches to a hash join into native
+    /// runtime-filter descriptors on the join node, AND assemble a
     /// `RuntimeFilterPlanResult`. Exercises the full standalone pipeline
     /// (analyze -> plan -> optimize -> planner RF placement -> codegen) over the test
     /// catalog's fact-like `tbl(id int, name varchar)` joined to the small
@@ -6381,18 +6325,16 @@ mysql_port = 47892
     fn codegen_emits_build_runtime_filters_from_annotation() {
         let build =
             build_fragments_for_query("SELECT count(*) FROM tbl a JOIN date_dim b ON a.id = b.id");
-        let has_rf = build.fragment_results.iter().any(|fr| {
-            fr.plan.nodes.iter().any(|n| {
-                n.hash_join_node
-                    .as_ref()
-                    .and_then(|hj| hj.build_runtime_filters.as_ref())
-                    .map(|v| !v.is_empty())
-                    .unwrap_or(false)
-            })
-        });
+        fn has_build_filter(node: &crate::proto::plan::DistributedNode) -> bool {
+            !node.build_runtime_filters.is_empty() || node.children.iter().any(has_build_filter)
+        }
+        let has_rf = build
+            .native_fragments
+            .values()
+            .any(|fragment| fragment.root.as_ref().is_some_and(has_build_filter));
         assert!(
             has_rf,
-            "expected a hash join thrift node with build_runtime_filters"
+            "expected a native hash join node with build_runtime_filters"
         );
         // The coordinator-facing RF plan must be assembled with native
         // descriptor metadata plus build/probe placement maps.
@@ -6435,9 +6377,9 @@ mysql_port = 47892
         );
 
         assert!(
-            build.fragment_results.len() > 1,
+            build.fragment_schedules.len() > 1,
             "fragments={}",
-            build.fragment_results.len()
+            build.fragment_schedules.len()
         );
         assert!(build.edges.iter().any(|edge| {
             matches!(
@@ -6459,10 +6401,10 @@ mysql_port = 47892
         );
 
         // Multiple fragments: root + CTE produce fragments + possible stream children.
-        assert!(build.fragment_results.len() > 1);
+        assert!(build.fragment_schedules.len() > 1);
 
         // At least one CTE produce fragment exists.
-        assert!(build.fragment_results.iter().any(|f| f.cte_id.is_some()));
+        assert!(build.fragment_schedules.iter().any(|f| f.cte_id.is_some()));
     }
 
     #[test]

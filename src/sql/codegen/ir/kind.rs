@@ -15,18 +15,4 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) use crate::sql::planner::payload::{
-    PlanAssertOneRowNode as DistributedAssertOneRowNode, PlanFilterNode as DistributedFilterNode,
-    PlanGenerateSeriesNode as DistributedGenerateSeriesNode,
-    PlanProjectNode as DistributedProjectNode, PlanRepeatNode as DistributedRepeatNode,
-    PlanScanNode as DistributedScanNode, PlanSortNode as DistributedSortNode,
-    PlanTableFunctionNode as DistributedTableFunctionNode, PlanValuesNode as DistributedValuesNode,
-    PlanWindowNode as DistributedWindowNode,
-};
-#[cfg(test)]
-pub(crate) use crate::sql::planner::physical::PhysicalHashJoinEqCondition;
-pub(crate) use crate::sql::planner::physical::{
-    DistributedChangeEventExpandNode, PhysicalHashAggregateNode as DistributedHashAggregateNode,
-    PhysicalHashAggregateNode, PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalSetOpNode,
-    PhysicalTopNNode, PlanSetOpKind as SetOpKind,
-};
+//! Reserved home for planner IR kind helpers.

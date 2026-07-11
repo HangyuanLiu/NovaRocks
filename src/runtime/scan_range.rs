@@ -39,11 +39,57 @@ impl ScanRangeParams {
             has_more: Some(false),
         }
     }
+
+    #[cfg_attr(not(feature = "compat"), allow(dead_code))]
+    pub(crate) fn starrocks_tablet(
+        tablet_id: i64,
+        partition_id: i64,
+        version: i64,
+    ) -> Result<Self, String> {
+        let range = StarRocksTabletScanRange::try_new(tablet_id, partition_id, version)?;
+        Ok(Self {
+            range: ScanRange::StarRocksTablet(range),
+            volume_id: None,
+            empty: Some(false),
+            has_more: Some(false),
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum ScanRange {
     File(FileScanRange),
+    #[cfg_attr(not(feature = "compat"), allow(dead_code))]
+    StarRocksTablet(StarRocksTabletScanRange),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StarRocksTabletScanRange {
+    pub(crate) tablet_id: i64,
+    pub(crate) partition_id: i64,
+    pub(crate) version: i64,
+}
+
+impl StarRocksTabletScanRange {
+    #[cfg_attr(not(feature = "compat"), allow(dead_code))]
+    fn try_new(tablet_id: i64, partition_id: i64, version: i64) -> Result<Self, String> {
+        for (field, value) in [
+            ("tablet_id", tablet_id),
+            ("partition_id", partition_id),
+            ("version", version),
+        ] {
+            if value <= 0 {
+                return Err(format!(
+                    "StarRocks tablet scan range {field} must be positive, got {value}"
+                ));
+            }
+        }
+        Ok(Self {
+            tablet_id,
+            partition_id,
+            version,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -191,6 +237,11 @@ pub(crate) fn thrift_scan_range_params_from_native(
             None::<plan_nodes::TBinlogScanRange>,
             None::<plan_nodes::TBenchmarkScanRange>,
         ),
+        ScanRange::StarRocksTablet(_) => {
+            return Err(
+                "native StarRocks tablet scan range does not have a Thrift projection".to_string(),
+            );
+        }
     };
     Ok(internal_service::TScanRangeParams::new(
         scan_range,
@@ -198,23 +249,6 @@ pub(crate) fn thrift_scan_range_params_from_native(
         src.empty,
         src.has_more,
     ))
-}
-
-#[cfg(feature = "compat")]
-pub(crate) fn thrift_scan_range_map_from_native(
-    src: &BTreeMap<i32, Vec<ScanRangeParams>>,
-) -> Result<BTreeMap<i32, Vec<internal_service::TScanRangeParams>>, String> {
-    src.iter()
-        .map(|(node_id, ranges)| {
-            Ok((
-                *node_id,
-                ranges
-                    .iter()
-                    .map(thrift_scan_range_params_from_native)
-                    .collect::<Result<Vec<_>, _>>()?,
-            ))
-        })
-        .collect()
 }
 
 #[cfg(feature = "compat")]
@@ -347,9 +381,53 @@ fn thrift_file_pruning_value_kind(kind: FilePruningValueKind) -> exprs::TExprNod
 
 #[cfg(feature = "compat")]
 fn thrift_int_literal_expr(value: i64) -> exprs::TExpr {
-    exprs::TExpr::new(vec![crate::sql::codegen::expr_compiler::int_literal_node(
-        value,
-    )])
+    let node = exprs::TExprNode {
+        node_type: exprs::TExprNodeType::INT_LITERAL,
+        type_: crate::types::arrow_thrift::thrift_type_desc_from_primitive(
+            types::TPrimitiveType::BIGINT,
+        ),
+        opcode: None,
+        num_children: 0,
+        agg_expr: None,
+        bool_literal: None,
+        case_expr: None,
+        date_literal: None,
+        float_literal: None,
+        int_literal: Some(exprs::TIntLiteral { value }),
+        in_predicate: None,
+        is_null_pred: None,
+        like_pred: None,
+        literal_pred: None,
+        slot_ref: None,
+        string_literal: None,
+        tuple_is_null_pred: None,
+        info_func: None,
+        decimal_literal: None,
+        output_scale: 0,
+        fn_call_expr: None,
+        large_int_literal: None,
+        output_column: None,
+        output_type: None,
+        vector_opcode: None,
+        fn_: None,
+        vararg_start_idx: None,
+        child_type: None,
+        vslot_ref: None,
+        used_subfield_names: None,
+        binary_literal: None,
+        copy_flag: None,
+        check_is_out_of_bounds: None,
+        use_vectorized: None,
+        has_nullable_child: None,
+        is_nullable: None,
+        child_type_desc: None,
+        is_monotonic: None,
+        dict_query_expr: None,
+        dictionary_get_expr: None,
+        is_index_only_filter: None,
+        is_nondeterministic: None,
+    };
+    exprs::TExpr::new(vec![node])
 }
 
 #[cfg(feature = "compat")]
@@ -365,6 +443,39 @@ fn thrift_extended_columns_from_native(
             )])))
         }
         _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn starrocks_tablet_range_requires_positive_identity() {
+        let valid = ScanRangeParams::starrocks_tablet(300, 100, 7)
+            .expect("positive StarRocks tablet range");
+        let ScanRange::StarRocksTablet(range) = valid.range else {
+            panic!("expected StarRocks tablet range");
+        };
+        assert_eq!(range.tablet_id, 300);
+        assert_eq!(range.partition_id, 100);
+        assert_eq!(range.version, 7);
+        assert_eq!(valid.empty, Some(false));
+        assert_eq!(valid.has_more, Some(false));
+
+        for (tablet_id, partition_id, version, field) in [
+            (0, 100, 7, "tablet_id"),
+            (-1, 100, 7, "tablet_id"),
+            (300, 0, 7, "partition_id"),
+            (300, -1, 7, "partition_id"),
+            (300, 100, 0, "version"),
+            (300, 100, -1, "version"),
+        ] {
+            let err = ScanRangeParams::starrocks_tablet(tablet_id, partition_id, version)
+                .expect_err("non-positive StarRocks range identity must fail");
+            assert!(err.contains(field), "{err}");
+            assert!(err.contains("positive"), "{err}");
+        }
     }
 }
 

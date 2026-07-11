@@ -37,12 +37,13 @@ pub(crate) struct RuntimeFilterParams {
 mod compat_tests {
     use std::collections::BTreeMap;
 
+    use crate::common::types::UniqueId;
     use crate::thrift::{runtime_filter, types};
 
     use super::RuntimeFilterParams;
 
     #[test]
-    fn thrift_runtime_filter_params_convert_to_native_and_back_for_compat_boundary() {
+    fn thrift_runtime_filter_params_convert_into_native_compat_boundary() {
         let thrift = runtime_filter::TRuntimeFilterParams {
             id_to_prober_params: Some(BTreeMap::from([(
                 11,
@@ -60,25 +61,11 @@ mod compat_tests {
         };
 
         let native = RuntimeFilterParams::from_thrift(&thrift).expect("from thrift");
-        let projected = native.to_thrift();
-
-        assert_eq!(projected.runtime_filter_max_size, Some(4096));
-        assert_eq!(
-            projected
-                .runtime_filter_builder_number
-                .as_ref()
-                .and_then(|counts| counts.get(&11)),
-            Some(&2)
-        );
-        let prober = &projected.id_to_prober_params.as_ref().unwrap()[&11][0];
-        assert_eq!(
-            prober.fragment_instance_id,
-            Some(types::TUniqueId::new(3, 4))
-        );
-        assert_eq!(
-            prober.fragment_instance_address,
-            Some(types::TNetworkAddress::new("10.0.0.11".to_string(), 9060))
-        );
+        assert_eq!(native.runtime_filter_max_size(), Some(4096));
+        assert_eq!(native.runtime_filter_builder_number().get(&11), Some(&2));
+        let prober = &native.id_to_prober_params()[&11][0];
+        assert_eq!(prober.fragment_instance_id(), UniqueId { hi: 3, lo: 4 });
+        assert_eq!(prober.endpoint().as_host_port(), "10.0.0.11:9060");
     }
 
     #[test]
@@ -252,30 +239,6 @@ impl RuntimeFilterParams {
         ))
     }
 
-    #[cfg(feature = "compat")]
-    pub(crate) fn to_thrift(&self) -> runtime_filter::TRuntimeFilterParams {
-        let id_to_prober_params = self
-            .id_to_prober_params
-            .iter()
-            .map(|(filter_id, probers)| {
-                (
-                    *filter_id,
-                    probers
-                        .iter()
-                        .map(compat_adapters::prober_params_to_thrift)
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        runtime_filter::TRuntimeFilterParams::new(
-            (!id_to_prober_params.is_empty()).then_some(id_to_prober_params),
-            (!self.runtime_filter_builder_number.is_empty())
-                .then_some(self.runtime_filter_builder_number.clone()),
-            self.runtime_filter_max_size,
-            None::<std::collections::BTreeSet<i32>>,
-        )
-    }
-
     pub(crate) fn to_worker_params(&self) -> RuntimeFilterWorkerParams {
         let id_to_prober_targets = self
             .id_to_prober_params
@@ -346,10 +309,6 @@ mod compat_adapters {
         }
     }
 
-    fn unique_id_to_thrift(src: UniqueId) -> types::TUniqueId {
-        types::TUniqueId::new(src.hi, src.lo)
-    }
-
     pub(super) fn prober_params_from_thrift(
         src: &runtime_filter::TRuntimeFilterProberParams,
     ) -> Result<RuntimeFilterProberDestination, String> {
@@ -366,16 +325,6 @@ mod compat_adapters {
             unique_id_from_thrift(&fragment_instance_id),
             endpoint,
         ))
-    }
-
-    pub(super) fn prober_params_to_thrift(
-        src: &RuntimeFilterProberDestination,
-    ) -> runtime_filter::TRuntimeFilterProberParams {
-        let fragment_instance_id = src.fragment_instance_id();
-        runtime_filter::TRuntimeFilterProberParams::new(
-            Some(unique_id_to_thrift(fragment_instance_id)),
-            Some(src.endpoint().to_network_address()),
-        )
     }
 }
 

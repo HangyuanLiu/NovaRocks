@@ -17,8 +17,6 @@
 
 use crate::sql::analysis::{self as query_ir, BinOp, ExprKind, TypedExpr};
 use crate::sql::planner::payload::{AggregateCall, WindowExpr};
-#[cfg(feature = "compat")]
-use crate::thrift::plan_nodes;
 
 /// Split a TypedExpr on AND into a flat list of conjuncts.
 pub(crate) fn split_and_conjuncts_typed(expr: &TypedExpr) -> Vec<&TypedExpr> {
@@ -157,111 +155,6 @@ pub(crate) fn typed_expr_display_name(expr: &TypedExpr) -> String {
             )
         }
         _ => format!("{:?}", expr.kind),
-    }
-}
-
-pub(crate) fn typed_expr_display_name_without_qualifiers(expr: &TypedExpr) -> String {
-    let mut expr = expr.clone();
-    strip_column_qualifiers(&mut expr);
-    typed_expr_display_name(&expr)
-}
-
-pub(crate) fn agg_call_display_name_without_qualifiers(call: &AggregateCall) -> String {
-    let mut call = call.clone();
-    for arg in &mut call.args {
-        strip_column_qualifiers(arg);
-    }
-    for item in &mut call.order_by {
-        strip_column_qualifiers(&mut item.expr);
-    }
-    agg_call_display_name(&call)
-}
-
-fn strip_column_qualifiers(expr: &mut TypedExpr) {
-    match &mut expr.kind {
-        ExprKind::ColumnRef { qualifier, .. } => {
-            *qualifier = None;
-        }
-        ExprKind::LambdaParamRef { .. }
-        | ExprKind::Literal(_)
-        | ExprKind::SubqueryPlaceholder { .. } => {}
-        ExprKind::BinaryOp { left, right, .. } => {
-            strip_column_qualifiers(left);
-            strip_column_qualifiers(right);
-        }
-        ExprKind::UnaryOp { expr, .. }
-        | ExprKind::Cast { expr, .. }
-        | ExprKind::IsNull { expr, .. }
-        | ExprKind::IsTruthValue { expr, .. }
-        | ExprKind::Nested(expr)
-        | ExprKind::Lambda { body: expr, .. } => {
-            strip_column_qualifiers(expr);
-        }
-        ExprKind::FunctionCall { args, .. } => {
-            for arg in args {
-                strip_column_qualifiers(arg);
-            }
-        }
-        ExprKind::LambdaFunction { body, .. } => {
-            strip_column_qualifiers(body);
-        }
-        ExprKind::AggregateCall { args, order_by, .. } => {
-            for arg in args {
-                strip_column_qualifiers(arg);
-            }
-            for item in order_by {
-                strip_column_qualifiers(&mut item.expr);
-            }
-        }
-        ExprKind::InList { expr, list, .. } => {
-            strip_column_qualifiers(expr);
-            for item in list {
-                strip_column_qualifiers(item);
-            }
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            strip_column_qualifiers(expr);
-            strip_column_qualifiers(low);
-            strip_column_qualifiers(high);
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            strip_column_qualifiers(expr);
-            strip_column_qualifiers(pattern);
-        }
-        ExprKind::Case {
-            operand,
-            when_then,
-            else_expr,
-        } => {
-            if let Some(operand) = operand {
-                strip_column_qualifiers(operand);
-            }
-            for (when, then) in when_then {
-                strip_column_qualifiers(when);
-                strip_column_qualifiers(then);
-            }
-            if let Some(else_expr) = else_expr {
-                strip_column_qualifiers(else_expr);
-            }
-        }
-        ExprKind::WindowCall {
-            args,
-            partition_by,
-            order_by,
-            ..
-        } => {
-            for arg in args {
-                strip_column_qualifiers(arg);
-            }
-            for expr in partition_by {
-                strip_column_qualifiers(expr);
-            }
-            for item in order_by {
-                strip_column_qualifiers(&mut item.expr);
-            }
-        }
     }
 }
 
@@ -515,23 +408,6 @@ pub(crate) fn agg_call_display_name(call: &AggregateCall) -> String {
     agg_call_display_name_from_parts(&call.name, &call.args, call.distinct, &call.order_by)
 }
 
-/// Map JoinKind to TJoinOp.
-#[cfg(feature = "compat")]
-pub(crate) fn join_kind_to_op(kind: query_ir::JoinKind) -> plan_nodes::TJoinOp {
-    match kind {
-        query_ir::JoinKind::Inner => plan_nodes::TJoinOp::INNER_JOIN,
-        query_ir::JoinKind::LeftOuter => plan_nodes::TJoinOp::LEFT_OUTER_JOIN,
-        query_ir::JoinKind::RightOuter => plan_nodes::TJoinOp::RIGHT_OUTER_JOIN,
-        query_ir::JoinKind::FullOuter => plan_nodes::TJoinOp::FULL_OUTER_JOIN,
-        query_ir::JoinKind::Cross => plan_nodes::TJoinOp::CROSS_JOIN,
-        query_ir::JoinKind::LeftSemi => plan_nodes::TJoinOp::LEFT_SEMI_JOIN,
-        query_ir::JoinKind::RightSemi => plan_nodes::TJoinOp::RIGHT_SEMI_JOIN,
-        query_ir::JoinKind::LeftAnti => plan_nodes::TJoinOp::LEFT_ANTI_JOIN,
-        query_ir::JoinKind::RightAnti => plan_nodes::TJoinOp::RIGHT_ANTI_JOIN,
-        query_ir::JoinKind::NullAwareLeftAnti => plan_nodes::TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN,
-    }
-}
-
 /// Group window expressions by their (partition_by, order_by, frame) signature.
 pub(crate) fn group_win_exprs_by_sig(exprs: &[WindowExpr]) -> Vec<Vec<usize>> {
     let sig = |e: &WindowExpr| -> String {
@@ -564,30 +440,14 @@ pub(crate) fn group_win_exprs_by_sig(exprs: &[WindowExpr]) -> Vec<Vec<usize>> {
 mod tests {
     use arrow::datatypes::DataType;
 
-    use super::{
-        agg_call_display_name_from_parts, agg_call_display_name_without_qualifiers,
-        typed_expr_display_name,
-    };
+    use super::{agg_call_display_name_from_parts, typed_expr_display_name};
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
-    use crate::sql::planner::payload::AggregateCall;
 
     fn col(name: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: crate::sql::column_id::ColumnId::UNSET,
                 qualifier: None,
-                column: name.to_string(),
-            },
-            data_type: DataType::Int64,
-            nullable: true,
-        }
-    }
-
-    fn qualified_col(qualifier: &str, name: &str) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::ColumnRef {
-                column_id: crate::sql::column_id::ColumnId::UNSET,
-                qualifier: Some(qualifier.to_string()),
                 column: name.to_string(),
             },
             data_type: DataType::Int64,
@@ -695,22 +555,6 @@ mod tests {
         assert_eq!(
             agg_call_display_name_from_parts("array_unique_agg", &[col("s_1")], false, &[]),
             "array_unique_agg(s_1)"
-        );
-    }
-
-    #[test]
-    fn agg_call_display_name_without_qualifiers_drops_column_qualifier() {
-        let call = AggregateCall {
-            name: "avg".to_string(),
-            args: vec![qualified_col("web_sales", "ws_quantity")],
-            distinct: false,
-            order_by: vec![],
-            result_type: DataType::Float64,
-            output_column_id: crate::sql::column_id::ColumnId::UNSET,
-        };
-        assert_eq!(
-            agg_call_display_name_without_qualifiers(&call),
-            "avg(ws_quantity)"
         );
     }
 }

@@ -103,6 +103,15 @@ fn encode_scan_range(src: &scan_range::ScanRange) -> Result<novarocks::ScanRange
                 file,
             )?)),
         }),
+        scan_range::ScanRange::StarRocksTablet(range) => Ok(novarocks::ScanRange {
+            kind: Some(novarocks::scan_range::Kind::StarrocksTablet(
+                novarocks::StarRocksTabletScanRange {
+                    tablet_id: range.tablet_id,
+                    partition_id: range.partition_id,
+                    version: range.version,
+                },
+            )),
+        }),
     }
 }
 

@@ -53,7 +53,7 @@ pub(crate) fn lower_starrocks_scan_node(
 mod tests {
     use super::*;
     use crate::lower::compat::node::decode::QueryGlobalDictMap;
-    use crate::sql::codegen::descriptors::DescriptorTableBuilder;
+    use crate::lower::compat::test_support::DescriptorTableBuilder;
     use crate::thrift::{descriptors, internal_service, plan_nodes, types};
     use arrow::datatypes::DataType;
     use std::collections::{BTreeMap, HashMap};

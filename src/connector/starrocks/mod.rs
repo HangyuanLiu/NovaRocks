@@ -27,4 +27,8 @@ pub(crate) mod table_schema_service;
 
 pub(crate) use object_store_profile::ObjectStoreProfile;
 pub(crate) use scan::build_native_object_store_profile_from_properties;
-pub use scan::{LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanOp, StarRocksScanRange};
+pub(crate) use scan::prepare_native_starrocks_scan;
+pub use scan::{
+    LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanOp, StarRocksScanRange,
+    StarRocksSchemaColumnHint,
+};

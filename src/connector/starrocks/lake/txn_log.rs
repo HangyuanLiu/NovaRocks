@@ -49,7 +49,8 @@ use crate::formats::starrocks::metadata::{
     load_bundle_segment_footers, load_tablet_snapshot, tablet_operator_relative_path,
 };
 use crate::formats::starrocks::plan::{
-    StarRocksOutputColumnHint, build_native_read_plan_with_output_hints,
+    StarRocksOutputColumnHint, StarRocksPhysicalColumnBinding,
+    build_native_read_plan_with_output_hints,
 };
 use crate::formats::starrocks::reader::build_native_record_batch;
 use crate::formats::starrocks::writer::bundle_meta::{
@@ -2017,6 +2018,7 @@ fn build_partial_update_column_hints(
                 schema_map.get(&normalized).cloned().unwrap_or((None, None));
             StarRocksOutputColumnHint {
                 schema_unique_id,
+                physical_binding: StarRocksPhysicalColumnBinding::LegacyName,
                 fallback_default_literal,
             }
         })

@@ -355,6 +355,7 @@ fn physical_payload(node: &DistributedNode) -> Option<PhysicalPlanKind> {
     }
 }
 
+#[cfg(test)]
 fn physical_kind_name(payload: &DistributedNodeKind) -> &'static str {
     match payload {
         DistributedNodeKind::Scan(_) => "Scan",

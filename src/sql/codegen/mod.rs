@@ -15,52 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Physical plan layer — converts [`LogicalPlanNode`] into Thrift execution plans.
+//! Physical plan layer — converts [`LogicalPlanNode`] into native execution plans.
 //!
 //! This layer allocates physical resources (tuple_id, slot_id, node_id),
-//! compiles `TypedExpr` into Thrift `TExpr`, and assembles the Thrift
-//! plan structures expected by the pipeline executor.
+//! compiles expressions, and assembles the plan structures expected by the
+//! pipeline executor.
 
 pub(crate) mod agg_type_infer;
 pub(crate) mod boundary_schema;
 pub(crate) mod connector_scan_wire;
-#[cfg(feature = "compat")]
-pub(crate) mod descriptors;
-#[cfg(feature = "compat")]
-pub(crate) mod expr_compiler;
-pub(crate) mod fallback_audit;
 pub(crate) mod fragment_builder;
 pub(crate) mod fragment_request;
 pub(crate) mod helpers;
-#[cfg(feature = "compat")]
-pub(crate) mod iceberg_change_stream_router_wire;
 pub(crate) mod iceberg_delta_scan_wire;
 pub(crate) mod iceberg_literal_json;
-#[cfg(feature = "compat")]
-pub(crate) mod iceberg_write_sink_wire;
 pub(crate) mod ir;
-#[cfg(feature = "compat")]
-pub(crate) mod nodes;
 pub(crate) mod proto_encode;
-pub(crate) mod resolve;
 pub(crate) mod runtime_filter;
-pub(crate) mod runtime_filter_lowering;
 pub(crate) mod scalar_materialize;
-#[cfg(feature = "compat")]
-pub(crate) mod type_infer;
 
 use arrow::datatypes::DataType;
-
-#[cfg(feature = "compat")]
-use crate::thrift::data_sinks;
-#[cfg(feature = "compat")]
-use crate::thrift::descriptors as thrift_descriptors;
-#[cfg(feature = "compat")]
-use crate::thrift::internal_service;
-#[cfg(feature = "compat")]
-use crate::thrift::partitions;
-#[cfg(feature = "compat")]
-use crate::thrift::plan_nodes;
 
 use super::analysis::cte::CteId;
 use super::column_id::ColumnId;
@@ -92,17 +66,9 @@ impl FragmentOutputKind {
     }
 }
 
-#[derive(Clone, Debug)]
-#[cfg(feature = "compat")]
-pub(crate) struct LoweredFragmentEdge {
-    pub edge: FragmentEdge,
-    pub compat_partition: partitions::TDataPartition,
-}
-
 /// Native per-fragment metadata used by scheduling and coordinator routing.
-/// This intentionally contains no thrift plan, descriptor, sink, or exec-param
-/// payload. Compat payloads stay in `FragmentBuildResult` until E9 gates the
-/// compact lowering path.
+/// This intentionally contains no Thrift plan, descriptor, sink, or exec-param
+/// payload.
 #[derive(Clone, Debug)]
 pub(crate) struct FragmentSchedulingMetadata {
     pub fragment_id: FragmentId,
@@ -117,29 +83,15 @@ pub(crate) struct FragmentSchedulingMetadata {
 }
 
 pub(crate) struct MultiFragmentBuildResult {
-    /// Per-fragment build results.
-    pub fragment_results: Vec<FragmentBuildResult>,
     pub fragment_schedules: Vec<FragmentSchedulingMetadata>,
+    pub native_fragments: std::collections::BTreeMap<FragmentId, crate::proto::plan::PlanFragment>,
     /// Which fragment is the root (result sink).
     pub root_fragment_id: FragmentId,
     /// Fragment-to-fragment data edges.
     pub edges: Vec<FragmentEdge>,
-    /// Codegen-side lowering products for edges that still feed compat thrift runtime sinks.
-    #[cfg(feature = "compat")]
-    pub lowered_edges: Vec<LoweredFragmentEdge>,
     pub boundary_schemas: Vec<boundary_schema::BoundarySchemaReport>,
     /// Runtime filter planning result (populated for standalone mode).
     pub rf_plan: Option<RuntimeFilterPlanResult>,
-}
-
-impl MultiFragmentBuildResult {
-    pub(crate) fn refresh_fragment_schedules(&mut self) {
-        self.fragment_schedules = self
-            .fragment_results
-            .iter()
-            .map(FragmentBuildResult::scheduling_metadata)
-            .collect();
-    }
 }
 
 /// Result of lowering runtime-filter annotations to execution wiring.
@@ -155,60 +107,6 @@ pub(crate) struct RuntimeFilterPlanResult {
     pub build_side_filters: std::collections::HashMap<FragmentId, Vec<i32>>,
     /// fragment_id -> (filter_id, probe_target_node_id) for probe-side targets.
     pub probe_side_filters: std::collections::HashMap<FragmentId, Vec<(i32, i32)>>,
-}
-
-/// Physical emission result for a single fragment.
-pub(crate) struct FragmentBuildResult {
-    pub fragment_id: FragmentId,
-    pub has_scan_nodes: bool,
-    pub output_kind: FragmentOutputKind,
-    #[cfg(feature = "compat")]
-    pub plan: plan_nodes::TPlan,
-    #[cfg(feature = "compat")]
-    pub desc_tbl: thrift_descriptors::TDescriptorTable,
-    #[cfg(feature = "compat")]
-    pub exec_params: internal_service::TPlanFragmentExecParams,
-    pub native_scan_ranges:
-        std::collections::BTreeMap<i32, Vec<crate::runtime::scan_range::ScanRangeParams>>,
-    #[cfg(feature = "compat")]
-    #[allow(dead_code)]
-    // populated by fragment builder, will be read when standalone multi-fragment execution is wired
-    pub output_sink: data_sinks::TDataSink,
-    #[cfg(feature = "compat")]
-    pub output_exprs: Option<Vec<crate::thrift::exprs::TExpr>>,
-    pub output_columns: Vec<OutputColumn>,
-    pub boundary_schemas: Vec<boundary_schema::BoundarySchemaReport>,
-    /// CTE ID if this is a multicast fragment.
-    pub cte_id: Option<CteId>,
-    /// Exchange node IDs in this fragment that consume from CTE fragments:
-    /// `(cte_id, exchange_node_id, receive_producer_column_ids)`.
-    pub cte_exchange_nodes: Vec<(CteId, i32, Vec<ColumnId>)>,
-    /// Per-fragment global dictionaries emitted to `TPlanFragment.query_global_dicts`.
-    /// Standalone SQL lowering no longer populates this after the native Decode
-    /// path was retired; external fragment producers may still carry it.
-    #[cfg(feature = "compat")]
-    pub query_global_dicts: Option<Vec<crate::thrift::data::TGlobalDict>>,
-    /// Per-fragment dictionary expressions emitted to
-    /// `TPlanFragment.query_global_dict_exprs`. Wired through for Task 7+;
-    /// today this stays `None` because no codegen path populates it.
-    #[cfg(feature = "compat")]
-    pub query_global_dict_exprs:
-        Option<std::collections::BTreeMap<i32, crate::thrift::exprs::TExpr>>,
-}
-
-impl FragmentBuildResult {
-    pub(crate) fn scheduling_metadata(&self) -> FragmentSchedulingMetadata {
-        FragmentSchedulingMetadata {
-            fragment_id: self.fragment_id,
-            has_scan_nodes: self.has_scan_nodes,
-            output_kind: self.output_kind,
-            native_scan_ranges: self.native_scan_ranges.clone(),
-            output_columns: self.output_columns.clone(),
-            boundary_schemas: self.boundary_schemas.clone(),
-            cte_id: self.cte_id,
-            cte_exchange_nodes: self.cte_exchange_nodes.clone(),
-        }
-    }
 }
 
 #[cfg(test)]

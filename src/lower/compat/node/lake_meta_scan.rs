@@ -52,7 +52,8 @@ use crate::runtime::query_context::QueryId;
 use crate::service::grpc_client::proto::starrocks::{ColumnPb, TabletSchemaPb};
 use crate::thrift::{descriptors, internal_service, plan_nodes, types};
 
-use super::lake_scan::{build_lake_properties, record_internal_catalog_name};
+use super::lake_scan::record_internal_catalog_name;
+use crate::connector::starrocks::fe_v2_meta::lake_scan_object_store_properties;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum MetaMetricKind {
@@ -343,7 +344,7 @@ pub(crate) fn lower_lake_meta_scan_node(
         .collect::<Vec<_>>();
     let tablet_path_map =
         resolve_tablet_paths_for_lake_meta_scan(query_id, fe_addr, &table_identity, &tablet_ids)?;
-    let properties = build_lake_properties(&tablet_path_map)?;
+    let properties = lake_scan_object_store_properties(&tablet_path_map)?;
     let object_store_profile = build_native_object_store_profile_from_properties(&properties)?;
     let require_tablet_snapshot = metric_by_slot.values().any(|metric| {
         matches!(

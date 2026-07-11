@@ -145,7 +145,7 @@ fn build_agg_scan_plan(
         index_by_unique.insert(projected.schema_unique_id, projected.output_index);
     }
 
-    for key in &plan.group_key_columns {
+    for (key_index, key) in plan.group_key_columns.iter().enumerate() {
         if index_by_unique.contains_key(&key.schema_unique_id) {
             continue;
         }
@@ -169,7 +169,19 @@ fn build_agg_scan_plan(
             fallback_is_nullable: key.schema.is_nullable,
         });
         for segment in &mut scan_plan.segments {
-            segment.projected_schemas.push(key.schema.clone());
+            let physical_key_schema = segment.group_key_schemas.get(key_index).ok_or_else(|| {
+                format!(
+                    "{} segment group key schema is missing: tablet_id={}, version={}, segment={}, key_column={}, key_index={}, segment_group_key_schemas={}",
+                    model_name(plan.table_model),
+                    plan.tablet_id,
+                    plan.version,
+                    segment.path,
+                    key.output_name,
+                    key_index,
+                    segment.group_key_schemas.len()
+                )
+            })?;
+            segment.projected_schemas.push(physical_key_schema.clone());
             segment.source_column_missing_by_output.push(false);
         }
         index_by_unique.insert(key.schema_unique_id, output_index);
@@ -1890,6 +1902,8 @@ mod tests {
                 footer_num_rows: 1,
                 projected_schemas: vec![value_schema],
                 source_column_missing_by_output: vec![false],
+                group_key_schemas: vec![key_schema.clone()],
+                delete_predicate_schemas: HashMap::new(),
             }],
             delete_predicates: Vec::new(),
             primary_delvec: None,

@@ -14,12 +14,12 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use crate::common::ids::SlotId;
 use crate::connector::starrocks::fe_v2_meta::{
     LakeScanTabletRef, LakeTableIdentity, find_cached_table_identity_names,
-    resolve_tablet_paths_for_lake_scan,
+    lake_scan_execution_properties,
 };
 use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::project::ProjectNode;
@@ -434,10 +434,8 @@ pub(crate) fn lower_lake_scan_node(
         hi: exec_params.query_id.hi,
         lo: exec_params.query_id.lo,
     });
-    let tablet_path_map = if refs.is_empty() {
-        HashMap::new()
-    } else {
-        resolve_tablet_paths_for_lake_scan(query_id, fe_addr, &table_identity, &refs).map_err(|e| {
+    let properties = lake_scan_execution_properties(query_id, fe_addr, &table_identity, &refs)
+        .map_err(|e| {
             format!(
                 "LAKE_SCAN_NODE resolve tablet paths failed for catalog={} db_name={} table_name={} db_id={} table_id={} schema_id={}: {}",
                 table_identity.catalog,
@@ -448,20 +446,7 @@ pub(crate) fn lower_lake_scan_node(
                 table_identity.schema_id,
                 e
             )
-        })?
-    };
-    let mut properties = if tablet_path_map.is_empty() {
-        BTreeMap::new()
-    } else {
-        build_lake_properties(&tablet_path_map)?
-    };
-    let partition_storage_paths = build_partition_storage_paths(&ranges, &tablet_path_map)?;
-    properties.remove("tablet_root_paths");
-    properties.insert(
-        "partition_storage_paths".to_string(),
-        serde_json::to_string(&partition_storage_paths)
-            .map_err(|e| format!("serialize partition_storage_paths json failed: {}", e))?,
-    );
+        })?;
     let limit = (node.limit >= 0).then_some(node.limit as usize);
     let batch_size = query_opts.and_then(|opts| opts.batch_size).or(Some(4096));
     let query_timeout = query_opts.and_then(|opts| opts.query_timeout);
@@ -481,7 +466,7 @@ pub(crate) fn lower_lake_scan_node(
     debug!(
         "LAKE_SCAN_NODE node_id={} resolved {} tablets via Starlet AddShard cache",
         node.node_id,
-        tablet_path_map.len()
+        refs.len()
     );
 
     // Parse TOPN_FILTER probe descriptors to build filter_id -> column_name map.
@@ -564,10 +549,12 @@ pub(crate) fn lower_lake_scan_node(
             table_id,
             schema_id,
             fe_addr: fe_addr.cloned(),
-            query_id: Some(types::TUniqueId {
+            query_id: Some(crate::common::types::UniqueId {
                 hi: exec_params.query_id.hi,
                 lo: exec_params.query_id.lo,
             }),
+            native_tablet_schema: None,
+            native_column_hints: None,
         }),
         topn_filter_column_map,
     };
@@ -703,163 +690,16 @@ pub(crate) fn record_internal_catalog_name(
     Ok(())
 }
 
-pub(crate) fn build_lake_properties(
-    tablet_path_map: &HashMap<i64, String>,
-) -> Result<BTreeMap<String, String>, String> {
-    if tablet_path_map.is_empty() {
-        return Err("lake scan tablet_path_map is empty".to_string());
-    }
-
-    let mut tablet_paths: BTreeMap<String, String> = BTreeMap::new();
-    for (tablet_id, path) in tablet_path_map {
-        if *tablet_id <= 0 {
-            return Err(format!(
-                "invalid tablet_id in resolved tablet path map: {}",
-                tablet_id
-            ));
-        }
-        let trimmed = path.trim();
-        if trimmed.is_empty() {
-            return Err(format!(
-                "resolved tablet path is empty for tablet_id={}",
-                tablet_id
-            ));
-        }
-        tablet_paths.insert(tablet_id.to_string(), trimmed.to_string());
-    }
-
-    let mut props = BTreeMap::new();
-    props.insert(
-        "tablet_root_paths".to_string(),
-        serde_json::to_string(&tablet_paths)
-            .map_err(|e| format!("serialize tablet_root_paths json failed: {}", e))?,
-    );
-
-    let selected_s3 = crate::connector::starrocks::fs_access::common_runtime_s3_config_for_paths(
-        tablet_paths.values().map(String::as_str),
-    )?;
-    if let Some(s3) = selected_s3 {
-        for (k, v) in s3.to_aws_s3_properties() {
-            props.insert(k, v);
-        }
-    }
-    Ok(props)
-}
-
-fn build_partition_storage_paths(
-    ranges: &[StarRocksScanRange],
-    tablet_path_map: &HashMap<i64, String>,
-) -> Result<BTreeMap<String, String>, String> {
-    let mut out = BTreeMap::new();
-    for range in ranges {
-        let partition_id = range.partition_id.ok_or_else(|| {
-            format!(
-                "missing partition_id while building partition_storage_paths for tablet_id={}",
-                range.tablet_id
-            )
-        })?;
-        if partition_id <= 0 {
-            return Err(format!(
-                "invalid partition_id while building partition_storage_paths: {}",
-                partition_id
-            ));
-        }
-        let raw_path = tablet_path_map.get(&range.tablet_id).ok_or_else(|| {
-            format!(
-                "missing resolved tablet path while building partition_storage_paths for tablet_id={}",
-                range.tablet_id
-            )
-        })?;
-        let partition_path = normalize_partition_storage_path(raw_path, range.tablet_id)?;
-        let key = partition_id.to_string();
-        match out.get(&key) {
-            None => {
-                out.insert(key, partition_path);
-            }
-            Some(existing) if existing == &partition_path => {}
-            Some(existing) => {
-                return Err(format!(
-                    "inconsistent partition storage paths for partition_id={}: existing={} new={} (tablet_id={})",
-                    partition_id, existing, partition_path, range.tablet_id
-                ));
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn normalize_partition_storage_path(path: &str, tablet_id: i64) -> Result<String, String> {
-    let trimmed = path.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return Err(format!(
-            "empty storage path while building partition_storage_paths for tablet_id={}",
-            tablet_id
-        ));
-    }
-    let standalone_tablet_suffix = format!("/tablet_{tablet_id}");
-    if let Some(prefix) = trimmed.strip_suffix(&standalone_tablet_suffix)
-        && !prefix.is_empty()
-    {
-        return Ok(prefix.trim_end_matches('/').to_string());
-    }
-    let tablet_id_suffix = format!("/{tablet_id}");
-    if let Some(prefix) = trimmed.strip_suffix(&tablet_id_suffix)
-        && !prefix.is_empty()
-    {
-        return Ok(prefix.trim_end_matches('/').to_string());
-    }
-    Ok(trimmed.to_string())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{build_partition_storage_paths, lower_lake_scan_node};
-    use crate::connector::starrocks::StarRocksScanRange;
+    use super::lower_lake_scan_node;
     use crate::exec::expr::ExprArena;
     use crate::exec::node::ExecNodeKind;
-    use crate::sql::codegen::descriptors::DescriptorTableBuilder;
+    use crate::lower::compat::test_support::DescriptorTableBuilder;
     use crate::thrift::internal_service;
     use crate::thrift::{descriptors, plan_nodes, types};
     use arrow::datatypes::DataType;
     use std::collections::{BTreeMap, HashMap};
-
-    #[test]
-    fn build_partition_storage_paths_collapses_tablet_suffix() {
-        let ranges = vec![
-            StarRocksScanRange {
-                tablet_id: 101,
-                partition_id: Some(7),
-                version: Some(1),
-            },
-            StarRocksScanRange {
-                tablet_id: 102,
-                partition_id: Some(7),
-                version: Some(1),
-            },
-            StarRocksScanRange {
-                tablet_id: 201,
-                partition_id: Some(8),
-                version: Some(1),
-            },
-        ];
-        let tablet_path_map = HashMap::from([
-            (101, "s3://bucket/root/7/101".to_string()),
-            (102, "s3://bucket/root/7/102/".to_string()),
-            (201, "s3://bucket/root/8/tablet_201".to_string()),
-        ]);
-
-        let paths = build_partition_storage_paths(&ranges, &tablet_path_map)
-            .expect("partition_storage_paths should build");
-
-        assert_eq!(
-            paths.get("7").map(String::as_str),
-            Some("s3://bucket/root/7")
-        );
-        assert_eq!(
-            paths.get("8").map(String::as_str),
-            Some("s3://bucket/root/8")
-        );
-    }
 
     fn empty_scan_exec_params(node_id: i32) -> internal_service::TPlanFragmentExecParams {
         let mut per_node_scan_ranges = BTreeMap::new();

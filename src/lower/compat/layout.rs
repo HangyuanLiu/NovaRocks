@@ -1045,7 +1045,7 @@ mod tests {
 
     #[test]
     fn infer_tuple_slot_order_collects_router_branch_partition_exprs() {
-        let partition_expr = crate::sql::codegen::expr_compiler::build_slot_ref_texpr(
+        let partition_expr = crate::lower::compat::test_support::build_slot_ref_texpr(
             9,
             3,
             scalar_type_desc(TPrimitiveType::INT),

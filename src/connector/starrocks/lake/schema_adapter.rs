@@ -553,7 +553,7 @@ fn build_create_tablet_column_pb_from_column_type(
         referenced_column_id: None,
         referenced_column: None,
         has_bitmap_index: None,
-        visible: None,
+        visible: Some(true),
         children_columns: Vec::new(),
         is_auto_increment: Some(false),
         agg_state_desc: None,
@@ -728,7 +728,7 @@ fn init_create_tablet_sub_field_pb() -> ColumnPb {
         referenced_column_id: None,
         referenced_column: None,
         has_bitmap_index: None,
-        visible: None,
+        visible: Some(true),
         children_columns: Vec::new(),
         is_auto_increment: Some(false),
         agg_state_desc: None,
@@ -1364,6 +1364,9 @@ mod tests {
         .expect("build decimalv2 column");
 
         assert_eq!(column_pb.r#type, "DECIMAL128");
+        assert_eq!(column_pb.is_key, Some(false));
+        assert_eq!(column_pb.is_nullable, Some(true));
+        assert_eq!(column_pb.visible, Some(true));
         assert_eq!(column_pb.precision, Some(27));
         assert_eq!(column_pb.frac, Some(9));
     }
@@ -1399,6 +1402,9 @@ mod tests {
         assert_eq!(column_pb.r#type, "ARRAY");
         assert_eq!(column_pb.children_columns.len(), 1);
         assert_eq!(column_pb.children_columns[0].r#type, "DECIMAL128");
+        assert_eq!(column_pb.children_columns[0].is_key, Some(false));
+        assert_eq!(column_pb.children_columns[0].is_nullable, Some(true));
+        assert_eq!(column_pb.children_columns[0].visible, Some(true));
         assert_eq!(column_pb.children_columns[0].precision, Some(27));
         assert_eq!(column_pb.children_columns[0].frac, Some(9));
     }

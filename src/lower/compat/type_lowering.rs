@@ -17,7 +17,6 @@
 use crate::common::util::FieldRenderSchema;
 use crate::thrift::types;
 use crate::types::PrimitiveType;
-pub(crate) use crate::types::arrow_thrift::THRIFT_TIME_UNIT_NANOS;
 use crate::types::arrow_thrift::{
     thrift_desc_to_arrow_field, thrift_desc_to_arrow_type, thrift_type_desc_from_primitive,
 };

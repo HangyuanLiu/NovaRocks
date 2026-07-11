@@ -36,6 +36,7 @@ pub(crate) fn encode_type(dt: &DataType) -> Result<common::TypeDesc, String> {
     encode_type_inner(dt, None)
 }
 
+#[cfg(test)]
 pub(crate) fn encode_field_type(field: &Field) -> Result<common::TypeDesc, String> {
     encode_type_inner(field.data_type(), Some(field))
 }

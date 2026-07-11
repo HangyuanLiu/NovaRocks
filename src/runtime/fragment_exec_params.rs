@@ -79,7 +79,18 @@ impl FragmentExecParams {
         compat_exec_params_from_parts(
             self.query_id,
             self.fragment_instance_id,
-            scan_range::thrift_scan_range_map_from_native(&self.per_node_scan_ranges)?,
+            self.per_node_scan_ranges
+                .iter()
+                .map(|(node_id, ranges)| {
+                    Ok((
+                        *node_id,
+                        ranges
+                            .iter()
+                            .map(scan_range::thrift_scan_range_params_from_native)
+                            .collect::<Result<Vec<_>, _>>()?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>, String>>()?,
             self.per_exch_num_senders.clone(),
             Some(self.destinations.clone()),
         )

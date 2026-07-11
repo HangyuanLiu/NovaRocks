@@ -21,6 +21,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use moka::sync::Cache;
 
 use crate::common::config;
+use crate::common::types::UniqueId;
 use crate::service::disk_report;
 use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
 use crate::thrift::agent_service::TTabletSchema;
@@ -292,7 +293,7 @@ pub(crate) fn fetch_table_schema_for_lake_scan(
     table_id: i64,
     schema_id: i64,
     tablet_id: Option<i64>,
-    query_id: Option<types::TUniqueId>,
+    query_id: Option<UniqueId>,
     local_schema: Option<&TTabletSchema>,
 ) -> Result<TTabletSchema, String> {
     let query_id = query_id.ok_or_else(|| {
@@ -313,7 +314,7 @@ pub(crate) fn fetch_table_schema_for_lake_scan(
             schema_id,
             source: frontend_service::TTableSchemaRequestSource::SCAN,
             tablet_id,
-            query_id: Some(query_id),
+            query_id: Some(types::TUniqueId::new(query_id.hi, query_id.lo)),
             txn_id: None,
         },
         local_schema,

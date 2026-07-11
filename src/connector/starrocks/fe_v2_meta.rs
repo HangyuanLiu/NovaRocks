@@ -14,9 +14,10 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 
+use crate::common::types::UniqueId;
 use crate::connector::starrocks::lake::context::get_tablet_runtime;
 use crate::connector::starrocks::starmgr;
 use crate::connector::starrocks::table_schema_service;
@@ -133,6 +134,130 @@ pub(crate) fn resolve_tablet_paths_for_lake_scan(
         })
         .collect::<Vec<_>>();
     resolve_tablet_paths_for_refs(query_id, fe_addr, table, &refs)
+}
+
+pub(crate) fn lake_scan_execution_properties(
+    query_id: Option<QueryId>,
+    fe_addr: Option<&types::TNetworkAddress>,
+    table: &LakeTableIdentity,
+    ranges: &[LakeScanTabletRef],
+) -> Result<BTreeMap<String, String>, String> {
+    let tablet_path_map = resolve_tablet_paths_for_lake_scan(query_id, fe_addr, table, ranges)?;
+    lake_scan_execution_properties_from_paths(ranges, &tablet_path_map)
+}
+
+pub(crate) fn lake_scan_execution_properties_from_paths(
+    ranges: &[LakeScanTabletRef],
+    tablet_path_map: &HashMap<i64, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    if !ranges.is_empty() && tablet_path_map.is_empty() {
+        return Err("lake scan tablet_path_map is empty".to_string());
+    }
+    let mut partition_paths = BTreeMap::new();
+    for range in ranges {
+        if range.tablet_id <= 0 {
+            return Err(format!(
+                "invalid tablet_id in lake scan execution properties: {}",
+                range.tablet_id
+            ));
+        }
+        if range.partition_id <= 0 {
+            return Err(format!(
+                "invalid partition_id in lake scan execution properties: {}",
+                range.partition_id
+            ));
+        }
+        let raw_path = tablet_path_map.get(&range.tablet_id).ok_or_else(|| {
+            format!(
+                "missing resolved tablet path while building partition_storage_paths for tablet_id={}",
+                range.tablet_id
+            )
+        })?;
+        let partition_path = normalize_partition_storage_path(raw_path, range.tablet_id)?;
+        let key = range.partition_id.to_string();
+        match partition_paths.get(&key) {
+            None => {
+                partition_paths.insert(key, partition_path);
+            }
+            Some(existing) if existing == &partition_path => {}
+            Some(existing) => {
+                return Err(format!(
+                    "inconsistent partition storage paths for partition_id={}: existing={} new={} (tablet_id={})",
+                    range.partition_id, existing, partition_path, range.tablet_id
+                ));
+            }
+        }
+    }
+
+    let mut properties = if tablet_path_map.is_empty() {
+        BTreeMap::new()
+    } else {
+        lake_scan_object_store_properties(tablet_path_map)?
+    };
+    properties.remove("tablet_root_paths");
+    properties.insert(
+        "partition_storage_paths".to_string(),
+        serde_json::to_string(&partition_paths)
+            .map_err(|err| format!("serialize partition_storage_paths json failed: {err}"))?,
+    );
+    Ok(properties)
+}
+
+pub(crate) fn lake_scan_object_store_properties(
+    tablet_path_map: &HashMap<i64, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    if tablet_path_map.is_empty() {
+        return Err("lake scan tablet_path_map is empty".to_string());
+    }
+    let mut tablet_paths = BTreeMap::new();
+    for (tablet_id, path) in tablet_path_map {
+        if *tablet_id <= 0 {
+            return Err(format!(
+                "invalid tablet_id in resolved tablet path map: {tablet_id}"
+            ));
+        }
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            return Err(format!(
+                "resolved tablet path is empty for tablet_id={tablet_id}"
+            ));
+        }
+        tablet_paths.insert(tablet_id.to_string(), trimmed.to_string());
+    }
+    let mut properties = BTreeMap::from([(
+        "tablet_root_paths".to_string(),
+        serde_json::to_string(&tablet_paths)
+            .map_err(|err| format!("serialize tablet_root_paths json failed: {err}"))?,
+    )]);
+    let selected_s3 = crate::connector::starrocks::fs_access::common_runtime_s3_config_for_paths(
+        tablet_paths.values().map(String::as_str),
+    )?;
+    if let Some(s3) = selected_s3 {
+        properties.extend(s3.to_aws_s3_properties());
+    }
+    Ok(properties)
+}
+
+fn normalize_partition_storage_path(path: &str, tablet_id: i64) -> Result<String, String> {
+    let trimmed = path.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(format!(
+            "empty storage path while building partition_storage_paths for tablet_id={tablet_id}"
+        ));
+    }
+    let standalone_tablet_suffix = format!("/tablet_{tablet_id}");
+    if let Some(prefix) = trimmed.strip_suffix(&standalone_tablet_suffix)
+        && !prefix.is_empty()
+    {
+        return Ok(prefix.trim_end_matches('/').to_string());
+    }
+    let tablet_id_suffix = format!("/{tablet_id}");
+    if let Some(prefix) = trimmed.strip_suffix(&tablet_id_suffix)
+        && !prefix.is_empty()
+    {
+        return Ok(prefix.trim_end_matches('/').to_string());
+    }
+    Ok(trimmed.to_string())
 }
 
 pub(crate) fn resolve_tablet_paths_for_lake_meta_scan(
@@ -378,7 +503,7 @@ pub(crate) fn fetch_table_schema_for_lake_scan(
     table_id: i64,
     schema_id: i64,
     tablet_id: Option<i64>,
-    query_id: Option<types::TUniqueId>,
+    query_id: Option<UniqueId>,
     local_schema: Option<&crate::thrift::agent_service::TTabletSchema>,
 ) -> Result<crate::thrift::agent_service::TTabletSchema, String> {
     table_schema_service::fetch_table_schema_for_lake_scan(
@@ -435,9 +560,9 @@ fn normalize_selected_tablet_path(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LakeTableIdentity, LakeTabletPartitionRef, cache_table_identity_names,
+        LakeScanTabletRef, LakeTableIdentity, LakeTabletPartitionRef, cache_table_identity_names,
         clear_table_identity_name_cache_for_test, find_cached_table_identity_names,
-        resolve_tablet_paths_for_refs,
+        lake_scan_execution_properties_from_paths, resolve_tablet_paths_for_refs,
     };
     use crate::connector::starrocks::lake::context::{
         TabletWriteContext, clear_tablet_runtime_cache_for_test, register_tablet_runtime,
@@ -454,6 +579,43 @@ mod tests {
             table_id: 9201,
             schema_id: 9301,
         }
+    }
+
+    #[test]
+    fn lake_scan_properties_collapse_tablet_suffix_to_partition_path() {
+        let ranges = vec![
+            LakeScanTabletRef {
+                tablet_id: 101,
+                partition_id: 7,
+                version: 1,
+            },
+            LakeScanTabletRef {
+                tablet_id: 102,
+                partition_id: 7,
+                version: 1,
+            },
+            LakeScanTabletRef {
+                tablet_id: 201,
+                partition_id: 8,
+                version: 1,
+            },
+        ];
+        let tablet_path_map = std::collections::HashMap::from([
+            (101, "/root/7/101".to_string()),
+            (102, "/root/7/102/".to_string()),
+            (201, "/root/8/tablet_201".to_string()),
+        ]);
+
+        let properties = lake_scan_execution_properties_from_paths(&ranges, &tablet_path_map)
+            .expect("lake scan execution properties");
+        let paths: std::collections::BTreeMap<String, String> = serde_json::from_str(
+            properties
+                .get("partition_storage_paths")
+                .expect("partition paths property"),
+        )
+        .expect("partition paths JSON");
+        assert_eq!(paths.get("7").map(String::as_str), Some("/root/7"));
+        assert_eq!(paths.get("8").map(String::as_str), Some("/root/8"));
     }
 
     #[test]

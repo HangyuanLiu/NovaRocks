@@ -23,10 +23,12 @@ use crate::sql::codegen::OutputColumn;
 pub(crate) enum BoundaryKind {
     ExchangeSender,
     ExchangeReceiver,
+    #[cfg(test)]
     RemoteRoot,
     ResultRoot,
 }
 
+#[cfg(test)]
 impl BoundaryKind {
     pub(crate) fn label(self) -> &'static str {
         match self {

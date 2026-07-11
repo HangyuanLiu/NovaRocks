@@ -19,6 +19,7 @@ use std::time::Instant;
 
 use serde_json::Value;
 
+use crate::common::types::UniqueId;
 use crate::connector::MinMaxPredicate;
 use crate::connector::starrocks::fs_access::{
     path_requires_object_store_profile, resolve_with_profile,
@@ -30,6 +31,7 @@ use crate::exec::node::scan::{ScanMorsel, ScanMorsels, ScanOp};
 use crate::novarocks_logging::{info, warn};
 use crate::runtime::profile::{ProfileUnit, RuntimeProfile};
 use crate::runtime::starlet_shard_registry;
+use crate::service::grpc_client::proto::starrocks::TabletSchemaPb;
 use crate::thrift::types;
 
 use super::reader::StarRocksNativeReader;
@@ -44,12 +46,21 @@ pub struct StarRocksScanRange {
 }
 
 #[derive(Clone, Debug)]
+pub struct StarRocksSchemaColumnHint {
+    pub name: String,
+    pub unique_id: i32,
+    pub default_value: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub struct LakeScanSchemaMeta {
     pub db_id: i64,
     pub table_id: i64,
     pub schema_id: i64,
     pub fe_addr: Option<types::TNetworkAddress>,
-    pub query_id: Option<types::TUniqueId>,
+    pub query_id: Option<UniqueId>,
+    pub native_tablet_schema: Option<TabletSchemaPb>,
+    pub native_column_hints: Option<Vec<StarRocksSchemaColumnHint>>,
 }
 
 #[derive(Clone, Debug)]

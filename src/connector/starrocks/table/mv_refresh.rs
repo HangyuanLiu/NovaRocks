@@ -60,7 +60,7 @@ use crate::connector::starrocks::table::schema_adapter::{
 };
 use crate::connector::starrocks::table::txn::{
     MvRefreshWriteMetadata, PartitionTarget, load_insert_plan, load_physical_insert_plan,
-    read_active_starrocks_physical_chunks, write_chunks_into_starrocks_partition,
+    write_chunks_into_starrocks_partition,
     write_chunks_into_starrocks_partition_for_aggregate_mv_upsert,
     write_chunks_into_starrocks_partition_for_mv_refresh_with_row_delta,
 };
@@ -3581,7 +3581,10 @@ mod tests {
             .iter()
             .position(|column| column.name.eq_ignore_ascii_case("amount_plus_one"))
             .ok_or_else(|| "orders_mv physical plan missing amount_plus_one column".to_string())?;
-        let chunks = read_active_starrocks_physical_chunks(&state, &plan)?;
+        let chunks =
+            crate::connector::starrocks::table::txn::read_active_starrocks_physical_chunks(
+                &state, &plan,
+            )?;
         let mut out = Vec::new();
         for chunk in &chunks {
             let ids = chunk

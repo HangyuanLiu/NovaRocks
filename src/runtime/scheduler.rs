@@ -83,10 +83,9 @@ struct IncomingEdge {
 /// Placement information for one fragment instance.
 #[derive(Clone, Debug)]
 pub(crate) struct FragmentInstancePlacement {
-    /// The fragment this instance belongs to. The coordinator iterates
-    /// `SchedulingPlan::by_fragment` by key, so this is currently only used for
-    /// diagnostics, but it keeps each placement self-describing.
-    #[allow(dead_code)]
+    /// The fragment this instance belongs to. The coordinator verifies this
+    /// self-description against the `SchedulingPlan::by_fragment` key before
+    /// constructing submissions.
     pub(crate) fragment_id: FragmentId,
     pub(crate) instance_index: usize,
     pub(crate) finst_id: UniqueId,
