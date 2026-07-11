@@ -17,7 +17,6 @@
 pub mod block_manager;
 pub mod dir_manager;
 pub mod ipc_serde;
-pub(crate) mod query_options_wire;
 pub mod spill_channel;
 pub mod spill_stream;
 pub mod spiller;

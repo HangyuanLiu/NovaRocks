@@ -1124,7 +1124,6 @@ fn nidl_d3g_native_runtime_query_options_do_not_use_thrift_model() {
     let forbidden = [
         "src/runtime/runtime_state.rs",
         "src/cache/mod.rs",
-        "src/exec/spill/query_options_wire.rs",
         "src/runtime/coordinator.rs",
         "src/runtime/native_fragment_wire.rs",
         "src/sql/codegen/proto_encode/instance.rs",
@@ -9963,6 +9962,185 @@ fn nfe_3_retired_control_plane_term_violations(
         .filter(|term| production.contains(**term))
         .map(|term| format!("{source}: retired generated-Thrift control-plane term `{term}`"))
         .collect()
+}
+
+fn nfe_3_raw_starrocks_idl_violations(source: &str, text: &str) -> Vec<String> {
+    let production = rust_sanitized_production_text(text);
+    let tokens = rust_use_tokens(&production);
+    let imports = rust_production_scoped_use_statements(text);
+    let canonical_paths = rust_production_canonical_paths(text, source);
+    [
+        "crate::thrift",
+        "crate::proto::starrocks",
+        "crate::proto::staros",
+    ]
+    .into_iter()
+    .filter(|term| {
+        let term_tokens = rust_use_tokens(term);
+        tokens
+            .windows(term_tokens.len())
+            .any(|window| window == term_tokens)
+            || imports.iter().any(|import| {
+                let path = rust_use_path(&import.import);
+                path == *term
+                    || path
+                        .strip_prefix(*term)
+                        .is_some_and(|suffix| suffix.starts_with("::"))
+            })
+            || {
+                let term_segments = term.split("::").collect::<Vec<_>>();
+                canonical_paths.iter().any(|path| {
+                    path.len() >= term_segments.len()
+                        && path
+                            .iter()
+                            .zip(&term_segments)
+                            .all(|(actual, expected)| actual == expected)
+                })
+            }
+    })
+    .map(|term| format!("{source}: FE-owned helper references raw StarRocks IDL `{term}`"))
+    .collect()
+}
+
+#[test]
+fn nfe_3_fe_owned_helpers_are_raw_starrocks_idl_free() {
+    let fixture = r#"
+        // crate::thrift in a comment must be ignored.
+        const NOTE: &str = "crate::proto::staros in a string must be ignored";
+        fn ordinary() { let _ = crate :: proto :: starrocks :: StatusPb::default(); }
+        #[cfg(feature = "compat")]
+        fn compat_only() { let _ = crate::thrift::types::TUniqueId::new(1, 2); }
+        #[cfg(test)]
+        fn test_only() { let _ = crate::proto::staros::WorkerInfo::default(); }
+    "#;
+    assert_eq!(
+        nfe_3_raw_starrocks_idl_violations("fixture.rs", fixture),
+        vec![
+            "fixture.rs: FE-owned helper references raw StarRocks IDL `crate::thrift`",
+            "fixture.rs: FE-owned helper references raw StarRocks IDL `crate::proto::starrocks`",
+        ],
+        "the NFE-3 helper guard must retain compat-cfg production items while ignoring comments, strings, and test-only items"
+    );
+
+    let grouped_use_fixture = r#"
+        use crate::{thrift::types::TUniqueId};
+        #[cfg(feature = "compat")]
+        use crate::proto::{starrocks::StatusPb, staros::WorkerInfo};
+        // use crate::{thrift::types::TUniqueId};
+        const NOTE: &str = "use crate::proto::{starrocks::StatusPb};";
+        #[cfg(test)]
+        use crate::{thrift::data::TResultBatch};
+    "#;
+    assert_eq!(
+        nfe_3_raw_starrocks_idl_violations("grouped.rs", grouped_use_fixture),
+        vec![
+            "grouped.rs: FE-owned helper references raw StarRocks IDL `crate::thrift`",
+            "grouped.rs: FE-owned helper references raw StarRocks IDL `crate::proto::starrocks`",
+            "grouped.rs: FE-owned helper references raw StarRocks IDL `crate::proto::staros`",
+        ],
+        "the NFE-3 helper guard must expand ordinary and compat-cfg grouped imports while ignoring grouped imports in comments, strings, and test-only items"
+    );
+
+    let alias_chain_fixture = r#"
+        use crate as root;
+        use root::thrift::types::TUniqueId;
+        #[cfg(feature = "compat")]
+        use crate::proto as wire;
+        #[cfg(feature = "compat")]
+        use wire::{starrocks::StatusPb, staros::WorkerInfo};
+        // use crate as hidden_root; use hidden_root::thrift::types::TUniqueId;
+        const NOTE: &str = "use crate::proto as hidden_wire; use hidden_wire::starrocks::StatusPb;";
+        #[cfg(test)]
+        use crate as test_root;
+        #[cfg(test)]
+        use test_root::thrift::data::TResultBatch;
+    "#;
+    assert_eq!(
+        nfe_3_raw_starrocks_idl_violations("aliases.rs", alias_chain_fixture),
+        vec![
+            "aliases.rs: FE-owned helper references raw StarRocks IDL `crate::thrift`",
+            "aliases.rs: FE-owned helper references raw StarRocks IDL `crate::proto::starrocks`",
+            "aliases.rs: FE-owned helper references raw StarRocks IDL `crate::proto::staros`",
+        ],
+        "the NFE-3 helper guard must resolve ordinary and compat-cfg file-local use aliases while ignoring alias chains in comments, strings, and test-only items"
+    );
+
+    let alias_usage_fixture = r#"
+        use crate as root;
+        fn ordinary(_: root::thrift::types::TUniqueId) {}
+        #[cfg(feature = "compat")]
+        use crate::proto as wire;
+        #[cfg(feature = "compat")]
+        fn compat_only() {
+            let _ = wire::starrocks::StatusPb::default();
+            let _ = wire::staros::WorkerInfo::default();
+        }
+        // fn hidden(_: root::thrift::types::TUniqueId) {}
+        const NOTE: &str = "wire::starrocks::StatusPb";
+        #[cfg(test)]
+        fn test_only(_: root::thrift::types::TUniqueId) {
+            let _ = wire::staros::WorkerInfo::default();
+        }
+    "#;
+    assert_eq!(
+        nfe_3_raw_starrocks_idl_violations("alias_usage.rs", alias_usage_fixture),
+        vec![
+            "alias_usage.rs: FE-owned helper references raw StarRocks IDL `crate::thrift`",
+            "alias_usage.rs: FE-owned helper references raw StarRocks IDL `crate::proto::starrocks`",
+            "alias_usage.rs: FE-owned helper references raw StarRocks IDL `crate::proto::staros`",
+        ],
+        "the NFE-3 helper guard must apply file-local use aliases to production type and expression paths while ignoring alias-qualified paths in comments, strings, and test-only items"
+    );
+
+    let repo = Path::new(manifest_dir());
+    let mut violations = Vec::new();
+    for source in [
+        "src/engine/query_options.rs",
+        "src/engine/dml_change_stream.rs",
+        "src/sql/common/change_stream.rs",
+        "src/runtime/coordinator.rs",
+        "src/runtime/dispatcher.rs",
+        "src/runtime/fragment_exec_params.rs",
+        "src/runtime/scan_range.rs",
+        "src/runtime/native_fragment_wire.rs",
+    ] {
+        let text = fs::read_to_string(repo.join(source)).expect(source);
+        violations.extend(nfe_3_raw_starrocks_idl_violations(source, &text));
+    }
+
+    for retired_path in [
+        "src/engine/query_options_wire.rs",
+        "src/exec/spill/query_options_wire.rs",
+    ] {
+        match fs::symlink_metadata(repo.join(retired_path)) {
+            Ok(_) => violations.push(format!("{retired_path}: retired helper file still exists")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => violations.push(format!(
+                "{retired_path}: failed to inspect path metadata: {error}"
+            )),
+        }
+    }
+
+    let common_change_stream = fs::read_to_string(repo.join("src/sql/common/change_stream.rs"))
+        .expect("src/sql/common/change_stream.rs");
+    let common_mod =
+        fs::read_to_string(repo.join("src/sql/common/mod.rs")).expect("src/sql/common/mod.rs");
+    for (source, text) in [
+        ("src/sql/common/change_stream.rs", common_change_stream),
+        ("src/sql/common/mod.rs", common_mod),
+    ] {
+        if rust_sanitized_production_text(&text).contains("branch_kind_from_thrift") {
+            violations.push(format!(
+                "{source}: external Thrift enum adapter must be owned by lower/compat"
+            ));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "NFE-3 FE helper ownership guard failed:\n{}",
+        violations.join("\n")
+    );
 }
 
 #[test]

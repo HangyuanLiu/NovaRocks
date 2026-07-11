@@ -79,7 +79,6 @@ pub(crate) mod name_resolve;
 pub(crate) mod parquet;
 pub(crate) mod procedure;
 pub(crate) mod query_options;
-pub(crate) mod query_options_wire;
 pub(crate) mod query_prep;
 mod query_stats;
 pub(crate) mod sql_expr;
@@ -2754,8 +2753,7 @@ fn explain_analyze_query(
     query_opts.enable_profile = true;
     let (dispatcher, scheduler) = coordinated_execution_services()?;
     let execution_start = std::time::Instant::now();
-    let query_opts =
-        crate::engine::query_options_wire::standalone_query_options_to_runtime(&query_opts);
+    let query_opts = query_opts.to_runtime();
     let outcome = crate::runtime::coordinator::ExecutionCoordinator::new(
         build_result,
         dispatcher,
@@ -3146,9 +3144,7 @@ pub(crate) fn execute_query_as_iceberg_write(
         build_result,
         dispatcher,
         scheduler,
-        crate::engine::query_options_wire::standalone_query_options_to_optional_runtime(
-            query_opts.as_ref(),
-        ),
+        StandaloneQueryOptions::optional_to_runtime(query_opts.as_ref()),
     )
     .execute_with_write_outcome()
 }
@@ -3356,10 +3352,7 @@ pub(crate) fn execute_planned_iceberg_change_stream_write(
     query_opts: Option<StandaloneQueryOptions>,
 ) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
     let (dispatcher, scheduler) = coordinated_execution_services()?;
-    let query_options =
-        crate::engine::query_options_wire::standalone_query_options_to_optional_runtime(
-            query_opts.as_ref(),
-        );
+    let query_options = StandaloneQueryOptions::optional_to_runtime(query_opts.as_ref());
     crate::runtime::coordinator::ExecutionCoordinator::new(
         build_result,
         dispatcher,
@@ -3735,9 +3728,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         build_result,
         dispatcher,
         scheduler,
-        crate::engine::query_options_wire::standalone_query_options_to_optional_runtime(
-            query_opts.as_ref(),
-        ),
+        StandaloneQueryOptions::optional_to_runtime(query_opts.as_ref()),
     )
     .execute()
 }
@@ -3797,9 +3788,7 @@ pub(crate) fn execute_logical_plan_with_options(
         build_result,
         dispatcher,
         scheduler,
-        crate::engine::query_options_wire::standalone_query_options_to_optional_runtime(
-            query_opts.as_ref(),
-        ),
+        StandaloneQueryOptions::optional_to_runtime(query_opts.as_ref()),
     )
     .execute()
 }
