@@ -594,7 +594,11 @@ mod tests {
 
     #[test]
     fn delta_scan_lowers_from_typed_thrift_payload_without_catalog_registry() {
-        let mut node = crate::sql::codegen::nodes::default_plan_node();
+        let mut node = crate::lower::compat::node::test_plan_node(
+            42,
+            plan_nodes::TPlanNodeType::ICEBERG_DELTA_SCAN_NODE,
+            0,
+        );
         node.node_id = 42;
         node.node_type = plan_nodes::TPlanNodeType::ICEBERG_DELTA_SCAN_NODE;
         node.num_children = 0;
@@ -644,7 +648,11 @@ mod tests {
 
     #[test]
     fn delta_scan_s3_table_location_requires_object_store_config() {
-        let mut node = crate::sql::codegen::nodes::default_plan_node();
+        let mut node = crate::lower::compat::node::test_plan_node(
+            43,
+            plan_nodes::TPlanNodeType::ICEBERG_DELTA_SCAN_NODE,
+            0,
+        );
         node.node_id = 43;
         node.node_type = plan_nodes::TPlanNodeType::ICEBERG_DELTA_SCAN_NODE;
         node.num_children = 0;
@@ -675,7 +683,11 @@ mod tests {
 
     #[test]
     fn delta_scan_s3_table_location_uses_object_store_config() {
-        let mut node = crate::sql::codegen::nodes::default_plan_node();
+        let mut node = crate::lower::compat::node::test_plan_node(
+            44,
+            plan_nodes::TPlanNodeType::ICEBERG_DELTA_SCAN_NODE,
+            0,
+        );
         node.node_id = 44;
         node.node_type = plan_nodes::TPlanNodeType::ICEBERG_DELTA_SCAN_NODE;
         node.num_children = 0;

@@ -6314,8 +6314,8 @@ mysql_port = 47892
     }
 
     /// OQ-5 Task 6: codegen must lower the runtime-filter annotations the
-    /// planner-side placement pass attaches to a hash join into thrift
-    /// `TRuntimeFilterDescription`s on the join node, AND assemble a
+    /// planner-side placement pass attaches to a hash join into native
+    /// runtime-filter descriptors on the join node, AND assemble a
     /// `RuntimeFilterPlanResult`. Exercises the full standalone pipeline
     /// (analyze -> plan -> optimize -> planner RF placement -> codegen) over the test
     /// catalog's fact-like `tbl(id int, name varchar)` joined to the small
@@ -6325,18 +6325,16 @@ mysql_port = 47892
     fn codegen_emits_build_runtime_filters_from_annotation() {
         let build =
             build_fragments_for_query("SELECT count(*) FROM tbl a JOIN date_dim b ON a.id = b.id");
-        let has_rf = build.fragment_results.iter().any(|fr| {
-            fr.plan.nodes.iter().any(|n| {
-                n.hash_join_node
-                    .as_ref()
-                    .and_then(|hj| hj.build_runtime_filters.as_ref())
-                    .map(|v| !v.is_empty())
-                    .unwrap_or(false)
-            })
-        });
+        fn has_build_filter(node: &crate::proto::plan::DistributedNode) -> bool {
+            !node.build_runtime_filters.is_empty() || node.children.iter().any(has_build_filter)
+        }
+        let has_rf = build
+            .native_fragments
+            .values()
+            .any(|fragment| fragment.root.as_ref().is_some_and(has_build_filter));
         assert!(
             has_rf,
-            "expected a hash join thrift node with build_runtime_filters"
+            "expected a native hash join node with build_runtime_filters"
         );
         // The coordinator-facing RF plan must be assembled with native
         // descriptor metadata plus build/probe placement maps.
@@ -6379,9 +6377,9 @@ mysql_port = 47892
         );
 
         assert!(
-            build.fragment_results.len() > 1,
+            build.fragment_schedules.len() > 1,
             "fragments={}",
-            build.fragment_results.len()
+            build.fragment_schedules.len()
         );
         assert!(build.edges.iter().any(|edge| {
             matches!(
@@ -6403,10 +6401,10 @@ mysql_port = 47892
         );
 
         // Multiple fragments: root + CTE produce fragments + possible stream children.
-        assert!(build.fragment_results.len() > 1);
+        assert!(build.fragment_schedules.len() > 1);
 
         // At least one CTE produce fragment exists.
-        assert!(build.fragment_results.iter().any(|f| f.cte_id.is_some()));
+        assert!(build.fragment_schedules.iter().any(|f| f.cte_id.is_some()));
     }
 
     #[test]

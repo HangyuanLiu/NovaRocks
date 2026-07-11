@@ -2037,7 +2037,7 @@ mod native_contract_tests {
             target_fragment_id,
             target_exchange_node_id: 70 + target_fragment_id as i32,
             output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
-            stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
+            stream_kind: crate::sql::planner::distributed::FragmentStreamKind::Gather,
             edge_kind: FragmentEdgeKind::IcebergChangeStreamRouter {
                 router_group_id: group_id,
                 branch_id,
@@ -3306,7 +3306,7 @@ mod native_contract_tests {
             target_fragment_id: 2,
             target_exchange_node_id: 77,
             output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
-            stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
+            stream_kind: crate::sql::planner::distributed::FragmentStreamKind::Gather,
             edge_kind: FragmentEdgeKind::IcebergChangeStreamRouter {
                 router_group_id: 7,
                 branch_id: 0,

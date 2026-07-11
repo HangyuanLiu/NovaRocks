@@ -485,6 +485,10 @@ fn cfg_attr_generated_path_values(attribute: &str) -> Vec<String> {
 }
 
 fn production_rs_files(root: &Path) -> Vec<PathBuf> {
+    production_rs_files_from_entries(root, &[root.join("mod.rs")])
+}
+
+fn production_rs_files_from_entries(root: &Path, entries: &[PathBuf]) -> Vec<PathBuf> {
     fn default_module_dir(source: &Path, root: &Path) -> PathBuf {
         let parent_dir = source.parent().unwrap_or(root);
         if source.file_name().is_some_and(|name| name == "mod.rs") {
@@ -555,15 +559,16 @@ fn production_rs_files(root: &Path) -> Vec<PathBuf> {
                 .map(|canonical| (canonical, path.clone()))
         })
         .collect::<BTreeMap<_, _>>();
-    let Some(entry) = fs::canonicalize(root.join("mod.rs")).ok() else {
-        return Vec::new();
-    };
-    if !candidates.contains_key(&entry) {
-        return Vec::new();
+    let mut reachable = BTreeSet::new();
+    let mut pending = Vec::new();
+    for entry in entries {
+        let Some(entry) = fs::canonicalize(entry).ok() else {
+            continue;
+        };
+        if candidates.contains_key(&entry) && reachable.insert(entry.clone()) {
+            pending.push(entry);
+        }
     }
-
-    let mut reachable = BTreeSet::from([entry.clone()]);
-    let mut pending = vec![entry];
     while let Some(parent) = pending.pop() {
         let text = fs::read_to_string(&parent).unwrap_or_default();
         for item in rust_module_items(&text)
@@ -9962,6 +9967,807 @@ fn nfe_1_task_3_runtime_submission_is_native_only() {
     );
 }
 
+const NFE_1_TASK_4_DISCONNECTED_CODEGEN_MODULES: &[&str] = &[
+    "descriptors",
+    "expr_compiler",
+    "fallback_audit",
+    "iceberg_change_stream_router_wire",
+    "iceberg_write_sink_wire",
+    "nodes",
+    "resolve",
+    "runtime_filter_lowering",
+    "type_infer",
+];
+
+const NFE_1_TASK_4_DISCONNECTED_IR_MODULES: &[&str] = &["lowering", "equiv"];
+
+const NFE_1_TASK_4_DISCONNECTED_PATHS: &[&str] = &[
+    "descriptors.rs",
+    "expr_compiler.rs",
+    "fallback_audit.rs",
+    "iceberg_change_stream_router_wire.rs",
+    "iceberg_write_sink_wire.rs",
+    "nodes.rs",
+    "resolve.rs",
+    "runtime_filter_lowering.rs",
+    "type_infer.rs",
+    "ir/lowering.rs",
+    "ir/equiv.rs",
+];
+
+#[derive(Debug, PartialEq, Eq)]
+enum Nfe1Task4RustToken {
+    Ident(String),
+    String(String),
+    InvalidString,
+    Punct(char),
+}
+
+fn nfe_1_task_4_is_ident_start(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphabetic()
+}
+
+fn nfe_1_task_4_is_ident_continue(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
+}
+
+fn nfe_1_task_4_raw_string_start(chars: &[char], index: usize) -> Option<(usize, usize)> {
+    if index > 0 && nfe_1_task_4_is_ident_continue(chars[index - 1]) {
+        return None;
+    }
+
+    let mut cursor = match chars.get(index).copied()? {
+        'r' => index + 1,
+        'b' if chars.get(index + 1) == Some(&'r') => index + 2,
+        'c' if chars.get(index + 1) == Some(&'r') => index + 2,
+        _ => return None,
+    };
+    let mut hashes = 0usize;
+    while chars.get(cursor) == Some(&'#') {
+        hashes += 1;
+        cursor += 1;
+    }
+    (chars.get(cursor) == Some(&'"')).then_some((cursor + 1, hashes))
+}
+
+fn nfe_1_task_4_raw_string_end(chars: &[char], index: usize, hashes: usize) -> bool {
+    chars.get(index) == Some(&'"')
+        && (0..hashes).all(|offset| chars.get(index + 1 + offset) == Some(&'#'))
+}
+
+fn nfe_1_task_4_cooked_string(chars: &[char], start: usize) -> (usize, Option<String>) {
+    let mut cursor = start + 1;
+    let mut value = String::new();
+    let mut valid = true;
+    let mut terminated = false;
+
+    while cursor < chars.len() {
+        match chars[cursor] {
+            '"' => {
+                cursor += 1;
+                terminated = true;
+                break;
+            }
+            '\\' => {
+                cursor += 1;
+                let Some(escaped) = chars.get(cursor).copied() else {
+                    valid = false;
+                    break;
+                };
+                match escaped {
+                    '\\' => value.push('\\'),
+                    '"' => value.push('"'),
+                    '\'' => value.push('\''),
+                    'n' => value.push('\n'),
+                    'r' => value.push('\r'),
+                    't' => value.push('\t'),
+                    '0' => value.push('\0'),
+                    'x' => {
+                        let decoded = chars
+                            .get(cursor + 1)
+                            .and_then(|ch| ch.to_digit(16))
+                            .zip(chars.get(cursor + 2).and_then(|ch| ch.to_digit(16)))
+                            .map(|(high, low)| high * 16 + low)
+                            .filter(|code| *code <= 0x7f);
+                        if let Some(decoded) = decoded.and_then(char::from_u32) {
+                            value.push(decoded);
+                            cursor += 2;
+                        } else {
+                            valid = false;
+                        }
+                    }
+                    'u' => {
+                        let mut unicode_cursor = cursor + 1;
+                        let mut decoded = 0u32;
+                        let mut digits = 0usize;
+                        let mut unicode_valid = chars.get(unicode_cursor) == Some(&'{');
+                        if unicode_valid {
+                            unicode_cursor += 1;
+                            while let Some(ch) = chars.get(unicode_cursor).copied() {
+                                if ch == '}' {
+                                    break;
+                                }
+                                if ch == '_' && digits > 0 {
+                                    unicode_cursor += 1;
+                                    continue;
+                                }
+                                let Some(digit) = ch.to_digit(16) else {
+                                    unicode_valid = false;
+                                    unicode_cursor += 1;
+                                    continue;
+                                };
+                                digits += 1;
+                                if digits > 6 {
+                                    unicode_valid = false;
+                                } else {
+                                    decoded = decoded * 16 + digit;
+                                }
+                                unicode_cursor += 1;
+                            }
+                            unicode_valid &= digits > 0
+                                && chars.get(unicode_cursor) == Some(&'}')
+                                && char::from_u32(decoded).is_some();
+                        }
+                        if unicode_valid {
+                            value.push(char::from_u32(decoded).unwrap());
+                            cursor = unicode_cursor;
+                        } else {
+                            valid = false;
+                            cursor = unicode_cursor.min(chars.len().saturating_sub(1));
+                        }
+                    }
+                    '\n' => {
+                        cursor += 1;
+                        while chars.get(cursor).is_some_and(|ch| ch.is_whitespace()) {
+                            cursor += 1;
+                        }
+                        continue;
+                    }
+                    '\r' if chars.get(cursor + 1) == Some(&'\n') => {
+                        cursor += 2;
+                        while chars.get(cursor).is_some_and(|ch| ch.is_whitespace()) {
+                            cursor += 1;
+                        }
+                        continue;
+                    }
+                    _ => valid = false,
+                }
+                cursor += 1;
+            }
+            ch => {
+                value.push(ch);
+                cursor += 1;
+            }
+        }
+    }
+
+    (cursor, (valid && terminated).then_some(value))
+}
+
+fn nfe_1_task_4_rust_tokens(text: &str) -> Vec<Nfe1Task4RustToken> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut tokens = Vec::new();
+    let mut cursor = 0usize;
+
+    while cursor < chars.len() {
+        if chars[cursor].is_whitespace() {
+            cursor += 1;
+            continue;
+        }
+        if chars.get(cursor) == Some(&'/') && chars.get(cursor + 1) == Some(&'/') {
+            cursor += 2;
+            while chars.get(cursor).is_some_and(|ch| *ch != '\n') {
+                cursor += 1;
+            }
+            continue;
+        }
+        if chars.get(cursor) == Some(&'/') && chars.get(cursor + 1) == Some(&'*') {
+            cursor += 2;
+            let mut depth = 1usize;
+            while cursor < chars.len() && depth > 0 {
+                if chars.get(cursor) == Some(&'/') && chars.get(cursor + 1) == Some(&'*') {
+                    depth += 1;
+                    cursor += 2;
+                } else if chars.get(cursor) == Some(&'*') && chars.get(cursor + 1) == Some(&'/') {
+                    depth -= 1;
+                    cursor += 2;
+                } else {
+                    cursor += 1;
+                }
+            }
+            continue;
+        }
+        if let Some((content_start, hashes)) = nfe_1_task_4_raw_string_start(&chars, cursor) {
+            cursor = content_start;
+            let mut value = String::new();
+            while cursor < chars.len() && !nfe_1_task_4_raw_string_end(&chars, cursor, hashes) {
+                value.push(chars[cursor]);
+                cursor += 1;
+            }
+            if cursor < chars.len() {
+                cursor += 1 + hashes;
+                tokens.push(Nfe1Task4RustToken::String(value));
+            } else {
+                tokens.push(Nfe1Task4RustToken::InvalidString);
+            }
+            continue;
+        }
+        if chars[cursor] == '"' {
+            let (next, value) = nfe_1_task_4_cooked_string(&chars, cursor);
+            cursor = next;
+            if let Some(value) = value {
+                tokens.push(Nfe1Task4RustToken::String(value));
+            } else {
+                tokens.push(Nfe1Task4RustToken::InvalidString);
+            }
+            continue;
+        }
+        if let Some(len) = nidl_e4_char_literal_len(&chars, cursor) {
+            cursor += len;
+            continue;
+        }
+        if chars.get(cursor) == Some(&'r')
+            && chars.get(cursor + 1) == Some(&'#')
+            && chars
+                .get(cursor + 2)
+                .is_some_and(|ch| nfe_1_task_4_is_ident_start(*ch))
+        {
+            cursor += 2;
+            let start = cursor;
+            while chars
+                .get(cursor)
+                .is_some_and(|ch| nfe_1_task_4_is_ident_continue(*ch))
+            {
+                cursor += 1;
+            }
+            tokens.push(Nfe1Task4RustToken::Ident(
+                chars[start..cursor].iter().collect(),
+            ));
+            continue;
+        }
+        if nfe_1_task_4_is_ident_start(chars[cursor]) {
+            let start = cursor;
+            cursor += 1;
+            while chars
+                .get(cursor)
+                .is_some_and(|ch| nfe_1_task_4_is_ident_continue(*ch))
+            {
+                cursor += 1;
+            }
+            tokens.push(Nfe1Task4RustToken::Ident(
+                chars[start..cursor].iter().collect(),
+            ));
+            continue;
+        }
+
+        tokens.push(Nfe1Task4RustToken::Punct(chars[cursor]));
+        cursor += 1;
+    }
+
+    tokens
+}
+
+fn nfe_1_task_4_delimited_end(tokens: &[Nfe1Task4RustToken], start: usize) -> Option<usize> {
+    let close = match tokens.get(start)? {
+        Nfe1Task4RustToken::Punct('(') => ')',
+        Nfe1Task4RustToken::Punct('[') => ']',
+        Nfe1Task4RustToken::Punct('{') => '}',
+        _ => return None,
+    };
+    let mut cursor = start + 1;
+    while cursor < tokens.len() {
+        match tokens.get(cursor) {
+            Some(Nfe1Task4RustToken::Punct(ch)) if *ch == close => return Some(cursor),
+            Some(Nfe1Task4RustToken::Punct('(' | '[' | '{')) => {
+                cursor = nfe_1_task_4_delimited_end(tokens, cursor)? + 1;
+            }
+            _ => cursor += 1,
+        }
+    }
+    None
+}
+
+fn nfe_1_task_4_top_level_comma(
+    tokens: &[Nfe1Task4RustToken],
+    start: usize,
+    end: usize,
+) -> Option<usize> {
+    let mut cursor = start;
+    while cursor < end {
+        if tokens.get(cursor) == Some(&Nfe1Task4RustToken::Punct(',')) {
+            return Some(cursor);
+        }
+        if matches!(
+            tokens.get(cursor),
+            Some(Nfe1Task4RustToken::Punct('(' | '[' | '{'))
+        ) {
+            let close = nfe_1_task_4_delimited_end(tokens, cursor)?;
+            if close >= end {
+                return None;
+            }
+            cursor = close + 1;
+            continue;
+        }
+        cursor += 1;
+    }
+    None
+}
+
+fn nfe_1_task_4_collect_loading_meta(
+    tokens: &[Nfe1Task4RustToken],
+    start: usize,
+    end: usize,
+    targets: &mut BTreeSet<String>,
+) {
+    let Some(Nfe1Task4RustToken::Ident(name)) = tokens.get(start) else {
+        return;
+    };
+
+    if name == "path" {
+        if end == start + 3
+            && tokens.get(start + 1) == Some(&Nfe1Task4RustToken::Punct('='))
+            && let Some(Nfe1Task4RustToken::String(path)) = tokens.get(start + 2)
+            && let Some(stem) = Path::new(path).file_stem().and_then(|stem| stem.to_str())
+        {
+            targets.insert(stem.to_string());
+        }
+        return;
+    }
+
+    if name != "cfg_attr" || tokens.get(start + 1) != Some(&Nfe1Task4RustToken::Punct('(')) {
+        return;
+    }
+    let Some(close) = nfe_1_task_4_delimited_end(tokens, start + 1) else {
+        return;
+    };
+    if close + 1 != end {
+        return;
+    }
+
+    let Some(predicate_end) = nfe_1_task_4_top_level_comma(tokens, start + 2, close) else {
+        return;
+    };
+    let mut attribute_start = predicate_end + 1;
+    while attribute_start < close {
+        let attribute_end =
+            nfe_1_task_4_top_level_comma(tokens, attribute_start, close).unwrap_or(close);
+        nfe_1_task_4_collect_loading_meta(tokens, attribute_start, attribute_end, targets);
+        attribute_start = attribute_end + 1;
+    }
+}
+
+fn nfe_1_task_4_attribute_path_targets(
+    tokens: &[Nfe1Task4RustToken],
+    start: usize,
+) -> Option<(usize, BTreeSet<String>)> {
+    if tokens.get(start) != Some(&Nfe1Task4RustToken::Punct('#'))
+        || tokens.get(start + 1) != Some(&Nfe1Task4RustToken::Punct('['))
+    {
+        return None;
+    }
+
+    let close = nfe_1_task_4_delimited_end(tokens, start + 1)?;
+    let mut targets = BTreeSet::new();
+    nfe_1_task_4_collect_loading_meta(tokens, start + 2, close, &mut targets);
+    Some((close + 1, targets))
+}
+
+fn nfe_1_task_4_module_declaration(
+    tokens: &[Nfe1Task4RustToken],
+    start: usize,
+) -> Option<(usize, String)> {
+    let mut cursor = start;
+    if tokens.get(cursor) == Some(&Nfe1Task4RustToken::Ident("pub".to_string())) {
+        cursor += 1;
+        if tokens.get(cursor) == Some(&Nfe1Task4RustToken::Punct('(')) {
+            let mut depth = 1usize;
+            cursor += 1;
+            while cursor < tokens.len() && depth > 0 {
+                match tokens[cursor] {
+                    Nfe1Task4RustToken::Punct('(') => depth += 1,
+                    Nfe1Task4RustToken::Punct(')') => depth -= 1,
+                    _ => {}
+                }
+                cursor += 1;
+            }
+            if depth != 0 {
+                return None;
+            }
+        }
+    }
+    if tokens.get(cursor) != Some(&Nfe1Task4RustToken::Ident("mod".to_string())) {
+        return None;
+    }
+    let Nfe1Task4RustToken::Ident(module) = tokens.get(cursor + 1)? else {
+        return None;
+    };
+    if !matches!(
+        tokens.get(cursor + 2),
+        Some(Nfe1Task4RustToken::Punct(';') | Nfe1Task4RustToken::Punct('{'))
+    ) {
+        return None;
+    }
+    Some((cursor + 3, module.clone()))
+}
+
+fn nfe_1_task_4_module_targets(text: &str) -> BTreeSet<String> {
+    let tokens = nfe_1_task_4_rust_tokens(text);
+    let mut targets = BTreeSet::new();
+    let mut pending_paths = BTreeSet::new();
+    let mut cursor = 0usize;
+
+    while cursor < tokens.len() {
+        if let Some((next, paths)) = nfe_1_task_4_attribute_path_targets(&tokens, cursor) {
+            pending_paths.extend(paths);
+            cursor = next;
+            continue;
+        }
+        if let Some((next, module)) = nfe_1_task_4_module_declaration(&tokens, cursor) {
+            targets.insert(module);
+            targets.append(&mut pending_paths);
+            cursor = next;
+            continue;
+        }
+
+        pending_paths.clear();
+        cursor += 1;
+    }
+
+    targets
+}
+
+fn nfe_1_task_4_disconnected_module_hits(text: &str, forbidden: &[&str]) -> Vec<String> {
+    let declarations = nfe_1_task_4_module_targets(text);
+    forbidden
+        .iter()
+        .filter(|module| declarations.contains(**module))
+        .map(|module| (*module).to_string())
+        .collect()
+}
+
+fn nfe_1_task_4_reachable_disconnected_path_hits(
+    module_root: &Path,
+    roots: &[PathBuf],
+    forbidden: &[&str],
+) -> Vec<String> {
+    let forbidden_by_path = forbidden
+        .iter()
+        .filter_map(|relative| {
+            fs::canonicalize(module_root.join(relative))
+                .ok()
+                .map(|canonical| (canonical, (*relative).to_string()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut hits = production_rs_files_from_entries(module_root, roots)
+        .into_iter()
+        .filter_map(|path| fs::canonicalize(path).ok())
+        .filter_map(|canonical| forbidden_by_path.get(&canonical).cloned())
+        .collect::<Vec<_>>();
+    hits.sort();
+    hits.dedup();
+    hits
+}
+
+fn nfe_1_task_4_module_graph_fixture(
+    name: &str,
+    files: &[(&str, &str)],
+) -> (PathBuf, Vec<PathBuf>) {
+    let root = std::env::temp_dir().join(format!(
+        "nfe_1_task_4_module_graph_{}_{}",
+        std::process::id(),
+        name
+    ));
+    fs::remove_dir_all(&root).ok();
+    for (path, source) in files {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, source).unwrap();
+    }
+    let roots = vec![root.join("mod.rs"), root.join("ir/mod.rs")];
+    (root, roots)
+}
+
+#[test]
+fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
+    let repo = Path::new(manifest_dir());
+    let mut violations = Vec::new();
+
+    let codegen_root = repo.join("src/sql/codegen");
+    let module_roots = vec![codegen_root.join("mod.rs"), codegen_root.join("ir/mod.rs")];
+    for path in nfe_1_task_4_reachable_disconnected_path_hits(
+        &codegen_root,
+        &module_roots,
+        NFE_1_TASK_4_DISCONNECTED_PATHS,
+    ) {
+        violations.push(format!(
+            "src/sql/codegen/{path}: disconnected legacy module must remain outside the production module graph"
+        ));
+    }
+
+    let ir_mod = fs::read_to_string(repo.join("src/sql/codegen/ir/mod.rs")).unwrap();
+    let ir_tokens = rust_use_tokens(&rust_sanitized_production_text(&ir_mod));
+    let expected_export = [
+        "pub",
+        "(",
+        "crate",
+        ")",
+        "use",
+        "fragment_build",
+        "::",
+        "lower_distributed_plan",
+        ";",
+    ];
+    if !ir_tokens.windows(expected_export.len()).any(|tokens| {
+        tokens
+            .iter()
+            .map(String::as_str)
+            .eq(expected_export.iter().copied())
+    }) {
+        violations.push(
+            "src/sql/codegen/ir/mod.rs: fragment_build must be exported unconditionally"
+                .to_string(),
+        );
+    }
+
+    for rel in [
+        "src/sql/codegen/mod.rs",
+        "src/sql/codegen/fragment_builder.rs",
+        "src/engine/mod.rs",
+        "src/engine/dml_change_stream.rs",
+        "src/runtime/coordinator.rs",
+        "src/runtime/dispatcher.rs",
+    ] {
+        let text = fs::read_to_string(repo.join(rel)).unwrap();
+        let production = rust_production_text_without_cfg_test(&text);
+        push_forbidden_terms(
+            &mut violations,
+            rel,
+            &production,
+            &[
+                "struct FragmentBuildResult",
+                "struct LoweredFragmentEdge",
+                "pub fragment_results:",
+                "pub lowered_edges:",
+                "refresh_fragment_schedules",
+            ],
+            "Task 4 removes legacy build carriers from production",
+        );
+    }
+
+    let fragment_build =
+        fs::read_to_string(repo.join("src/sql/codegen/ir/fragment_build.rs")).unwrap();
+    let production = rust_production_text_without_cfg_test(&fragment_build);
+    push_forbidden_terms(
+        &mut violations,
+        "src/sql/codegen/ir/fragment_build.rs",
+        &production,
+        &[
+            "crate::thrift",
+            "struct FragmentBuildResult",
+            "cfg(feature = \"compat\")",
+        ],
+        "the unique fragment builder must be feature-neutral and Thrift-free",
+    );
+
+    assert!(
+        violations.is_empty(),
+        "NFE-1 Task 4 unique native builder guard failed:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn nfe_1_task_4_guard_fixture_rejects_all_disconnected_codegen_modules() {
+    let codegen_fixture = r#"
+        pub(crate) mod descriptors;
+        pub(crate) mod expr_compiler;
+        pub(crate) mod fallback_audit;
+        pub(crate) mod iceberg_change_stream_router_wire;
+        pub(crate) mod iceberg_write_sink_wire;
+        #[path =
+            "nodes.rs"
+        ]
+        mod aliased_nodes;
+        pub(in crate::sql) mod resolve;
+        pub(crate) mod runtime_filter_lowering;
+        pub(crate) mod type_infer;
+    "#;
+    let ir_fixture = r#"
+        #[path="lowering.rs"] mod aliased_lowering;
+        pub(in crate::sql) mod equiv;
+    "#;
+    let mut detected = nfe_1_task_4_disconnected_module_hits(
+        codegen_fixture,
+        NFE_1_TASK_4_DISCONNECTED_CODEGEN_MODULES,
+    );
+    detected.extend(nfe_1_task_4_disconnected_module_hits(
+        ir_fixture,
+        NFE_1_TASK_4_DISCONNECTED_IR_MODULES,
+    ));
+    detected.sort();
+
+    let mut expected = vec![
+        "descriptors",
+        "equiv",
+        "expr_compiler",
+        "fallback_audit",
+        "iceberg_change_stream_router_wire",
+        "iceberg_write_sink_wire",
+        "lowering",
+        "nodes",
+        "resolve",
+        "runtime_filter_lowering",
+        "type_infer",
+    ];
+    expected.sort();
+    assert_eq!(detected, expected);
+}
+
+#[test]
+fn nfe_1_task_4_guard_fixture_finds_cfg_attr_path_targets_recursively() {
+    let fixture = r#"
+        #[cfg_attr(path = "descriptors.rs", path = "nodes.rs")]
+        #[cfg_attr(not(feature = "compat"), path = "type_infer.rs")]
+        mod conditional_alias;
+
+        #[cfg_attr(
+            path = "fallback_audit.rs",
+            cfg_attr(path = "expr_compiler.rs", path = "resolve.rs")
+        )]
+        mod nested_alias;
+    "#;
+
+    assert_eq!(
+        nfe_1_task_4_disconnected_module_hits(fixture, NFE_1_TASK_4_DISCONNECTED_CODEGEN_MODULES,),
+        vec![
+            "nodes".to_string(),
+            "resolve".to_string(),
+            "type_infer".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn nfe_1_task_4_guard_fixture_ignores_path_keys_in_non_loading_meta() {
+    let fixture = r#"
+        #[cfg(path = "nodes.rs")]
+        mod harmless {}
+    "#;
+
+    assert!(
+        nfe_1_task_4_disconnected_module_hits(fixture, NFE_1_TASK_4_DISCONNECTED_CODEGEN_MODULES,)
+            .is_empty()
+    );
+}
+
+#[test]
+fn nfe_1_task_4_guard_fixture_ignores_raw_c_string_contents() {
+    let fixture = r##"
+        const RAW_C: &CStr = cr#"ordinary " quote
+            pub(crate) mod nodes;
+        "#;
+    "##;
+
+    assert!(
+        nfe_1_task_4_disconnected_module_hits(fixture, NFE_1_TASK_4_DISCONNECTED_CODEGEN_MODULES,)
+            .is_empty()
+    );
+}
+
+#[test]
+fn nfe_1_task_4_guard_fixture_decodes_valid_cooked_path_escapes() {
+    let fixture = r#"
+        #[path = "no\x64es.rs"]
+        mod hex_alias;
+        #[path = "\u{72}esolve.rs"]
+        mod unicode_alias;
+        #[path = "type_\
+            infer.rs"]
+        mod continued_alias;
+    "#;
+
+    assert_eq!(
+        nfe_1_task_4_disconnected_module_hits(fixture, NFE_1_TASK_4_DISCONNECTED_CODEGEN_MODULES,),
+        vec![
+            "nodes".to_string(),
+            "resolve".to_string(),
+            "type_infer".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn nfe_1_task_4_guard_fixture_ignores_comments_and_strings() {
+    let fixture = r##"
+        // pub(in crate::sql) mod nodes;
+        /*
+        #[path = "resolve.rs"]
+        mod aliased_resolve;
+        */
+        const NORMAL: &str = "pub(crate) mod type_infer;";
+        const META: &str = "#[cfg_attr(feature = \"compat\", path = \"nodes.rs\")] mod alias;";
+        const RAW: &str = r#"
+            pub(crate) mod descriptors;
+            #[cfg_attr(feature = "compat", path = "expr_compiler.rs")]
+            mod aliased_expr_compiler;
+        "#;
+        #[path = "no\des.rs"]
+        mod invalid_escape;
+    "##;
+
+    assert!(
+        nfe_1_task_4_disconnected_module_hits(fixture, NFE_1_TASK_4_DISCONNECTED_CODEGEN_MODULES,)
+            .is_empty()
+    );
+}
+
+#[test]
+fn nfe_1_task_4_guard_fixture_rejects_orphan_reachable_through_child_module_graph() {
+    let (root, roots) = nfe_1_task_4_module_graph_fixture(
+        "reachable_orphans",
+        &[
+            ("mod.rs", "mod helpers;\n"),
+            ("ir/mod.rs", "pub(crate) struct Safe;\n"),
+            (
+                "helpers.rs",
+                r#"
+#[path = "nodes.rs"]
+mod direct_alias;
+
+mod nested {
+    #[cfg_attr(feature = "compat", path = "../../resolve.rs")]
+    mod conditional_alias;
+}
+"#,
+            ),
+            ("nodes.rs", "pub(crate) struct LegacyNode;\n"),
+            ("resolve.rs", "pub(crate) struct LegacyResolver;\n"),
+            ("helpers/nested/.keep", ""),
+        ],
+    );
+
+    assert_eq!(
+        nfe_1_task_4_reachable_disconnected_path_hits(
+            &root,
+            &roots,
+            NFE_1_TASK_4_DISCONNECTED_PATHS,
+        ),
+        vec!["nodes.rs".to_string(), "resolve.rs".to_string()]
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn nfe_1_task_4_guard_fixture_ignores_non_code_legacy_module_decoys_recursively() {
+    let (root, roots) = nfe_1_task_4_module_graph_fixture(
+        "module_decoys",
+        &[
+            ("mod.rs", "mod helpers;\n"),
+            ("ir/mod.rs", "pub(crate) struct Safe;\n"),
+            (
+                "helpers.rs",
+                r####"
+// mod lowering;
+/* #[path = "nodes.rs"] mod legacy; */
+const COOKED: &str = "mod equiv; lowering::lower_distributed_plan";
+const RAW: &str = r#"#[path = "resolve.rs"] mod legacy;"#;
+const RAW_C: &CStr = cr##"mod lowering; lowering::lower_distributed_plan"##;
+"####,
+            ),
+        ],
+    );
+
+    assert!(
+        nfe_1_task_4_reachable_disconnected_path_hits(
+            &root,
+            &roots,
+            NFE_1_TASK_4_DISCONNECTED_PATHS,
+        )
+        .is_empty()
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn nidl_d3l_native_mainline_thrift_usage_is_explicitly_allowlisted() {
     let repo = Path::new(manifest_dir());
@@ -11506,6 +12312,12 @@ fn nidl_e9_noncompat_lower_compat_import_hits_in(root: &Path) -> Vec<String> {
     for path in rs_files(root) {
         let rel_path = rel(&path);
         if nidl_e9_is_lower_compat_scope(&rel_path) {
+            continue;
+        }
+        // NFE-1 deliberately leaves the legacy Thrift emitter as unreachable
+        // source for NFE-2 to delete. `nodes.rs` is owned exclusively by the
+        // disconnected `ir/lowering.rs` path and is not a production module.
+        if rel_path == "src/sql/codegen/nodes.rs" {
             continue;
         }
         if nidl_e9_file_is_cfg_compat_module(&path) {

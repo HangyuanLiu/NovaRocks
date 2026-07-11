@@ -627,11 +627,45 @@ mod tests {
     use crate::exec::node::ExecNodeKind;
     use crate::exec::node::lookup::LookUpNode;
     use crate::exec::node::values::ValuesNode;
+    use crate::lower::compat::test_support::{DescriptorTableBuilder, build_slot_ref_texpr};
     use crate::lower::compat::type_lowering::scalar_type_desc;
-    use crate::sql::codegen::descriptors::DescriptorTableBuilder;
-    use crate::sql::codegen::expr_compiler::build_slot_ref_texpr;
     use crate::thrift::exprs::{TExpr, TExprNode, TExprNodeType, TSlotRef};
     use crate::thrift::opcodes::TExprOpcode;
+
+    fn test_hash_join_node(
+        join_op: plan_nodes::TJoinOp,
+        eq_join_conjuncts: Vec<plan_nodes::TEqJoinCondition>,
+    ) -> plan_nodes::TPlanNode {
+        let mut node = crate::lower::compat::node::test_plan_node(
+            7,
+            plan_nodes::TPlanNodeType::HASH_JOIN_NODE,
+            2,
+        );
+        node.row_tuples = vec![1, 2];
+        node.nullable_tuples = vec![false, true];
+        node.hash_join_node = Some(plan_nodes::THashJoinNode {
+            join_op,
+            eq_join_conjuncts,
+            other_join_conjuncts: None,
+            is_push_down: None,
+            add_probe_filters: None,
+            is_rewritten_from_not_in: None,
+            sql_join_predicates: None,
+            sql_predicates: None,
+            build_runtime_filters: None,
+            build_runtime_filters_from_planner: None,
+            distribution_mode: Some(plan_nodes::TJoinDistributionMode::BROADCAST),
+            partition_exprs: None,
+            output_columns: None,
+            interpolate_passthrough: None,
+            late_materialization: None,
+            enable_partition_hash_join: None,
+            is_skew_join: None,
+            common_slot_map: None,
+            asof_join_condition: None,
+        });
+        node
+    }
 
     #[test]
     fn common_join_key_type_promotes_mixed_integers() {
@@ -674,18 +708,13 @@ mod tests {
             None::<Vec<descriptors::TTableDescriptor>>,
             None::<bool>,
         );
-        let node = crate::sql::codegen::nodes::build_hash_join_node(
-            7,
-            &[1],
-            &[2],
+        let node = test_hash_join_node(
             plan_nodes::TJoinOp::LEFT_OUTER_JOIN,
-            plan_nodes::TJoinDistributionMode::BROADCAST,
             vec![plan_nodes::TEqJoinCondition {
                 left: slot_ref_expr(1, 11),
                 right: slot_ref_expr(2, 22),
                 opcode: None,
             }],
-            Vec::new(),
         );
         assert_eq!(node.nullable_tuples, vec![false, true]);
 

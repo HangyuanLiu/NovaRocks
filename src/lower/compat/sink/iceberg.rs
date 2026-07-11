@@ -969,7 +969,7 @@ mod tests {
     }
 
     fn slot_expr(slot_id: i32, primitive: types::TPrimitiveType) -> exprs::TExpr {
-        crate::sql::codegen::expr_compiler::build_slot_ref_texpr(
+        crate::lower::compat::test_support::build_slot_ref_texpr(
             slot_id,
             1,
             thrift_type_desc(primitive),

@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(feature = "compat")]
-use std::collections::HashSet;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use arrow::datatypes::DataType;
@@ -28,12 +26,13 @@ use crate::sql::catalog::{IcebergDataFileBinding, ScanSource, TableDef};
 use crate::sql::codegen::boundary_schema::{
     BoundaryKind, BoundarySchemaReport, output_columns_to_boundary_columns,
 };
-use crate::sql::codegen::connector_scan_wire::{ThriftScanContext, to_native_file_scan};
+use crate::sql::codegen::connector_scan_wire::{
+    ConnectorScanContext, plan_native_starrocks_scan_node, to_native_file_scan,
+};
 use crate::sql::codegen::runtime_filter::PlannedRuntimeFilter;
-#[cfg(not(feature = "compat"))]
-use crate::sql::codegen::{FragmentBuildResult, MultiFragmentBuildResult};
 use crate::sql::codegen::{
-    FragmentOutputKind, FragmentSchedulingMetadata, OutputColumn, RuntimeFilterPlanResult,
+    FragmentOutputKind, FragmentSchedulingMetadata, MultiFragmentBuildResult, OutputColumn,
+    RuntimeFilterPlanResult,
 };
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::{
@@ -42,61 +41,19 @@ use crate::sql::planner::distributed::{
 };
 use crate::sql::planner::payload::PlanScanNode;
 
-#[cfg(not(feature = "compat"))]
 pub(crate) fn lower_distributed_plan(
     dp: &DistributedPlan,
     catalog: &dyn crate::sql::catalog::CatalogProvider,
     connectors: &crate::connector::ConnectorRegistry,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
 ) -> Result<MultiFragmentBuildResult, String> {
-    let native = build_native_fragment_payload(dp, catalog, connectors, mv_refresh_ctx)?;
-    let fragment_results = native
-        .fragment_schedules
-        .iter()
-        .map(|schedule| FragmentBuildResult {
-            fragment_id: schedule.fragment_id,
-            has_scan_nodes: schedule.has_scan_nodes,
-            output_kind: schedule.output_kind,
-            native_scan_ranges: schedule.native_scan_ranges.clone(),
-            output_columns: schedule.output_columns.clone(),
-            boundary_schemas: schedule.boundary_schemas.clone(),
-            cte_id: schedule.cte_id,
-            cte_exchange_nodes: schedule.cte_exchange_nodes.clone(),
-        })
-        .collect();
-
-    Ok(MultiFragmentBuildResult {
-        fragment_results,
-        fragment_schedules: native.fragment_schedules,
-        native_fragments: native.native_fragments,
-        root_fragment_id: native.root_fragment_id,
-        edges: native.edges,
-        boundary_schemas: native.boundary_schemas,
-        rf_plan: native.rf_plan,
-    })
-}
-
-pub(crate) struct NativeFragmentBuildPayload {
-    pub(crate) fragment_schedules: Vec<FragmentSchedulingMetadata>,
-    pub(crate) native_fragments: BTreeMap<FragmentId, crate::proto::plan::PlanFragment>,
-    pub(crate) root_fragment_id: FragmentId,
-    pub(crate) edges: Vec<crate::sql::codegen::FragmentEdge>,
-    pub(crate) boundary_schemas: Vec<BoundarySchemaReport>,
-    pub(crate) rf_plan: Option<RuntimeFilterPlanResult>,
-}
-
-pub(crate) fn build_native_fragment_payload(
-    dp: &DistributedPlan,
-    catalog: &dyn crate::sql::catalog::CatalogProvider,
-    connectors: &crate::connector::ConnectorRegistry,
-    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
-) -> Result<NativeFragmentBuildPayload, String> {
     let _ = catalog;
     validate_distributed_plan(dp)?;
 
     let mut refreshed = refresh_distributed_plan_for_fragment_build(dp, mv_refresh_ctx)?;
     lower_native_fragment_edges(&mut refreshed)?;
-    let native_scan_planning = build_native_scan_ranges(&refreshed, connectors, mv_refresh_ctx)?;
+    let native_scan_planning =
+        build_native_scan_ranges(&mut refreshed, connectors, mv_refresh_ctx)?;
     let native_scan_ranges = &native_scan_planning.scan_ranges;
 
     let mut fragment_schedules = Vec::with_capacity(refreshed.fragments.len());
@@ -158,7 +115,7 @@ pub(crate) fn build_native_fragment_payload(
         refreshed.root_fragment_id,
     )?;
 
-    Ok(NativeFragmentBuildPayload {
+    Ok(MultiFragmentBuildResult {
         fragment_schedules,
         native_fragments,
         root_fragment_id: refreshed.root_fragment_id,
@@ -214,6 +171,13 @@ fn lower_native_fragment_edges(dp: &mut DistributedPlan) -> Result<(), String> {
     let mut stream_source_partitions = BTreeMap::new();
     let mut router_target_partitions = BTreeMap::new();
     for edge in &mut dp.edges {
+        let edge_context = format!(
+            "{} edge source_fragment_id={} target_fragment_id={} target_exchange_node_id={}",
+            fragment_edge_kind_label(&edge.edge_kind),
+            edge.source_fragment_id,
+            edge.target_fragment_id,
+            edge.target_exchange_node_id
+        );
         let exchange = target_exchange_for_edge(&fragments_by_id, edge)?;
         match &edge.edge_kind {
             FragmentEdgeKind::Stream => {
@@ -231,7 +195,11 @@ fn lower_native_fragment_edges(dp: &mut DistributedPlan) -> Result<(), String> {
                     &exchange.output_columns
                 };
                 edge.output_partition = exchange.partition.clone();
-                edge.stream_kind = fragment_stream_kind(&edge.output_partition);
+                edge.stream_kind = canonical_fragment_stream_kind(
+                    &edge.output_partition,
+                    edge.stream_kind,
+                    &edge_context,
+                )?;
                 edge.output_slot_ids = native_output_column_ids(output_columns, "stream edge")?;
                 if stream_source_partitions
                     .insert(edge.source_fragment_id, edge.output_partition.clone())
@@ -254,7 +222,11 @@ fn lower_native_fragment_edges(dp: &mut DistributedPlan) -> Result<(), String> {
                     ));
                 }
                 edge.output_partition = exchange.partition.clone();
-                edge.stream_kind = fragment_stream_kind(&edge.output_partition);
+                edge.stream_kind = canonical_fragment_stream_kind(
+                    &edge.output_partition,
+                    edge.stream_kind,
+                    &edge_context,
+                )?;
                 edge.output_slot_ids = receive_producer_column_ids
                     .iter()
                     .map(|column_id| native_output_column_id(*column_id, "CTE multicast edge"))
@@ -317,7 +289,11 @@ fn lower_native_fragment_edges(dp: &mut DistributedPlan) -> Result<(), String> {
                     &route.output_partition_ordinals,
                     &format!("branch {:?} partition", route.branch_kind),
                 )?;
-                edge.stream_kind = fragment_stream_kind(&edge.output_partition);
+                edge.stream_kind = canonical_fragment_stream_kind(
+                    &edge.output_partition,
+                    edge.stream_kind,
+                    &edge_context,
+                )?;
                 let target = (edge.target_fragment_id, edge.target_exchange_node_id);
                 if let Some(existing) = router_target_partitions.get(&target)
                     && !native_partitions_equal(existing, &edge.output_partition)?
@@ -711,17 +687,17 @@ struct NativeScanPlanningResult {
 }
 
 fn build_native_scan_ranges(
-    dp: &DistributedPlan,
+    dp: &mut DistributedPlan,
     connectors: &crate::connector::ConnectorRegistry,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
 ) -> Result<NativeScanPlanningResult, String> {
     let mut out = BTreeMap::new();
     let mut starrocks_scan_sources = BTreeMap::new();
-    for fragment in &dp.fragments {
+    for fragment in &mut dp.fragments {
         let mut per_node = BTreeMap::new();
         collect_native_scan_ranges(
             fragment.fragment_id,
-            &fragment.root,
+            &mut fragment.root,
             connectors,
             mv_refresh_ctx,
             &mut per_node,
@@ -737,7 +713,7 @@ fn build_native_scan_ranges(
 
 fn collect_native_scan_ranges(
     fragment_id: FragmentId,
-    node: &DistributedNode,
+    node: &mut DistributedNode,
     connectors: &crate::connector::ConnectorRegistry,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
     out: &mut BTreeMap<i32, Vec<scan_range::ScanRangeParams>>,
@@ -746,7 +722,7 @@ fn collect_native_scan_ranges(
         crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor,
     >,
 ) -> Result<(), String> {
-    if let DistributedNodeKind::Scan(scan) = &node.payload {
+    if let DistributedNodeKind::Scan(scan) = &mut node.payload {
         let (ranges, starrocks_source) =
             native_scan_ranges_for_scan(node.node_id, scan, connectors, mv_refresh_ctx)?;
         out.insert(node.node_id, ranges);
@@ -761,7 +737,7 @@ fn collect_native_scan_ranges(
             ));
         }
     }
-    for child in &node.children {
+    for child in &mut node.children {
         if child.fragment_id == fragment_id {
             collect_native_scan_ranges(
                 fragment_id,
@@ -778,7 +754,7 @@ fn collect_native_scan_ranges(
 
 fn native_scan_ranges_for_scan(
     scan_node_id: i32,
-    scan: &PlanScanNode,
+    scan: &mut PlanScanNode,
     connectors: &crate::connector::ConnectorRegistry,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
 ) -> Result<
@@ -790,15 +766,8 @@ fn native_scan_ranges_for_scan(
 > {
     match &scan.table.source {
         ScanSource::StarRocks { .. } => {
-            #[cfg(feature = "compat")]
-            {
-                let planned = plan_starrocks_scan_node(scan_node_id, scan, connectors)?;
-                Ok((planned.ranges, Some(planned.source)))
-            }
-            #[cfg(not(feature = "compat"))]
-            {
-                Err("StarRocks native scan planning requires feature compat".to_string())
-            }
+            let planned = plan_native_starrocks_scan_node(scan_node_id, scan, connectors)?;
+            Ok((planned.ranges, Some(planned.source)))
         }
         ScanSource::IcebergDataFiles { .. } => {
             build_iceberg_scan_ranges_from_source(scan_node_id, scan, &scan.table.source, None)
@@ -849,97 +818,6 @@ fn native_scan_ranges_for_scan(
     }
 }
 
-#[cfg(feature = "compat")]
-#[derive(Clone, Debug)]
-struct PlannedNativeStarRocksScan {
-    ranges: Vec<scan_range::ScanRangeParams>,
-    source: crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor,
-}
-
-#[cfg(feature = "compat")]
-fn plan_starrocks_scan_node(
-    scan_node_id: i32,
-    scan: &PlanScanNode,
-    connectors: &crate::connector::ConnectorRegistry,
-) -> Result<PlannedNativeStarRocksScan, String> {
-    use crate::connector::starrocks::table::scan_planner::{
-        StarRocksTableScanPlanner, starrocks_scan_handle, starrocks_split,
-    };
-
-    let ScanSource::StarRocks { db_id, table_id } = &scan.table.source else {
-        return Err(format!(
-            "native StarRocks scan planning node_id={scan_node_id} received non-StarRocks source"
-        ));
-    };
-    for (field, value) in [("db_id", *db_id), ("table_id", *table_id)] {
-        if value <= 0 {
-            return Err(format!(
-                "StarRocks ScanNode node_id={scan_node_id} {field} must be positive, got {value}"
-            ));
-        }
-    }
-    let planner = connectors.scan_planner("starrocks")?;
-    let table_handle = StarRocksTableScanPlanner::table_handle_from_source(
-        &scan.database,
-        &scan.table.name,
-        *db_id,
-        *table_id,
-    );
-    let scan_handle = planner.begin_scan(table_handle, BeginScanContext::default())?;
-    let handle = starrocks_scan_handle(&scan_handle)?;
-    if handle.table.db_id != *db_id || handle.table.table_id != *table_id {
-        return Err(format!(
-            "StarRocks ScanNode node_id={scan_node_id} planned scan handle identity mismatch: source=({db_id}, {table_id}) handle=({}, {})",
-            handle.table.db_id, handle.table.table_id
-        ));
-    }
-    let native_source = handle.native_source();
-    let source = crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor {
-        catalog_name: native_source.catalog_name,
-        db_id: native_source.db_id,
-        table_id: native_source.table_id,
-        schema_id: native_source.schema_id,
-        storage_columns: native_source
-            .storage_columns
-            .into_iter()
-            .map(|column| {
-                crate::sql::codegen::proto_encode::plan::StarRocksStorageColumnDescriptor {
-                    name: column.name,
-                    unique_id: column.unique_id,
-                    default_value: column.default_value,
-                }
-            })
-            .collect(),
-        tablet_schema: crate::sql::codegen::proto_encode::plan::starrocks_tablet_schema_descriptor(
-            native_source.tablet_schema,
-        ),
-    };
-    let splits = planner.plan_splits(&scan_handle, SplitPlanningContext::default())?;
-    if splits.is_empty() {
-        return Err(format!(
-            "StarRocks table {}.{} has no selected tablet splits",
-            scan.database, scan.table.name
-        ));
-    }
-    let mut tablets = HashSet::new();
-    let mut ranges = Vec::with_capacity(splits.len());
-    for split in &splits {
-        let split = starrocks_split(split)?;
-        if !tablets.insert(split.tablet_id) {
-            return Err(format!(
-                "StarRocks ScanNode node_id={scan_node_id} has duplicate tablet_id={}",
-                split.tablet_id
-            ));
-        }
-        ranges.push(scan_range::ScanRangeParams::starrocks_tablet(
-            split.tablet_id,
-            split.partition_id,
-            split.version,
-        )?);
-    }
-    Ok(PlannedNativeStarRocksScan { ranges, source })
-}
-
 fn build_iceberg_scan_ranges_from_source(
     scan_node_id: i32,
     scan: &PlanScanNode,
@@ -985,35 +863,316 @@ fn build_iceberg_scan_ranges_from_source(
 fn plan_iceberg_scan_ranges(
     connectors: &crate::connector::ConnectorRegistry,
     scan_node_id: i32,
-    scan: &PlanScanNode,
+    scan: &mut PlanScanNode,
     table_handle: crate::connector::scan_planning::TableHandle,
 ) -> Result<Vec<scan_range::ScanRangeParams>, String> {
-    let ScanSource::IcebergDataFiles {
-        cloud_properties, ..
-    } = &scan.table.source
-    else {
+    let ScanSource::IcebergDataFiles { table, .. } = &scan.table.source else {
         return Err("Iceberg scan range source must be Iceberg data files".to_string());
     };
+    let table = table.clone();
     let planner = connectors.scan_planner("iceberg")?;
     let scan_handle = planner.begin_scan(table_handle, BeginScanContext::default())?;
     let splits = planner.plan_splits(&scan_handle, SplitPlanningContext::default())?;
+    let equality_required = equality_delete_required_columns(scan_node_id, &table, &splits)?;
+    if !equality_required.is_empty() {
+        let existing_required = match scan.required_columns.take() {
+            Some(required) => required,
+            None => unrestricted_scan_required_columns(scan),
+        };
+        scan.required_columns = Some(merge_required_columns_with_additional(
+            Some(existing_required),
+            &equality_required,
+        ));
+    }
     let plan = to_native_file_scan(
         planner.name(),
         &scan_handle,
         &splits,
-        ThriftScanContext {
-            database: scan.database.clone(),
-            table: scan.table.name.clone(),
-            node_id: scan_node_id,
-            scan_tuple_id: scan_node_id,
-            min_max_predicates: Vec::new(),
+        ConnectorScanContext {
+            min_max_predicates: native_scan_min_max_predicates(&scan.predicates),
             change_op_slot: None,
-            cloud_properties: cloud_properties.clone(),
             columns: scan.table.columns.clone(),
-            ..ThriftScanContext::default()
         },
     )?;
     Ok(plan.scan_ranges)
+}
+
+fn native_scan_min_max_predicates(
+    predicates: &[crate::sql::analysis::TypedExpr],
+) -> Vec<crate::common::min_max_predicate::MinMaxPredicate> {
+    let mut out = Vec::new();
+    for predicate in predicates {
+        collect_native_min_max_predicates(predicate, &mut out);
+    }
+    out
+}
+
+fn collect_native_min_max_predicates(
+    expr: &crate::sql::analysis::TypedExpr,
+    out: &mut Vec<crate::common::min_max_predicate::MinMaxPredicate>,
+) {
+    use crate::sql::analysis::{BinOp, ExprKind};
+
+    match &expr.kind {
+        ExprKind::Nested(inner) => collect_native_min_max_predicates(inner, out),
+        ExprKind::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
+            collect_native_min_max_predicates(left, out);
+            collect_native_min_max_predicates(right, out);
+        }
+        ExprKind::BinaryOp { left, op, right } => {
+            if let Some(predicate) = native_min_max_comparison(left, *op, right) {
+                out.push(predicate);
+            } else if let Some(predicate) =
+                native_min_max_comparison(right, reverse_comparison(*op), left)
+            {
+                out.push(predicate);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn reverse_comparison(op: crate::sql::analysis::BinOp) -> crate::sql::analysis::BinOp {
+    use crate::sql::analysis::BinOp;
+    match op {
+        BinOp::Lt => BinOp::Gt,
+        BinOp::Le => BinOp::Ge,
+        BinOp::Gt => BinOp::Lt,
+        BinOp::Ge => BinOp::Le,
+        other => other,
+    }
+}
+
+fn native_min_max_comparison(
+    column: &crate::sql::analysis::TypedExpr,
+    op: crate::sql::analysis::BinOp,
+    literal: &crate::sql::analysis::TypedExpr,
+) -> Option<crate::common::min_max_predicate::MinMaxPredicate> {
+    use crate::common::min_max_predicate::MinMaxPredicate;
+    use crate::sql::analysis::{BinOp, ExprKind};
+
+    let ExprKind::ColumnRef { column: name, .. } = &column.kind else {
+        return None;
+    };
+    if column.data_type != literal.data_type {
+        return None;
+    }
+    let value = native_min_max_literal(literal)?;
+    Some(match op {
+        BinOp::Eq => MinMaxPredicate::Eq {
+            column: name.clone(),
+            value,
+        },
+        BinOp::Lt => MinMaxPredicate::Lt {
+            column: name.clone(),
+            value,
+        },
+        BinOp::Le => MinMaxPredicate::Le {
+            column: name.clone(),
+            value,
+        },
+        BinOp::Gt => MinMaxPredicate::Gt {
+            column: name.clone(),
+            value,
+        },
+        BinOp::Ge => MinMaxPredicate::Ge {
+            column: name.clone(),
+            value,
+        },
+        _ => return None,
+    })
+}
+
+fn native_min_max_literal(
+    expr: &crate::sql::analysis::TypedExpr,
+) -> Option<crate::common::min_max_predicate::MinMaxPredicateValue> {
+    use crate::common::min_max_predicate::MinMaxPredicateValue;
+    use crate::sql::analysis::{ExprKind, LiteralValue};
+    use arrow::datatypes::{DataType, TimeUnit};
+
+    let ExprKind::Literal(literal) = &expr.kind else {
+        return None;
+    };
+    match (&expr.data_type, literal) {
+        (DataType::Boolean, LiteralValue::Bool(value)) => {
+            Some(MinMaxPredicateValue::Boolean(*value))
+        }
+        (DataType::Int8 | DataType::Int16 | DataType::Int32, LiteralValue::Int(value)) => {
+            i32::try_from(*value).ok().map(MinMaxPredicateValue::Int32)
+        }
+        (DataType::Int64, LiteralValue::Int(value)) => Some(MinMaxPredicateValue::Int64(*value)),
+        (DataType::Float32, LiteralValue::Float(value)) if value.is_finite() => {
+            Some(MinMaxPredicateValue::Float(*value as f32))
+        }
+        (DataType::Float64, LiteralValue::Float(value)) if value.is_finite() => {
+            Some(MinMaxPredicateValue::Double(*value))
+        }
+        (DataType::Utf8 | DataType::LargeUtf8, LiteralValue::String(value)) => {
+            Some(MinMaxPredicateValue::ByteArray(value.as_bytes().to_vec()))
+        }
+        (DataType::Binary | DataType::LargeBinary, LiteralValue::Binary(value)) => {
+            Some(MinMaxPredicateValue::ByteArray(value.clone()))
+        }
+        (DataType::Date32, LiteralValue::Int(value)) => {
+            i32::try_from(*value).ok().map(MinMaxPredicateValue::Date32)
+        }
+        (DataType::Timestamp(TimeUnit::Microsecond, _), LiteralValue::Int(value)) => {
+            Some(MinMaxPredicateValue::DateTimeMicros(*value))
+        }
+        (DataType::Timestamp(TimeUnit::Nanosecond, _), LiteralValue::Int(value)) => {
+            Some(MinMaxPredicateValue::DateTimeNanos(*value))
+        }
+        _ => None,
+    }
+}
+
+fn merge_required_columns_with_additional(
+    existing: Option<Vec<String>>,
+    additional: &[String],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for name in existing
+        .unwrap_or_default()
+        .into_iter()
+        .chain(additional.iter().cloned())
+    {
+        if seen.insert(name.to_ascii_lowercase()) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+fn unrestricted_scan_required_columns(scan: &PlanScanNode) -> Vec<String> {
+    let table_columns = scan
+        .table
+        .columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect::<Vec<_>>();
+    let scan_columns = scan
+        .columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect::<Vec<_>>();
+    merge_required_columns_with_additional(Some(table_columns), &scan_columns)
+}
+
+fn equality_delete_required_columns(
+    scan_node_id: i32,
+    table: &crate::sql::catalog::IcebergTableInfo,
+    splits: &[crate::connector::scan_planning::Split],
+) -> Result<Vec<String>, String> {
+    let mut schema_by_id = BTreeMap::new();
+    let mut schema_by_name = BTreeMap::new();
+    for field in &table.schema.fields {
+        if schema_by_id
+            .insert(field.field_id, field.name.clone())
+            .is_some()
+        {
+            return Err(format!(
+                "Iceberg ScanNode node_id={scan_node_id} table schema has duplicate field id {}",
+                field.field_id
+            ));
+        }
+        let normalized = field.name.to_ascii_lowercase();
+        if schema_by_name
+            .insert(normalized, field.name.clone())
+            .is_some()
+        {
+            return Err(format!(
+                "Iceberg ScanNode node_id={scan_node_id} table schema has duplicate field name {}",
+                field.name
+            ));
+        }
+    }
+
+    let mut required = Vec::new();
+    let mut required_seen = BTreeSet::new();
+    for split in splits {
+        let file = crate::connector::iceberg::scan_planner::iceberg_split(split)?;
+        for delete in &file.data_file.delete_files {
+            if delete.file_content != crate::sql::catalog::IcebergDeleteFileContent::Equality {
+                continue;
+            }
+
+            let mut resolved_ids = Vec::new();
+            let mut ids_seen = BTreeSet::new();
+            for field_id in &delete.equality_field_ids {
+                if !ids_seen.insert(*field_id) {
+                    return Err(format!(
+                        "Iceberg equality-delete file {} has duplicate equality field id {}",
+                        delete.path, field_id
+                    ));
+                }
+                let name = schema_by_id.get(field_id).ok_or_else(|| {
+                    format!(
+                        "Iceberg equality-delete file {} references unknown field id {} in table {}",
+                        delete.path, field_id, table.table
+                    )
+                })?;
+                resolved_ids.push(name.clone());
+            }
+
+            let mut resolved_names = Vec::new();
+            let mut names_seen = BTreeSet::new();
+            for name in &delete.equality_column_names {
+                let normalized = name.to_ascii_lowercase();
+                if !names_seen.insert(normalized.clone()) {
+                    return Err(format!(
+                        "Iceberg equality-delete file {} has duplicate equality column name {}",
+                        delete.path, name
+                    ));
+                }
+                let canonical = schema_by_name.get(&normalized).ok_or_else(|| {
+                    format!(
+                        "Iceberg equality-delete file {} references unknown equality column {} in table {}",
+                        delete.path, name, table.table
+                    )
+                })?;
+                resolved_names.push(canonical.clone());
+            }
+
+            let columns = match (resolved_ids.is_empty(), resolved_names.is_empty()) {
+                (true, true) => {
+                    return Err(format!(
+                        "Iceberg equality-delete file {} has no equality field identity",
+                        delete.path
+                    ));
+                }
+                (false, false) => {
+                    let ids = resolved_ids
+                        .iter()
+                        .map(|name| name.to_ascii_lowercase())
+                        .collect::<BTreeSet<_>>();
+                    let names = resolved_names
+                        .iter()
+                        .map(|name| name.to_ascii_lowercase())
+                        .collect::<BTreeSet<_>>();
+                    if ids != names {
+                        return Err(format!(
+                            "Iceberg equality-delete file {} field id/name mismatch: ids={resolved_ids:?} names={resolved_names:?}",
+                            delete.path
+                        ));
+                    }
+                    resolved_ids
+                }
+                (false, true) => resolved_ids,
+                (true, false) => resolved_names,
+            };
+            for name in columns {
+                if required_seen.insert(name.to_ascii_lowercase()) {
+                    required.push(name);
+                }
+            }
+        }
+    }
+    Ok(required)
 }
 
 fn effective_scan_column_names(scan: &PlanScanNode) -> Vec<String> {
@@ -1544,11 +1703,26 @@ fn fragment_output_kind(sink: &crate::sql::planner::distributed::DataSink) -> Fr
     }
 }
 
-fn fragment_stream_kind(partition: &DataPartition) -> FragmentStreamKind {
-    match partition.kind {
-        PartitionKind::Unpartitioned => FragmentStreamKind::Gather,
-        PartitionKind::Random => FragmentStreamKind::Broadcast,
-        PartitionKind::Hash => FragmentStreamKind::Partitioned,
+fn canonical_fragment_stream_kind(
+    partition: &DataPartition,
+    planned_stream_kind: FragmentStreamKind,
+    context: &str,
+) -> Result<FragmentStreamKind, String> {
+    let valid = matches!(
+        (partition.kind, planned_stream_kind),
+        (
+            PartitionKind::Unpartitioned,
+            FragmentStreamKind::Gather | FragmentStreamKind::Broadcast
+        ) | (PartitionKind::Random, FragmentStreamKind::Other)
+            | (PartitionKind::Hash, FragmentStreamKind::Partitioned)
+    );
+    if valid {
+        Ok(planned_stream_kind)
+    } else {
+        Err(format!(
+            "{context} has invalid stream/partition combination: partition_kind={:?} stream_kind={planned_stream_kind:?}; allowed combinations are Unpartitioned+Gather, Unpartitioned+Broadcast, Random+Other, and Hash+Partitioned",
+            partition.kind
+        ))
     }
 }
 
@@ -1629,6 +1803,786 @@ mod tests {
                 rows: Vec::new(),
                 columns,
             }),
+        }
+    }
+
+    #[derive(Debug)]
+    struct PlannedIcebergFiles {
+        files: Vec<crate::sql::catalog::IcebergDataFileInfo>,
+    }
+
+    impl crate::connector::scan_planning::ConnectorScanPlanner for PlannedIcebergFiles {
+        fn name(&self) -> &'static str {
+            "iceberg"
+        }
+
+        fn begin_scan(
+            &self,
+            table: crate::connector::scan_planning::TableHandle,
+            _ctx: crate::connector::scan_planning::BeginScanContext,
+        ) -> Result<crate::connector::scan_planning::ScanHandle, String> {
+            let table = table
+                .downcast_ref::<crate::connector::iceberg::scan_planner::IcebergTableHandle>()
+                .ok_or_else(|| "PlannedIcebergFiles expected IcebergTableHandle".to_string())?
+                .clone();
+            Ok(crate::connector::scan_planning::ScanHandle::new(
+                "iceberg",
+                crate::connector::iceberg::scan_planner::IcebergScanHandle { table },
+            ))
+        }
+
+        fn plan_splits(
+            &self,
+            _scan: &crate::connector::scan_planning::ScanHandle,
+            _ctx: crate::connector::scan_planning::SplitPlanningContext,
+        ) -> Result<Vec<crate::connector::scan_planning::Split>, String> {
+            Ok(self
+                .files
+                .iter()
+                .cloned()
+                .map(|data_file| {
+                    crate::connector::scan_planning::Split::new(
+                        "iceberg",
+                        crate::connector::iceberg::scan_planner::IcebergSplit { data_file },
+                    )
+                })
+                .collect())
+        }
+    }
+
+    fn iceberg_schema_field(
+        field_id: i32,
+        name: &str,
+    ) -> crate::sql::catalog::IcebergSchemaFieldDef {
+        crate::sql::catalog::IcebergSchemaFieldDef {
+            field_id,
+            name: name.to_string(),
+            initial_default: None,
+            write_default: None,
+            initial_default_json: None,
+            write_default_json: None,
+            children: Vec::new(),
+        }
+    }
+
+    fn iceberg_table_info() -> crate::sql::catalog::IcebergTableInfo {
+        crate::sql::catalog::IcebergTableInfo {
+            catalog: "test_catalog".to_string(),
+            namespace: "test_db".to_string(),
+            table: "test_table".to_string(),
+            table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
+            current_snapshot_id: Some(7),
+            schema_id: 1,
+            location: "s3://bucket/test_table".to_string(),
+            schema: crate::sql::catalog::IcebergSchemaDef {
+                fields: vec![
+                    iceberg_schema_field(1, "id"),
+                    iceberg_schema_field(3, "category"),
+                ],
+            },
+            serialized_metadata: None,
+            serialized_metadata_rows: None,
+        }
+    }
+
+    fn equality_delete_file(
+        equality_column_names: Vec<&str>,
+        equality_field_ids: Vec<i32>,
+    ) -> crate::sql::catalog::IcebergDeleteFileInfo {
+        crate::sql::catalog::IcebergDeleteFileInfo {
+            path: "s3://bucket/eq-delete.parquet".to_string(),
+            file_format: crate::sql::catalog::IcebergDeleteFileFormat::Parquet,
+            file_content: crate::sql::catalog::IcebergDeleteFileContent::Equality,
+            length: Some(1),
+            content_offset: None,
+            content_size_in_bytes: None,
+            sequence_number: Some(2),
+            partition_spec_id: Some(0),
+            partition_key: Some("Struct([])".to_string()),
+            equality_column_names: equality_column_names
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            equality_field_ids,
+        }
+    }
+
+    fn iceberg_data_file(
+        delete_files: Vec<crate::sql::catalog::IcebergDeleteFileInfo>,
+    ) -> crate::sql::catalog::IcebergDataFileInfo {
+        crate::sql::catalog::IcebergDataFileInfo {
+            path: "s3://bucket/data.parquet".to_string(),
+            size: 128,
+            row_count: Some(10),
+            column_stats: None,
+            partition_spec_id: Some(0),
+            partition_key: Some("Struct([])".to_string()),
+            first_row_id: None,
+            data_sequence_number: Some(1),
+            ivm_change_op: None,
+            included_positions: None,
+            delete_files,
+            manifest_path: None,
+            partition_values: Vec::new(),
+        }
+    }
+
+    fn iceberg_i32_stats_file(
+        path: &str,
+        min: i32,
+        max: i32,
+    ) -> crate::sql::catalog::IcebergDataFileInfo {
+        let mut file = iceberg_data_file(Vec::new());
+        file.path = path.to_string();
+        file.column_stats = Some(HashMap::from([(
+            "id".to_string(),
+            crate::sql::catalog::IcebergColumnStats {
+                null_count: Some(0),
+                value_count: Some(10),
+                column_size: None,
+                lower_bound: Some(min.to_le_bytes().to_vec()),
+                upper_bound: Some(max.to_le_bytes().to_vec()),
+            },
+        )]));
+        file
+    }
+
+    fn iceberg_identity_partition_file(
+        path: &str,
+        id: i32,
+    ) -> crate::sql::catalog::IcebergDataFileInfo {
+        let mut file = iceberg_data_file(Vec::new());
+        file.path = path.to_string();
+        file.partition_key = Some(format!("Struct([{id}])"));
+        file.partition_values = vec![crate::sql::catalog::IcebergPartitionFieldValue {
+            source_column: "id".to_string(),
+            field_name: "id".to_string(),
+            transform: "identity".to_string(),
+            value: Some(crate::sql::catalog::IcebergPartitionValue::Int32(id)),
+        }];
+        file
+    }
+
+    fn position_delete_file(path: &str) -> crate::sql::catalog::IcebergDeleteFileInfo {
+        crate::sql::catalog::IcebergDeleteFileInfo {
+            path: path.to_string(),
+            file_format: crate::sql::catalog::IcebergDeleteFileFormat::Parquet,
+            file_content: crate::sql::catalog::IcebergDeleteFileContent::Position,
+            length: Some(1),
+            content_offset: None,
+            content_size_in_bytes: None,
+            sequence_number: Some(2),
+            partition_spec_id: Some(0),
+            partition_key: Some("Struct([])".to_string()),
+            equality_column_names: Vec::new(),
+            equality_field_ids: Vec::new(),
+        }
+    }
+
+    fn iceberg_scan_plan(required_columns: Option<Vec<&str>>) -> DistributedPlan {
+        iceberg_scan_plan_with_outputs(required_columns, &["id"])
+    }
+
+    fn iceberg_scan_plan_with_outputs(
+        required_columns: Option<Vec<&str>>,
+        output_names: &[&str],
+    ) -> DistributedPlan {
+        let id = AnalysisOutputColumn {
+            column_id: ColumnId::new_for_test(1),
+            name: "id".to_string(),
+            data_type: DataType::Int32,
+            nullable: false,
+            is_internal: false,
+        };
+        let category = AnalysisOutputColumn {
+            column_id: ColumnId::new_for_test(3),
+            name: "category".to_string(),
+            data_type: DataType::Utf8,
+            nullable: true,
+            is_internal: false,
+        };
+        let all_outputs = [id, category];
+        let output_columns = output_names
+            .iter()
+            .map(|name| {
+                all_outputs
+                    .iter()
+                    .find(|column| column.name == *name)
+                    .unwrap_or_else(|| panic!("unknown Iceberg scan test output {name}"))
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        let table = TableDef {
+            name: "ice_t".to_string(),
+            columns: vec![
+                crate::sql::catalog::ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                },
+                crate::sql::catalog::ColumnDef {
+                    name: "category".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: true,
+                    write_default: None,
+                    logical_type: None,
+                },
+            ],
+            iceberg_row_lineage_metadata_columns: Vec::new(),
+            source: ScanSource::IcebergDataFiles {
+                table: iceberg_table_info(),
+                files: Vec::new(),
+                cloud_properties: BTreeMap::new(),
+                binding: IcebergDataFileBinding::CurrentSnapshot,
+            },
+        };
+        let scan = DistributedNode {
+            node_id: 10,
+            fragment_id: 0,
+            tuple_ids: vec![10],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            stats: stats(),
+            payload: DistributedNodeKind::Scan(PlanScanNode {
+                database: "default".to_string(),
+                table,
+                alias: None,
+                columns: output_columns.clone(),
+                predicates: Vec::new(),
+                required_columns: required_columns
+                    .map(|columns| columns.into_iter().map(str::to_string).collect()),
+                variant_columns: Vec::new(),
+                mv_rewritten_from: None,
+            }),
+        };
+        DistributedPlan {
+            fragments: vec![PlanFragment {
+                fragment_id: 0,
+                root: scan,
+                data_partition: DataPartition::unpartitioned(),
+                output_partition: DataPartition::unpartitioned(),
+                sink: crate::sql::planner::distributed::DataSink::Result,
+                output_exprs: None,
+                output_columns,
+                cte_id: None,
+                cte_exchange_nodes: Vec::new(),
+            }],
+            root_fragment_id: 0,
+            edges: Vec::new(),
+        }
+    }
+
+    fn set_iceberg_scan_predicates(plan: &mut DistributedPlan, predicates: Vec<TypedExpr>) {
+        let DistributedNodeKind::Scan(scan) = &mut plan.fragments[0].root.payload else {
+            panic!("root must be scan");
+        };
+        scan.predicates = predicates;
+    }
+
+    fn id_eq_literal(value: i64) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: ColumnId::new_for_test(1),
+                        qualifier: Some("ice_t".to_string()),
+                        column: "id".to_string(),
+                    },
+                    data_type: DataType::Int32,
+                    nullable: false,
+                }),
+                op: crate::sql::analysis::BinOp::Eq,
+                right: Box::new(TypedExpr {
+                    kind: ExprKind::Literal(crate::sql::analysis::LiteralValue::Int(value)),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                }),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        }
+    }
+
+    fn iceberg_registry(files: Vec<crate::sql::catalog::IcebergDataFileInfo>) -> ConnectorRegistry {
+        let mut registry = ConnectorRegistry::new();
+        registry.register_scan_planner(std::sync::Arc::new(PlannedIcebergFiles { files }));
+        registry
+    }
+
+    fn native_root_scan(result: &MultiFragmentBuildResult) -> &crate::proto::plan::ScanNode {
+        let root = result.native_fragments[&result.root_fragment_id]
+            .root
+            .as_ref()
+            .expect("root node");
+        let crate::proto::plan::distributed_node::Payload::Physical(physical) =
+            root.payload.as_ref().expect("root payload")
+        else {
+            panic!("root must be physical");
+        };
+        let crate::proto::plan::plan_node::Kind::Scan(scan) =
+            physical.kind.as_ref().expect("physical kind")
+        else {
+            panic!("root must be scan");
+        };
+        scan
+    }
+
+    fn native_file_ranges(
+        result: &MultiFragmentBuildResult,
+    ) -> &[crate::runtime::scan_range::ScanRangeParams] {
+        result.fragment_schedules[0]
+            .native_scan_ranges
+            .get(&10)
+            .map(Vec::as_slice)
+            .expect("scan node ranges")
+    }
+
+    fn native_file_range(
+        range: &crate::runtime::scan_range::ScanRangeParams,
+    ) -> &crate::runtime::scan_range::FileScanRange {
+        match &range.range {
+            crate::runtime::scan_range::ScanRange::File(file) => file,
+            crate::runtime::scan_range::ScanRange::StarRocksTablet(_) => {
+                panic!("expected file range")
+            }
+        }
+    }
+
+    #[test]
+    fn equality_delete_field_ids_are_merged_into_native_required_columns() {
+        let plan = iceberg_scan_plan(Some(vec!["id"]));
+        let registry = iceberg_registry(vec![iceberg_data_file(vec![equality_delete_file(
+            Vec::new(),
+            vec![3],
+        )])]);
+
+        let result = lower_distributed_plan(&plan, &EmptyCatalog, &registry, None)
+            .expect("build native Iceberg scan");
+
+        assert_eq!(
+            native_root_scan(&result).required_columns,
+            vec!["id", "category"]
+        );
+    }
+
+    #[test]
+    fn equality_delete_column_names_are_merged_into_native_required_columns() {
+        let plan = iceberg_scan_plan(Some(vec!["id"]));
+        let registry = iceberg_registry(vec![iceberg_data_file(vec![equality_delete_file(
+            vec!["category"],
+            Vec::new(),
+        )])]);
+
+        let result = lower_distributed_plan(&plan, &EmptyCatalog, &registry, None)
+            .expect("build native Iceberg scan");
+
+        assert_eq!(
+            native_root_scan(&result).required_columns,
+            vec!["id", "category"]
+        );
+    }
+
+    #[test]
+    fn equality_delete_key_from_planned_splits_is_hidden_from_query_projection() {
+        let plan = iceberg_scan_plan(Some(vec!["id"]));
+        let registry = iceberg_registry(vec![iceberg_data_file(vec![equality_delete_file(
+            Vec::new(),
+            vec![3],
+        )])]);
+
+        let result = lower_distributed_plan(&plan, &EmptyCatalog, &registry, None)
+            .expect("build native Iceberg scan");
+        let scan = native_root_scan(&result);
+
+        assert_eq!(scan.required_columns, vec!["id", "category"]);
+        assert_eq!(
+            scan.columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id"]
+        );
+    }
+
+    #[test]
+    fn equality_delete_with_unrestricted_non_key_projection_preserves_full_read_layout() {
+        let plan = iceberg_scan_plan_with_outputs(None, &["id"]);
+        let registry = iceberg_registry(vec![iceberg_data_file(vec![equality_delete_file(
+            Vec::new(),
+            vec![3],
+        )])]);
+
+        let result = lower_distributed_plan(&plan, &EmptyCatalog, &registry, None)
+            .expect("build unrestricted native Iceberg scan");
+        let scan = native_root_scan(&result);
+
+        assert_eq!(scan.required_columns, vec!["id", "category"]);
+        assert_eq!(
+            scan.columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id"]
+        );
+        let table = scan.table.as_ref().expect("native scan table");
+        assert!(
+            table.columns.iter().any(|column| column.name == "category"),
+            "hidden equality key must be materializable from the table schema"
+        );
+    }
+
+    #[test]
+    fn equality_delete_with_unrestricted_select_all_preserves_all_query_outputs() {
+        let plan = iceberg_scan_plan_with_outputs(None, &["id", "category"]);
+        let registry = iceberg_registry(vec![iceberg_data_file(vec![equality_delete_file(
+            Vec::new(),
+            vec![3],
+        )])]);
+
+        let result = lower_distributed_plan(&plan, &EmptyCatalog, &registry, None)
+            .expect("build unrestricted SELECT * Iceberg scan");
+        let scan = native_root_scan(&result);
+
+        assert_eq!(scan.required_columns, vec!["id", "category"]);
+        assert_eq!(
+            scan.columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "category"]
+        );
+    }
+
+    #[test]
+    fn equality_delete_unknown_field_id_is_native_planning_error() {
+        let plan = iceberg_scan_plan(Some(vec!["id"]));
+        let registry = iceberg_registry(vec![iceberg_data_file(vec![equality_delete_file(
+            Vec::new(),
+            vec![99],
+        )])]);
+
+        let err = match lower_distributed_plan(&plan, &EmptyCatalog, &registry, None) {
+            Ok(_) => panic!("unknown equality field id must fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.contains("unknown field id 99"), "{err}");
+    }
+
+    #[test]
+    fn equality_delete_duplicate_identity_is_native_planning_error() {
+        for delete_file in [
+            equality_delete_file(Vec::new(), vec![3, 3]),
+            equality_delete_file(vec!["category", "CATEGORY"], Vec::new()),
+        ] {
+            let plan = iceberg_scan_plan(Some(vec!["id"]));
+            let registry = iceberg_registry(vec![iceberg_data_file(vec![delete_file])]);
+
+            let err = match lower_distributed_plan(&plan, &EmptyCatalog, &registry, None) {
+                Ok(_) => panic!("duplicate equality identity must fail"),
+                Err(err) => err,
+            };
+            assert!(err.contains("duplicate equality"), "{err}");
+        }
+    }
+
+    #[test]
+    fn equality_delete_field_id_and_name_mismatch_is_native_planning_error() {
+        let plan = iceberg_scan_plan(Some(vec!["id"]));
+        let registry = iceberg_registry(vec![iceberg_data_file(vec![equality_delete_file(
+            vec!["id"],
+            vec![3],
+        )])]);
+
+        let err = match lower_distributed_plan(&plan, &EmptyCatalog, &registry, None) {
+            Ok(_) => panic!("equality id/name mismatch must fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.contains("field id/name mismatch"), "{err}");
+    }
+
+    #[test]
+    fn native_iceberg_scan_predicate_prunes_file_stats_for_id_12() {
+        let mut plan = iceberg_scan_plan(None);
+        set_iceberg_scan_predicates(&mut plan, vec![id_eq_literal(12)]);
+        let registry = iceberg_registry(vec![
+            iceberg_i32_stats_file("s3://bucket/id-1-5.parquet", 1, 5),
+            iceberg_i32_stats_file("s3://bucket/id-10-20.parquet", 10, 20),
+        ]);
+
+        let result = lower_distributed_plan(&plan, &EmptyCatalog, &registry, None)
+            .expect("build native Iceberg scan");
+        let ranges = native_file_ranges(&result);
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(
+            native_file_range(&ranges[0]).full_path.as_deref(),
+            Some("s3://bucket/id-10-20.parquet")
+        );
+    }
+
+    #[test]
+    fn native_iceberg_scan_predicate_prunes_identity_partition_for_id_12() {
+        let mut plan = iceberg_scan_plan(None);
+        set_iceberg_scan_predicates(&mut plan, vec![id_eq_literal(12)]);
+        let registry = iceberg_registry(vec![
+            iceberg_identity_partition_file("s3://bucket/id-1.parquet", 1),
+            iceberg_identity_partition_file("s3://bucket/id-12.parquet", 12),
+        ]);
+
+        let result = lower_distributed_plan(&plan, &EmptyCatalog, &registry, None)
+            .expect("build native Iceberg scan");
+        let ranges = native_file_ranges(&result);
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(
+            native_file_range(&ranges[0]).full_path.as_deref(),
+            Some("s3://bucket/id-12.parquet")
+        );
+    }
+
+    #[test]
+    fn native_iceberg_scan_splits_large_plain_file() {
+        let plan = iceberg_scan_plan(None);
+        let mut file = iceberg_data_file(Vec::new());
+        file.path = "s3://bucket/large.parquet".to_string();
+        file.size = 300 * 1024 * 1024;
+        let registry = iceberg_registry(vec![file]);
+
+        let result = lower_distributed_plan(&plan, &EmptyCatalog, &registry, None)
+            .expect("build native Iceberg scan");
+        let ranges = native_file_ranges(&result);
+
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(native_file_range(&ranges[0]).offset, 0);
+        assert_eq!(native_file_range(&ranges[1]).offset, 128 * 1024 * 1024);
+        assert_eq!(native_file_range(&ranges[2]).offset, 256 * 1024 * 1024);
+        assert_eq!(native_file_range(&ranges[2]).length, 44 * 1024 * 1024);
+    }
+
+    #[test]
+    fn native_iceberg_scan_rejects_excessive_delete_apply_cost() {
+        let plan = iceberg_scan_plan(None);
+        let delete_files = (0..1025)
+            .map(|idx| position_delete_file(&format!("s3://bucket/delete-{idx}.parquet")))
+            .collect();
+        let registry = iceberg_registry(vec![iceberg_data_file(delete_files)]);
+
+        let err = match lower_distributed_plan(&plan, &EmptyCatalog, &registry, None) {
+            Ok(_) => panic!("delete-heavy scan must fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.contains("too many Iceberg delete files"), "{err}");
+    }
+
+    #[test]
+    fn native_iceberg_scan_unsupported_predicate_does_not_guess_pruning() {
+        let mut plan = iceberg_scan_plan(None);
+        set_iceberg_scan_predicates(
+            &mut plan,
+            vec![TypedExpr {
+                kind: ExprKind::FunctionCall {
+                    name: "abs".to_string(),
+                    args: vec![id_eq_literal(12)],
+                    distinct: false,
+                },
+                data_type: DataType::Boolean,
+                nullable: false,
+            }],
+        );
+        let registry = iceberg_registry(vec![
+            iceberg_i32_stats_file("s3://bucket/id-1-5.parquet", 1, 5),
+            iceberg_i32_stats_file("s3://bucket/id-10-20.parquet", 10, 20),
+        ]);
+
+        let result = lower_distributed_plan(&plan, &EmptyCatalog, &registry, None)
+            .expect("unsupported pruning predicate must preserve scan semantics");
+
+        assert_eq!(native_file_ranges(&result).len(), 2);
+    }
+
+    #[test]
+    fn planner_broadcast_edge_remains_broadcast_through_builder_and_scheduling() {
+        use crate::sql::planner::physical::{
+            PhysicalPlanKind, PhysicalPlanNode, RedistributeMode, RedistributeNode,
+        };
+
+        let columns = vec![output_col(1, "k")];
+        let values = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Values(PlanValuesNode {
+                rows: Vec::new(),
+                columns: columns.clone(),
+            }),
+            children: Vec::new(),
+            output_columns: columns.clone(),
+            stats: stats(),
+            probe_runtime_filters: Vec::new(),
+        };
+        let broadcast = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Redistribute(RedistributeNode {
+                mode: RedistributeMode::Broadcast,
+                partition_exprs: Vec::new(),
+                output_columns: columns.clone(),
+            }),
+            children: vec![values],
+            output_columns: columns,
+            stats: stats(),
+            probe_runtime_filters: Vec::new(),
+        };
+        let planned = crate::sql::planner::distributed::build::build_distributed_plan(&broadcast)
+            .expect("planner broadcast DistributedPlan");
+        assert_eq!(planned.edges[0].stream_kind, FragmentStreamKind::Broadcast);
+        assert!(matches!(
+            planned.edges[0].output_partition.kind,
+            PartitionKind::Unpartitioned
+        ));
+
+        let mut result =
+            lower_distributed_plan(&planned, &EmptyCatalog, &ConnectorRegistry::new(), None)
+                .expect("native fragment build");
+        assert_eq!(result.edges[0].stream_kind, FragmentStreamKind::Broadcast);
+        assert!(matches!(
+            result.edges[0].output_partition.kind,
+            PartitionKind::Unpartitioned
+        ));
+
+        let target_fragment_id = result.edges[0].target_fragment_id;
+        for schedule in &mut result.fragment_schedules {
+            schedule.output_kind = if schedule.fragment_id == target_fragment_id {
+                FragmentOutputKind::TerminalWrite
+            } else {
+                FragmentOutputKind::NonTerminal
+            };
+            if schedule.fragment_id == target_fragment_id {
+                schedule.has_scan_nodes = true;
+                schedule.native_scan_ranges.insert(
+                    99,
+                    vec![
+                        build_iceberg_metadata_scan_range_params(),
+                        build_iceberg_metadata_scan_range_params(),
+                        build_iceberg_metadata_scan_range_params(),
+                    ],
+                );
+            }
+        }
+        let scheduler = crate::runtime::scheduler::FragmentScheduler::new(vec![
+            "127.0.0.1:19001".parse().unwrap(),
+            "127.0.0.1:19002".parse().unwrap(),
+            "127.0.0.1:19003".parse().unwrap(),
+        ]);
+        let scheduling = scheduler
+            .assign(
+                &result.fragment_schedules,
+                &result.edges,
+                crate::common::types::UniqueId { hi: 1, lo: 7 },
+            )
+            .expect("schedule broadcast plan");
+        assert_eq!(
+            scheduling.by_fragment[&target_fragment_id].len(),
+            3,
+            "broadcast input must not collapse a target with three scan ranges to Gather"
+        );
+    }
+
+    #[test]
+    fn random_partition_with_other_stream_kind_remains_other() {
+        let mut plan = stream_exchange_plan(ExchangeFlavor::Distribution);
+        let DistributedNodeKind::Exchange(exchange) = &mut plan.fragments[1].root.payload else {
+            panic!("target must be exchange");
+        };
+        exchange.partition = DataPartition {
+            kind: PartitionKind::Random,
+            exprs: Vec::new(),
+        };
+        plan.edges[0].stream_kind = FragmentStreamKind::Other;
+
+        let result = lower_distributed_plan(&plan, &EmptyCatalog, &ConnectorRegistry::new(), None)
+            .expect("build random stream");
+
+        assert_eq!(result.edges[0].stream_kind, FragmentStreamKind::Other);
+        assert!(matches!(
+            result.edges[0].output_partition.kind,
+            PartitionKind::Random
+        ));
+    }
+
+    #[test]
+    fn unpartitioned_stream_rejects_other_and_partitioned_with_edge_context() {
+        for stream_kind in [FragmentStreamKind::Other, FragmentStreamKind::Partitioned] {
+            let mut plan = stream_exchange_plan(ExchangeFlavor::Distribution);
+            plan.edges[0].stream_kind = stream_kind;
+
+            let err =
+                match lower_distributed_plan(&plan, &EmptyCatalog, &ConnectorRegistry::new(), None)
+                {
+                    Ok(_) => {
+                        panic!("Unpartitioned edge with stream kind {stream_kind:?} must fail")
+                    }
+                    Err(err) => err,
+                };
+
+            assert!(err.contains("Unpartitioned"), "{err}");
+            assert!(err.contains(&format!("{stream_kind:?}")), "{err}");
+            assert!(err.contains("source_fragment_id=1"), "{err}");
+            assert!(err.contains("target_fragment_id=0"), "{err}");
+            assert!(err.contains("target_exchange_node_id=20"), "{err}");
+        }
+    }
+
+    #[test]
+    fn legal_stream_partition_kind_combinations_remain_unchanged() {
+        let cases = [
+            (DataPartition::unpartitioned(), FragmentStreamKind::Gather),
+            (
+                DataPartition::unpartitioned(),
+                FragmentStreamKind::Broadcast,
+            ),
+            (
+                DataPartition {
+                    kind: PartitionKind::Random,
+                    exprs: Vec::new(),
+                },
+                FragmentStreamKind::Other,
+            ),
+            (
+                DataPartition {
+                    kind: PartitionKind::Hash,
+                    exprs: vec![column_ref(1, "k")],
+                },
+                FragmentStreamKind::Partitioned,
+            ),
+        ];
+
+        for (partition, stream_kind) in cases {
+            let mut plan = stream_exchange_plan(ExchangeFlavor::Distribution);
+            let DistributedNodeKind::Exchange(exchange) = &mut plan.fragments[1].root.payload
+            else {
+                panic!("target must be exchange");
+            };
+            exchange.partition = partition.clone();
+            plan.edges[0].stream_kind = stream_kind;
+
+            let result =
+                lower_distributed_plan(&plan, &EmptyCatalog, &ConnectorRegistry::new(), None)
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "legal stream combination {:?}+{stream_kind:?} must lower: {err}",
+                            partition.kind
+                        )
+                    });
+
+            assert_eq!(result.edges[0].stream_kind, stream_kind);
+            assert_eq!(
+                std::mem::discriminant(&result.edges[0].output_partition.kind),
+                std::mem::discriminant(&partition.kind)
+            );
         }
     }
 
@@ -1713,7 +2667,7 @@ mod tests {
 
         for (label, flavor) in cases {
             let dp = stream_exchange_plan(flavor);
-            build_native_fragment_payload(&dp, &EmptyCatalog, &ConnectorRegistry::new(), None)
+            lower_distributed_plan(&dp, &EmptyCatalog, &ConnectorRegistry::new(), None)
                 .unwrap_or_else(|err| panic!("{label} stream exchange should lower: {err}"));
         }
     }
@@ -1733,10 +2687,10 @@ mod tests {
             panic!("consumer must be an exchange");
         };
         exchange.partition = expected_partition.clone();
+        dp.edges[0].stream_kind = FragmentStreamKind::Partitioned;
 
-        let result =
-            build_native_fragment_payload(&dp, &EmptyCatalog, &ConnectorRegistry::new(), None)
-                .expect("native fragment build");
+        let result = lower_distributed_plan(&dp, &EmptyCatalog, &ConnectorRegistry::new(), None)
+            .expect("native fragment build");
 
         assert!(matches!(
             result.edges[0].output_partition.kind,
@@ -1814,17 +2768,19 @@ mod tests {
             edges: Vec::new(),
         };
         let mut branch =
-            crate::sql::planner::ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![2]);
+            crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![2]);
         branch.output_partition_ordinals = vec![2];
-        branch.sink_spec.iceberg.serialized_metadata =
-            Some(crate::sql::planner::write_sink::test_support::unpartitioned_metadata_json());
+        branch.sink_spec.iceberg.serialized_metadata = Some(
+            crate::sql::planner::distributed::write::sink::test_support::unpartitioned_metadata_json(),
+        );
         let dag =
-            crate::sql::planner::ChangeStreamWriteDagSpec::for_test(Some(0), None, vec![branch]);
-        let mut planned = crate::sql::planner::with_iceberg_change_stream_write(dp, "test_db", dag)
+            crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec::for_test(Some(0), None, vec![branch]);
+        let mut planned =
+            crate::sql::planner::distributed::write::plan::with_iceberg_change_stream_write(
+                dp, "test_db", dag,
+            )
             .expect("plan change-stream write")
             .distributed_plan;
-        planned.edges[0].output_partition = DataPartition::unpartitioned();
-        planned.edges[0].stream_kind = FragmentStreamKind::Gather;
         let target_fragment_id = planned.edges[0].target_fragment_id;
         let target_exchange_node_id = planned.edges[0].target_exchange_node_id;
         let target = planned
@@ -1839,7 +2795,7 @@ mod tests {
         exchange.partition = DataPartition::unpartitioned();
 
         let result =
-            build_native_fragment_payload(&planned, &EmptyCatalog, &ConnectorRegistry::new(), None)
+            lower_distributed_plan(&planned, &EmptyCatalog, &ConnectorRegistry::new(), None)
                 .expect("native fragment build");
 
         let edge = &result.edges[0];
@@ -1917,13 +2873,17 @@ mod tests {
             edges: Vec::new(),
         };
         let mut branch =
-            crate::sql::planner::ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![2]);
+            crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![2]);
         branch.output_partition_ordinals = vec![2];
-        branch.sink_spec.iceberg.serialized_metadata =
-            Some(crate::sql::planner::write_sink::test_support::unpartitioned_metadata_json());
+        branch.sink_spec.iceberg.serialized_metadata = Some(
+            crate::sql::planner::distributed::write::sink::test_support::unpartitioned_metadata_json(),
+        );
         let dag =
-            crate::sql::planner::ChangeStreamWriteDagSpec::for_test(Some(0), None, vec![branch]);
-        let mut planned = crate::sql::planner::with_iceberg_change_stream_write(dp, "test_db", dag)
+            crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec::for_test(Some(0), None, vec![branch]);
+        let mut planned =
+            crate::sql::planner::distributed::write::plan::with_iceberg_change_stream_write(
+                dp, "test_db", dag,
+            )
             .expect("plan change-stream write")
             .distributed_plan;
 
@@ -1951,7 +2911,7 @@ mod tests {
         };
         planned.edges.push(second_edge);
 
-        let err = match build_native_fragment_payload(
+        let err = match lower_distributed_plan(
             &planned,
             &EmptyCatalog,
             &ConnectorRegistry::new(),
@@ -2008,9 +2968,8 @@ mod tests {
             offset: Some(0),
         });
 
-        let result =
-            build_native_fragment_payload(&dp, &EmptyCatalog, &ConnectorRegistry::new(), None)
-                .expect("native fragment build");
+        let result = lower_distributed_plan(&dp, &EmptyCatalog, &ConnectorRegistry::new(), None)
+            .expect("native fragment build");
         let fragment_ids = result
             .native_fragments
             .keys()
@@ -2027,13 +2986,59 @@ mod tests {
     }
 
     #[test]
+    fn lower_distributed_plan_owns_native_write_sink_shape() {
+        let columns = vec![output_col(1, "id")];
+        let mut sink_spec =
+            crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec();
+        sink_spec.target_table.columns[0].data_type = DataType::Int64;
+        sink_spec.target_columns[0].data_type = DataType::Int64;
+        let fragment = PlanFragment {
+            fragment_id: 0,
+            root: physical_values_node(0, 10, columns.clone()),
+            data_partition: DataPartition::unpartitioned(),
+            output_partition: DataPartition::unpartitioned(),
+            sink: crate::sql::planner::distributed::DataSink::IcebergWrite(
+                crate::sql::planner::distributed::write::sink::IcebergWriteFragmentSink {
+                    descriptor_database: "default".to_string(),
+                    spec: sink_spec,
+                    input: crate::sql::planner::distributed::write::sink::IcebergWriteInputBinding::RootOutputByOrdinal,
+                },
+            ),
+            output_exprs: None,
+            output_columns: columns,
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        };
+        let plan = DistributedPlan {
+            fragments: vec![fragment],
+            root_fragment_id: 0,
+            edges: Vec::new(),
+        };
+
+        let result = lower_distributed_plan(&plan, &EmptyCatalog, &ConnectorRegistry::new(), None)
+            .expect("native write fragment build");
+        assert_eq!(
+            result.fragment_schedules[0].output_kind,
+            FragmentOutputKind::TerminalWrite
+        );
+        let sink = result.native_fragments[&0]
+            .sink
+            .as_ref()
+            .expect("native sink");
+        assert!(matches!(
+            sink.kind,
+            Some(crate::proto::plan::data_sink::Kind::IcebergWrite(_))
+        ));
+    }
+
+    #[test]
     fn native_fragment_ownership_rejects_missing_fragment_and_root() {
         let dp = stream_exchange_plan(ExchangeFlavor::LimitOffset {
             limit: Some(1),
             offset: Some(0),
         });
         let mut result =
-            build_native_fragment_payload(&dp, &EmptyCatalog, &ConnectorRegistry::new(), None)
+            lower_distributed_plan(&dp, &EmptyCatalog, &ConnectorRegistry::new(), None)
                 .expect("native fragment build");
 
         result.native_fragments.remove(&1);
@@ -2141,9 +3146,8 @@ mod tests {
             }],
         };
 
-        let result =
-            build_native_fragment_payload(&dp, &EmptyCatalog, &ConnectorRegistry::new(), None)
-                .expect("native lower plan");
+        let result = lower_distributed_plan(&dp, &EmptyCatalog, &ConnectorRegistry::new(), None)
+            .expect("native lower plan");
 
         assert_eq!(result.edges[0].output_slot_ids, vec![1, 3]);
         let native_consumer = result

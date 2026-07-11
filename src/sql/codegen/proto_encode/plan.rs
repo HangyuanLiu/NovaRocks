@@ -207,6 +207,7 @@ fn starrocks_column_schema_descriptor(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn encode_distributed_plan(
     src: &DistributedPlan,
 ) -> Result<plan::DistributedPlan, String> {
@@ -833,6 +834,7 @@ fn normalize_encoded_subtree_output_columns(
     normalize_encoded_node_output_columns(node)
 }
 
+#[cfg(test)]
 pub(crate) fn encode_plan_fragment(src: &PlanFragment) -> Result<plan::PlanFragment, String> {
     encode_plan_fragment_with_context(
         src,
@@ -1000,6 +1002,7 @@ fn encode_iceberg_write_sink_output_columns(
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn encode_node(src: &DistributedNode) -> Result<plan::DistributedNode, String> {
     encode_node_with_context(
         src,

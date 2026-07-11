@@ -26,16 +26,6 @@ use crate::types::logical::{LogicalType, field_with_logical_type};
 const THRIFT_TIME_UNIT_MICROS: i32 = 2;
 pub(crate) const THRIFT_TIME_UNIT_NANOS: i32 = 3;
 
-pub(crate) fn thrift_time_unit_for_arrow(unit: TimeUnit) -> Result<Option<i32>, String> {
-    match unit {
-        TimeUnit::Microsecond => Ok(None),
-        TimeUnit::Nanosecond => Ok(Some(THRIFT_TIME_UNIT_NANOS)),
-        other => Err(format!(
-            "unsupported timestamp unit {other:?} for thrift descriptor; only Microsecond/Nanosecond supported"
-        )),
-    }
-}
-
 pub(crate) fn thrift_type_desc_from_primitive(
     primitive: types::TPrimitiveType,
 ) -> types::TTypeDesc {

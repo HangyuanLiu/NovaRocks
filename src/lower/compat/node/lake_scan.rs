@@ -695,7 +695,7 @@ mod tests {
     use super::lower_lake_scan_node;
     use crate::exec::expr::ExprArena;
     use crate::exec::node::ExecNodeKind;
-    use crate::sql::codegen::descriptors::DescriptorTableBuilder;
+    use crate::lower::compat::test_support::DescriptorTableBuilder;
     use crate::thrift::internal_service;
     use crate::thrift::{descriptors, plan_nodes, types};
     use arrow::datatypes::DataType;

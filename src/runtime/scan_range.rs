@@ -381,9 +381,53 @@ fn thrift_file_pruning_value_kind(kind: FilePruningValueKind) -> exprs::TExprNod
 
 #[cfg(feature = "compat")]
 fn thrift_int_literal_expr(value: i64) -> exprs::TExpr {
-    exprs::TExpr::new(vec![crate::sql::codegen::expr_compiler::int_literal_node(
-        value,
-    )])
+    let node = exprs::TExprNode {
+        node_type: exprs::TExprNodeType::INT_LITERAL,
+        type_: crate::types::arrow_thrift::thrift_type_desc_from_primitive(
+            types::TPrimitiveType::BIGINT,
+        ),
+        opcode: None,
+        num_children: 0,
+        agg_expr: None,
+        bool_literal: None,
+        case_expr: None,
+        date_literal: None,
+        float_literal: None,
+        int_literal: Some(exprs::TIntLiteral { value }),
+        in_predicate: None,
+        is_null_pred: None,
+        like_pred: None,
+        literal_pred: None,
+        slot_ref: None,
+        string_literal: None,
+        tuple_is_null_pred: None,
+        info_func: None,
+        decimal_literal: None,
+        output_scale: 0,
+        fn_call_expr: None,
+        large_int_literal: None,
+        output_column: None,
+        output_type: None,
+        vector_opcode: None,
+        fn_: None,
+        vararg_start_idx: None,
+        child_type: None,
+        vslot_ref: None,
+        used_subfield_names: None,
+        binary_literal: None,
+        copy_flag: None,
+        check_is_out_of_bounds: None,
+        use_vectorized: None,
+        has_nullable_child: None,
+        is_nullable: None,
+        child_type_desc: None,
+        is_monotonic: None,
+        dict_query_expr: None,
+        dictionary_get_expr: None,
+        is_index_only_filter: None,
+        is_nondeterministic: None,
+    };
+    exprs::TExpr::new(vec![node])
 }
 
 #[cfg(feature = "compat")]

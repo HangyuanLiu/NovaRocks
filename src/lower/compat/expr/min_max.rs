@@ -47,9 +47,8 @@ fn get_column_name_from_slot(
 mod tests {
     use super::*;
     use crate::connector::{MinMaxPredicate, MinMaxPredicateValue};
-    use crate::lower::compat::type_lowering::THRIFT_TIME_UNIT_NANOS;
-    use crate::sql::codegen::type_infer::arrow_type_to_type_desc;
     use crate::thrift::types;
+    use crate::types::arrow_thrift::THRIFT_TIME_UNIT_NANOS;
     use arrow::datatypes::DataType;
     use std::collections::HashMap;
 
@@ -202,7 +201,12 @@ mod tests {
     }
 
     fn type_desc(data_type: &DataType) -> types::TTypeDesc {
-        arrow_type_to_type_desc(data_type).expect("type desc")
+        let primitive = match data_type {
+            DataType::Utf8 => types::TPrimitiveType::VARCHAR,
+            DataType::Int64 => types::TPrimitiveType::BIGINT,
+            other => panic!("unsupported test type {other:?}"),
+        };
+        crate::lower::compat::type_lowering::scalar_type_desc(primitive)
     }
 
     #[test]

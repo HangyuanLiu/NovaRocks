@@ -15,30 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Lowering and explain support for the planner-owned DistributedPlan Bridge 2 IR.
+//! Planner-owned DistributedPlan IR and native fragment builder.
 
 pub(crate) mod explain;
 pub(crate) mod fragment_build;
 pub(crate) mod kind;
-#[cfg(feature = "compat")]
-pub(crate) mod lowering;
-
-#[cfg(all(test, feature = "compat"))]
-pub(crate) mod equiv;
 
 pub(crate) use explain::{explain_distributed_plan, explain_distributed_plan_analyze};
-#[cfg(not(feature = "compat"))]
 pub(crate) use fragment_build::lower_distributed_plan;
-#[cfg(feature = "compat")]
-pub(crate) use lowering::lower_distributed_plan;
 
 fn validate_global_node_ids(
     plan: &crate::sql::planner::distributed::DistributedPlan,
 ) -> Result<(), String> {
     fn visit(
         node: &crate::sql::planner::distributed::DistributedNode,
-        fragment_id: crate::sql::codegen::FragmentId,
-        owners: &mut std::collections::HashMap<i32, crate::sql::codegen::FragmentId>,
+        fragment_id: crate::sql::planner::distributed::FragmentId,
+        owners: &mut std::collections::HashMap<i32, crate::sql::planner::distributed::FragmentId>,
     ) -> Result<(), String> {
         if let Some(previous_fragment_id) = owners.insert(node.node_id, fragment_id) {
             return Err(format!(
