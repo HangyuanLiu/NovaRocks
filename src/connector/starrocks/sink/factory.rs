@@ -625,7 +625,7 @@ impl OlapTableSinkFactory {
         if all_refs.is_empty() {
             return Err("OLAP_TABLE_SINK resolved empty tablet refs for write targets".to_string());
         }
-        let path_map = resolve_tablet_paths_for_olap_sink(None, None, &table_identity, &all_refs)?;
+        let path_map = resolve_tablet_paths_for_olap_sink(None, &table_identity, &all_refs)?;
         let shard_infos =
             starlet_shard_registry::select_infos(&all_tablets.into_iter().collect::<Vec<_>>());
 

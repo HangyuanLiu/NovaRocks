@@ -535,10 +535,6 @@ struct TExecPlanFragmentParams {
   // writes typed Arrow IPC exchange payloads instead of TResultBatch rows.
   10002: optional bool novarocks_typed_result_sink;
 
-  // NovaRocks-only plan provenance marker. NovaRocks-generated fragments set
-  // this to true; external StarRocks FE fragments never send this field and
-  // therefore default to StarRocks FE-compatible semantics.
-  10003: optional bool novarocks_generated_plan;
 }
 
 struct TExecPlanFragmentResult {

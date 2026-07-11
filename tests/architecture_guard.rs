@@ -9952,6 +9952,136 @@ fn nfe_2_legacy_thrift_emitter_path_violations(root: &Path) -> Vec<String> {
     violations
 }
 
+fn nfe_3_retired_control_plane_term_violations(
+    source: &str,
+    text: &str,
+    forbidden: &[&str],
+) -> Vec<String> {
+    let production = rust_sanitized_production_text(text);
+    forbidden
+        .iter()
+        .filter(|term| production.contains(**term))
+        .map(|term| format!("{source}: retired generated-Thrift control-plane term `{term}`"))
+        .collect()
+}
+
+#[test]
+fn nfe_3_dead_generated_thrift_control_plane_is_absent() {
+    let fixture = r#"
+        // to_compat_exec_params in a comment must be ignored.
+        const NOTE: &str = "compat_exec_params_from_parts in a string must be ignored";
+        fn ordinary() { compat_destination_from_runtime(); }
+        #[cfg(feature = "compat")]
+        fn compat_only() { thrift_scan_range_params_from_native(); }
+        #[cfg(test)]
+        fn test_only() { compat_change_op_slot_id(); }
+    "#;
+    let fixture_violations = nfe_3_retired_control_plane_term_violations(
+        "fixture.rs",
+        fixture,
+        &[
+            "to_compat_exec_params",
+            "compat_exec_params_from_parts",
+            "compat_destination_from_runtime",
+            "thrift_scan_range_params_from_native",
+            "compat_change_op_slot_id",
+        ],
+    );
+    assert_eq!(
+        fixture_violations,
+        vec![
+            "fixture.rs: retired generated-Thrift control-plane term `compat_destination_from_runtime`",
+            "fixture.rs: retired generated-Thrift control-plane term `thrift_scan_range_params_from_native`",
+        ],
+        "the NFE-3 guard must retain compat-cfg production items while ignoring comments, strings, and test-only items"
+    );
+
+    let repo = Path::new(manifest_dir());
+    let mut violations = Vec::new();
+    let thrift_idl = fs::read_to_string(repo.join("idl/compat/thrift/InternalService.thrift"))
+        .expect("read InternalService.thrift");
+    if thrift_idl.lines().any(|line| {
+        line.split("//")
+            .next()
+            .is_some_and(|code| code.contains("novarocks_generated_plan"))
+    }) {
+        violations.push(
+            "idl/compat/thrift/InternalService.thrift: retired field `novarocks_generated_plan`"
+                .to_string(),
+        );
+    }
+
+    for (source, forbidden) in [
+        (
+            "src/service/internal_service.rs",
+            &[
+                "plan_origin_from_request",
+                "PlanOrigin",
+                "novarocks_generated_plan",
+            ][..],
+        ),
+        (
+            "src/lower/compat/fragment.rs",
+            &["PlanOrigin", "NovaRocksGenerated"][..],
+        ),
+        (
+            "src/lower/compat/node/mod.rs",
+            &["PlanOrigin", "NovaRocksGenerated"][..],
+        ),
+        (
+            "src/lower/compat/node/decode.rs",
+            &["PlanOrigin", "NovaRocksGenerated"][..],
+        ),
+        (
+            "src/lower/compat/node/starrocks_scan.rs",
+            &["PlanOrigin", "NovaRocksGenerated"][..],
+        ),
+        (
+            "src/runtime/fragment_exec_params.rs",
+            &[
+                "to_compat_exec_params",
+                "compat_exec_params_from_parts",
+                "compat_destination_from_runtime",
+                "crate::thrift",
+                "crate::proto::starrocks",
+                "crate::proto::staros",
+            ][..],
+        ),
+        (
+            "src/runtime/scan_range.rs",
+            &[
+                "thrift_scan_range_params_from_native",
+                "thrift_hdfs_scan_range_from_native",
+                "thrift_extended_columns_from_native",
+                "compat_change_op_slot_id",
+                "crate::thrift",
+                "crate::proto::starrocks",
+                "crate::proto::staros",
+            ][..],
+        ),
+        (
+            "src/runtime/native_fragment_wire.rs",
+            &[
+                "crate::thrift",
+                "crate::proto::starrocks",
+                "crate::proto::staros",
+            ][..],
+        ),
+        ("src/runtime/endpoint.rs", &["to_network_address"][..]),
+    ] {
+        let text = fs::read_to_string(repo.join(source)).expect(source);
+        violations.extend(nfe_3_retired_control_plane_term_violations(
+            source, &text, forbidden,
+        ));
+    }
+
+    assert!(
+        violations.is_empty(),
+        "NFE-3 retired generated-Thrift control-plane guard failed:\n{}",
+        violations.join("\n")
+    );
+}
+
 #[test]
 fn nfe_2_legacy_thrift_emitters_are_physically_absent() {
     let violations = nfe_2_legacy_thrift_emitter_path_violations(Path::new(manifest_dir()));
@@ -10156,17 +10286,6 @@ fn nidl_d3l_native_mainline_thrift_usage_is_explicitly_allowlisted() {
     }
 
     let compat_allowlist = [
-        (
-            "src/runtime/fragment_exec_params.rs",
-            &[
-                "compat_exec_params_from_parts",
-                "compat_destination_from_runtime",
-            ][..],
-        ),
-        (
-            "src/runtime/scan_range.rs",
-            &["thrift_scan_range_params_from_native"][..],
-        ),
         ("src/runtime/query_options.rs", &["from_thrift"][..]),
         ("src/runtime/runtime_filter_params.rs", &["from_thrift"][..]),
     ];

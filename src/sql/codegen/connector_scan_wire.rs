@@ -36,7 +36,6 @@ const ICEBERG_DELETE_APPLY_MAX_BYTES_PER_DATA_FILE: i64 = 512 * 1024 * 1024;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ConnectorScanContext {
     pub(crate) min_max_predicates: Vec<MinMaxPredicate>,
-    pub(crate) change_op_slot: Option<i32>,
     pub(crate) columns: Vec<ColumnDef>,
 }
 
@@ -195,7 +194,6 @@ fn build_iceberg_native_scan_ranges(
         }
         ranges.extend(build_native_file_scan_range_params_for_file(
             file,
-            ctx.change_op_slot,
             &pruning_columns,
         )?);
     }
@@ -252,7 +250,6 @@ fn pruning_columns_for_scan(
 
 fn build_native_file_scan_range_params_for_file(
     file: &IcebergDataFileInfo,
-    change_op_slot: Option<i32>,
     columns: &[PruningColumn],
 ) -> Result<Vec<scan_range::ScanRangeParams>, String> {
     validate_iceberg_delete_apply_cost(&file.path, &file.delete_files)?;
@@ -270,7 +267,6 @@ fn build_native_file_scan_range_params_for_file(
                 file.data_sequence_number,
                 file.ivm_change_op,
                 file.included_positions.as_ref(),
-                change_op_slot,
                 &file.delete_files,
                 file_pruning_min_max_values.clone(),
             )
@@ -502,7 +498,6 @@ pub(crate) fn build_native_file_scan_range_params(
     data_sequence_number: Option<i64>,
     ivm_change_op: Option<i8>,
     included_positions: Option<&Vec<i64>>,
-    change_op_slot: Option<i32>,
     delete_files: &[IcebergDeleteFileInfo],
     file_pruning_min_max_values: Option<BTreeMap<i32, scan_range::FilePruningMinMaxValue>>,
 ) -> Result<scan_range::ScanRangeParams, String> {
@@ -581,7 +576,6 @@ pub(crate) fn build_native_file_scan_range_params(
             use_iceberg_jni_metadata_reader: false,
             ivm_change_op,
             file_pruning_min_max_values,
-            compat_change_op_slot_id: change_op_slot,
         },
     ))
 }

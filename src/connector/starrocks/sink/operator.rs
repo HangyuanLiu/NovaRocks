@@ -1480,7 +1480,7 @@ impl OlapTableSinkOperator {
                 })
                 .collect::<Vec<_>>();
             let path_map =
-                resolve_tablet_paths_for_olap_sink(None, None, &self.plan.table_identity, &refs)?;
+                resolve_tablet_paths_for_olap_sink(None, &self.plan.table_identity, &refs)?;
             let shard_infos = starlet_shard_registry::select_infos(&new_tablets);
             for index_plan in &mut self.index_write_plans {
                 let Some(index_new_tablets) = new_tablets_by_index.get(&index_plan.index_id) else {

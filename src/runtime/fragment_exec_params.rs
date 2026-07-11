@@ -19,11 +19,7 @@ use std::collections::BTreeMap;
 
 use crate::common::types::UniqueId;
 use crate::runtime::endpoint::FragmentDestination;
-#[cfg(feature = "compat")]
-use crate::runtime::scan_range;
 use crate::runtime::scan_range::ScanRangeParams;
-#[cfg(feature = "compat")]
-use crate::thrift::{data_sinks, internal_service, types};
 
 #[derive(Clone, Debug)]
 pub(crate) struct FragmentExecParams {
@@ -71,77 +67,6 @@ impl FragmentExecParams {
     pub(crate) fn destinations(&self) -> &[FragmentDestination] {
         &self.destinations
     }
-
-    #[cfg(feature = "compat")]
-    pub(crate) fn to_compat_exec_params(
-        &self,
-    ) -> Result<internal_service::TPlanFragmentExecParams, String> {
-        compat_exec_params_from_parts(
-            self.query_id,
-            self.fragment_instance_id,
-            self.per_node_scan_ranges
-                .iter()
-                .map(|(node_id, ranges)| {
-                    Ok((
-                        *node_id,
-                        ranges
-                            .iter()
-                            .map(scan_range::thrift_scan_range_params_from_native)
-                            .collect::<Result<Vec<_>, _>>()?,
-                    ))
-                })
-                .collect::<Result<BTreeMap<_, _>, String>>()?,
-            self.per_exch_num_senders.clone(),
-            Some(self.destinations.clone()),
-        )
-    }
-}
-
-#[cfg(feature = "compat")]
-pub(crate) fn compat_destination_from_runtime(
-    destination: FragmentDestination,
-) -> data_sinks::TPlanFragmentDestination {
-    data_sinks::TPlanFragmentDestination::new(
-        thrift_unique_id(*destination.finst_id()),
-        None::<types::TNetworkAddress>,
-        Some(destination.endpoint().to_network_address()),
-        None::<i32>,
-    )
-}
-
-#[cfg(feature = "compat")]
-pub(crate) fn compat_exec_params_from_parts(
-    query_id: UniqueId,
-    fragment_instance_id: UniqueId,
-    per_node_scan_ranges: BTreeMap<i32, Vec<internal_service::TScanRangeParams>>,
-    per_exch_num_senders: BTreeMap<i32, i32>,
-    destinations: Option<Vec<FragmentDestination>>,
-) -> Result<internal_service::TPlanFragmentExecParams, String> {
-    validate_sender_counts(&per_exch_num_senders)?;
-    Ok(internal_service::TPlanFragmentExecParams {
-        query_id: thrift_unique_id(query_id),
-        fragment_instance_id: thrift_unique_id(fragment_instance_id),
-        per_node_scan_ranges,
-        per_exch_num_senders,
-        destinations: destinations.map(|items| {
-            items
-                .into_iter()
-                .map(compat_destination_from_runtime)
-                .collect()
-        }),
-        sender_id: None,
-        num_senders: None,
-        send_query_statistics_with_every_batch: None,
-        use_vectorized: None,
-        runtime_filter_params: None,
-        instances_number: None,
-        enable_exchange_pass_through: None,
-        node_to_per_driver_seq_scan_ranges: None,
-        enable_exchange_perf: None,
-        pipeline_sink_dop: None,
-        report_when_finish: None,
-        exec_debug_options: None,
-    })
 }
 
 fn validate_sender_counts(per_exch_num_senders: &BTreeMap<i32, i32>) -> Result<(), String> {
@@ -154,9 +79,4 @@ fn validate_sender_counts(per_exch_num_senders: &BTreeMap<i32, i32>) -> Result<(
         }
     }
     Ok(())
-}
-
-#[cfg(feature = "compat")]
-fn thrift_unique_id(id: UniqueId) -> types::TUniqueId {
-    types::TUniqueId::new(id.hi, id.lo)
 }

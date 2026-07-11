@@ -890,7 +890,6 @@ fn plan_iceberg_scan_ranges(
         &splits,
         ConnectorScanContext {
             min_max_predicates: native_scan_min_max_predicates(&scan.predicates),
-            change_op_slot: None,
             columns: scan.table.columns.clone(),
         },
     )?;
@@ -1205,7 +1204,6 @@ fn build_iceberg_metadata_scan_range_params() -> scan_range::ScanRangeParams {
         use_iceberg_jni_metadata_reader: true,
         ivm_change_op: None,
         file_pruning_min_max_values: None,
-        compat_change_op_slot_id: None,
     })
 }
 

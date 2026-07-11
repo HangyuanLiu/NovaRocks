@@ -47,7 +47,7 @@ use crate::lower::common::fragment_runtime::{
 use crate::lower::compat::layout::{
     build_tuple_slot_order, infer_tuple_slot_order, reorder_tuple_slots,
 };
-use crate::lower::compat::node::{Lowered, PlanOrigin, lower_plan};
+use crate::lower::compat::node::{Lowered, lower_plan};
 use crate::lower::compat::type_lowering::{
     native_primitive_type_from_desc, render_schema_from_type_desc,
 };
@@ -831,7 +831,6 @@ pub(crate) fn execute_fragment(
     backend_num: Option<i32>,
     mem_tracker: Option<std::sync::Arc<crate::runtime::mem_tracker::MemTracker>>,
     typed_result_sink: bool,
-    plan_origin: PlanOrigin,
 ) -> Result<FragmentOutput, String> {
     let runtime_query_opts = runtime_query_options_from_thrift(query_opts)?;
     let runtime_query_opts = apply_query_option_overrides(runtime_query_opts);
@@ -929,7 +928,6 @@ pub(crate) fn execute_fragment(
                 &layout_hints,
                 last_query_id,
                 fe_addr,
-                plan_origin,
             )?
         };
 
@@ -1609,7 +1607,6 @@ mod tests {
             None,
             None,
             false,
-            crate::lower::compat::node::PlanOrigin::StarRocksFeCompatible,
         )
         .expect_err("missing router payload must fail");
 
@@ -1655,7 +1652,6 @@ mod tests {
             None,
             None,
             false,
-            crate::lower::compat::node::PlanOrigin::StarRocksFeCompatible,
         )
         .expect_err("duplicate branch kind must fail");
 

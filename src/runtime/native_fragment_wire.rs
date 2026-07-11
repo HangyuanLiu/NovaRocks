@@ -23,8 +23,6 @@ use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::fragment_exec_params::FragmentExecParams;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::runtime_filter_params::RuntimeFilterParams;
-#[cfg(all(test, feature = "compat"))]
-use crate::thrift::internal_service;
 
 pub(crate) type DataStreamSink = proto::plan::DataStreamSink;
 pub(crate) type IcebergChangeStreamRouterBranch = proto::plan::IcebergChangeStreamBranchRoute;
@@ -33,8 +31,6 @@ pub(crate) type IcebergChangeStreamRouterSink = proto::plan::IcebergChangeStream
 pub(crate) type MultiCastDataStreamSink = proto::plan::MultiCastDataStreamSink;
 pub(crate) type DataPartition = proto::plan::DataPartition;
 
-#[cfg(all(test, feature = "compat"))]
-pub(crate) type SpillMode = internal_service::TSpillMode;
 pub(crate) fn query_options_from_native(
     src: &proto::novarocks::QueryOptions,
 ) -> Result<QueryOptions, String> {

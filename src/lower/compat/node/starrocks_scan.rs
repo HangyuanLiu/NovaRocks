@@ -16,8 +16,8 @@
 // under the License.
 use std::collections::HashMap;
 
+use crate::lower::compat::node::Lowered;
 use crate::lower::compat::node::decode::QueryGlobalDictMap;
-use crate::lower::compat::node::{Lowered, PlanOrigin};
 use crate::novarocks_connectors::ConnectorRegistry;
 use crate::thrift::{descriptors, internal_service, plan_nodes, types};
 
@@ -31,7 +31,6 @@ pub(crate) fn lower_starrocks_scan_node(
     _query_opts: Option<&internal_service::TQueryOptions>,
     _connectors: &ConnectorRegistry,
     _query_global_dict_map: &QueryGlobalDictMap,
-    _plan_origin: PlanOrigin,
 ) -> Result<Lowered, String> {
     if node.num_children != 0 {
         return Err(format!(
@@ -194,7 +193,6 @@ mod tests {
             None,
             &connectors,
             &query_global_dict_map,
-            crate::lower::compat::node::PlanOrigin::StarRocksFeCompatible,
         );
 
         let Err(err) = result else {
