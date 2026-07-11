@@ -55,9 +55,16 @@ fn rs_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 #[derive(Debug)]
-struct RustExternalModuleItem {
+struct RustModuleItem {
     attributes: Vec<String>,
-    inline_modules: Vec<String>,
+    inline_modules: Vec<RustInlineModuleContext>,
+    is_external: bool,
+    name: String,
+}
+
+#[derive(Clone, Debug)]
+struct RustInlineModuleContext {
+    attributes: Vec<String>,
     name: String,
 }
 
@@ -79,7 +86,20 @@ fn rust_source_tokens(text: &str) -> Vec<RustSourceToken> {
             continue;
         }
         let start = index;
-        if bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_' {
+        let raw_identifier = bytes[index] == b'r'
+            && bytes.get(index + 1) == Some(&b'#')
+            && bytes
+                .get(index + 2)
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_');
+        if raw_identifier {
+            index += 3;
+            while bytes
+                .get(index)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            {
+                index += 1;
+            }
+        } else if bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_' {
             index += 1;
             while bytes
                 .get(index)
@@ -93,7 +113,11 @@ fn rust_source_tokens(text: &str) -> Vec<RustSourceToken> {
             index += 1;
         }
         tokens.push(RustSourceToken {
-            text: sanitized[start..index].to_string(),
+            text: if raw_identifier {
+                sanitized[start + 2..index].to_string()
+            } else {
+                sanitized[start..index].to_string()
+            },
             start,
             end: index,
         });
@@ -122,12 +146,12 @@ fn rust_matching_token(
     None
 }
 
-fn rust_external_module_items_in_range(
+fn rust_module_items_in_range(
     text: &str,
     tokens: &[RustSourceToken],
     range: std::ops::Range<usize>,
-    inline_modules: &[String],
-    items: &mut Vec<RustExternalModuleItem>,
+    inline_modules: &[RustInlineModuleContext],
+    items: &mut Vec<RustModuleItem>,
 ) {
     let mut start = range.start;
     while start < range.end {
@@ -164,9 +188,10 @@ fn rust_external_module_items_in_range(
                 .get(cursor + 2)
                 .is_some_and(|token| token.text == ";");
         if is_external {
-            items.push(RustExternalModuleItem {
+            items.push(RustModuleItem {
                 attributes,
                 inline_modules: inline_modules.to_vec(),
+                is_external: true,
                 name: tokens[cursor + 1].text.clone(),
             });
             start = cursor + 3;
@@ -183,6 +208,12 @@ fn rust_external_module_items_in_range(
                 start += 1;
                 continue;
             };
+            items.push(RustModuleItem {
+                attributes: attributes.clone(),
+                inline_modules: inline_modules.to_vec(),
+                is_external: false,
+                name: tokens[cursor + 1].text.clone(),
+            });
             if attributes
                 .iter()
                 .any(|attribute| cfg_attribute_requires_test(attribute))
@@ -191,8 +222,11 @@ fn rust_external_module_items_in_range(
                 continue;
             }
             let mut nested = inline_modules.to_vec();
-            nested.push(tokens[cursor + 1].text.clone());
-            rust_external_module_items_in_range(text, tokens, open + 1..close, &nested, items);
+            nested.push(RustInlineModuleContext {
+                attributes,
+                name: tokens[cursor + 1].text.clone(),
+            });
+            rust_module_items_in_range(text, tokens, open + 1..close, &nested, items);
             start = close + 1;
         } else if tokens.get(cursor).is_some_and(|token| token.text == "{") {
             start =
@@ -203,16 +237,20 @@ fn rust_external_module_items_in_range(
     }
 }
 
-fn rust_external_module_items(text: &str) -> Vec<RustExternalModuleItem> {
+fn rust_module_items(text: &str) -> Vec<RustModuleItem> {
     let tokens = rust_source_tokens(text);
     let mut items = Vec::new();
-    rust_external_module_items_in_range(text, &tokens, 0..tokens.len(), &[], &mut items);
+    rust_module_items_in_range(text, &tokens, 0..tokens.len(), &[], &mut items);
     items
 }
 
 fn cfg_predicate_requires_test(tokens: &[String], start: usize) -> Option<(bool, usize)> {
     let owner = tokens.get(start)?;
-    if owner == "test" {
+    if owner == "test"
+        && tokens
+            .get(start + 1)
+            .is_none_or(|token| matches!(token.as_str(), "," | ")"))
+    {
         return Some((true, start + 1));
     }
     if !matches!(owner.as_str(), "all" | "any" | "not")
@@ -263,6 +301,61 @@ fn cfg_attribute_requires_test(attribute: &str) -> bool {
     cfg_predicate_requires_test(&tokens, cfg + 2).is_some_and(|(required, _)| required)
 }
 
+fn decode_rust_string_literal(literal: &str) -> Option<String> {
+    let literal = literal.trim();
+    if let Some(raw) = literal.strip_prefix('r') {
+        let hashes = raw.chars().take_while(|ch| *ch == '#').count();
+        let raw = raw.get(hashes..)?;
+        let content = raw.strip_prefix('"')?;
+        let closing = format!("\"{}", "#".repeat(hashes));
+        return content.strip_suffix(&closing).map(str::to_string);
+    }
+
+    let content = literal.strip_prefix('"')?.strip_suffix('"')?;
+    let chars = content.chars().collect::<Vec<_>>();
+    let mut decoded = String::new();
+    let mut index = 0usize;
+    while index < chars.len() {
+        if chars[index] != '\\' {
+            decoded.push(chars[index]);
+            index += 1;
+            continue;
+        }
+        index += 1;
+        match *chars.get(index)? {
+            '\\' => decoded.push('\\'),
+            '"' => decoded.push('"'),
+            'n' => decoded.push('\n'),
+            'r' => decoded.push('\r'),
+            't' => decoded.push('\t'),
+            '0' => decoded.push('\0'),
+            'x' => {
+                let hi = chars.get(index + 1)?.to_digit(16)?;
+                let lo = chars.get(index + 2)?.to_digit(16)?;
+                decoded.push(char::from_u32((hi << 4) | lo)?);
+                index += 2;
+            }
+            'u' if chars.get(index + 1) == Some(&'{') => {
+                let close = chars[index + 2..].iter().position(|ch| *ch == '}')? + index + 2;
+                let value = chars[index + 2..close]
+                    .iter()
+                    .filter(|ch| **ch != '_')
+                    .collect::<String>();
+                decoded.push(char::from_u32(u32::from_str_radix(&value, 16).ok()?)?);
+                index = close;
+            }
+            '\n' => {
+                while chars.get(index + 1).is_some_and(|ch| ch.is_whitespace()) {
+                    index += 1;
+                }
+            }
+            _ => return None,
+        }
+        index += 1;
+    }
+    Some(decoded)
+}
+
 fn path_attribute_value(attribute: &str) -> Option<String> {
     let tokens = rust_use_tokens(&rust_lexically_sanitized(attribute));
     let body = tokens
@@ -277,11 +370,42 @@ fn path_attribute_value(attribute: &str) -> Option<String> {
     let equals = attribute.find('=')?;
     let value = attribute[equals + 1..].trim();
     let value = value.strip_suffix(']')?.trim();
-    let value = value.strip_prefix('"')?.strip_suffix('"')?;
-    Some(value.to_string())
+    decode_rust_string_literal(value)
 }
 
 fn production_rs_files(root: &Path) -> Vec<PathBuf> {
+    fn default_module_dir(source: &Path, root: &Path) -> PathBuf {
+        let parent_dir = source.parent().unwrap_or(root);
+        if source.file_name().is_some_and(|name| name == "mod.rs") {
+            parent_dir.to_path_buf()
+        } else {
+            source
+                .file_stem()
+                .map_or_else(|| parent_dir.to_path_buf(), |stem| parent_dir.join(stem))
+        }
+    }
+
+    fn inline_module_dir(
+        source: &Path,
+        root: &Path,
+        inline_modules: &[RustInlineModuleContext],
+    ) -> PathBuf {
+        let source_parent = source.parent().unwrap_or(root);
+        let mut directory = default_module_dir(source, root);
+        for inline in inline_modules {
+            if let Some(path) = inline
+                .attributes
+                .iter()
+                .find_map(|attribute| path_attribute_value(attribute))
+            {
+                directory = source_parent.join(path);
+            } else {
+                directory.push(&inline.name);
+            }
+        }
+        directory
+    }
+
     let files = rs_files(root);
     let candidates = files
         .iter()
@@ -302,7 +426,10 @@ fn production_rs_files(root: &Path) -> Vec<PathBuf> {
     let mut pending = vec![entry];
     while let Some(parent) = pending.pop() {
         let text = fs::read_to_string(&parent).unwrap_or_default();
-        for item in rust_external_module_items(&text) {
+        for item in rust_module_items(&text)
+            .into_iter()
+            .filter(|item| item.is_external)
+        {
             if item
                 .attributes
                 .iter()
@@ -311,20 +438,18 @@ fn production_rs_files(root: &Path) -> Vec<PathBuf> {
                 continue;
             }
             let parent_dir = parent.parent().unwrap_or(root);
+            let module_dir = inline_module_dir(&parent, root, &item.inline_modules);
             let targets = if let Some(explicit) = item
                 .attributes
                 .iter()
                 .find_map(|attribute| path_attribute_value(attribute))
             {
-                vec![parent_dir.join(explicit)]
+                vec![if item.inline_modules.is_empty() {
+                    parent_dir.join(explicit)
+                } else {
+                    module_dir.join(explicit)
+                }]
             } else {
-                let mut module_dir = parent_dir.to_path_buf();
-                if parent.file_name().is_none_or(|name| name != "mod.rs")
-                    && let Some(stem) = parent.file_stem()
-                {
-                    module_dir.push(stem);
-                }
-                module_dir.extend(item.inline_modules.iter());
                 vec![
                     module_dir.join(format!("{}.rs", item.name)),
                     module_dir.join(&item.name).join("mod.rs"),
@@ -813,7 +938,18 @@ pub(crate) fn production_tail() {
 }
 
 fn non_test_optimizer_refs(path: &Path) -> Vec<(usize, String)> {
-    non_test_line_hits(path, |line| line.contains("crate::sql::optimizer::"))
+    let original = fs::read_to_string(path).unwrap_or_default();
+    let production = rust_sanitized_production_text(&original);
+    original
+        .lines()
+        .zip(production.lines())
+        .enumerate()
+        .filter_map(|(index, (original, production))| {
+            production
+                .contains("crate::sql::optimizer::")
+                .then(|| (index + 1, original.trim().to_string()))
+        })
+        .collect()
 }
 
 fn test_dir() -> PathBuf {
@@ -1454,6 +1590,12 @@ fn detector_flags_non_test_and_skips_cfg_test_blocks() {
         &tmp,
         "\
 use crate::sql::optimizer::operator::AggMode;
+#[allow(unused_imports)]
+#[cfg(all(feature = \"compat\", test))]
+use crate::sql::optimizer::operator::TestOnlyReordered;
+#[allow(unused_imports)] #[cfg(all(test, feature = \"compat\"))] use crate::sql::optimizer::operator::TestOnlySameLine;
+#[cfg(test_feature)] use crate::sql::optimizer::operator::ProductionFeature;
+#[cfg(test = \"production\")] use crate::sql::optimizer::operator::ProductionKeyValue;
 #[cfg(test)]
 mod tests {
     use crate::sql::optimizer::operator::TopNPhase;
@@ -1474,7 +1616,17 @@ fn prod() { let _ = crate::sql::optimizer::property::DistributionSpec::Any; }
                 "use crate::sql::optimizer::operator::AggMode;".to_string()
             ),
             (
+                6,
+                "#[cfg(test_feature)] use crate::sql::optimizer::operator::ProductionFeature;"
+                    .to_string()
+            ),
+            (
                 7,
+                "#[cfg(test = \"production\")] use crate::sql::optimizer::operator::ProductionKeyValue;"
+                    .to_string()
+            ),
+            (
+                13,
                 "fn prod() { let _ = crate::sql::optimizer::property::DistributionSpec::Any; }"
                     .to_string()
             ),
@@ -2075,6 +2227,7 @@ fn rust_item_end_token(tokens: &[RustSourceToken], start: usize) -> Option<usize
     let mut paren_depth = 0usize;
     let mut bracket_depth = 0usize;
     let mut brace_depth = 0usize;
+    let mut angle_depth = 0usize;
     let mut cursor = start;
     while cursor < tokens.len() {
         match tokens[cursor].text.as_str() {
@@ -2082,7 +2235,13 @@ fn rust_item_end_token(tokens: &[RustSourceToken], start: usize) -> Option<usize
             ")" => paren_depth = paren_depth.checked_sub(1)?,
             "[" => bracket_depth += 1,
             "]" => bracket_depth = bracket_depth.checked_sub(1)?,
-            "{" if paren_depth == 0 && bracket_depth == 0 && !semicolon_terminated => {
+            "<" => angle_depth += 1,
+            ">" => angle_depth = angle_depth.saturating_sub(1),
+            "{" if paren_depth == 0
+                && bracket_depth == 0
+                && angle_depth == 0
+                && !semicolon_terminated =>
+            {
                 let close = rust_matching_token(tokens, cursor, "{", "}")?;
                 return Some(
                     if tokens.get(close + 1).is_some_and(|token| token.text == ";") {
@@ -2094,7 +2253,12 @@ fn rust_item_end_token(tokens: &[RustSourceToken], start: usize) -> Option<usize
             }
             "{" => brace_depth += 1,
             "}" => brace_depth = brace_depth.checked_sub(1)?,
-            ";" if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+            ";" | ","
+                if paren_depth == 0
+                    && bracket_depth == 0
+                    && brace_depth == 0
+                    && angle_depth == 0 =>
+            {
                 return Some(cursor);
             }
             _ => {}
@@ -2243,7 +2407,7 @@ fn planner_path_module_attribute_violations_in(text: &str) -> Vec<String> {
     }
 
     let production = rust_sanitized_production_text(text);
-    rust_external_module_items(&production)
+    rust_module_items(&production)
         .into_iter()
         .flat_map(|item| {
             item.attributes
@@ -2316,6 +2480,20 @@ fn rust_use_tokens(text: &str) -> Vec<String> {
         let ch = chars[index];
         if ch.is_whitespace() {
             index += 1;
+            continue;
+        }
+        if ch == 'r'
+            && chars.get(index + 1) == Some(&'#')
+            && chars
+                .get(index + 2)
+                .is_some_and(|ch| ch.is_ascii_alphabetic() || *ch == '_')
+        {
+            let start = index + 2;
+            index += 3;
+            while index < chars.len() && is_ident_char(chars[index]) {
+                index += 1;
+            }
+            tokens.push(chars[start..index].iter().collect());
             continue;
         }
         if is_ident_char(ch) {
@@ -3683,6 +3861,7 @@ fn planner_path_module_attribute_detector_rejects_bypasses() {
         "#[cfg_attr(any(feature = \"a\", feature = \"b\"), allow(dead_code), path = \"legacy.rs\")] pub(super) mod legacy;",
         "#[cfg_attr(feature = \"compat\", cfg_attr(feature = \"nested\", path = \"legacy.rs\"))] mod nested_legacy;",
         "#[cfg(test_feature)] #[path = \"legacy.rs\"] mod production_legacy;",
+        "#[path = \"redirected\"] mod redirected_inline { mod hidden; }",
     ];
     for source in invalid {
         let violations = planner_path_module_attribute_violations_in(source);
@@ -4555,6 +4734,18 @@ fn planner_stage_first_dependency_detector_covers_bypasses() {
             "#[cfg(test_feature)] use crate::sql::optimizer::Optimizer;",
         ),
         (
+            "src/sql/planner/logical/node.rs",
+            "#[cfg(test = \"production\")] use crate::sql::optimizer::Optimizer;",
+        ),
+        (
+            "src/sql/planner/logical/node.rs",
+            "#[cfg(any(test, test = \"production\"))] use crate::sql::optimizer::Optimizer;",
+        ),
+        (
+            "src/sql/planner/logical/node.rs",
+            "type Leak = crate::sql::planner::r#physical::Node;",
+        ),
+        (
             r"src\sql\planner\logical\node.rs",
             "use crate::sql::optimizer::Optimizer;",
         ),
@@ -4614,6 +4805,16 @@ fn planner_stage_first_dependency_detector_covers_bypasses() {
             r"src\sql\planner\payload.rs",
             "use crate::sql::planner::physical::Physical;",
         ),
+        (
+            "src/sql/planner/logical/node.rs",
+            r#"
+enum Guarded {
+    #[cfg(all(feature = "compat", test))]
+    Hidden(crate::sql::optimizer::Optimizer),
+    Visible(crate::sql::optimizer::Optimizer),
+}
+"#,
+        ),
     ];
     for (source_rel, source) in invalid {
         let violations = planner_stage_first_dependency_violations_in(source_rel, source);
@@ -4662,6 +4863,23 @@ const RAW: &str = r#"crate::sql::codegen::Codegen"#;
             "src/sql/planner/logical/node.rs",
             "#[allow(unused_imports)] #[cfg(all(feature = \"compat\", test))] use crate::sql::optimizer::Optimizer;",
         ),
+        (
+            "src/sql/planner/logical/node.rs",
+            r#"
+enum Guarded {
+    #[cfg(all(feature = "compat", test))]
+    HiddenTuple(crate::sql::optimizer::Optimizer),
+    #[cfg(all(feature = "compat", test))]
+    HiddenUnit,
+    Safe,
+}
+struct GuardedFields {
+    #[cfg(all(feature = "compat", test))]
+    hidden: crate::sql::optimizer::Optimizer,
+    safe: usize,
+}
+"#,
+        ),
     ];
     for (source_rel, source) in valid {
         let violations = planner_stage_first_dependency_violations_in(source_rel, source);
@@ -4684,9 +4902,10 @@ fn planner_production_source_collection_excludes_external_test_modules() {
     fs::create_dir_all(root.join("owner/inline_name")).unwrap();
     fs::create_dir_all(root.join("foo")).unwrap();
     fs::create_dir_all(root.join("unreachable_inline")).unwrap();
+    fs::create_dir_all(root.join("redirected")).unwrap();
     fs::write(
         root.join("mod.rs"),
-        r#"
+        r###"
 mod production;
 #[cfg(test)]
 #[path = "production.rs"]
@@ -4705,13 +4924,22 @@ mod any_cfg;
 mod non_test;
 #[cfg_attr(feature = "compat", cfg(test))]
 mod cfg_attr_production;
+#[cfg(test = "production")]
+mod keyed_test;
+#[cfg(any(test, test = "production"))]
+mod any_keyed_test;
+#[path = r#"raw_hidden.rs"#]
+mod raw_path;
+#[path = "escaped\x2d\u{0068}idden.rs"]
+mod escaped_path;
+mod r#type;
 #[cfg(test)]
 mod foo;
 #[cfg(test)]
 mod unreachable_inline {
     mod child;
 }
-"#,
+"###,
     )
     .unwrap();
     let forbidden = "use crate::sql::planner::physical::PhysicalPlanNode;\n";
@@ -4723,13 +4951,21 @@ mod unreachable_inline {
 mod fixture;
 mod inline_name {
     #[cfg(test)]
+    mod test_child;
+    #[path = "other.rs"]
     mod child;
+}
+#[path = "redirected"]
+mod redirected_inline {
+    mod hidden;
 }
 "#,
     )
     .unwrap();
     fs::write(root.join("owner/fixture.rs"), forbidden).unwrap();
-    fs::write(root.join("owner/inline_name/child.rs"), forbidden).unwrap();
+    fs::write(root.join("owner/inline_name/test_child.rs"), forbidden).unwrap();
+    fs::write(root.join("owner/inline_name/other.rs"), forbidden).unwrap();
+    fs::write(root.join("redirected/hidden.rs"), forbidden).unwrap();
     fs::write(
         root.join("tests/mod.rs"),
         format!(
@@ -4743,6 +4979,15 @@ mod inline_name {
     fs::write(root.join("any_cfg.rs"), forbidden).unwrap();
     fs::write(root.join("non_test.rs"), forbidden).unwrap();
     fs::write(root.join("cfg_attr_production.rs"), forbidden).unwrap();
+    fs::write(root.join("keyed_test.rs"), forbidden).unwrap();
+    fs::write(root.join("any_keyed_test.rs"), forbidden).unwrap();
+    fs::write(
+        root.join("raw_hidden.rs"),
+        "use crate::sql::optimizer::Optimizer;\n",
+    )
+    .unwrap();
+    fs::write(root.join("escaped-hidden.rs"), forbidden).unwrap();
+    fs::write(root.join("type.rs"), forbidden).unwrap();
     fs::write(root.join("foo/mod.rs"), forbidden).unwrap();
     fs::write(root.join("foo/nested.rs"), forbidden).unwrap();
     fs::write(root.join("unreachable_inline/child.rs"), forbidden).unwrap();
@@ -4756,11 +5001,18 @@ mod inline_name {
         relative,
         BTreeSet::from([
             "any_cfg.rs".to_string(),
+            "any_keyed_test.rs".to_string(),
             "cfg_attr_production.rs".to_string(),
+            "escaped-hidden.rs".to_string(),
+            "keyed_test.rs".to_string(),
             "mod.rs".to_string(),
             "non_test.rs".to_string(),
             "owner.rs".to_string(),
+            "owner/inline_name/other.rs".to_string(),
             "production.rs".to_string(),
+            "raw_hidden.rs".to_string(),
+            "redirected/hidden.rs".to_string(),
+            "type.rs".to_string(),
         ]),
         "only cfg predicates that require test may exclude external modules"
     );
@@ -4772,6 +5024,11 @@ mod inline_name {
         )
         .is_empty(),
         "the same forbidden dependency in a production sibling must still fail"
+    );
+    assert_eq!(
+        path_attribute_value(r##"#[path = "dir\\quoted\".rs"]"##),
+        Some("dir\\quoted\".rs".to_string()),
+        "ordinary path strings must decode escaped backslashes and quotes"
     );
     fs::remove_dir_all(&root).ok();
 }
