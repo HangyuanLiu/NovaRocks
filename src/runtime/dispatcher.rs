@@ -24,17 +24,15 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-#[cfg(all(test, feature = "compat"))]
-use std::sync::Arc;
-#[cfg(all(test, feature = "compat"))]
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
 
-#[cfg(all(test, feature = "compat"))]
+#[cfg(test)]
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
 use crate::exec::chunk::Chunk;
-#[cfg(all(test, feature = "compat"))]
+#[cfg(test)]
 use crate::exec::chunk::ChunkSchema;
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::proto::common::UniqueId as ProtoUniqueId;
@@ -43,15 +41,9 @@ use crate::proto::novarocks::{
     fetch_result_response::Status as FetchStatus,
 };
 use crate::service::grpc_client::NovaRocksGrpcRemoteClient;
-#[cfg(all(test, feature = "compat"))]
-use crate::thrift::data_sinks;
-#[cfg(feature = "compat")]
-use crate::thrift::internal_service;
-#[cfg(all(test, feature = "compat"))]
-use crate::thrift::types;
-#[cfg(all(test, feature = "compat"))]
+#[cfg(test)]
 use arrow::datatypes::{DataType, Field, Schema};
-#[cfg(all(test, feature = "compat"))]
+#[cfg(test)]
 use arrow::record_batch::RecordBatch;
 use tracing::warn;
 
@@ -73,7 +65,7 @@ pub enum FetchOutcome {
 /// Fragment dispatcher trait.
 ///
 /// Implementations choose where and how fragments run.  The coordinator
-/// calls `submit_fragment_submission` for each fragment (non-blocking), then polls
+/// calls `submit_fragment` for each fragment (non-blocking), then polls
 /// `fetch_result` for the root fragment instance until `Eof` or `Err`.
 pub trait FragmentDispatcher: Send + Sync + 'static {
     #[cfg(test)]
@@ -81,34 +73,11 @@ pub trait FragmentDispatcher: Send + Sync + 'static {
 
     /// Submit a fragment for asynchronous execution to the given backend.
     /// Returns immediately.
-    #[cfg(feature = "compat")]
     fn submit_fragment(
         &self,
         backend_idx: usize,
-        params: internal_service::TExecPlanFragmentParams,
-    ) -> Result<(), String>;
-
-    /// Submit a fragment with optional NovaRocks-native sidecar payloads.
-    ///
-    /// Existing in-process and test dispatchers can keep implementing only the
-    /// legacy thrift method; the remote dispatcher overrides this to require
-    /// NovaRocks-native plan/instance parameters for gRPC submission.
-    fn submit_fragment_submission(
-        &self,
-        backend_idx: usize,
         submission: FragmentSubmission,
-    ) -> Result<(), String> {
-        #[cfg(feature = "compat")]
-        {
-            return self.submit_fragment(backend_idx, submission.into_thrift_params());
-        }
-        #[cfg(not(feature = "compat"))]
-        {
-            let _ = backend_idx;
-            let _ = submission;
-            Err("fragment dispatcher must implement native fragment submission".to_string())
-        }
-    }
+    ) -> Result<(), String>;
 
     /// Poll for the next result chunk from the root fragment on the given
     /// backend.
@@ -133,89 +102,48 @@ pub trait FragmentDispatcher: Send + Sync + 'static {
     }
 }
 
-/// Return the pipeline DOP for standalone distributed execution.
-///
-/// Unified with the FE-compatible path: delegates to `exec_env::calc_pipeline_dop`, which honors a
-/// positive `session_dop` override (from `SET pipeline_dop = N`) and otherwise auto-derives
-/// cores/2 (= half the executor threads). This replaced the former hardcoded `min(cores, 4)` cap
-/// that left most cores idle on machines with >8 cores (e.g. TPC-H q18's CPU-bound partitioned
-/// joins ran only 4 build + 4 probe drivers on a 10-core box). The cores/2 headroom is deliberate —
-/// it leaves cores for scan threads, the exchange IO pool, and the gRPC server. Pass 0 for auto.
-pub(crate) fn compute_pipeline_dop(session_dop: i32) -> i32 {
-    crate::runtime::exec_env::calc_pipeline_dop(session_dop)
-}
-
-/// Pipeline DOP for a standalone fragment whose output is a write/data sink (load/insert/export).
-/// Delegates to `exec_env::calc_sink_pipeline_dop` (StarRocks `getSinkDefaultDOP`): a positive
-/// `session_dop` override wins; otherwise the lower sink curve (cores/3, or min(32, cores/4) above
-/// 24 cores) so writes don't starve query CPU. Compute fragments keep `compute_pipeline_dop`.
-pub(crate) fn compute_sink_pipeline_dop(session_dop: i32) -> i32 {
-    crate::runtime::exec_env::calc_sink_pipeline_dop(session_dop)
-}
-
 pub(crate) struct FragmentSubmission {
-    #[cfg(feature = "compat")]
-    thrift_params: internal_service::TExecPlanFragmentParams,
-    native_plan: Option<crate::proto::plan::PlanFragment>,
-    native_instance_params: Option<crate::proto::novarocks::InstanceParams>,
+    plan: crate::proto::plan::PlanFragment,
+    instance_params: crate::proto::novarocks::InstanceParams,
 }
 
 impl FragmentSubmission {
-    #[cfg(feature = "compat")]
-    pub(crate) fn thrift_only(params: internal_service::TExecPlanFragmentParams) -> Self {
-        Self {
-            thrift_params: params,
-            native_plan: None,
-            native_instance_params: None,
-        }
-    }
-
-    #[cfg(feature = "compat")]
-    pub(crate) fn with_native(
-        params: internal_service::TExecPlanFragmentParams,
-        native_plan: crate::proto::plan::PlanFragment,
-        native_instance_params: crate::proto::novarocks::InstanceParams,
+    pub(crate) fn new(
+        plan: crate::proto::plan::PlanFragment,
+        instance_params: crate::proto::novarocks::InstanceParams,
     ) -> Self {
         Self {
-            thrift_params: params,
-            native_plan: Some(native_plan),
-            native_instance_params: Some(native_instance_params),
+            plan,
+            instance_params,
         }
-    }
-
-    #[cfg(not(feature = "compat"))]
-    pub(crate) fn with_native(
-        native_plan: crate::proto::plan::PlanFragment,
-        native_instance_params: crate::proto::novarocks::InstanceParams,
-    ) -> Self {
-        Self {
-            native_plan: Some(native_plan),
-            native_instance_params: Some(native_instance_params),
-        }
-    }
-
-    #[cfg(feature = "compat")]
-    pub(crate) fn thrift_params(&self) -> &internal_service::TExecPlanFragmentParams {
-        &self.thrift_params
     }
 
     #[cfg(test)]
-    pub(crate) fn native_plan_for_test(&self) -> Option<&crate::proto::plan::PlanFragment> {
-        self.native_plan.as_ref()
+    pub(crate) fn plan_for_test(&self) -> &crate::proto::plan::PlanFragment {
+        &self.plan
+    }
+
+    pub(crate) fn fragment_id(&self) -> u32 {
+        self.plan.fragment_id
+    }
+
+    pub(crate) fn query_id(&self) -> Result<UniqueId, String> {
+        let id = self
+            .instance_params
+            .query_id
+            .as_ref()
+            .ok_or_else(|| "fragment submission missing query_id".to_string())?;
+        Ok(UniqueId {
+            hi: id.hi,
+            lo: id.lo,
+        })
     }
 
     pub(crate) fn fragment_instance_id(&self) -> Result<UniqueId, String> {
-        #[cfg(feature = "compat")]
-        if let Some(exec) = self.thrift_params.params.as_ref() {
-            return Ok(UniqueId {
-                hi: exec.fragment_instance_id.hi,
-                lo: exec.fragment_instance_id.lo,
-            });
-        }
         let id = self
-            .native_instance_params
+            .instance_params
+            .fragment_instance_id
             .as_ref()
-            .and_then(|params| params.fragment_instance_id.as_ref())
             .ok_or_else(|| "fragment submission missing fragment_instance_id".to_string())?;
         Ok(UniqueId {
             hi: id.hi,
@@ -223,21 +151,10 @@ impl FragmentSubmission {
         })
     }
 
-    #[cfg(feature = "compat")]
-    pub(crate) fn into_thrift_params(self) -> internal_service::TExecPlanFragmentParams {
-        self.thrift_params
-    }
-
-    fn into_submit_fragment_request(self) -> Result<SubmitFragmentRequest, String> {
-        match (self.native_plan, self.native_instance_params) {
-            (Some(plan), Some(instance_params)) => Ok(SubmitFragmentRequest {
-                plan: Some(plan),
-                instance_params: Some(instance_params),
-            }),
-            _ => Err(
-                "thrift-only fragment submission is no longer supported by NovaRocksGrpc SubmitFragment"
-                    .to_string(),
-            ),
+    fn into_submit_fragment_request(self) -> SubmitFragmentRequest {
+        SubmitFragmentRequest {
+            plan: Some(self.plan),
+            instance_params: Some(self.instance_params),
         }
     }
 }
@@ -320,16 +237,7 @@ impl FragmentDispatcher for RemoteDispatcher {
         self
     }
 
-    #[cfg(feature = "compat")]
     fn submit_fragment(
-        &self,
-        backend_idx: usize,
-        params: internal_service::TExecPlanFragmentParams,
-    ) -> Result<(), String> {
-        self.submit_fragment_submission(backend_idx, FragmentSubmission::thrift_only(params))
-    }
-
-    fn submit_fragment_submission(
         &self,
         backend_idx: usize,
         submission: FragmentSubmission,
@@ -345,7 +253,7 @@ impl FragmentDispatcher for RemoteDispatcher {
             let _ = std::io::Write::flush(&mut std::io::stdout());
             return Err(format!("debug submit fault injected on call {call_index}"));
         }
-        let request = submission.into_submit_fragment_request()?;
+        let request = submission.into_submit_fragment_request();
         let resp = client
             .blocking_submit_fragment(request)
             .map_err(|e| format!("BE[{backend_idx}] ({addr}): {e}"))?;
@@ -473,11 +381,50 @@ impl FragmentDispatcher for RemoteDispatcher {
     }
 }
 
+#[cfg(test)]
+mod native_submission_contract_tests {
+    use super::*;
+
+    #[test]
+    fn fragment_submission_requires_native_plan_and_instance_params() {
+        let submission = FragmentSubmission::new(
+            crate::proto::plan::PlanFragment {
+                fragment_id: 9,
+                ..Default::default()
+            },
+            crate::proto::novarocks::InstanceParams {
+                query_id: Some(ProtoUniqueId { hi: 7, lo: 9 }),
+                fragment_instance_id: Some(ProtoUniqueId { hi: 7, lo: 11 }),
+                backend_num: 3,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            submission.query_id().expect("native query id"),
+            UniqueId { hi: 7, lo: 9 }
+        );
+        assert_eq!(
+            submission.fragment_instance_id().expect("native finst id"),
+            UniqueId { hi: 7, lo: 11 }
+        );
+        let request = submission.into_submit_fragment_request();
+        assert_eq!(request.plan.expect("native plan").fragment_id, 9);
+        assert_eq!(
+            request
+                .instance_params
+                .expect("native instance params")
+                .backend_num,
+            3
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(all(test, feature = "compat"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -502,139 +449,15 @@ mod tests {
         UniqueId { hi, lo }
     }
 
-    fn make_empty_exec_params(hi: i64, lo: i64) -> internal_service::TPlanFragmentExecParams {
-        internal_service::TPlanFragmentExecParams {
-            query_id: types::TUniqueId::new(hi, lo),
-            fragment_instance_id: types::TUniqueId::new(hi, lo),
-            per_node_scan_ranges: Default::default(),
-            per_exch_num_senders: Default::default(),
-            destinations: None,
-            sender_id: None,
-            num_senders: None,
-            send_query_statistics_with_every_batch: None,
-            use_vectorized: None,
-            runtime_filter_params: None,
-            instances_number: None,
-            enable_exchange_pass_through: None,
-            node_to_per_driver_seq_scan_ranges: None,
-            enable_exchange_perf: None,
-            pipeline_sink_dop: None,
-            report_when_finish: None,
-            exec_debug_options: None,
-        }
-    }
-
-    /// Build a minimal TExecPlanFragmentParams with a non-result (NOOP) sink.
-    fn make_noop_sink_params(hi: i64, lo: i64) -> internal_service::TExecPlanFragmentParams {
-        use crate::thrift::partitions;
-        let noop_sink = data_sinks::TDataSink::new(
-            data_sinks::TDataSinkType::NOOP_SINK,
-            None::<data_sinks::TDataStreamSink>,
-            None::<data_sinks::TResultSink>,
-            None::<data_sinks::TMysqlTableSink>,
-            None::<data_sinks::TExportSink>,
-            None::<data_sinks::TOlapTableSink>,
-            None::<data_sinks::TMemoryScratchSink>,
-            None::<data_sinks::TMultiCastDataStreamSink>,
-            None::<data_sinks::TSchemaTableSink>,
-            None::<data_sinks::TIcebergTableSink>,
-            None::<data_sinks::THiveTableSink>,
-            None::<data_sinks::TTableFunctionTableSink>,
-            None::<data_sinks::TDictionaryCacheSink>,
-            None::<Vec<Box<data_sinks::TDataSink>>>,
-            None::<i64>,
-            None::<data_sinks::TSplitDataStreamSink>,
-            None::<data_sinks::TIcebergChangeStreamRouterSink>,
-        );
-        let fragment = crate::thrift::planner::TPlanFragment::new(
-            None::<crate::thrift::plan_nodes::TPlan>,
-            None::<Vec<crate::thrift::exprs::TExpr>>,
-            Some(noop_sink),
-            partitions::TDataPartition::new(
-                partitions::TPartitionType::UNPARTITIONED,
-                None::<Vec<crate::thrift::exprs::TExpr>>,
-                None::<Vec<partitions::TRangePartition>>,
-                None::<Vec<partitions::TBucketProperty>>,
-            ),
-            None::<i64>,
-            None::<i64>,
-            None::<Vec<crate::thrift::data::TGlobalDict>>,
-            None::<Vec<crate::thrift::data::TGlobalDict>>,
-            None::<crate::thrift::planner::TCacheParam>,
-            None::<std::collections::BTreeMap<i32, crate::thrift::exprs::TExpr>>,
-            None::<crate::thrift::planner::TGroupExecutionParam>,
-        );
-        internal_service::TExecPlanFragmentParams::new(
-            internal_service::InternalServiceVersion::V1,
-            Some(fragment),
-            None::<crate::thrift::descriptors::TDescriptorTable>,
-            Some(make_empty_exec_params(hi, lo)),
-            None::<types::TNetworkAddress>,
-            None::<i32>,
-            None::<internal_service::TQueryGlobals>,
-            None::<internal_service::TQueryOptions>,
-            None::<bool>,
-            None::<types::TResourceInfo>,
-            None::<String>,
-            None::<String>,
-            None::<i64>,
-            None::<internal_service::TLoadErrorHubInfo>,
-            None::<bool>,
-            None::<i32>,
-            None::<std::collections::BTreeMap<types::TPlanNodeId, i32>>,
-            None::<crate::thrift::work_group::TWorkGroup>,
-            None::<bool>,
-            None::<i32>,
-            None::<bool>,
-            None::<bool>,
-            None::<internal_service::TAdaptiveDopParam>,
-            None::<i32>,
-            None::<internal_service::TPredicateTreeParams>,
-            None::<Vec<i32>>,
-            None::<i32>,
-            None::<types::TNetworkAddress>,
-            None::<bool>,
-            None::<bool>, // novarocks_generated_plan
-        )
-    }
-
-    #[test]
-    fn fragment_submission_thrift_only_request_is_rejected() {
-        let err = FragmentSubmission::thrift_only(make_noop_sink_params(1, 2))
-            .into_submit_fragment_request()
-            .expect_err("thrift-only native gRPC request must be rejected");
-
-        assert!(
-            err.contains("thrift-only fragment submission is no longer supported"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn fragment_submission_proto_sidecar_carries_native_payload() {
-        let request = FragmentSubmission::with_native(
-            make_noop_sink_params(1, 2),
-            crate::proto::plan::PlanFragment {
-                fragment_id: 9,
-                ..Default::default()
-            },
+    fn make_submission(hi: i64, lo: i64) -> FragmentSubmission {
+        FragmentSubmission::new(
+            crate::proto::plan::PlanFragment::default(),
             crate::proto::novarocks::InstanceParams {
-                backend_num: 3,
+                query_id: Some(ProtoUniqueId { hi, lo: 99 }),
+                fragment_instance_id: Some(ProtoUniqueId { hi, lo }),
                 ..Default::default()
             },
         )
-        .into_submit_fragment_request()
-        .expect("build proto request");
-
-        assert_eq!(request.plan.as_ref().expect("native plan").fragment_id, 9);
-        assert_eq!(
-            request
-                .instance_params
-                .as_ref()
-                .expect("native instance params")
-                .backend_num,
-            3
-        );
     }
 
     #[derive(Clone)]
@@ -825,14 +648,10 @@ mod tests {
         state.submit_code.store(1, Ordering::SeqCst);
         let addr = spawn_mock_server(Arc::clone(&state));
         let dispatcher = RemoteDispatcher::new(&[addr]).expect("construct");
-        let submission = FragmentSubmission::with_native(
-            make_noop_sink_params(1, 2),
-            crate::proto::plan::PlanFragment::default(),
-            crate::proto::novarocks::InstanceParams::default(),
-        );
+        let submission = make_submission(1, 2);
 
         let err = dispatcher
-            .submit_fragment_submission(0, submission)
+            .submit_fragment(0, submission)
             .expect_err("nonzero submit status should error");
 
         assert!(err.contains("submit failed"));
@@ -1041,39 +860,8 @@ mod tests {
         let a = spawn_mock_server(Arc::new(MockState::default()));
         let d = RemoteDispatcher::new(&[a]).expect("construct");
         let err = d
-            .submit_fragment(5, make_noop_sink_params(1, 2))
+            .submit_fragment(5, make_submission(1, 2))
             .expect_err("oob idx");
         assert!(err.contains("backend_idx") && err.contains('5'));
-    }
-
-    #[test]
-    fn compute_pipeline_dop_is_unified_with_calc_pipeline_dop() {
-        // Auto mode (session_dop = 0): no more hardcoded `min(cores, 4)` cap — must equal the shared
-        // cores/2 derivation used by the FE-compatible path.
-        let dop = compute_pipeline_dop(0);
-        assert!(dop > 0, "dop must be positive, got {dop}");
-        assert_eq!(
-            dop,
-            crate::runtime::exec_env::calc_pipeline_dop(0),
-            "standalone DOP must delegate to exec_env::calc_pipeline_dop"
-        );
-        // A positive session override (SET pipeline_dop = N) is honored verbatim.
-        assert_eq!(compute_pipeline_dop(7), 7);
-        assert_eq!(compute_pipeline_dop(1), 1);
-    }
-
-    #[test]
-    fn compute_sink_pipeline_dop_is_lower_and_honors_override() {
-        // Auto mode: the sink curve is never higher than the compute curve (cores/3..4 vs cores/2),
-        // so write fragments don't starve query CPU.
-        let sink = compute_sink_pipeline_dop(0);
-        let compute = compute_pipeline_dop(0);
-        assert!(sink > 0, "sink dop must be positive, got {sink}");
-        assert!(
-            sink <= compute,
-            "sink dop ({sink}) must be <= compute dop ({compute})"
-        );
-        // A positive session override pins the sink DOP too.
-        assert_eq!(compute_sink_pipeline_dop(7), 7);
     }
 }

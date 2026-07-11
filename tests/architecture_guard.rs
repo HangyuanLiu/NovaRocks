@@ -9648,8 +9648,8 @@ fn nidl_d3e_native_runtime_routing_has_no_thrift_shaped_endpoint_model() {
 
     let coordinator = fs::read_to_string(repo.join("src/runtime/coordinator.rs")).unwrap();
     assert!(
-        coordinator.contains("fn exec_destination_from_runtime"),
-        "coordinator must keep destination conversion in a named execution-parameter boundary helper"
+        !coordinator.contains("fn exec_destination_from_runtime"),
+        "native-only coordinator must not retain the Thrift execution destination adapter"
     );
     assert!(
         coordinator.contains("fn native_stream_destination"),
@@ -9904,6 +9904,65 @@ fn nfe_1_task_2_native_fragment_build_owns_submission_payload() {
 }
 
 #[test]
+fn nfe_1_task_3_runtime_submission_is_native_only() {
+    let repo = Path::new(manifest_dir());
+    let mut violations = Vec::new();
+
+    for rel in ["src/runtime/dispatcher.rs", "src/runtime/coordinator.rs"] {
+        let text = fs::read_to_string(repo.join(rel)).unwrap();
+        let production = rust_production_text_without_cfg_test(&text);
+        push_forbidden_terms(
+            &mut violations,
+            rel,
+            &production,
+            &[
+                "crate::thrift",
+                "TExecPlanFragmentParams",
+                "TDataSink",
+                "TDataPartition",
+                "CompatFragmentPlanPayload",
+                "build_exec_plan_fragment_params",
+                "submit_fragment_submission",
+                "thrift_only",
+                "with_native",
+                "thrift_params",
+                "into_thrift_params",
+                "Option<crate::proto::plan::PlanFragment>",
+                "Option<crate::proto::novarocks::InstanceParams>",
+                "CompatEdgeSidecar",
+                "inject_runtime_filter_merge_nodes",
+                "compat_data_sink_requires_write_report",
+            ],
+            "Task 3 requires native-only coordinator and dispatcher production code",
+        );
+    }
+    for rel in [
+        "src/runtime/exec_params.rs",
+        "src/runtime/exec_params_compat.rs",
+    ] {
+        if repo.join(rel).exists() {
+            violations.push(format!(
+                "{rel}: retired zero-call NovaRocks FE exec-param adapter must be deleted"
+            ));
+        }
+    }
+    let runtime_mod = fs::read_to_string(repo.join("src/runtime/mod.rs")).unwrap();
+    for forbidden in ["mod exec_params;", "mod exec_params_compat;"] {
+        if runtime_mod.contains(forbidden) {
+            violations.push(format!(
+                "src/runtime/mod.rs: retired adapter declaration `{forbidden}` must be deleted"
+            ));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "NFE-1 Task 3 native-only submission guard failed:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
 fn nidl_d3l_native_mainline_thrift_usage_is_explicitly_allowlisted() {
     let repo = Path::new(manifest_dir());
     let mut violations = Vec::new();
@@ -10000,14 +10059,8 @@ fn nidl_d3l_native_mainline_thrift_usage_is_explicitly_allowlisted() {
             "src/runtime/scan_range.rs",
             &["thrift_scan_range_params_from_native"][..],
         ),
-        (
-            "src/runtime/query_options.rs",
-            &["from_thrift", "to_thrift"][..],
-        ),
-        (
-            "src/runtime/runtime_filter_params.rs",
-            &["from_thrift", "to_thrift"][..],
-        ),
+        ("src/runtime/query_options.rs", &["from_thrift"][..]),
+        ("src/runtime/runtime_filter_params.rs", &["from_thrift"][..]),
     ];
     for (source, markers) in compat_allowlist {
         let text = fs::read_to_string(repo.join(source)).unwrap();
@@ -10027,6 +10080,18 @@ fn nidl_d3l_native_mainline_thrift_usage_is_explicitly_allowlisted() {
             "src/runtime/scan_range.rs: retired bulk native-to-Thrift scan-range projection must remain absent"
                 .to_string(),
         );
+    }
+    for source in [
+        "src/runtime/query_options.rs",
+        "src/runtime/runtime_filter_params.rs",
+    ] {
+        let text = fs::read_to_string(repo.join(source)).unwrap();
+        let production_text = rust_production_text_without_cfg_test(&text);
+        if production_text.contains("fn to_thrift") {
+            violations.push(format!(
+                "{source}: native runtime contract must not project back into Thrift"
+            ));
+        }
     }
 
     assert!(
@@ -11127,8 +11192,6 @@ const NIDL_E0_COMPAT_SCOPE: &[&str] = &[
     "src/exec/operators/fetch_processor.rs",
     "src/lower/compat",
     "src/runtime/descriptor_snapshot_thrift.rs",
-    "src/runtime/exec_params.rs",
-    "src/runtime/exec_params_compat.rs",
     "src/runtime/sink_commit_wire.rs",
     "src/runtime/write_coordinator_compat.rs",
     "src/service/backend_service.rs",
@@ -12309,15 +12372,16 @@ fn nidl_e4_scheduler_and_coordinator_use_native_scheduling_metadata() {
         }
     }
 
-    let exec_params = fs::read_to_string(repo.join("src/runtime/exec_params.rs")).unwrap();
-    let exec_params_prod = rust_production_text_without_cfg_test(&exec_params);
-    nidl_e4_push_forbidden_code_terms(
-        &mut violations,
+    for retired in [
         "src/runtime/exec_params.rs",
-        &exec_params_prod,
-        &["FragmentBuildResult", "fr.desc_tbl"],
-        "exec-params helper must accept explicit compat descriptor payload, not FragmentBuildResult",
-    );
+        "src/runtime/exec_params_compat.rs",
+    ] {
+        if repo.join(retired).exists() {
+            violations.push(format!(
+                "{retired}: retired NovaRocks FE exec-param adapter must remain deleted"
+            ));
+        }
+    }
 
     let coordinator = fs::read_to_string(repo.join("src/runtime/coordinator.rs")).unwrap();
     let coordinator_prod = rust_production_text_without_cfg_test(&coordinator);

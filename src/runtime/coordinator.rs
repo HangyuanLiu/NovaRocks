@@ -26,18 +26,14 @@
 //! All instance placement (instance counts, finst ids, backend index,
 //! scan-range splits, destinations, prober params, per-exchange sender counts)
 //! is owned by [`FragmentScheduler`]. The coordinator translates each placement
-//! into a `TExecPlanFragmentParams` and submits it through the
-//! `FragmentDispatcher`. `RemoteDispatcher` routes per-instance to BEs over
-//! gRPC.
+//! into native fragment submissions. `RemoteDispatcher` routes per-instance
+//! to BEs over gRPC.
 //!
 //! At a single backend (all-in-one / 1FE+1BE), the scheduler produces one
 //! instance per fragment and this path reproduces the prior single-instance
 //! wiring exactly.
 
-#[cfg(feature = "compat")]
-use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use arrow::array::ArrayRef;
@@ -49,14 +45,9 @@ use crate::common::types::UniqueId;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::novarocks_logging::debug;
 use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher, FragmentSubmission};
-#[cfg(feature = "compat")]
-use crate::runtime::exec_params::{
-    CompatFragmentPlanPayload, ExecPlanFragmentParamOptions, build_exec_plan_fragment_params,
-};
 use crate::runtime::profile::RuntimeProfileTree;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::query_state::QueryState;
-use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 use crate::runtime::scheduler::{
     FragmentInstancePlacement, FragmentScheduler, topological_sort_bottom_up,
 };
@@ -65,19 +56,9 @@ use crate::runtime::write_coordinator::{
     unregister_query,
 };
 use crate::sql::analysis::cte::CteId;
-#[cfg(feature = "compat")]
-use crate::sql::codegen::LoweredFragmentEdge;
-use crate::sql::codegen::{MultiFragmentBuildResult, RuntimeFilterPlanResult};
+use crate::sql::codegen::{FragmentOutputKind, MultiFragmentBuildResult, RuntimeFilterPlanResult};
 use crate::sql::column_id::ColumnId;
-use crate::sql::planner::distributed::{
-    DataPartition, FragmentEdge, FragmentEdgeKind, FragmentId, PartitionKind,
-};
-#[cfg(feature = "compat")]
-use crate::thrift::data_sinks;
-#[cfg(feature = "compat")]
-use crate::thrift::partitions;
-#[cfg(feature = "compat")]
-use crate::thrift::types;
+use crate::sql::planner::distributed::{FragmentEdge, FragmentEdgeKind, FragmentId};
 
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 
@@ -92,23 +73,6 @@ pub(crate) struct CoordinatedQueryResult {
     pub(crate) write_commit: Option<WriteCommitInput>,
     pub(crate) write_abort: Option<WriteAbortInput>,
     pub(crate) fragment_profiles: Vec<RuntimeProfileTree>,
-}
-
-#[derive(Clone)]
-#[cfg(feature = "compat")]
-struct CompatCteConsumer {
-    fragment_id: FragmentId,
-    exchange_node_id: i32,
-    partition: partitions::TDataPartition,
-    output_slot_ids: Vec<i32>,
-}
-
-type FragmentEdgeKey = (FragmentId, FragmentId, i32);
-
-#[cfg(feature = "compat")]
-struct CompatEdgeSidecar {
-    partition: partitions::TDataPartition,
-    output_slot_ids: Vec<i32>,
 }
 
 /// Coordinates multi-fragment query execution across one or more backends.
@@ -151,15 +115,13 @@ impl ExecutionCoordinator {
         collect_profiles: bool,
     ) -> Result<CoordinatedQueryResult, String> {
         let MultiFragmentBuildResult {
-            mut fragment_results,
             fragment_schedules,
             native_fragments,
             root_fragment_id,
             edges,
-            #[cfg(feature = "compat")]
-            lowered_edges,
             boundary_schemas,
             rf_plan,
+            ..
         } = self.build_result;
         let query_options = self.query_options;
         let dispatcher = self.dispatcher;
@@ -181,7 +143,7 @@ impl ExecutionCoordinator {
 
         debug!(
             "coordinator topology: fragments={} edges={} root={} backends={}",
-            fragment_results.len(),
+            native_fragments_by_id.len(),
             edges.len(),
             root_fragment_id,
             scheduler.backends().len()
@@ -204,7 +166,6 @@ impl ExecutionCoordinator {
         }
 
         validate_fragment_schedule_payloads(
-            &fragment_results,
             &fragment_schedules,
             &native_fragments_by_id,
             root_fragment_id,
@@ -218,9 +179,8 @@ impl ExecutionCoordinator {
             scheduler.fill_runtime_filter_params_with_live(&mut plan, rf, &live)?;
         }
         scheduler.fill_per_exch_num_senders(&mut plan, &edges);
+        validate_native_scheduling_plan(&fragment_schedules, &native_fragments_by_id, &plan)?;
         let execution_root_fragment_id = plan.root_fragment_id;
-        #[cfg(feature = "compat")]
-        let compat_edge_sidecars = build_compat_edge_sidecars(&edges, lowered_edges)?;
 
         // ---------------------------------------------------------------
         // 2. Build per-edge / CTE consumer indices used for sink wiring.
@@ -253,10 +213,6 @@ impl ExecutionCoordinator {
                 Vec<ColumnId>,
             )>,
         > = BTreeMap::new();
-        // CTE id -> compat consumers used only for TMultiCastDataStreamSink.
-        #[cfg(feature = "compat")]
-        let mut compat_cte_consumers: BTreeMap<CteId, Vec<CompatCteConsumer>> = BTreeMap::new();
-
         for e in &edges {
             match &e.edge_kind {
                 FragmentEdgeKind::Stream => {}
@@ -275,22 +231,6 @@ impl ExecutionCoordinator {
                         e.output_slot_ids.clone(),
                         receive_producer_column_ids.clone(),
                     ));
-                    #[cfg(feature = "compat")]
-                    {
-                        compat_cte_consumers
-                            .entry(*cte_id)
-                            .or_default()
-                            .push(CompatCteConsumer {
-                                fragment_id: e.target_fragment_id,
-                                exchange_node_id: e.target_exchange_node_id,
-                                partition: compat_partition_for_edge(&compat_edge_sidecars, e)?,
-                                output_slot_ids: compat_output_slot_ids_for_edge(
-                                    &compat_edge_sidecars,
-                                    e,
-                                )?
-                                .to_vec(),
-                            });
-                    }
                 }
                 FragmentEdgeKind::IcebergChangeStreamRouter { .. } => {}
             }
@@ -316,50 +256,14 @@ impl ExecutionCoordinator {
                         receive_producer_column_ids.clone(),
                     ));
                 }
-                #[cfg(feature = "compat")]
-                {
-                    let compat_consumers = compat_cte_consumers.entry(*cte_id).or_default();
-                    if !compat_consumers.iter().any(|consumer| {
-                        consumer.fragment_id == schedule.fragment_id
-                            && consumer.exchange_node_id == *exchange_node_id
-                    }) {
-                        compat_consumers.push(CompatCteConsumer {
-                            fragment_id: schedule.fragment_id,
-                            exchange_node_id: *exchange_node_id,
-                            partition: unpartitioned_partition(),
-                            output_slot_ids: Vec::new(),
-                        });
-                    }
-                }
             }
         }
 
         // ---------------------------------------------------------------
-        // 3. Inject the designated runtime-filter merge node into descriptors.
+        // 3. Translate every placement into a native fragment submission.
         // ---------------------------------------------------------------
-        // The merge node is the backend that hosts the execution anchor. For
-        // result roots this is the single root instance; for write-only DAGs it
-        // is the first instance of the selected writer anchor.
-        #[cfg(feature = "compat")]
-        if rf_plan.is_some() {
-            let merge_addr = backend_to_network_addr(&live, plan.root_backend_idx)?;
-            inject_runtime_filter_merge_nodes(&mut fragment_results, &merge_addr);
-        }
-
-        // ---------------------------------------------------------------
-        // 4. Translate every placement into a fragment params and submit.
-        // ---------------------------------------------------------------
-        // Honor a per-session `SET pipeline_dop = N` override; 0/None
-        // means auto (cores/2).
-        let session_dop = query_options
-            .as_ref()
-            .and_then(|opts| opts.pipeline_dop)
-            .unwrap_or(0);
-        let pipeline_dop = crate::runtime::dispatcher::compute_pipeline_dop(session_dop);
         let needs_fragment_status_report =
             dispatcher.needs_fragment_status_report() || collect_profiles;
-        #[cfg(feature = "compat")]
-        let mut novarocks_report_addr: Option<types::TNetworkAddress> = None;
         let mut novarocks_report_endpoint: Option<crate::runtime::endpoint::RuntimeEndpoint> = None;
 
         // Snapshot the per-consumer-fragment instance destinations for CTE
@@ -384,11 +288,6 @@ impl ExecutionCoordinator {
             })
             .collect();
 
-        let fr_by_id: BTreeMap<FragmentId, &crate::sql::codegen::FragmentBuildResult> =
-            fragment_results
-                .iter()
-                .map(|fr| (fr.fragment_id, fr))
-                .collect();
         let schedule_by_id: BTreeMap<FragmentId, &crate::sql::codegen::FragmentSchedulingMetadata> =
             fragment_schedules
                 .iter()
@@ -396,9 +295,8 @@ impl ExecutionCoordinator {
                 .collect();
 
         // Build a fragment-id -> instance count map from the scheduling plan.
-        // This is used by build_instance_runtime_filter_params to set the correct
-        // builder_number for each runtime filter id (must equal the number of
-        // build-side instances, not a hardcoded 1).
+        // Builder numbers must equal the number of build-side instances, not a
+        // hardcoded 1.
         let instance_counts: BTreeMap<FragmentId, usize> = plan
             .by_fragment
             .iter()
@@ -414,9 +312,6 @@ impl ExecutionCoordinator {
         let mut expected_writers = Vec::new();
 
         for (&fragment_id, placements) in &plan.by_fragment {
-            let fr = *fr_by_id
-                .get(&fragment_id)
-                .ok_or_else(|| format!("fragment {fragment_id} missing from build results"))?;
             let schedule = *schedule_by_id
                 .get(&fragment_id)
                 .ok_or_else(|| format!("fragment {fragment_id} missing from native schedules"))?;
@@ -427,6 +322,15 @@ impl ExecutionCoordinator {
                 && router_edges.is_none()
                 && schedule.cte_id.is_none()
                 && schedule.output_kind.is_terminal_write();
+            let is_producer =
+                stream_edge.is_some() || router_edges.is_some() || schedule.cte_id.is_some();
+            validate_fragment_output_kind(
+                fragment_id,
+                is_root,
+                is_terminal_write,
+                is_producer,
+                schedule.output_kind,
+            )?;
 
             // Classify the fragment once.
             if !is_root
@@ -450,96 +354,8 @@ impl ExecutionCoordinator {
                 schedule.cte_id.is_some(),
             )?;
 
-            #[cfg(feature = "compat")]
-            let compat_starrocks_carrier_index = build_compat_starrocks_carrier_index(fr)?;
-
             for placement in placements {
-                #[cfg(feature = "compat")]
-                // Build the output sink for this fragment class.
-                let (output_sink, fragment_partition, exec_destinations) = if is_root {
-                    (fr.output_sink.clone(), unpartitioned_partition(), None)
-                } else if let Some(edge) = stream_edge {
-                    let compat_partition = compat_partition_for_edge(&compat_edge_sidecars, edge)?;
-                    let stream_sink = build_stream_sink_for_edge(
-                        edge,
-                        compat_partition.clone(),
-                        compat_output_slot_ids_for_edge(&compat_edge_sidecars, edge)?,
-                    );
-                    let output_sink = wrap_data_stream_sink(stream_sink);
-                    let exec_destinations = placement
-                        .destinations
-                        .iter()
-                        .map(exec_destination_from_runtime)
-                        .collect();
-                    (output_sink, compat_partition, Some(exec_destinations))
-                } else if router_edges.is_some() {
-                    let output_sink = fr.output_sink.clone();
-                    // Router branches carry their own destinations in the sink payload.
-                    (output_sink, unpartitioned_partition(), None)
-                } else if is_terminal_write {
-                    (fr.output_sink.clone(), unpartitioned_partition(), None)
-                } else {
-                    // CTE producer.
-                    let cte_id = schedule
-                        .cte_id
-                        .ok_or_else(|| "CTE fragment missing cte_id".to_string())?;
-                    let consumers = compat_cte_consumers
-                        .get(&cte_id)
-                        .cloned()
-                        .unwrap_or_default();
-                    if consumers.is_empty() {
-                        return Err(format!("CTE fragment (cte_id={cte_id}) has no consumers"));
-                    }
-                    let mut sinks = Vec::with_capacity(consumers.len());
-                    let mut destinations = Vec::with_capacity(consumers.len());
-                    for consumer in &consumers {
-                        let stream_sink = data_sinks::TDataStreamSink::new(
-                            consumer.exchange_node_id,
-                            consumer.partition.clone(),
-                            None::<bool>,
-                            None::<bool>,
-                            None::<i32>,
-                            stream_sink_output_columns(&consumer.output_slot_ids),
-                            None::<i64>,
-                        );
-                        sinks.push(stream_sink);
-                        let dests = consumer_dests
-                            .get(&consumer.fragment_id)
-                            .ok_or_else(|| {
-                                format!(
-                                    "CTE consumer fragment {} has no placements",
-                                    consumer.fragment_id
-                                )
-                            })?
-                            .iter()
-                            .map(exec_destination_from_runtime)
-                            .collect();
-                        destinations.push(dests);
-                    }
-                    let multi_cast_sink =
-                        data_sinks::TMultiCastDataStreamSink::new(sinks, destinations);
-                    let output_sink = wrap_multi_cast_sink(multi_cast_sink);
-                    // Multicast carries its own destinations on the sub-sinks.
-                    (output_sink, unpartitioned_partition(), None)
-                };
-
                 let fragment_has_write_sink = is_terminal_write;
-                #[cfg(feature = "compat")]
-                let (fragment_report_addr, fragment_report_endpoint) =
-                    if fragment_has_write_sink || needs_fragment_status_report {
-                        if novarocks_report_addr.is_none() || novarocks_report_endpoint.is_none() {
-                            let endpoint = local_coordinator_report_endpoint()?;
-                            novarocks_report_addr = Some(endpoint.to_network_address());
-                            novarocks_report_endpoint = Some(endpoint);
-                        }
-                        (
-                            novarocks_report_addr.clone(),
-                            novarocks_report_endpoint.clone(),
-                        )
-                    } else {
-                        (None, None)
-                    };
-                #[cfg(not(feature = "compat"))]
                 let fragment_report_endpoint =
                     if fragment_has_write_sink || needs_fragment_status_report {
                         if novarocks_report_endpoint.is_none() {
@@ -549,58 +365,6 @@ impl ExecutionCoordinator {
                     } else {
                         None
                     };
-                // Align with StarRocks: a write/data-sink fragment (iceberg/hive/olap load/insert)
-                // runs at the lower sink DOP curve so it doesn't starve query CPU; compute fragments
-                // keep cores/2 (`pipeline_dop`). A `SET pipeline_dop = N` override pins both.
-                let fragment_dop = if fragment_has_write_sink {
-                    crate::runtime::dispatcher::compute_sink_pipeline_dop(session_dop)
-                } else {
-                    pipeline_dop
-                };
-
-                #[cfg(feature = "compat")]
-                let params = {
-                    let mut exec_params = fr.exec_params.clone();
-                    exec_params.query_id = unique_id_to_thrift(query_id);
-                    exec_params.fragment_instance_id = unique_id_to_thrift(placement.finst_id);
-                    exec_params.per_node_scan_ranges = compat_scan_ranges_for_placement(
-                        fr,
-                        placement,
-                        placements.len(),
-                        &compat_starrocks_carrier_index,
-                    )?;
-                    exec_params.per_exch_num_senders = placement.per_exch_num_senders.clone();
-                    exec_params.destinations = exec_destinations;
-                    if let Some(rf) = rf_plan.as_ref() {
-                        let rf_params = build_instance_runtime_filter_params(
-                            rf,
-                            &placement.runtime_filter_prober_params,
-                            &instance_counts,
-                        );
-                        exec_params.runtime_filter_params = Some(rf_params.to_thrift());
-                    }
-
-                    let compat_query_options = query_options.as_ref().map(QueryOptions::to_thrift);
-                    build_exec_plan_fragment_params(
-                        CompatFragmentPlanPayload {
-                            plan: fr.plan.clone(),
-                            desc_tbl: fr.desc_tbl.clone(),
-                            output_sink,
-                            output_exprs: fr.output_exprs.clone(),
-                            fragment_partition,
-                            query_global_dicts: fr.query_global_dicts.clone(),
-                            query_global_dict_exprs: fr.query_global_dict_exprs.clone(),
-                        },
-                        exec_params,
-                        compat_query_options,
-                        fragment_dop,
-                        ExecPlanFragmentParamOptions {
-                            backend_num: Some(placement.instance_index as i32),
-                            novarocks_report_addr: fragment_report_addr,
-                            novarocks_typed_result_sink: is_root && needs_fragment_status_report,
-                        },
-                    )
-                };
 
                 if fragment_has_write_sink {
                     expected_writers.push(WriterKey {
@@ -636,13 +400,6 @@ impl ExecutionCoordinator {
                         )?;
                     }
                 }
-                #[cfg(feature = "compat")]
-                params.params.as_ref().ok_or_else(|| {
-                    format!("fragment {fragment_id} missing exec params for native submission")
-                })?;
-                #[cfg(feature = "compat")]
-                let typed_result_sink = params.novarocks_typed_result_sink.unwrap_or(false);
-                #[cfg(not(feature = "compat"))]
                 let typed_result_sink = is_root && needs_fragment_status_report;
                 let native_rf_builder_number =
                     runtime_filter_builder_number_for_instance(rf_plan.as_ref(), &instance_counts);
@@ -663,15 +420,7 @@ impl ExecutionCoordinator {
                         fragment_report_endpoint.as_ref(),
                         typed_result_sink,
                     )?;
-                #[cfg(feature = "compat")]
-                let submission = FragmentSubmission::with_native(
-                    params,
-                    native_fragment,
-                    native_instance_params,
-                );
-                #[cfg(not(feature = "compat"))]
-                let submission =
-                    FragmentSubmission::with_native(native_fragment, native_instance_params);
+                let submission = FragmentSubmission::new(native_fragment, native_instance_params);
 
                 submissions_by_fragment
                     .entry(fragment_id)
@@ -714,18 +463,7 @@ impl ExecutionCoordinator {
         let root_schedule = schedule_by_id
             .get(&execution_root_fragment_id)
             .ok_or_else(|| "root fragment not found in native schedules".to_string())?;
-        #[cfg(feature = "compat")]
-        let root_uses_result_buffer = root_uses_result_buffer(&submissions, &plan.root_finst_id)?;
-        #[cfg(not(feature = "compat"))]
         let root_uses_result_buffer = !root_schedule.output_kind.is_terminal_write();
-        #[cfg(feature = "compat")]
-        let expected_root_chunk_schema =
-            if root_uses_typed_result_sink(&submissions, &plan.root_finst_id)? {
-                Some(build_root_expected_chunk_schema(root_schedule)?)
-            } else {
-                None
-            };
-        #[cfg(not(feature = "compat"))]
         let expected_root_chunk_schema = if root_uses_result_buffer {
             Some(build_root_expected_chunk_schema(root_schedule)?)
         } else {
@@ -736,6 +474,7 @@ impl ExecutionCoordinator {
             &dispatcher,
             &mut tracker,
             submissions,
+            execution_root_fragment_id,
             plan.root_backend_idx,
             plan.root_finst_id.clone(),
             &query_id,
@@ -921,175 +660,6 @@ fn same_unit_timestamp_metadata_mismatch(expected: &DataType, actual: &DataType)
     )
 }
 
-/// An `UNPARTITIONED` data partition (the common default).
-#[cfg(feature = "compat")]
-fn unpartitioned_partition() -> partitions::TDataPartition {
-    partitions::TDataPartition::new(
-        partitions::TPartitionType::UNPARTITIONED,
-        None::<Vec<crate::thrift::exprs::TExpr>>,
-        None::<Vec<partitions::TRangePartition>>,
-        None::<Vec<partitions::TBucketProperty>>,
-    )
-}
-
-#[cfg(feature = "compat")]
-fn partition_type_for_data_partition(partition: &DataPartition) -> partitions::TPartitionType {
-    match partition.kind {
-        PartitionKind::Unpartitioned => partitions::TPartitionType::UNPARTITIONED,
-        PartitionKind::Random => partitions::TPartitionType::RANDOM,
-        PartitionKind::Hash => partitions::TPartitionType::HASH_PARTITIONED,
-    }
-}
-
-fn fragment_edge_key(edge: &FragmentEdge) -> FragmentEdgeKey {
-    (
-        edge.source_fragment_id,
-        edge.target_fragment_id,
-        edge.target_exchange_node_id,
-    )
-}
-
-#[cfg(feature = "compat")]
-fn build_compat_edge_sidecars(
-    edges: &[FragmentEdge],
-    lowered_edges: Vec<LoweredFragmentEdge>,
-) -> Result<BTreeMap<FragmentEdgeKey, CompatEdgeSidecar>, String> {
-    let mut by_key = BTreeMap::new();
-    for lowered in lowered_edges {
-        let key = fragment_edge_key(&lowered.edge);
-        let sidecar = CompatEdgeSidecar {
-            partition: lowered.compat_partition,
-            output_slot_ids: lowered.edge.output_slot_ids,
-        };
-        if by_key.insert(key, sidecar).is_some() {
-            return Err(format!(
-                "lowered edge sidecars contain duplicate edge source={} target={} exchange={}",
-                key.0, key.1, key.2
-            ));
-        }
-    }
-    for edge in edges {
-        let key = fragment_edge_key(edge);
-        if !by_key.contains_key(&key) {
-            return Err(format!(
-                "fragment edge source={} target={} exchange={} is missing lowered compat partition",
-                key.0, key.1, key.2
-            ));
-        }
-    }
-    Ok(by_key)
-}
-
-#[cfg(feature = "compat")]
-fn compat_partition_for_edge(
-    compat_edge_sidecars: &BTreeMap<FragmentEdgeKey, CompatEdgeSidecar>,
-    edge: &FragmentEdge,
-) -> Result<partitions::TDataPartition, String> {
-    let key = fragment_edge_key(edge);
-    compat_edge_sidecars
-        .get(&key)
-        .map(|sidecar| sidecar.partition.clone())
-        .ok_or_else(|| {
-            format!(
-                "fragment edge source={} target={} exchange={} is missing lowered compat partition",
-                key.0, key.1, key.2
-            )
-        })
-}
-
-#[cfg(feature = "compat")]
-fn compat_output_slot_ids_for_edge<'a>(
-    compat_edge_sidecars: &'a BTreeMap<FragmentEdgeKey, CompatEdgeSidecar>,
-    edge: &FragmentEdge,
-) -> Result<&'a [i32], String> {
-    let key = fragment_edge_key(edge);
-    compat_edge_sidecars
-        .get(&key)
-        .map(|sidecar| sidecar.output_slot_ids.as_slice())
-        .ok_or_else(|| {
-            format!(
-                "fragment edge source={} target={} exchange={} is missing lowered output slots",
-                key.0, key.1, key.2
-            )
-        })
-}
-
-/// Wrap a `TDataStreamSink` in a DATA_STREAM_SINK `TDataSink`.
-#[cfg(feature = "compat")]
-fn wrap_data_stream_sink(stream_sink: data_sinks::TDataStreamSink) -> data_sinks::TDataSink {
-    data_sinks::TDataSink::new(
-        data_sinks::TDataSinkType::DATA_STREAM_SINK,
-        Some(stream_sink),
-        None::<data_sinks::TResultSink>,
-        None::<data_sinks::TMysqlTableSink>,
-        None::<data_sinks::TExportSink>,
-        None::<data_sinks::TOlapTableSink>,
-        None::<data_sinks::TMemoryScratchSink>,
-        None::<data_sinks::TMultiCastDataStreamSink>,
-        None::<data_sinks::TSchemaTableSink>,
-        None::<data_sinks::TIcebergTableSink>,
-        None::<data_sinks::THiveTableSink>,
-        None::<data_sinks::TTableFunctionTableSink>,
-        None::<data_sinks::TDictionaryCacheSink>,
-        None::<Vec<Box<data_sinks::TDataSink>>>,
-        None::<i64>,
-        None::<data_sinks::TSplitDataStreamSink>,
-        None::<data_sinks::TIcebergChangeStreamRouterSink>,
-    )
-}
-
-#[cfg(feature = "compat")]
-fn build_stream_sink_for_edge(
-    edge: &FragmentEdge,
-    compat_partition: partitions::TDataPartition,
-    output_slot_ids: &[i32],
-) -> data_sinks::TDataStreamSink {
-    data_sinks::TDataStreamSink::new(
-        edge.target_exchange_node_id,
-        compat_partition,
-        None::<bool>,
-        None::<bool>,
-        None::<i32>,
-        stream_sink_output_columns(output_slot_ids),
-        None::<i64>,
-    )
-}
-
-#[cfg(feature = "compat")]
-fn stream_sink_output_columns(output_slot_ids: &[i32]) -> Option<Vec<i32>> {
-    if output_slot_ids.is_empty() {
-        None
-    } else {
-        Some(output_slot_ids.to_vec())
-    }
-}
-
-/// Wrap a `TMultiCastDataStreamSink` in a MULTI_CAST_DATA_STREAM_SINK `TDataSink`.
-#[cfg(feature = "compat")]
-fn wrap_multi_cast_sink(
-    multi_cast_sink: data_sinks::TMultiCastDataStreamSink,
-) -> data_sinks::TDataSink {
-    data_sinks::TDataSink::new(
-        data_sinks::TDataSinkType::MULTI_CAST_DATA_STREAM_SINK,
-        None::<data_sinks::TDataStreamSink>,
-        None::<data_sinks::TResultSink>,
-        None::<data_sinks::TMysqlTableSink>,
-        None::<data_sinks::TExportSink>,
-        None::<data_sinks::TOlapTableSink>,
-        None::<data_sinks::TMemoryScratchSink>,
-        Some(multi_cast_sink),
-        None::<data_sinks::TSchemaTableSink>,
-        None::<data_sinks::TIcebergTableSink>,
-        None::<data_sinks::THiveTableSink>,
-        None::<data_sinks::TTableFunctionTableSink>,
-        None::<data_sinks::TDictionaryCacheSink>,
-        None::<Vec<Box<data_sinks::TDataSink>>>,
-        None::<i64>,
-        None::<data_sinks::TSplitDataStreamSink>,
-        None::<data_sinks::TIcebergChangeStreamRouterSink>,
-    )
-}
-
 fn build_stream_edge_by_source<'a>(
     edges: &'a [FragmentEdge],
 ) -> Result<BTreeMap<FragmentId, &'a FragmentEdge>, String> {
@@ -1198,440 +768,6 @@ fn group_router_edges_by_source<'a>(
     Ok(grouped)
 }
 
-#[cfg(feature = "compat")]
-fn wrap_iceberg_change_stream_router_sink(
-    template: &data_sinks::TIcebergChangeStreamRouterSink,
-    branch_edges: &[&FragmentEdge],
-    compat_edge_sidecars: &BTreeMap<FragmentEdgeKey, CompatEdgeSidecar>,
-    placements: &BTreeMap<FragmentId, Vec<FragmentInstancePlacement>>,
-) -> Result<data_sinks::TDataSink, String> {
-    if branch_edges.is_empty() {
-        return Err("Iceberg change-stream router sink has no branch edges".to_string());
-    }
-
-    let mut branches = Vec::with_capacity(branch_edges.len());
-    for edge in branch_edges {
-        let FragmentEdgeKind::IcebergChangeStreamRouter {
-            router_group_id,
-            branch_id,
-            branch_kind,
-        } = edge.edge_kind
-        else {
-            return Err(format!(
-                "fragment {} edge to fragment {} is not an Iceberg change-stream router edge",
-                edge.source_fragment_id, edge.target_fragment_id
-            ));
-        };
-        let template_branch = template
-            .branches
-            .iter()
-            .find(|branch| {
-                branch.branch_id == branch_id
-                    && crate::sql::common::branch_kind_from_thrift(branch.branch_kind)
-                        .is_ok_and(|template_kind| template_kind == branch_kind)
-            })
-            .ok_or_else(|| {
-                format!(
-                    "Iceberg change-stream router source={} group={} branch_id={} branch_kind={:?} \
-                     has no matching template branch",
-                    edge.source_fragment_id, router_group_id, branch_id, branch_kind
-                )
-            })?;
-
-        let mut stream_sink = template_branch.stream_sink.clone();
-        stream_sink.dest_node_id = edge.target_exchange_node_id;
-        stream_sink.output_partition = compat_partition_for_edge(compat_edge_sidecars, edge)?;
-        stream_sink.output_columns = stream_sink_output_columns(compat_output_slot_ids_for_edge(
-            compat_edge_sidecars,
-            edge,
-        )?);
-        let destinations = placements
-            .get(&edge.target_fragment_id)
-            .ok_or_else(|| {
-                format!(
-                    "Iceberg change-stream router source={} group={} branch_id={} target fragment {} \
-                     has no placements",
-                    edge.source_fragment_id,
-                    router_group_id,
-                    branch_id,
-                    edge.target_fragment_id
-                )
-            })?
-            .iter()
-                .map(|placement| {
-                    let destination = crate::runtime::endpoint::FragmentDestination::new(
-                        placement.finst_id,
-                        placement.endpoint.clone(),
-                    );
-                    exec_destination_from_runtime(&destination)
-                })
-            .collect();
-
-        branches.push(data_sinks::TIcebergChangeStreamRouterBranch::new(
-            branch_id,
-            template_branch.branch_kind,
-            stream_sink,
-            destinations,
-        ));
-    }
-
-    let router_sink = data_sinks::TIcebergChangeStreamRouterSink::new(
-        template.change_op_slot_id,
-        template.data_route_slot_id,
-        branches,
-    );
-
-    Ok(data_sinks::TDataSink::new(
-        data_sinks::TDataSinkType::ICEBERG_CHANGE_STREAM_ROUTER_SINK,
-        None::<data_sinks::TDataStreamSink>,
-        None::<data_sinks::TResultSink>,
-        None::<data_sinks::TMysqlTableSink>,
-        None::<data_sinks::TExportSink>,
-        None::<data_sinks::TOlapTableSink>,
-        None::<data_sinks::TMemoryScratchSink>,
-        None::<data_sinks::TMultiCastDataStreamSink>,
-        None::<data_sinks::TSchemaTableSink>,
-        None::<data_sinks::TIcebergTableSink>,
-        None::<data_sinks::THiveTableSink>,
-        None::<data_sinks::TTableFunctionTableSink>,
-        None::<data_sinks::TDictionaryCacheSink>,
-        None::<Vec<Box<data_sinks::TDataSink>>>,
-        None::<i64>,
-        None::<data_sinks::TSplitDataStreamSink>,
-        Some(router_sink),
-    ))
-}
-
-#[cfg(feature = "compat")]
-#[derive(Clone, Debug)]
-struct CompatStarRocksCarrier {
-    params: crate::thrift::internal_service::TScanRangeParams,
-    partition_id: i64,
-    version: i64,
-}
-
-#[cfg(feature = "compat")]
-#[derive(Clone, Debug, Default)]
-struct CompatStarRocksCarrierIndex {
-    by_node: HashMap<i32, HashMap<i64, CompatStarRocksCarrier>>,
-}
-
-#[cfg(feature = "compat")]
-fn build_compat_starrocks_carrier_index(
-    fragment: &crate::sql::codegen::FragmentBuildResult,
-) -> Result<CompatStarRocksCarrierIndex, String> {
-    let mut native_by_node = HashMap::new();
-    for (node_id, native_ranges) in &fragment.native_scan_ranges {
-        let mut native_tablets = HashMap::new();
-        let mut has_file_range = false;
-        for params in native_ranges {
-            match &params.range {
-                crate::runtime::scan_range::ScanRange::File(_) => has_file_range = true,
-                crate::runtime::scan_range::ScanRange::StarRocksTablet(tablet) => {
-                    if native_tablets
-                        .insert(tablet.tablet_id, (tablet.partition_id, tablet.version))
-                        .is_some()
-                    {
-                        return Err(format!(
-                            "duplicate native StarRocks scan range for node_id={node_id} tablet_id={}",
-                            tablet.tablet_id
-                        ));
-                    }
-                }
-            }
-        }
-        if native_tablets.is_empty() {
-            continue;
-        }
-        if has_file_range {
-            return Err(format!(
-                "mixed native File and StarRocks scan ranges for node_id={node_id}"
-            ));
-        }
-        native_by_node.insert(*node_id, native_tablets);
-    }
-
-    let mut legacy_by_node = HashMap::new();
-    for (node_id, legacy_ranges) in &fragment.exec_params.per_node_scan_ranges {
-        let Some(_) = native_by_node.get(node_id) else {
-            if let Some(legacy) = legacy_ranges
-                .iter()
-                .find_map(|params| params.scan_range.internal_scan_range.as_ref())
-            {
-                return Err(format!(
-                    "extra legacy StarRocks scan range carrier for node_id={node_id} tablet_id={}",
-                    legacy.tablet_id
-                ));
-            }
-            continue;
-        };
-        let mut legacy_tablets = HashMap::new();
-        for params in legacy_ranges {
-            let legacy = params
-                .scan_range
-                .internal_scan_range
-                .as_ref()
-                .ok_or_else(|| {
-                    format!(
-                        "legacy StarRocks scan range carrier is not internal for node_id={node_id}"
-                    )
-                })?;
-            let version = legacy.version.parse::<i64>().map_err(|_| {
-                format!(
-                    "legacy StarRocks scan range carrier for node_id={node_id} tablet_id={} has invalid version `{}`",
-                    legacy.tablet_id, legacy.version
-                )
-            })?;
-            let partition_id = legacy.partition_id.ok_or_else(|| {
-                format!(
-                    "legacy StarRocks scan range carrier for node_id={node_id} tablet_id={} is missing partition_id",
-                    legacy.tablet_id
-                )
-            })?;
-            if legacy_tablets
-                .insert(
-                    legacy.tablet_id,
-                    CompatStarRocksCarrier {
-                        params: params.clone(),
-                        partition_id,
-                        version,
-                    },
-                )
-                .is_some()
-            {
-                return Err(format!(
-                    "duplicate legacy StarRocks scan range carrier for node_id={node_id} tablet_id={}",
-                    legacy.tablet_id
-                ));
-            }
-        }
-        legacy_by_node.insert(*node_id, legacy_tablets);
-    }
-
-    let mut by_node = HashMap::with_capacity(native_by_node.len());
-    let mut reconciliation_errors = Vec::new();
-    for (node_id, native_tablets) in native_by_node {
-        let legacy_tablets = legacy_by_node.remove(&node_id).unwrap_or_default();
-        for (tablet_id, (native_partition_id, native_version)) in &native_tablets {
-            match legacy_tablets.get(tablet_id) {
-                Some(legacy)
-                    if legacy.partition_id != *native_partition_id
-                        || legacy.version != *native_version =>
-                {
-                    reconciliation_errors.push((
-                        node_id,
-                        *tablet_id,
-                        1_u8,
-                        format!(
-                            "legacy StarRocks scan range carrier identity mismatch for node_id={node_id}: native=({tablet_id}, {native_partition_id}, {native_version}) legacy=({tablet_id}, {}, {})",
-                            legacy.partition_id, legacy.version
-                        ),
-                    ));
-                }
-                Some(_) => {}
-                None => reconciliation_errors.push((
-                    node_id,
-                    *tablet_id,
-                    0_u8,
-                    format!(
-                        "missing legacy StarRocks scan range carrier for node_id={node_id} tablet_id={tablet_id}"
-                    ),
-                )),
-            }
-        }
-        for tablet_id in legacy_tablets.keys() {
-            if !native_tablets.contains_key(tablet_id) {
-                reconciliation_errors.push((
-                    node_id,
-                    *tablet_id,
-                    2_u8,
-                    format!(
-                        "extra legacy StarRocks scan range carrier for node_id={node_id} tablet_id={tablet_id}"
-                    ),
-                ));
-            }
-        }
-        by_node.insert(node_id, legacy_tablets);
-    }
-    debug_assert!(legacy_by_node.is_empty());
-    if !reconciliation_errors.is_empty() {
-        reconciliation_errors
-            .sort_unstable_by_key(|(node_id, tablet_id, kind, _)| (*node_id, *tablet_id, *kind));
-        return Err(reconciliation_errors
-            .into_iter()
-            .map(|(_, _, _, message)| message)
-            .collect::<Vec<_>>()
-            .join("; "));
-    }
-    Ok(CompatStarRocksCarrierIndex { by_node })
-}
-
-#[cfg(feature = "compat")]
-fn compat_scan_ranges_for_placement(
-    fragment: &crate::sql::codegen::FragmentBuildResult,
-    placement: &FragmentInstancePlacement,
-    placement_count: usize,
-    starrocks_carriers: &CompatStarRocksCarrierIndex,
-) -> Result<BTreeMap<i32, Vec<crate::thrift::internal_service::TScanRangeParams>>, String> {
-    let compat_ranges = &fragment.exec_params.per_node_scan_ranges;
-    let mut assigned = BTreeMap::new();
-    for (node_id, native_ranges) in &placement.scan_ranges {
-        let mut selected = Vec::with_capacity(native_ranges.len());
-        for native in native_ranges {
-            match &native.range {
-                crate::runtime::scan_range::ScanRange::File(_) => selected.push(
-                    crate::runtime::scan_range::thrift_scan_range_params_from_native(native)?,
-                ),
-                crate::runtime::scan_range::ScanRange::StarRocksTablet(tablet) => {
-                    let carrier = starrocks_carriers
-                        .by_node
-                        .get(node_id)
-                        .and_then(|carriers| carriers.get(&tablet.tablet_id))
-                        .ok_or_else(|| {
-                            format!(
-                                "native StarRocks placement has no validated legacy carrier for node_id={node_id} tablet_id={}",
-                                tablet.tablet_id
-                            )
-                        })?;
-                    if carrier.partition_id != tablet.partition_id
-                        || carrier.version != tablet.version
-                    {
-                        return Err(format!(
-                            "native StarRocks placement identity mismatch for node_id={node_id}: placement=({}, {}, {}) carrier=({}, {}, {})",
-                            tablet.tablet_id,
-                            tablet.partition_id,
-                            tablet.version,
-                            tablet.tablet_id,
-                            carrier.partition_id,
-                            carrier.version
-                        ));
-                    }
-                    selected.push(carrier.params.clone());
-                }
-            }
-        }
-        assigned.insert(*node_id, selected);
-    }
-
-    if compat_ranges.is_empty() {
-        return Ok(assigned);
-    }
-    if placement_count == 0 {
-        return Err(format!(
-            "fragment {} has scan ranges but no placements",
-            fragment.fragment_id
-        ));
-    }
-
-    for (node_id, ranges) in compat_ranges {
-        if assigned.contains_key(node_id) {
-            continue;
-        }
-        assigned.insert(
-            *node_id,
-            ranges
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, range)| {
-                    (idx % placement_count == placement.instance_index).then_some(range.clone())
-                })
-                .collect::<Vec<_>>(),
-        );
-    }
-    Ok(assigned)
-}
-
-#[cfg(feature = "compat")]
-fn is_write_sink(params: &crate::thrift::internal_service::TExecPlanFragmentParams) -> bool {
-    params
-        .fragment
-        .as_ref()
-        .and_then(|fragment| fragment.output_sink.as_ref())
-        .map(compat_data_sink_requires_write_report)
-        .unwrap_or(false)
-}
-
-#[cfg(feature = "compat")]
-fn compat_data_sink_requires_write_report(sink: &data_sinks::TDataSink) -> bool {
-    matches!(
-        sink.type_,
-        data_sinks::TDataSinkType::ICEBERG_TABLE_SINK
-            | data_sinks::TDataSinkType::ICEBERG_DELETE_SINK
-            | data_sinks::TDataSinkType::ICEBERG_DV_SINK
-            | data_sinks::TDataSinkType::ICEBERG_EQUALITY_DELETE_SINK
-            | data_sinks::TDataSinkType::HIVE_TABLE_SINK
-            | data_sinks::TDataSinkType::OLAP_TABLE_SINK
-    )
-}
-
-#[cfg(feature = "compat")]
-fn uses_result_buffer_sink(
-    params: &crate::thrift::internal_service::TExecPlanFragmentParams,
-) -> bool {
-    matches!(
-        params
-            .fragment
-            .as_ref()
-            .and_then(|fragment| fragment.output_sink.as_ref())
-            .map(|sink| sink.type_),
-        Some(data_sinks::TDataSinkType::RESULT_SINK)
-    )
-}
-
-#[cfg(feature = "compat")]
-fn root_uses_result_buffer(
-    submissions: &[(usize, FragmentSubmission)],
-    root_finst_id: &UniqueId,
-) -> Result<bool, String> {
-    let root = submissions
-        .iter()
-        .map(|(_, submission)| submission.thrift_params())
-        .find(|params| {
-            params
-                .params
-                .as_ref()
-                .map(|exec| {
-                    exec.fragment_instance_id.hi == root_finst_id.hi
-                        && exec.fragment_instance_id.lo == root_finst_id.lo
-                })
-                .unwrap_or(false)
-        })
-        .ok_or_else(|| {
-            format!(
-                "root fragment {}/{} is missing from submissions",
-                root_finst_id.hi, root_finst_id.lo
-            )
-        })?;
-    Ok(uses_result_buffer_sink(root))
-}
-
-#[cfg(feature = "compat")]
-fn root_uses_typed_result_sink(
-    submissions: &[(usize, FragmentSubmission)],
-    root_finst_id: &UniqueId,
-) -> Result<bool, String> {
-    let root = submissions
-        .iter()
-        .map(|(_, submission)| submission.thrift_params())
-        .find(|params| {
-            params
-                .params
-                .as_ref()
-                .map(|exec| {
-                    exec.fragment_instance_id.hi == root_finst_id.hi
-                        && exec.fragment_instance_id.lo == root_finst_id.lo
-                })
-                .unwrap_or(false)
-        })
-        .ok_or_else(|| {
-            format!(
-                "root fragment {}/{} is missing from submissions",
-                root_finst_id.hi, root_finst_id.lo
-            )
-        })?;
-    Ok(root.novarocks_typed_result_sink.unwrap_or(false))
-}
-
 struct RegisteredWriteCoordinator {
     query_id: UniqueId,
 }
@@ -1648,47 +784,10 @@ impl Drop for RegisteredWriteCoordinator {
     }
 }
 
-#[cfg(feature = "compat")]
-fn unique_id_to_thrift(id: UniqueId) -> types::TUniqueId {
-    types::TUniqueId::new(id.hi, id.lo)
-}
-
 fn validate_write_commit_ready(
     write: &Arc<Mutex<WriteCoordinator>>,
 ) -> Result<WriteCommitInput, String> {
     write.lock().expect("write coordinator lock").commit_input()
-}
-
-/// Convert `backends[idx]` into a `TNetworkAddress`.
-#[cfg(feature = "compat")]
-fn backend_to_network_addr(
-    live: &[(usize, SocketAddr)],
-    idx: usize,
-) -> Result<types::TNetworkAddress, String> {
-    let addr = live_backend_addr(live, idx)?;
-    Ok(types::TNetworkAddress::new(
-        addr.ip().to_string(),
-        addr.port() as i32,
-    ))
-}
-
-fn live_backend_addr(
-    live: &[(usize, SocketAddr)],
-    backend_idx: usize,
-) -> Result<SocketAddr, String> {
-    live.iter()
-        .find_map(|(idx, addr)| (*idx == backend_idx).then_some(*addr))
-        .ok_or_else(|| format!("backend index {backend_idx} missing from live snapshot"))
-}
-
-#[cfg(feature = "compat")]
-fn local_coordinator_report_addr() -> Result<types::TNetworkAddress, String> {
-    let cfg = crate::novarocks_config::config()
-        .map_err(|e| format!("cannot read coordinator config: {e}"))?;
-    let host = crate::common::network::advertise_host().unwrap_or_else(|_| cfg.server.host.clone());
-    let port =
-        crate::service::grpc_server::grpc_server_bound_port().unwrap_or(cfg.server.grpc_port);
-    Ok(types::TNetworkAddress::new(host, port as i32))
 }
 
 fn local_coordinator_report_endpoint() -> Result<crate::runtime::endpoint::RuntimeEndpoint, String>
@@ -1720,21 +819,51 @@ fn ensure_native_fragment_sink_supported(
     ))
 }
 
+fn validate_fragment_output_kind(
+    fragment_id: FragmentId,
+    is_root: bool,
+    is_terminal_write: bool,
+    is_producer: bool,
+    output_kind: FragmentOutputKind,
+) -> Result<(), String> {
+    if is_root {
+        return match output_kind {
+            FragmentOutputKind::Result | FragmentOutputKind::TerminalWrite => Ok(()),
+            FragmentOutputKind::NonTerminal => Err(format!(
+                "root fragment {fragment_id} must have Result or TerminalWrite output kind"
+            )),
+        };
+    }
+    if is_terminal_write {
+        return (output_kind == FragmentOutputKind::TerminalWrite)
+            .then_some(())
+            .ok_or_else(|| {
+                format!(
+                    "terminal write fragment {fragment_id} must have TerminalWrite output kind, got {output_kind:?}"
+                )
+            });
+    }
+    if is_producer {
+        return (output_kind == FragmentOutputKind::NonTerminal)
+            .then_some(())
+            .ok_or_else(|| {
+                format!(
+                    "producer fragment {fragment_id} must have NonTerminal output kind, got {output_kind:?}"
+                )
+            });
+    }
+    Ok(())
+}
+
 fn validate_fragment_schedule_payloads(
-    fragment_results: &[crate::sql::codegen::FragmentBuildResult],
     fragment_schedules: &[crate::sql::codegen::FragmentSchedulingMetadata],
     native_fragments: &BTreeMap<FragmentId, crate::proto::plan::PlanFragment>,
     root_fragment_id: FragmentId,
     boundary_schemas: &[crate::sql::codegen::boundary_schema::BoundarySchemaReport],
 ) -> Result<(), String> {
-    let result_ids: BTreeSet<FragmentId> =
-        fragment_results.iter().map(|fr| fr.fragment_id).collect();
     let schedule_ids: BTreeSet<FragmentId> =
         fragment_schedules.iter().map(|fr| fr.fragment_id).collect();
     let native_ids: BTreeSet<FragmentId> = native_fragments.keys().copied().collect();
-    if result_ids.len() != fragment_results.len() {
-        return Err("compat fragment_results contain duplicate fragment ids".to_string());
-    }
     if schedule_ids.len() != fragment_schedules.len() {
         return Err("native fragment_schedules contain duplicate fragment ids".to_string());
     }
@@ -1743,56 +872,16 @@ fn validate_fragment_schedule_payloads(
             "native fragment build is missing root fragment id={root_fragment_id}"
         ));
     }
-    if result_ids != schedule_ids {
-        return Err(format!(
-            "native fragment_schedules ids {:?} do not match compat fragment_results ids {:?}",
-            schedule_ids, result_ids
-        ));
-    }
     if native_ids != schedule_ids {
         return Err(format!(
             "native fragment ids {:?} do not match fragment_schedules ids {:?}",
             native_ids, schedule_ids
         ));
     }
-    for fragment in fragment_results {
-        let schedule = fragment_schedules
-            .iter()
-            .find(|schedule| schedule.fragment_id == fragment.fragment_id)
-            .expect("fragment and schedule ids were validated above");
-        let carrier_schedule = fragment.scheduling_metadata();
-        let scan_ranges_match = carrier_schedule.native_scan_ranges.len()
-            == schedule.native_scan_ranges.len()
-            && carrier_schedule
-                .native_scan_ranges
-                .iter()
-                .all(|(node_id, ranges)| {
-                    schedule
-                        .native_scan_ranges
-                        .get(node_id)
-                        .is_some_and(|scheduled| scheduled.len() == ranges.len())
-                });
-        let output_columns_match = carrier_schedule.output_columns.len()
-            == schedule.output_columns.len()
-            && carrier_schedule
-                .output_columns
-                .iter()
-                .zip(&schedule.output_columns)
-                .all(|(carrier, scheduled)| {
-                    carrier.name == scheduled.name
-                        && carrier.data_type == scheduled.data_type
-                        && carrier.nullable == scheduled.nullable
-                });
-        if carrier_schedule.has_scan_nodes != schedule.has_scan_nodes
-            || carrier_schedule.output_kind != schedule.output_kind
-            || !scan_ranges_match
-            || !output_columns_match
-            || carrier_schedule.boundary_schemas != schedule.boundary_schemas
-            || carrier_schedule.cte_id != schedule.cte_id
-            || carrier_schedule.cte_exchange_nodes != schedule.cte_exchange_nodes
-        {
+    for (&fragment_id, fragment) in native_fragments {
+        if fragment.fragment_id != fragment_id {
             return Err(format!(
-                "compat fragment carrier metadata does not match native schedule for fragment id={}",
+                "native fragment map key {fragment_id} does not match encoded fragment id {}",
                 fragment.fragment_id
             ));
         }
@@ -1812,7 +901,60 @@ fn validate_fragment_schedule_payloads(
     Ok(())
 }
 
+fn validate_native_scheduling_plan(
+    fragment_schedules: &[crate::sql::codegen::FragmentSchedulingMetadata],
+    native_fragments: &BTreeMap<FragmentId, crate::proto::plan::PlanFragment>,
+    plan: &crate::runtime::scheduler::SchedulingPlan,
+) -> Result<(), String> {
+    let schedule_ids: BTreeSet<FragmentId> =
+        fragment_schedules.iter().map(|fr| fr.fragment_id).collect();
+    let native_ids: BTreeSet<FragmentId> = native_fragments.keys().copied().collect();
+    let placement_ids: BTreeSet<FragmentId> = plan.by_fragment.keys().copied().collect();
+    if native_ids != schedule_ids || native_ids != placement_ids {
+        return Err(format!(
+            "native scheduling plan fragment id set mismatch: native={native_ids:?}, \
+             schedules={schedule_ids:?}, placements={placement_ids:?}"
+        ));
+    }
+    for (&fragment_id, placements) in &plan.by_fragment {
+        if placements.is_empty() {
+            return Err(format!(
+                "native scheduling plan fragment {fragment_id} has no placements"
+            ));
+        }
+        for (placement_index, placement) in placements.iter().enumerate() {
+            if placement.fragment_id != fragment_id {
+                return Err(format!(
+                    "native scheduling plan map key {fragment_id} does not match placement \
+                     {placement_index} fragment_id {}",
+                    placement.fragment_id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn patch_native_iceberg_change_stream_router_sink(
+    fragment: &mut crate::proto::plan::PlanFragment,
+    fragment_id: FragmentId,
+    router_group_id: i32,
+    branch_edges: &[&FragmentEdge],
+    placements: &BTreeMap<FragmentId, Vec<FragmentInstancePlacement>>,
+) -> Result<(), String> {
+    let mut patched_fragment = fragment.clone();
+    patch_native_iceberg_change_stream_router_sink_in_place(
+        &mut patched_fragment,
+        fragment_id,
+        router_group_id,
+        branch_edges,
+        placements,
+    )?;
+    *fragment = patched_fragment;
+    Ok(())
+}
+
+fn patch_native_iceberg_change_stream_router_sink_in_place(
     fragment: &mut crate::proto::plan::PlanFragment,
     fragment_id: FragmentId,
     router_group_id: i32,
@@ -1831,6 +973,66 @@ fn patch_native_iceberg_change_stream_router_sink(
             ));
         }
     };
+
+    if router.group_id != router_group_id {
+        return Err(format!(
+            "native Iceberg change-stream router source={fragment_id} expected group={router_group_id} \
+             but encoded group={}",
+            router.group_id
+        ));
+    }
+
+    let mut edge_route_keys = BTreeSet::new();
+    for edge in branch_edges {
+        let FragmentEdgeKind::IcebergChangeStreamRouter {
+            router_group_id: edge_group_id,
+            branch_id,
+            branch_kind,
+        } = &edge.edge_kind
+        else {
+            return Err(format!(
+                "fragment {} edge to fragment {} is not an Iceberg change-stream router edge",
+                edge.source_fragment_id, edge.target_fragment_id
+            ));
+        };
+        if *edge_group_id != router_group_id {
+            return Err(format!(
+                "native Iceberg change-stream router source={} expected group={} but edge uses group={}",
+                fragment_id, router_group_id, edge_group_id
+            ));
+        }
+        if !edge_route_keys.insert((*branch_id, *branch_kind)) {
+            return Err(format!(
+                "native Iceberg change-stream router source={fragment_id} group={router_group_id} \
+                 has duplicate branch edge route key branch_id={branch_id} branch_kind={branch_kind:?}"
+            ));
+        }
+    }
+
+    let mut encoded_route_keys = BTreeSet::new();
+    for route in &router.branches {
+        let branch_kind = native_change_stream_branch_kind(route.branch_kind).map_err(|err| {
+            format!(
+                "native Iceberg change-stream router source={fragment_id} group={router_group_id} \
+                 branch_id={} has invalid encoded branch kind: {err}",
+                route.branch_id
+            )
+        })?;
+        if !encoded_route_keys.insert((route.branch_id, branch_kind)) {
+            return Err(format!(
+                "native Iceberg change-stream router source={fragment_id} group={router_group_id} \
+                 has duplicate encoded route key branch_id={} branch_kind={branch_kind:?}",
+                route.branch_id
+            ));
+        }
+    }
+
+    if encoded_route_keys != edge_route_keys {
+        return Err(format!(
+            "native Iceberg change-stream router source={fragment_id} group={router_group_id} \
+             route key set mismatch: encoded={encoded_route_keys:?}, branch_edges={edge_route_keys:?}"
+        ));
+    }
 
     for edge in branch_edges {
         let FragmentEdgeKind::IcebergChangeStreamRouter {
@@ -1991,18 +1193,6 @@ fn patch_native_cte_multicast_sink(
     Ok(())
 }
 
-#[cfg(feature = "compat")]
-fn exec_destination_from_runtime(
-    src: &crate::runtime::endpoint::FragmentDestination,
-) -> data_sinks::TPlanFragmentDestination {
-    data_sinks::TPlanFragmentDestination::new(
-        types::TUniqueId::new(src.finst_id().hi, src.finst_id().lo),
-        None::<types::TNetworkAddress>,
-        Some(src.endpoint().to_network_address()),
-        None::<i32>,
-    )
-}
-
 fn native_stream_destination(
     src: &crate::runtime::endpoint::FragmentDestination,
 ) -> crate::proto::plan::StreamDestination {
@@ -2144,31 +1334,6 @@ fn native_cte_multicast_contract_slot_map(
     map
 }
 
-/// Assemble the per-instance runtime filter routing params from
-/// scheduler-provided prober params plus the global builder-number map.
-///
-/// `instance_counts` maps fragment id to the number of instances the scheduler
-/// assigned to it. For each build fragment, every filter id it produces must
-/// wait for exactly that many partial filters before the merge node broadcasts.
-/// Hardcoding 1 here would cause the merge to broadcast after the first
-/// partial, silently dropping N-1 partials and producing an incomplete bloom
-/// filter at N > 1 instances (wrong join results).
-fn build_instance_runtime_filter_params(
-    rf_plan: &RuntimeFilterPlanResult,
-    id_to_prober_params: &BTreeMap<
-        i32,
-        Vec<crate::runtime::endpoint::RuntimeFilterProberDestination>,
-    >,
-    instance_counts: &BTreeMap<FragmentId, usize>,
-) -> RuntimeFilterParams {
-    let builder_number = runtime_filter_builder_number_for_instance(Some(rf_plan), instance_counts);
-    RuntimeFilterParams::new(
-        id_to_prober_params.clone(),
-        builder_number,
-        Some(16_i64 * 1024 * 1024),
-    )
-}
-
 fn runtime_filter_builder_number_for_instance(
     rf_plan: Option<&RuntimeFilterPlanResult>,
     instance_counts: &BTreeMap<FragmentId, usize>,
@@ -2186,33 +1351,6 @@ fn runtime_filter_builder_number_for_instance(
         }
     }
     builder_number
-}
-
-/// Inject the designated runtime-filter merge node into every descriptor that
-/// has remote targets.
-///
-/// This mutates the per-fragment `hash_join_node.build_runtime_filters`
-/// descriptors in place (these are what actually ship to the BE). The merge
-/// node is the backend hosting the root instance; at one backend it equals the
-/// local exchange address (prior behavior).
-#[cfg(feature = "compat")]
-fn inject_runtime_filter_merge_nodes(
-    fragment_results: &mut [crate::sql::codegen::FragmentBuildResult],
-    merge_addr: &types::TNetworkAddress,
-) {
-    for fr in fragment_results.iter_mut() {
-        for node in fr.plan.nodes.iter_mut() {
-            if let Some(ref mut hj) = node.hash_join_node
-                && let Some(ref mut rf_descs) = hj.build_runtime_filters
-            {
-                for desc in rf_descs.iter_mut() {
-                    if desc.has_remote_targets == Some(true) {
-                        desc.runtime_filter_merge_nodes = Some(vec![merge_addr.clone()]);
-                    }
-                }
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2339,44 +1477,6 @@ fn standalone_query_profiles() -> &'static Mutex<StandaloneQueryProfileRegistry>
     REGISTRY.get_or_init(|| Mutex::new(StandaloneQueryProfileRegistry::default()))
 }
 
-#[cfg(feature = "compat")]
-pub(crate) fn record_standalone_query_profile_report(
-    params: &crate::thrift::frontend_service::TReportExecStatusParams,
-) -> Result<bool, String> {
-    let Some(query_id) = params.query_id.as_ref() else {
-        return Ok(false);
-    };
-    let key = (query_id.hi, query_id.lo);
-    let mut guard = standalone_query_profiles()
-        .lock()
-        .expect("standalone query profile registry lock");
-    if !guard.active.contains(&key) {
-        return Ok(false);
-    }
-
-    let done = params.done.unwrap_or(false);
-    let status = params
-        .status
-        .as_ref()
-        .ok_or_else(|| "TReportExecStatusParams missing status".to_string())?;
-    if done
-        && status.status_code == crate::thrift::status_code::TStatusCode::OK
-        && let Some(profile) = params.profile.as_ref()
-    {
-        let finst_id = params
-            .fragment_instance_id
-            .as_ref()
-            .ok_or_else(|| "TReportExecStatusParams missing fragment_instance_id".to_string())?;
-        let native = crate::service::fe_report::runtime_profile_tree_from_thrift_for_fe(profile)?;
-        guard
-            .profiles
-            .entry(key)
-            .or_default()
-            .insert((finst_id.hi, finst_id.lo), native);
-    }
-    Ok(true)
-}
-
 pub(crate) fn record_native_standalone_query_profile_report(
     report: &crate::proto::novarocks::ExecStatusReport,
 ) -> Result<bool, String> {
@@ -2479,6 +1579,76 @@ impl Drop for QueryStateRegistrationGuard {
 // Submit-and-fetch orchestration (testable helper)
 // ---------------------------------------------------------------------------
 
+fn prevalidate_fragment_submissions(
+    submissions: &[(usize, FragmentSubmission)],
+    expected_query_id: UniqueId,
+    expected_root_fragment_id: FragmentId,
+    root_backend_idx: usize,
+    root_finst_id: UniqueId,
+) -> Result<Vec<UniqueId>, String> {
+    let mut ids = Vec::with_capacity(submissions.len());
+    let mut seen = BTreeSet::new();
+    let mut root_matches = 0_usize;
+    for (index, (backend_idx, submission)) in submissions.iter().enumerate() {
+        let finst_id = submission
+            .fragment_instance_id()
+            .map_err(|e| format!("fragment submission {index}: {e}"))?;
+        let context = format!(
+            "fragment submission {index} (fragment_id={}, fragment_instance_id={}/{})",
+            submission.fragment_id(),
+            finst_id.hi,
+            finst_id.lo
+        );
+        if finst_id.hi == 0 && finst_id.lo == 0 {
+            return Err(format!("{context} has zero fragment_instance_id"));
+        }
+        let submission_query_id = submission
+            .query_id()
+            .map_err(|e| format!("{context}: {e}"))?;
+        if submission_query_id.hi == 0 && submission_query_id.lo == 0 {
+            return Err(format!("{context} has zero query_id"));
+        }
+        if submission_query_id != expected_query_id {
+            return Err(format!(
+                "{context} query_id mismatch: expected {}/{}, got {}/{}",
+                expected_query_id.hi,
+                expected_query_id.lo,
+                submission_query_id.hi,
+                submission_query_id.lo
+            ));
+        }
+        if !seen.insert(finst_id) {
+            return Err(format!(
+                "duplicate fragment_instance_id {finst_id} at {context}"
+            ));
+        }
+        if finst_id == root_finst_id {
+            root_matches += 1;
+            if submission.fragment_id() != expected_root_fragment_id
+                || *backend_idx != root_backend_idx
+            {
+                return Err(format!(
+                    "root submission identity mismatch for fragment_instance_id={}/{}: expected fragment_id={} backend={}, got fragment_id={} backend={}",
+                    root_finst_id.hi,
+                    root_finst_id.lo,
+                    expected_root_fragment_id,
+                    root_backend_idx,
+                    submission.fragment_id(),
+                    backend_idx
+                ));
+            }
+        }
+        ids.push(finst_id);
+    }
+    if root_matches != 1 {
+        return Err(format!(
+            "root submission missing or duplicated: expected fragment_id={expected_root_fragment_id} backend={root_backend_idx} fragment_instance_id={}/{}, found {root_matches} matching fragment_instance_id values",
+            root_finst_id.hi, root_finst_id.lo
+        ));
+    }
+    Ok(ids)
+}
+
 /// Submit each `(backend_idx, params)` through the dispatcher in order, tracking
 /// accepted instances per backend, then poll the root fragment until EOF.
 ///
@@ -2488,6 +1658,7 @@ pub(crate) fn submit_and_fetch_loop(
     dispatcher: &Arc<dyn FragmentDispatcher>,
     tracker: &mut InFlightTracker,
     submissions: Vec<(usize, FragmentSubmission)>,
+    execution_root_fragment_id: FragmentId,
     root_backend_idx: usize,
     root_finst_id: UniqueId,
     query_id: &UniqueId,
@@ -2507,10 +1678,16 @@ pub(crate) fn submit_and_fetch_loop(
     };
     let _failure_guard = StandaloneQueryFailureGuard::register(query_id);
     let _profile_guard = collect_profiles.then(|| StandaloneQueryProfileGuard::register(query_id));
+    let validated_finst_ids = prevalidate_fragment_submissions(
+        &submissions,
+        *query_id,
+        execution_root_fragment_id,
+        root_backend_idx,
+        root_finst_id,
+    )?;
 
-    for (backend_idx, submission) in submissions {
-        let finst_id = submission.fragment_instance_id()?;
-        if let Err(e) = dispatcher.submit_fragment_submission(backend_idx, submission) {
+    for ((backend_idx, submission), finst_id) in submissions.into_iter().zip(validated_finst_ids) {
+        if let Err(e) = dispatcher.submit_fragment(backend_idx, submission) {
             tracker.cancel_all(dispatcher.as_ref());
             return Err(e);
         }
@@ -2812,6 +1989,351 @@ fn notify_write_commit_wait_observer(commit_error: &str) {
 #[cfg(test)]
 mod native_contract_tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use arrow::array::{Array, Decimal128Array, Int32Array};
+
+    use crate::proto::plan as native_plan;
+    use crate::runtime::write_coordinator::FragmentExecStatusReport;
+
+    fn schedule(fragment_id: FragmentId) -> crate::sql::codegen::FragmentSchedulingMetadata {
+        crate::sql::codegen::FragmentSchedulingMetadata {
+            fragment_id,
+            has_scan_nodes: false,
+            output_kind: crate::sql::codegen::FragmentOutputKind::Result,
+            native_scan_ranges: BTreeMap::new(),
+            output_columns: Vec::new(),
+            boundary_schemas: Vec::new(),
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        }
+    }
+
+    fn placement(fragment_id: FragmentId, instance_lo: i64) -> FragmentInstancePlacement {
+        FragmentInstancePlacement {
+            fragment_id,
+            instance_index: 0,
+            finst_id: UniqueId {
+                hi: 92_000,
+                lo: instance_lo,
+            },
+            backend_idx: 0,
+            endpoint: crate::runtime::endpoint::RuntimeEndpoint::new("10.0.0.2", 9030).unwrap(),
+            scan_ranges: BTreeMap::new(),
+            destinations: Vec::new(),
+            runtime_filter_prober_params: BTreeMap::new(),
+            per_exch_num_senders: BTreeMap::new(),
+        }
+    }
+
+    fn router_edge(
+        group_id: i32,
+        branch_id: i32,
+        branch_kind: crate::sql::common::ChangeStreamBranchKind,
+        target_fragment_id: FragmentId,
+    ) -> FragmentEdge {
+        FragmentEdge {
+            source_fragment_id: 1,
+            target_fragment_id,
+            target_exchange_node_id: 70 + target_fragment_id as i32,
+            output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+            stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
+            edge_kind: FragmentEdgeKind::IcebergChangeStreamRouter {
+                router_group_id: group_id,
+                branch_id,
+                branch_kind,
+            },
+            output_slot_ids: vec![10],
+        }
+    }
+
+    fn router_route(
+        branch_id: i32,
+        branch_kind: native_plan::ChangeStreamBranchKind,
+    ) -> native_plan::IcebergChangeStreamBranchRoute {
+        native_plan::IcebergChangeStreamBranchRoute {
+            branch_id,
+            branch_kind: branch_kind as i32,
+            target_fragment_id: 0,
+            target_exchange_node_id: -1,
+            output_ordinals: vec![0],
+            output_partition_ordinals: Vec::new(),
+            output_partition: Some(native_plan::DataPartition {
+                kind: native_plan::PartitionKind::Unpartitioned as i32,
+                exprs: Vec::new(),
+            }),
+            destinations: None,
+        }
+    }
+
+    fn router_fragment(
+        group_id: i32,
+        branches: Vec<native_plan::IcebergChangeStreamBranchRoute>,
+    ) -> native_plan::PlanFragment {
+        native_plan::PlanFragment {
+            fragment_id: 1,
+            sink: Some(native_plan::DataSink {
+                kind: Some(native_plan::data_sink::Kind::IcebergChangeStreamRouter(
+                    native_plan::IcebergChangeStreamRouterSink {
+                        group_id,
+                        change_op_output_ordinal: 0,
+                        data_route_output_ordinal: None,
+                        branches,
+                    },
+                )),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn router_branches_mut(
+        fragment: &mut native_plan::PlanFragment,
+    ) -> &mut Vec<native_plan::IcebergChangeStreamBranchRoute> {
+        let Some(native_plan::data_sink::Kind::IcebergChangeStreamRouter(router)) =
+            fragment.sink.as_mut().and_then(|sink| sink.kind.as_mut())
+        else {
+            panic!("router sink");
+        };
+        &mut router.branches
+    }
+
+    fn assert_router_rejected_without_mutation(
+        mut fragment: native_plan::PlanFragment,
+        edges: Vec<FragmentEdge>,
+        expected_error: &str,
+    ) {
+        let before = fragment.clone();
+        let edge_refs: Vec<&FragmentEdge> = edges.iter().collect();
+        let placements = BTreeMap::from([(2, vec![placement(2, 2)]), (3, vec![placement(3, 3)])]);
+
+        let err = patch_native_iceberg_change_stream_router_sink(
+            &mut fragment,
+            1,
+            7,
+            &edge_refs,
+            &placements,
+        )
+        .expect_err("router contract drift must fail");
+
+        assert!(err.contains(expected_error), "{err}");
+        assert_eq!(fragment, before, "router validation must precede patching");
+    }
+
+    fn submission(
+        fragment_id: FragmentId,
+        query_id: UniqueId,
+        fragment_instance_id: UniqueId,
+    ) -> FragmentSubmission {
+        FragmentSubmission::new(
+            native_plan::PlanFragment {
+                fragment_id,
+                ..Default::default()
+            },
+            crate::proto::novarocks::InstanceParams {
+                query_id: Some(crate::proto::common::UniqueId {
+                    hi: query_id.hi,
+                    lo: query_id.lo,
+                }),
+                fragment_instance_id: Some(crate::proto::common::UniqueId {
+                    hi: fragment_instance_id.hi,
+                    lo: fragment_instance_id.lo,
+                }),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn submission_with_optional_query_id(
+        fragment_id: FragmentId,
+        query_id: Option<UniqueId>,
+        fragment_instance_id: UniqueId,
+    ) -> FragmentSubmission {
+        FragmentSubmission::new(
+            native_plan::PlanFragment {
+                fragment_id,
+                ..Default::default()
+            },
+            crate::proto::novarocks::InstanceParams {
+                query_id: query_id.map(|id| crate::proto::common::UniqueId {
+                    hi: id.hi,
+                    lo: id.lo,
+                }),
+                fragment_instance_id: Some(crate::proto::common::UniqueId {
+                    hi: fragment_instance_id.hi,
+                    lo: fragment_instance_id.lo,
+                }),
+                ..Default::default()
+            },
+        )
+    }
+
+    struct CapturingDispatcher {
+        submissions: Mutex<Vec<(usize, FragmentId, UniqueId)>>,
+        submit_count: AtomicUsize,
+        fail_on_submit: Option<usize>,
+        cancellations: Mutex<Vec<UniqueId>>,
+        fetch_behavior: TestFetchBehavior,
+        fetch_count: AtomicUsize,
+        first_fetch: std::sync::atomic::AtomicBool,
+    }
+
+    enum TestFetchBehavior {
+        Eof,
+        Error(String),
+        NotReady,
+        QueryStateFailure(String),
+        EofWithProfiles(Vec<crate::proto::novarocks::ExecStatusReport>),
+    }
+
+    impl CapturingDispatcher {
+        fn new(fail_on_submit: Option<usize>) -> Arc<Self> {
+            Self::with_fetch(fail_on_submit, TestFetchBehavior::Eof)
+        }
+
+        fn with_fetch(
+            fail_on_submit: Option<usize>,
+            fetch_behavior: TestFetchBehavior,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                submissions: Mutex::new(Vec::new()),
+                submit_count: AtomicUsize::new(0),
+                fail_on_submit,
+                cancellations: Mutex::new(Vec::new()),
+                fetch_behavior,
+                fetch_count: AtomicUsize::new(0),
+                first_fetch: std::sync::atomic::AtomicBool::new(true),
+            })
+        }
+    }
+
+    impl FragmentDispatcher for CapturingDispatcher {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn submit_fragment(
+            &self,
+            backend_idx: usize,
+            submission: FragmentSubmission,
+        ) -> Result<(), String> {
+            let call = self.submit_count.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.fail_on_submit == Some(call) {
+                return Err(format!("native submit failed on call {call}"));
+            }
+            let finst_id = submission.fragment_instance_id()?;
+            self.submissions.lock().unwrap().push((
+                backend_idx,
+                submission.plan_for_test().fragment_id,
+                finst_id,
+            ));
+            Ok(())
+        }
+
+        fn fetch_result(
+            &self,
+            _backend_idx: usize,
+            finst_id: UniqueId,
+            _max_wait_ms: i64,
+            _expected_chunk_schema: Option<&ChunkSchemaRef>,
+        ) -> Result<FetchOutcome, String> {
+            self.fetch_count.fetch_add(1, Ordering::SeqCst);
+            match &self.fetch_behavior {
+                TestFetchBehavior::Eof => Ok(FetchOutcome::Eof),
+                TestFetchBehavior::Error(message) => Ok(FetchOutcome::Err(message.clone())),
+                TestFetchBehavior::NotReady => Ok(FetchOutcome::NotReady),
+                TestFetchBehavior::QueryStateFailure(message) => {
+                    if self.first_fetch.swap(false, Ordering::SeqCst) {
+                        crate::runtime::query_state::in_flight_table()
+                            .on_fragment_done(finst_id, Err(message.clone()));
+                        Ok(FetchOutcome::NotReady)
+                    } else {
+                        panic!("query-state failure must be observed before another fetch")
+                    }
+                }
+                TestFetchBehavior::EofWithProfiles(reports) => {
+                    if self.first_fetch.swap(false, Ordering::SeqCst) {
+                        for report in reports {
+                            assert!(
+                                record_native_standalone_query_profile_report(report)
+                                    .expect("record native profile report")
+                            );
+                        }
+                    }
+                    Ok(FetchOutcome::Eof)
+                }
+            }
+        }
+
+        fn cancel_fragments(&self, _backend_idx: usize, finst_ids: &[UniqueId]) {
+            self.cancellations
+                .lock()
+                .unwrap()
+                .extend_from_slice(finst_ids);
+        }
+
+        fn backend_count(&self) -> usize {
+            2
+        }
+    }
+
+    fn writer_key(
+        query_id: UniqueId,
+        fragment_instance_id: UniqueId,
+        backend_num: i32,
+    ) -> WriterKey {
+        WriterKey {
+            query_id,
+            fragment_instance_id,
+            backend_num,
+        }
+    }
+
+    fn write_report(
+        writer: &WriterKey,
+        status: crate::proto::common::Status,
+        path: Option<&str>,
+    ) -> FragmentExecStatusReport {
+        let iceberg_commits = path
+            .map(|path| {
+                vec![crate::proto::novarocks::IcebergCommitInfo {
+                    iceberg_data_file: Some(crate::proto::novarocks::IcebergDataFile {
+                        path: Some(path.to_string()),
+                        record_count: Some(7),
+                        file_size_in_bytes: Some(70),
+                        file_content: crate::proto::novarocks::IcebergFileContent::Data as i32,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]
+            })
+            .unwrap_or_default();
+        FragmentExecStatusReport {
+            query_id: writer.query_id,
+            fragment_instance_id: writer.fragment_instance_id,
+            backend_num: writer.backend_num,
+            done: true,
+            status,
+            iceberg_commits,
+            load_counters: BTreeMap::new(),
+            loaded_rows: 7,
+            loaded_bytes: 70,
+            filtered_rows: 0,
+        }
+    }
+
+    fn ok_status() -> crate::proto::common::Status {
+        crate::proto::common::Status {
+            code: 0,
+            message: String::new(),
+        }
+    }
+
+    fn err_status(message: &str) -> crate::proto::common::Status {
+        crate::proto::common::Status {
+            code: 1,
+            message: message.to_string(),
+        }
+    }
 
     #[test]
     fn native_fragment_sink_support_allows_dynamic_stream_sink() {
@@ -2827,68 +2349,794 @@ mod native_contract_tests {
         ensure_native_fragment_sink_supported(9, false, false, false, false, true)
             .expect("native execution patches MULTI_CAST_DATA_STREAM_SINK fragments");
     }
-}
-
-#[cfg(all(test, feature = "compat"))]
-mod tests {
-    use std::collections::BTreeMap;
-    use std::sync::Arc;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-    use super::*;
-    use crate::common::ids::SlotId;
-    use crate::exec::chunk::{Chunk, ChunkSchema};
-    use crate::proto::{common, novarocks};
-    use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher};
-    use crate::runtime::profile::ProfileUnit;
-    use crate::runtime::write_coordinator::{
-        FragmentExecStatusReport, WriteCoordinator, WriterKey, write_registry_test_guard,
-    };
-    use crate::thrift::{status, status_code};
-    use arrow::array::{
-        Array, ArrayRef, BinaryArray, Decimal128Array, FixedSizeBinaryArray, Int32Array,
-        TimestampMicrosecondArray,
-    };
-    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-    use arrow::record_batch::RecordBatch;
 
     #[test]
-    fn fragment_schedule_payload_validation_rejects_id_mismatch() {
-        let fragment_results = vec![fragment_for_scan_range_merge_test(BTreeMap::new())];
-        let fragment_schedules = vec![crate::sql::codegen::FragmentSchedulingMetadata {
-            fragment_id: 7,
-            has_scan_nodes: false,
-            output_kind: crate::sql::codegen::FragmentOutputKind::Result,
-            native_scan_ranges: BTreeMap::new(),
-            output_columns: Vec::new(),
-            boundary_schemas: Vec::new(),
-            cte_id: None,
-            cte_exchange_nodes: Vec::new(),
-        }];
+    fn native_output_kind_validation_is_exhaustive() {
+        use crate::sql::codegen::FragmentOutputKind;
 
-        let native_fragments = BTreeMap::from([(
+        validate_fragment_output_kind(1, true, false, false, FragmentOutputKind::Result)
+            .expect("result root");
+        validate_fragment_output_kind(1, true, true, false, FragmentOutputKind::TerminalWrite)
+            .expect("write-only root");
+        let err =
+            validate_fragment_output_kind(1, true, false, false, FragmentOutputKind::NonTerminal)
+                .expect_err("root cannot be nonterminal");
+        assert!(err.contains("root fragment 1"), "{err}");
+
+        validate_fragment_output_kind(2, false, false, true, FragmentOutputKind::NonTerminal)
+            .expect("non-root producer");
+        for output_kind in [
+            FragmentOutputKind::Result,
+            FragmentOutputKind::TerminalWrite,
+        ] {
+            let err = validate_fragment_output_kind(2, false, false, true, output_kind)
+                .expect_err("producer must be nonterminal");
+            assert!(err.contains("producer fragment 2"), "{err}");
+        }
+
+        validate_fragment_output_kind(3, false, true, false, FragmentOutputKind::TerminalWrite)
+            .expect("non-root terminal writer");
+        for output_kind in [FragmentOutputKind::Result, FragmentOutputKind::NonTerminal] {
+            let err = validate_fragment_output_kind(3, false, true, false, output_kind)
+                .expect_err("terminal writer must use terminal output kind");
+            assert!(err.contains("terminal write fragment 3"), "{err}");
+        }
+    }
+
+    #[test]
+    fn native_payload_validation_rejects_schedule_and_encoded_id_drift() {
+        let schedules = vec![schedule(7)];
+        let err = validate_fragment_schedule_payloads(
+            &schedules,
+            &BTreeMap::from([(
+                8,
+                native_plan::PlanFragment {
+                    fragment_id: 8,
+                    ..Default::default()
+                },
+            )]),
+            8,
+            &[],
+        )
+        .expect_err("schedule/native id drift must fail");
+        assert!(err.contains("do not match"), "{err}");
+
+        let err = validate_fragment_schedule_payloads(
+            &schedules,
+            &BTreeMap::from([(
+                7,
+                native_plan::PlanFragment {
+                    fragment_id: 9,
+                    ..Default::default()
+                },
+            )]),
             7,
-            crate::proto::plan::PlanFragment {
+            &[],
+        )
+        .expect_err("map/encoded fragment id drift must fail");
+        assert!(err.contains("map key 7"), "{err}");
+    }
+
+    #[test]
+    fn native_scheduling_plan_validation_rejects_fragment_set_drift_before_side_effects() {
+        let schedules = vec![schedule(3), schedule(7)];
+        let fragments = BTreeMap::from([
+            (
+                3,
+                native_plan::PlanFragment {
+                    fragment_id: 3,
+                    ..Default::default()
+                },
+            ),
+            (
+                7,
+                native_plan::PlanFragment {
+                    fragment_id: 7,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let plan = crate::runtime::scheduler::SchedulingPlan {
+            root_fragment_id: 7,
+            by_fragment: BTreeMap::from([(7, vec![placement(7, 7)])]),
+            root_finst_id: UniqueId { hi: 92_000, lo: 7 },
+            root_backend_idx: 0,
+        };
+        let mut side_effects = 0;
+
+        let err = validate_native_scheduling_plan(&schedules, &fragments, &plan)
+            .map(|()| side_effects += 1)
+            .expect_err("scheduling-plan fragment set drift must fail");
+
+        assert!(err.contains("fragment id set"), "{err}");
+        assert_eq!(side_effects, 0);
+    }
+
+    #[test]
+    fn native_scheduling_plan_validation_rejects_empty_non_root_placements() {
+        let schedules = vec![schedule(3), schedule(7)];
+        let fragments = BTreeMap::from([
+            (
+                3,
+                native_plan::PlanFragment {
+                    fragment_id: 3,
+                    ..Default::default()
+                },
+            ),
+            (
+                7,
+                native_plan::PlanFragment {
+                    fragment_id: 7,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let plan = crate::runtime::scheduler::SchedulingPlan {
+            root_fragment_id: 7,
+            by_fragment: BTreeMap::from([(3, Vec::new()), (7, vec![placement(7, 7)])]),
+            root_finst_id: UniqueId { hi: 92_000, lo: 7 },
+            root_backend_idx: 0,
+        };
+        let mut side_effects = 0;
+
+        let err = validate_native_scheduling_plan(&schedules, &fragments, &plan)
+            .map(|()| side_effects += 1)
+            .expect_err("empty non-root placements must fail");
+
+        assert!(err.contains("fragment 3 has no placements"), "{err}");
+        assert_eq!(side_effects, 0);
+    }
+
+    #[test]
+    fn native_scheduling_plan_validation_rejects_placement_fragment_id_drift() {
+        let schedules = vec![schedule(7)];
+        let fragments = BTreeMap::from([(
+            7,
+            native_plan::PlanFragment {
                 fragment_id: 7,
                 ..Default::default()
             },
         )]);
-        let err = validate_fragment_schedule_payloads(
-            &fragment_results,
-            &fragment_schedules,
-            &native_fragments,
-            7,
-            &[],
-        )
-        .expect_err("mismatched native schedules must be rejected");
+        let plan = crate::runtime::scheduler::SchedulingPlan {
+            root_fragment_id: 7,
+            by_fragment: BTreeMap::from([(7, vec![placement(8, 7)])]),
+            root_finst_id: UniqueId { hi: 92_000, lo: 7 },
+            root_backend_idx: 0,
+        };
+        let mut side_effects = 0;
 
-        assert!(err.contains("native fragment_schedules ids {7}"), "{err}");
-        assert!(err.contains("compat fragment_results ids {0}"), "{err}");
+        let err = validate_native_scheduling_plan(&schedules, &fragments, &plan)
+            .map(|()| side_effects += 1)
+            .expect_err("placement fragment id drift must fail");
+
+        assert!(err.contains("map key 7"), "{err}");
+        assert!(err.contains("fragment_id 8"), "{err}");
+        assert_eq!(side_effects, 0);
     }
 
     #[test]
-    fn typed_root_alignment_renames_fields_and_widens_runtime_nullability() {
+    fn submit_loop_uses_native_submission_in_default_and_compat() {
+        let inner = CapturingDispatcher::new(None);
+        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+        let query_id = UniqueId {
+            hi: 91_000,
+            lo: 91_001,
+        };
+        let root_finst_id = UniqueId { hi: 91_000, lo: 2 };
+        let mut tracker = InFlightTracker::default();
+
+        let result = submit_and_fetch_loop(
+            &dispatcher,
+            &mut tracker,
+            vec![
+                (1, submission(3, query_id, UniqueId { hi: 91_000, lo: 1 })),
+                (0, submission(7, query_id, UniqueId { hi: 91_000, lo: 2 })),
+            ],
+            7,
+            0,
+            root_finst_id,
+            &query_id,
+            true,
+            1_000,
+            None,
+            None,
+            false,
+        )
+        .expect("native submissions execute");
+
+        assert!(result.chunks.is_empty());
+        assert_eq!(
+            *inner.submissions.lock().unwrap(),
+            vec![
+                (1, 3, UniqueId { hi: 91_000, lo: 1 }),
+                (0, 7, UniqueId { hi: 91_000, lo: 2 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn submit_failure_cancels_only_native_instances_already_accepted() {
+        let inner = CapturingDispatcher::new(Some(2));
+        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+        let query_id = UniqueId {
+            hi: 92_000,
+            lo: 92_001,
+        };
+        let mut tracker = InFlightTracker::default();
+
+        let err = submit_and_fetch_loop(
+            &dispatcher,
+            &mut tracker,
+            vec![
+                (1, submission(3, query_id, UniqueId { hi: 92_000, lo: 1 })),
+                (0, submission(7, query_id, UniqueId { hi: 92_000, lo: 2 })),
+            ],
+            7,
+            0,
+            UniqueId { hi: 92_000, lo: 2 },
+            &query_id,
+            true,
+            1_000,
+            None,
+            None,
+            false,
+        )
+        .expect_err("second native submit must fail");
+
+        assert!(err.contains("native submit failed on call 2"), "{err}");
+        assert_eq!(
+            *inner.cancellations.lock().unwrap(),
+            vec![UniqueId { hi: 92_000, lo: 1 }]
+        );
+    }
+
+    #[test]
+    fn submission_ids_are_prevalidated_before_any_dispatch() {
+        let inner = CapturingDispatcher::new(None);
+        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+        let query_id = UniqueId {
+            hi: 94_000,
+            lo: 94_001,
+        };
+        let malformed = FragmentSubmission::new(
+            native_plan::PlanFragment {
+                fragment_id: 7,
+                ..Default::default()
+            },
+            crate::proto::novarocks::InstanceParams {
+                query_id: Some(crate::proto::common::UniqueId {
+                    hi: query_id.hi,
+                    lo: query_id.lo,
+                }),
+                ..Default::default()
+            },
+        );
+        let mut tracker = InFlightTracker::default();
+
+        let err = submit_and_fetch_loop(
+            &dispatcher,
+            &mut tracker,
+            vec![
+                (1, submission(3, query_id, UniqueId { hi: 94_000, lo: 1 })),
+                (0, malformed),
+            ],
+            7,
+            0,
+            UniqueId { hi: 94_000, lo: 2 },
+            &query_id,
+            true,
+            1_000,
+            None,
+            None,
+            false,
+        )
+        .expect_err("malformed later submission must fail before dispatch");
+
+        assert!(err.contains("missing fragment_instance_id"), "{err}");
+        assert!(inner.submissions.lock().unwrap().is_empty());
+        assert!(inner.cancellations.lock().unwrap().is_empty());
+        assert!(tracker.by_backend.is_empty());
+    }
+
+    #[test]
+    fn duplicate_and_zero_submission_ids_fail_before_dispatch() {
+        for (submissions, expected) in [
+            (
+                vec![
+                    (
+                        1,
+                        submission(
+                            3,
+                            UniqueId {
+                                hi: 95_000,
+                                lo: 95_001,
+                            },
+                            UniqueId { hi: 95_000, lo: 1 },
+                        ),
+                    ),
+                    (
+                        0,
+                        submission(
+                            7,
+                            UniqueId {
+                                hi: 95_000,
+                                lo: 95_001,
+                            },
+                            UniqueId { hi: 95_000, lo: 1 },
+                        ),
+                    ),
+                ],
+                "duplicate fragment_instance_id",
+            ),
+            (
+                vec![(
+                    0,
+                    submission(
+                        7,
+                        UniqueId {
+                            hi: 95_000,
+                            lo: 95_001,
+                        },
+                        UniqueId { hi: 0, lo: 0 },
+                    ),
+                )],
+                "zero fragment_instance_id",
+            ),
+        ] {
+            let inner = CapturingDispatcher::new(None);
+            let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+            let query_id = UniqueId {
+                hi: 95_000,
+                lo: 95_001,
+            };
+            let mut tracker = InFlightTracker::default();
+            let err = submit_and_fetch_loop(
+                &dispatcher,
+                &mut tracker,
+                submissions,
+                7,
+                0,
+                UniqueId { hi: 95_000, lo: 99 },
+                &query_id,
+                true,
+                1_000,
+                None,
+                None,
+                false,
+            )
+            .expect_err("invalid submission ids must fail");
+            assert!(err.contains(expected), "{err}");
+            assert!(inner.submissions.lock().unwrap().is_empty());
+            assert!(tracker.by_backend.is_empty());
+        }
+    }
+
+    #[test]
+    fn submission_query_ids_are_prevalidated_before_any_dispatch() {
+        let expected_query_id = UniqueId {
+            hi: 95_500,
+            lo: 95_501,
+        };
+        let invalid_query_ids = [
+            (None, "missing query_id"),
+            (Some(UniqueId { hi: 0, lo: 0 }), "zero query_id"),
+            (
+                Some(UniqueId {
+                    hi: 95_500,
+                    lo: 95_599,
+                }),
+                "query_id mismatch",
+            ),
+        ];
+
+        for (invalid_query_id, expected_error) in invalid_query_ids {
+            for prepend_valid_submission in [false, true] {
+                let invalid_finst_id = UniqueId { hi: 95_500, lo: 2 };
+                let invalid =
+                    submission_with_optional_query_id(7, invalid_query_id, invalid_finst_id);
+                let mut submissions = Vec::new();
+                if prepend_valid_submission {
+                    submissions.push((
+                        1,
+                        submission(3, expected_query_id, UniqueId { hi: 95_500, lo: 1 }),
+                    ));
+                }
+                submissions.push((0, invalid));
+
+                let inner = CapturingDispatcher::new(None);
+                let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+                let mut tracker = InFlightTracker::default();
+                let err = submit_and_fetch_loop(
+                    &dispatcher,
+                    &mut tracker,
+                    submissions,
+                    7,
+                    0,
+                    invalid_finst_id,
+                    &expected_query_id,
+                    true,
+                    1_000,
+                    None,
+                    None,
+                    false,
+                )
+                .expect_err("invalid submission query id must fail before dispatch");
+
+                assert!(err.contains(expected_error), "{err}");
+                let expected_index = usize::from(prepend_valid_submission);
+                assert!(
+                    err.contains(&format!("fragment submission {expected_index}")),
+                    "{err}"
+                );
+                assert!(err.contains("fragment_id=7"), "{err}");
+                assert!(err.contains("fragment_instance_id=95500/2"), "{err}");
+                assert!(inner.submissions.lock().unwrap().is_empty());
+                assert!(inner.cancellations.lock().unwrap().is_empty());
+                assert!(tracker.by_backend.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn root_submission_fragment_and_backend_are_prevalidated_before_dispatch() {
+        let query_id = UniqueId {
+            hi: 95_600,
+            lo: 95_601,
+        };
+        let root_finst_id = UniqueId { hi: 95_600, lo: 2 };
+        let cases = [
+            (
+                vec![
+                    (0, submission(7, query_id, UniqueId { hi: 95_600, lo: 1 })),
+                    (0, submission(3, query_id, root_finst_id)),
+                ],
+                "got fragment_id=3 backend=0",
+            ),
+            (
+                vec![
+                    (1, submission(3, query_id, UniqueId { hi: 95_600, lo: 1 })),
+                    (1, submission(7, query_id, root_finst_id)),
+                ],
+                "got fragment_id=7 backend=1",
+            ),
+        ];
+
+        for (submissions, got_context) in cases {
+            let inner = CapturingDispatcher::new(None);
+            let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+            let mut tracker = InFlightTracker::default();
+            let err = submit_and_fetch_loop(
+                &dispatcher,
+                &mut tracker,
+                submissions,
+                7,
+                0,
+                root_finst_id,
+                &query_id,
+                true,
+                1_000,
+                None,
+                None,
+                false,
+            )
+            .expect_err("root submission identity drift must fail before dispatch");
+
+            assert!(err.contains("expected fragment_id=7 backend=0"), "{err}");
+            assert!(err.contains(got_context), "{err}");
+            assert!(err.contains("fragment_instance_id=95600/2"), "{err}");
+            assert!(inner.submissions.lock().unwrap().is_empty());
+            assert!(inner.cancellations.lock().unwrap().is_empty());
+            assert!(tracker.by_backend.is_empty());
+        }
+    }
+
+    #[test]
+    fn fetch_error_timeout_query_failure_and_disconnect_cancel_all_native_submissions() {
+        let cases = [
+            (
+                TestFetchBehavior::Error("native fetch failed".to_string()),
+                1_000,
+                "native fetch failed",
+            ),
+            (TestFetchBehavior::NotReady, 0, "query timed out"),
+            (
+                TestFetchBehavior::QueryStateFailure("remote fragment failed".to_string()),
+                1_000,
+                "remote fragment failed",
+            ),
+        ];
+        for (index, (behavior, timeout_ms, expected)) in cases.into_iter().enumerate() {
+            let hi = 96_000 + index as i64;
+            let inner = CapturingDispatcher::with_fetch(None, behavior);
+            let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+            let mut tracker = InFlightTracker::default();
+            let err = submit_and_fetch_loop(
+                &dispatcher,
+                &mut tracker,
+                vec![
+                    (
+                        1,
+                        submission(3, UniqueId { hi, lo: 99 }, UniqueId { hi, lo: 1 }),
+                    ),
+                    (
+                        0,
+                        submission(7, UniqueId { hi, lo: 99 }, UniqueId { hi, lo: 2 }),
+                    ),
+                ],
+                7,
+                0,
+                UniqueId { hi, lo: 2 },
+                &UniqueId { hi, lo: 99 },
+                true,
+                timeout_ms,
+                None,
+                None,
+                false,
+            )
+            .expect_err("native lifecycle failure must surface");
+            assert!(err.contains(expected), "{err}");
+            let mut canceled = inner.cancellations.lock().unwrap().clone();
+            canceled.sort();
+            assert_eq!(
+                canceled,
+                vec![UniqueId { hi, lo: 1 }, UniqueId { hi, lo: 2 }]
+            );
+        }
+
+        let hi = 96_100;
+        let inner = CapturingDispatcher::with_fetch(None, TestFetchBehavior::NotReady);
+        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+        let disconnected = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let err = crate::runtime::query_cancel::with_client_disconnect_signal(disconnected, || {
+            let mut tracker = InFlightTracker::default();
+            submit_and_fetch_loop(
+                &dispatcher,
+                &mut tracker,
+                vec![
+                    (
+                        1,
+                        submission(3, UniqueId { hi, lo: 99 }, UniqueId { hi, lo: 1 }),
+                    ),
+                    (
+                        0,
+                        submission(7, UniqueId { hi, lo: 99 }, UniqueId { hi, lo: 2 }),
+                    ),
+                ],
+                7,
+                0,
+                UniqueId { hi, lo: 2 },
+                &UniqueId { hi, lo: 99 },
+                true,
+                1_000,
+                None,
+                None,
+                false,
+            )
+        })
+        .expect_err("disconnect must surface");
+        assert!(err.contains("client disconnected"), "{err}");
+        let mut canceled = inner.cancellations.lock().unwrap().clone();
+        canceled.sort();
+        assert_eq!(
+            canceled,
+            vec![UniqueId { hi, lo: 1 }, UniqueId { hi, lo: 2 }]
+        );
+    }
+
+    #[test]
+    fn write_failure_before_root_eof_surfaces_abort_without_fetching() {
+        let query_id = UniqueId { hi: 97_000, lo: 99 };
+        let finished = writer_key(query_id, UniqueId { hi: 97_000, lo: 10 }, 0);
+        let failed = writer_key(query_id, UniqueId { hi: 97_000, lo: 11 }, 0);
+        let write = Arc::new(Mutex::new(
+            WriteCoordinator::new(query_id, vec![finished.clone(), failed.clone()]).unwrap(),
+        ));
+        write
+            .lock()
+            .unwrap()
+            .apply_report(write_report(
+                &finished,
+                ok_status(),
+                Some("s3://warehouse/finished.parquet"),
+            ))
+            .unwrap();
+        write
+            .lock()
+            .unwrap()
+            .apply_report(write_report(
+                &failed,
+                err_status("writer failed before EOF"),
+                None,
+            ))
+            .unwrap();
+        let inner = CapturingDispatcher::with_fetch(None, TestFetchBehavior::NotReady);
+        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+        let mut tracker = InFlightTracker::default();
+        let result = submit_and_fetch_loop(
+            &dispatcher,
+            &mut tracker,
+            vec![
+                (1, submission(3, query_id, UniqueId { hi: 97_000, lo: 1 })),
+                (0, submission(7, query_id, UniqueId { hi: 97_000, lo: 2 })),
+            ],
+            7,
+            0,
+            UniqueId { hi: 97_000, lo: 2 },
+            &query_id,
+            true,
+            1_000,
+            None,
+            Some(&write),
+            false,
+        )
+        .expect("writer failure returns structured abort");
+        assert!(result.write_commit.is_none());
+        let abort = result.write_abort.expect("write abort");
+        assert!(abort.reason.contains("writer failed before EOF"));
+        assert_eq!(abort.completed_writer_outputs.len(), 1);
+        assert_eq!(abort.incomplete_writers, vec![failed]);
+        assert_eq!(inner.fetch_count.load(Ordering::SeqCst), 0);
+        assert_eq!(inner.cancellations.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn write_commit_and_abort_after_root_eof_preserve_native_lifecycle() {
+        for (index, failure) in [false, true].into_iter().enumerate() {
+            let hi = 97_100 + index as i64;
+            let query_id = UniqueId { hi, lo: 99 };
+            let writer = writer_key(query_id, UniqueId { hi, lo: 10 }, 0);
+            let write = Arc::new(Mutex::new(
+                WriteCoordinator::new(query_id, vec![writer.clone()]).unwrap(),
+            ));
+            let inner = CapturingDispatcher::new(None);
+            let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+            let (wait_tx, wait_rx) = std::sync::mpsc::channel();
+            let _observer = set_write_commit_wait_observer("missing writer final report", wait_tx);
+            let write_for_report = Arc::clone(&write);
+            let writer_for_report = writer.clone();
+            let report_thread = std::thread::spawn(move || {
+                wait_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("post-EOF write wait signal");
+                let status = if failure {
+                    err_status("writer failed after EOF")
+                } else {
+                    ok_status()
+                };
+                write_for_report
+                    .lock()
+                    .unwrap()
+                    .apply_report(write_report(
+                        &writer_for_report,
+                        status,
+                        (!failure).then_some("s3://warehouse/committed.parquet"),
+                    ))
+                    .unwrap();
+            });
+            let mut tracker = InFlightTracker::default();
+            let result = submit_and_fetch_loop(
+                &dispatcher,
+                &mut tracker,
+                vec![(0, submission(7, query_id, UniqueId { hi, lo: 2 }))],
+                7,
+                0,
+                UniqueId { hi, lo: 2 },
+                &query_id,
+                true,
+                1_000,
+                None,
+                Some(&write),
+                false,
+            )
+            .expect("post-EOF write outcome");
+            report_thread.join().unwrap();
+            if failure {
+                assert!(result.write_commit.is_none());
+                assert!(
+                    result
+                        .write_abort
+                        .as_ref()
+                        .is_some_and(|abort| abort.reason.contains("writer failed after EOF"))
+                );
+                assert_eq!(inner.cancellations.lock().unwrap().len(), 1);
+            } else {
+                assert!(result.write_commit.is_some());
+                assert!(result.write_abort.is_none());
+                assert!(inner.cancellations.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn write_only_root_skips_fetch_and_waits_for_commit() {
+        let query_id = UniqueId { hi: 97_200, lo: 99 };
+        let writer = writer_key(query_id, UniqueId { hi: 97_200, lo: 2 }, 0);
+        let write = Arc::new(Mutex::new(
+            WriteCoordinator::new(query_id, vec![writer.clone()]).unwrap(),
+        ));
+        write
+            .lock()
+            .unwrap()
+            .apply_report(write_report(
+                &writer,
+                ok_status(),
+                Some("s3://warehouse/write-only.parquet"),
+            ))
+            .unwrap();
+        let inner = CapturingDispatcher::with_fetch(None, TestFetchBehavior::NotReady);
+        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+        let mut tracker = InFlightTracker::default();
+        let result = submit_and_fetch_loop(
+            &dispatcher,
+            &mut tracker,
+            vec![(0, submission(7, query_id, UniqueId { hi: 97_200, lo: 2 }))],
+            7,
+            0,
+            UniqueId { hi: 97_200, lo: 2 },
+            &query_id,
+            false,
+            1_000,
+            None,
+            Some(&write),
+            false,
+        )
+        .expect("write-only root commits");
+        assert!(result.write_commit.is_some());
+        assert!(result.write_abort.is_none());
+        assert_eq!(inner.fetch_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn native_profile_collection_deduplicates_fragment_reports() {
+        let query_id = UniqueId { hi: 97_300, lo: 99 };
+        let finst_id = UniqueId { hi: 97_300, lo: 2 };
+        let report = crate::proto::novarocks::ExecStatusReport {
+            query_id: Some(crate::proto::common::UniqueId {
+                hi: query_id.hi,
+                lo: query_id.lo,
+            }),
+            fragment_instance_id: Some(crate::proto::common::UniqueId {
+                hi: finst_id.hi,
+                lo: finst_id.lo,
+            }),
+            status: Some(ok_status()),
+            done: true,
+            profile: Some(crate::proto::novarocks::RuntimeProfileTree {
+                root: Some(crate::proto::novarocks::ProfileNode {
+                    name: "root".to_string(),
+                    node_id: 7,
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        };
+        let inner = CapturingDispatcher::with_fetch(
+            None,
+            TestFetchBehavior::EofWithProfiles(vec![report.clone(), report]),
+        );
+        let dispatcher: Arc<dyn FragmentDispatcher> = inner;
+        let mut tracker = InFlightTracker::default();
+        let result = submit_and_fetch_loop(
+            &dispatcher,
+            &mut tracker,
+            vec![(0, submission(7, query_id, finst_id))],
+            7,
+            0,
+            finst_id,
+            &query_id,
+            true,
+            1_000,
+            None,
+            None,
+            true,
+        )
+        .expect("native profiles collected");
+        assert_eq!(result.fragment_profiles.len(), 1);
+        assert_eq!(result.fragment_profiles[0].root.node_id, 7);
+    }
+
+    #[test]
+    fn typed_root_alignment_renames_fields_and_rejects_decimal_drift() {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "wire_i",
             DataType::Int32,
@@ -2898,2232 +3146,73 @@ mod tests {
             Arc::clone(&schema),
             vec![Arc::new(Int32Array::from(vec![Some(1), None]))],
         )
-        .expect("typed batch");
+        .unwrap();
         let chunk_schema =
             ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(7)])
-                .expect("chunk schema");
-        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
+                .unwrap();
+        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).unwrap();
+        let aligned = align_fetch_chunks_to_output_columns(
+            vec![chunk],
+            &[crate::sql::codegen::OutputColumn {
+                name: "col1".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+            }],
+        )
+        .unwrap();
+        assert_eq!(aligned[0].batch.schema().field(0).name(), "col1");
+        assert!(aligned[0].batch.schema().field(0).is_nullable());
+        assert!(
+            aligned[0]
+                .batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .is_null(1)
+        );
 
-        let columns = vec![crate::sql::codegen::OutputColumn {
-            name: "col1".to_string(),
-            data_type: DataType::Int32,
-            nullable: false,
-        }];
-
-        let chunks =
-            align_fetch_chunks_to_output_columns(vec![chunk], &columns).expect("align chunks");
-        let batch = &chunks[0].batch;
-        assert_eq!(batch.schema().field(0).name(), "col1");
-        assert!(batch.schema().field(0).is_nullable());
-        let values = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("int32 array");
-        assert_eq!(values.value(0), 1);
-        assert!(values.is_null(1));
-    }
-
-    #[test]
-    fn typed_root_alignment_rejects_decimal_precision_drift() {
-        let decimal = Decimal128Array::from(vec![Some(100_000_000_000_000_000_000_i128), None])
+        let decimal = Decimal128Array::from(vec![Some(100_i128)])
             .with_precision_and_scale(38, 2)
-            .expect("decimal array");
-        let schema = Arc::new(Schema::new(vec![Field::new(
+            .unwrap();
+        let decimal_schema = Arc::new(Schema::new(vec![Field::new(
             "wire_price",
             DataType::Decimal128(38, 2),
-            true,
-        )]));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(decimal) as ArrayRef])
-            .expect("typed batch");
-        let chunk_schema =
-            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(11)])
-                .expect("chunk schema");
-        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
-
-        let columns = vec![crate::sql::codegen::OutputColumn {
-            name: "price".to_string(),
-            data_type: DataType::Decimal128(20, 2),
-            nullable: true,
-        }];
-
-        let err = align_fetch_chunks_to_output_columns(vec![chunk], &columns)
-            .expect_err("typed root must reject decimal precision drift");
-
-        assert!(
-            err.contains("typed root result column 0 type mismatch"),
-            "{err}"
-        );
-        assert!(err.contains("Decimal128(20, 2)"), "{err}");
-        assert!(err.contains("Decimal128(38, 2)"), "{err}");
-    }
-
-    #[test]
-    fn typed_root_alignment_retags_same_unit_timestamp_timezone_metadata() {
-        let timestamp =
-            Arc::new(TimestampMicrosecondArray::from(vec![Some(1_234_i64), None])) as ArrayRef;
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "wire_ts",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-            true,
+            false,
         )]));
         let batch =
-            RecordBatch::try_new(Arc::clone(&schema), vec![timestamp]).expect("typed batch");
-        let chunk_schema =
-            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(12)])
-                .expect("chunk schema");
-        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
-
-        let target_type = DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into()));
-        let columns = vec![crate::sql::codegen::OutputColumn {
-            name: "ts".to_string(),
-            data_type: target_type.clone(),
-            nullable: true,
-        }];
-
-        let chunks =
-            align_fetch_chunks_to_output_columns(vec![chunk], &columns).expect("align chunks");
-        let batch = &chunks[0].batch;
-        assert_eq!(batch.schema().field(0).name(), "ts");
-        assert_eq!(batch.schema().field(0).data_type(), &target_type);
-        let values = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .expect("timestamp micros");
-        assert_eq!(values.value(0), 1_234);
-        assert!(values.is_null(1));
-    }
-
-    #[test]
-    fn typed_root_alignment_preserves_largeint_type() {
-        let largeint = crate::common::largeint::array_from_i128(&[Some(128), Some(-5)])
-            .expect("largeint array");
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "wire_big",
-            DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH),
-            true,
-        )]));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![largeint]).expect("typed batch");
-        let chunk_schema =
-            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(12)])
-                .expect("chunk schema");
-        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
-
-        let columns = vec![crate::sql::codegen::OutputColumn {
-            name: "big_value".to_string(),
-            data_type: DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH),
-            nullable: true,
-        }];
-
-        let chunks =
-            align_fetch_chunks_to_output_columns(vec![chunk], &columns).expect("align chunks");
-        let batch = &chunks[0].batch;
-        assert_eq!(batch.schema().field(0).name(), "big_value");
-        let largeint_values = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .expect("largeint array");
-        assert_eq!(
-            crate::common::largeint::i128_from_be_bytes(largeint_values.value(0)).unwrap(),
-            128
-        );
-        assert_eq!(
-            crate::common::largeint::i128_from_be_bytes(largeint_values.value(1)).unwrap(),
-            -5
-        );
-    }
-
-    #[test]
-    fn typed_root_alignment_rejects_binary_mysql_text_for_complex_decimal_and_largeint() {
-        let make_binary_chunk = || {
-            let schema = Arc::new(Schema::new(vec![Field::new(
-                "col_0",
-                DataType::Binary,
-                true,
-            )]));
-            let batch = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![Arc::new(BinaryArray::from_vec(vec![
-                    b"{\"a\":1}".as_slice(),
-                ]))],
-            )
-            .expect("binary batch");
-            let chunk_schema =
-                ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(0)])
-                    .expect("chunk schema");
-            Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk")
-        };
-
-        for target_type in [
-            DataType::Struct(vec![Field::new("a", DataType::Int32, true)].into()),
-            DataType::Decimal128(20, 2),
-            DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH),
-        ] {
-            let columns = vec![crate::sql::codegen::OutputColumn {
-                name: "payload".to_string(),
-                data_type: target_type,
-                nullable: true,
-            }];
-            let err = align_fetch_chunks_to_output_columns(vec![make_binary_chunk()], &columns)
-                .expect_err("binary mysql text must not be coerced at typed root");
-            assert!(err.contains("type mismatch"), "{err}");
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Simple mock (all-success, Eof on fetch)
-    // -----------------------------------------------------------------------
-
-    /// Mock dispatcher that records submitted fragment instance IDs and
-    /// immediately returns `Eof` for `fetch_result`.
-    struct MockDispatcher {
-        submitted_finst_ids: Mutex<Vec<(i64, i64)>>,
-        submitted_native_fragments: Mutex<Vec<crate::proto::plan::PlanFragment>>,
-    }
-
-    impl MockDispatcher {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                submitted_finst_ids: Mutex::new(Vec::new()),
-                submitted_native_fragments: Mutex::new(Vec::new()),
-            })
-        }
-
-        fn submitted_count(&self) -> usize {
-            self.submitted_finst_ids.lock().unwrap().len()
-        }
-
-        fn submitted_native_fragments(&self) -> Vec<crate::proto::plan::PlanFragment> {
-            self.submitted_native_fragments.lock().unwrap().clone()
-        }
-    }
-
-    impl FragmentDispatcher for MockDispatcher {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
-        fn submit_fragment(
-            &self,
-            _backend_idx: usize,
-            params: crate::thrift::internal_service::TExecPlanFragmentParams,
-        ) -> Result<(), String> {
-            let finst = params
-                .params
-                .as_ref()
-                .map(|p| (p.fragment_instance_id.hi, p.fragment_instance_id.lo))
-                .unwrap_or((0, 0));
-            self.submitted_finst_ids.lock().unwrap().push(finst);
-            Ok(())
-        }
-
-        fn submit_fragment_submission(
-            &self,
-            backend_idx: usize,
-            submission: FragmentSubmission,
-        ) -> Result<(), String> {
-            if let Some(native_plan) = submission.native_plan_for_test() {
-                self.submitted_native_fragments
-                    .lock()
-                    .unwrap()
-                    .push(native_plan.clone());
-            }
-            self.submit_fragment(backend_idx, submission.into_thrift_params())
-        }
-
-        fn fetch_result(
-            &self,
-            _backend_idx: usize,
-            _finst_id: UniqueId,
-            _max_wait_ms: i64,
-            _expected_chunk_schema: Option<&ChunkSchemaRef>,
-        ) -> Result<FetchOutcome, String> {
-            Ok(FetchOutcome::Eof)
-        }
-
-        fn cancel_fragments(&self, _backend_idx: usize, _finst_ids: &[UniqueId]) {}
-
-        fn backend_count(&self) -> usize {
-            1
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Controllable mock for I2 / I3 / I4 scenarios
-    // -----------------------------------------------------------------------
-
-    enum FetchBehavior {
-        Eof,
-        Err(String),
-        NotReady,
-    }
-
-    struct ControllableDispatcher {
-        /// All submitted finst ids (in order).
-        submitted: Mutex<Vec<UniqueId>>,
-        /// All cancelled finst ids (accumulated across cancel_fragments calls).
-        cancelled: Mutex<Vec<UniqueId>>,
-        /// Number of submits completed so far.
-        submit_count: AtomicUsize,
-        /// Number of fetch_result calls completed so far.
-        fetch_count: AtomicUsize,
-        /// Fail when submit_count reaches this value (1-indexed).
-        fail_on_submit: Option<usize>,
-        fetch_behavior: FetchBehavior,
-    }
-
-    impl ControllableDispatcher {
-        fn succeeds_always_eof() -> Arc<Self> {
-            Arc::new(Self {
-                submitted: Mutex::new(Vec::new()),
-                cancelled: Mutex::new(Vec::new()),
-                submit_count: AtomicUsize::new(0),
-                fetch_count: AtomicUsize::new(0),
-                fail_on_submit: None,
-                fetch_behavior: FetchBehavior::Eof,
-            })
-        }
-
-        fn fails_on_submit_n(n: usize) -> Arc<Self> {
-            Arc::new(Self {
-                submitted: Mutex::new(Vec::new()),
-                cancelled: Mutex::new(Vec::new()),
-                submit_count: AtomicUsize::new(0),
-                fetch_count: AtomicUsize::new(0),
-                fail_on_submit: Some(n),
-                fetch_behavior: FetchBehavior::Eof,
-            })
-        }
-
-        fn fetch_returns_err(msg: impl Into<String>) -> Arc<Self> {
-            Arc::new(Self {
-                submitted: Mutex::new(Vec::new()),
-                cancelled: Mutex::new(Vec::new()),
-                submit_count: AtomicUsize::new(0),
-                fetch_count: AtomicUsize::new(0),
-                fail_on_submit: None,
-                fetch_behavior: FetchBehavior::Err(msg.into()),
-            })
-        }
-
-        fn fetch_returns_not_ready() -> Arc<Self> {
-            Arc::new(Self {
-                submitted: Mutex::new(Vec::new()),
-                cancelled: Mutex::new(Vec::new()),
-                submit_count: AtomicUsize::new(0),
-                fetch_count: AtomicUsize::new(0),
-                fail_on_submit: None,
-                fetch_behavior: FetchBehavior::NotReady,
-            })
-        }
-
-        fn submitted_ids(&self) -> Vec<UniqueId> {
-            self.submitted.lock().unwrap().clone()
-        }
-
-        fn cancelled_ids(&self) -> Vec<UniqueId> {
-            self.cancelled.lock().unwrap().clone()
-        }
-
-        fn fetch_count(&self) -> usize {
-            self.fetch_count.load(Ordering::SeqCst)
-        }
-    }
-
-    struct QueryStateFailureDispatcher {
-        submitted: Mutex<Vec<UniqueId>>,
-        cancelled: Mutex<Vec<UniqueId>>,
-        fetch_count: AtomicUsize,
-        first_fetch: AtomicBool,
-        failure_reason: String,
-    }
-
-    impl QueryStateFailureDispatcher {
-        fn new(reason: impl Into<String>) -> Arc<Self> {
-            Arc::new(Self {
-                submitted: Mutex::new(Vec::new()),
-                cancelled: Mutex::new(Vec::new()),
-                fetch_count: AtomicUsize::new(0),
-                first_fetch: AtomicBool::new(true),
-                failure_reason: reason.into(),
-            })
-        }
-
-        fn cancelled_ids(&self) -> Vec<UniqueId> {
-            self.cancelled.lock().unwrap().clone()
-        }
-
-        fn submitted_ids(&self) -> Vec<UniqueId> {
-            self.submitted.lock().unwrap().clone()
-        }
-
-        fn fetch_count(&self) -> usize {
-            self.fetch_count.load(Ordering::SeqCst)
-        }
-    }
-
-    struct RecordingWaitDispatcher {
-        submitted: Mutex<Vec<UniqueId>>,
-        fetch_waits_ms: Mutex<Vec<i64>>,
-        fetch_count: AtomicUsize,
-    }
-
-    struct EofSignalDispatcher {
-        submitted: Mutex<Vec<UniqueId>>,
-        cancelled: Mutex<Vec<UniqueId>>,
-        eof_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
-    }
-
-    impl RecordingWaitDispatcher {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                submitted: Mutex::new(Vec::new()),
-                fetch_waits_ms: Mutex::new(Vec::new()),
-                fetch_count: AtomicUsize::new(0),
-            })
-        }
-
-        fn fetch_waits_ms(&self) -> Vec<i64> {
-            self.fetch_waits_ms.lock().unwrap().clone()
-        }
-    }
-
-    impl EofSignalDispatcher {
-        fn new(eof_tx: std::sync::mpsc::Sender<()>) -> Arc<Self> {
-            Arc::new(Self {
-                submitted: Mutex::new(Vec::new()),
-                cancelled: Mutex::new(Vec::new()),
-                eof_tx: Mutex::new(Some(eof_tx)),
-            })
-        }
-
-        fn cancelled_ids(&self) -> Vec<UniqueId> {
-            self.cancelled.lock().unwrap().clone()
-        }
-    }
-
-    impl FragmentDispatcher for ControllableDispatcher {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
-        fn submit_fragment(
-            &self,
-            _backend_idx: usize,
-            params: crate::thrift::internal_service::TExecPlanFragmentParams,
-        ) -> Result<(), String> {
-            let n = self.submit_count.fetch_add(1, Ordering::SeqCst) + 1;
-            if self.fail_on_submit == Some(n) {
-                return Err(format!("mock: submit failed on call {n}"));
-            }
-            let finst_id = params
-                .params
-                .as_ref()
-                .map(|ep| native_id(ep.fragment_instance_id.hi, ep.fragment_instance_id.lo))
-                .unwrap_or_else(|| native_id(0, 0));
-            self.submitted.lock().unwrap().push(finst_id);
-            Ok(())
-        }
-
-        fn fetch_result(
-            &self,
-            _backend_idx: usize,
-            _finst_id: UniqueId,
-            _max_wait_ms: i64,
-            _expected_chunk_schema: Option<&ChunkSchemaRef>,
-        ) -> Result<FetchOutcome, String> {
-            self.fetch_count.fetch_add(1, Ordering::SeqCst);
-            match &self.fetch_behavior {
-                FetchBehavior::Eof => Ok(FetchOutcome::Eof),
-                FetchBehavior::Err(msg) => Ok(FetchOutcome::Err(msg.clone())),
-                FetchBehavior::NotReady => Ok(FetchOutcome::NotReady),
-            }
-        }
-
-        fn cancel_fragments(&self, _backend_idx: usize, finst_ids: &[UniqueId]) {
-            self.cancelled.lock().unwrap().extend_from_slice(finst_ids);
-        }
-
-        fn backend_count(&self) -> usize {
-            1
-        }
-    }
-
-    impl FragmentDispatcher for QueryStateFailureDispatcher {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
-        fn submit_fragment(
-            &self,
-            _backend_idx: usize,
-            params: crate::thrift::internal_service::TExecPlanFragmentParams,
-        ) -> Result<(), String> {
-            let finst_id = params
-                .params
-                .as_ref()
-                .map(|ep| native_id(ep.fragment_instance_id.hi, ep.fragment_instance_id.lo))
-                .unwrap_or_else(|| native_id(0, 0));
-            self.submitted.lock().unwrap().push(finst_id);
-            Ok(())
-        }
-
-        fn fetch_result(
-            &self,
-            _backend_idx: usize,
-            finst_id: UniqueId,
-            _max_wait_ms: i64,
-            _expected_chunk_schema: Option<&ChunkSchemaRef>,
-        ) -> Result<FetchOutcome, String> {
-            self.fetch_count.fetch_add(1, Ordering::SeqCst);
-            if self.first_fetch.swap(false, Ordering::SeqCst) {
-                crate::runtime::query_state::in_flight_table()
-                    .on_fragment_done(finst_id, Err(self.failure_reason.clone()));
-                Ok(FetchOutcome::NotReady)
-            } else {
-                panic!("fetch_result called after query state failure should have been observed");
-            }
-        }
-
-        fn cancel_fragments(&self, _backend_idx: usize, finst_ids: &[UniqueId]) {
-            self.cancelled.lock().unwrap().extend_from_slice(finst_ids);
-        }
-
-        fn backend_count(&self) -> usize {
-            1
-        }
-    }
-
-    impl FragmentDispatcher for RecordingWaitDispatcher {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
-        fn submit_fragment(
-            &self,
-            _backend_idx: usize,
-            params: crate::thrift::internal_service::TExecPlanFragmentParams,
-        ) -> Result<(), String> {
-            let finst_id = params
-                .params
-                .as_ref()
-                .map(|ep| native_id(ep.fragment_instance_id.hi, ep.fragment_instance_id.lo))
-                .unwrap_or_else(|| native_id(0, 0));
-            self.submitted.lock().unwrap().push(finst_id);
-            Ok(())
-        }
-
-        fn fetch_result(
-            &self,
-            _backend_idx: usize,
-            _finst_id: UniqueId,
-            max_wait_ms: i64,
-            _expected_chunk_schema: Option<&ChunkSchemaRef>,
-        ) -> Result<FetchOutcome, String> {
-            self.fetch_waits_ms.lock().unwrap().push(max_wait_ms);
-            let call = self.fetch_count.fetch_add(1, Ordering::SeqCst);
-            if call == 0 {
-                Ok(FetchOutcome::NotReady)
-            } else {
-                Ok(FetchOutcome::Eof)
-            }
-        }
-
-        fn cancel_fragments(&self, _backend_idx: usize, _finst_ids: &[UniqueId]) {}
-
-        fn backend_count(&self) -> usize {
-            1
-        }
-    }
-
-    impl FragmentDispatcher for EofSignalDispatcher {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
-        fn submit_fragment(
-            &self,
-            _backend_idx: usize,
-            params: crate::thrift::internal_service::TExecPlanFragmentParams,
-        ) -> Result<(), String> {
-            let finst_id = params
-                .params
-                .as_ref()
-                .map(|ep| native_id(ep.fragment_instance_id.hi, ep.fragment_instance_id.lo))
-                .unwrap_or_else(|| native_id(0, 0));
-            self.submitted.lock().unwrap().push(finst_id);
-            Ok(())
-        }
-
-        fn fetch_result(
-            &self,
-            _backend_idx: usize,
-            _finst_id: UniqueId,
-            _max_wait_ms: i64,
-            _expected_chunk_schema: Option<&ChunkSchemaRef>,
-        ) -> Result<FetchOutcome, String> {
-            if let Some(tx) = self.eof_tx.lock().unwrap().take() {
-                tx.send(()).expect("signal root EOF");
-            }
-            Ok(FetchOutcome::Eof)
-        }
-
-        fn cancel_fragments(&self, _backend_idx: usize, finst_ids: &[UniqueId]) {
-            self.cancelled.lock().unwrap().extend_from_slice(finst_ids);
-        }
-
-        fn backend_count(&self) -> usize {
-            1
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Helpers
-    // -----------------------------------------------------------------------
-
-    fn make_params_with_finst(
-        hi: i64,
-        lo: i64,
-    ) -> crate::thrift::internal_service::TExecPlanFragmentParams {
-        use crate::thrift::{data_sinks, internal_service, partitions, types};
-
-        let result_sink = data_sinks::TDataSink::new(
-            data_sinks::TDataSinkType::RESULT_SINK,
-            None::<data_sinks::TDataStreamSink>,
-            None::<data_sinks::TResultSink>,
-            None::<data_sinks::TMysqlTableSink>,
-            None::<data_sinks::TExportSink>,
-            None::<data_sinks::TOlapTableSink>,
-            None::<data_sinks::TMemoryScratchSink>,
-            None::<data_sinks::TMultiCastDataStreamSink>,
-            None::<data_sinks::TSchemaTableSink>,
-            None::<data_sinks::TIcebergTableSink>,
-            None::<data_sinks::THiveTableSink>,
-            None::<data_sinks::TTableFunctionTableSink>,
-            None::<data_sinks::TDictionaryCacheSink>,
-            None::<Vec<Box<data_sinks::TDataSink>>>,
-            None::<i64>,
-            None::<data_sinks::TSplitDataStreamSink>,
-            None::<data_sinks::TIcebergChangeStreamRouterSink>,
-        );
-        let fragment = crate::thrift::planner::TPlanFragment::new(
-            None::<crate::thrift::plan_nodes::TPlan>,
-            None::<Vec<crate::thrift::exprs::TExpr>>,
-            Some(result_sink),
-            partitions::TDataPartition::new(
-                partitions::TPartitionType::UNPARTITIONED,
-                None::<Vec<crate::thrift::exprs::TExpr>>,
-                None::<Vec<partitions::TRangePartition>>,
-                None::<Vec<partitions::TBucketProperty>>,
-            ),
-            None::<i64>,
-            None::<i64>,
-            None::<Vec<crate::thrift::data::TGlobalDict>>,
-            None::<Vec<crate::thrift::data::TGlobalDict>>,
-            None::<crate::thrift::planner::TCacheParam>,
-            None::<std::collections::BTreeMap<i32, crate::thrift::exprs::TExpr>>,
-            None::<crate::thrift::planner::TGroupExecutionParam>,
-        );
-        let exec_params = internal_service::TPlanFragmentExecParams {
-            query_id: types::TUniqueId::new(hi, lo),
-            fragment_instance_id: types::TUniqueId::new(hi, lo),
-            per_node_scan_ranges: Default::default(),
-            per_exch_num_senders: Default::default(),
-            destinations: None,
-            sender_id: None,
-            num_senders: None,
-            send_query_statistics_with_every_batch: None,
-            use_vectorized: None,
-            runtime_filter_params: None,
-            instances_number: None,
-            enable_exchange_pass_through: None,
-            node_to_per_driver_seq_scan_ranges: None,
-            enable_exchange_perf: None,
-            pipeline_sink_dop: None,
-            report_when_finish: None,
-            exec_debug_options: None,
-        };
-        internal_service::TExecPlanFragmentParams::new(
-            internal_service::InternalServiceVersion::V1,
-            Some(fragment),
-            None::<crate::thrift::descriptors::TDescriptorTable>,
-            Some(exec_params),
-            None::<types::TNetworkAddress>,
-            None::<i32>,
-            None::<internal_service::TQueryGlobals>,
-            None,
-            None::<bool>,
-            None::<types::TResourceInfo>,
-            None::<String>,
-            None::<String>,
-            None::<i64>,
-            None::<internal_service::TLoadErrorHubInfo>,
-            None::<bool>,
-            None::<i32>,
-            None::<std::collections::BTreeMap<types::TPlanNodeId, i32>>,
-            None::<crate::thrift::work_group::TWorkGroup>,
-            None::<bool>,
-            None::<i32>,
-            None::<bool>,
-            None::<bool>,
-            None::<internal_service::TAdaptiveDopParam>,
-            None::<i32>,
-            None::<internal_service::TPredicateTreeParams>,
-            None::<Vec<i32>>,
-            None::<i32>,
-            None::<types::TNetworkAddress>,
-            None::<bool>,
-            None::<bool>, // novarocks_generated_plan
+            RecordBatch::try_new(Arc::clone(&decimal_schema), vec![Arc::new(decimal)]).unwrap();
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            decimal_schema.as_ref(),
+            &[SlotId::new(8)],
         )
-    }
-
-    fn make_params_with_sink_type(
-        sink_type: data_sinks::TDataSinkType,
-    ) -> crate::thrift::internal_service::TExecPlanFragmentParams {
-        let mut params = make_params_with_finst(30, 40);
-        params
-            .fragment
-            .as_mut()
-            .expect("fragment")
-            .output_sink
-            .as_mut()
-            .expect("output sink")
-            .type_ = sink_type;
-        params
-    }
-
-    fn make_params_with_finst_and_sink_type(
-        hi: i64,
-        lo: i64,
-        sink_type: data_sinks::TDataSinkType,
-    ) -> crate::thrift::internal_service::TExecPlanFragmentParams {
-        let mut params = make_params_with_finst(hi, lo);
-        params
-            .fragment
-            .as_mut()
-            .expect("fragment")
-            .output_sink
-            .as_mut()
-            .expect("output sink")
-            .type_ = sink_type;
-        params
-    }
-
-    fn fake_stream_edge(
-        source_fragment_id: FragmentId,
-        target_fragment_id: FragmentId,
-        target_exchange_node_id: i32,
-    ) -> FragmentEdge {
-        FragmentEdge {
-            source_fragment_id,
-            target_fragment_id,
-            target_exchange_node_id,
-            output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
-            stream_kind: crate::sql::planner::distributed::FragmentStreamKind::Gather,
-            edge_kind: FragmentEdgeKind::Stream,
-            output_slot_ids: Vec::new(),
-        }
-    }
-
-    fn fake_router_edge(
-        source_fragment_id: FragmentId,
-        target_fragment_id: FragmentId,
-        target_exchange_node_id: i32,
-        router_group_id: i32,
-        branch_id: i32,
-        branch_kind: crate::sql::common::ChangeStreamBranchKind,
-    ) -> FragmentEdge {
-        FragmentEdge {
-            source_fragment_id,
-            target_fragment_id,
-            target_exchange_node_id,
-            output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
-            stream_kind: crate::sql::planner::distributed::FragmentStreamKind::Gather,
-            edge_kind: FragmentEdgeKind::IcebergChangeStreamRouter {
-                router_group_id,
-                branch_id,
-                branch_kind,
-            },
-            output_slot_ids: Vec::new(),
-        }
-    }
-
-    fn hash_key_expr_for_test(column_id: u32, column: &str) -> crate::sql::analysis::TypedExpr {
-        crate::sql::analysis::TypedExpr {
-            kind: crate::sql::analysis::ExprKind::ColumnRef {
-                column_id: ColumnId::new_for_test(column_id),
-                qualifier: None,
-                column: column.to_string(),
-            },
-            data_type: DataType::Int64,
-            nullable: false,
-        }
-    }
-
-    fn assert_single_slot_ref_partition_expr(
-        partition: &partitions::TDataPartition,
-        expected_slot_id: i32,
-    ) {
-        assert_eq!(
-            partition.type_,
-            partitions::TPartitionType::HASH_PARTITIONED
-        );
-        let exprs = partition
-            .partition_exprs
-            .as_ref()
-            .expect("hash partition should carry compiled partition exprs");
-        assert_eq!(exprs.len(), 1);
-        let node = exprs[0].nodes.first().expect("slot-ref expr node");
-        assert_eq!(
-            node.node_type,
-            crate::thrift::exprs::TExprNodeType::SLOT_REF
-        );
-        assert_eq!(
-            node.slot_ref.as_ref().expect("slot_ref").slot_id,
-            expected_slot_id
-        );
-    }
-
-    fn compiled_hash_partition_for_test(slot_id: i32) -> partitions::TDataPartition {
-        partitions::TDataPartition::new(
-            partitions::TPartitionType::HASH_PARTITIONED,
-            Some(vec![
-                crate::sql::codegen::expr_compiler::build_slot_ref_texpr(
-                    slot_id,
-                    1,
-                    crate::types::arrow_thrift::thrift_type_desc_from_primitive(
-                        crate::thrift::types::TPrimitiveType::BIGINT,
-                    ),
-                ),
-            ]),
-            None::<Vec<partitions::TRangePartition>>,
-            None::<Vec<partitions::TBucketProperty>>,
-        )
-    }
-
-    fn compat_edge_sidecar_map_for_test(
-        edge: &FragmentEdge,
-        partition: partitions::TDataPartition,
-        output_slot_ids: Vec<i32>,
-    ) -> BTreeMap<FragmentEdgeKey, CompatEdgeSidecar> {
-        BTreeMap::from([(
-            fragment_edge_key(edge),
-            CompatEdgeSidecar {
-                partition,
-                output_slot_ids,
-            },
-        )])
-    }
-
-    fn empty_router_sink_for_test() -> data_sinks::TIcebergChangeStreamRouterSink {
-        data_sinks::TIcebergChangeStreamRouterSink::new(1, None::<i32>, vec![])
-    }
-
-    fn empty_data_sink_for_test(sink_type: data_sinks::TDataSinkType) -> data_sinks::TDataSink {
-        data_sinks::TDataSink::new(
-            sink_type,
-            None::<data_sinks::TDataStreamSink>,
-            None::<data_sinks::TResultSink>,
-            None::<data_sinks::TMysqlTableSink>,
-            None::<data_sinks::TExportSink>,
-            None::<data_sinks::TOlapTableSink>,
-            None::<data_sinks::TMemoryScratchSink>,
-            None::<data_sinks::TMultiCastDataStreamSink>,
-            None::<data_sinks::TSchemaTableSink>,
-            None::<data_sinks::TIcebergTableSink>,
-            None::<data_sinks::THiveTableSink>,
-            None::<data_sinks::TTableFunctionTableSink>,
-            None::<data_sinks::TDictionaryCacheSink>,
-            None::<Vec<Box<data_sinks::TDataSink>>>,
-            None::<i64>,
-            None::<data_sinks::TSplitDataStreamSink>,
-            None::<data_sinks::TIcebergChangeStreamRouterSink>,
-        )
-    }
-
-    fn fake_placement(
-        fragment_id: FragmentId,
-        instance_index: usize,
-        finst_lo: i64,
-        host: &str,
-    ) -> FragmentInstancePlacement {
-        FragmentInstancePlacement {
-            fragment_id,
-            instance_index,
-            finst_id: native_id(11, finst_lo),
-            backend_idx: instance_index,
-            endpoint: crate::runtime::endpoint::RuntimeEndpoint::new(host, 9010)
-                .expect("test endpoint"),
-            scan_ranges: BTreeMap::new(),
-            destinations: Vec::new(),
-            runtime_filter_prober_params: BTreeMap::new(),
-            per_exch_num_senders: BTreeMap::new(),
-        }
-    }
-
-    fn native_file_scan_range_for_test(marker: i32) -> crate::runtime::scan_range::ScanRangeParams {
-        let mut params = crate::runtime::scan_range::ScanRangeParams::file(
-            crate::runtime::scan_range::FileScanRange {
-                file_format: crate::runtime::scan_range::FileFormat::Parquet,
-                full_path: Some(format!("s3://bucket/native-{marker}.parquet")),
-                relative_path: None,
-                table_id: None,
-                offset: 0,
-                length: 1,
-                file_length: 1,
-                delete_files: Vec::new(),
-                deletion_vector_descriptor: None,
-                first_row_id: None,
-                data_sequence_number: None,
-                modification_time: None,
-                datacache_options: None,
-                included_positions: Vec::new(),
-                serialized_split: None,
-                use_iceberg_jni_metadata_reader: false,
-                ivm_change_op: None,
-                file_pruning_min_max_values: None,
-                compat_change_op_slot_id: None,
-            },
-        );
-        params.volume_id = Some(marker);
-        params
-    }
-
-    fn compat_scan_range_for_test(
-        marker: i32,
-    ) -> crate::thrift::internal_service::TScanRangeParams {
-        crate::thrift::internal_service::TScanRangeParams::new(
-            crate::thrift::plan_nodes::TScanRange::new(
-                None::<crate::thrift::plan_nodes::TInternalScanRange>,
-                None::<Vec<u8>>,
-                None::<crate::thrift::plan_nodes::TBrokerScanRange>,
-                None::<crate::thrift::plan_nodes::TEsScanRange>,
-                None::<crate::thrift::plan_nodes::THdfsScanRange>,
-                None::<crate::thrift::plan_nodes::TBinlogScanRange>,
-                None::<crate::thrift::plan_nodes::TBenchmarkScanRange>,
-            ),
-            Some(marker),
-            Some(false),
-            Some(false),
-        )
-    }
-
-    fn native_starrocks_scan_range_for_test(
-        tablet_id: i64,
-        partition_id: i64,
-        version: i64,
-    ) -> crate::runtime::scan_range::ScanRangeParams {
-        crate::runtime::scan_range::ScanRangeParams::starrocks_tablet(
-            tablet_id,
-            partition_id,
-            version,
-        )
-        .expect("valid native StarRocks tablet range")
-    }
-
-    fn compat_starrocks_scan_range_for_test(
-        tablet_id: i64,
-        partition_id: i64,
-        version: i64,
-    ) -> crate::thrift::internal_service::TScanRangeParams {
-        let internal = crate::thrift::plan_nodes::TInternalScanRange::new(
-            Vec::new(),
-            "30".to_string(),
-            version.to_string(),
-            version.to_string(),
-            tablet_id,
-            "analytics".to_string(),
-            None::<Vec<crate::thrift::plan_nodes::TKeyRange>>,
-            None::<String>,
-            Some("orders".to_string()),
-            Some(partition_id),
-            None::<i64>,
-            Some(true),
-            None::<i32>,
-            Some(false),
-            Some(false),
-            None::<i64>,
-            Some("default_catalog".to_string()),
-        );
-        crate::thrift::internal_service::TScanRangeParams::new(
-            crate::thrift::plan_nodes::TScanRange::new(
-                Some(internal),
-                None::<Vec<u8>>,
-                None::<crate::thrift::plan_nodes::TBrokerScanRange>,
-                None::<crate::thrift::plan_nodes::TEsScanRange>,
-                None::<crate::thrift::plan_nodes::THdfsScanRange>,
-                None::<crate::thrift::plan_nodes::TBinlogScanRange>,
-                None::<crate::thrift::plan_nodes::TBenchmarkScanRange>,
-            ),
-            None::<i32>,
-            Some(false),
-            Some(false),
-        )
-    }
-
-    fn fragment_for_scan_range_merge_test(
-        compat_ranges: BTreeMap<i32, Vec<crate::thrift::internal_service::TScanRangeParams>>,
-    ) -> crate::sql::codegen::FragmentBuildResult {
-        let mut params = make_params_with_finst(1, 1);
-        let exec_params = params
-            .params
-            .as_mut()
-            .expect("exec params for scan range merge test");
-        exec_params.per_node_scan_ranges = compat_ranges;
-        crate::sql::codegen::FragmentBuildResult {
-            fragment_id: 0,
-            has_scan_nodes: false,
-            output_kind: crate::sql::codegen::FragmentOutputKind::Result,
-            plan: crate::thrift::plan_nodes::TPlan::new(Vec::new()),
-            desc_tbl: crate::thrift::descriptors::TDescriptorTable::new(
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                false,
-            ),
-            exec_params: exec_params.clone(),
-            native_scan_ranges: BTreeMap::new(),
-            output_sink: empty_data_sink_for_test(data_sinks::TDataSinkType::RESULT_SINK),
-            output_exprs: None,
-            output_columns: Vec::new(),
-            boundary_schemas: Vec::new(),
-            cte_id: None,
-            cte_exchange_nodes: Vec::new(),
-            query_global_dicts: None,
-            query_global_dict_exprs: None,
-        }
-    }
-
-    #[test]
-    fn proto_coordinator_submits_native_scan_ranges_without_compat_projection() {
-        let mut fragment = fragment_for_scan_range_merge_test(BTreeMap::new());
-        fragment
-            .native_scan_ranges
-            .insert(10, vec![native_file_scan_range_for_test(101)]);
-        let mut native_fragment = crate::proto::plan::PlanFragment {
-            fragment_id: fragment.fragment_id,
-            root: Some(crate::proto::plan::DistributedNode {
-                node_id: 10,
-                fragment_id: fragment.fragment_id,
-                limit: -1,
-                payload: Some(crate::proto::plan::distributed_node::Payload::Physical(
-                    crate::proto::plan::PlanNode {
-                        kind: Some(crate::proto::plan::plan_node::Kind::Values(
-                            crate::proto::plan::ValuesNode::default(),
-                        )),
-                        ..Default::default()
-                    },
-                )),
-                ..Default::default()
-            }),
-            sink: Some(crate::proto::plan::DataSink {
-                kind: Some(crate::proto::plan::data_sink::Kind::Result(true)),
-            }),
-            ..Default::default()
-        };
-        native_fragment.output_columns = Vec::new();
-        let native_fragments = BTreeMap::from([(fragment.fragment_id, native_fragment)]);
-        let fragment_schedule = fragment.scheduling_metadata();
-        let build = MultiFragmentBuildResult {
-            fragment_results: vec![fragment],
-            fragment_schedules: vec![fragment_schedule],
-            native_fragments,
-            root_fragment_id: 0,
-            edges: Vec::new(),
-            lowered_edges: Vec::new(),
-            boundary_schemas: Vec::new(),
-            rf_plan: None,
-        };
-        let dispatcher = MockDispatcher::new();
-        let scheduler = Arc::new(FragmentScheduler::new(vec![
-            "127.0.0.1:19010".parse().expect("backend addr"),
-        ]));
-
-        let result = ExecutionCoordinator::new(build, dispatcher.clone(), scheduler, None)
-            .execute_with_write_outcome();
-
-        assert!(
-            result.is_ok(),
-            "coordinator rejected native scan ranges: {result:?}"
-        );
-        assert_eq!(dispatcher.submitted_count(), 1);
-    }
-
-    #[test]
-    fn proto_coordinator_submits_starrocks_with_matching_legacy_carrier() {
-        let mut fragment = fragment_for_scan_range_merge_test(BTreeMap::from([(
-            10,
-            vec![compat_starrocks_scan_range_for_test(300, 100, 7)],
-        )]));
-        fragment
-            .native_scan_ranges
-            .insert(10, vec![native_starrocks_scan_range_for_test(300, 100, 7)]);
-        let native_fragment = crate::proto::plan::PlanFragment {
-            fragment_id: fragment.fragment_id,
-            root: Some(crate::proto::plan::DistributedNode {
-                node_id: 10,
-                fragment_id: fragment.fragment_id,
-                limit: -1,
-                payload: Some(crate::proto::plan::distributed_node::Payload::Physical(
-                    crate::proto::plan::PlanNode {
-                        kind: Some(crate::proto::plan::plan_node::Kind::Values(
-                            crate::proto::plan::ValuesNode::default(),
-                        )),
-                        ..Default::default()
-                    },
-                )),
-                ..Default::default()
-            }),
-            sink: Some(crate::proto::plan::DataSink {
-                kind: Some(crate::proto::plan::data_sink::Kind::Result(true)),
-            }),
-            ..Default::default()
-        };
-        let native_fragments = BTreeMap::from([(fragment.fragment_id, native_fragment)]);
-        let fragment_schedule = fragment.scheduling_metadata();
-        let build = MultiFragmentBuildResult {
-            fragment_results: vec![fragment],
-            fragment_schedules: vec![fragment_schedule],
-            native_fragments,
-            root_fragment_id: 0,
-            edges: Vec::new(),
-            lowered_edges: Vec::new(),
-            boundary_schemas: Vec::new(),
-            rf_plan: None,
-        };
-        let dispatcher = MockDispatcher::new();
-        let scheduler = Arc::new(FragmentScheduler::new(vec![
-            "127.0.0.1:19010".parse().expect("backend addr"),
-        ]));
-
-        let result = ExecutionCoordinator::new(build, dispatcher.clone(), scheduler, None)
-            .execute_with_write_outcome();
-
-        assert!(
-            result.is_ok(),
-            "coordinator rejected native StarRocks scan with matching carrier: {result:?}"
-        );
-        assert_eq!(dispatcher.submitted_count(), 1);
-    }
-
-    #[test]
-    fn proto_coordinator_submits_native_router_fragment_with_noop_compat_carrier() {
-        use crate::proto::plan as native_plan;
-        use crate::sql::codegen::FragmentOutputKind;
-        use crate::sql::common::ChangeStreamBranchKind;
-
-        let root_fragment = fragment_for_scan_range_merge_test(BTreeMap::new());
-        let mut router_fragment = fragment_for_scan_range_merge_test(BTreeMap::new());
-        router_fragment.fragment_id = 1;
-        router_fragment.output_kind = FragmentOutputKind::NonTerminal;
-        router_fragment.output_sink =
-            empty_data_sink_for_test(data_sinks::TDataSinkType::NOOP_SINK);
-
-        let edge = fake_router_edge(1, 0, 77, 7, 0, ChangeStreamBranchKind::DeleteDv);
-        let native_root = native_plan::PlanFragment {
-            fragment_id: root_fragment.fragment_id,
-            root: Some(native_plan::DistributedNode {
-                node_id: 10,
-                fragment_id: root_fragment.fragment_id,
-                limit: -1,
-                payload: Some(native_plan::distributed_node::Payload::Physical(
-                    native_plan::PlanNode {
-                        kind: Some(native_plan::plan_node::Kind::Values(
-                            native_plan::ValuesNode::default(),
-                        )),
-                        ..Default::default()
-                    },
-                )),
-                ..Default::default()
-            }),
-            sink: Some(native_plan::DataSink {
-                kind: Some(native_plan::data_sink::Kind::Result(true)),
-            }),
-            ..Default::default()
-        };
-        let native_router = native_plan::PlanFragment {
-            fragment_id: router_fragment.fragment_id,
-            root: Some(native_plan::DistributedNode {
-                node_id: 20,
-                fragment_id: router_fragment.fragment_id,
-                limit: -1,
-                payload: Some(native_plan::distributed_node::Payload::Physical(
-                    native_plan::PlanNode {
-                        kind: Some(native_plan::plan_node::Kind::Values(
-                            native_plan::ValuesNode::default(),
-                        )),
-                        ..Default::default()
-                    },
-                )),
-                ..Default::default()
-            }),
-            data_partition: Some(native_plan::DataPartition {
-                kind: native_plan::PartitionKind::Unpartitioned as i32,
-                exprs: Vec::new(),
-            }),
-            output_partition: Some(native_plan::DataPartition {
-                kind: native_plan::PartitionKind::Unpartitioned as i32,
-                exprs: Vec::new(),
-            }),
-            sink: Some(native_plan::DataSink {
-                kind: Some(native_plan::data_sink::Kind::IcebergChangeStreamRouter(
-                    native_plan::IcebergChangeStreamRouterSink {
-                        group_id: 7,
-                        change_op_output_ordinal: 0,
-                        data_route_output_ordinal: None,
-                        branches: vec![native_plan::IcebergChangeStreamBranchRoute {
-                            branch_id: 0,
-                            branch_kind: native_plan::ChangeStreamBranchKind::DeleteDv as i32,
-                            target_fragment_id: u32::MAX,
-                            target_exchange_node_id: -1,
-                            output_ordinals: Vec::new(),
-                            output_partition_ordinals: Vec::new(),
-                            output_partition: Some(native_plan::DataPartition {
-                                kind: native_plan::PartitionKind::Unpartitioned as i32,
-                                exprs: Vec::new(),
-                            }),
-                            destinations: None,
-                        }],
-                    },
-                )),
-            }),
-            output_exprs: Vec::new(),
-            output_columns: Vec::new(),
-            cte_id: None,
-            cte_exchange_nodes: Vec::new(),
-        };
-        let native_fragments = BTreeMap::from([
-            (root_fragment.fragment_id, native_root),
-            (router_fragment.fragment_id, native_router),
-        ]);
-        let fragment_schedules = vec![
-            root_fragment.scheduling_metadata(),
-            router_fragment.scheduling_metadata(),
-        ];
-        let build = MultiFragmentBuildResult {
-            fragment_results: vec![root_fragment, router_fragment],
-            fragment_schedules,
-            native_fragments,
-            root_fragment_id: 0,
-            edges: vec![edge.clone()],
-            lowered_edges: vec![LoweredFragmentEdge {
-                edge,
-                compat_partition: unpartitioned_partition(),
-            }],
-            boundary_schemas: Vec::new(),
-            rf_plan: None,
-        };
-        let dispatcher = MockDispatcher::new();
-        let scheduler = Arc::new(FragmentScheduler::new(vec![
-            "127.0.0.1:19010".parse().expect("backend addr"),
-        ]));
-
-        let result = ExecutionCoordinator::new(build, dispatcher.clone(), scheduler, None)
-            .execute_with_write_outcome();
-
-        assert!(
-            result.is_ok(),
-            "coordinator rejected proto router with noop compat carrier: {result:?}"
-        );
-        assert_eq!(dispatcher.submitted_count(), 2);
-        let submitted = dispatcher.submitted_native_fragments();
-        let router = submitted
-            .iter()
-            .find(|fragment| fragment.fragment_id == 1)
-            .expect("submitted native router fragment");
-        let Some(native_plan::data_sink::Kind::IcebergChangeStreamRouter(router_sink)) =
-            router.sink.as_ref().and_then(|sink| sink.kind.as_ref())
-        else {
-            panic!("expected submitted native router sink");
-        };
-        let branch = router_sink.branches.first().expect("router branch");
-        assert_eq!(branch.target_fragment_id, 0);
-        assert_eq!(branch.target_exchange_node_id, 77);
-        assert_eq!(
-            branch
-                .destinations
-                .as_ref()
-                .expect("patched destinations")
-                .destinations
-                .len(),
-            1
-        );
-    }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn compat_scan_ranges_for_placement_merges_native_and_compat_only_nodes() {
-        let fragment = fragment_for_scan_range_merge_test(BTreeMap::from([
-            (10, vec![compat_scan_range_for_test(999)]),
-            (
-                20,
-                vec![
-                    compat_scan_range_for_test(201),
-                    compat_scan_range_for_test(202),
-                    compat_scan_range_for_test(203),
-                ],
-            ),
-        ]));
-        let mut placement = fake_placement(0, 1, 200, "10.0.0.20");
-        placement
-            .scan_ranges
-            .insert(10, vec![native_file_scan_range_for_test(101)]);
-
-        let carrier_index = build_compat_starrocks_carrier_index(&fragment)
-            .expect("no StarRocks carriers for native File range");
-        let merged = compat_scan_ranges_for_placement(&fragment, &placement, 2, &carrier_index)
-            .expect("merge native and compat scan ranges");
-
-        assert_eq!(
-            merged[&10]
-                .iter()
-                .map(|range| range.volume_id.expect("native marker"))
-                .collect::<Vec<_>>(),
-            vec![101],
-            "native scan range key must not be replaced by compat projection"
-        );
-        assert_eq!(
-            merged[&20]
-                .iter()
-                .map(|range| range.volume_id.expect("compat marker"))
-                .collect::<Vec<_>>(),
-            vec![202],
-            "compat-only scan range key must still be assigned round-robin"
-        );
-    }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn compat_scan_ranges_for_placement_selects_matching_starrocks_carrier() {
-        let mut fragment = fragment_for_scan_range_merge_test(BTreeMap::from([(
-            10,
-            vec![
-                compat_starrocks_scan_range_for_test(300, 100, 7),
-                compat_starrocks_scan_range_for_test(301, 101, 8),
-            ],
-        )]));
-        fragment.native_scan_ranges.insert(
-            10,
-            vec![
-                native_starrocks_scan_range_for_test(300, 100, 7),
-                native_starrocks_scan_range_for_test(301, 101, 8),
-            ],
-        );
-        let mut placement = fake_placement(0, 1, 200, "10.0.0.20");
-        placement
-            .scan_ranges
-            .insert(10, vec![native_starrocks_scan_range_for_test(301, 101, 8)]);
-
-        let carrier_index = build_compat_starrocks_carrier_index(&fragment)
-            .expect("validated StarRocks carrier index");
-        let selected = compat_scan_ranges_for_placement(&fragment, &placement, 2, &carrier_index)
-            .expect("matching legacy StarRocks carrier");
-        let internal = selected[&10][0]
-            .scan_range
-            .internal_scan_range
-            .as_ref()
-            .expect("legacy internal scan range");
-        assert_eq!(internal.tablet_id, 301);
-        assert_eq!(internal.partition_id, Some(101));
-        assert_eq!(internal.version, "8");
-    }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn compat_scan_ranges_for_placement_rejects_missing_starrocks_carrier() {
-        let mut fragment = fragment_for_scan_range_merge_test(BTreeMap::from([(
-            10,
-            vec![compat_starrocks_scan_range_for_test(300, 100, 7)],
-        )]));
-        fragment
-            .native_scan_ranges
-            .insert(10, vec![native_starrocks_scan_range_for_test(999, 100, 7)]);
-
-        let err = build_compat_starrocks_carrier_index(&fragment)
-            .expect_err("missing legacy StarRocks carrier must fail");
-        assert!(
-            err.contains(
-                "missing legacy StarRocks scan range carrier for node_id=10 tablet_id=999"
-            ),
-            "{err}"
-        );
-    }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn compat_scan_ranges_for_placement_rejects_duplicate_starrocks_carrier() {
-        let carrier = compat_starrocks_scan_range_for_test(300, 100, 7);
-        let mut fragment = fragment_for_scan_range_merge_test(BTreeMap::from([(
-            10,
-            vec![carrier.clone(), carrier],
-        )]));
-        fragment
-            .native_scan_ranges
-            .insert(10, vec![native_starrocks_scan_range_for_test(300, 100, 7)]);
-
-        let err = build_compat_starrocks_carrier_index(&fragment)
-            .expect_err("duplicate legacy StarRocks carrier must fail");
-        assert!(
-            err.contains(
-                "duplicate legacy StarRocks scan range carrier for node_id=10 tablet_id=300"
-            ),
-            "{err}"
-        );
-    }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn compat_scan_ranges_for_placement_rejects_starrocks_identity_mismatch() {
-        let mut fragment = fragment_for_scan_range_merge_test(BTreeMap::from([(
-            10,
-            vec![compat_starrocks_scan_range_for_test(300, 999, 7)],
-        )]));
-        fragment
-            .native_scan_ranges
-            .insert(10, vec![native_starrocks_scan_range_for_test(300, 100, 7)]);
-
-        let err = build_compat_starrocks_carrier_index(&fragment)
-            .expect_err("mismatched legacy StarRocks carrier must fail");
-        assert!(
-            err.contains(
-                "legacy StarRocks scan range carrier identity mismatch for node_id=10: native=(300, 100, 7) legacy=(300, 999, 7)"
-            ),
-            "{err}"
-        );
-    }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn compat_scan_ranges_for_placement_rejects_extra_legacy_starrocks_carrier() {
-        let mut fragment = fragment_for_scan_range_merge_test(BTreeMap::from([(
-            10,
-            vec![
-                compat_starrocks_scan_range_for_test(300, 100, 7),
-                compat_starrocks_scan_range_for_test(301, 101, 8),
-            ],
-        )]));
-        fragment
-            .native_scan_ranges
-            .insert(10, vec![native_starrocks_scan_range_for_test(300, 100, 7)]);
-        let err = build_compat_starrocks_carrier_index(&fragment)
-            .expect_err("extra legacy StarRocks carrier must fail");
-        assert!(
-            err.contains("extra legacy StarRocks scan range carrier for node_id=10 tablet_id=301"),
-            "{err}"
-        );
-    }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn compat_starrocks_carrier_index_rejects_legacy_only_node() {
-        let fragment = fragment_for_scan_range_merge_test(BTreeMap::from([(
-            10,
-            vec![compat_starrocks_scan_range_for_test(300, 100, 7)],
-        )]));
-
-        let err = build_compat_starrocks_carrier_index(&fragment)
-            .expect_err("legacy-only StarRocks carrier must fail");
-        assert!(
-            err.contains("extra legacy StarRocks scan range carrier for node_id=10 tablet_id=300"),
-            "{err}"
-        );
-    }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn compat_starrocks_carrier_index_reports_accounting_errors_in_tablet_order() {
-        let mut fragment = fragment_for_scan_range_merge_test(BTreeMap::from([
-            (10, vec![compat_starrocks_scan_range_for_test(301, 101, 8)]),
-            (11, vec![compat_starrocks_scan_range_for_test(401, 201, 18)]),
-        ]));
-        fragment.native_scan_ranges.insert(
-            10,
-            vec![
-                native_starrocks_scan_range_for_test(302, 102, 9),
-                native_starrocks_scan_range_for_test(300, 100, 7),
-            ],
-        );
-        fragment
-            .native_scan_ranges
-            .insert(11, vec![native_starrocks_scan_range_for_test(400, 200, 17)]);
-
-        let err = build_compat_starrocks_carrier_index(&fragment)
-            .expect_err("carrier accounting mismatch must fail");
-        assert_eq!(
-            err,
-            "missing legacy StarRocks scan range carrier for node_id=10 tablet_id=300; extra legacy StarRocks scan range carrier for node_id=10 tablet_id=301; missing legacy StarRocks scan range carrier for node_id=10 tablet_id=302; missing legacy StarRocks scan range carrier for node_id=11 tablet_id=400; extra legacy StarRocks scan range carrier for node_id=11 tablet_id=401"
-        );
-    }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn compat_starrocks_carrier_index_rejects_duplicate_native_tablet() {
-        let mut fragment = fragment_for_scan_range_merge_test(BTreeMap::from([(
-            10,
-            vec![compat_starrocks_scan_range_for_test(300, 100, 7)],
-        )]));
-        fragment.native_scan_ranges.insert(
-            10,
-            vec![
-                native_starrocks_scan_range_for_test(300, 100, 7),
-                native_starrocks_scan_range_for_test(300, 100, 7),
-            ],
-        );
-
-        let err = build_compat_starrocks_carrier_index(&fragment)
-            .expect_err("duplicate native StarRocks tablet must fail");
-        assert!(
-            err.contains("duplicate native StarRocks scan range for node_id=10 tablet_id=300"),
-            "{err}"
-        );
-    }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn compat_starrocks_carrier_index_rejects_non_internal_legacy_range() {
-        let mut fragment = fragment_for_scan_range_merge_test(BTreeMap::from([(
-            10,
-            vec![compat_scan_range_for_test(999)],
-        )]));
-        fragment
-            .native_scan_ranges
-            .insert(10, vec![native_starrocks_scan_range_for_test(300, 100, 7)]);
-
-        let err = build_compat_starrocks_carrier_index(&fragment)
-            .expect_err("non-internal legacy StarRocks range must fail");
-        assert!(
-            err.contains("legacy StarRocks scan range carrier is not internal for node_id=10"),
-            "{err}"
-        );
-    }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn compat_starrocks_carrier_index_rejects_invalid_legacy_version() {
-        let mut carrier = compat_starrocks_scan_range_for_test(300, 100, 7);
-        carrier
-            .scan_range
-            .internal_scan_range
-            .as_mut()
-            .expect("internal carrier")
-            .version = "invalid".to_string();
-        let mut fragment =
-            fragment_for_scan_range_merge_test(BTreeMap::from([(10, vec![carrier])]));
-        fragment
-            .native_scan_ranges
-            .insert(10, vec![native_starrocks_scan_range_for_test(300, 100, 7)]);
-
-        let err = build_compat_starrocks_carrier_index(&fragment)
-            .expect_err("invalid legacy StarRocks version must fail");
-        assert!(
-            err.contains(
-                "legacy StarRocks scan range carrier for node_id=10 tablet_id=300 has invalid version `invalid`"
-            ),
-            "{err}"
-        );
-    }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn compat_starrocks_carrier_index_is_reused_across_placements() {
-        let mut fragment = fragment_for_scan_range_merge_test(BTreeMap::from([(
-            10,
-            vec![
-                compat_starrocks_scan_range_for_test(300, 100, 7),
-                compat_starrocks_scan_range_for_test(301, 101, 8),
-            ],
-        )]));
-        fragment.native_scan_ranges.insert(
-            10,
-            vec![
-                native_starrocks_scan_range_for_test(300, 100, 7),
-                native_starrocks_scan_range_for_test(301, 101, 8),
-            ],
-        );
-        let index = build_compat_starrocks_carrier_index(&fragment)
-            .expect("build one fragment-level StarRocks carrier index");
-        let _: &std::collections::HashMap<
-            i32,
-            std::collections::HashMap<i64, CompatStarRocksCarrier>,
-        > = &index.by_node;
-        assert_eq!(index.by_node[&10].len(), 2);
-
-        for (instance_index, tablet_id, partition_id, version) in
-            [(0, 300, 100, 7), (1, 301, 101, 8)]
-        {
-            let mut placement =
-                fake_placement(0, instance_index, 200 + instance_index as i64, "10.0.0.20");
-            placement.scan_ranges.insert(
-                10,
-                vec![native_starrocks_scan_range_for_test(
-                    tablet_id,
-                    partition_id,
-                    version,
-                )],
-            );
-            let selected = compat_scan_ranges_for_placement(&fragment, &placement, 2, &index)
-                .expect("reuse fragment-level carrier index");
-            assert_eq!(
-                selected[&10][0]
-                    .scan_range
-                    .internal_scan_range
-                    .as_ref()
-                    .expect("internal carrier")
-                    .tablet_id,
-                tablet_id
-            );
-        }
-    }
-
-    fn fake_destination(
-        finst_lo: i64,
-        host: &str,
-    ) -> crate::runtime::endpoint::FragmentDestination {
-        crate::runtime::endpoint::FragmentDestination::new(
-            crate::common::types::UniqueId {
-                hi: 11,
-                lo: finst_lo,
-            },
-            crate::runtime::endpoint::RuntimeEndpoint::new(host, 9010).expect("test endpoint"),
-        )
-    }
-
-    fn is_write_sink_for_test(
-        params: &crate::thrift::internal_service::TExecPlanFragmentParams,
-    ) -> bool {
-        super::is_write_sink(params)
-    }
-
-    fn id(hi: i64, lo: i64) -> types::TUniqueId {
-        types::TUniqueId::new(hi, lo)
-    }
-
-    fn native_id(hi: i64, lo: i64) -> UniqueId {
-        UniqueId { hi, lo }
-    }
-
-    fn runtime_query_id(hi: i64, lo: i64) -> crate::runtime::query_context::QueryId {
-        crate::runtime::query_context::QueryId { hi, lo }
-    }
-
-    fn writer_key(
-        query_hi: i64,
-        query_lo: i64,
-        finst_hi: i64,
-        finst_lo: i64,
-        backend_num: i32,
-    ) -> WriterKey {
-        WriterKey {
-            query_id: native_id(query_hi, query_lo),
-            fragment_instance_id: native_id(finst_hi, finst_lo),
-            backend_num,
-        }
-    }
-
-    fn ok_status() -> status::TStatus {
-        status::TStatus::new(status_code::TStatusCode::OK, None)
-    }
-
-    fn err_status(msg: &str) -> status::TStatus {
-        status::TStatus::new(
-            status_code::TStatusCode::INTERNAL_ERROR,
-            Some(vec![msg.to_string()]),
-        )
-    }
-
-    fn write_report(
-        writer: &WriterKey,
-        done: bool,
-        status: status::TStatus,
-        path: &str,
-    ) -> FragmentExecStatusReport {
-        let iceberg_commits = if path.is_empty() {
-            Vec::new()
-        } else {
-            vec![novarocks::IcebergCommitInfo {
-                iceberg_data_file: Some(novarocks::IcebergDataFile {
-                    path: Some(path.to_string()),
-                    record_count: Some(3),
-                    file_size_in_bytes: Some(30),
-                    file_content: novarocks::IcebergFileContent::Data as i32,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }]
-        };
-        let status = common::Status {
-            code: status.status_code.0,
-            message: status
-                .error_msgs
-                .as_ref()
-                .map(|msgs| msgs.join("; "))
-                .unwrap_or_default(),
-        };
-        FragmentExecStatusReport {
-            query_id: writer.query_id,
-            fragment_instance_id: writer.fragment_instance_id,
-            backend_num: writer.backend_num,
-            done,
-            status,
-            iceberg_commits,
-            load_counters: Default::default(),
-            loaded_rows: 3,
-            loaded_bytes: 30,
-            filtered_rows: 0,
-        }
-    }
-
-    fn profile_report_params(
-        query_id: types::TUniqueId,
-        finst_id: types::TUniqueId,
-        profile: crate::thrift::runtime_profile::TRuntimeProfileTree,
-    ) -> crate::thrift::frontend_service::TReportExecStatusParams {
-        crate::thrift::frontend_service::TReportExecStatusParams::new(
-            crate::thrift::frontend_service::FrontendServiceVersion::V1,
-            Some(query_id),
-            Some(0),
-            Some(finst_id),
-            Some(ok_status()),
-            Some(true),
-            Some(profile),
-            Option::<Vec<String>>::None,
-            Option::<Vec<String>>::None,
-            None,
-            None,
-            Option::<Vec<String>>::None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-    }
-
-    fn profile_tree_for_plan_node(
-        node_id: i32,
-    ) -> crate::thrift::runtime_profile::TRuntimeProfileTree {
-        let profiler = crate::runtime::profile::Profiler::new("fragment");
-        let common = profiler
-            .child(format!("SCAN (plan_node_id={node_id})"))
-            .child("CommonMetrics");
-        common.counter_set("PullRowNum", ProfileUnit::Unit, 3);
-        common.counter_set("OperatorTotalTime", ProfileUnit::TimeNs, 1_000);
-        common.counter_set("OperatorPeakMemoryUsage", ProfileUnit::Bytes, 64);
-        crate::service::fe_report::runtime_profile_tree_to_thrift_for_fe(&profiler.to_native_tree())
-            .expect("profile tree converts to thrift")
-    }
-
-    // -----------------------------------------------------------------------
-    // Original regression tests
-    // -----------------------------------------------------------------------
-
-    /// Wrap params as native submissions for low-level submit/fetch loop tests.
-    fn single_backend(
-        params: Vec<crate::thrift::internal_service::TExecPlanFragmentParams>,
-    ) -> Vec<(usize, FragmentSubmission)> {
-        params
-            .into_iter()
-            .map(|p| {
-                (
-                    0usize,
-                    FragmentSubmission::with_native(p, Default::default(), Default::default()),
-                )
-            })
-            .collect()
-    }
-
-    /// Verify that `ExecutionCoordinator::new` accepts `Arc<dyn FragmentDispatcher>`
-    /// (regression guard against re-introduction of exchange_host/port parameters).
-    #[test]
-    fn constructor_accepts_dispatcher() {
-        let dispatcher: Arc<dyn FragmentDispatcher> = MockDispatcher::new();
-        // Just verify the trait object is usable for the submit/cancel surface.
-        assert_eq!(dispatcher.backend_count(), 1);
-    }
-
-    /// Verify that `MockDispatcher::submitted_count` starts at zero.
-    #[test]
-    fn mock_dispatcher_starts_empty() {
-        let d = MockDispatcher::new();
-        assert_eq!(d.submitted_count(), 0);
-    }
-
-    // -----------------------------------------------------------------------
-    // InFlightTracker tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn in_flight_tracker_groups_by_backend() {
-        let mut tracker = InFlightTracker::default();
-        tracker.record_submitted(0, native_id(1, 10));
-        tracker.record_submitted(1, native_id(1, 20));
-        tracker.record_submitted(0, native_id(1, 11));
-
-        assert_eq!(tracker.by_backend.len(), 2, "two distinct backends");
-        assert_eq!(
-            tracker.by_backend[&0].len(),
-            2,
-            "backend 0 got two instances"
-        );
-        assert_eq!(
-            tracker.by_backend[&1].len(),
-            1,
-            "backend 1 got one instance"
-        );
-    }
-
-    /// Mock dispatcher that records the (backend_idx, finst_ids) of every
-    /// cancel_fragments call so cancel fan-out can be asserted.
-    struct RecordingCancelDispatcher {
-        cancels: Mutex<Vec<(usize, Vec<UniqueId>)>>,
-    }
-
-    impl RecordingCancelDispatcher {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                cancels: Mutex::new(Vec::new()),
-            })
-        }
-    }
-
-    impl FragmentDispatcher for RecordingCancelDispatcher {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
-        fn submit_fragment(
-            &self,
-            _backend_idx: usize,
-            _params: crate::thrift::internal_service::TExecPlanFragmentParams,
-        ) -> Result<(), String> {
-            Ok(())
-        }
-
-        fn fetch_result(
-            &self,
-            _backend_idx: usize,
-            _finst_id: UniqueId,
-            _max_wait_ms: i64,
-            _expected_chunk_schema: Option<&ChunkSchemaRef>,
-        ) -> Result<FetchOutcome, String> {
-            Ok(FetchOutcome::Eof)
-        }
-
-        fn cancel_fragments(&self, backend_idx: usize, finst_ids: &[UniqueId]) {
-            self.cancels
-                .lock()
-                .unwrap()
-                .push((backend_idx, finst_ids.to_vec()));
-        }
-
-        fn backend_count(&self) -> usize {
-            2
-        }
-    }
-
-    #[test]
-    fn in_flight_tracker_cancel_all_fans_out_per_backend() {
-        let dispatcher = RecordingCancelDispatcher::new();
-        let mut tracker = InFlightTracker::default();
-        tracker.record_submitted(0, native_id(7, 1));
-        tracker.record_submitted(1, native_id(7, 2));
-        tracker.record_submitted(1, native_id(7, 3));
-
-        tracker.cancel_all(dispatcher.as_ref());
-
-        let cancels = dispatcher.cancels.lock().unwrap();
-        assert_eq!(cancels.len(), 2, "one cancel call per backend");
-        let backend0 = cancels
-            .iter()
-            .find(|(idx, _)| *idx == 0)
-            .expect("backend 0");
-        let backend1 = cancels
-            .iter()
-            .find(|(idx, _)| *idx == 1)
-            .expect("backend 1");
-        assert_eq!(backend0.1.len(), 1, "backend 0 cancels 1 instance");
-        assert_eq!(backend1.1.len(), 2, "backend 1 cancels 2 instances");
-    }
-
-    #[test]
-    fn write_sink_detection_marks_supported_write_sinks() {
-        for sink_type in [
-            data_sinks::TDataSinkType::ICEBERG_TABLE_SINK,
-            data_sinks::TDataSinkType::ICEBERG_DELETE_SINK,
-            data_sinks::TDataSinkType::ICEBERG_DV_SINK,
-            data_sinks::TDataSinkType::ICEBERG_EQUALITY_DELETE_SINK,
-            data_sinks::TDataSinkType::HIVE_TABLE_SINK,
-            data_sinks::TDataSinkType::OLAP_TABLE_SINK,
-        ] {
-            let params = make_params_with_sink_type(sink_type);
-            assert!(
-                is_write_sink_for_test(&params),
-                "{sink_type:?} must register with the write coordinator"
-            );
-        }
-
-        for sink_type in [
-            data_sinks::TDataSinkType::NOOP_SINK,
-            data_sinks::TDataSinkType::RESULT_SINK,
-            data_sinks::TDataSinkType::DATA_STREAM_SINK,
-        ] {
-            let params = make_params_with_sink_type(sink_type);
-            assert!(
-                !is_write_sink_for_test(&params),
-                "{sink_type:?} must not register with the write coordinator"
-            );
-        }
-    }
-
-    #[test]
-    fn coordinator_groups_multiple_router_edges_from_same_source() {
-        use crate::sql::common::ChangeStreamBranchKind;
-
-        let edges = vec![
-            fake_router_edge(1, 2, 11, 7, 0, ChangeStreamBranchKind::DeleteDv),
-            fake_router_edge(1, 3, 12, 7, 1, ChangeStreamBranchKind::ReuseData),
-        ];
-        let grouped = group_router_edges_by_source(&edges).expect("router groups");
-        assert_eq!(grouped.len(), 1);
-        assert_eq!(grouped[&(1, 7)].len(), 2);
-    }
-
-    #[test]
-    fn coordinator_rejects_router_edges_with_duplicate_target_exchange() {
-        use crate::sql::common::ChangeStreamBranchKind;
-
-        let edges = vec![
-            fake_router_edge(1, 2, 11, 7, 0, ChangeStreamBranchKind::DeleteDv),
-            fake_router_edge(1, 2, 11, 7, 1, ChangeStreamBranchKind::ReuseData),
-        ];
-        let err = group_router_edges_by_source(&edges).expect_err("duplicate target exchange");
-        assert!(
-            err.contains("repeats target exchange"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn coordinator_still_rejects_multiple_plain_stream_edges_from_same_source() {
-        let edges = vec![fake_stream_edge(1, 2, 11), fake_stream_edge(1, 3, 12)];
-        let err = build_stream_edge_by_source(&edges).expect_err("multiple plain streams");
-        assert!(err.contains("multiple outgoing stream edges"));
-    }
-
-    #[test]
-    fn compat_edge_sidecar_preserves_lowered_output_slots() {
-        let mut original = fake_stream_edge(1, 2, 77);
-        original.output_slot_ids = vec![31, 12, 9];
-        let mut lowered = original.clone();
-        lowered.output_slot_ids = vec![3, 4, 2, 1];
-
-        let sidecars = build_compat_edge_sidecars(
-            &[original.clone()],
-            vec![LoweredFragmentEdge {
-                edge: lowered,
-                compat_partition: unpartitioned_partition(),
+        .unwrap();
+        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).unwrap();
+        let err = align_fetch_chunks_to_output_columns(
+            vec![chunk],
+            &[crate::sql::codegen::OutputColumn {
+                name: "price".to_string(),
+                data_type: DataType::Decimal128(20, 2),
+                nullable: false,
             }],
         )
-        .expect("compat edge sidecars");
-
-        assert_eq!(
-            compat_output_slot_ids_for_edge(&sidecars, &original).expect("lowered output slots"),
-            &[3, 4, 2, 1]
-        );
-        let sink = build_stream_sink_for_edge(
-            &original,
-            compat_partition_for_edge(&sidecars, &original).expect("partition"),
-            compat_output_slot_ids_for_edge(&sidecars, &original).expect("lowered output slots"),
-        );
-        assert_eq!(sink.output_columns, Some(vec![3, 4, 2, 1]));
-    }
-
-    #[test]
-    fn plain_stream_sink_carries_edge_output_columns() {
-        let mut edge = fake_stream_edge(1, 2, 77);
-        edge.output_slot_ids = vec![31, 12, 9];
-        edge.output_partition = DataPartition::hash(vec![hash_key_expr_for_test(1, "bucket")]);
-
-        let sink =
-            build_stream_sink_for_edge(&edge, compiled_hash_partition_for_test(31), &[31, 12, 9]);
-
-        assert_eq!(sink.dest_node_id, 77);
-        assert_eq!(sink.output_columns, Some(vec![31, 12, 9]));
-        assert_single_slot_ref_partition_expr(&sink.output_partition, 31);
-    }
-
-    #[test]
-    fn plain_stream_sink_omits_empty_output_columns() {
-        let edge = fake_stream_edge(1, 2, 77);
-
-        let sink = build_stream_sink_for_edge(&edge, unpartitioned_partition(), &[]);
-
-        assert_eq!(sink.output_columns, None);
-    }
-
-    #[test]
-    fn router_sink_does_not_require_write_report() {
-        let sink = data_sinks::TDataSink {
-            type_: data_sinks::TDataSinkType::ICEBERG_CHANGE_STREAM_ROUTER_SINK,
-            iceberg_change_stream_router_sink: Some(empty_router_sink_for_test()),
-            ..empty_data_sink_for_test(data_sinks::TDataSinkType::ICEBERG_CHANGE_STREAM_ROUTER_SINK)
-        };
-        assert!(!compat_data_sink_requires_write_report(&sink));
-    }
-
-    #[test]
-    fn router_sink_wrapper_uses_edge_exchange_node_and_preserves_projection() {
-        use crate::sql::common::ChangeStreamBranchKind;
-
-        let mut edge = fake_router_edge(1, 2, 77, 7, 0, ChangeStreamBranchKind::DeleteDv);
-        edge.output_partition = DataPartition::hash(vec![hash_key_expr_for_test(1, "bucket")]);
-        let placeholder_partition = unpartitioned_partition();
-        let template_stream_sink = data_sinks::TDataStreamSink::new(
-            999,
-            placeholder_partition,
-            None::<bool>,
-            None::<bool>,
-            None::<i32>,
-            Some(vec![10, 11]),
-            None::<i64>,
-        );
-        let template = data_sinks::TIcebergChangeStreamRouterSink::new(
-            3,
-            Some(4),
-            vec![data_sinks::TIcebergChangeStreamRouterBranch::new(
-                0,
-                data_sinks::TIcebergChangeStreamRouterBranchKind::DELETE_DV,
-                template_stream_sink,
-                vec![],
-            )],
-        );
-        let placements = BTreeMap::from([(
-            2,
-            vec![
-                fake_placement(2, 0, 200, "10.0.0.20"),
-                fake_placement(2, 1, 201, "10.0.0.21"),
-            ],
-        )]);
-        let compat_sidecars = compat_edge_sidecar_map_for_test(
-            &edge,
-            compiled_hash_partition_for_test(10),
-            vec![12, 9],
-        );
-
-        let wrapped = wrap_iceberg_change_stream_router_sink(
-            &template,
-            &[&edge],
-            &compat_sidecars,
-            &placements,
-        )
-        .expect("wrap");
-        let router = wrapped
-            .iceberg_change_stream_router_sink
-            .as_ref()
-            .expect("router sink");
-        assert_eq!(router.change_op_slot_id, 3);
-        assert_eq!(router.data_route_slot_id, Some(4));
-        assert_eq!(router.branches.len(), 1);
-        let branch = &router.branches[0];
-        assert_eq!(
-            branch.stream_sink.dest_node_id, 77,
-            "branch stream sink must route to the edge exchange node"
-        );
-        assert_eq!(branch.stream_sink.output_columns, Some(vec![12, 9]));
-        assert_eq!(
-            branch.stream_sink.output_partition.type_,
-            partitions::TPartitionType::HASH_PARTITIONED
-        );
-        assert_single_slot_ref_partition_expr(&branch.stream_sink.output_partition, 10);
-        assert_eq!(branch.destinations.len(), 2);
-        assert_eq!(branch.destinations[0].fragment_instance_id.lo, 200);
-        assert_eq!(
-            branch.destinations[0]
-                .brpc_server
-                .as_ref()
-                .expect("brpc")
-                .hostname,
-            "10.0.0.20"
-        );
-        assert_eq!(branch.destinations[1].fragment_instance_id.lo, 201);
-    }
-
-    #[test]
-    fn native_router_patch_preserves_static_output_partition() {
-        use crate::proto::expr;
-        use crate::proto::plan as native_plan;
-        use crate::sql::common::ChangeStreamBranchKind;
-
-        let mut edge = fake_router_edge(1, 2, 77, 7, 0, ChangeStreamBranchKind::DeleteDv);
-        edge.output_partition = DataPartition::hash(Vec::new());
-        let mut fragment = native_plan::PlanFragment {
-            fragment_id: 1,
-            root: None,
-            data_partition: Some(native_plan::DataPartition {
-                kind: native_plan::PartitionKind::Unpartitioned as i32,
-                exprs: Vec::new(),
-            }),
-            output_partition: Some(native_plan::DataPartition {
-                kind: native_plan::PartitionKind::Unpartitioned as i32,
-                exprs: Vec::new(),
-            }),
-            sink: Some(native_plan::DataSink {
-                kind: Some(native_plan::data_sink::Kind::IcebergChangeStreamRouter(
-                    native_plan::IcebergChangeStreamRouterSink {
-                        group_id: 7,
-                        change_op_output_ordinal: 0,
-                        data_route_output_ordinal: None,
-                        branches: vec![native_plan::IcebergChangeStreamBranchRoute {
-                            branch_id: 0,
-                            branch_kind: native_plan::ChangeStreamBranchKind::DeleteDv as i32,
-                            target_fragment_id: 0,
-                            target_exchange_node_id: -1,
-                            output_ordinals: vec![0],
-                            output_partition_ordinals: vec![0],
-                            output_partition: Some(native_plan::DataPartition {
-                                kind: native_plan::PartitionKind::Hash as i32,
-                                exprs: vec![expr::Expr {
-                                    r#type: None,
-                                    nullable: false,
-                                    kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
-                                        column_id: 42,
-                                        qualifier: None,
-                                        column: Some("bucket".to_string()),
-                                    })),
-                                }],
-                            }),
-                            destinations: None,
-                        }],
-                    },
-                )),
-            }),
-            output_exprs: Vec::new(),
-            output_columns: Vec::new(),
-            cte_id: None,
-            cte_exchange_nodes: Vec::new(),
-        };
-        let placements = BTreeMap::from([(2, vec![fake_placement(2, 0, 200, "10.0.0.20")])]);
-
-        patch_native_iceberg_change_stream_router_sink(&mut fragment, 1, 7, &[&edge], &placements)
-            .expect("patch native router sink");
-
-        let Some(native_plan::data_sink::Kind::IcebergChangeStreamRouter(router)) =
-            fragment.sink.as_ref().and_then(|sink| sink.kind.as_ref())
-        else {
-            panic!("expected native router sink");
-        };
-        let branch = router.branches.first().expect("router branch");
-        assert_eq!(branch.target_fragment_id, 2);
-        assert_eq!(branch.target_exchange_node_id, 77);
-        assert_eq!(
-            branch
-                .destinations
-                .as_ref()
-                .expect("destinations")
-                .destinations
-                .len(),
-            1
-        );
-        let partition = branch
-            .output_partition
-            .as_ref()
-            .expect("static output partition");
-        assert_eq!(partition.kind, native_plan::PartitionKind::Hash as i32);
-        let [expr] = partition.exprs.as_slice() else {
-            panic!("expected one partition expr");
-        };
-        let Some(expr::expr::Kind::ColumnRef(column_ref)) = expr.kind.as_ref() else {
-            panic!("expected preserved column ref");
-        };
-        assert_eq!(column_ref.column_id, 42);
-    }
-
-    #[test]
-    fn native_router_patch_rejects_missing_output_partition() {
-        use crate::proto::plan as native_plan;
-        use crate::sql::common::ChangeStreamBranchKind;
-
-        let edge = fake_router_edge(1, 2, 77, 7, 0, ChangeStreamBranchKind::DeleteDv);
-        let mut fragment = native_plan::PlanFragment {
-            fragment_id: 1,
-            root: None,
-            data_partition: Some(native_plan::DataPartition {
-                kind: native_plan::PartitionKind::Unpartitioned as i32,
-                exprs: Vec::new(),
-            }),
-            output_partition: Some(native_plan::DataPartition {
-                kind: native_plan::PartitionKind::Unpartitioned as i32,
-                exprs: Vec::new(),
-            }),
-            sink: Some(native_plan::DataSink {
-                kind: Some(native_plan::data_sink::Kind::IcebergChangeStreamRouter(
-                    native_plan::IcebergChangeStreamRouterSink {
-                        group_id: 7,
-                        change_op_output_ordinal: 0,
-                        data_route_output_ordinal: None,
-                        branches: vec![native_plan::IcebergChangeStreamBranchRoute {
-                            branch_id: 0,
-                            branch_kind: native_plan::ChangeStreamBranchKind::DeleteDv as i32,
-                            target_fragment_id: 0,
-                            target_exchange_node_id: -1,
-                            output_ordinals: vec![0],
-                            output_partition_ordinals: vec![0],
-                            output_partition: None,
-                            destinations: None,
-                        }],
-                    },
-                )),
-            }),
-            output_exprs: Vec::new(),
-            output_columns: Vec::new(),
-            cte_id: None,
-            cte_exchange_nodes: Vec::new(),
-        };
-        let placements = BTreeMap::new();
-
-        let err = patch_native_iceberg_change_stream_router_sink(
-            &mut fragment,
-            1,
-            7,
-            &[&edge],
-            &placements,
-        )
-        .expect_err("native router patch must not reconstruct partition from thrift");
-
-        assert!(
-            err.contains("missing output_partition from native encoder"),
-            "{err}"
-        );
+        .expect_err("decimal precision drift must fail");
+        assert!(err.contains("type mismatch"), "{err}");
     }
 
     #[test]
     fn native_cte_multicast_patch_uses_source_root_output_slots() {
-        use crate::proto::{common, expr, plan as native_plan};
+        use crate::proto::{common, expr};
 
-        fn native_scalar_type(prim: common::PrimitiveType) -> common::TypeDesc {
-            common::TypeDesc {
-                kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
-                    r#type: prim as i32,
-                    len: None,
-                    precision: None,
-                    scale: None,
-                    time_unit: None,
-                })),
-            }
-        }
-
+        let bigint = common::TypeDesc {
+            kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
+                r#type: common::PrimitiveType::Bigint as i32,
+                len: None,
+                precision: None,
+                scale: None,
+                time_unit: None,
+            })),
+        };
         let mut fragment = native_plan::PlanFragment {
             fragment_id: 1,
             root: Some(native_plan::DistributedNode {
@@ -5142,9 +3231,7 @@ mod tests {
                             native_plan::ProjectNode {
                                 items: vec![native_plan::ProjectItem {
                                     expr: Some(expr::Expr {
-                                        r#type: Some(native_scalar_type(
-                                            common::PrimitiveType::Bigint,
-                                        )),
+                                        r#type: Some(bigint),
                                         nullable: true,
                                         kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
                                             column_id: 20,
@@ -5169,11 +3256,8 @@ mod tests {
                 kind: native_plan::PartitionKind::Unpartitioned as i32,
                 exprs: Vec::new(),
             }),
-            sink: None,
-            output_exprs: Vec::new(),
-            output_columns: Vec::new(),
             cte_id: Some(3),
-            cte_exchange_nodes: Vec::new(),
+            ..Default::default()
         };
         let consumers = vec![(
             2,
@@ -5185,1020 +3269,265 @@ mod tests {
             vec![13],
             vec![ColumnId::new_for_test(13)],
         )];
-        let destinations = BTreeMap::from([(2, vec![fake_destination(200, "10.0.0.20")])]);
+        let destination = crate::runtime::endpoint::FragmentDestination::new(
+            UniqueId { hi: 98_000, lo: 1 },
+            crate::runtime::endpoint::RuntimeEndpoint::new("10.0.0.20", 9010).unwrap(),
+        );
 
-        patch_native_cte_multicast_sink(&mut fragment, 1, 3, &consumers, &destinations)
-            .expect("patch native cte sink");
+        patch_native_cte_multicast_sink(
+            &mut fragment,
+            1,
+            3,
+            &consumers,
+            &BTreeMap::from([(2, vec![destination])]),
+        )
+        .expect("patch native CTE sink");
 
         let Some(native_plan::data_sink::Kind::MultiCastDataStream(sink)) =
             fragment.sink.as_ref().and_then(|sink| sink.kind.as_ref())
         else {
-            panic!("expected native multicast sink");
+            panic!("native multicast sink");
         };
         assert_eq!(sink.sinks.len(), 1);
         assert_eq!(sink.sinks[0].output_columns, vec![10]);
+        assert_eq!(sink.destinations[0].destinations.len(), 1);
+        assert_eq!(
+            sink.destinations[0].destinations[0].endpoint,
+            "10.0.0.20:9010"
+        );
     }
 
     #[test]
-    fn native_cte_multicast_patch_maps_contract_subset_to_source_root_slots() {
-        use crate::proto::{common, plan as native_plan};
+    fn router_patch_changes_only_the_placement_clone() {
+        use crate::sql::common::ChangeStreamBranchKind;
 
-        fn native_scalar_type(prim: common::PrimitiveType) -> common::TypeDesc {
-            common::TypeDesc {
-                kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
-                    r#type: prim as i32,
-                    len: None,
-                    precision: None,
-                    scale: None,
-                    time_unit: None,
-                })),
-            }
-        }
-
-        fn native_output_column(column_id: u32, name: &str) -> common::OutputColumn {
-            common::OutputColumn {
-                column_id,
-                name: name.to_string(),
-                r#type: Some(native_scalar_type(common::PrimitiveType::Bigint)),
-                nullable: false,
-                is_internal: false,
-            }
-        }
-
-        let root_a = native_output_column(1, "a");
-        let root_b = native_output_column(2, "b");
-        let root_c = native_output_column(3, "c");
-        let mut fragment = native_plan::PlanFragment {
+        let edge = FragmentEdge {
+            source_fragment_id: 1,
+            target_fragment_id: 2,
+            target_exchange_node_id: 77,
+            output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
+            stream_kind: crate::sql::codegen::FragmentStreamKind::Gather,
+            edge_kind: FragmentEdgeKind::IcebergChangeStreamRouter {
+                router_group_id: 7,
+                branch_id: 0,
+                branch_kind: ChangeStreamBranchKind::DeleteDv,
+            },
+            output_slot_ids: vec![10],
+        };
+        let static_fragment = native_plan::PlanFragment {
             fragment_id: 1,
-            root: Some(native_plan::DistributedNode {
-                node_id: 5,
-                fragment_id: 1,
-                tuple_ids: Vec::new(),
-                nullable_tuple_ids: Vec::new(),
-                limit: -1,
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
-                children: vec![native_plan::DistributedNode {
-                    node_id: 4,
-                    fragment_id: 1,
-                    tuple_ids: Vec::new(),
-                    nullable_tuple_ids: Vec::new(),
-                    limit: -1,
-                    build_runtime_filters: Vec::new(),
-                    probe_runtime_filters: Vec::new(),
-                    children: Vec::new(),
-                    payload: Some(native_plan::distributed_node::Payload::Physical(
-                        native_plan::PlanNode {
-                            output_columns: vec![root_a.clone(), root_b.clone(), root_c.clone()],
-                            kind: Some(native_plan::plan_node::Kind::Values(
-                                native_plan::ValuesNode {
-                                    rows: Vec::new(),
-                                    columns: vec![root_a.clone(), root_b.clone(), root_c.clone()],
-                                },
-                            )),
-                        },
-                    )),
-                }],
-                payload: Some(native_plan::distributed_node::Payload::Physical(
-                    native_plan::PlanNode {
-                        output_columns: vec![root_a, root_b, root_c],
-                        kind: Some(native_plan::plan_node::Kind::Filter(
-                            native_plan::FilterNode { predicate: None },
-                        )),
+            sink: Some(native_plan::DataSink {
+                kind: Some(native_plan::data_sink::Kind::IcebergChangeStreamRouter(
+                    native_plan::IcebergChangeStreamRouterSink {
+                        group_id: 7,
+                        change_op_output_ordinal: 0,
+                        data_route_output_ordinal: None,
+                        branches: vec![native_plan::IcebergChangeStreamBranchRoute {
+                            branch_id: 0,
+                            branch_kind: native_plan::ChangeStreamBranchKind::DeleteDv as i32,
+                            target_fragment_id: 0,
+                            target_exchange_node_id: -1,
+                            output_ordinals: vec![0],
+                            output_partition_ordinals: Vec::new(),
+                            output_partition: Some(native_plan::DataPartition {
+                                kind: native_plan::PartitionKind::Unpartitioned as i32,
+                                exprs: Vec::new(),
+                            }),
+                            destinations: None,
+                        }],
                     },
                 )),
             }),
-            data_partition: Some(native_plan::DataPartition {
-                kind: native_plan::PartitionKind::Unpartitioned as i32,
-                exprs: Vec::new(),
-            }),
-            output_partition: Some(native_plan::DataPartition {
-                kind: native_plan::PartitionKind::Unpartitioned as i32,
-                exprs: Vec::new(),
-            }),
-            sink: None,
-            output_exprs: Vec::new(),
-            output_columns: vec![native_output_column(6, "a"), native_output_column(8, "c")],
-            cte_id: Some(3),
-            cte_exchange_nodes: Vec::new(),
+            ..Default::default()
         };
-        let consumers = vec![(
-            2,
-            77,
-            native_plan::DataPartition {
-                kind: native_plan::PartitionKind::Unpartitioned as i32,
-                exprs: Vec::new(),
-            },
-            vec![6, 8],
-            vec![ColumnId::new_for_test(1), ColumnId::new_for_test(3)],
-        )];
-        let destinations = BTreeMap::from([(2, vec![fake_destination(200, "10.0.0.20")])]);
-
-        patch_native_cte_multicast_sink(&mut fragment, 1, 3, &consumers, &destinations)
-            .expect("patch native cte sink");
-
-        let Some(native_plan::data_sink::Kind::MultiCastDataStream(sink)) =
-            fragment.sink.as_ref().and_then(|sink| sink.kind.as_ref())
-        else {
-            panic!("expected native multicast sink");
+        let mut placement_clone = static_fragment.clone();
+        let placement = FragmentInstancePlacement {
+            fragment_id: 2,
+            instance_index: 0,
+            finst_id: UniqueId { hi: 93_000, lo: 1 },
+            backend_idx: 4,
+            endpoint: crate::runtime::endpoint::RuntimeEndpoint::new("10.0.0.2", 9030).unwrap(),
+            scan_ranges: BTreeMap::new(),
+            destinations: Vec::new(),
+            runtime_filter_prober_params: BTreeMap::new(),
+            per_exch_num_senders: BTreeMap::new(),
         };
-        assert_eq!(sink.sinks.len(), 1);
-        assert_eq!(sink.sinks[0].output_columns, vec![1, 3]);
-    }
 
-    #[test]
-    fn write_failure_seen_by_coordinator_cancels_inflight_fragments() {
-        let mut guard = write_registry_test_guard();
-        let query_id = native_id(710, 711);
-        let writer = writer_key(710, 711, 712, 713, 0);
-        let write = guard
-            .register_query(query_id, vec![writer.clone()])
-            .expect("register writer");
-
-        write
-            .lock()
-            .expect("write coordinator lock")
-            .apply_report(write_report(&writer, true, err_status("writer failed"), ""))
-            .expect("failed writer report");
-
-        let dispatcher = RecordingCancelDispatcher::new();
-        let mut tracker = InFlightTracker::default();
-        let submitted = native_id(710, 900);
-        tracker.record_submitted(0, submitted.clone());
-
-        let err = poll_write_failure_and_cancel(&write, &tracker, dispatcher.as_ref())
-            .expect_err("writer failure must propagate");
-
-        assert!(err.contains("writer failed"), "{err}");
-        let cancels = dispatcher.cancels.lock().unwrap();
-        assert_eq!(cancels.len(), 1, "writer failure cancels submitted work");
-        assert_eq!(cancels[0].0, 0);
-        assert_eq!(cancels[0].1, vec![submitted]);
-        let commit_err = write
-            .lock()
-            .expect("write coordinator lock")
-            .commit_input()
-            .expect_err("failed writer must block commit");
-        assert!(commit_err.contains("writer failed"), "{commit_err}");
-    }
-
-    #[test]
-    fn write_commit_readiness_helper_accepts_finished_writers() {
-        let query_id = native_id(720, 721);
-        let writer = writer_key(720, 721, 722, 723, 0);
-        let write = Arc::new(Mutex::new(
-            WriteCoordinator::new(query_id, vec![writer.clone()]).expect("write coordinator"),
-        ));
-        write
-            .lock()
-            .expect("write coordinator lock")
-            .apply_report(write_report(
-                &writer,
-                true,
-                ok_status(),
-                "s3://warehouse/data.parquet",
-            ))
-            .expect("writer report");
-
-        let commit = validate_write_commit_ready(&write).expect("commit input");
-
-        assert_eq!(commit.write_id, query_id);
-        assert_eq!(commit.writers.len(), 1);
-        assert_eq!(commit.writers[0].writer_key, writer);
-    }
-
-    #[test]
-    fn write_commit_readiness_helper_rejects_missing_final_report() {
-        let query_id = native_id(730, 731);
-        let writer = writer_key(730, 731, 732, 733, 0);
-        let write = Arc::new(Mutex::new(
-            WriteCoordinator::new(query_id, vec![writer]).expect("write coordinator"),
-        ));
-
-        let err = validate_write_commit_ready(&write)
-            .expect_err("missing writer final report must block commit readiness");
-
-        assert!(err.contains("missing writer final report"), "{err}");
-    }
-
-    #[test]
-    fn delayed_write_final_report_after_root_eof_is_accepted() {
-        let writer = writer_key(740, 741, 742, 743, 0);
-        let write = Arc::new(Mutex::new(
-            WriteCoordinator::new(native_id(740, 741), vec![writer.clone()])
-                .expect("write coordinator"),
-        ));
-        let (eof_tx, eof_rx) = std::sync::mpsc::channel();
-        let inner = EofSignalDispatcher::new(eof_tx);
-        let dispatcher: Arc<dyn FragmentDispatcher> = inner;
-        let write_for_report = Arc::clone(&write);
-        let writer_for_report = writer.clone();
-        let report_thread = std::thread::spawn(move || {
-            eof_rx.recv().expect("root EOF signal");
-            write_for_report
-                .lock()
-                .expect("write coordinator lock")
-                .apply_report(write_report(
-                    &writer_for_report,
-                    true,
-                    ok_status(),
-                    "s3://warehouse/delayed.parquet",
-                ))
-                .expect("delayed writer report");
-        });
-
-        let root_finst_id = native_id(740, 1);
-        let params = single_backend(vec![
-            make_params_with_finst(740, 10),
-            make_params_with_finst(740, 1),
-        ]);
-        let mut tracker = InFlightTracker::default();
-        let result = submit_and_fetch_loop(
-            &dispatcher,
-            &mut tracker,
-            params,
-            0,
-            root_finst_id,
-            &native_id(740, 741),
-            true,
-            1_000,
-            None,
-            Some(&write),
-            false,
-        );
-
-        report_thread.join().expect("delayed report thread");
-        assert!(
-            result.is_ok(),
-            "delayed writer final report after root EOF must be accepted, got {result:?}"
-        );
-        let output = result.expect("delayed final report succeeds");
-        assert!(output.chunks.is_empty());
-        assert!(output.write_commit.is_some());
-        assert!(output.write_abort.is_none());
-    }
-
-    #[test]
-    fn write_failure_during_post_eof_wait_surfaces_abort_and_cancels_submitted_fragments() {
-        let query_id = native_id(760, 761);
-        let writer = writer_key(760, 761, 762, 763, 0);
-        let write = Arc::new(Mutex::new(
-            WriteCoordinator::new(native_id(760, 761), vec![writer.clone()])
-                .expect("write coordinator"),
-        ));
-        let (eof_tx, _eof_rx) = std::sync::mpsc::channel();
-        let inner = EofSignalDispatcher::new(eof_tx);
-        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
-        let (wait_tx, wait_rx) = std::sync::mpsc::channel();
-        let _wait_observer = set_write_commit_wait_observer(
-            format!("query={}/{}", query_id.hi, query_id.lo),
-            wait_tx,
-        );
-        let write_for_report = Arc::clone(&write);
-        let writer_for_report = writer.clone();
-        let report_thread = std::thread::spawn(move || {
-            let wait_error = wait_rx
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .expect("post-EOF write wait signal");
-            assert!(
-                wait_error.contains("missing writer final report"),
-                "{wait_error}"
-            );
-            write_for_report
-                .lock()
-                .expect("write coordinator lock")
-                .apply_report(write_report(
-                    &writer_for_report,
-                    true,
-                    err_status("delayed writer failure"),
-                    "",
-                ))
-                .expect("delayed writer failure report");
-        });
-
-        let root_finst_id = native_id(760, 1);
-        let params = single_backend(vec![
-            make_params_with_finst(760, 10),
-            make_params_with_finst(760, 1),
-        ]);
-        let mut tracker = InFlightTracker::default();
-        let result = submit_and_fetch_loop(
-            &dispatcher,
-            &mut tracker,
-            params,
-            0,
-            root_finst_id,
-            &query_id,
-            true,
-            1_000,
-            None,
-            Some(&write),
-            false,
+        patch_native_iceberg_change_stream_router_sink(
+            &mut placement_clone,
+            1,
+            7,
+            &[&edge],
+            &BTreeMap::from([(2, vec![placement])]),
         )
-        .expect("writer failure during post-EOF wait must surface write abort");
+        .expect("patch placement-local clone");
 
-        report_thread.join().expect("delayed report thread");
-        assert!(result.write_commit.is_none());
-        let abort = result
-            .write_abort
-            .expect("writer failure must surface write abort");
-        assert!(
-            abort.reason.contains("delayed writer failure"),
-            "{}",
-            abort.reason
-        );
-        assert_eq!(abort.incomplete_writers, vec![writer]);
+        fn route(
+            fragment: &native_plan::PlanFragment,
+        ) -> &native_plan::IcebergChangeStreamBranchRoute {
+            let Some(native_plan::data_sink::Kind::IcebergChangeStreamRouter(router)) =
+                fragment.sink.as_ref().and_then(|sink| sink.kind.as_ref())
+            else {
+                panic!("router sink");
+            };
+            &router.branches[0]
+        }
+        assert!(route(&static_fragment).destinations.is_none());
         assert_eq!(
-            inner.cancelled_ids(),
-            vec![native_id(760, 10), native_id(760, 1)],
-            "post-EOF writer failure must cancel all submitted fragments"
-        );
-        let commit_err = write
-            .lock()
-            .expect("write coordinator lock")
-            .commit_input()
-            .expect_err("failed writer must block commit");
-        assert!(
-            commit_err.contains("delayed writer failure"),
-            "{commit_err}"
-        );
-    }
-
-    #[test]
-    fn write_failure_before_root_eof_surfaces_abort_with_completed_writer_outputs() {
-        let writer_ok = writer_key(780, 781, 782, 783, 0);
-        let writer_failed = writer_key(780, 781, 784, 785, 0);
-        let write = Arc::new(Mutex::new(
-            WriteCoordinator::new(
-                native_id(780, 781),
-                vec![writer_ok.clone(), writer_failed.clone()],
-            )
-            .expect("write coordinator"),
-        ));
-        write
-            .lock()
-            .expect("write coordinator lock")
-            .apply_report(write_report(
-                &writer_ok,
-                true,
-                ok_status(),
-                "s3://warehouse/pre-eof-ok.parquet",
-            ))
-            .expect("finished writer report");
-        write
-            .lock()
-            .expect("write coordinator lock")
-            .apply_report(write_report(
-                &writer_failed,
-                true,
-                err_status("pre-EOF writer failure"),
-                "",
-            ))
-            .expect("failed writer report");
-
-        let inner = ControllableDispatcher::fetch_returns_not_ready();
-        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
-        let root_finst_id = native_id(780, 1);
-        let params = single_backend(vec![
-            make_params_with_finst(780, 10),
-            make_params_with_finst(780, 1),
-        ]);
-        let mut tracker = InFlightTracker::default();
-
-        let result = submit_and_fetch_loop(
-            &dispatcher,
-            &mut tracker,
-            params,
-            0,
-            root_finst_id,
-            &native_id(780, 781),
-            true,
-            1_000,
-            None,
-            Some(&write),
-            false,
-        )
-        .expect("pre-EOF writer failure must surface write abort");
-
-        assert!(result.write_commit.is_none());
-        let abort = result
-            .write_abort
-            .expect("pre-EOF writer failure must return abort input");
-        assert!(
-            abort.reason.contains("pre-EOF writer failure"),
-            "{}",
-            abort.reason
-        );
-        assert_eq!(abort.completed_writer_outputs.len(), 1);
-        assert_eq!(
-            abort.completed_writer_outputs[0].iceberg_commits[0]
-                .iceberg_data_file
+            route(&placement_clone)
+                .destinations
                 .as_ref()
-                .and_then(|file| file.path.as_deref()),
-            Some("s3://warehouse/pre-eof-ok.parquet")
+                .unwrap()
+                .destinations
+                .len(),
+            1
         );
-        assert_eq!(abort.incomplete_writers, vec![writer_failed]);
-        assert_eq!(
-            inner.cancelled_ids(),
-            vec![native_id(780, 10), native_id(780, 1)],
-            "pre-EOF writer failure must cancel submitted fragments"
-        );
-        assert_eq!(
-            inner.fetch_count(),
-            0,
-            "write failure should be observed before the next root fetch"
-        );
+        assert_eq!(route(&placement_clone).target_exchange_node_id, 77);
     }
 
     #[test]
-    fn standalone_report_failure_cancels_inflight_fragments() {
-        let inner = ControllableDispatcher::fetch_returns_not_ready();
-        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
-        let root_finst_id = native_id(786, 1);
-        let params = single_backend(vec![
-            make_params_with_finst(786, 10),
-            make_params_with_finst(786, 1),
-        ]);
-        let mut tracker = InFlightTracker::default();
+    fn router_patch_rejects_extra_encoded_route_before_mutation() {
+        use crate::sql::common::ChangeStreamBranchKind;
 
-        let report_thread = std::thread::spawn(|| {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            record_standalone_query_failure(
-                crate::runtime::query_context::QueryId { hi: 786, lo: 1 },
-                "remote fragment failed".to_string(),
-            );
-        });
-
-        let err = submit_and_fetch_loop(
-            &dispatcher,
-            &mut tracker,
-            params,
-            0,
-            root_finst_id,
-            &native_id(786, 1),
-            true,
-            1_000,
-            None,
-            None,
-            false,
-        )
-        .expect_err("standalone report failure must surface before timeout");
-
-        report_thread.join().expect("report thread");
-        assert!(err.contains("remote fragment failed"), "{err}");
-        assert_eq!(
-            inner.cancelled_ids(),
-            vec![native_id(786, 10), native_id(786, 1)],
-            "standalone report failure must cancel all submitted fragments"
-        );
-    }
-
-    #[test]
-    fn collect_profiles_waits_for_final_report_after_root_eof() {
-        let query_id = native_id(787, 1);
-        let root_finst_id = native_id(787, 10);
-        let (eof_tx, eof_rx) = std::sync::mpsc::channel();
-        let inner = EofSignalDispatcher::new(eof_tx);
-        let dispatcher: Arc<dyn FragmentDispatcher> = inner;
-        let report_thread = std::thread::spawn(move || {
-            eof_rx.recv().expect("root EOF signal");
-            let accepted = record_standalone_query_profile_report(&profile_report_params(
-                id(787, 1),
-                id(787, 10),
-                profile_tree_for_plan_node(2),
-            ))
-            .expect("record profile report");
-            assert!(accepted, "profile report must match active query collector");
-        });
-
-        let params = single_backend(vec![make_params_with_finst(787, 10)]);
-        let mut tracker = InFlightTracker::default();
-        let result = submit_and_fetch_loop(
-            &dispatcher,
-            &mut tracker,
-            params,
-            0,
-            root_finst_id,
-            &query_id,
-            true,
-            1_000,
-            None,
-            None,
-            true,
-        )
-        .expect("profile final report should be collected after root EOF");
-
-        report_thread.join().expect("profile report thread");
-        assert_eq!(result.fragment_profiles.len(), 1);
-        assert!(result.write_commit.is_none());
-        assert!(result.write_abort.is_none());
-    }
-
-    #[test]
-    fn duplicate_profile_reports_for_same_fragment_count_once() {
-        let query_id = native_id(788, 1);
-        let finst_id = native_id(788, 10);
-        let _guard = StandaloneQueryProfileGuard::register(&query_id);
-        let params = profile_report_params(id(788, 1), id(788, 10), profile_tree_for_plan_node(2));
-
-        assert!(
-            record_standalone_query_profile_report(&params).expect("first thrift profile report")
-        );
-        assert!(
-            record_standalone_query_profile_report(&params)
-                .expect("duplicate thrift profile report")
-        );
-        assert_eq!(
-            standalone_query_profile_count(&query_id),
-            1,
-            "duplicate thrift profile reports from the same finst must be idempotent"
-        );
-
-        let taken = take_standalone_query_profiles(&query_id);
-        assert_eq!(taken.len(), 1);
-
-        let native_report = crate::proto::novarocks::ExecStatusReport {
-            query_id: Some(crate::proto::common::UniqueId {
-                hi: query_id.hi,
-                lo: query_id.lo,
-            }),
-            fragment_instance_id: Some(crate::proto::common::UniqueId {
-                hi: finst_id.hi,
-                lo: finst_id.lo,
-            }),
-            backend_num: 0,
-            status: Some(crate::proto::common::Status {
-                code: 0,
-                message: String::new(),
-            }),
-            done: true,
-            iceberg_commits: Vec::new(),
-            loaded_rows: 0,
-            sink_load_bytes: 0,
-            filtered_rows: 0,
-            profile: Some(crate::runtime::profile::RuntimeProfile::new("FragmentRoot").to_proto()),
-        };
-        assert!(
-            record_native_standalone_query_profile_report(&native_report)
-                .expect("first native profile report")
-        );
-        assert!(
-            record_native_standalone_query_profile_report(&native_report)
-                .expect("duplicate native profile report")
-        );
-        assert_eq!(
-            standalone_query_profile_count(&query_id),
-            1,
-            "duplicate native profile reports from the same finst must be idempotent"
-        );
-    }
-
-    #[test]
-    fn write_only_root_waits_for_commit_without_fetching_result_buffer() {
-        let query_id = native_id(790, 791);
-        let writer = writer_key(790, 791, 790, 1, 0);
-        let write = Arc::new(Mutex::new(
-            WriteCoordinator::new(native_id(790, 791), vec![writer.clone()])
-                .expect("write coordinator"),
-        ));
-        write
-            .lock()
-            .expect("write coordinator lock")
-            .apply_report(write_report(
-                &writer,
-                true,
-                ok_status(),
-                "s3://warehouse/write-only-root.parquet",
-            ))
-            .expect("writer report");
-
-        let inner = ControllableDispatcher::fetch_returns_err("no result for this query");
-        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
-        let root_finst_id = writer.fragment_instance_id;
-        let params = single_backend(vec![
-            make_params_with_finst(790, 10),
-            make_params_with_finst_and_sink_type(
-                790,
-                1,
-                data_sinks::TDataSinkType::ICEBERG_TABLE_SINK,
+        assert_router_rejected_without_mutation(
+            router_fragment(
+                7,
+                vec![
+                    router_route(0, native_plan::ChangeStreamBranchKind::DeleteDv),
+                    router_route(1, native_plan::ChangeStreamBranchKind::ReuseData),
+                ],
             ),
-        ]);
-        let mut tracker = InFlightTracker::default();
-
-        let result = submit_and_fetch_loop(
-            &dispatcher,
-            &mut tracker,
-            params,
-            0,
-            root_finst_id,
-            &query_id,
-            false,
-            1_000,
-            None,
-            Some(&write),
-            false,
-        )
-        .expect("write-only root should use writer reports instead of result fetch");
-
-        assert!(result.chunks.is_empty());
-        assert!(result.write_commit.is_some());
-        assert!(result.write_abort.is_none());
-        assert_eq!(
-            inner.fetch_count(),
-            0,
-            "write-only roots do not create result buffers and must not be fetched"
+            vec![router_edge(7, 0, ChangeStreamBranchKind::DeleteDv, 2)],
+            "route key set",
         );
     }
 
     #[test]
-    fn missing_write_final_report_after_root_eof_times_out_and_cancels() {
-        let query_id = native_id(750, 751);
-        let writer = writer_key(750, 751, 752, 753, 0);
-        let write = Arc::new(Mutex::new(
-            WriteCoordinator::new(query_id, vec![writer.clone()]).expect("write coordinator"),
-        ));
-        let inner = ControllableDispatcher::succeeds_always_eof();
-        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
-        let root_finst_id = native_id(750, 1);
-        let params = single_backend(vec![
-            make_params_with_finst(750, 10),
-            make_params_with_finst(750, 1),
-        ]);
-        let mut tracker = InFlightTracker::default();
+    fn router_patch_rejects_missing_encoded_route_before_mutation() {
+        use crate::sql::common::ChangeStreamBranchKind;
 
-        let result = submit_and_fetch_loop(
-            &dispatcher,
-            &mut tracker,
-            params,
-            0,
-            root_finst_id,
-            &query_id,
-            true,
-            25,
-            None,
-            Some(&write),
-            false,
-        )
-        .expect("missing writer final report after EOF must surface write abort");
-
-        assert!(result.write_commit.is_none());
-        let abort = result
-            .write_abort
-            .expect("missing final report timeout must create abort input");
-        assert!(abort.reason.contains("timed out"), "{}", abort.reason);
-        assert!(
-            abort.reason.contains("missing writer final report"),
-            "{}",
-            abort.reason
-        );
-        let cancelled = inner.cancelled_ids();
-        assert_eq!(
-            cancelled.len(),
-            2,
-            "missing final report timeout must cancel all submitted fragments"
-        );
-        assert_eq!(abort.completed_writer_outputs.len(), 0);
-        assert_eq!(abort.incomplete_writers, vec![writer]);
-    }
-
-    #[test]
-    fn legacy_query_result_wrapper_returns_write_abort_reason_as_error() {
-        let query_result = QueryResult {
-            columns: Vec::new(),
-            chunks: Vec::new(),
-        };
-        let err = query_result_or_write_abort_error(CoordinatedQueryResult {
-            query_result,
-            write_commit: None,
-            write_abort: Some(WriteAbortInput {
-                write_id: native_id(770, 771),
-                reason: "write abort reason".to_string(),
-                completed_writer_outputs: Vec::new(),
-                incomplete_writers: Vec::new(),
-            }),
-            fragment_profiles: Vec::new(),
-        })
-        .expect_err("legacy query-result wrapper must not hide write aborts");
-
-        assert_eq!(err, "write abort reason");
-    }
-
-    // -----------------------------------------------------------------------
-    // I4: submit_and_fetch_loop orchestration tests
-    // -----------------------------------------------------------------------
-
-    /// I4: submit_and_fetch_loop submits all fragments in order and returns
-    /// empty chunks when the dispatcher returns Eof immediately.
-    #[test]
-    fn execute_submits_all_fragments_and_fetches_to_eof() {
-        let inner = ControllableDispatcher::succeeds_always_eof();
-        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
-        let query_id = native_id(1, 99);
-        let runtime_query_id = runtime_query_id(query_id.hi, query_id.lo);
-        let root_finst_id = native_id(1, 1);
-        let params = single_backend(vec![
-            make_params_with_finst(1, 10),
-            make_params_with_finst(1, 1),
-        ]);
-        let mut tracker = InFlightTracker::default();
-        let result = submit_and_fetch_loop(
-            &dispatcher,
-            &mut tracker,
-            params,
-            0,
-            root_finst_id,
-            &query_id,
-            true,
-            100,
-            None,
-            None,
-            false,
-        );
-        assert!(result.is_ok(), "expected Ok, got {result:?}");
-        let output = result.unwrap();
-        assert!(
-            output.chunks.is_empty(),
-            "expected no chunks from Eof dispatcher"
-        );
-        assert!(
-            output.write_commit.is_none(),
-            "non-write query should not produce write commit input"
-        );
-        assert!(
-            output.write_abort.is_none(),
-            "non-write query should not produce write abort input"
-        );
-        assert_eq!(
-            inner.submitted_ids().len(),
-            2,
-            "both fragments must be submitted"
-        );
-        assert_eq!(
-            crate::runtime::query_state::in_flight_table().state(runtime_query_id),
-            None,
-            "submit_and_fetch_loop must forget query_state entries on success"
-        );
-    }
-
-    /// I2: When the second submit fails, the coordinator cancels the first
-    /// fragment instance and returns an error.
-    #[test]
-    fn execute_cancels_already_submitted_on_submit_failure() {
-        let inner = ControllableDispatcher::fails_on_submit_n(2);
-        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
-        let root_finst_id = native_id(2, 1);
-        let params = single_backend(vec![
-            make_params_with_finst(2, 10),
-            make_params_with_finst(2, 1),
-        ]);
-        let mut tracker = InFlightTracker::default();
-        let result = submit_and_fetch_loop(
-            &dispatcher,
-            &mut tracker,
-            params,
-            0,
-            root_finst_id,
-            &native_id(2, 99),
-            true,
-            100,
-            None,
-            None,
-            false,
-        );
-        assert!(result.is_err(), "expected Err on submit failure");
-        let submitted = inner.submitted_ids();
-        assert_eq!(
-            submitted.len(),
-            1,
-            "only the first fragment should be submitted"
-        );
-        assert_eq!(submitted[0].hi, 2);
-        assert_eq!(submitted[0].lo, 10);
-        let cancelled = inner.cancelled_ids();
-        assert_eq!(
-            cancelled.len(),
-            1,
-            "the first submitted fragment must be cancelled"
-        );
-        assert_eq!(cancelled[0].hi, 2);
-        assert_eq!(cancelled[0].lo, 10);
-        assert_eq!(
-            crate::runtime::query_state::in_flight_table().state(runtime_query_id(2, 99)),
-            None,
-            "submit_and_fetch_loop must forget query_state entries on submit failure"
-        );
-    }
-
-    /// I3: When fetch returns FetchOutcome::Err, all submitted fragment
-    /// instances are cancelled before the error propagates.
-    #[test]
-    fn execute_cancels_all_submitted_on_fetch_error() {
-        let inner = ControllableDispatcher::fetch_returns_err("boom");
-        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
-        let root_finst_id = native_id(3, 1);
-        let params = single_backend(vec![
-            make_params_with_finst(3, 10),
-            make_params_with_finst(3, 1),
-        ]);
-        let mut tracker = InFlightTracker::default();
-        let result = submit_and_fetch_loop(
-            &dispatcher,
-            &mut tracker,
-            params,
-            0,
-            root_finst_id,
-            &native_id(3, 99),
-            true,
-            100,
-            None,
-            None,
-            false,
-        );
-        assert!(result.is_err(), "expected Err on fetch error");
-        let err = result.unwrap_err();
-        assert!(
-            err.contains("boom"),
-            "error message should contain 'boom', got: {err}"
-        );
-        let submitted = inner.submitted_ids();
-        assert_eq!(
-            submitted.len(),
-            2,
-            "both fragments must be submitted before fetch"
-        );
-        let cancelled = inner.cancelled_ids();
-        assert_eq!(
-            cancelled.len(),
-            2,
-            "all submitted fragments must be cancelled on fetch error"
-        );
-    }
-
-    #[test]
-    fn query_timeout_triggers_cancel() {
-        let inner = ControllableDispatcher::fetch_returns_not_ready();
-        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
-        let root_finst_id = native_id(4, 1);
-        let params = single_backend(vec![
-            make_params_with_finst(4, 10),
-            make_params_with_finst(4, 1),
-        ]);
-        let mut tracker = InFlightTracker::default();
-        let result = submit_and_fetch_loop(
-            &dispatcher,
-            &mut tracker,
-            params,
-            0,
-            root_finst_id,
-            &native_id(4, 99),
-            true,
-            10,
-            None,
-            None,
-            false,
-        );
-        assert!(result.is_err(), "expected timeout error");
-        let err = result.unwrap_err();
-        assert!(
-            err.contains("timed out"),
-            "error should explain timeout, got: {err}"
-        );
-        assert!(
-            inner.fetch_count() > 0,
-            "positive timeout must exercise the NotReady fetch loop"
-        );
-        let cancelled = inner.cancelled_ids();
-        assert_eq!(
-            cancelled.len(),
-            2,
-            "all submitted fragments must be cancelled on timeout"
-        );
-    }
-
-    #[test]
-    fn execute_aborts_before_second_fetch_when_query_state_failed() {
-        let inner = QueryStateFailureDispatcher::new("remote query failed");
-        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
-        let root_finst_id = native_id(8, 1);
-        let params = single_backend(vec![
-            make_params_with_finst(8, 10),
-            make_params_with_finst(8, 1),
-        ]);
-        let mut tracker = InFlightTracker::default();
-
-        let result = submit_and_fetch_loop(
-            &dispatcher,
-            &mut tracker,
-            params,
-            0,
-            root_finst_id,
-            &native_id(8, 99),
-            true,
-            100,
-            None,
-            None,
-            false,
-        );
-
-        let err = result.expect_err("query state failure must propagate");
-        assert!(
-            err.contains("remote query failed"),
-            "error should contain failure reason, got: {err}"
-        );
-        assert_eq!(
-            inner.fetch_count(),
-            1,
-            "coordinator must stop before the second fetch after observing query failure"
-        );
-        assert_eq!(
-            inner.submitted_ids().len(),
-            2,
-            "both fragments should have been submitted before failure is observed"
-        );
-        assert_eq!(
-            inner.cancelled_ids().len(),
-            2,
-            "query_state failure must cancel all submitted fragments"
-        );
-    }
-
-    #[test]
-    fn fetch_loop_caps_remote_waits_below_full_timeout() {
-        let inner = RecordingWaitDispatcher::new();
-        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
-        let root_finst_id = native_id(6, 1);
-        let params = single_backend(vec![
-            make_params_with_finst(6, 10),
-            make_params_with_finst(6, 1),
-        ]);
-
-        let mut tracker = InFlightTracker::default();
-        let result = submit_and_fetch_loop(
-            &dispatcher,
-            &mut tracker,
-            params,
-            0,
-            root_finst_id,
-            &native_id(6, 99),
-            true,
-            300_000,
-            None,
-            None,
-            false,
-        );
-
-        assert!(result.is_ok(), "expected fetch loop to finish after Eof");
-        let waits = inner.fetch_waits_ms();
-        assert!(
-            !waits.is_empty(),
-            "expected fetch_result to be called at least once"
-        );
-        assert!(
-            waits[0] <= 500,
-            "expected fetch wait to be capped to a short poll, got {} ms",
-            waits[0]
-        );
-    }
-
-    #[test]
-    fn client_disconnect_triggers_cancel() {
-        let inner = ControllableDispatcher::fetch_returns_not_ready();
-        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
-        let root_finst_id = native_id(5, 1);
-        let params = single_backend(vec![
-            make_params_with_finst(5, 10),
-            make_params_with_finst(5, 1),
-        ]);
-        let disconnected = Arc::new(std::sync::atomic::AtomicBool::new(true));
-
-        let result =
-            crate::runtime::query_cancel::with_client_disconnect_signal(disconnected, || {
-                let mut tracker = InFlightTracker::default();
-                submit_and_fetch_loop(
-                    &dispatcher,
-                    &mut tracker,
-                    params,
+        assert_router_rejected_without_mutation(
+            router_fragment(
+                7,
+                vec![router_route(
                     0,
-                    root_finst_id,
-                    &native_id(5, 99),
-                    true,
-                    100,
-                    None,
-                    None,
-                    false,
-                )
-            });
+                    native_plan::ChangeStreamBranchKind::DeleteDv,
+                )],
+            ),
+            vec![
+                router_edge(7, 0, ChangeStreamBranchKind::DeleteDv, 2),
+                router_edge(7, 1, ChangeStreamBranchKind::ReuseData, 3),
+            ],
+            "route key set",
+        );
+    }
 
-        let err = result.expect_err("expected client disconnect error");
-        assert!(
-            err.contains("client disconnected"),
-            "disconnect error should be explicit, got: {err}"
+    #[test]
+    fn router_patch_rejects_duplicate_encoded_route_key_before_mutation() {
+        use crate::sql::common::ChangeStreamBranchKind;
+
+        assert_router_rejected_without_mutation(
+            router_fragment(
+                7,
+                vec![
+                    router_route(0, native_plan::ChangeStreamBranchKind::DeleteDv),
+                    router_route(0, native_plan::ChangeStreamBranchKind::DeleteDv),
+                ],
+            ),
+            vec![router_edge(7, 0, ChangeStreamBranchKind::DeleteDv, 2)],
+            "duplicate encoded route key",
         );
-        let cancelled = inner.cancelled_ids();
-        assert_eq!(
-            cancelled.len(),
-            2,
-            "all submitted fragments must be cancelled on disconnect"
+    }
+
+    #[test]
+    fn router_patch_rejects_encoded_group_id_drift_before_mutation() {
+        use crate::sql::common::ChangeStreamBranchKind;
+
+        assert_router_rejected_without_mutation(
+            router_fragment(
+                8,
+                vec![router_route(
+                    0,
+                    native_plan::ChangeStreamBranchKind::DeleteDv,
+                )],
+            ),
+            vec![router_edge(7, 0, ChangeStreamBranchKind::DeleteDv, 2)],
+            "encoded group=8",
         );
+    }
+
+    #[test]
+    fn router_patch_rejects_single_missing_partition_without_mutation() {
+        use crate::sql::common::ChangeStreamBranchKind;
+
+        let mut fragment = router_fragment(
+            7,
+            vec![router_route(
+                0,
+                native_plan::ChangeStreamBranchKind::DeleteDv,
+            )],
+        );
+        router_branches_mut(&mut fragment)[0].output_partition = None;
+
+        assert_router_rejected_without_mutation(
+            fragment,
+            vec![router_edge(7, 0, ChangeStreamBranchKind::DeleteDv, 2)],
+            "missing output_partition",
+        );
+    }
+
+    #[test]
+    fn router_patch_rejects_later_missing_partition_without_partial_patch() {
+        use crate::sql::common::ChangeStreamBranchKind;
+
+        let mut fragment = router_fragment(
+            7,
+            vec![
+                router_route(0, native_plan::ChangeStreamBranchKind::DeleteDv),
+                router_route(1, native_plan::ChangeStreamBranchKind::ReuseData),
+            ],
+        );
+        router_branches_mut(&mut fragment)[1].output_partition = None;
+
+        assert_router_rejected_without_mutation(
+            fragment,
+            vec![
+                router_edge(7, 0, ChangeStreamBranchKind::DeleteDv, 2),
+                router_edge(7, 1, ChangeStreamBranchKind::ReuseData, 3),
+            ],
+            "missing output_partition",
+        );
+    }
+
+    #[test]
+    fn router_patch_rejects_later_missing_placements_without_partial_patch() {
+        use crate::sql::common::ChangeStreamBranchKind;
+
+        assert_router_rejected_without_mutation(
+            router_fragment(
+                7,
+                vec![
+                    router_route(0, native_plan::ChangeStreamBranchKind::DeleteDv),
+                    router_route(1, native_plan::ChangeStreamBranchKind::ReuseData),
+                ],
+            ),
+            vec![
+                router_edge(7, 0, ChangeStreamBranchKind::DeleteDv, 2),
+                router_edge(7, 1, ChangeStreamBranchKind::ReuseData, 4),
+            ],
+            "target fragment 4 has no placements",
+        );
+    }
+
+    #[test]
+    fn runtime_filter_builder_number_uses_native_instance_counts() {
+        let rf = RuntimeFilterPlanResult {
+            all_filters: Default::default(),
+            build_side_filters: std::collections::HashMap::from([(3, vec![11, 12])]),
+            probe_side_filters: Default::default(),
+        };
+        let numbers =
+            runtime_filter_builder_number_for_instance(Some(&rf), &BTreeMap::from([(3, 4_usize)]));
+        assert_eq!(numbers, BTreeMap::from([(11, 4), (12, 4)]));
     }
 }
