@@ -11,11 +11,13 @@ use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::JoinKind;
 use crate::sql::optimizer::options::current_session_optimizer_settings;
+use crate::sql::planner::physical::runtime_filter::{
+    RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
+};
 use crate::sql::planner::physical::{
     JoinDistribution, JoinExecutionMode, PhysicalHashJoinEqCondition, PhysicalHashJoinNode,
     PhysicalPlanKind, PhysicalPlanNode, PhysicalPlanStats, RedistributeMode,
 };
-use crate::sql::planner::runtime_filter::{RuntimeFilterBuildIntent, RuntimeFilterProbeIntent};
 use std::collections::HashSet;
 
 /// Rule name recognized by `SET disable_optimizer_rules='RuntimeFilterPushDown'`.

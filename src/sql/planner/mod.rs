@@ -31,7 +31,6 @@ pub(crate) mod optimizer_bridge;
 pub(crate) mod ordering;
 pub(crate) mod payload;
 pub(crate) mod physical;
-pub(crate) mod runtime_filter;
 pub(crate) mod write_plan;
 pub(crate) mod write_sink;
 
@@ -44,11 +43,6 @@ pub(crate) use distributed_plan_build::{
     build_distributed_plan, union_distinct_must_be_rewritten_error,
 };
 pub(crate) use logical::build::{plan_output_columns, plan_query};
-pub(crate) use runtime_filter::{
-    PlannedRuntimeFilter, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
-};
-#[allow(unused_imports)]
-pub(crate) use runtime_filter::{WiredRuntimeFilterBuild, WiredRuntimeFilterProbe};
 pub(crate) use write_plan::{with_iceberg_change_stream_write, with_iceberg_write_sink};
 pub(crate) use write_sink::{
     IcebergWriteFragmentSink, IcebergWriteInputBinding, IcebergWriteSinkMode, IcebergWriteSinkSpec,

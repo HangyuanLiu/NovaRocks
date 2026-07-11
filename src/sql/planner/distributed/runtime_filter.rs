@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -15,15 +16,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod fragment;
-mod node;
-pub(crate) mod runtime_filter;
+//! Distributed-stage runtime-filter wiring.
 
-pub(crate) use fragment::{
-    DataPartition, DataSink, DistributedPlan, FragmentEdge, FragmentEdgeKind, FragmentId,
-    FragmentStreamKind, PartitionKind, PlanFragment,
+use crate::sql::planner::distributed::FragmentId;
+use crate::sql::planner::physical::runtime_filter::{
+    RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
 };
-pub(crate) use node::{
-    DistributedNode, DistributedNodeKind, ExchangeFlavor, ExchangeReceiver,
-    distributed_kind_from_physical, distributed_kind_to_physical,
-};
+
+#[derive(Clone, Debug)]
+pub(crate) struct WiredRuntimeFilterBuild {
+    pub intent: RuntimeFilterBuildIntent,
+    pub source_fragment_id: FragmentId,
+    pub target_fragment_ids: Vec<FragmentId>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WiredRuntimeFilterProbe {
+    pub intent: RuntimeFilterProbeIntent,
+    pub source_fragment_id: FragmentId,
+}

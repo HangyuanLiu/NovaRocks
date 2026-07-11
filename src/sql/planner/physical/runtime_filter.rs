@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -15,7 +16,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Physical runtime-filter execution vocabulary.
+//! Physical-stage runtime-filter intent and execution vocabulary.
+//!
+//! Intent annotations are complete after placement, before fragment topology
+//! exists. They therefore carry no optional fragment-routing fields.
+
+use crate::sql::analysis::TypedExpr;
+
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeFilterBuildIntent {
+    pub filter_id: i32,
+    pub build_expr: TypedExpr,
+    pub probe_expr: TypedExpr,
+    pub expr_order: usize,
+    pub execution_mode: JoinExecutionMode,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeFilterProbeIntent {
+    pub filter_id: i32,
+    pub probe_expr: TypedExpr,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JoinExecutionMode {

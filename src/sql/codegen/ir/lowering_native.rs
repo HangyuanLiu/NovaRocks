@@ -27,11 +27,11 @@ use crate::sql::codegen::boundary_schema::{
     BoundaryKind, BoundarySchemaReport, output_columns_to_boundary_columns,
 };
 use crate::sql::codegen::connector_scan_wire::{ThriftScanContext, to_native_file_scan};
+use crate::sql::codegen::runtime_filter::PlannedRuntimeFilter;
 use crate::sql::codegen::{
     FragmentBuildResult, FragmentOutputKind, FragmentSchedulingMetadata, MultiFragmentBuildResult,
     OutputColumn, RuntimeFilterPlanResult,
 };
-use crate::sql::planner::PlannedRuntimeFilter;
 use crate::sql::planner::distributed::{
     DataPartition, DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor,
     FragmentEdgeKind, FragmentId, FragmentStreamKind, PartitionKind, PlanFragment,
@@ -828,7 +828,7 @@ fn collect_runtime_filter_probe_targets(
     out: &mut HashMap<i32, Vec<(FragmentId, i32)>>,
 ) {
     for probe in &node.probe_runtime_filters {
-        out.entry(probe.filter_id)
+        out.entry(probe.intent.filter_id)
             .or_default()
             .push((fragment_id, node.node_id));
     }
@@ -847,7 +847,7 @@ fn collect_runtime_filter_builds(
 ) {
     for build in &node.build_runtime_filters {
         let targets = probe_targets
-            .get(&build.filter_id)
+            .get(&build.intent.filter_id)
             .cloned()
             .unwrap_or_default();
         let probe_target_node_ids = targets.iter().map(|(_, node_id)| *node_id).collect();
@@ -855,25 +855,25 @@ fn collect_runtime_filter_builds(
             .iter()
             .any(|(target_fragment_id, _)| *target_fragment_id != fragment_id);
         all_filters.insert(
-            build.filter_id,
+            build.intent.filter_id,
             PlannedRuntimeFilter {
-                filter_id: build.filter_id,
+                filter_id: build.intent.filter_id,
                 build_plan_node_id: node.node_id,
                 probe_target_node_ids,
                 has_remote_targets,
-                execution_mode: build.execution_mode,
-                expr_order: i32::try_from(build.expr_order).unwrap_or(i32::MAX),
+                execution_mode: build.intent.execution_mode,
+                expr_order: i32::try_from(build.intent.expr_order).unwrap_or(i32::MAX),
             },
         );
         build_side_filters
             .entry(fragment_id)
             .or_default()
-            .push(build.filter_id);
+            .push(build.intent.filter_id);
         for (target_fragment_id, target_node_id) in targets {
             probe_side_filters
                 .entry(target_fragment_id)
                 .or_default()
-                .push((build.filter_id, target_node_id));
+                .push((build.intent.filter_id, target_node_id));
         }
     }
     for child in &node.children {

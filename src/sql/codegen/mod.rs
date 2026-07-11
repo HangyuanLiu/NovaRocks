@@ -43,6 +43,7 @@ pub(crate) mod ir;
 pub(crate) mod nodes;
 pub(crate) mod proto_encode;
 pub(crate) mod resolve;
+pub(crate) mod runtime_filter;
 pub(crate) mod runtime_filter_lowering;
 pub(crate) mod scalar_materialize;
 #[cfg(feature = "compat")]
@@ -148,7 +149,8 @@ impl MultiFragmentBuildResult {
 /// the execution coordinator (`setup_runtime_filter_params`).
 pub(crate) struct RuntimeFilterPlanResult {
     /// filter_id -> native RF descriptor for coordinator-side wiring.
-    pub all_filters: std::collections::HashMap<i32, crate::sql::planner::PlannedRuntimeFilter>,
+    pub all_filters:
+        std::collections::HashMap<i32, crate::sql::codegen::runtime_filter::PlannedRuntimeFilter>,
     /// fragment_id -> build-side filter IDs in that fragment.
     pub build_side_filters: std::collections::HashMap<FragmentId, Vec<i32>>,
     /// fragment_id -> (filter_id, probe_target_node_id) for probe-side targets.
