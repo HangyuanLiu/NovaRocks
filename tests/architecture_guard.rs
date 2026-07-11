@@ -325,6 +325,7 @@ fn decode_rust_string_literal(literal: &str) -> Option<String> {
         match *chars.get(index)? {
             '\\' => decoded.push('\\'),
             '"' => decoded.push('"'),
+            '\'' => decoded.push('\''),
             'n' => decoded.push('\n'),
             'r' => decoded.push('\r'),
             't' => decoded.push('\t'),
@@ -373,6 +374,90 @@ fn path_attribute_value(attribute: &str) -> Option<String> {
     decode_rust_string_literal(value)
 }
 
+fn cfg_attr_generated_path_values(attribute: &str) -> Vec<String> {
+    fn argument_ranges(
+        tokens: &[RustSourceToken],
+        open: usize,
+        close: usize,
+    ) -> Vec<std::ops::Range<usize>> {
+        let mut arguments = Vec::new();
+        let mut start = open + 1;
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut brace_depth = 0usize;
+        for index in open + 1..close {
+            match tokens[index].text.as_str() {
+                "(" => paren_depth += 1,
+                ")" => paren_depth = paren_depth.saturating_sub(1),
+                "[" => bracket_depth += 1,
+                "]" => bracket_depth = bracket_depth.saturating_sub(1),
+                "{" => brace_depth += 1,
+                "}" => brace_depth = brace_depth.saturating_sub(1),
+                "," if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                    arguments.push(start..index);
+                    start = index + 1;
+                }
+                _ => {}
+            }
+        }
+        arguments.push(start..close);
+        arguments
+    }
+
+    fn collect(
+        attribute: &str,
+        tokens: &[RustSourceToken],
+        cfg_attr: usize,
+        paths: &mut BTreeSet<String>,
+    ) {
+        if tokens
+            .get(cfg_attr)
+            .is_none_or(|token| token.text != "cfg_attr")
+            || tokens
+                .get(cfg_attr + 1)
+                .is_none_or(|token| token.text != "(")
+        {
+            return;
+        }
+        let Some(close) = rust_matching_token(tokens, cfg_attr + 1, "(", ")") else {
+            return;
+        };
+        for range in argument_ranges(tokens, cfg_attr + 1, close)
+            .into_iter()
+            .skip(1)
+        {
+            let Some(head) = tokens.get(range.start) else {
+                continue;
+            };
+            if head.text == "path"
+                && tokens
+                    .get(range.start + 1)
+                    .is_some_and(|token| token.text == "=")
+            {
+                let value_start = tokens[range.start + 1].end;
+                let value_end = tokens
+                    .get(range.end)
+                    .map_or(tokens[close].start, |token| token.start);
+                if let Some(path) =
+                    decode_rust_string_literal(attribute[value_start..value_end].trim())
+                {
+                    paths.insert(path);
+                }
+            } else if head.text == "cfg_attr" {
+                collect(attribute, tokens, range.start, paths);
+            }
+        }
+    }
+
+    let tokens = rust_source_tokens(attribute);
+    let Some(open) = tokens.iter().position(|token| token.text == "[") else {
+        return Vec::new();
+    };
+    let mut paths = BTreeSet::new();
+    collect(attribute, &tokens, open + 1, &mut paths);
+    paths.into_iter().collect()
+}
+
 fn production_rs_files(root: &Path) -> Vec<PathBuf> {
     fn default_module_dir(source: &Path, root: &Path) -> PathBuf {
         let parent_dir = source.parent().unwrap_or(root);
@@ -385,25 +470,54 @@ fn production_rs_files(root: &Path) -> Vec<PathBuf> {
         }
     }
 
-    fn inline_module_dir(
+    fn direct_paths(attributes: &[String]) -> Vec<String> {
+        attributes
+            .iter()
+            .filter_map(|attribute| path_attribute_value(attribute))
+            .collect()
+    }
+
+    fn conditional_paths(attributes: &[String]) -> Vec<String> {
+        attributes
+            .iter()
+            .flat_map(|attribute| cfg_attr_generated_path_values(attribute))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn inline_module_dirs(
         source: &Path,
         root: &Path,
         inline_modules: &[RustInlineModuleContext],
-    ) -> PathBuf {
+    ) -> Vec<PathBuf> {
         let source_parent = source.parent().unwrap_or(root);
-        let mut directory = default_module_dir(source, root);
-        for inline in inline_modules {
-            if let Some(path) = inline
-                .attributes
-                .iter()
-                .find_map(|attribute| path_attribute_value(attribute))
-            {
-                directory = source_parent.join(path);
+        let mut directories = BTreeSet::new();
+        for (index, inline) in inline_modules.iter().enumerate() {
+            let direct = direct_paths(&inline.attributes);
+            let conditional = conditional_paths(&inline.attributes);
+            let containing = if index == 0 {
+                BTreeSet::from([source_parent.to_path_buf()])
             } else {
-                directory.push(&inline.name);
+                directories
+            };
+            let mut next = BTreeSet::new();
+            for directory in containing {
+                if direct.is_empty() {
+                    let default_parent = if index == 0 {
+                        default_module_dir(source, root)
+                    } else {
+                        directory.clone()
+                    };
+                    next.insert(default_parent.join(&inline.name));
+                } else {
+                    next.extend(direct.iter().map(|path| directory.join(path)));
+                }
+                next.extend(conditional.iter().map(|path| directory.join(path)));
             }
+            directories = next;
         }
-        directory
+        directories.into_iter().collect()
     }
 
     let files = rs_files(root);
@@ -438,23 +552,32 @@ fn production_rs_files(root: &Path) -> Vec<PathBuf> {
                 continue;
             }
             let parent_dir = parent.parent().unwrap_or(root);
-            let module_dir = inline_module_dir(&parent, root, &item.inline_modules);
-            let targets = if let Some(explicit) = item
-                .attributes
-                .iter()
-                .find_map(|attribute| path_attribute_value(attribute))
-            {
-                vec![if item.inline_modules.is_empty() {
-                    parent_dir.join(explicit)
-                } else {
-                    module_dir.join(explicit)
-                }]
+            let module_dirs = if item.inline_modules.is_empty() {
+                vec![default_module_dir(&parent, root)]
             } else {
-                vec![
-                    module_dir.join(format!("{}.rs", item.name)),
-                    module_dir.join(&item.name).join("mod.rs"),
-                ]
+                inline_module_dirs(&parent, root, &item.inline_modules)
             };
+            let explicit_bases = if item.inline_modules.is_empty() {
+                vec![parent_dir.to_path_buf()]
+            } else {
+                module_dirs.clone()
+            };
+            let direct = direct_paths(&item.attributes);
+            let conditional = conditional_paths(&item.attributes);
+            let mut targets = BTreeSet::new();
+            if direct.is_empty() {
+                for module_dir in &module_dirs {
+                    targets.insert(module_dir.join(format!("{}.rs", item.name)));
+                    targets.insert(module_dir.join(&item.name).join("mod.rs"));
+                }
+            } else {
+                for base in &explicit_bases {
+                    targets.extend(direct.iter().map(|path| base.join(path)));
+                }
+            }
+            for base in &explicit_bases {
+                targets.extend(conditional.iter().map(|path| base.join(path)));
+            }
             for target in targets {
                 let Some(target) = fs::canonicalize(target).ok() else {
                     continue;
@@ -2235,8 +2358,10 @@ fn rust_item_end_token(tokens: &[RustSourceToken], start: usize) -> Option<usize
             ")" => paren_depth = paren_depth.checked_sub(1)?,
             "[" => bracket_depth += 1,
             "]" => bracket_depth = bracket_depth.checked_sub(1)?,
-            "<" => angle_depth += 1,
-            ">" => angle_depth = angle_depth.saturating_sub(1),
+            "<" if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => angle_depth += 1,
+            ">" if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                angle_depth = angle_depth.saturating_sub(1)
+            }
             "{" if paren_depth == 0
                 && bracket_depth == 0
                 && angle_depth == 0
@@ -2253,11 +2378,13 @@ fn rust_item_end_token(tokens: &[RustSourceToken], start: usize) -> Option<usize
             }
             "{" => brace_depth += 1,
             "}" => brace_depth = brace_depth.checked_sub(1)?,
-            ";" | ","
-                if paren_depth == 0
-                    && bracket_depth == 0
-                    && brace_depth == 0
-                    && angle_depth == 0 =>
+            ";" if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                return Some(cursor);
+            }
+            "," if paren_depth == 0
+                && bracket_depth == 0
+                && brace_depth == 0
+                && angle_depth == 0 =>
             {
                 return Some(cursor);
             }
@@ -4815,6 +4942,18 @@ enum Guarded {
 }
 "#,
         ),
+        (
+            "src/sql/planner/logical/node.rs",
+            r#"
+#[cfg(all(feature = "compat", test))]
+const HIDDEN: bool = crate::sql::optimizer::FLAG < 1;
+enum Demo {
+    #[cfg(all(feature = "compat", test))]
+    Hidden(crate::sql::optimizer::Optimizer, [u8; (1 < 2) as usize]),
+    Visible(crate::sql::optimizer::Optimizer),
+}
+"#,
+        ),
     ];
     for (source_rel, source) in invalid {
         let violations = planner_stage_first_dependency_violations_in(source_rel, source);
@@ -4880,6 +5019,18 @@ struct GuardedFields {
 }
 "#,
         ),
+        (
+            "src/sql/planner/logical/node.rs",
+            r#"
+#[cfg(all(feature = "compat", test))]
+const HIDDEN: bool = crate::sql::optimizer::FLAG < 1;
+enum Demo {
+    #[cfg(all(feature = "compat", test))]
+    Hidden(crate::sql::optimizer::Optimizer, [u8; (1 < 2) as usize]),
+    Visible,
+}
+"#,
+        ),
     ];
     for (source_rel, source) in valid {
         let violations = planner_stage_first_dependency_violations_in(source_rel, source);
@@ -4924,6 +5075,10 @@ mod any_cfg;
 mod non_test;
 #[cfg_attr(feature = "compat", cfg(test))]
 mod cfg_attr_production;
+#[cfg_attr(feature = "alt", path = "conditional_alt.rs")]
+mod conditional_owner;
+#[cfg_attr(feature = "outer", cfg_attr(feature = "inner", path = "nested_alt.rs"))]
+mod nested_conditional_owner;
 #[cfg(test = "production")]
 mod keyed_test;
 #[cfg(any(test, test = "production"))]
@@ -4932,6 +5087,8 @@ mod any_keyed_test;
 mod raw_path;
 #[path = "escaped\x2d\u{0068}idden.rs"]
 mod escaped_path;
+#[path = "leak\'s.rs"]
+mod apostrophe_path;
 mod r#type;
 #[cfg(test)]
 mod foo;
@@ -4959,6 +5116,18 @@ mod inline_name {
 mod redirected_inline {
     mod hidden;
 }
+mod outer {
+    #[path = "redirected"]
+    mod inner {
+        mod hidden;
+    }
+}
+mod conditional_outer {
+    #[cfg_attr(feature = "alt", path = "branch")]
+    mod conditional_inner {
+        mod hidden;
+    }
+}
 "#,
     )
     .unwrap();
@@ -4966,6 +5135,20 @@ mod redirected_inline {
     fs::write(root.join("owner/inline_name/test_child.rs"), forbidden).unwrap();
     fs::write(root.join("owner/inline_name/other.rs"), forbidden).unwrap();
     fs::write(root.join("redirected/hidden.rs"), forbidden).unwrap();
+    fs::create_dir_all(root.join("owner/outer/redirected")).unwrap();
+    fs::write(root.join("owner/outer/redirected/hidden.rs"), forbidden).unwrap();
+    fs::create_dir_all(root.join("owner/conditional_outer/conditional_inner")).unwrap();
+    fs::create_dir_all(root.join("owner/conditional_outer/branch")).unwrap();
+    fs::write(
+        root.join("owner/conditional_outer/conditional_inner/hidden.rs"),
+        forbidden,
+    )
+    .unwrap();
+    fs::write(
+        root.join("owner/conditional_outer/branch/hidden.rs"),
+        forbidden,
+    )
+    .unwrap();
     fs::write(
         root.join("tests/mod.rs"),
         format!(
@@ -4979,6 +5162,26 @@ mod redirected_inline {
     fs::write(root.join("any_cfg.rs"), forbidden).unwrap();
     fs::write(root.join("non_test.rs"), forbidden).unwrap();
     fs::write(root.join("cfg_attr_production.rs"), forbidden).unwrap();
+    fs::write(
+        root.join("conditional_owner.rs"),
+        "pub(crate) struct Safe;\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("conditional_alt.rs"),
+        "use crate::sql::optimizer::Optimizer;\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("nested_conditional_owner.rs"),
+        "pub(crate) struct Safe;\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("nested_alt.rs"),
+        "use crate::sql::optimizer::Optimizer;\n",
+    )
+    .unwrap();
     fs::write(root.join("keyed_test.rs"), forbidden).unwrap();
     fs::write(root.join("any_keyed_test.rs"), forbidden).unwrap();
     fs::write(
@@ -4987,6 +5190,7 @@ mod redirected_inline {
     )
     .unwrap();
     fs::write(root.join("escaped-hidden.rs"), forbidden).unwrap();
+    fs::write(root.join("leak's.rs"), forbidden).unwrap();
     fs::write(root.join("type.rs"), forbidden).unwrap();
     fs::write(root.join("foo/mod.rs"), forbidden).unwrap();
     fs::write(root.join("foo/nested.rs"), forbidden).unwrap();
@@ -5003,15 +5207,23 @@ mod redirected_inline {
             "any_cfg.rs".to_string(),
             "any_keyed_test.rs".to_string(),
             "cfg_attr_production.rs".to_string(),
+            "conditional_alt.rs".to_string(),
+            "conditional_owner.rs".to_string(),
             "escaped-hidden.rs".to_string(),
             "keyed_test.rs".to_string(),
+            "leak's.rs".to_string(),
             "mod.rs".to_string(),
             "non_test.rs".to_string(),
             "owner.rs".to_string(),
+            "owner/conditional_outer/branch/hidden.rs".to_string(),
+            "owner/conditional_outer/conditional_inner/hidden.rs".to_string(),
             "owner/inline_name/other.rs".to_string(),
+            "owner/outer/redirected/hidden.rs".to_string(),
             "production.rs".to_string(),
             "raw_hidden.rs".to_string(),
             "redirected/hidden.rs".to_string(),
+            "nested_alt.rs".to_string(),
+            "nested_conditional_owner.rs".to_string(),
             "type.rs".to_string(),
         ]),
         "only cfg predicates that require test may exclude external modules"
