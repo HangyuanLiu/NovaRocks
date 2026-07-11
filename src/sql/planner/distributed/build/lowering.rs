@@ -158,7 +158,7 @@ pub(super) fn lower_fragment_local_node_with_payload(
             }
 
             let node_id = first_node_id.ok_or_else(|| {
-                "build_distributed_plan: PhysicalWindow produced no thrift node".to_string()
+                "build_distributed_plan: PhysicalWindow produced no distributed node".to_string()
             })?;
             (node_id, tuple_ids)
         }

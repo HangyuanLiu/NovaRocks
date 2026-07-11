@@ -19,7 +19,7 @@ use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{OutputColumn, SortItem};
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::runtime_filter::{
-    WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
+    BoundRuntimeFilterBuild, BoundRuntimeFilterProbe,
 };
 use crate::sql::planner::payload::{
     PlanAssertOneRowNode, PlanFilterNode, PlanGenerateSeriesNode, PlanProjectNode, PlanRepeatNode,
@@ -189,8 +189,8 @@ pub(crate) struct DistributedNode {
     pub tuple_ids: Vec<i32>,
     pub nullable_tuple_ids: Vec<i32>,
     pub limit: i64,
-    pub build_runtime_filters: Vec<WiredRuntimeFilterBuild>,
-    pub probe_runtime_filters: Vec<WiredRuntimeFilterProbe>,
+    pub build_runtime_filters: Vec<BoundRuntimeFilterBuild>,
+    pub probe_runtime_filters: Vec<BoundRuntimeFilterProbe>,
     pub children: Vec<DistributedNode>,
     pub stats: PhysicalPlanStats,
     pub payload: DistributedNodeKind,

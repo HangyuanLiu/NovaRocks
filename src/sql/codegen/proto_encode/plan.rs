@@ -30,10 +30,14 @@ use crate::proto::{common, plan};
 use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, TypedExpr};
 use crate::sql::catalog;
 use crate::sql::codegen::agg_type_infer::infer_agg_function_types;
+use crate::sql::codegen::connector_scan_planning::{
+    StarRocksColumnSchemaDescriptor, StarRocksKeysTypeDescriptor, StarRocksScanSourceDescriptor,
+    StarRocksTabletSchemaDescriptor,
+};
 use crate::sql::common::{ChangeStreamBranchKind, JoinKind};
 use crate::sql::parser::ast::SqlType;
 use crate::sql::planner::distributed::runtime_filter::{
-    WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
+    BoundRuntimeFilterBuild, BoundRuntimeFilterProbe,
 };
 use crate::sql::planner::distributed::write::sink::IcebergWriteInputBinding;
 use crate::sql::planner::distributed::write::sink::{
@@ -54,157 +58,6 @@ pub(crate) struct NativePlanEncodeContext<'a> {
     pub(crate) mv_refresh_ctx:
         Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
     pub(crate) starrocks_scan_sources: Option<&'a BTreeMap<i32, StarRocksScanSourceDescriptor>>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StarRocksStorageColumnDescriptor {
-    pub(crate) name: String,
-    pub(crate) unique_id: i32,
-    pub(crate) default_value: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(not(feature = "compat"), allow(dead_code))]
-pub(crate) enum StarRocksKeysTypeDescriptor {
-    Duplicate,
-    Unique,
-    Aggregate,
-    Primary,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StarRocksColumnSchemaDescriptor {
-    pub(crate) unique_id: i32,
-    pub(crate) name: Option<String>,
-    pub(crate) physical_type: String,
-    pub(crate) is_key: bool,
-    pub(crate) aggregation: Option<String>,
-    pub(crate) nullable: bool,
-    pub(crate) default_value: Option<String>,
-    pub(crate) precision: Option<i32>,
-    pub(crate) scale: Option<i32>,
-    pub(crate) visible: bool,
-    pub(crate) children: Vec<StarRocksColumnSchemaDescriptor>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StarRocksTabletSchemaDescriptor {
-    pub(crate) schema_id: i64,
-    pub(crate) keys_type: StarRocksKeysTypeDescriptor,
-    pub(crate) num_short_key_columns: Option<i32>,
-    pub(crate) sort_key_idxes: Vec<u32>,
-    pub(crate) sort_key_unique_ids: Vec<u32>,
-    pub(crate) columns: Vec<StarRocksColumnSchemaDescriptor>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StarRocksScanSourceDescriptor {
-    pub(crate) catalog_name: String,
-    pub(crate) db_id: i64,
-    pub(crate) table_id: i64,
-    pub(crate) schema_id: i64,
-    pub(crate) storage_columns: Vec<StarRocksStorageColumnDescriptor>,
-    pub(crate) tablet_schema: StarRocksTabletSchemaDescriptor,
-}
-
-#[cfg(test)]
-pub(crate) fn test_starrocks_tablet_schema_descriptor(
-    schema_id: i64,
-    columns: &[StarRocksStorageColumnDescriptor],
-) -> StarRocksTabletSchemaDescriptor {
-    StarRocksTabletSchemaDescriptor {
-        schema_id,
-        keys_type: StarRocksKeysTypeDescriptor::Duplicate,
-        num_short_key_columns: Some(1.min(columns.len()) as i32),
-        sort_key_idxes: if columns.is_empty() { vec![] } else { vec![0] },
-        sort_key_unique_ids: columns
-            .first()
-            .map(|column| column.unique_id as u32)
-            .into_iter()
-            .collect(),
-        columns: columns
-            .iter()
-            .enumerate()
-            .map(|(index, column)| StarRocksColumnSchemaDescriptor {
-                unique_id: column.unique_id,
-                name: Some(column.name.clone()),
-                physical_type: "BIGINT".to_string(),
-                is_key: index == 0,
-                aggregation: None,
-                nullable: true,
-                default_value: column.default_value.clone(),
-                precision: None,
-                scale: None,
-                visible: true,
-                children: vec![],
-            })
-            .collect(),
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn test_starrocks_tablet_schema_descriptor_for_column(
-    schema_id: i64,
-    name: &str,
-    unique_id: i32,
-    default_value: Option<&str>,
-) -> StarRocksTabletSchemaDescriptor {
-    test_starrocks_tablet_schema_descriptor(
-        schema_id,
-        &[StarRocksStorageColumnDescriptor {
-            name: name.to_string(),
-            unique_id,
-            default_value: default_value.map(str::to_string),
-        }],
-    )
-}
-
-#[cfg(feature = "compat")]
-pub(crate) fn starrocks_tablet_schema_descriptor(
-    schema: crate::connector::starrocks::table::scan_planner::StarRocksNativeTabletSchema,
-) -> StarRocksTabletSchemaDescriptor {
-    use crate::connector::starrocks::table::scan_planner::StarRocksNativeKeysType;
-
-    StarRocksTabletSchemaDescriptor {
-        schema_id: schema.schema_id,
-        keys_type: match schema.keys_type {
-            StarRocksNativeKeysType::Duplicate => StarRocksKeysTypeDescriptor::Duplicate,
-            StarRocksNativeKeysType::Unique => StarRocksKeysTypeDescriptor::Unique,
-            StarRocksNativeKeysType::Aggregate => StarRocksKeysTypeDescriptor::Aggregate,
-            StarRocksNativeKeysType::Primary => StarRocksKeysTypeDescriptor::Primary,
-        },
-        num_short_key_columns: schema.num_short_key_columns,
-        sort_key_idxes: schema.sort_key_idxes,
-        sort_key_unique_ids: schema.sort_key_unique_ids,
-        columns: schema
-            .columns
-            .into_iter()
-            .map(starrocks_column_schema_descriptor)
-            .collect(),
-    }
-}
-
-#[cfg(feature = "compat")]
-fn starrocks_column_schema_descriptor(
-    column: crate::connector::starrocks::table::scan_planner::StarRocksNativeColumnSchema,
-) -> StarRocksColumnSchemaDescriptor {
-    StarRocksColumnSchemaDescriptor {
-        unique_id: column.unique_id,
-        name: column.name,
-        physical_type: column.physical_type,
-        is_key: column.is_key,
-        aggregation: column.aggregation,
-        nullable: column.nullable,
-        default_value: column.default_value,
-        precision: column.precision,
-        scale: column.scale,
-        visible: column.visible,
-        children: column
-            .children
-            .into_iter()
-            .map(starrocks_column_schema_descriptor)
-            .collect(),
-    }
 }
 
 #[cfg(test)]
@@ -1044,12 +897,12 @@ pub(crate) fn encode_node_with_context(
         build_runtime_filters: src
             .build_runtime_filters
             .iter()
-            .map(encode_wired_runtime_filter_build)
+            .map(encode_bound_runtime_filter_build)
             .collect::<Result<Vec<_>, _>>()?,
         probe_runtime_filters: src
             .probe_runtime_filters
             .iter()
-            .map(encode_wired_runtime_filter_probe)
+            .map(encode_bound_runtime_filter_probe)
             .collect::<Result<Vec<_>, _>>()?,
         children,
         payload: Some(payload),
@@ -2029,8 +1882,8 @@ fn encode_fragment_edge_kind(src: &FragmentEdgeKind) -> plan::FragmentEdgeKind {
     }
 }
 
-fn encode_wired_runtime_filter_build(
-    src: &WiredRuntimeFilterBuild,
+fn encode_bound_runtime_filter_build(
+    src: &BoundRuntimeFilterBuild,
 ) -> Result<plan::RuntimeFilterBuild, String> {
     Ok(plan::RuntimeFilterBuild {
         filter_id: src.intent.filter_id,
@@ -2043,8 +1896,8 @@ fn encode_wired_runtime_filter_build(
     })
 }
 
-fn encode_wired_runtime_filter_probe(
-    src: &WiredRuntimeFilterProbe,
+fn encode_bound_runtime_filter_probe(
+    src: &BoundRuntimeFilterProbe,
 ) -> Result<plan::RuntimeFilterProbe, String> {
     Ok(plan::RuntimeFilterProbe {
         filter_id: src.intent.filter_id,
@@ -2308,7 +2161,7 @@ fn encode_scan_source(
                 to_snapshot_id,
             } => {
                 let runtime_plan =
-                    crate::sql::codegen::iceberg_delta_scan_wire::build_iceberg_delta_scan_runtime_plan(
+                    crate::sql::codegen::iceberg_delta_scan_planning::build_iceberg_delta_scan_runtime_plan(
                         table,
                         *from_snapshot_id,
                         *to_snapshot_id,
@@ -2321,7 +2174,7 @@ fn encode_scan_source(
                     from_snapshot_id: *from_snapshot_id,
                     to_snapshot_id: *to_snapshot_id,
                     delta_plan: Some(
-                        crate::sql::codegen::iceberg_delta_scan_wire::encode_iceberg_delta_scan_plan_native(
+                        super::iceberg_delta_scan::encode_iceberg_delta_scan_plan_native(
                             &runtime_plan,
                         )?,
                     ),

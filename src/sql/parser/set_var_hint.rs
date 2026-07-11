@@ -22,8 +22,8 @@
 //! via `SELECT /*+ SET_VAR(name=value) */ ...`. NovaRocks's standalone
 //! server doesn't yet have a full session-variable engine, but a handful
 //! of execution-affecting flags surface in SQL tests. This module scans
-//! the SQL text for those flags before parse-time so the caller can wire
-//! them into `TQueryOptions` (which the executor already honours).
+//! the SQL text for those flags before parse-time so the caller can bind
+//! them into native query options consumed by the executor.
 //!
 //! Currently supported:
 //! - `sql_mode='ALLOW_THROW_EXCEPTION'` → enables strict overflow errors

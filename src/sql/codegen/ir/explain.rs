@@ -29,7 +29,7 @@ use crate::sql::explain::{
     format_project_item, format_sort_items, format_window_exprs,
 };
 use crate::sql::planner::distributed::runtime_filter::{
-    WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
+    BoundRuntimeFilterBuild, BoundRuntimeFilterProbe,
 };
 use crate::sql::planner::distributed::{
     DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor, ExchangeReceiver,
@@ -1267,7 +1267,7 @@ fn fmt_f64(v: f64) -> String {
 }
 
 fn push_build_rf_lines(
-    filters: &[WiredRuntimeFilterBuild],
+    filters: &[BoundRuntimeFilterBuild],
     level: ExplainLevel,
     pad: &str,
     out: &mut Vec<String>,
@@ -1286,7 +1286,7 @@ fn push_build_rf_lines(
 }
 
 fn push_probe_rf_lines(
-    filters: &[WiredRuntimeFilterProbe],
+    filters: &[BoundRuntimeFilterProbe],
     level: ExplainLevel,
     pad: &str,
     out: &mut Vec<String>,

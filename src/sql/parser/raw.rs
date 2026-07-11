@@ -21,8 +21,8 @@ use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
 
 /// Parse SQL into a raw sqlparser AST without converting to the custom AST.
-/// This is used by the standalone ThriftPlanBuilder which works directly
-/// with sqlparser types to avoid the limitations of the custom AST.
+/// This is used by standalone analysis and planning paths that work directly
+/// with sqlparser types.
 pub(crate) fn parse_sql_raw(sql: &str) -> Result<sqlparser::ast::Statement, String> {
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
     parse_normalized_sql_raw(&normalized)

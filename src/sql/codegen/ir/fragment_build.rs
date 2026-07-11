@@ -26,8 +26,9 @@ use crate::sql::catalog::{IcebergDataFileBinding, ScanSource, TableDef};
 use crate::sql::codegen::boundary_schema::{
     BoundaryKind, BoundarySchemaReport, output_columns_to_boundary_columns,
 };
-use crate::sql::codegen::connector_scan_wire::{
-    ConnectorScanContext, plan_native_starrocks_scan_node, to_native_file_scan,
+use crate::sql::codegen::connector_scan_planning::{
+    ConnectorScanContext, StarRocksScanSourceDescriptor, plan_native_starrocks_scan_node,
+    to_native_file_scan,
 };
 use crate::sql::codegen::runtime_filter::PlannedRuntimeFilter;
 use crate::sql::codegen::{
@@ -682,8 +683,7 @@ fn reorder_refresh_table_columns_by_projected_names(
 #[derive(Clone, Debug, Default)]
 struct NativeScanPlanningResult {
     scan_ranges: BTreeMap<FragmentId, BTreeMap<i32, Vec<scan_range::ScanRangeParams>>>,
-    starrocks_scan_sources:
-        BTreeMap<i32, crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor>,
+    starrocks_scan_sources: BTreeMap<i32, StarRocksScanSourceDescriptor>,
 }
 
 fn build_native_scan_ranges(
@@ -717,10 +717,7 @@ fn collect_native_scan_ranges(
     connectors: &crate::connector::ConnectorRegistry,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
     out: &mut BTreeMap<i32, Vec<scan_range::ScanRangeParams>>,
-    starrocks_scan_sources: &mut BTreeMap<
-        i32,
-        crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor,
-    >,
+    starrocks_scan_sources: &mut BTreeMap<i32, StarRocksScanSourceDescriptor>,
 ) -> Result<(), String> {
     if let DistributedNodeKind::Scan(scan) = &mut node.payload {
         let (ranges, starrocks_source) =
@@ -760,7 +757,7 @@ fn native_scan_ranges_for_scan(
 ) -> Result<
     (
         Vec<scan_range::ScanRangeParams>,
-        Option<crate::sql::codegen::proto_encode::plan::StarRocksScanSourceDescriptor>,
+        Option<StarRocksScanSourceDescriptor>,
     ),
     String,
 > {

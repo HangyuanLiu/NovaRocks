@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 
 use crate::sql::planner::distributed::runtime_filter::{
-    WiredRuntimeFilterBuild, WiredRuntimeFilterProbe,
+    BoundRuntimeFilterBuild, BoundRuntimeFilterProbe,
 };
 use crate::sql::planner::distributed::{
     DistributedNode, DistributedNodeKind, FragmentId, PlanFragment,
@@ -81,7 +81,10 @@ impl RuntimeFilterBindings {
     }
 }
 
-pub(super) fn wire(fragments: &mut [PlanFragment], bindings: RuntimeFilterBindings) {
+pub(super) fn bind_runtime_filters(
+    fragments: &mut [PlanFragment],
+    bindings: RuntimeFilterBindings,
+) {
     let mut source_fragment_by_filter = HashMap::new();
     for build in &bindings.builds {
         source_fragment_by_filter
@@ -102,7 +105,7 @@ pub(super) fn wire(fragments: &mut [PlanFragment], bindings: RuntimeFilterBindin
         }
     }
 
-    let mut builds_by_node: HashMap<i32, Vec<WiredRuntimeFilterBuild>> = HashMap::new();
+    let mut builds_by_node: HashMap<i32, Vec<BoundRuntimeFilterBuild>> = HashMap::new();
     for build in bindings.builds {
         let target_fragment_ids = target_fragments_by_filter
             .get(&build.intent.filter_id)
@@ -111,14 +114,14 @@ pub(super) fn wire(fragments: &mut [PlanFragment], bindings: RuntimeFilterBindin
         builds_by_node
             .entry(build.node_id)
             .or_default()
-            .push(WiredRuntimeFilterBuild {
+            .push(BoundRuntimeFilterBuild {
                 intent: build.intent,
                 source_fragment_id: build.fragment_id,
                 target_fragment_ids,
             });
     }
 
-    let mut probes_by_node: HashMap<i32, Vec<WiredRuntimeFilterProbe>> = HashMap::new();
+    let mut probes_by_node: HashMap<i32, Vec<BoundRuntimeFilterProbe>> = HashMap::new();
     for probe in bindings.probes {
         let filter_id = probe.intent.filter_id;
         let Some(&source_fragment_id) = source_fragment_by_filter.get(&filter_id) else {
@@ -127,11 +130,11 @@ pub(super) fn wire(fragments: &mut [PlanFragment], bindings: RuntimeFilterBindin
         let probes = probes_by_node.entry(probe.node_id).or_default();
         if probes
             .iter()
-            .any(|wired| wired.intent.filter_id == filter_id)
+            .any(|bound| bound.intent.filter_id == filter_id)
         {
             continue;
         }
-        probes.push(WiredRuntimeFilterProbe {
+        probes.push(BoundRuntimeFilterProbe {
             intent: probe.intent,
             source_fragment_id,
         });
@@ -144,8 +147,8 @@ pub(super) fn wire(fragments: &mut [PlanFragment], bindings: RuntimeFilterBindin
 
 fn attach_runtime_filters(
     node: &mut DistributedNode,
-    builds_by_node: &mut HashMap<i32, Vec<WiredRuntimeFilterBuild>>,
-    probes_by_node: &mut HashMap<i32, Vec<WiredRuntimeFilterProbe>>,
+    builds_by_node: &mut HashMap<i32, Vec<BoundRuntimeFilterBuild>>,
+    probes_by_node: &mut HashMap<i32, Vec<BoundRuntimeFilterProbe>>,
 ) {
     if let Some(mut builds) = builds_by_node.remove(&node.node_id) {
         node.build_runtime_filters.append(&mut builds);

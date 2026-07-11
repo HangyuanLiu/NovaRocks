@@ -16,7 +16,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Distributed-stage runtime-filter wiring.
+//! Distributed-stage runtime-filter bindings.
 
 use crate::sql::planner::distributed::FragmentId;
 use crate::sql::planner::physical::runtime_filter::{
@@ -24,14 +24,14 @@ use crate::sql::planner::physical::runtime_filter::{
 };
 
 #[derive(Clone, Debug)]
-pub(crate) struct WiredRuntimeFilterBuild {
+pub(crate) struct BoundRuntimeFilterBuild {
     pub intent: RuntimeFilterBuildIntent,
     pub source_fragment_id: FragmentId,
     pub target_fragment_ids: Vec<FragmentId>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct WiredRuntimeFilterProbe {
+pub(crate) struct BoundRuntimeFilterProbe {
     pub intent: RuntimeFilterProbeIntent,
     pub source_fragment_id: FragmentId,
 }

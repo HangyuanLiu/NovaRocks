@@ -3593,7 +3593,7 @@ fn distributed_build_mod_surface_detector_rejects_extra_and_non_crate_functions(
     let valid = r#"
 mod fragment_cut;
 mod lowering;
-mod runtime_filter_wire;
+mod runtime_filter_binding;
 
 pub(crate) fn build_distributed_plan() {}
 pub(crate) fn union_distinct_must_be_rewritten_error() {}
@@ -6064,14 +6064,14 @@ fn planner_distributed_build_has_pass_owners() {
     let mod_path = build.join("mod.rs");
     let lowering_path = build.join("lowering.rs");
     let fragment_cut_path = build.join("fragment_cut.rs");
-    let runtime_filter_wire_path = build.join("runtime_filter_wire.rs");
+    let runtime_filter_binding_path = build.join("runtime_filter_binding.rs");
     let tests_path = build.join("tests.rs");
 
     for path in [
         &mod_path,
         &lowering_path,
         &fragment_cut_path,
-        &runtime_filter_wire_path,
+        &runtime_filter_binding_path,
         &tests_path,
     ] {
         assert!(
@@ -6097,14 +6097,14 @@ fn planner_distributed_build_has_pass_owners() {
         BTreeSet::from([
             "fragment_cut".to_string(),
             "lowering".to_string(),
-            "runtime_filter_wire".to_string(),
+            "runtime_filter_binding".to_string(),
         ]),
         "distributed/build/mod.rs must declare exactly three production concerns"
     );
     for declaration in [
         "mod fragment_cut;",
         "mod lowering;",
-        "mod runtime_filter_wire;",
+        "mod runtime_filter_binding;",
     ] {
         assert!(
             has_non_comment_line(&build_mod, declaration),
@@ -6162,8 +6162,8 @@ fn planner_distributed_build_has_pass_owners() {
         ),
         (&lowering_path, fs::read_to_string(&lowering_path).unwrap()),
         (
-            &runtime_filter_wire_path,
-            fs::read_to_string(&runtime_filter_wire_path).unwrap(),
+            &runtime_filter_binding_path,
+            fs::read_to_string(&runtime_filter_binding_path).unwrap(),
         ),
     ];
     let planner_sources = rs_files(&planner)
@@ -6173,9 +6173,9 @@ fn planner_distributed_build_has_pass_owners() {
     for (name, owner) in [
         ("FragmentCutBuilder", &fragment_cut_path),
         ("NodeIdAllocator", &lowering_path),
-        ("RuntimeFilterBindings", &runtime_filter_wire_path),
-        ("RuntimeFilterBuildBinding", &runtime_filter_wire_path),
-        ("RuntimeFilterProbeBinding", &runtime_filter_wire_path),
+        ("RuntimeFilterBindings", &runtime_filter_binding_path),
+        ("RuntimeFilterBuildBinding", &runtime_filter_binding_path),
+        ("RuntimeFilterProbeBinding", &runtime_filter_binding_path),
     ] {
         let declarations = rust_named_declaration_owners(
             &planner_sources,
@@ -6193,9 +6193,9 @@ fn planner_distributed_build_has_pass_owners() {
         ("physical_kind_name", &fragment_cut_path),
         ("lower_fragment_local_node", &lowering_path),
         ("distributed_node_ordering", &lowering_path),
-        ("record", &runtime_filter_wire_path),
-        ("wire", &runtime_filter_wire_path),
-        ("attach_runtime_filters", &runtime_filter_wire_path),
+        ("record", &runtime_filter_binding_path),
+        ("bind_runtime_filters", &runtime_filter_binding_path),
+        ("attach_runtime_filters", &runtime_filter_binding_path),
     ] {
         let declarations = rust_named_declaration_owners(
             &planner_sources,
@@ -6216,8 +6216,8 @@ fn planner_distributed_build_has_pass_owners() {
         "DataSink",
         "RuntimeFilterBuildIntent",
         "RuntimeFilterProbeIntent",
-        "WiredRuntimeFilterBuild",
-        "WiredRuntimeFilterProbe",
+        "BoundRuntimeFilterBuild",
+        "BoundRuntimeFilterProbe",
         "physical.children",
     ] {
         assert!(
@@ -6231,7 +6231,7 @@ fn planner_distributed_build_has_pass_owners() {
         "lowering.rs must not recursively visit the physical tree"
     );
 
-    let runtime_filter_wire = rust_sanitized_production_text(&owners[2].1);
+    let runtime_filter_binding = rust_sanitized_production_text(&owners[2].1);
     for forbidden in [
         "crate::sql::optimizer",
         "crate::sql::codegen",
@@ -6245,8 +6245,8 @@ fn planner_distributed_build_has_pass_owners() {
         "TopN",
     ] {
         assert!(
-            !runtime_filter_wire.contains(forbidden),
-            "runtime_filter_wire.rs must not decide placement/topology or wire protocol: {forbidden}"
+            !runtime_filter_binding.contains(forbidden),
+            "runtime_filter_binding.rs must not decide placement/topology or wire protocol: {forbidden}"
         );
     }
 
@@ -6544,7 +6544,7 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
         ),
         (
             &distributed_owner,
-            &["WiredRuntimeFilterBuild", "WiredRuntimeFilterProbe"][..],
+            &["BoundRuntimeFilterBuild", "BoundRuntimeFilterProbe"][..],
         ),
         (&codegen_owner, &["PlannedRuntimeFilter"][..]),
     ] {
@@ -6567,8 +6567,8 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
     let lifecycle_items = BTreeSet::from([
         "RuntimeFilterBuildIntent",
         "RuntimeFilterProbeIntent",
-        "WiredRuntimeFilterBuild",
-        "WiredRuntimeFilterProbe",
+        "BoundRuntimeFilterBuild",
+        "BoundRuntimeFilterProbe",
         "PlannedRuntimeFilter",
     ]);
     for path in rs_files(&src_dir()) {
@@ -6615,10 +6615,10 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
         !distributed_uses.iter().any(|import| {
             matches!(
                 rust_use_path(import).split("::").last(),
-                Some("WiredRuntimeFilterBuild" | "WiredRuntimeFilterProbe")
+                Some("BoundRuntimeFilterBuild" | "BoundRuntimeFilterProbe")
             )
         }),
-        "distributed/mod.rs must not flat re-export Wired runtime-filter types: {distributed_uses:?}"
+        "distributed/mod.rs must not flat re-export bound runtime-filter types: {distributed_uses:?}"
     );
 
     let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/mod.rs")).unwrap();
@@ -6628,13 +6628,13 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
     );
 
     let distributed_text = fs::read_to_string(&distributed_owner).unwrap();
-    for (wired, intent_type) in [
-        ("WiredRuntimeFilterBuild", "RuntimeFilterBuildIntent"),
-        ("WiredRuntimeFilterProbe", "RuntimeFilterProbeIntent"),
+    for (bound, intent_type) in [
+        ("BoundRuntimeFilterBuild", "RuntimeFilterBuildIntent"),
+        ("BoundRuntimeFilterProbe", "RuntimeFilterProbeIntent"),
     ] {
-        let header = format!("pub(crate) struct {wired} {{");
+        let header = format!("pub(crate) struct {bound} {{");
         let fields = nidl_e4_struct_code_span(&distributed_text, &header)
-            .unwrap_or_else(|| panic!("missing distributed runtime-filter struct {wired}"))
+            .unwrap_or_else(|| panic!("missing distributed runtime-filter struct {bound}"))
             .into_iter()
             .map(|(_, line)| line)
             .collect::<Vec<_>>();
@@ -6642,7 +6642,7 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
             fields
                 .iter()
                 .any(|line| line == &format!("pub intent: {intent_type},")),
-            "{wired} must compose its physical intent: {fields:?}"
+            "{bound} must compose its physical intent: {fields:?}"
         );
         for duplicated in [
             "filter_id",
@@ -6655,26 +6655,26 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
                 !fields
                     .iter()
                     .any(|line| line.starts_with(&format!("pub {duplicated}:"))),
-                "{wired} must not redeclare physical intent field {duplicated}: {fields:?}"
+                "{bound} must not redeclare physical intent field {duplicated}: {fields:?}"
             );
         }
     }
 
-    let builder_path = planner.join("distributed/build/runtime_filter_wire.rs");
+    let builder_path = planner.join("distributed/build/runtime_filter_binding.rs");
     let builder_text = fs::read_to_string(&builder_path).unwrap();
     assert!(
         nidl_e4_function_signature_contains(
             &builder_text,
-            "wire",
+            "bind_runtime_filters",
             "bindings: RuntimeFilterBindings"
         ),
-        "runtime_filter_wire::wire must consume owned RuntimeFilterBindings"
+        "runtime_filter_binding::bind_runtime_filters must consume owned RuntimeFilterBindings"
     );
     let builder_production = rust_sanitized_production_text(&builder_text);
     assert!(
         builder_production.contains("for build in bindings.builds {")
             && builder_production.contains("for probe in bindings.probes {"),
-        "runtime_filter_wire::wire must consume both owned binding Vecs"
+        "runtime_filter_binding::bind_runtime_filters must consume both owned binding Vecs"
     );
 }
 
@@ -10103,6 +10103,10 @@ fn nfe_3_fe_owned_helpers_are_raw_starrocks_idl_free() {
         "src/runtime/fragment_exec_params.rs",
         "src/runtime/scan_range.rs",
         "src/runtime/native_fragment_wire.rs",
+        "src/sql/codegen/connector_scan_planning.rs",
+        "src/sql/codegen/iceberg_delta_scan_planning.rs",
+        "src/sql/codegen/proto_encode/iceberg_delta_scan.rs",
+        "src/sql/planner/distributed/build/runtime_filter_binding.rs",
     ] {
         let text = fs::read_to_string(repo.join(source)).expect(source);
         violations.extend(nfe_3_raw_starrocks_idl_violations(source, &text));
@@ -10139,6 +10143,253 @@ fn nfe_3_fe_owned_helpers_are_raw_starrocks_idl_free() {
     assert!(
         violations.is_empty(),
         "NFE-3 FE helper ownership guard failed:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn nfe_3_native_planning_owners_are_named_explicitly() {
+    let repo = Path::new(manifest_dir());
+    let expected_owners = [
+        "src/sql/codegen/connector_scan_planning.rs",
+        "src/sql/codegen/iceberg_delta_scan_planning.rs",
+        "src/sql/codegen/proto_encode/iceberg_delta_scan.rs",
+        "src/sql/planner/distributed/build/runtime_filter_binding.rs",
+    ];
+    let retired_owners = [
+        "src/sql/codegen/connector_scan_wire.rs",
+        "src/sql/codegen/iceberg_delta_scan_wire.rs",
+        "src/sql/planner/distributed/build/runtime_filter_wire.rs",
+    ];
+    let mut violations = Vec::new();
+
+    for source in expected_owners {
+        match fs::symlink_metadata(repo.join(source)) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => violations.push(format!("{source}: expected regular owner file")),
+            Err(error) => violations.push(format!("{source}: missing owner file: {error}")),
+        }
+    }
+    for source in retired_owners {
+        match fs::symlink_metadata(repo.join(source)) {
+            Ok(_) => violations.push(format!("{source}: retired `_wire` owner still exists")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => violations.push(format!("{source}: failed to inspect path: {error}")),
+        }
+    }
+
+    let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/mod.rs")).unwrap();
+    let build_mod =
+        fs::read_to_string(repo.join("src/sql/planner/distributed/build/mod.rs")).unwrap();
+    let proto_mod = fs::read_to_string(repo.join("src/sql/codegen/proto_encode/mod.rs")).unwrap();
+    for (source, text, required) in [
+        (
+            "src/sql/codegen/mod.rs",
+            codegen_mod.as_str(),
+            &[
+                "mod connector_scan_planning;",
+                "mod iceberg_delta_scan_planning;",
+            ][..],
+        ),
+        (
+            "src/sql/planner/distributed/build/mod.rs",
+            build_mod.as_str(),
+            &["mod runtime_filter_binding;"][..],
+        ),
+        (
+            "src/sql/codegen/proto_encode/mod.rs",
+            proto_mod.as_str(),
+            &["mod iceberg_delta_scan;"][..],
+        ),
+    ] {
+        let production = rust_sanitized_production_text(text);
+        for declaration in required {
+            if !compact_line(&production).contains(&compact_line(declaration)) {
+                violations.push(format!("{source}: missing `{declaration}`"));
+            }
+        }
+    }
+    for (source, text) in [
+        ("src/sql/codegen/mod.rs", codegen_mod.as_str()),
+        (
+            "src/sql/planner/distributed/build/mod.rs",
+            build_mod.as_str(),
+        ),
+    ] {
+        let production = rust_sanitized_production_text(text);
+        for retired in [
+            "connector_scan_wire",
+            "iceberg_delta_scan_wire",
+            "runtime_filter_wire",
+        ] {
+            if production.contains(retired) {
+                violations.push(format!("{source}: retired module name `{retired}`"));
+            }
+        }
+    }
+
+    let planning_path = repo.join("src/sql/codegen/connector_scan_planning.rs");
+    let encoder_path = repo.join("src/sql/codegen/proto_encode/plan.rs");
+    if planning_path.is_file() {
+        let planning = fs::read_to_string(&planning_path).unwrap();
+        let encoder = fs::read_to_string(&encoder_path).unwrap();
+        for descriptor in [
+            "StarRocksStorageColumnDescriptor",
+            "StarRocksKeysTypeDescriptor",
+            "StarRocksColumnSchemaDescriptor",
+            "StarRocksTabletSchemaDescriptor",
+            "StarRocksScanSourceDescriptor",
+        ] {
+            if rust_named_type_declaration_count(&planning, descriptor) != 1 {
+                violations.push(format!(
+                    "{}: must own exactly one `{descriptor}` declaration",
+                    rel(&planning_path)
+                ));
+            }
+            if rust_named_type_declaration_count(&encoder, descriptor) != 0 {
+                violations.push(format!(
+                    "{}: encoder must import rather than declare `{descriptor}`",
+                    rel(&encoder_path)
+                ));
+            }
+        }
+    }
+
+    let delta_planning_path = repo.join("src/sql/codegen/iceberg_delta_scan_planning.rs");
+    let delta_encoder_path = repo.join("src/sql/codegen/proto_encode/iceberg_delta_scan.rs");
+    if delta_planning_path.is_file() && delta_encoder_path.is_file() {
+        let planning = fs::read_to_string(&delta_planning_path).unwrap();
+        let encoder = fs::read_to_string(&delta_encoder_path).unwrap();
+        if rust_named_function_declaration_count(&planning, "build_iceberg_delta_scan_runtime_plan")
+            != 1
+        {
+            violations.push(format!(
+                "{}: must own runtime-plan construction",
+                rel(&delta_planning_path)
+            ));
+        }
+        if rust_named_function_declaration_count(&planning, "encode_iceberg_delta_scan_plan_native")
+            != 0
+        {
+            violations.push(format!(
+                "{}: planning owner must not encode Proto",
+                rel(&delta_planning_path)
+            ));
+        }
+        if rust_named_function_declaration_count(&encoder, "encode_iceberg_delta_scan_plan_native")
+            != 1
+        {
+            violations.push(format!(
+                "{}: must own native Proto encoding",
+                rel(&delta_encoder_path)
+            ));
+        }
+    }
+
+    let sql_sources = rs_files(&repo.join("src/sql"))
+        .into_iter()
+        .map(|path| (rel(&path), fs::read_to_string(path).unwrap()))
+        .collect::<Vec<_>>();
+    for retired in [
+        "WiredRuntimeFilterBuild",
+        "WiredRuntimeFilterProbe",
+        "runtime_filter_wire",
+    ] {
+        for (source, text) in &sql_sources {
+            if rust_sanitized_production_text(text).contains(retired) {
+                violations.push(format!("{source}: retired RF owner/symbol `{retired}`"));
+            }
+        }
+    }
+    for (symbol, expected_owner) in [
+        (
+            "BoundRuntimeFilterBuild",
+            "src/sql/planner/distributed/runtime_filter.rs",
+        ),
+        (
+            "BoundRuntimeFilterProbe",
+            "src/sql/planner/distributed/runtime_filter.rs",
+        ),
+        (
+            "bind_runtime_filters",
+            "src/sql/planner/distributed/build/runtime_filter_binding.rs",
+        ),
+    ] {
+        let declarations = sql_sources
+            .iter()
+            .filter_map(|(source, text)| {
+                let count = if symbol == "bind_runtime_filters" {
+                    rust_named_function_declaration_count(text, symbol)
+                } else {
+                    rust_named_type_declaration_count(text, symbol)
+                };
+                (count > 0).then(|| format!("{source} ({count})"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            declarations,
+            vec![format!("{expected_owner} (1)")],
+            "{symbol} must have exactly one explicit owner"
+        );
+    }
+
+    for source in [
+        "src/sql/codegen/connector_scan_planning.rs",
+        "src/sql/codegen/iceberg_delta_scan_planning.rs",
+        "src/sql/planner/distributed/build/runtime_filter_binding.rs",
+    ] {
+        if let Ok(text) = fs::read_to_string(repo.join(source)) {
+            violations.extend(nfe_3_raw_starrocks_idl_violations(source, &text));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "NFE-3 native planning owner guard failed:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn nfe_3_audit_baselines_do_not_reauthorize_retired_paths() {
+    let audit_path = Path::new(manifest_dir()).join("tools/dev/audit_thrift_boundaries.py");
+    let audit = fs::read_to_string(&audit_path).unwrap();
+    let compact = audit.lines().map(compact_line).collect::<String>();
+    let mut violations = Vec::new();
+
+    for retired in [
+        "src/runtime/exec_params.rs",
+        "src/runtime/exec_params_compat.rs",
+        "src/engine/query_options_wire.rs",
+        "src/exec/spill/query_options_wire.rs",
+    ] {
+        let key = format!("\"{retired}\":BaselineEntry(");
+        if compact.contains(&key) {
+            violations.push(format!(
+                "{retired}: retired path must not retain an audit baseline"
+            ));
+        }
+    }
+
+    for (native, owner) in [
+        ("src/engine/dml_change_stream.rs", "B7"),
+        ("src/runtime/coordinator.rs", "control-plane"),
+        ("src/runtime/dispatcher.rs", "control-plane"),
+        ("src/runtime/fragment_exec_params.rs", "control-plane"),
+        ("src/runtime/scan_range.rs", "B5"),
+        ("src/runtime/native_fragment_wire.rs", "control-plane"),
+    ] {
+        let prefix = format!("\"{native}\":BaselineEntry(\"domain-leak\",\"{owner}\",0,");
+        if !compact.contains(&prefix) {
+            violations.push(format!(
+                "{native}: NFE-native owner must have domain-leak/{owner} max_hits=0"
+            ));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "NFE-3 audit baseline guard failed:\n{}",
         violations.join("\n")
     );
 }
@@ -12395,7 +12646,7 @@ fn nidl_e3_planner_ir_uses_native_partition_and_runtime_filter_types() {
         "src/sql/planner/distributed/build/mod.rs",
         "src/sql/planner/distributed/build/lowering.rs",
         "src/sql/planner/distributed/build/fragment_cut.rs",
-        "src/sql/planner/distributed/build/runtime_filter_wire.rs",
+        "src/sql/planner/distributed/build/runtime_filter_binding.rs",
         "src/sql/planner/physical/mod.rs",
         "src/sql/planner/physical/node.rs",
         "src/sql/planner/physical/runtime_filter.rs",

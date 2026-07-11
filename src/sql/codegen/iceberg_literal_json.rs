@@ -34,11 +34,11 @@ pub(crate) fn serialize_iceberg_literal_json(
                 serde_json::to_string(&hex).map_err(|e| format!("serialize Binary default: {e}"))
             }
             other => Err(format!(
-                "unsupported primitive literal for thrift/native emission: {other:?}"
+                "unsupported primitive literal for native plan emission: {other:?}"
             )),
         },
         other => Err(format!(
-            "unsupported literal kind for thrift/native emission: {other:?}"
+            "unsupported literal kind for native plan emission: {other:?}"
         )),
     }
 }
