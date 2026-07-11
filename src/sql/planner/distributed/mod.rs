@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) mod build;
 mod fragment;
 mod node;
 pub(crate) mod runtime_filter;

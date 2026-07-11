@@ -1393,7 +1393,10 @@ fn planner_distributed_and_codegen_do_not_import_optimizer() {
     let mut checked = vec![
         src_dir().join("sql/planner/distributed/fragment.rs"),
         src_dir().join("sql/planner/distributed/node.rs"),
-        src_dir().join("sql/planner/distributed_plan_build.rs"),
+        src_dir().join("sql/planner/distributed/build/mod.rs"),
+        src_dir().join("sql/planner/distributed/build/lowering.rs"),
+        src_dir().join("sql/planner/distributed/build/fragment_cut.rs"),
+        src_dir().join("sql/planner/distributed/build/runtime_filter_wire.rs"),
     ];
     checked.extend(rs_files(&src_dir().join("sql/codegen")));
 
@@ -1738,6 +1741,20 @@ fn rust_named_function_declaration_count(text: &str, name: &str) -> usize {
         .windows(2)
         .filter(|tokens| tokens[0] == "fn" && tokens[1] == name)
         .count()
+}
+
+fn rust_named_declaration_owners(
+    sources: &[(String, String)],
+    name: &str,
+    declaration_count: fn(&str, &str) -> usize,
+) -> Vec<String> {
+    sources
+        .iter()
+        .filter_map(|(path, text)| {
+            let count = declaration_count(text, name);
+            (count > 0).then(|| format!("{path} ({count})"))
+        })
+        .collect()
 }
 
 fn rust_named_const_declaration_count(text: &str, name: &str) -> usize {
@@ -2519,6 +2536,227 @@ fn rust_canonical_path_is_legacy_distributed_owner(canonical: &[String]) -> bool
             canonical[3].as_str(),
             "distributed_node" | "distributed_fragment"
         )
+}
+
+fn rust_canonical_path_is_legacy_distributed_build_owner(canonical: &[String]) -> bool {
+    canonical.len() >= 4
+        && canonical[..3] == ["crate", "sql", "planner"]
+        && (canonical[3] == "distributed_plan_build"
+            || (canonical.len() == 4
+                && matches!(
+                    canonical[3].as_str(),
+                    "build_distributed_plan" | "union_distinct_must_be_rewritten_error"
+                )))
+}
+
+fn distributed_build_surface_violations_in(source_rel: &str, text: &str) -> Vec<String> {
+    rust_production_canonical_paths(text, source_rel)
+        .into_iter()
+        .filter(|path| rust_canonical_path_is_legacy_distributed_build_owner(path))
+        .map(|path| path.join("::"))
+        .collect()
+}
+
+fn top_level_production_function_name(item: &str) -> Option<String> {
+    let tokens = rust_use_tokens(item);
+    tokens
+        .windows(2)
+        .find(|tokens| tokens[0] == "fn")
+        .map(|tokens| tokens[1].clone())
+}
+
+fn top_level_production_function_is_pub_crate(item: &str) -> bool {
+    let tokens = rust_use_tokens(item);
+    let Some(function_index) = tokens.iter().position(|token| token == "fn") else {
+        return false;
+    };
+    tokens[..function_index].windows(4).any(|window| {
+        window[0] == "pub" && window[1] == "(" && window[2] == "crate" && window[3] == ")"
+    })
+}
+
+fn distributed_build_mod_surface_violations(text: &str) -> Vec<String> {
+    let functions = top_level_production_functions(text);
+    let mut names = functions
+        .iter()
+        .filter_map(|function| top_level_production_function_name(function))
+        .collect::<Vec<_>>();
+    names.sort();
+    let mut violations = Vec::new();
+    let expected = vec![
+        "build_distributed_plan".to_string(),
+        "union_distinct_must_be_rewritten_error".to_string(),
+    ];
+    if names != expected || names.len() != functions.len() {
+        violations.push(format!(
+            "top-level production functions must be exactly {expected:?}, got {names:?}: {functions:?}"
+        ));
+    }
+    for function in &functions {
+        if !top_level_production_function_is_pub_crate(function) {
+            violations.push(format!(
+                "top-level build function must use pub(crate) visibility: {function}"
+            ));
+        }
+    }
+    violations
+}
+
+fn rust_canonical_path_is_distributed_build_namespace(canonical: &[String]) -> bool {
+    canonical.len() >= 5 && canonical[..5] == ["crate", "sql", "planner", "distributed", "build"]
+}
+
+fn planner_root_distributed_build_surface_violations(text: &str) -> Vec<String> {
+    rust_production_canonical_paths(text, "src/sql/planner/mod.rs")
+        .into_iter()
+        .filter(|path| rust_canonical_path_is_distributed_build_namespace(path))
+        .map(|path| path.join("::"))
+        .collect()
+}
+
+#[test]
+fn distributed_build_surface_detector_covers_paths_aliases_scopes_and_noise() {
+    for source in [
+        "use crate::sql::planner::{distributed_plan_build::build_distributed_plan};",
+        "use crate::sql::planner::distributed_plan_build as legacy;\nfn f() { legacy::build_distributed_plan(); }",
+        "use crate::sql::planner as planner;\nfn f() { planner::build_distributed_plan(); }",
+        "fn f() { crate::sql::planner::union_distinct_must_be_rewritten_error(); }",
+        "fn f() { super::super::super::planner::build_distributed_plan(); }",
+        "mod nested { fn f() { crate::sql::planner::distributed_plan_build::build_distributed_plan(); } }",
+    ] {
+        assert!(
+            !distributed_build_surface_violations_in("src/sql/codegen/ir/explain.rs", source)
+                .is_empty(),
+            "legacy/grouped/alias/relative/FQ/inline build path must be detected: {source}"
+        );
+    }
+
+    let noise = r###"
+// crate::sql::planner::build_distributed_plan();
+const TEXT: &str = "crate::sql::planner::distributed_plan_build";
+#[cfg(test)]
+mod tests {
+    use crate::sql::planner::build_distributed_plan;
+}
+"###;
+    assert!(
+        distributed_build_surface_violations_in("src/sql/codegen/ir/explain.rs", noise).is_empty(),
+        "comments, strings, and cfg(test) items must be ignored"
+    );
+}
+
+#[test]
+fn distributed_build_mod_surface_detector_rejects_extra_and_non_crate_functions() {
+    let valid = r#"
+mod fragment_cut;
+mod lowering;
+mod runtime_filter_wire;
+
+pub(crate) fn build_distributed_plan() {}
+pub(crate) fn union_distinct_must_be_rewritten_error() {}
+
+#[cfg(test)]
+fn test_only_helper() {}
+"#;
+    assert!(
+        distributed_build_mod_surface_violations(valid).is_empty(),
+        "exact build surface must be accepted"
+    );
+
+    for invalid in [
+        format!("{valid}\nfn extra_private_helper() {{}}"),
+        format!("{valid}\npub(crate) fn extra_public_helper() {{}}"),
+        valid.replacen(
+            "pub(crate) fn build_distributed_plan",
+            "fn build_distributed_plan",
+            1,
+        ),
+        valid.replacen(
+            "pub(crate) fn union_distinct_must_be_rewritten_error",
+            "pub(super) fn union_distinct_must_be_rewritten_error",
+            1,
+        ),
+    ] {
+        assert!(
+            !distributed_build_mod_surface_violations(&invalid).is_empty(),
+            "extra function or non-pub(crate) entry must be rejected: {invalid}"
+        );
+    }
+}
+
+#[test]
+fn distributed_build_owner_detector_includes_non_owner_planner_duplicates() {
+    let sources = vec![
+        (
+            "src/sql/planner/distributed/build/lowering.rs".to_string(),
+            "struct NodeIdAllocator; fn lower_fragment_local_node() {}".to_string(),
+        ),
+        (
+            "src/sql/planner/physical/node.rs".to_string(),
+            "struct NodeIdAllocator; fn lower_fragment_local_node() {}".to_string(),
+        ),
+        (
+            "src/sql/planner/logical/node.rs".to_string(),
+            "#[cfg(test)] struct NodeIdAllocator; #[cfg(test)] fn lower_fragment_local_node() {}"
+                .to_string(),
+        ),
+    ];
+
+    assert_eq!(
+        rust_named_declaration_owners(
+            &sources,
+            "NodeIdAllocator",
+            rust_named_type_declaration_count,
+        ),
+        vec![
+            "src/sql/planner/distributed/build/lowering.rs (1)",
+            "src/sql/planner/physical/node.rs (1)",
+        ],
+        "type duplicates outside the concern owner must be visible"
+    );
+    assert_eq!(
+        rust_named_declaration_owners(
+            &sources,
+            "lower_fragment_local_node",
+            rust_named_function_declaration_count,
+        ),
+        vec![
+            "src/sql/planner/distributed/build/lowering.rs (1)",
+            "src/sql/planner/physical/node.rs (1)",
+        ],
+        "function duplicates outside the concern owner must be visible"
+    );
+}
+
+#[test]
+fn planner_root_distributed_build_surface_detector_rejects_forwarding_paths() {
+    for source in [
+        "use crate::sql::planner::distributed::{build};",
+        "use crate::sql::planner::distributed::build as builder;\npub(crate) fn forward() { builder::build_distributed_plan(); }",
+        "pub(crate) fn forward() { crate::sql::planner::distributed::build::build_distributed_plan(); }",
+        "pub(crate) fn forward() { distributed::build::build_distributed_plan(); }",
+        "mod facade { pub(crate) fn forward() { super::distributed::build::build_distributed_plan(); } }",
+        "use self::distributed::build::build_distributed_plan as inner;\npub(crate) fn differently_named_wrapper() { inner(); }",
+    ] {
+        assert!(
+            !planner_root_distributed_build_surface_violations(source).is_empty(),
+            "planner-root import/call/forwarder must be rejected: {source}"
+        );
+    }
+
+    let noise = r###"
+// distributed::build::build_distributed_plan();
+const TEXT: &str = "crate::sql::planner::distributed::build";
+#[cfg(test)]
+mod tests {
+    use super::distributed::build::build_distributed_plan;
+}
+pub(crate) use logical::build::{plan_output_columns, plan_query};
+"###;
+    assert!(
+        planner_root_distributed_build_surface_violations(noise).is_empty(),
+        "comments, strings, cfg(test), and unrelated paths must be ignored"
+    );
 }
 
 fn rust_canonical_path_is_planner_root_distributed_core(canonical: &[String]) -> bool {
@@ -3959,6 +4197,7 @@ fn planner_distributed_core_has_stage_namespace() {
         "distributed/node.rs",
         "distributed/fragment.rs",
         "distributed/runtime_filter.rs",
+        "distributed/build/mod.rs",
     ] {
         let path = planner.join(relative);
         assert!(
@@ -3976,8 +4215,8 @@ fn planner_distributed_core_has_stage_namespace() {
         );
     }
     assert!(
-        planner.join("distributed_plan_build.rs").is_file(),
-        "root distributed_plan_build.rs must remain until PDB-2 M2c"
+        !planner.join("distributed_plan_build.rs").exists(),
+        "root distributed_plan_build.rs must be deleted by PDB-2 M2c"
     );
 
     let fragment_path = planner.join("distributed/fragment.rs");
@@ -4075,14 +4314,16 @@ fn planner_distributed_core_has_stage_namespace() {
     assert_eq!(
         planner_namespace_module_declarations(&distributed_mod),
         BTreeSet::from([
+            "build".to_string(),
             "fragment".to_string(),
             "node".to_string(),
             "runtime_filter".to_string(),
             "write".to_string(),
         ]),
-        "distributed/mod.rs must declare exactly fragment, node, runtime_filter, and write"
+        "distributed/mod.rs must declare exactly build, fragment, node, runtime_filter, and write"
     );
     for declaration in [
+        "pub(crate) mod build;",
         "mod fragment;",
         "mod node;",
         "pub(crate) mod runtime_filter;",
@@ -4122,16 +4363,16 @@ fn planner_distributed_core_has_stage_namespace() {
     assert!(has_non_comment_line(&facade, "pub(crate) mod distributed;"));
     assert!(!has_module_declaration(&facade, "distributed_node"));
     assert!(!has_module_declaration(&facade, "distributed_fragment"));
-    assert!(has_module_declaration(&facade, "distributed_plan_build"));
+    assert!(!has_module_declaration(&facade, "distributed_plan_build"));
     let facade_uses = rust_production_use_statements(&facade);
     assert!(
-        facade_uses
-            .contains(&"pub(crate)|distributed_plan_build::build_distributed_plan".to_string())
-            && facade_uses.contains(
-                &"pub(crate)|distributed_plan_build::union_distinct_must_be_rewritten_error"
-                    .to_string()
-            ),
-        "planner facade must retain the two root distributed builder entries: {facade_uses:?}"
+        !facade_uses.iter().any(|import| {
+            matches!(
+                rust_use_path(import).split("::").last(),
+                Some("build_distributed_plan" | "union_distinct_must_be_rewritten_error")
+            )
+        }),
+        "planner facade must not flatten distributed build entries: {facade_uses:?}"
     );
     assert!(
         !facade_uses
@@ -4337,6 +4578,228 @@ fn planner_distributed_core_has_stage_namespace() {
 }
 
 #[test]
+fn planner_distributed_build_has_pass_owners() {
+    let planner = src_dir().join("sql/planner");
+    let build = planner.join("distributed/build");
+    let mod_path = build.join("mod.rs");
+    let lowering_path = build.join("lowering.rs");
+    let fragment_cut_path = build.join("fragment_cut.rs");
+    let runtime_filter_wire_path = build.join("runtime_filter_wire.rs");
+    let tests_path = build.join("tests.rs");
+
+    for path in [
+        &mod_path,
+        &lowering_path,
+        &fragment_cut_path,
+        &runtime_filter_wire_path,
+        &tests_path,
+    ] {
+        assert!(
+            path.is_file(),
+            "missing distributed build owner: {}",
+            rel(path)
+        );
+    }
+    assert!(
+        !planner.join("distributed_plan_build.rs").exists(),
+        "legacy root distributed_plan_build.rs must be deleted"
+    );
+
+    let build_mod = fs::read_to_string(&mod_path).unwrap();
+    let build_surface_violations = distributed_build_mod_surface_violations(&build_mod);
+    assert!(
+        build_surface_violations.is_empty(),
+        "distributed/build/mod.rs function surface must stay closed:\n{}",
+        build_surface_violations.join("\n")
+    );
+    assert_eq!(
+        planner_namespace_module_declarations(&build_mod),
+        BTreeSet::from([
+            "fragment_cut".to_string(),
+            "lowering".to_string(),
+            "runtime_filter_wire".to_string(),
+        ]),
+        "distributed/build/mod.rs must declare exactly three production concerns"
+    );
+    for declaration in [
+        "mod fragment_cut;",
+        "mod lowering;",
+        "mod runtime_filter_wire;",
+    ] {
+        assert!(
+            has_non_comment_line(&build_mod, declaration),
+            "build/mod.rs concern owner must stay private: {declaration}"
+        );
+    }
+    assert!(
+        has_cfg_test_mod_tests(&build_mod),
+        "build/mod.rs must declare sibling #[cfg(test)] mod tests"
+    );
+    for function in [
+        "build_distributed_plan",
+        "union_distinct_must_be_rewritten_error",
+    ] {
+        let declarations = rs_files(&planner)
+            .into_iter()
+            .filter_map(|path| {
+                let text = fs::read_to_string(&path).unwrap();
+                let count = rust_named_function_declaration_count(&text, function);
+                (count > 0).then(|| format!("{} ({count})", rel(&path)))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            declarations,
+            vec![format!("{} (1)", rel(&mod_path))],
+            "{function} must be declared exactly once across planner production sources"
+        );
+    }
+    let planner_mod_path = planner.join("mod.rs");
+    let planner_mod = fs::read_to_string(&planner_mod_path).unwrap();
+    let planner_root_build_violations =
+        planner_root_distributed_build_surface_violations(&planner_mod);
+    assert!(
+        planner_root_build_violations.is_empty(),
+        "planner/mod.rs must not import, call, or forward distributed::build:\n{}",
+        planner_root_build_violations.join("\n")
+    );
+    assert!(
+        !rust_use_tokens(&rust_sanitized_production_text(&build_mod))
+            .windows(2)
+            .any(|tokens| tokens == ["pub", "use"]),
+        "build/mod.rs must not re-export concern internals"
+    );
+    for forbidden in ["struct", "enum", "LoweredPlanNode"] {
+        assert!(
+            !rust_sanitized_production_text(&build_mod).contains(forbidden),
+            "build/mod.rs must remain a thin coordinator without {forbidden}"
+        );
+    }
+
+    let owners = [
+        (
+            &fragment_cut_path,
+            fs::read_to_string(&fragment_cut_path).unwrap(),
+        ),
+        (&lowering_path, fs::read_to_string(&lowering_path).unwrap()),
+        (
+            &runtime_filter_wire_path,
+            fs::read_to_string(&runtime_filter_wire_path).unwrap(),
+        ),
+    ];
+    let planner_sources = rs_files(&planner)
+        .into_iter()
+        .map(|path| (rel(&path), fs::read_to_string(path).unwrap()))
+        .collect::<Vec<_>>();
+    for (name, owner) in [
+        ("FragmentCutBuilder", &fragment_cut_path),
+        ("NodeIdAllocator", &lowering_path),
+        ("RuntimeFilterBindings", &runtime_filter_wire_path),
+        ("RuntimeFilterBuildBinding", &runtime_filter_wire_path),
+        ("RuntimeFilterProbeBinding", &runtime_filter_wire_path),
+    ] {
+        let declarations = rust_named_declaration_owners(
+            &planner_sources,
+            name,
+            rust_named_type_declaration_count,
+        );
+        assert_eq!(
+            declarations,
+            vec![format!("{} (1)", rel(owner))],
+            "{name} must have exactly one build concern owner"
+        );
+    }
+    for (name, owner) in [
+        ("expect_child_count", &fragment_cut_path),
+        ("physical_kind_name", &fragment_cut_path),
+        ("lower_fragment_local_node", &lowering_path),
+        ("distributed_node_ordering", &lowering_path),
+        ("record", &runtime_filter_wire_path),
+        ("wire", &runtime_filter_wire_path),
+        ("attach_runtime_filters", &runtime_filter_wire_path),
+    ] {
+        let declarations = rust_named_declaration_owners(
+            &planner_sources,
+            name,
+            rust_named_function_declaration_count,
+        );
+        assert_eq!(
+            declarations,
+            vec![format!("{} (1)", rel(owner))],
+            "{name} must have exactly one build concern owner"
+        );
+    }
+
+    let lowering = rust_sanitized_production_text(&owners[1].1);
+    for forbidden in [
+        "PlanFragment",
+        "FragmentEdge",
+        "DataSink",
+        "RuntimeFilterBuildIntent",
+        "RuntimeFilterProbeIntent",
+        "WiredRuntimeFilterBuild",
+        "WiredRuntimeFilterProbe",
+        "physical.children",
+    ] {
+        assert!(
+            !lowering.contains(forbidden),
+            "lowering.rs must not own topology/RF/physical recursion token {forbidden}"
+        );
+    }
+    assert_eq!(
+        rust_named_function_declaration_count(&lowering, "visit"),
+        0,
+        "lowering.rs must not recursively visit the physical tree"
+    );
+
+    let runtime_filter_wire = rust_sanitized_production_text(&owners[2].1);
+    for forbidden in [
+        "crate::sql::optimizer",
+        "crate::sql::codegen",
+        "crate::proto",
+        "crate::thrift",
+        "FragmentEdge",
+        "PartitionKind",
+        "DataPartition",
+        "Redistribute",
+        "CTEAnchor",
+        "TopN",
+    ] {
+        assert!(
+            !runtime_filter_wire.contains(forbidden),
+            "runtime_filter_wire.rs must not decide placement/topology or wire protocol: {forbidden}"
+        );
+    }
+
+    let fragment_cut = rust_sanitized_production_text(&owners[0].1);
+    assert_eq!(
+        rust_named_function_declaration_count(&fragment_cut, "visit"),
+        1,
+        "fragment_cut.rs must own the only physical-tree visitor"
+    );
+    for forbidden in ["LoweredPlanNode", "struct Lowered", "enum Lowered"] {
+        assert!(
+            !owners
+                .iter()
+                .any(|(_, text)| { rust_sanitized_production_text(text).contains(forbidden) }),
+            "distributed build must not introduce a second full-tree IR: {forbidden}"
+        );
+    }
+
+    let mut legacy = Vec::new();
+    for path in rs_files(&src_dir()) {
+        let text = fs::read_to_string(&path).unwrap();
+        for violation in distributed_build_surface_violations_in(&rel(&path), &text) {
+            legacy.push(format!("{}: {violation}", rel(&path)));
+        }
+    }
+    assert!(
+        legacy.is_empty(),
+        "legacy/planner-root distributed build paths must be absent:\n{}",
+        legacy.join("\n")
+    );
+}
+
+#[test]
 fn planner_distributed_write_surface_has_stage_namespace() {
     let repo = Path::new(manifest_dir());
     let planner = repo.join("src/sql/planner");
@@ -4368,12 +4831,13 @@ fn planner_distributed_write_surface_has_stage_namespace() {
     assert_eq!(
         planner_namespace_module_declarations(&distributed_mod),
         BTreeSet::from([
+            "build".to_string(),
             "fragment".to_string(),
             "node".to_string(),
             "runtime_filter".to_string(),
             "write".to_string(),
         ]),
-        "distributed/mod.rs must declare exactly fragment, node, runtime_filter, and write"
+        "distributed/mod.rs must declare exactly build, fragment, node, runtime_filter, and write"
     );
     assert!(
         has_non_comment_line(&distributed_mod, "pub(crate) mod write;"),
@@ -4716,25 +5180,21 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
         }
     }
 
-    let builder_path = planner.join("distributed_plan_build.rs");
+    let builder_path = planner.join("distributed/build/runtime_filter_wire.rs");
     let builder_text = fs::read_to_string(&builder_path).unwrap();
     assert!(
         nidl_e4_function_signature_contains(
             &builder_text,
-            "wire_runtime_filters",
-            "build_bindings: Vec<RuntimeFilterBuildBinding>"
-        ) && nidl_e4_function_signature_contains(
-            &builder_text,
-            "wire_runtime_filters",
-            "probe_bindings: Vec<RuntimeFilterProbeBinding>"
+            "wire",
+            "bindings: RuntimeFilterBindings"
         ),
-        "wire_runtime_filters must consume owned runtime-filter binding Vecs"
+        "runtime_filter_wire::wire must consume owned RuntimeFilterBindings"
     );
     let builder_production = rust_sanitized_production_text(&builder_text);
     assert!(
-        builder_production.contains("for build in build_bindings {")
-            && builder_production.contains("for probe in probe_bindings {"),
-        "wire_runtime_filters must consume both owned binding Vecs"
+        builder_production.contains("for build in bindings.builds {")
+            && builder_production.contains("for probe in bindings.probes {"),
+        "runtime_filter_wire::wire must consume both owned binding Vecs"
     );
 }
 
@@ -5101,7 +5561,7 @@ fn stage_validation_guard_stays_deleted() {
 
 #[test]
 fn build_distributed_plan_signature_is_planner_typed() {
-    let path = src_dir().join("sql/planner/distributed_plan_build.rs");
+    let path = src_dir().join("sql/planner/distributed/build/mod.rs");
     let text = fs::read_to_string(&path).unwrap();
     let sig = text
         .lines()
@@ -5509,11 +5969,12 @@ fn nidl_d3a_test_contract_modules_do_not_leak_into_production_code() {
 
 #[test]
 fn distributed_build_does_not_call_optimizer_cost_model() {
-    let file = src_dir().join("sql/planner/distributed_plan_build.rs");
     let mut violations = Vec::new();
-    for needle in ["compute_cost_estimate", "broadcast_decision("] {
-        for (line, text) in non_test_line_hits(&file, |line| line.contains(needle)) {
-            violations.push(format!("{}:{}: {}", rel(&file), line, text));
+    for file in rs_files(&src_dir().join("sql/planner/distributed/build")) {
+        for needle in ["compute_cost_estimate", "broadcast_decision("] {
+            for (line, text) in non_test_line_hits(&file, |line| line.contains(needle)) {
+                violations.push(format!("{}:{}: {}", rel(&file), line, text));
+            }
         }
     }
 
@@ -9950,7 +10411,10 @@ fn nidl_e3_planner_ir_uses_native_partition_and_runtime_filter_types() {
         "src/sql/planner/distributed/write/change_stream.rs",
         "src/sql/planner/distributed/write/plan.rs",
         "src/sql/planner/distributed/write/sink.rs",
-        "src/sql/planner/distributed_plan_build.rs",
+        "src/sql/planner/distributed/build/mod.rs",
+        "src/sql/planner/distributed/build/lowering.rs",
+        "src/sql/planner/distributed/build/fragment_cut.rs",
+        "src/sql/planner/distributed/build/runtime_filter_wire.rs",
         "src/sql/planner/physical/mod.rs",
         "src/sql/planner/physical/node.rs",
         "src/sql/planner/physical/runtime_filter.rs",
