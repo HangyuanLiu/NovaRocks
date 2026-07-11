@@ -491,7 +491,10 @@ fn production_rs_files(root: &Path) -> Vec<PathBuf> {
 fn production_rs_files_from_entries(root: &Path, entries: &[PathBuf]) -> Vec<PathBuf> {
     fn default_module_dir(source: &Path, root: &Path) -> PathBuf {
         let parent_dir = source.parent().unwrap_or(root);
-        if source.file_name().is_some_and(|name| name == "mod.rs") {
+        if source
+            .file_name()
+            .is_some_and(|name| matches!(name.to_str(), Some("mod.rs" | "lib.rs" | "main.rs")))
+        {
             parent_dir.to_path_buf()
         } else {
             source
@@ -10000,6 +10003,1004 @@ fn nfe_3_raw_starrocks_idl_violations(source: &str, text: &str) -> Vec<String> {
     })
     .map(|term| format!("{source}: FE-owned helper references raw StarRocks IDL `{term}`"))
     .collect()
+}
+
+type Nfe4PublicReexportGraph = BTreeMap<Vec<String>, Vec<Vec<String>>>;
+
+fn nfe_4_public_reexport_graph(sources: &[(String, String)]) -> Nfe4PublicReexportGraph {
+    let mut graph = Nfe4PublicReexportGraph::new();
+    for (source, text) in sources {
+        let aliases = rust_production_scoped_aliases(text);
+        for raw in rust_raw_production_use_statements(text)
+            .into_iter()
+            .filter(|raw| matches!(raw.visibility.as_str(), "pub" | "pub(crate)"))
+        {
+            let Some(mut exported) = rust_source_module_segments(source) else {
+                continue;
+            };
+            exported.extend(raw.inline_modules.clone());
+
+            let glob = raw
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment == "*");
+            if !glob {
+                let Some(local_name) = raw
+                    .path
+                    .alias
+                    .clone()
+                    .filter(|alias| alias != "_")
+                    .or_else(|| raw.path.segments.last().cloned())
+                else {
+                    continue;
+                };
+                exported.push(local_name);
+            }
+
+            let resolved = rust_resolve_scoped_paths(
+                &raw.path.segments,
+                &raw.inline_modules,
+                &aliases,
+                &mut BTreeSet::new(),
+                0,
+            )
+            .unwrap_or_else(|| {
+                vec![RustScopedUsePath {
+                    segments: raw.path.segments.clone(),
+                    inline_modules: raw.inline_modules.clone(),
+                }]
+            });
+            for resolved in resolved {
+                let Some(mut target) = rust_canonical_path_segments_in_scope(
+                    &resolved.segments,
+                    source,
+                    &resolved.inline_modules,
+                ) else {
+                    continue;
+                };
+                if glob {
+                    target.pop();
+                }
+                if exported == target {
+                    continue;
+                }
+                let targets = graph.entry(exported.clone()).or_default();
+                if !targets.contains(&target) {
+                    targets.push(target);
+                    targets.sort();
+                }
+            }
+        }
+    }
+    graph
+}
+
+fn nfe_4_raw_starrocks_idl_violations(
+    source: &str,
+    text: &str,
+    reexports: &Nfe4PublicReexportGraph,
+) -> Vec<String> {
+    nfe_4_raw_starrocks_idl_violations_with_cache(source, text, reexports, &mut BTreeMap::new())
+}
+
+fn nfe_4_forbidden_seed_mask(path: &[String]) -> u8 {
+    [
+        (&["crate", "thrift"][..], 1u8),
+        (&["crate", "proto", "starrocks"][..], 2u8),
+        (&["crate", "proto", "staros"][..], 4u8),
+    ]
+    .into_iter()
+    .filter(|(prefix, _)| {
+        path.len() >= prefix.len()
+            && path
+                .iter()
+                .zip(prefix.iter())
+                .all(|(actual, expected)| actual == expected)
+    })
+    .fold(0, |mask, (_, bit)| mask | bit)
+}
+
+fn nfe_4_reexport_forbidden_mask(
+    path: &[String],
+    graph: &Nfe4PublicReexportGraph,
+    cache: &mut BTreeMap<Vec<String>, u8>,
+    visiting: &mut BTreeSet<Vec<String>>,
+) -> (u8, bool) {
+    let direct = nfe_4_forbidden_seed_mask(path);
+    if direct != 0 {
+        return (direct, true);
+    }
+    if let Some(mask) = cache.get(path) {
+        return (*mask, true);
+    }
+    let matched = (1..=path.len()).rev().find_map(|prefix_len| {
+        graph
+            .get(&path[..prefix_len])
+            .map(|targets| (prefix_len, targets))
+    });
+    let Some((prefix_len, targets)) = matched else {
+        cache.insert(path.to_vec(), 0);
+        return (0, true);
+    };
+    let prefix = path[..prefix_len].to_vec();
+    if !visiting.insert(prefix.clone()) {
+        return (0, false);
+    }
+    let mut mask = 0;
+    let mut complete = true;
+    for target in targets {
+        let mut rewritten = target.clone();
+        rewritten.extend_from_slice(&path[prefix_len..]);
+        let (target_mask, target_complete) =
+            nfe_4_reexport_forbidden_mask(&rewritten, graph, cache, visiting);
+        mask |= target_mask;
+        complete &= target_complete;
+    }
+    visiting.remove(&prefix);
+    if complete {
+        cache.insert(path.to_vec(), mask);
+    }
+    (mask, complete)
+}
+
+fn nfe_4_raw_starrocks_idl_violations_with_cache(
+    source: &str,
+    text: &str,
+    reexports: &Nfe4PublicReexportGraph,
+    cache: &mut BTreeMap<Vec<String>, u8>,
+) -> Vec<String> {
+    let production = rust_sanitized_production_text(text);
+    let tokens = rust_use_tokens(&production);
+    let canonical_source = if rust_source_module_segments(source).is_some() {
+        source.to_string()
+    } else if let Some((_, crate_relative)) = source.rsplit_once("/src/") {
+        format!("src/{crate_relative}")
+    } else {
+        source.to_string()
+    };
+    let canonical_paths = rust_production_canonical_paths(text, &canonical_source);
+    let mut mask = canonical_paths.iter().fold(0, |mask, path| {
+        mask | nfe_4_reexport_forbidden_mask(path, reexports, cache, &mut BTreeSet::new()).0
+    });
+    for (term, bit) in [
+        ("crate::thrift", 1u8),
+        ("crate::proto::starrocks", 2u8),
+        ("crate::proto::staros", 4u8),
+    ] {
+        let term_tokens = rust_use_tokens(term);
+        let direct = tokens
+            .windows(term_tokens.len())
+            .any(|window| window == term_tokens);
+        if direct {
+            mask |= bit;
+        }
+    }
+
+    [
+        ("crate::thrift", 1u8),
+        ("crate::proto::starrocks", 2u8),
+        ("crate::proto::staros", 4u8),
+    ]
+    .into_iter()
+    .filter(|(_, bit)| mask & bit != 0)
+    .map(|(term, _)| term)
+    .map(|term| format!("{source}: FE-owned helper references raw StarRocks IDL `{term}`"))
+    .collect()
+}
+
+fn nfe_4_collect_production_owner_files(
+    root: &Path,
+    entries: &[PathBuf],
+) -> Result<Vec<PathBuf>, String> {
+    if entries.is_empty() {
+        return Err(format!("{}: owner entry set is empty", root.display()));
+    }
+    for entry in entries {
+        match fs::symlink_metadata(entry) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => return Err(format!("{}: owner entry is not a file", entry.display())),
+            Err(error) => {
+                return Err(format!(
+                    "{}: failed to inspect owner entry: {error}",
+                    entry.display()
+                ));
+            }
+        }
+    }
+
+    let files = production_rs_files_from_entries(root, entries);
+    if files.is_empty() {
+        return Err(format!("{}: production owner set is empty", root.display()));
+    }
+    for entry in entries {
+        let canonical = fs::canonicalize(entry)
+            .map_err(|error| format!("{}: canonicalize failed: {error}", entry.display()))?;
+        if !files.iter().any(|file| {
+            fs::canonicalize(file)
+                .ok()
+                .is_some_and(|file| file == canonical)
+        }) {
+            return Err(format!(
+                "{}: production owner entry was not collected",
+                entry.display()
+            ));
+        }
+    }
+    Ok(files)
+}
+
+const NFE_4_RETIRED_GENERATED_THRIFT_PATHS: &[&str] = &[
+    "src/sql/codegen/descriptors.rs",
+    "src/sql/codegen/expr_compiler.rs",
+    "src/sql/codegen/fallback_audit.rs",
+    "src/sql/codegen/iceberg_change_stream_router_wire.rs",
+    "src/sql/codegen/iceberg_write_sink_wire.rs",
+    "src/sql/codegen/nodes.rs",
+    "src/sql/codegen/resolve.rs",
+    "src/sql/codegen/runtime_filter_lowering.rs",
+    "src/sql/codegen/type_infer.rs",
+    "src/sql/codegen/ir/lowering.rs",
+    "src/sql/codegen/ir/lowering_native.rs",
+    "src/sql/codegen/ir/equiv.rs",
+    "src/runtime/exec_params.rs",
+    "src/runtime/exec_params_compat.rs",
+    "src/engine/query_options_wire.rs",
+    "src/exec/spill/query_options_wire.rs",
+    "src/sql/codegen/connector_scan_wire.rs",
+    "src/sql/codegen/iceberg_delta_scan_wire.rs",
+    "src/sql/planner/distributed/build/runtime_filter_wire.rs",
+];
+
+fn nfe_4_retired_generated_thrift_path_violations(root: &Path) -> Vec<String> {
+    NFE_4_RETIRED_GENERATED_THRIFT_PATHS
+        .iter()
+        .filter_map(|relative| match fs::symlink_metadata(root.join(relative)) {
+            Ok(_) => Some((*relative).to_string()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => Some(format!(
+                "{relative}: failed to inspect path metadata: {error}"
+            )),
+        })
+        .collect()
+}
+
+const NFE_4_RETIRED_FE_SYMBOLS: &[&str] = &[
+    "PlanWireFormat",
+    "current_plan_wire_format",
+    "default_plan_wire_format",
+    "plan_wire_format",
+    "thrift_only",
+    "FragmentBuildResult",
+    "LoweredFragmentEdge",
+    "fragment_results",
+    "lowered_edges",
+    "NativePlanSidecars",
+    "CompatFragmentPlanPayload",
+    "CompatEdgeSidecar",
+    "TExecPlanFragmentParams",
+    "TPlanFragment",
+    "TPlanNode",
+    "TDescriptorTable",
+    "TDataSink",
+    "TDataPartition",
+    "TExpr",
+    "thrift_params",
+    "into_thrift_params",
+    "build_exec_plan_fragment_params",
+    "novarocks_generated_plan",
+    "PlanOrigin",
+    "NovaRocksGenerated",
+    "plan_origin_from_request",
+    "to_compat_exec_params",
+    "compat_exec_params_from_parts",
+    "compat_destination_from_runtime",
+    "thrift_scan_range_params_from_native",
+    "thrift_hdfs_scan_range_from_native",
+    "thrift_extended_columns_from_native",
+    "thrift_scan_range_map_from_native",
+    "compat_change_op_slot_id",
+    "to_network_address",
+    "connector_scan_wire",
+    "iceberg_delta_scan_wire",
+    "runtime_filter_wire",
+    "WiredRuntimeFilterBuild",
+    "WiredRuntimeFilterProbe",
+    "branch_kind_from_thrift",
+];
+
+fn nfe_4_retired_fe_symbol_violations(source: &str, text: &str) -> Vec<String> {
+    let forbidden = NFE_4_RETIRED_FE_SYMBOLS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut seen = BTreeSet::new();
+    rust_use_tokens(&rust_sanitized_production_text(text))
+        .into_iter()
+        .filter(|token| forbidden.contains(token.as_str()) && seen.insert(token.clone()))
+        .map(|symbol| format!("{source}: retired FE generated-Thrift symbol `{symbol}`"))
+        .collect()
+}
+
+fn nfe_4_ledger_and_audit_contract_violations(
+    ledger: &str,
+    compat_scope: &[&str],
+    audit: &str,
+) -> Vec<String> {
+    fn baseline_max_hits(line: &str) -> Option<&str> {
+        let (_, arguments) = line.split_once("BaselineEntry(")?;
+        arguments.split(',').nth(2)
+    }
+
+    let mut violations = Vec::new();
+    let ledger_entries = ledger
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>();
+    if !ledger_entries.is_empty() {
+        violations.push(format!(
+            "NIDL ledger must stay empty: {}",
+            ledger_entries.join(", ")
+        ));
+    }
+
+    let fe_owners = [
+        "src/sql",
+        "src/engine",
+        "src/runtime/coordinator.rs",
+        "src/runtime/dispatcher.rs",
+        "tests/sql-test-runner/src",
+    ];
+    for scope in compat_scope {
+        if fe_owners.iter().any(|owner| {
+            owner == scope
+                || owner.starts_with(&format!("{scope}/"))
+                || scope.starts_with(&format!("{owner}/"))
+        }) {
+            violations.push(format!(
+                "{scope}: FE owner must not enter NIDL compat scope"
+            ));
+        }
+    }
+
+    let compact_lines = audit.lines().map(compact_line).collect::<Vec<_>>();
+    for line in &compact_lines {
+        let Some((quoted_path, _)) = line.split_once("\":BaselineEntry(") else {
+            continue;
+        };
+        let Some(path) = quoted_path.strip_prefix('"') else {
+            continue;
+        };
+        let fe_native = path.starts_with("src/engine/")
+            || matches!(
+                path,
+                "src/runtime/coordinator.rs" | "src/runtime/dispatcher.rs"
+            );
+        if fe_native && baseline_max_hits(line).is_none_or(|max_hits| max_hits != "0") {
+            violations.push(format!(
+                "{path}: FE/native audit baseline must stay at max_hits=0"
+            ));
+        }
+    }
+
+    let compact = compact_lines.join("");
+    for retired in NFE_4_RETIRED_GENERATED_THRIFT_PATHS {
+        if compact.contains(&format!("\"{retired}\":BaselineEntry(")) {
+            violations.push(format!(
+                "{retired}: retired path must not retain an audit baseline"
+            ));
+        }
+    }
+    for (path, prefix) in [
+        (
+            "src/runtime/query_options.rs",
+            "\"src/runtime/query_options.rs\":BaselineEntry(\"legal-boundary\",\"B7-wire\",1,",
+        ),
+        (
+            "src/runtime/runtime_filter_params.rs",
+            "\"src/runtime/runtime_filter_params.rs\":BaselineEntry(\"legal-boundary\",\"B3-wire\",1,",
+        ),
+        (
+            "src/runtime/endpoint.rs",
+            "\"src/runtime/endpoint.rs\":BaselineEntry(\"legal-boundary\",\"control-plane-wire\",2,",
+        ),
+    ] {
+        if !compact.contains(prefix) {
+            violations.push(format!(
+                "{path}: required external ingress audit baseline is missing"
+            ));
+        }
+    }
+    violations
+}
+
+#[test]
+fn nfe_4_raw_starrocks_idl_detector_resolves_compat_and_reexports() {
+    let sources = vec![
+        ("src/lib.rs".to_string(), "mod bridge;".to_string()),
+        (
+            "src/bridge.rs".to_string(),
+            r#"
+                pub use crate::proto;
+                pub use crate::proto as wire;
+                pub use crate::proto::*;
+                pub use crate::{proto as grouped_wire};
+            "#
+            .to_string(),
+        ),
+        (
+            "src/second.rs".to_string(),
+            "pub(crate) use crate::bridge::wire as second_wire;".to_string(),
+        ),
+        (
+            "src/cycle_a.rs".to_string(),
+            "pub use crate::cycle_b::looped;".to_string(),
+        ),
+        (
+            "src/cycle_b.rs".to_string(),
+            "pub use crate::cycle_a::looped;".to_string(),
+        ),
+        (
+            "src/growth.rs".to_string(),
+            "pub use crate::growth::nested::*;".to_string(),
+        ),
+    ];
+    let reexports = nfe_4_public_reexport_graph(&sources);
+    let direct = r#"
+        fn direct(_: crate::thrift::types::TUniqueId) {
+            let _ = crate::proto::starrocks::StatusPb::default();
+            let _ = crate::proto::staros::WorkerInfo::default();
+        }
+        use crate::{thrift::types::TUniqueId, proto::{starrocks, staros}};
+    "#;
+    assert_eq!(
+        nfe_4_raw_starrocks_idl_violations("src/direct.rs", direct, &BTreeMap::new()),
+        vec![
+            "src/direct.rs: FE-owned helper references raw StarRocks IDL `crate::thrift`",
+            "src/direct.rs: FE-owned helper references raw StarRocks IDL `crate::proto::starrocks`",
+            "src/direct.rs: FE-owned helper references raw StarRocks IDL `crate::proto::staros`",
+        ]
+    );
+
+    let file_local_aliases = r#"
+        use crate as root;
+        use root::proto as local_wire;
+        use root::thrift as local_thrift;
+        fn aliases(_: local_thrift::types::TUniqueId) {
+            let _ = local_wire::starrocks::StatusPb::default();
+            let _ = local_wire::staros::WorkerInfo::default();
+        }
+    "#;
+    assert_eq!(
+        nfe_4_raw_starrocks_idl_violations(
+            "src/file_aliases.rs",
+            file_local_aliases,
+            &BTreeMap::new(),
+        ),
+        vec![
+            "src/file_aliases.rs: FE-owned helper references raw StarRocks IDL `crate::thrift`",
+            "src/file_aliases.rs: FE-owned helper references raw StarRocks IDL `crate::proto::starrocks`",
+            "src/file_aliases.rs: FE-owned helper references raw StarRocks IDL `crate::proto::staros`",
+        ]
+    );
+
+    let noise_and_native = r##"
+        // crate::bridge::proto::starrocks::StatusPb
+        const NOTE: &str = "crate::bridge::wire::staros::WorkerInfo";
+        const RAW_NOTE: &str = r#"crate::bridge::starrocks::StatusPb"#;
+        const MARKER: char = 'x';
+        #[cfg(test)]
+        fn test_only() {
+            let _ = crate::bridge::proto::starrocks::StatusPb::default();
+        }
+        fn native() {
+            let _ = crate::proto::common::Status::default();
+            let _ = crate::proto::expr::Expr::default();
+            let _ = crate::proto::filter::RuntimeFilter::default();
+            let _ = crate::proto::novarocks::InstanceParams::default();
+            let _ = crate::proto::plan::PlanFragment::default();
+        }
+    "##;
+    assert!(
+        nfe_4_raw_starrocks_idl_violations("src/noise.rs", noise_and_native, &BTreeMap::new(),)
+            .is_empty()
+    );
+
+    for (name, consumer, expected) in [
+        (
+            "ordinary facade",
+            "fn f() { let _ = crate::bridge::proto::starrocks::StatusPb::default(); }",
+            "crate::proto::starrocks",
+        ),
+        (
+            "compat alias facade",
+            "#[cfg(feature = \"compat\")] fn f() { let _ = crate::bridge::wire::staros::WorkerInfo::default(); }",
+            "crate::proto::staros",
+        ),
+        (
+            "glob facade",
+            "fn f() { let _ = crate::bridge::starrocks::StatusPb::default(); }",
+            "crate::proto::starrocks",
+        ),
+        (
+            "grouped facade",
+            "fn f() { let _ = crate::bridge::grouped_wire::staros::WorkerInfo::default(); }",
+            "crate::proto::staros",
+        ),
+        (
+            "multi-hop conservative facade",
+            "#[cfg(any(test, feature = \"compat\"))] fn f() { let _ = crate::second::second_wire::starrocks::StatusPb::default(); }",
+            "crate::proto::starrocks",
+        ),
+    ] {
+        let source = format!("src/{name}.rs");
+        assert!(
+            nfe_4_raw_starrocks_idl_violations(&source, consumer, &BTreeMap::new()).is_empty(),
+            "{name} must contain no direct/file-local raw-IDL seed"
+        );
+        assert_eq!(
+            nfe_4_raw_starrocks_idl_violations(&source, consumer, &reexports),
+            vec![format!(
+                "{source}: FE-owned helper references raw StarRocks IDL `{expected}`"
+            )],
+            "{name} must depend exclusively on cross-file public re-export resolution"
+        );
+    }
+
+    let cycle = vec![
+        "crate".to_string(),
+        "cycle_a".to_string(),
+        "looped".to_string(),
+        "StatusPb".to_string(),
+    ];
+    let mut cycle_cache = BTreeMap::new();
+    assert_eq!(
+        nfe_4_reexport_forbidden_mask(&cycle, &reexports, &mut cycle_cache, &mut BTreeSet::new(),),
+        (0, false),
+        "cyclic re-exports must terminate as incomplete rather than resolved-safe"
+    );
+    assert!(
+        !cycle_cache.contains_key(&cycle),
+        "an incomplete cyclic resolution must not poison the safe-result cache"
+    );
+    let growth = vec![
+        "crate".to_string(),
+        "growth".to_string(),
+        "SafeType".to_string(),
+    ];
+    let mut growth_cache = BTreeMap::new();
+    assert_eq!(
+        nfe_4_reexport_forbidden_mask(&growth, &reexports, &mut growth_cache, &mut BTreeSet::new(),),
+        (0, false),
+        "a re-export cycle that grows the rewritten suffix must terminate without fabricating a forbidden seed"
+    );
+    assert!(
+        !growth_cache.contains_key(&growth),
+        "a suffix-growing cycle must not be cached as resolved-safe"
+    );
+}
+
+#[test]
+fn nfe_4_public_reexport_graph_resolves_private_source_aliases() {
+    let sources = vec![
+        (
+            "src/bridge.rs".to_string(),
+            r#"
+                use crate::proto as private_wire;
+                pub use private_wire::starrocks as exposed;
+            "#
+            .to_string(),
+        ),
+        (
+            "src/grouped_bridge.rs".to_string(),
+            r#"
+                use crate::{proto as private_wire};
+                pub use private_wire::{staros as exposed_staros};
+            "#
+            .to_string(),
+        ),
+    ];
+    let reexports = nfe_4_public_reexport_graph(&sources);
+    for (consumer, expected) in [
+        (
+            "fn use_facade() { let _ = crate::bridge::exposed::StatusPb::default(); }",
+            "crate::proto::starrocks",
+        ),
+        (
+            "fn use_facade() { let _ = crate::grouped_bridge::exposed_staros::WorkerInfo::default(); }",
+            "crate::proto::staros",
+        ),
+    ] {
+        assert!(
+            nfe_4_raw_starrocks_idl_violations("src/fe.rs", consumer, &BTreeMap::new()).is_empty(),
+            "the consumer has no direct raw-IDL seed without the defining file's re-export graph"
+        );
+        assert_eq!(
+            nfe_4_raw_starrocks_idl_violations("src/fe.rs", consumer, &reexports),
+            vec![format!(
+                "src/fe.rs: FE-owned helper references raw StarRocks IDL `{expected}`"
+            )],
+            "public grouped re-exports must resolve private grouped aliases from their defining source file"
+        );
+    }
+}
+
+#[test]
+fn nfe_4_public_reexport_graph_resolves_long_valid_chains() {
+    let mut sources = (0..66)
+        .map(|index| {
+            (
+                format!("src/hop_{index}.rs"),
+                format!("pub use crate::hop_{}::wire;", index + 1),
+            )
+        })
+        .collect::<Vec<_>>();
+    sources.push((
+        "src/hop_66.rs".to_string(),
+        "pub use crate::proto::starrocks as wire;".to_string(),
+    ));
+    let consumer = "fn use_facade() { let _ = crate::hop_0::wire::StatusPb::default(); }";
+    assert!(
+        nfe_4_raw_starrocks_idl_violations("src/fe.rs", consumer, &BTreeMap::new()).is_empty(),
+        "the consumer has no direct raw-IDL seed without the public re-export graph"
+    );
+    assert_eq!(
+        nfe_4_raw_starrocks_idl_violations(
+            "src/fe.rs",
+            consumer,
+            &nfe_4_public_reexport_graph(&sources),
+        ),
+        vec!["src/fe.rs: FE-owned helper references raw StarRocks IDL `crate::proto::starrocks`"],
+        "valid public re-export chains must not become safe at an arbitrary fixed depth"
+    );
+}
+
+#[test]
+fn nfe_4_fe_owner_collection_follows_production_module_graph() {
+    let root =
+        std::env::temp_dir().join(format!("nfe_4_fe_owner_collection_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(root.join("chosen")).unwrap();
+    fs::write(
+        root.join("mod.rs"),
+        r#"
+            mod production;
+            #[cfg(feature = "compat")]
+            mod compat_owner;
+            #[cfg(any(test, feature = "compat"))]
+            mod conservative;
+            #[cfg(test)]
+            mod external_tests;
+            #[path = "chosen/direct.rs"]
+            mod direct_path;
+            #[cfg_attr(feature = "compat", path = "chosen/compat_path.rs")]
+            mod conditional_path;
+        "#,
+    )
+    .unwrap();
+    for relative in [
+        "production.rs",
+        "compat_owner.rs",
+        "conservative.rs",
+        "external_tests.rs",
+        "chosen/direct.rs",
+        "chosen/compat_path.rs",
+        "conditional_path.rs",
+    ] {
+        fs::write(root.join(relative), "pub fn marker() {}\n").unwrap();
+    }
+
+    let collected = nfe_4_collect_production_owner_files(&root, &[root.join("mod.rs")])
+        .expect("fixture owner collection must be non-vacuous");
+    let relative = collected
+        .iter()
+        .map(|path| path.strip_prefix(&root).unwrap().display().to_string())
+        .collect::<BTreeSet<_>>();
+    assert!(relative.contains("mod.rs"));
+    assert!(relative.contains("production.rs"));
+    assert!(relative.contains("compat_owner.rs"));
+    assert!(relative.contains("conservative.rs"));
+    assert!(relative.contains("chosen/direct.rs"));
+    assert!(relative.contains("chosen/compat_path.rs"));
+    assert!(relative.contains("conditional_path.rs"));
+    assert!(!relative.contains("external_tests.rs"));
+    assert!(
+        nfe_4_collect_production_owner_files(&root, &[root.join("missing.rs")]).is_err(),
+        "a missing owner entry must fail closed"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn nfe_4_fe_owned_raw_sources_are_starrocks_idl_free() {
+    let repo = Path::new(manifest_dir());
+    let src = repo.join("src");
+    let runner = repo.join("tests/sql-test-runner/src");
+    let mut violations = Vec::new();
+
+    let crate_sources = nfe_4_collect_production_owner_files(&src, &[src.join("lib.rs")])
+        .expect("main crate production graph must be non-vacuous")
+        .into_iter()
+        .map(|path| {
+            let source = rel(&path);
+            let text = fs::read_to_string(&path).expect(&source);
+            (source, text)
+        })
+        .collect::<Vec<_>>();
+    let reexports = nfe_4_public_reexport_graph(&crate_sources);
+
+    let mut owners = Vec::new();
+    for (root, entries) in [
+        (repo.join("src/sql"), vec![repo.join("src/sql/mod.rs")]),
+        (
+            repo.join("src/engine"),
+            vec![repo.join("src/engine/mod.rs")],
+        ),
+        (
+            repo.join("src/runtime"),
+            vec![
+                repo.join("src/runtime/coordinator.rs"),
+                repo.join("src/runtime/dispatcher.rs"),
+            ],
+        ),
+        (runner.clone(), vec![runner.join("main.rs")]),
+    ] {
+        match nfe_4_collect_production_owner_files(&root, &entries) {
+            Ok(files) => owners.extend(files),
+            Err(error) => violations.push(error),
+        }
+    }
+    owners.sort();
+    owners.dedup();
+
+    let owner_rel = owners.iter().map(|path| rel(path)).collect::<BTreeSet<_>>();
+    for required in [
+        "src/sql/mod.rs",
+        "src/sql/codegen/ir/fragment_build.rs",
+        "src/engine/mod.rs",
+        "src/engine/statement.rs",
+        "src/runtime/coordinator.rs",
+        "src/runtime/dispatcher.rs",
+        "tests/sql-test-runner/src/main.rs",
+        "tests/sql-test-runner/src/cluster.rs",
+    ] {
+        if !owner_rel.contains(required) {
+            violations.push(format!(
+                "{required}: required FE production owner was not collected"
+            ));
+        }
+    }
+
+    let mut reexport_cache = BTreeMap::new();
+    for path in owners {
+        let source = rel(&path);
+        let text = fs::read_to_string(&path).expect(&source);
+        violations.extend(nfe_4_raw_starrocks_idl_violations_with_cache(
+            &source,
+            &text,
+            &reexports,
+            &mut reexport_cache,
+        ));
+        violations.extend(nfe_4_retired_fe_symbol_violations(&source, &text));
+    }
+
+    assert!(
+        violations.is_empty(),
+        "NFE-4 FE production owners must have zero raw StarRocks IDL references:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn nfe_4_retired_generated_thrift_paths_are_physically_absent() {
+    assert!(
+        nfe_4_retired_generated_thrift_path_violations(Path::new(manifest_dir())).is_empty(),
+        "all arc-level retired generated-Thrift paths must remain physically absent"
+    );
+
+    let root = std::env::temp_dir().join(format!(
+        "nfe_4_retired_generated_thrift_paths_{}",
+        std::process::id()
+    ));
+    fs::remove_dir_all(&root).ok();
+    let relative = "src/sql/codegen/descriptors.rs";
+    let fixture = root.join(relative);
+    fs::create_dir_all(fixture.parent().unwrap()).unwrap();
+
+    fs::write(&fixture, "fixture\n").unwrap();
+    assert_eq!(
+        nfe_4_retired_generated_thrift_path_violations(&root),
+        vec![relative.to_string()]
+    );
+    fs::remove_file(&fixture).unwrap();
+    fs::create_dir(&fixture).unwrap();
+    assert_eq!(
+        nfe_4_retired_generated_thrift_path_violations(&root),
+        vec![relative.to_string()]
+    );
+    fs::remove_dir(&fixture).unwrap();
+
+    #[cfg(unix)]
+    {
+        let target = root.join("target.rs");
+        fs::write(&target, "target\n").unwrap();
+        std::os::unix::fs::symlink(&target, &fixture).unwrap();
+        assert_eq!(
+            nfe_4_retired_generated_thrift_path_violations(&root),
+            vec![relative.to_string()]
+        );
+        fs::remove_file(&fixture).unwrap();
+        std::os::unix::fs::symlink(root.join("missing.rs"), &fixture).unwrap();
+        assert_eq!(
+            nfe_4_retired_generated_thrift_path_violations(&root),
+            vec![relative.to_string()],
+            "dangling symlinks must count as present retired paths"
+        );
+        fs::remove_file(&fixture).unwrap();
+    }
+
+    assert!(nfe_4_retired_generated_thrift_path_violations(&root).is_empty());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn nfe_4_retired_symbol_detector_keeps_compat_and_ignores_noise() {
+    let fixture = r#"
+        // TPlanNode and PlanWireFormat in comments are ignored.
+        const NOTE: &str = "to_compat_exec_params runtime_filter_wire";
+        fn ordinary(_: TPlanNode) { current_plan_wire_format(); }
+        #[cfg(feature = "compat")]
+        fn compat_only() { thrift_scan_range_map_from_native(); }
+        #[cfg(test)]
+        fn test_only(_: TExpr) { to_network_address(); }
+    "#;
+    assert_eq!(
+        nfe_4_retired_fe_symbol_violations("fixture.rs", fixture),
+        vec![
+            "fixture.rs: retired FE generated-Thrift symbol `TPlanNode`",
+            "fixture.rs: retired FE generated-Thrift symbol `current_plan_wire_format`",
+            "fixture.rs: retired FE generated-Thrift symbol `thrift_scan_range_map_from_native`",
+        ]
+    );
+}
+
+#[test]
+fn nfe_4_ledger_and_audit_contract_detector_is_non_vacuous() {
+    let violations = nfe_4_ledger_and_audit_contract_violations(
+        "src/sql/codegen/bad.rs\n",
+        &["src/sql"],
+        r#"
+            BASELINE = {
+                "src/engine/mod.rs": BaselineEntry("domain-leak", "B7", 1, "bad"),
+                "src/runtime/coordinator.rs": BaselineEntry("domain-leak", "control-plane", 1, "bad"),
+                "src/sql/codegen/descriptors.rs": BaselineEntry("domain-leak", "legacy", 0, "bad"),
+            }
+        "#,
+    );
+    for expected in [
+        "NIDL ledger must stay empty",
+        "FE owner must not enter NIDL compat scope",
+        "src/engine/mod.rs: FE/native audit baseline must stay at max_hits=0",
+        "src/runtime/coordinator.rs: FE/native audit baseline must stay at max_hits=0",
+        "src/sql/codegen/descriptors.rs: retired path must not retain an audit baseline",
+        "src/runtime/query_options.rs: required external ingress audit baseline is missing",
+        "src/runtime/runtime_filter_params.rs: required external ingress audit baseline is missing",
+        "src/runtime/endpoint.rs: required external ingress audit baseline is missing",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "missing `{expected}` in {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn nfe_4_ledger_audit_native_structure_and_external_ingress_are_fixed() {
+    let repo = Path::new(manifest_dir());
+    let ledger = fs::read_to_string(repo.join(NIDL_E0_LEDGER_PATH)).unwrap();
+    let audit = fs::read_to_string(repo.join("tools/dev/audit_thrift_boundaries.py")).unwrap();
+    let mut violations =
+        nfe_4_ledger_and_audit_contract_violations(&ledger, NIDL_E0_COMPAT_SCOPE, &audit);
+
+    let app_config = fs::read_to_string(repo.join("src/common/app_config.rs")).unwrap();
+    let app_tokens = rust_use_tokens(&rust_sanitized_production_text(&app_config));
+    let tombstone = ["fn", "reject_removed_plan_wire_format"];
+    if !app_tokens.windows(tombstone.len()).any(|tokens| {
+        tokens
+            .iter()
+            .map(String::as_str)
+            .eq(tombstone.iter().copied())
+    }) || !app_config.contains("runtime.plan_wire_format has been removed")
+    {
+        violations.push(
+            "src/common/app_config.rs: removed plan_wire_format rejection tombstone is missing"
+                .to_string(),
+        );
+    }
+
+    for (source, required) in [
+        ("src/runtime/query_options.rs", "from_thrift"),
+        ("src/runtime/runtime_filter_params.rs", "from_thrift"),
+        ("src/runtime/endpoint.rs", "from_network_address"),
+    ] {
+        let text = fs::read_to_string(repo.join(source)).unwrap();
+        if !rust_use_tokens(&rust_sanitized_production_text(&text))
+            .iter()
+            .any(|token| token == required)
+        {
+            violations.push(format!(
+                "{source}: required external ingress adapter `{required}` is missing"
+            ));
+        }
+    }
+
+    for source in [
+        "src/sql/codegen/ir/fragment_build.rs",
+        "src/sql/codegen/connector_scan_planning.rs",
+        "src/sql/codegen/iceberg_delta_scan_planning.rs",
+        "src/sql/codegen/proto_encode/iceberg_delta_scan.rs",
+        "src/sql/planner/distributed/build/runtime_filter_binding.rs",
+    ] {
+        match fs::symlink_metadata(repo.join(source)) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => violations.push(format!("{source}: native owner is not a regular file")),
+            Err(error) => violations.push(format!("{source}: native owner is missing: {error}")),
+        }
+    }
+
+    let fragment_build =
+        fs::read_to_string(repo.join("src/sql/codegen/ir/fragment_build.rs")).unwrap();
+    let fragment_production = rust_sanitized_production_text(&fragment_build);
+    if fragment_production.contains("cfg") && fragment_production.contains("compat") {
+        violations.push(
+            "src/sql/codegen/ir/fragment_build.rs: unique native builder must be compat-neutral"
+                .to_string(),
+        );
+    }
+
+    let codegen = fs::read_to_string(repo.join("src/sql/codegen/mod.rs")).unwrap();
+    let codegen_compact = compact_line(&rust_sanitized_production_text(&codegen));
+    if !codegen_compact.contains(
+        "pubnative_fragments:std::collections::BTreeMap<FragmentId,crate::proto::plan::PlanFragment>",
+    ) {
+        violations.push(
+            "src/sql/codegen/mod.rs: MultiFragmentBuildResult must own required native PlanFragment map"
+                .to_string(),
+        );
+    }
+
+    let dispatcher = fs::read_to_string(repo.join("src/runtime/dispatcher.rs")).unwrap();
+    let dispatcher_compact = compact_line(&rust_sanitized_production_text(&dispatcher));
+    for required in [
+        "plan:crate::proto::plan::PlanFragment",
+        "instance_params:crate::proto::novarocks::InstanceParams",
+    ] {
+        if !dispatcher_compact.contains(required) {
+            violations.push(format!(
+                "src/runtime/dispatcher.rs: FragmentSubmission missing required native field `{required}`"
+            ));
+        }
+    }
+    for forbidden in [
+        "plan:Option<crate::proto::plan::PlanFragment>",
+        "instance_params:Option<crate::proto::novarocks::InstanceParams>",
+    ] {
+        if dispatcher_compact.contains(forbidden) {
+            violations.push(format!(
+                "src/runtime/dispatcher.rs: FragmentSubmission retains optional dual carrier `{forbidden}`"
+            ));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "NFE-4 ledger/audit/native structure contract failed:\n{}",
+        violations.join("\n")
+    );
 }
 
 #[test]
