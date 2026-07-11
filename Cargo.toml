@@ -102,6 +102,7 @@ tdigest = { version = "0.2.3", features = ["use_serde"] }
 [dev-dependencies]
 tempfile = "3"
 mockito = "1"
+syn = { version = "2", features = ["full", "visit"] }
 
 [features]
 ssb = []

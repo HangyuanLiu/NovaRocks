@@ -11003,6 +11003,1317 @@ fn nfe_4_ledger_audit_native_structure_and_external_ingress_are_fixed() {
     );
 }
 
+const NFE_4_EXTERNAL_FIXTURE_BASENAME: &str = "select_1_exec_batch_plan_fragments_v1.bin";
+const NFE_4_EXTERNAL_FIXTURE_INCLUDE_PATH: &str =
+    "fixtures/external_starrocks_fe/select_1_exec_batch_plan_fragments_v1.bin";
+const NFE_4_EXTERNAL_FIXTURE_SIZE: usize = 3_456;
+const NFE_4_EXTERNAL_FIXTURE_SHA256: &str =
+    "1c7bda906c9828d7999f93c36197f5f896e8611c27953510e07a18966e624095";
+const NFE_4_EXTERNAL_PRODUCER_REVISION: &str = "fe0bed0bdcb520a758a34f572f445f398ca7d5a3";
+const NFE_4_EXTERNAL_PRODUCER_ARTIFACT_SHA256: &str =
+    "f2950e2f8e6d2db9091a2eb0c1ad25318f4385c1d3c586926aa414f9a97d9346";
+const NFE_4_EXTERNAL_QUERY_ID: &str = "019f51afb5c37c92-9c5da9f1a67bbebf";
+const NFE_4_EXTERNAL_FINST_ID: &str = "019f51afb5c37c92-9c5da9f1a67bbec0";
+
+fn nfe_4_no_symlink_component_violations(repo: &Path, path: &Path, label: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    let relative = match path.strip_prefix(repo) {
+        Ok(relative) => relative,
+        Err(_) => {
+            return vec![format!(
+                "{label} must remain below repository root: {}",
+                path.display()
+            )];
+        }
+    };
+    let mut current = repo.to_path_buf();
+    for component in std::iter::once(None).chain(relative.components().map(Some)) {
+        if let Some(component) = component {
+            current.push(component.as_os_str());
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => violations.push(format!(
+                "{label} path component must not be a symlink: {}",
+                current.display()
+            )),
+            Ok(_) => {}
+            Err(error) => {
+                violations.push(format!(
+                    "{label} path component is missing or unreadable at {}: {error}",
+                    current.display()
+                ));
+                break;
+            }
+        }
+    }
+    violations
+}
+
+fn nfe_4_syn_cfg_meta_requires_test(meta: &syn::Meta) -> bool {
+    use syn::parse::Parser;
+
+    match meta {
+        syn::Meta::Path(path) => path.is_ident("test"),
+        syn::Meta::List(list)
+            if list.path.is_ident("all")
+                || list.path.is_ident("any")
+                || list.path.is_ident("not") =>
+        {
+            let parser = syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated;
+            let Ok(children) = parser.parse2(list.tokens.clone()) else {
+                return false;
+            };
+            if list.path.is_ident("all") {
+                children.iter().any(nfe_4_syn_cfg_meta_requires_test)
+            } else if list.path.is_ident("any") {
+                !children.is_empty() && children.iter().all(nfe_4_syn_cfg_meta_requires_test)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+fn nfe_4_syn_attrs_require_test(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        let syn::Meta::List(cfg) = &attr.meta else {
+            return false;
+        };
+        cfg.path.is_ident("cfg")
+            && syn::parse2::<syn::Meta>(cfg.tokens.clone())
+                .is_ok_and(|meta| nfe_4_syn_cfg_meta_requires_test(&meta))
+    })
+}
+
+fn nfe_4_syn_item_attrs(item: &syn::Item) -> &[syn::Attribute] {
+    match item {
+        syn::Item::Const(item) => &item.attrs,
+        syn::Item::Enum(item) => &item.attrs,
+        syn::Item::ExternCrate(item) => &item.attrs,
+        syn::Item::Fn(item) => &item.attrs,
+        syn::Item::ForeignMod(item) => &item.attrs,
+        syn::Item::Impl(item) => &item.attrs,
+        syn::Item::Macro(item) => &item.attrs,
+        syn::Item::Mod(item) => &item.attrs,
+        syn::Item::Static(item) => &item.attrs,
+        syn::Item::Struct(item) => &item.attrs,
+        syn::Item::Trait(item) => &item.attrs,
+        syn::Item::TraitAlias(item) => &item.attrs,
+        syn::Item::Type(item) => &item.attrs,
+        syn::Item::Union(item) => &item.attrs,
+        syn::Item::Use(item) => &item.attrs,
+        syn::Item::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn nfe_4_syn_impl_item_attrs(item: &syn::ImplItem) -> &[syn::Attribute] {
+    match item {
+        syn::ImplItem::Const(item) => &item.attrs,
+        syn::ImplItem::Fn(item) => &item.attrs,
+        syn::ImplItem::Type(item) => &item.attrs,
+        syn::ImplItem::Macro(item) => &item.attrs,
+        syn::ImplItem::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn nfe_4_syn_trait_item_attrs(item: &syn::TraitItem) -> &[syn::Attribute] {
+    match item {
+        syn::TraitItem::Const(item) => &item.attrs,
+        syn::TraitItem::Fn(item) => &item.attrs,
+        syn::TraitItem::Type(item) => &item.attrs,
+        syn::TraitItem::Macro(item) => &item.attrs,
+        syn::TraitItem::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn nfe_4_syn_foreign_item_attrs(item: &syn::ForeignItem) -> &[syn::Attribute] {
+    match item {
+        syn::ForeignItem::Fn(item) => &item.attrs,
+        syn::ForeignItem::Static(item) => &item.attrs,
+        syn::ForeignItem::Type(item) => &item.attrs,
+        syn::ForeignItem::Macro(item) => &item.attrs,
+        syn::ForeignItem::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn nfe_4_syn_expr_attrs(expr: &syn::Expr) -> &[syn::Attribute] {
+    match expr {
+        syn::Expr::Array(expr) => &expr.attrs,
+        syn::Expr::Assign(expr) => &expr.attrs,
+        syn::Expr::Async(expr) => &expr.attrs,
+        syn::Expr::Await(expr) => &expr.attrs,
+        syn::Expr::Binary(expr) => &expr.attrs,
+        syn::Expr::Block(expr) => &expr.attrs,
+        syn::Expr::Break(expr) => &expr.attrs,
+        syn::Expr::Call(expr) => &expr.attrs,
+        syn::Expr::Cast(expr) => &expr.attrs,
+        syn::Expr::Closure(expr) => &expr.attrs,
+        syn::Expr::Const(expr) => &expr.attrs,
+        syn::Expr::Continue(expr) => &expr.attrs,
+        syn::Expr::Field(expr) => &expr.attrs,
+        syn::Expr::ForLoop(expr) => &expr.attrs,
+        syn::Expr::Group(expr) => &expr.attrs,
+        syn::Expr::If(expr) => &expr.attrs,
+        syn::Expr::Index(expr) => &expr.attrs,
+        syn::Expr::Infer(expr) => &expr.attrs,
+        syn::Expr::Let(expr) => &expr.attrs,
+        syn::Expr::Lit(expr) => &expr.attrs,
+        syn::Expr::Loop(expr) => &expr.attrs,
+        syn::Expr::Macro(expr) => &expr.attrs,
+        syn::Expr::Match(expr) => &expr.attrs,
+        syn::Expr::MethodCall(expr) => &expr.attrs,
+        syn::Expr::Paren(expr) => &expr.attrs,
+        syn::Expr::Path(expr) => &expr.attrs,
+        syn::Expr::Range(expr) => &expr.attrs,
+        syn::Expr::RawAddr(expr) => &expr.attrs,
+        syn::Expr::Reference(expr) => &expr.attrs,
+        syn::Expr::Repeat(expr) => &expr.attrs,
+        syn::Expr::Return(expr) => &expr.attrs,
+        syn::Expr::Struct(expr) => &expr.attrs,
+        syn::Expr::Try(expr) => &expr.attrs,
+        syn::Expr::TryBlock(expr) => &expr.attrs,
+        syn::Expr::Tuple(expr) => &expr.attrs,
+        syn::Expr::Unary(expr) => &expr.attrs,
+        syn::Expr::Unsafe(expr) => &expr.attrs,
+        syn::Expr::While(expr) => &expr.attrs,
+        syn::Expr::Yield(expr) => &expr.attrs,
+        syn::Expr::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn nfe_4_syn_stmt_attrs(stmt: &syn::Stmt) -> &[syn::Attribute] {
+    match stmt {
+        syn::Stmt::Local(local) => &local.attrs,
+        syn::Stmt::Item(item) => nfe_4_syn_item_attrs(item),
+        syn::Stmt::Expr(expr, _) => nfe_4_syn_expr_attrs(expr),
+        syn::Stmt::Macro(item) => &item.attrs,
+    }
+}
+
+fn nfe_4_is_absolute_std_include_bytes(path: &syn::Path) -> bool {
+    path.leading_colon.is_some()
+        && path.segments.len() == 2
+        && path.segments[0].ident == "std"
+        && matches!(path.segments[0].arguments, syn::PathArguments::None)
+        && path.segments[1].ident == "include_bytes"
+        && matches!(path.segments[1].arguments, syn::PathArguments::None)
+}
+
+fn nfe_4_is_submit_exec_batch_path(path: &syn::Path) -> bool {
+    path.leading_colon.is_some()
+        && path.segments.len() == 2
+        && path.segments[0].ident == "novarocks"
+        && matches!(path.segments[0].arguments, syn::PathArguments::None)
+        && path.segments[1].ident == "submit_exec_batch_plan_fragments"
+        && matches!(path.segments[1].arguments, syn::PathArguments::None)
+}
+
+fn nfe_4_use_tree_binds_novarocks(tree: &syn::UseTree) -> bool {
+    match tree {
+        syn::UseTree::Path(path) => nfe_4_use_tree_binds_novarocks(&path.tree),
+        syn::UseTree::Name(name) => name.ident == "novarocks",
+        syn::UseTree::Rename(rename) => rename.rename == "novarocks",
+        syn::UseTree::Group(group) => group.items.iter().any(nfe_4_use_tree_binds_novarocks),
+        syn::UseTree::Glob(_) => false,
+    }
+}
+
+fn nfe_4_is_crate_fixture_expr(expr: &syn::Expr) -> bool {
+    let syn::Expr::Path(expr) = expr else {
+        return false;
+    };
+    expr.qself.is_none()
+        && expr.path.leading_colon.is_none()
+        && expr.path.segments.len() == 2
+        && expr.path.segments[0].ident == "crate"
+        && matches!(expr.path.segments[0].arguments, syn::PathArguments::None)
+        && expr.path.segments[1].ident == "FIXTURE"
+        && matches!(expr.path.segments[1].arguments, syn::PathArguments::None)
+}
+
+fn nfe_4_is_exact_inner_compat_cfg(attr: &syn::Attribute) -> bool {
+    if !matches!(attr.style, syn::AttrStyle::Inner(_)) {
+        return false;
+    }
+    let syn::Meta::List(cfg) = &attr.meta else {
+        return false;
+    };
+    if !cfg.path.is_ident("cfg") {
+        return false;
+    }
+    let Ok(syn::Meta::NameValue(feature)) = syn::parse2::<syn::Meta>(cfg.tokens.clone()) else {
+        return false;
+    };
+    feature.path.is_ident("feature")
+        && matches!(
+            feature.value,
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(ref value),
+                ..
+            }) if value.value() == "compat"
+        )
+}
+
+#[derive(Default)]
+struct Nfe4IncludeBytesVisitor {
+    paths: Vec<Option<String>>,
+    submit_args_bind_crate_fixture: Vec<bool>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for Nfe4IncludeBytesVisitor {
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+            return;
+        }
+        syn::visit::visit_item(self, item);
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_impl_item_attrs(item)) {
+            return;
+        }
+        syn::visit::visit_impl_item(self, item);
+    }
+
+    fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_trait_item_attrs(item)) {
+            return;
+        }
+        syn::visit::visit_trait_item(self, item);
+    }
+
+    fn visit_foreign_item(&mut self, item: &'ast syn::ForeignItem) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_foreign_item_attrs(item)) {
+            return;
+        }
+        syn::visit::visit_foreign_item(self, item);
+    }
+
+    fn visit_stmt(&mut self, stmt: &'ast syn::Stmt) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_stmt_attrs(stmt)) {
+            return;
+        }
+        syn::visit::visit_stmt(self, stmt);
+    }
+
+    fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_expr_attrs(expr)) {
+            return;
+        }
+        if let syn::Expr::Call(call) = expr
+            && let syn::Expr::Path(function) = call.func.as_ref()
+            && function.qself.is_none()
+            && nfe_4_is_submit_exec_batch_path(&function.path)
+        {
+            self.submit_args_bind_crate_fixture.push(
+                call.args.len() == 1 && call.args.first().is_some_and(nfe_4_is_crate_fixture_expr),
+            );
+        }
+        syn::visit::visit_expr(self, expr);
+    }
+
+    fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+        if nfe_4_syn_attrs_require_test(&arm.attrs) {
+            return;
+        }
+        syn::visit::visit_arm(self, arm);
+    }
+
+    fn visit_field(&mut self, field: &'ast syn::Field) {
+        if nfe_4_syn_attrs_require_test(&field.attrs) {
+            return;
+        }
+        syn::visit::visit_field(self, field);
+    }
+
+    fn visit_variant(&mut self, variant: &'ast syn::Variant) {
+        if nfe_4_syn_attrs_require_test(&variant.attrs) {
+            return;
+        }
+        syn::visit::visit_variant(self, variant);
+    }
+
+    fn visit_field_value(&mut self, field: &'ast syn::FieldValue) {
+        if nfe_4_syn_attrs_require_test(&field.attrs) {
+            return;
+        }
+        syn::visit::visit_field_value(self, field);
+    }
+
+    fn visit_macro(&mut self, item: &'ast syn::Macro) {
+        if item
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "include_bytes")
+        {
+            self.paths.push(
+                nfe_4_is_absolute_std_include_bytes(&item.path)
+                    .then(|| syn::parse2::<syn::LitStr>(item.tokens.clone()).ok())
+                    .flatten()
+                    .map(|lit| lit.value()),
+            );
+        }
+        syn::visit::visit_macro(self, item);
+    }
+}
+
+fn nfe_4_consumer_ast_violations(text: &str) -> Vec<String> {
+    use syn::visit::Visit;
+
+    let file = match syn::parse_file(text) {
+        Ok(file) => file,
+        Err(error) => return vec![format!("fixture consumer must parse as Rust: {error}")],
+    };
+    let mut violations = Vec::new();
+
+    if file.attrs.len() != 1 || !nfe_4_is_exact_inner_compat_cfg(&file.attrs[0]) {
+        violations.push(format!(
+            "fixture consumer must have exactly one File attribute and it must be inner #![cfg(feature = \"compat\")], got {} attributes",
+            file.attrs.len()
+        ));
+    }
+
+    for item in &file.items {
+        match item {
+            syn::Item::ExternCrate(item)
+                if item.ident == "std"
+                    || item
+                        .rename
+                        .as_ref()
+                        .is_some_and(|(_, rename)| rename == "std") =>
+            {
+                violations.push(
+                    "fixture consumer must not redefine or alias crate name `std`".to_string(),
+                );
+            }
+            syn::Item::Mod(item) if item.ident == "novarocks" => {
+                violations.push(
+                    "fixture consumer must not define a local module named `novarocks`".to_string(),
+                );
+            }
+            syn::Item::ExternCrate(item)
+                if item.ident == "novarocks"
+                    || item
+                        .rename
+                        .as_ref()
+                        .is_some_and(|(_, rename)| rename == "novarocks") =>
+            {
+                violations.push(
+                    "fixture consumer must not redefine or alias crate name `novarocks`"
+                        .to_string(),
+                );
+            }
+            syn::Item::Use(item) if nfe_4_use_tree_binds_novarocks(&item.tree) => {
+                violations.push(
+                    "fixture consumer must not import a binding named `novarocks`".to_string(),
+                );
+            }
+            syn::Item::Macro(item)
+                if item
+                    .ident
+                    .as_ref()
+                    .is_some_and(|ident| ident == "include_bytes") =>
+            {
+                violations.push(
+                    "fixture consumer must not define a local `include_bytes` macro".to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let fixture_consts = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Const(item)
+                if item.ident == "FIXTURE" && !nfe_4_syn_attrs_require_test(&item.attrs) =>
+            {
+                Some(item)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if fixture_consts.len() != 1 {
+        violations.push(format!(
+            "fixture consumer must have exactly one top-level production const FIXTURE, got {}",
+            fixture_consts.len()
+        ));
+    } else {
+        let initializer = fixture_consts[0].expr.as_ref();
+        let fixture_path = match initializer {
+            syn::Expr::Macro(expr) if nfe_4_is_absolute_std_include_bytes(&expr.mac.path) => {
+                syn::parse2::<syn::LitStr>(expr.mac.tokens.clone())
+                    .ok()
+                    .map(|lit| lit.value())
+            }
+            _ => None,
+        };
+        if fixture_path.as_deref() != Some(NFE_4_EXTERNAL_FIXTURE_INCLUDE_PATH) {
+            violations.push(format!(
+                "const FIXTURE initializer must directly include `{NFE_4_EXTERNAL_FIXTURE_INCLUDE_PATH}`, got {fixture_path:?}"
+            ));
+        }
+    }
+
+    let mut visitor = Nfe4IncludeBytesVisitor::default();
+    visitor.visit_file(&file);
+    if visitor.paths != vec![Some(NFE_4_EXTERNAL_FIXTURE_INCLUDE_PATH.to_string())] {
+        violations.push(format!(
+            "fixture consumer must contain exactly one production include_bytes! of `{NFE_4_EXTERNAL_FIXTURE_INCLUDE_PATH}`, got {:?}",
+            visitor.paths
+        ));
+    }
+    if visitor.submit_args_bind_crate_fixture != vec![true] {
+        violations.push(format!(
+            "fixture consumer must contain exactly one production ::novarocks::submit_exec_batch_plan_fragments call whose sole argument is crate::FIXTURE, got {:?}",
+            visitor.submit_args_bind_crate_fixture
+        ));
+    }
+
+    violations
+}
+
+fn nfe_4_fixture_reference_files(repo: &Path) -> BTreeSet<String> {
+    fn ignored_dir(relative: &Path) -> bool {
+        if relative.components().any(|component| {
+            matches!(
+                component.as_os_str().to_str(),
+                Some(".git" | "target" | "logs" | ".superpowers")
+            )
+        }) {
+            return true;
+        }
+        relative.starts_with("docker/iceberg-rest/runtime")
+    }
+
+    fn contains(bytes: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty() && bytes.windows(needle.len()).any(|window| window == needle)
+    }
+
+    fn collect(repo: &Path, dir: &Path, out: &mut BTreeSet<String>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            let relative = path.strip_prefix(repo).unwrap_or(&path);
+            if ignored_dir(relative) {
+                continue;
+            }
+            if metadata.is_dir() {
+                collect(repo, &path, out);
+                continue;
+            }
+            if !metadata.file_type().is_file() {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            if contains(&bytes, NFE_4_EXTERNAL_FIXTURE_BASENAME.as_bytes())
+                || contains(&bytes, NFE_4_EXTERNAL_FIXTURE_INCLUDE_PATH.as_bytes())
+            {
+                out.insert(relative.display().to_string());
+            }
+        }
+    }
+
+    let mut references = BTreeSet::new();
+    collect(repo, repo, &mut references);
+    references
+}
+
+fn nfe_4_external_compat_fixture_contract_violations(repo: &Path) -> Vec<String> {
+    use sha2::{Digest, Sha256};
+
+    let fixture_dir = repo.join("tests/fixtures/external_starrocks_fe");
+    let fixture = fixture_dir.join(NFE_4_EXTERNAL_FIXTURE_BASENAME);
+    let readme = fixture_dir.join("README.md");
+    let consumer = repo.join("tests/external_starrocks_fe_compat.rs");
+    let mut violations = Vec::new();
+
+    for (label, path) in [
+        ("external fixture", fixture.as_path()),
+        ("fixture provenance", readme.as_path()),
+        ("fixture consumer", consumer.as_path()),
+    ] {
+        violations.extend(nfe_4_no_symlink_component_violations(repo, path, label));
+    }
+
+    for (label, path) in [
+        ("external fixture", fixture.as_path()),
+        ("fixture provenance", readme.as_path()),
+        ("fixture consumer", consumer.as_path()),
+    ] {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => violations.push(format!(
+                "{label} must be a regular file, not a directory or symlink: {}",
+                path.display()
+            )),
+            Err(error) => violations.push(format!(
+                "{label} is missing or unreadable at {}: {error}",
+                path.display()
+            )),
+        }
+    }
+
+    if violations.is_empty() {
+        let bytes = fs::read(&fixture).expect("fixture was checked as readable");
+        if bytes.len() != NFE_4_EXTERNAL_FIXTURE_SIZE {
+            violations.push(format!(
+                "external fixture size changed: expected {}, got {}",
+                NFE_4_EXTERNAL_FIXTURE_SIZE,
+                bytes.len()
+            ));
+        }
+        let sha = format!("{:x}", Sha256::digest(&bytes));
+        if sha != NFE_4_EXTERNAL_FIXTURE_SHA256 {
+            violations.push(format!(
+                "external fixture SHA-256 changed: expected {}, got {sha}",
+                NFE_4_EXTERNAL_FIXTURE_SHA256
+            ));
+        }
+        let readme_text = fs::read_to_string(&readme).expect("README was checked as readable");
+        for required in [
+            &format!("Producer revision: StarRocks upstream `{NFE_4_EXTERNAL_PRODUCER_REVISION}`"),
+            &format!(
+                "Producer artifact: deployed `starrocks-fe.jar`, SHA-256 `{NFE_4_EXTERNAL_PRODUCER_ARTIFACT_SHA256}`"
+            ),
+            &format!("Fixture: `{NFE_4_EXTERNAL_FIXTURE_BASENAME}`"),
+            "SQL: `SELECT /*+SET_VAR(enable_constant_execute_in_fe=false)*/ 1`",
+            "Session setup: `SET enable_single_node_schedule=true`",
+            "RPC: `exec_batch_plan_fragments`",
+            "Protocol: Thrift Binary",
+            &format!("Query ID: `{NFE_4_EXTERNAL_QUERY_ID}`"),
+            &format!("Fragment instance ID: `{NFE_4_EXTERNAL_FINST_ID}`"),
+            "Normalization: none.",
+            &format!("SHA-256: `{NFE_4_EXTERNAL_FIXTURE_SHA256}`"),
+        ] {
+            if !readme_text.contains(required) {
+                violations.push(format!(
+                    "fixture README is missing provenance field `{required}`"
+                ));
+            }
+        }
+        let consumer_text =
+            fs::read_to_string(&consumer).expect("consumer was checked as readable");
+        violations.extend(nfe_4_consumer_ast_violations(&consumer_text));
+        let consumer_production = compact_line(&rust_sanitized_production_text(&consumer_text));
+        for required in [
+            "novarocks_rs_try_fetch_result_batch(",
+            "novarocks_rs_free_buf(",
+            "novarocks::thrift::data::TResultBatch",
+        ] {
+            if !consumer_production.contains(required) {
+                violations.push(format!(
+                    "fixture consumer production code is missing required operation `{required}`"
+                ));
+            }
+        }
+        for forbidden in [
+            "TExecBatchPlanFragmentsParams::new",
+            "TExecPlanFragmentParams::new",
+            "TPlanNode::new",
+            "TBinaryOutputProtocol",
+            "thrift_binary_serialize",
+            "lower_distributed_plan",
+            "sql::codegen",
+        ] {
+            if consumer_production.contains(forbidden) {
+                violations.push(format!(
+                    "fixture consumer must not build or serialize a plan: `{forbidden}`"
+                ));
+            }
+        }
+
+        let reference_files = nfe_4_fixture_reference_files(repo);
+        let expected_reference_files = BTreeSet::from([
+            "tests/architecture_guard.rs".to_string(),
+            "tests/external_starrocks_fe_compat.rs".to_string(),
+            "tests/fixtures/external_starrocks_fe/README.md".to_string(),
+        ]);
+        if reference_files != expected_reference_files {
+            violations.push(format!(
+                "external fixture references changed: expected {expected_reference_files:?}, got {reference_files:?}"
+            ));
+        }
+
+        match fs::read_dir(&fixture_dir) {
+            Ok(entries) => {
+                let mut actual_entries = BTreeSet::new();
+                for entry in entries.flatten() {
+                    actual_entries.insert(entry.file_name().to_string_lossy().into_owned());
+                }
+                let expected_entries = BTreeSet::from([
+                    "README.md".to_string(),
+                    NFE_4_EXTERNAL_FIXTURE_BASENAME.to_string(),
+                ]);
+                if actual_entries != expected_entries {
+                    violations.push(format!(
+                        "fixture directory must contain exactly README.md and the external binary: expected {expected_entries:?}, got {actual_entries:?}"
+                    ));
+                }
+            }
+            Err(error) => violations.push(format!(
+                "fixture directory is missing or unreadable at {}: {error}",
+                fixture_dir.display()
+            )),
+        }
+    }
+
+    violations
+}
+
+#[test]
+fn nfe_4_external_compat_fixture_is_external_input() {
+    let violations = nfe_4_external_compat_fixture_contract_violations(Path::new(manifest_dir()));
+    assert!(
+        violations.is_empty(),
+        "NFE-4 external compatibility fixture must remain external read-only input:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn nfe_4_external_compat_fixture_detector_rejects_self_certification_and_comment_stubs() {
+    use sha2::{Digest, Sha256};
+
+    let root = std::env::temp_dir().join(format!(
+        "nfe_4_external_fixture_self_certification_{}",
+        std::process::id()
+    ));
+    fs::remove_dir_all(&root).ok();
+    let fixture_dir = root.join("tests/fixtures/external_starrocks_fe");
+    fs::create_dir_all(&fixture_dir).unwrap();
+    let replacement = b"replacement fixture bytes";
+    fs::write(
+        fixture_dir.join("select_1_exec_batch_plan_fragments_v1.bin"),
+        replacement,
+    )
+    .unwrap();
+    let replacement_sha = format!("{:x}", Sha256::digest(replacement));
+    fs::write(
+        fixture_dir.join("README.md"),
+        format!(
+            "Producer revision: fake\nSQL: SELECT /*+SET_VAR(enable_constant_execute_in_fe=false)*/ 1\nRPC: `exec_batch_plan_fragments`\nProtocol: Thrift Binary\nFragment instance ID: fake\nNormalization: none\nSHA-256: `{replacement_sha}`\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("tests/external_starrocks_fe_compat.rs"),
+        r#"
+            // #![cfg(feature = "compat")]
+            // include_bytes!("fixtures/external_starrocks_fe/select_1_exec_batch_plan_fragments_v1.bin")
+            // submit_exec_batch_plan_fragments
+            // novarocks_rs_try_fetch_result_batch
+            // novarocks_rs_free_buf
+            // TResultBatch
+        "#,
+    )
+    .unwrap();
+
+    let violations = nfe_4_external_compat_fixture_contract_violations(&root);
+    assert!(
+        !violations.is_empty(),
+        "replacement bytes plus a synchronized README and comment-only consumer must not self-certify"
+    );
+    fs::remove_dir_all(&root).unwrap();
+}
+
+fn nfe_4_external_fixture_attack_repo(case: &str, consumer: String) -> PathBuf {
+    let source_repo = Path::new(manifest_dir());
+    let root = std::env::temp_dir().join(format!(
+        "nfe_4_external_fixture_{case}_{}",
+        std::process::id()
+    ));
+    fs::remove_dir_all(&root).ok();
+    let fixture_dir = root.join("tests/fixtures/external_starrocks_fe");
+    fs::create_dir_all(&fixture_dir).unwrap();
+    for relative in ["README.md", NFE_4_EXTERNAL_FIXTURE_BASENAME] {
+        fs::copy(
+            source_repo
+                .join("tests/fixtures/external_starrocks_fe")
+                .join(relative),
+            fixture_dir.join(relative),
+        )
+        .unwrap();
+    }
+    fs::write(
+        root.join("tests/architecture_guard.rs"),
+        format!("const EXTERNAL_FIXTURE: &str = \"{NFE_4_EXTERNAL_FIXTURE_BASENAME}\";\n"),
+    )
+    .unwrap();
+    fs::write(root.join("tests/external_starrocks_fe_compat.rs"), consumer).unwrap();
+    root
+}
+
+#[test]
+fn nfe_4_external_compat_fixture_detector_rejects_comment_metadata_and_alternative_include() {
+    let root = nfe_4_external_fixture_attack_repo(
+        "comment_metadata",
+        format!(
+            r#"
+                // #![cfg(feature = "compat")]
+                // include_bytes!("fixtures/external_starrocks_fe/{NFE_4_EXTERNAL_FIXTURE_BASENAME}")
+                const FIXTURE: &[u8] = include_bytes!("fixtures/locally_generated.bin");
+                fn consume() {{
+                    ::novarocks::submit_exec_batch_plan_fragments(crate::FIXTURE);
+                    novarocks_rs_try_fetch_result_batch();
+                    novarocks_rs_free_buf();
+                    let _: novarocks::thrift::data::TResultBatch;
+                }}
+            "#
+        ),
+    );
+
+    let violations = nfe_4_external_compat_fixture_contract_violations(&root);
+    assert!(
+        !violations.is_empty(),
+        "comment-only compat metadata plus an alternative production include must fail: {violations:?}"
+    );
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn nfe_4_external_compat_fixture_detector_rejects_raw_string_include_decoy() {
+    let root = nfe_4_external_fixture_attack_repo(
+        "raw_string_decoy",
+        format!(
+            r####"
+                #![cfg(feature = "compat")]
+                const DECOY: &str = r###"include_bytes!("fixtures/external_starrocks_fe/{NFE_4_EXTERNAL_FIXTURE_BASENAME}")"###;
+                const FIXTURE: &[u8] = include_bytes!("fixtures/locally_generated.bin");
+                fn consume() {{
+                    ::novarocks::submit_exec_batch_plan_fragments(crate::FIXTURE);
+                    novarocks_rs_try_fetch_result_batch();
+                    novarocks_rs_free_buf();
+                    let _: novarocks::thrift::data::TResultBatch;
+                }}
+            "####
+        ),
+    );
+
+    let violations = nfe_4_external_compat_fixture_contract_violations(&root);
+    assert!(
+        !violations.is_empty(),
+        "a raw-string exact-path decoy plus an alternative production include must fail: {violations:?}"
+    );
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn nfe_4_external_compat_fixture_detector_rejects_multiple_production_includes() {
+    let root = nfe_4_external_fixture_attack_repo(
+        "multiple_includes",
+        format!(
+            r#"
+                #![cfg(feature = "compat")]
+                const FIXTURE: &[u8] = ::std::include_bytes!("fixtures/external_starrocks_fe/{NFE_4_EXTERNAL_FIXTURE_BASENAME}");
+                const EXTRA: &[u8] = ::std::include_bytes!("fixtures/locally_generated.bin");
+                fn consume() {{
+                    ::novarocks::submit_exec_batch_plan_fragments(crate::FIXTURE);
+                    novarocks_rs_try_fetch_result_batch();
+                    novarocks_rs_free_buf();
+                    let _: novarocks::thrift::data::TResultBatch;
+                }}
+            "#
+        ),
+    );
+
+    let violations = nfe_4_external_compat_fixture_contract_violations(&root);
+    assert!(
+        !violations.is_empty(),
+        "the external consumer must contain exactly one production include_bytes!: {violations:?}"
+    );
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn nfe_4_external_compat_fixture_detector_rejects_unused_exact_decoy_for_nonparen_fixture_include()
+{
+    let mut accepted = Vec::new();
+    for (case, fixture_include) in [
+        (
+            "brace_fixture_include",
+            "include_bytes!{\"fixtures/locally_generated.bin\"}",
+        ),
+        (
+            "bracket_fixture_include",
+            "include_bytes![\"fixtures/locally_generated.bin\"]",
+        ),
+    ] {
+        let root = nfe_4_external_fixture_attack_repo(
+            case,
+            format!(
+                r#"
+                    #![cfg(feature = "compat")]
+                    const UNUSED_EXACT_DECOY: &[u8] = ::std::include_bytes!("{NFE_4_EXTERNAL_FIXTURE_INCLUDE_PATH}");
+                    const FIXTURE: &[u8] = {fixture_include};
+                    fn consume() {{
+                        ::novarocks::submit_exec_batch_plan_fragments(crate::FIXTURE);
+                        novarocks_rs_try_fetch_result_batch();
+                        novarocks_rs_free_buf();
+                        let _: novarocks::thrift::data::TResultBatch;
+                    }}
+                "#
+            ),
+        );
+        let violations = nfe_4_external_compat_fixture_contract_violations(&root);
+        if violations.is_empty() {
+            accepted.push(case);
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+    assert!(
+        accepted.is_empty(),
+        "only const FIXTURE may include the exact external bytes; decoy-bypassed delimiters were accepted: {accepted:?}"
+    );
+}
+
+#[test]
+fn nfe_4_external_compat_fixture_detector_rejects_macro_token_cfg_decoy() {
+    let root = nfe_4_external_fixture_attack_repo(
+        "macro_token_cfg_decoy",
+        format!(
+            r#"
+                swallow!(#![cfg(feature = "compat")]);
+                const FIXTURE: &[u8] = ::std::include_bytes!("{NFE_4_EXTERNAL_FIXTURE_INCLUDE_PATH}");
+                fn consume() {{
+                    ::novarocks::submit_exec_batch_plan_fragments(crate::FIXTURE);
+                    novarocks_rs_try_fetch_result_batch();
+                    novarocks_rs_free_buf();
+                    let _: novarocks::thrift::data::TResultBatch;
+                }}
+            "#
+        ),
+    );
+    let violations = nfe_4_external_compat_fixture_contract_violations(&root);
+    assert!(
+        !violations.is_empty(),
+        "cfg tokens inside another macro must not count as a crate attribute: {violations:?}"
+    );
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn nfe_4_external_compat_fixture_detector_rejects_committed_generator_references() {
+    let consumer =
+        fs::read_to_string(Path::new(manifest_dir()).join("tests/external_starrocks_fe_compat.rs"))
+            .unwrap();
+    let root = nfe_4_external_fixture_attack_repo("committed_generator_refs", consumer);
+    fs::create_dir_all(root.join("tools")).unwrap();
+    fs::write(
+        root.join("build.rs"),
+        format!("// regenerate {NFE_4_EXTERNAL_FIXTURE_INCLUDE_PATH}\n"),
+    )
+    .unwrap();
+    fs::write(
+        root.join("tools/ExternalFixtureGenerator.java"),
+        format!("// reads {NFE_4_EXTERNAL_FIXTURE_BASENAME}\n"),
+    )
+    .unwrap();
+
+    let violations = nfe_4_external_compat_fixture_contract_violations(&root);
+    assert!(
+        !violations.is_empty(),
+        "raw committed generator references outside the fixed three-file set must fail: {violations:?}"
+    );
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn nfe_4_external_compat_fixture_ast_accepts_exact_delimiters_and_ignores_cfg_test() {
+    for (case, fixture_include) in [
+        (
+            "exact_brace_include",
+            format!("::std::include_bytes!{{\"{NFE_4_EXTERNAL_FIXTURE_INCLUDE_PATH}\"}}"),
+        ),
+        (
+            "exact_bracket_include",
+            format!("::std::include_bytes![\"{NFE_4_EXTERNAL_FIXTURE_INCLUDE_PATH}\"]"),
+        ),
+    ] {
+        let root = nfe_4_external_fixture_attack_repo(
+            case,
+            format!(
+                r#"
+                    #![cfg(feature = "compat")]
+                    const FIXTURE: &[u8] = {fixture_include};
+                    #[cfg(test)]
+                    const TEST_ONLY: &[u8] = include_bytes!("fixtures/locally_generated.bin");
+                    fn consume() {{
+                        ::novarocks::submit_exec_batch_plan_fragments(crate::FIXTURE);
+                        novarocks_rs_try_fetch_result_batch();
+                        novarocks_rs_free_buf();
+                        let _: novarocks::thrift::data::TResultBatch;
+                    }}
+                "#
+            ),
+        );
+        let violations = nfe_4_external_compat_fixture_contract_violations(&root);
+        assert!(
+            violations.is_empty(),
+            "exact brace/bracket fixture includes must be accepted and cfg(test) includes ignored: {fixture_include}: {violations:?}"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+#[test]
+fn nfe_4_external_compat_fixture_detector_rejects_local_include_bytes_shadow() {
+    let root = nfe_4_external_fixture_attack_repo(
+        "local_include_bytes_shadow",
+        format!(
+            r#"
+                #![cfg(feature = "compat")]
+                macro_rules! include_bytes {{ ($path:literal) => {{ b"" }}; }}
+                const FIXTURE: &[u8] = include_bytes!("{NFE_4_EXTERNAL_FIXTURE_INCLUDE_PATH}");
+                fn consume() {{
+                    ::novarocks::submit_exec_batch_plan_fragments(crate::FIXTURE);
+                    novarocks_rs_try_fetch_result_batch();
+                    novarocks_rs_free_buf();
+                    let _: novarocks::thrift::data::TResultBatch;
+                }}
+            "#
+        ),
+    );
+    let violations = nfe_4_external_compat_fixture_contract_violations(&root);
+    assert!(
+        !violations.is_empty(),
+        "a locally shadowed include_bytes macro must not establish external fixture provenance: {violations:?}"
+    );
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn nfe_4_external_compat_fixture_detector_rejects_self_as_std_prelude_hijack() {
+    let root = nfe_4_external_fixture_attack_repo(
+        "self_as_std_prelude_hijack",
+        format!(
+            r#"
+                #![cfg(feature = "compat")]
+                #![no_implicit_prelude]
+                #[macro_export]
+                macro_rules! include_bytes {{ ($path:literal) => {{ b"" }}; }}
+                extern crate self as std;
+                const FIXTURE: &[u8] = ::std::include_bytes!("{NFE_4_EXTERNAL_FIXTURE_INCLUDE_PATH}");
+                fn consume() {{
+                    ::novarocks::submit_exec_batch_plan_fragments(crate::FIXTURE);
+                    novarocks_rs_try_fetch_result_batch();
+                    novarocks_rs_free_buf();
+                    let _: novarocks::thrift::data::TResultBatch;
+                }}
+            "#
+        ),
+    );
+    let violations = nfe_4_external_compat_fixture_contract_violations(&root);
+    assert!(
+        !violations.is_empty(),
+        "no_implicit_prelude plus self-as-std must not hijack the absolute include macro: {violations:?}"
+    );
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn nfe_4_external_compat_fixture_detector_rejects_inner_static_fixture_shadow() {
+    let root = nfe_4_external_fixture_attack_repo(
+        "inner_static_fixture_shadow",
+        format!(
+            r#"
+                #![cfg(feature = "compat")]
+                const FIXTURE: &[u8] = ::std::include_bytes!("{NFE_4_EXTERNAL_FIXTURE_INCLUDE_PATH}");
+                fn consume() {{
+                    static FIXTURE: &[u8] = b"shadow";
+                    ::novarocks::submit_exec_batch_plan_fragments(FIXTURE);
+                    novarocks_rs_try_fetch_result_batch();
+                    novarocks_rs_free_buf();
+                    let _: novarocks::thrift::data::TResultBatch;
+                }}
+            "#
+        ),
+    );
+    let violations = nfe_4_external_compat_fixture_contract_violations(&root);
+    assert!(
+        !violations.is_empty(),
+        "submit must bind explicitly to crate::FIXTURE rather than an inner static shadow: {violations:?}"
+    );
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn nfe_4_external_compat_fixture_detector_rejects_novarocks_crate_rebinding() {
+    for (case, rebinding, expected_violation) in [
+        (
+            "local_module",
+            r#"
+                mod novarocks {
+                    pub fn submit_exec_batch_plan_fragments(_: &[u8]) {}
+                }
+            "#,
+            "local module named `novarocks`",
+        ),
+        (
+            "extern_crate_rename",
+            r#"
+                extern crate self as novarocks;
+            "#,
+            "redefine or alias crate name `novarocks`",
+        ),
+        (
+            "extern_crate_name",
+            r#"
+                extern crate novarocks as real_novarocks;
+            "#,
+            "redefine or alias crate name `novarocks`",
+        ),
+        (
+            "grouped_use_rename",
+            r#"
+                mod fake {
+                    pub fn submit_exec_batch_plan_fragments(_: &[u8]) {}
+                }
+                use crate::{fake as novarocks};
+            "#,
+            "import a binding named `novarocks`",
+        ),
+    ] {
+        let root = nfe_4_external_fixture_attack_repo(
+            &format!("novarocks_crate_rebinding_{case}"),
+            format!(
+                r#"
+                    #![cfg(feature = "compat")]
+                    {rebinding}
+                    const FIXTURE: &[u8] = ::std::include_bytes!("{NFE_4_EXTERNAL_FIXTURE_INCLUDE_PATH}");
+                    fn consume() {{
+                        novarocks::submit_exec_batch_plan_fragments(crate::FIXTURE);
+                        novarocks_rs_try_fetch_result_batch();
+                        novarocks_rs_free_buf();
+                        let _: novarocks::thrift::data::TResultBatch;
+                    }}
+                "#
+            ),
+        );
+        let violations = nfe_4_external_compat_fixture_contract_violations(&root);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected_violation)),
+            "case {case} must report its novarocks crate rebinding explicitly: {violations:?}"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+#[test]
+fn nfe_4_external_compat_fixture_detector_rejects_additional_inner_gating_attributes() {
+    let mut accepted = Vec::new();
+    for (case, extra_gate) in [
+        ("extra_cfg", "#![cfg(unix)]"),
+        ("extra_cfg_attr", "#![cfg_attr(unix, allow(dead_code))]"),
+    ] {
+        let consumer = fs::read_to_string(
+            Path::new(manifest_dir()).join("tests/external_starrocks_fe_compat.rs"),
+        )
+        .unwrap()
+        .replacen(
+            "#![cfg(feature = \"compat\")]",
+            &format!("#![cfg(feature = \"compat\")]\n{extra_gate}"),
+            1,
+        );
+        let root = nfe_4_external_fixture_attack_repo(case, consumer);
+        let violations = nfe_4_external_compat_fixture_contract_violations(&root);
+        if violations.is_empty() {
+            accepted.push(case);
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+    assert!(
+        accepted.is_empty(),
+        "the exact compat cfg must be the sole crate-level gating attribute: {accepted:?}"
+    );
+}
+
+#[test]
+fn nfe_4_external_compat_fixture_detector_rejects_extensionless_makefile_and_kotlin_references() {
+    let consumer =
+        fs::read_to_string(Path::new(manifest_dir()).join("tests/external_starrocks_fe_compat.rs"))
+            .unwrap();
+    let root = nfe_4_external_fixture_attack_repo("all_file_reference_scan", consumer);
+    fs::create_dir_all(root.join("tools")).unwrap();
+    for (relative, contents) in [
+        (
+            "tools/regenerate_external_fixture",
+            format!("# {NFE_4_EXTERNAL_FIXTURE_BASENAME}\n"),
+        ),
+        (
+            "Makefile",
+            format!("# {NFE_4_EXTERNAL_FIXTURE_INCLUDE_PATH}\n"),
+        ),
+        (
+            "tools/ExternalFixture.kt",
+            format!("// {NFE_4_EXTERNAL_FIXTURE_BASENAME}\n"),
+        ),
+    ] {
+        fs::write(root.join(relative), contents).unwrap();
+    }
+    let violations = nfe_4_external_compat_fixture_contract_violations(&root);
+    assert!(
+        !violations.is_empty(),
+        "raw references in regular files must be detected without an extension allowlist: {violations:?}"
+    );
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn nfe_4_external_compat_fixture_detector_rejects_every_extra_fixture_entry_kind() {
+    let consumer =
+        fs::read_to_string(Path::new(manifest_dir()).join("tests/external_starrocks_fe_compat.rs"))
+            .unwrap();
+    let mut accepted = Vec::new();
+    for case in ["extensionless_file", "directory", "symlink"] {
+        let root = nfe_4_external_fixture_attack_repo(case, consumer.clone());
+        let fixture_dir = root.join("tests/fixtures/external_starrocks_fe");
+        match case {
+            "extensionless_file" => fs::write(fixture_dir.join("generator"), []).unwrap(),
+            "directory" => fs::create_dir(fixture_dir.join("nested")).unwrap(),
+            "symlink" => {
+                std::os::unix::fs::symlink(fixture_dir.join("README.md"), fixture_dir.join("alias"))
+                    .unwrap()
+            }
+            _ => unreachable!(),
+        }
+        let violations = nfe_4_external_compat_fixture_contract_violations(&root);
+        if violations.is_empty() {
+            accepted.push(case);
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+    assert!(
+        accepted.is_empty(),
+        "fixture directory extras must fail regardless of entry kind or extension: {accepted:?}"
+    );
+}
+
+#[test]
+fn nfe_4_external_compat_fixture_ast_ignores_deep_definite_cfg_test_subtrees() {
+    let root = nfe_4_external_fixture_attack_repo(
+        "deep_cfg_test_subtrees",
+        format!(
+            r#"
+                #![cfg(feature = "compat")]
+                const FIXTURE: &[u8] = ::std::include_bytes!("{NFE_4_EXTERNAL_FIXTURE_INCLUDE_PATH}");
+                struct Holder;
+                impl Holder {{
+                    #[cfg(test)]
+                    const TEST_ONLY: &'static [u8] = include_bytes!("fixtures/impl-test-only.bin");
+                }}
+                fn nested() {{
+                    #[cfg(test)]
+                    let _ = include_bytes!("fixtures/stmt-test-only.bin");
+                }}
+                fn consume() {{
+                    ::novarocks::submit_exec_batch_plan_fragments(crate::FIXTURE);
+                    novarocks_rs_try_fetch_result_batch();
+                    novarocks_rs_free_buf();
+                    let _: novarocks::thrift::data::TResultBatch;
+                }}
+            "#
+        ),
+    );
+    let violations = nfe_4_external_compat_fixture_contract_violations(&root);
+    assert!(
+        violations.is_empty(),
+        "definite cfg(test) impl items and nested statements must be excluded: {violations:?}"
+    );
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn nfe_4_external_compat_fixture_ast_keeps_cfg_any_test_or_compat_subtrees() {
+    let root = nfe_4_external_fixture_attack_repo(
+        "cfg_any_test_or_compat",
+        format!(
+            r#"
+                #![cfg(feature = "compat")]
+                const FIXTURE: &[u8] = ::std::include_bytes!("{NFE_4_EXTERNAL_FIXTURE_INCLUDE_PATH}");
+                #[cfg(any(test, feature = "compat"))]
+                const COMPAT_VISIBLE: &[u8] = include_bytes!("fixtures/compat-visible.bin");
+                fn consume() {{
+                    ::novarocks::submit_exec_batch_plan_fragments(crate::FIXTURE);
+                    novarocks_rs_try_fetch_result_batch();
+                    novarocks_rs_free_buf();
+                    let _: novarocks::thrift::data::TResultBatch;
+                }}
+            "#
+        ),
+    );
+    let violations = nfe_4_external_compat_fixture_contract_violations(&root);
+    assert!(
+        !violations.is_empty(),
+        "cfg(any(test, feature = \"compat\")) is production-visible under compat and must not be skipped"
+    );
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn nfe_4_external_compat_fixture_detector_rejects_symlinked_parent() {
+    let source_repo = Path::new(manifest_dir());
+    let root = std::env::temp_dir().join(format!(
+        "nfe_4_external_fixture_symlink_parent_{}",
+        std::process::id()
+    ));
+    let external = std::env::temp_dir().join(format!(
+        "nfe_4_external_fixture_symlink_target_{}",
+        std::process::id()
+    ));
+    fs::remove_dir_all(&root).ok();
+    fs::remove_dir_all(&external).ok();
+    fs::create_dir_all(root.join("tests")).unwrap();
+    fs::create_dir_all(external.join("external_starrocks_fe")).unwrap();
+    for relative in ["README.md", "select_1_exec_batch_plan_fragments_v1.bin"] {
+        fs::copy(
+            source_repo
+                .join("tests/fixtures/external_starrocks_fe")
+                .join(relative),
+            external.join("external_starrocks_fe").join(relative),
+        )
+        .unwrap();
+    }
+    fs::copy(
+        source_repo.join("tests/external_starrocks_fe_compat.rs"),
+        root.join("tests/external_starrocks_fe_compat.rs"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&external, root.join("tests/fixtures")).unwrap();
+
+    let violations = nfe_4_external_compat_fixture_contract_violations(&root);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("must not be a symlink")),
+        "a symlinked fixture parent must fail explicitly even when each leaf resolves to a regular file: {violations:?}"
+    );
+    fs::remove_dir_all(&root).unwrap();
+    fs::remove_dir_all(&external).unwrap();
+}
+
 #[test]
 fn nfe_3_fe_owned_helpers_are_raw_starrocks_idl_free() {
     let fixture = r#"
