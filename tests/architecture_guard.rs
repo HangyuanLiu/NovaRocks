@@ -407,7 +407,9 @@ fn cfg_attr_generated_path_values(attribute: &str) -> Vec<String> {
     fn collect(
         attribute: &str,
         tokens: &[RustSourceToken],
+        token_texts: &[String],
         cfg_attr: usize,
+        enclosing_requires_test: bool,
         paths: &mut BTreeSet<String>,
     ) {
         if tokens
@@ -422,6 +424,12 @@ fn cfg_attr_generated_path_values(attribute: &str) -> Vec<String> {
         let Some(close) = rust_matching_token(tokens, cfg_attr + 1, "(", ")") else {
             return;
         };
+        let predicate_requires_test = cfg_predicate_requires_test(token_texts, cfg_attr + 2)
+            .is_some_and(|(requires_test, _)| requires_test);
+        let branch_requires_test = enclosing_requires_test || predicate_requires_test;
+        if branch_requires_test {
+            return;
+        }
         for range in argument_ranges(tokens, cfg_attr + 1, close)
             .into_iter()
             .skip(1)
@@ -444,17 +452,35 @@ fn cfg_attr_generated_path_values(attribute: &str) -> Vec<String> {
                     paths.insert(path);
                 }
             } else if head.text == "cfg_attr" {
-                collect(attribute, tokens, range.start, paths);
+                collect(
+                    attribute,
+                    tokens,
+                    token_texts,
+                    range.start,
+                    branch_requires_test,
+                    paths,
+                );
             }
         }
     }
 
     let tokens = rust_source_tokens(attribute);
+    let token_texts = tokens
+        .iter()
+        .map(|token| token.text.clone())
+        .collect::<Vec<_>>();
     let Some(open) = tokens.iter().position(|token| token.text == "[") else {
         return Vec::new();
     };
     let mut paths = BTreeSet::new();
-    collect(attribute, &tokens, open + 1, &mut paths);
+    collect(
+        attribute,
+        &tokens,
+        &token_texts,
+        open + 1,
+        false,
+        &mut paths,
+    );
     paths.into_iter().collect()
 }
 
@@ -5079,6 +5105,14 @@ mod cfg_attr_production;
 mod conditional_owner;
 #[cfg_attr(feature = "outer", cfg_attr(feature = "inner", path = "nested_alt.rs"))]
 mod nested_conditional_owner;
+#[cfg_attr(test, path = "test_only_alt.rs")]
+mod test_only_conditional_owner;
+#[cfg_attr(all(test, feature = "alt"), path = "all_test_only_alt.rs")]
+mod all_test_only_conditional_owner;
+#[cfg_attr(test, cfg_attr(feature = "inner", path = "nested_test_only_alt.rs"))]
+mod nested_test_only_conditional_owner;
+#[cfg_attr(any(test, feature = "alt"), path = "any_production_alt.rs")]
+mod any_production_conditional_owner;
 #[cfg(test = "production")]
 mod keyed_test;
 #[cfg(any(test, test = "production"))]
@@ -5182,6 +5216,30 @@ mod conditional_outer {
         "use crate::sql::optimizer::Optimizer;\n",
     )
     .unwrap();
+    for default in [
+        "test_only_conditional_owner.rs",
+        "all_test_only_conditional_owner.rs",
+        "nested_test_only_conditional_owner.rs",
+        "any_production_conditional_owner.rs",
+    ] {
+        fs::write(root.join(default), "pub(crate) struct Safe;\n").unwrap();
+    }
+    for test_only in [
+        "test_only_alt.rs",
+        "all_test_only_alt.rs",
+        "nested_test_only_alt.rs",
+    ] {
+        fs::write(
+            root.join(test_only),
+            "use crate::sql::optimizer::Optimizer;\n",
+        )
+        .unwrap();
+    }
+    fs::write(
+        root.join("any_production_alt.rs"),
+        "use crate::sql::optimizer::Optimizer;\n",
+    )
+    .unwrap();
     fs::write(root.join("keyed_test.rs"), forbidden).unwrap();
     fs::write(root.join("any_keyed_test.rs"), forbidden).unwrap();
     fs::write(
@@ -5206,6 +5264,9 @@ mod conditional_outer {
         BTreeSet::from([
             "any_cfg.rs".to_string(),
             "any_keyed_test.rs".to_string(),
+            "any_production_alt.rs".to_string(),
+            "any_production_conditional_owner.rs".to_string(),
+            "all_test_only_conditional_owner.rs".to_string(),
             "cfg_attr_production.rs".to_string(),
             "conditional_alt.rs".to_string(),
             "conditional_owner.rs".to_string(),
@@ -5224,6 +5285,8 @@ mod conditional_outer {
             "redirected/hidden.rs".to_string(),
             "nested_alt.rs".to_string(),
             "nested_conditional_owner.rs".to_string(),
+            "nested_test_only_conditional_owner.rs".to_string(),
+            "test_only_conditional_owner.rs".to_string(),
             "type.rs".to_string(),
         ]),
         "only cfg predicates that require test may exclude external modules"
