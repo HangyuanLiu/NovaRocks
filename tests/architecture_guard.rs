@@ -6166,11 +6166,21 @@ fn planner_distributed_build_has_pass_owners() {
                 (count > 0).then(|| format!("{} ({count})", rel(&path)))
             })
             .collect::<Vec<_>>();
-        assert_eq!(
-            declarations,
-            vec![format!("{} (1)", rel(&mod_path))],
-            "{function} must be declared exactly once across planner production sources"
-        );
+        let (expected, owner_contract) = match function {
+            "build_distributed_plan" => (
+                vec![
+                    format!("{} (1)", rel(&mod_path)),
+                    format!("{} (1)", rel(&planner.join("pipeline/mod.rs"))),
+                ],
+                "be declared once in distributed/build and once in pipeline for the borrowed and owned stage entries",
+            ),
+            "union_distinct_must_be_rewritten_error" => (
+                vec![format!("{} (1)", rel(&mod_path))],
+                "be declared once in distributed/build",
+            ),
+            _ => unreachable!(),
+        };
+        assert_eq!(declarations, expected, "{function} must {owner_contract}");
     }
     let planner_mod_path = planner.join("mod.rs");
     let planner_mod = fs::read_to_string(&planner_mod_path).unwrap();
