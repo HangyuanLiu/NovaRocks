@@ -2081,6 +2081,24 @@ fn planner_stage_first_boundaries_are_closed() {
         "planner stage-first dependency policy violations:\n{}",
         dependency_violations.join("\n")
     );
+
+    let mut checked = rs_files(&src_dir());
+    checked.extend(rs_files(&Path::new(manifest_dir()).join("tests")));
+    let one_shot_facades = checked
+        .into_iter()
+        .flat_map(|file| {
+            optimizer_to_distributed_facade_signatures_in(
+                &fs::read_to_string(&file).expect("read Rust source"),
+            )
+            .into_iter()
+            .map(move |signature| format!("{}:{signature}", rel(&file)))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        one_shot_facades.is_empty(),
+        "OptimizerPhysicalNode-to-DistributedPlan one-shot facades are forbidden in production and tests:\n{}",
+        one_shot_facades.join("\n")
+    );
 }
 
 fn logical_build_surface_violations(text: &str) -> Vec<String> {
@@ -4888,6 +4906,56 @@ mod sibling {
         }),
         "test-only and lexical noise paths must remain ignored: {paths:?}"
     );
+}
+
+fn optimizer_to_distributed_facade_signatures_in(text: &str) -> Vec<String> {
+    let source = rust_lexically_sanitized(text);
+    let mut violations = Vec::new();
+    let mut line = 1usize;
+
+    for item in source.split_inclusive(['{', '}', ';']) {
+        let item_line = line;
+        line += item.bytes().filter(|byte| *byte == b'\n').count();
+        let signature = item.trim().trim_end_matches(['{', '}', ';']).trim();
+        if !is_rust_function_item_header(signature) {
+            continue;
+        }
+        if signature.split_once("->").is_some_and(|(inputs, output)| {
+            inputs.contains("OptimizerPhysicalNode") && output.contains("DistributedPlan")
+        }) {
+            violations.push(format!("{item_line}: {signature}"));
+        }
+    }
+
+    violations
+}
+
+#[test]
+fn optimizer_to_distributed_facade_detector_rejects_renamed_helpers() {
+    let source = [
+        "fn renamed_terminal_helper(optimizer: &",
+        "OptimizerPhysical",
+        "Node) -> Result<",
+        "Distributed",
+        "Plan, String> { todo!() }",
+    ]
+    .concat();
+
+    let violations = optimizer_to_distributed_facade_signatures_in(&source);
+    assert_eq!(violations.len(), 1, "renamed facade must be rejected");
+
+    let explicit_transitions = [
+        "fn test_explain() { let physical = optimizer_bridge::to_physical_plan(&optimizer).unwrap(); let distributed = pipeline::build_distributed_plan(physical).unwrap(); }",
+        "fn optimizer_to_physical(optimizer: &OptimizerPhysicalNode) -> Result<PhysicalPlanNode, String> { todo!() }",
+        "fn physical_to_distributed(physical: PhysicalPlanNode) -> Result<DistributedPlan, String> { todo!() }",
+        "fn reversed(distributed: DistributedPlan) -> OptimizerPhysicalNode { todo!() }",
+    ];
+    for source in explicit_transitions {
+        assert!(
+            optimizer_to_distributed_facade_signatures_in(source).is_empty(),
+            "explicit typed transitions must remain valid: {source}"
+        );
+    }
 }
 
 #[test]
