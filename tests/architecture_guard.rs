@@ -2493,6 +2493,7 @@ pub(crate) mod optimizer_bridge;
 pub(crate) mod ordering;
 pub(crate) mod payload;
 pub(crate) mod physical;
+pub(crate) mod pipeline;
 pub(crate) use logical::build::{plan_output_columns, plan_query};
 "#;
 
@@ -3972,6 +3973,7 @@ pub(crate) mod optimizer_bridge;
 pub(crate) mod ordering;
 pub(crate) mod payload;
 pub(crate) mod physical;
+pub(crate) mod pipeline;
 pub(crate) use logical::build::{plan_output_columns, plan_query};
 
 #[cfg(test)]
@@ -3987,6 +3989,7 @@ fn reordered_test_helper() {}
 
     let invalid = [
         format!("{valid}\nmod extra;"),
+        valid.replace("pub(crate) mod pipeline;", "mod pipeline;"),
         valid.replace("pub(crate) mod physical;", "mod physical;"),
         valid.replace("pub(crate) mod physical;", "pub(super) mod physical;"),
         format!("{valid}\npub(crate) use physical::PhysicalPlanNode;"),
