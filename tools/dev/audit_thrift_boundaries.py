@@ -184,7 +184,6 @@ BASELINE: dict[str, BaselineEntry] = {
     "src/exec/expr/cast.rs": BaselineEntry("domain-leak", "B7", 0, "Execution cast path still uses thrift primitive conversion helpers"),
     "src/exec/operators/aggregate/mod.rs": BaselineEntry("domain-leak", "B7", 0, "Aggregate operator no longer carries thrift-derived metadata"),
     "src/engine/statement.rs": BaselineEntry("domain-leak", "B7", 0, "Standalone statement path consumes thrift-free standalone query options"),
-    "src/sql/codegen/iceberg_write_sink_wire.rs": BaselineEntry("legal-boundary", "B7-wire", 0, "Standalone Iceberg write sink wire adapter builds FE-compatible sink thrift payloads"),
 }
 
 

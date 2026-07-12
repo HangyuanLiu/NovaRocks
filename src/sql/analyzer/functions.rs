@@ -633,7 +633,7 @@ fn sum_map_value_type_name(data_type: &DataType) -> &'static str {
 }
 
 pub(super) fn is_aggregate_function(name: &str) -> bool {
-    // Keep in sync with expr_compiler::is_aggregate_function.
+    // Analyzer-owned aggregate classification used by expression resolution.
     is_state_combinator_aggregate_function(name)
         || matches!(
             name,

@@ -19,11 +19,11 @@
 //!
 //! Before this module landed, analyzer and codegen each carried their own
 //! private "given a function name and argument types, what is the return
-//! type?" logic — analyzer in [`crate::sql::analyzer::functions`] and codegen
-//! in [`crate::sql::codegen::expr_compiler`]. The two copies were drifting
-//! (the codegen side, for example, recognised `parse_url -> Utf8` while
-//! analyzer did not), and adding a new SQL function meant patching both
-//! sides at once.
+//! type?" logic — analyzer in [`crate::sql::analyzer::functions`] and the now
+//! retired legacy FE Thrift expression emitter. The two copies were drifting
+//! (the emitter side, for example, recognised `parse_url -> Utf8` while the
+//! analyzer did not), and adding a new SQL function meant patching both sides
+//! at once.
 //!
 //! This module follows StarRocks' [`functions.py`] approach: every supported
 //! scalar function (and operator) is described once, by a [`Signature`] of

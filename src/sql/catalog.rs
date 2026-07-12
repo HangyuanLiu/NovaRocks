@@ -123,8 +123,8 @@ pub struct IcebergSchemaFieldDef {
     /// Spec-compliant JSON encoding of `initial_default` precomputed at the
     /// point of construction where the iceberg `Type` is still available.
     /// Necessary because `iceberg::spec::Literal::Int128` carries no scale,
-    /// so decimal defaults cannot be serialised correctly from the literal
-    /// alone in `descriptors::to_thrift_iceberg_schema_field`.
+    /// so decimal defaults cannot be serialized correctly from the literal
+    /// alone after the logical Iceberg type is no longer available.
     /// `None` falls back to the type-blind serializer.
     pub initial_default_json: Option<String>,
     /// Spec-compliant JSON encoding of `write_default`, for the same reason as
