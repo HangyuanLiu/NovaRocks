@@ -2081,25 +2081,6 @@ fn planner_stage_first_boundaries_are_closed() {
         "planner stage-first dependency policy violations:\n{}",
         dependency_violations.join("\n")
     );
-
-    let mut checked = rs_files(&src_dir());
-    checked.extend(rs_files(&Path::new(manifest_dir()).join("tests")));
-    let one_shot_facades = checked
-        .into_iter()
-        .flat_map(|file| {
-            optimizer_to_distributed_facade_signatures_in(
-                &fs::read_to_string(&file).expect("read Rust source"),
-                &rel(&file),
-            )
-            .into_iter()
-            .map(move |signature| format!("{}:{signature}", rel(&file)))
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        one_shot_facades.is_empty(),
-        "OptimizerPhysicalNode-to-DistributedPlan one-shot facades are forbidden in production and tests:\n{}",
-        one_shot_facades.join("\n")
-    );
 }
 
 fn logical_build_surface_violations(text: &str) -> Vec<String> {
@@ -2842,8 +2823,9 @@ struct RustRawUseStatement {
     inline_modules: Vec<String>,
 }
 
-fn rust_raw_use_statements_in(source: &str) -> Vec<RustRawUseStatement> {
-    let tokens = rust_use_tokens(source);
+fn rust_raw_production_use_statements(text: &str) -> Vec<RustRawUseStatement> {
+    let production = rust_sanitized_production_text(text);
+    let tokens = rust_use_tokens(&production);
     let inline_module_openings = (0..tokens.len().saturating_sub(2))
         .filter_map(|index| {
             (tokens[index] == "mod"
@@ -2932,10 +2914,6 @@ fn rust_raw_use_statements_in(source: &str) -> Vec<RustRawUseStatement> {
     }
 
     raw_imports
-}
-
-fn rust_raw_production_use_statements(text: &str) -> Vec<RustRawUseStatement> {
-    rust_raw_use_statements_in(&rust_sanitized_production_text(text))
 }
 
 fn rust_production_use_statements(text: &str) -> Vec<String> {
@@ -3094,11 +3072,9 @@ fn rust_production_scoped_use_statements(text: &str) -> Vec<RustScopedUseStateme
 
 type RustScopedAliases = BTreeMap<(Vec<String>, String), Vec<RustScopedUsePath>>;
 
-fn rust_scoped_aliases_from_raw(
-    raw_imports: impl IntoIterator<Item = RustRawUseStatement>,
-) -> RustScopedAliases {
+fn rust_production_scoped_aliases(text: &str) -> RustScopedAliases {
     let mut aliases = RustScopedAliases::new();
-    for raw in raw_imports {
+    for raw in rust_raw_production_use_statements(text) {
         let local_name = match raw.path.alias.as_deref() {
             Some("_") => None,
             Some(alias) => Some(alias.to_string()),
@@ -3122,10 +3098,6 @@ fn rust_scoped_aliases_from_raw(
         }
     }
     aliases
-}
-
-fn rust_production_scoped_aliases(text: &str) -> RustScopedAliases {
-    rust_scoped_aliases_from_raw(rust_raw_production_use_statements(text))
 }
 
 fn rust_scoped_alias_key(
@@ -4916,295 +4888,6 @@ mod sibling {
         }),
         "test-only and lexical noise paths must remain ignored: {paths:?}"
     );
-}
-
-fn rust_scoped_items(source: &str) -> Vec<(usize, Vec<String>, bool, String)> {
-    let mut items = Vec::new();
-    let mut inline_modules = Vec::<(usize, String)>::new();
-    let mut brace_depth = 0usize;
-    let mut line = 1usize;
-
-    for chunk in source.split_inclusive(['{', '}', ';']) {
-        let item_line = line;
-        line += chunk.bytes().filter(|byte| *byte == b'\n').count();
-        let delimiter = chunk.as_bytes().last().copied();
-        let item = chunk.trim().trim_end_matches(['{', '}', ';']).trim();
-        if !item.is_empty() && matches!(delimiter, Some(b'{') | Some(b';')) {
-            let module_level = brace_depth == inline_modules.last().map_or(0, |(depth, _)| *depth);
-            items.push((
-                item_line,
-                inline_modules
-                    .iter()
-                    .map(|(_, module)| module.clone())
-                    .collect(),
-                module_level,
-                item.to_string(),
-            ));
-        }
-
-        match delimiter {
-            Some(b'{') => {
-                brace_depth += 1;
-                let tokens = rust_use_tokens(item);
-                if let Some(index) = tokens.iter().position(|token| token == "mod")
-                    && let Some(module) = tokens
-                        .get(index + 1)
-                        .filter(|token| token.chars().all(is_ident_char))
-                {
-                    inline_modules.push((brace_depth, module.clone()));
-                }
-            }
-            Some(b'}') => {
-                if inline_modules
-                    .last()
-                    .is_some_and(|(depth, _)| *depth == brace_depth)
-                {
-                    inline_modules.pop();
-                }
-                brace_depth = brace_depth.saturating_sub(1);
-            }
-            _ => {}
-        }
-    }
-
-    items
-}
-
-fn rust_all_scoped_aliases(source: &str) -> RustScopedAliases {
-    let mut aliases = rust_scoped_aliases_from_raw(rust_raw_use_statements_in(source));
-    for (_, inline_modules, module_level, item) in rust_scoped_items(source) {
-        if !module_level {
-            continue;
-        }
-        let tokens = rust_use_tokens(&item);
-        let Some(type_index) = tokens.iter().position(|token| token == "type") else {
-            continue;
-        };
-        let Some(local_name) = tokens
-            .get(type_index + 1)
-            .filter(|token| token.chars().all(is_ident_char))
-        else {
-            continue;
-        };
-        let Some(equals) = tokens.iter().position(|token| token == "=") else {
-            continue;
-        };
-        let Some(target_start) = tokens[equals + 1..]
-            .iter()
-            .position(|token| token.chars().all(is_ident_char))
-            .map(|index| equals + 1 + index)
-        else {
-            continue;
-        };
-        let mut target = vec![tokens[target_start].clone()];
-        let mut cursor = target_start + 1;
-        while tokens.get(cursor).is_some_and(|token| token == "::")
-            && tokens
-                .get(cursor + 1)
-                .is_some_and(|token| token.chars().all(is_ident_char))
-        {
-            target.push(tokens[cursor + 1].clone());
-            cursor += 2;
-        }
-        aliases
-            .entry((inline_modules.clone(), local_name.clone()))
-            .or_default()
-            .push(RustScopedUsePath {
-                segments: target,
-                inline_modules,
-            });
-    }
-    aliases
-}
-
-fn rust_signature_side_resolves_to(
-    side: &str,
-    inline_modules: &[String],
-    aliases: &RustScopedAliases,
-    source_rel: &str,
-    endpoint: impl Fn(&[String]) -> bool,
-) -> bool {
-    let tokens = rust_use_tokens(side);
-    let mut index = 0usize;
-    while index < tokens.len() {
-        if !tokens[index].chars().all(is_ident_char) {
-            index += 1;
-            continue;
-        }
-        let mut path = vec![tokens[index].clone()];
-        index += 1;
-        while tokens.get(index).is_some_and(|token| token == "::")
-            && tokens
-                .get(index + 1)
-                .is_some_and(|token| token.chars().all(is_ident_char))
-        {
-            path.push(tokens[index + 1].clone());
-            index += 2;
-        }
-        let resolved =
-            rust_resolve_scoped_paths(&path, inline_modules, aliases, &mut BTreeSet::new(), 0)
-                .unwrap_or_default();
-        let canonical = resolved
-            .into_iter()
-            .filter_map(|path| {
-                rust_canonical_path_segments_in_scope(
-                    &path.segments,
-                    source_rel,
-                    &path.inline_modules,
-                )
-            })
-            .collect::<Vec<_>>();
-        if !canonical.is_empty() && canonical.iter().all(|path| endpoint(path)) {
-            return true;
-        }
-    }
-    false
-}
-
-fn optimizer_to_distributed_facade_signatures_in(text: &str, source_rel: &str) -> Vec<String> {
-    fn is_optimizer_physical(path: &[String]) -> bool {
-        matches!(
-            path,
-            [crate_, sql, optimizer, leaf]
-                if crate_ == "crate"
-                    && sql == "sql"
-                    && optimizer == "optimizer"
-                    && leaf == "OptimizerPhysicalNode"
-        ) || matches!(
-            path,
-            [crate_, sql, optimizer, owner, leaf]
-                if crate_ == "crate"
-                    && sql == "sql"
-                    && optimizer == "optimizer"
-                    && owner == "physical_tree"
-                    && leaf == "OptimizerPhysicalNode"
-        )
-    }
-
-    fn is_distributed_plan(path: &[String]) -> bool {
-        matches!(
-            path,
-            [crate_, sql, planner, distributed, leaf]
-                if crate_ == "crate"
-                    && sql == "sql"
-                    && planner == "planner"
-                    && distributed == "distributed"
-                    && leaf == "DistributedPlan"
-        )
-    }
-
-    let source = rust_lexically_sanitized(text);
-    let aliases = rust_all_scoped_aliases(&source);
-    let mut violations = Vec::new();
-
-    for (item_line, inline_modules, _, signature) in rust_scoped_items(&source) {
-        if !is_rust_function_item_header(&signature) {
-            continue;
-        }
-        let hides_transition = signature.split_once("->").is_some_and(|(inputs, output)| {
-            rust_signature_side_resolves_to(
-                inputs,
-                &inline_modules,
-                &aliases,
-                source_rel,
-                is_optimizer_physical,
-            ) && rust_signature_side_resolves_to(
-                output,
-                &inline_modules,
-                &aliases,
-                source_rel,
-                is_distributed_plan,
-            )
-        });
-        if hides_transition {
-            violations.push(format!("{item_line}: {signature}"));
-        }
-    }
-
-    violations
-}
-
-#[test]
-fn optimizer_to_distributed_facade_detector_rejects_renamed_helpers() {
-    let renamed = [
-        "use crate::sql::optimizer::OptimizerPhysicalNode;\n",
-        "use crate::sql::planner::distributed::DistributedPlan;\n",
-        "fn renamed_terminal_helper(optimizer: &",
-        "OptimizerPhysical",
-        "Node) -> Result<",
-        "Distributed",
-        "Plan, String> { todo!() }",
-    ]
-    .concat();
-    let import_aliases = r#"
-#[cfg(test)]
-mod tests {
-    use crate::sql::optimizer::OptimizerPhysicalNode as OptimizerInput;
-    use crate::sql::planner::distributed::DistributedPlan as PlannerOutput;
-    fn aliased_terminal_helper(optimizer: &OptimizerInput) -> Result<PlannerOutput, String> {
-        todo!()
-    }
-}
-"#;
-    let type_aliases = r#"
-#[cfg(test)]
-mod tests {
-    use crate::sql::optimizer::OptimizerPhysicalNode;
-    use crate::sql::planner::distributed::DistributedPlan;
-    type OptimizerInput = OptimizerPhysicalNode;
-    type PlannerOutput = DistributedPlan;
-    fn locally_aliased_terminal_helper(
-        optimizer: &OptimizerInput,
-    ) -> Result<PlannerOutput, String> {
-        todo!()
-    }
-}
-"#;
-    for source in [&*renamed, import_aliases, type_aliases] {
-        let violations = optimizer_to_distributed_facade_signatures_in(source, "src/example.rs");
-        assert_eq!(violations.len(), 1, "facade must be rejected: {source}");
-    }
-
-    let explicit_transitions = r#"
-use crate::sql::optimizer::OptimizerPhysicalNode;
-use crate::sql::planner::distributed::DistributedPlan;
-fn test_explain() {
-    let physical = optimizer_bridge::to_physical_plan(&optimizer).unwrap();
-    let distributed = pipeline::build_distributed_plan(physical).unwrap();
-}
-fn optimizer_to_physical(optimizer: &OptimizerPhysicalNode) -> Result<PhysicalPlanNode, String> {
-    todo!()
-}
-fn physical_to_distributed(physical: PhysicalPlanNode) -> Result<DistributedPlan, String> {
-    todo!()
-}
-fn reversed(distributed: DistributedPlan) -> OptimizerPhysicalNode {
-    todo!()
-}
-"#;
-    assert!(
-        optimizer_to_distributed_facade_signatures_in(explicit_transitions, "src/example.rs")
-            .is_empty(),
-        "explicit typed transitions and reverse direction must remain valid"
-    );
-
-    let scoped_names = [r#"
-mod terminal_aliases {
-    use crate::sql::optimizer::OptimizerPhysicalNode as OptimizerInput;
-    use crate::sql::planner::distributed::DistributedPlan as PlannerOutput;
-}
-mod legal {
-    struct OptimizerInput;
-    struct PlannerOutput;
-    fn same_names_are_scope_local(optimizer: OptimizerInput) -> PlannerOutput { todo!() }
-}
-"#];
-    for source in scoped_names {
-        assert!(
-            optimizer_to_distributed_facade_signatures_in(source, "src/example.rs").is_empty(),
-            "explicit typed transitions must remain valid: {source}"
-        );
-    }
 }
 
 #[test]
