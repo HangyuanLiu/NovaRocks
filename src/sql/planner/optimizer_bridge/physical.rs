@@ -16,11 +16,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::sql::analysis::{ExprKind, TypedExpr};
-use crate::sql::codegen::scalar_materialize::{
+use super::scalar::{
     materialize, materialize_aggregate_calls, materialize_exprs, materialize_project_items,
     materialize_sort_keys, materialize_window_exprs,
 };
+use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::{JoinKind, OutputColumn};
 use crate::sql::optimizer::operator::{Operator, PhysicalDistributionOp};
@@ -743,7 +743,7 @@ fn planner_stats(node: &OptimizerPhysicalNode) -> PhysicalPlanStats {
     }
 }
 
-pub(crate) fn optimizer_physical_to_plan(
+pub(super) fn optimizer_physical_to_plan(
     root: &OptimizerPhysicalNode,
 ) -> Result<PhysicalPlanNode, String> {
     let scalars = root
@@ -757,21 +757,25 @@ pub(crate) fn optimizer_physical_to_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
+    use crate::sql::analysis::{ExprKind, LiteralValue, ProjectItem, TypedExpr};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::{ChangeStreamBranchKind, JoinKind, OutputColumn};
     use crate::sql::optimizer::operator::{
         AggMode, AggregateOutputLayout, ChangeEventExpandOp, ChangeEventOutputExpr,
         ChangeEventSpec, JoinDistribution, Operator, PhysicalDistributionOp,
-        PhysicalHashAggregateOp, PhysicalHashJoinOp, ScanOp, ScanVariantColumn, UnionOp, ValuesOp,
+        PhysicalHashAggregateOp, PhysicalHashJoinOp, ProjectOp, ScanOp, ScanVariantColumn, UnionOp,
+        ValuesOp,
     };
-    use crate::sql::optimizer::physical_tree::{OptimizerPhysicalNode, PlanExecutionProps};
+    use crate::sql::optimizer::physical_tree::{
+        OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
+    };
     use crate::sql::optimizer::property::{
         DistributionSpec, HashSource as OptimizerHashSource, PhysicalPropertySet,
     };
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::{Confidence, CostEstimate, Statistics};
+    use crate::sql::planner::optimizer_bridge::scalar::intern_project_items;
     use crate::sql::planner::physical::PhysicalPlanKind;
     use std::sync::Arc;
 
@@ -1532,5 +1536,72 @@ mod tests {
 
         let err = optimizer_physical_to_plan(&node).expect_err("logical op should be rejected");
         assert!(err.contains("Bridge 2a expected a physical operator"));
+    }
+
+    #[test]
+    fn bridge_rejects_unbound_project_column_before_distributed_build() {
+        let input_id = ColumnId::new_for_test(1);
+        let missing_id = ColumnId::new_for_test(99);
+        let output_id = ColumnId::new_for_test(2);
+        let mut scalars = ScalarArena::new();
+        let items = intern_project_items(
+            &mut scalars,
+            &[ProjectItem {
+                expr: TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: missing_id,
+                        qualifier: None,
+                        column: "missing".to_string(),
+                    },
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                },
+                output_name: "p".to_string(),
+                output_column_id: output_id,
+            }],
+        );
+        let input = OutputColumn {
+            column_id: input_id,
+            name: "v".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        };
+        let output = OutputColumn {
+            column_id: output_id,
+            name: "p".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        };
+        let mut plan = OptimizerPhysicalNode {
+            op: Operator::PhysicalProject(ProjectOp {
+                items,
+                output_qualifier: None,
+            }),
+            children: vec![OptimizerPhysicalNode {
+                op: Operator::PhysicalValues(ValuesOp {
+                    rows: vec![],
+                    columns: vec![input.clone()],
+                }),
+                children: vec![],
+                output_columns: vec![input],
+                stats: Statistics::default(),
+                explain_stats: Default::default(),
+                execution_props: PlanExecutionProps::default(),
+            }],
+            output_columns: vec![output],
+            stats: Statistics::default(),
+            explain_stats: Default::default(),
+            execution_props: PlanExecutionProps::default(),
+        };
+        attach_scalar_arena(&mut plan, Arc::new(scalars));
+
+        let err = super::super::to_physical_plan(&plan)
+            .expect_err("unbound project ColumnId must fail at optimizer bridge");
+        assert!(
+            err.contains("not produced by child scope"),
+            "unexpected err={err}"
+        );
     }
 }

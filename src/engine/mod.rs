@@ -2740,10 +2740,8 @@ fn explain_analyze_query(
         mv_candidates,
     )?;
 
-    let dp =
-        crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
-            &physical,
-        )?;
+    let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&physical)?;
+    let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)?;
     let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
         crate::sql::codegen::FragmentBuildRequest::result(&dp, codegen_catalog, connectors, None),
     )?;
@@ -2919,10 +2917,8 @@ fn explain_query(
     if matches!(level, ExplainLevel::Costs) {
         lines.extend(query_stats.snapshot.display_rows());
     }
-    let dp =
-        crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
-            &physical,
-        )?;
+    let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&physical)?;
+    let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)?;
     lines.extend(explain_distributed_plan(&dp, level));
 
     build_string_query_result("Explain String", lines)
@@ -3119,10 +3115,8 @@ pub(crate) fn execute_query_as_iceberg_write(
             Vec::new(),
         )?,
     };
-    let dp =
-        crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
-            &physical,
-        )?;
+    let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&physical)?;
+    let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)?;
     let dp = crate::sql::planner::distributed::write::plan::with_iceberg_write_sink(
         dp,
         crate::sql::planner::distributed::write::sink::IcebergWriteFragmentSink {
@@ -3312,10 +3306,8 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_native_pla
         .expect("standalone connector registry read lock")
         .clone();
     snapshot_effective_backend_count_into_session();
-    let dp =
-        crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
-            physical_plan,
-        )?;
+    let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(physical_plan)?;
+    let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)?;
     let planned_dp =
         crate::sql::planner::distributed::write::plan::with_iceberg_change_stream_write(
             dp,
@@ -3711,10 +3703,8 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         exchange_port,
     )?;
 
-    let dp =
-        crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
-            &physical,
-        )?;
+    let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&physical)?;
+    let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)?;
     let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
         crate::sql::codegen::FragmentBuildRequest::result(
             &dp,
@@ -3771,10 +3761,8 @@ pub(crate) fn execute_logical_plan_with_options(
         exchange_port,
     )?;
 
-    let dp =
-        crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
-            &physical,
-        )?;
+    let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&physical)?;
+    let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)?;
     let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
         crate::sql::codegen::FragmentBuildRequest::result(
             &dp,
@@ -5457,10 +5445,9 @@ mysql_port = 47892
             Vec::new(),
         )
         .expect("optimize");
-        let dp =
-            crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
-                &physical,
-            )
+        let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&physical)
+            .expect("convert optimizer physical plan");
+        let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)
             .expect("build DistributedPlan");
         crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
             crate::sql::codegen::FragmentBuildRequest::result(&dp, &catalog, &registry, None),

@@ -2022,6 +2022,8 @@ fn planner_distributed_and_codegen_do_not_import_optimizer() {
 #[test]
 fn planner_stage_first_boundaries_are_closed() {
     let planner = src_dir().join("sql/planner");
+    assert!(planner.join("pipeline/mod.rs").exists());
+    assert!(!planner.join("optimizer_bridge/distributed.rs").exists());
     let root_files = fs::read_dir(&planner)
         .unwrap()
         .flatten()
@@ -3406,11 +3408,13 @@ fn planner_stage_first_dependency_violations_in(source_rel: &str, text: &str) ->
     let logical = source_rel.starts_with("src/sql/planner/logical/");
     let physical = source_rel.starts_with("src/sql/planner/physical/");
     let distributed = source_rel.starts_with("src/sql/planner/distributed/");
+    let optimizer_bridge = source_rel.starts_with("src/sql/planner/optimizer_bridge/");
+    let pipeline = source_rel.starts_with("src/sql/planner/pipeline/");
     let neutral = matches!(
         source_rel.as_str(),
         "src/sql/planner/payload.rs" | "src/sql/planner/ordering.rs"
     );
-    if !logical && !physical && !distributed && !neutral {
+    if !logical && !physical && !distributed && !optimizer_bridge && !pipeline && !neutral {
         return Vec::new();
     }
 
@@ -3429,6 +3433,7 @@ fn planner_stage_first_dependency_violations_in(source_rel: &str, text: &str) ->
             let planner_physical = starts_with(path, &["crate", "sql", "planner", "physical"]);
             let planner_distributed =
                 starts_with(path, &["crate", "sql", "planner", "distributed"]);
+            let planner_pipeline = starts_with(path, &["crate", "sql", "planner", "pipeline"]);
             let optimizer = starts_with(path, &["crate", "sql", "optimizer"]);
             let optimizer_options = starts_with(path, &["crate", "sql", "optimizer", "options"]);
             let codegen = starts_with(path, &["crate", "sql", "codegen"]);
@@ -3437,25 +3442,33 @@ fn planner_stage_first_dependency_violations_in(source_rel: &str, text: &str) ->
             if logical {
                 planner_physical
                     || planner_distributed
+                    || planner_pipeline
                     || optimizer
                     || (planner_bridge && !planner_bridge_property)
                     || (codegen && !codegen_helpers)
             } else if physical {
                 planner_logical
                     || planner_distributed
+                    || planner_pipeline
                     || (optimizer && !optimizer_options)
                     || codegen
                     || planner_bridge
             } else if distributed {
                 planner_logical_build
+                    || planner_pipeline
                     || optimizer
                     || codegen
                     || (planner_bridge && !planner_bridge_property)
+            } else if optimizer_bridge {
+                planner_distributed || planner_pipeline || codegen
+            } else if pipeline {
+                planner_logical || planner_bridge || planner_pipeline || optimizer || codegen
             } else {
                 planner_logical
                     || planner_bridge
                     || planner_physical
                     || planner_distributed
+                    || planner_pipeline
                     || optimizer
                     || codegen
             }
@@ -4954,7 +4967,27 @@ fn planner_stage_first_dependency_detector_covers_bypasses() {
         ),
         (
             "src/sql/planner/distributed/build/lowering.rs",
-            "use crate::sql::planner::optimizer_bridge::distributed::Bridge;",
+            "use crate::sql::planner::optimizer_bridge::to_physical_plan;",
+        ),
+        (
+            "src/sql/planner/optimizer_bridge/distributed.rs",
+            "use crate::sql::{optimizer::Optimizer, planner::{logical::Node, physical::Physical, distributed::Plan}};",
+        ),
+        (
+            "src/sql/planner/pipeline/mod.rs",
+            "use crate::sql::optimizer::OptimizerPhysicalNode;",
+        ),
+        (
+            "src/sql/planner/pipeline/mod.rs",
+            "use crate::sql::planner::optimizer_bridge::to_physical_plan;",
+        ),
+        (
+            "src/sql/planner/physical/node.rs",
+            "use crate::sql::planner::pipeline::build_distributed_plan;",
+        ),
+        (
+            "src/sql/planner/payload.rs",
+            "use crate::sql::planner::pipeline::build_distributed_plan;",
         ),
         (
             "src/sql/planner/payload.rs",
@@ -5017,8 +5050,8 @@ enum Demo {
             "use crate::sql::planner::distributed::DistributedPlan;",
         ),
         (
-            "src/sql/planner/optimizer_bridge/distributed.rs",
-            "use crate::sql::{optimizer::Optimizer, planner::{logical::Node, physical::Physical, distributed::Plan}};",
+            "src/sql/planner/pipeline/mod.rs",
+            "use crate::sql::planner::{physical::PhysicalPlanNode, distributed::DistributedPlan};",
         ),
         (
             "src/sql/planner/imv_rewrite/entrypoint.rs",
@@ -6964,12 +6997,16 @@ fn planner_logical_ir_and_payload_have_stage_owners() {
 #[test]
 fn optimizer_bridge_is_the_only_allowlisted_converter() {
     let bridge = src_dir().join("sql/planner/optimizer_bridge/physical.rs");
+    let root = src_dir().join("sql/planner/optimizer_bridge/mod.rs");
     assert!(bridge.exists(), "Bridge 2a must exist at {}", rel(&bridge));
     let text = fs::read_to_string(&bridge).unwrap();
+    let root = fs::read_to_string(&root).unwrap();
     assert!(
         text.contains("crate::sql::optimizer"),
         "Bridge 2a should be the explicit optimizer-to-planner conversion boundary"
     );
+    assert!(root.contains("pub(crate) fn to_physical_plan"));
+    assert!(!root.contains("mod distributed"));
 }
 
 #[test]

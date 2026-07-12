@@ -1406,19 +1406,18 @@ mod tests {
         let catalog = crate::engine::catalog::InMemoryCatalog::default();
         let connectors = crate::connector::ConnectorRegistry::default();
 
-        let result = crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
-            &physical,
-        )
-        .and_then(|dp| {
-            crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
-                crate::sql::codegen::FragmentBuildRequest::result(
-                    &dp,
-                    &catalog,
-                    &connectors,
-                    None,
-                ),
-            )
-        });
+        let result = crate::sql::planner::optimizer_bridge::to_physical_plan(&physical)
+            .and_then(crate::sql::planner::pipeline::build_distributed_plan)
+            .and_then(|dp| {
+                crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
+                    crate::sql::codegen::FragmentBuildRequest::result(
+                        &dp,
+                        &catalog,
+                        &connectors,
+                        None,
+                    ),
+                )
+            });
 
         if let Err(err) = result {
             assert!(

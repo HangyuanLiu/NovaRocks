@@ -1569,12 +1569,8 @@ mod tests {
     fn build_distributed_plan(plan: &OptimizerPhysicalNode) -> Result<DistributedPlan, String> {
         let mut plan = plan.clone();
         prepare_bridge2_test_props(&mut plan);
-        let mut physical =
-            crate::sql::planner::optimizer_bridge::physical::optimizer_physical_to_plan(&plan)?;
-        crate::sql::planner::physical::runtime_filter_placement::place_runtime_filters(
-            &mut physical,
-        );
-        crate::sql::planner::distributed::build::build_distributed_plan(&physical)
+        let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&plan)?;
+        crate::sql::planner::pipeline::build_distributed_plan(physical)
     }
 
     fn prepare_bridge2_test_props(node: &mut OptimizerPhysicalNode) {
