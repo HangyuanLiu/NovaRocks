@@ -58,9 +58,10 @@ pub(crate) fn build_runtime_state(
     profiler: Option<&Profiler>,
 ) -> Result<Arc<RuntimeState>, String> {
     let cache_options = CacheOptions::from_query_options(inputs.query_options.as_ref())?;
-    let spill_config = crate::exec::spill::query_options_wire::spill_config_from_query_options(
-        inputs.query_options.as_ref(),
-    )?;
+    let spill_config = inputs
+        .query_options
+        .as_ref()
+        .and_then(|opts| opts.spill.clone());
     let spill_manager = spill_config
         .as_ref()
         .map(|config| Arc::new(QuerySpillManager::new(config.clone(), profiler)));

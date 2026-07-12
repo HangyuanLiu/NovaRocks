@@ -18,14 +18,14 @@
 
 mod fragment_cut;
 mod lowering;
-mod runtime_filter_wire;
+mod runtime_filter_binding;
 
 use crate::sql::planner::distributed::DistributedPlan;
 use crate::sql::planner::physical::PhysicalPlanNode;
 
 pub(crate) fn build_distributed_plan(plan: &PhysicalPlanNode) -> Result<DistributedPlan, String> {
     let mut cut = fragment_cut::cut(plan)?;
-    runtime_filter_wire::wire(&mut cut.plan.fragments, cut.bindings);
+    runtime_filter_binding::bind_runtime_filters(&mut cut.plan.fragments, cut.bindings);
     Ok(cut.plan)
 }
 

@@ -1124,7 +1124,6 @@ fn nidl_d3g_native_runtime_query_options_do_not_use_thrift_model() {
     let forbidden = [
         "src/runtime/runtime_state.rs",
         "src/cache/mod.rs",
-        "src/exec/spill/query_options_wire.rs",
         "src/runtime/coordinator.rs",
         "src/runtime/native_fragment_wire.rs",
         "src/sql/codegen/proto_encode/instance.rs",
@@ -3594,7 +3593,7 @@ fn distributed_build_mod_surface_detector_rejects_extra_and_non_crate_functions(
     let valid = r#"
 mod fragment_cut;
 mod lowering;
-mod runtime_filter_wire;
+mod runtime_filter_binding;
 
 pub(crate) fn build_distributed_plan() {}
 pub(crate) fn union_distinct_must_be_rewritten_error() {}
@@ -6065,14 +6064,14 @@ fn planner_distributed_build_has_pass_owners() {
     let mod_path = build.join("mod.rs");
     let lowering_path = build.join("lowering.rs");
     let fragment_cut_path = build.join("fragment_cut.rs");
-    let runtime_filter_wire_path = build.join("runtime_filter_wire.rs");
+    let runtime_filter_binding_path = build.join("runtime_filter_binding.rs");
     let tests_path = build.join("tests.rs");
 
     for path in [
         &mod_path,
         &lowering_path,
         &fragment_cut_path,
-        &runtime_filter_wire_path,
+        &runtime_filter_binding_path,
         &tests_path,
     ] {
         assert!(
@@ -6098,14 +6097,14 @@ fn planner_distributed_build_has_pass_owners() {
         BTreeSet::from([
             "fragment_cut".to_string(),
             "lowering".to_string(),
-            "runtime_filter_wire".to_string(),
+            "runtime_filter_binding".to_string(),
         ]),
         "distributed/build/mod.rs must declare exactly three production concerns"
     );
     for declaration in [
         "mod fragment_cut;",
         "mod lowering;",
-        "mod runtime_filter_wire;",
+        "mod runtime_filter_binding;",
     ] {
         assert!(
             has_non_comment_line(&build_mod, declaration),
@@ -6163,8 +6162,8 @@ fn planner_distributed_build_has_pass_owners() {
         ),
         (&lowering_path, fs::read_to_string(&lowering_path).unwrap()),
         (
-            &runtime_filter_wire_path,
-            fs::read_to_string(&runtime_filter_wire_path).unwrap(),
+            &runtime_filter_binding_path,
+            fs::read_to_string(&runtime_filter_binding_path).unwrap(),
         ),
     ];
     let planner_sources = rs_files(&planner)
@@ -6174,9 +6173,9 @@ fn planner_distributed_build_has_pass_owners() {
     for (name, owner) in [
         ("FragmentCutBuilder", &fragment_cut_path),
         ("NodeIdAllocator", &lowering_path),
-        ("RuntimeFilterBindings", &runtime_filter_wire_path),
-        ("RuntimeFilterBuildBinding", &runtime_filter_wire_path),
-        ("RuntimeFilterProbeBinding", &runtime_filter_wire_path),
+        ("RuntimeFilterBindings", &runtime_filter_binding_path),
+        ("RuntimeFilterBuildBinding", &runtime_filter_binding_path),
+        ("RuntimeFilterProbeBinding", &runtime_filter_binding_path),
     ] {
         let declarations = rust_named_declaration_owners(
             &planner_sources,
@@ -6194,9 +6193,9 @@ fn planner_distributed_build_has_pass_owners() {
         ("physical_kind_name", &fragment_cut_path),
         ("lower_fragment_local_node", &lowering_path),
         ("distributed_node_ordering", &lowering_path),
-        ("record", &runtime_filter_wire_path),
-        ("wire", &runtime_filter_wire_path),
-        ("attach_runtime_filters", &runtime_filter_wire_path),
+        ("record", &runtime_filter_binding_path),
+        ("bind_runtime_filters", &runtime_filter_binding_path),
+        ("attach_runtime_filters", &runtime_filter_binding_path),
     ] {
         let declarations = rust_named_declaration_owners(
             &planner_sources,
@@ -6217,8 +6216,8 @@ fn planner_distributed_build_has_pass_owners() {
         "DataSink",
         "RuntimeFilterBuildIntent",
         "RuntimeFilterProbeIntent",
-        "WiredRuntimeFilterBuild",
-        "WiredRuntimeFilterProbe",
+        "BoundRuntimeFilterBuild",
+        "BoundRuntimeFilterProbe",
         "physical.children",
     ] {
         assert!(
@@ -6232,7 +6231,7 @@ fn planner_distributed_build_has_pass_owners() {
         "lowering.rs must not recursively visit the physical tree"
     );
 
-    let runtime_filter_wire = rust_sanitized_production_text(&owners[2].1);
+    let runtime_filter_binding = rust_sanitized_production_text(&owners[2].1);
     for forbidden in [
         "crate::sql::optimizer",
         "crate::sql::codegen",
@@ -6246,8 +6245,8 @@ fn planner_distributed_build_has_pass_owners() {
         "TopN",
     ] {
         assert!(
-            !runtime_filter_wire.contains(forbidden),
-            "runtime_filter_wire.rs must not decide placement/topology or wire protocol: {forbidden}"
+            !runtime_filter_binding.contains(forbidden),
+            "runtime_filter_binding.rs must not decide placement/topology or wire protocol: {forbidden}"
         );
     }
 
@@ -6545,7 +6544,7 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
         ),
         (
             &distributed_owner,
-            &["WiredRuntimeFilterBuild", "WiredRuntimeFilterProbe"][..],
+            &["BoundRuntimeFilterBuild", "BoundRuntimeFilterProbe"][..],
         ),
         (&codegen_owner, &["PlannedRuntimeFilter"][..]),
     ] {
@@ -6568,8 +6567,8 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
     let lifecycle_items = BTreeSet::from([
         "RuntimeFilterBuildIntent",
         "RuntimeFilterProbeIntent",
-        "WiredRuntimeFilterBuild",
-        "WiredRuntimeFilterProbe",
+        "BoundRuntimeFilterBuild",
+        "BoundRuntimeFilterProbe",
         "PlannedRuntimeFilter",
     ]);
     for path in rs_files(&src_dir()) {
@@ -6616,10 +6615,10 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
         !distributed_uses.iter().any(|import| {
             matches!(
                 rust_use_path(import).split("::").last(),
-                Some("WiredRuntimeFilterBuild" | "WiredRuntimeFilterProbe")
+                Some("BoundRuntimeFilterBuild" | "BoundRuntimeFilterProbe")
             )
         }),
-        "distributed/mod.rs must not flat re-export Wired runtime-filter types: {distributed_uses:?}"
+        "distributed/mod.rs must not flat re-export bound runtime-filter types: {distributed_uses:?}"
     );
 
     let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/mod.rs")).unwrap();
@@ -6629,13 +6628,13 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
     );
 
     let distributed_text = fs::read_to_string(&distributed_owner).unwrap();
-    for (wired, intent_type) in [
-        ("WiredRuntimeFilterBuild", "RuntimeFilterBuildIntent"),
-        ("WiredRuntimeFilterProbe", "RuntimeFilterProbeIntent"),
+    for (bound, intent_type) in [
+        ("BoundRuntimeFilterBuild", "RuntimeFilterBuildIntent"),
+        ("BoundRuntimeFilterProbe", "RuntimeFilterProbeIntent"),
     ] {
-        let header = format!("pub(crate) struct {wired} {{");
+        let header = format!("pub(crate) struct {bound} {{");
         let fields = nidl_e4_struct_code_span(&distributed_text, &header)
-            .unwrap_or_else(|| panic!("missing distributed runtime-filter struct {wired}"))
+            .unwrap_or_else(|| panic!("missing distributed runtime-filter struct {bound}"))
             .into_iter()
             .map(|(_, line)| line)
             .collect::<Vec<_>>();
@@ -6643,7 +6642,7 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
             fields
                 .iter()
                 .any(|line| line == &format!("pub intent: {intent_type},")),
-            "{wired} must compose its physical intent: {fields:?}"
+            "{bound} must compose its physical intent: {fields:?}"
         );
         for duplicated in [
             "filter_id",
@@ -6656,26 +6655,26 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
                 !fields
                     .iter()
                     .any(|line| line.starts_with(&format!("pub {duplicated}:"))),
-                "{wired} must not redeclare physical intent field {duplicated}: {fields:?}"
+                "{bound} must not redeclare physical intent field {duplicated}: {fields:?}"
             );
         }
     }
 
-    let builder_path = planner.join("distributed/build/runtime_filter_wire.rs");
+    let builder_path = planner.join("distributed/build/runtime_filter_binding.rs");
     let builder_text = fs::read_to_string(&builder_path).unwrap();
     assert!(
         nidl_e4_function_signature_contains(
             &builder_text,
-            "wire",
+            "bind_runtime_filters",
             "bindings: RuntimeFilterBindings"
         ),
-        "runtime_filter_wire::wire must consume owned RuntimeFilterBindings"
+        "runtime_filter_binding::bind_runtime_filters must consume owned RuntimeFilterBindings"
     );
     let builder_production = rust_sanitized_production_text(&builder_text);
     assert!(
         builder_production.contains("for build in bindings.builds {")
             && builder_production.contains("for probe in bindings.probes {"),
-        "runtime_filter_wire::wire must consume both owned binding Vecs"
+        "runtime_filter_binding::bind_runtime_filters must consume both owned binding Vecs"
     );
 }
 
@@ -9952,6 +9951,566 @@ fn nfe_2_legacy_thrift_emitter_path_violations(root: &Path) -> Vec<String> {
     violations
 }
 
+fn nfe_3_retired_control_plane_term_violations(
+    source: &str,
+    text: &str,
+    forbidden: &[&str],
+) -> Vec<String> {
+    let production = rust_sanitized_production_text(text);
+    forbidden
+        .iter()
+        .filter(|term| production.contains(**term))
+        .map(|term| format!("{source}: retired generated-Thrift control-plane term `{term}`"))
+        .collect()
+}
+
+fn nfe_3_raw_starrocks_idl_violations(source: &str, text: &str) -> Vec<String> {
+    let production = rust_sanitized_production_text(text);
+    let tokens = rust_use_tokens(&production);
+    let imports = rust_production_scoped_use_statements(text);
+    let canonical_paths = rust_production_canonical_paths(text, source);
+    [
+        "crate::thrift",
+        "crate::proto::starrocks",
+        "crate::proto::staros",
+    ]
+    .into_iter()
+    .filter(|term| {
+        let term_tokens = rust_use_tokens(term);
+        tokens
+            .windows(term_tokens.len())
+            .any(|window| window == term_tokens)
+            || imports.iter().any(|import| {
+                let path = rust_use_path(&import.import);
+                path == *term
+                    || path
+                        .strip_prefix(*term)
+                        .is_some_and(|suffix| suffix.starts_with("::"))
+            })
+            || {
+                let term_segments = term.split("::").collect::<Vec<_>>();
+                canonical_paths.iter().any(|path| {
+                    path.len() >= term_segments.len()
+                        && path
+                            .iter()
+                            .zip(&term_segments)
+                            .all(|(actual, expected)| actual == expected)
+                })
+            }
+    })
+    .map(|term| format!("{source}: FE-owned helper references raw StarRocks IDL `{term}`"))
+    .collect()
+}
+
+#[test]
+fn nfe_3_fe_owned_helpers_are_raw_starrocks_idl_free() {
+    let fixture = r#"
+        // crate::thrift in a comment must be ignored.
+        const NOTE: &str = "crate::proto::staros in a string must be ignored";
+        fn ordinary() { let _ = crate :: proto :: starrocks :: StatusPb::default(); }
+        #[cfg(feature = "compat")]
+        fn compat_only() { let _ = crate::thrift::types::TUniqueId::new(1, 2); }
+        #[cfg(test)]
+        fn test_only() { let _ = crate::proto::staros::WorkerInfo::default(); }
+    "#;
+    assert_eq!(
+        nfe_3_raw_starrocks_idl_violations("fixture.rs", fixture),
+        vec![
+            "fixture.rs: FE-owned helper references raw StarRocks IDL `crate::thrift`",
+            "fixture.rs: FE-owned helper references raw StarRocks IDL `crate::proto::starrocks`",
+        ],
+        "the NFE-3 helper guard must retain compat-cfg production items while ignoring comments, strings, and test-only items"
+    );
+
+    let grouped_use_fixture = r#"
+        use crate::{thrift::types::TUniqueId};
+        #[cfg(feature = "compat")]
+        use crate::proto::{starrocks::StatusPb, staros::WorkerInfo};
+        // use crate::{thrift::types::TUniqueId};
+        const NOTE: &str = "use crate::proto::{starrocks::StatusPb};";
+        #[cfg(test)]
+        use crate::{thrift::data::TResultBatch};
+    "#;
+    assert_eq!(
+        nfe_3_raw_starrocks_idl_violations("grouped.rs", grouped_use_fixture),
+        vec![
+            "grouped.rs: FE-owned helper references raw StarRocks IDL `crate::thrift`",
+            "grouped.rs: FE-owned helper references raw StarRocks IDL `crate::proto::starrocks`",
+            "grouped.rs: FE-owned helper references raw StarRocks IDL `crate::proto::staros`",
+        ],
+        "the NFE-3 helper guard must expand ordinary and compat-cfg grouped imports while ignoring grouped imports in comments, strings, and test-only items"
+    );
+
+    let alias_chain_fixture = r#"
+        use crate as root;
+        use root::thrift::types::TUniqueId;
+        #[cfg(feature = "compat")]
+        use crate::proto as wire;
+        #[cfg(feature = "compat")]
+        use wire::{starrocks::StatusPb, staros::WorkerInfo};
+        // use crate as hidden_root; use hidden_root::thrift::types::TUniqueId;
+        const NOTE: &str = "use crate::proto as hidden_wire; use hidden_wire::starrocks::StatusPb;";
+        #[cfg(test)]
+        use crate as test_root;
+        #[cfg(test)]
+        use test_root::thrift::data::TResultBatch;
+    "#;
+    assert_eq!(
+        nfe_3_raw_starrocks_idl_violations("aliases.rs", alias_chain_fixture),
+        vec![
+            "aliases.rs: FE-owned helper references raw StarRocks IDL `crate::thrift`",
+            "aliases.rs: FE-owned helper references raw StarRocks IDL `crate::proto::starrocks`",
+            "aliases.rs: FE-owned helper references raw StarRocks IDL `crate::proto::staros`",
+        ],
+        "the NFE-3 helper guard must resolve ordinary and compat-cfg file-local use aliases while ignoring alias chains in comments, strings, and test-only items"
+    );
+
+    let alias_usage_fixture = r#"
+        use crate as root;
+        fn ordinary(_: root::thrift::types::TUniqueId) {}
+        #[cfg(feature = "compat")]
+        use crate::proto as wire;
+        #[cfg(feature = "compat")]
+        fn compat_only() {
+            let _ = wire::starrocks::StatusPb::default();
+            let _ = wire::staros::WorkerInfo::default();
+        }
+        // fn hidden(_: root::thrift::types::TUniqueId) {}
+        const NOTE: &str = "wire::starrocks::StatusPb";
+        #[cfg(test)]
+        fn test_only(_: root::thrift::types::TUniqueId) {
+            let _ = wire::staros::WorkerInfo::default();
+        }
+    "#;
+    assert_eq!(
+        nfe_3_raw_starrocks_idl_violations("alias_usage.rs", alias_usage_fixture),
+        vec![
+            "alias_usage.rs: FE-owned helper references raw StarRocks IDL `crate::thrift`",
+            "alias_usage.rs: FE-owned helper references raw StarRocks IDL `crate::proto::starrocks`",
+            "alias_usage.rs: FE-owned helper references raw StarRocks IDL `crate::proto::staros`",
+        ],
+        "the NFE-3 helper guard must apply file-local use aliases to production type and expression paths while ignoring alias-qualified paths in comments, strings, and test-only items"
+    );
+
+    let repo = Path::new(manifest_dir());
+    let mut violations = Vec::new();
+    for source in [
+        "src/engine/query_options.rs",
+        "src/engine/dml_change_stream.rs",
+        "src/sql/common/change_stream.rs",
+        "src/runtime/coordinator.rs",
+        "src/runtime/dispatcher.rs",
+        "src/runtime/fragment_exec_params.rs",
+        "src/runtime/scan_range.rs",
+        "src/runtime/native_fragment_wire.rs",
+        "src/sql/codegen/connector_scan_planning.rs",
+        "src/sql/codegen/iceberg_delta_scan_planning.rs",
+        "src/sql/codegen/proto_encode/iceberg_delta_scan.rs",
+        "src/sql/planner/distributed/build/runtime_filter_binding.rs",
+    ] {
+        let text = fs::read_to_string(repo.join(source)).expect(source);
+        violations.extend(nfe_3_raw_starrocks_idl_violations(source, &text));
+    }
+
+    for retired_path in [
+        "src/engine/query_options_wire.rs",
+        "src/exec/spill/query_options_wire.rs",
+    ] {
+        match fs::symlink_metadata(repo.join(retired_path)) {
+            Ok(_) => violations.push(format!("{retired_path}: retired helper file still exists")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => violations.push(format!(
+                "{retired_path}: failed to inspect path metadata: {error}"
+            )),
+        }
+    }
+
+    let common_change_stream = fs::read_to_string(repo.join("src/sql/common/change_stream.rs"))
+        .expect("src/sql/common/change_stream.rs");
+    let common_mod =
+        fs::read_to_string(repo.join("src/sql/common/mod.rs")).expect("src/sql/common/mod.rs");
+    for (source, text) in [
+        ("src/sql/common/change_stream.rs", common_change_stream),
+        ("src/sql/common/mod.rs", common_mod),
+    ] {
+        if rust_sanitized_production_text(&text).contains("branch_kind_from_thrift") {
+            violations.push(format!(
+                "{source}: external Thrift enum adapter must be owned by lower/compat"
+            ));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "NFE-3 FE helper ownership guard failed:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn nfe_3_native_planning_owners_are_named_explicitly() {
+    let repo = Path::new(manifest_dir());
+    let expected_owners = [
+        "src/sql/codegen/connector_scan_planning.rs",
+        "src/sql/codegen/iceberg_delta_scan_planning.rs",
+        "src/sql/codegen/proto_encode/iceberg_delta_scan.rs",
+        "src/sql/planner/distributed/build/runtime_filter_binding.rs",
+    ];
+    let retired_owners = [
+        "src/sql/codegen/connector_scan_wire.rs",
+        "src/sql/codegen/iceberg_delta_scan_wire.rs",
+        "src/sql/planner/distributed/build/runtime_filter_wire.rs",
+    ];
+    let mut violations = Vec::new();
+
+    for source in expected_owners {
+        match fs::symlink_metadata(repo.join(source)) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => violations.push(format!("{source}: expected regular owner file")),
+            Err(error) => violations.push(format!("{source}: missing owner file: {error}")),
+        }
+    }
+    for source in retired_owners {
+        match fs::symlink_metadata(repo.join(source)) {
+            Ok(_) => violations.push(format!("{source}: retired `_wire` owner still exists")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => violations.push(format!("{source}: failed to inspect path: {error}")),
+        }
+    }
+
+    let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/mod.rs")).unwrap();
+    let build_mod =
+        fs::read_to_string(repo.join("src/sql/planner/distributed/build/mod.rs")).unwrap();
+    let proto_mod = fs::read_to_string(repo.join("src/sql/codegen/proto_encode/mod.rs")).unwrap();
+    for (source, text, required) in [
+        (
+            "src/sql/codegen/mod.rs",
+            codegen_mod.as_str(),
+            &[
+                "mod connector_scan_planning;",
+                "mod iceberg_delta_scan_planning;",
+            ][..],
+        ),
+        (
+            "src/sql/planner/distributed/build/mod.rs",
+            build_mod.as_str(),
+            &["mod runtime_filter_binding;"][..],
+        ),
+        (
+            "src/sql/codegen/proto_encode/mod.rs",
+            proto_mod.as_str(),
+            &["mod iceberg_delta_scan;"][..],
+        ),
+    ] {
+        let production = rust_sanitized_production_text(text);
+        for declaration in required {
+            if !compact_line(&production).contains(&compact_line(declaration)) {
+                violations.push(format!("{source}: missing `{declaration}`"));
+            }
+        }
+    }
+    for (source, text) in [
+        ("src/sql/codegen/mod.rs", codegen_mod.as_str()),
+        (
+            "src/sql/planner/distributed/build/mod.rs",
+            build_mod.as_str(),
+        ),
+    ] {
+        let production = rust_sanitized_production_text(text);
+        for retired in [
+            "connector_scan_wire",
+            "iceberg_delta_scan_wire",
+            "runtime_filter_wire",
+        ] {
+            if production.contains(retired) {
+                violations.push(format!("{source}: retired module name `{retired}`"));
+            }
+        }
+    }
+
+    let planning_path = repo.join("src/sql/codegen/connector_scan_planning.rs");
+    let encoder_path = repo.join("src/sql/codegen/proto_encode/plan.rs");
+    if planning_path.is_file() {
+        let planning = fs::read_to_string(&planning_path).unwrap();
+        let encoder = fs::read_to_string(&encoder_path).unwrap();
+        for descriptor in [
+            "StarRocksStorageColumnDescriptor",
+            "StarRocksKeysTypeDescriptor",
+            "StarRocksColumnSchemaDescriptor",
+            "StarRocksTabletSchemaDescriptor",
+            "StarRocksScanSourceDescriptor",
+        ] {
+            if rust_named_type_declaration_count(&planning, descriptor) != 1 {
+                violations.push(format!(
+                    "{}: must own exactly one `{descriptor}` declaration",
+                    rel(&planning_path)
+                ));
+            }
+            if rust_named_type_declaration_count(&encoder, descriptor) != 0 {
+                violations.push(format!(
+                    "{}: encoder must import rather than declare `{descriptor}`",
+                    rel(&encoder_path)
+                ));
+            }
+        }
+    }
+
+    let delta_planning_path = repo.join("src/sql/codegen/iceberg_delta_scan_planning.rs");
+    let delta_encoder_path = repo.join("src/sql/codegen/proto_encode/iceberg_delta_scan.rs");
+    if delta_planning_path.is_file() && delta_encoder_path.is_file() {
+        let planning = fs::read_to_string(&delta_planning_path).unwrap();
+        let encoder = fs::read_to_string(&delta_encoder_path).unwrap();
+        if rust_named_function_declaration_count(&planning, "build_iceberg_delta_scan_runtime_plan")
+            != 1
+        {
+            violations.push(format!(
+                "{}: must own runtime-plan construction",
+                rel(&delta_planning_path)
+            ));
+        }
+        if rust_named_function_declaration_count(&planning, "encode_iceberg_delta_scan_plan_native")
+            != 0
+        {
+            violations.push(format!(
+                "{}: planning owner must not encode Proto",
+                rel(&delta_planning_path)
+            ));
+        }
+        if rust_named_function_declaration_count(&encoder, "encode_iceberg_delta_scan_plan_native")
+            != 1
+        {
+            violations.push(format!(
+                "{}: must own native Proto encoding",
+                rel(&delta_encoder_path)
+            ));
+        }
+    }
+
+    let sql_sources = rs_files(&repo.join("src/sql"))
+        .into_iter()
+        .map(|path| (rel(&path), fs::read_to_string(path).unwrap()))
+        .collect::<Vec<_>>();
+    for retired in [
+        "WiredRuntimeFilterBuild",
+        "WiredRuntimeFilterProbe",
+        "runtime_filter_wire",
+    ] {
+        for (source, text) in &sql_sources {
+            if rust_sanitized_production_text(text).contains(retired) {
+                violations.push(format!("{source}: retired RF owner/symbol `{retired}`"));
+            }
+        }
+    }
+    for (symbol, expected_owner) in [
+        (
+            "BoundRuntimeFilterBuild",
+            "src/sql/planner/distributed/runtime_filter.rs",
+        ),
+        (
+            "BoundRuntimeFilterProbe",
+            "src/sql/planner/distributed/runtime_filter.rs",
+        ),
+        (
+            "bind_runtime_filters",
+            "src/sql/planner/distributed/build/runtime_filter_binding.rs",
+        ),
+    ] {
+        let declarations = sql_sources
+            .iter()
+            .filter_map(|(source, text)| {
+                let count = if symbol == "bind_runtime_filters" {
+                    rust_named_function_declaration_count(text, symbol)
+                } else {
+                    rust_named_type_declaration_count(text, symbol)
+                };
+                (count > 0).then(|| format!("{source} ({count})"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            declarations,
+            vec![format!("{expected_owner} (1)")],
+            "{symbol} must have exactly one explicit owner"
+        );
+    }
+
+    for source in [
+        "src/sql/codegen/connector_scan_planning.rs",
+        "src/sql/codegen/iceberg_delta_scan_planning.rs",
+        "src/sql/planner/distributed/build/runtime_filter_binding.rs",
+    ] {
+        if let Ok(text) = fs::read_to_string(repo.join(source)) {
+            violations.extend(nfe_3_raw_starrocks_idl_violations(source, &text));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "NFE-3 native planning owner guard failed:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn nfe_3_audit_baselines_do_not_reauthorize_retired_paths() {
+    let audit_path = Path::new(manifest_dir()).join("tools/dev/audit_thrift_boundaries.py");
+    let audit = fs::read_to_string(&audit_path).unwrap();
+    let compact = audit.lines().map(compact_line).collect::<String>();
+    let mut violations = Vec::new();
+
+    for retired in [
+        "src/runtime/exec_params.rs",
+        "src/runtime/exec_params_compat.rs",
+        "src/engine/query_options_wire.rs",
+        "src/exec/spill/query_options_wire.rs",
+    ] {
+        let key = format!("\"{retired}\":BaselineEntry(");
+        if compact.contains(&key) {
+            violations.push(format!(
+                "{retired}: retired path must not retain an audit baseline"
+            ));
+        }
+    }
+
+    for (native, owner) in [
+        ("src/engine/dml_change_stream.rs", "B7"),
+        ("src/runtime/coordinator.rs", "control-plane"),
+        ("src/runtime/dispatcher.rs", "control-plane"),
+        ("src/runtime/fragment_exec_params.rs", "control-plane"),
+        ("src/runtime/scan_range.rs", "B5"),
+        ("src/runtime/native_fragment_wire.rs", "control-plane"),
+    ] {
+        let prefix = format!("\"{native}\":BaselineEntry(\"domain-leak\",\"{owner}\",0,");
+        if !compact.contains(&prefix) {
+            violations.push(format!(
+                "{native}: NFE-native owner must have domain-leak/{owner} max_hits=0"
+            ));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "NFE-3 audit baseline guard failed:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn nfe_3_dead_generated_thrift_control_plane_is_absent() {
+    let fixture = r#"
+        // to_compat_exec_params in a comment must be ignored.
+        const NOTE: &str = "compat_exec_params_from_parts in a string must be ignored";
+        fn ordinary() { compat_destination_from_runtime(); }
+        #[cfg(feature = "compat")]
+        fn compat_only() { thrift_scan_range_params_from_native(); }
+        #[cfg(test)]
+        fn test_only() { compat_change_op_slot_id(); }
+    "#;
+    let fixture_violations = nfe_3_retired_control_plane_term_violations(
+        "fixture.rs",
+        fixture,
+        &[
+            "to_compat_exec_params",
+            "compat_exec_params_from_parts",
+            "compat_destination_from_runtime",
+            "thrift_scan_range_params_from_native",
+            "compat_change_op_slot_id",
+        ],
+    );
+    assert_eq!(
+        fixture_violations,
+        vec![
+            "fixture.rs: retired generated-Thrift control-plane term `compat_destination_from_runtime`",
+            "fixture.rs: retired generated-Thrift control-plane term `thrift_scan_range_params_from_native`",
+        ],
+        "the NFE-3 guard must retain compat-cfg production items while ignoring comments, strings, and test-only items"
+    );
+
+    let repo = Path::new(manifest_dir());
+    let mut violations = Vec::new();
+    let thrift_idl = fs::read_to_string(repo.join("idl/compat/thrift/InternalService.thrift"))
+        .expect("read InternalService.thrift");
+    if thrift_idl.lines().any(|line| {
+        line.split("//")
+            .next()
+            .is_some_and(|code| code.contains("novarocks_generated_plan"))
+    }) {
+        violations.push(
+            "idl/compat/thrift/InternalService.thrift: retired field `novarocks_generated_plan`"
+                .to_string(),
+        );
+    }
+
+    for (source, forbidden) in [
+        (
+            "src/service/internal_service.rs",
+            &[
+                "plan_origin_from_request",
+                "PlanOrigin",
+                "novarocks_generated_plan",
+            ][..],
+        ),
+        (
+            "src/lower/compat/fragment.rs",
+            &["PlanOrigin", "NovaRocksGenerated"][..],
+        ),
+        (
+            "src/lower/compat/node/mod.rs",
+            &["PlanOrigin", "NovaRocksGenerated"][..],
+        ),
+        (
+            "src/lower/compat/node/decode.rs",
+            &["PlanOrigin", "NovaRocksGenerated"][..],
+        ),
+        (
+            "src/lower/compat/node/starrocks_scan.rs",
+            &["PlanOrigin", "NovaRocksGenerated"][..],
+        ),
+        (
+            "src/runtime/fragment_exec_params.rs",
+            &[
+                "to_compat_exec_params",
+                "compat_exec_params_from_parts",
+                "compat_destination_from_runtime",
+                "crate::thrift",
+                "crate::proto::starrocks",
+                "crate::proto::staros",
+            ][..],
+        ),
+        (
+            "src/runtime/scan_range.rs",
+            &[
+                "thrift_scan_range_params_from_native",
+                "thrift_hdfs_scan_range_from_native",
+                "thrift_extended_columns_from_native",
+                "compat_change_op_slot_id",
+                "crate::thrift",
+                "crate::proto::starrocks",
+                "crate::proto::staros",
+            ][..],
+        ),
+        (
+            "src/runtime/native_fragment_wire.rs",
+            &[
+                "crate::thrift",
+                "crate::proto::starrocks",
+                "crate::proto::staros",
+            ][..],
+        ),
+        ("src/runtime/endpoint.rs", &["to_network_address"][..]),
+    ] {
+        let text = fs::read_to_string(repo.join(source)).expect(source);
+        violations.extend(nfe_3_retired_control_plane_term_violations(
+            source, &text, forbidden,
+        ));
+    }
+
+    assert!(
+        violations.is_empty(),
+        "NFE-3 retired generated-Thrift control-plane guard failed:\n{}",
+        violations.join("\n")
+    );
+}
+
 #[test]
 fn nfe_2_legacy_thrift_emitters_are_physically_absent() {
     let violations = nfe_2_legacy_thrift_emitter_path_violations(Path::new(manifest_dir()));
@@ -10156,17 +10715,6 @@ fn nidl_d3l_native_mainline_thrift_usage_is_explicitly_allowlisted() {
     }
 
     let compat_allowlist = [
-        (
-            "src/runtime/fragment_exec_params.rs",
-            &[
-                "compat_exec_params_from_parts",
-                "compat_destination_from_runtime",
-            ][..],
-        ),
-        (
-            "src/runtime/scan_range.rs",
-            &["thrift_scan_range_params_from_native"][..],
-        ),
         ("src/runtime/query_options.rs", &["from_thrift"][..]),
         ("src/runtime/runtime_filter_params.rs", &["from_thrift"][..]),
     ];
@@ -12098,7 +12646,7 @@ fn nidl_e3_planner_ir_uses_native_partition_and_runtime_filter_types() {
         "src/sql/planner/distributed/build/mod.rs",
         "src/sql/planner/distributed/build/lowering.rs",
         "src/sql/planner/distributed/build/fragment_cut.rs",
-        "src/sql/planner/distributed/build/runtime_filter_wire.rs",
+        "src/sql/planner/distributed/build/runtime_filter_binding.rs",
         "src/sql/planner/physical/mod.rs",
         "src/sql/planner/physical/node.rs",
         "src/sql/planner/physical/runtime_filter.rs",

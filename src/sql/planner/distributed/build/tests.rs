@@ -5,9 +5,9 @@ use arrow::datatypes::DataType;
 use super::fragment_cut::cut;
 use super::fragment_cut::stream_exchange_output_columns;
 use super::lowering::{NodeIdAllocator, lower_fragment_local_node};
-use super::runtime_filter_wire::{
-    RuntimeFilterBindings, RuntimeFilterBuildBinding as WireBuildBinding,
-    RuntimeFilterProbeBinding as WireProbeBinding, wire,
+use super::runtime_filter_binding::{
+    RuntimeFilterBindings, RuntimeFilterBuildBinding as BuildBinding,
+    RuntimeFilterProbeBinding as ProbeBinding, bind_runtime_filters,
 };
 use super::{build_distributed_plan, union_distinct_must_be_rewritten_error};
 use crate::sql::analysis::cte::CteId;
@@ -431,7 +431,7 @@ fn stream_exchange_output_columns_falls_back_to_requested_when_source_is_empty()
 }
 
 #[test]
-fn build_distributed_plan_wires_runtime_filters_across_redistribute_fragment() {
+fn build_distributed_plan_binds_runtime_filters_across_redistribute_fragment() {
     let filter_id = 77;
     let probe_expr = column_ref_expr(1, "l_k", DataType::Int64, false);
     let build_expr = column_ref_expr(2, "r_k", DataType::Int64, false);
@@ -621,7 +621,7 @@ fn build_distributed_plan_keeps_runtime_filter_probe_on_filter() {
 }
 
 #[test]
-fn wire_runtime_filters_preserves_dedup_skip_empty_targets_and_target_order() {
+fn bind_runtime_filters_preserves_dedup_skip_empty_targets_and_target_order() {
     let mut fragments = vec![
         test_fragment(distributed_values_node(1, 0)),
         test_fragment(distributed_values_node(2, 2)),
@@ -636,7 +636,7 @@ fn wire_runtime_filters_preserves_dedup_skip_empty_targets_and_target_order() {
         test_probe_binding(4, 3, 99),
     ];
 
-    wire(
+    bind_runtime_filters(
         &mut fragments,
         RuntimeFilterBindings {
             builds: build_bindings,
@@ -668,7 +668,7 @@ fn wire_runtime_filters_preserves_dedup_skip_empty_targets_and_target_order() {
 }
 
 #[test]
-fn runtime_filter_wire_seam_preserves_binding_contract() {
+fn runtime_filter_binding_seam_preserves_binding_contract() {
     let mut fragments = vec![
         test_fragment(distributed_values_node(1, 0)),
         test_fragment(distributed_values_node(2, 2)),
@@ -676,19 +676,16 @@ fn runtime_filter_wire_seam_preserves_binding_contract() {
         test_fragment(distributed_values_node(4, 3)),
     ];
     let bindings = RuntimeFilterBindings {
-        builds: vec![
-            test_wire_build_binding(1, 0, 10),
-            test_wire_build_binding(1, 0, 11),
-        ],
+        builds: vec![test_build_binding(1, 0, 10), test_build_binding(1, 0, 11)],
         probes: vec![
-            test_wire_probe_binding(2, 2, 10),
-            test_wire_probe_binding(2, 2, 10),
-            test_wire_probe_binding(3, 1, 10),
-            test_wire_probe_binding(4, 3, 99),
+            test_probe_binding(2, 2, 10),
+            test_probe_binding(2, 2, 10),
+            test_probe_binding(3, 1, 10),
+            test_probe_binding(4, 3, 99),
         ],
     };
 
-    wire(&mut fragments, bindings);
+    bind_runtime_filters(&mut fragments, bindings);
 
     let build_node = &fragments[0].root;
     assert_eq!(build_node.build_runtime_filters.len(), 2);
@@ -1129,7 +1126,7 @@ fn build_distributed_plan_hash_redistribute_creates_exchange_edge() {
 }
 
 #[test]
-fn fragment_cut_seam_preserves_exchange_topology_before_rf_wire() {
+fn fragment_cut_seam_preserves_exchange_topology_before_rf_binding() {
     let filter_id = 91;
     let probe_expr = column_ref_expr(1, "l_k", DataType::Int64, false);
     let build_expr = column_ref_expr(2, "r_k", DataType::Int64, false);
@@ -1211,15 +1208,15 @@ fn fragment_cut_seam_preserves_exchange_topology_before_rf_wire() {
     assert_eq!(cut.bindings.probes[0].intent.filter_id, filter_id);
     assert_eq!(cut.bindings.probes[0].fragment_id, 1);
 
-    fn assert_runtime_filters_unwired(node: &DistributedNode) {
+    fn assert_runtime_filters_unbound(node: &DistributedNode) {
         assert!(node.build_runtime_filters.is_empty());
         assert!(node.probe_runtime_filters.is_empty());
         for child in &node.children {
-            assert_runtime_filters_unwired(child);
+            assert_runtime_filters_unbound(child);
         }
     }
     for fragment in &cut.plan.fragments {
-        assert_runtime_filters_unwired(&fragment.root);
+        assert_runtime_filters_unbound(&fragment.root);
     }
 }
 
@@ -2874,8 +2871,8 @@ fn test_fragment(root: DistributedNode) -> PlanFragment {
     }
 }
 
-fn test_build_binding(node_id: i32, fragment_id: u32, filter_id: i32) -> WireBuildBinding {
-    WireBuildBinding {
+fn test_build_binding(node_id: i32, fragment_id: u32, filter_id: i32) -> BuildBinding {
+    BuildBinding {
         node_id,
         fragment_id,
         intent: RuntimeFilterBuildIntent {
@@ -2888,33 +2885,8 @@ fn test_build_binding(node_id: i32, fragment_id: u32, filter_id: i32) -> WireBui
     }
 }
 
-fn test_probe_binding(node_id: i32, fragment_id: u32, filter_id: i32) -> WireProbeBinding {
-    WireProbeBinding {
-        node_id,
-        fragment_id,
-        intent: RuntimeFilterProbeIntent {
-            filter_id,
-            probe_expr: column_ref_expr(1, "probe", DataType::Int64, false),
-        },
-    }
-}
-
-fn test_wire_build_binding(node_id: i32, fragment_id: u32, filter_id: i32) -> WireBuildBinding {
-    WireBuildBinding {
-        node_id,
-        fragment_id,
-        intent: RuntimeFilterBuildIntent {
-            filter_id,
-            build_expr: column_ref_expr(2, "build", DataType::Int64, false),
-            probe_expr: column_ref_expr(1, "probe", DataType::Int64, false),
-            expr_order: 0,
-            execution_mode: JoinExecutionMode::Partitioned,
-        },
-    }
-}
-
-fn test_wire_probe_binding(node_id: i32, fragment_id: u32, filter_id: i32) -> WireProbeBinding {
-    WireProbeBinding {
+fn test_probe_binding(node_id: i32, fragment_id: u32, filter_id: i32) -> ProbeBinding {
+    ProbeBinding {
         node_id,
         fragment_id,
         intent: RuntimeFilterProbeIntent {

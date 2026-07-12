@@ -92,7 +92,7 @@ mod tests {
             "distributed/build/fragment_cut.rs",
             "distributed/build/lowering.rs",
             "distributed/build/mod.rs",
-            "distributed/build/runtime_filter_wire.rs",
+            "distributed/build/runtime_filter_binding.rs",
         ] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("src/sql/planner")

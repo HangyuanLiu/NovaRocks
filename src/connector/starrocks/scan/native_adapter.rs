@@ -56,7 +56,6 @@ pub(crate) fn prepare_native_starrocks_scan(
             hi: query_id.hi,
             lo: query_id.lo,
         }),
-        None,
         &LakeTableIdentity {
             catalog: source.catalog_name.clone(),
             db_name: scan.database.clone(),

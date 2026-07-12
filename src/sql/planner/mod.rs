@@ -20,7 +20,7 @@
 //! This is a structural transformation that builds a relational algebra tree
 //! from the analyzed query IR. It also owns Bridge 2, which materializes
 //! physical optimizer plans into planner-side distributed plan fragments before
-//! codegen lowers them to Thrift.
+//! codegen encodes them into NovaRocks native fragments.
 
 pub(crate) mod distributed;
 pub(crate) mod imv_rewrite;

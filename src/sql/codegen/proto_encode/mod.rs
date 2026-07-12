@@ -16,6 +16,7 @@
 // under the License.
 
 pub(crate) mod expr;
+mod iceberg_delta_scan;
 pub(crate) mod instance;
 pub(crate) mod plan;
 pub(crate) mod types;
@@ -33,6 +34,7 @@ mod tests {
     use super::{instance, plan};
     use crate::proto::{common, expr};
     use crate::sql::analysis::{ExprKind, SortItem, SubqueryKind, TypedExpr};
+    use crate::sql::codegen::connector_scan_planning as connector_scan;
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::{
         BinOp, LambdaParam, LiteralValue, UnOp, WindowBound, WindowFrame, WindowFrameType,
@@ -1588,17 +1590,17 @@ mod tests {
 
         let descriptors = BTreeMap::from([(
             7,
-            plan::StarRocksScanSourceDescriptor {
+            connector_scan::StarRocksScanSourceDescriptor {
                 catalog_name: "default_catalog".to_string(),
                 db_id: 1,
                 table_id: 2,
                 schema_id: 3,
-                storage_columns: vec![plan::StarRocksStorageColumnDescriptor {
+                storage_columns: vec![connector_scan::StarRocksStorageColumnDescriptor {
                     name: "id".to_string(),
                     unique_id: 11,
                     default_value: Some("42".to_string()),
                 }],
-                tablet_schema: plan::test_starrocks_tablet_schema_descriptor_for_column(
+                tablet_schema: connector_scan::test_starrocks_tablet_schema_descriptor_for_column(
                     3,
                     "id",
                     11,
@@ -1704,13 +1706,13 @@ mod tests {
 
         let descriptors = std::collections::BTreeMap::from([(
             7,
-            plan::StarRocksScanSourceDescriptor {
+            connector_scan::StarRocksScanSourceDescriptor {
                 catalog_name: "default_catalog".to_string(),
                 db_id: 1,
                 table_id: 99,
                 schema_id: 3,
                 storage_columns: Vec::new(),
-                tablet_schema: plan::test_starrocks_tablet_schema_descriptor(3, &[]),
+                tablet_schema: connector_scan::test_starrocks_tablet_schema_descriptor(3, &[]),
             },
         )]);
         let err = plan::encode_node_with_context(
@@ -1757,55 +1759,58 @@ mod tests {
                 },
             ),
         };
-        let valid_column = plan::StarRocksStorageColumnDescriptor {
+        let valid_column = connector_scan::StarRocksStorageColumnDescriptor {
             name: "id".to_string(),
             unique_id: 11,
             default_value: None,
         };
         let invalid = [
             (
-                plan::StarRocksScanSourceDescriptor {
+                connector_scan::StarRocksScanSourceDescriptor {
                     catalog_name: String::new(),
                     db_id: 1,
                     table_id: 2,
                     schema_id: 3,
                     storage_columns: vec![valid_column.clone()],
-                    tablet_schema: plan::test_starrocks_tablet_schema_descriptor_for_column(
-                        3, "id", 11, None,
-                    ),
+                    tablet_schema:
+                        connector_scan::test_starrocks_tablet_schema_descriptor_for_column(
+                            3, "id", 11, None,
+                        ),
                 },
                 "catalog_name",
             ),
             (
-                plan::StarRocksScanSourceDescriptor {
+                connector_scan::StarRocksScanSourceDescriptor {
                     catalog_name: "default_catalog".to_string(),
                     db_id: 1,
                     table_id: 2,
                     schema_id: 0,
                     storage_columns: vec![valid_column.clone()],
-                    tablet_schema: plan::test_starrocks_tablet_schema_descriptor_for_column(
-                        0, "id", 11, None,
-                    ),
+                    tablet_schema:
+                        connector_scan::test_starrocks_tablet_schema_descriptor_for_column(
+                            0, "id", 11, None,
+                        ),
                 },
                 "schema_id must be positive",
             ),
             (
-                plan::StarRocksScanSourceDescriptor {
+                connector_scan::StarRocksScanSourceDescriptor {
                     catalog_name: "default_catalog".to_string(),
                     db_id: 1,
                     table_id: 2,
                     schema_id: 3,
                     storage_columns: vec![
                         valid_column.clone(),
-                        plan::StarRocksStorageColumnDescriptor {
+                        connector_scan::StarRocksStorageColumnDescriptor {
                             name: "flag".to_string(),
                             unique_id: 11,
                             default_value: None,
                         },
                     ],
-                    tablet_schema: plan::test_starrocks_tablet_schema_descriptor_for_column(
-                        3, "id", 11, None,
-                    ),
+                    tablet_schema:
+                        connector_scan::test_starrocks_tablet_schema_descriptor_for_column(
+                            3, "id", 11, None,
+                        ),
                 },
                 "duplicate unique_id 11",
             ),
@@ -1871,7 +1876,6 @@ mod tests {
                         max_float_value: None,
                     },
                 )])),
-                compat_change_op_slot_id: None,
             },
         );
         scan_range.volume_id = Some(13);

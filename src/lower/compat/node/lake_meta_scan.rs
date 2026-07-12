@@ -113,7 +113,6 @@ pub(crate) fn lower_lake_meta_scan_node(
     layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     exec_params: Option<&internal_service::TPlanFragmentExecParams>,
     db_name_hint: Option<&str>,
-    fe_addr: Option<&types::TNetworkAddress>,
 ) -> Result<Lowered, String> {
     if node.num_children != 0 {
         return Err(format!(
@@ -343,7 +342,7 @@ pub(crate) fn lower_lake_meta_scan_node(
         .map(|(tablet_id, _)| *tablet_id)
         .collect::<Vec<_>>();
     let tablet_path_map =
-        resolve_tablet_paths_for_lake_meta_scan(query_id, fe_addr, &table_identity, &tablet_ids)?;
+        resolve_tablet_paths_for_lake_meta_scan(query_id, &table_identity, &tablet_ids)?;
     let properties = lake_scan_object_store_properties(&tablet_path_map)?;
     let object_store_profile = build_native_object_store_profile_from_properties(&properties)?;
     let require_tablet_snapshot = metric_by_slot.values().any(|metric| {

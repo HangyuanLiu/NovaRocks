@@ -29,7 +29,7 @@ use crate::sql::parser::ast::Statement;
 use crate::sql::parser::dialect::StarRocksDialect;
 
 /// Parse SQL into a raw sqlparser AST (no custom AST conversion).
-/// Used by the standalone ThriftPlanBuilder.
+/// Used by standalone analysis and planning paths that consume sqlparser types.
 pub(crate) fn parse_sql_raw(sql: &str) -> Result<sqlparser::ast::Statement, String> {
     raw::parse_sql_raw(sql)
 }

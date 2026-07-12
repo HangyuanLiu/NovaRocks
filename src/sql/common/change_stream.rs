@@ -52,27 +52,6 @@ impl ChangeStreamBranchKind {
     }
 }
 
-#[cfg(feature = "compat")]
-pub(crate) fn branch_kind_from_thrift(
-    value: crate::thrift::data_sinks::TIcebergChangeStreamRouterBranchKind,
-) -> Result<ChangeStreamBranchKind, String> {
-    match value {
-        crate::thrift::data_sinks::TIcebergChangeStreamRouterBranchKind::DELETE_DV => {
-            Ok(ChangeStreamBranchKind::DeleteDv)
-        }
-        crate::thrift::data_sinks::TIcebergChangeStreamRouterBranchKind::REUSE_DATA => {
-            Ok(ChangeStreamBranchKind::ReuseData)
-        }
-        crate::thrift::data_sinks::TIcebergChangeStreamRouterBranchKind::FRESH_DATA => {
-            Ok(ChangeStreamBranchKind::FreshData)
-        }
-        _ => Err(format!(
-            "unsupported Iceberg change-stream router branch kind {}",
-            value.0
-        )),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,41 +79,5 @@ mod tests {
                 data_route: Some(2),
             }
         );
-    }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn from_thrift_accepts_known_branch_kinds() {
-        assert_eq!(
-            branch_kind_from_thrift(
-                crate::thrift::data_sinks::TIcebergChangeStreamRouterBranchKind::DELETE_DV
-            )
-            .expect("DELETE_DV"),
-            ChangeStreamBranchKind::DeleteDv
-        );
-        assert_eq!(
-            branch_kind_from_thrift(
-                crate::thrift::data_sinks::TIcebergChangeStreamRouterBranchKind::REUSE_DATA
-            )
-            .expect("REUSE_DATA"),
-            ChangeStreamBranchKind::ReuseData
-        );
-        assert_eq!(
-            branch_kind_from_thrift(
-                crate::thrift::data_sinks::TIcebergChangeStreamRouterBranchKind::FRESH_DATA
-            )
-            .expect("FRESH_DATA"),
-            ChangeStreamBranchKind::FreshData
-        );
-    }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn from_thrift_rejects_unknown_branch_kind_without_panic() {
-        let err = branch_kind_from_thrift(
-            crate::thrift::data_sinks::TIcebergChangeStreamRouterBranchKind(99),
-        )
-        .expect_err("unknown branch kind");
-        assert!(err.contains("unsupported Iceberg change-stream router branch kind 99"));
     }
 }

@@ -73,11 +73,6 @@ impl RuntimeEndpoint {
     }
 
     #[cfg(feature = "compat")]
-    pub(crate) fn to_network_address(&self) -> types::TNetworkAddress {
-        types::TNetworkAddress::new(self.host.clone(), self.port)
-    }
-
-    #[cfg(feature = "compat")]
     pub(crate) fn from_network_address(addr: &types::TNetworkAddress) -> Result<Self, String> {
         Self::new(addr.hostname.clone(), addr.port)
     }
@@ -190,13 +185,13 @@ mod tests {
 
     #[cfg(feature = "compat")]
     #[test]
-    fn roundtrips_network_address() {
-        let endpoint = RuntimeEndpoint::parse("be-1.internal:8060").expect("endpoint");
-        let addr = endpoint.to_network_address();
+    fn accepts_network_address() {
+        let addr = types::TNetworkAddress::new("be-1.internal".to_string(), 8060);
 
-        let roundtrip = RuntimeEndpoint::from_network_address(&addr).expect("roundtrip");
+        let endpoint = RuntimeEndpoint::from_network_address(&addr).expect("endpoint");
 
-        assert_eq!(roundtrip, endpoint);
+        assert_eq!(endpoint.host(), "be-1.internal");
+        assert_eq!(endpoint.port(), 8060);
     }
 
     #[cfg(feature = "compat")]

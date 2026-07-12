@@ -47,7 +47,7 @@ use crate::lower::common::fragment_runtime::{
 use crate::lower::compat::layout::{
     build_tuple_slot_order, infer_tuple_slot_order, reorder_tuple_slots,
 };
-use crate::lower::compat::node::{Lowered, PlanOrigin, lower_plan};
+use crate::lower::compat::node::{Lowered, lower_plan};
 use crate::lower::compat::type_lowering::{
     native_primitive_type_from_desc, render_schema_from_type_desc,
 };
@@ -318,7 +318,7 @@ fn iceberg_router_input_from_compat(
         .branches
         .iter()
         .map(|branch| {
-            let branch_kind = crate::sql::common::branch_kind_from_thrift(branch.branch_kind)?;
+            let branch_kind = branch_kind_from_thrift(branch.branch_kind)?;
             Ok(IcebergChangeStreamRouterBranchFactoryInput {
                 branch_id: branch.branch_id,
                 branch_kind,
@@ -338,6 +338,28 @@ fn iceberg_router_input_from_compat(
         data_route_slot_id: router.data_route_slot_id,
         branches,
     })
+}
+
+fn branch_kind_from_thrift(
+    value: data_sinks::TIcebergChangeStreamRouterBranchKind,
+) -> Result<crate::sql::common::ChangeStreamBranchKind, String> {
+    use crate::sql::common::ChangeStreamBranchKind;
+
+    match value {
+        data_sinks::TIcebergChangeStreamRouterBranchKind::DELETE_DV => {
+            Ok(ChangeStreamBranchKind::DeleteDv)
+        }
+        data_sinks::TIcebergChangeStreamRouterBranchKind::REUSE_DATA => {
+            Ok(ChangeStreamBranchKind::ReuseData)
+        }
+        data_sinks::TIcebergChangeStreamRouterBranchKind::FRESH_DATA => {
+            Ok(ChangeStreamBranchKind::FreshData)
+        }
+        _ => Err(format!(
+            "unsupported Iceberg change-stream router branch kind {}",
+            value.0
+        )),
+    }
 }
 
 fn iceberg_sink_type_name(t: data_sinks::TDataSinkType) -> &'static str {
@@ -831,7 +853,6 @@ pub(crate) fn execute_fragment(
     backend_num: Option<i32>,
     mem_tracker: Option<std::sync::Arc<crate::runtime::mem_tracker::MemTracker>>,
     typed_result_sink: bool,
-    plan_origin: PlanOrigin,
 ) -> Result<FragmentOutput, String> {
     let runtime_query_opts = runtime_query_options_from_thrift(query_opts)?;
     let runtime_query_opts = apply_query_option_overrides(runtime_query_opts);
@@ -929,7 +950,6 @@ pub(crate) fn execute_fragment(
                 &layout_hints,
                 last_query_id,
                 fe_addr,
-                plan_origin,
             )?
         };
 
@@ -1345,6 +1365,7 @@ mod tests {
 
     use crate::lower::compat::type_lowering::scalar_type_desc;
     use crate::service::result_batch_wire::{ResultSinkFormat, ResultSinkType};
+    use crate::sql::common::ChangeStreamBranchKind;
     use crate::thrift::{
         data_sinks, exprs, internal_service, partitions, plan_nodes, planner, types,
     };
@@ -1376,6 +1397,43 @@ mod tests {
         assert_eq!(
             crate::lower::compat::sink::iceberg::iceberg_sink_mode_for_type(sink_type),
             crate::connector::iceberg::IcebergSinkMode::EqualityDeletes
+        );
+    }
+
+    #[test]
+    fn branch_kind_from_thrift_accepts_known_values() {
+        assert_eq!(
+            super::branch_kind_from_thrift(
+                data_sinks::TIcebergChangeStreamRouterBranchKind::DELETE_DV
+            )
+            .expect("DELETE_DV"),
+            ChangeStreamBranchKind::DeleteDv
+        );
+        assert_eq!(
+            super::branch_kind_from_thrift(
+                data_sinks::TIcebergChangeStreamRouterBranchKind::REUSE_DATA
+            )
+            .expect("REUSE_DATA"),
+            ChangeStreamBranchKind::ReuseData
+        );
+        assert_eq!(
+            super::branch_kind_from_thrift(
+                data_sinks::TIcebergChangeStreamRouterBranchKind::FRESH_DATA
+            )
+            .expect("FRESH_DATA"),
+            ChangeStreamBranchKind::FreshData
+        );
+    }
+
+    #[test]
+    fn branch_kind_from_thrift_rejects_unknown_value_without_panic() {
+        let err =
+            super::branch_kind_from_thrift(data_sinks::TIcebergChangeStreamRouterBranchKind(99))
+                .expect_err("unknown branch kind");
+
+        assert_eq!(
+            err,
+            "unsupported Iceberg change-stream router branch kind 99"
         );
     }
 
@@ -1609,7 +1667,6 @@ mod tests {
             None,
             None,
             false,
-            crate::lower::compat::node::PlanOrigin::StarRocksFeCompatible,
         )
         .expect_err("missing router payload must fail");
 
@@ -1655,7 +1712,6 @@ mod tests {
             None,
             None,
             false,
-            crate::lower::compat::node::PlanOrigin::StarRocksFeCompatible,
         )
         .expect_err("duplicate branch kind must fail");
 

@@ -112,7 +112,6 @@ fn clear_table_identity_name_cache_for_test() {
 
 pub(crate) fn resolve_tablet_paths_for_lake_scan(
     query_id: Option<QueryId>,
-    fe_addr: Option<&types::TNetworkAddress>,
     table: &LakeTableIdentity,
     ranges: &[LakeScanTabletRef],
 ) -> Result<HashMap<i64, String>, String> {
@@ -133,16 +132,15 @@ pub(crate) fn resolve_tablet_paths_for_lake_scan(
             tablet_id: r.tablet_id,
         })
         .collect::<Vec<_>>();
-    resolve_tablet_paths_for_refs(query_id, fe_addr, table, &refs)
+    resolve_tablet_paths_for_refs(query_id, table, &refs)
 }
 
 pub(crate) fn lake_scan_execution_properties(
     query_id: Option<QueryId>,
-    fe_addr: Option<&types::TNetworkAddress>,
     table: &LakeTableIdentity,
     ranges: &[LakeScanTabletRef],
 ) -> Result<BTreeMap<String, String>, String> {
-    let tablet_path_map = resolve_tablet_paths_for_lake_scan(query_id, fe_addr, table, ranges)?;
+    let tablet_path_map = resolve_tablet_paths_for_lake_scan(query_id, table, ranges)?;
     lake_scan_execution_properties_from_paths(ranges, &tablet_path_map)
 }
 
@@ -262,7 +260,6 @@ fn normalize_partition_storage_path(path: &str, tablet_id: i64) -> Result<String
 
 pub(crate) fn resolve_tablet_paths_for_lake_meta_scan(
     query_id: Option<QueryId>,
-    fe_addr: Option<&types::TNetworkAddress>,
     table: &LakeTableIdentity,
     tablet_ids: &[i64],
 ) -> Result<HashMap<i64, String>, String> {
@@ -278,21 +275,19 @@ pub(crate) fn resolve_tablet_paths_for_lake_meta_scan(
             tablet_id: *tablet_id,
         })
         .collect::<Vec<_>>();
-    resolve_tablet_paths_for_refs(query_id, fe_addr, table, &refs)
+    resolve_tablet_paths_for_refs(query_id, table, &refs)
 }
 
 pub(crate) fn resolve_tablet_paths_for_olap_sink(
     query_id: Option<QueryId>,
-    fe_addr: Option<&types::TNetworkAddress>,
     table: &LakeTableIdentity,
     refs: &[LakeTabletPartitionRef],
 ) -> Result<HashMap<i64, String>, String> {
-    resolve_tablet_paths_for_refs(query_id, fe_addr, table, refs)
+    resolve_tablet_paths_for_refs(query_id, table, refs)
 }
 
 fn resolve_tablet_paths_for_refs(
     query_id: Option<QueryId>,
-    _fe_addr: Option<&types::TNetworkAddress>,
     table: &LakeTableIdentity,
     refs: &[LakeTabletPartitionRef],
 ) -> Result<HashMap<i64, String>, String> {
@@ -638,7 +633,7 @@ mod tests {
                 tablet_id: 9_001_002,
             },
         ];
-        let resolved = resolve_tablet_paths_for_refs(None, None, &table, &refs).unwrap();
+        let resolved = resolve_tablet_paths_for_refs(None, &table, &refs).unwrap();
         assert_eq!(resolved.len(), 2);
         assert_eq!(
             resolved.get(&9_001_001),
@@ -671,7 +666,7 @@ mod tests {
                 tablet_id: 9_004_053,
             },
         ];
-        let resolved = resolve_tablet_paths_for_refs(None, None, &table, &refs).unwrap();
+        let resolved = resolve_tablet_paths_for_refs(None, &table, &refs).unwrap();
         assert_eq!(
             resolved.get(&9_004_051),
             Some(&"s3://bucket/root/db1/p1/9004051".to_string())
@@ -702,7 +697,7 @@ mod tests {
                 tablet_id: 9_002_002,
             },
         ];
-        let err = resolve_tablet_paths_for_refs(None, None, &table, &refs).unwrap_err();
+        let err = resolve_tablet_paths_for_refs(None, &table, &refs).unwrap_err();
         assert!(err.contains("after local AddShard cache"), "err={err}");
         assert!(err.contains("9002002"), "err={err}");
     }
@@ -735,7 +730,7 @@ mod tests {
         let refs = vec![LakeTabletPartitionRef {
             tablet_id: 9_003_001,
         }];
-        let resolved = resolve_tablet_paths_for_refs(None, None, &table, &refs).unwrap();
+        let resolved = resolve_tablet_paths_for_refs(None, &table, &refs).unwrap();
         assert_eq!(
             resolved.get(&9_003_001),
             Some(&"s3://bucket/persisted/t9003001".to_string())

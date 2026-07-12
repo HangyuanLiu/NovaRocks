@@ -35,7 +35,7 @@ use crate::sql::planner::physical::{
 use super::lowering::{
     NodeIdAllocator, lower_fragment_local_node, lower_fragment_local_node_with_payload,
 };
-use super::runtime_filter_wire::RuntimeFilterBindings;
+use super::runtime_filter_binding::RuntimeFilterBindings;
 use super::union_distinct_must_be_rewritten_error;
 
 pub(super) struct FragmentCutResult {

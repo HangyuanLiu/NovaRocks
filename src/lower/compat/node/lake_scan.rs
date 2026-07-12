@@ -434,7 +434,7 @@ pub(crate) fn lower_lake_scan_node(
         hi: exec_params.query_id.hi,
         lo: exec_params.query_id.lo,
     });
-    let properties = lake_scan_execution_properties(query_id, fe_addr, &table_identity, &refs)
+    let properties = lake_scan_execution_properties(query_id, &table_identity, &refs)
         .map_err(|e| {
             format!(
                 "LAKE_SCAN_NODE resolve tablet paths failed for catalog={} db_name={} table_name={} db_id={} table_id={} schema_id={}: {}",
