@@ -3379,7 +3379,11 @@ enable_path_style_access = true
         );
         assert_eq!(
             startup_timeout_from_env(Some("180")),
-            std::time::Duration::from_secs(180)
+            std::time::Duration::from_secs(120)
+        );
+        assert_eq!(
+            startup_timeout_from_env(Some(&u64::MAX.to_string())),
+            std::time::Duration::from_secs(120)
         );
         assert_eq!(
             startup_timeout_from_env(Some("bogus")),

@@ -18,6 +18,8 @@
 use crate::types::RunnerConfig;
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
+use mysql::prelude::Queryable;
+use mysql::{Conn as MysqlConn, OptsBuilder};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
@@ -52,6 +54,207 @@ pub(crate) struct CrossProcessRuntime {
     pub(crate) fe_http_port: u16,
     pub(crate) fe_grpc_port: u16,
     pub(crate) fe_mysql_port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BackendTopologyRow {
+    grpc_port: u16,
+    state: String,
+    alive: bool,
+}
+
+const BACKEND_TOPOLOGY_TIMEOUT_CAP: Duration = Duration::from_secs(120);
+const TOPOLOGY_MYSQL_IO_TIMEOUT_CAP: Duration = Duration::from_secs(2);
+const TOPOLOGY_MYSQL_IO_TIMEOUT_MIN: Duration = Duration::from_millis(1);
+const PROCESS_LOG_TAIL_BYTES: usize = 8 * 1024;
+
+fn bounded_backend_topology_timeout(requested: Duration) -> Duration {
+    requested.min(BACKEND_TOPOLOGY_TIMEOUT_CAP)
+}
+
+fn backend_topology_deadline(now: Instant, requested: Duration) -> Instant {
+    now.checked_add(bounded_backend_topology_timeout(requested))
+        .unwrap_or(now)
+}
+
+fn topology_mysql_io_timeout(remaining: Duration) -> Duration {
+    remaining
+        .min(TOPOLOGY_MYSQL_IO_TIMEOUT_CAP)
+        .max(TOPOLOGY_MYSQL_IO_TIMEOUT_MIN)
+}
+
+fn push_bounded_log_line(buffer: &mut String, line: &str, capacity: usize) {
+    if capacity == 0 {
+        buffer.clear();
+        return;
+    }
+    if !buffer.is_empty() {
+        buffer.push('\n');
+    }
+    buffer.push_str(line);
+    if buffer.len() <= capacity {
+        return;
+    }
+    let mut start = buffer.len() - capacity;
+    while start < buffer.len() && !buffer.is_char_boundary(start) {
+        start += 1;
+    }
+    buffer.drain(..start);
+}
+
+fn validate_live_backend_topology(
+    expected_ports: &[u16],
+    rows: &[BackendTopologyRow],
+) -> Result<()> {
+    let expected = expected_ports.len();
+    let live = rows
+        .iter()
+        .filter(|row| row.state == "Live" && row.alive)
+        .count();
+    let mut configured_ports = expected_ports.to_vec();
+    configured_ports.sort_unstable();
+    let mut observed_ports = rows.iter().map(|row| row.grpc_port).collect::<Vec<_>>();
+    observed_ports.sort_unstable();
+    if rows.len() == expected && live == expected && observed_ports == configured_ports {
+        return Ok(());
+    }
+
+    let observed = rows
+        .iter()
+        .map(|row| format!("{}:{}:{}", row.grpc_port, row.state, row.alive))
+        .collect::<Vec<_>>()
+        .join(",");
+    bail!(
+        "SHOW BACKENDS topology is not ready: registered={} expected={}; live={} expected={}; configured_ports={configured_ports:?} observed_ports={observed_ports:?}; rows=[{}]",
+        rows.len(),
+        expected,
+        live,
+        expected,
+        observed
+    )
+}
+
+fn wait_for_live_backend_topology_with<Q, S, H>(
+    expected_ports: &[u16],
+    timeout: Duration,
+    mut process_health: H,
+    mut query: Q,
+    mut sleep: S,
+) -> Result<Vec<BackendTopologyRow>>
+where
+    Q: FnMut(Duration) -> Result<Vec<BackendTopologyRow>>,
+    S: FnMut(Duration),
+    H: FnMut() -> Result<String>,
+{
+    let expected = expected_ports.len();
+    let deadline = backend_topology_deadline(Instant::now(), timeout);
+    loop {
+        process_health().context(
+            "cross-process FE/BE exited before SHOW BACKENDS topology became ready",
+        )?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let io_timeout = topology_mysql_io_timeout(remaining);
+        let last_observation = match query(io_timeout) {
+            Ok(rows) => match validate_live_backend_topology(expected_ports, &rows) {
+                Ok(()) => return Ok(rows),
+                Err(error) => error.to_string(),
+            },
+            Err(error) => format!("SHOW BACKENDS query failed: {error:#}"),
+        };
+
+        if Instant::now() >= deadline {
+            let process_diagnostics = process_health().context(
+                "cross-process FE/BE exited during the bounded SHOW BACKENDS query",
+            )?;
+            bail!(
+                "timed out waiting for SHOW BACKENDS {expected}/{expected} Live; last_observation={last_observation}; {}",
+                process_diagnostics
+            );
+        }
+        sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(100)),
+        );
+    }
+}
+
+fn wait_for_live_backend_topology(
+    mysql_user: &str,
+    runtime: &CrossProcessRuntime,
+    fe_config_path: &Path,
+    be_config_paths: &[PathBuf],
+    fe_process: &mut ProcessGuard,
+    be_processes: &mut [ProcessGuard],
+) -> Result<()> {
+    let expected_ports = runtime.be.iter().map(|be| be.grpc).collect::<Vec<_>>();
+    let expected = expected_ports.len();
+    let host = "127.0.0.1";
+    let port = runtime.fe_mysql_port;
+    let rows = wait_for_live_backend_topology_with(
+        &expected_ports,
+        startup_timeout(),
+        || {
+            process_runtime_diagnostics(
+                fe_process,
+                be_processes,
+                fe_config_path,
+                be_config_paths,
+                runtime,
+            )
+        },
+        |io_timeout| {
+            let builder = OptsBuilder::new()
+                .ip_or_hostname(Some(host))
+                .tcp_port(port)
+                .prefer_socket(false)
+                .user(Some(mysql_user))
+                .tcp_connect_timeout(Some(io_timeout))
+                .read_timeout(Some(io_timeout))
+                .write_timeout(Some(io_timeout));
+            let mut conn = MysqlConn::new(builder)
+                .with_context(|| format!("connect to cross-process FE MySQL at {host}:{port}"))?;
+            let rows: Vec<mysql::Row> = conn
+                .query("SHOW BACKENDS")
+                .context("query SHOW BACKENDS from cross-process FE")?;
+            rows.into_iter()
+                .map(|row| {
+                    let grpc_port = row
+                        .get::<String, usize>(2)
+                        .context("SHOW BACKENDS row missing GrpcPort")?
+                        .parse::<u16>()
+                        .context("parse SHOW BACKENDS GrpcPort")?;
+                    let state = row
+                        .get::<String, usize>(3)
+                        .context("SHOW BACKENDS row missing State")?;
+                    let alive = row
+                        .get::<String, usize>(4)
+                        .context("SHOW BACKENDS row missing Alive")?
+                        .eq_ignore_ascii_case("true");
+                    Ok(BackendTopologyRow {
+                        grpc_port,
+                        state,
+                        alive,
+                    })
+                })
+                .collect()
+        },
+        thread::sleep,
+    )?;
+    let diagnostics = process_runtime_diagnostics(
+        fe_process,
+        be_processes,
+        fe_config_path,
+        be_config_paths,
+        runtime,
+    )?;
+    println!(
+        "cross-process topology barrier PASS: SHOW BACKENDS {}/{} Live; {}",
+        rows.len(),
+        expected,
+        diagnostics
+    );
+    Ok(())
 }
 
 pub(crate) trait ServerHandle: Send {
@@ -408,6 +611,17 @@ impl CrossProcessServerHandle {
                 base_config_path.display()
             )
         })?;
+        let mysql_user = base_config
+            .parse::<Value>()
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("standalone_server")
+                    .and_then(|server| server.get("user"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_else(|| "root".to_string());
 
         let render = |role: ClusterProcessRole, be_index: usize| -> Result<String> {
             match metadata_db_override {
@@ -466,7 +680,7 @@ impl CrossProcessServerHandle {
         let _ = reserved.fe_http_port.release();
         let _ = reserved.fe_grpc_port.release();
         let _ = reserved.fe_mysql_port.release();
-        let fe_process = ProcessGuard::spawn(
+        let mut fe_process = ProcessGuard::spawn(
             &novarocks_bin,
             "fe",
             &fe_config_path,
@@ -478,6 +692,15 @@ impl CrossProcessServerHandle {
             runtime.fe_mysql_port,
             fe_config_path.display()
         );
+        wait_for_live_backend_topology(
+            &mysql_user,
+            &runtime,
+            &fe_config_path,
+            &be_config_paths,
+            &mut fe_process,
+            &mut be_processes,
+        )
+        .context("cross-process backend topology barrier")?;
 
         Ok(Self {
             target_host: "127.0.0.1".to_string(),
@@ -576,7 +799,8 @@ impl Drop for CrossProcessServerHandle {
 
 struct ProcessGuard {
     child: Child,
-    stdout_rx: mpsc::Receiver<String>,
+    readiness_rx: mpsc::Receiver<()>,
+    stdout_buffer: Arc<Mutex<String>>,
     stderr_buffer: Arc<Mutex<String>>,
     _stdout_thread: thread::JoinHandle<()>,
     stderr_thread: Option<thread::JoinHandle<()>>,
@@ -590,15 +814,23 @@ impl ProcessGuard {
 
         let stdout = child.stdout.take().context("capture child stdout")?;
         let stderr = child.stderr.take();
-        let (tx, rx) = mpsc::channel();
+        let (ready_tx, readiness_rx) = mpsc::sync_channel::<()>(1);
+        let ready_marker_for_thread = ready_marker.to_string();
+        let stdout_buffer = Arc::new(Mutex::new(String::new()));
+        let stdout_tail = Arc::clone(&stdout_buffer);
         let stdout_thread = thread::spawn(move || {
             let reader = BufReader::new(stdout);
+            let mut ready_sent = false;
             for line in reader.lines() {
                 let Ok(line) = line else {
                     break;
                 };
-                if tx.send(line).is_err() {
-                    break;
+                if let Ok(mut buffer) = stdout_tail.lock() {
+                    push_bounded_log_line(&mut buffer, &line, PROCESS_LOG_TAIL_BYTES);
+                }
+                if !ready_sent && line.contains(&ready_marker_for_thread) {
+                    let _ = ready_tx.try_send(());
+                    ready_sent = true;
                 }
             }
         });
@@ -612,10 +844,7 @@ impl ProcessGuard {
                         break;
                     };
                     if let Ok(mut buffer) = stderr_buffer.lock() {
-                        if !buffer.is_empty() {
-                            buffer.push('\n');
-                        }
-                        buffer.push_str(&line);
+                        push_bounded_log_line(&mut buffer, &line, PROCESS_LOG_TAIL_BYTES);
                     }
                 }
             })
@@ -623,7 +852,8 @@ impl ProcessGuard {
 
         let mut process = Self {
             child,
-            stdout_rx: rx,
+            readiness_rx,
+            stdout_buffer,
             stderr_buffer,
             _stdout_thread: stdout_thread,
             stderr_thread,
@@ -661,31 +891,26 @@ impl ProcessGuard {
     }
 
     fn wait_for_ready(&mut self, marker: &str) -> Result<()> {
-        let deadline = Instant::now() + startup_timeout();
-        let mut stdout = Vec::new();
+        let deadline = backend_topology_deadline(Instant::now(), startup_timeout());
         loop {
             if let Some(status) = self.child.try_wait()? {
                 self.join_stderr_thread();
+                let stdout = self.read_stdout();
                 let stderr = self.read_stderr();
                 bail!(
                     "{}",
                     format_startup_failure(
                         marker,
                         &format!(
-                            "novarocks exited before readiness marker with status {status}; stdout={stdout:?}; stderr={stderr}"
+                            "novarocks exited before readiness marker with status {status}; stdout_tail={stdout:?}; stderr_tail={stderr}"
                         ),
                         &stderr,
                     )
                 );
             }
 
-            match self.stdout_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(line) => {
-                    if line.contains(marker) {
-                        return Ok(());
-                    }
-                    stdout.push(line);
-                }
+            match self.readiness_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(()) => return Ok(()),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     let status = self.wait_for_exit_after_stdout_disconnect()?;
@@ -694,6 +919,7 @@ impl ProcessGuard {
                         let _ = self.child.wait();
                     }
                     self.join_stderr_thread();
+                    let stdout = self.read_stdout();
                     let stderr = self.read_stderr();
                     let status_detail = match status {
                         Some(status) => format!("; child status={status}"),
@@ -707,7 +933,7 @@ impl ProcessGuard {
                         format_startup_failure(
                             marker,
                             &format!(
-                                "stdout closed before readiness marker{status_detail}; stdout={stdout:?}; stderr={stderr}"
+                                "stdout closed before readiness marker{status_detail}; stdout_tail={stdout:?}; stderr_tail={stderr}"
                             ),
                             &stderr,
                         )
@@ -719,13 +945,14 @@ impl ProcessGuard {
                 let _ = self.child.kill();
                 let _ = self.child.wait();
                 self.join_stderr_thread();
+                let stdout = self.read_stdout();
                 let stderr = self.read_stderr();
                 bail!(
                     "{}",
                     format_startup_failure(
                         marker,
                         &format!(
-                            "timed out waiting for readiness marker; stdout={stdout:?}; stderr={stderr}"
+                            "timed out waiting for readiness marker; stdout_tail={stdout:?}; stderr_tail={stderr}"
                         ),
                         &stderr,
                     )
@@ -734,11 +961,50 @@ impl ProcessGuard {
         }
     }
 
+    fn read_stdout(&self) -> String {
+        self.stdout_buffer
+            .lock()
+            .map(|buffer| buffer.clone())
+            .unwrap_or_default()
+    }
+
     fn read_stderr(&mut self) -> String {
         self.stderr_buffer
             .lock()
             .map(|buffer| buffer.clone())
             .unwrap_or_default()
+    }
+
+    fn runtime_diagnostic(
+        &mut self,
+        label: &str,
+        endpoint: &str,
+        config_path: &Path,
+    ) -> Result<String> {
+        let pid = self.pid();
+        let status = self.child.try_wait().with_context(|| {
+            format!("inspect {label} pid={pid} endpoint={endpoint} process status")
+        })?;
+        let stdout_tail = self
+            .stdout_buffer
+            .lock()
+            .map(|buffer| buffer.clone())
+            .unwrap_or_else(|_| "<stdout lock poisoned>".to_string());
+        let stderr_tail = self
+            .stderr_buffer
+            .lock()
+            .map(|buffer| buffer.clone())
+            .unwrap_or_else(|_| "<stderr lock poisoned>".to_string());
+        match status {
+            Some(status) => bail!(
+                "{label} exited status={status} pid={pid} endpoint={endpoint} config={} stdout_tail={stdout_tail:?} stderr_tail={stderr_tail:?}",
+                config_path.display()
+            ),
+            None => Ok(format!(
+                "{label}=running pid={pid} endpoint={endpoint} config={} stdout_tail={stdout_tail:?} stderr_tail={stderr_tail:?}",
+                config_path.display()
+            )),
+        }
     }
 
     fn wait_for_exit_after_stdout_disconnect(&mut self) -> Result<Option<ExitStatus>> {
@@ -753,6 +1019,60 @@ impl ProcessGuard {
             thread::sleep(Duration::from_millis(10));
         }
     }
+}
+
+fn process_runtime_diagnostics(
+    fe_process: &mut ProcessGuard,
+    be_processes: &mut [ProcessGuard],
+    fe_config_path: &Path,
+    be_config_paths: &[PathBuf],
+    runtime: &CrossProcessRuntime,
+) -> Result<String> {
+    if be_processes.len() != runtime.be.len() || be_config_paths.len() != runtime.be.len() {
+        bail!(
+            "cross-process diagnostic cardinality mismatch: processes={} configs={} endpoints={}",
+            be_processes.len(),
+            be_config_paths.len(),
+            runtime.be.len()
+        );
+    }
+
+    let mut diagnostics = Vec::with_capacity(be_processes.len() + 1);
+    let mut exited = false;
+    match fe_process.runtime_diagnostic(
+        "FE",
+        &format!("mysql://127.0.0.1:{}", runtime.fe_mysql_port),
+        fe_config_path,
+    ) {
+        Ok(diagnostic) => diagnostics.push(diagnostic),
+        Err(error) => {
+            exited = true;
+            diagnostics.push(format!("{error:#}"));
+        }
+    }
+    for (index, ((process, config_path), ports)) in be_processes
+        .iter_mut()
+        .zip(be_config_paths.iter())
+        .zip(runtime.be.iter())
+        .enumerate()
+    {
+        match process.runtime_diagnostic(
+            &format!("BE[{index}]"),
+            &format!("grpc://127.0.0.1:{}", ports.grpc),
+            config_path,
+        ) {
+            Ok(diagnostic) => diagnostics.push(diagnostic),
+            Err(error) => {
+                exited = true;
+                diagnostics.push(format!("{error:#}"));
+            }
+        }
+    }
+    let diagnostics = diagnostics.join("; ");
+    if exited {
+        bail!("cross-process process exited: {diagnostics}");
+    }
+    Ok(diagnostics)
 }
 
 impl Drop for ProcessGuard {
@@ -789,7 +1109,7 @@ pub(crate) fn startup_timeout_from_env(raw: Option<&str>) -> Duration {
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .filter(|secs| *secs > 0)
         .unwrap_or(120);
-    Duration::from_secs(timeout_secs)
+    bounded_backend_topology_timeout(Duration::from_secs(timeout_secs))
 }
 
 struct ReservedBePorts {
@@ -898,6 +1218,234 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn backend_row(grpc_port: u16, state: &str, alive: bool) -> BackendTopologyRow {
+        BackendTopologyRow {
+            grpc_port,
+            state: state.to_string(),
+            alive,
+        }
+    }
+
+    #[test]
+    fn live_backend_topology_requires_exact_configured_count_and_all_live() {
+        let expected = [19070, 19071];
+        let ready = vec![
+            backend_row(19070, "Live", true),
+            backend_row(19071, "Live", true),
+        ];
+        validate_live_backend_topology(&expected, &ready).expect("2/2 Live should pass");
+
+        let extra = vec![
+            backend_row(19070, "Live", true),
+            backend_row(19071, "Live", true),
+            backend_row(19072, "Live", true),
+        ];
+        let err = validate_live_backend_topology(&expected, &extra)
+            .expect_err("an extra registered backend must fail the exact topology");
+        assert!(err.to_string().contains("registered=3 expected=2"), "{err}");
+
+        let registering = vec![
+            backend_row(19070, "Live", true),
+            backend_row(19071, "Registering", false),
+        ];
+        let err = validate_live_backend_topology(&expected, &registering)
+            .expect_err("a non-Live configured backend must fail readiness");
+        assert!(err.to_string().contains("live=1 expected=2"), "{err}");
+        assert!(err.to_string().contains("19071:Registering:false"), "{err}");
+
+        let stale_replacement = vec![
+            backend_row(19070, "Live", true),
+            backend_row(19072, "Live", true),
+        ];
+        let err = validate_live_backend_topology(&expected, &stale_replacement)
+            .expect_err("a stale Live backend must not replace a configured endpoint");
+        assert!(
+            err.to_string()
+                .contains("configured_ports=[19070, 19071] observed_ports=[19070, 19072]"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn backend_topology_barrier_retries_until_general_n_is_live() {
+        let mut attempts = 0;
+        let mut io_timeouts = Vec::new();
+        let snapshot = wait_for_live_backend_topology_with(
+            &[19070, 19071],
+            Duration::from_secs(1),
+            || Ok("fe=running be=[running,running]".to_string()),
+            |io_timeout| {
+                io_timeouts.push(io_timeout);
+                attempts += 1;
+                if attempts == 1 {
+                    Ok(vec![
+                        backend_row(19070, "Live", true),
+                        backend_row(19071, "Registering", false),
+                    ])
+                } else {
+                    Ok(vec![
+                        backend_row(19070, "Live", true),
+                        backend_row(19071, "Live", true),
+                    ])
+                }
+            },
+            |_| {},
+        )
+        .expect("barrier should retry until 2/2 Live");
+
+        assert_eq!(attempts, 2);
+        assert_eq!(snapshot.len(), 2);
+        assert!(
+            io_timeouts
+                .iter()
+                .all(|timeout| *timeout > Duration::ZERO && *timeout <= Duration::from_secs(2)),
+            "unexpected per-attempt MySQL timeouts: {io_timeouts:?}"
+        );
+    }
+
+    #[test]
+    fn backend_topology_barrier_timeout_includes_pid_and_endpoint_diagnostics() {
+        let err = wait_for_live_backend_topology_with(
+            &[19070, 19071, 19072],
+            Duration::ZERO,
+            || Ok("fe_pid=11 be_pids=[21,22,23] fe_mysql=127.0.0.1:29030 be_grpc=[127.0.0.1:19070,127.0.0.1:19071,127.0.0.1:19072]".to_string()),
+            |_| Ok(vec![backend_row(19070, "Live", true)]),
+            |_| {},
+        )
+        .expect_err("incomplete topology must time out");
+
+        let message = format!("{err:#}");
+        assert!(message.contains("timed out waiting for SHOW BACKENDS 3/3 Live"), "{message}");
+        assert!(message.contains("registered=1 expected=3"), "{message}");
+        assert!(message.contains("fe_pid=11"), "{message}");
+        assert!(message.contains("be_pids=[21,22,23]"), "{message}");
+        assert!(message.contains("fe_mysql=127.0.0.1:29030"), "{message}");
+        assert!(message.contains("be_grpc=[127.0.0.1:19070"), "{message}");
+    }
+
+    #[test]
+    fn backend_topology_barrier_fails_before_query_when_a_process_exits() {
+        let mut queries = 0;
+        let err = wait_for_live_backend_topology_with(
+            &[19070],
+            Duration::from_secs(30),
+            || {
+                bail!(
+                    "FE exited status=exit status: 9 pid=11 endpoint=mysql://127.0.0.1:29030 config=/tmp/fe.toml stdout_tail=ready stderr_tail=fatal"
+                )
+            },
+            |_| {
+                queries += 1;
+                Ok(vec![backend_row(19070, "Live", true)])
+            },
+            |_| {},
+        )
+        .expect_err("a dead FE must fail without waiting for the topology timeout");
+
+        assert_eq!(queries, 0, "SHOW BACKENDS must not run after process exit");
+        let message = format!("{err:#}");
+        assert!(message.contains("FE exited status=exit status: 9"), "{message}");
+        assert!(message.contains("config=/tmp/fe.toml"), "{message}");
+        assert!(message.contains("stderr_tail=fatal"), "{message}");
+    }
+
+    #[test]
+    fn backend_topology_timeout_refreshes_process_health_after_query() {
+        let mut health_checks = 0;
+        let err = wait_for_live_backend_topology_with(
+            &[19070],
+            Duration::ZERO,
+            || {
+                health_checks += 1;
+                if health_checks == 1 {
+                    Ok("FE=running before query".to_string())
+                } else {
+                    bail!(
+                        "FE exited post-query status=exit status: 7 pid=11 config=/tmp/fe.toml stderr_tail=post-query-fatal"
+                    )
+                }
+            },
+            |_| Ok(vec![backend_row(19070, "Registering", false)]),
+            |_| {},
+        )
+        .expect_err("timeout must refresh process health after the bounded query");
+
+        assert_eq!(health_checks, 2, "health must be sampled before and after query");
+        let message = format!("{err:#}");
+        assert!(message.contains("FE exited post-query status=exit status: 7"), "{message}");
+        assert!(message.contains("post-query-fatal"), "{message}");
+    }
+
+    #[test]
+    fn topology_timeouts_are_bounded_and_deadline_addition_cannot_panic() {
+        assert_eq!(
+            bounded_backend_topology_timeout(Duration::MAX),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            topology_mysql_io_timeout(Duration::from_secs(30)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            topology_mysql_io_timeout(Duration::from_millis(250)),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            topology_mysql_io_timeout(Duration::ZERO),
+            Duration::from_millis(1)
+        );
+        let now = Instant::now();
+        let deadline = backend_topology_deadline(now, Duration::MAX);
+        assert!(deadline >= now);
+        assert!(deadline.duration_since(now) <= Duration::from_secs(120));
+    }
+
+    #[test]
+    fn process_log_tail_is_bounded_and_keeps_the_latest_lines() {
+        let mut buffer = String::new();
+        push_bounded_log_line(&mut buffer, "first", 16);
+        push_bounded_log_line(&mut buffer, "second", 16);
+        push_bounded_log_line(&mut buffer, "third", 16);
+
+        assert!(buffer.len() <= 16, "buffer={buffer:?}");
+        assert!(buffer.contains("third"), "buffer={buffer:?}");
+        assert!(!buffer.contains("first"), "buffer={buffer:?}");
+    }
+
+    #[test]
+    fn cross_process_launch_runs_show_backends_barrier_after_fe_ready() {
+        let source = include_str!("cluster.rs")
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("production cluster source");
+        let launch = source
+            .split("fn launch_impl(")
+            .nth(1)
+            .expect("launch_impl")
+            .split("fn ensure_be_index")
+            .next()
+            .expect("launch_impl body");
+        let fe_ready = launch
+            .find("let mut fe_process = ProcessGuard::spawn(")
+            .expect("FE spawn");
+        let barrier = launch
+            .find("wait_for_live_backend_topology(")
+            .expect("SHOW BACKENDS topology barrier");
+        let return_handle = launch.find("Ok(Self {").expect("return handle");
+        assert!(fe_ready < barrier, "barrier must run after FE readiness");
+        assert!(barrier < return_handle, "barrier must run before SQL receives the handle");
+        assert!(
+            source.contains("process_runtime_diagnostics("),
+            "barrier must collect live FE/BE process diagnostics"
+        );
+        assert!(
+            source.contains(".tcp_connect_timeout(Some(io_timeout))")
+                && source.contains(".read_timeout(Some(io_timeout))")
+                && source.contains(".write_timeout(Some(io_timeout))"),
+            "SHOW BACKENDS MySQL connection must use bounded IO timeouts"
+        );
+    }
+
     #[test]
     fn process_guard_declares_drop_cleanup() {
         assert!(include_str!("cluster.rs").contains("impl Drop for ProcessGuard"));
@@ -916,6 +1464,32 @@ mod tests {
         assert!(
             source.contains("self.join_stderr_thread();"),
             "wait_for_ready should join stderr thread before reading stderr"
+        );
+    }
+
+    #[test]
+    fn process_guard_readiness_channel_is_bounded_and_one_shot() {
+        let source = include_str!("cluster.rs")
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("source before tests");
+        assert!(
+            source.contains("mpsc::sync_channel::<()>(1)"),
+            "readiness signal must use a one-slot bounded channel"
+        );
+        assert!(
+            !source.contains("mpsc::channel()"),
+            "stdout lines must not accumulate in an unbounded channel"
+        );
+        assert!(
+            source.contains("if !ready_sent && line.contains(&ready_marker_for_thread)")
+                && source.contains("let _ = ready_tx.try_send(());")
+                && source.contains("ready_sent = true;"),
+            "stdout reader must signal readiness at most once"
+        );
+        assert!(
+            source.contains("push_bounded_log_line(&mut buffer, &line, PROCESS_LOG_TAIL_BYTES)"),
+            "stdout reader must keep draining into the bounded tail after readiness"
         );
     }
 
