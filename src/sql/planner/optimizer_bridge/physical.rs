@@ -908,6 +908,14 @@ mod tests {
     }
 
     #[test]
+    fn public_bridge_entry_verifies_and_materializes_optimizer_physical_plan() {
+        let physical = super::super::to_physical_plan(&values_node())
+            .expect("public optimizer bridge should convert");
+        assert!(matches!(physical.kind, PhysicalPlanKind::Values(_)));
+        assert!(physical.probe_runtime_filters.is_empty());
+    }
+
+    #[test]
     fn physical_scan_output_columns_follow_required_columns() {
         let columns = vec![output_column(1, "k"), output_column(2, "s")];
         let mut node = base_node(Operator::PhysicalScan(ScanOp {

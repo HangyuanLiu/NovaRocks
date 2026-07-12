@@ -21,3 +21,11 @@ pub(crate) mod physical;
 pub(crate) mod plan;
 pub(crate) mod property;
 pub(crate) mod scalar;
+
+use crate::sql::optimizer::OptimizerPhysicalNode;
+use crate::sql::planner::physical::PhysicalPlanNode;
+
+pub(crate) fn to_physical_plan(plan: &OptimizerPhysicalNode) -> Result<PhysicalPlanNode, String> {
+    id_binding::verify_optimizer_id_binding(plan)?;
+    physical::optimizer_physical_to_plan(plan)
+}
