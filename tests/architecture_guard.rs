@@ -17371,6 +17371,68 @@ fn coor_4_dead_write_compat_ingress_is_deleted_and_real_fe_path_remains() {
 }
 
 #[test]
+fn coor_4_write_operation_mapping_is_engine_owned() {
+    let repo = Path::new(manifest_dir());
+    let engine_path = repo.join("src/engine/write_operation_lifecycle.rs");
+    let retired = repo.join(["src/runtime/", "write_operation_lifecycle.rs"].concat());
+    assert!(
+        !retired.exists(),
+        "runtime operation mapping owner must be retired"
+    );
+    let engine = rust_sanitized_production_text(
+        &fs::read_to_string(engine_path).expect("read engine write lifecycle"),
+    );
+    for required in [
+        "pub(crate) struct WriteOperationContext",
+        "pub(crate) fn operation_request_from_write_commit",
+        "pub(crate) fn operation_fact_update_from_write_abort",
+        "pub(crate) fn create_writer_operation_from_commit",
+        "pub(crate) fn record_writer_abort_fact",
+    ] {
+        assert!(
+            engine.contains(required),
+            "engine lifecycle missing {required}"
+        );
+    }
+
+    let coordinator_write_files = rs_files(&repo.join("src/coordinator/write"));
+    assert_eq!(
+        coordinator_write_files.len(),
+        2,
+        "coordinator write metadata scan must cover the exact owner tree"
+    );
+    for path in coordinator_write_files {
+        let relative = rel(&path);
+        let production = rust_sanitized_production_text(
+            &fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {relative}: {err}")),
+        );
+        for forbidden in [
+            "CreateIcebergOperationRequest",
+            "IcebergOperationFactUpdate",
+            "IcebergOperationRepository",
+            "metadata_provider",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "{relative} leaks engine metadata lifecycle term {forbidden}"
+            );
+        }
+    }
+
+    let retired_module = ["runtime::", "write_operation_lifecycle"].concat();
+    for path in rs_files(&repo.join("src")) {
+        let relative = rel(&path);
+        let production = rust_sanitized_production_text(
+            &fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {relative}: {err}")),
+        );
+        assert!(
+            !production.contains(&retired_module),
+            "{relative} references retired module path {retired_module}"
+        );
+    }
+}
+
+#[test]
 fn coor_2_thrift_audit_scans_coordinator_owners() {
     let repo = Path::new(manifest_dir());
     let audit_path = repo.join("tools/dev/audit_thrift_boundaries.py");
