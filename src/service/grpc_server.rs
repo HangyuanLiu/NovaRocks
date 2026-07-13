@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
@@ -44,11 +44,13 @@ use crate::common::engine_error::EngineError;
 use crate::common::types::format_uuid;
 #[cfg(feature = "compat")]
 use crate::connector::starrocks::starmgr;
+use crate::coordinator::ports::CoordinatorReportHandler;
 #[cfg(feature = "compat")]
 use crate::novarocks_logging::warn;
 use crate::novarocks_logging::{error, info};
 #[cfg(feature = "compat")]
 use crate::runtime::starlet_shard_registry;
+use crate::service::grpc_coordinator_adapter::LegacyCoordinatorReportHandler;
 use crate::service::internal_rpc;
 #[cfg(feature = "compat")]
 use crate::service::stream_load_http;
@@ -79,9 +81,18 @@ fn grpc_server_state() -> &'static Mutex<GrpcServerState> {
     STATE.get_or_init(|| Mutex::new(GrpcServerState::default()))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct GrpcService {
     allow_local_execution: bool,
+    report_handler: Arc<dyn CoordinatorReportHandler>,
+}
+
+impl std::fmt::Debug for GrpcService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GrpcService")
+            .field("allow_local_execution", &self.allow_local_execution)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for GrpcService {
@@ -92,14 +103,28 @@ impl Default for GrpcService {
 
 impl GrpcService {
     pub fn full_execution() -> Self {
+        Self::full_execution_with_report_handler(Arc::new(LegacyCoordinatorReportHandler))
+    }
+
+    pub(crate) fn full_execution_with_report_handler(
+        report_handler: Arc<dyn CoordinatorReportHandler>,
+    ) -> Self {
         Self {
             allow_local_execution: true,
+            report_handler,
         }
     }
 
     pub fn report_only() -> Self {
+        Self::report_only_with_report_handler(Arc::new(LegacyCoordinatorReportHandler))
+    }
+
+    pub(crate) fn report_only_with_report_handler(
+        report_handler: Arc<dyn CoordinatorReportHandler>,
+    ) -> Self {
         Self {
             allow_local_execution: false,
+            report_handler,
         }
     }
 
@@ -441,11 +466,12 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         request: tonic::Request<proto::novarocks::ReportExecStatusRequest>,
     ) -> Result<tonic::Response<proto::novarocks::ReportExecStatusResponse>, tonic::Status> {
         let report = request.into_inner().report;
+        let report_handler = Arc::clone(&self.report_handler);
         let result = tokio::task::spawn_blocking(move || {
             let report = report.ok_or_else(|| {
                 EngineError::protocol_decode("ReportExecStatusRequest missing report")
             })?;
-            handle_native_standalone_report_exec_status(report)?;
+            report_handler.handle_exec_status_report(report)?;
             Ok::<(), EngineError>(())
         })
         .await
@@ -477,9 +503,10 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
     ) -> Result<tonic::Response<proto::novarocks::BatchReportExecStatusResponse>, tonic::Status>
     {
         let reports = request.into_inner().reports;
+        let report_handler = Arc::clone(&self.report_handler);
         let result = tokio::task::spawn_blocking(move || {
             for report in reports {
-                handle_native_standalone_report_exec_status(report)?;
+                report_handler.handle_exec_status_report(report)?;
             }
             Ok::<(), EngineError>(())
         })
@@ -512,125 +539,6 @@ fn emit_grpc_typed_fetch_marker(status: i32) {
         println!("NOVAROCKS_GRPC_FETCH_TYPED status={status}");
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
-}
-
-fn handle_native_standalone_report_exec_status(
-    report: proto::novarocks::ExecStatusReport,
-) -> Result<(), EngineError> {
-    let failure = failed_query_from_native_report(&report).map_err(EngineError::protocol_decode)?;
-    let profile_report_accepted =
-        crate::runtime::coordinator::record_native_standalone_query_profile_report(&report)
-            .map_err(EngineError::protocol_decode)?;
-    match crate::runtime::write_coordinator::lookup_native_writer_report(&report)
-        .map_err(EngineError::protocol_decode)?
-    {
-        crate::runtime::write_coordinator::WriterReportLookup::Expected => {
-            let result = crate::runtime::write_report::report_from_native(report)
-                .map_err(EngineError::protocol_decode)
-                .and_then(crate::runtime::write_coordinator::handle_fragment_report_exec_status);
-            match result {
-                Ok(_) => Ok(()),
-                Err(err) => {
-                    if let Some(failure) = failure {
-                        mark_failed_query_report(failure);
-                    }
-                    Err(err)
-                }
-            }
-        }
-        crate::runtime::write_coordinator::WriterReportLookup::UnknownWriter { query_id } => {
-            if !report.iceberg_commits.is_empty() {
-                let message = format!(
-                    "unknown writer report with write metadata for query {}/{}, fragment {}/{}, backend {}",
-                    query_id.hi,
-                    query_id.lo,
-                    report
-                        .fragment_instance_id
-                        .as_ref()
-                        .map(|id| id.hi)
-                        .unwrap_or_default(),
-                    report
-                        .fragment_instance_id
-                        .as_ref()
-                        .map(|id| id.lo)
-                        .unwrap_or_default(),
-                    report.backend_num,
-                );
-                crate::runtime::write_coordinator::mark_query_failed(&query_id, message.clone());
-                return Err(EngineError::distributed_write_output_mismatch(
-                    "reportExecStatus",
-                    message,
-                ));
-            }
-            if let Some(failure) = failure {
-                crate::runtime::write_coordinator::mark_query_failed(
-                    &query_id,
-                    failure.error.clone(),
-                );
-                mark_failed_query_report(failure);
-            }
-            Ok(())
-        }
-        crate::runtime::write_coordinator::WriterReportLookup::UnknownQuery { query_id } => {
-            if let Some(failure) = failure {
-                mark_failed_query_report(failure);
-                Ok(())
-            } else if profile_report_accepted {
-                Ok(())
-            } else {
-                Err(EngineError::write_coordinator_gone(query_id))
-            }
-        }
-    }
-}
-
-struct FailedQueryReport {
-    query_id: crate::runtime::query_context::QueryId,
-    finst_id: crate::common::types::UniqueId,
-    error: String,
-}
-
-fn failed_query_from_native_report(
-    report: &proto::novarocks::ExecStatusReport,
-) -> Result<Option<FailedQueryReport>, String> {
-    let Some(status) = report.status.as_ref() else {
-        return Ok(None);
-    };
-    if status.code == 0 {
-        return Ok(None);
-    }
-    let query = report
-        .query_id
-        .as_ref()
-        .ok_or_else(|| "ExecStatusReport missing query_id".to_string())?;
-    let finst = report
-        .fragment_instance_id
-        .as_ref()
-        .ok_or_else(|| "ExecStatusReport missing fragment_instance_id".to_string())?;
-    let error = if status.message.is_empty() {
-        format!("status={}", status.code)
-    } else {
-        status.message.clone()
-    };
-    Ok(Some(FailedQueryReport {
-        query_id: crate::runtime::query_context::QueryId {
-            hi: query.hi,
-            lo: query.lo,
-        },
-        finst_id: crate::common::types::UniqueId {
-            hi: finst.hi,
-            lo: finst.lo,
-        },
-        error,
-    }))
-}
-
-fn mark_failed_query_report(report: FailedQueryReport) {
-    crate::service::fragment_control::mark_query_failed_from_report(
-        report.query_id,
-        report.finst_id,
-        report.error,
-    );
 }
 
 #[cfg(feature = "compat")]
@@ -1371,13 +1279,47 @@ mod pr3_tests {
     use super::proto::novarocks::fetch_result_response::Status as FetchStatus;
     use super::proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc as _;
     use super::proto::novarocks::{
-        CancelFragmentRequest, ExchangeRequest, ExecStatusReport, FetchResultRequest,
-        HeartbeatRequest, IcebergCommitInfo, IcebergDataFile, IcebergFileContent,
-        ReportExecStatusRequest, SubmitFragmentRequest,
+        BatchReportExecStatusRequest, CancelFragmentRequest, ExchangeRequest, ExecStatusReport,
+        FetchResultRequest, HeartbeatRequest, IcebergCommitInfo, IcebergDataFile,
+        IcebergFileContent, ReportExecStatusRequest, SubmitFragmentRequest,
     };
     use super::proto::{novarocks, plan};
+    use crate::common::engine_error::EngineError;
     use crate::common::types::UniqueId;
+    use crate::coordinator::ports::CoordinatorReportHandler;
+    use std::sync::{Arc, Mutex};
     use tonic::Request;
+
+    struct CapturingReportHandler {
+        reports: Mutex<Vec<ExecStatusReport>>,
+        error: Option<EngineError>,
+    }
+
+    impl CapturingReportHandler {
+        fn accepting() -> Self {
+            Self {
+                reports: Mutex::new(Vec::new()),
+                error: None,
+            }
+        }
+
+        fn failing(error: EngineError) -> Self {
+            Self {
+                reports: Mutex::new(Vec::new()),
+                error: Some(error),
+            }
+        }
+    }
+
+    impl CoordinatorReportHandler for CapturingReportHandler {
+        fn handle_exec_status_report(&self, report: ExecStatusReport) -> Result<(), EngineError> {
+            self.reports.lock().expect("capture reports").push(report);
+            match &self.error {
+                Some(error) => Err(error.clone()),
+                None => Ok(()),
+            }
+        }
+    }
 
     fn id(hi: i64, lo: i64) -> UniqueId {
         UniqueId { hi, lo }
@@ -1674,6 +1616,69 @@ mod pr3_tests {
         assert_ne!(body.status_code, 0);
         assert_eq!(body.error_code, "ProtocolDecodeError");
         assert!(body.message.contains("missing report"), "{}", body.message);
+    }
+
+    #[tokio::test]
+    async fn report_exec_status_forwards_complete_report_to_injected_handler() {
+        let report = write_report(id(901, 902), id(903, 904));
+        let handler = Arc::new(CapturingReportHandler::accepting());
+        let svc = GrpcService::full_execution_with_report_handler(handler.clone());
+
+        let body = svc
+            .report_exec_status(Request::new(ReportExecStatusRequest {
+                report: Some(report.clone()),
+            }))
+            .await
+            .expect("RPC level success")
+            .into_inner();
+
+        assert_eq!(body.status_code, super::REPORT_EXEC_STATUS_OK);
+        let captured = handler.reports.lock().expect("captured reports");
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0], report);
+    }
+
+    #[tokio::test]
+    async fn batch_report_exec_status_preserves_handler_order() {
+        let first = ok_report(id(911, 912), id(913, 914));
+        let second = write_report(id(921, 922), id(923, 924));
+        let handler = Arc::new(CapturingReportHandler::accepting());
+        let svc = GrpcService::report_only_with_report_handler(handler.clone());
+
+        let body = svc
+            .batch_report_exec_status(Request::new(BatchReportExecStatusRequest {
+                reports: vec![first.clone(), second.clone()],
+            }))
+            .await
+            .expect("RPC level success")
+            .into_inner();
+
+        assert_eq!(body.status_code, super::REPORT_EXEC_STATUS_OK);
+        let captured = handler.reports.lock().expect("captured reports");
+        assert_eq!(captured.as_slice(), &[first, second]);
+    }
+
+    #[tokio::test]
+    async fn report_exec_status_maps_injected_engine_error() {
+        let query_id = id(931, 932);
+        let expected = EngineError::write_coordinator_gone(query_id);
+        let handler = Arc::new(CapturingReportHandler::failing(expected.clone()));
+        let svc = GrpcService::full_execution_with_report_handler(handler.clone());
+        let report = ok_report(query_id, id(933, 934));
+
+        let body = svc
+            .report_exec_status(Request::new(ReportExecStatusRequest {
+                report: Some(report.clone()),
+            }))
+            .await
+            .expect("RPC level success")
+            .into_inner();
+
+        assert_eq!(body.status_code, expected.to_report_status_code());
+        assert_eq!(body.message, expected.to_user_message());
+        assert_eq!(body.error_code, expected.to_report_error_code());
+        let captured = handler.reports.lock().expect("captured reports");
+        assert_eq!(captured.as_slice(), &[report]);
     }
 
     #[tokio::test]

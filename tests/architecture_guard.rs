@@ -17001,3 +17001,22 @@ fn coor_1_runtime_coordinator_has_only_injected_service_ports() {
     assert!(ports.contains("pub(crate) struct CoordinatorExecutionPorts"));
     assert!(ports.contains("pub(crate) trait CoordinatorObserver"));
 }
+
+#[test]
+fn coor_1_grpc_report_ingress_uses_coordinator_port() {
+    let repo = Path::new(manifest_dir());
+    let grpc =
+        fs::read_to_string(repo.join("src/service/grpc_server.rs")).expect("read grpc server");
+    let grpc = rust_sanitized_production_text(&grpc);
+    assert!(grpc.contains("CoordinatorReportHandler"));
+    for forbidden in [
+        "runtime::coordinator::record_native_standalone_query_profile_report",
+        "runtime::write_coordinator::lookup_native_writer_report",
+        "runtime::write_coordinator::handle_fragment_report_exec_status",
+    ] {
+        assert!(
+            !grpc.contains(forbidden),
+            "gRPC transport owns runtime report logic: {forbidden}"
+        );
+    }
+}

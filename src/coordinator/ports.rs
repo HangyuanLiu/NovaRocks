@@ -24,6 +24,13 @@ pub(crate) trait CoordinatorObserver: Send + Sync + 'static {
     fn fragment_scheduled(&self);
 }
 
+pub(crate) trait CoordinatorReportHandler: Send + Sync + 'static {
+    fn handle_exec_status_report(
+        &self,
+        report: crate::proto::novarocks::ExecStatusReport,
+    ) -> Result<(), crate::common::engine_error::EngineError>;
+}
+
 pub(crate) struct CoordinatorExecutionPorts {
     pub(crate) dispatcher: Arc<dyn FragmentDispatcher>,
     pub(crate) report_endpoint: RuntimeEndpoint,
