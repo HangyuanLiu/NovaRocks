@@ -58,6 +58,29 @@ impl Coverage {
 
         Ok(())
     }
+
+    pub(crate) fn is_canonically_equivalent_to(&self, other: &Self) -> bool {
+        CanonicalCoverage::from(self) == CanonicalCoverage::from(other)
+    }
+
+    pub(crate) fn witness_ids_in_order(&self) -> Vec<CoverageWitnessId> {
+        let mut witness_ids = BTreeSet::new();
+        self.collect_witness_ids(&mut witness_ids);
+        witness_ids.into_iter().collect()
+    }
+
+    fn collect_witness_ids(&self, witness_ids: &mut BTreeSet<CoverageWitnessId>) {
+        match self {
+            Self::Leaf(witness_id) => {
+                witness_ids.insert(*witness_id);
+            }
+            Self::AllOf(children) | Self::AnyOf(children) => {
+                for child in children {
+                    child.collect_witness_ids(witness_ids);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -144,5 +167,45 @@ mod tests {
             Coverage::Leaf(CoverageWitnessId::new(3)),
         ]);
         assert_eq!(coverage.validate_shape(), Ok(()));
+    }
+
+    #[test]
+    fn coverage_owns_canonical_equivalence() {
+        let left = Coverage::AllOf(vec![
+            Coverage::Leaf(CoverageWitnessId::new(2)),
+            Coverage::AnyOf(vec![
+                Coverage::Leaf(CoverageWitnessId::new(3)),
+                Coverage::Leaf(CoverageWitnessId::new(1)),
+            ]),
+        ]);
+        let right = Coverage::AllOf(vec![
+            Coverage::AnyOf(vec![
+                Coverage::Leaf(CoverageWitnessId::new(1)),
+                Coverage::Leaf(CoverageWitnessId::new(3)),
+            ]),
+            Coverage::Leaf(CoverageWitnessId::new(2)),
+        ]);
+
+        assert!(left.is_canonically_equivalent_to(&right));
+    }
+
+    #[test]
+    fn coverage_owns_sorted_witness_traversal() {
+        let coverage = Coverage::AllOf(vec![
+            Coverage::Leaf(CoverageWitnessId::new(9)),
+            Coverage::AnyOf(vec![
+                Coverage::Leaf(CoverageWitnessId::new(3)),
+                Coverage::Leaf(CoverageWitnessId::new(5)),
+            ]),
+        ]);
+
+        assert_eq!(
+            coverage.witness_ids_in_order(),
+            vec![
+                CoverageWitnessId::new(3),
+                CoverageWitnessId::new(5),
+                CoverageWitnessId::new(9),
+            ]
+        );
     }
 }

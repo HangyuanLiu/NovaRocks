@@ -15,12 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod contract;
-mod coverage;
-mod graph;
-mod validation;
-
-pub(crate) use contract::*;
-pub(crate) use coverage::*;
-pub(crate) use graph::*;
-pub(crate) use validation::*;
+pub(crate) mod contract;
+pub(crate) mod coverage;
+pub(crate) mod graph;
+pub(crate) mod validation;

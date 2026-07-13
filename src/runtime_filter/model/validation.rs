@@ -20,10 +20,11 @@ use std::fmt;
 
 use super::contract::{
     ArtifactCapability, BindingId, ChannelId, CompletionFenceKind, CompletionRequirement,
-    ConsumerActivation, ContributionKind, CoverageWitnessId, PlanNodeId, ReductionRequirement,
-    RuntimeFilterLifecycle, RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
+    ConsumerActivation, ContributionKind, CoverageWitnessId, NullSemantics, PlanNodeId,
+    ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
+    RuntimeFilterPolicyRequirement,
 };
-use super::coverage::{Coverage, CoverageShapeError};
+use super::coverage::CoverageShapeError;
 use super::graph::{
     ApplyPoint, ConsumerRequirement, ProducerRequirement, RuntimeFilterBindingRole,
     RuntimeFilterBindingSpec, RuntimeFilterChannelSpec, RuntimeFilterGraph,
@@ -55,12 +56,16 @@ pub(crate) enum GraphValidationErrorKind {
     DeadlineExceedsLimit,
     RetriesExceedLimit,
     CompleteOnceCoverageMismatch,
+    EmptyOrderContract,
     DomainLifecycleMismatch,
+    ProducerClosedContributionMissing,
     MembershipReductionMismatch,
     MembershipContributionMissing,
     MembershipContributionMismatch,
+    FinalDomainShardRequiresNullSafeEqual,
     OrderedBoundReductionMismatch,
     OrderedBoundContributionMissing,
+    OrderedBoundContributionMismatch(ContributionKind),
     BindingIdMismatch {
         map_key: BindingId,
         object_id: BindingId,
@@ -313,7 +318,9 @@ fn validate_policy(
 
 fn validate_channel_matrix(channel: &RuntimeFilterChannelSpec) -> Result<(), GraphValidationError> {
     if channel.lifecycle == RuntimeFilterLifecycle::CompleteOnce
-        && !coverage_equivalent(&channel.availability_coverage, &channel.terminal_coverage)
+        && !channel
+            .availability_coverage
+            .is_canonically_equivalent_to(&channel.terminal_coverage)
     {
         return Err(channel_error(
             channel.channel_id,
@@ -321,8 +328,18 @@ fn validate_channel_matrix(channel: &RuntimeFilterChannelSpec) -> Result<(), Gra
         ));
     }
 
+    if !channel
+        .allowed_contribution_kinds
+        .contains(&ContributionKind::ProducerClosed)
+    {
+        return Err(channel_error(
+            channel.channel_id,
+            GraphValidationErrorKind::ProducerClosedContributionMissing,
+        ));
+    }
+
     match &channel.logical_domain {
-        RuntimeFilterLogicalDomain::Membership { .. } => {
+        RuntimeFilterLogicalDomain::Membership { null_semantics, .. } => {
             if channel.lifecycle != RuntimeFilterLifecycle::CompleteOnce {
                 return Err(channel_error(
                     channel.channel_id,
@@ -341,6 +358,12 @@ fn validate_channel_matrix(channel: &RuntimeFilterChannelSpec) -> Result<(), Gra
             let has_final_shard = channel
                 .allowed_contribution_kinds
                 .contains(&ContributionKind::FinalDomainShard);
+            if has_final_shard && *null_semantics != NullSemantics::NullSafeEqual {
+                return Err(channel_error(
+                    channel.channel_id,
+                    GraphValidationErrorKind::FinalDomainShardRequiresNullSafeEqual,
+                ));
+            }
             if !has_value_delta && !has_final_shard {
                 return Err(channel_error(
                     channel.channel_id,
@@ -361,7 +384,13 @@ fn validate_channel_matrix(channel: &RuntimeFilterChannelSpec) -> Result<(), Gra
                 ));
             }
         }
-        RuntimeFilterLogicalDomain::OrderedBound(_) => {
+        RuntimeFilterLogicalDomain::OrderedBound(order_contract) => {
+            if order_contract.keys.is_empty() {
+                return Err(channel_error(
+                    channel.channel_id,
+                    GraphValidationErrorKind::EmptyOrderContract,
+                ));
+            }
             if channel.lifecycle != RuntimeFilterLifecycle::MonotonicUpdates {
                 return Err(channel_error(
                     channel.channel_id,
@@ -378,21 +407,21 @@ fn validate_channel_matrix(channel: &RuntimeFilterChannelSpec) -> Result<(), Gra
                     ));
                 }
             };
-            if !channel
-                .allowed_contribution_kinds
-                .contains(&required_contribution)
+            if let Some(forbidden) = [
+                ContributionKind::ValueDomainDelta,
+                ContributionKind::FinalDomainShard,
+            ]
+            .into_iter()
+            .find(|kind| channel.allowed_contribution_kinds.contains(kind))
             {
                 return Err(channel_error(
                     channel.channel_id,
-                    GraphValidationErrorKind::OrderedBoundContributionMissing,
+                    GraphValidationErrorKind::OrderedBoundContributionMismatch(forbidden),
                 ));
             }
-            if channel
+            if !channel
                 .allowed_contribution_kinds
-                .contains(&ContributionKind::ValueDomainDelta)
-                || channel
-                    .allowed_contribution_kinds
-                    .contains(&ContributionKind::FinalDomainShard)
+                .contains(&required_contribution)
             {
                 return Err(channel_error(
                     channel.channel_id,
@@ -488,7 +517,7 @@ fn validate_coverage_ownership(
 ) -> Result<(), GraphValidationError> {
     let mut witness_ids = BTreeSet::new();
     for coverage in [&channel.availability_coverage, &channel.terminal_coverage] {
-        collect_coverage_witnesses(coverage, &mut witness_ids);
+        witness_ids.extend(coverage.witness_ids_in_order());
     }
     if let Some(witness_id) = witness_ids.difference(producer_witnesses).next() {
         return Err(channel_error(
@@ -497,49 +526,6 @@ fn validate_coverage_ownership(
         ));
     }
     Ok(())
-}
-
-#[derive(Eq, Ord, PartialEq, PartialOrd)]
-enum CanonicalCoverage {
-    Leaf(CoverageWitnessId),
-    AllOf(Vec<CanonicalCoverage>),
-    AnyOf(Vec<CanonicalCoverage>),
-}
-
-impl From<&Coverage> for CanonicalCoverage {
-    fn from(coverage: &Coverage) -> Self {
-        match coverage {
-            Coverage::Leaf(witness_id) => Self::Leaf(*witness_id),
-            Coverage::AllOf(children) => Self::AllOf(canonical_children(children)),
-            Coverage::AnyOf(children) => Self::AnyOf(canonical_children(children)),
-        }
-    }
-}
-
-fn canonical_children(children: &[Coverage]) -> Vec<CanonicalCoverage> {
-    let mut canonical = children
-        .iter()
-        .map(CanonicalCoverage::from)
-        .collect::<Vec<_>>();
-    canonical.sort();
-    canonical
-}
-
-fn coverage_equivalent(left: &Coverage, right: &Coverage) -> bool {
-    CanonicalCoverage::from(left) == CanonicalCoverage::from(right)
-}
-
-fn collect_coverage_witnesses(coverage: &Coverage, witness_ids: &mut BTreeSet<CoverageWitnessId>) {
-    match coverage {
-        Coverage::Leaf(witness_id) => {
-            witness_ids.insert(*witness_id);
-        }
-        Coverage::AllOf(children) | Coverage::AnyOf(children) => {
-            for child in children {
-                collect_coverage_witnesses(child, witness_ids);
-            }
-        }
-    }
 }
 
 fn validate_consumer(
@@ -596,8 +582,16 @@ fn binding_error(
 mod tests {
     use std::collections::BTreeSet;
 
+    use super::super::contract::{
+        ArtifactCapability, BindingId, ChannelId, CompletionFenceKind, CompletionRequirement,
+        ConsumerActivation, ContributionKind, CoverageWitnessId, LateApplyGranularity,
+        NullSemantics, PlanFragmentId, PlanNodeId, ReductionRequirement,
+        RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
+    };
+    use super::super::coverage::{Coverage, CoverageShapeError};
     use super::super::graph::tests::*;
-    use super::super::*;
+    use super::super::graph::{RuntimeFilterBindingRole, RuntimeFilterGraph};
+    use super::*;
 
     fn join_graph() -> RuntimeFilterGraph {
         let mut graph = RuntimeFilterGraph::default();
@@ -854,6 +848,90 @@ mod tests {
                 ContributionKind::FinalDomainShard,
             ),
         );
+    }
+
+    #[test]
+    fn validate_requires_nonempty_order_contract_keys() {
+        let mut graph = topn_graph();
+        let RuntimeFilterLogicalDomain::OrderedBound(order) = &mut graph
+            .channel_mut_for_test(ChannelId::new(1))
+            .unwrap()
+            .logical_domain
+        else {
+            panic!("expected ordered-bound channel");
+        };
+        order.keys.clear();
+
+        assert_kind(&graph, GraphValidationErrorKind::EmptyOrderContract);
+    }
+
+    #[test]
+    fn validate_requires_channel_level_producer_closed() {
+        for mut graph in [join_graph(), topn_graph(), aggregate_graph()] {
+            graph
+                .channel_mut_for_test(ChannelId::new(1))
+                .unwrap()
+                .allowed_contribution_kinds
+                .remove(&ContributionKind::ProducerClosed);
+            assert_kind(
+                &graph,
+                GraphValidationErrorKind::ProducerClosedContributionMissing,
+            );
+        }
+    }
+
+    #[test]
+    fn validate_distinguishes_forbidden_ordered_membership_from_missing_ordered_update() {
+        let mut forbidden = topn_graph();
+        forbidden
+            .channel_mut_for_test(ChannelId::new(1))
+            .unwrap()
+            .allowed_contribution_kinds = BTreeSet::from([
+            ContributionKind::ValueDomainDelta,
+            ContributionKind::ProducerClosed,
+        ]);
+        assert_kind(
+            &forbidden,
+            GraphValidationErrorKind::OrderedBoundContributionMismatch(
+                ContributionKind::ValueDomainDelta,
+            ),
+        );
+
+        let mut missing = topn_graph();
+        missing
+            .channel_mut_for_test(ChannelId::new(1))
+            .unwrap()
+            .allowed_contribution_kinds = BTreeSet::from([ContributionKind::ProducerClosed]);
+        assert_kind(
+            &missing,
+            GraphValidationErrorKind::OrderedBoundContributionMissing,
+        );
+    }
+
+    #[test]
+    fn validate_requires_null_safe_equal_for_final_domain_shards() {
+        let mut aggregate = aggregate_graph();
+        aggregate
+            .channel_mut_for_test(ChannelId::new(1))
+            .unwrap()
+            .logical_domain = RuntimeFilterLogicalDomain::Membership {
+            value_type: arrow::datatypes::DataType::Int64,
+            null_semantics: NullSemantics::NeverMatches,
+        };
+        assert_kind(
+            &aggregate,
+            GraphValidationErrorKind::FinalDomainShardRequiresNullSafeEqual,
+        );
+
+        let mut join = join_graph();
+        join.channel_mut_for_test(ChannelId::new(1))
+            .unwrap()
+            .logical_domain = RuntimeFilterLogicalDomain::Membership {
+            value_type: arrow::datatypes::DataType::Int64,
+            null_semantics: NullSemantics::NullSafeEqual,
+        };
+        join.validate()
+            .expect("value-domain Join may use null-safe equality");
     }
 
     #[test]

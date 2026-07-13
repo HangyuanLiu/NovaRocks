@@ -3052,11 +3052,24 @@ fn usize_to_u32(value: usize) -> Result<u32, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use arrow::datatypes::DataType;
 
     use super::*;
     use crate::proto::expr::expr;
-    use crate::runtime_filter::model::RuntimeFilterGraph;
+    use crate::runtime_filter::model::contract::{
+        ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
+        ContributionKind, CoverageWitnessId, NullSemantics, PlanFragmentId, PlanNodeId,
+        ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
+        RuntimeFilterPolicyRequirement,
+    };
+    use crate::runtime_filter::model::coverage::Coverage;
+    use crate::runtime_filter::model::graph::{
+        ApplyPoint, ConsumerRequirement, PlanLocation, ProducerRequirement,
+        RuntimeFilterBindingRole, RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
+        RuntimeFilterGraph,
+    };
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed::DataPartition;
@@ -3069,7 +3082,7 @@ mod tests {
     use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 
     #[test]
-    fn empty_runtime_filter_graph_is_wire_neutral_and_bound_node_filters_still_encode() {
+    fn nonempty_runtime_filter_graph_is_wire_neutral_and_bound_node_filters_still_encode() {
         let mut source = two_fragment_stream_plan_for_test();
         let mut second_target = source.fragments[1].clone();
         second_target.fragment_id = 2;
@@ -3119,14 +3132,96 @@ mod tests {
                 source_fragment_id: 1,
             });
 
-        let encoded_source = encode_distributed_plan(&source).expect("encode source plan");
-        let mut reset_graph = source.clone();
-        reset_graph.runtime_filter_graph = RuntimeFilterGraph::default();
-        // RFD-1 keeps the graph planner-only until RFD-5A/CGO-13 defines wire lowering.
-        let encoded_reset = encode_distributed_plan(&reset_graph).expect("encode reset graph plan");
+        let mut empty_graph = source.clone();
+        empty_graph.runtime_filter_graph = RuntimeFilterGraph::default();
+        assert!(empty_graph.runtime_filter_graph.is_empty());
+        let encoded_empty = encode_distributed_plan(&empty_graph).expect("encode empty graph plan");
 
-        assert_eq!(encoded_reset, encoded_source);
-        let root = encoded_reset.fragments[0].root.as_ref().expect("root node");
+        let mut nonempty_graph = source.clone();
+        nonempty_graph
+            .runtime_filter_graph
+            .insert_channel(RuntimeFilterChannelSpec {
+                channel_id: ChannelId::new(1),
+                logical_domain: RuntimeFilterLogicalDomain::Membership {
+                    value_type: DataType::Int64,
+                    null_semantics: NullSemantics::NeverMatches,
+                },
+                lifecycle: RuntimeFilterLifecycle::CompleteOnce,
+                availability_coverage: Coverage::Leaf(CoverageWitnessId::new(1)),
+                terminal_coverage: Coverage::Leaf(CoverageWitnessId::new(1)),
+                reduction_requirement: ReductionRequirement::SetUnion,
+                allowed_contribution_kinds: BTreeSet::from([
+                    ContributionKind::ValueDomainDelta,
+                    ContributionKind::ProducerClosed,
+                ]),
+                required_consumer_capabilities: BTreeSet::from([
+                    ArtifactCapability::Membership,
+                    ArtifactCapability::EmptyDomain,
+                ]),
+                policy: RuntimeFilterPolicyRequirement {
+                    max_contribution_bytes: 1024,
+                    max_artifact_bytes: 4096,
+                    deadline_ms: 30_000,
+                    max_retries: 3,
+                },
+            })
+            .expect("insert channel");
+        nonempty_graph
+            .runtime_filter_graph
+            .insert_binding(RuntimeFilterBindingSpec {
+                binding_id: BindingId::new(1),
+                channel_id: ChannelId::new(1),
+                coverage_witness_id: Some(CoverageWitnessId::new(1)),
+                location: PlanLocation {
+                    fragment_id: PlanFragmentId::new(1),
+                    node_id: PlanNodeId::new(21),
+                },
+                expression: build_expr.clone(),
+                apply_point: ApplyPoint::NodeOutput,
+                role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
+                    contribution_kinds: BTreeSet::from([
+                        ContributionKind::ValueDomainDelta,
+                        ContributionKind::ProducerClosed,
+                    ]),
+                    completion_requirement: CompletionRequirement::ProducerClosed,
+                }),
+            })
+            .expect("insert producer binding");
+        nonempty_graph
+            .runtime_filter_graph
+            .insert_binding(RuntimeFilterBindingSpec {
+                binding_id: BindingId::new(2),
+                channel_id: ChannelId::new(1),
+                coverage_witness_id: None,
+                location: PlanLocation {
+                    fragment_id: PlanFragmentId::new(0),
+                    node_id: PlanNodeId::new(0),
+                },
+                expression: probe_expr.clone(),
+                apply_point: ApplyPoint::NodeInput,
+                role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
+                    capabilities: BTreeSet::from([
+                        ArtifactCapability::Membership,
+                        ArtifactCapability::EmptyDomain,
+                    ]),
+                    activation: ConsumerActivation::BlockingSnapshot,
+                }),
+            })
+            .expect("insert consumer binding");
+        assert!(!nonempty_graph.runtime_filter_graph.is_empty());
+        nonempty_graph
+            .runtime_filter_graph
+            .validate()
+            .expect("nonempty graph fixture must be structurally valid");
+        // RFD-1 keeps the graph planner-only until RFD-5A/CGO-13 defines wire lowering.
+        let encoded_nonempty =
+            encode_distributed_plan(&nonempty_graph).expect("encode nonempty graph plan");
+
+        assert_eq!(encoded_nonempty, encoded_empty);
+        let root = encoded_nonempty.fragments[0]
+            .root
+            .as_ref()
+            .expect("root node");
         assert_eq!(root.build_runtime_filters.len(), 1);
         let encoded_build = &root.build_runtime_filters[0];
         assert_eq!(encoded_build.filter_id, 41);

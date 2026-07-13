@@ -198,7 +198,15 @@ pub(super) mod tests {
 
     use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
 
-    use super::super::*;
+    use super::super::contract::{
+        ArtifactCapability, BindingId, ChannelId, ComparatorDigest, CompletionRequirement,
+        ConsumerActivation, ContributionKind, CoverageWitnessId, NullOrder, NullSemantics,
+        OrderContract, OrderKeyContract, PlanFragmentId, PlanNodeId, ReductionRequirement,
+        RuntimeFilterLifecycle, RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
+        SortDirection,
+    };
+    use super::super::coverage::Coverage;
+    use super::*;
 
     pub(crate) fn expression() -> TypedExpr {
         TypedExpr {

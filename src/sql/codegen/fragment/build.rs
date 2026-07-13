@@ -1756,7 +1756,7 @@ mod tests {
 
     use super::*;
     use crate::connector::ConnectorRegistry;
-    use crate::runtime_filter::model::RuntimeFilterGraph;
+    use crate::runtime_filter::model::graph::RuntimeFilterGraph;
     use crate::sql::analysis::cte::CteId;
     use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, TypedExpr};
     use crate::sql::catalog::{CatalogProvider, TableDef};

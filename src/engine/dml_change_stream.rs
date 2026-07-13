@@ -888,7 +888,7 @@ fn output_ordinal_by_name(
 #[cfg(test)]
 mod native_mutation_tests {
     use super::*;
-    use crate::runtime_filter::model::RuntimeFilterGraph;
+    use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 
     struct EmptyCatalog;
 

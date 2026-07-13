@@ -230,22 +230,25 @@ mod tests {
             completion: CompletionRequirement::ProducerClosed,
         };
 
+        let RuntimeFilterLogicalDomain::Membership {
+            value_type,
+            null_semantics,
+        } = &matrix.domain
+        else {
+            panic!("Join requires a membership domain");
+        };
+        assert_eq!(value_type, &DataType::Int64);
+        assert_eq!(*null_semantics, NullSemantics::NeverMatches);
+        assert_eq!(matrix.lifecycle, RuntimeFilterLifecycle::CompleteOnce);
         assert_eq!(
-            matrix,
-            ProducerMatrix {
-                domain: RuntimeFilterLogicalDomain::Membership {
-                    value_type: DataType::Int64,
-                    null_semantics: NullSemantics::NeverMatches,
-                },
-                lifecycle: RuntimeFilterLifecycle::CompleteOnce,
-                contributions: BTreeSet::from([
-                    ContributionKind::ValueDomainDelta,
-                    ContributionKind::ProducerClosed,
-                ]),
-                reduction: ReductionRequirement::SetUnion,
-                completion: CompletionRequirement::ProducerClosed,
-            }
+            matrix.contributions,
+            BTreeSet::from([
+                ContributionKind::ValueDomainDelta,
+                ContributionKind::ProducerClosed,
+            ])
         );
+        assert_eq!(matrix.reduction, ReductionRequirement::SetUnion);
+        assert_eq!(matrix.completion, CompletionRequirement::ProducerClosed);
     }
 
     #[test]
@@ -274,12 +277,24 @@ mod tests {
                 completion: CompletionRequirement::ProducerClosed,
             };
 
-            assert!(matches!(
-                matrix.domain,
-                RuntimeFilterLogicalDomain::OrderedBound(_)
-            ));
+            let RuntimeFilterLogicalDomain::OrderedBound(order) = &matrix.domain else {
+                panic!("TopN requires an ordered-bound domain");
+            };
+            assert_eq!(order.keys.len(), 1);
+            assert_eq!(order.keys[0].data_type, DataType::Int64);
+            assert_eq!(order.keys[0].direction, SortDirection::Descending);
+            assert_eq!(order.keys[0].null_order, NullOrder::First);
+            assert!(!order.inclusive);
+            assert_eq!(order.comparator_digest.get(), [9; 32]);
             assert_eq!(matrix.lifecycle, RuntimeFilterLifecycle::MonotonicUpdates);
-            assert_eq!(matrix.contributions.len(), 3);
+            assert_eq!(
+                matrix.contributions,
+                BTreeSet::from([
+                    ContributionKind::OrderedBoundUpdate,
+                    ContributionKind::TopKSummary,
+                    ContributionKind::ProducerClosed,
+                ])
+            );
             assert_eq!(matrix.reduction, reduction);
             assert_eq!(matrix.completion, CompletionRequirement::ProducerClosed);
         }
@@ -303,23 +318,27 @@ mod tests {
             ),
         };
 
+        let RuntimeFilterLogicalDomain::Membership {
+            value_type,
+            null_semantics,
+        } = &matrix.domain
+        else {
+            panic!("Aggregate committed-domain requires a membership domain");
+        };
+        assert_eq!(value_type, &DataType::Int64);
+        assert_eq!(*null_semantics, NullSemantics::NullSafeEqual);
+        assert_eq!(matrix.lifecycle, RuntimeFilterLifecycle::CompleteOnce);
         assert_eq!(
-            matrix,
-            ProducerMatrix {
-                domain: RuntimeFilterLogicalDomain::Membership {
-                    value_type: DataType::Int64,
-                    null_semantics: NullSemantics::NullSafeEqual,
-                },
-                lifecycle: RuntimeFilterLifecycle::CompleteOnce,
-                contributions: BTreeSet::from([
-                    ContributionKind::FinalDomainShard,
-                    ContributionKind::ProducerClosed,
-                ]),
-                reduction: ReductionRequirement::SetUnion,
-                completion: CompletionRequirement::FencedFinalDomain(
-                    CompletionFenceKind::CommittedDomainFrozen,
-                ),
-            }
+            matrix.contributions,
+            BTreeSet::from([
+                ContributionKind::FinalDomainShard,
+                ContributionKind::ProducerClosed,
+            ])
+        );
+        assert_eq!(matrix.reduction, ReductionRequirement::SetUnion);
+        assert_eq!(
+            matrix.completion,
+            CompletionRequirement::FencedFinalDomain(CompletionFenceKind::CommittedDomainFrozen)
         );
     }
 

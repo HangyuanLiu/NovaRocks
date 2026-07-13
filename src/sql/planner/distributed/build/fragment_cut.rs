@@ -18,7 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::runtime_filter::model::RuntimeFilterGraph;
+use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::column_id::ColumnId;

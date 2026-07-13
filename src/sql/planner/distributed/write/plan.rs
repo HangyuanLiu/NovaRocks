@@ -401,7 +401,7 @@ mod tests {
     use super::super::sink::{
         IcebergWriteFragmentSink, IcebergWriteInputBinding, synthetic_iceberg_write_table_id,
     };
-    use crate::runtime_filter::model::RuntimeFilterGraph;
+    use crate::runtime_filter::model::graph::RuntimeFilterGraph;
     use crate::sql::analysis::{ExprKind, OutputColumn};
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::ChangeStreamBranchKind;
