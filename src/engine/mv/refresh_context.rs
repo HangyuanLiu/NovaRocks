@@ -1489,9 +1489,13 @@ pub(crate) mod tests_support {
     use crate::engine::mv::table_ref::IcebergTableRef;
     use crate::meta::repository::mv::StoredMvDefinition;
     use crate::meta::repository::mv_contract::{
+        AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
         ExpressionLineage, HiddenApplyKeyContract, MvSchemaContract, OutputColumnLineage,
         OutputContract, TargetContract, TargetVisibleColumn,
+    };
+    use crate::sql::catalog::{
+        IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter,
     };
 
     use super::*;
@@ -1683,6 +1687,308 @@ pub(crate) mod tests_support {
             )
             .expect("dummy_rewrite_context: from_parts must succeed on canonical fixture"),
         )
+    }
+
+    pub(crate) struct TargetLocatorRefreshFixture {
+        pub(crate) _warehouse: tempfile::TempDir,
+        pub(crate) target_entry: Arc<IcebergCatalogEntry>,
+        pub(crate) iceberg_catalog: Arc<dyn iceberg::Catalog>,
+        pub(crate) target_table: iceberg::table::Table,
+        pub(crate) target_snapshot_id: i64,
+    }
+
+    pub(crate) fn target_locator_refresh_fixture(test_name: &str) -> TargetLocatorRefreshFixture {
+        let warehouse = tempfile::Builder::new()
+            .prefix(&format!("novarocks_target_locator_{test_name}_"))
+            .tempdir()
+            .expect("warehouse tempdir");
+        let warehouse_uri = format!("file://{}", warehouse.path().join("warehouse").display());
+        let target_entry = Arc::new(
+            crate::connector::iceberg::catalog::registry::build_catalog_entry(
+                "tgt",
+                &[
+                    ("type".to_string(), "iceberg".to_string()),
+                    ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                    ("iceberg.catalog.warehouse".to_string(), warehouse_uri),
+                ],
+            )
+            .expect("target catalog entry"),
+        );
+        crate::connector::iceberg::catalog::registry::create_namespace(&target_entry, "db")
+            .expect("create target namespace");
+        crate::connector::iceberg::catalog::registry::create_table(
+            &target_entry,
+            "db",
+            "mv",
+            &[
+                crate::sql::TableColumnDef {
+                    name: "k".to_string(),
+                    data_type: crate::sql::SqlType::BigInt,
+                    nullable: false,
+                    aggregation: None,
+                    default: None,
+                },
+                crate::sql::TableColumnDef {
+                    name: "v".to_string(),
+                    data_type: crate::sql::SqlType::BigInt,
+                    nullable: true,
+                    aggregation: None,
+                    default: None,
+                },
+            ],
+            None,
+            &[],
+            &[],
+        )
+        .expect("create target table");
+        crate::connector::iceberg::catalog::registry::insert_rows(
+            &target_entry,
+            "db",
+            "mv",
+            &[
+                vec![crate::sql::Literal::Int(10), crate::sql::Literal::Int(100)],
+                vec![crate::sql::Literal::Int(20), crate::sql::Literal::Int(200)],
+            ],
+        )
+        .expect("insert target rows");
+        let loaded =
+            crate::connector::iceberg::catalog::registry::load_table(&target_entry, "db", "mv")
+                .expect("load target table");
+        let target_snapshot_id = loaded
+            .table
+            .metadata()
+            .current_snapshot_id()
+            .expect("target snapshot");
+        let iceberg_catalog =
+            crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&target_entry)
+                .expect("build target iceberg catalog");
+
+        TargetLocatorRefreshFixture {
+            _warehouse: warehouse,
+            target_entry,
+            iceberg_catalog,
+            target_table: loaded.table,
+            target_snapshot_id,
+        }
+    }
+
+    fn target_field_id(schema: &Schema, name: &str) -> i32 {
+        schema
+            .as_struct()
+            .fields()
+            .iter()
+            .find(|field| field.name == name)
+            .unwrap_or_else(|| panic!("missing target field {name}"))
+            .id
+    }
+
+    fn rewrite_context_for_target_fixture(
+        target_table: &iceberg::table::Table,
+        target_snapshot_id: i64,
+    ) -> Arc<IcebergMvRewriteContext> {
+        let metadata = target_table.metadata();
+        let target_schema = metadata.current_schema().clone();
+        let mut contract = make_schema_contract();
+        let k_id = target_field_id(target_schema.as_ref(), "k");
+        let v_id = target_field_id(target_schema.as_ref(), "v");
+        contract.target.table_uuid = metadata.uuid().to_string();
+        contract.target.schema_id_at_create = metadata.current_schema_id();
+        contract.target.visible_columns[0].target_field_id = k_id;
+        contract.target.visible_columns[1].target_field_id = v_id;
+        contract.target.hidden_apply_key.target_field_id = k_id;
+        let target = make_target();
+        let mv_def = Arc::new(make_mv_definition());
+        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
+        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
+
+        Arc::new(
+            IcebergMvRewriteContext::from_parts(
+                target,
+                42,
+                Some("sess_cat".to_string()),
+                "sess_db".to_string(),
+                mv_def,
+                query,
+                base_refs,
+                pin,
+                Some(target_snapshot_id),
+                metadata.uuid().to_string(),
+                target_schema,
+                Some(Arc::new(contract)),
+            )
+            .expect("target fixture rewrite context"),
+        )
+    }
+
+    pub(crate) fn refresh_context_for_target_fixture(
+        fixture: &TargetLocatorRefreshFixture,
+    ) -> IcebergMvRefreshContext {
+        IcebergMvRefreshContext {
+            rewrite: rewrite_context_for_target_fixture(
+                &fixture.target_table,
+                fixture.target_snapshot_id,
+            ),
+            target_entry: fixture.target_entry.clone(),
+            base_catalog_entries: BTreeMap::new(),
+            iceberg_catalog: fixture.iceberg_catalog.clone(),
+            target_table: fixture.target_table.clone(),
+            affected_partitions:
+                crate::engine::mv::partition::AffectedTargetPartitions::not_derived("test context"),
+            pruning_limits: MvRefreshPruningLimits::default(),
+        }
+    }
+
+    pub(crate) fn target_fixture_table_info(ctx: &IcebergMvRefreshContext) -> IcebergTableInfo {
+        target_table_info_for_target(ctx, "tgt", "db", "mv").expect("target fixture table info")
+    }
+
+    pub(crate) fn aggregate_target_state_refresh_fixture()
+    -> (IcebergMvRefreshContext, IcebergMvTargetStateScan) {
+        use iceberg::{NamespaceIdent, TableIdent};
+
+        let warehouse_dir = tempfile::TempDir::new()
+            .expect("aggregate target warehouse tempdir")
+            .keep();
+        let warehouse = format!("file://{}", warehouse_dir.join("warehouse").display());
+        let target_entry = Arc::new(
+            crate::connector::iceberg::catalog::registry::build_catalog_entry(
+                "tgt",
+                &[
+                    ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                    ("iceberg.catalog.warehouse".to_string(), warehouse.clone()),
+                ],
+            )
+            .expect("aggregate target entry"),
+        );
+        let iceberg_catalog: Arc<dyn iceberg::Catalog> = Arc::new(
+            crate::connector::iceberg::catalog::registry::build_hadoop_catalog(&target_entry)
+                .expect("build aggregate target catalog"),
+        );
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(7)
+                .with_fields(vec![
+                    Arc::new(NestedField::required(
+                        100,
+                        "k",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::optional(
+                        101,
+                        "v",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::required(
+                        999,
+                        "__row_id__",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                    Arc::new(NestedField::required(
+                        200,
+                        "__agg_state_v",
+                        Type::Primitive(PrimitiveType::Binary),
+                    )),
+                ])
+                .build()
+                .expect("aggregate target schema"),
+        );
+        let metadata = iceberg::spec::TableMetadataBuilder::new(
+            schema.as_ref().clone(),
+            iceberg::spec::PartitionSpec::unpartition_spec().into_unbound(),
+            iceberg::spec::SortOrder::unsorted_order(),
+            format!("{warehouse}/target/table"),
+            iceberg::spec::FormatVersion::V3,
+            std::collections::HashMap::new(),
+        )
+        .expect("aggregate metadata builder")
+        .build()
+        .expect("aggregate metadata")
+        .metadata;
+        let target_uuid = metadata.uuid().to_string();
+        let target_table = iceberg::table::Table::builder()
+            .file_io(iceberg::io::FileIO::new_with_fs())
+            .metadata(metadata)
+            .identifier(TableIdent::new(
+                NamespaceIdent::new("db".to_string()),
+                "mv".to_string(),
+            ))
+            .build()
+            .expect("aggregate target table");
+
+        let mut contract = make_schema_contract();
+        contract.target.table_uuid = target_uuid.clone();
+        contract.target.schema_id_at_create = 7;
+        contract.target.hidden_apply_key.column_name = "__row_id__".to_string();
+        contract.target.hidden_apply_key.target_field_id = 999;
+        contract.target.hidden_apply_key.source = ApplyKeySource::GroupRowId;
+        contract.aggregate = Some(AggregateStateContract {
+            state_layout_version: 1,
+            row_id_column_name: "__row_id__".to_string(),
+            state_columns: vec![AggregateStateColumnContract {
+                column_name: "__agg_state_v".to_string(),
+                target_field_id: 200,
+                type_signature: "varbinary".to_string(),
+                nullable: false,
+                role: AggregateStateRoleContract::Single,
+            }],
+        });
+        let rewrite = Arc::new(
+            IcebergMvRewriteContext::from_parts(
+                make_target(),
+                42,
+                Some("sess_cat".to_string()),
+                "sess_db".to_string(),
+                Arc::new(make_mv_definition()),
+                Arc::new(parse_query(
+                    "SELECT k, COUNT(*) AS v FROM ice.db.b GROUP BY k",
+                )),
+                Arc::from(vec![make_ref("ice", "db", "b")]),
+                Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")])),
+                None,
+                target_uuid.clone(),
+                schema,
+                Some(Arc::new(contract)),
+            )
+            .expect("aggregate rewrite context"),
+        );
+        let (_, layout) = rewrite
+            .aggregate_shape_and_layout_for_execution()
+            .expect("aggregate execution layout");
+        let physical_column_names = layout
+            .physical_columns
+            .iter()
+            .map(|column| column.column.name.clone())
+            .collect();
+        let ctx = IcebergMvRefreshContext {
+            rewrite,
+            target_entry,
+            base_catalog_entries: BTreeMap::new(),
+            iceberg_catalog,
+            target_table,
+            affected_partitions:
+                crate::engine::mv::partition::AffectedTargetPartitions::not_derived("test context"),
+            pruning_limits: MvRefreshPruningLimits::default(),
+        };
+        let scan = IcebergMvTargetStateScan {
+            catalog: "tgt".to_string(),
+            database: "db".to_string(),
+            table: "mv".to_string(),
+            target_table_uuid: target_uuid,
+            target_snapshot_id: None,
+            aggregate_state_layout_version: 1,
+            columns: Vec::new(),
+            group_key_names: vec!["k".to_string()],
+            aggregate_state_names: vec!["__agg_state_v".to_string()],
+            physical_column_names,
+            row_id_column_name: "__row_id__".to_string(),
+            row_filter: IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+                row_id_column_name: "__row_id__".to_string(),
+                branch_scope: None,
+            },
+            partition_constraint: IcebergMvTargetStatePartitionConstraint::Unpartitioned,
+        };
+        (ctx, scan)
     }
 }
 
@@ -2476,156 +2782,6 @@ mod tests {
             cloud.get("aws.s3.endpoint").map(String::as_str),
             Some("base-endpoint")
         );
-    }
-
-    struct TargetLocatorRefreshFixture {
-        _warehouse: tempfile::TempDir,
-        target_entry: Arc<IcebergCatalogEntry>,
-        iceberg_catalog: Arc<dyn iceberg::Catalog>,
-        target_table: iceberg::table::Table,
-        target_snapshot_id: i64,
-    }
-
-    fn target_locator_refresh_fixture(test_name: &str) -> TargetLocatorRefreshFixture {
-        let warehouse = tempfile::Builder::new()
-            .prefix(&format!("novarocks_target_locator_{test_name}_"))
-            .tempdir()
-            .expect("warehouse tempdir");
-        let warehouse_uri = format!("file://{}", warehouse.path().join("warehouse").display());
-        let target_entry = Arc::new(
-            crate::connector::iceberg::catalog::registry::build_catalog_entry(
-                "tgt",
-                &[
-                    ("type".to_string(), "iceberg".to_string()),
-                    ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
-                    ("iceberg.catalog.warehouse".to_string(), warehouse_uri),
-                ],
-            )
-            .expect("target catalog entry"),
-        );
-        crate::connector::iceberg::catalog::registry::create_namespace(&target_entry, "db")
-            .expect("create target namespace");
-        crate::connector::iceberg::catalog::registry::create_table(
-            &target_entry,
-            "db",
-            "mv",
-            &[
-                crate::sql::TableColumnDef {
-                    name: "k".to_string(),
-                    data_type: crate::sql::SqlType::BigInt,
-                    nullable: false,
-                    aggregation: None,
-                    default: None,
-                },
-                crate::sql::TableColumnDef {
-                    name: "v".to_string(),
-                    data_type: crate::sql::SqlType::BigInt,
-                    nullable: true,
-                    aggregation: None,
-                    default: None,
-                },
-            ],
-            None,
-            &[],
-            &[],
-        )
-        .expect("create target table");
-        crate::connector::iceberg::catalog::registry::insert_rows(
-            &target_entry,
-            "db",
-            "mv",
-            &[
-                vec![crate::sql::Literal::Int(10), crate::sql::Literal::Int(100)],
-                vec![crate::sql::Literal::Int(20), crate::sql::Literal::Int(200)],
-            ],
-        )
-        .expect("insert target rows");
-        let loaded =
-            crate::connector::iceberg::catalog::registry::load_table(&target_entry, "db", "mv")
-                .expect("load target table");
-        let target_snapshot_id = loaded
-            .table
-            .metadata()
-            .current_snapshot_id()
-            .expect("target snapshot");
-        let iceberg_catalog =
-            crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&target_entry)
-                .expect("build target iceberg catalog");
-
-        TargetLocatorRefreshFixture {
-            _warehouse: warehouse,
-            target_entry,
-            iceberg_catalog,
-            target_table: loaded.table,
-            target_snapshot_id,
-        }
-    }
-
-    fn target_field_id(schema: &Schema, name: &str) -> i32 {
-        schema
-            .as_struct()
-            .fields()
-            .iter()
-            .find(|field| field.name == name)
-            .unwrap_or_else(|| panic!("missing target field {name}"))
-            .id
-    }
-
-    fn rewrite_context_for_target_fixture(
-        target_table: &iceberg::table::Table,
-        target_snapshot_id: i64,
-    ) -> Arc<IcebergMvRewriteContext> {
-        let metadata = target_table.metadata();
-        let target_schema = metadata.current_schema().clone();
-        let mut contract = make_schema_contract();
-        let k_id = target_field_id(target_schema.as_ref(), "k");
-        let v_id = target_field_id(target_schema.as_ref(), "v");
-        contract.target.table_uuid = metadata.uuid().to_string();
-        contract.target.schema_id_at_create = metadata.current_schema_id();
-        contract.target.visible_columns[0].target_field_id = k_id;
-        contract.target.visible_columns[1].target_field_id = v_id;
-        contract.target.hidden_apply_key.target_field_id = k_id;
-        let target = make_target();
-        let mv_def = Arc::new(make_mv_definition());
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
-        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-
-        Arc::new(
-            IcebergMvRewriteContext::from_parts(
-                target,
-                42,
-                Some("sess_cat".to_string()),
-                "sess_db".to_string(),
-                mv_def,
-                query,
-                base_refs,
-                pin,
-                Some(target_snapshot_id),
-                metadata.uuid().to_string(),
-                target_schema,
-                Some(Arc::new(contract)),
-            )
-            .expect("target fixture rewrite context"),
-        )
-    }
-
-    fn refresh_context_for_target_fixture(
-        fixture: &TargetLocatorRefreshFixture,
-    ) -> IcebergMvRefreshContext {
-        IcebergMvRefreshContext {
-            rewrite: rewrite_context_for_target_fixture(
-                &fixture.target_table,
-                fixture.target_snapshot_id,
-            ),
-            target_entry: fixture.target_entry.clone(),
-            base_catalog_entries: BTreeMap::new(),
-            iceberg_catalog: fixture.iceberg_catalog.clone(),
-            target_table: fixture.target_table.clone(),
-            affected_partitions:
-                crate::engine::mv::partition::AffectedTargetPartitions::not_derived("test context"),
-            pruning_limits: MvRefreshPruningLimits::default(),
-        }
     }
 
     #[test]

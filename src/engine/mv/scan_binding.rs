@@ -297,10 +297,15 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+    use crate::engine::mv::refresh_context::tests_support::{
+        TargetLocatorRefreshFixture, aggregate_target_state_refresh_fixture,
+        refresh_context_for_target_fixture, target_fixture_table_info,
+        target_locator_refresh_fixture,
+    };
     use crate::sql::catalog::{
         IcebergDataFileBinding, IcebergDataFileInfo, IcebergMvTargetLocatorScan,
         IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter,
-        IcebergMvTargetStateScan, IcebergSchemaDef,
+        IcebergMvTargetStateScan, IcebergSchemaDef, TableDef,
     };
 
     fn table_info(catalog: &str, table: &str) -> IcebergTableInfo {
@@ -341,6 +346,186 @@ mod tests {
         }
     }
 
+    fn plan_scan(source: ScanSource) -> PlanScanNode {
+        PlanScanNode {
+            database: "db".to_string(),
+            table: TableDef {
+                name: "scan".to_string(),
+                columns: Vec::new(),
+                iceberg_row_lineage_metadata_columns: Vec::new(),
+                source,
+            },
+            alias: None,
+            columns: Vec::new(),
+            predicates: Vec::new(),
+            required_columns: None,
+            variant_columns: Vec::new(),
+            mv_rewritten_from: None,
+        }
+    }
+
+    struct DeltaOverwriteRefreshFixture {
+        _base_warehouse: tempfile::TempDir,
+        _target_fixture: TargetLocatorRefreshFixture,
+        ctx: IcebergMvRefreshContext,
+        table: IcebergTableInfo,
+        from_snapshot_id: i64,
+        to_snapshot_id: i64,
+    }
+
+    fn delta_overwrite_refresh_fixture(test_name: &str) -> DeltaOverwriteRefreshFixture {
+        use std::sync::Arc;
+
+        use crate::connector::iceberg::catalog::registry::{
+            block_on_iceberg, build_catalog_entry, build_iceberg_catalog, create_namespace,
+            create_table, insert_rows, load_table,
+        };
+        use crate::connector::iceberg::commit::{
+            CommitCtx, CommitOpKind, IcebergCommitAction, IcebergCommitCollector, OverwriteCommit,
+        };
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+
+        let target_fixture = target_locator_refresh_fixture(&format!("{test_name}_target"));
+        let mut ctx = refresh_context_for_target_fixture(&target_fixture);
+        let warehouse = tempfile::Builder::new()
+            .prefix(&format!("novarocks_delta_binding_{test_name}_"))
+            .tempdir()
+            .expect("delta warehouse");
+        let warehouse_uri = format!("file://{}", warehouse.path().join("warehouse").display());
+        let entry = build_catalog_entry(
+            "ice",
+            &[
+                ("type".to_string(), "iceberg".to_string()),
+                ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                ("iceberg.catalog.warehouse".to_string(), warehouse_uri),
+                (
+                    "aws.s3.endpoint_url".to_string(),
+                    "http://127.0.0.1:9000".to_string(),
+                ),
+            ],
+        )
+        .expect("delta catalog entry");
+        create_namespace(&entry, "db").expect("delta namespace");
+        create_table(
+            &entry,
+            "db",
+            "base",
+            &[crate::sql::TableColumnDef {
+                name: "k".to_string(),
+                data_type: crate::sql::SqlType::BigInt,
+                nullable: false,
+                aggregation: None,
+                default: None,
+            }],
+            None,
+            &[],
+            &[
+                ("format-version".to_string(), "3".to_string()),
+                ("write.row-lineage".to_string(), "true".to_string()),
+            ],
+        )
+        .expect("delta table");
+        insert_rows(
+            &entry,
+            "db",
+            "base",
+            &[
+                vec![crate::sql::Literal::Int(1)],
+                vec![crate::sql::Literal::Int(2)],
+            ],
+        )
+        .expect("seed delta table");
+        let loaded = load_table(&entry, "db", "base").expect("load seeded delta table");
+        let metadata = loaded.table.metadata();
+        let from_snapshot_id = metadata.current_snapshot_id().expect("seed snapshot id");
+        let replacement = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![3]))],
+        )
+        .expect("replacement batch");
+        let replacement_files = block_on_iceberg(async {
+            crate::connector::iceberg::data_writer::write_record_batches_as_data_files(
+                &loaded.table,
+                [replacement],
+            )
+            .await
+        })
+        .expect("replacement write runtime")
+        .expect("replacement data file");
+        let table_ident = iceberg::TableIdent::from_strs(["db", "base"]).expect("table ident");
+        let catalog = build_iceberg_catalog(&entry).expect("delta iceberg catalog");
+        let collector = Arc::new(
+            IcebergCommitCollector::new(
+                CommitOpKind::Overwrite,
+                table_ident,
+                Some(from_snapshot_id),
+                metadata.last_sequence_number(),
+                metadata.current_schema().clone(),
+                metadata.default_partition_spec().clone(),
+                format!("{}/data/_staging/test-overwrite", metadata.location()),
+                crate::common::types::UniqueId { hi: 0, lo: 107 },
+            )
+            .with_table_metadata(metadata.clone()),
+        );
+        for data_file in replacement_files {
+            collector.inject_written_file(
+                crate::engine::iceberg_writer::data_file_to_written_file(
+                    &data_file,
+                    metadata.default_partition_spec_id(),
+                )
+                .expect("replacement written file"),
+            );
+        }
+        block_on_iceberg(async {
+            let file_io = loaded.table.file_io().clone();
+            let snapshot_properties = BTreeMap::new();
+            let commit_ctx = CommitCtx {
+                collector: &collector,
+                table: &loaded.table,
+                catalog: catalog.as_ref(),
+                file_io: &file_io,
+                commit_uuid: uuid::Uuid::new_v4(),
+                abort_handle: collector.abort_log.clone(),
+                target_ref: "main",
+                snapshot_properties: &snapshot_properties,
+            };
+            OverwriteCommit.commit(commit_ctx).await
+        })
+        .expect("overwrite runtime")
+        .expect("overwrite commit");
+        entry.invalidate_table_cache("db", "base");
+        let loaded = load_table(&entry, "db", "base").expect("load overwritten delta table");
+        let to_snapshot_id = loaded
+            .table
+            .metadata()
+            .current_snapshot_id()
+            .expect("overwrite snapshot id");
+        let table = IcebergTableInfo {
+            catalog: "ice".to_string(),
+            namespace: "db".to_string(),
+            table: "base".to_string(),
+            table_uuid: Some(loaded.table.metadata().uuid().to_string()),
+            current_snapshot_id: Some(to_snapshot_id),
+            schema_id: loaded.table.metadata().current_schema_id(),
+            location: loaded.table.metadata().location().to_string(),
+            schema: IcebergSchemaDef { fields: Vec::new() },
+            serialized_metadata: None,
+            serialized_metadata_rows: None,
+        };
+        ctx.base_catalog_entries.insert("ice".to_string(), entry);
+
+        DeltaOverwriteRefreshFixture {
+            _base_warehouse: warehouse,
+            _target_fixture: target_fixture,
+            ctx,
+            table,
+            from_snapshot_id,
+            to_snapshot_id,
+        }
+    }
+
     fn panic_version(_: &IcebergTableInfo, _: i64) -> Result<ScanSource, String> {
         panic!("unexpected version resolver call")
     }
@@ -365,6 +550,171 @@ mod tests {
     fn iceberg_mv_refresh_context_implements_scan_binding_resolver() {
         fn assert_impl<T: ScanBindingResolver>() {}
         assert_impl::<IcebergMvRefreshContext>();
+    }
+
+    #[test]
+    fn real_context_resolves_version_at_exact_pinned_snapshot() {
+        let fixture = target_locator_refresh_fixture("scan_binding_version");
+        let mut ctx = refresh_context_for_target_fixture(&fixture);
+        ctx.base_catalog_entries
+            .insert("tgt".to_string(), fixture.target_entry.as_ref().clone());
+        let table = target_fixture_table_info(&ctx);
+        let resolved = ctx
+            .resolve_scan(
+                101,
+                &plan_scan(ScanSource::IcebergVersionTable {
+                    table,
+                    snapshot_id: fixture.target_snapshot_id,
+                }),
+            )
+            .expect("real version adapter")
+            .expect("version binding");
+
+        let ResolvedScanExecution::IcebergFiles(files) = resolved else {
+            panic!("expected file binding");
+        };
+        assert_eq!(files.binding, IcebergDataFileBinding::ExplicitFiles);
+        assert_eq!(files.files.len(), 1);
+        assert_eq!(files.files[0].row_count, Some(2));
+    }
+
+    #[test]
+    fn real_context_version_errors_preserve_catalog_table_and_pinned_snapshot() {
+        let fixture = target_locator_refresh_fixture("scan_binding_version_errors");
+        let mut ctx = refresh_context_for_target_fixture(&fixture);
+        let table = target_fixture_table_info(&ctx);
+
+        let mut missing_catalog = table.clone();
+        missing_catalog.catalog = "missing_catalog".to_string();
+        let err = ctx
+            .resolve_scan(
+                102,
+                &plan_scan(ScanSource::IcebergVersionTable {
+                    table: missing_catalog,
+                    snapshot_id: fixture.target_snapshot_id,
+                }),
+            )
+            .expect_err("missing catalog must fail");
+        assert!(err.contains("missing_catalog"), "{err}");
+        assert!(err.contains("node_id=102"), "{err}");
+
+        ctx.base_catalog_entries
+            .insert("tgt".to_string(), fixture.target_entry.as_ref().clone());
+        let mut missing_table = table.clone();
+        missing_table.table = "missing_table".to_string();
+        let err = ctx
+            .resolve_scan(
+                103,
+                &plan_scan(ScanSource::IcebergVersionTable {
+                    table: missing_table,
+                    snapshot_id: fixture.target_snapshot_id,
+                }),
+            )
+            .expect_err("missing table must fail");
+        assert!(err.contains("tgt.db.missing_table"), "{err}");
+        assert!(err.contains("node_id=103"), "{err}");
+
+        let missing_snapshot_id = fixture.target_snapshot_id.wrapping_add(1_000_000);
+        let err = ctx
+            .resolve_scan(
+                104,
+                &plan_scan(ScanSource::IcebergVersionTable {
+                    table,
+                    snapshot_id: missing_snapshot_id,
+                }),
+            )
+            .expect_err("missing pinned snapshot must not use current snapshot");
+        assert!(err.contains(&missing_snapshot_id.to_string()), "{err}");
+        assert!(err.contains("node_id=104"), "{err}");
+    }
+
+    #[test]
+    fn real_context_resolves_target_locator_through_trait_adapter() {
+        let fixture = target_locator_refresh_fixture("scan_binding_locator");
+        let ctx = refresh_context_for_target_fixture(&fixture);
+        let resolved = ctx
+            .resolve_scan(
+                105,
+                &plan_scan(ScanSource::IcebergMvTargetLocator(
+                    IcebergMvTargetLocatorScan {
+                        catalog: "tgt".to_string(),
+                        database: "db".to_string(),
+                        table: "mv".to_string(),
+                        target_table_uuid: ctx.rewrite.target_table_uuid.clone(),
+                        target_snapshot_id: Some(fixture.target_snapshot_id),
+                        apply_key_column: "k".to_string(),
+                        branch_id_column: None,
+                    },
+                )),
+            )
+            .expect("real target locator adapter")
+            .expect("locator binding");
+        let ResolvedScanExecution::IcebergFiles(files) = resolved else {
+            panic!("expected file binding");
+        };
+        assert_eq!(
+            files.table.current_snapshot_id,
+            Some(fixture.target_snapshot_id)
+        );
+        assert_eq!(files.files.len(), 1);
+    }
+
+    #[test]
+    fn real_context_resolves_target_state_through_trait_adapter() {
+        let (ctx, target_scan) = aggregate_target_state_refresh_fixture();
+        let resolved = ctx
+            .resolve_scan(
+                106,
+                &plan_scan(ScanSource::IcebergMvTargetState(target_scan)),
+            )
+            .expect("real target-state adapter")
+            .expect("target-state binding");
+        let ResolvedScanExecution::IcebergFiles(files) = resolved else {
+            panic!("expected file binding");
+        };
+        assert_eq!(files.binding, IcebergDataFileBinding::ExplicitFiles);
+        assert!(
+            files.files.is_empty(),
+            "no target snapshot should bind no files"
+        );
+        assert!(
+            files
+                .table
+                .schema
+                .fields
+                .iter()
+                .any(|field| field.name == "__agg_state_v"),
+            "target-state binding must preserve aggregate physical projection"
+        );
+    }
+
+    #[test]
+    fn real_delta_builder_materializes_changes_delete_visibility_and_cloud_properties() {
+        let fixture = delta_overwrite_refresh_fixture("scan_binding_delta");
+        let resolved = fixture
+            .ctx
+            .resolve_scan(
+                107,
+                &plan_scan(ScanSource::IcebergDeltaTable {
+                    table: fixture.table,
+                    from_snapshot_id: fixture.from_snapshot_id,
+                    to_snapshot_id: fixture.to_snapshot_id,
+                }),
+            )
+            .expect("real delta adapter")
+            .expect("delta binding");
+        let ResolvedScanExecution::IcebergDelta(delta) = resolved else {
+            panic!("expected delta binding");
+        };
+        assert!(!delta.runtime_plan.change_files.is_empty());
+        assert!(!delta.runtime_plan.cloud_properties.is_empty());
+        let delete_side = delta
+            .runtime_plan
+            .delete_side
+            .expect("overwrite delta must materialize delete side");
+        assert!(!delete_side.previous_data_file_lineage.is_empty());
+        assert!(!delete_side.previous_delete_visibility_data_files.is_empty());
+        assert!(!delete_side.deleted_data_file_paths.is_empty());
     }
 
     #[test]
