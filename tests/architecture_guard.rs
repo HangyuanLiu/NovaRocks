@@ -13069,7 +13069,7 @@ fn nfe_3_native_planning_owners_are_named_explicitly() {
         }
     }
 
-    let delta_planning_path = repo.join("src/sql/codegen/scan/iceberg_delta.rs");
+    let delta_planning_path = repo.join("src/engine/mv/scan_binding.rs");
     let delta_encoder_path = repo.join("src/sql/codegen/proto_encode/iceberg_delta_scan.rs");
     if delta_planning_path.is_file() && delta_encoder_path.is_file() {
         let planning = fs::read_to_string(&delta_planning_path).unwrap();
@@ -13852,9 +13852,19 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
         "build_iceberg_delta_scan_runtime_plan",
         rust_named_function_declaration_count,
     );
-    if delta_owners != ["src/sql/codegen/scan/iceberg_delta.rs (1)"] {
+    if !delta_owners.is_empty() {
         violations.push(format!(
-            "Iceberg delta runtime planner must have one final owner, got {delta_owners:?}"
+            "Iceberg delta runtime planner must not be owned by codegen, got {delta_owners:?}"
+        ));
+    }
+    let delta_planning_owner = fs::read_to_string(repo.join("src/engine/mv/scan_binding.rs"))
+        .map(|text| {
+            rust_named_function_declaration_count(&text, "build_iceberg_delta_scan_runtime_plan")
+        })
+        .unwrap_or_default();
+    if delta_planning_owner != 1 {
+        violations.push(format!(
+            "src/engine/mv/scan_binding.rs: expected one Iceberg delta runtime planner, got {delta_planning_owner}"
         ));
     }
 
@@ -17511,5 +17521,417 @@ fn coor_2_final_control_plane_ownership_is_non_vacuous() {
     assert_eq!(
         coordinator_hits, 0,
         "all eight coordinator production files must have zero audited thrift hits"
+    );
+}
+
+#[derive(Clone, Debug)]
+struct Cgo8GuardSource {
+    path: String,
+    text: String,
+}
+
+impl Cgo8GuardSource {
+    fn new(path: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            text: text.into(),
+        }
+    }
+}
+
+fn cgo_8_tokens_contain(tokens: &[String], expected: &[&str]) -> bool {
+    tokens.windows(expected.len()).any(|window| {
+        window
+            .iter()
+            .map(String::as_str)
+            .eq(expected.iter().copied())
+    })
+}
+
+fn cgo_8_matching_paren(tokens: &[String], open: usize) -> Option<usize> {
+    (tokens.get(open)? == "(").then_some(())?;
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(open) {
+        match token.as_str() {
+            "(" => depth += 1,
+            ")" => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn cgo_8_function_signature_violations(source: &str, tokens: &[String]) -> Vec<String> {
+    const FORBIDDEN_TYPES: &[&str] = &["DistributedPlan", "DistributedNode", "PlanScanNode"];
+    let mut violations = Vec::new();
+    for function in tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(index, token)| (token == "fn").then_some(index))
+    {
+        let Some(name) = tokens.get(function + 1) else {
+            continue;
+        };
+        let Some(open) = (function + 2..tokens.len()).find(|index| tokens[*index] == "(") else {
+            continue;
+        };
+        let Some(close) = cgo_8_matching_paren(tokens, open) else {
+            continue;
+        };
+        let signature = &tokens[open + 1..close];
+        for forbidden in FORBIDDEN_TYPES {
+            for type_index in signature
+                .iter()
+                .enumerate()
+                .filter_map(|(index, token)| (token == forbidden).then_some(index))
+            {
+                let parameter_start = signature[..type_index]
+                    .iter()
+                    .rposition(|token| token == ",")
+                    .map_or(0, |index| index + 1);
+                let prefix = &signature[parameter_start..type_index];
+                let ampersand = prefix.iter().position(|token| token == "&");
+                let mutable = prefix.iter().position(|token| token == "mut");
+                if matches!((ampersand, mutable), (Some(reference), Some(mutable)) if reference < mutable)
+                {
+                    violations.push(format!(
+                        "mutable-plan: {source}: function `{name}` accepts &mut {forbidden}"
+                    ));
+                }
+            }
+        }
+    }
+    violations
+}
+
+fn cgo_8_has_call(tokens: &[String], name: &str) -> bool {
+    tokens.iter().enumerate().any(|(index, token)| {
+        token == name
+            && tokens.get(index + 1).is_some_and(|token| token == "(")
+            && tokens
+                .get(index.wrapping_sub(1))
+                .is_none_or(|token| token != "fn")
+    })
+}
+
+fn cgo_8_immutable_scan_preparation_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
+    const RETIRED_NAMES: &[&str] = &[
+        "refresh_distributed_plan_for_fragment_build",
+        "refresh_distributed_node_scan_tables_for_native",
+        "refresh_scan_table_for_codegen",
+        "lower_native_fragment_edges",
+    ];
+    const ENCODER_PLANNING_CALLS: &[&str] = &[
+        "build_iceberg_delta_scan_runtime_plan",
+        "plan_changes",
+        "load_table",
+        "version_scan_source",
+        "target_state_scan_source",
+        "target_locator_scan_source",
+    ];
+
+    let codegen = sources
+        .iter()
+        .filter(|source| source.path.starts_with("src/sql/codegen/"))
+        .collect::<Vec<_>>();
+    let preparation = sources
+        .iter()
+        .filter(|source| source.path == "src/sql/codegen/scan/preparation.rs")
+        .collect::<Vec<_>>();
+    let encoders = sources
+        .iter()
+        .filter(|source| source.path.starts_with("src/sql/codegen/proto_encode/"))
+        .collect::<Vec<_>>();
+    let mut violations = Vec::new();
+    for (owner, collection) in [
+        ("production", sources.len()),
+        ("codegen", codegen.len()),
+        ("scan preparation", preparation.len()),
+        ("encoder", encoders.len()),
+    ] {
+        if collection == 0 {
+            violations.push(format!("{owner} owner set is empty"));
+        }
+    }
+
+    let prepared_sources = sources
+        .iter()
+        .map(|source| {
+            let production = rust_sanitized_production_text(&source.text);
+            let tokens = rust_use_tokens(&production);
+            (source, tokens)
+        })
+        .collect::<Vec<_>>();
+
+    for (source, tokens) in &prepared_sources {
+        for retired in RETIRED_NAMES {
+            if tokens.iter().any(|token| token == retired) {
+                violations.push(format!(
+                    "retired-name: {} references `{retired}`",
+                    source.path
+                ));
+            }
+        }
+    }
+
+    for source in codegen {
+        let (_, tokens) = prepared_sources
+            .iter()
+            .find(|(candidate, _)| candidate.path == source.path)
+            .expect("prepared codegen owner must exist");
+        if tokens
+            .iter()
+            .any(|token| token == "IcebergMvRefreshContext")
+            || cgo_8_tokens_contain(tokens, &["engine", "::", "mv", "::", "refresh_context"])
+        {
+            violations.push(format!(
+                "refresh-context: {} references the engine MV refresh context",
+                source.path
+            ));
+        }
+    }
+
+    let mut preparation_functions = 0usize;
+    for source in preparation {
+        let (_, tokens) = prepared_sources
+            .iter()
+            .find(|(candidate, _)| candidate.path == source.path)
+            .expect("prepared scan owner must exist");
+        preparation_functions += tokens.iter().filter(|token| *token == "fn").count();
+        violations.extend(cgo_8_function_signature_violations(&source.path, tokens));
+    }
+    if !sources.is_empty() && preparation_functions == 0 {
+        violations.push("scan preparation production function owner set is empty".to_string());
+    }
+
+    let mut encoder_functions = 0usize;
+    for source in encoders {
+        let (_, tokens) = prepared_sources
+            .iter()
+            .find(|(candidate, _)| candidate.path == source.path)
+            .expect("prepared encoder owner must exist");
+        encoder_functions += tokens.iter().filter(|token| *token == "fn").count();
+        for forbidden in ENCODER_PLANNING_CALLS {
+            if cgo_8_has_call(tokens, forbidden) {
+                violations.push(format!(
+                    "encoder-planning: {} calls `{forbidden}`",
+                    source.path
+                ));
+            }
+        }
+    }
+    if !sources.is_empty() && encoder_functions == 0 {
+        violations.push("encoder production function owner set is empty".to_string());
+    }
+
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+fn cgo_8_fixture_sources(preparation: &str, encoder: &str, other: &str) -> Vec<Cgo8GuardSource> {
+    vec![
+        Cgo8GuardSource::new("src/sql/codegen/scan/preparation.rs", preparation),
+        Cgo8GuardSource::new("src/sql/codegen/proto_encode/plan.rs", encoder),
+        Cgo8GuardSource::new("src/lib.rs", other),
+    ]
+}
+
+#[test]
+fn cgo_8_detector_is_source_aware_and_covers_each_guard_class() {
+    let cases = [
+        (
+            "codegen refresh context dependency",
+            cgo_8_fixture_sources(
+                "use crate::engine::mv::refresh_context::IcebergMvRefreshContext;",
+                "pub(crate) fn encode() {}",
+                "pub fn root() {}",
+            ),
+            "refresh-context",
+        ),
+        (
+            "mutable scan preparation signature",
+            cgo_8_fixture_sources(
+                "pub(crate) fn prepare_scan_bindings(plan: &mut DistributedPlan) {}",
+                "pub(crate) fn encode() {}",
+                "pub fn root() {}",
+            ),
+            "mutable-plan",
+        ),
+        (
+            "retired production helper",
+            cgo_8_fixture_sources(
+                "pub(crate) fn prepare_scan_bindings() {}",
+                "pub(crate) fn encode() {}",
+                "fn lower_native_fragment_edges() {}",
+            ),
+            "retired-name",
+        ),
+        (
+            "encoder runtime planning call",
+            cgo_8_fixture_sources(
+                "pub(crate) fn prepare_scan_bindings() {}",
+                "pub(crate) fn encode() { build_iceberg_delta_scan_runtime_plan(); }",
+                "pub fn root() {}",
+            ),
+            "encoder-planning",
+        ),
+    ];
+
+    for (case, sources, expected_class) in cases {
+        let violations = cgo_8_immutable_scan_preparation_violations(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected_class)),
+            "{case} was not detected: {violations:?}"
+        );
+    }
+
+    for forbidden in ["DistributedPlan", "DistributedNode", "PlanScanNode"] {
+        let sources = cgo_8_fixture_sources(
+            &format!("fn prepare(value: &mut {forbidden}) {{}}"),
+            "fn encode() {}",
+            "fn root() {}",
+        );
+        assert!(
+            cgo_8_immutable_scan_preparation_violations(&sources)
+                .iter()
+                .any(|violation| violation.contains("mutable-plan")),
+            "mutable preparation parameter `{forbidden}` must be rejected"
+        );
+    }
+    for retired in [
+        "refresh_distributed_plan_for_fragment_build",
+        "refresh_distributed_node_scan_tables_for_native",
+        "refresh_scan_table_for_codegen",
+        "lower_native_fragment_edges",
+    ] {
+        let sources = cgo_8_fixture_sources(
+            "fn prepare() {}",
+            "fn encode() {}",
+            &format!("fn root() {{ {retired}(); }}"),
+        );
+        assert!(
+            cgo_8_immutable_scan_preparation_violations(&sources)
+                .iter()
+                .any(|violation| violation.contains("retired-name")),
+            "retired helper `{retired}` must be rejected"
+        );
+    }
+    for forbidden in [
+        "build_iceberg_delta_scan_runtime_plan",
+        "plan_changes",
+        "load_table",
+        "version_scan_source",
+        "target_state_scan_source",
+        "target_locator_scan_source",
+    ] {
+        let sources = cgo_8_fixture_sources(
+            "fn prepare() {}",
+            &format!("fn encode() {{ owner.{forbidden}(); }}"),
+            "fn root() {}",
+        );
+        assert!(
+            cgo_8_immutable_scan_preparation_violations(&sources)
+                .iter()
+                .any(|violation| violation.contains("encoder-planning")),
+            "encoder planning call `{forbidden}` must be rejected"
+        );
+    }
+
+    let clean = cgo_8_fixture_sources(
+        "pub(crate) fn prepare_scan_bindings(plan: &DistributedPlan) {}",
+        "pub(crate) fn encode(prepared: &PreparedScanBindings) {}",
+        "pub fn root() {}",
+    );
+    assert!(
+        cgo_8_immutable_scan_preparation_violations(&clean).is_empty(),
+        "clean fixture must pass"
+    );
+
+    let noise = cgo_8_fixture_sources(
+        r#"
+pub(crate) fn prepare_scan_bindings(plan: &DistributedPlan) {}
+// use crate::engine::mv::refresh_context::IcebergMvRefreshContext;
+// fn commented_out(plan: &mut PlanScanNode) {}
+const NOTE: &str = "IcebergMvRefreshContext fn prepare(plan: &mut DistributedPlan)";
+#[cfg(test)]
+use crate::engine::mv::refresh_context::IcebergMvRefreshContext;
+#[cfg(test)]
+fn prepare_for_test(node: &mut DistributedNode) {
+    refresh_distributed_plan_for_fragment_build();
+}
+"#,
+        r#"
+pub(crate) fn encode() {}
+// plan_changes();
+const NOTE: &str = "load_table";
+#[cfg(test)]
+fn test_only_encoder() {
+    build_iceberg_delta_scan_runtime_plan();
+}
+"#,
+        r#"
+pub fn root() {}
+// refresh_scan_table_for_codegen();
+const NOTE: &str = "lower_native_fragment_edges";
+#[cfg(test)]
+fn retired_test_helper() { lower_native_fragment_edges(); }
+"#,
+    );
+    let noise_violations = cgo_8_immutable_scan_preparation_violations(&noise);
+    assert!(
+        noise_violations.is_empty(),
+        "comments, strings, and cfg(test) items must not trip guards: {noise_violations:?}"
+    );
+}
+
+#[test]
+fn cgo_8_detector_rejects_vacuous_owner_sets() {
+    let violations = cgo_8_immutable_scan_preparation_violations(&[]);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("owner set is empty")),
+        "empty owner collections must fail closed: {violations:?}"
+    );
+
+    let missing_encoder = [Cgo8GuardSource::new(
+        "src/sql/codegen/scan/preparation.rs",
+        "fn prepare() {}",
+    )];
+    assert!(
+        cgo_8_immutable_scan_preparation_violations(&missing_encoder)
+            .iter()
+            .any(|violation| violation == "encoder owner set is empty"),
+        "missing encoder owners must fail closed"
+    );
+}
+
+#[test]
+fn cgo_8_immutable_scan_preparation_boundaries_hold_in_production() {
+    let src = src_dir();
+    let files = production_rs_files_from_entries(&src, &[src.join("lib.rs"), src.join("main.rs")]);
+    let sources = files
+        .into_iter()
+        .map(|path| {
+            Cgo8GuardSource::new(
+                rel(&path),
+                fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("read {}: {error}", path.display())),
+            )
+        })
+        .collect::<Vec<_>>();
+    let violations = cgo_8_immutable_scan_preparation_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "CGO-8 immutable scan-preparation architecture guard failed:\n{}",
+        violations.join("\n")
     );
 }
