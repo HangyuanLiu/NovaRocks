@@ -74,7 +74,7 @@ pub(crate) enum GraphValidationErrorKind {
     DuplicateCoverageWitness(CoverageWitnessId),
     EmptyProducerContributions,
     UnsupportedProducerContribution(ContributionKind),
-    FencedFinalContributionMissing,
+    RequiredProducerContributionMissing(ContributionKind),
     ProducerCompletionMismatch {
         expected: CompletionRequirement,
         actual: CompletionRequirement,
@@ -238,7 +238,7 @@ impl RuntimeFilterGraph {
             }
 
             let mut producer_witnesses = BTreeSet::new();
-            for (binding, requirement) in &producers {
+            for (binding, _) in &producers {
                 let witness_id = binding
                     .coverage_witness_id
                     .expect("producer witness presence was validated before channel relationships");
@@ -248,6 +248,8 @@ impl RuntimeFilterGraph {
                         GraphValidationErrorKind::DuplicateCoverageWitness(witness_id),
                     ));
                 }
+            }
+            for (binding, requirement) in &producers {
                 validate_producer(channel, binding, requirement)?;
             }
 
@@ -424,6 +426,42 @@ fn validate_producer(
         ));
     }
 
+    let required_contributions = match &channel.logical_domain {
+        RuntimeFilterLogicalDomain::Membership { .. }
+            if channel
+                .allowed_contribution_kinds
+                .contains(&ContributionKind::FinalDomainShard) =>
+        {
+            BTreeSet::from([
+                ContributionKind::FinalDomainShard,
+                ContributionKind::ProducerClosed,
+            ])
+        }
+        RuntimeFilterLogicalDomain::Membership { .. } => BTreeSet::from([
+            ContributionKind::ValueDomainDelta,
+            ContributionKind::ProducerClosed,
+        ]),
+        RuntimeFilterLogicalDomain::OrderedBound(_) => {
+            let reduction_contribution = match channel.reduction_requirement {
+                ReductionRequirement::TightenOrderedBound => ContributionKind::OrderedBoundUpdate,
+                ReductionRequirement::MergeTopKSummary => ContributionKind::TopKSummary,
+                ReductionRequirement::SetUnion => unreachable!(
+                    "ordered-bound reduction was validated before producer relationships"
+                ),
+            };
+            BTreeSet::from([reduction_contribution, ContributionKind::ProducerClosed])
+        }
+    };
+    if let Some(missing) = required_contributions
+        .difference(&requirement.contribution_kinds)
+        .next()
+    {
+        return Err(binding_error(
+            binding,
+            GraphValidationErrorKind::RequiredProducerContributionMissing(*missing),
+        ));
+    }
+
     let expected_completion = if channel
         .allowed_contribution_kinds
         .contains(&ContributionKind::FinalDomainShard)
@@ -441,18 +479,6 @@ fn validate_producer(
             },
         ));
     }
-    if matches!(
-        requirement.completion_requirement,
-        CompletionRequirement::FencedFinalDomain(_)
-    ) && !requirement
-        .contribution_kinds
-        .contains(&ContributionKind::FinalDomainShard)
-    {
-        return Err(binding_error(
-            binding,
-            GraphValidationErrorKind::FencedFinalContributionMissing,
-        ));
-    }
     Ok(())
 }
 
@@ -460,18 +486,15 @@ fn validate_coverage_ownership(
     channel: &RuntimeFilterChannelSpec,
     producer_witnesses: &BTreeSet<CoverageWitnessId>,
 ) -> Result<(), GraphValidationError> {
+    let mut witness_ids = BTreeSet::new();
     for coverage in [&channel.availability_coverage, &channel.terminal_coverage] {
-        let mut witness_ids = Vec::new();
         collect_coverage_witnesses(coverage, &mut witness_ids);
-        for witness_id in witness_ids {
-            if producer_witnesses.contains(&witness_id) {
-                continue;
-            }
-            return Err(channel_error(
-                channel.channel_id,
-                GraphValidationErrorKind::UnknownCoverageWitness(witness_id),
-            ));
-        }
+    }
+    if let Some(witness_id) = witness_ids.difference(producer_witnesses).next() {
+        return Err(channel_error(
+            channel.channel_id,
+            GraphValidationErrorKind::UnknownCoverageWitness(*witness_id),
+        ));
     }
     Ok(())
 }
@@ -506,9 +529,11 @@ fn coverage_equivalent(left: &Coverage, right: &Coverage) -> bool {
     CanonicalCoverage::from(left) == CanonicalCoverage::from(right)
 }
 
-fn collect_coverage_witnesses(coverage: &Coverage, witness_ids: &mut Vec<CoverageWitnessId>) {
+fn collect_coverage_witnesses(coverage: &Coverage, witness_ids: &mut BTreeSet<CoverageWitnessId>) {
     match coverage {
-        Coverage::Leaf(witness_id) => witness_ids.push(*witness_id),
+        Coverage::Leaf(witness_id) => {
+            witness_ids.insert(*witness_id);
+        }
         Coverage::AllOf(children) | Coverage::AnyOf(children) => {
             for child in children {
                 collect_coverage_witnesses(child, witness_ids);
@@ -825,7 +850,9 @@ mod tests {
         }
         assert_kind(
             &fenced,
-            GraphValidationErrorKind::FencedFinalContributionMissing,
+            GraphValidationErrorKind::RequiredProducerContributionMissing(
+                ContributionKind::FinalDomainShard,
+            ),
         );
     }
 
@@ -1033,6 +1060,128 @@ mod tests {
                 ),
             },
         );
+    }
+
+    #[test]
+    fn validate_rejects_producers_missing_matrix_required_contributions() {
+        fn remove_contribution(graph: &mut RuntimeFilterGraph, contribution: ContributionKind) {
+            if let RuntimeFilterBindingRole::Producer(requirement) =
+                &mut graph.binding_mut_for_test(BindingId::new(1)).unwrap().role
+            {
+                requirement.contribution_kinds.remove(&contribution);
+            }
+        }
+
+        let mut cases = Vec::new();
+
+        for missing in [
+            ContributionKind::ValueDomainDelta,
+            ContributionKind::ProducerClosed,
+        ] {
+            let mut graph = join_graph();
+            remove_contribution(&mut graph, missing);
+            cases.push((graph, missing));
+        }
+
+        for missing in [
+            ContributionKind::FinalDomainShard,
+            ContributionKind::ProducerClosed,
+        ] {
+            let mut graph = aggregate_graph();
+            remove_contribution(&mut graph, missing);
+            cases.push((graph, missing));
+        }
+
+        for missing in [
+            ContributionKind::OrderedBoundUpdate,
+            ContributionKind::ProducerClosed,
+        ] {
+            let mut graph = topn_graph();
+            remove_contribution(&mut graph, missing);
+            cases.push((graph, missing));
+        }
+
+        for missing in [
+            ContributionKind::TopKSummary,
+            ContributionKind::ProducerClosed,
+        ] {
+            let mut graph = topn_graph();
+            graph
+                .channel_mut_for_test(ChannelId::new(1))
+                .unwrap()
+                .reduction_requirement = ReductionRequirement::MergeTopKSummary;
+            if let RuntimeFilterBindingRole::Producer(requirement) =
+                &mut graph.binding_mut_for_test(BindingId::new(1)).unwrap().role
+            {
+                requirement.contribution_kinds = BTreeSet::from([
+                    ContributionKind::TopKSummary,
+                    ContributionKind::ProducerClosed,
+                ]);
+            }
+            remove_contribution(&mut graph, missing);
+            cases.push((graph, missing));
+        }
+
+        for (graph, missing) in cases {
+            assert_kind(
+                &graph,
+                GraphValidationErrorKind::RequiredProducerContributionMissing(missing),
+            );
+        }
+    }
+
+    #[test]
+    fn witness_uniqueness_precedes_every_producer_matrix_error() {
+        let mut graph = join_graph();
+        if let RuntimeFilterBindingRole::Producer(requirement) =
+            &mut graph.binding_mut_for_test(BindingId::new(1)).unwrap().role
+        {
+            requirement
+                .contribution_kinds
+                .insert(ContributionKind::OrderedBoundUpdate);
+        }
+        graph
+            .insert_binding(join_producer_binding(
+                BindingId::new(3),
+                ChannelId::new(1),
+                CoverageWitnessId::new(1),
+            ))
+            .unwrap();
+
+        assert_kind(
+            &graph,
+            GraphValidationErrorKind::DuplicateCoverageWitness(CoverageWitnessId::new(1)),
+        );
+    }
+
+    #[test]
+    fn coverage_ownership_selects_lowest_unknown_witness_independent_of_child_order() {
+        fn invalid_graph(reverse: bool) -> RuntimeFilterGraph {
+            let mut graph = join_graph();
+            let children = if reverse {
+                vec![
+                    Coverage::Leaf(CoverageWitnessId::new(99)),
+                    Coverage::Leaf(CoverageWitnessId::new(3)),
+                ]
+            } else {
+                vec![
+                    Coverage::Leaf(CoverageWitnessId::new(3)),
+                    Coverage::Leaf(CoverageWitnessId::new(99)),
+                ]
+            };
+            let channel = graph.channel_mut_for_test(ChannelId::new(1)).unwrap();
+            channel.availability_coverage = Coverage::AllOf(children.clone());
+            channel.terminal_coverage = Coverage::AllOf(children);
+            graph
+        }
+
+        let expected = GraphValidationError {
+            channel_id: Some(ChannelId::new(1)),
+            binding_id: None,
+            kind: GraphValidationErrorKind::UnknownCoverageWitness(CoverageWitnessId::new(3)),
+        };
+        assert_eq!(invalid_graph(false).validate(), Err(expected.clone()));
+        assert_eq!(invalid_graph(true).validate(), Err(expected));
     }
 
     #[test]
