@@ -121,22 +121,22 @@ fn prepare_scan_node(
             return store_planned_starrocks_scan(fragment_id, node_id, planned, bindings);
         }
         source if scan_source_requires_resolver(source) => {
-            let source_kind = scan_source_kind(source);
+            let source_context = scan_source_context(source);
             let resolver = resolver.ok_or_else(|| {
                 format!(
-                    "scan source {source_kind} node_id={node_id} requires scan binding resolver"
+                    "scan source {source_context} node_id={node_id} requires scan binding resolver"
                 )
             })?;
             resolver
                 .resolve_scan(node_id, scan)
                 .map_err(|err| {
                     format!(
-                        "scan binding resolver failed for required source {source_kind} node_id={node_id}: {err}"
+                        "scan binding resolver failed for required source {source_context} node_id={node_id}: {err}"
                     )
                 })?
                 .ok_or_else(|| {
                     format!(
-                        "scan binding resolver returned no binding for required source {source_kind} node_id={node_id}"
+                        "scan binding resolver returned no binding for required source {source_context} node_id={node_id}"
                     )
                 })?
         }
@@ -262,6 +262,19 @@ fn scan_source_kind(source: &ScanSource) -> &'static str {
         ScanSource::IcebergVersionTable { .. } => "IcebergVersionTable",
         ScanSource::IcebergMvTargetState(_) => "IcebergMvTargetState",
         ScanSource::IcebergMvTargetLocator(_) => "IcebergMvTargetLocator",
+    }
+}
+
+fn scan_source_context(source: &ScanSource) -> String {
+    match source {
+        ScanSource::IcebergDeltaTable {
+            from_snapshot_id,
+            to_snapshot_id,
+            ..
+        } => format!(
+            "IcebergDeltaTable from_snapshot_id={from_snapshot_id} to_snapshot_id={to_snapshot_id}"
+        ),
+        _ => scan_source_kind(source).to_string(),
     }
 }
 

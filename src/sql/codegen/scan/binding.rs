@@ -210,6 +210,13 @@ impl ScanExecutionBindings {
             .map(Vec::as_slice)
     }
 
+    pub(crate) fn scan_ranges_for_fragment(
+        &self,
+        fragment_id: FragmentId,
+    ) -> Option<&BTreeMap<i32, Vec<ScanRangeParams>>> {
+        self.scan_ranges.get(&fragment_id)
+    }
+
     pub(crate) fn insert_starrocks_source(
         &mut self,
         node_id: i32,
