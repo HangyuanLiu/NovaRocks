@@ -17788,7 +17788,12 @@ fn cgo_8_scan_macro_cursor(mut cursor: syn::buffer::Cursor<'_>, findings: &mut C
         } else if let Some((ident, after)) = cursor.ident() {
             let ident = cgo_8_ident_text(&ident);
             if skip_metavariable_ident {
-                tokens.push("|".to_string());
+                if ident == "crate" {
+                    findings.identifiers.insert(ident.clone());
+                    tokens.push(ident);
+                } else {
+                    tokens.push("|".to_string());
+                }
             } else {
                 findings.identifiers.insert(ident.clone());
                 tokens.push(ident);
@@ -19296,6 +19301,7 @@ fn cgo_8_paths_globs_and_macro_tokens_cannot_bypass_guards() {
         "fn probe() { opaque!(crate::engine::mv::refresh_context::Hidden); }",
         "fn probe() { opaque!(outer!(IcebergMvRefreshContext)); }",
         "macro_rules! leak { () => { crate::engine::mv::refresh_context::Hidden } }",
+        "macro_rules! leak { () => { $crate::engine::mv::refresh_context::Hidden } }",
     ] {
         let sources = cgo_8_fixture_sources("fn prepare() {}", "fn encode() {}", codegen)
             .into_iter()
