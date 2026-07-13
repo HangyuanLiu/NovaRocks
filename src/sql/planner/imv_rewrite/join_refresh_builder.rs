@@ -1400,16 +1400,16 @@ mod tests {
             104,
         )
         .expect("coalesce plan");
-        let physical = optimize_for_test(plan);
+        let optimized_tree = optimize_for_test(plan);
         let catalog = crate::engine::catalog::InMemoryCatalog::default();
         let connectors = crate::connector::ConnectorRegistry::default();
 
-        let result = crate::sql::planner::optimizer_bridge::to_physical_plan(&physical)
+        let result = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
             .and_then(crate::sql::planner::pipeline::build_distributed_plan)
-            .and_then(|dp| {
+            .and_then(|distributed_plan| {
                 crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
                     crate::sql::codegen::FragmentBuildRequest::result(
-                        &dp,
+                        &distributed_plan,
                         &catalog,
                         &connectors,
                         None,

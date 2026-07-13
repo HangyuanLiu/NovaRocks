@@ -1141,7 +1141,7 @@ fn p3_cube_without_grouping_survives_optimizer_id_binding() {
         &mut scalar_arena,
     )
     .expect("logical to opt expr");
-    let physical = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
+    let optimized_tree = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
         opt_expr,
         scalar_arena,
         &std::collections::HashMap::new(),
@@ -1151,8 +1151,10 @@ fn p3_cube_without_grouping_survives_optimizer_id_binding() {
     )
     .expect("optimizer should produce a physical plan");
 
-    crate::sql::planner::optimizer_bridge::id_binding::verify_optimizer_id_binding(&physical)
-        .expect("CUBE synthetic grouping output must survive optimizer extraction");
+    crate::sql::planner::optimizer_bridge::id_binding::verify_optimized_tree_id_binding(
+        &optimized_tree,
+    )
+    .expect("CUBE synthetic grouping output must survive optimizer extraction");
 }
 
 #[test]
@@ -1168,7 +1170,7 @@ fn p3_rollup_order_by_only_key_survives_optimizer_id_binding() {
         &mut scalar_arena,
     )
     .expect("logical to opt expr");
-    let physical = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
+    let optimized_tree = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
         opt_expr,
         scalar_arena,
         &std::collections::HashMap::new(),
@@ -1178,8 +1180,10 @@ fn p3_rollup_order_by_only_key_survives_optimizer_id_binding() {
     )
     .expect("optimizer should produce a physical plan");
 
-    crate::sql::planner::optimizer_bridge::id_binding::verify_optimizer_id_binding(&physical)
-        .expect("ROLLUP ORDER BY-only key must bind to aggregate repeat-key output");
+    crate::sql::planner::optimizer_bridge::id_binding::verify_optimized_tree_id_binding(
+        &optimized_tree,
+    )
+    .expect("ROLLUP ORDER BY-only key must bind to aggregate repeat-key output");
 }
 
 #[test]
@@ -1208,7 +1212,7 @@ fn p3_rollup_window_order_by_alias_extra_survives_optimizer_id_binding() {
         &mut scalar_arena,
     )
     .expect("logical to opt expr");
-    let physical = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
+    let optimized_tree = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
         opt_expr,
         scalar_arena,
         &std::collections::HashMap::new(),
@@ -1218,8 +1222,10 @@ fn p3_rollup_window_order_by_alias_extra_survives_optimizer_id_binding() {
     )
     .expect("optimizer should produce a physical plan");
 
-    crate::sql::planner::optimizer_bridge::id_binding::verify_optimizer_id_binding(&physical)
-        .expect("ROLLUP window ORDER BY alias extras must bind to child/window outputs");
+    crate::sql::planner::optimizer_bridge::id_binding::verify_optimized_tree_id_binding(
+        &optimized_tree,
+    )
+    .expect("ROLLUP window ORDER BY alias extras must bind to child/window outputs");
 }
 
 #[test]
@@ -1238,7 +1244,7 @@ fn p3_aggregate_order_by_alias_topn_survives_optimizer_id_binding() {
         &mut scalar_arena,
     )
     .expect("logical to opt expr");
-    let physical = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
+    let optimized_tree = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
         opt_expr,
         scalar_arena,
         &std::collections::HashMap::new(),
@@ -1248,8 +1254,10 @@ fn p3_aggregate_order_by_alias_topn_survives_optimizer_id_binding() {
     )
     .expect("optimizer should produce a physical plan");
 
-    crate::sql::planner::optimizer_bridge::id_binding::verify_optimizer_id_binding(&physical)
-        .expect("aggregate ORDER BY alias TopN must bind to aggregate project output");
+    crate::sql::planner::optimizer_bridge::id_binding::verify_optimized_tree_id_binding(
+        &optimized_tree,
+    )
+    .expect("aggregate ORDER BY alias TopN must bind to aggregate project output");
 }
 
 #[test]

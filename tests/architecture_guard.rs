@@ -15947,3 +15947,35 @@ fn psm_8_logical_optimizer_bridge_vocabulary_is_explicit() {
         }
     }
 }
+
+#[test]
+fn psm_8_physical_bridge_vocabulary_is_explicit() {
+    let bridge = src_dir().join("sql/planner/optimizer_bridge");
+    let root = fs::read_to_string(bridge.join("mod.rs")).unwrap();
+    let id_binding = fs::read_to_string(bridge.join("id_binding.rs")).unwrap();
+    let physical = fs::read_to_string(bridge.join("physical.rs")).unwrap();
+
+    assert!(root.contains("optimized: &OptimizedOperatorNode"));
+    assert!(root.contains("verify_optimized_tree_id_binding(optimized)?"));
+    assert!(root.contains("materialize_physical_plan(optimized)"));
+    assert!(id_binding.contains("fn verify_optimized_tree_id_binding("));
+    assert!(physical.contains("fn materialize_physical_plan("));
+
+    let retired_verify = ["verify_optimizer", "_id_binding"].concat();
+    let retired_materialize = ["optimizer_physical", "_to_plan"].concat();
+    for root in [src_dir(), Path::new(manifest_dir()).join("tests")] {
+        for file in rs_files(&root) {
+            let text = fs::read_to_string(&file).unwrap();
+            assert!(
+                !text.contains(&retired_verify),
+                "{} uses {retired_verify}",
+                rel(&file)
+            );
+            assert!(
+                !text.contains(&retired_materialize),
+                "{} uses {retired_materialize}",
+                rel(&file)
+            );
+        }
+    }
+}

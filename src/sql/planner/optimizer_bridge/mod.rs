@@ -24,7 +24,9 @@ pub(crate) mod scalar;
 use crate::sql::optimizer::OptimizedOperatorNode;
 use crate::sql::planner::physical::PhysicalPlanNode;
 
-pub(crate) fn to_physical_plan(plan: &OptimizedOperatorNode) -> Result<PhysicalPlanNode, String> {
-    id_binding::verify_optimizer_id_binding(plan)?;
-    physical::optimizer_physical_to_plan(plan)
+pub(crate) fn to_physical_plan(
+    optimized: &OptimizedOperatorNode,
+) -> Result<PhysicalPlanNode, String> {
+    id_binding::verify_optimized_tree_id_binding(optimized)?;
+    physical::materialize_physical_plan(optimized)
 }

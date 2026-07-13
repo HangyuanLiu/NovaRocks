@@ -2700,12 +2700,15 @@ mod tests {
             );
         }
 
-        let physical = optimize_logical_for_test(outcome.plan.clone());
-        assert_physical_project_refs_resolve_to_child_outputs(&physical);
+        let optimized_tree = optimize_logical_for_test(outcome.plan.clone());
+        assert_physical_project_refs_resolve_to_child_outputs(&optimized_tree);
         assert!(
-            !physical.output_columns.iter().any(ImvRowIdColumn::matches),
+            !optimized_tree
+                .output_columns
+                .iter()
+                .any(ImvRowIdColumn::matches),
             "physical root must not advertise raw base _row_id columns as change-stream outputs: {:?}",
-            physical.output_columns
+            optimized_tree.output_columns
         );
     }
 
@@ -2823,9 +2826,9 @@ mod tests {
                     )
                 }
                 .expect("join projection coalesce plan");
-                let physical = optimize_logical_for_test(coalesce);
+                let optimized_tree = optimize_logical_for_test(coalesce);
 
-                assert_physical_project_refs_resolve_to_child_outputs(&physical);
+                assert_physical_project_refs_resolve_to_child_outputs(&optimized_tree);
             })
             .expect("spawn physical scope test")
             .join()
@@ -2871,13 +2874,13 @@ mod tests {
                     )
                 }
                 .expect("join projection/filter coalesce plan");
-                let physical = optimize_logical_for_test(coalesce);
+                let optimized_tree = optimize_logical_for_test(coalesce);
 
-                crate::sql::planner::optimizer_bridge::id_binding::verify_optimizer_id_binding(
-                    &physical,
+                crate::sql::planner::optimizer_bridge::id_binding::verify_optimized_tree_id_binding(
+                    &optimized_tree,
                 )
-                    .expect("join projection/filter physical coalesce plan must bind ids");
-                assert_physical_project_refs_resolve_to_child_outputs(&physical);
+                .expect("join projection/filter physical coalesce plan must bind ids");
+                assert_physical_project_refs_resolve_to_child_outputs(&optimized_tree);
             })
             .expect("spawn join filter physical scope test")
             .join()
@@ -2923,9 +2926,9 @@ mod tests {
                     )
                 }
                 .expect("join side-filter coalesce plan");
-                let physical = optimize_logical_for_test(coalesce);
+                let optimized_tree = optimize_logical_for_test(coalesce);
 
-                assert_physical_project_refs_resolve_to_child_outputs(&physical);
+                assert_physical_project_refs_resolve_to_child_outputs(&optimized_tree);
             })
             .expect("spawn join side-filter physical scope test")
             .join()
@@ -2973,20 +2976,22 @@ mod tests {
                     )
                 }
                 .expect("join projection coalesce plan");
-                let physical = optimize_logical_for_test(coalesce);
+                let optimized_tree = optimize_logical_for_test(coalesce);
                 let catalog = crate::engine::catalog::InMemoryCatalog::default();
                 let mut connectors = crate::connector::ConnectorRegistry::default();
                 connectors.register_scan_planner(Arc::new(
                     crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
                 ));
 
-                let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&physical)
-                    .expect("convert optimizer physical plan");
-                let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)
+                let physical_plan =
+                    crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                        .expect("convert optimizer physical plan");
+                let distributed_plan =
+                    crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
                     .expect("build DistributedPlan");
                 crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
                     crate::sql::codegen::FragmentBuildRequest::result(
-                        &dp,
+                        &distributed_plan,
                         &catalog,
                         &connectors,
                         Some(&refresh_ctx),

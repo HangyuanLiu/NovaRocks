@@ -11061,7 +11061,7 @@ fn repartition_iceberg_join_mv_overwrite(
         target_table.clone(),
         Arc::clone(&collector),
         ImvRefreshPlannedChangeStream {
-            physical_plan: planned_query.physical_plan,
+            optimized_tree: planned_query.optimized_tree,
             output_columns: planned_query.output_columns,
             change_stream: change_stream_override.unwrap_or(planned_query.change_stream),
             producer_branches: vec![ImvChangeStreamProducerBranch::FreshData],
@@ -11275,7 +11275,7 @@ fn first_refresh_iceberg_join_mv(
         target_table.clone(),
         Arc::clone(&collector),
         ImvRefreshPlannedChangeStream {
-            physical_plan: planned_query.physical_plan,
+            optimized_tree: planned_query.optimized_tree,
             output_columns: planned_query.output_columns,
             change_stream: change_stream_override.unwrap_or(planned_query.change_stream),
             producer_branches: vec![ImvChangeStreamProducerBranch::FreshData],
@@ -13595,7 +13595,7 @@ fn execute_join_delta_branches_logical(
         target_table.clone(),
         Arc::clone(&collector),
         ImvRefreshPlannedChangeStream {
-            physical_plan: planned_query.physical_plan,
+            optimized_tree: planned_query.optimized_tree,
             output_columns: planned_query.output_columns,
             change_stream: change_stream_override.unwrap_or(planned_query.change_stream),
             producer_branches,
@@ -13927,7 +13927,7 @@ fn execute_append_only_join_delta_branches(
             target_table.clone(),
             Arc::clone(&collector),
             ImvRefreshPlannedChangeStream {
-                physical_plan: planned_query.physical_plan,
+                optimized_tree: planned_query.optimized_tree,
                 output_columns: planned_query.output_columns,
                 change_stream: planned_query.change_stream,
                 producer_branches: vec![ImvChangeStreamProducerBranch::FreshData],
@@ -14245,7 +14245,7 @@ fn execute_join_delta_branches(
         target_table.clone(),
         Arc::clone(&collector),
         ImvRefreshPlannedChangeStream {
-            physical_plan: planned_query.physical_plan,
+            optimized_tree: planned_query.optimized_tree,
             output_columns: planned_query.output_columns,
             change_stream: planned_query.change_stream,
             producer_branches: vec![
@@ -14667,7 +14667,7 @@ enum ImvChangeStreamProducerBranch {
 const IMV_CHANGE_STREAM_DATA_ROUTE_COLUMN: &str = "__change_data_route";
 
 struct ImvRefreshPlannedChangeStream<'a> {
-    physical_plan: crate::sql::optimizer::OptimizedOperatorNode,
+    optimized_tree: crate::sql::optimizer::OptimizedOperatorNode,
     output_columns: Vec<OutputColumn>,
     change_stream: crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
     producer_branches: Vec<ImvChangeStreamProducerBranch>,
@@ -14712,7 +14712,7 @@ fn execute_imv_change_stream_write(
         state,
         Some(&target.catalog),
         &target.namespace,
-        &refresh_plan.physical_plan,
+        &refresh_plan.optimized_tree,
         &mut dag,
         refresh_plan.mv_refresh_ctx,
     )?;
@@ -14774,15 +14774,15 @@ fn ensure_imv_change_stream_data_route(
 
     let route_output = imv_data_route_output_column(&refresh_plan.output_columns);
     let route_output_ordinal = refresh_plan.output_columns.len();
-    let physical_plan = add_imv_data_route_project(
-        refresh_plan.physical_plan,
+    let optimized_tree = add_imv_data_route_project(
+        refresh_plan.optimized_tree,
         &refresh_plan.output_columns,
         action_output.as_ref(),
         row_lineage_output.as_ref(),
         route_mode,
         route_output.clone(),
     )?;
-    refresh_plan.physical_plan = physical_plan;
+    refresh_plan.optimized_tree = optimized_tree;
     refresh_plan.output_columns.push(route_output);
 
     Ok((refresh_plan, Some(route_output_ordinal)))
@@ -15708,7 +15708,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
         target_table.clone(),
         Arc::clone(&collector),
         ImvRefreshPlannedChangeStream {
-            physical_plan: planned_query.physical_plan,
+            optimized_tree: planned_query.optimized_tree,
             output_columns: planned_query.output_columns,
             change_stream: planned_query.change_stream,
             producer_branches,

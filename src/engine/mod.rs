@@ -2731,7 +2731,7 @@ fn explain_analyze_query(
         None => Vec::new(),
     };
     snapshot_effective_backend_count_into_session();
-    let physical = crate::sql::optimizer::optimize(
+    let optimized_tree = crate::sql::optimizer::optimize(
         opt_expr,
         scalar_arena,
         &query_stats.snapshot,
@@ -2740,10 +2740,15 @@ fn explain_analyze_query(
         mv_candidates,
     )?;
 
-    let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&physical)?;
-    let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)?;
+    let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
+    let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)?;
     let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
-        crate::sql::codegen::FragmentBuildRequest::result(&dp, codegen_catalog, connectors, None),
+        crate::sql::codegen::FragmentBuildRequest::result(
+            &distributed_plan,
+            codegen_catalog,
+            connectors,
+            None,
+        ),
     )?;
     let planning_elapsed = planning_start.elapsed();
 
@@ -2796,7 +2801,7 @@ fn explain_analyze_query(
         lines.push(counters);
     }
     lines.extend(explain_distributed_plan_analyze(
-        &dp,
+        &distributed_plan,
         ExplainLevel::Analyze,
         &actuals,
         Some(&per_fragment),
@@ -2904,7 +2909,7 @@ fn explain_query(
     };
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
     snapshot_effective_backend_count_into_session();
-    let physical = crate::sql::optimizer::optimize(
+    let optimized_tree = crate::sql::optimizer::optimize(
         opt_expr,
         scalar_arena,
         &query_stats.snapshot,
@@ -2917,9 +2922,9 @@ fn explain_query(
     if matches!(level, ExplainLevel::Costs) {
         lines.extend(query_stats.snapshot.display_rows());
     }
-    let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&physical)?;
-    let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)?;
-    lines.extend(explain_distributed_plan(&dp, level));
+    let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
+    let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)?;
+    lines.extend(explain_distributed_plan(&distributed_plan, level));
 
     build_string_query_result("Explain String", lines)
 }
@@ -3098,7 +3103,7 @@ pub(crate) fn execute_query_as_iceberg_write(
     let providers = query_stats::QueryStatsProviders::from_standalone_state(state);
     let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut opt_expr);
     snapshot_effective_backend_count_into_session();
-    let physical = match root_distribution {
+    let optimized_tree = match root_distribution {
         Some(root_distribution) => crate::sql::optimizer::optimize_with_root_distribution(
             opt_expr,
             scalar_arena,
@@ -3115,10 +3120,10 @@ pub(crate) fn execute_query_as_iceberg_write(
             Vec::new(),
         )?,
     };
-    let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&physical)?;
-    let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)?;
-    let dp = crate::sql::planner::distributed::write::plan::with_iceberg_write_sink(
-        dp,
+    let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
+    let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)?;
+    let distributed_plan = crate::sql::planner::distributed::write::plan::with_iceberg_write_sink(
+        distributed_plan,
         crate::sql::planner::distributed::write::sink::IcebergWriteFragmentSink {
             descriptor_database: current_database.to_string(),
             spec: sink_spec,
@@ -3127,7 +3132,7 @@ pub(crate) fn execute_query_as_iceberg_write(
     )?;
     let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
         crate::sql::codegen::FragmentBuildRequest::result(
-            &dp,
+            &distributed_plan,
             &catalog_snapshot,
             &connectors_snapshot,
             None,
@@ -3270,7 +3275,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
     state: &Arc<StandaloneState>,
     _current_catalog: Option<&str>,
     current_database: &str,
-    physical_plan: &crate::sql::optimizer::OptimizedOperatorNode,
+    optimized_tree: &crate::sql::optimizer::OptimizedOperatorNode,
     dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
 ) -> Result<PlannedIcebergChangeStreamWrite, String> {
@@ -3278,7 +3283,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
         state,
         _current_catalog,
         current_database,
-        physical_plan,
+        optimized_tree,
         dag,
         mv_refresh_ctx,
         None,
@@ -3290,7 +3295,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_native_pla
     state: &Arc<StandaloneState>,
     _current_catalog: Option<&str>,
     current_database: &str,
-    physical_plan: &crate::sql::optimizer::OptimizedOperatorNode,
+    optimized_tree: &crate::sql::optimizer::OptimizedOperatorNode,
     dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
     native_plan_mutation: Option<ChangeStreamNativePlanMutation<'_>>,
@@ -3306,11 +3311,11 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_native_pla
         .expect("standalone connector registry read lock")
         .clone();
     snapshot_effective_backend_count_into_session();
-    let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(physical_plan)?;
-    let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)?;
+    let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(optimized_tree)?;
+    let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)?;
     let planned_dp =
         crate::sql::planner::distributed::write::plan::with_iceberg_change_stream_write(
-            dp,
+            distributed_plan,
             current_database,
             dag.clone(),
         )?;
@@ -3359,7 +3364,7 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
     current_database: &str,
-    physical_plan: &crate::sql::optimizer::OptimizedOperatorNode,
+    optimized_tree: &crate::sql::optimizer::OptimizedOperatorNode,
     dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
     query_opts: Option<StandaloneQueryOptions>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
@@ -3368,7 +3373,7 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
         state,
         current_catalog,
         current_database,
-        physical_plan,
+        optimized_tree,
         dag,
         mv_refresh_ctx,
     )?;
@@ -3507,7 +3512,7 @@ pub(crate) fn execute_preexpanded_mv_refresh_query_with_options(
 }
 
 pub(crate) struct PlannedIcebergChangeStreamRefreshQuery {
-    pub(crate) physical_plan: crate::sql::optimizer::OptimizedOperatorNode,
+    pub(crate) optimized_tree: crate::sql::optimizer::OptimizedOperatorNode,
     pub(crate) output_columns: Vec<crate::sql::analysis::OutputColumn>,
     pub(crate) change_stream:
         crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
@@ -3566,7 +3571,7 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
     let providers = query_stats::QueryStatsProviders::from_connectors(connectors);
     let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut opt_expr);
     snapshot_effective_backend_count_into_session();
-    let physical_plan = crate::sql::optimizer::optimize(
+    let optimized_tree = crate::sql::optimizer::optimize(
         opt_expr,
         scalar_arena,
         &query_stats.snapshot,
@@ -3574,9 +3579,9 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
         None,
         Vec::new(),
     )?;
-    let output_columns = physical_plan.output_columns.clone();
+    let output_columns = optimized_tree.output_columns.clone();
     Ok(PlannedIcebergChangeStreamRefreshQuery {
-        physical_plan,
+        optimized_tree,
         output_columns,
         change_stream,
     })
@@ -3597,7 +3602,7 @@ pub(crate) fn plan_logical_for_iceberg_change_stream_refresh(
     let providers = query_stats::QueryStatsProviders::from_connectors(connectors);
     let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut opt_expr);
     snapshot_effective_backend_count_into_session();
-    let physical_plan = crate::sql::optimizer::optimize(
+    let optimized_tree = crate::sql::optimizer::optimize(
         opt_expr,
         scalar_arena,
         &query_stats.snapshot,
@@ -3605,9 +3610,9 @@ pub(crate) fn plan_logical_for_iceberg_change_stream_refresh(
         None,
         Vec::new(),
     )?;
-    let output_columns = physical_plan.output_columns.clone();
+    let output_columns = optimized_tree.output_columns.clone();
     Ok(PlannedIcebergChangeStreamRefreshQuery {
-        physical_plan,
+        optimized_tree,
         output_columns,
         change_stream,
     })
@@ -3688,7 +3693,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     };
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
     snapshot_effective_backend_count_into_session();
-    let physical = crate::sql::optimizer::optimize(
+    let optimized_tree = crate::sql::optimizer::optimize(
         opt_expr,
         scalar_arena,
         &query_stats.snapshot,
@@ -3703,11 +3708,11 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         exchange_port,
     )?;
 
-    let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&physical)?;
-    let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)?;
+    let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
+    let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)?;
     let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
         crate::sql::codegen::FragmentBuildRequest::result(
-            &dp,
+            &distributed_plan,
             codegen_catalog,
             connectors,
             mv_refresh_ctx,
@@ -3747,7 +3752,7 @@ pub(crate) fn execute_logical_plan_with_options(
         .unwrap_or_else(|| query_stats::QueryStatsProviders::from_connectors(connectors));
     let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut opt_expr);
     snapshot_effective_backend_count_into_session();
-    let physical = crate::sql::optimizer::optimize(
+    let optimized_tree = crate::sql::optimizer::optimize(
         opt_expr,
         scalar_arena,
         &query_stats.snapshot,
@@ -3761,11 +3766,11 @@ pub(crate) fn execute_logical_plan_with_options(
         exchange_port,
     )?;
 
-    let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&physical)?;
-    let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)?;
+    let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
+    let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)?;
     let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
         crate::sql::codegen::FragmentBuildRequest::result(
-            &dp,
+            &distributed_plan,
             codegen_catalog,
             connectors,
             mv_refresh_ctx,
@@ -5435,7 +5440,7 @@ mysql_port = 47892
             super::query_stats::QueryStatsProviders::from_standalone_state(&stats_state);
         let query_stats =
             super::query_stats::QueryStatsCollector::new(providers).collect(&mut opt_expr);
-        let physical = crate::sql::optimizer::optimize(
+        let optimized_tree = crate::sql::optimizer::optimize(
             opt_expr,
             scalar_arena,
             &query_stats.snapshot,
@@ -5444,12 +5449,18 @@ mysql_port = 47892
             Vec::new(),
         )
         .expect("optimize");
-        let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&physical)
-            .expect("convert optimizer physical plan");
-        let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
+        let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
         crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
-            crate::sql::codegen::FragmentBuildRequest::result(&dp, &catalog, &registry, None),
+            crate::sql::codegen::FragmentBuildRequest::result(
+                &distributed_plan,
+                &catalog,
+                &registry,
+                None,
+            ),
         )
         .expect("build fragments")
     }
@@ -9039,7 +9050,7 @@ path = "meta/operations.sqlite"
                 is_internal: false,
             },
         ];
-        let mut physical_plan = OptimizedOperatorNode {
+        let mut optimized_tree = OptimizedOperatorNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: Vec::new(),
                 columns: output_columns.clone(),
@@ -9054,7 +9065,7 @@ path = "meta/operations.sqlite"
             output_columns,
             execution_props: PlanExecutionProps::default(),
         };
-        attach_scalar_arena(&mut physical_plan, Arc::new(ScalarArena::new()));
+        attach_scalar_arena(&mut optimized_tree, Arc::new(ScalarArena::new()));
         let state = Arc::new(StandaloneState::default());
         let branch = ChangeStreamWriteBranchSpec::reuse_data_for_test(vec![2]);
         let mut dag = ChangeStreamWriteDagSpec::for_test(Some(0), Some(1), vec![branch]);
@@ -9063,7 +9074,7 @@ path = "meta/operations.sqlite"
             &state,
             None,
             "default",
-            &physical_plan,
+            &optimized_tree,
             &mut dag,
             None,
             None,

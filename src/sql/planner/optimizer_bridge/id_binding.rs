@@ -32,7 +32,7 @@ use crate::sql::planner::optimizer_bridge::scalar::{
     materialize_sort_keys, materialize_window_exprs,
 };
 
-pub(crate) fn verify_optimizer_id_binding(plan: &OptimizedOperatorNode) -> Result<(), String> {
+pub(crate) fn verify_optimized_tree_id_binding(plan: &OptimizedOperatorNode) -> Result<(), String> {
     let scalars = plan
         .execution_props
         .scalar_arena
@@ -791,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn p3_verify_optimizer_id_binding_rejects_unset_columnref() {
+    fn p3_verify_optimized_tree_id_binding_rejects_unset_columnref() {
         let err = verify_expr(
             &column_ref(ColumnId::UNSET, "a"),
             &std::collections::HashSet::new(),
@@ -802,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn p3_verify_optimizer_id_binding_rejects_missing_input_binding() {
+    fn p3_verify_optimized_tree_id_binding_rejects_missing_input_binding() {
         let input_id = ColumnId::new_for_test(1);
         let missing_id = ColumnId::new_for_test(99);
         let output_id = ColumnId::new_for_test(2);
@@ -812,7 +812,7 @@ mod tests {
             output_id,
         );
 
-        let err = verify_optimizer_id_binding(&plan).expect_err("missing ColumnId must fail");
+        let err = verify_optimized_tree_id_binding(&plan).expect_err("missing ColumnId must fail");
         assert!(
             err.contains("not produced by child scope"),
             "unexpected err={err}"
@@ -820,7 +820,7 @@ mod tests {
     }
 
     #[test]
-    fn p3_verify_optimizer_id_binding_rejects_logical_operator_with_planner_bridge_label() {
+    fn p3_verify_optimized_tree_id_binding_rejects_logical_operator_with_planner_bridge_label() {
         let mut plan = values_node(vec![]);
         plan.op = Operator::LogicalValues(ValuesOp {
             rows: vec![],
@@ -828,7 +828,7 @@ mod tests {
         });
         attach_scalar_arena(&mut plan, Arc::new(ScalarArena::new()));
 
-        let err = verify_optimizer_id_binding(&plan).expect_err("logical op must fail");
+        let err = verify_optimized_tree_id_binding(&plan).expect_err("logical op must fail");
         assert!(
             err.contains("optimizer id binding verifier"),
             "unexpected err={err}"
@@ -854,11 +854,12 @@ mod tests {
             project_output_id,
         );
 
-        verify_optimizer_id_binding(&plan).expect("project should bind aggregate call output id");
+        verify_optimized_tree_id_binding(&plan)
+            .expect("project should bind aggregate call output id");
     }
 
     #[test]
-    fn p3_verify_optimizer_id_binding_accepts_hidden_group_key_layout_output() {
+    fn p3_verify_optimized_tree_id_binding_accepts_hidden_group_key_layout_output() {
         let input_id = ColumnId::new_for_test(1);
         let group_output_id = ColumnId::new_for_test(4);
         let aggregate_output_id = ColumnId::new_for_test(5);
@@ -898,7 +899,7 @@ mod tests {
             project_output_id,
         );
 
-        verify_optimizer_id_binding(&plan)
+        verify_optimized_tree_id_binding(&plan)
             .expect("project should bind hidden group layout output id");
     }
 
@@ -917,7 +918,8 @@ mod tests {
             project_output_id,
         );
 
-        verify_optimizer_id_binding(&plan).expect("project should bind Repeat grouping output id");
+        verify_optimized_tree_id_binding(&plan)
+            .expect("project should bind Repeat grouping output id");
     }
 
     #[test]
@@ -969,7 +971,7 @@ mod tests {
         };
         attach_scalar_arena(&mut aggregate, Arc::new(scalars));
 
-        verify_optimizer_id_binding(&aggregate)
+        verify_optimized_tree_id_binding(&aggregate)
             .expect("distribution must preserve Repeat grouping output id for aggregate grouping");
     }
 
@@ -994,8 +996,8 @@ mod tests {
         };
         attach_scalar_arena(&mut plan, Arc::new(ScalarArena::new()));
 
-        let err =
-            verify_optimizer_id_binding(&plan).expect_err("CTEConsume arity mismatch must fail");
+        let err = verify_optimized_tree_id_binding(&plan)
+            .expect_err("CTEConsume arity mismatch must fail");
         assert!(
             err.contains("CTEConsume output/producers arity mismatch for cte_id=9"),
             "unexpected err={err}"

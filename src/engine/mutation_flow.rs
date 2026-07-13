@@ -334,7 +334,7 @@ fn build_update_mor_change_stream_write_plan(
         false,
     )?;
     let producer = build_update_mor_change_event_expand_plan(
-        planned.physical_plan,
+        planned.optimized_tree,
         target_columns,
         new_sequence_number,
     )?;
@@ -400,7 +400,7 @@ fn update_change_stream_target_sql(
 }
 
 fn build_update_mor_change_event_expand_plan(
-    physical: crate::sql::optimizer::OptimizedOperatorNode,
+    optimized_tree: crate::sql::optimizer::OptimizedOperatorNode,
     target_columns: &[crate::engine::catalog::ColumnDef],
     new_sequence_number: i64,
 ) -> Result<crate::sql::optimizer::OptimizedOperatorNode, String> {
@@ -414,22 +414,22 @@ fn build_update_mor_change_event_expand_plan(
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::scalar::{HashableLiteral, ScalarNode};
 
-    let mut scalar_arena = physical
+    let mut scalar_arena = optimized_tree
         .execution_props
         .scalar_arena
         .as_deref()
         .cloned()
         .ok_or_else(|| "MOR UPDATE physical plan is missing scalar arena".to_string())?;
-    let child_outputs = physical.output_columns.clone();
+    let child_outputs = optimized_tree.output_columns.clone();
     let row_id_input = output_column_by_name(&child_outputs, "__nr_row_id", "UPDATE row id")?;
     let hash_distribution = DistributionSpec::shuffle_agg([row_id_input.column_id]);
 
-    let child_stats = physical.stats.clone();
+    let child_stats = optimized_tree.stats.clone();
     let distributed = OptimizedOperatorNode {
         op: Operator::PhysicalDistribution(PhysicalDistributionOp {
             spec: hash_distribution,
         }),
-        children: vec![physical],
+        children: vec![optimized_tree],
         stats: child_stats.clone(),
         explain_stats: OptimizerExplainStats::default(),
         output_columns: child_outputs.clone(),
@@ -618,7 +618,7 @@ fn build_update_mor_change_event_expand_plan(
 }
 
 fn build_merge_mor_change_event_expand_plan(
-    physical: crate::sql::optimizer::OptimizedOperatorNode,
+    optimized_tree: crate::sql::optimizer::OptimizedOperatorNode,
     target_columns: &[crate::engine::catalog::ColumnDef],
     new_sequence_number: i64,
     matched_update: bool,
@@ -636,23 +636,23 @@ fn build_merge_mor_change_event_expand_plan(
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::scalar::{HashableLiteral, ScalarNode};
 
-    let mut scalar_arena = physical
+    let mut scalar_arena = optimized_tree
         .execution_props
         .scalar_arena
         .as_deref()
         .cloned()
         .ok_or_else(|| "MOR MERGE physical plan is missing scalar arena".to_string())?;
-    let child_outputs = physical.output_columns.clone();
+    let child_outputs = optimized_tree.output_columns.clone();
     let assert_key_input =
         output_column_by_name(&child_outputs, "__nr_merge_assert_key", "MERGE assert key")?;
     let hash_distribution = DistributionSpec::shuffle_agg([assert_key_input.column_id]);
 
-    let child_stats = physical.stats.clone();
+    let child_stats = optimized_tree.stats.clone();
     let distributed = OptimizedOperatorNode {
         op: Operator::PhysicalDistribution(PhysicalDistributionOp {
             spec: hash_distribution,
         }),
-        children: vec![physical],
+        children: vec![optimized_tree],
         stats: child_stats.clone(),
         explain_stats: OptimizerExplainStats::default(),
         output_columns: child_outputs.clone(),
@@ -3146,7 +3146,7 @@ fn build_merge_mor_change_stream_write_plan(
         false,
     )?;
     let producer = build_merge_mor_change_event_expand_plan(
-        planned.physical_plan,
+        planned.optimized_tree,
         target_columns,
         new_sequence_number,
         has_matched_update,

@@ -681,10 +681,10 @@ mod is_known_rule_name_tests {
             None,
         );
         let factory = ColumnRefFactory::new();
-        let physical = optimize_logical(plan, &HashMap::new(), factory, None, Vec::new())
+        let optimized_tree = optimize_logical(plan, &HashMap::new(), factory, None, Vec::new())
             .expect("optimize values");
-        let physical_debug = format!("{physical:?}");
-        assert!(physical_debug.contains("PhysicalValues"));
+        let optimized_tree_debug = format!("{optimized_tree:?}");
+        assert!(optimized_tree_debug.contains("PhysicalValues"));
     }
 
     struct AllocatingLimitRule {
@@ -1345,7 +1345,7 @@ mod is_known_rule_name_tests {
             narrow_base_stats(1_680, &["a", "b", "v"]),
         );
 
-        let physical = optimize(
+        let optimized_tree = optimize(
             query,
             query_scalars,
             &stats,
@@ -1356,8 +1356,8 @@ mod is_known_rule_name_tests {
         .expect("optimize");
 
         assert!(
-            plan_contains_mv_scan(&physical, "or_mv"),
-            "optimizer should select the cheaper exact OR MV alternative, got {physical:#?}"
+            plan_contains_mv_scan(&optimized_tree, "or_mv"),
+            "optimizer should select the cheaper exact OR MV alternative, got {optimized_tree:#?}"
         );
     }
 
@@ -1566,10 +1566,10 @@ mod is_known_rule_name_tests {
             None,
         );
         let factory = ColumnRefFactory::new();
-        let physical = optimize_logical(plan, &HashMap::new(), factory, None, Vec::new())
+        let optimized_tree = optimize_logical(plan, &HashMap::new(), factory, None, Vec::new())
             .expect("optimize assert one row");
-        let physical_debug = format!("{physical:?}");
-        assert!(physical_debug.contains("PhysicalAssertOneRow"));
+        let optimized_tree_debug = format!("{optimized_tree:?}");
+        assert!(optimized_tree_debug.contains("PhysicalAssertOneRow"));
     }
 
     #[test]
@@ -1707,7 +1707,7 @@ mod is_known_rule_name_tests {
             other => panic!("expected project root, got {other:?}"),
         };
 
-        let default_physical = optimize_logical(
+        let default_optimized_tree = optimize_logical(
             logical.clone(),
             &HashMap::new(),
             ColumnRefFactory::new(),
@@ -1715,24 +1715,24 @@ mod is_known_rule_name_tests {
             Vec::new(),
         )
         .expect("default optimize");
-        assert_root_distribution(&default_physical, &DistributionSpec::Gather);
+        assert_root_distribution(&default_optimized_tree, &DistributionSpec::Gather);
 
         let root_distribution = DistributionSpec::shuffle_agg([hash_col]);
-        let physical = optimize_logical_with_root_distribution(
+        let optimized_tree = optimize_logical_with_root_distribution(
             logical,
             &HashMap::new(),
             ColumnRefFactory::new(),
             root_distribution.clone(),
         )
         .expect("optimize with root distribution");
-        assert_root_distribution(&physical, &root_distribution);
+        assert_root_distribution(&optimized_tree, &root_distribution);
     }
 
     fn assert_root_distribution(
-        physical: &crate::sql::optimizer::optimized_tree::OptimizedOperatorNode,
+        optimized_tree: &crate::sql::optimizer::optimized_tree::OptimizedOperatorNode,
         expected: &crate::sql::optimizer::property::DistributionSpec,
     ) {
-        match &physical.op {
+        match &optimized_tree.op {
             crate::sql::optimizer::operator::Operator::PhysicalDistribution(op) => {
                 assert_eq!(&op.spec, expected);
             }
@@ -1852,12 +1852,12 @@ mod is_known_rule_name_tests {
             "expected query rewrite pipeline to set ranking partition-topn, trace: {:#?}, got: {rewritten_logical:#?}",
             rewrite_ctx.trace().events()
         );
-        let physical = optimize_logical(logical, &HashMap::new(), factory, None, Vec::new())
+        let optimized_tree = optimize_logical(logical, &HashMap::new(), factory, None, Vec::new())
             .expect("optimize ranking window");
 
         assert!(
-            has_rank_partition_topn_sort(&physical),
-            "expected RankingWindowPredicatePushdown to survive into the physical plan, got: {physical:#?}"
+            has_rank_partition_topn_sort(&optimized_tree),
+            "expected RankingWindowPredicatePushdown to survive into the physical plan, got: {optimized_tree:#?}"
         );
     }
 
@@ -1932,7 +1932,7 @@ mod is_known_rule_name_tests {
 
         // optimize: M1b's decorrelation rules must rewrite the Apply to a
         // join; no ApplyException error, no residual Apply.
-        let physical = optimize_logical(
+        let optimized_tree = optimize_logical(
             plan,
             &HashMap::new(),
             ColumnRefFactory::new(),
@@ -1941,7 +1941,7 @@ mod is_known_rule_name_tests {
         )
         .expect("optimize must succeed: M1b decorrelates correlated aggregate scalar subquery");
 
-        let physical_debug = format!("{physical:?}");
+        let physical_debug = format!("{optimized_tree:?}");
         // The correlated aggregate scalar path becomes a LEFT OUTER JOIN (HashJoin or NestLoop).
         assert!(
             physical_debug.contains("HashJoin") || physical_debug.contains("NestLoop"),
