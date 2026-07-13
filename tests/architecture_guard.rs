@@ -17514,9 +17514,10 @@ enum Cgo8Namespace {
     Value,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Cgo8AstScope {
     module_path: Vec<String>,
+    module_scope: bool,
     type_bindings: BTreeMap<String, Vec<Vec<String>>>,
     value_bindings: BTreeMap<String, Vec<Vec<String>>>,
     glob_imports: Vec<Vec<String>>,
@@ -17525,29 +17526,21 @@ struct Cgo8AstScope {
 }
 
 impl Cgo8AstScope {
-    fn resolve_segments(&self, segments: &[String], namespace: Cgo8Namespace) -> Vec<Vec<String>> {
+    fn nested(&self) -> Self {
+        let mut scope = self.clone();
+        scope.module_scope = false;
+        scope
+    }
+
+    fn resolve_unqualified(
+        &self,
+        segments: &[String],
+        namespace: Cgo8Namespace,
+        include_globs: bool,
+    ) -> Vec<Vec<String>> {
         let Some(first) = segments.first() else {
             return Vec::new();
         };
-        if first == "crate" {
-            return vec![segments.to_vec()];
-        }
-        let mut index = 0usize;
-        let mut relative = self.module_path.clone();
-        while segments.get(index).is_some_and(|segment| segment == "self") {
-            index += 1;
-        }
-        while segments
-            .get(index)
-            .is_some_and(|segment| segment == "super")
-        {
-            relative.pop();
-            index += 1;
-        }
-        if index > 0 {
-            relative.extend_from_slice(&segments[index..]);
-            return vec![relative];
-        }
         let (bindings, shadows) = match namespace {
             Cgo8Namespace::Type => (&self.type_bindings, &self.type_shadows),
             Cgo8Namespace::Value => (&self.value_bindings, &self.value_shadows),
@@ -17570,23 +17563,14 @@ impl Cgo8AstScope {
             path.extend_from_slice(segments);
             path
         }];
-        resolved.extend(self.glob_imports.iter().map(|glob| {
-            let mut path = glob.clone();
-            path.extend_from_slice(segments);
-            path
-        }));
+        if include_globs {
+            resolved.extend(self.glob_imports.iter().map(|glob| {
+                let mut path = glob.clone();
+                path.extend_from_slice(segments);
+                path
+            }));
+        }
         resolved
-    }
-
-    fn resolve_path(&self, path: &syn::Path, namespace: Cgo8Namespace) -> Vec<Vec<String>> {
-        self.resolve_segments(
-            &path
-                .segments
-                .iter()
-                .map(|segment| segment.ident.to_string())
-                .collect::<Vec<_>>(),
-            namespace,
-        )
     }
 }
 
@@ -17609,17 +17593,26 @@ fn cgo_8_expand_use_tree(
             prefix.pop();
         }
         syn::UseTree::Name(name) => {
+            let is_self = name.ident == "self";
             let mut target = prefix.clone();
-            target.push(name.ident.to_string());
+            if !is_self {
+                target.push(name.ident.to_string());
+            }
             bindings.push(Cgo8UseBinding {
-                local: Some(name.ident.to_string()),
+                local: Some(if is_self {
+                    prefix.last().cloned().unwrap_or_else(|| "self".to_string())
+                } else {
+                    name.ident.to_string()
+                }),
                 target,
                 glob: false,
             });
         }
         syn::UseTree::Rename(rename) => {
             let mut target = prefix.clone();
-            target.push(rename.ident.to_string());
+            if rename.ident != "self" {
+                target.push(rename.ident.to_string());
+            }
             bindings.push(Cgo8UseBinding {
                 local: Some(rename.rename.to_string()),
                 target,
@@ -17753,6 +17746,67 @@ fn cgo_8_forbidden_call_canonical(path: &[String]) -> Option<&'static str> {
 }
 
 #[derive(Default)]
+struct Cgo8MacroFindings {
+    identifiers: BTreeSet<String>,
+    paths: Vec<Vec<String>>,
+}
+
+fn cgo_8_scan_macro_cursor(mut cursor: syn::buffer::Cursor<'_>, findings: &mut Cgo8MacroFindings) {
+    let mut tokens = Vec::new();
+    while !cursor.eof() {
+        if let Some((inside, _, _, after)) = cursor.any_group() {
+            cgo_8_scan_macro_cursor(inside, findings);
+            tokens.push("|".to_string());
+            cursor = after;
+        } else if let Some((ident, after)) = cursor.ident() {
+            let ident = ident.to_string();
+            findings.identifiers.insert(ident.clone());
+            tokens.push(ident);
+            cursor = after;
+        } else if let Some((punct, after)) = cursor.punct() {
+            tokens.push(punct.as_char().to_string());
+            cursor = after;
+        } else if let Some((_, after)) = cursor.literal() {
+            tokens.push("|".to_string());
+            cursor = after;
+        } else if let Some((_, after)) = cursor.token_tree() {
+            tokens.push("|".to_string());
+            cursor = after;
+        } else {
+            break;
+        }
+    }
+
+    let mut index = 0usize;
+    while index < tokens.len() {
+        if !tokens[index].chars().all(is_ident_char) {
+            index += 1;
+            continue;
+        }
+        let mut path = vec![tokens[index].clone()];
+        let mut next = index + 1;
+        while tokens.get(next).is_some_and(|token| token == ":")
+            && tokens.get(next + 1).is_some_and(|token| token == ":")
+            && tokens
+                .get(next + 2)
+                .is_some_and(|token| token.chars().all(is_ident_char))
+        {
+            path.push(tokens[next + 2].clone());
+            next += 3;
+        }
+        findings.paths.push(path);
+        index = next;
+    }
+}
+
+fn cgo_8_macro_findings(item: &syn::Macro) -> Cgo8MacroFindings {
+    let buffer = syn::buffer::TokenBuffer::new2(item.tokens.clone());
+    let mut findings = Cgo8MacroFindings::default();
+    cgo_8_scan_macro_cursor(buffer.begin(), &mut findings);
+    findings
+}
+
+#[derive(Default)]
 struct Cgo8AstResult {
     violations: Vec<String>,
     production_functions: usize,
@@ -17772,15 +17826,102 @@ impl<'a> Cgo8AstVisitor<'a> {
         self.scopes.last().expect("CGO-8 AST scope must exist")
     }
 
+    fn resolve_segments(&self, segments: &[String], namespace: Cgo8Namespace) -> Vec<Vec<String>> {
+        self.resolve_segments_with_globs(segments, namespace, true)
+    }
+
+    fn resolve_segments_with_globs(
+        &self,
+        segments: &[String],
+        namespace: Cgo8Namespace,
+        include_globs: bool,
+    ) -> Vec<Vec<String>> {
+        let Some(first) = segments.first() else {
+            return Vec::new();
+        };
+        if first == "crate" {
+            return vec![segments.to_vec()];
+        }
+        let mut index = 0usize;
+        let mut module_path = self.scope().module_path.clone();
+        let explicit_module = if first == "self" {
+            index = 1;
+            true
+        } else {
+            while segments
+                .get(index)
+                .is_some_and(|segment| segment == "super")
+            {
+                module_path.pop();
+                index += 1;
+            }
+            index > 0
+        };
+        if explicit_module {
+            let remainder = &segments[index..];
+            if remainder.is_empty() {
+                return vec![module_path];
+            }
+            if let Some(module_scope) = self
+                .scopes
+                .iter()
+                .rev()
+                .find(|scope| scope.module_scope && scope.module_path == module_path)
+            {
+                return module_scope.resolve_unqualified(remainder, namespace, include_globs);
+            }
+            module_path.extend_from_slice(remainder);
+            return vec![module_path];
+        }
+        self.scope()
+            .resolve_unqualified(segments, namespace, include_globs)
+    }
+
+    fn resolve_path(&self, path: &syn::Path, namespace: Cgo8Namespace) -> Vec<Vec<String>> {
+        self.resolve_segments(
+            &path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>(),
+            namespace,
+        )
+    }
+
+    fn normalize_scope_bindings(&mut self) {
+        let scope = self.scopes.last_mut().unwrap();
+        for targets in scope
+            .type_bindings
+            .values_mut()
+            .chain(scope.value_bindings.values_mut())
+        {
+            targets.sort();
+            targets.dedup();
+        }
+        scope.glob_imports.sort();
+        scope.glob_imports.dedup();
+    }
+
     fn register_use(&mut self, item: &syn::ItemUse) {
         let mut raw = Vec::new();
         cgo_8_expand_use_tree(&item.tree, &mut Vec::new(), &mut raw);
         for binding in raw {
-            let targets = self
-                .scope()
-                .resolve_segments(&binding.target, Cgo8Namespace::Type);
-            for target in &targets {
-                if self.codegen && cgo_8_refresh_context_path(target) {
+            let type_targets =
+                self.resolve_segments_with_globs(&binding.target, Cgo8Namespace::Type, false);
+            let value_targets =
+                self.resolve_segments_with_globs(&binding.target, Cgo8Namespace::Value, false);
+            let mut all_targets = type_targets
+                .iter()
+                .chain(&value_targets)
+                .cloned()
+                .collect::<Vec<_>>();
+            all_targets.sort();
+            all_targets.dedup();
+            for target in &all_targets {
+                if self.codegen
+                    && (cgo_8_refresh_context_path(target)
+                        || binding.glob && cgo_8_refresh_context_glob_ancestor(target))
+                {
                     self.result.violations.push(format!(
                         "refresh-context: {} imports `{}`",
                         self.source,
@@ -17790,45 +17931,18 @@ impl<'a> Cgo8AstVisitor<'a> {
             }
             let scope = self.scopes.last_mut().unwrap();
             if binding.glob {
-                scope.glob_imports.extend(targets);
+                scope.glob_imports.extend(all_targets);
             } else if let Some(local) = binding.local {
                 scope.type_shadows.remove(&local);
                 scope.value_shadows.remove(&local);
-                scope.type_bindings.insert(local.clone(), targets.clone());
-                scope.value_bindings.insert(local, targets);
+                scope.type_bindings.insert(local.clone(), type_targets);
+                scope.value_bindings.insert(local, value_targets);
             }
         }
     }
 
-    fn register_item(&mut self, item: &syn::Item) {
-        if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
-            return;
-        }
+    fn register_item_declaration(&mut self, item: &syn::Item) {
         match item {
-            syn::Item::Use(item) => self.register_use(item),
-            syn::Item::Type(item) => {
-                let local = item.ident.to_string();
-                let targets = cgo_8_type_path(&item.ty)
-                    .map(|path| self.scope().resolve_path(&path.path, Cgo8Namespace::Type))
-                    .unwrap_or_default();
-                for target in &targets {
-                    if self.codegen && cgo_8_refresh_context_path(target) {
-                        self.result.violations.push(format!(
-                            "refresh-context: {} references `{}`",
-                            self.source,
-                            target.join("::")
-                        ));
-                    }
-                }
-                let scope = self.scopes.last_mut().unwrap();
-                if targets.is_empty() {
-                    scope.type_shadows.insert(local.clone());
-                    scope.type_bindings.remove(&local);
-                } else {
-                    scope.type_shadows.remove(&local);
-                    scope.type_bindings.insert(local, targets);
-                }
-            }
             syn::Item::Struct(item) => {
                 self.scopes
                     .last_mut()
@@ -17843,6 +17957,27 @@ impl<'a> Cgo8AstVisitor<'a> {
                     .type_shadows
                     .insert(item.ident.to_string());
             }
+            syn::Item::Union(item) => {
+                self.scopes
+                    .last_mut()
+                    .unwrap()
+                    .type_shadows
+                    .insert(item.ident.to_string());
+            }
+            syn::Item::Trait(item) => {
+                self.scopes
+                    .last_mut()
+                    .unwrap()
+                    .type_shadows
+                    .insert(item.ident.to_string());
+            }
+            syn::Item::Mod(item) => {
+                self.scopes
+                    .last_mut()
+                    .unwrap()
+                    .type_shadows
+                    .insert(item.ident.to_string());
+            }
             syn::Item::Fn(item) => {
                 self.scopes
                     .last_mut()
@@ -17850,13 +17985,74 @@ impl<'a> Cgo8AstVisitor<'a> {
                     .value_shadows
                     .insert(item.sig.ident.to_string());
             }
+            syn::Item::Const(item) => {
+                self.scopes
+                    .last_mut()
+                    .unwrap()
+                    .value_shadows
+                    .insert(item.ident.to_string());
+            }
+            syn::Item::Static(item) => {
+                self.scopes
+                    .last_mut()
+                    .unwrap()
+                    .value_shadows
+                    .insert(item.ident.to_string());
+            }
             _ => {}
+        };
+    }
+
+    fn register_type_alias(&mut self, item: &syn::ItemType) {
+        let local = item.ident.to_string();
+        let targets = cgo_8_type_path(&item.ty)
+            .map(|path| self.resolve_path(&path.path, Cgo8Namespace::Type))
+            .unwrap_or_default();
+        for target in &targets {
+            if self.codegen && cgo_8_refresh_context_path(target) {
+                self.result.violations.push(format!(
+                    "refresh-context: {} references `{}`",
+                    self.source,
+                    target.join("::")
+                ));
+            }
+        }
+        let scope = self.scopes.last_mut().unwrap();
+        if targets.is_empty() {
+            scope.type_shadows.insert(local.clone());
+            scope.type_bindings.remove(&local);
+        } else {
+            scope.type_shadows.remove(&local);
+            scope.type_bindings.insert(local, targets);
         }
     }
 
     fn register_items<'b>(&mut self, items: impl IntoIterator<Item = &'b syn::Item>) {
-        for item in items {
-            self.register_item(item);
+        let items = items
+            .into_iter()
+            .filter(|item| !nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)))
+            .collect::<Vec<_>>();
+        for item in &items {
+            self.register_item_declaration(item);
+        }
+        let alias_items = items
+            .iter()
+            .filter(|item| matches!(item, syn::Item::Use(_) | syn::Item::Type(_)))
+            .copied()
+            .collect::<Vec<_>>();
+        for _ in 0..=alias_items.len() {
+            let before = self.scope().clone();
+            for item in &alias_items {
+                match item {
+                    syn::Item::Use(item) => self.register_use(item),
+                    syn::Item::Type(item) => self.register_type_alias(item),
+                    _ => unreachable!(),
+                }
+            }
+            self.normalize_scope_bindings();
+            if *self.scope() == before {
+                break;
+            }
         }
     }
 
@@ -17868,6 +18064,9 @@ impl<'a> Cgo8AstVisitor<'a> {
             let syn::FnArg::Typed(input) = input else {
                 continue;
             };
+            if nfe_4_syn_attrs_require_test(&input.attrs) {
+                continue;
+            }
             let syn::Type::Reference(reference) = input.ty.as_ref() else {
                 continue;
             };
@@ -17877,7 +18076,7 @@ impl<'a> Cgo8AstVisitor<'a> {
             let Some(path) = cgo_8_type_path(&reference.elem) else {
                 continue;
             };
-            for canonical in self.scope().resolve_path(&path.path, Cgo8Namespace::Type) {
+            for canonical in self.resolve_path(&path.path, Cgo8Namespace::Type) {
                 if let Some(forbidden) = cgo_8_forbidden_mutable_canonical(&canonical) {
                     self.result.violations.push(format!(
                         "mutable-plan: {}: function `{}` accepts &mut {forbidden}",
@@ -17890,16 +18089,20 @@ impl<'a> Cgo8AstVisitor<'a> {
 
     fn enter_function(&mut self, signature: &syn::Signature) {
         self.result.production_functions += 1;
-        let mut scope = self.scope().clone();
+        let mut scope = self.scope().nested();
         for parameter in &signature.generics.params {
-            if let syn::GenericParam::Type(parameter) = parameter {
+            if let syn::GenericParam::Type(parameter) = parameter
+                && !nfe_4_syn_attrs_require_test(&parameter.attrs)
+            {
                 let name = parameter.ident.to_string();
                 scope.type_bindings.remove(&name);
                 scope.type_shadows.insert(name);
             }
         }
         for input in &signature.inputs {
-            if let syn::FnArg::Typed(input) = input {
+            if let syn::FnArg::Typed(input) = input
+                && !nfe_4_syn_attrs_require_test(&input.attrs)
+            {
                 cgo_8_pattern_bindings(&input.pat, &mut scope.value_shadows);
             }
         }
@@ -17911,7 +18114,7 @@ impl<'a> Cgo8AstVisitor<'a> {
         if !self.encoder {
             return;
         }
-        for canonical in self.scope().resolve_path(path, Cgo8Namespace::Value) {
+        for canonical in self.resolve_path(path, Cgo8Namespace::Value) {
             if let Some(forbidden) = cgo_8_forbidden_call_canonical(&canonical) {
                 self.result.violations.push(format!(
                     "encoder-planning: {} calls `{forbidden}`",
@@ -17925,7 +18128,7 @@ impl<'a> Cgo8AstVisitor<'a> {
         if !self.codegen {
             return;
         }
-        for canonical in self.scope().resolve_path(path, namespace) {
+        for canonical in self.resolve_path(path, namespace) {
             if cgo_8_refresh_context_path(&canonical) {
                 self.result.violations.push(format!(
                     "refresh-context: {} references `{}`",
@@ -17962,6 +18165,7 @@ impl<'ast> syn::visit::Visit<'ast> for Cgo8AstVisitor<'_> {
                             path.push(module.ident.to_string());
                             path
                         },
+                        module_scope: true,
                         ..Default::default()
                     };
                     scope.type_shadows.insert(module.ident.to_string());
@@ -18007,18 +18211,18 @@ impl<'ast> syn::visit::Visit<'ast> for Cgo8AstVisitor<'_> {
     }
 
     fn visit_block(&mut self, block: &'ast syn::Block) {
-        self.scopes.push(self.scope().clone());
+        self.scopes.push(self.scope().nested());
         let items = block.stmts.iter().filter_map(|stmt| match stmt {
             syn::Stmt::Item(item) => Some(item),
             _ => None,
         });
         self.register_items(items);
         for stmt in &block.stmts {
-            if nfe_4_syn_attrs_require_test(nfe_4_syn_stmt_attrs(stmt)) {
-                continue;
-            }
-            syn::visit::visit_stmt(self, stmt);
+            self.visit_stmt(stmt);
             if let syn::Stmt::Local(local) = stmt {
+                if nfe_4_syn_attrs_require_test(&local.attrs) {
+                    continue;
+                }
                 cgo_8_pattern_bindings(
                     &local.pat,
                     &mut self.scopes.last_mut().unwrap().value_shadows,
@@ -18035,6 +18239,69 @@ impl<'ast> syn::visit::Visit<'ast> for Cgo8AstVisitor<'_> {
         syn::visit::visit_expr(self, expr);
     }
 
+    fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_impl_item_attrs(item)) {
+            return;
+        }
+        syn::visit::visit_impl_item(self, item);
+    }
+
+    fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_trait_item_attrs(item)) {
+            return;
+        }
+        syn::visit::visit_trait_item(self, item);
+    }
+
+    fn visit_foreign_item(&mut self, item: &'ast syn::ForeignItem) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_foreign_item_attrs(item)) {
+            return;
+        }
+        syn::visit::visit_foreign_item(self, item);
+    }
+
+    fn visit_stmt(&mut self, stmt: &'ast syn::Stmt) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_stmt_attrs(stmt)) {
+            return;
+        }
+        syn::visit::visit_stmt(self, stmt);
+    }
+
+    fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+        if nfe_4_syn_attrs_require_test(&arm.attrs) {
+            return;
+        }
+        self.scopes.push(self.scope().nested());
+        cgo_8_pattern_bindings(&arm.pat, &mut self.scopes.last_mut().unwrap().value_shadows);
+        self.visit_pat(&arm.pat);
+        if let Some((_, guard)) = &arm.guard {
+            self.visit_expr(guard);
+        }
+        self.visit_expr(&arm.body);
+        self.scopes.pop();
+    }
+
+    fn visit_field(&mut self, field: &'ast syn::Field) {
+        if nfe_4_syn_attrs_require_test(&field.attrs) {
+            return;
+        }
+        syn::visit::visit_field(self, field);
+    }
+
+    fn visit_variant(&mut self, variant: &'ast syn::Variant) {
+        if nfe_4_syn_attrs_require_test(&variant.attrs) {
+            return;
+        }
+        syn::visit::visit_variant(self, variant);
+    }
+
+    fn visit_field_value(&mut self, field: &'ast syn::FieldValue) {
+        if nfe_4_syn_attrs_require_test(&field.attrs) {
+            return;
+        }
+        syn::visit::visit_field_value(self, field);
+    }
+
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
         if let syn::Expr::Path(function) = call.func.as_ref()
             && function.qself.is_none()
@@ -18044,18 +18311,10 @@ impl<'ast> syn::visit::Visit<'ast> for Cgo8AstVisitor<'_> {
         syn::visit::visit_expr_call(self, call);
     }
 
-    fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
-        if path.qself.is_none() {
-            self.analyze_refresh_path(&path.path, Cgo8Namespace::Value);
-        }
-        syn::visit::visit_expr_path(self, path);
-    }
-
-    fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
-        if path.qself.is_none() {
-            self.analyze_refresh_path(&path.path, Cgo8Namespace::Type);
-        }
-        syn::visit::visit_type_path(self, path);
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        self.analyze_refresh_path(path, Cgo8Namespace::Type);
+        self.analyze_refresh_path(path, Cgo8Namespace::Value);
+        syn::visit::visit_path(self, path);
     }
 
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
@@ -18068,13 +18327,7 @@ impl<'ast> syn::visit::Visit<'ast> for Cgo8AstVisitor<'_> {
                     | "version_scan_source"
                     | "target_state_scan_source"
                     | "target_locator_scan_source"
-            ) || method == "load_table"
-                && matches!(
-                    call.receiver.as_ref(),
-                    syn::Expr::Path(receiver)
-                        if receiver.path.is_ident("catalog")
-                            && !self.scope().value_shadows.contains("catalog")
-                );
+            ) || method == "load_table";
             if forbidden {
                 self.result.violations.push(format!(
                     "encoder-planning: {} calls `{method}`",
@@ -18083,6 +18336,97 @@ impl<'ast> syn::visit::Visit<'ast> for Cgo8AstVisitor<'_> {
             }
         }
         syn::visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_expr_closure(&mut self, closure: &'ast syn::ExprClosure) {
+        self.scopes.push(self.scope().nested());
+        for input in &closure.inputs {
+            cgo_8_pattern_bindings(input, &mut self.scopes.last_mut().unwrap().value_shadows);
+        }
+        syn::visit::visit_expr_closure(self, closure);
+        self.scopes.pop();
+    }
+
+    fn visit_expr_for_loop(&mut self, loop_expr: &'ast syn::ExprForLoop) {
+        self.visit_expr(&loop_expr.expr);
+        self.scopes.push(self.scope().nested());
+        cgo_8_pattern_bindings(
+            &loop_expr.pat,
+            &mut self.scopes.last_mut().unwrap().value_shadows,
+        );
+        self.visit_pat(&loop_expr.pat);
+        self.visit_block(&loop_expr.body);
+        self.scopes.pop();
+    }
+
+    fn visit_expr_if(&mut self, if_expr: &'ast syn::ExprIf) {
+        if let syn::Expr::Let(let_expr) = if_expr.cond.as_ref() {
+            self.visit_expr(&let_expr.expr);
+            self.scopes.push(self.scope().nested());
+            cgo_8_pattern_bindings(
+                &let_expr.pat,
+                &mut self.scopes.last_mut().unwrap().value_shadows,
+            );
+            self.visit_pat(&let_expr.pat);
+            self.visit_block(&if_expr.then_branch);
+            self.scopes.pop();
+            if let Some((_, otherwise)) = &if_expr.else_branch {
+                self.visit_expr(otherwise);
+            }
+        } else {
+            syn::visit::visit_expr_if(self, if_expr);
+        }
+    }
+
+    fn visit_expr_while(&mut self, while_expr: &'ast syn::ExprWhile) {
+        if let syn::Expr::Let(let_expr) = while_expr.cond.as_ref() {
+            self.visit_expr(&let_expr.expr);
+            self.scopes.push(self.scope().nested());
+            cgo_8_pattern_bindings(
+                &let_expr.pat,
+                &mut self.scopes.last_mut().unwrap().value_shadows,
+            );
+            self.visit_pat(&let_expr.pat);
+            self.visit_block(&while_expr.body);
+            self.scopes.pop();
+        } else {
+            syn::visit::visit_expr_while(self, while_expr);
+        }
+    }
+
+    fn visit_macro(&mut self, item: &'ast syn::Macro) {
+        let findings = cgo_8_macro_findings(item);
+        if self.codegen {
+            let exact_type = findings.identifiers.contains("IcebergMvRefreshContext");
+            let refresh_path = findings
+                .paths
+                .iter()
+                .any(|path| cgo_8_refresh_context_path(path));
+            if exact_type || refresh_path {
+                self.result.violations.push(format!(
+                    "refresh-context: {} references refresh context in macro tokens",
+                    self.source
+                ));
+            }
+        }
+        if self.encoder {
+            for forbidden in [
+                "build_iceberg_delta_scan_runtime_plan",
+                "plan_changes",
+                "load_table",
+                "version_scan_source",
+                "target_state_scan_source",
+                "target_locator_scan_source",
+            ] {
+                if findings.identifiers.contains(forbidden) {
+                    self.result.violations.push(format!(
+                        "encoder-planning: {} macro tokens reference `{forbidden}`",
+                        self.source
+                    ));
+                }
+            }
+        }
+        syn::visit::visit_macro(self, item);
     }
 }
 
@@ -18098,6 +18442,7 @@ fn cgo_8_ast_analysis(source: &Cgo8GuardSource) -> Result<Cgo8AstResult, String>
         scopes: vec![Cgo8AstScope {
             module_path: rust_source_module_segments(&source.path)
                 .unwrap_or_else(|| vec!["crate".to_string()]),
+            module_scope: true,
             ..Default::default()
         }],
         result: Cgo8AstResult::default(),
@@ -18122,7 +18467,12 @@ fn cgo_8_refresh_context_path(path: &[String]) -> bool {
     const TARGET: &[&str] = &["crate", "engine", "mv", "refresh_context"];
     let path = path.iter().map(String::as_str).collect::<Vec<_>>();
     path.starts_with(TARGET)
-        || path.last() == Some(&"*") && TARGET.starts_with(&path[..path.len().saturating_sub(1)])
+}
+
+fn cgo_8_refresh_context_glob_ancestor(path: &[String]) -> bool {
+    const TARGET: &[&str] = &["crate", "engine", "mv", "refresh_context"];
+    let path = path.iter().map(String::as_str).collect::<Vec<_>>();
+    TARGET.starts_with(&path)
 }
 
 fn cgo_8_production_source_texts(repo: &Path) -> Vec<(String, String)> {
@@ -18682,13 +19032,12 @@ mod local { struct DistributedPlan; fn prepare(plan: &mut DistributedPlan) {} }
 fn parameter_shadow(plan_changes: fn()) { plan_changes(); }
 fn local_let_shadow() { let plan_changes = || {}; plan_changes(); }
 fn local_fn_shadow() { fn plan_changes() {} plan_changes(); }
-fn unrelated(cache: Cache) { cache.load_table(); }
 "#,
         "fn root() {}",
     );
     assert!(
         cgo_8_immutable_scan_preparation_violations(&shadows).is_empty(),
-        "generic/local type and value shadows plus unrelated load_table methods must stay clean"
+        "generic/local type and value shadows must stay clean"
     );
 
     for refresh in [
@@ -18723,6 +19072,243 @@ fn unrelated(cache: Cache) { cache.load_table(); }
                 && violation.contains("src/sql/codegen/proto_encode/plan.rs")
         }),
         "invalid production Rust must fail closed with its source path: {parse_violations:?}"
+    );
+}
+
+#[test]
+fn cgo_8_encoder_load_table_method_is_always_forbidden() {
+    for encoder in [
+        "struct Catalog; impl Catalog { fn load_table(&self) {} } fn encode(renamed: Catalog) { renamed.load_table(); }",
+        "struct Catalog; impl Catalog { fn load_table(&self) {} } fn encode(catalog: Catalog) { let renamed = catalog; renamed.load_table(); }",
+        "struct Encoder; impl Encoder { fn load_table(&self) {} fn encode(&self) { self.load_table(); } }",
+    ] {
+        let sources = cgo_8_fixture_sources("fn prepare() {}", encoder, "fn root() {}");
+        let violations = cgo_8_immutable_scan_preparation_violations(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|v| { v.contains("encoder-planning") && v.contains("load_table") }),
+            "load_table method receiver bypassed guard: {encoder}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn cgo_8_scope_resolution_handles_parents_forward_aliases_and_patterns() {
+    for preparation in [
+        r#"
+use crate::sql::planner::distributed::DistributedPlan as Plan;
+mod nested { fn prepare(plan: &mut super::Plan) {} }
+"#,
+        r#"
+type LocalPlan = AliasPlan;
+use crate::sql::planner::distributed::DistributedPlan as Plan;
+type AliasPlan = Plan;
+fn prepare(plan: &mut LocalPlan) {}
+"#,
+        r#"
+use crate::sql::planner::distributed::{self as dist};
+fn prepare(plan: &mut dist::DistributedPlan) {}
+"#,
+        r#"
+use crate::sql::planner::distributed::{self};
+fn prepare(plan: &mut distributed::DistributedPlan) {}
+"#,
+    ] {
+        let sources = cgo_8_fixture_sources(preparation, "fn encode() {}", "fn root() {}");
+        let violations = cgo_8_immutable_scan_preparation_violations(&sources);
+        assert!(
+            violations.iter().any(|v| v.contains("mutable-plan")),
+            "parent/forward/self alias bypassed guard: {preparation}: {violations:?}"
+        );
+    }
+
+    let forward_encoder_aliases = cgo_8_fixture_sources(
+        "fn prepare() {}",
+        r#"
+use iceberg_alias::changes::plan_changes as plan;
+use connector_alias::iceberg as iceberg_alias;
+use crate::connector as connector_alias;
+fn encode() { plan(); }
+"#,
+        "fn root() {}",
+    );
+    assert!(
+        cgo_8_immutable_scan_preparation_violations(&forward_encoder_aliases)
+            .iter()
+            .any(|v| v.contains("encoder-planning")),
+        "forward use-alias chains must resolve independently of item order"
+    );
+
+    for clean_encoder in [
+        r#"
+use crate::connector::iceberg::changes::plan_changes;
+fn encode(local: fn()) { (|plan_changes: fn()| plan_changes())(local); }
+"#,
+        r#"
+use crate::connector::iceberg::changes::plan_changes;
+fn encode(items: Vec<fn()>) { for plan_changes in items { plan_changes(); } }
+"#,
+        r#"
+use crate::connector::iceberg::changes::plan_changes;
+fn encode(local: fn()) { match local { plan_changes => plan_changes() } }
+"#,
+        r#"
+use crate::connector::iceberg::changes::plan_changes;
+fn encode(local: Option<fn()>) { if let Some(plan_changes) = local { plan_changes(); } }
+"#,
+        r#"
+use crate::connector::iceberg::changes::plan_changes;
+fn encode(mut local: Option<fn()>) { while let Some(plan_changes) = local.take() { plan_changes(); } }
+"#,
+    ] {
+        let sources = cgo_8_fixture_sources("fn prepare() {}", clean_encoder, "fn root() {}");
+        let violations = cgo_8_immutable_scan_preparation_violations(&sources);
+        assert!(
+            violations.is_empty(),
+            "pattern binding must shadow only inside its lexical scope: {clean_encoder}: {violations:?}"
+        );
+
+        let outside = clean_encoder.replacen("fn encode", "fn local_encode", 1);
+        let outside = format!("{outside}\nfn encode() {{ plan_changes(); }}");
+        let sources = cgo_8_fixture_sources("fn prepare() {}", &outside, "fn root() {}");
+        assert!(
+            cgo_8_immutable_scan_preparation_violations(&sources)
+                .iter()
+                .any(|v| v.contains("encoder-planning")),
+            "pattern shadow must not escape its lexical scope: {clean_encoder}"
+        );
+    }
+}
+
+#[test]
+fn cgo_8_cfg_test_attributes_gate_every_relevant_ast_node() {
+    let sources = cgo_8_fixture_sources(
+        r#"
+use crate::sql::planner::distributed::DistributedPlan;
+fn prepare(#[cfg(test)] plan: &mut DistributedPlan) {}
+"#,
+        "fn encode() {}",
+        r#"
+struct Fields {
+    #[cfg(test)] leak: crate::engine::mv::refresh_context::Hidden,
+}
+enum Variants {
+    #[cfg(test)] Leak(crate::engine::mv::refresh_context::Hidden),
+}
+trait Trait {
+    #[cfg(test)] type Leak: crate::engine::mv::refresh_context::Hidden;
+}
+impl Trait for Fields {
+    #[cfg(test)] type Leak = crate::engine::mv::refresh_context::Hidden;
+}
+extern "C" {
+    #[cfg(test)] static LEAK: crate::engine::mv::refresh_context::Hidden;
+}
+fn probe() {
+    #[cfg(test)] let leak: crate::engine::mv::refresh_context::Hidden = todo!();
+    let _ = match 0 {
+        #[cfg(test)] 0 => crate::engine::mv::refresh_context::leak,
+        _ => 0,
+    };
+    let _ = Fields {
+        #[cfg(test)] leak: crate::engine::mv::refresh_context::leak,
+    };
+    #[cfg(test)] crate::engine::mv::refresh_context::leak;
+}
+"#,
+    )
+    .into_iter()
+    .map(|source| {
+        if source.path == "src/lib.rs" {
+            Cgo8GuardSource::new("src/sql/codegen/cfg_probe.rs", source.text)
+        } else {
+            source
+        }
+    })
+    .collect::<Vec<_>>();
+    let violations = cgo_8_immutable_scan_preparation_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "cfg(test) AST nodes and PatType parameters must be excluded: {violations:?}"
+    );
+}
+
+#[test]
+fn cgo_8_paths_globs_and_macro_tokens_cannot_bypass_guards() {
+    for codegen in [
+        "use crate::engine::mv::*; fn probe() {}",
+        "fn probe() { let _ = crate::engine::mv::refresh_context::Hidden {}; }",
+        "fn probe(value: Value) { if let crate::engine::mv::refresh_context::Hidden = value {} }",
+        "struct Local; impl crate::engine::mv::refresh_context::Hidden for Local {}",
+        "fn probe() { opaque!(crate::engine::mv::refresh_context::Hidden); }",
+        "fn probe() { opaque!(outer!(IcebergMvRefreshContext)); }",
+        "macro_rules! leak { () => { crate::engine::mv::refresh_context::Hidden } }",
+    ] {
+        let sources = cgo_8_fixture_sources("fn prepare() {}", "fn encode() {}", codegen)
+            .into_iter()
+            .map(|source| {
+                if source.path == "src/lib.rs" {
+                    Cgo8GuardSource::new("src/sql/codegen/path_probe.rs", source.text)
+                } else {
+                    source
+                }
+            })
+            .collect::<Vec<_>>();
+        let violations = cgo_8_immutable_scan_preparation_violations(&sources);
+        assert!(
+            violations.iter().any(|v| v.contains("refresh-context")),
+            "refresh path/token bypassed guard: {codegen}: {violations:?}"
+        );
+    }
+
+    for forbidden in [
+        "build_iceberg_delta_scan_runtime_plan",
+        "plan_changes",
+        "load_table",
+        "version_scan_source",
+        "target_state_scan_source",
+        "target_locator_scan_source",
+    ] {
+        let call = if forbidden == "load_table" {
+            "receiver.load_table()".to_string()
+        } else {
+            format!("{forbidden}()")
+        };
+        let encoder = format!("fn encode() {{ opaque!(outer!({call})); }}");
+        let sources = cgo_8_fixture_sources("fn prepare() {}", &encoder, "fn root() {}");
+        let violations = cgo_8_immutable_scan_preparation_violations(&sources);
+        assert!(
+            violations.iter().any(|v| v.contains("encoder-planning")),
+            "macro token call bypassed encoder guard: {encoder}: {violations:?}"
+        );
+    }
+
+    let macro_definition = cgo_8_fixture_sources(
+        "fn prepare() {}",
+        "macro_rules! leak { () => { plan_changes() } } fn encode() {}",
+        "fn root() {}",
+    );
+    assert!(
+        cgo_8_immutable_scan_preparation_violations(&macro_definition)
+            .iter()
+            .any(|v| v.contains("encoder-planning")),
+        "production macro definitions must not hide encoder planning calls"
+    );
+
+    let macro_noise = cgo_8_fixture_sources(
+        "fn prepare() {}",
+        r#"
+fn encode() {
+    opaque!("plan_changes() crate::engine::mv::refresh_context");
+    #[cfg(test)] opaque!(plan_changes());
+}
+"#,
+        "fn root() {}",
+    );
+    assert!(
+        cgo_8_immutable_scan_preparation_violations(&macro_noise).is_empty(),
+        "macro strings and cfg(test) macro statements must stay clean"
     );
 }
 
