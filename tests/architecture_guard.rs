@@ -7197,6 +7197,88 @@ fn runtime_filter_model_local_roots(text: &str) -> BTreeSet<String> {
     roots
 }
 
+#[derive(Default)]
+struct RuntimeFilterExternalPathAudit {
+    paths: BTreeSet<Vec<String>>,
+}
+
+impl RuntimeFilterExternalPathAudit {
+    fn collect_use_tree(&mut self, tree: &syn::UseTree, prefix: &mut Vec<String>) {
+        match tree {
+            syn::UseTree::Path(path) => {
+                prefix.push(path.ident.to_string());
+                self.collect_use_tree(&path.tree, prefix);
+                prefix.pop();
+            }
+            syn::UseTree::Name(name) => {
+                let mut path = prefix.clone();
+                path.push(name.ident.to_string());
+                self.paths.insert(path);
+            }
+            syn::UseTree::Rename(rename) => {
+                let mut path = prefix.clone();
+                path.push(rename.ident.to_string());
+                self.paths.insert(path);
+            }
+            syn::UseTree::Glob(_) => {
+                let mut path = prefix.clone();
+                path.push("*".to_string());
+                self.paths.insert(path);
+            }
+            syn::UseTree::Group(group) => {
+                for item in &group.items {
+                    self.collect_use_tree(item, prefix);
+                }
+            }
+        }
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterExternalPathAudit {
+    fn visit_item_extern_crate(&mut self, item: &'ast syn::ItemExternCrate) {
+        self.paths.insert(vec![item.ident.to_string()]);
+        syn::visit::visit_item_extern_crate(self, item);
+    }
+
+    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        if item.leading_colon.is_some() {
+            self.collect_use_tree(&item.tree, &mut Vec::new());
+        }
+        syn::visit::visit_item_use(self, item);
+    }
+
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        if path.leading_colon.is_some() {
+            self.paths.insert(
+                path.segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect(),
+            );
+        }
+        syn::visit::visit_path(self, path);
+    }
+}
+
+fn runtime_filter_external_paths(text: &str) -> BTreeSet<Vec<String>> {
+    let production = rust_sanitized_production_text(text);
+    let file = syn::parse_file(&production)
+        .expect("runtime-filter model production source must parse as Rust");
+    let mut audit = RuntimeFilterExternalPathAudit::default();
+    syn::visit::Visit::visit_file(&mut audit, &file);
+    audit.paths
+}
+
+fn runtime_filter_path_is_allowlisted(canonical: &[String], allowed_prefixes: &[&[&str]]) -> bool {
+    allowed_prefixes.iter().any(|prefix| {
+        canonical.len() >= prefix.len()
+            && canonical
+                .iter()
+                .zip(prefix.iter())
+                .all(|(actual, expected)| actual == expected)
+    })
+}
+
 fn runtime_filter_model_dependency_violations(source_rel: &str, text: &str) -> Vec<String> {
     let allowed_prefixes: &[&[&str]] = match source_rel {
         "src/runtime_filter/model/mod.rs" => &[],
@@ -7224,23 +7306,24 @@ fn runtime_filter_model_dependency_violations(source_rel: &str, text: &str) -> V
     };
     let local_roots = runtime_filter_model_local_roots(text);
 
-    rust_production_canonical_paths(text, source_rel)
+    let mut violations = rust_production_canonical_paths(text, source_rel)
         .into_iter()
         .map(|canonical| runtime_filter_dependency_path(&canonical, source_rel))
         .filter(|canonical| {
             !canonical
                 .first()
                 .is_some_and(|root| local_roots.contains(root))
-                && !allowed_prefixes.iter().any(|prefix| {
-                    canonical.len() >= prefix.len()
-                        && canonical
-                            .iter()
-                            .zip(prefix.iter())
-                            .all(|(actual, expected)| actual == expected)
-                })
+                && !runtime_filter_path_is_allowlisted(canonical, allowed_prefixes)
         })
         .map(|canonical| format!("{source_rel}: {}", canonical.join("::")))
-        .collect()
+        .collect::<BTreeSet<_>>();
+    violations.extend(
+        runtime_filter_external_paths(text)
+            .into_iter()
+            .filter(|path| !runtime_filter_path_is_allowlisted(path, allowed_prefixes))
+            .map(|path| format!("{source_rel}: external {}", path.join("::"))),
+    );
+    violations.into_iter().collect()
 }
 
 fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> Vec<String> {
@@ -7403,6 +7486,9 @@ fn runtime_filter_model_dependency_allowlist_rejects_forbidden_synthetic_imports
         "const reqwest: () = (); use reqwest::Client;",
         "static serde: () = (); use serde::Serialize;",
         "fn f() { struct serde; } use serde::Serialize;",
+        "mod std {} use ::std::net::TcpStream;",
+        "extern crate reqwest;",
+        "extern crate reqwest as http; use http::Client;",
     ] {
         assert!(
             !runtime_filter_model_dependency_violations(source_rel, source).is_empty(),
@@ -7413,6 +7499,14 @@ fn runtime_filter_model_dependency_allowlist_rejects_forbidden_synthetic_imports
     assert!(
         runtime_filter_model_dependency_violations(source_rel, "use arrow::datatypes::DataType;")
             .is_empty()
+    );
+    assert!(
+        runtime_filter_model_dependency_violations(
+            source_rel,
+            "mod arrow {} use ::arrow::datatypes::DataType;"
+        )
+        .is_empty(),
+        "allowlisted absolute dependency must not be rejected or confused with a local root"
     );
     for source in [
         "enum LocalDomain { Empty } type Domain = LocalDomain;",
