@@ -21,7 +21,6 @@
 //! compiles expressions, and assembles the plan structures expected by the
 //! pipeline executor.
 
-pub(crate) mod agg_type_infer;
 pub(crate) mod boundary_schema;
 pub(crate) mod connector_scan_planning;
 pub(crate) mod fragment_builder;

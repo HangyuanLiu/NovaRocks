@@ -26,7 +26,7 @@ use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::aggregate::{AggFunction, AggOrderSpec, AggTypeSignature, AggregateNode};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{common as proto_common, plan};
-use crate::sql::codegen::agg_type_infer::infer_agg_function_types;
+use crate::types::aggregate::infer_agg_function_types;
 
 pub(super) fn lower_hash_aggregate_node(
     node: &plan::DistributedNode,
