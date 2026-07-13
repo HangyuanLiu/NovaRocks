@@ -26,7 +26,6 @@ pub(crate) mod boundary_schema;
 pub(crate) mod connector_scan_planning;
 pub(crate) mod fragment_builder;
 pub(crate) mod fragment_request;
-pub(crate) mod helpers;
 pub(crate) mod iceberg_delta_scan_planning;
 pub(crate) mod iceberg_literal_json;
 pub(crate) mod ir;

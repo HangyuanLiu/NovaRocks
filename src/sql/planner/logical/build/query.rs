@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::sql::analysis::cte::CTERegistry;
+use crate::sql::analysis::expr_display::typed_expr_display_name;
 use crate::sql::analysis::*;
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use crate::sql::planner::logical::*;
@@ -379,7 +380,7 @@ fn collect_extra_sort_items(
         {
             continue;
         }
-        let output_name = crate::sql::codegen::helpers::typed_expr_display_name(&item.expr);
+        let output_name = typed_expr_display_name(&item.expr);
         let output_name_lower = output_name.to_lowercase();
         if !output_names.contains(&output_name_lower) && added.insert(output_name_lower) {
             let output_column_id = if let ExprKind::ColumnRef { column_id, .. } = &item.expr.kind {
@@ -496,12 +497,7 @@ fn rewrite_sort_items_to_projection_refs(
 ) -> Vec<SortItem> {
     let extra_names: std::collections::HashMap<String, &ProjectItem> = extra_items
         .iter()
-        .map(|item| {
-            (
-                crate::sql::codegen::helpers::typed_expr_display_name(&item.expr).to_lowercase(),
-                item,
-            )
-        })
+        .map(|item| (typed_expr_display_name(&item.expr).to_lowercase(), item))
         .collect();
     // SELECT output columns keyed by display name. A non-ColumnRef ORDER BY item
     // (e.g. `sum(x)`) whose display name matches a SELECT output already computed
@@ -523,8 +519,7 @@ fn rewrite_sort_items_to_projection_refs(
     order_by
         .iter()
         .map(|item| {
-            let display =
-                crate::sql::codegen::helpers::typed_expr_display_name(&item.expr).to_lowercase();
+            let display = typed_expr_display_name(&item.expr).to_lowercase();
             if let ExprKind::ColumnRef { column_id, .. } = &item.expr.kind
                 && *column_id != ColumnId::UNSET
                 && output_by_id.contains_key(column_id)

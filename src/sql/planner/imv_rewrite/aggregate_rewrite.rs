@@ -21,13 +21,13 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use iceberg::spec::{NestedField, PrimitiveType, Type};
 
+use crate::sql::analysis::expr_display::typed_expr_display_name;
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr, UnOp,
 };
 use crate::sql::catalog::{
     ColumnDef, IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter, TableDef,
 };
-use crate::sql::codegen::helpers::typed_expr_display_name;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;

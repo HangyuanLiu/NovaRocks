@@ -15,31 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Canonical display identities for analyzed expressions.
+//!
+//! These strings are used as scope and slot identities in addition to display
+//! output. They are not freely changeable UI text: formatting changes can alter
+//! expression resolution and slot binding semantics.
+
 use crate::sql::analysis::{self as query_ir, BinOp, ExprKind, TypedExpr};
-use crate::sql::planner::payload::{AggregateCall, WindowExpr};
-
-/// Split a TypedExpr on AND into a flat list of conjuncts.
-pub(crate) fn split_and_conjuncts_typed(expr: &TypedExpr) -> Vec<&TypedExpr> {
-    let mut result = Vec::new();
-    collect_and_conjuncts_typed(expr, &mut result);
-    result
-}
-
-fn collect_and_conjuncts_typed<'a>(expr: &'a TypedExpr, out: &mut Vec<&'a TypedExpr>) {
-    match &expr.kind {
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::And,
-            right,
-        } => {
-            collect_and_conjuncts_typed(left, out);
-            collect_and_conjuncts_typed(right, out);
-        }
-        _ => {
-            out.push(expr);
-        }
-    }
-}
 
 /// Display name for a TypedExpr (used as scope key for group_by columns).
 /// Must be deterministic — same expression always produces the same name.
@@ -401,39 +383,6 @@ fn group_concat_display_name_from_parts(
     out.push_str(&separator_display);
     out.push(')');
     out
-}
-
-/// Display name for an AggregateCall.
-pub(crate) fn agg_call_display_name(call: &AggregateCall) -> String {
-    agg_call_display_name_from_parts(&call.name, &call.args, call.distinct, &call.order_by)
-}
-
-/// Group window expressions by their (partition_by, order_by, frame) signature.
-pub(crate) fn group_win_exprs_by_sig(exprs: &[WindowExpr]) -> Vec<Vec<usize>> {
-    let sig = |e: &WindowExpr| -> String {
-        format!(
-            "{:?}|{:?}|{:?}",
-            e.partition_by
-                .iter()
-                .map(|p| format!("{:?}", p.kind))
-                .collect::<Vec<_>>(),
-            e.order_by
-                .iter()
-                .map(|o| format!("{:?}:{}", o.expr.kind, o.asc))
-                .collect::<Vec<_>>(),
-            e.window_frame,
-        )
-    };
-    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
-    for (i, e) in exprs.iter().enumerate() {
-        let s = sig(e);
-        if let Some(g) = groups.iter_mut().find(|(gs, _)| *gs == s) {
-            g.1.push(i);
-        } else {
-            groups.push((s, vec![i]));
-        }
-    }
-    groups.into_iter().map(|(_, indices)| indices).collect()
 }
 
 #[cfg(test)]

@@ -2071,6 +2071,15 @@ fn planner_stage_first_boundaries_are_closed() {
                 .map(|violation| format!("{source_rel}: {violation}")),
         );
     }
+    for file in production_rs_files(&src_dir().join("sql/optimizer")) {
+        let source_rel = rel(&file);
+        let text = fs::read_to_string(&file).unwrap();
+        dependency_violations.extend(
+            planner_stage_first_dependency_violations_in(&source_rel, &text)
+                .into_iter()
+                .map(|violation| format!("{source_rel}: {violation}")),
+        );
+    }
     assert!(
         path_attribute_violations.is_empty(),
         "planner production modules must not bypass physical source ownership with path attributes:\n{}",
@@ -3406,6 +3415,8 @@ fn planner_stage_first_dependency_violations_in(source_rel: &str, text: &str) ->
 
     let source_rel = source_rel.replace('\\', "/");
     let logical = source_rel.starts_with("src/sql/planner/logical/");
+    let imv_rewrite = source_rel.starts_with("src/sql/planner/imv_rewrite/");
+    let optimizer = source_rel.starts_with("src/sql/optimizer/");
     let physical = source_rel.starts_with("src/sql/planner/physical/");
     let distributed = source_rel.starts_with("src/sql/planner/distributed/");
     let optimizer_bridge = source_rel.starts_with("src/sql/planner/optimizer_bridge/");
@@ -3414,7 +3425,15 @@ fn planner_stage_first_dependency_violations_in(source_rel: &str, text: &str) ->
         source_rel.as_str(),
         "src/sql/planner/payload.rs" | "src/sql/planner/ordering.rs"
     );
-    if !logical && !physical && !distributed && !optimizer_bridge && !pipeline && !neutral {
+    if !logical
+        && !imv_rewrite
+        && !optimizer
+        && !physical
+        && !distributed
+        && !optimizer_bridge
+        && !pipeline
+        && !neutral
+    {
         return Vec::new();
     }
 
@@ -3434,42 +3453,66 @@ fn planner_stage_first_dependency_violations_in(source_rel: &str, text: &str) ->
             let planner_distributed =
                 starts_with(path, &["crate", "sql", "planner", "distributed"]);
             let planner_pipeline = starts_with(path, &["crate", "sql", "planner", "pipeline"]);
-            let optimizer = starts_with(path, &["crate", "sql", "optimizer"]);
+            let optimizer_dependency = starts_with(path, &["crate", "sql", "optimizer"]);
             let optimizer_options = starts_with(path, &["crate", "sql", "optimizer", "options"]);
             let codegen = starts_with(path, &["crate", "sql", "codegen"]);
-            let codegen_helpers = starts_with(path, &["crate", "sql", "codegen", "helpers"]);
+            // CGO-2 owns moving aggregate type inference out of codegen. Keep this
+            // exception exact so that follow-up can delete it without reopening
+            // any other optimizer -> codegen dependency.
+            let optimizer_codegen_agg_type_infer_owner_exception =
+                starts_with(path, &["crate", "sql", "codegen", "agg_type_infer"]);
+            let imv_fragment_builder = starts_with(
+                path,
+                &[
+                    "crate",
+                    "sql",
+                    "codegen",
+                    "fragment_builder",
+                    "PlanFragmentBuilder",
+                ],
+            );
+            let imv_fragment_request =
+                starts_with(path, &["crate", "sql", "codegen", "FragmentBuildRequest"]);
 
             if logical {
                 planner_physical
                     || planner_distributed
                     || planner_pipeline
-                    || optimizer
+                    || optimizer_dependency
                     || (planner_bridge && !planner_bridge_property)
-                    || (codegen && !codegen_helpers)
+                    || codegen
+            } else if optimizer {
+                codegen && !optimizer_codegen_agg_type_infer_owner_exception
+            } else if imv_rewrite {
+                codegen && !imv_fragment_builder && !imv_fragment_request
             } else if physical {
                 planner_logical
                     || planner_distributed
                     || planner_pipeline
-                    || (optimizer && !optimizer_options)
+                    || (optimizer_dependency && !optimizer_options)
                     || codegen
                     || planner_bridge
             } else if distributed {
                 planner_logical_build
                     || planner_pipeline
-                    || optimizer
+                    || optimizer_dependency
                     || codegen
                     || (planner_bridge && !planner_bridge_property)
             } else if optimizer_bridge {
                 planner_distributed || planner_pipeline || codegen
             } else if pipeline {
-                planner_logical || planner_bridge || planner_pipeline || optimizer || codegen
+                planner_logical
+                    || planner_bridge
+                    || planner_pipeline
+                    || optimizer_dependency
+                    || codegen
             } else {
                 planner_logical
                     || planner_bridge
                     || planner_physical
                     || planner_distributed
                     || planner_pipeline
-                    || optimizer
+                    || optimizer_dependency
                     || codegen
             }
         })
@@ -4938,6 +4981,42 @@ fn planner_stage_first_dependency_detector_covers_bypasses() {
             "use crate::sql::codegen::proto_encode::Encoder;",
         ),
         (
+            "src/sql/planner/logical/node.rs",
+            "use crate::sql::codegen::helpers::display_name;",
+        ),
+        (
+            "src/sql/optimizer/rule.rs",
+            "use crate::sql::codegen::Codegen;",
+        ),
+        (
+            "src/sql/optimizer/rule.rs",
+            "use crate::sql::{codegen::{helpers::display_name, ir::Plan}, column_id::ColumnId};",
+        ),
+        (
+            "src/sql/optimizer/rule.rs",
+            "use crate::sql::codegen as lowering; type Leak = lowering::FragmentBuildRequest;",
+        ),
+        (
+            "src/sql/optimizer/rule.rs",
+            "type Leak = crate::sql::codegen::proto_encode::Encoder;",
+        ),
+        (
+            "src/sql/planner/imv_rewrite/entrypoint.rs",
+            "use crate::sql::codegen::helpers::display_name;",
+        ),
+        (
+            "src/sql/planner/imv_rewrite/entrypoint.rs",
+            "use crate::sql::{codegen::{proto_encode::Encoder, ir::Plan}, column_id::ColumnId};",
+        ),
+        (
+            "src/sql/planner/imv_rewrite/entrypoint.rs",
+            "use crate::sql::codegen as lowering; type Leak = lowering::helpers::DisplayName;",
+        ),
+        (
+            "src/sql/planner/imv_rewrite/entrypoint.rs",
+            "type Leak = crate::sql::codegen::proto_encode::Encoder;",
+        ),
+        (
             "src/sql/planner/physical/node.rs",
             "use crate::sql::planner::{logical::Node, distributed::Plan};",
         ),
@@ -5034,8 +5113,12 @@ enum Demo {
 
     let valid = [
         (
+            "src/sql/optimizer/cascades_rules/split_aggregate.rs",
+            "use crate::sql::codegen::agg_type_infer::infer_agg_function_types;",
+        ),
+        (
             "src/sql/planner/logical/node.rs",
-            "use crate::sql::planner::{payload::Payload, ordering::Ordering, optimizer_bridge::property::Property}; use crate::sql::codegen::helpers::display_name;",
+            "use crate::sql::planner::{payload::Payload, ordering::Ordering, optimizer_bridge::property::Property};",
         ),
         (
             "src/sql/planner/physical/node.rs",
@@ -5055,7 +5138,11 @@ enum Demo {
         ),
         (
             "src/sql/planner/imv_rewrite/entrypoint.rs",
-            "use crate::sql::{optimizer::Optimizer, codegen::Codegen}; use crate::sql::planner::{logical::Node, physical::Physical, distributed::Plan};",
+            "use crate::sql::codegen::fragment_builder::PlanFragmentBuilder; use crate::sql::codegen::FragmentBuildRequest;",
+        ),
+        (
+            "src/sql/planner/imv_rewrite/entrypoint.rs",
+            "let fragment = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(request); let request = crate::sql::codegen::FragmentBuildRequest::result(plan);",
         ),
         (
             "src/sql/planner/logical/node.rs",

@@ -21,6 +21,7 @@
 //! This layer does NOT contain physical concepts (tuple_id, slot_id).
 
 pub(crate) mod cte;
+pub(crate) mod expr_display;
 
 use arrow::datatypes::DataType;
 
