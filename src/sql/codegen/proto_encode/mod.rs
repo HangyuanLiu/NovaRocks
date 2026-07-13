@@ -19,18 +19,16 @@ pub(crate) mod expr;
 mod iceberg_delta_scan;
 pub(crate) mod instance;
 pub(crate) mod plan;
-pub(crate) mod types;
 
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
+    use arrow::datatypes::{DataType, Field};
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use prost::Message;
 
     use super::expr::encode_expr;
-    use super::types::{decode_field_type, decode_type, encode_field_type, encode_type};
     use super::{instance, plan};
     use crate::proto::{common, expr};
     use crate::sql::analysis::{ExprKind, SortItem, SubqueryKind, TypedExpr};
@@ -39,21 +37,7 @@ mod tests {
     use crate::sql::common::{
         BinOp, LambdaParam, LiteralValue, UnOp, WindowBound, WindowFrame, WindowFrameType,
     };
-    use crate::types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
-
-    fn roundtrip_message<M>(value: &M) -> M
-    where
-        M: Message + Default,
-    {
-        M::decode(value.encode_to_vec().as_slice()).expect("decode proto message")
-    }
-
-    fn scalar_primitive(desc: &common::TypeDesc) -> common::PrimitiveType {
-        let common::type_desc::Kind::Scalar(scalar) = desc.kind.as_ref().expect("type kind") else {
-            panic!("expected scalar TypeDesc");
-        };
-        common::PrimitiveType::try_from(scalar.r#type).expect("known primitive")
-    }
+    use crate::types::native_proto::decode_type;
 
     fn literal_expr(value: LiteralValue, data_type: DataType) -> TypedExpr {
         TypedExpr {
@@ -88,149 +72,10 @@ mod tests {
     }
 
     fn assert_expr_roundtrip(encoded: expr::Expr) -> expr::Expr {
-        let decoded = roundtrip_message(&encoded);
+        let decoded =
+            expr::Expr::decode(encoded.encode_to_vec().as_slice()).expect("decode proto message");
         assert_eq!(encoded, decoded);
         decoded
-    }
-
-    #[test]
-    fn recursive_arrow_type_round_trips_through_type_desc() {
-        let data_type = DataType::List(Arc::new(Field::new(
-            "item",
-            DataType::Struct(Fields::from(vec![
-                Arc::new(Field::new("amount", DataType::Decimal128(18, 2), true)),
-                Arc::new(Field::new(
-                    "ids",
-                    DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
-                    true,
-                )),
-            ])),
-            true,
-        )));
-
-        let encoded = encode_type(&data_type).expect("encode recursive type");
-        let decoded_proto: common::TypeDesc = roundtrip_message(&encoded);
-        assert_eq!(encoded, decoded_proto);
-        assert_eq!(
-            decode_type(&decoded_proto).expect("decode recursive type"),
-            data_type
-        );
-    }
-
-    #[test]
-    fn map_type_round_trips_through_type_desc() {
-        let data_type = DataType::Map(
-            Arc::new(Field::new(
-                "entries",
-                DataType::Struct(Fields::from(vec![
-                    Arc::new(Field::new("key", DataType::Utf8, true)),
-                    Arc::new(Field::new("value", DataType::Decimal128(12, 4), true)),
-                ])),
-                false,
-            )),
-            false,
-        );
-
-        let encoded = encode_type(&data_type).expect("encode map type");
-        let decoded_proto: common::TypeDesc = roundtrip_message(&encoded);
-        assert_eq!(encoded, decoded_proto);
-        assert_eq!(
-            decode_type(&decoded_proto).expect("decode map type"),
-            data_type
-        );
-    }
-
-    #[test]
-    fn metadata_logical_fields_encode_to_logical_primitives() {
-        let cases = [
-            (
-                field_with_logical_type(
-                    Field::new("json_payload", DataType::Utf8, true),
-                    LogicalType::Json,
-                ),
-                common::PrimitiveType::Json,
-                DataType::Utf8,
-                Some(LogicalType::Json),
-            ),
-            (
-                field_with_logical_type(
-                    Field::new("hll_state", DataType::Binary, true),
-                    LogicalType::Hll,
-                ),
-                common::PrimitiveType::Hll,
-                DataType::Binary,
-                Some(LogicalType::Hll),
-            ),
-            (
-                field_with_logical_type(
-                    Field::new("bitmap_state", DataType::Binary, true),
-                    LogicalType::Bitmap,
-                ),
-                common::PrimitiveType::Bitmap,
-                DataType::Binary,
-                Some(LogicalType::Bitmap),
-            ),
-            (
-                field_with_logical_type(
-                    Field::new("object_state", DataType::Binary, true),
-                    LogicalType::Object,
-                ),
-                common::PrimitiveType::Object,
-                DataType::Binary,
-                Some(LogicalType::Object),
-            ),
-            (
-                field_with_logical_type(
-                    Field::new("percentile_state", DataType::Binary, true),
-                    LogicalType::Percentile,
-                ),
-                common::PrimitiveType::Percentile,
-                DataType::Binary,
-                Some(LogicalType::Percentile),
-            ),
-            (
-                Field::new("variant_payload", DataType::LargeBinary, true),
-                common::PrimitiveType::Variant,
-                DataType::LargeBinary,
-                None,
-            ),
-            (
-                Field::new("large_int", DataType::FixedSizeBinary(16), true),
-                common::PrimitiveType::Largeint,
-                DataType::FixedSizeBinary(16),
-                None,
-            ),
-        ];
-
-        for (field, expected_primitive, expected_type, expected_logical) in cases {
-            let encoded = encode_field_type(&field).expect("encode logical field");
-            assert_eq!(scalar_primitive(&encoded), expected_primitive);
-
-            let decoded = decode_field_type(field.name(), field.is_nullable(), &encoded)
-                .expect("decode field");
-            assert_eq!(decoded.data_type(), &expected_type);
-            assert_eq!(logical_type_of_field(&decoded), expected_logical);
-        }
-    }
-
-    #[test]
-    fn nested_logical_field_metadata_survives_decode_type() {
-        let data_type = DataType::Struct(Fields::from(vec![Arc::new(field_with_logical_type(
-            Field::new("payload", DataType::Utf8, true),
-            LogicalType::Json,
-        ))]));
-
-        let encoded = encode_type(&data_type).expect("encode struct with logical child");
-        let decoded = decode_type(&roundtrip_message(&encoded)).expect("decode logical child");
-
-        let DataType::Struct(fields) = decoded else {
-            panic!("expected struct");
-        };
-        assert_eq!(fields[0].data_type(), &DataType::Utf8);
-        assert_eq!(
-            logical_type_of_field(fields[0].as_ref()),
-            Some(LogicalType::Json)
-        );
     }
 
     #[test]
@@ -305,19 +150,6 @@ mod tests {
     }
 
     #[test]
-    fn invalid_decimal_type_widths_are_rejected() {
-        let err = encode_type(&DataType::Decimal128(39, 0))
-            .expect_err("Decimal128 precision above 38 must fail");
-        assert!(err.contains("Decimal128"));
-        assert!(err.contains("precision"));
-
-        let err = encode_type(&DataType::Decimal256(77, 0))
-            .expect_err("Decimal256 precision above 76 must fail");
-        assert!(err.contains("Decimal256"));
-        assert!(err.contains("precision"));
-    }
-
-    #[test]
     fn invalid_decimal_literal_widths_are_rejected() {
         let decimal128 = literal_expr(
             LiteralValue::Decimal("1".to_string()),
@@ -381,8 +213,16 @@ mod tests {
         };
         assert_eq!(lambda.params[0].name.as_deref(), Some("x"));
         assert_eq!(lambda.params[0].slot_id, 3);
+        let common::type_desc::Kind::Scalar(scalar) = lambda.params[0]
+            .r#type
+            .as_ref()
+            .and_then(|desc| desc.kind.as_ref())
+            .expect("type kind")
+        else {
+            panic!("expected scalar TypeDesc");
+        };
         assert_eq!(
-            scalar_primitive(lambda.params[0].r#type.as_ref().expect("type")),
+            common::PrimitiveType::try_from(scalar.r#type).expect("known primitive"),
             common::PrimitiveType::Bigint
         );
         let variants = vec![
@@ -581,8 +421,16 @@ mod tests {
         else {
             panic!("expected cast");
         };
+        let common::type_desc::Kind::Scalar(scalar) = cast
+            .target
+            .as_ref()
+            .and_then(|desc| desc.kind.as_ref())
+            .expect("target type kind")
+        else {
+            panic!("expected scalar TypeDesc");
+        };
         assert_eq!(
-            scalar_primitive(cast.target.as_ref().expect("target type")),
+            common::PrimitiveType::try_from(scalar.r#type).expect("known primitive"),
             common::PrimitiveType::Double
         );
 
@@ -666,22 +514,6 @@ mod tests {
 
         let err = encode_expr(&malformed).expect_err("scale mismatch");
         assert!(err.contains("scale"));
-    }
-
-    #[test]
-    fn unsupported_timestamp_unit_reports_clear_error() {
-        let err = encode_type(&DataType::Timestamp(TimeUnit::Second, None))
-            .expect_err("second timestamp rejected");
-
-        assert!(err.contains("unsupported timestamp unit"));
-    }
-
-    #[test]
-    fn unsupported_time64_unit_reports_clear_error() {
-        let err = encode_type(&DataType::Time64(TimeUnit::Nanosecond))
-            .expect_err("nanosecond Time64 rejected");
-
-        assert!(err.contains("unsupported Time64 unit"));
     }
 
     fn planner_output_column(
@@ -851,7 +683,9 @@ mod tests {
         };
 
         let encoded = plan::encode_distributed_plan(&plan).expect("encode distributed plan");
-        let decoded: crate::proto::plan::DistributedPlan = roundtrip_message(&encoded);
+        let decoded =
+            crate::proto::plan::DistributedPlan::decode(encoded.encode_to_vec().as_slice())
+                .expect("decode proto message");
 
         assert_eq!(decoded.root_fragment_id, 1);
         assert_eq!(decoded.fragments.len(), 2);

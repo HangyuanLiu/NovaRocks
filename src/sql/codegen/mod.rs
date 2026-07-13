@@ -106,29 +106,3 @@ pub(crate) struct RuntimeFilterPlanResult {
     /// fragment_id -> (filter_id, probe_target_node_id) for probe-side targets.
     pub probe_side_filters: std::collections::HashMap<FragmentId, Vec<(i32, i32)>>,
 }
-
-#[cfg(test)]
-mod tests {
-    use arrow::datatypes::DataType;
-
-    use super::proto_encode::types::decode_type;
-    use crate::proto::common;
-
-    #[test]
-    fn proto_type_decode_is_available_to_sibling_lowering_modules() {
-        let desc = common::TypeDesc {
-            kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
-                r#type: common::PrimitiveType::Int as i32,
-                len: None,
-                precision: None,
-                scale: None,
-                time_unit: None,
-            })),
-        };
-
-        assert_eq!(
-            decode_type(&desc).expect("decode int TypeDesc"),
-            DataType::Int32
-        );
-    }
-}

@@ -200,8 +200,8 @@ mod tests {
     use super::*;
     use crate::common::ids::SlotId;
     use crate::proto::common;
-    use crate::sql::codegen::proto_encode::types::{encode_field_type, encode_type};
     use crate::types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
+    use crate::types::native_proto::{encode_field_type, encode_type};
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
         encode_type(data_type).expect("encode type")

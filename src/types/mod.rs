@@ -22,6 +22,7 @@ pub(crate) mod arrow_primitive;
 pub(crate) mod arrow_thrift;
 pub(crate) mod coercion;
 pub(crate) mod logical;
+pub(crate) mod native_proto;
 mod predicate;
 pub(crate) mod primitive;
 

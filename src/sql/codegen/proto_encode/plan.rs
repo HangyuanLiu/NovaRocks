@@ -25,7 +25,6 @@ use iceberg::spec::{ListType, MapType, NestedField, PrimitiveType, StructType, T
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use super::expr::{encode_expr, encode_sort_items, encode_window_frame};
-use super::types::encode_type;
 use crate::proto::{common, plan};
 use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, TypedExpr};
 use crate::sql::catalog;
@@ -53,6 +52,7 @@ use crate::sql::planner::physical::{
     PhysicalPlanKind, PlanSetOpKind, RedistributeMode, TopNPhase,
 };
 use crate::types::aggregate::infer_agg_function_types;
+use crate::types::native_proto::encode_type;
 
 pub(crate) struct NativePlanEncodeContext<'a> {
     pub(crate) mv_refresh_ctx:

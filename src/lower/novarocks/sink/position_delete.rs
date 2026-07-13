@@ -208,7 +208,7 @@ mod tests {
 
     use crate::connector::iceberg::sink_plan::IcebergSinkMode;
     use crate::proto::{common, expr, plan};
-    use crate::sql::codegen::proto_encode::types::encode_type;
+    use crate::types::native_proto::encode_type;
 
     fn typed_column_def(name: &str, data_type: DataType, nullable: bool) -> plan::ColumnDef {
         plan::ColumnDef {
