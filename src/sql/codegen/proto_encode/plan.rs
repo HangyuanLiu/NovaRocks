@@ -2160,14 +2160,16 @@ fn encode_scan_source(
                 from_snapshot_id,
                 to_snapshot_id,
             } => {
-                let runtime_plan =
-                    crate::sql::codegen::scan::iceberg_delta::build_iceberg_delta_scan_runtime_plan(
-                        table,
-                        *from_snapshot_id,
-                        *to_snapshot_id,
-                        ctx.mv_refresh_ctx,
-                    )
-                    .map_err(|err| format!("Iceberg delta scan native sidecar: {err}"))?;
+                let refresh_ctx = ctx.mv_refresh_ctx.ok_or_else(|| {
+                    "Iceberg delta scan requires MV refresh context".to_string()
+                })?;
+                let runtime_plan = crate::engine::mv::scan_binding::build_iceberg_delta_scan_runtime_plan(
+                    table,
+                    *from_snapshot_id,
+                    *to_snapshot_id,
+                    refresh_ctx,
+                )
+                .map_err(|err| format!("Iceberg delta scan native sidecar: {err}"))?;
 
                 Kind::IcebergDeltaTable(plan::IcebergDeltaTable {
                     table: Some(encode_iceberg_table_info(table)?),
