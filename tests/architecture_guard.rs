@@ -2972,85 +2972,14 @@ struct RustScopedUseStatement {
     inline_modules: Vec<String>,
 }
 
-fn rust_resolve_scoped_use_paths(
-    path: &[String],
-    inline_modules: &[String],
-    aliases: &BTreeMap<String, Vec<RustScopedUsePath>>,
-    resolving: &mut BTreeSet<String>,
-    depth: usize,
-) -> Option<Vec<RustScopedUsePath>> {
-    if depth > aliases.len() {
-        return None;
-    }
-
-    let Some(owner_index) = path
-        .iter()
-        .position(|segment| segment != "self" && segment != "super")
-    else {
-        return Some(vec![RustScopedUsePath {
-            segments: path.to_vec(),
-            inline_modules: inline_modules.to_vec(),
-        }]);
-    };
-    let owner = &path[owner_index];
-    let Some(targets) = aliases.get(owner) else {
-        return Some(vec![RustScopedUsePath {
-            segments: path.to_vec(),
-            inline_modules: inline_modules.to_vec(),
-        }]);
-    };
-    if !resolving.insert(owner.clone()) {
-        return None;
-    }
-
-    let mut resolved = BTreeSet::new();
-    for target in targets {
-        let Some(target_paths) = rust_resolve_scoped_use_paths(
-            &target.segments,
-            &target.inline_modules,
-            aliases,
-            resolving,
-            depth + 1,
-        ) else {
-            continue;
-        };
-        for mut target_path in target_paths {
-            target_path
-                .segments
-                .extend_from_slice(&path[owner_index + 1..]);
-            resolved.insert(target_path);
-        }
-    }
-    resolving.remove(owner);
-    (!resolved.is_empty()).then(|| resolved.into_iter().collect())
-}
-
 fn rust_production_scoped_use_statements(text: &str) -> Vec<RustScopedUseStatement> {
     let raw_imports = rust_raw_production_use_statements(text);
-    let mut aliases = BTreeMap::<String, Vec<RustScopedUsePath>>::new();
-    for raw in &raw_imports {
-        let Some(alias) = raw
-            .path
-            .alias
-            .as_ref()
-            .filter(|alias| alias.as_str() != "_")
-        else {
-            continue;
-        };
-        let target = RustScopedUsePath {
-            segments: raw.path.segments.clone(),
-            inline_modules: raw.inline_modules.clone(),
-        };
-        let targets = aliases.entry(alias.clone()).or_default();
-        if !targets.contains(&target) {
-            targets.push(target);
-        }
-    }
+    let aliases = rust_production_scoped_aliases(text);
 
     raw_imports
         .into_iter()
         .flat_map(|raw| {
-            let resolved = rust_resolve_scoped_use_paths(
+            let resolved = rust_resolve_scoped_paths(
                 &raw.path.segments,
                 &raw.inline_modules,
                 &aliases,
@@ -3421,16 +3350,31 @@ fn codegen_explain_owner_detector_covers_paths_aliases_relative_and_test_noise()
         ),
         (
             "src/sql/codegen/ir/mod.rs",
+            "use crate::sql::*;\nfn f() { explain::distributed::explain_distributed_plan(); }",
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            "use crate::*;\nfn f() { sql::explain::distributed::explain_distributed_plan(); }",
+        ),
+        ("src/sql/codegen/ir/mod.rs", "pub(crate) use crate::sql::*;"),
+        ("src/sql/codegen/ir/mod.rs", "pub(crate) use crate::*;"),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            "#[path = \"../explain/distributed.rs\"]\nmod presentation;",
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
             "pub(crate) fn explain_distributed_plan() {}",
         ),
         ("src/sql/codegen/ir/mod.rs", "mod explain;"),
     ];
-    for (source_rel, source) in invalid {
-        assert!(
-            !codegen_explain_owner_violations_in(source_rel, source).is_empty(),
-            "codegen EXPLAIN ownership backedge must be rejected: {source_rel}: {source}"
-        );
-    }
+    let missed_invalid = invalid
+        .into_iter()
+        .filter(|(source_rel, source)| {
+            codegen_explain_owner_violations_in(source_rel, source).is_empty()
+        })
+        .map(|(source_rel, source)| format!("{source_rel}: {source}"))
+        .collect::<Vec<_>>();
 
     let valid = [
         (
@@ -3452,13 +3396,43 @@ use crate::sql::explain::distributed::explain_distributed_plan;
 fn explain_distributed_plan_analyze() {}
 "#,
         ),
-    ];
-    for (source_rel, source) in valid {
-        assert!(
-            codegen_explain_owner_violations_in(source_rel, source).is_empty(),
-            "final owner, unrelated codegen, and test-only noise must be accepted: {source_rel}: {source}"
-        );
+        (
+            "src/sql/codegen/ir/mod.rs",
+            r#"
+mod left {
+    use crate::sql as owner;
+}
+mod right {
+    mod safe {
+        pub mod explain { pub struct X; }
     }
+    use self::safe as owner;
+    use owner::explain::X;
+}
+"#,
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            r#"
+#[cfg(all(feature = "some-test-helper", test))]
+fn explain_distributed_plan() {}
+"#,
+        ),
+    ];
+    let rejected_valid = valid
+        .into_iter()
+        .filter_map(|(source_rel, source)| {
+            let violations = codegen_explain_owner_violations_in(source_rel, source);
+            (!violations.is_empty())
+                .then(|| format!("{source_rel}: {source}\nviolations: {violations:?}"))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        missed_invalid.is_empty() && rejected_valid.is_empty(),
+        "codegen EXPLAIN ownership detector mismatches:\nmissed invalid:\n{}\nrejected valid:\n{}",
+        missed_invalid.join("\n---\n"),
+        rejected_valid.join("\n---\n")
+    );
 }
 
 fn codegen_explain_owner_violations_in(source_rel: &str, text: &str) -> Vec<String> {
@@ -3491,21 +3465,40 @@ fn codegen_explain_owner_violations_in(source_rel: &str, text: &str) -> Vec<Stri
         rust_production_canonical_paths(text, &source_rel)
             .into_iter()
             .filter(|path| {
-                path.len() >= EXPLAIN_NAMESPACE.len()
+                let imports_explain_namespace = path.len() >= EXPLAIN_NAMESPACE.len()
                     && path
                         .iter()
                         .zip(EXPLAIN_NAMESPACE)
-                        .all(|(actual, expected)| actual == expected)
+                        .all(|(actual, expected)| actual == expected);
+                let imports_ancestor_glob = path.last().is_some_and(|segment| segment == "*")
+                    && path.len() <= EXPLAIN_NAMESPACE.len()
+                    && path[..path.len() - 1]
+                        .iter()
+                        .zip(EXPLAIN_NAMESPACE)
+                        .all(|(actual, expected)| actual == expected);
+                imports_explain_namespace || imports_ancestor_glob
             })
             .map(|path| format!("codegen production imports `{}`", path.join("::"))),
     );
 
-    if rust_module_item_declarations(text).contains("explain") {
+    violations.extend(
+        planner_path_module_attribute_violations_in(text)
+            .into_iter()
+            .map(|violation| {
+                format!("codegen production has path-affecting module attribute: {violation}")
+            }),
+    );
+
+    let production = rust_sanitized_production_text(text);
+    if rust_module_items(&production)
+        .iter()
+        .any(|item| item.inline_modules.is_empty() && item.name == "explain")
+    {
         violations.push("codegen production declares `mod explain`".to_string());
     }
 
     violations.extend(
-        top_level_production_functions(text)
+        top_level_production_functions(&production)
             .into_iter()
             .filter_map(|function| {
                 let name = top_level_production_function_name(&function)?;
@@ -4883,6 +4876,66 @@ mod nested {
             .iter()
             .any(|import| { rust_scoped_use_imports_legacy_planner_owner(import, source_rel) }),
         "grouped alias targets that reach planner::stats must be rejected: {forbidden_alias_chain:?}"
+    );
+}
+
+#[test]
+fn scoped_use_alias_resolution_is_lexical_and_terminates_cycles() {
+    let sibling_shadowing = r#"
+mod left {
+    use crate::sql as owner;
+}
+mod right {
+    mod safe {
+        pub mod explain { pub struct X; }
+    }
+    use self::safe as owner;
+    use owner::explain::X;
+}
+"#;
+    let sibling_paths =
+        rust_production_canonical_paths(sibling_shadowing, "src/sql/codegen/ir/mod.rs");
+    assert!(
+        sibling_paths.iter().any(|path| path
+            == &[
+                "crate", "sql", "codegen", "ir", "right", "safe", "explain", "X",
+            ]),
+        "sibling-local owner alias must resolve in its lexical scope: {sibling_paths:?}"
+    );
+    assert!(
+        !sibling_paths.iter().any(|path| path.starts_with(&[
+            "crate".to_string(),
+            "sql".to_string(),
+            "explain".to_string()
+        ])),
+        "left sibling alias must not contaminate right sibling paths: {sibling_paths:?}"
+    );
+
+    let parent_child_and_cycle = r#"
+mod parent {
+    use crate::proto as owner;
+    mod child {
+        use super::owner as inherited;
+        use inherited::plan::Node;
+    }
+}
+mod cyclic {
+    use second as first;
+    use first as second;
+    use first::Thing;
+}
+"#;
+    let paths =
+        rust_production_canonical_paths(parent_child_and_cycle, "src/sql/codegen/ir/mod.rs");
+    assert!(
+        paths
+            .iter()
+            .any(|path| path == &["crate", "proto", "plan", "Node"]),
+        "child alias chain must resolve through its explicit parent scope: {paths:?}"
+    );
+    assert!(
+        paths.len() < 20,
+        "cyclic aliases must terminate without path explosion: {paths:?}"
     );
 }
 
