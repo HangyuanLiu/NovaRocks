@@ -36,6 +36,12 @@ use crate::sql::codegen::scan::connector::{
     ConnectorScanContext, StarRocksScanSourceDescriptor, plan_native_starrocks_scan_node,
     to_native_file_scan,
 };
+use crate::sql::codegen::scan::preparation::{
+    build_iceberg_metadata_scan_range_params, effective_scan_column_names,
+    equality_delete_required_columns, merge_required_columns_with_projected,
+    native_scan_min_max_predicates, projected_target_locator_column_names,
+    projected_target_state_column_names,
+};
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::{
     DataPartition, DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor,
@@ -480,24 +486,6 @@ fn scan_output_columns_for_refreshed_table(
     out
 }
 
-pub(super) fn merge_required_columns_with_projected(
-    existing: Option<Vec<String>>,
-    projected_names: &[String],
-) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut seen = BTreeSet::new();
-    for name in projected_names
-        .iter()
-        .cloned()
-        .chain(existing.unwrap_or_default())
-    {
-        if seen.insert(name.to_lowercase()) {
-            out.push(name);
-        }
-    }
-    out
-}
-
 fn refresh_scan_table_for_codegen(
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
     table: &TableDef,
@@ -872,7 +860,8 @@ fn plan_iceberg_scan_ranges(
     let planner = connectors.scan_planner("iceberg")?;
     let scan_handle = planner.begin_scan(table_handle, BeginScanContext::default())?;
     let splits = planner.plan_splits(&scan_handle, SplitPlanningContext::default())?;
-    let equality_required = equality_delete_required_columns(scan_node_id, &table, &splits)?;
+    let equality_required = equality_delete_required_columns(&table, &splits)
+        .map_err(|err| format!("Iceberg ScanNode node_id={scan_node_id}: {err}"))?;
     if !equality_required.is_empty() {
         let existing_required = match scan.required_columns.take() {
             Some(required) => required,
@@ -893,139 +882,6 @@ fn plan_iceberg_scan_ranges(
         },
     )?;
     Ok(plan.scan_ranges)
-}
-
-fn native_scan_min_max_predicates(
-    predicates: &[crate::sql::analysis::TypedExpr],
-) -> Vec<crate::common::min_max_predicate::MinMaxPredicate> {
-    let mut out = Vec::new();
-    for predicate in predicates {
-        collect_native_min_max_predicates(predicate, &mut out);
-    }
-    out
-}
-
-fn collect_native_min_max_predicates(
-    expr: &crate::sql::analysis::TypedExpr,
-    out: &mut Vec<crate::common::min_max_predicate::MinMaxPredicate>,
-) {
-    use crate::sql::analysis::{BinOp, ExprKind};
-
-    match &expr.kind {
-        ExprKind::Nested(inner) => collect_native_min_max_predicates(inner, out),
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::And,
-            right,
-        } => {
-            collect_native_min_max_predicates(left, out);
-            collect_native_min_max_predicates(right, out);
-        }
-        ExprKind::BinaryOp { left, op, right } => {
-            if let Some(predicate) = native_min_max_comparison(left, *op, right) {
-                out.push(predicate);
-            } else if let Some(predicate) =
-                native_min_max_comparison(right, reverse_comparison(*op), left)
-            {
-                out.push(predicate);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn reverse_comparison(op: crate::sql::analysis::BinOp) -> crate::sql::analysis::BinOp {
-    use crate::sql::analysis::BinOp;
-    match op {
-        BinOp::Lt => BinOp::Gt,
-        BinOp::Le => BinOp::Ge,
-        BinOp::Gt => BinOp::Lt,
-        BinOp::Ge => BinOp::Le,
-        other => other,
-    }
-}
-
-fn native_min_max_comparison(
-    column: &crate::sql::analysis::TypedExpr,
-    op: crate::sql::analysis::BinOp,
-    literal: &crate::sql::analysis::TypedExpr,
-) -> Option<crate::common::min_max_predicate::MinMaxPredicate> {
-    use crate::common::min_max_predicate::MinMaxPredicate;
-    use crate::sql::analysis::{BinOp, ExprKind};
-
-    let ExprKind::ColumnRef { column: name, .. } = &column.kind else {
-        return None;
-    };
-    if column.data_type != literal.data_type {
-        return None;
-    }
-    let value = native_min_max_literal(literal)?;
-    Some(match op {
-        BinOp::Eq => MinMaxPredicate::Eq {
-            column: name.clone(),
-            value,
-        },
-        BinOp::Lt => MinMaxPredicate::Lt {
-            column: name.clone(),
-            value,
-        },
-        BinOp::Le => MinMaxPredicate::Le {
-            column: name.clone(),
-            value,
-        },
-        BinOp::Gt => MinMaxPredicate::Gt {
-            column: name.clone(),
-            value,
-        },
-        BinOp::Ge => MinMaxPredicate::Ge {
-            column: name.clone(),
-            value,
-        },
-        _ => return None,
-    })
-}
-
-fn native_min_max_literal(
-    expr: &crate::sql::analysis::TypedExpr,
-) -> Option<crate::common::min_max_predicate::MinMaxPredicateValue> {
-    use crate::common::min_max_predicate::MinMaxPredicateValue;
-    use crate::sql::analysis::{ExprKind, LiteralValue};
-    use arrow::datatypes::{DataType, TimeUnit};
-
-    let ExprKind::Literal(literal) = &expr.kind else {
-        return None;
-    };
-    match (&expr.data_type, literal) {
-        (DataType::Boolean, LiteralValue::Bool(value)) => {
-            Some(MinMaxPredicateValue::Boolean(*value))
-        }
-        (DataType::Int8 | DataType::Int16 | DataType::Int32, LiteralValue::Int(value)) => {
-            i32::try_from(*value).ok().map(MinMaxPredicateValue::Int32)
-        }
-        (DataType::Int64, LiteralValue::Int(value)) => Some(MinMaxPredicateValue::Int64(*value)),
-        (DataType::Float32, LiteralValue::Float(value)) if value.is_finite() => {
-            Some(MinMaxPredicateValue::Float(*value as f32))
-        }
-        (DataType::Float64, LiteralValue::Float(value)) if value.is_finite() => {
-            Some(MinMaxPredicateValue::Double(*value))
-        }
-        (DataType::Utf8 | DataType::LargeUtf8, LiteralValue::String(value)) => {
-            Some(MinMaxPredicateValue::ByteArray(value.as_bytes().to_vec()))
-        }
-        (DataType::Binary | DataType::LargeBinary, LiteralValue::Binary(value)) => {
-            Some(MinMaxPredicateValue::ByteArray(value.clone()))
-        }
-        (DataType::Date32, LiteralValue::Int(value)) => {
-            i32::try_from(*value).ok().map(MinMaxPredicateValue::Date32)
-        }
-        (DataType::Timestamp(TimeUnit::Microsecond, _), LiteralValue::Int(value)) => {
-            Some(MinMaxPredicateValue::DateTimeMicros(*value))
-        }
-        (DataType::Timestamp(TimeUnit::Nanosecond, _), LiteralValue::Int(value)) => {
-            Some(MinMaxPredicateValue::DateTimeNanos(*value))
-        }
-        _ => None,
-    }
 }
 
 fn merge_required_columns_with_additional(
@@ -1059,212 +915,6 @@ fn unrestricted_scan_required_columns(scan: &PlanScanNode) -> Vec<String> {
         .map(|column| column.name.clone())
         .collect::<Vec<_>>();
     merge_required_columns_with_additional(Some(table_columns), &scan_columns)
-}
-
-fn equality_delete_required_columns(
-    scan_node_id: i32,
-    table: &crate::sql::catalog::IcebergTableInfo,
-    splits: &[crate::connector::scan_planning::Split],
-) -> Result<Vec<String>, String> {
-    let mut schema_by_id = BTreeMap::new();
-    let mut schema_by_name = BTreeMap::new();
-    for field in &table.schema.fields {
-        if schema_by_id
-            .insert(field.field_id, field.name.clone())
-            .is_some()
-        {
-            return Err(format!(
-                "Iceberg ScanNode node_id={scan_node_id} table schema has duplicate field id {}",
-                field.field_id
-            ));
-        }
-        let normalized = field.name.to_ascii_lowercase();
-        if schema_by_name
-            .insert(normalized, field.name.clone())
-            .is_some()
-        {
-            return Err(format!(
-                "Iceberg ScanNode node_id={scan_node_id} table schema has duplicate field name {}",
-                field.name
-            ));
-        }
-    }
-
-    let mut required = Vec::new();
-    let mut required_seen = BTreeSet::new();
-    for split in splits {
-        let file = crate::connector::iceberg::scan_planner::iceberg_split(split)?;
-        for delete in &file.data_file.delete_files {
-            if delete.file_content != crate::sql::catalog::IcebergDeleteFileContent::Equality {
-                continue;
-            }
-
-            let mut resolved_ids = Vec::new();
-            let mut ids_seen = BTreeSet::new();
-            for field_id in &delete.equality_field_ids {
-                if !ids_seen.insert(*field_id) {
-                    return Err(format!(
-                        "Iceberg equality-delete file {} has duplicate equality field id {}",
-                        delete.path, field_id
-                    ));
-                }
-                let name = schema_by_id.get(field_id).ok_or_else(|| {
-                    format!(
-                        "Iceberg equality-delete file {} references unknown field id {} in table {}",
-                        delete.path, field_id, table.table
-                    )
-                })?;
-                resolved_ids.push(name.clone());
-            }
-
-            let mut resolved_names = Vec::new();
-            let mut names_seen = BTreeSet::new();
-            for name in &delete.equality_column_names {
-                let normalized = name.to_ascii_lowercase();
-                if !names_seen.insert(normalized.clone()) {
-                    return Err(format!(
-                        "Iceberg equality-delete file {} has duplicate equality column name {}",
-                        delete.path, name
-                    ));
-                }
-                let canonical = schema_by_name.get(&normalized).ok_or_else(|| {
-                    format!(
-                        "Iceberg equality-delete file {} references unknown equality column {} in table {}",
-                        delete.path, name, table.table
-                    )
-                })?;
-                resolved_names.push(canonical.clone());
-            }
-
-            let columns = match (resolved_ids.is_empty(), resolved_names.is_empty()) {
-                (true, true) => {
-                    return Err(format!(
-                        "Iceberg equality-delete file {} has no equality field identity",
-                        delete.path
-                    ));
-                }
-                (false, false) => {
-                    let ids = resolved_ids
-                        .iter()
-                        .map(|name| name.to_ascii_lowercase())
-                        .collect::<BTreeSet<_>>();
-                    let names = resolved_names
-                        .iter()
-                        .map(|name| name.to_ascii_lowercase())
-                        .collect::<BTreeSet<_>>();
-                    if ids != names {
-                        return Err(format!(
-                            "Iceberg equality-delete file {} field id/name mismatch: ids={resolved_ids:?} names={resolved_names:?}",
-                            delete.path
-                        ));
-                    }
-                    resolved_ids
-                }
-                (false, true) => resolved_ids,
-                (true, false) => resolved_names,
-            };
-            for name in columns {
-                if required_seen.insert(name.to_ascii_lowercase()) {
-                    required.push(name);
-                }
-            }
-        }
-    }
-    Ok(required)
-}
-
-fn effective_scan_column_names(scan: &PlanScanNode) -> Vec<String> {
-    scan.required_columns.clone().unwrap_or_else(|| {
-        scan.table
-            .columns
-            .iter()
-            .map(|column| column.name.clone())
-            .collect()
-    })
-}
-
-fn build_iceberg_metadata_scan_range_params() -> scan_range::ScanRangeParams {
-    scan_range::ScanRangeParams::file(scan_range::FileScanRange {
-        file_format: scan_range::FileFormat::Parquet,
-        full_path: Some("iceberg-metadata".to_string()),
-        relative_path: None,
-        table_id: None,
-        offset: 0,
-        length: 0,
-        file_length: 0,
-        delete_files: Vec::new(),
-        deletion_vector_descriptor: None,
-        first_row_id: None,
-        data_sequence_number: None,
-        modification_time: None,
-        datacache_options: None,
-        included_positions: Vec::new(),
-        serialized_split: Some(String::new()),
-        use_iceberg_jni_metadata_reader: true,
-        ivm_change_op: None,
-        file_pruning_min_max_values: None,
-    })
-}
-
-fn projected_target_state_column_names(
-    scan: &crate::sql::catalog::IcebergMvTargetStateScan,
-) -> Vec<String> {
-    let mut names = Vec::new();
-    push_unique_projected_name(&mut names, &scan.row_id_column_name);
-    for name in scan
-        .group_key_names
-        .iter()
-        .chain(scan.aggregate_state_names.iter())
-    {
-        push_unique_projected_name(&mut names, name);
-    }
-    if let crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
-        branch_scope: Some(scope),
-        ..
-    } = &scan.row_filter
-    {
-        push_unique_projected_name(&mut names, &scope.branch_id_column_name);
-    }
-    for name in [
-        crate::exec::row_position::ICEBERG_FILE_PATH_COL,
-        crate::exec::row_position::ICEBERG_ROW_POS_COL,
-        crate::exec::row_position::ICEBERG_ROW_ID_COL,
-        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
-    ] {
-        push_unique_projected_name(&mut names, name);
-    }
-    names
-}
-
-fn projected_target_locator_column_names(
-    scan: &crate::sql::catalog::IcebergMvTargetLocatorScan,
-) -> Vec<String> {
-    let mut names = vec![scan.apply_key_column.clone()];
-    if let Some(branch_id_column) = &scan.branch_id_column
-        && !names
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case(branch_id_column))
-    {
-        names.push(branch_id_column.clone());
-    }
-    for name in [
-        crate::exec::row_position::ICEBERG_FILE_PATH_COL,
-        crate::exec::row_position::ICEBERG_ROW_POS_COL,
-        crate::exec::row_position::ICEBERG_ROW_ID_COL,
-        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
-    ] {
-        push_unique_projected_name(&mut names, name);
-    }
-    names
-}
-
-fn push_unique_projected_name(names: &mut Vec<String>, name: &str) {
-    if !names
-        .iter()
-        .any(|existing| existing.eq_ignore_ascii_case(name))
-    {
-        names.push(name.to_string());
-    }
 }
 
 fn reject_target_state_equality_deletes(source: &ScanSource) -> Result<(), String> {

@@ -18,3 +18,4 @@
 pub(crate) mod binding;
 pub(crate) mod connector;
 pub(crate) mod iceberg_delta;
+pub(crate) mod preparation;
