@@ -3795,7 +3795,7 @@ pub(crate) fn execute_logical_plan_with_options(
 
 fn coordinated_execution_services() -> Result<
     (
-        Arc<dyn crate::runtime::dispatcher::FragmentDispatcher>,
+        Arc<dyn crate::coordinator::dispatch::FragmentDispatcher>,
         Arc<crate::runtime::scheduler::FragmentScheduler>,
     ),
     String,
@@ -3808,13 +3808,15 @@ fn coordinated_execution_services() -> Result<
         ClusterRole::Fe | ClusterRole::AllInOne => {
             let entries = backend_ops::live_backend_dispatch_entries()?;
             let dispatcher = Arc::new(
-                crate::runtime::dispatcher::RemoteDispatcher::new_with_backend_ids(&entries)?,
+                crate::service::grpc_fragment_dispatcher::RemoteDispatcher::new_with_backend_ids(
+                    &entries,
+                )?,
             );
             let scheduler = Arc::new(
                 crate::runtime::scheduler::FragmentScheduler::new_with_backend_ids(entries),
             );
             (
-                dispatcher as Arc<dyn crate::runtime::dispatcher::FragmentDispatcher>,
+                dispatcher as Arc<dyn crate::coordinator::dispatch::FragmentDispatcher>,
                 scheduler,
             )
         }
@@ -3833,7 +3835,7 @@ fn coordinated_execution_services() -> Result<
 /// - `Be`: standalone coordinator must not be entered when the process is a pure BE.
 pub(crate) fn dispatcher_for_role(
     role: crate::common::app_config::ClusterRole,
-) -> Result<Arc<dyn crate::runtime::dispatcher::FragmentDispatcher>, String> {
+) -> Result<Arc<dyn crate::coordinator::dispatch::FragmentDispatcher>, String> {
     use crate::common::app_config::ClusterRole;
     match role {
         ClusterRole::Fe => {
@@ -3841,7 +3843,9 @@ pub(crate) fn dispatcher_for_role(
                 configured_fe_dispatch_entries_and_live_fallback()?;
             if let Some(entries) = configured {
                 return Ok(Arc::new(
-                    crate::runtime::dispatcher::RemoteDispatcher::new_with_backend_ids(&entries)?,
+                    crate::service::grpc_fragment_dispatcher::RemoteDispatcher::new_with_backend_ids(
+                        &entries,
+                    )?,
                 ));
             }
             if !may_use_live_registry {
@@ -3852,13 +3856,17 @@ pub(crate) fn dispatcher_for_role(
             let entries = backend_ops::live_backend_dispatch_entries()
                 .map_err(|e| with_fe_error_context(e))?;
             Ok(Arc::new(
-                crate::runtime::dispatcher::RemoteDispatcher::new_with_backend_ids(&entries)?,
+                crate::service::grpc_fragment_dispatcher::RemoteDispatcher::new_with_backend_ids(
+                    &entries,
+                )?,
             ))
         }
         ClusterRole::AllInOne => {
             let entries = backend_ops::live_backend_dispatch_entries()?;
             Ok(Arc::new(
-                crate::runtime::dispatcher::RemoteDispatcher::new_with_backend_ids(&entries)?,
+                crate::service::grpc_fragment_dispatcher::RemoteDispatcher::new_with_backend_ids(
+                    &entries,
+                )?,
             ))
         }
         ClusterRole::Be => Err("role=be must not enter standalone coordinator".to_string()),
@@ -3898,20 +3906,6 @@ fn with_fe_error_context(err: String) -> String {
         err
     } else {
         format!("role=fe: {err}")
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn dispatcher_kind_for_test(
-    dispatcher: &Arc<dyn crate::runtime::dispatcher::FragmentDispatcher>,
-) -> &'static str {
-    if dispatcher
-        .as_any()
-        .is::<crate::runtime::dispatcher::RemoteDispatcher>()
-    {
-        "remote"
-    } else {
-        "unknown"
     }
 }
 
@@ -8736,7 +8730,6 @@ path = "meta/operations.sqlite"
 
         let dispatcher = super::dispatcher_for_role(ClusterRole::AllInOne).expect("dispatcher");
 
-        assert_eq!(super::dispatcher_kind_for_test(&dispatcher), "remote");
         assert_eq!(dispatcher.backend_count(), 1);
     }
 
@@ -8759,7 +8752,6 @@ path = "meta/operations.sqlite"
         let (dispatcher, scheduler) =
             super::coordinated_execution_services().expect("coordinated services");
 
-        assert_eq!(super::dispatcher_kind_for_test(&dispatcher), "remote");
         assert_eq!(dispatcher.backend_count(), 1);
         assert_eq!(scheduler.live_backend_entries(), &[(2usize, endpoint)]);
     }

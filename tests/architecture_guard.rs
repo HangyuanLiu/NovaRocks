@@ -10363,7 +10363,11 @@ fn nfe_1_task_3_runtime_submission_is_native_only() {
     let repo = Path::new(manifest_dir());
     let mut violations = Vec::new();
 
-    for rel in ["src/runtime/dispatcher.rs", "src/runtime/coordinator.rs"] {
+    for rel in [
+        "src/coordinator/dispatch.rs",
+        "src/runtime/coordinator.rs",
+        "src/service/grpc_fragment_dispatcher.rs",
+    ] {
         let text = fs::read_to_string(repo.join(rel)).unwrap();
         let production = rust_production_text_without_cfg_test(&text);
         push_forbidden_terms(
@@ -10839,8 +10843,9 @@ fn nfe_4_ledger_and_audit_contract_violations(
     let fe_owners = [
         "src/sql",
         "src/engine",
+        "src/coordinator/dispatch.rs",
         "src/runtime/coordinator.rs",
-        "src/runtime/dispatcher.rs",
+        "src/service/grpc_fragment_dispatcher.rs",
         "tests/sql-test-runner/src",
     ];
     for scope in compat_scope {
@@ -10866,7 +10871,9 @@ fn nfe_4_ledger_and_audit_contract_violations(
         let fe_native = path.starts_with("src/engine/")
             || matches!(
                 path,
-                "src/runtime/coordinator.rs" | "src/runtime/dispatcher.rs"
+                "src/coordinator/dispatch.rs"
+                    | "src/runtime/coordinator.rs"
+                    | "src/service/grpc_fragment_dispatcher.rs"
             );
         if fe_native && baseline_max_hits(line).is_none_or(|max_hits| max_hits != "0") {
             violations.push(format!(
@@ -11231,10 +11238,15 @@ fn nfe_4_fe_owned_raw_sources_are_starrocks_idl_free() {
         ),
         (
             repo.join("src/runtime"),
-            vec![
-                repo.join("src/runtime/coordinator.rs"),
-                repo.join("src/runtime/dispatcher.rs"),
-            ],
+            vec![repo.join("src/runtime/coordinator.rs")],
+        ),
+        (
+            repo.join("src/coordinator"),
+            vec![repo.join("src/coordinator/dispatch.rs")],
+        ),
+        (
+            repo.join("src/service"),
+            vec![repo.join("src/service/grpc_fragment_dispatcher.rs")],
         ),
         (runner.clone(), vec![runner.join("main.rs")]),
     ] {
@@ -11252,8 +11264,9 @@ fn nfe_4_fe_owned_raw_sources_are_starrocks_idl_free() {
         "src/sql/codegen/fragment/build.rs",
         "src/engine/mod.rs",
         "src/engine/statement.rs",
+        "src/coordinator/dispatch.rs",
         "src/runtime/coordinator.rs",
-        "src/runtime/dispatcher.rs",
+        "src/service/grpc_fragment_dispatcher.rs",
         "tests/sql-test-runner/src/main.rs",
         "tests/sql-test-runner/src/cluster.rs",
     ] {
@@ -11465,7 +11478,7 @@ fn nfe_4_ledger_audit_native_structure_and_external_ingress_are_fixed() {
         );
     }
 
-    let dispatcher = fs::read_to_string(repo.join("src/runtime/dispatcher.rs")).unwrap();
+    let dispatcher = fs::read_to_string(repo.join("src/coordinator/dispatch.rs")).unwrap();
     let dispatcher_compact = compact_line(&rust_sanitized_production_text(&dispatcher));
     for required in [
         "plan:crate::proto::plan::PlanFragment",
@@ -11473,7 +11486,7 @@ fn nfe_4_ledger_audit_native_structure_and_external_ingress_are_fixed() {
     ] {
         if !dispatcher_compact.contains(required) {
             violations.push(format!(
-                "src/runtime/dispatcher.rs: FragmentSubmission missing required native field `{required}`"
+                "src/coordinator/dispatch.rs: FragmentSubmission missing required native field `{required}`"
             ));
         }
     }
@@ -11483,7 +11496,7 @@ fn nfe_4_ledger_audit_native_structure_and_external_ingress_are_fixed() {
     ] {
         if dispatcher_compact.contains(forbidden) {
             violations.push(format!(
-                "src/runtime/dispatcher.rs: FragmentSubmission retains optional dual carrier `{forbidden}`"
+                "src/coordinator/dispatch.rs: FragmentSubmission retains optional dual carrier `{forbidden}`"
             ));
         }
     }
@@ -12902,8 +12915,9 @@ fn nfe_3_fe_owned_helpers_are_raw_starrocks_idl_free() {
         "src/engine/query_options.rs",
         "src/engine/dml_change_stream.rs",
         "src/sql/common/change_stream.rs",
+        "src/coordinator/dispatch.rs",
         "src/runtime/coordinator.rs",
-        "src/runtime/dispatcher.rs",
+        "src/service/grpc_fragment_dispatcher.rs",
         "src/runtime/fragment_exec_params.rs",
         "src/runtime/scan_range.rs",
         "src/runtime/native_fragment_wire.rs",
@@ -13174,8 +13188,9 @@ fn nfe_3_audit_baselines_do_not_reauthorize_retired_paths() {
 
     for (native, owner) in [
         ("src/engine/dml_change_stream.rs", "B7"),
+        ("src/coordinator/dispatch.rs", "control-plane"),
         ("src/runtime/coordinator.rs", "control-plane"),
-        ("src/runtime/dispatcher.rs", "control-plane"),
+        ("src/service/grpc_fragment_dispatcher.rs", "control-plane"),
         ("src/runtime/fragment_exec_params.rs", "control-plane"),
         ("src/runtime/scan_range.rs", "B5"),
         ("src/runtime/native_fragment_wire.rs", "control-plane"),
@@ -13887,8 +13902,9 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
     for rel in [
         "src/engine/mod.rs",
         "src/engine/dml_change_stream.rs",
+        "src/coordinator/dispatch.rs",
         "src/runtime/coordinator.rs",
-        "src/runtime/dispatcher.rs",
+        "src/service/grpc_fragment_dispatcher.rs",
     ] {
         let text = fs::read_to_string(repo.join(rel)).unwrap();
         let production = rust_sanitized_production_text(&text);
@@ -16932,4 +16948,37 @@ fn psm_8_physical_bridge_vocabulary_is_explicit() {
             );
         }
     }
+}
+
+#[test]
+fn coor_1_dispatch_port_and_grpc_adapter_own_layers() {
+    let repo = Path::new(manifest_dir());
+    let port_path = repo.join("src/coordinator/dispatch.rs");
+    let adapter_path = repo.join("src/service/grpc_fragment_dispatcher.rs");
+    let legacy_path = repo.join(["src/runtime/", "dispatcher.rs"].concat());
+
+    assert!(port_path.is_file(), "coordinator dispatch port must exist");
+    assert!(
+        adapter_path.is_file(),
+        "gRPC fragment dispatcher adapter must exist"
+    );
+    assert!(
+        !legacy_path.exists(),
+        "runtime dispatcher forwarding module must be deleted"
+    );
+
+    let port = fs::read_to_string(port_path).expect("read coordinator dispatch port");
+    let port = rust_sanitized_production_text(&port);
+    assert!(port.contains("pub trait FragmentDispatcher"));
+    assert!(port.contains("pub(crate) struct FragmentSubmission"));
+    assert!(port.contains("pub enum FetchOutcome"));
+    assert!(!port.contains("crate::service"));
+    assert!(!port.contains("NovaRocksGrpcRemoteClient"));
+    assert!(!port.contains("fn as_any("));
+
+    let adapter = fs::read_to_string(adapter_path).expect("read gRPC adapter");
+    let adapter = rust_sanitized_production_text(&adapter);
+    assert!(adapter.contains("pub struct RemoteDispatcher"));
+    assert!(adapter.contains("impl FragmentDispatcher for RemoteDispatcher"));
+    assert!(adapter.contains("NovaRocksGrpcRemoteClient"));
 }

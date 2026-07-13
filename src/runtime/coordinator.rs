@@ -42,9 +42,9 @@ use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
+use crate::coordinator::dispatch::{FetchOutcome, FragmentDispatcher, FragmentSubmission};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::novarocks_logging::debug;
-use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher, FragmentSubmission};
 use crate::runtime::profile::RuntimeProfileTree;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::query_state::QueryState;
@@ -2209,10 +2209,6 @@ mod native_contract_tests {
     }
 
     impl FragmentDispatcher for CapturingDispatcher {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
         fn submit_fragment(
             &self,
             backend_idx: usize,

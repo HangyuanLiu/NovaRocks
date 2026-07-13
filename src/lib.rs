@@ -24,6 +24,7 @@ mod tests;
 pub mod cache;
 pub mod common;
 pub mod connector;
+pub mod coordinator;
 pub mod engine;
 pub mod exec;
 pub mod formats;
