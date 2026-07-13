@@ -17345,6 +17345,32 @@ fn coor_4_write_registration_lifetime_belongs_to_write_owner() {
 }
 
 #[test]
+fn coor_4_dead_write_compat_ingress_is_deleted_and_real_fe_path_remains() {
+    let repo = Path::new(manifest_dir());
+    let retired = repo.join(["src/runtime/", "write_coordinator_compat.rs"].concat());
+    assert!(
+        !retired.exists(),
+        "dead compat write ingress must be deleted"
+    );
+
+    let runtime_mod = rust_sanitized_production_text(
+        &fs::read_to_string(repo.join("src/runtime/mod.rs")).expect("read runtime modules"),
+    );
+    assert!(!runtime_mod.contains("mod write_coordinator_compat"));
+
+    let fe_report =
+        fs::read_to_string(repo.join("src/service/fe_report.rs")).expect("read FE report producer");
+    let exec_status = fs::read_to_string(repo.join("src/service/exec_status_report.rs"))
+        .expect("read FE report encoder");
+    let exec_state = fs::read_to_string(repo.join("src/service/exec_state_reporter.rs"))
+        .expect("read FE report transport");
+    assert!(fe_report.contains("StarRocksFrontend"));
+    assert!(fe_report.contains("ExecStatusReportInput"));
+    assert!(exec_status.contains("TReportExecStatusParams"));
+    assert!(exec_state.contains("report_exec_status"));
+}
+
+#[test]
 fn coor_2_thrift_audit_scans_coordinator_owners() {
     let repo = Path::new(manifest_dir());
     let audit_path = repo.join("tools/dev/audit_thrift_boundaries.py");

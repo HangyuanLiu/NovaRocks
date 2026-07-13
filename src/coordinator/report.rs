@@ -285,6 +285,49 @@ mod tests {
     }
 
     #[test]
+    fn expected_writer_missing_status_is_recorded_as_failure() {
+        let mut guard = crate::coordinator::write::write_registry_test_guard();
+        let query = UniqueId { hi: 520_005, lo: 1 };
+        let finst = UniqueId { hi: 520_005, lo: 2 };
+        let writer = crate::coordinator::write::report::WriterKey {
+            query_id: query,
+            fragment_instance_id: finst,
+            backend_num: 7,
+        };
+        let coordinator = guard
+            .register_query(query, vec![writer])
+            .expect("register expected writer");
+        let mut native = report(query, finst);
+        native.backend_num = 7;
+        native.status = None;
+
+        CoordinatorExecStatusReportHandler
+            .handle_exec_status_report(native)
+            .expect("missing status is a writer failure report, not a decode panic");
+
+        assert_eq!(
+            coordinator.lock().unwrap().failed_reason(),
+            Some("ExecStatusReport missing status".to_string())
+        );
+    }
+
+    #[test]
+    fn unknown_query_missing_status_is_classified_before_status_decode() {
+        let query = UniqueId { hi: 520_006, lo: 1 };
+        let finst = UniqueId { hi: 520_006, lo: 2 };
+        let mut native = report(query, finst);
+        native.status = None;
+
+        let err = CoordinatorExecStatusReportHandler
+            .handle_exec_status_report(native)
+            .expect_err("unknown query must be classified before status decode");
+
+        let expected = EngineError::write_coordinator_gone(query);
+        assert_eq!(err.code(), expected.code());
+        assert_eq!(err.to_string(), expected.to_string());
+    }
+
+    #[test]
     fn report_failure_fans_out_to_query_peers_and_result_buffer() {
         let query_id = QueryId { hi: 520_003, lo: 1 };
         let finst_a = UniqueId { hi: 520_003, lo: 2 };

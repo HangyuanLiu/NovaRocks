@@ -41,8 +41,6 @@ pub(crate) mod query_options;
 pub mod query_result;
 pub(crate) mod query_state;
 pub(crate) mod registry_cleanup;
-#[cfg(feature = "compat")]
-pub(crate) mod write_coordinator_compat;
 // Result buffer fetch infrastructure is accessed from C++ shim FFI path.
 #[allow(dead_code)]
 pub mod result_buffer;
