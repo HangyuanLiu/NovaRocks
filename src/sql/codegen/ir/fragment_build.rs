@@ -26,11 +26,11 @@ use crate::sql::catalog::{IcebergDataFileBinding, ScanSource, TableDef};
 use crate::sql::codegen::boundary_schema::{
     BoundaryKind, BoundarySchemaReport, output_columns_to_boundary_columns,
 };
-use crate::sql::codegen::connector_scan_planning::{
+use crate::sql::codegen::runtime_filter::PlannedRuntimeFilter;
+use crate::sql::codegen::scan::connector::{
     ConnectorScanContext, StarRocksScanSourceDescriptor, plan_native_starrocks_scan_node,
     to_native_file_scan,
 };
-use crate::sql::codegen::runtime_filter::PlannedRuntimeFilter;
 use crate::sql::codegen::{
     FragmentOutputKind, FragmentSchedulingMetadata, MultiFragmentBuildResult, OutputColumn,
     RuntimeFilterPlanResult,

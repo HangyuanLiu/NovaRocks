@@ -22,15 +22,13 @@
 //! pipeline executor.
 
 pub(crate) mod boundary_schema;
-pub(crate) mod connector_scan_planning;
 pub(crate) mod fragment_builder;
 pub(crate) mod fragment_request;
-pub(crate) mod iceberg_delta_scan_planning;
-pub(crate) mod iceberg_literal_json;
 pub(crate) mod ir;
 pub(crate) mod proto_encode;
 pub(crate) mod runtime_filter;
 pub(crate) mod scalar_materialize;
+pub(crate) mod scan;
 
 use arrow::datatypes::DataType;
 
