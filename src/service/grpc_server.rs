@@ -1292,31 +1292,36 @@ mod pr3_tests {
 
     struct CapturingReportHandler {
         reports: Mutex<Vec<ExecStatusReport>>,
-        error: Option<EngineError>,
+        fail_on_call: Option<(usize, EngineError)>,
     }
 
     impl CapturingReportHandler {
         fn accepting() -> Self {
             Self {
                 reports: Mutex::new(Vec::new()),
-                error: None,
+                fail_on_call: None,
             }
         }
 
         fn failing(error: EngineError) -> Self {
+            Self::failing_on_call(1, error)
+        }
+
+        fn failing_on_call(call: usize, error: EngineError) -> Self {
             Self {
                 reports: Mutex::new(Vec::new()),
-                error: Some(error),
+                fail_on_call: Some((call, error)),
             }
         }
     }
 
     impl CoordinatorReportHandler for CapturingReportHandler {
         fn handle_exec_status_report(&self, report: ExecStatusReport) -> Result<(), EngineError> {
-            self.reports.lock().expect("capture reports").push(report);
-            match &self.error {
-                Some(error) => Err(error.clone()),
-                None => Ok(()),
+            let mut reports = self.reports.lock().expect("capture reports");
+            reports.push(report);
+            match &self.fail_on_call {
+                Some((call, error)) if reports.len() == *call => Err(error.clone()),
+                _ => Ok(()),
             }
         }
     }
@@ -1654,6 +1659,30 @@ mod pr3_tests {
             .into_inner();
 
         assert_eq!(body.status_code, super::REPORT_EXEC_STATUS_OK);
+        let captured = handler.reports.lock().expect("captured reports");
+        assert_eq!(captured.as_slice(), &[first, second]);
+    }
+
+    #[tokio::test]
+    async fn batch_report_exec_status_stops_after_first_handler_error() {
+        let first = ok_report(id(951, 952), id(953, 954));
+        let second = ok_report(id(961, 962), id(963, 964));
+        let third = ok_report(id(971, 972), id(973, 974));
+        let expected = EngineError::write_coordinator_gone(id(961, 962));
+        let handler = Arc::new(CapturingReportHandler::failing_on_call(2, expected.clone()));
+        let svc = GrpcService::report_only_with_report_handler(handler.clone());
+
+        let body = svc
+            .batch_report_exec_status(Request::new(BatchReportExecStatusRequest {
+                reports: vec![first.clone(), second.clone(), third],
+            }))
+            .await
+            .expect("RPC level success")
+            .into_inner();
+
+        assert_eq!(body.status_code, expected.to_report_status_code());
+        assert_eq!(body.message, expected.to_user_message());
+        assert_eq!(body.error_code, expected.to_report_error_code());
         let captured = handler.reports.lock().expect("captured reports");
         assert_eq!(captured.as_slice(), &[first, second]);
     }

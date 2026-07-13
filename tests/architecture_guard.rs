@@ -16981,6 +16981,31 @@ fn coor_1_dispatch_port_and_grpc_adapter_own_layers() {
     assert!(adapter.contains("pub struct RemoteDispatcher"));
     assert!(adapter.contains("impl FragmentDispatcher for RemoteDispatcher"));
     assert!(adapter.contains("NovaRocksGrpcRemoteClient"));
+
+    let native_dual = fs::read_to_string(repo.join("tools/ci/native-dual-cross-process.sh"))
+        .expect("read native dual cross-process gate");
+    let service_proto = fs::read_to_string(repo.join("idl/novarocks/service.proto"))
+        .expect("read NovaRocks service IDL");
+    for (owner, source) in [
+        ("native dual cross-process gate", native_dual.as_str()),
+        ("NovaRocks service IDL", service_proto.as_str()),
+    ] {
+        for retired in ["runtime::dispatcher", "src/runtime/dispatcher.rs"] {
+            assert!(
+                !source.contains(retired),
+                "{owner} still references retired dispatch owner {retired}"
+            );
+        }
+    }
+
+    let native_contract_filter = "coordinator::dispatch::tests::fragment_submission_requires_native_plan_and_instance_params";
+    assert_eq!(
+        native_dual.matches(native_contract_filter).count(),
+        2,
+        "normal and compat native contract gates must use the coordinator-owned test"
+    );
+    assert!(service_proto.contains("src/service/grpc_fragment_dispatcher.rs"));
+    assert!(service_proto.contains("src/coordinator/dispatch.rs"));
 }
 
 #[test]
