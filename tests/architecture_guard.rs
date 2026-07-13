@@ -2549,6 +2549,11 @@ fn planner_path_module_attribute_violations_in(text: &str) -> Vec<String> {
         let Some(close) = matching_paren(meta, 1) else {
             return false;
         };
+        if cfg_predicate_requires_test(meta, 2)
+            .is_some_and(|(predicate_requires_test, _)| predicate_requires_test)
+        {
+            return false;
+        }
         let mut arguments = Vec::<std::ops::Range<usize>>::new();
         let mut argument_start = 2usize;
         let mut depth = 0usize;
@@ -2972,85 +2977,14 @@ struct RustScopedUseStatement {
     inline_modules: Vec<String>,
 }
 
-fn rust_resolve_scoped_use_paths(
-    path: &[String],
-    inline_modules: &[String],
-    aliases: &BTreeMap<String, Vec<RustScopedUsePath>>,
-    resolving: &mut BTreeSet<String>,
-    depth: usize,
-) -> Option<Vec<RustScopedUsePath>> {
-    if depth > aliases.len() {
-        return None;
-    }
-
-    let Some(owner_index) = path
-        .iter()
-        .position(|segment| segment != "self" && segment != "super")
-    else {
-        return Some(vec![RustScopedUsePath {
-            segments: path.to_vec(),
-            inline_modules: inline_modules.to_vec(),
-        }]);
-    };
-    let owner = &path[owner_index];
-    let Some(targets) = aliases.get(owner) else {
-        return Some(vec![RustScopedUsePath {
-            segments: path.to_vec(),
-            inline_modules: inline_modules.to_vec(),
-        }]);
-    };
-    if !resolving.insert(owner.clone()) {
-        return None;
-    }
-
-    let mut resolved = BTreeSet::new();
-    for target in targets {
-        let Some(target_paths) = rust_resolve_scoped_use_paths(
-            &target.segments,
-            &target.inline_modules,
-            aliases,
-            resolving,
-            depth + 1,
-        ) else {
-            continue;
-        };
-        for mut target_path in target_paths {
-            target_path
-                .segments
-                .extend_from_slice(&path[owner_index + 1..]);
-            resolved.insert(target_path);
-        }
-    }
-    resolving.remove(owner);
-    (!resolved.is_empty()).then(|| resolved.into_iter().collect())
-}
-
 fn rust_production_scoped_use_statements(text: &str) -> Vec<RustScopedUseStatement> {
     let raw_imports = rust_raw_production_use_statements(text);
-    let mut aliases = BTreeMap::<String, Vec<RustScopedUsePath>>::new();
-    for raw in &raw_imports {
-        let Some(alias) = raw
-            .path
-            .alias
-            .as_ref()
-            .filter(|alias| alias.as_str() != "_")
-        else {
-            continue;
-        };
-        let target = RustScopedUsePath {
-            segments: raw.path.segments.clone(),
-            inline_modules: raw.inline_modules.clone(),
-        };
-        let targets = aliases.entry(alias.clone()).or_default();
-        if !targets.contains(&target) {
-            targets.push(target);
-        }
-    }
+    let aliases = rust_production_scoped_aliases(text);
 
     raw_imports
         .into_iter()
         .flat_map(|raw| {
-            let resolved = rust_resolve_scoped_use_paths(
+            let resolved = rust_resolve_scoped_paths(
                 &raw.path.segments,
                 &raw.inline_modules,
                 &aliases,
@@ -3404,6 +3338,258 @@ fn rust_production_canonical_paths(text: &str, source_rel: &str) -> Vec<Vec<Stri
     canonical.into_iter().collect()
 }
 
+#[test]
+fn codegen_explain_owner_detector_covers_paths_aliases_relative_and_test_noise() {
+    let invalid = [
+        (
+            "src/sql/codegen/ir/explain.rs",
+            "use crate::sql::explain::distributed::explain_distributed_plan;",
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            "use crate::sql::explain as presentation;\npub(crate) use presentation::distributed::explain_distributed_plan;",
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            "use super::super::explain::distributed::explain_distributed_plan;",
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            "use crate::sql::*;\nfn f() { explain::distributed::explain_distributed_plan(); }",
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            "use crate::*;\nfn f() { sql::explain::distributed::explain_distributed_plan(); }",
+        ),
+        ("src/sql/codegen/ir/mod.rs", "pub(crate) use crate::sql::*;"),
+        ("src/sql/codegen/ir/mod.rs", "pub(crate) use crate::*;"),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            "#[path = \"../../explain/distributed.rs\"]\nmod presentation;",
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            "pub(crate) fn explain_distributed_plan() {}",
+        ),
+        ("src/sql/codegen/ir/mod.rs", "mod explain;"),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            "mod safe { pub mod explain { pub(crate) fn explain_distributed_plan() {} } }",
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            "mod presentation { pub(crate) fn explain_distributed_plan() {} }",
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            "mod presentation { include!(\"../../explain/distributed.rs\"); }",
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            "extern crate self as owner; use owner::sql::explain::distributed::explain_distributed_plan;",
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            "use std::include as inject; inject!(\"../../explain/distributed.rs\");",
+        ),
+    ];
+    let missed_invalid = invalid
+        .into_iter()
+        .filter(|(source_rel, source)| {
+            codegen_explain_owner_violations_in(source_rel, source).is_empty()
+        })
+        .map(|(source_rel, source)| format!("{source_rel}: {source}"))
+        .collect::<Vec<_>>();
+
+    let valid = [
+        (
+            "src/sql/explain/distributed.rs",
+            "use crate::sql::explain::profile::QueryProfile;\npub(crate) fn explain_distributed_plan() {}",
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            "use crate::sql::planner::distributed::DistributedPlan;\npub(crate) fn lower_distributed_plan() {}",
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            r#"
+#[cfg(test)]
+mod explain;
+#[cfg(test)]
+use crate::sql::explain::distributed::explain_distributed_plan;
+#[cfg(test)]
+fn explain_distributed_plan_analyze() {}
+"#,
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            r#"
+mod left {
+    use crate::sql as owner;
+}
+mod right {
+    mod safe {
+        pub mod presentation { pub struct X; }
+    }
+    use self::safe as owner;
+    use owner::presentation::X;
+}
+"#,
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            r#"
+#[cfg(all(feature = "some-test-helper", test))]
+fn explain_distributed_plan() {}
+"#,
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            r#"
+#[cfg(test)]
+mod presentation {
+    pub(crate) fn explain_distributed_plan() {}
+    include!("../../explain/distributed.rs");
+    extern crate self as owner;
+    use std::include as inject;
+    inject!("../../explain/distributed.rs");
+}
+"#,
+        ),
+    ];
+    let rejected_valid = valid
+        .into_iter()
+        .filter_map(|(source_rel, source)| {
+            let violations = codegen_explain_owner_violations_in(source_rel, source);
+            (!violations.is_empty())
+                .then(|| format!("{source_rel}: {source}\nviolations: {violations:?}"))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        missed_invalid.is_empty() && rejected_valid.is_empty(),
+        "codegen EXPLAIN ownership detector mismatches:\nmissed invalid:\n{}\nrejected valid:\n{}",
+        missed_invalid.join("\n---\n"),
+        rejected_valid.join("\n---\n")
+    );
+}
+
+fn codegen_explain_owner_violations_in(source_rel: &str, text: &str) -> Vec<String> {
+    const EXPLAIN_NAMESPACE: &[&str] = &["crate", "sql", "explain"];
+    const EXPLAIN_ENTRY_NAMES: &[&str] = &[
+        "explain_distributed_plan",
+        "explain_distributed_plan_analyze",
+    ];
+
+    let source_rel = source_rel.replace('\\', "/");
+    if !source_rel.starts_with("src/sql/codegen/") {
+        return Vec::new();
+    }
+
+    let mut violations = Vec::new();
+    let source_path = Path::new(&source_rel);
+    let has_explain_component = source_path
+        .components()
+        .any(|component| component.as_os_str() == "explain");
+    let has_explain_stem = source_path
+        .file_stem()
+        .is_some_and(|stem| stem == "explain");
+    if has_explain_component || has_explain_stem {
+        violations.push(format!(
+            "codegen source path must not own an `explain` module: {source_rel}"
+        ));
+    }
+
+    violations.extend(
+        rust_production_canonical_paths(text, &source_rel)
+            .into_iter()
+            .filter(|path| {
+                let imports_explain_namespace = path.len() >= EXPLAIN_NAMESPACE.len()
+                    && path
+                        .iter()
+                        .zip(EXPLAIN_NAMESPACE)
+                        .all(|(actual, expected)| actual == expected);
+                let imports_ancestor_glob = path.last().is_some_and(|segment| segment == "*")
+                    && path.len() <= EXPLAIN_NAMESPACE.len()
+                    && path[..path.len() - 1]
+                        .iter()
+                        .zip(EXPLAIN_NAMESPACE)
+                        .all(|(actual, expected)| actual == expected);
+                imports_explain_namespace || imports_ancestor_glob
+            })
+            .map(|path| format!("codegen production imports `{}`", path.join("::"))),
+    );
+
+    violations.extend(
+        planner_path_module_attribute_violations_in(text)
+            .into_iter()
+            .map(|violation| {
+                format!("codegen production has path-affecting module attribute: {violation}")
+            }),
+    );
+
+    let production = rust_sanitized_production_text(text);
+    let production_tokens = rust_use_tokens(&production);
+    if production_tokens
+        .windows(2)
+        .any(|tokens| tokens == ["extern", "crate"])
+    {
+        violations.push("codegen production declares `extern crate`".to_string());
+    }
+    if production_tokens
+        .windows(2)
+        .any(|tokens| tokens == ["include", "!"])
+    {
+        violations.push("codegen production invokes `include!`".to_string());
+    }
+    if rust_raw_production_use_statements(&production)
+        .iter()
+        .any(|import| {
+            import
+                .path
+                .segments
+                .last()
+                .is_some_and(|leaf| leaf == "include")
+        })
+    {
+        violations.push("codegen production imports the `include` macro".to_string());
+    }
+    if rust_module_items(&production)
+        .iter()
+        .any(|item| item.name == "explain")
+    {
+        violations.push("codegen production declares `mod explain`".to_string());
+    }
+
+    violations.extend(EXPLAIN_ENTRY_NAMES.iter().filter_map(|entry| {
+        (rust_named_function_declaration_count(&production, entry) > 0)
+            .then(|| format!("codegen production defines distributed EXPLAIN entry `{entry}`"))
+    }));
+
+    violations
+}
+
+#[test]
+fn codegen_production_cannot_own_or_import_distributed_explain() {
+    assert!(
+        !src_dir().join("sql/codegen/ir/explain.rs").exists(),
+        "the retired codegen EXPLAIN owner source must stay deleted"
+    );
+
+    let mut violations = Vec::new();
+    for file in production_rs_files(&src_dir().join("sql/codegen")) {
+        let source_rel = rel(&file);
+        let text = fs::read_to_string(&file).unwrap();
+        for violation in codegen_explain_owner_violations_in(&source_rel, &text) {
+            violations.push(format!("{source_rel}: {violation}"));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "codegen production must not own or import distributed EXPLAIN:\n{}",
+        violations.join("\n")
+    );
+}
+
 fn native_lowering_codegen_dependency_violations_in(source_rel: &str, text: &str) -> Vec<String> {
     const FORBIDDEN: &[&str] = &["crate", "sql", "codegen"];
 
@@ -3715,11 +3901,11 @@ fn distributed_build_surface_detector_covers_paths_aliases_scopes_and_noise() {
         "use crate::sql::planner::distributed_plan_build as legacy;\nfn f() { legacy::build_distributed_plan(); }",
         "use crate::sql::planner as planner;\nfn f() { planner::build_distributed_plan(); }",
         "fn f() { crate::sql::planner::union_distinct_must_be_rewritten_error(); }",
-        "fn f() { super::super::super::planner::build_distributed_plan(); }",
+        "fn f() { super::super::planner::build_distributed_plan(); }",
         "mod nested { fn f() { crate::sql::planner::distributed_plan_build::build_distributed_plan(); } }",
     ] {
         assert!(
-            !distributed_build_surface_violations_in("src/sql/codegen/ir/explain.rs", source)
+            !distributed_build_surface_violations_in("src/sql/explain/distributed.rs", source)
                 .is_empty(),
             "legacy/grouped/alias/relative/FQ/inline build path must be detected: {source}"
         );
@@ -3734,7 +3920,7 @@ mod tests {
 }
 "###;
     assert!(
-        distributed_build_surface_violations_in("src/sql/codegen/ir/explain.rs", noise).is_empty(),
+        distributed_build_surface_violations_in("src/sql/explain/distributed.rs", noise).is_empty(),
         "comments, strings, and cfg(test) items must be ignored"
     );
 }
@@ -4170,6 +4356,8 @@ fn planner_path_module_attribute_detector_rejects_bypasses() {
         "mod stage { #[cfg_attr(feature = \"compat\", path = \"legacy.rs\")] mod legacy; }",
         "#[cfg_attr(any(feature = \"a\", feature = \"b\"), allow(dead_code), path = \"legacy.rs\")] pub(super) mod legacy;",
         "#[cfg_attr(feature = \"compat\", cfg_attr(feature = \"nested\", path = \"legacy.rs\"))] mod nested_legacy;",
+        "#[cfg_attr(any(test, feature = \"compat\"), path = \"legacy.rs\")] mod maybe_production_legacy;",
+        "#[cfg_attr(feature = \"compat\", cfg_attr(any(test, feature = \"nested\"), path = \"legacy.rs\"))] mod nested_maybe_production_legacy;",
         "#[cfg(test_feature)] #[path = \"legacy.rs\"] mod production_legacy;",
         "#[path = \"redirected\"] mod redirected_inline { mod hidden; }",
     ];
@@ -4196,6 +4384,14 @@ mod documented;
 mod predicate_only;
 #[cfg_attr(feature = "compat", derive(path::Trait))]
 mod derived;
+#[cfg_attr(test, path = "test_fixture.rs")]
+mod cfg_attr_test_fixture;
+#[cfg_attr(all(test, feature = "compat"), path = "test_fixture.rs")]
+mod cfg_attr_all_test_fixture;
+#[cfg_attr(feature = "compat", cfg_attr(test, path = "test_fixture.rs"))]
+mod nested_cfg_attr_test_fixture;
+#[cfg_attr(test, cfg_attr(feature = "compat", path = "test_fixture.rs"))]
+mod test_cfg_attr_nested_fixture;
 // #[path = "comment.rs"] mod comment;
 const TEXT: &str = "#[path = fake.rs] mod string_fake;";
 const RAW: &str = r#"#[cfg_attr(x, path = fake.rs)] mod raw_fake;"#;
@@ -4626,7 +4822,7 @@ fn planner_physical_legacy_owner_detector_distinguishes_sibling_and_unrelated_pa
     ));
     assert!(rust_use_imports_legacy_planner_owner(
         "private|crate::sql::planner::plan::PhysicalPlanNode",
-        "src/sql/codegen/ir/explain.rs",
+        "src/sql/explain/distributed.rs",
     ));
     assert!(!rust_use_imports_legacy_planner_owner(
         "pub(crate)|stats::*",
@@ -4747,6 +4943,66 @@ mod nested {
             .iter()
             .any(|import| { rust_scoped_use_imports_legacy_planner_owner(import, source_rel) }),
         "grouped alias targets that reach planner::stats must be rejected: {forbidden_alias_chain:?}"
+    );
+}
+
+#[test]
+fn scoped_use_alias_resolution_is_lexical_and_terminates_cycles() {
+    let sibling_shadowing = r#"
+mod left {
+    use crate::sql as owner;
+}
+mod right {
+    mod safe {
+        pub mod explain { pub struct X; }
+    }
+    use self::safe as owner;
+    use owner::explain::X;
+}
+"#;
+    let sibling_paths =
+        rust_production_canonical_paths(sibling_shadowing, "src/sql/codegen/ir/mod.rs");
+    assert!(
+        sibling_paths.iter().any(|path| path
+            == &[
+                "crate", "sql", "codegen", "ir", "right", "safe", "explain", "X",
+            ]),
+        "sibling-local owner alias must resolve in its lexical scope: {sibling_paths:?}"
+    );
+    assert!(
+        !sibling_paths.iter().any(|path| path.starts_with(&[
+            "crate".to_string(),
+            "sql".to_string(),
+            "explain".to_string()
+        ])),
+        "left sibling alias must not contaminate right sibling paths: {sibling_paths:?}"
+    );
+
+    let parent_child_and_cycle = r#"
+mod parent {
+    use crate::proto as owner;
+    mod child {
+        use super::owner as inherited;
+        use inherited::plan::Node;
+    }
+}
+mod cyclic {
+    use second as first;
+    use first as second;
+    use first::Thing;
+}
+"#;
+    let paths =
+        rust_production_canonical_paths(parent_child_and_cycle, "src/sql/codegen/ir/mod.rs");
+    assert!(
+        paths
+            .iter()
+            .any(|path| path == &["crate", "proto", "plan", "Node"]),
+        "child alias chain must resolve through its explicit parent scope: {paths:?}"
+    );
+    assert!(
+        paths.len() < 20,
+        "cyclic aliases must terminate without path explosion: {paths:?}"
     );
 }
 

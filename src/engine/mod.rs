@@ -2703,8 +2703,8 @@ fn explain_analyze_query(
     query_opts: Option<StandaloneQueryOptions>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
-    use crate::sql::codegen::ir::explain_distributed_plan_analyze;
     use crate::sql::explain::ExplainLevel;
+    use crate::sql::explain::distributed::explain_distributed_plan_analyze;
 
     let planning_start = std::time::Instant::now();
     let (resolved, cte_registry, mut factory) =
@@ -2880,8 +2880,8 @@ fn explain_query(
     level: crate::sql::explain::ExplainLevel,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
-    use crate::sql::codegen::ir::explain_distributed_plan;
     use crate::sql::explain::ExplainLevel;
+    use crate::sql::explain::distributed::explain_distributed_plan;
 
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
