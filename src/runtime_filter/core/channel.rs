@@ -16,7 +16,7 @@
 // under the License.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use arrow::datatypes::DataType;
@@ -55,20 +55,24 @@ const TERMINAL_METADATA_BYTES: usize = size_of::<u64>();
 pub(crate) enum ChannelAction {
     None,
     Progress {
+        order: Option<u64>,
         outcome: SubmitOutcome,
         events: Vec<RuntimeFilterEvent>,
     },
     Completed {
+        order: u64,
         outcome: SubmitOutcome,
         snapshot: Arc<LogicalSnapshot>,
         events: Vec<RuntimeFilterEvent>,
     },
     Unavailable {
+        order: u64,
         outcome: SubmitOutcome,
         reason: UnavailableReason,
         events: Vec<RuntimeFilterEvent>,
     },
     Cancelled {
+        order: u64,
         events: Vec<RuntimeFilterEvent>,
     },
 }
@@ -103,7 +107,17 @@ impl ChannelAction {
             Self::Progress { events, .. }
             | Self::Completed { events, .. }
             | Self::Unavailable { events, .. }
-            | Self::Cancelled { events } => events,
+            | Self::Cancelled { events, .. } => events,
+        }
+    }
+
+    pub(crate) const fn dispatch_order(&self) -> Option<u64> {
+        match self {
+            Self::None => None,
+            Self::Progress { order, .. } => *order,
+            Self::Completed { order, .. }
+            | Self::Unavailable { order, .. }
+            | Self::Cancelled { order, .. } => Some(*order),
         }
     }
 }
@@ -115,9 +129,20 @@ struct ProducerRuntime {
 
 enum ChannelTerminal {
     Collecting,
-    Completed(Arc<LogicalSnapshot>),
-    Unavailable(UnavailableReason),
-    Cancelled,
+    Completed {
+        order: u64,
+        snapshot: Arc<LogicalSnapshot>,
+        events: Vec<RuntimeFilterEvent>,
+    },
+    Unavailable {
+        order: u64,
+        reason: UnavailableReason,
+        events: Vec<RuntimeFilterEvent>,
+    },
+    Cancelled {
+        order: u64,
+        events: Vec<RuntimeFilterEvent>,
+    },
 }
 
 struct ChannelState {
@@ -126,6 +151,7 @@ struct ChannelState {
     witnesses: BTreeMap<CoverageWitnessId, WitnessProgress>,
     reducer: MembershipReducer,
     reservation: RetainedMemoryReservation,
+    next_dispatch_order: u64,
 }
 
 struct LockedAction {
@@ -156,7 +182,7 @@ pub(crate) struct RuntimeFilterChannel {
     null_semantics: NullSemantics,
     max_contribution_bytes: u64,
     max_reducer_bytes: u64,
-    deadline: Instant,
+    deadline: OnceLock<Instant>,
     memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
     state: Mutex<ChannelState>,
 }
@@ -169,6 +195,22 @@ impl RuntimeFilterChannel {
         epoch: DeploymentEpoch,
         deployment: &CompleteOnceChannelDeployment,
         deadline: Instant,
+        memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
+    ) -> Result<Self, ChannelBuildError> {
+        let channel =
+            Self::new_unanchored(query_id, participant_id, epoch, deployment, memory_account)?;
+        channel
+            .deadline
+            .set(deadline)
+            .expect("new channel deadline is initialized exactly once");
+        Ok(channel)
+    }
+
+    pub(crate) fn new_unanchored(
+        query_id: UniqueId,
+        participant_id: RuntimeFilterParticipantId,
+        epoch: DeploymentEpoch,
+        deployment: &CompleteOnceChannelDeployment,
         memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
     ) -> Result<Self, ChannelBuildError> {
         let (data_type, null_semantics) = match deployment.logical_domain() {
@@ -226,7 +268,7 @@ impl RuntimeFilterChannel {
             null_semantics,
             max_contribution_bytes: deployment.policy().max_contribution_bytes,
             max_reducer_bytes: deployment.core_budget().max_reducer_bytes(),
-            deadline,
+            deadline: OnceLock::new(),
             memory_account,
             state: Mutex::new(ChannelState {
                 terminal: ChannelTerminal::Collecting,
@@ -234,8 +276,13 @@ impl RuntimeFilterChannel {
                 witnesses,
                 reducer,
                 reservation: RetainedMemoryReservation::empty(),
+                next_dispatch_order: 0,
             }),
         })
+    }
+
+    pub(crate) fn initialize_deadline(&self, deadline: Instant) -> Result<(), ()> {
+        self.deadline.set(deadline).map_err(|_| ())
     }
 
     pub(crate) fn open_producer(
@@ -271,6 +318,17 @@ impl RuntimeFilterChannel {
         Ok(SubmitOutcome::Applied)
     }
 
+    pub(crate) fn authorize_submit(
+        &self,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        partition_id: PartitionId,
+    ) -> Result<(), RuntimeContractViolation> {
+        let state = self.state.lock().unwrap();
+        partition_state(&state, binding_id, fragment_instance_id, partition_id)?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn submit(
         &self,
@@ -290,6 +348,7 @@ impl RuntimeFilterChannel {
             sequence,
         );
         let mut incoming_reservation: Option<RetainedMemoryReservation> = None;
+        let mut reservation_failed_for = None;
         loop {
             let mut state = self.state.lock().unwrap();
             partition_state(&state, binding_id, fragment_instance_id, partition_id)?;
@@ -320,7 +379,7 @@ impl RuntimeFilterChannel {
             }
             if matches!(
                 state.terminal,
-                ChannelTerminal::Unavailable(_) | ChannelTerminal::Cancelled
+                ChannelTerminal::Unavailable { .. } | ChannelTerminal::Cancelled { .. }
             ) {
                 return Ok(progress(SubmitOutcome::TerminalNoop));
             }
@@ -333,6 +392,7 @@ impl RuntimeFilterChannel {
                 {
                     return if *previous == fingerprint {
                         Ok(ChannelAction::Progress {
+                            order: Some(next_dispatch_order(&mut state)),
                             outcome: SubmitOutcome::Duplicate,
                             events: vec![RuntimeFilterEvent::DeltaDuplicateIgnored { identity }],
                         })
@@ -441,12 +501,24 @@ impl RuntimeFilterChannel {
                 .map(|reservation| reservation.bytes())
                 != Some(retained_growth)
             {
+                if reservation_failed_for == Some(retained_growth) {
+                    let locked = self.make_unavailable(
+                        &mut state,
+                        UnavailableReason::ResourceLimit,
+                        SubmitOutcome::TerminalNoop,
+                    );
+                    drop(state);
+                    return Ok(locked.finish());
+                }
                 drop(state);
                 drop(incoming_reservation.take());
-                incoming_reservation = Some(RetainedMemoryReservation::new(
+                match RetainedMemoryReservation::try_new(
                     self.memory_account.clone(),
                     retained_growth,
-                ));
+                ) {
+                    Ok(reservation) => incoming_reservation = Some(reservation),
+                    Err(_) => reservation_failed_for = Some(retained_growth),
+                }
                 continue;
             }
             let incoming = incoming_reservation
@@ -498,12 +570,13 @@ impl RuntimeFilterChannel {
         terminal_sequence: ProducerSequence,
     ) -> Result<ChannelAction, RuntimeContractViolation> {
         let mut incoming_reservation: Option<RetainedMemoryReservation> = None;
+        let mut reservation_failed = false;
         loop {
             let mut state = self.state.lock().unwrap();
             partition_state(&state, binding_id, fragment_instance_id, partition_id)?;
             if matches!(
                 state.terminal,
-                ChannelTerminal::Unavailable(_) | ChannelTerminal::Cancelled
+                ChannelTerminal::Unavailable { .. } | ChannelTerminal::Cancelled { .. }
             ) {
                 return Ok(progress(SubmitOutcome::TerminalNoop));
             }
@@ -564,12 +637,24 @@ impl RuntimeFilterChannel {
                 .map(|reservation| reservation.bytes())
                 != Some(TERMINAL_METADATA_BYTES)
             {
+                if reservation_failed {
+                    let locked = self.make_unavailable(
+                        &mut state,
+                        UnavailableReason::ResourceLimit,
+                        SubmitOutcome::TerminalNoop,
+                    );
+                    drop(state);
+                    return Ok(locked.finish());
+                }
                 drop(state);
                 drop(incoming_reservation.take());
-                incoming_reservation = Some(RetainedMemoryReservation::new(
+                match RetainedMemoryReservation::try_new(
                     self.memory_account.clone(),
                     TERMINAL_METADATA_BYTES,
-                ));
+                ) {
+                    Ok(reservation) => incoming_reservation = Some(reservation),
+                    Err(_) => reservation_failed = true,
+                }
                 continue;
             }
             let incoming = incoming_reservation
@@ -658,7 +743,9 @@ impl RuntimeFilterChannel {
 
     pub(crate) fn expire_deadline(&self, now: Instant) -> ChannelAction {
         let mut state = self.state.lock().unwrap();
-        if now < self.deadline || !matches!(state.terminal, ChannelTerminal::Collecting) {
+        if self.deadline.get().is_none_or(|deadline| now < *deadline)
+            || !matches!(state.terminal, ChannelTerminal::Collecting)
+        {
             return ChannelAction::None;
         }
         let locked = self.make_unavailable(
@@ -676,21 +763,128 @@ impl RuntimeFilterChannel {
             return ChannelAction::None;
         }
         let release_after_unlock = self.detach_collecting_state(&mut state);
-        state.terminal = ChannelTerminal::Cancelled;
-        let action = ChannelAction::Cancelled {
-            events: vec![RuntimeFilterEvent::ChannelCancelled {
-                identity: self.event_identity,
-            }],
+        let events = vec![RuntimeFilterEvent::ChannelCancelled {
+            identity: self.event_identity,
+        }];
+        let order = next_dispatch_order(&mut state);
+        state.terminal = ChannelTerminal::Cancelled {
+            order,
+            events: events.clone(),
         };
+        let action = ChannelAction::Cancelled { order, events };
         drop(state);
         drop(release_after_unlock);
         action
     }
 
+    pub(crate) fn terminal_action(&self) -> ChannelAction {
+        let state = self.state.lock().unwrap();
+        terminal_action_from_state(&state)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reject_submit_resource_exhausted(
+        &self,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        partition_id: PartitionId,
+        sequence: ProducerSequence,
+        delta: &ValueDomainDelta,
+    ) -> Result<ChannelAction, RuntimeContractViolation> {
+        let identity = ContributionIdentity::new(
+            self.event_identity.query_id(),
+            self.event_identity.participant_id(),
+            self.channel_id,
+            self.event_identity.epoch(),
+            ProducerStreamId::new(binding_id, fragment_instance_id, partition_id),
+            sequence,
+        );
+        let mut state = self.state.lock().unwrap();
+        partition_state(&state, binding_id, fragment_instance_id, partition_id)?;
+        if !delta.matches_data_type(&self.data_type) {
+            return Err(violation(
+                RuntimeContractViolationKind::TypeMismatch,
+                "delta type does not match channel membership type",
+            ));
+        }
+        if matches!(
+            state.terminal,
+            ChannelTerminal::Unavailable { .. } | ChannelTerminal::Cancelled { .. }
+        ) {
+            return Ok(terminal_action_from_state(&state));
+        }
+        let fingerprint = delta.fingerprint();
+        if let Some(previous) =
+            partition_state(&state, binding_id, fragment_instance_id, partition_id)?
+                .and_then(|partition| partition.seen.get(&sequence))
+        {
+            return if *previous == fingerprint {
+                Ok(ChannelAction::Progress {
+                    order: Some(next_dispatch_order(&mut state)),
+                    outcome: SubmitOutcome::Duplicate,
+                    events: vec![RuntimeFilterEvent::DeltaDuplicateIgnored { identity }],
+                })
+            } else {
+                Err(violation(
+                    RuntimeContractViolationKind::ConflictingReplay,
+                    "same contribution identity carried a different payload",
+                ))
+            };
+        }
+        let instance_progress =
+            instance_mut(&mut state, binding_id, fragment_instance_id)?.progress;
+        let (partition_progress, terminal_sequence) =
+            partition_state(&state, binding_id, fragment_instance_id, partition_id)?
+                .map_or((TerminalProgress::Pending, None), |partition| {
+                    (partition.progress, partition.terminal_sequence)
+                });
+        if instance_progress == TerminalProgress::Impossible
+            || partition_progress == TerminalProgress::Impossible
+        {
+            return Ok(progress(SubmitOutcome::TerminalNoop));
+        }
+        if partition_progress == TerminalProgress::Satisfied {
+            return Err(violation(
+                RuntimeContractViolationKind::SequenceOutsideTerminalRange,
+                "new delta arrived after partition close",
+            ));
+        }
+        if !matches!(state.terminal, ChannelTerminal::Collecting) {
+            return Ok(terminal_action_from_state(&state));
+        }
+        if terminal_sequence.is_some_and(|terminal| sequence >= terminal) {
+            return Err(violation(
+                RuntimeContractViolationKind::SequenceOutsideTerminalRange,
+                "delta sequence is outside the exclusive terminal range",
+            ));
+        }
+        let locked = self.make_unavailable(
+            &mut state,
+            UnavailableReason::ResourceLimit,
+            SubmitOutcome::TerminalNoop,
+        );
+        drop(state);
+        Ok(locked.finish())
+    }
+
+    pub(crate) fn resource_exhausted(&self) -> ChannelAction {
+        let mut state = self.state.lock().unwrap();
+        if !matches!(state.terminal, ChannelTerminal::Collecting) {
+            return terminal_action_from_state(&state);
+        }
+        let locked = self.make_unavailable(
+            &mut state,
+            UnavailableReason::ResourceLimit,
+            SubmitOutcome::TerminalNoop,
+        );
+        drop(state);
+        locked.finish()
+    }
+
     pub(crate) fn snapshot(&self) -> Option<Arc<LogicalSnapshot>> {
         let state = self.state.lock().unwrap();
         match &state.terminal {
-            ChannelTerminal::Completed(snapshot) => Some(snapshot.clone()),
+            ChannelTerminal::Completed { snapshot, .. } => Some(snapshot.clone()),
             _ => None,
         }
     }
@@ -765,12 +959,18 @@ impl RuntimeFilterChannel {
                     std::mem::replace(&mut state.reservation, RetainedMemoryReservation::empty());
                 let snapshot =
                     Arc::new(LogicalSnapshot::first(self.channel_id, domain, reservation));
-                state.terminal = ChannelTerminal::Completed(snapshot.clone());
                 events.push(RuntimeFilterEvent::ChannelCompleted {
                     identity: self.event_identity,
                     version: snapshot.version(),
                 });
+                let order = next_dispatch_order(state);
+                state.terminal = ChannelTerminal::Completed {
+                    order,
+                    snapshot: snapshot.clone(),
+                    events: events.clone(),
+                };
                 LockedAction::without_release(ChannelAction::Completed {
+                    order,
                     outcome: SubmitOutcome::Completed,
                     snapshot,
                     events,
@@ -783,7 +983,12 @@ impl RuntimeFilterChannel {
                 events,
             ),
             CoverageProgress::Pending => {
-                LockedAction::without_release(ChannelAction::Progress { outcome, events })
+                let order = (!events.is_empty()).then(|| next_dispatch_order(state));
+                LockedAction::without_release(ChannelAction::Progress {
+                    order,
+                    outcome,
+                    events,
+                })
             }
         }
     }
@@ -805,13 +1010,19 @@ impl RuntimeFilterChannel {
         mut events: Vec<RuntimeFilterEvent>,
     ) -> LockedAction {
         let release_after_unlock = self.detach_collecting_state(state);
-        state.terminal = ChannelTerminal::Unavailable(reason);
         events.push(RuntimeFilterEvent::ChannelUnavailable {
             identity: self.event_identity,
             reason,
         });
+        let order = next_dispatch_order(state);
+        state.terminal = ChannelTerminal::Unavailable {
+            order,
+            reason,
+            events: events.clone(),
+        };
         LockedAction {
             action: ChannelAction::Unavailable {
+                order,
                 outcome,
                 reason,
                 events,
@@ -836,9 +1047,49 @@ impl RuntimeFilterChannel {
 
 fn progress(outcome: SubmitOutcome) -> ChannelAction {
     ChannelAction::Progress {
+        order: None,
         outcome,
         events: Vec::new(),
     }
+}
+
+fn terminal_action_from_state(state: &ChannelState) -> ChannelAction {
+    match &state.terminal {
+        ChannelTerminal::Collecting => ChannelAction::None,
+        ChannelTerminal::Completed {
+            order,
+            snapshot,
+            events,
+        } => ChannelAction::Completed {
+            order: *order,
+            outcome: SubmitOutcome::TerminalNoop,
+            snapshot: snapshot.clone(),
+            events: events.clone(),
+        },
+        ChannelTerminal::Unavailable {
+            order,
+            reason,
+            events,
+        } => ChannelAction::Unavailable {
+            order: *order,
+            outcome: SubmitOutcome::TerminalNoop,
+            reason: *reason,
+            events: events.clone(),
+        },
+        ChannelTerminal::Cancelled { order, events } => ChannelAction::Cancelled {
+            order: *order,
+            events: events.clone(),
+        },
+    }
+}
+
+fn next_dispatch_order(state: &mut ChannelState) -> u64 {
+    let order = state.next_dispatch_order;
+    state.next_dispatch_order = state
+        .next_dispatch_order
+        .checked_add(1)
+        .expect("runtime filter channel dispatch order exhausted");
+    order
 }
 
 fn violation(
@@ -945,7 +1196,7 @@ mod tests {
     };
     use crate::runtime_filter::port::subscription::UnavailableReason;
     use crate::runtime_filter::port::support::{
-        RuntimeFilterMemoryAccount, TemporaryContributionLease,
+        MemoryAccountError, RuntimeFilterMemoryAccount, TemporaryContributionLease,
     };
     use crate::runtime_filter::port::value_domain::{MembershipValues, ValueDomainDelta};
 
@@ -958,9 +1209,10 @@ mod tests {
     }
 
     impl RuntimeFilterMemoryAccount for Account {
-        fn consume(&self, bytes: usize) {
+        fn try_consume(&self, bytes: usize) -> Result<(), MemoryAccountError> {
             let current = self.current.fetch_add(bytes, Ordering::SeqCst) + bytes;
             self.peak.fetch_max(current, Ordering::SeqCst);
+            Ok(())
         }
 
         fn release(&self, bytes: usize) {
@@ -990,15 +1242,41 @@ mod tests {
     }
 
     impl RuntimeFilterMemoryAccount for ReentrantAccount {
-        fn consume(&self, bytes: usize) {
+        fn try_consume(&self, bytes: usize) -> Result<(), MemoryAccountError> {
             self.current.fetch_add(bytes, Ordering::SeqCst);
             self.reenter();
+            Ok(())
         }
 
         fn release(&self, bytes: usize) {
             self.current.fetch_sub(bytes, Ordering::SeqCst);
             self.reenter();
         }
+    }
+
+    struct RejectingAccount;
+
+    impl RuntimeFilterMemoryAccount for RejectingAccount {
+        fn try_consume(&self, _bytes: usize) -> Result<(), MemoryAccountError> {
+            Err(MemoryAccountError::CapacityExceeded)
+        }
+
+        fn release(&self, _bytes: usize) {}
+    }
+
+    struct BlockingRejectingAccount {
+        entered: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl RuntimeFilterMemoryAccount for BlockingRejectingAccount {
+        fn try_consume(&self, _bytes: usize) -> Result<(), MemoryAccountError> {
+            self.entered.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+            Err(MemoryAccountError::CapacityExceeded)
+        }
+
+        fn release(&self, _bytes: usize) {}
     }
 
     fn uid(lo: i64) -> UniqueId {
@@ -2122,6 +2400,84 @@ mod tests {
         assert_eq!(account.current.load(Ordering::SeqCst), completed_retained);
         drop(snapshot);
         assert_eq!(account.current.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn retained_memory_account_rejection_fails_open_as_resource_limit() {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let channel = RuntimeFilterChannel::new(
+            uid(99),
+            RuntimeFilterParticipantId::new(1),
+            DeploymentEpoch::new(1),
+            &deployment(
+                Coverage::Leaf(CoverageWitnessId::new(1)),
+                &[(10, 1, 10)],
+                4096,
+                4096,
+            ),
+            deadline,
+            Arc::new(RejectingAccount),
+        )
+        .unwrap();
+        channel
+            .open_producer(BindingId::new(10), uid(10), 1)
+            .unwrap();
+        let temporary = Arc::new(Account::default());
+        let action = submit(&channel, temporary, 10, 10, 0, &[1]).unwrap();
+        assert_eq!(
+            action.unavailable_reason(),
+            Some(UnavailableReason::ResourceLimit)
+        );
+        assert!(channel.snapshot().is_none());
+    }
+
+    #[test]
+    fn rejected_reservation_revalidates_terminal_state_before_resource_limit() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let account = Arc::new(BlockingRejectingAccount {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        });
+        let channel = Arc::new(
+            RuntimeFilterChannel::new(
+                uid(99),
+                RuntimeFilterParticipantId::new(1),
+                DeploymentEpoch::new(1),
+                &deployment(
+                    Coverage::Leaf(CoverageWitnessId::new(1)),
+                    &[(10, 1, 10)],
+                    4096,
+                    4096,
+                ),
+                Instant::now() + Duration::from_secs(10),
+                account,
+            )
+            .unwrap(),
+        );
+        channel
+            .open_producer(BindingId::new(10), uid(10), 1)
+            .unwrap();
+        let submit_channel = channel.clone();
+        let temporary = Arc::new(Account::default());
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            done_tx
+                .send(submit(&submit_channel, temporary, 10, 10, 0, &[1]))
+                .unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(channel.cancel(), ChannelAction::Cancelled { .. }));
+        release_tx.send(()).unwrap();
+        let action = done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(action.outcome(), SubmitOutcome::TerminalNoop);
+        assert!(matches!(
+            channel.terminal_action(),
+            ChannelAction::Cancelled { .. }
+        ));
     }
 
     #[test]

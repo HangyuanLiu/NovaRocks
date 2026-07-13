@@ -23,8 +23,13 @@ pub(crate) trait RuntimeFilterClock: Send + Sync {
     fn now(&self) -> Instant;
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MemoryAccountError {
+    CapacityExceeded,
+}
+
 pub(crate) trait RuntimeFilterMemoryAccount: Send + Sync {
-    fn consume(&self, bytes: usize);
+    fn try_consume(&self, bytes: usize) -> Result<(), MemoryAccountError>;
     fn release(&self, bytes: usize);
 }
 
@@ -34,11 +39,14 @@ struct MemoryLease {
 }
 
 impl MemoryLease {
-    fn new(account: Arc<dyn RuntimeFilterMemoryAccount>, bytes: usize) -> Self {
+    fn try_new(
+        account: Arc<dyn RuntimeFilterMemoryAccount>,
+        bytes: usize,
+    ) -> Result<Self, MemoryAccountError> {
         if bytes != 0 {
-            account.consume(bytes);
+            account.try_consume(bytes)?;
         }
-        Self { account, bytes }
+        Ok(Self { account, bytes })
     }
 }
 
@@ -53,8 +61,16 @@ impl Drop for MemoryLease {
 pub(crate) struct TemporaryContributionLease(MemoryLease);
 
 impl TemporaryContributionLease {
+    pub(crate) fn try_new(
+        account: Arc<dyn RuntimeFilterMemoryAccount>,
+        bytes: usize,
+    ) -> Result<Self, MemoryAccountError> {
+        MemoryLease::try_new(account, bytes).map(Self)
+    }
+
+    #[cfg(test)]
     pub(crate) fn new(account: Arc<dyn RuntimeFilterMemoryAccount>, bytes: usize) -> Self {
-        Self(MemoryLease::new(account, bytes))
+        Self::try_new(account, bytes).expect("test memory account accepts reservation")
     }
 
     pub(crate) const fn bytes(&self) -> usize {
@@ -75,6 +91,7 @@ impl fmt::Debug for TemporaryContributionLease {
 pub(crate) enum RetainedReservationError {
     SizeOverflow,
     AccountMismatch,
+    CapacityExceeded,
 }
 
 impl fmt::Display for RetainedReservationError {
@@ -82,6 +99,9 @@ impl fmt::Display for RetainedReservationError {
         match self {
             Self::SizeOverflow => write!(formatter, "retained reservation size overflow"),
             Self::AccountMismatch => write!(formatter, "retained reservation account mismatch"),
+            Self::CapacityExceeded => {
+                write!(formatter, "retained reservation account rejected bytes")
+            }
         }
     }
 }
@@ -128,15 +148,25 @@ impl RetainedMemoryReservation {
         }
     }
 
-    pub(crate) fn new(account: Arc<dyn RuntimeFilterMemoryAccount>, bytes: usize) -> Self {
+    pub(crate) fn try_new(
+        account: Arc<dyn RuntimeFilterMemoryAccount>,
+        bytes: usize,
+    ) -> Result<Self, RetainedReservationError> {
         if bytes == 0 {
-            return Self::empty();
+            return Ok(Self::empty());
         }
-        account.consume(bytes);
-        Self {
+        account
+            .try_consume(bytes)
+            .map_err(|_| RetainedReservationError::CapacityExceeded)?;
+        Ok(Self {
             account: Some(account),
             bytes,
-        }
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new(account: Arc<dyn RuntimeFilterMemoryAccount>, bytes: usize) -> Self {
+        Self::try_new(account, bytes).expect("test memory account accepts reservation")
     }
 
     pub(crate) fn absorb(
@@ -220,13 +250,31 @@ mod tests {
     struct CountingMemoryAccount(AtomicUsize);
 
     impl RuntimeFilterMemoryAccount for CountingMemoryAccount {
-        fn consume(&self, bytes: usize) {
+        fn try_consume(&self, bytes: usize) -> Result<(), MemoryAccountError> {
             self.0.fetch_add(bytes, Ordering::SeqCst);
+            Ok(())
         }
 
         fn release(&self, bytes: usize) {
             self.0.fetch_sub(bytes, Ordering::SeqCst);
         }
+    }
+
+    struct RejectingMemoryAccount;
+
+    impl RuntimeFilterMemoryAccount for RejectingMemoryAccount {
+        fn try_consume(&self, _bytes: usize) -> Result<(), MemoryAccountError> {
+            Err(MemoryAccountError::CapacityExceeded)
+        }
+
+        fn release(&self, _bytes: usize) {}
+    }
+
+    #[test]
+    fn temporary_and_retained_reservations_propagate_account_rejection() {
+        let account = Arc::new(RejectingMemoryAccount);
+        assert!(TemporaryContributionLease::try_new(account.clone(), 1).is_err());
+        assert!(RetainedMemoryReservation::try_new(account, 1).is_err());
     }
 
     #[test]

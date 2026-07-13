@@ -46,6 +46,7 @@ pub(crate) enum InstallContractErrorKind {
     InvalidBudget,
     ConflictingDeployment,
     EpochMismatch,
+    ServiceClosed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -95,6 +96,7 @@ pub(crate) enum RuntimeContractViolationKind {
     ConflictingReplay,
     ConflictingTerminalSequence,
     SequenceOutsideTerminalRange,
+    ServiceUnavailable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -223,6 +225,7 @@ mod tests {
             RuntimeContractViolationKind::SequenceOutsideTerminalRange => {
                 "sequence-outside-terminal-range"
             }
+            RuntimeContractViolationKind::ServiceUnavailable => "service-unavailable",
         }
     }
 
