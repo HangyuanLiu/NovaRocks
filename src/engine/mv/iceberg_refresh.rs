@@ -14683,7 +14683,7 @@ fn execute_imv_change_stream_write(
     collector: Arc<IcebergCommitCollector>,
     refresh_plan: ImvRefreshPlannedChangeStream<'_>,
     target_ref: &str,
-) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
+) -> Result<crate::coordinator::execution::CoordinatedQueryResult, String> {
     let (refresh_plan, data_route_output_ordinal) =
         ensure_imv_change_stream_data_route(refresh_plan)?;
     let entry = state

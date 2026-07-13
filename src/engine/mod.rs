@@ -2758,7 +2758,7 @@ fn explain_analyze_query(
     let (execution_ports, scheduler) = coordinated_execution_services()?;
     let execution_start = std::time::Instant::now();
     let query_opts = query_opts.to_runtime();
-    let outcome = crate::runtime::coordinator::ExecutionCoordinator::new(
+    let outcome = crate::coordinator::execution::ExecutionCoordinator::new(
         build_result,
         execution_ports,
         scheduler,
@@ -3057,7 +3057,7 @@ pub(crate) fn execute_query_as_iceberg_write(
     sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
     query_opts: Option<StandaloneQueryOptions>,
     root_distribution_resolver: Option<IcebergWriteRootDistributionResolver>,
-) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
+) -> Result<crate::coordinator::execution::CoordinatedQueryResult, String> {
     // Time-travel: a branch DML write's scan carries `FOR VERSION AS OF '<branch>'`
     // (delete_flow's DV position scan; the MOR-UPDATE branch row scan). Resolve those
     // version-bearing refs to synthetic per-snapshot tables bound to the BRANCH head
@@ -3141,7 +3141,7 @@ pub(crate) fn execute_query_as_iceberg_write(
         ),
     )?;
     let (execution_ports, scheduler) = coordinated_execution_services()?;
-    crate::runtime::coordinator::ExecutionCoordinator::new(
+    crate::coordinator::execution::ExecutionCoordinator::new(
         build_result,
         execution_ports,
         scheduler,
@@ -3227,7 +3227,7 @@ pub(crate) fn install_change_stream_write_test_observer(
 #[cfg(test)]
 pub(crate) fn observe_change_stream_write_build_for_test(
     topology: &crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamWriteTopology,
-) -> Option<crate::runtime::coordinator::CoordinatedQueryResult> {
+) -> Option<crate::coordinator::execution::CoordinatedQueryResult> {
     let mut observer = change_stream_write_test_observer()
         .lock()
         .expect("change-stream write test observer lock");
@@ -3248,7 +3248,7 @@ pub(crate) fn observe_change_stream_write_build_for_test(
                 .collect(),
         });
     if observer.short_circuit_after_build {
-        Some(crate::runtime::coordinator::CoordinatedQueryResult {
+        Some(crate::coordinator::execution::CoordinatedQueryResult {
             query_result: crate::runtime::query_result::QueryResult::empty(),
             write_commit: None,
             write_abort: None,
@@ -3349,10 +3349,10 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_native_pla
 pub(crate) fn execute_planned_iceberg_change_stream_write(
     build_result: crate::sql::codegen::fragment::MultiFragmentBuildResult,
     query_opts: Option<StandaloneQueryOptions>,
-) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
+) -> Result<crate::coordinator::execution::CoordinatedQueryResult, String> {
     let (execution_ports, scheduler) = coordinated_execution_services()?;
     let query_options = StandaloneQueryOptions::optional_to_runtime(query_opts.as_ref());
-    crate::runtime::coordinator::ExecutionCoordinator::new(
+    crate::coordinator::execution::ExecutionCoordinator::new(
         build_result,
         execution_ports,
         scheduler,
@@ -3370,7 +3370,7 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
     dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
     query_opts: Option<StandaloneQueryOptions>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
-) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
+) -> Result<crate::coordinator::execution::CoordinatedQueryResult, String> {
     let planned = build_physical_plan_as_iceberg_change_stream_write(
         state,
         current_catalog,
@@ -3726,7 +3726,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         ),
     )?;
     let (execution_ports, scheduler) = coordinated_execution_services()?;
-    crate::runtime::coordinator::ExecutionCoordinator::new(
+    crate::coordinator::execution::ExecutionCoordinator::new(
         build_result,
         execution_ports,
         scheduler,
@@ -3784,7 +3784,7 @@ pub(crate) fn execute_logical_plan_with_options(
         ),
     )?;
     let (execution_ports, scheduler) = coordinated_execution_services()?;
-    crate::runtime::coordinator::ExecutionCoordinator::new(
+    crate::coordinator::execution::ExecutionCoordinator::new(
         build_result,
         execution_ports,
         scheduler,

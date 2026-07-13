@@ -18,9 +18,9 @@
 use std::sync::Arc;
 
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
+use crate::coordinator::execution::CoordinatedQueryResult;
 use crate::engine::StandaloneState;
 use crate::engine::query_options::StandaloneQueryOptions;
-use crate::runtime::coordinator::CoordinatedQueryResult;
 use crate::sql::analysis::OutputColumn;
 use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::optimizer::OptimizedOperatorNode;

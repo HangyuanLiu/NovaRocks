@@ -1127,7 +1127,7 @@ fn nidl_d3g_native_runtime_query_options_do_not_use_thrift_model() {
     let forbidden = [
         "src/runtime/runtime_state.rs",
         "src/cache/mod.rs",
-        "src/runtime/coordinator.rs",
+        "src/coordinator/execution.rs",
         "src/runtime/native_fragment_wire.rs",
         "src/sql/codegen/proto_encode/instance.rs",
     ];
@@ -1148,7 +1148,7 @@ fn nidl_d3h_native_runtime_filter_params_do_not_use_thrift_model() {
         "src/runtime/runtime_state.rs",
         "src/runtime/query_context.rs",
         "src/runtime/native_fragment_wire.rs",
-        "src/runtime/coordinator.rs",
+        "src/coordinator/execution.rs",
         "src/sql/codegen/proto_encode/instance.rs",
         "src/lower/common/fragment_runtime.rs",
         "src/exec/operators/hashjoin/hash_join_build_sink.rs",
@@ -10110,7 +10110,7 @@ fn nidl_d3e_native_runtime_routing_has_no_thrift_shaped_endpoint_model() {
         }
     }
 
-    let coordinator = fs::read_to_string(repo.join("src/runtime/coordinator.rs")).unwrap();
+    let coordinator = fs::read_to_string(repo.join("src/coordinator/execution.rs")).unwrap();
     assert!(
         !coordinator.contains("fn exec_destination_from_runtime"),
         "native-only coordinator must not retain the Thrift execution destination adapter"
@@ -10189,7 +10189,7 @@ fn nidl_d3i_native_fragment_exec_params_are_not_thrift_shaped() {
 #[test]
 fn nidl_d3j_native_delta_scan_sidecar_is_not_patched_from_thrift_plan() {
     let repo = Path::new(manifest_dir());
-    let coordinator = fs::read_to_string(repo.join("src/runtime/coordinator.rs")).unwrap();
+    let coordinator = fs::read_to_string(repo.join("src/coordinator/execution.rs")).unwrap();
     let mut violations = Vec::new();
 
     for forbidden in [
@@ -10200,7 +10200,7 @@ fn nidl_d3j_native_delta_scan_sidecar_is_not_patched_from_thrift_plan() {
     ] {
         if coordinator.contains(forbidden) {
             violations.push(format!(
-                "src/runtime/coordinator.rs: native Iceberg delta sidecar must not use `{forbidden}`"
+                "src/coordinator/execution.rs: native Iceberg delta sidecar must not use `{forbidden}`"
             ));
         }
     }
@@ -10222,7 +10222,7 @@ fn nidl_d3j_native_delta_scan_sidecar_is_not_patched_from_thrift_plan() {
 #[test]
 fn nidl_d3k_native_dynamic_sink_partition_does_not_roundtrip_thrift_partition() {
     let repo = Path::new(manifest_dir());
-    let coordinator = fs::read_to_string(repo.join("src/runtime/coordinator.rs")).unwrap();
+    let coordinator = fs::read_to_string(repo.join("src/coordinator/execution.rs")).unwrap();
     let mut violations = Vec::new();
 
     for forbidden in [
@@ -10231,14 +10231,14 @@ fn nidl_d3k_native_dynamic_sink_partition_does_not_roundtrip_thrift_partition() 
     ] {
         if coordinator.contains(forbidden) {
             violations.push(format!(
-                "src/runtime/coordinator.rs: native dynamic sink patch must not use `{forbidden}`"
+                "src/coordinator/execution.rs: native dynamic sink patch must not use `{forbidden}`"
             ));
         }
     }
 
     if coordinator.contains("Vec<(FragmentId, i32, partitions::TDataPartition, Vec<i32>)>") {
         violations.push(
-            "src/runtime/coordinator.rs: CTE native consumer index must not store thrift TDataPartition"
+            "src/coordinator/execution.rs: CTE native consumer index must not store thrift TDataPartition"
                 .to_string(),
         );
     }
@@ -10296,10 +10296,10 @@ fn nfe_0_novarocks_generated_execution_has_no_plan_wire_selector() {
         "NovaRocks config must not expose the retired plan-wire selector",
     );
 
-    let coordinator = fs::read_to_string(repo.join("src/runtime/coordinator.rs")).unwrap();
+    let coordinator = fs::read_to_string(repo.join("src/coordinator/execution.rs")).unwrap();
     push_forbidden_terms(
         &mut violations,
-        "src/runtime/coordinator.rs",
+        "src/coordinator/execution.rs",
         &coordinator,
         &[
             "PlanWireFormat",
@@ -10334,7 +10334,7 @@ fn nfe_1_task_2_native_fragment_build_owns_submission_payload() {
         );
     }
 
-    for rel in ["src/engine/mod.rs", "src/runtime/coordinator.rs"] {
+    for rel in ["src/engine/mod.rs", "src/coordinator/execution.rs"] {
         let text = fs::read_to_string(repo.join(rel)).unwrap();
         push_forbidden_terms(
             &mut violations,
@@ -10365,7 +10365,7 @@ fn nfe_1_task_3_runtime_submission_is_native_only() {
 
     for rel in [
         "src/coordinator/dispatch.rs",
-        "src/runtime/coordinator.rs",
+        "src/coordinator/execution.rs",
         "src/service/grpc_fragment_dispatcher.rs",
     ] {
         let text = fs::read_to_string(repo.join(rel)).unwrap();
@@ -10844,7 +10844,7 @@ fn nfe_4_ledger_and_audit_contract_violations(
         "src/sql",
         "src/engine",
         "src/coordinator/dispatch.rs",
-        "src/runtime/coordinator.rs",
+        "src/coordinator/execution.rs",
         "src/service/grpc_fragment_dispatcher.rs",
         "tests/sql-test-runner/src",
     ];
@@ -10872,7 +10872,7 @@ fn nfe_4_ledger_and_audit_contract_violations(
             || matches!(
                 path,
                 "src/coordinator/dispatch.rs"
-                    | "src/runtime/coordinator.rs"
+                    | "src/coordinator/execution.rs"
                     | "src/service/grpc_fragment_dispatcher.rs"
             );
         if fe_native && baseline_max_hits(line).is_none_or(|max_hits| max_hits != "0") {
@@ -11237,12 +11237,11 @@ fn nfe_4_fe_owned_raw_sources_are_starrocks_idl_free() {
             vec![repo.join("src/engine/mod.rs")],
         ),
         (
-            repo.join("src/runtime"),
-            vec![repo.join("src/runtime/coordinator.rs")],
-        ),
-        (
             repo.join("src/coordinator"),
-            vec![repo.join("src/coordinator/dispatch.rs")],
+            vec![
+                repo.join("src/coordinator/dispatch.rs"),
+                repo.join("src/coordinator/execution.rs"),
+            ],
         ),
         (
             repo.join("src/service"),
@@ -11265,7 +11264,7 @@ fn nfe_4_fe_owned_raw_sources_are_starrocks_idl_free() {
         "src/engine/mod.rs",
         "src/engine/statement.rs",
         "src/coordinator/dispatch.rs",
-        "src/runtime/coordinator.rs",
+        "src/coordinator/execution.rs",
         "src/service/grpc_fragment_dispatcher.rs",
         "tests/sql-test-runner/src/main.rs",
         "tests/sql-test-runner/src/cluster.rs",
@@ -11378,7 +11377,7 @@ fn nfe_4_ledger_and_audit_contract_detector_is_non_vacuous() {
         r#"
             BASELINE = {
                 "src/engine/mod.rs": BaselineEntry("domain-leak", "B7", 1, "bad"),
-                "src/runtime/coordinator.rs": BaselineEntry("domain-leak", "control-plane", 1, "bad"),
+                "src/coordinator/execution.rs": BaselineEntry("domain-leak", "control-plane", 1, "bad"),
                 "src/sql/codegen/descriptors.rs": BaselineEntry("domain-leak", "legacy", 0, "bad"),
             }
         "#,
@@ -11387,7 +11386,7 @@ fn nfe_4_ledger_and_audit_contract_detector_is_non_vacuous() {
         "NIDL ledger must stay empty",
         "FE owner must not enter NIDL compat scope",
         "src/engine/mod.rs: FE/native audit baseline must stay at max_hits=0",
-        "src/runtime/coordinator.rs: FE/native audit baseline must stay at max_hits=0",
+        "src/coordinator/execution.rs: FE/native audit baseline must stay at max_hits=0",
         "src/sql/codegen/descriptors.rs: retired path must not retain an audit baseline",
         "src/runtime/query_options.rs: required external ingress audit baseline is missing",
         "src/runtime/runtime_filter_params.rs: required external ingress audit baseline is missing",
@@ -12916,7 +12915,7 @@ fn nfe_3_fe_owned_helpers_are_raw_starrocks_idl_free() {
         "src/engine/dml_change_stream.rs",
         "src/sql/common/change_stream.rs",
         "src/coordinator/dispatch.rs",
-        "src/runtime/coordinator.rs",
+        "src/coordinator/execution.rs",
         "src/service/grpc_fragment_dispatcher.rs",
         "src/runtime/fragment_exec_params.rs",
         "src/runtime/scan_range.rs",
@@ -13189,7 +13188,7 @@ fn nfe_3_audit_baselines_do_not_reauthorize_retired_paths() {
     for (native, owner) in [
         ("src/engine/dml_change_stream.rs", "B7"),
         ("src/coordinator/dispatch.rs", "control-plane"),
-        ("src/runtime/coordinator.rs", "control-plane"),
+        ("src/coordinator/execution.rs", "control-plane"),
         ("src/service/grpc_fragment_dispatcher.rs", "control-plane"),
         ("src/runtime/fragment_exec_params.rs", "control-plane"),
         ("src/runtime/scan_range.rs", "B5"),
@@ -13689,7 +13688,7 @@ pub(crate) use result::MultiFragmentBuildResult;
 "#,
         ),
         (
-            "src/runtime/coordinator.rs",
+            "src/coordinator/execution.rs",
             "use crate::sql::codegen::fragment::{FragmentBuildRequest, MultiFragmentBuildResult};",
         ),
         (
@@ -13903,7 +13902,7 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
         "src/engine/mod.rs",
         "src/engine/dml_change_stream.rs",
         "src/coordinator/dispatch.rs",
-        "src/runtime/coordinator.rs",
+        "src/coordinator/execution.rs",
         "src/service/grpc_fragment_dispatcher.rs",
     ] {
         let text = fs::read_to_string(repo.join(rel)).unwrap();
@@ -13950,11 +13949,11 @@ fn nidl_d3l_native_mainline_thrift_usage_is_explicitly_allowlisted() {
         "native scheduler must use FragmentBuildResult metadata, not compat thrift structs",
     );
 
-    let coordinator = fs::read_to_string(repo.join("src/runtime/coordinator.rs")).unwrap();
+    let coordinator = fs::read_to_string(repo.join("src/coordinator/execution.rs")).unwrap();
     let coordinator = rust_production_text_without_cfg_test(&coordinator);
     push_forbidden_terms(
         &mut violations,
-        "src/runtime/coordinator.rs",
+        "src/coordinator/execution.rs",
         &coordinator,
         &[
             "patch_native_iceberg_delta_scan_payloads",
@@ -16331,11 +16330,11 @@ fn nidl_e4_scheduler_and_coordinator_use_native_scheduling_metadata() {
         }
     }
 
-    let coordinator = fs::read_to_string(repo.join("src/runtime/coordinator.rs")).unwrap();
+    let coordinator = fs::read_to_string(repo.join("src/coordinator/execution.rs")).unwrap();
     let coordinator_prod = rust_production_text_without_cfg_test(&coordinator);
     nidl_e4_push_forbidden_code_terms(
         &mut violations,
-        "src/runtime/coordinator.rs",
+        "src/coordinator/execution.rs",
         &coordinator_prod,
         &[
             "scheduler.assign_with_live(&fragment_results",
@@ -16353,7 +16352,7 @@ fn nidl_e4_scheduler_and_coordinator_use_native_scheduling_metadata() {
         line.contains("fragment_schedules")
     }) {
         violations.push(
-            "src/runtime/coordinator.rs: coordinator must destructure and use fragment_schedules"
+            "src/coordinator/execution.rs: coordinator must destructure and use fragment_schedules"
                 .to_string(),
         );
     }
@@ -17009,14 +17008,14 @@ fn coor_1_dispatch_port_and_grpc_adapter_own_layers() {
 }
 
 #[test]
-fn coor_1_runtime_coordinator_has_only_injected_service_ports() {
+fn coor_1_execution_coordinator_has_only_injected_service_ports() {
     let repo = Path::new(manifest_dir());
-    let runtime = fs::read_to_string(repo.join("src/runtime/coordinator.rs"))
-        .expect("read runtime coordinator");
-    let runtime = rust_sanitized_production_text(&runtime);
+    let execution = fs::read_to_string(repo.join("src/coordinator/execution.rs"))
+        .expect("read execution coordinator");
+    let execution = rust_sanitized_production_text(&execution);
     assert!(
-        !runtime.contains("crate::service"),
-        "runtime coordinator must not depend on service modules"
+        !execution.contains("crate::service"),
+        "execution coordinator must not depend on service modules"
     );
 
     let ports =
@@ -17035,7 +17034,7 @@ fn coor_1_grpc_report_ingress_uses_coordinator_port() {
     let grpc = rust_sanitized_production_text(&grpc);
     assert!(grpc.contains("CoordinatorReportHandler"));
     for forbidden in [
-        "runtime::coordinator::record_native_standalone_query_profile_report",
+        "coordinator::execution::record_native_standalone_query_profile_report",
         "runtime::write_coordinator::lookup_native_writer_report",
         "runtime::write_coordinator::handle_fragment_report_exec_status",
     ] {
@@ -17079,5 +17078,48 @@ fn coor_2_scheduler_owner_is_top_level_and_snapshot_is_shared() {
     assert!(
         !compact.contains(&format!("\"{legacy_owner}\":BaselineEntry(")),
         "retired runtime scheduler must not retain an audit baseline"
+    );
+}
+
+#[test]
+fn coor_2_execution_coordinator_has_one_top_level_owner() {
+    let repo = Path::new(manifest_dir());
+    let execution_path = repo.join("src/coordinator/execution.rs");
+    let legacy_path = repo.join(["src/runtime/", "coordinator.rs"].concat());
+
+    assert!(execution_path.is_file());
+    assert!(!legacy_path.exists());
+
+    let execution = rust_sanitized_production_text(
+        &fs::read_to_string(execution_path).expect("read coordinator execution"),
+    );
+    assert!(execution.contains("pub(crate) struct ExecutionCoordinator"));
+    assert!(!execution.contains("QueryCoordinator"));
+    assert!(!execution.contains("crate::service"));
+
+    let retired_crate_path = ["crate::runtime::", "coordinator"].concat();
+    let retired_module_path = ["runtime::", "coordinator"].concat();
+    let mut scanned = 0usize;
+    let mut execution_owner_count = 0usize;
+    for path in rs_files(&repo.join("src")) {
+        scanned += 1;
+        let production = rust_sanitized_production_text(
+            &fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", rel(&path))),
+        );
+        execution_owner_count += production
+            .matches("pub(crate) struct ExecutionCoordinator")
+            .count();
+        for retired in [&retired_crate_path, &retired_module_path] {
+            assert!(
+                !production.contains(retired),
+                "{} still references retired execution owner {retired}",
+                rel(&path)
+            );
+        }
+    }
+    assert!(scanned > 0, "production source scan must be non-empty");
+    assert_eq!(
+        execution_owner_count, 1,
+        "ExecutionCoordinator must have exactly one production owner"
     );
 }

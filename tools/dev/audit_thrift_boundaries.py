@@ -147,7 +147,7 @@ BASELINE: dict[str, BaselineEntry] = {
     "src/connector/starrocks/table/mv_ddl.rs": BaselineEntry("legal-boundary", "B6-wire", 0, "StarRocks MV DDL is a protocol adapter boundary"),
     "src/connector/starrocks/scan/reader.rs": BaselineEntry("legal-boundary", "B6-wire", 1, "StarRocks scan reader is a StarRocks protocol adapter boundary"),
     "src/connector/schema/context.rs": BaselineEntry("legal-boundary", "B6-wire", 1, "Schema context exposes StarRocks-compatible metadata"),
-    "src/runtime/coordinator.rs": BaselineEntry("domain-leak", "control-plane", 0, "Runtime coordinator orchestrates native fragment scheduling metadata"),
+    "src/coordinator/execution.rs": BaselineEntry("domain-leak", "control-plane", 0, "Coordinator execution orchestrates native fragment scheduling metadata"),
     "src/runtime/change_op.rs": BaselineEntry("legal-boundary", "B5-wire", 2, "Runtime change-op adapter extracts FE-compatible HDFS extended-column payloads"),
     "src/runtime/endpoint.rs": BaselineEntry("legal-boundary", "control-plane-wire", 2, "Runtime endpoint adapter decodes external FE network addresses"),
     "src/runtime/fragment_exec_params.rs": BaselineEntry("domain-leak", "control-plane", 0, "Fragment exec params are native runtime scheduling metadata"),

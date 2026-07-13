@@ -28,6 +28,7 @@ use crate::connector::iceberg::commit::{
 use crate::connector::iceberg::operation_lifecycle::{
     IcebergOperationFact, operation_fact_from_commit_result, operation_fact_from_finalize_failure,
 };
+use crate::coordinator::execution::CoordinatedQueryResult;
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::iceberg_change_stream_write::{
@@ -37,7 +38,6 @@ use crate::meta::repository::iceberg_operation::{
     CreateIcebergOperationRequest, IcebergOperationFactUpdate, IcebergOperationKind,
     IcebergOperationState, IcebergOperationTarget,
 };
-use crate::runtime::coordinator::CoordinatedQueryResult;
 use crate::runtime::query_result::QueryResult;
 use crate::runtime::write_coordinator::WriteCommitInput;
 
