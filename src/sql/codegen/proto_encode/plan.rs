@@ -3109,7 +3109,7 @@ mod tests {
             .push(BoundRuntimeFilterProbe {
                 intent: RuntimeFilterProbeIntent {
                     filter_id: 41,
-                    probe_expr,
+                    probe_expr: probe_expr.clone(),
                 },
                 source_fragment_id: 0,
             });
@@ -3123,12 +3123,31 @@ mod tests {
         assert_eq!(encoded_reset, encoded_source);
         let root = encoded_reset.fragments[0].root.as_ref().expect("root node");
         assert_eq!(root.build_runtime_filters.len(), 1);
-        assert_eq!(root.build_runtime_filters[0].filter_id, 41);
-        assert_eq!(root.build_runtime_filters[0].source_fragment_id, 0);
-        assert_eq!(root.build_runtime_filters[0].target_fragment_ids, vec![0]);
+        let encoded_build = &root.build_runtime_filters[0];
+        assert_eq!(encoded_build.filter_id, 41);
+        assert_eq!(
+            encoded_build.build_expr,
+            Some(encode_expr(&build_expr).expect("encode expected build expr"))
+        );
+        assert_eq!(
+            encoded_build.probe_expr,
+            Some(encode_expr(&probe_expr).expect("encode expected probe expr"))
+        );
+        assert_eq!(encoded_build.expr_order, 2);
+        assert_eq!(
+            encoded_build.execution_mode,
+            plan::JoinExecutionMode::Partitioned as i32
+        );
+        assert_eq!(encoded_build.source_fragment_id, 0);
+        assert_eq!(encoded_build.target_fragment_ids, vec![0]);
         assert_eq!(root.probe_runtime_filters.len(), 1);
-        assert_eq!(root.probe_runtime_filters[0].filter_id, 41);
-        assert_eq!(root.probe_runtime_filters[0].source_fragment_id, 0);
+        let encoded_probe = &root.probe_runtime_filters[0];
+        assert_eq!(encoded_probe.filter_id, 41);
+        assert_eq!(
+            encoded_probe.probe_expr,
+            Some(encode_expr(&probe_expr).expect("encode expected probe expr"))
+        );
+        assert_eq!(encoded_probe.source_fragment_id, 0);
     }
 
     #[test]
