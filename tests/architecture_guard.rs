@@ -17123,3 +17123,91 @@ fn coor_2_execution_coordinator_has_one_top_level_owner() {
         "ExecutionCoordinator must have exactly one production owner"
     );
 }
+
+#[test]
+fn coor_2_query_profile_control_plane_is_top_level() {
+    let repo = Path::new(manifest_dir());
+    let profile_path = repo.join("src/coordinator/profile/mod.rs");
+    let correlate_path = repo.join("src/coordinator/profile/correlate.rs");
+    let legacy_path = repo.join(["src/runtime/", "profile_correlate.rs"].concat());
+
+    assert!(
+        profile_path.is_file(),
+        "coordinator profile owner must exist"
+    );
+    assert!(
+        correlate_path.is_file(),
+        "coordinator profile correlation owner must exist"
+    );
+    assert!(
+        !legacy_path.exists(),
+        "runtime profile correlation forwarding module must be deleted"
+    );
+
+    let profile = rust_sanitized_production_text(
+        &fs::read_to_string(profile_path).expect("read coordinator profile owner"),
+    );
+    let correlate = rust_sanitized_production_text(
+        &fs::read_to_string(correlate_path).expect("read coordinator profile correlation"),
+    );
+    let execution = rust_sanitized_production_text(
+        &fs::read_to_string(repo.join("src/coordinator/execution.rs"))
+            .expect("read coordinator execution"),
+    );
+    assert!(profile.contains("struct StandaloneQueryProfileRegistry"));
+    assert!(
+        profile.contains("record_native_standalone_query_profile_report"),
+        "profile owner must decode native profile reports"
+    );
+    assert!(
+        correlate.contains("collect_actuals_by_plan_node_id_from_profile_trees"),
+        "profile owner must correlate native profile trees"
+    );
+    assert!(!execution.contains("struct StandaloneQueryProfileRegistry"));
+
+    let retired_crate_path = ["crate::runtime::", "profile_correlate"].concat();
+    let retired_module_path = ["runtime::", "profile_correlate"].concat();
+    let mut scanned = 0usize;
+    for path in rs_files(&repo.join("src/coordinator")) {
+        scanned += 1;
+        let production = rust_sanitized_production_text(
+            &fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", rel(&path))),
+        );
+        assert!(
+            !production.contains("crate::service"),
+            "{} imports a service concrete from production coordinator code",
+            rel(&path)
+        );
+    }
+    assert!(scanned > 0, "coordinator production scan must be non-empty");
+    for path in rs_files(&repo.join("src")) {
+        let production = rust_sanitized_production_text(
+            &fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", rel(&path))),
+        );
+        for retired in [&retired_crate_path, &retired_module_path] {
+            assert!(
+                !production.contains(retired),
+                "{} still references retired profile owner {retired}",
+                rel(&path)
+            );
+        }
+    }
+
+    let audit = fs::read_to_string(repo.join("tools/dev/audit_thrift_boundaries.py"))
+        .expect("read thrift boundary audit");
+    let compact = audit.lines().map(compact_line).collect::<String>();
+    for expected in [
+        "\"src/coordinator/profile/mod.rs\": BaselineEntry(\"domain-leak\", \"control-plane\", 0, \"Coordinator query profile registry decodes native profile reports\"),",
+        "\"src/coordinator/profile/correlate.rs\": BaselineEntry(\"domain-leak\", \"control-plane\", 0, \"Coordinator profile correlation consumes native runtime profile trees\"),",
+    ] {
+        assert!(
+            compact.contains(&compact_line(expected)),
+            "coordinator profile owner must have an exact native-only audit baseline: {expected}"
+        );
+    }
+    let legacy_owner = ["src/runtime/", "profile_correlate.rs"].concat();
+    assert!(
+        !compact.contains(&format!("\"{legacy_owner}\":BaselineEntry(")),
+        "retired runtime profile correlation must not retain an audit baseline"
+    );
+}

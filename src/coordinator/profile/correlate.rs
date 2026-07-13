@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use crate::runtime::profile::{ProfileNode, Profiler, RuntimeProfileTree};
+use crate::runtime::profile::{ProfileNode, RuntimeProfileTree};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ActualMetrics {
@@ -66,10 +66,15 @@ pub(crate) struct DistributedProfileSummary {
     pub(crate) scan_io_time_ns: i64,
 }
 
+#[cfg(test)]
+use crate::runtime::profile::Profiler;
+
+#[cfg(test)]
 pub(crate) fn collect_actuals_by_plan_node_id(profiler: &Profiler) -> HashMap<i32, ActualMetrics> {
     collect_actuals_by_plan_node_id_multi(std::slice::from_ref(profiler))
 }
 
+#[cfg(test)]
 pub(crate) fn collect_actuals_by_plan_node_id_multi(
     profilers: &[Profiler],
 ) -> HashMap<i32, ActualMetrics> {

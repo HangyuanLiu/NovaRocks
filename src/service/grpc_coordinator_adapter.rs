@@ -37,7 +37,7 @@ impl CoordinatorReportHandler for LegacyCoordinatorReportHandler {
         let failure =
             failed_query_from_native_report(&report).map_err(EngineError::protocol_decode)?;
         let profile_report_accepted =
-            crate::coordinator::execution::record_native_standalone_query_profile_report(&report)
+            crate::coordinator::profile::record_native_standalone_query_profile_report(&report)
                 .map_err(EngineError::protocol_decode)?;
         match crate::runtime::write_coordinator::lookup_native_writer_report(&report)
             .map_err(EngineError::protocol_decode)?

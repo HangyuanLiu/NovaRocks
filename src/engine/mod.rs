@@ -2774,16 +2774,17 @@ fn explain_analyze_query(
     }
 
     let actuals =
-        crate::runtime::profile_correlate::collect_actuals_by_plan_node_id_from_profile_trees(
+        crate::coordinator::profile::correlate::collect_actuals_by_plan_node_id_from_profile_trees(
             &outcome.fragment_profiles,
         );
     let profile_summary =
-        crate::runtime::profile_correlate::collect_distributed_profile_summary_from_profile_trees(
+        crate::coordinator::profile::correlate::collect_distributed_profile_summary_from_profile_trees(
             &outcome.fragment_profiles,
         );
-    let per_fragment = crate::runtime::profile_correlate::collect_per_fragment_profile_summaries(
-        &outcome.fragment_profiles,
-    );
+    let per_fragment =
+        crate::coordinator::profile::correlate::collect_per_fragment_profile_summaries(
+            &outcome.fragment_profiles,
+        );
     let mut lines = Vec::new();
     lines.push(format!(
         "Planning: {} / Execution: {} / Rows: {}",
@@ -2793,7 +2794,7 @@ fn explain_analyze_query(
     ));
     lines.push(format_distributed_profile_summary(&profile_summary));
     if let Some(counters) =
-        crate::runtime::profile_correlate::format_counter_sums_from_profile_trees(
+        crate::coordinator::profile::correlate::format_counter_sums_from_profile_trees(
             &outcome.fragment_profiles,
             ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES,
             "ProfileCounters",
@@ -2820,7 +2821,7 @@ const ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES: &[&str] = &[
 ];
 
 fn format_distributed_profile_summary(
-    summary: &crate::runtime::profile_correlate::DistributedProfileSummary,
+    summary: &crate::coordinator::profile::correlate::DistributedProfileSummary,
 ) -> String {
     format!(
         "Profile: fragments={} fragment_wall_max={} fragment_wall_sum={} driver_total={} driver_blocked={} source_wait={} sink_wait={} dependency_wait={} operator_active={} exchange_wait={} exchange_process={} network={} scan_io={}",

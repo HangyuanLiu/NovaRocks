@@ -44,6 +44,9 @@ use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
 use crate::coordinator::dispatch::{FetchOutcome, FragmentDispatcher, FragmentSubmission};
 use crate::coordinator::ports::{CoordinatorExecutionPorts, CoordinatorObserver};
+use crate::coordinator::profile::{
+    StandaloneQueryProfileGuard, standalone_query_profile_count, take_standalone_query_profiles,
+};
 use crate::coordinator::scheduler::{
     FragmentInstancePlacement, FragmentScheduler, topological_sort_bottom_up,
 };
@@ -63,6 +66,9 @@ use crate::sql::codegen::fragment::{
 };
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::{FragmentEdge, FragmentEdgeKind, FragmentId};
+
+#[cfg(test)]
+use crate::coordinator::profile::record_native_standalone_query_profile_report;
 
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 
@@ -1457,97 +1463,6 @@ impl Drop for StandaloneQueryFailureGuard {
             .expect("standalone query failure registry lock");
         guard.active.remove(&self.key);
         guard.failures.remove(&self.key);
-    }
-}
-
-#[derive(Default)]
-struct StandaloneQueryProfileRegistry {
-    active: BTreeSet<(i64, i64)>,
-    profiles: BTreeMap<(i64, i64), BTreeMap<(i64, i64), RuntimeProfileTree>>,
-}
-
-fn standalone_query_profiles() -> &'static Mutex<StandaloneQueryProfileRegistry> {
-    static REGISTRY: OnceLock<Mutex<StandaloneQueryProfileRegistry>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(StandaloneQueryProfileRegistry::default()))
-}
-
-pub(crate) fn record_native_standalone_query_profile_report(
-    report: &crate::proto::novarocks::ExecStatusReport,
-) -> Result<bool, String> {
-    let Some(query_id) = report.query_id.as_ref() else {
-        return Ok(false);
-    };
-    let key = (query_id.hi, query_id.lo);
-    let mut guard = standalone_query_profiles()
-        .lock()
-        .expect("standalone query profile registry lock");
-    if !guard.active.contains(&key) {
-        return Ok(false);
-    }
-
-    let Some(status) = report.status.as_ref() else {
-        return Err("ExecStatusReport missing status".to_string());
-    };
-    if report.done
-        && status.code == 0
-        && let Some(profile) = report.profile.as_ref()
-    {
-        let Some(finst_id) = report.fragment_instance_id.as_ref() else {
-            return Err("ExecStatusReport missing fragment_instance_id".to_string());
-        };
-        let native = RuntimeProfileTree::from_proto(profile)?;
-        guard
-            .profiles
-            .entry(key)
-            .or_default()
-            .insert((finst_id.hi, finst_id.lo), native);
-    }
-    Ok(true)
-}
-
-fn standalone_query_profile_count(query_id: &UniqueId) -> usize {
-    standalone_query_profiles()
-        .lock()
-        .expect("standalone query profile registry lock")
-        .profiles
-        .get(&query_failure_key(query_id))
-        .map(BTreeMap::len)
-        .unwrap_or(0)
-}
-
-fn take_standalone_query_profiles(query_id: &UniqueId) -> Vec<RuntimeProfileTree> {
-    standalone_query_profiles()
-        .lock()
-        .expect("standalone query profile registry lock")
-        .profiles
-        .remove(&query_failure_key(query_id))
-        .map(|profiles| profiles.into_values().collect())
-        .unwrap_or_default()
-}
-
-struct StandaloneQueryProfileGuard {
-    key: (i64, i64),
-}
-
-impl StandaloneQueryProfileGuard {
-    fn register(query_id: &UniqueId) -> Self {
-        let key = query_failure_key(query_id);
-        let mut guard = standalone_query_profiles()
-            .lock()
-            .expect("standalone query profile registry lock");
-        guard.profiles.remove(&key);
-        guard.active.insert(key);
-        Self { key }
-    }
-}
-
-impl Drop for StandaloneQueryProfileGuard {
-    fn drop(&mut self) {
-        let mut guard = standalone_query_profiles()
-            .lock()
-            .expect("standalone query profile registry lock");
-        guard.active.remove(&self.key);
-        guard.profiles.remove(&self.key);
     }
 }
 
