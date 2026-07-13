@@ -62,7 +62,7 @@ use crate::runtime::endpoint::{
     FragmentDestination, RuntimeEndpoint, RuntimeFilterProberDestination,
 };
 use crate::runtime::scan_range::ScanRangeParams;
-use crate::sql::codegen::{FragmentSchedulingMetadata, RuntimeFilterPlanResult};
+use crate::sql::codegen::fragment::{FragmentSchedulingMetadata, RuntimeFilterPlanResult};
 use crate::sql::planner::distributed::{
     FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind, PartitionKind,
 };
@@ -663,8 +663,9 @@ mod tests {
     use std::net::SocketAddr;
     use std::str::FromStr;
 
-    use crate::sql::codegen::RuntimeFilterPlanResult;
-    use crate::sql::codegen::{FragmentOutputKind, FragmentSchedulingMetadata};
+    use crate::sql::codegen::fragment::{
+        FragmentOutputKind, FragmentSchedulingMetadata, RuntimeFilterPlanResult,
+    };
     use crate::sql::planner::distributed::{
         DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind, PartitionKind,
     };

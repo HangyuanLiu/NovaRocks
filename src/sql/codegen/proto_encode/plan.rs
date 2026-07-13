@@ -28,7 +28,7 @@ use super::expr::{encode_expr, encode_sort_items, encode_window_frame};
 use crate::proto::{common, plan};
 use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, TypedExpr};
 use crate::sql::catalog;
-use crate::sql::codegen::connector_scan_planning::{
+use crate::sql::codegen::scan::connector::{
     StarRocksColumnSchemaDescriptor, StarRocksKeysTypeDescriptor, StarRocksScanSourceDescriptor,
     StarRocksTabletSchemaDescriptor,
 };
@@ -2161,7 +2161,7 @@ fn encode_scan_source(
                 to_snapshot_id,
             } => {
                 let runtime_plan =
-                    crate::sql::codegen::iceberg_delta_scan_planning::build_iceberg_delta_scan_runtime_plan(
+                    crate::sql::codegen::scan::iceberg_delta::build_iceberg_delta_scan_runtime_plan(
                         table,
                         *from_snapshot_id,
                         *to_snapshot_id,
@@ -2601,7 +2601,7 @@ fn encode_iceberg_schema_default_json(
         return Ok(Some(json.clone()));
     }
     literal
-        .map(crate::sql::codegen::iceberg_literal_json::serialize_iceberg_literal_json)
+        .map(super::iceberg_literal_json::serialize_iceberg_literal_json)
         .transpose()
         .map_err(|err| format!("encode Iceberg schema {label} JSON: {err}"))
 }

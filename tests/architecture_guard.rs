@@ -1937,7 +1937,7 @@ fn planner_runtime_filter_source_inventory_covers_entire_src_tree() {
     fs::remove_dir_all(&root).ok();
     for relative in [
         "src/sql/planner/physical/runtime_filter.rs",
-        "src/sql/codegen/runtime_filter.rs",
+        "src/sql/codegen/fragment/runtime_filter.rs",
         "src/runtime/runtime_filter_duplicate.rs",
     ] {
         let path = root.join(relative);
@@ -1955,7 +1955,7 @@ fn planner_runtime_filter_source_inventory_covers_entire_src_tree() {
         actual,
         BTreeSet::from([
             "src/runtime/runtime_filter_duplicate.rs".to_string(),
-            "src/sql/codegen/runtime_filter.rs".to_string(),
+            "src/sql/codegen/fragment/runtime_filter.rs".to_string(),
             "src/sql/planner/physical/runtime_filter.rs".to_string(),
         ]),
         "runtime-filter type uniqueness must inspect every Rust source file"
@@ -3738,18 +3738,18 @@ fn planner_stage_first_dependency_violations_in(source_rel: &str, text: &str) ->
             let optimizer_dependency = starts_with(path, &["crate", "sql", "optimizer"]);
             let optimizer_options = starts_with(path, &["crate", "sql", "optimizer", "options"]);
             let codegen = starts_with(path, &["crate", "sql", "codegen"]);
-            let imv_fragment_builder = starts_with(
+            let imv_fragment_build =
+                starts_with(path, &["crate", "sql", "codegen", "fragment", "build"]);
+            let imv_fragment_request = starts_with(
                 path,
                 &[
                     "crate",
                     "sql",
                     "codegen",
-                    "fragment_builder",
-                    "PlanFragmentBuilder",
+                    "fragment",
+                    "FragmentBuildRequest",
                 ],
             );
-            let imv_fragment_request =
-                starts_with(path, &["crate", "sql", "codegen", "FragmentBuildRequest"]);
 
             if logical {
                 planner_physical
@@ -3761,7 +3761,7 @@ fn planner_stage_first_dependency_violations_in(source_rel: &str, text: &str) ->
             } else if optimizer {
                 codegen
             } else if imv_rewrite {
-                codegen && !imv_fragment_builder && !imv_fragment_request
+                codegen && !imv_fragment_build && !imv_fragment_request
             } else if physical {
                 planner_logical
                     || planner_distributed
@@ -5480,7 +5480,7 @@ enum Demo {
             "use crate::sql::planner::{physical::Physical, payload::Payload, optimizer_bridge::property::Property, logical::node::LogicalNode};",
         ),
         (
-            "src/sql/codegen/ir/mod.rs",
+            "src/sql/codegen/fragment/build.rs",
             "use crate::sql::planner::distributed::DistributedPlan;",
         ),
         (
@@ -5489,11 +5489,11 @@ enum Demo {
         ),
         (
             "src/sql/planner/imv_rewrite/entrypoint.rs",
-            "use crate::sql::codegen::fragment_builder::PlanFragmentBuilder; use crate::sql::codegen::FragmentBuildRequest;",
+            "use crate::sql::codegen::fragment::{build, FragmentBuildRequest};",
         ),
         (
             "src/sql/planner/imv_rewrite/entrypoint.rs",
-            "let fragment = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(request); let request = crate::sql::codegen::FragmentBuildRequest::result(plan);",
+            "let fragment = crate::sql::codegen::fragment::build(request); let request = crate::sql::codegen::fragment::FragmentBuildRequest::result(plan);",
         ),
         (
             "src/sql/planner/logical/node.rs",
@@ -7003,7 +7003,7 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
     let planner = repo.join("src/sql/planner");
     let physical_owner = planner.join("physical/runtime_filter.rs");
     let distributed_owner = planner.join("distributed/runtime_filter.rs");
-    let codegen_owner = repo.join("src/sql/codegen/runtime_filter.rs");
+    let codegen_owner = repo.join("src/sql/codegen/fragment/runtime_filter.rs");
 
     for owner in [&codegen_owner, &distributed_owner, &physical_owner] {
         assert!(
@@ -7108,10 +7108,10 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
         "distributed/mod.rs must not flat re-export bound runtime-filter types: {distributed_uses:?}"
     );
 
-    let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/mod.rs")).unwrap();
+    let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/fragment/mod.rs")).unwrap();
     assert!(
-        has_non_comment_line(&codegen_mod, "pub(crate) mod runtime_filter;"),
-        "codegen/mod.rs must declare its Planned runtime-filter owner"
+        has_non_comment_line(&codegen_mod, "mod runtime_filter;"),
+        "codegen/fragment/mod.rs must declare its Planned runtime-filter owner"
     );
 
     let distributed_text = fs::read_to_string(&distributed_owner).unwrap();
@@ -10321,13 +10321,16 @@ fn nfe_1_task_2_native_fragment_build_owns_submission_payload() {
     let repo = Path::new(manifest_dir());
     let mut violations = Vec::new();
 
-    let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/mod.rs")).unwrap();
-    if !codegen_mod.contains("pub native_fragments:")
-        || !codegen_mod.contains("BTreeMap<FragmentId, crate::proto::plan::PlanFragment>")
+    let result = fs::read_to_string(repo.join("src/sql/codegen/fragment/result.rs")).unwrap();
+    let result_production = rust_sanitized_production_text(&result);
+    let result_compact = compact_line(&result_production);
+    if rust_named_type_declaration_count(&result_production, "MultiFragmentBuildResult") != 1
+        || !result_compact.contains(
+            "pubnative_fragments:std::collections::BTreeMap<FragmentId,crate::proto::plan::PlanFragment>",
+        )
     {
         violations.push(
-            "src/sql/codegen/mod.rs: MultiFragmentBuildResult must own required native fragments"
-                .to_string(),
+            "src/sql/codegen/fragment/result.rs: MultiFragmentBuildResult must uniquely own required native fragments".to_string(),
         );
     }
 
@@ -11246,7 +11249,7 @@ fn nfe_4_fe_owned_raw_sources_are_starrocks_idl_free() {
     let owner_rel = owners.iter().map(|path| rel(path)).collect::<BTreeSet<_>>();
     for required in [
         "src/sql/mod.rs",
-        "src/sql/codegen/ir/fragment_build.rs",
+        "src/sql/codegen/fragment/build.rs",
         "src/engine/mod.rs",
         "src/engine/statement.rs",
         "src/runtime/coordinator.rs",
@@ -11427,9 +11430,10 @@ fn nfe_4_ledger_audit_native_structure_and_external_ingress_are_fixed() {
     }
 
     for source in [
-        "src/sql/codegen/ir/fragment_build.rs",
-        "src/sql/codegen/connector_scan_planning.rs",
-        "src/sql/codegen/iceberg_delta_scan_planning.rs",
+        "src/sql/codegen/fragment/build.rs",
+        "src/sql/codegen/fragment/result.rs",
+        "src/sql/codegen/scan/connector.rs",
+        "src/sql/codegen/scan/iceberg_delta.rs",
         "src/sql/codegen/proto_encode/iceberg_delta_scan.rs",
         "src/sql/planner/distributed/build/runtime_filter_binding.rs",
     ] {
@@ -11441,22 +11445,22 @@ fn nfe_4_ledger_audit_native_structure_and_external_ingress_are_fixed() {
     }
 
     let fragment_build =
-        fs::read_to_string(repo.join("src/sql/codegen/ir/fragment_build.rs")).unwrap();
+        fs::read_to_string(repo.join("src/sql/codegen/fragment/build.rs")).unwrap();
     let fragment_production = rust_sanitized_production_text(&fragment_build);
     if fragment_production.contains("cfg") && fragment_production.contains("compat") {
         violations.push(
-            "src/sql/codegen/ir/fragment_build.rs: unique native builder must be compat-neutral"
+            "src/sql/codegen/fragment/build.rs: unique native builder must be compat-neutral"
                 .to_string(),
         );
     }
 
-    let codegen = fs::read_to_string(repo.join("src/sql/codegen/mod.rs")).unwrap();
-    let codegen_compact = compact_line(&rust_sanitized_production_text(&codegen));
-    if !codegen_compact.contains(
+    let result = fs::read_to_string(repo.join("src/sql/codegen/fragment/result.rs")).unwrap();
+    let result_compact = compact_line(&rust_sanitized_production_text(&result));
+    if !result_compact.contains(
         "pubnative_fragments:std::collections::BTreeMap<FragmentId,crate::proto::plan::PlanFragment>",
     ) {
         violations.push(
-            "src/sql/codegen/mod.rs: MultiFragmentBuildResult must own required native PlanFragment map"
+            "src/sql/codegen/fragment/result.rs: MultiFragmentBuildResult must own required native PlanFragment map"
                 .to_string(),
         );
     }
@@ -12903,8 +12907,8 @@ fn nfe_3_fe_owned_helpers_are_raw_starrocks_idl_free() {
         "src/runtime/fragment_exec_params.rs",
         "src/runtime/scan_range.rs",
         "src/runtime/native_fragment_wire.rs",
-        "src/sql/codegen/connector_scan_planning.rs",
-        "src/sql/codegen/iceberg_delta_scan_planning.rs",
+        "src/sql/codegen/scan/connector.rs",
+        "src/sql/codegen/scan/iceberg_delta.rs",
         "src/sql/codegen/proto_encode/iceberg_delta_scan.rs",
         "src/sql/planner/distributed/build/runtime_filter_binding.rs",
     ] {
@@ -12951,8 +12955,8 @@ fn nfe_3_fe_owned_helpers_are_raw_starrocks_idl_free() {
 fn nfe_3_native_planning_owners_are_named_explicitly() {
     let repo = Path::new(manifest_dir());
     let expected_owners = [
-        "src/sql/codegen/connector_scan_planning.rs",
-        "src/sql/codegen/iceberg_delta_scan_planning.rs",
+        "src/sql/codegen/scan/connector.rs",
+        "src/sql/codegen/scan/iceberg_delta.rs",
         "src/sql/codegen/proto_encode/iceberg_delta_scan.rs",
         "src/sql/planner/distributed/build/runtime_filter_binding.rs",
     ];
@@ -12978,18 +12982,15 @@ fn nfe_3_native_planning_owners_are_named_explicitly() {
         }
     }
 
-    let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/mod.rs")).unwrap();
+    let scan_mod = fs::read_to_string(repo.join("src/sql/codegen/scan/mod.rs")).unwrap();
     let build_mod =
         fs::read_to_string(repo.join("src/sql/planner/distributed/build/mod.rs")).unwrap();
     let proto_mod = fs::read_to_string(repo.join("src/sql/codegen/proto_encode/mod.rs")).unwrap();
     for (source, text, required) in [
         (
-            "src/sql/codegen/mod.rs",
-            codegen_mod.as_str(),
-            &[
-                "mod connector_scan_planning;",
-                "mod iceberg_delta_scan_planning;",
-            ][..],
+            "src/sql/codegen/scan/mod.rs",
+            scan_mod.as_str(),
+            &["pub(crate) mod connector;", "pub(crate) mod iceberg_delta;"][..],
         ),
         (
             "src/sql/planner/distributed/build/mod.rs",
@@ -13010,7 +13011,7 @@ fn nfe_3_native_planning_owners_are_named_explicitly() {
         }
     }
     for (source, text) in [
-        ("src/sql/codegen/mod.rs", codegen_mod.as_str()),
+        ("src/sql/codegen/scan/mod.rs", scan_mod.as_str()),
         (
             "src/sql/planner/distributed/build/mod.rs",
             build_mod.as_str(),
@@ -13028,7 +13029,7 @@ fn nfe_3_native_planning_owners_are_named_explicitly() {
         }
     }
 
-    let planning_path = repo.join("src/sql/codegen/connector_scan_planning.rs");
+    let planning_path = repo.join("src/sql/codegen/scan/connector.rs");
     let encoder_path = repo.join("src/sql/codegen/proto_encode/plan.rs");
     if planning_path.is_file() {
         let planning = fs::read_to_string(&planning_path).unwrap();
@@ -13055,7 +13056,7 @@ fn nfe_3_native_planning_owners_are_named_explicitly() {
         }
     }
 
-    let delta_planning_path = repo.join("src/sql/codegen/iceberg_delta_scan_planning.rs");
+    let delta_planning_path = repo.join("src/sql/codegen/scan/iceberg_delta.rs");
     let delta_encoder_path = repo.join("src/sql/codegen/proto_encode/iceberg_delta_scan.rs");
     if delta_planning_path.is_file() && delta_encoder_path.is_file() {
         let planning = fs::read_to_string(&delta_planning_path).unwrap();
@@ -13134,8 +13135,8 @@ fn nfe_3_native_planning_owners_are_named_explicitly() {
     }
 
     for source in [
-        "src/sql/codegen/connector_scan_planning.rs",
-        "src/sql/codegen/iceberg_delta_scan_planning.rs",
+        "src/sql/codegen/scan/connector.rs",
+        "src/sql/codegen/scan/iceberg_delta.rs",
         "src/sql/planner/distributed/build/runtime_filter_binding.rs",
     ] {
         if let Ok(text) = fs::read_to_string(repo.join(source)) {
@@ -13352,46 +13353,545 @@ fn nfe_2_legacy_thrift_emitter_absence_guard_is_non_vacuous() {
     fs::remove_dir_all(root).unwrap();
 }
 
+fn codegen_fragment_namespace_violations_in(source_rel: &str, text: &str) -> Vec<String> {
+    const ROOT: &[&str] = &["crate", "sql", "codegen"];
+    const RETIRED_MODULES: &[&str] = &[
+        "ir",
+        "fragment_builder",
+        "scalar_materialize",
+        "fragment_request",
+        "boundary_schema",
+        "runtime_filter",
+        "connector_scan_planning",
+        "iceberg_delta_scan_planning",
+        "iceberg_literal_json",
+    ];
+    const FINAL_FRAGMENT_SURFACE: &[&str] = &[
+        "build",
+        "FragmentBuildRequest",
+        "FragmentOutputKind",
+        "FragmentSchedulingMetadata",
+        "MultiFragmentBuildResult",
+        "OutputColumn",
+        "RuntimeFilterPlanResult",
+        "BoundarySchemaReport",
+    ];
+    const FORBIDDEN_LEGACY_SYMBOLS: &[&str] = &["lower_distributed_plan", "PlanFragmentBuilder"];
+
+    fn starts_with(path: &[String], prefix: &[&str]) -> bool {
+        path.len() >= prefix.len()
+            && path
+                .iter()
+                .zip(prefix)
+                .all(|(actual, expected)| actual == expected)
+    }
+
+    let source_rel = source_rel.replace('\\', "/");
+    let source_path = Path::new(&source_rel);
+    let mut violations = Vec::new();
+    let retired_source = source_rel == "src/sql/codegen/ir"
+        || source_rel.starts_with("src/sql/codegen/ir/")
+        || source_path
+            .parent()
+            .is_some_and(|parent| parent == Path::new("src/sql/codegen"))
+            && source_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| RETIRED_MODULES.contains(&stem));
+    if retired_source {
+        violations.push(format!("retired codegen source path exists: {source_rel}"));
+    }
+
+    if source_rel == "src/sql/codegen/mod.rs" {
+        for module in rust_module_item_declarations(text) {
+            if RETIRED_MODULES.contains(&module.as_str()) {
+                violations.push(format!("codegen root declares retired module `{module}`"));
+            }
+        }
+    }
+
+    for path in rust_production_canonical_paths(text, &source_rel) {
+        if starts_with(&path, ROOT) {
+            let tail = &path[ROOT.len()..];
+            if tail
+                .first()
+                .is_some_and(|segment| RETIRED_MODULES.contains(&segment.as_str()))
+            {
+                violations.push(format!(
+                    "production path reaches retired codegen namespace `{}`",
+                    path.join("::")
+                ));
+            }
+            if tail
+                .first()
+                .is_some_and(|segment| FINAL_FRAGMENT_SURFACE.contains(&segment.as_str()))
+            {
+                violations.push(format!(
+                    "production path bypasses the fragment namespace through `{}`",
+                    path.join("::")
+                ));
+            }
+            if tail
+                .iter()
+                .any(|segment| FORBIDDEN_LEGACY_SYMBOLS.contains(&segment.as_str()))
+            {
+                violations.push(format!(
+                    "production path restores forbidden legacy fragment API `{}`",
+                    path.join("::")
+                ));
+            }
+        }
+    }
+
+    for import in rust_production_scoped_use_statements(text) {
+        let Some(alias) = import
+            .import
+            .split_once(" as ")
+            .map(|(_, alias)| alias.to_string())
+        else {
+            continue;
+        };
+        let Some(path) = rust_canonical_use_segments_in_scope(
+            &import.import,
+            &source_rel,
+            &import.inline_modules,
+        ) else {
+            continue;
+        };
+        if path.len() == ROOT.len() + 1
+            && starts_with(&path, ROOT)
+            && path.last().is_some_and(|leaf| leaf == "fragment")
+        {
+            violations.push(format!(
+                "fragment namespace is hidden behind alias `{alias}`"
+            ));
+        }
+        if starts_with(&path, &["crate", "sql", "codegen", "fragment"])
+            && path.last().is_some_and(|leaf| {
+                FINAL_FRAGMENT_SURFACE.contains(&leaf.as_str()) && leaf.as_str() != alias
+            })
+        {
+            violations.push(format!(
+                "fragment API `{}` is hidden behind alias `{alias}`",
+                path.join("::")
+            ));
+        }
+    }
+
+    if source_rel == "src/sql/codegen/mod.rs" {
+        for import in rust_production_scoped_use_statements(text) {
+            if !rust_use_is_public(&import.import) {
+                continue;
+            }
+            let Some(path) = rust_canonical_use_segments_in_scope(
+                &import.import,
+                &source_rel,
+                &import.inline_modules,
+            ) else {
+                continue;
+            };
+            if starts_with(&path, &["crate", "sql", "codegen", "fragment"])
+                && path
+                    .last()
+                    .is_some_and(|leaf| FINAL_FRAGMENT_SURFACE.contains(&leaf.as_str()))
+            {
+                violations.push(format!(
+                    "codegen root re-exports fragment API `{}`",
+                    path.join("::")
+                ));
+            }
+        }
+    }
+    if source_rel == "src/sql/codegen/fragment/mod.rs" {
+        for import in rust_production_scoped_use_statements(text) {
+            if !rust_use_is_public(&import.import) {
+                continue;
+            }
+            let alias = import
+                .import
+                .split_once(" as ")
+                .map(|(_, alias)| alias.to_string());
+            let Some(path) = rust_canonical_use_segments_in_scope(
+                &import.import,
+                &source_rel,
+                &import.inline_modules,
+            ) else {
+                continue;
+            };
+            let Some(binding) = alias.or_else(|| path.last().cloned()) else {
+                continue;
+            };
+            if FORBIDDEN_LEGACY_SYMBOLS.contains(&binding.as_str()) {
+                violations.push(format!(
+                    "fragment namespace exports forbidden legacy binding `{binding}`"
+                ));
+            }
+        }
+    }
+
+    let production = rust_sanitized_production_text(text);
+    if source_rel.starts_with("src/") {
+        if rust_named_function_declaration_count(&production, "lower_distributed_plan") > 0 {
+            violations.push(format!(
+                "forbidden legacy fragment function is declared in {source_rel}"
+            ));
+        }
+        if rust_named_type_declaration_count(&production, "PlanFragmentBuilder") > 0 {
+            violations.push(format!(
+                "forbidden legacy fragment builder is declared in {source_rel}"
+            ));
+        }
+    }
+    if source_rel != "src/sql/codegen/fragment/build.rs"
+        && rust_named_function_declaration_count(&production, "build") > 0
+        && source_rel.starts_with("src/sql/codegen/")
+    {
+        violations.push(format!(
+            "fragment build entry is declared outside its final owner: {source_rel}"
+        ));
+    }
+    for (name, owner) in [
+        (
+            "FragmentBuildRequest",
+            "src/sql/codegen/fragment/request.rs",
+        ),
+        (
+            "MultiFragmentBuildResult",
+            "src/sql/codegen/fragment/result.rs",
+        ),
+    ] {
+        if source_rel != owner && rust_named_type_declaration_count(&production, name) > 0 {
+            violations.push(format!(
+                "fragment carrier `{name}` is declared outside `{owner}`"
+            ));
+        }
+    }
+
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+#[test]
+fn codegen_fragment_namespace_detector_covers_legacy_aliases_reexports_and_test_noise() {
+    let invalid = [
+        ("src/sql/codegen/ir/fragment_build.rs", ""),
+        ("src/sql/codegen/fragment_builder.rs", ""),
+        (
+            "src/engine/mod.rs",
+            "use crate::sql::codegen::fragment::build as lower_distributed_plan;",
+        ),
+        (
+            "src/engine/mod.rs",
+            "use crate::sql::codegen::fragment as frag; frag::build(request);",
+        ),
+        (
+            "src/engine/mod.rs",
+            "use crate::sql::codegen::{fragment as frag}; frag::build(request);",
+        ),
+        (
+            "src/engine/mod.rs",
+            "use crate::sql::codegen::fragment::{self as frag}; frag::build(request);",
+        ),
+        (
+            "src/engine/mod.rs",
+            "crate::sql::codegen::fragment::lower_distributed_plan(request);",
+        ),
+        (
+            "src/sql/codegen/fragment/mod.rs",
+            "mod legacy; pub(crate) use legacy::lower_distributed_plan;",
+        ),
+        (
+            "src/engine/mod.rs",
+            "crate::sql::codegen::fragment::PlanFragmentBuilder::build(request);",
+        ),
+        (
+            "src/sql/codegen/fragment/legacy.rs",
+            "pub(crate) fn lower_distributed_plan() {}",
+        ),
+        (
+            "src/sql/codegen/fragment/legacy.rs",
+            "pub(crate) struct PlanFragmentBuilder;",
+        ),
+        (
+            "src/sql/codegen/fragment/mod.rs",
+            "pub(crate) use crate::runtime::legacy_build as lower_distributed_plan;",
+        ),
+        (
+            "src/runtime/legacy_build.rs",
+            "pub(crate) fn lower_distributed_plan() {}",
+        ),
+        (
+            "src/runtime/legacy_build.rs",
+            "pub(crate) struct PlanFragmentBuilder;",
+        ),
+        (
+            "src/sql/codegen/fragment/mod.rs",
+            "pub(crate) use crate::runtime::LegacyBuilder as PlanFragmentBuilder;",
+        ),
+        (
+            "src/sql/codegen/mod.rs",
+            "pub(crate) use fragment::{FragmentBuildRequest, MultiFragmentBuildResult};",
+        ),
+        ("src/sql/codegen/mod.rs", "mod ir;"),
+        ("src/sql/codegen/mod.rs", "mod fragment_builder;"),
+        (
+            "src/engine/mod.rs",
+            "type Leak = crate::sql::codegen::MultiFragmentBuildResult;",
+        ),
+        (
+            "src/engine/mod.rs",
+            "use crate::sql::codegen::{FragmentBuildRequest, MultiFragmentBuildResult};",
+        ),
+        (
+            "src/sql/codegen/fragment/result.rs",
+            "use super::super::MultiFragmentBuildResult;",
+        ),
+        (
+            "src/engine/mod.rs",
+            "crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(request);",
+        ),
+    ];
+    let missed_invalid = invalid
+        .into_iter()
+        .filter_map(|(source_rel, text)| {
+            codegen_fragment_namespace_violations_in(source_rel, text)
+                .is_empty()
+                .then(|| format!("{source_rel}: {text}"))
+        })
+        .collect::<Vec<_>>();
+
+    let valid = [
+        (
+            "src/sql/codegen/fragment/mod.rs",
+            r#"
+mod build;
+mod request;
+mod result;
+pub(crate) use build::build;
+pub(crate) use request::FragmentBuildRequest;
+pub(crate) use result::MultiFragmentBuildResult;
+"#,
+        ),
+        (
+            "src/runtime/coordinator.rs",
+            "use crate::sql::codegen::fragment::{FragmentBuildRequest, MultiFragmentBuildResult};",
+        ),
+        (
+            "src/engine/mod.rs",
+            "let result: crate::sql::codegen::fragment::MultiFragmentBuildResult = crate::sql::codegen::fragment::build(request)?;",
+        ),
+        (
+            "src/sql/codegen/fragment/mod.rs",
+            r#"
+// use crate::sql::codegen::fragment_builder::PlanFragmentBuilder;
+const NOTE: &str = "crate::sql::codegen::MultiFragmentBuildResult";
+#[cfg(test)]
+use crate::sql::codegen::{FragmentBuildRequest, MultiFragmentBuildResult};
+#[cfg(test)]
+mod ir;
+#[cfg(test)]
+pub(crate) use crate::runtime::legacy_build as lower_distributed_plan;
+"#,
+        ),
+    ];
+    let rejected_valid = valid
+        .into_iter()
+        .filter_map(|(source_rel, text)| {
+            let violations = codegen_fragment_namespace_violations_in(source_rel, text);
+            (!violations.is_empty())
+                .then(|| format!("{source_rel}: {text}\nviolations: {violations:?}"))
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        missed_invalid.is_empty() && rejected_valid.is_empty(),
+        "fragment namespace detector mismatches:\nmissed invalid:\n{}\nrejected valid:\n{}",
+        missed_invalid.join("\n---\n"),
+        rejected_valid.join("\n---\n")
+    );
+}
+
 #[test]
 fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
     let repo = Path::new(manifest_dir());
     let mut violations = Vec::new();
 
-    let ir_mod = fs::read_to_string(repo.join("src/sql/codegen/ir/mod.rs")).unwrap();
-    let ir_tokens = rust_use_tokens(&rust_sanitized_production_text(&ir_mod));
-    let expected_export = [
-        "pub",
-        "(",
-        "crate",
-        ")",
-        "use",
-        "fragment_build",
-        "::",
-        "lower_distributed_plan",
-        ";",
-    ];
-    if !ir_tokens.windows(expected_export.len()).any(|tokens| {
-        tokens
-            .iter()
-            .map(String::as_str)
-            .eq(expected_export.iter().copied())
-    }) {
+    let codegen_root = repo.join("src/sql/codegen");
+    let codegen_mod = fs::read_to_string(codegen_root.join("mod.rs")).unwrap();
+    let actual_root_modules = rust_module_item_declarations(&codegen_mod);
+    let expected_root_modules = BTreeSet::from([
+        "fragment".to_string(),
+        "proto_encode".to_string(),
+        "scan".to_string(),
+    ]);
+    if actual_root_modules != expected_root_modules {
+        violations.push(format!(
+            "src/sql/codegen/mod.rs: production modules must be exactly {expected_root_modules:?}, got {actual_root_modules:?}"
+        ));
+    }
+
+    for retired in [
+        "src/sql/codegen/ir",
+        "src/sql/codegen/fragment_builder.rs",
+        "src/sql/codegen/scalar_materialize.rs",
+        "src/sql/codegen/fragment_request.rs",
+        "src/sql/codegen/boundary_schema.rs",
+        "src/sql/codegen/runtime_filter.rs",
+        "src/sql/codegen/connector_scan_planning.rs",
+        "src/sql/codegen/iceberg_delta_scan_planning.rs",
+        "src/sql/codegen/iceberg_literal_json.rs",
+    ] {
+        match fs::symlink_metadata(repo.join(retired)) {
+            Ok(_) => violations.push(format!("{retired}: retired path still exists")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => violations.push(format!(
+                "{retired}: failed to inspect retired path metadata: {error}"
+            )),
+        }
+    }
+
+    let fragment_mod_path = codegen_root.join("fragment/mod.rs");
+    let fragment_mod = fs::read_to_string(&fragment_mod_path).unwrap();
+    let build_exports = rust_production_scoped_use_statements(&fragment_mod)
+        .into_iter()
+        .filter(|import| rust_use_is_public(&import.import))
+        .filter_map(|import| {
+            rust_canonical_use_segments_in_scope(
+                &import.import,
+                "src/sql/codegen/fragment/mod.rs",
+                &import.inline_modules,
+            )
+        })
+        .filter(|path| {
+            path == &[
+                "crate".to_string(),
+                "sql".to_string(),
+                "codegen".to_string(),
+                "fragment".to_string(),
+                "build".to_string(),
+                "build".to_string(),
+            ]
+        })
+        .count();
+    if build_exports != 1 {
+        violations.push(format!(
+            "src/sql/codegen/fragment/mod.rs: expected exactly one outward build entry, got {build_exports}"
+        ));
+    }
+
+    let codegen_sources = rs_files(&codegen_root)
+        .into_iter()
+        .map(|path| (rel(&path), fs::read_to_string(path).unwrap()))
+        .collect::<Vec<_>>();
+    let build_owners = rust_named_declaration_owners(
+        &codegen_sources,
+        "build",
+        rust_named_function_declaration_count,
+    );
+    if build_owners != ["src/sql/codegen/fragment/build.rs (1)"] {
+        violations.push(format!(
+            "fragment build function must have one final owner, got {build_owners:?}"
+        ));
+    }
+
+    for (name, expected_owner) in [
+        (
+            "FragmentBuildRequest",
+            "src/sql/codegen/fragment/request.rs (1)",
+        ),
+        ("OutputColumn", "src/sql/codegen/fragment/result.rs (1)"),
+        (
+            "FragmentOutputKind",
+            "src/sql/codegen/fragment/result.rs (1)",
+        ),
+        (
+            "FragmentSchedulingMetadata",
+            "src/sql/codegen/fragment/result.rs (1)",
+        ),
+        (
+            "MultiFragmentBuildResult",
+            "src/sql/codegen/fragment/result.rs (1)",
+        ),
+        (
+            "RuntimeFilterPlanResult",
+            "src/sql/codegen/fragment/result.rs (1)",
+        ),
+        (
+            "StarRocksScanSourceDescriptor",
+            "src/sql/codegen/scan/connector.rs (1)",
+        ),
+    ] {
+        let owners = rust_named_declaration_owners(
+            &codegen_sources,
+            name,
+            rust_named_type_declaration_count,
+        );
+        if owners != [expected_owner] {
+            violations.push(format!(
+                "{name} must have one final declaration owner, got {owners:?}"
+            ));
+        }
+    }
+    let delta_owners = rust_named_declaration_owners(
+        &codegen_sources,
+        "build_iceberg_delta_scan_runtime_plan",
+        rust_named_function_declaration_count,
+    );
+    if delta_owners != ["src/sql/codegen/scan/iceberg_delta.rs (1)"] {
+        violations.push(format!(
+            "Iceberg delta runtime planner must have one final owner, got {delta_owners:?}"
+        ));
+    }
+
+    let fragment_build = fs::read_to_string(codegen_root.join("fragment/build.rs")).unwrap();
+    let production = rust_sanitized_production_text(&fragment_build);
+    violations.extend(nfe_3_raw_starrocks_idl_violations(
+        "src/sql/codegen/fragment/build.rs",
+        &fragment_build,
+    ));
+    let production_tokens = rust_use_tokens(&production);
+    if production_tokens
+        .windows(3)
+        .any(|tokens| tokens[0] == "cfg" && tokens[1] == "(" && tokens[2] == "feature")
+        || production_tokens.iter().any(|token| token == "compat")
+    {
         violations.push(
-            "src/sql/codegen/ir/mod.rs: fragment_build must be exported unconditionally"
+            "src/sql/codegen/fragment/build.rs: unique native builder must be feature-neutral"
                 .to_string(),
+        );
+    }
+    for builder in ["PlanFragmentBuilder", "FragmentBuilder"] {
+        let owners = rust_named_declaration_owners(
+            &codegen_sources,
+            builder,
+            rust_named_type_declaration_count,
+        );
+        if !owners.is_empty() {
+            violations.push(format!(
+                "retired second builder type `{builder}` still has owners {owners:?}"
+            ));
+        }
+    }
+
+    for path in rs_files(&src_dir()) {
+        let source_rel = rel(&path);
+        let text = fs::read_to_string(&path).unwrap();
+        violations.extend(
+            codegen_fragment_namespace_violations_in(&source_rel, &text)
+                .into_iter()
+                .map(|violation| format!("{source_rel}: {violation}")),
         );
     }
 
     for rel in [
-        "src/sql/codegen/mod.rs",
-        "src/sql/codegen/fragment_builder.rs",
         "src/engine/mod.rs",
         "src/engine/dml_change_stream.rs",
         "src/runtime/coordinator.rs",
         "src/runtime/dispatcher.rs",
     ] {
         let text = fs::read_to_string(repo.join(rel)).unwrap();
-        let production = rust_production_text_without_cfg_test(&text);
+        let production = rust_sanitized_production_text(&text);
         push_forbidden_terms(
             &mut violations,
             rel,
@@ -13406,21 +13906,6 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
             "Task 4 removes legacy build carriers from production",
         );
     }
-
-    let fragment_build =
-        fs::read_to_string(repo.join("src/sql/codegen/ir/fragment_build.rs")).unwrap();
-    let production = rust_production_text_without_cfg_test(&fragment_build);
-    push_forbidden_terms(
-        &mut violations,
-        "src/sql/codegen/ir/fragment_build.rs",
-        &production,
-        &[
-            "crate::thrift",
-            "struct FragmentBuildResult",
-            "cfg(feature = \"compat\")",
-        ],
-        "the unique fragment builder must be feature-neutral and Thrift-free",
-    );
 
     assert!(
         violations.is_empty(),
@@ -15453,7 +15938,7 @@ fn nidl_e3_planner_ir_uses_native_partition_and_runtime_filter_types() {
         "src/sql/planner/physical/runtime_filter_placement.rs",
         "src/sql/planner/physical/stats.rs",
         "src/sql/planner/physical/vocab.rs",
-        "src/sql/codegen/runtime_filter.rs",
+        "src/sql/codegen/fragment/runtime_filter.rs",
     ] {
         let text = fs::read_to_string(repo.join(source)).unwrap();
         let text = rust_production_text_without_cfg_test(&text);
@@ -15472,11 +15957,11 @@ fn nidl_e3_planner_ir_uses_native_partition_and_runtime_filter_types() {
         );
     }
 
-    let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/mod.rs")).unwrap();
+    let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/fragment/result.rs")).unwrap();
     let codegen_mod = rust_production_text_without_cfg_test(&codegen_mod);
     push_forbidden_terms(
         &mut violations,
-        "src/sql/codegen/mod.rs",
+        "src/sql/codegen/fragment/result.rs",
         &codegen_mod,
         &[
             "pub compat_output_partition:",
@@ -15769,27 +16254,25 @@ fn nidl_e4_scheduler_and_coordinator_use_native_scheduling_metadata() {
     let repo = Path::new(manifest_dir());
     let mut violations = Vec::new();
 
-    let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/mod.rs")).unwrap();
-    let codegen_mod_prod = rust_production_text_without_cfg_test(&codegen_mod);
+    let result = fs::read_to_string(repo.join("src/sql/codegen/fragment/result.rs")).unwrap();
+    let result_prod = rust_production_text_without_cfg_test(&result);
     if !nidl_e4_has_exact_code_line(
-        &codegen_mod_prod,
+        &result_prod,
         "pub(crate) struct FragmentSchedulingMetadata {",
     ) {
         violations.push(
-            "src/sql/codegen/mod.rs: E4 must expose a native FragmentSchedulingMetadata result"
-                .to_string(),
+            "src/sql/codegen/fragment/result.rs: E4 must expose a native FragmentSchedulingMetadata result".to_string(),
         );
     }
     if !nidl_e4_struct_has_code_line(
-        &codegen_mod_prod,
+        &result_prod,
         "pub(crate) struct MultiFragmentBuildResult {",
         |line| {
             line.trim_end_matches(',') == "pub fragment_schedules: Vec<FragmentSchedulingMetadata>"
         },
     ) {
         violations.push(
-            "src/sql/codegen/mod.rs: MultiFragmentBuildResult must carry native fragment_schedules"
-                .to_string(),
+            "src/sql/codegen/fragment/result.rs: MultiFragmentBuildResult must carry native fragment_schedules".to_string(),
         );
     }
 

@@ -15,21 +15,5 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Feature-neutral entry point for the native fragment builder.
-
-use crate::sql::codegen::{FragmentBuildRequest, MultiFragmentBuildResult};
-
-pub(crate) struct PlanFragmentBuilder;
-
-impl PlanFragmentBuilder {
-    pub(crate) fn build(
-        request: FragmentBuildRequest<'_>,
-    ) -> Result<MultiFragmentBuildResult, String> {
-        crate::sql::codegen::ir::lower_distributed_plan(
-            request.distributed_plan,
-            request.catalog,
-            request.connectors,
-            request.mv_refresh_ctx,
-        )
-    }
-}
+pub(crate) mod connector;
+pub(crate) mod iceberg_delta;

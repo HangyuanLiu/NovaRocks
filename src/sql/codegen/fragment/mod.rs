@@ -15,4 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Reserved home for planner IR kind helpers.
+mod boundary_schema;
+mod build;
+mod request;
+mod result;
+mod runtime_filter;
+
+pub(crate) use boundary_schema::BoundarySchemaReport;
+pub(crate) use build::build;
+pub(crate) use request::FragmentBuildRequest;
+pub(crate) use result::{
+    FragmentOutputKind, FragmentSchedulingMetadata, MultiFragmentBuildResult, OutputColumn,
+    RuntimeFilterPlanResult,
+};

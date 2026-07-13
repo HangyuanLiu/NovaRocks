@@ -21,7 +21,7 @@ use crate::exec::node::iceberg_delta_scan::{
     BaseDataFileLineage, DeletedFileVisibility, DeltaScanDeleteSidePayload, DeltaSourceFile,
     DeltaSourceRole, EqualityDeleteTargetData, PositionDeleteFileFormat, PositionDeleteSourceData,
 };
-use crate::sql::codegen::iceberg_delta_scan_planning::IcebergDeltaScanRuntimePlan;
+use crate::sql::codegen::scan::iceberg_delta::IcebergDeltaScanRuntimePlan;
 
 pub(super) fn encode_iceberg_delta_scan_plan_native(
     plan: &IcebergDeltaScanRuntimePlan,

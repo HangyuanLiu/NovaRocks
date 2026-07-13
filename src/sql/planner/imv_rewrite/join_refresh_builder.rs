@@ -1407,8 +1407,8 @@ mod tests {
         let result = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
             .and_then(crate::sql::planner::pipeline::build_distributed_plan)
             .and_then(|distributed_plan| {
-                crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
-                    crate::sql::codegen::FragmentBuildRequest::result(
+                crate::sql::codegen::fragment::build(
+                    crate::sql::codegen::fragment::FragmentBuildRequest::result(
                         &distributed_plan,
                         &catalog,
                         &connectors,

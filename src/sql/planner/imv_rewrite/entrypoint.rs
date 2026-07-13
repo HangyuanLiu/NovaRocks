@@ -2936,7 +2936,7 @@ mod tests {
     }
 
     #[test]
-    fn pure_join_refresh_fragment_builder_lowers_coalesce_plan() {
+    fn pure_join_refresh_fragment_materialization_lowers_coalesce_plan() {
         std::thread::Builder::new()
             .name("imv-join-fragment-lowering-test".to_string())
             .stack_size(16 * 1024 * 1024)
@@ -2989,8 +2989,8 @@ mod tests {
                 let distributed_plan =
                     crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
                     .expect("build DistributedPlan");
-                crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
-                    crate::sql::codegen::FragmentBuildRequest::result(
+                crate::sql::codegen::fragment::build(
+                    crate::sql::codegen::fragment::FragmentBuildRequest::result(
                         &distributed_plan,
                         &catalog,
                         &connectors,

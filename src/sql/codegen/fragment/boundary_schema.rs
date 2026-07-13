@@ -17,7 +17,7 @@
 
 use arrow::datatypes::DataType;
 
-use crate::sql::codegen::OutputColumn;
+use super::OutputColumn;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BoundaryKind {
@@ -77,8 +77,8 @@ pub(crate) fn output_columns_to_boundary_columns(
 mod tests {
     use arrow::datatypes::DataType;
 
+    use super::super::OutputColumn;
     use super::{BoundaryKind, output_columns_to_boundary_columns};
-    use crate::sql::codegen::OutputColumn;
 
     #[test]
     fn boundary_kind_labels_are_stable() {

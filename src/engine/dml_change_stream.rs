@@ -1107,8 +1107,8 @@ mod native_mutation_tests {
         assert_eq!(plan.fragments[0].root.children[0].node_id, 3);
         assert_eq!(plan.fragments[0].root.children[0].children[0].node_id, 1);
 
-        let build = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
-            crate::sql::codegen::FragmentBuildRequest::result(
+        let build = crate::sql::codegen::fragment::build(
+            crate::sql::codegen::fragment::FragmentBuildRequest::result(
                 &plan,
                 &EmptyCatalog,
                 &crate::connector::ConnectorRegistry::new(),

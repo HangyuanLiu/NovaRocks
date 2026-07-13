@@ -19,21 +19,22 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use arrow::datatypes::DataType;
 
+use super::boundary_schema::{
+    BoundaryKind, BoundarySchemaReport, output_columns_to_boundary_columns,
+};
+use super::request::FragmentBuildRequest;
+use super::result::{
+    FragmentOutputKind, FragmentSchedulingMetadata, MultiFragmentBuildResult, OutputColumn,
+    RuntimeFilterPlanResult,
+};
+use super::runtime_filter::PlannedRuntimeFilter;
 use crate::connector::scan_planning::{BeginScanContext, SplitPlanningContext};
 use crate::runtime::scan_range;
 use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
 use crate::sql::catalog::{IcebergDataFileBinding, ScanSource, TableDef};
-use crate::sql::codegen::boundary_schema::{
-    BoundaryKind, BoundarySchemaReport, output_columns_to_boundary_columns,
-};
-use crate::sql::codegen::connector_scan_planning::{
+use crate::sql::codegen::scan::connector::{
     ConnectorScanContext, StarRocksScanSourceDescriptor, plan_native_starrocks_scan_node,
     to_native_file_scan,
-};
-use crate::sql::codegen::runtime_filter::PlannedRuntimeFilter;
-use crate::sql::codegen::{
-    FragmentOutputKind, FragmentSchedulingMetadata, MultiFragmentBuildResult, OutputColumn,
-    RuntimeFilterPlanResult,
 };
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::{
@@ -42,12 +43,13 @@ use crate::sql::planner::distributed::{
 };
 use crate::sql::planner::payload::PlanScanNode;
 
-pub(crate) fn lower_distributed_plan(
-    dp: &DistributedPlan,
-    catalog: &dyn crate::sql::catalog::CatalogProvider,
-    connectors: &crate::connector::ConnectorRegistry,
-    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
-) -> Result<MultiFragmentBuildResult, String> {
+pub(crate) fn build(request: FragmentBuildRequest<'_>) -> Result<MultiFragmentBuildResult, String> {
+    let FragmentBuildRequest {
+        distributed_plan: dp,
+        catalog,
+        connectors,
+        mv_refresh_ctx,
+    } = request;
     let _ = catalog;
     validate_distributed_plan(dp)?;
 
@@ -1456,8 +1458,33 @@ fn collect_runtime_filter_builds(
     }
 }
 
-pub(super) fn validate_distributed_plan(dp: &DistributedPlan) -> Result<(), String> {
-    super::validate_global_node_ids(dp)?;
+fn validate_global_node_ids(plan: &DistributedPlan) -> Result<(), String> {
+    fn visit(
+        node: &DistributedNode,
+        fragment_id: FragmentId,
+        owners: &mut HashMap<i32, FragmentId>,
+    ) -> Result<(), String> {
+        if let Some(previous_fragment_id) = owners.insert(node.node_id, fragment_id) {
+            return Err(format!(
+                "DistributedPlan contains duplicate node_id={} in fragments {} and {}",
+                node.node_id, previous_fragment_id, fragment_id
+            ));
+        }
+        for child in &node.children {
+            visit(child, fragment_id, owners)?;
+        }
+        Ok(())
+    }
+
+    let mut owners = HashMap::new();
+    for fragment in &plan.fragments {
+        visit(&fragment.root, fragment.fragment_id, &mut owners)?;
+    }
+    Ok(())
+}
+
+fn validate_distributed_plan(dp: &DistributedPlan) -> Result<(), String> {
+    validate_global_node_ids(dp)?;
     if dp.fragments.is_empty() {
         return Err("lower_distributed_plan requires at least one fragment".to_string());
     }
@@ -1765,6 +1792,58 @@ mod tests {
             nullable: false,
             is_internal: false,
         }
+    }
+
+    #[test]
+    fn distributed_plan_rejects_duplicate_node_id_across_fragments() {
+        fn values_node(fragment_id: u32, node_id: i32) -> DistributedNode {
+            DistributedNode {
+                node_id,
+                fragment_id,
+                tuple_ids: Vec::new(),
+                nullable_tuple_ids: Vec::new(),
+                limit: -1,
+                build_runtime_filters: Vec::new(),
+                probe_runtime_filters: Vec::new(),
+                children: Vec::new(),
+                stats: PhysicalPlanStats {
+                    output_row_count: 0.0,
+                    row_count_confidence: PlannerConfidence::Fallback,
+                    column_statistics: HashMap::new(),
+                    cost_estimate: None,
+                    broadcast_decision: None,
+                },
+                payload: DistributedNodeKind::Values(PlanValuesNode {
+                    rows: Vec::new(),
+                    columns: Vec::new(),
+                }),
+            }
+        }
+
+        let fragments = [0, 1]
+            .into_iter()
+            .map(|fragment_id| PlanFragment {
+                fragment_id,
+                root: values_node(fragment_id, 7),
+                data_partition: DataPartition::unpartitioned(),
+                output_partition: DataPartition::unpartitioned(),
+                sink: crate::sql::planner::distributed::DataSink::Noop,
+                output_exprs: None,
+                output_columns: Vec::new(),
+                cte_id: None,
+                cte_exchange_nodes: Vec::new(),
+            })
+            .collect();
+        let plan = DistributedPlan {
+            fragments,
+            root_fragment_id: 0,
+            edges: Vec::new(),
+        };
+
+        let err = validate_global_node_ids(&plan)
+            .expect_err("node ids are global descriptor keys and must be unique");
+        assert!(err.contains("duplicate node_id=7"), "{err}");
+        assert!(err.contains("fragments 0 and 1"), "{err}");
     }
 
     fn column_ref(id: u32, name: &str) -> TypedExpr {
@@ -2156,8 +2235,13 @@ mod tests {
             vec![3],
         )])]);
 
-        let result = lower_distributed_plan(&plan, &EmptyCatalog, &registry, None)
-            .expect("build native Iceberg scan");
+        let result = build(FragmentBuildRequest::result(
+            &plan,
+            &EmptyCatalog,
+            &registry,
+            None,
+        ))
+        .expect("build native Iceberg scan");
 
         assert_eq!(
             native_root_scan(&result).required_columns,
@@ -2173,8 +2257,13 @@ mod tests {
             Vec::new(),
         )])]);
 
-        let result = lower_distributed_plan(&plan, &EmptyCatalog, &registry, None)
-            .expect("build native Iceberg scan");
+        let result = build(FragmentBuildRequest::result(
+            &plan,
+            &EmptyCatalog,
+            &registry,
+            None,
+        ))
+        .expect("build native Iceberg scan");
 
         assert_eq!(
             native_root_scan(&result).required_columns,
@@ -2190,8 +2279,13 @@ mod tests {
             vec![3],
         )])]);
 
-        let result = lower_distributed_plan(&plan, &EmptyCatalog, &registry, None)
-            .expect("build native Iceberg scan");
+        let result = build(FragmentBuildRequest::result(
+            &plan,
+            &EmptyCatalog,
+            &registry,
+            None,
+        ))
+        .expect("build native Iceberg scan");
         let scan = native_root_scan(&result);
 
         assert_eq!(scan.required_columns, vec!["id", "category"]);
@@ -2212,8 +2306,13 @@ mod tests {
             vec![3],
         )])]);
 
-        let result = lower_distributed_plan(&plan, &EmptyCatalog, &registry, None)
-            .expect("build unrestricted native Iceberg scan");
+        let result = build(FragmentBuildRequest::result(
+            &plan,
+            &EmptyCatalog,
+            &registry,
+            None,
+        ))
+        .expect("build unrestricted native Iceberg scan");
         let scan = native_root_scan(&result);
 
         assert_eq!(scan.required_columns, vec!["id", "category"]);
@@ -2239,8 +2338,13 @@ mod tests {
             vec![3],
         )])]);
 
-        let result = lower_distributed_plan(&plan, &EmptyCatalog, &registry, None)
-            .expect("build unrestricted SELECT * Iceberg scan");
+        let result = build(FragmentBuildRequest::result(
+            &plan,
+            &EmptyCatalog,
+            &registry,
+            None,
+        ))
+        .expect("build unrestricted SELECT * Iceberg scan");
         let scan = native_root_scan(&result);
 
         assert_eq!(scan.required_columns, vec!["id", "category"]);
@@ -2261,7 +2365,12 @@ mod tests {
             vec![99],
         )])]);
 
-        let err = match lower_distributed_plan(&plan, &EmptyCatalog, &registry, None) {
+        let err = match build(FragmentBuildRequest::result(
+            &plan,
+            &EmptyCatalog,
+            &registry,
+            None,
+        )) {
             Ok(_) => panic!("unknown equality field id must fail"),
             Err(err) => err,
         };
@@ -2278,7 +2387,12 @@ mod tests {
             let plan = iceberg_scan_plan(Some(vec!["id"]));
             let registry = iceberg_registry(vec![iceberg_data_file(vec![delete_file])]);
 
-            let err = match lower_distributed_plan(&plan, &EmptyCatalog, &registry, None) {
+            let err = match build(FragmentBuildRequest::result(
+                &plan,
+                &EmptyCatalog,
+                &registry,
+                None,
+            )) {
                 Ok(_) => panic!("duplicate equality identity must fail"),
                 Err(err) => err,
             };
@@ -2294,7 +2408,12 @@ mod tests {
             vec![3],
         )])]);
 
-        let err = match lower_distributed_plan(&plan, &EmptyCatalog, &registry, None) {
+        let err = match build(FragmentBuildRequest::result(
+            &plan,
+            &EmptyCatalog,
+            &registry,
+            None,
+        )) {
             Ok(_) => panic!("equality id/name mismatch must fail"),
             Err(err) => err,
         };
@@ -2311,8 +2430,13 @@ mod tests {
             iceberg_i32_stats_file("s3://bucket/id-10-20.parquet", 10, 20),
         ]);
 
-        let result = lower_distributed_plan(&plan, &EmptyCatalog, &registry, None)
-            .expect("build native Iceberg scan");
+        let result = build(FragmentBuildRequest::result(
+            &plan,
+            &EmptyCatalog,
+            &registry,
+            None,
+        ))
+        .expect("build native Iceberg scan");
         let ranges = native_file_ranges(&result);
 
         assert_eq!(ranges.len(), 1);
@@ -2331,8 +2455,13 @@ mod tests {
             iceberg_identity_partition_file("s3://bucket/id-12.parquet", 12),
         ]);
 
-        let result = lower_distributed_plan(&plan, &EmptyCatalog, &registry, None)
-            .expect("build native Iceberg scan");
+        let result = build(FragmentBuildRequest::result(
+            &plan,
+            &EmptyCatalog,
+            &registry,
+            None,
+        ))
+        .expect("build native Iceberg scan");
         let ranges = native_file_ranges(&result);
 
         assert_eq!(ranges.len(), 1);
@@ -2350,8 +2479,13 @@ mod tests {
         file.size = 300 * 1024 * 1024;
         let registry = iceberg_registry(vec![file]);
 
-        let result = lower_distributed_plan(&plan, &EmptyCatalog, &registry, None)
-            .expect("build native Iceberg scan");
+        let result = build(FragmentBuildRequest::result(
+            &plan,
+            &EmptyCatalog,
+            &registry,
+            None,
+        ))
+        .expect("build native Iceberg scan");
         let ranges = native_file_ranges(&result);
 
         assert_eq!(ranges.len(), 3);
@@ -2369,7 +2503,12 @@ mod tests {
             .collect();
         let registry = iceberg_registry(vec![iceberg_data_file(delete_files)]);
 
-        let err = match lower_distributed_plan(&plan, &EmptyCatalog, &registry, None) {
+        let err = match build(FragmentBuildRequest::result(
+            &plan,
+            &EmptyCatalog,
+            &registry,
+            None,
+        )) {
             Ok(_) => panic!("delete-heavy scan must fail"),
             Err(err) => err,
         };
@@ -2397,8 +2536,13 @@ mod tests {
             iceberg_i32_stats_file("s3://bucket/id-10-20.parquet", 10, 20),
         ]);
 
-        let result = lower_distributed_plan(&plan, &EmptyCatalog, &registry, None)
-            .expect("unsupported pruning predicate must preserve scan semantics");
+        let result = build(FragmentBuildRequest::result(
+            &plan,
+            &EmptyCatalog,
+            &registry,
+            None,
+        ))
+        .expect("unsupported pruning predicate must preserve scan semantics");
 
         assert_eq!(native_file_ranges(&result).len(), 2);
     }
@@ -2439,9 +2583,13 @@ mod tests {
             PartitionKind::Unpartitioned
         ));
 
-        let mut result =
-            lower_distributed_plan(&planned, &EmptyCatalog, &ConnectorRegistry::new(), None)
-                .expect("native fragment build");
+        let mut result = build(FragmentBuildRequest::result(
+            &planned,
+            &EmptyCatalog,
+            &ConnectorRegistry::new(),
+            None,
+        ))
+        .expect("native fragment build");
         assert_eq!(result.edges[0].stream_kind, FragmentStreamKind::Broadcast);
         assert!(matches!(
             result.edges[0].output_partition.kind,
@@ -2498,8 +2646,13 @@ mod tests {
         };
         plan.edges[0].stream_kind = FragmentStreamKind::Other;
 
-        let result = lower_distributed_plan(&plan, &EmptyCatalog, &ConnectorRegistry::new(), None)
-            .expect("build random stream");
+        let result = build(FragmentBuildRequest::result(
+            &plan,
+            &EmptyCatalog,
+            &ConnectorRegistry::new(),
+            None,
+        ))
+        .expect("build random stream");
 
         assert_eq!(result.edges[0].stream_kind, FragmentStreamKind::Other);
         assert!(matches!(
@@ -2514,14 +2667,17 @@ mod tests {
             let mut plan = stream_exchange_plan(ExchangeFlavor::Distribution);
             plan.edges[0].stream_kind = stream_kind;
 
-            let err =
-                match lower_distributed_plan(&plan, &EmptyCatalog, &ConnectorRegistry::new(), None)
-                {
-                    Ok(_) => {
-                        panic!("Unpartitioned edge with stream kind {stream_kind:?} must fail")
-                    }
-                    Err(err) => err,
-                };
+            let err = match build(FragmentBuildRequest::result(
+                &plan,
+                &EmptyCatalog,
+                &ConnectorRegistry::new(),
+                None,
+            )) {
+                Ok(_) => {
+                    panic!("Unpartitioned edge with stream kind {stream_kind:?} must fail")
+                }
+                Err(err) => err,
+            };
 
             assert!(err.contains("Unpartitioned"), "{err}");
             assert!(err.contains(&format!("{stream_kind:?}")), "{err}");
@@ -2564,14 +2720,18 @@ mod tests {
             exchange.partition = partition.clone();
             plan.edges[0].stream_kind = stream_kind;
 
-            let result =
-                lower_distributed_plan(&plan, &EmptyCatalog, &ConnectorRegistry::new(), None)
-                    .unwrap_or_else(|err| {
-                        panic!(
-                            "legal stream combination {:?}+{stream_kind:?} must lower: {err}",
-                            partition.kind
-                        )
-                    });
+            let result = build(FragmentBuildRequest::result(
+                &plan,
+                &EmptyCatalog,
+                &ConnectorRegistry::new(),
+                None,
+            ))
+            .unwrap_or_else(|err| {
+                panic!(
+                    "legal stream combination {:?}+{stream_kind:?} must lower: {err}",
+                    partition.kind
+                )
+            });
 
             assert_eq!(result.edges[0].stream_kind, stream_kind);
             assert_eq!(
@@ -2662,8 +2822,13 @@ mod tests {
 
         for (label, flavor) in cases {
             let dp = stream_exchange_plan(flavor);
-            lower_distributed_plan(&dp, &EmptyCatalog, &ConnectorRegistry::new(), None)
-                .unwrap_or_else(|err| panic!("{label} stream exchange should lower: {err}"));
+            build(FragmentBuildRequest::result(
+                &dp,
+                &EmptyCatalog,
+                &ConnectorRegistry::new(),
+                None,
+            ))
+            .unwrap_or_else(|err| panic!("{label} stream exchange should lower: {err}"));
         }
     }
 
@@ -2684,8 +2849,13 @@ mod tests {
         exchange.partition = expected_partition.clone();
         dp.edges[0].stream_kind = FragmentStreamKind::Partitioned;
 
-        let result = lower_distributed_plan(&dp, &EmptyCatalog, &ConnectorRegistry::new(), None)
-            .expect("native fragment build");
+        let result = build(FragmentBuildRequest::result(
+            &dp,
+            &EmptyCatalog,
+            &ConnectorRegistry::new(),
+            None,
+        ))
+        .expect("native fragment build");
 
         assert!(matches!(
             result.edges[0].output_partition.kind,
@@ -2789,9 +2959,13 @@ mod tests {
         };
         exchange.partition = DataPartition::unpartitioned();
 
-        let result =
-            lower_distributed_plan(&planned, &EmptyCatalog, &ConnectorRegistry::new(), None)
-                .expect("native fragment build");
+        let result = build(FragmentBuildRequest::result(
+            &planned,
+            &EmptyCatalog,
+            &ConnectorRegistry::new(),
+            None,
+        ))
+        .expect("native fragment build");
 
         let edge = &result.edges[0];
         assert!(matches!(edge.output_partition.kind, PartitionKind::Hash));
@@ -2906,12 +3080,12 @@ mod tests {
         };
         planned.edges.push(second_edge);
 
-        let err = match lower_distributed_plan(
+        let err = match build(FragmentBuildRequest::result(
             &planned,
             &EmptyCatalog,
             &ConnectorRegistry::new(),
             None,
-        ) {
+        )) {
             Ok(_) => panic!("one receiver cannot have conflicting route partitions"),
             Err(err) => err,
         };
@@ -2963,8 +3137,15 @@ mod tests {
             offset: Some(0),
         });
 
-        let result = lower_distributed_plan(&dp, &EmptyCatalog, &ConnectorRegistry::new(), None)
-            .expect("native fragment build");
+        let result = crate::sql::codegen::fragment::build(
+            crate::sql::codegen::fragment::FragmentBuildRequest::result(
+                &dp,
+                &EmptyCatalog,
+                &ConnectorRegistry::new(),
+                None,
+            ),
+        )
+        .expect("native fragment build");
         let fragment_ids = result
             .native_fragments
             .keys()
@@ -3010,8 +3191,13 @@ mod tests {
             edges: Vec::new(),
         };
 
-        let result = lower_distributed_plan(&plan, &EmptyCatalog, &ConnectorRegistry::new(), None)
-            .expect("native write fragment build");
+        let result = build(FragmentBuildRequest::result(
+            &plan,
+            &EmptyCatalog,
+            &ConnectorRegistry::new(),
+            None,
+        ))
+        .expect("native write fragment build");
         assert_eq!(
             result.fragment_schedules[0].output_kind,
             FragmentOutputKind::TerminalWrite
@@ -3032,9 +3218,13 @@ mod tests {
             limit: Some(1),
             offset: Some(0),
         });
-        let mut result =
-            lower_distributed_plan(&dp, &EmptyCatalog, &ConnectorRegistry::new(), None)
-                .expect("native fragment build");
+        let mut result = build(FragmentBuildRequest::result(
+            &dp,
+            &EmptyCatalog,
+            &ConnectorRegistry::new(),
+            None,
+        ))
+        .expect("native fragment build");
 
         result.native_fragments.remove(&1);
         let err = validate_native_fragment_ownership(
@@ -3141,8 +3331,13 @@ mod tests {
             }],
         };
 
-        let result = lower_distributed_plan(&dp, &EmptyCatalog, &ConnectorRegistry::new(), None)
-            .expect("native lower plan");
+        let result = build(FragmentBuildRequest::result(
+            &dp,
+            &EmptyCatalog,
+            &ConnectorRegistry::new(),
+            None,
+        ))
+        .expect("native lower plan");
 
         assert_eq!(result.edges[0].output_slot_ids, vec![1, 3]);
         let native_consumer = result

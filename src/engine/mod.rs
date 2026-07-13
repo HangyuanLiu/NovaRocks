@@ -2743,8 +2743,8 @@ fn explain_analyze_query(
 
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
     let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)?;
-    let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
-        crate::sql::codegen::FragmentBuildRequest::result(
+    let build_result = crate::sql::codegen::fragment::build(
+        crate::sql::codegen::fragment::FragmentBuildRequest::result(
             &distributed_plan,
             codegen_catalog,
             connectors,
@@ -3132,8 +3132,8 @@ pub(crate) fn execute_query_as_iceberg_write(
             input: crate::sql::planner::distributed::write::sink::IcebergWriteInputBinding::RootOutputByOrdinal,
         },
     )?;
-    let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
-        crate::sql::codegen::FragmentBuildRequest::result(
+    let build_result = crate::sql::codegen::fragment::build(
+        crate::sql::codegen::fragment::FragmentBuildRequest::result(
             &distributed_plan,
             &catalog_snapshot,
             &connectors_snapshot,
@@ -3260,7 +3260,7 @@ pub(crate) fn observe_change_stream_write_build_for_test(
 }
 
 pub(crate) struct PlannedIcebergChangeStreamWrite {
-    pub(crate) build_result: crate::sql::codegen::MultiFragmentBuildResult,
+    pub(crate) build_result: crate::sql::codegen::fragment::MultiFragmentBuildResult,
     pub(crate) commit_plan:
         crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan,
     #[cfg(test)]
@@ -3326,8 +3326,8 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_native_pla
     if let Some(mutate_native_plan) = native_plan_mutation {
         mutate_native_plan(&mut distributed_plan)?;
     }
-    let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
-        crate::sql::codegen::FragmentBuildRequest::result(
+    let build_result = crate::sql::codegen::fragment::build(
+        crate::sql::codegen::fragment::FragmentBuildRequest::result(
             &distributed_plan,
             &catalog_snapshot,
             &connectors_snapshot,
@@ -3347,7 +3347,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_native_pla
 }
 
 pub(crate) fn execute_planned_iceberg_change_stream_write(
-    build_result: crate::sql::codegen::MultiFragmentBuildResult,
+    build_result: crate::sql::codegen::fragment::MultiFragmentBuildResult,
     query_opts: Option<StandaloneQueryOptions>,
 ) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
     let (dispatcher, scheduler) = coordinated_execution_services()?;
@@ -3717,8 +3717,8 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
 
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
     let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)?;
-    let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
-        crate::sql::codegen::FragmentBuildRequest::result(
+    let build_result = crate::sql::codegen::fragment::build(
+        crate::sql::codegen::fragment::FragmentBuildRequest::result(
             &distributed_plan,
             codegen_catalog,
             connectors,
@@ -3775,8 +3775,8 @@ pub(crate) fn execute_logical_plan_with_options(
 
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
     let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)?;
-    let build_result = crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
-        crate::sql::codegen::FragmentBuildRequest::result(
+    let build_result = crate::sql::codegen::fragment::build(
+        crate::sql::codegen::fragment::FragmentBuildRequest::result(
             &distributed_plan,
             codegen_catalog,
             connectors,
@@ -5355,7 +5355,9 @@ mysql_port = 47892
     }
 
     #[cfg(feature = "compat")]
-    fn build_fragments_for_query(sql: &str) -> crate::sql::codegen::MultiFragmentBuildResult {
+    fn build_fragments_for_query(
+        sql: &str,
+    ) -> crate::sql::codegen::fragment::MultiFragmentBuildResult {
         use crate::sql::catalog::{
             ColumnDef, PhysicalTableLayout, ScanSource, StarRocksTabletRef, TableDef,
         };
@@ -5462,8 +5464,8 @@ mysql_port = 47892
                 .expect("convert optimizer physical plan");
         let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
-        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
-            crate::sql::codegen::FragmentBuildRequest::result(
+        crate::sql::codegen::fragment::build(
+            crate::sql::codegen::fragment::FragmentBuildRequest::result(
                 &distributed_plan,
                 &catalog,
                 &registry,

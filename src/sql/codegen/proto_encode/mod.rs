@@ -17,6 +17,7 @@
 
 pub(crate) mod expr;
 mod iceberg_delta_scan;
+mod iceberg_literal_json;
 pub(crate) mod instance;
 pub(crate) mod plan;
 
@@ -32,7 +33,7 @@ mod tests {
     use super::{instance, plan};
     use crate::proto::{common, expr};
     use crate::sql::analysis::{ExprKind, SortItem, SubqueryKind, TypedExpr};
-    use crate::sql::codegen::connector_scan_planning as connector_scan;
+    use crate::sql::codegen::scan::connector as connector_scan;
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::{
         BinOp, LambdaParam, LiteralValue, UnOp, WindowBound, WindowFrame, WindowFrameType,

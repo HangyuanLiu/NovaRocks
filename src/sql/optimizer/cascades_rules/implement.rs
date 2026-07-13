@@ -2032,9 +2032,9 @@ mod window_split_tests {
     // recursion into newly-allocated groups whose physical_exprs were not yet
     // implemented. The deleted test
     // `window_to_physical_builds_chain_for_multi_group` asserted chain shape
-    // and is therefore obsolete. Multi-group decomposition still happens, but
-    // at the fragment_builder level (visit_window_multi_group) rather than at
-    // the cascades rule level.
+    // and is therefore obsolete. Multi-group decomposition still happens in
+    // `build_distributed_plan` window lowering
+    // (planner/distributed/build/lowering.rs), rather than at the cascades rule level.
 
     /// Single window expression with empty partition_by and empty order_by.
     /// The signature is empty → single group → no PhysicalSort inserted.

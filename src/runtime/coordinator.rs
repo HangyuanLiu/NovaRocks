@@ -56,7 +56,10 @@ use crate::runtime::write_coordinator::{
     unregister_query,
 };
 use crate::sql::analysis::cte::CteId;
-use crate::sql::codegen::{FragmentOutputKind, MultiFragmentBuildResult, RuntimeFilterPlanResult};
+use crate::sql::codegen::fragment::{
+    FragmentOutputKind, FragmentSchedulingMetadata, MultiFragmentBuildResult, OutputColumn,
+    RuntimeFilterPlanResult,
+};
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::{FragmentEdge, FragmentEdgeKind, FragmentId};
 
@@ -288,11 +291,10 @@ impl ExecutionCoordinator {
             })
             .collect();
 
-        let schedule_by_id: BTreeMap<FragmentId, &crate::sql::codegen::FragmentSchedulingMetadata> =
-            fragment_schedules
-                .iter()
-                .map(|fr| (fr.fragment_id, fr))
-                .collect();
+        let schedule_by_id: BTreeMap<FragmentId, &FragmentSchedulingMetadata> = fragment_schedules
+            .iter()
+            .map(|fr| (fr.fragment_id, fr))
+            .collect();
 
         // Build a fragment-id -> instance count map from the scheduling plan.
         // Builder numbers must equal the number of build-side instances, not a
@@ -538,7 +540,7 @@ fn query_result_or_write_abort_error(
 }
 
 fn build_root_expected_chunk_schema(
-    root_fragment: &crate::sql::codegen::FragmentSchedulingMetadata,
+    root_fragment: &FragmentSchedulingMetadata,
 ) -> Result<ChunkSchemaRef, String> {
     let output_columns = &root_fragment.output_columns;
     if output_columns.is_empty() {
@@ -564,7 +566,7 @@ fn build_root_expected_chunk_schema(
 
 fn align_fetch_chunks_to_output_columns(
     chunks: Vec<Chunk>,
-    output_columns: &[crate::sql::codegen::OutputColumn],
+    output_columns: &[OutputColumn],
 ) -> Result<Vec<Chunk>, String> {
     chunks
         .into_iter()
@@ -574,7 +576,7 @@ fn align_fetch_chunks_to_output_columns(
 
 fn align_fetch_chunk_to_output_columns(
     chunk: Chunk,
-    output_columns: &[crate::sql::codegen::OutputColumn],
+    output_columns: &[OutputColumn],
 ) -> Result<Chunk, String> {
     if chunk.batch.num_columns() != output_columns.len() {
         return Err(format!(
@@ -856,10 +858,10 @@ fn validate_fragment_output_kind(
 }
 
 fn validate_fragment_schedule_payloads(
-    fragment_schedules: &[crate::sql::codegen::FragmentSchedulingMetadata],
+    fragment_schedules: &[FragmentSchedulingMetadata],
     native_fragments: &BTreeMap<FragmentId, crate::proto::plan::PlanFragment>,
     root_fragment_id: FragmentId,
-    boundary_schemas: &[crate::sql::codegen::boundary_schema::BoundarySchemaReport],
+    boundary_schemas: &[crate::sql::codegen::fragment::BoundarySchemaReport],
 ) -> Result<(), String> {
     let schedule_ids: BTreeSet<FragmentId> =
         fragment_schedules.iter().map(|fr| fr.fragment_id).collect();
@@ -902,7 +904,7 @@ fn validate_fragment_schedule_payloads(
 }
 
 fn validate_native_scheduling_plan(
-    fragment_schedules: &[crate::sql::codegen::FragmentSchedulingMetadata],
+    fragment_schedules: &[FragmentSchedulingMetadata],
     native_fragments: &BTreeMap<FragmentId, crate::proto::plan::PlanFragment>,
     plan: &crate::runtime::scheduler::SchedulingPlan,
 ) -> Result<(), String> {
@@ -1996,11 +1998,11 @@ mod native_contract_tests {
     use crate::proto::plan as native_plan;
     use crate::runtime::write_coordinator::FragmentExecStatusReport;
 
-    fn schedule(fragment_id: FragmentId) -> crate::sql::codegen::FragmentSchedulingMetadata {
-        crate::sql::codegen::FragmentSchedulingMetadata {
+    fn schedule(fragment_id: FragmentId) -> FragmentSchedulingMetadata {
+        FragmentSchedulingMetadata {
             fragment_id,
             has_scan_nodes: false,
-            output_kind: crate::sql::codegen::FragmentOutputKind::Result,
+            output_kind: FragmentOutputKind::Result,
             native_scan_ranges: BTreeMap::new(),
             output_columns: Vec::new(),
             boundary_schemas: Vec::new(),
@@ -2352,7 +2354,7 @@ mod native_contract_tests {
 
     #[test]
     fn native_output_kind_validation_is_exhaustive() {
-        use crate::sql::codegen::FragmentOutputKind;
+        use crate::sql::codegen::fragment::FragmentOutputKind;
 
         validate_fragment_output_kind(1, true, false, false, FragmentOutputKind::Result)
             .expect("result root");
@@ -3153,7 +3155,7 @@ mod native_contract_tests {
         let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).unwrap();
         let aligned = align_fetch_chunks_to_output_columns(
             vec![chunk],
-            &[crate::sql::codegen::OutputColumn {
+            &[OutputColumn {
                 name: "col1".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
@@ -3190,7 +3192,7 @@ mod native_contract_tests {
         let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).unwrap();
         let err = align_fetch_chunks_to_output_columns(
             vec![chunk],
-            &[crate::sql::codegen::OutputColumn {
+            &[OutputColumn {
                 name: "price".to_string(),
                 data_type: DataType::Decimal128(20, 2),
                 nullable: false,
