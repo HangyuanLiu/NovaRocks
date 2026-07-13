@@ -32,6 +32,7 @@ use crate::connector::scan_planning::{BeginScanContext, SplitPlanningContext};
 use crate::runtime::scan_range;
 use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
 use crate::sql::catalog::{IcebergDataFileBinding, ScanSource, TableDef};
+use crate::sql::codegen::scan::binding::ScanExecutionBindings;
 use crate::sql::codegen::scan::connector::{
     ConnectorScanContext, StarRocksScanSourceDescriptor, plan_native_starrocks_scan_node,
     to_native_file_scan,
@@ -102,11 +103,14 @@ pub(crate) fn build(request: FragmentBuildRequest<'_>) -> Result<MultiFragmentBu
         .collect::<Vec<_>>();
     boundary_schemas.extend(edge_boundary_schemas(&refreshed)?);
 
+    let mut legacy_encode_bindings = ScanExecutionBindings::default();
+    for (node_id, descriptor) in &native_scan_planning.starrocks_scan_sources {
+        legacy_encode_bindings.insert_starrocks_source(*node_id, descriptor.clone())?;
+    }
     let encoded = crate::sql::codegen::proto_encode::plan::encode_distributed_plan_with_context(
         &refreshed,
         crate::sql::codegen::proto_encode::plan::NativePlanEncodeContext {
-            mv_refresh_ctx,
-            starrocks_scan_sources: Some(&native_scan_planning.starrocks_scan_sources),
+            scan_bindings: Some(&legacy_encode_bindings),
         },
     )?;
     let mut native_fragments = BTreeMap::new();

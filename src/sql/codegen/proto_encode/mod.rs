@@ -33,6 +33,7 @@ mod tests {
     use super::{instance, plan};
     use crate::proto::{common, expr};
     use crate::sql::analysis::{ExprKind, SortItem, SubqueryKind, TypedExpr};
+    use crate::sql::codegen::scan::binding::ScanExecutionBindings;
     use crate::sql::codegen::scan::connector as connector_scan;
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::{
@@ -1389,8 +1390,6 @@ mod tests {
 
     #[test]
     fn native_plan_encoder_maps_starrocks_scan_source_descriptor() {
-        use std::collections::BTreeMap;
-
         let scan = crate::sql::planner::distributed::DistributedNode {
             node_id: 7,
             fragment_id: 0,
@@ -1423,32 +1422,35 @@ mod tests {
             ),
         };
 
-        let descriptors = BTreeMap::from([(
-            7,
-            connector_scan::StarRocksScanSourceDescriptor {
-                catalog_name: "default_catalog".to_string(),
-                db_id: 1,
-                table_id: 2,
-                schema_id: 3,
-                storage_columns: vec![connector_scan::StarRocksStorageColumnDescriptor {
-                    name: "id".to_string(),
-                    unique_id: 11,
-                    default_value: Some("42".to_string()),
-                }],
-                tablet_schema: connector_scan::test_starrocks_tablet_schema_descriptor_for_column(
-                    3,
-                    "id",
-                    11,
-                    Some("42"),
-                ),
-            },
-        )]);
+        let mut bindings = ScanExecutionBindings::default();
+        bindings
+            .insert_starrocks_source(
+                7,
+                connector_scan::StarRocksScanSourceDescriptor {
+                    catalog_name: "default_catalog".to_string(),
+                    db_id: 1,
+                    table_id: 2,
+                    schema_id: 3,
+                    storage_columns: vec![connector_scan::StarRocksStorageColumnDescriptor {
+                        name: "id".to_string(),
+                        unique_id: 11,
+                        default_value: Some("42".to_string()),
+                    }],
+                    tablet_schema:
+                        connector_scan::test_starrocks_tablet_schema_descriptor_for_column(
+                            3,
+                            "id",
+                            11,
+                            Some("42"),
+                        ),
+                },
+            )
+            .expect("insert StarRocks source descriptor");
 
         let encoded = plan::encode_node_with_context(
             &scan,
             &plan::NativePlanEncodeContext {
-                mv_refresh_ctx: None,
-                starrocks_scan_sources: Some(&descriptors),
+                scan_bindings: Some(&bindings),
             },
         )
         .expect("encode StarRocks native scan source");
@@ -1539,22 +1541,24 @@ mod tests {
             .expect_err("StarRocks scan without a builder descriptor must fail");
         assert!(err.contains("missing native source descriptor"), "{err}");
 
-        let descriptors = std::collections::BTreeMap::from([(
-            7,
-            connector_scan::StarRocksScanSourceDescriptor {
-                catalog_name: "default_catalog".to_string(),
-                db_id: 1,
-                table_id: 99,
-                schema_id: 3,
-                storage_columns: Vec::new(),
-                tablet_schema: connector_scan::test_starrocks_tablet_schema_descriptor(3, &[]),
-            },
-        )]);
+        let mut bindings = ScanExecutionBindings::default();
+        bindings
+            .insert_starrocks_source(
+                7,
+                connector_scan::StarRocksScanSourceDescriptor {
+                    catalog_name: "default_catalog".to_string(),
+                    db_id: 1,
+                    table_id: 99,
+                    schema_id: 3,
+                    storage_columns: Vec::new(),
+                    tablet_schema: connector_scan::test_starrocks_tablet_schema_descriptor(3, &[]),
+                },
+            )
+            .expect("insert mismatched StarRocks descriptor");
         let err = plan::encode_node_with_context(
             &scan,
             &plan::NativePlanEncodeContext {
-                mv_refresh_ctx: None,
-                starrocks_scan_sources: Some(&descriptors),
+                scan_bindings: Some(&bindings),
             },
         )
         .expect_err("mismatched builder descriptor must fail");
@@ -1651,12 +1655,14 @@ mod tests {
             ),
         ];
         for (descriptor, expected) in invalid {
-            let descriptors = std::collections::BTreeMap::from([(7, descriptor)]);
+            let mut bindings = ScanExecutionBindings::default();
+            bindings
+                .insert_starrocks_source(7, descriptor)
+                .expect("insert invalid descriptor for encoder validation");
             let err = plan::encode_node_with_context(
                 &scan,
                 &plan::NativePlanEncodeContext {
-                    mv_refresh_ctx: None,
-                    starrocks_scan_sources: Some(&descriptors),
+                    scan_bindings: Some(&bindings),
                 },
             )
             .expect_err("invalid StarRocks source must fail");
