@@ -17,6 +17,10 @@
 
 mod contract;
 mod coverage;
+mod graph;
+mod validation;
 
 pub(crate) use contract::*;
 pub(crate) use coverage::*;
+pub(crate) use graph::*;
+pub(crate) use validation::*;
