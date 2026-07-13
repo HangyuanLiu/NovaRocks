@@ -151,7 +151,7 @@ mod tests {
     use crate::exec::node::ExecNodeKind;
     use crate::proto::{common, expr, plan};
     use crate::runtime::exchange::ExchangeKey;
-    use crate::sql::codegen::proto_encode::types::encode_type;
+    use crate::types::native_proto::encode_type;
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
         encode_type(data_type).expect("encode type")

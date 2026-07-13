@@ -136,7 +136,7 @@ mod tests {
     use crate::exec::node::scan::ScanMorsel;
     use crate::formats::FileFormatConfig;
     use crate::proto::{common, expr, novarocks, plan};
-    use crate::sql::codegen::proto_encode::types::encode_type;
+    use crate::types::native_proto::encode_type;
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
         encode_type(data_type).expect("encode type")

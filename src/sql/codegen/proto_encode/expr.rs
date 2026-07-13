@@ -18,11 +18,11 @@
 use arrow::datatypes::DataType;
 use arrow_buffer::i256;
 
-use super::types::encode_type;
 use crate::common::largeint;
 use crate::proto::{common, expr};
 use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
 use crate::sql::common::{BinOp, LiteralValue, UnOp, WindowBound, WindowFrame, WindowFrameType};
+use crate::types::native_proto::encode_type;
 
 pub(crate) fn encode_expr(e: &TypedExpr) -> Result<expr::Expr, String> {
     Ok(expr::Expr {

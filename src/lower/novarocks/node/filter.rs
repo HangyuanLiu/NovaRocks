@@ -59,7 +59,7 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::expr::ExprArena;
     use crate::proto::{common, expr, plan};
-    use crate::sql::codegen::proto_encode::types::encode_type;
+    use crate::types::native_proto::encode_type;
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
         encode_type(data_type).expect("encode type")

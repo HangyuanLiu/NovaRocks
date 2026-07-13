@@ -172,8 +172,8 @@ pub(crate) mod tests {
     use crate::exec::chunk::Chunk;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue, function::FunctionKind};
     use crate::proto::{common, expr};
-    use crate::sql::codegen::proto_encode::types::encode_type;
     use crate::types::logical::{LogicalType, field_with_logical_type};
+    use crate::types::native_proto::encode_type;
 
     pub(crate) fn type_desc(data_type: &DataType) -> common::TypeDesc {
         encode_type(data_type).expect("encode type")
