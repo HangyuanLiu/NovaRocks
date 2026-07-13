@@ -21,6 +21,7 @@ use crate::exec::node::iceberg_delta_scan::{
     DeltaScanDeleteSidePayload, DeltaSourceFile, IcebergDeltaDataColumnPayload,
 };
 
+#[derive(Clone, Debug)]
 pub(crate) struct IcebergDeltaScanRuntimePlan {
     pub(crate) table_location: String,
     pub(crate) data_columns: Vec<IcebergDeltaDataColumnPayload>,
@@ -29,6 +30,7 @@ pub(crate) struct IcebergDeltaScanRuntimePlan {
     pub(crate) delete_side: Option<DeltaScanDeleteSidePayload>,
 }
 
+// TODO(CGO-8 Task 4): Move this engine-owned resolution into the MV scan binding adapter.
 pub(crate) fn build_iceberg_delta_scan_runtime_plan(
     table: &crate::sql::catalog::IcebergTableInfo,
     from_snapshot_id: i64,
