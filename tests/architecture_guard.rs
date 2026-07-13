@@ -3405,13 +3405,26 @@ fn rust_production_canonical_paths(text: &str, source_rel: &str) -> Vec<Vec<Stri
 }
 
 fn native_lowering_codegen_dependency_violations_in(source_rel: &str, text: &str) -> Vec<String> {
+    const FORBIDDEN: &[&str] = &["crate", "sql", "codegen"];
+
     let source_rel = source_rel.replace('\\', "/");
     if !source_rel.starts_with("src/lower/novarocks/") {
         return Vec::new();
     }
     rust_production_canonical_paths(text, &source_rel)
         .into_iter()
-        .filter(|path| path.len() >= 3 && path[..3] == ["crate", "sql", "codegen"])
+        .filter(|path| {
+            path.len() >= FORBIDDEN.len()
+                && path
+                    .iter()
+                    .zip(FORBIDDEN)
+                    .all(|(actual, expected)| actual == expected)
+                || path.last().is_some_and(|segment| segment == "*")
+                    && path[..path.len() - 1]
+                        .iter()
+                        .zip(FORBIDDEN)
+                        .all(|(actual, expected)| actual == expected)
+        })
         .map(|path| path.join("::"))
         .collect()
 }
@@ -3431,9 +3444,24 @@ fn native_lowering_codegen_dependency_detector_covers_bypasses() {
             "src/lower/novarocks/node/filter.rs",
             "type Leak = super::super::super::super::sql::codegen::Codegen;",
         ),
+        (
+            "src/lower/novarocks/node/filter.rs",
+            "use crate::sql::*; type Leak = codegen::Codegen;",
+        ),
+        (
+            "src/lower/novarocks/node/filter.rs",
+            "use crate::*; type Leak = sql::codegen::Codegen;",
+        ),
+        (
+            "src/lower/novarocks/node/filter.rs",
+            "use crate::sql as planner_sql; use planner_sql::*; type Leak = codegen::Codegen;",
+        ),
     ];
     for (source_rel, source) in invalid {
-        assert!(!native_lowering_codegen_dependency_violations_in(source_rel, source).is_empty());
+        assert!(
+            !native_lowering_codegen_dependency_violations_in(source_rel, source).is_empty(),
+            "forbidden native-lowering dependency must be rejected: {source}"
+        );
     }
 
     let valid = [
@@ -3444,6 +3472,10 @@ fn native_lowering_codegen_dependency_detector_covers_bypasses() {
         (
             "src/lower/novarocks/node/filter.rs",
             "#[cfg(test)] use crate::sql::codegen::proto_encode::types::encode_type;",
+        ),
+        (
+            "src/sql/codegen/proto_encode/types.rs",
+            "use crate::sql::*; type LocalOwner = codegen::Codegen;",
         ),
     ];
     for (source_rel, source) in valid {

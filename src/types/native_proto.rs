@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Native FE TypeDesc encoding. `TypeDesc` is a SQL type contract, not a full
-//! Arrow schema round-trip: top-level Arrow field names/nullability are outside
-//! this boundary, and logical SQL markers require `Field` metadata.
+//! Bidirectional NovaRocks native protobuf `TypeDesc` codec. `TypeDesc` is a SQL
+//! type contract, not a full Arrow schema round-trip: top-level Arrow field
+//! names/nullability are outside this boundary, and logical SQL markers require
+//! `Field` metadata.
 
 use std::sync::Arc;
 
@@ -28,7 +29,6 @@ use crate::proto::common;
 use crate::types::logical::field_with_logical_type;
 use crate::types::logical::{LogicalType, logical_type_of_field};
 
-#[allow(dead_code)]
 const TIME_UNIT_MICROS: i32 = 2;
 const TIME_UNIT_NANOS: i32 = 3;
 
@@ -41,12 +41,10 @@ pub(crate) fn encode_field_type(field: &Field) -> Result<common::TypeDesc, Strin
     encode_type_inner(field.data_type(), Some(field))
 }
 
-#[allow(dead_code)]
 pub(crate) fn decode_type(desc: &common::TypeDesc) -> Result<DataType, String> {
     decode_type_inner(desc)
 }
 
-#[allow(dead_code)]
 pub(crate) fn decode_field_type(
     name: &str,
     nullable: bool,
@@ -202,7 +200,6 @@ fn scalar_desc(
     }
 }
 
-#[allow(dead_code)]
 fn decode_type_inner(desc: &common::TypeDesc) -> Result<DataType, String> {
     use common::type_desc::Kind;
 
@@ -241,7 +238,6 @@ fn decode_type_inner(desc: &common::TypeDesc) -> Result<DataType, String> {
     }
 }
 
-#[allow(dead_code)]
 fn decode_scalar_type(scalar: &common::ScalarType) -> Result<DataType, String> {
     use common::PrimitiveType;
 
@@ -288,7 +284,6 @@ fn decode_scalar_type(scalar: &common::ScalarType) -> Result<DataType, String> {
     }
 }
 
-#[allow(dead_code)]
 fn decode_decimal_type(
     primitive: common::PrimitiveType,
     scalar: &common::ScalarType,
@@ -345,7 +340,6 @@ fn logical_primitive(logical_type: LogicalType) -> common::PrimitiveType {
     }
 }
 
-#[allow(dead_code)]
 fn logical_type_from_desc(desc: &common::TypeDesc) -> Option<LogicalType> {
     let common::type_desc::Kind::Scalar(scalar) = desc.kind.as_ref()? else {
         return None;
@@ -591,6 +585,192 @@ mod tests {
         assert_eq!(
             decode_type(&missing_precision).unwrap_err(),
             "decimal precision missing"
+        );
+    }
+
+    #[test]
+    fn malformed_decimal_and_datetime_descs_report_exact_errors() {
+        struct DecimalCase {
+            primitive: common::PrimitiveType,
+            precision: Option<i32>,
+            scale: Option<i32>,
+            expected: &'static str,
+        }
+
+        let decimal_cases = [
+            DecimalCase {
+                primitive: common::PrimitiveType::Decimal32,
+                precision: Some(10),
+                scale: Some(0),
+                expected: "Decimal32 precision 10 must be between 1 and 9",
+            },
+            DecimalCase {
+                primitive: common::PrimitiveType::Decimal64,
+                precision: Some(19),
+                scale: Some(0),
+                expected: "Decimal64 precision 19 must be between 1 and 18",
+            },
+            DecimalCase {
+                primitive: common::PrimitiveType::Decimal128,
+                precision: Some(39),
+                scale: Some(0),
+                expected: "Decimal128 precision 39 must be between 1 and 38",
+            },
+            DecimalCase {
+                primitive: common::PrimitiveType::Decimal256,
+                precision: Some(77),
+                scale: Some(0),
+                expected: "Decimal256 precision 77 must be between 1 and 76",
+            },
+            DecimalCase {
+                primitive: common::PrimitiveType::Decimal32,
+                precision: Some(9),
+                scale: None,
+                expected: "decimal scale missing",
+            },
+            DecimalCase {
+                primitive: common::PrimitiveType::Decimal64,
+                precision: Some(18),
+                scale: None,
+                expected: "decimal scale missing",
+            },
+            DecimalCase {
+                primitive: common::PrimitiveType::Decimal128,
+                precision: Some(38),
+                scale: None,
+                expected: "decimal scale missing",
+            },
+            DecimalCase {
+                primitive: common::PrimitiveType::Decimal256,
+                precision: Some(76),
+                scale: None,
+                expected: "decimal scale missing",
+            },
+            DecimalCase {
+                primitive: common::PrimitiveType::Decimal32,
+                precision: Some(9),
+                scale: Some(-1),
+                expected: "Decimal32 scale -1 must be between 0 and precision 9",
+            },
+            DecimalCase {
+                primitive: common::PrimitiveType::Decimal64,
+                precision: Some(18),
+                scale: Some(-1),
+                expected: "Decimal64 scale -1 must be between 0 and precision 18",
+            },
+            DecimalCase {
+                primitive: common::PrimitiveType::Decimal128,
+                precision: Some(38),
+                scale: Some(-1),
+                expected: "Decimal128 scale -1 must be between 0 and precision 38",
+            },
+            DecimalCase {
+                primitive: common::PrimitiveType::Decimal256,
+                precision: Some(76),
+                scale: Some(-1),
+                expected: "Decimal256 scale -1 must be between 0 and precision 76",
+            },
+            DecimalCase {
+                primitive: common::PrimitiveType::Decimal32,
+                precision: Some(8),
+                scale: Some(9),
+                expected: "Decimal32 scale 9 must be between 0 and precision 8",
+            },
+            DecimalCase {
+                primitive: common::PrimitiveType::Decimal64,
+                precision: Some(17),
+                scale: Some(18),
+                expected: "Decimal64 scale 18 must be between 0 and precision 17",
+            },
+            DecimalCase {
+                primitive: common::PrimitiveType::Decimal128,
+                precision: Some(37),
+                scale: Some(38),
+                expected: "Decimal128 scale 38 must be between 0 and precision 37",
+            },
+            DecimalCase {
+                primitive: common::PrimitiveType::Decimal256,
+                precision: Some(75),
+                scale: Some(76),
+                expected: "Decimal256 scale 76 must be between 0 and precision 75",
+            },
+        ];
+
+        for case in decimal_cases {
+            let desc = scalar_desc(case.primitive, case.precision, case.scale, None);
+            assert_eq!(decode_type(&desc).unwrap_err(), case.expected);
+        }
+
+        let datetime = scalar_desc(common::PrimitiveType::Datetime, None, None, Some(99));
+        assert_eq!(
+            decode_type(&datetime).unwrap_err(),
+            "unsupported DATETIME time_unit 99; only unset/2/3 supported"
+        );
+    }
+
+    #[test]
+    fn malformed_map_and_struct_descs_report_stable_first_errors() {
+        let valid_int = scalar_desc(common::PrimitiveType::Int, None, None, None);
+        let malformed = common::TypeDesc { kind: None };
+
+        let map_key_missing_before_malformed_value = common::TypeDesc {
+            kind: Some(common::type_desc::Kind::Map(Box::new(common::MapType {
+                key: None,
+                value: Some(Box::new(malformed.clone())),
+            }))),
+        };
+        assert_eq!(
+            decode_type(&map_key_missing_before_malformed_value).unwrap_err(),
+            "MapType.key missing"
+        );
+
+        let map_value_missing_after_valid_key = common::TypeDesc {
+            kind: Some(common::type_desc::Kind::Map(Box::new(common::MapType {
+                key: Some(Box::new(valid_int.clone())),
+                value: None,
+            }))),
+        };
+        assert_eq!(
+            decode_type(&map_value_missing_after_valid_key).unwrap_err(),
+            "MapType.value missing"
+        );
+
+        let struct_first_type_missing_before_later_malformed = common::TypeDesc {
+            kind: Some(common::type_desc::Kind::Strct(common::StructType {
+                fields: vec![
+                    common::StructField {
+                        name: "first".to_string(),
+                        r#type: None,
+                    },
+                    common::StructField {
+                        name: "later".to_string(),
+                        r#type: Some(malformed),
+                    },
+                ],
+            })),
+        };
+        assert_eq!(
+            decode_type(&struct_first_type_missing_before_later_malformed).unwrap_err(),
+            "StructField.type missing"
+        );
+
+        let struct_later_type_missing_after_valid_first = common::TypeDesc {
+            kind: Some(common::type_desc::Kind::Strct(common::StructType {
+                fields: vec![
+                    common::StructField {
+                        name: "first".to_string(),
+                        r#type: Some(valid_int),
+                    },
+                    common::StructField {
+                        name: "later".to_string(),
+                        r#type: None,
+                    },
+                ],
+            })),
+        };
+        assert_eq!(
+            decode_type(&struct_later_type_missing_after_valid_first).unwrap_err(),
+            "StructField.type missing"
         );
     }
 }
