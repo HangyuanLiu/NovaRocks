@@ -3070,23 +3070,28 @@ mod tests {
 
     #[test]
     fn empty_runtime_filter_graph_is_wire_neutral_and_bound_node_filters_still_encode() {
-        let mut source = single_fragment_router_plan_for_test();
+        let mut source = two_fragment_stream_plan_for_test();
+        let mut second_target = source.fragments[1].clone();
+        second_target.fragment_id = 2;
+        second_target.root.fragment_id = 2;
+        second_target.root.node_id = 21;
+        source.fragments.push(second_target);
         let build_expr = TypedExpr {
             kind: ExprKind::ColumnRef {
-                column_id: ColumnId::new_for_test(3),
+                column_id: ColumnId::new_for_test(2),
                 qualifier: None,
-                column: "bucket".to_string(),
+                column: "delta".to_string(),
             },
-            data_type: DataType::Int32,
+            data_type: DataType::Int64,
             nullable: false,
         };
         let probe_expr = TypedExpr {
             kind: ExprKind::ColumnRef {
-                column_id: ColumnId::new_for_test(2),
+                column_id: ColumnId::new_for_test(1),
                 qualifier: None,
-                column: "route".to_string(),
+                column: "old".to_string(),
             },
-            data_type: DataType::Int32,
+            data_type: DataType::Int64,
             nullable: false,
         };
         source.fragments[0]
@@ -3100,8 +3105,8 @@ mod tests {
                     expr_order: 2,
                     execution_mode: JoinExecutionMode::Partitioned,
                 },
-                source_fragment_id: 0,
-                target_fragment_ids: vec![0],
+                source_fragment_id: 1,
+                target_fragment_ids: vec![0, 2],
             });
         source.fragments[0]
             .root
@@ -3111,7 +3116,7 @@ mod tests {
                     filter_id: 41,
                     probe_expr: probe_expr.clone(),
                 },
-                source_fragment_id: 0,
+                source_fragment_id: 1,
             });
 
         let encoded_source = encode_distributed_plan(&source).expect("encode source plan");
@@ -3138,8 +3143,8 @@ mod tests {
             encoded_build.execution_mode,
             plan::JoinExecutionMode::Partitioned as i32
         );
-        assert_eq!(encoded_build.source_fragment_id, 0);
-        assert_eq!(encoded_build.target_fragment_ids, vec![0]);
+        assert_eq!(encoded_build.source_fragment_id, 1);
+        assert_eq!(encoded_build.target_fragment_ids, vec![0, 2]);
         assert_eq!(root.probe_runtime_filters.len(), 1);
         let encoded_probe = &root.probe_runtime_filters[0];
         assert_eq!(encoded_probe.filter_id, 41);
@@ -3147,7 +3152,7 @@ mod tests {
             encoded_probe.probe_expr,
             Some(encode_expr(&probe_expr).expect("encode expected probe expr"))
         );
-        assert_eq!(encoded_probe.source_fragment_id, 0);
+        assert_eq!(encoded_probe.source_fragment_id, 1);
     }
 
     #[test]
