@@ -9798,7 +9798,7 @@ fn nidl_d3f_native_scan_range_proto_is_file_only() {
 fn nidl_d3f_native_runtime_layers_do_not_import_thrift_scan_ranges() {
     let repo = Path::new(manifest_dir());
     let guarded_files = [
-        "src/runtime/scheduler.rs",
+        "src/coordinator/scheduler/mod.rs",
         "src/sql/codegen/proto_encode/instance.rs",
     ];
     let forbidden = ["TScanRangeParams", "THdfsScanRange", "TInternalScanRange"];
@@ -10088,7 +10088,7 @@ fn nidl_d3e_native_runtime_routing_has_no_thrift_shaped_endpoint_model() {
     }
 
     let checked_sources = [
-        "src/runtime/scheduler.rs",
+        "src/coordinator/scheduler/mod.rs",
         "src/sql/codegen/proto_encode/instance.rs",
     ];
     for source in checked_sources {
@@ -10243,7 +10243,7 @@ fn nidl_d3k_native_dynamic_sink_partition_does_not_roundtrip_thrift_partition() 
         );
     }
 
-    let scheduler = fs::read_to_string(repo.join("src/runtime/scheduler.rs")).unwrap();
+    let scheduler = fs::read_to_string(repo.join("src/coordinator/scheduler/mod.rs")).unwrap();
     for forbidden in [
         "use crate::thrift::partitions::TPartitionType;",
         "Vec<(FragmentId, TPartitionType, FragmentStreamKind)>",
@@ -10251,7 +10251,7 @@ fn nidl_d3k_native_dynamic_sink_partition_does_not_roundtrip_thrift_partition() 
     ] {
         if scheduler.contains(forbidden) {
             violations.push(format!(
-                "src/runtime/scheduler.rs: scheduling topology must use native edge.output_partition, not compat thrift partition via `{forbidden}`"
+                "src/coordinator/scheduler/mod.rs: scheduling topology must use native edge.output_partition, not compat thrift partition via `{forbidden}`"
             ));
         }
     }
@@ -13935,11 +13935,11 @@ fn nidl_d3l_native_mainline_thrift_usage_is_explicitly_allowlisted() {
     let repo = Path::new(manifest_dir());
     let mut violations = Vec::new();
 
-    let scheduler = fs::read_to_string(repo.join("src/runtime/scheduler.rs")).unwrap();
+    let scheduler = fs::read_to_string(repo.join("src/coordinator/scheduler/mod.rs")).unwrap();
     let scheduler = rust_production_text_without_cfg_test(&scheduler);
     push_forbidden_terms(
         &mut violations,
-        "src/runtime/scheduler.rs",
+        "src/coordinator/scheduler/mod.rs",
         &scheduler,
         &[
             "fragment_sink_is_terminal_write_sink",
@@ -16292,11 +16292,11 @@ fn nidl_e4_scheduler_and_coordinator_use_native_scheduling_metadata() {
         );
     }
 
-    let scheduler = fs::read_to_string(repo.join("src/runtime/scheduler.rs")).unwrap();
+    let scheduler = fs::read_to_string(repo.join("src/coordinator/scheduler/mod.rs")).unwrap();
     let scheduler_prod = rust_production_text_without_cfg_test(&scheduler);
     nidl_e4_push_forbidden_code_terms(
         &mut violations,
-        "src/runtime/scheduler.rs",
+        "src/coordinator/scheduler/mod.rs",
         &scheduler_prod,
         &[
             "FragmentBuildResult",
@@ -16315,7 +16315,7 @@ fn nidl_e4_scheduler_and_coordinator_use_native_scheduling_metadata() {
             "fragments: &[FragmentSchedulingMetadata]",
         ) {
             violations.push(format!(
-                "src/runtime/scheduler.rs: {fn_name} signature must accept FragmentSchedulingMetadata"
+                "src/coordinator/scheduler/mod.rs: {fn_name} signature must accept FragmentSchedulingMetadata"
             ));
         }
     }
@@ -17043,5 +17043,25 @@ fn coor_1_grpc_report_ingress_uses_coordinator_port() {
             !grpc.contains(forbidden),
             "gRPC transport owns runtime report logic: {forbidden}"
         );
+    }
+}
+
+#[test]
+fn coor_2_scheduler_owner_is_top_level_and_snapshot_is_shared() {
+    let repo = Path::new(manifest_dir());
+    let scheduler_path = repo.join("src/coordinator/scheduler/mod.rs");
+    let legacy_path = repo.join(["src/runtime/", "scheduler.rs"].concat());
+    assert!(scheduler_path.is_file());
+    assert!(!legacy_path.exists());
+    let scheduler = rust_sanitized_production_text(
+        &fs::read_to_string(scheduler_path).expect("read coordinator scheduler"),
+    );
+    for required in [
+        "pub(crate) struct LiveBackendSnapshot",
+        "pub(crate) struct FragmentScheduler",
+        "pub(crate) struct SchedulingPlan",
+        "pub(crate) struct FragmentInstancePlacement",
+    ] {
+        assert!(scheduler.contains(required), "missing {required}");
     }
 }

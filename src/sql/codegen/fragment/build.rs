@@ -2615,7 +2615,7 @@ mod tests {
                 );
             }
         }
-        let scheduler = crate::runtime::scheduler::FragmentScheduler::new(vec![
+        let scheduler = crate::coordinator::scheduler::FragmentScheduler::new(vec![
             "127.0.0.1:19001".parse().unwrap(),
             "127.0.0.1:19002".parse().unwrap(),
             "127.0.0.1:19003".parse().unwrap(),

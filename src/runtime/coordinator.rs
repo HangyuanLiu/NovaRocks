@@ -44,14 +44,14 @@ use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
 use crate::coordinator::dispatch::{FetchOutcome, FragmentDispatcher, FragmentSubmission};
 use crate::coordinator::ports::{CoordinatorExecutionPorts, CoordinatorObserver};
+use crate::coordinator::scheduler::{
+    FragmentInstancePlacement, FragmentScheduler, topological_sort_bottom_up,
+};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::novarocks_logging::debug;
 use crate::runtime::profile::RuntimeProfileTree;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::query_state::QueryState;
-use crate::runtime::scheduler::{
-    FragmentInstancePlacement, FragmentScheduler, topological_sort_bottom_up,
-};
 use crate::runtime::write_coordinator::{
     WriteAbortInput, WriteCommitInput, WriteCoordinator, WriterKey, register_query,
     unregister_query,
@@ -179,12 +179,12 @@ impl ExecutionCoordinator {
             root_fragment_id,
             &boundary_schemas,
         )?;
-        let live = scheduler.live_backend_entries().to_vec();
+        let live = scheduler.live_backend_snapshot().entries();
         let mut plan =
-            scheduler.assign_with_live(&fragment_schedules, &edges, query_id.clone(), &live)?;
-        scheduler.fill_destinations_with_live(&mut plan, &edges, &live)?;
+            scheduler.assign_with_live(&fragment_schedules, &edges, query_id.clone(), live)?;
+        scheduler.fill_destinations_with_live(&mut plan, &edges, live)?;
         if let Some(rf) = rf_plan.as_ref() {
-            scheduler.fill_runtime_filter_params_with_live(&mut plan, rf, &live)?;
+            scheduler.fill_runtime_filter_params_with_live(&mut plan, rf, live)?;
         }
         scheduler.fill_per_exch_num_senders(&mut plan, &edges);
         validate_native_scheduling_plan(&fragment_schedules, &native_fragments_by_id, &plan)?;
@@ -898,7 +898,7 @@ fn validate_fragment_schedule_payloads(
 fn validate_native_scheduling_plan(
     fragment_schedules: &[FragmentSchedulingMetadata],
     native_fragments: &BTreeMap<FragmentId, crate::proto::plan::PlanFragment>,
-    plan: &crate::runtime::scheduler::SchedulingPlan,
+    plan: &crate::coordinator::scheduler::SchedulingPlan,
 ) -> Result<(), String> {
     let schedule_ids: BTreeSet<FragmentId> =
         fragment_schedules.iter().map(|fr| fr.fragment_id).collect();
@@ -2437,7 +2437,7 @@ mod native_contract_tests {
                 },
             ),
         ]);
-        let plan = crate::runtime::scheduler::SchedulingPlan {
+        let plan = crate::coordinator::scheduler::SchedulingPlan {
             root_fragment_id: 7,
             by_fragment: BTreeMap::from([(7, vec![placement(7, 7)])]),
             root_finst_id: UniqueId { hi: 92_000, lo: 7 },
@@ -2472,7 +2472,7 @@ mod native_contract_tests {
                 },
             ),
         ]);
-        let plan = crate::runtime::scheduler::SchedulingPlan {
+        let plan = crate::coordinator::scheduler::SchedulingPlan {
             root_fragment_id: 7,
             by_fragment: BTreeMap::from([(3, Vec::new()), (7, vec![placement(7, 7)])]),
             root_finst_id: UniqueId { hi: 92_000, lo: 7 },
@@ -2498,7 +2498,7 @@ mod native_contract_tests {
                 ..Default::default()
             },
         )]);
-        let plan = crate::runtime::scheduler::SchedulingPlan {
+        let plan = crate::coordinator::scheduler::SchedulingPlan {
             root_fragment_id: 7,
             by_fragment: BTreeMap::from([(7, vec![placement(8, 7)])]),
             root_finst_id: UniqueId { hi: 92_000, lo: 7 },

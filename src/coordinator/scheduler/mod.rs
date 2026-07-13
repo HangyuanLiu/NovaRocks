@@ -67,7 +67,26 @@ use crate::sql::planner::distributed::{
     FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind, PartitionKind,
 };
 
-type LiveBackend = (usize, SocketAddr);
+pub(crate) type LiveBackend = (usize, SocketAddr);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LiveBackendSnapshot {
+    entries: Vec<LiveBackend>,
+}
+
+impl LiveBackendSnapshot {
+    pub(crate) fn new(entries: Vec<LiveBackend>) -> Self {
+        Self { entries }
+    }
+
+    pub(crate) fn from_endpoints(backends: Vec<SocketAddr>) -> Self {
+        Self::new(backends.into_iter().enumerate().collect())
+    }
+
+    pub(crate) fn entries(&self) -> &[LiveBackend] {
+        &self.entries
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct IncomingEdge {
@@ -123,25 +142,30 @@ pub(crate) struct SchedulingPlan {
 /// Decides which backend each fragment instance lands on.
 pub(crate) struct FragmentScheduler {
     backends: Vec<SocketAddr>,
-    live_backends: Vec<LiveBackend>,
+    live_backend_snapshot: LiveBackendSnapshot,
 }
 
 impl FragmentScheduler {
     /// Create a new scheduler with the given backends.
     pub(crate) fn new(backends: Vec<SocketAddr>) -> Self {
-        let live_backends = backends.iter().copied().enumerate().collect();
-        Self {
-            backends,
-            live_backends,
-        }
+        Self::from_live_backend_snapshot(LiveBackendSnapshot::from_endpoints(backends))
     }
 
     /// Create a scheduler from explicit backend ids and endpoints.
     pub(crate) fn new_with_backend_ids(backends: Vec<LiveBackend>) -> Self {
-        let endpoints = backends.iter().map(|(_, endpoint)| *endpoint).collect();
+        Self::from_live_backend_snapshot(LiveBackendSnapshot::new(backends))
+    }
+
+    /// Create a scheduler from the immutable live backend snapshot shared by bootstrap.
+    pub(crate) fn from_live_backend_snapshot(live_backend_snapshot: LiveBackendSnapshot) -> Self {
+        let backends = live_backend_snapshot
+            .entries()
+            .iter()
+            .map(|(_, endpoint)| *endpoint)
+            .collect();
         Self {
-            backends: endpoints,
-            live_backends: backends,
+            backends,
+            live_backend_snapshot,
         }
     }
 
@@ -150,9 +174,9 @@ impl FragmentScheduler {
         &self.backends
     }
 
-    /// Return the live backend-id/endpoint snapshot used by this scheduler.
-    pub(crate) fn live_backend_entries(&self) -> &[LiveBackend] {
-        &self.live_backends
+    /// Return the immutable live backend snapshot owned by this scheduler.
+    pub(crate) fn live_backend_snapshot(&self) -> &LiveBackendSnapshot {
+        &self.live_backend_snapshot
     }
 
     /// Assign each fragment to one or more instances across the known backends.
@@ -167,8 +191,12 @@ impl FragmentScheduler {
         edges: &[FragmentEdge],
         query_id: UniqueId,
     ) -> Result<SchedulingPlan, String> {
-        let live = self.full_live_snapshot();
-        self.assign_with_live(fragments, edges, query_id, &live)
+        self.assign_with_live(
+            fragments,
+            edges,
+            query_id,
+            self.live_backend_snapshot.entries(),
+        )
     }
 
     pub(crate) fn assign_with_live(
@@ -371,8 +399,7 @@ impl FragmentScheduler {
     /// `FragmentDestination` entries are built, and the full list is appended
     /// to every source-fragment instance's `destinations` vec.
     pub(crate) fn fill_destinations(&self, plan: &mut SchedulingPlan, edges: &[FragmentEdge]) {
-        let live = self.full_live_snapshot();
-        self.fill_destinations_with_live(plan, edges, &live)
+        self.fill_destinations_with_live(plan, edges, self.live_backend_snapshot.entries())
             .expect("configured backend snapshot should resolve all placements");
     }
 
@@ -424,9 +451,12 @@ impl FragmentScheduler {
         plan: &mut SchedulingPlan,
         rf_plan: &RuntimeFilterPlanResult,
     ) {
-        let live = self.full_live_snapshot();
-        self.fill_runtime_filter_params_with_live(plan, rf_plan, &live)
-            .expect("configured backend snapshot should resolve all placements");
+        self.fill_runtime_filter_params_with_live(
+            plan,
+            rf_plan,
+            self.live_backend_snapshot.entries(),
+        )
+        .expect("configured backend snapshot should resolve all placements");
     }
 
     pub(crate) fn fill_runtime_filter_params_with_live(
@@ -506,10 +536,6 @@ impl FragmentScheduler {
                 }
             }
         }
-    }
-
-    fn full_live_snapshot(&self) -> Vec<LiveBackend> {
-        self.live_backends.clone()
     }
 }
 

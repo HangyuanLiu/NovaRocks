@@ -57,7 +57,6 @@ pub mod runtime_filter_worker;
 pub mod runtime_state;
 pub mod scan_executor;
 pub(crate) mod scan_range;
-pub(crate) mod scheduler;
 pub mod sink_commit;
 #[cfg(feature = "compat")]
 pub(crate) mod sink_commit_wire;

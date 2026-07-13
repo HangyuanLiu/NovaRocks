@@ -3796,7 +3796,7 @@ pub(crate) fn execute_logical_plan_with_options(
 fn coordinated_execution_services() -> Result<
     (
         crate::coordinator::ports::CoordinatorExecutionPorts,
-        Arc<crate::runtime::scheduler::FragmentScheduler>,
+        Arc<crate::coordinator::scheduler::FragmentScheduler>,
     ),
     String,
 > {
@@ -3807,13 +3807,16 @@ fn coordinated_execution_services() -> Result<
     let (dispatcher, scheduler) = match role {
         ClusterRole::Fe | ClusterRole::AllInOne => {
             let entries = backend_ops::live_backend_dispatch_entries()?;
+            let snapshot = crate::coordinator::scheduler::LiveBackendSnapshot::new(entries);
             let dispatcher = Arc::new(
                 crate::service::grpc_fragment_dispatcher::RemoteDispatcher::new_with_backend_ids(
-                    &entries,
+                    snapshot.entries(),
                 )?,
             );
             let scheduler = Arc::new(
-                crate::runtime::scheduler::FragmentScheduler::new_with_backend_ids(entries),
+                crate::coordinator::scheduler::FragmentScheduler::from_live_backend_snapshot(
+                    snapshot,
+                ),
             );
             (
                 dispatcher as Arc<dyn crate::coordinator::dispatch::FragmentDispatcher>,
@@ -8761,7 +8764,10 @@ path = "meta/operations.sqlite"
             super::coordinated_execution_services().expect("coordinated services");
 
         assert_eq!(execution_ports.dispatcher.backend_count(), 1);
-        assert_eq!(scheduler.live_backend_entries(), &[(2usize, endpoint)]);
+        assert_eq!(
+            scheduler.live_backend_snapshot().entries(),
+            &[(2usize, endpoint)]
+        );
     }
 
     fn install_optimizer_backend_count_config(
