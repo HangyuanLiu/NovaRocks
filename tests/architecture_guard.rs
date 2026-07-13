@@ -15961,6 +15961,28 @@ fn psm_8_physical_bridge_vocabulary_is_explicit() {
     assert!(id_binding.contains("fn verify_optimized_tree_id_binding("));
     assert!(physical.contains("fn materialize_physical_plan("));
 
+    for relative in [
+        "engine/mod.rs",
+        "sql/planner/logical/build/tests.rs",
+        "sql/planner/imv_rewrite/entrypoint.rs",
+        "sql/planner/imv_rewrite/join_refresh_builder.rs",
+        "sql/codegen/ir/explain.rs",
+    ] {
+        let file = src_dir().join(relative);
+        let text = fs::read_to_string(&file).unwrap();
+        for (line_index, line) in text.lines().enumerate() {
+            if line.contains("to_physical_plan(&") {
+                assert!(
+                    line.contains("to_physical_plan(&optimized_tree)"),
+                    "{}:{} must pass optimized_tree directly to to_physical_plan: {}",
+                    rel(&file),
+                    line_index + 1,
+                    line.trim()
+                );
+            }
+        }
+    }
+
     let retired_verify = ["verify_optimizer", "_id_binding"].concat();
     let retired_materialize = ["optimizer_physical", "_to_plan"].concat();
     for root in [src_dir(), Path::new(manifest_dir()).join("tests")] {

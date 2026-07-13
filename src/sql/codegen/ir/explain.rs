@@ -1616,10 +1616,11 @@ mod tests {
 
     #[test]
     fn normal_scan_project_agg_renders_node_id_prefixes() {
-        let mut optimizer = aggregate_count_plan(project_plan(scan_plan()));
-        prepare_bridge2_test_props(&mut optimizer);
-        let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
-            .expect("convert optimizer physical plan");
+        let mut optimized_tree = aggregate_count_plan(project_plan(scan_plan()));
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
         let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
 
@@ -1633,10 +1634,11 @@ mod tests {
 
     #[test]
     fn shared_distributed_formatter_path_covers_scan_and_project() {
-        let mut optimizer = project_plan(scan_plan());
-        prepare_bridge2_test_props(&mut optimizer);
-        let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
-            .expect("convert optimizer physical plan");
+        let mut optimized_tree = project_plan(scan_plan());
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
         let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
         let root = &distributed_plan
@@ -1709,13 +1711,14 @@ mod tests {
 
     #[test]
     fn verbose_shuffle_agg_renders_fragments_and_exchange() {
-        let mut optimizer = aggregate_count_plan(distribution_plan(
+        let mut optimized_tree = aggregate_count_plan(distribution_plan(
             scan_plan(),
             DistributionSpec::shuffle_agg([ColumnId::new_for_test(1)]),
         ));
-        prepare_bridge2_test_props(&mut optimizer);
-        let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
-            .expect("convert optimizer physical plan");
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
         let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
 
@@ -1729,10 +1732,11 @@ mod tests {
 
     #[test]
     fn sort_with_partition_limit_renders_topn_suffix() {
-        let mut optimizer = sort_with_partition_limit_plan(scan_plan());
-        prepare_bridge2_test_props(&mut optimizer);
-        let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
-            .expect("convert optimizer physical plan");
+        let mut optimized_tree = sort_with_partition_limit_plan(scan_plan());
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
         let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
 
@@ -1746,8 +1750,8 @@ mod tests {
 
     #[test]
     fn costs_renders_colstats_from_ir_stats_only_at_costs_level() {
-        let mut scan = scan_plan();
-        scan.stats.column_statistics.insert(
+        let mut optimized_tree = scan_plan();
+        optimized_tree.stats.column_statistics.insert(
             ColumnId::new_for_test(1),
             ColumnStatistic {
                 min_value: 0.0,
@@ -1757,9 +1761,10 @@ mod tests {
                 ..ColumnStatistic::for_test_with_ndv(1000.0, Confidence::Exact)
             },
         );
-        prepare_bridge2_test_props(&mut scan);
-        let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&scan)
-            .expect("convert optimizer physical plan");
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
         let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
 
@@ -1783,8 +1788,8 @@ mod tests {
 
     #[test]
     fn costs_colstats_ndv_uses_scientific_not_i64_saturation_for_huge_values() {
-        let mut scan = scan_plan();
-        scan.stats.column_statistics.insert(
+        let mut optimized_tree = scan_plan();
+        optimized_tree.stats.column_statistics.insert(
             ColumnId::new_for_test(1),
             ColumnStatistic {
                 min_value: 0.0,
@@ -1794,9 +1799,10 @@ mod tests {
                 ..ColumnStatistic::for_test_with_ndv(1.0e300, Confidence::Exact)
             },
         );
-        prepare_bridge2_test_props(&mut scan);
-        let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&scan)
-            .expect("convert optimizer physical plan");
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
         let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
 
@@ -1813,10 +1819,11 @@ mod tests {
 
     #[test]
     fn costs_level_renders_dimensional_costs() {
-        let mut optimizer = scan_plan();
-        prepare_bridge2_test_props(&mut optimizer);
-        let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
-            .expect("convert optimizer physical plan");
+        let mut optimized_tree = scan_plan();
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
         let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
 
@@ -1956,10 +1963,11 @@ mod tests {
 
     #[test]
     fn hash_join_line_places_broadcast_tokens_at_the_expected_levels() {
-        let mut optimizer = inner_join_two_values();
-        prepare_bridge2_test_props(&mut optimizer);
-        let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
-            .expect("convert optimizer physical plan");
+        let mut optimized_tree = inner_join_two_values();
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
         let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
 
@@ -1998,10 +2006,11 @@ mod tests {
 
     #[test]
     fn detailed_ir_explain_shows_build_and_probe_rf_but_normal_hides_them() {
-        let mut join = inner_join_two_values();
-        prepare_bridge2_test_props(&mut join);
-        let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&join)
-            .expect("convert optimizer physical plan");
+        let mut optimized_tree = inner_join_two_values();
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
         let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
 
@@ -2034,10 +2043,11 @@ mod tests {
 
     #[test]
     fn analyze_renders_actuals_for_nodes_present_in_map_only() {
-        let mut optimizer = aggregate_count_plan(project_plan(scan_plan()));
-        prepare_bridge2_test_props(&mut optimizer);
-        let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
-            .expect("convert optimizer physical plan");
+        let mut optimized_tree = aggregate_count_plan(project_plan(scan_plan()));
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
         let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
         let mut actuals = HashMap::new();
@@ -2092,10 +2102,11 @@ mod tests {
 
     #[test]
     fn analyze_renders_per_fragment_profile_under_fragment_header() {
-        let mut optimizer = aggregate_count_plan(project_plan(scan_plan()));
-        prepare_bridge2_test_props(&mut optimizer);
-        let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
-            .expect("convert optimizer physical plan");
+        let mut optimized_tree = aggregate_count_plan(project_plan(scan_plan()));
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
         let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
         let actuals = HashMap::new();
@@ -2139,10 +2150,11 @@ mod tests {
 
     #[test]
     fn actual_suffix_renders_phase_timers_and_minmax() {
-        let mut optimizer = aggregate_count_plan(project_plan(scan_plan()));
-        prepare_bridge2_test_props(&mut optimizer);
-        let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
-            .expect("convert optimizer physical plan");
+        let mut optimized_tree = aggregate_count_plan(project_plan(scan_plan()));
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
         let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
         let mut actuals = HashMap::new();
@@ -2184,10 +2196,11 @@ mod tests {
 
     #[test]
     fn actual_suffix_renders_dictionary_metrics_when_present() {
-        let mut optimizer = aggregate_count_plan(project_plan(scan_plan()));
-        prepare_bridge2_test_props(&mut optimizer);
-        let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
-            .expect("convert optimizer physical plan");
+        let mut optimized_tree = aggregate_count_plan(project_plan(scan_plan()));
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
         let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
         let mut actuals = HashMap::new();
@@ -2226,10 +2239,11 @@ mod tests {
 
     #[test]
     fn actual_suffix_clamps_negative_min_time() {
-        let mut optimizer = aggregate_count_plan(project_plan(scan_plan()));
-        prepare_bridge2_test_props(&mut optimizer);
-        let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
-            .expect("convert optimizer physical plan");
+        let mut optimized_tree = aggregate_count_plan(project_plan(scan_plan()));
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
         let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
         let mut actuals = HashMap::new();
@@ -2265,10 +2279,11 @@ mod tests {
 
     #[test]
     fn analyze_without_actuals_matches_existing_explain() {
-        let mut optimizer = aggregate_count_plan(project_plan(scan_plan()));
-        prepare_bridge2_test_props(&mut optimizer);
-        let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
-            .expect("convert optimizer physical plan");
+        let mut optimized_tree = aggregate_count_plan(project_plan(scan_plan()));
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
         let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
         let actuals = HashMap::new();
@@ -2286,12 +2301,13 @@ mod tests {
 
     #[test]
     fn aggregate_group_display_does_not_match_descendant_scan_by_name_only() {
-        let mut optimizer = aggregate_count_on_projected_id_plan(project_alias_collision_plan(
-            alias_collision_scan_plan(),
-        ));
-        prepare_bridge2_test_props(&mut optimizer);
-        let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
-            .expect("convert optimizer physical plan");
+        let mut optimized_tree = aggregate_count_on_projected_id_plan(
+            project_alias_collision_plan(alias_collision_scan_plan()),
+        );
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
         let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
 
