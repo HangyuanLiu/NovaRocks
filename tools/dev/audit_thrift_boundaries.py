@@ -157,6 +157,7 @@ BASELINE: dict[str, BaselineEntry] = {
     "src/runtime/profile.rs": BaselineEntry("legal-boundary", "control-plane-wire", 1, "Runtime profile stores FE-compatible profile metadata"),
     "src/coordinator/profile/mod.rs": BaselineEntry("domain-leak", "control-plane", 0, "Coordinator query profile registry decodes native profile reports"),
     "src/coordinator/profile/correlate.rs": BaselineEntry("domain-leak", "control-plane", 0, "Coordinator profile correlation consumes native runtime profile trees"),
+    "src/coordinator/report.rs": BaselineEntry("domain-leak", "control-plane", 0, "Coordinator report handling consumes native exec-status reports"),
     "src/runtime/result_buffer.rs": BaselineEntry("legal-boundary", "control-plane-wire", 3, "Result buffer exports FE-compatible result metadata"),
     "src/runtime/runtime_state.rs": BaselineEntry("legal-boundary", "control-plane-wire", 7, "Runtime state carries FE-compatible payload references"),
     "src/runtime/native_fragment_wire.rs": BaselineEntry("domain-leak", "control-plane", 0, "Native fragment wire adapter consumes NovaRocks Proto only"),

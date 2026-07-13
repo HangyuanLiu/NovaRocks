@@ -45,12 +45,12 @@ use crate::common::types::format_uuid;
 #[cfg(feature = "compat")]
 use crate::connector::starrocks::starmgr;
 use crate::coordinator::ports::CoordinatorReportHandler;
+use crate::coordinator::report::CoordinatorExecStatusReportHandler;
 #[cfg(feature = "compat")]
 use crate::novarocks_logging::warn;
 use crate::novarocks_logging::{error, info};
 #[cfg(feature = "compat")]
 use crate::runtime::starlet_shard_registry;
-use crate::service::grpc_coordinator_adapter::LegacyCoordinatorReportHandler;
 use crate::service::internal_rpc;
 #[cfg(feature = "compat")]
 use crate::service::stream_load_http;
@@ -103,7 +103,7 @@ impl Default for GrpcService {
 
 impl GrpcService {
     pub fn full_execution() -> Self {
-        Self::full_execution_with_report_handler(Arc::new(LegacyCoordinatorReportHandler))
+        Self::full_execution_with_report_handler(Arc::new(CoordinatorExecStatusReportHandler))
     }
 
     pub(crate) fn full_execution_with_report_handler(
@@ -116,7 +116,7 @@ impl GrpcService {
     }
 
     pub fn report_only() -> Self {
-        Self::report_only_with_report_handler(Arc::new(LegacyCoordinatorReportHandler))
+        Self::report_only_with_report_handler(Arc::new(CoordinatorExecStatusReportHandler))
     }
 
     pub(crate) fn report_only_with_report_handler(

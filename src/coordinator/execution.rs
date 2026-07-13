@@ -34,7 +34,7 @@
 //! wiring exactly.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -47,6 +47,7 @@ use crate::coordinator::ports::{CoordinatorExecutionPorts, CoordinatorObserver};
 use crate::coordinator::profile::{
     StandaloneQueryProfileGuard, standalone_query_profile_count, take_standalone_query_profiles,
 };
+use crate::coordinator::report::{StandaloneQueryFailureGuard, take_standalone_query_failure};
 use crate::coordinator::scheduler::{
     FragmentInstancePlacement, FragmentScheduler, topological_sort_bottom_up,
 };
@@ -1402,68 +1403,6 @@ pub(crate) fn poll_write_failure_and_cancel(
         .expect("write coordinator lock")
         .mark_canceled_except_finished(reason.clone());
     Err(reason)
-}
-
-#[derive(Default)]
-struct StandaloneQueryFailureRegistry {
-    active: BTreeSet<(i64, i64)>,
-    failures: BTreeMap<(i64, i64), String>,
-}
-
-fn standalone_query_failures() -> &'static Mutex<StandaloneQueryFailureRegistry> {
-    static REGISTRY: OnceLock<Mutex<StandaloneQueryFailureRegistry>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(StandaloneQueryFailureRegistry::default()))
-}
-
-fn query_failure_key(query_id: &UniqueId) -> (i64, i64) {
-    (query_id.hi, query_id.lo)
-}
-
-pub(crate) fn record_standalone_query_failure(
-    query_id: crate::runtime::query_context::QueryId,
-    error: String,
-) {
-    let key = (query_id.hi, query_id.lo);
-    let mut guard = standalone_query_failures()
-        .lock()
-        .expect("standalone query failure registry lock");
-    if guard.active.contains(&key) {
-        guard.failures.entry(key).or_insert(error);
-    }
-}
-
-fn take_standalone_query_failure(query_id: &UniqueId) -> Option<String> {
-    standalone_query_failures()
-        .lock()
-        .expect("standalone query failure registry lock")
-        .failures
-        .remove(&query_failure_key(query_id))
-}
-
-struct StandaloneQueryFailureGuard {
-    key: (i64, i64),
-}
-
-impl StandaloneQueryFailureGuard {
-    fn register(query_id: &UniqueId) -> Self {
-        let key = query_failure_key(query_id);
-        let mut guard = standalone_query_failures()
-            .lock()
-            .expect("standalone query failure registry lock");
-        guard.failures.remove(&key);
-        guard.active.insert(key);
-        Self { key }
-    }
-}
-
-impl Drop for StandaloneQueryFailureGuard {
-    fn drop(&mut self) {
-        let mut guard = standalone_query_failures()
-            .lock()
-            .expect("standalone query failure registry lock");
-        guard.active.remove(&self.key);
-        guard.failures.remove(&self.key);
-    }
 }
 
 #[derive(Debug)]

@@ -17211,3 +17211,86 @@ fn coor_2_query_profile_control_plane_is_top_level() {
         "retired runtime profile correlation must not retain an audit baseline"
     );
 }
+
+#[test]
+fn coor_2_report_handler_is_query_control_plane() {
+    let repo = Path::new(manifest_dir());
+    let report_path = repo.join("src/coordinator/report.rs");
+    assert!(report_path.is_file(), "coordinator report owner must exist");
+
+    let report = rust_sanitized_production_text(
+        &fs::read_to_string(&report_path).expect("read coordinator report owner"),
+    );
+    for required in [
+        "struct CoordinatorExecStatusReportHandler",
+        "impl CoordinatorReportHandler for CoordinatorExecStatusReportHandler",
+        "struct StandaloneQueryFailureRegistry",
+        "struct StandaloneQueryFailureGuard",
+        "mark_query_failed_from_report",
+    ] {
+        assert!(report.contains(required), "report owner missing {required}");
+    }
+
+    let execution = rust_sanitized_production_text(
+        &fs::read_to_string(repo.join("src/coordinator/execution.rs"))
+            .expect("read coordinator execution"),
+    );
+    assert!(!execution.contains("struct StandaloneQueryFailureRegistry"));
+
+    let adapter = rust_sanitized_production_text(
+        &fs::read_to_string(repo.join("src/service/grpc_coordinator_adapter.rs"))
+            .expect("read gRPC coordinator adapter"),
+    );
+    for forbidden in [
+        "impl CoordinatorReportHandler",
+        "WriterReportLookup",
+        "FailedQueryReport",
+        "mark_failed_query_report",
+    ] {
+        assert!(
+            !adapter.contains(forbidden),
+            "service adapter still owns report orchestration: {forbidden}"
+        );
+    }
+
+    let fragment_control = rust_sanitized_production_text(
+        &fs::read_to_string(repo.join("src/service/fragment_control.rs"))
+            .expect("read fragment control"),
+    );
+    assert!(fragment_control.contains("pub fn cancel"));
+    assert!(!fragment_control.contains("mark_query_failed_from_report"));
+
+    assert!(repo.join("src/runtime/write_coordinator.rs").is_file());
+    assert!(repo.join("src/runtime/write_report.rs").is_file());
+    assert!(!repo.join("src/coordinator/write.rs").exists());
+    assert!(!repo.join("src/coordinator/write").exists());
+
+    let mut scanned = 0usize;
+    for path in rs_files(&repo.join("src/coordinator")) {
+        scanned += 1;
+        let production = rust_sanitized_production_text(
+            &fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", rel(&path))),
+        );
+        assert!(
+            !production.contains("crate::service"),
+            "{} imports a service concrete from production coordinator code",
+            rel(&path)
+        );
+    }
+    assert!(scanned > 0, "coordinator production scan must be non-empty");
+
+    let proto = fs::read_to_string(repo.join("idl/novarocks/service.proto"))
+        .expect("read native service IDL");
+    assert!(proto.contains("src/coordinator/report.rs"));
+
+    let audit = fs::read_to_string(repo.join("tools/dev/audit_thrift_boundaries.py"))
+        .expect("read thrift boundary audit");
+    let compact = audit.lines().map(compact_line).collect::<String>();
+    let expected = compact_line(
+        "\"src/coordinator/report.rs\": BaselineEntry(\"domain-leak\", \"control-plane\", 0, \"Coordinator report handling consumes native exec-status reports\"),",
+    );
+    assert!(
+        compact.contains(&expected),
+        "coordinator report owner must have an exact native-only audit baseline"
+    );
+}
