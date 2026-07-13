@@ -361,7 +361,7 @@ mod tests {
     use crate::sql::planner::logical::{
         LogicalAggregateNode, LogicalJoinNode, LogicalPlanKind, LogicalPlanNode, LogicalUnionNode,
     };
-    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
+    use crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr;
     use crate::sql::planner::payload::{
         AggregateCall, PlanFilterNode, PlanProjectNode, PlanScanNode,
     };
@@ -383,14 +383,14 @@ mod tests {
         ));
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let RewriteResult::Changed(rewritten_expr) = rule.apply(expr, &mut ctx).expect("rewrite")
         else {
             panic!("expected Changed(Union)");
         };
         let arena = ctx.scalar_arena();
-        let rewritten = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+        let rewritten = crate::sql::planner::optimizer_bridge::logical::to_logical_plan(
             rewritten_expr,
             &arena.borrow(),
         );
@@ -421,14 +421,14 @@ mod tests {
         ));
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let RewriteResult::Changed(rewritten_expr) = rule.apply(expr, &mut ctx).expect("rewrite")
         else {
             panic!("expected Changed(Union)");
         };
         let arena = ctx.scalar_arena();
-        let rewritten = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+        let rewritten = crate::sql::planner::optimizer_bridge::logical::to_logical_plan(
             rewritten_expr,
             &arena.borrow(),
         );
@@ -456,7 +456,7 @@ mod tests {
         ));
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         let err = rule
             .apply(expr, &mut ctx)
             .expect_err("scan branch must fail");
@@ -491,7 +491,7 @@ mod tests {
         ));
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&expr, &ctx));
     }
 
@@ -509,7 +509,7 @@ mod tests {
         ));
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&expr, &ctx));
     }
 
@@ -531,12 +531,12 @@ mod tests {
         );
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         let out_expr = build_imv_pipeline()
             .rewrite(expr, &mut ctx)
             .expect("pipeline must succeed");
         let arena = ctx.scalar_arena();
-        let out = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+        let out = crate::sql::planner::optimizer_bridge::logical::to_logical_plan(
             out_expr,
             &arena.borrow(),
         );
@@ -1357,12 +1357,12 @@ mod tests {
         let plan = aggregate_over(filtered);
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         let out_expr = build_imv_pipeline()
             .rewrite(expr, &mut ctx)
             .expect("aggregate over filtered join must compose");
         let arena = ctx.scalar_arena();
-        let out = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+        let out = crate::sql::planner::optimizer_bridge::logical::to_logical_plan(
             out_expr,
             &arena.borrow(),
         );
@@ -1385,12 +1385,12 @@ mod tests {
         let plan = aggregate_over(outer);
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         let out_expr = build_imv_pipeline()
             .rewrite(expr, &mut ctx)
             .expect("nested join aggregate must use aggregate change stream");
         let arena = ctx.scalar_arena();
-        let out = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+        let out = crate::sql::planner::optimizer_bridge::logical::to_logical_plan(
             out_expr,
             &arena.borrow(),
         );
@@ -1429,12 +1429,12 @@ mod tests {
         );
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         let out_expr = build_imv_pipeline()
             .rewrite(expr, &mut ctx)
             .expect("branch union of Project-over-Aggregate must compose");
         let arena = ctx.scalar_arena();
-        let out = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+        let out = crate::sql::planner::optimizer_bridge::logical::to_logical_plan(
             out_expr,
             &arena.borrow(),
         );
@@ -1482,12 +1482,12 @@ mod tests {
         );
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         let out_expr = build_imv_pipeline()
             .rewrite(expr, &mut ctx)
             .expect("branch union of aggregate-over-join must compose");
         let arena = ctx.scalar_arena();
-        let out = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+        let out = crate::sql::planner::optimizer_bridge::logical::to_logical_plan(
             out_expr,
             &arena.borrow(),
         );

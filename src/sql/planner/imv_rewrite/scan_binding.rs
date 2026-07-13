@@ -258,7 +258,7 @@ mod tests {
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::imv_rewrite::action_propagation::InjectActionColumnRule;
     use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
-    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
+    use crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr;
 
     fn iceberg_table_info(uuid: Option<&str>) -> IcebergTableInfo {
         IcebergTableInfo {
@@ -372,14 +372,14 @@ mod tests {
             None,
         );
         let bind = BindIcebergScanRule;
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena.borrow_mut());
         let RewriteResult::Changed(changed_expr) =
             bind.apply(expr, &mut ctx).expect("bind must succeed")
         else {
             panic!("expected changed scan");
         };
         let arena_ref = ctx.scalar_arena();
-        let changed = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+        let changed = crate::sql::planner::optimizer_bridge::logical::to_logical_plan(
             changed_expr.clone(),
             &arena_ref.borrow(),
         );
@@ -444,14 +444,14 @@ mod tests {
         );
 
         let bind = BindIcebergScanRule;
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena.borrow_mut());
         let RewriteResult::Changed(changed_expr) =
             bind.apply(expr, &mut ctx).expect("bind must succeed")
         else {
             panic!("expected changed scan");
         };
         let arena_ref = ctx.scalar_arena();
-        let changed = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+        let changed = crate::sql::planner::optimizer_bridge::logical::to_logical_plan(
             changed_expr,
             &arena_ref.borrow(),
         );

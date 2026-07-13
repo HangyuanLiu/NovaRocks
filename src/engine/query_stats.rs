@@ -428,7 +428,7 @@ mod tests {
             "catalog stats source should be visible in query-scoped stats"
         );
 
-        let physical = crate::sql::optimizer::optimize(
+        let optimized_tree = crate::sql::optimizer::optimize(
             opt_expr,
             ScalarArena::new(),
             &plan.snapshot,
@@ -437,7 +437,7 @@ mod tests {
             Vec::new(),
         )
         .expect("optimizer should consume bound catalog stats");
-        assert_eq!(physical.stats.output_row_count, 3.0);
+        assert_eq!(optimized_tree.stats.output_row_count, 3.0);
     }
 
     #[test]

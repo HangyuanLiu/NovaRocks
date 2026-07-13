@@ -16,15 +16,17 @@
 // under the License.
 
 pub(crate) mod id_binding;
+pub(crate) mod logical;
 mod physical;
-pub(crate) mod plan;
 pub(crate) mod property;
 pub(crate) mod scalar;
 
-use crate::sql::optimizer::OptimizerPhysicalNode;
+use crate::sql::optimizer::OptimizedOperatorNode;
 use crate::sql::planner::physical::PhysicalPlanNode;
 
-pub(crate) fn to_physical_plan(plan: &OptimizerPhysicalNode) -> Result<PhysicalPlanNode, String> {
-    id_binding::verify_optimizer_id_binding(plan)?;
-    physical::optimizer_physical_to_plan(plan)
+pub(crate) fn to_physical_plan(
+    optimized: &OptimizedOperatorNode,
+) -> Result<PhysicalPlanNode, String> {
+    id_binding::verify_optimized_tree_id_binding(optimized)?;
+    physical::materialize_physical_plan(optimized)
 }

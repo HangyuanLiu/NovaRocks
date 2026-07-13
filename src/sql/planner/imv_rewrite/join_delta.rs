@@ -1543,7 +1543,7 @@ mod tests {
     use crate::sql::planner::logical::{
         LogicalAggregateNode, LogicalImvVersionNode, LogicalJoinNode, LogicalPlanKind,
     };
-    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
+    use crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr;
     use crate::sql::planner::payload::{PlanProjectNode, PlanScanNode};
 
     #[test]
@@ -1574,11 +1574,11 @@ mod tests {
             None,
         );
         let arena_rc = ctx.scalar_arena();
-        let non_root_expr = logical_plan_to_opt_expr(&non_root, &mut arena_rc.borrow_mut());
+        let non_root_expr = to_optimizer_expr(&non_root, &mut arena_rc.borrow_mut());
         assert!(rule.matches(&non_root_expr, &ctx));
 
         let over_agg = delta(aggregate_over(join_over(JoinKind::Inner)));
-        let over_agg_expr = logical_plan_to_opt_expr(&over_agg, &mut arena_rc.borrow_mut());
+        let over_agg_expr = to_optimizer_expr(&over_agg, &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&over_agg_expr, &ctx));
     }
 
@@ -1597,13 +1597,13 @@ mod tests {
         );
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("expand")
         else {
             panic!("pure join-delta must expand ImvDelta(Join) directly into a Union");
         };
         let arena = ctx.scalar_arena();
-        let changed = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+        let changed = crate::sql::planner::optimizer_bridge::logical::to_logical_plan(
             changed_expr,
             &arena.borrow(),
         );
@@ -1648,13 +1648,13 @@ mod tests {
         );
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("expand")
         else {
             panic!("pure join-delta must expand into a Union");
         };
         let arena = ctx.scalar_arena();
-        let changed = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+        let changed = crate::sql::planner::optimizer_bridge::logical::to_logical_plan(
             changed_expr,
             &arena.borrow(),
         );
@@ -1770,7 +1770,7 @@ mod tests {
         );
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         let err = rule.apply(expr, &mut ctx).expect_err("outer must reject");
         assert!(err.contains("inner/cross"), "unexpected: {err}");
     }
@@ -1792,14 +1792,14 @@ mod tests {
         );
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         let RewriteResult::Changed(changed_expr) =
             rule.apply(expr, &mut ctx).expect("expand outer")
         else {
             panic!("expected Union");
         };
         let arena = ctx.scalar_arena();
-        let changed = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+        let changed = crate::sql::planner::optimizer_bridge::logical::to_logical_plan(
             changed_expr,
             &arena.borrow(),
         );
@@ -1833,7 +1833,7 @@ mod tests {
         );
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         let result = rule
             .apply(expr, &mut ctx)
             .expect("early join-delta rewrite must not require descriptor lineage");
@@ -1858,7 +1858,7 @@ mod tests {
         let plan = project_payload_only(join_apply_key_union());
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(
             rule.matches(&expr, &ctx),
             "Project above a join apply-key union must expose the key for coalescing"
@@ -1869,7 +1869,7 @@ mod tests {
             panic!("join apply-key propagation must change the Project");
         };
         let arena = ctx.scalar_arena();
-        let changed = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+        let changed = crate::sql::planner::optimizer_bridge::logical::to_logical_plan(
             changed_expr,
             &arena.borrow(),
         );
@@ -1890,7 +1890,7 @@ mod tests {
         let plan = project_payload_only(join_apply_key_union());
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(
             rule.matches(&expr, &ctx),
             "Project above a join apply-key union must expose action for coalescing"
@@ -1901,7 +1901,7 @@ mod tests {
             panic!("join action propagation must change the Project");
         };
         let arena = ctx.scalar_arena();
-        let changed = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+        let changed = crate::sql::planner::optimizer_bridge::logical::to_logical_plan(
             changed_expr,
             &arena.borrow(),
         );
@@ -2475,7 +2475,7 @@ mod tests {
 
         let ctx = build_ctx();
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
 
         let rule = super::UnsupportedJoinKindCheckRule;
         assert!(
@@ -2484,7 +2484,7 @@ mod tests {
         );
 
         let mut ctx2 = build_ctx();
-        let expr2 = logical_plan_to_opt_expr(&plan, &mut ctx2.scalar_arena().borrow_mut());
+        let expr2 = to_optimizer_expr(&plan, &mut ctx2.scalar_arena().borrow_mut());
         let result = rule
             .apply(expr2, &mut ctx2)
             .expect("apply must not return Err");
@@ -2523,7 +2523,7 @@ mod tests {
         };
         ctx.set_extension::<ImvExtension>(ext);
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
 
         let rule = super::UnsupportedJoinKindCheckRule;
         assert!(

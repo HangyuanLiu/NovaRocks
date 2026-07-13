@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Optimizer physical operator tree extracted from the Memo after optimization.
+//! Optimized physical operator tree extracted from the Memo.
 
 use std::sync::Arc;
 
@@ -61,18 +61,18 @@ pub(crate) struct OptimizerExplainStats {
     pub broadcast_decision: Option<BroadcastDecision>,
 }
 
-/// A node in the optimizer physical operator tree produced by `extract_best`.
+/// A node in the optimized physical operator tree produced by `extract_best`.
 #[derive(Clone, Debug)]
-pub(crate) struct OptimizerPhysicalNode {
+pub(crate) struct OptimizedOperatorNode {
     pub op: Operator,
-    pub children: Vec<OptimizerPhysicalNode>,
+    pub children: Vec<OptimizedOperatorNode>,
     pub stats: Statistics,
     pub explain_stats: OptimizerExplainStats,
     pub output_columns: Vec<OutputColumn>,
     pub execution_props: PlanExecutionProps,
 }
 
-pub(crate) fn attach_scalar_arena(root: &mut OptimizerPhysicalNode, arena: Arc<ScalarArena>) {
+pub(crate) fn attach_scalar_arena(root: &mut OptimizedOperatorNode, arena: Arc<ScalarArena>) {
     root.execution_props.scalar_arena = Some(Arc::clone(&arena));
     for child in &mut root.children {
         attach_scalar_arena(child, Arc::clone(&arena));
@@ -85,7 +85,7 @@ mod execution_prop_tests {
 
     #[test]
     fn physical_node_carries_execution_properties() {
-        let node = OptimizerPhysicalNode {
+        let node = OptimizedOperatorNode {
             op: make_test_op(),
             children: vec![],
             stats: Statistics {
@@ -93,7 +93,7 @@ mod execution_prop_tests {
                 column_statistics: Default::default(),
                 ..Default::default()
             },
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+            explain_stats: crate::sql::optimizer::optimized_tree::OptimizerExplainStats::default(),
             output_columns: vec![],
             execution_props: PlanExecutionProps {
                 output_property: crate::sql::optimizer::property::PhysicalPropertySet::broadcast(),

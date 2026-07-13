@@ -291,7 +291,7 @@ mod tests {
     use crate::sql::planner::logical::{
         LogicalAggregateNode, LogicalApplyNode, LogicalPlanKind, LogicalPlanNode,
     };
-    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
+    use crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr;
     use crate::sql::planner::payload::{
         AggregateCall, PlanFilterNode, PlanScanNode, PlanValuesNode,
     };
@@ -313,7 +313,7 @@ mod tests {
         ctx: &mut RewriteContext,
     ) -> crate::sql::optimizer::opt_expr::OptExpr {
         let arena = ctx.scalar_arena();
-        logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut())
+        to_optimizer_expr(&plan, &mut arena.borrow_mut())
     }
 
     fn col_ref(id: ColumnId, name: &str, dt: DataType) -> TypedExpr {

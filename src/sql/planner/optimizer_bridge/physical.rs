@@ -24,7 +24,7 @@ use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::{JoinKind, OutputColumn};
 use crate::sql::optimizer::operator::{Operator, PhysicalDistributionOp};
-use crate::sql::optimizer::physical_tree::{JoinExecutionDistribution, OptimizerPhysicalNode};
+use crate::sql::optimizer::optimized_tree::{JoinExecutionDistribution, OptimizedOperatorNode};
 use crate::sql::optimizer::property::DistributionSpec;
 use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, DistinctValueCount};
@@ -46,7 +46,7 @@ struct BridgeCtx<'a> {
 }
 
 impl BridgeCtx<'_> {
-    fn convert_node(&self, node: &OptimizerPhysicalNode) -> Result<PhysicalPlanNode, String> {
+    fn convert_node(&self, node: &OptimizedOperatorNode) -> Result<PhysicalPlanNode, String> {
         if node.op.is_logical() {
             return Err(format!(
                 "Bridge 2a expected a physical operator, got logical operator {:?}",
@@ -73,7 +73,7 @@ impl BridgeCtx<'_> {
         })
     }
 
-    fn convert_kind(&self, node: &OptimizerPhysicalNode) -> Result<PhysicalPlanKind, String> {
+    fn convert_kind(&self, node: &OptimizedOperatorNode) -> Result<PhysicalPlanKind, String> {
         match &node.op {
             Operator::PhysicalScan(op) => Ok(PhysicalPlanKind::Scan(PlanScanNode {
                 database: op.database.clone(),
@@ -300,7 +300,7 @@ impl BridgeCtx<'_> {
     }
 }
 
-fn physical_node_output_columns(node: &OptimizerPhysicalNode) -> Vec<OutputColumn> {
+fn physical_node_output_columns(node: &OptimizedOperatorNode) -> Vec<OutputColumn> {
     match &node.op {
         Operator::PhysicalScan(scan) => scan_materialized_output_columns(scan),
         Operator::PhysicalDistribution(_) => physical_distribution_output_columns(node),
@@ -321,7 +321,7 @@ fn physical_node_output_columns(node: &OptimizerPhysicalNode) -> Vec<OutputColum
 ///
 /// Aggregate completeness comes from `AggregateOutputLayout`, not from the
 /// aggregate's planner-visible output projection.
-fn physical_node_materialized_output_columns(node: &OptimizerPhysicalNode) -> Vec<OutputColumn> {
+fn physical_node_materialized_output_columns(node: &OptimizedOperatorNode) -> Vec<OutputColumn> {
     match &node.op {
         Operator::PhysicalHashAggregate(aggregate) => aggregate.output_layout.full_output_columns(),
         _ => physical_node_output_columns(node),
@@ -331,14 +331,14 @@ fn physical_node_materialized_output_columns(node: &OptimizerPhysicalNode) -> Ve
 /// Materializes the child producer contract onto the distribution boundary.
 /// The enclosing `PhysicalPlanNode::output_columns` is the source layout;
 /// `RedistributeNode::output_columns` remains the requested exchange order.
-fn physical_distribution_output_columns(node: &OptimizerPhysicalNode) -> Vec<OutputColumn> {
+fn physical_distribution_output_columns(node: &OptimizedOperatorNode) -> Vec<OutputColumn> {
     node.children
         .first()
         .map(physical_node_materialized_output_columns)
         .unwrap_or_else(|| node.output_columns.clone())
 }
 
-fn physical_passthrough_output_columns(node: &OptimizerPhysicalNode) -> Vec<OutputColumn> {
+fn physical_passthrough_output_columns(node: &OptimizedOperatorNode) -> Vec<OutputColumn> {
     node.children
         .first()
         .map(physical_node_materialized_output_columns)
@@ -347,7 +347,7 @@ fn physical_passthrough_output_columns(node: &OptimizerPhysicalNode) -> Vec<Outp
 
 fn physical_join_output_columns(
     join_type: JoinKind,
-    node: &OptimizerPhysicalNode,
+    node: &OptimizedOperatorNode,
 ) -> Vec<OutputColumn> {
     if node.children.len() != 2 {
         return node.output_columns.clone();
@@ -462,7 +462,7 @@ fn scan_materialized_output_columns(
     }
 }
 
-fn validate_shape(node: &OptimizerPhysicalNode) -> Result<(), String> {
+fn validate_shape(node: &OptimizedOperatorNode) -> Result<(), String> {
     match &node.op {
         Operator::PhysicalScan(_)
         | Operator::PhysicalValues(_)
@@ -505,7 +505,7 @@ fn validate_shape(node: &OptimizerPhysicalNode) -> Result<(), String> {
 }
 
 fn expect_arity(
-    node: &OptimizerPhysicalNode,
+    node: &OptimizedOperatorNode,
     operator: &'static str,
     expected: usize,
 ) -> Result<(), String> {
@@ -520,7 +520,7 @@ fn expect_arity(
 }
 
 fn validate_set_op_shape(
-    node: &OptimizerPhysicalNode,
+    node: &OptimizedOperatorNode,
     operator: &'static str,
     child_output_columns: &[Vec<crate::sql::common::OutputColumn>],
 ) -> Result<(), String> {
@@ -643,7 +643,7 @@ fn redistribute_mode(op: &PhysicalDistributionOp) -> Result<RedistributeMode, St
 fn redistribute_partition_exprs(
     _scalars: &ScalarArena,
     mode: &RedistributeMode,
-    child: &OptimizerPhysicalNode,
+    child: &OptimizedOperatorNode,
 ) -> Vec<TypedExpr> {
     let RedistributeMode::Hash { cols, .. } = mode else {
         return Vec::new();
@@ -702,7 +702,7 @@ fn planner_column_statistic(stat: &ColumnStatistic) -> PlannerColumnStatistic {
     }
 }
 
-fn planner_stats(node: &OptimizerPhysicalNode) -> PhysicalPlanStats {
+fn planner_stats(node: &OptimizedOperatorNode) -> PhysicalPlanStats {
     PhysicalPlanStats {
         output_row_count: node.stats.output_row_count,
         row_count_confidence: planner_confidence(node.stats.row_count_confidence),
@@ -743,14 +743,14 @@ fn planner_stats(node: &OptimizerPhysicalNode) -> PhysicalPlanStats {
     }
 }
 
-pub(super) fn optimizer_physical_to_plan(
-    root: &OptimizerPhysicalNode,
+pub(super) fn materialize_physical_plan(
+    root: &OptimizedOperatorNode,
 ) -> Result<PhysicalPlanNode, String> {
     let scalars = root
         .execution_props
         .scalar_arena
         .as_deref()
-        .ok_or_else(|| "Bridge 2a requires OptimizerPhysicalNode.scalar_arena".to_string())?;
+        .ok_or_else(|| "Bridge 2a requires OptimizedOperatorNode.scalar_arena".to_string())?;
     BridgeCtx { scalars }.convert_node(root)
 }
 
@@ -767,8 +767,8 @@ mod tests {
         PhysicalHashAggregateOp, PhysicalHashJoinOp, ProjectOp, ScanOp, ScanVariantColumn, UnionOp,
         ValuesOp,
     };
-    use crate::sql::optimizer::physical_tree::{
-        OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
+    use crate::sql::optimizer::optimized_tree::{
+        OptimizedOperatorNode, PlanExecutionProps, attach_scalar_arena,
     };
     use crate::sql::optimizer::property::{
         DistributionSpec, HashSource as OptimizerHashSource, PhysicalPropertySet,
@@ -788,9 +788,9 @@ mod tests {
     }
 
     fn attach_arena(
-        mut node: OptimizerPhysicalNode,
+        mut node: OptimizedOperatorNode,
         arena: Arc<ScalarArena>,
-    ) -> OptimizerPhysicalNode {
+    ) -> OptimizedOperatorNode {
         node.execution_props.scalar_arena = Some(arena);
         node
     }
@@ -839,8 +839,8 @@ mod tests {
         assert_eq!(column, expected_name);
     }
 
-    fn base_node(op: Operator) -> OptimizerPhysicalNode {
-        OptimizerPhysicalNode {
+    fn base_node(op: Operator) -> OptimizedOperatorNode {
+        OptimizedOperatorNode {
             op,
             children: vec![],
             stats: Statistics {
@@ -859,7 +859,7 @@ mod tests {
         }
     }
 
-    fn raw_values_node() -> OptimizerPhysicalNode {
+    fn raw_values_node() -> OptimizedOperatorNode {
         base_node(Operator::PhysicalValues(ValuesOp {
             rows: vec![],
             columns: vec![],
@@ -887,7 +887,7 @@ mod tests {
         }
     }
 
-    fn values_node() -> OptimizerPhysicalNode {
+    fn values_node() -> OptimizedOperatorNode {
         attach_arena(
             base_node(Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
@@ -905,7 +905,7 @@ mod tests {
 
     #[test]
     fn bridge_converts_values_without_optimizer_types() {
-        let physical = optimizer_physical_to_plan(&values_node()).expect("bridge should convert");
+        let physical = materialize_physical_plan(&values_node()).expect("bridge should convert");
         assert!(matches!(physical.kind, PhysicalPlanKind::Values(_)));
         assert!(physical.probe_runtime_filters.is_empty());
         assert_eq!(physical.stats.output_row_count, 1.0);
@@ -936,7 +936,7 @@ mod tests {
         node.output_columns = columns;
         let node = attach_arena(node, Arc::new(ScalarArena::new()));
 
-        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        let physical = materialize_physical_plan(&node).expect("bridge should convert");
 
         assert!(matches!(physical.kind, PhysicalPlanKind::Scan(_)));
         assert_output_columns_eq(&physical.output_columns, &[output_column(2, "s")]);
@@ -983,7 +983,7 @@ mod tests {
         node.output_columns = scan_columns;
         let node = attach_arena(node, Arc::new(ScalarArena::new()));
 
-        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        let physical = materialize_physical_plan(&node).expect("bridge should convert");
 
         assert_output_columns_eq(&physical.output_columns, &[payload, synthetic, extended]);
     }
@@ -1001,7 +1001,7 @@ mod tests {
             Arc::new(arena),
         );
 
-        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        let physical = materialize_physical_plan(&node).expect("bridge should convert");
         let PhysicalPlanKind::Values(values) = physical.kind else {
             panic!("expected Values");
         };
@@ -1032,7 +1032,7 @@ mod tests {
         node.children.push(child);
         let node = attach_arena(node, Arc::new(ScalarArena::new()));
 
-        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        let physical = materialize_physical_plan(&node).expect("bridge should convert");
         let PhysicalPlanKind::Redistribute(redistribute) = physical.kind else {
             panic!("expected Redistribute");
         };
@@ -1075,7 +1075,7 @@ mod tests {
         node.children.push(child);
         let node = attach_arena(node, Arc::new(ScalarArena::new()));
 
-        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        let physical = materialize_physical_plan(&node).expect("bridge should convert");
         let PhysicalPlanKind::Redistribute(redistribute) = physical.kind else {
             panic!("expected Redistribute");
         };
@@ -1117,7 +1117,7 @@ mod tests {
         node.children.push(aggregate);
         let node = attach_arena(node, Arc::new(arena));
 
-        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        let physical = materialize_physical_plan(&node).expect("bridge should convert");
         let PhysicalPlanKind::Redistribute(redistribute) = physical.kind else {
             panic!("expected Redistribute");
         };
@@ -1172,7 +1172,7 @@ mod tests {
         node.children.push(aggregate);
         let node = attach_arena(node, Arc::new(arena));
 
-        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        let physical = materialize_physical_plan(&node).expect("bridge should convert");
         let PhysicalPlanKind::Redistribute(redistribute) = physical.kind else {
             panic!("expected Redistribute");
         };
@@ -1219,7 +1219,7 @@ mod tests {
         node.children.push(aggregate);
         let node = attach_arena(node, Arc::new(arena));
 
-        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        let physical = materialize_physical_plan(&node).expect("bridge should convert");
         let PhysicalPlanKind::Redistribute(redistribute) = physical.kind else {
             panic!("expected Redistribute");
         };
@@ -1253,7 +1253,7 @@ mod tests {
         node.children.push(raw_values_node());
         let node = attach_arena(node, Arc::new(arena));
 
-        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        let physical = materialize_physical_plan(&node).expect("bridge should convert");
         let PhysicalPlanKind::ChangeEventExpand(expand) = physical.kind else {
             panic!("expected ChangeEventExpand");
         };
@@ -1306,7 +1306,7 @@ mod tests {
         node.children.push(raw_values_node());
         let node = attach_arena(node, Arc::new(ScalarArena::new()));
 
-        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        let physical = materialize_physical_plan(&node).expect("bridge should convert");
         let PhysicalPlanKind::Redistribute(redistribute) = physical.kind else {
             panic!("expected Redistribute");
         };
@@ -1326,7 +1326,7 @@ mod tests {
         node.children.push(raw_values_node());
         let node = attach_arena(node, Arc::new(ScalarArena::new()));
 
-        let err = optimizer_physical_to_plan(&node).expect_err("Any should be rejected");
+        let err = materialize_physical_plan(&node).expect_err("Any should be rejected");
         assert!(err.contains("DistributionSpec::Any"));
     }
 
@@ -1339,7 +1339,7 @@ mod tests {
             Arc::new(ScalarArena::new()),
         );
 
-        let err = optimizer_physical_to_plan(&node).expect_err("distribution needs one child");
+        let err = materialize_physical_plan(&node).expect_err("distribution needs one child");
         assert!(err.contains("PhysicalDistribution"));
         assert!(err.contains("expected 1 children, got 0"));
     }
@@ -1355,7 +1355,7 @@ mod tests {
         node.children.push(raw_values_node());
         let node = attach_arena(node, Arc::new(ScalarArena::new()));
 
-        let err = optimizer_physical_to_plan(&node).expect_err("hash join needs two children");
+        let err = materialize_physical_plan(&node).expect_err("hash join needs two children");
         assert!(err.contains("PhysicalHashJoin"));
         assert!(err.contains("expected 2 children, got 1"));
     }
@@ -1380,7 +1380,7 @@ mod tests {
         node.children.push(right);
         let node = attach_arena(node, Arc::new(ScalarArena::new()));
 
-        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        let physical = materialize_physical_plan(&node).expect("bridge should convert");
         let PhysicalPlanKind::HashJoin(join) = &physical.kind else {
             panic!("expected HashJoin");
         };
@@ -1408,7 +1408,7 @@ mod tests {
             node.output_columns = vec![left_column.clone(), right_column.clone()];
             node.children = vec![left, right];
             let node = attach_arena(node, Arc::new(ScalarArena::new()));
-            optimizer_physical_to_plan(&node).expect("bridge should convert")
+            materialize_physical_plan(&node).expect("bridge should convert")
         };
 
         let left_outer = convert(JoinKind::LeftOuter);
@@ -1443,7 +1443,7 @@ mod tests {
         node.children.push(raw_values_node());
         let node = attach_arena(node, Arc::new(ScalarArena::new()));
 
-        let err = optimizer_physical_to_plan(&node).expect_err("set-op metadata must match");
+        let err = materialize_physical_plan(&node).expect_err("set-op metadata must match");
         assert!(err.contains("PhysicalUnion"));
         assert!(err.contains("child_output_columns metadata expected 2 entries, got 1"));
     }
@@ -1459,7 +1459,7 @@ mod tests {
         node.children.push(raw_values_node());
         let node = attach_arena(node, Arc::new(ScalarArena::new()));
 
-        let err = optimizer_physical_to_plan(&node).expect_err("set-op metadata is required");
+        let err = materialize_physical_plan(&node).expect_err("set-op metadata is required");
         assert!(err.contains("PhysicalUnion"));
         assert!(err.contains("child_output_columns metadata expected 2 entries, got 0"));
     }
@@ -1477,7 +1477,7 @@ mod tests {
         node.children.push(raw_values_node());
         let node = attach_arena(node, Arc::new(ScalarArena::new()));
 
-        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        let physical = materialize_physical_plan(&node).expect("bridge should convert");
         let PhysicalPlanKind::SetOp(set_op) = physical.kind else {
             panic!("expected SetOp");
         };
@@ -1513,7 +1513,7 @@ mod tests {
         });
         node.explain_stats.broadcast_decision = None;
 
-        let physical = optimizer_physical_to_plan(&node).expect("bridge should convert");
+        let physical = materialize_physical_plan(&node).expect("bridge should convert");
         let cost = physical
             .stats
             .cost_estimate
@@ -1534,7 +1534,7 @@ mod tests {
             Arc::new(ScalarArena::new()),
         );
 
-        let err = optimizer_physical_to_plan(&node).expect_err("logical op should be rejected");
+        let err = materialize_physical_plan(&node).expect_err("logical op should be rejected");
         assert!(err.contains("Bridge 2a expected a physical operator"));
     }
 
@@ -1574,12 +1574,12 @@ mod tests {
             nullable: false,
             is_internal: false,
         };
-        let mut plan = OptimizerPhysicalNode {
+        let mut plan = OptimizedOperatorNode {
             op: Operator::PhysicalProject(ProjectOp {
                 items,
                 output_qualifier: None,
             }),
-            children: vec![OptimizerPhysicalNode {
+            children: vec![OptimizedOperatorNode {
                 op: Operator::PhysicalValues(ValuesOp {
                     rows: vec![],
                     columns: vec![input.clone()],

@@ -1547,8 +1547,8 @@ mod tests {
         PhysicalHashAggregateOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp, ProjectOp,
         ScanOp, ValuesOp,
     };
-    use crate::sql::optimizer::physical_tree::{
-        JoinExecutionDistribution, OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
+    use crate::sql::optimizer::optimized_tree::{
+        JoinExecutionDistribution, OptimizedOperatorNode, PlanExecutionProps, attach_scalar_arena,
     };
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::scalar::ScalarArena;
@@ -1566,7 +1566,7 @@ mod tests {
         PhysicalPlanStats, PlannerBroadcastDecision, PlannerConfidence,
     };
 
-    fn prepare_bridge2_test_props(node: &mut OptimizerPhysicalNode) {
+    fn prepare_bridge2_test_props(node: &mut OptimizedOperatorNode) {
         for child in &mut node.children {
             prepare_bridge2_test_props(child);
         }
@@ -1616,14 +1616,15 @@ mod tests {
 
     #[test]
     fn normal_scan_project_agg_renders_node_id_prefixes() {
-        let mut optimizer = aggregate_count_plan(project_plan(scan_plan()));
-        prepare_bridge2_test_props(&mut optimizer);
-        let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
-            .expect("convert optimizer physical plan");
-        let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)
+        let mut optimized_tree = aggregate_count_plan(project_plan(scan_plan()));
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
+        let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
 
-        let text = explain_distributed_plan(&dp, ExplainLevel::Normal).join("\n");
+        let text = explain_distributed_plan(&distributed_plan, ExplainLevel::Normal).join("\n");
 
         assert!(!text.contains("PLAN FRAGMENT"));
         assert!(text.contains("3:HASH AGGREGATE"));
@@ -1633,16 +1634,17 @@ mod tests {
 
     #[test]
     fn shared_distributed_formatter_path_covers_scan_and_project() {
-        let mut optimizer = project_plan(scan_plan());
-        prepare_bridge2_test_props(&mut optimizer);
-        let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
-            .expect("convert optimizer physical plan");
-        let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)
+        let mut optimized_tree = project_plan(scan_plan());
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
+        let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
-        let root = &dp
+        let root = &distributed_plan
             .fragments
             .iter()
-            .find(|fragment| fragment.fragment_id == dp.root_fragment_id)
+            .find(|fragment| fragment.fragment_id == distributed_plan.root_fragment_id)
             .expect("root fragment")
             .root;
 
@@ -1666,7 +1668,7 @@ mod tests {
             Some("SCAN test_db.t (alias=t)".to_string())
         );
 
-        let text = explain_distributed_plan(&dp, ExplainLevel::Normal).join("\n");
+        let text = explain_distributed_plan(&distributed_plan, ExplainLevel::Normal).join("\n");
         assert!(
             text.contains("2:PROJECT [t.k AS k]"),
             "missing shared PROJECT header in distributed explain:\n{text}"
@@ -1709,17 +1711,18 @@ mod tests {
 
     #[test]
     fn verbose_shuffle_agg_renders_fragments_and_exchange() {
-        let mut optimizer = aggregate_count_plan(distribution_plan(
+        let mut optimized_tree = aggregate_count_plan(distribution_plan(
             scan_plan(),
             DistributionSpec::shuffle_agg([ColumnId::new_for_test(1)]),
         ));
-        prepare_bridge2_test_props(&mut optimizer);
-        let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
-            .expect("convert optimizer physical plan");
-        let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
+        let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
 
-        let text = explain_distributed_plan(&dp, ExplainLevel::Verbose).join("\n");
+        let text = explain_distributed_plan(&distributed_plan, ExplainLevel::Verbose).join("\n");
 
         assert!(text.contains("PLAN FRAGMENT 0"));
         assert!(text.contains("PLAN FRAGMENT 1"));
@@ -1729,14 +1732,15 @@ mod tests {
 
     #[test]
     fn sort_with_partition_limit_renders_topn_suffix() {
-        let mut optimizer = sort_with_partition_limit_plan(scan_plan());
-        prepare_bridge2_test_props(&mut optimizer);
-        let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
-            .expect("convert optimizer physical plan");
-        let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)
+        let mut optimized_tree = sort_with_partition_limit_plan(scan_plan());
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
+        let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
 
-        let text = explain_distributed_plan(&dp, ExplainLevel::Normal).join("\n");
+        let text = explain_distributed_plan(&distributed_plan, ExplainLevel::Normal).join("\n");
 
         assert!(
             text.contains("2:SORT BY [t.k ASC NULLS LAST] partition_limit=3 topn_type=RANK"),
@@ -1746,8 +1750,8 @@ mod tests {
 
     #[test]
     fn costs_renders_colstats_from_ir_stats_only_at_costs_level() {
-        let mut scan = scan_plan();
-        scan.stats.column_statistics.insert(
+        let mut optimized_tree = scan_plan();
+        optimized_tree.stats.column_statistics.insert(
             ColumnId::new_for_test(1),
             ColumnStatistic {
                 min_value: 0.0,
@@ -1757,15 +1761,16 @@ mod tests {
                 ..ColumnStatistic::for_test_with_ndv(1000.0, Confidence::Exact)
             },
         );
-        prepare_bridge2_test_props(&mut scan);
-        let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&scan)
-            .expect("convert optimizer physical plan");
-        let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
+        let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
 
-        let normal = explain_distributed_plan(&dp, ExplainLevel::Normal).join("\n");
-        let verbose = explain_distributed_plan(&dp, ExplainLevel::Verbose).join("\n");
-        let costs = explain_distributed_plan(&dp, ExplainLevel::Costs).join("\n");
+        let normal = explain_distributed_plan(&distributed_plan, ExplainLevel::Normal).join("\n");
+        let verbose = explain_distributed_plan(&distributed_plan, ExplainLevel::Verbose).join("\n");
+        let costs = explain_distributed_plan(&distributed_plan, ExplainLevel::Costs).join("\n");
 
         assert!(
             !normal.contains("colstats="),
@@ -1783,8 +1788,8 @@ mod tests {
 
     #[test]
     fn costs_colstats_ndv_uses_scientific_not_i64_saturation_for_huge_values() {
-        let mut scan = scan_plan();
-        scan.stats.column_statistics.insert(
+        let mut optimized_tree = scan_plan();
+        optimized_tree.stats.column_statistics.insert(
             ColumnId::new_for_test(1),
             ColumnStatistic {
                 min_value: 0.0,
@@ -1794,13 +1799,14 @@ mod tests {
                 ..ColumnStatistic::for_test_with_ndv(1.0e300, Confidence::Exact)
             },
         );
-        prepare_bridge2_test_props(&mut scan);
-        let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&scan)
-            .expect("convert optimizer physical plan");
-        let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
+        let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
 
-        let costs = explain_distributed_plan(&dp, ExplainLevel::Costs).join("\n");
+        let costs = explain_distributed_plan(&distributed_plan, ExplainLevel::Costs).join("\n");
         assert!(
             costs.contains("ndv=1.0000e300"),
             "huge NDV should use scientific notation:\n{costs}"
@@ -1813,14 +1819,15 @@ mod tests {
 
     #[test]
     fn costs_level_renders_dimensional_costs() {
-        let mut optimizer = scan_plan();
-        prepare_bridge2_test_props(&mut optimizer);
-        let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
-            .expect("convert optimizer physical plan");
-        let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)
+        let mut optimized_tree = scan_plan();
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
+        let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
 
-        let costs = explain_distributed_plan(&dp, ExplainLevel::Costs).join("\n");
+        let costs = explain_distributed_plan(&distributed_plan, ExplainLevel::Costs).join("\n");
         assert!(costs.contains("1:SCAN test_db.t (alias=t) (rows=3 cost={cpu="));
         assert!(costs.contains("memory="));
         assert!(costs.contains("network="));
@@ -1956,18 +1963,19 @@ mod tests {
 
     #[test]
     fn hash_join_line_places_broadcast_tokens_at_the_expected_levels() {
-        let mut optimizer = inner_join_two_values();
-        prepare_bridge2_test_props(&mut optimizer);
-        let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
-            .expect("convert optimizer physical plan");
-        let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)
+        let mut optimized_tree = inner_join_two_values();
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
+        let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
 
-        let normal = explain_distributed_plan(&dp, ExplainLevel::Normal).join("\n");
+        let normal = explain_distributed_plan(&distributed_plan, ExplainLevel::Normal).join("\n");
         assert!(!normal.contains("bcast_"));
         assert!(!normal.contains(" bcast={"));
 
-        let verbose = explain_distributed_plan(&dp, ExplainLevel::Verbose).join("\n");
+        let verbose = explain_distributed_plan(&distributed_plan, ExplainLevel::Verbose).join("\n");
         let verbose_line = verbose
             .lines()
             .find(|line| line.contains("HASH JOIN"))
@@ -1980,7 +1988,7 @@ mod tests {
             "verdict should render before stats trailer: {verbose_line}"
         );
 
-        let costs = explain_distributed_plan(&dp, ExplainLevel::Costs).join("\n");
+        let costs = explain_distributed_plan(&distributed_plan, ExplainLevel::Costs).join("\n");
         let costs_line = costs
             .lines()
             .find(|line| line.contains("HASH JOIN"))
@@ -1998,11 +2006,12 @@ mod tests {
 
     #[test]
     fn detailed_ir_explain_shows_build_and_probe_rf_but_normal_hides_them() {
-        let mut join = inner_join_two_values();
-        prepare_bridge2_test_props(&mut join);
-        let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&join)
-            .expect("convert optimizer physical plan");
-        let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)
+        let mut optimized_tree = inner_join_two_values();
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
+        let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
 
         for level in [
@@ -2010,7 +2019,7 @@ mod tests {
             ExplainLevel::Costs,
             ExplainLevel::Analyze,
         ] {
-            let text = explain_distributed_plan(&dp, level).join("\n");
+            let text = explain_distributed_plan(&distributed_plan, level).join("\n");
             assert!(
                 text.contains("build runtime filters:"),
                 "missing build RF at {level:?}:\n{text}"
@@ -2025,7 +2034,7 @@ mod tests {
             );
         }
 
-        let normal = explain_distributed_plan(&dp, ExplainLevel::Normal).join("\n");
+        let normal = explain_distributed_plan(&distributed_plan, ExplainLevel::Normal).join("\n");
         assert!(
             !normal.contains("runtime filters:"),
             "Normal must hide RF lines:\n{normal}"
@@ -2034,11 +2043,12 @@ mod tests {
 
     #[test]
     fn analyze_renders_actuals_for_nodes_present_in_map_only() {
-        let mut optimizer = aggregate_count_plan(project_plan(scan_plan()));
-        prepare_bridge2_test_props(&mut optimizer);
-        let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
-            .expect("convert optimizer physical plan");
-        let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)
+        let mut optimized_tree = aggregate_count_plan(project_plan(scan_plan()));
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
+        let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
         let mut actuals = HashMap::new();
         actuals.insert(
@@ -2060,8 +2070,13 @@ mod tests {
             },
         );
 
-        let text =
-            explain_distributed_plan_analyze(&dp, ExplainLevel::Analyze, &actuals, None).join("\n");
+        let text = explain_distributed_plan_analyze(
+            &distributed_plan,
+            ExplainLevel::Analyze,
+            &actuals,
+            None,
+        )
+        .join("\n");
 
         assert!(
             text.contains("3:HASH AGGREGATE (SINGLE, group by: [t.k]) stats={rows=3 conf=fallback} act={rows=7 time=2.3ms peak=4.0MB}"),
@@ -2087,16 +2102,17 @@ mod tests {
 
     #[test]
     fn analyze_renders_per_fragment_profile_under_fragment_header() {
-        let mut optimizer = aggregate_count_plan(project_plan(scan_plan()));
-        prepare_bridge2_test_props(&mut optimizer);
-        let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
-            .expect("convert optimizer physical plan");
-        let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)
+        let mut optimized_tree = aggregate_count_plan(project_plan(scan_plan()));
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
+        let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
         let actuals = HashMap::new();
         // Key the per-fragment map by the first fragment's root node id, the same key the renderer
         // applies (`fragment.root.node_id`) — so the test never hardcodes node ids.
-        let frags = explain_fragment_order(&dp);
+        let frags = explain_fragment_order(&distributed_plan);
         let rep = frags[0].root.node_id;
         let mut per_fragment = HashMap::new();
         per_fragment.insert(
@@ -2109,7 +2125,7 @@ mod tests {
         );
 
         let text = explain_distributed_plan_analyze(
-            &dp,
+            &distributed_plan,
             ExplainLevel::Analyze,
             &actuals,
             Some(&per_fragment),
@@ -2122,18 +2138,24 @@ mod tests {
             "{text}"
         );
         // Without the per-fragment map, no Profile line is rendered.
-        let plain =
-            explain_distributed_plan_analyze(&dp, ExplainLevel::Analyze, &actuals, None).join("\n");
+        let plain = explain_distributed_plan_analyze(
+            &distributed_plan,
+            ExplainLevel::Analyze,
+            &actuals,
+            None,
+        )
+        .join("\n");
         assert!(!plain.contains("Profile: active="), "{plain}");
     }
 
     #[test]
     fn actual_suffix_renders_phase_timers_and_minmax() {
-        let mut optimizer = aggregate_count_plan(project_plan(scan_plan()));
-        prepare_bridge2_test_props(&mut optimizer);
-        let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
-            .expect("convert optimizer physical plan");
-        let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)
+        let mut optimized_tree = aggregate_count_plan(project_plan(scan_plan()));
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
+        let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
         let mut actuals = HashMap::new();
         actuals.insert(
@@ -2152,8 +2174,13 @@ mod tests {
             },
         );
 
-        let text =
-            explain_distributed_plan_analyze(&dp, ExplainLevel::Analyze, &actuals, None).join("\n");
+        let text = explain_distributed_plan_analyze(
+            &distributed_plan,
+            ExplainLevel::Analyze,
+            &actuals,
+            None,
+        )
+        .join("\n");
 
         assert!(
             text.contains(
@@ -2169,11 +2196,12 @@ mod tests {
 
     #[test]
     fn actual_suffix_renders_dictionary_metrics_when_present() {
-        let mut optimizer = aggregate_count_plan(project_plan(scan_plan()));
-        prepare_bridge2_test_props(&mut optimizer);
-        let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
-            .expect("convert optimizer physical plan");
-        let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)
+        let mut optimized_tree = aggregate_count_plan(project_plan(scan_plan()));
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
+        let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
         let mut actuals = HashMap::new();
         actuals.insert(
@@ -2193,8 +2221,13 @@ mod tests {
             },
         );
 
-        let text =
-            explain_distributed_plan_analyze(&dp, ExplainLevel::Analyze, &actuals, None).join("\n");
+        let text = explain_distributed_plan_analyze(
+            &distributed_plan,
+            ExplainLevel::Analyze,
+            &actuals,
+            None,
+        )
+        .join("\n");
 
         assert!(
             text.contains(
@@ -2206,11 +2239,12 @@ mod tests {
 
     #[test]
     fn actual_suffix_clamps_negative_min_time() {
-        let mut optimizer = aggregate_count_plan(project_plan(scan_plan()));
-        prepare_bridge2_test_props(&mut optimizer);
-        let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
-            .expect("convert optimizer physical plan");
-        let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)
+        let mut optimized_tree = aggregate_count_plan(project_plan(scan_plan()));
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
+        let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
         let mut actuals = HashMap::new();
         actuals.insert(
@@ -2225,8 +2259,13 @@ mod tests {
             },
         );
 
-        let text =
-            explain_distributed_plan_analyze(&dp, ExplainLevel::Analyze, &actuals, None).join("\n");
+        let text = explain_distributed_plan_analyze(
+            &distributed_plan,
+            ExplainLevel::Analyze,
+            &actuals,
+            None,
+        )
+        .join("\n");
 
         assert!(
             text.contains("min=0ns"),
@@ -2240,32 +2279,39 @@ mod tests {
 
     #[test]
     fn analyze_without_actuals_matches_existing_explain() {
-        let mut optimizer = aggregate_count_plan(project_plan(scan_plan()));
-        prepare_bridge2_test_props(&mut optimizer);
-        let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
-            .expect("convert optimizer physical plan");
-        let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)
+        let mut optimized_tree = aggregate_count_plan(project_plan(scan_plan()));
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
+        let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
         let actuals = HashMap::new();
 
         assert_eq!(
-            explain_distributed_plan(&dp, ExplainLevel::Analyze),
-            explain_distributed_plan_analyze(&dp, ExplainLevel::Analyze, &actuals, None)
+            explain_distributed_plan(&distributed_plan, ExplainLevel::Analyze),
+            explain_distributed_plan_analyze(
+                &distributed_plan,
+                ExplainLevel::Analyze,
+                &actuals,
+                None,
+            )
         );
     }
 
     #[test]
     fn aggregate_group_display_does_not_match_descendant_scan_by_name_only() {
-        let mut optimizer = aggregate_count_on_projected_id_plan(project_alias_collision_plan(
-            alias_collision_scan_plan(),
-        ));
-        prepare_bridge2_test_props(&mut optimizer);
-        let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
-            .expect("convert optimizer physical plan");
-        let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)
+        let mut optimized_tree = aggregate_count_on_projected_id_plan(
+            project_alias_collision_plan(alias_collision_scan_plan()),
+        );
+        prepare_bridge2_test_props(&mut optimized_tree);
+        let physical_plan =
+            crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                .expect("convert optimizer physical plan");
+        let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
 
-        let text = explain_distributed_plan(&dp, ExplainLevel::Normal).join("\n");
+        let text = explain_distributed_plan(&distributed_plan, ExplainLevel::Normal).join("\n");
 
         assert!(
             text.contains("3:HASH AGGREGATE (SINGLE, group by: [id])"),
@@ -2277,7 +2323,7 @@ mod tests {
         );
     }
 
-    fn scan_plan() -> OptimizerPhysicalNode {
+    fn scan_plan() -> OptimizedOperatorNode {
         let k = output_col(1, "k", DataType::Int64, false);
         let v = output_col(2, "v", DataType::Int64, true);
         physical_node(
@@ -2297,7 +2343,7 @@ mod tests {
         )
     }
 
-    fn alias_collision_scan_plan() -> OptimizerPhysicalNode {
+    fn alias_collision_scan_plan() -> OptimizedOperatorNode {
         let id = output_col(1, "id", DataType::Int64, false);
         let v = output_col(2, "v", DataType::Int64, true);
         physical_node(
@@ -2328,7 +2374,7 @@ mod tests {
         )
     }
 
-    fn project_alias_collision_plan(child: OptimizerPhysicalNode) -> OptimizerPhysicalNode {
+    fn project_alias_collision_plan(child: OptimizedOperatorNode) -> OptimizedOperatorNode {
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let output_columns = vec![output_col(3, "id", DataType::Int64, true)];
         let items = vec![ProjectItem {
@@ -2347,7 +2393,7 @@ mod tests {
         )
     }
 
-    fn project_plan(child: OptimizerPhysicalNode) -> OptimizerPhysicalNode {
+    fn project_plan(child: OptimizedOperatorNode) -> OptimizedOperatorNode {
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let output_columns = vec![output_col(1, "k", DataType::Int64, false)];
         let items = vec![ProjectItem {
@@ -2366,7 +2412,7 @@ mod tests {
         )
     }
 
-    fn aggregate_count_plan(child: OptimizerPhysicalNode) -> OptimizerPhysicalNode {
+    fn aggregate_count_plan(child: OptimizedOperatorNode) -> OptimizedOperatorNode {
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let k = output_col(1, "k", DataType::Int64, false);
         let count = output_col(3, "count(*)", DataType::Int64, true);
@@ -2396,7 +2442,7 @@ mod tests {
         )
     }
 
-    fn aggregate_count_on_projected_id_plan(child: OptimizerPhysicalNode) -> OptimizerPhysicalNode {
+    fn aggregate_count_on_projected_id_plan(child: OptimizedOperatorNode) -> OptimizedOperatorNode {
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let id = output_col(3, "id", DataType::Int64, true);
         let count = output_col(4, "count(*)", DataType::Int64, true);
@@ -2434,7 +2480,7 @@ mod tests {
         )
     }
 
-    fn sort_with_partition_limit_plan(child: OptimizerPhysicalNode) -> OptimizerPhysicalNode {
+    fn sort_with_partition_limit_plan(child: OptimizedOperatorNode) -> OptimizedOperatorNode {
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let output_columns = child.output_columns.clone();
         physical_node_with_scalars(
@@ -2458,9 +2504,9 @@ mod tests {
     }
 
     fn distribution_plan(
-        child: OptimizerPhysicalNode,
+        child: OptimizedOperatorNode,
         spec: DistributionSpec,
-    ) -> OptimizerPhysicalNode {
+    ) -> OptimizedOperatorNode {
         let output_columns = child.output_columns.clone();
         physical_node(
             Operator::PhysicalDistribution(PhysicalDistributionOp { spec }),
@@ -2469,7 +2515,7 @@ mod tests {
         )
     }
 
-    fn inner_join_two_values() -> OptimizerPhysicalNode {
+    fn inner_join_two_values() -> OptimizedOperatorNode {
         let left_col = output_col(1, "left_key", DataType::Int64, false);
         let right_col = output_col(2, "right_key", DataType::Int64, false);
         let left = physical_node(
@@ -2516,27 +2562,27 @@ mod tests {
 
     fn physical_node(
         op: Operator,
-        children: Vec<OptimizerPhysicalNode>,
+        children: Vec<OptimizedOperatorNode>,
         output_columns: Vec<OutputColumn>,
-    ) -> OptimizerPhysicalNode {
+    ) -> OptimizedOperatorNode {
         let scalars = scalars_from_children(&children);
         physical_node_with_scalars(op, children, output_columns, scalars)
     }
 
     fn physical_node_with_scalars(
         op: Operator,
-        children: Vec<OptimizerPhysicalNode>,
+        children: Vec<OptimizedOperatorNode>,
         output_columns: Vec<OutputColumn>,
         scalars: ScalarArena,
-    ) -> OptimizerPhysicalNode {
-        let mut plan = OptimizerPhysicalNode {
+    ) -> OptimizedOperatorNode {
+        let mut plan = OptimizedOperatorNode {
             op,
             children,
             stats: Statistics {
                 output_row_count: 3.0,
                 ..Default::default()
             },
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+            explain_stats: crate::sql::optimizer::optimized_tree::OptimizerExplainStats::default(),
             output_columns,
             execution_props: PlanExecutionProps::default(),
         };
@@ -2544,7 +2590,7 @@ mod tests {
         plan
     }
 
-    fn scalars_from_children(children: &[OptimizerPhysicalNode]) -> ScalarArena {
+    fn scalars_from_children(children: &[OptimizedOperatorNode]) -> ScalarArena {
         children
             .iter()
             .find_map(|child| child.execution_props.scalar_arena.as_deref().cloned())

@@ -463,7 +463,7 @@ mod tests {
     use crate::sql::planner::logical::{
         LogicalAggregateNode, LogicalJoinNode, LogicalPlanKind, LogicalUnionNode,
     };
-    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
+    use crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr;
     use crate::sql::planner::payload::{PlanFilterNode, PlanProjectNode, PlanScanNode};
 
     #[test]
@@ -472,7 +472,7 @@ mod tests {
         let ctx = build_ctx();
         let plan = delta(aggregate_over(source_union(true)));
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
     }
 
@@ -482,7 +482,7 @@ mod tests {
         let ctx = build_ctx();
         let plan = delta(aggregate_over(marked_source_union()));
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&expr, &ctx));
     }
 
@@ -493,7 +493,7 @@ mod tests {
         let plan = delta(aggregate_over(source_union(true)));
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let RewriteResult::Changed(rewritten_expr) = rule
             .apply(expr, &mut ctx)
@@ -502,7 +502,7 @@ mod tests {
             panic!("expected Changed(ImvDelta)");
         };
         let arena_ref = ctx.scalar_arena();
-        let rewritten = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+        let rewritten = crate::sql::planner::optimizer_bridge::logical::to_logical_plan(
             rewritten_expr,
             &arena_ref.borrow(),
         );
@@ -559,7 +559,7 @@ mod tests {
         let plan = delta(project_filter_union(true));
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let RewriteResult::Changed(rewritten_expr) = rule
             .apply(expr, &mut ctx)
@@ -568,7 +568,7 @@ mod tests {
             panic!("expected Changed(Union)");
         };
         let arena_ref = ctx.scalar_arena();
-        let rewritten = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+        let rewritten = crate::sql::planner::optimizer_bridge::logical::to_logical_plan(
             rewritten_expr,
             &arena_ref.borrow(),
         );
@@ -619,7 +619,7 @@ mod tests {
         );
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let RewriteResult::Changed(rewritten_expr) = rule
             .apply(expr, &mut ctx)
@@ -628,7 +628,7 @@ mod tests {
             panic!("expected Changed(Union)");
         };
         let arena_ref = ctx.scalar_arena();
-        let rewritten = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+        let rewritten = crate::sql::planner::optimizer_bridge::logical::to_logical_plan(
             rewritten_expr,
             &arena_ref.borrow(),
         );
@@ -665,7 +665,7 @@ mod tests {
         ));
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let err = rule
             .apply(expr, &mut ctx)
@@ -690,7 +690,7 @@ mod tests {
         ));
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let err = rule
             .apply(expr, &mut ctx)
@@ -708,7 +708,7 @@ mod tests {
         let plan = delta(project_filter_union(false));
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&expr, &ctx));
         let err = rule
             .apply(expr, &mut ctx)

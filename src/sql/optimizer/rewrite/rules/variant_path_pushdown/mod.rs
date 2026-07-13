@@ -41,9 +41,7 @@ mod tests {
     use crate::sql::optimizer::rewrite::tree::rewrite_with_rule;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
-    use crate::sql::planner::optimizer_bridge::plan::{
-        logical_plan_to_opt_expr, opt_expr_to_logical_plan,
-    };
+    use crate::sql::planner::optimizer_bridge::logical::{to_logical_plan, to_optimizer_expr};
     use crate::sql::planner::payload::{PlanFilterNode, PlanProjectNode, PlanScanNode};
 
     fn add_column(
@@ -220,13 +218,13 @@ mod tests {
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_column_ref_factory(factory);
         let mut scalars = ScalarArena::new();
-        let opt_plan = logical_plan_to_opt_expr(&plan, &mut scalars);
+        let opt_plan = to_optimizer_expr(&plan, &mut scalars);
         let arena_rc = Rc::new(RefCell::new(scalars));
         ctx.set_scalar_arena(arena_rc.clone());
         let (opt_result, changed) =
             rewrite_with_rule(opt_plan, &VariantPathPushdownRule, &mut ctx).unwrap();
         let arena = arena_rc.borrow();
-        (opt_expr_to_logical_plan(opt_result, &arena), changed)
+        (to_logical_plan(opt_result, &arena), changed)
     }
 
     fn scan_from_plan(plan: &LogicalPlanNode) -> &PlanScanNode {

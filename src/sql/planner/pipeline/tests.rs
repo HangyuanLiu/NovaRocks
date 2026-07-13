@@ -22,8 +22,8 @@ use crate::sql::common::{JoinKind, OutputColumn};
 use crate::sql::optimizer::operator::{
     JoinDistribution, Operator, PhysicalHashJoinEqCondition, PhysicalHashJoinOp, ValuesOp,
 };
-use crate::sql::optimizer::physical_tree::{
-    JoinExecutionDistribution, OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
+use crate::sql::optimizer::optimized_tree::{
+    JoinExecutionDistribution, OptimizedOperatorNode, PlanExecutionProps, attach_scalar_arena,
 };
 use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::optimizer::statistics::Statistics;
@@ -57,8 +57,8 @@ fn column_ref(column_id: ColumnId, name: &str) -> TypedExpr {
     }
 }
 
-fn values_node(columns: Vec<OutputColumn>) -> OptimizerPhysicalNode {
-    OptimizerPhysicalNode {
+fn values_node(columns: Vec<OutputColumn>) -> OptimizedOperatorNode {
+    OptimizedOperatorNode {
         op: Operator::PhysicalValues(ValuesOp {
             rows: vec![],
             columns: columns.clone(),
@@ -79,7 +79,7 @@ fn has_probe_rf(node: &DistributedNode) -> bool {
     !node.probe_runtime_filters.is_empty() || node.children.iter().any(has_probe_rf)
 }
 
-fn broadcast_hash_join_without_optimizer_rf_annotations() -> OptimizerPhysicalNode {
+fn broadcast_hash_join_without_optimizer_rf_annotations() -> OptimizedOperatorNode {
     let probe_id = ColumnId::new_for_test(1);
     let build_id = ColumnId::new_for_test(2);
     let probe_col = int_col(probe_id, "probe_key");
@@ -87,7 +87,7 @@ fn broadcast_hash_join_without_optimizer_rf_annotations() -> OptimizerPhysicalNo
     let mut scalars = ScalarArena::new();
     let left = intern_typed(&mut scalars, &column_ref(probe_id, "probe_key"));
     let right = intern_typed(&mut scalars, &column_ref(build_id, "build_key"));
-    let mut plan = OptimizerPhysicalNode {
+    let mut plan = OptimizedOperatorNode {
         op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
             eq_conditions: vec![PhysicalHashJoinEqCondition {

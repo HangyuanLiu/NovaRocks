@@ -23,7 +23,7 @@ use crate::engine::query_options::StandaloneQueryOptions;
 use crate::runtime::coordinator::CoordinatedQueryResult;
 use crate::sql::analysis::OutputColumn;
 use crate::sql::common::ChangeStreamBranchKind;
-use crate::sql::optimizer::OptimizerPhysicalNode;
+use crate::sql::optimizer::OptimizedOperatorNode;
 use crate::sql::planner::distributed::write::change_stream::{
     ChangeStreamWriteBranchSpec, ChangeStreamWriteDagSpec,
 };
@@ -32,7 +32,7 @@ use crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec;
 pub(crate) const DML_CHANGE_STREAM_DATA_ROUTE_COLUMN: &str = "__change_data_route";
 
 pub(crate) struct DmlChangeStreamWritePlan {
-    pub(crate) producer: OptimizerPhysicalNode,
+    pub(crate) producer: OptimizedOperatorNode,
     pub(crate) dag: ChangeStreamWriteDagSpec,
     pub(crate) pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
 }
@@ -100,7 +100,7 @@ impl DmlChangeStreamBranchSet {
 pub(crate) fn build_dml_change_stream_write_plan(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
-    producer: OptimizerPhysicalNode,
+    producer: OptimizedOperatorNode,
     branch_set: DmlChangeStreamBranchSet,
     target_ref: &str,
 ) -> Result<DmlChangeStreamWritePlan, String> {
@@ -1451,11 +1451,11 @@ mod tests {
             .collect()
     }
 
-    fn physical_values_plan_for_execution_test() -> crate::sql::optimizer::OptimizerPhysicalNode {
+    fn physical_values_plan_for_execution_test() -> crate::sql::optimizer::OptimizedOperatorNode {
         use crate::sql::column_id::ColumnId;
         use crate::sql::optimizer::operator::{Operator, ValuesOp};
-        use crate::sql::optimizer::physical_tree::{
-            OptimizerExplainStats, OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
+        use crate::sql::optimizer::optimized_tree::{
+            OptimizedOperatorNode, OptimizerExplainStats, PlanExecutionProps, attach_scalar_arena,
         };
         use crate::sql::optimizer::scalar::ScalarArena;
         use crate::sql::optimizer::statistics::Statistics;
@@ -1483,7 +1483,7 @@ mod tests {
                 is_internal: false,
             },
         ];
-        let mut physical_plan = OptimizerPhysicalNode {
+        let mut physical_plan = OptimizedOperatorNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: Vec::new(),
                 columns: output_columns.clone(),

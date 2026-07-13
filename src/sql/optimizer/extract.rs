@@ -18,14 +18,14 @@
 //! Extract the best optimizer physical operator tree from the Memo after top-down search.
 //!
 //! Walks the winner map starting from the root group with the required
-//! physical properties, recursively building an `OptimizerPhysicalNode` tree.
+//! physical properties, recursively building an `OptimizedOperatorNode` tree.
 
 use std::collections::HashMap;
 
 use super::memo::{GroupId, Memo};
 use super::operator::{JoinDistribution, Operator, PhysicalDistributionOp, ProjectOp, SortOp};
-use super::physical_tree::{
-    JoinExecutionDistribution, OptimizerExplainStats, OptimizerPhysicalNode, PlanExecutionProps,
+use super::optimized_tree::{
+    JoinExecutionDistribution, OptimizedOperatorNode, OptimizerExplainStats, PlanExecutionProps,
 };
 use super::property::{OrderingSpec, PhysicalPropertySet};
 use super::search::{EnforcerKind, Winner};
@@ -37,7 +37,7 @@ use arrow::datatypes::DataType;
 /// Extract the best optimizer physical operator tree from the Memo.
 ///
 /// Walks the winner map starting from `root_group` with `required` properties.
-/// For each winner, if it has an enforcer, an enforcer OptimizerPhysicalNode is
+/// For each winner, if it has an enforcer, an enforcer OptimizedOperatorNode is
 /// created wrapping the recursive extraction with the enforcer's child props.
 /// Otherwise, the winner's physical expression is used directly with children
 /// extracted according to the child properties recorded by search.
@@ -46,7 +46,7 @@ pub(crate) fn extract_best(
     root_group: GroupId,
     required: &PhysicalPropertySet,
     winners: &HashMap<(GroupId, PhysicalPropertySet), Winner>,
-) -> Result<OptimizerPhysicalNode, String> {
+) -> Result<OptimizedOperatorNode, String> {
     let cache_key = (root_group, required.clone());
     let winner = winners.get(&cache_key).ok_or_else(|| {
         format!(
@@ -135,7 +135,7 @@ pub(crate) fn extract_best(
         .map(|enforcer| enforcer.child_props.clone())
         .unwrap_or_else(|| winner.output.clone());
 
-    let inner_node = OptimizerPhysicalNode {
+    let inner_node = OptimizedOperatorNode {
         op,
         children,
         stats: group_stats.clone(),
@@ -173,7 +173,7 @@ pub(crate) fn extract_best(
             }
         };
 
-        return Ok(OptimizerPhysicalNode {
+        return Ok(OptimizedOperatorNode {
             op: enforcer_op,
             children: vec![inner_node],
             stats: group_stats,
@@ -215,7 +215,7 @@ fn output_columns_for_physical_expr(
     op: &Operator,
     scalars: &ScalarArena,
     group_output_columns: Vec<OutputColumn>,
-    children: &[OptimizerPhysicalNode],
+    children: &[OptimizedOperatorNode],
 ) -> Vec<OutputColumn> {
     match op {
         Operator::PhysicalProject(project) => {
@@ -233,7 +233,7 @@ fn output_columns_for_physical_expr(
 
 fn join_output_columns(
     join_type: crate::sql::analysis::JoinKind,
-    children: &[OptimizerPhysicalNode],
+    children: &[OptimizedOperatorNode],
 ) -> Option<Vec<OutputColumn>> {
     if children.len() != 2 {
         return None;
@@ -689,8 +689,8 @@ mod tests {
         }
     }
 
-    fn physical_node_with_outputs(output_columns: Vec<OutputColumn>) -> OptimizerPhysicalNode {
-        OptimizerPhysicalNode {
+    fn physical_node_with_outputs(output_columns: Vec<OutputColumn>) -> OptimizedOperatorNode {
+        OptimizedOperatorNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
                 columns: output_columns.clone(),
@@ -956,7 +956,7 @@ mod tests {
 
         assert_eq!(
             plan.execution_props.join_distribution,
-            Some(crate::sql::optimizer::physical_tree::JoinExecutionDistribution::Partitioned)
+            Some(crate::sql::optimizer::optimized_tree::JoinExecutionDistribution::Partitioned)
         );
         assert_eq!(plan.execution_props.child_output_properties.len(), 2);
         assert_eq!(plan.execution_props.output_property, winner.output);

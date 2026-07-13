@@ -1755,7 +1755,7 @@ use crate::sql::optimizer::operator::TestOnlyReordered;
 #[cfg(test)]
 mod tests {
     use crate::sql::optimizer::operator::TopNPhase;
-    fn fixture() { let _ = crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(); }
+    fn fixture() { let _ = crate::sql::optimizer::optimized_tree::OptimizerExplainStats::default(); }
 }
 fn prod() { let _ = crate::sql::optimizer::property::DistributionSpec::Any; }
 ",
@@ -4781,7 +4781,7 @@ fn expression_leak() {
     for source in [
         r#"
 use crate::sql as sql_root;
-type Leak = sql_root::optimizer::OptimizerPhysicalNode;
+type Leak = sql_root::optimizer::OptimizedOperatorNode;
 "#,
         r#"
 use crate::sql::codegen as codegen_owner;
@@ -4820,10 +4820,10 @@ type Leak = planner_root::logical::build::LogicalPlanBuilder;
 fn planner_guard_tracks_relative_and_inline_module_non_use_paths() {
     let source_rel = "src/sql/planner/distributed/node.rs";
     for source in [
-        "type Leak = super::super::super::optimizer::OptimizerPhysicalNode;",
+        "type Leak = super::super::super::optimizer::OptimizedOperatorNode;",
         r#"
 mod nested {
-    type Leak = super::super::super::super::optimizer::OptimizerPhysicalNode;
+    type Leak = super::super::super::super::optimizer::OptimizedOperatorNode;
 }
 "#,
         r#"
@@ -4831,7 +4831,7 @@ use crate::proto as owner;
 type Allowed = owner::plan::DistributedNode;
 mod nested {
     use crate::sql as owner;
-    type Leak = owner::optimizer::OptimizerPhysicalNode;
+    type Leak = owner::optimizer::OptimizedOperatorNode;
 }
 "#,
     ] {
@@ -4854,13 +4854,13 @@ fn planner_guard_non_use_path_detector_ignores_cfg_test_and_lexical_noise() {
 #[cfg(test)]
 mod tests {
     use crate::sql as sql_root;
-    type AliasLeak = sql_root::optimizer::OptimizerPhysicalNode;
-    type RelativeLeak = super::super::super::super::optimizer::OptimizerPhysicalNode;
+    type AliasLeak = sql_root::optimizer::OptimizedOperatorNode;
+    type RelativeLeak = super::super::super::super::optimizer::OptimizedOperatorNode;
 }
 
 // type CommentLeak = crate::sql::planner::DistributedPlan;
 const TEXT: &str = "crate::sql::codegen::FragmentEdge";
-const RAW: &str = r#"crate::sql::optimizer::OptimizerPhysicalNode"#;
+const RAW: &str = r#"crate::sql::optimizer::OptimizedOperatorNode"#;
 use crate::proto as owner;
 type Allowed = owner::plan::DistributedNode;
 use crate::sql as _;
@@ -4975,7 +4975,7 @@ fn planner_stage_first_dependency_detector_covers_bypasses() {
         ),
         (
             "src/sql/planner/pipeline/mod.rs",
-            "use crate::sql::optimizer::OptimizerPhysicalNode;",
+            "use crate::sql::optimizer::OptimizedOperatorNode;",
         ),
         (
             "src/sql/planner/pipeline/mod.rs",
@@ -7053,8 +7053,8 @@ fn engine_has_no_direct_exec_resurrection() {
         ];
         if !optimizer_physical_allowlist.contains(&rel_path.as_str()) {
             for (line, text) in non_test_line_hits(&file, |line| {
-                line.contains("crate::sql::optimizer::physical_tree")
-                    || line.contains("OptimizerPhysicalNode")
+                line.contains("crate::sql::optimizer::optimized_tree")
+                    || line.contains("OptimizedOperatorNode")
             }) {
                 violations.push(format!(
                     "{}:{}: engine must not consume optimizer physical tree: {}",
@@ -15848,4 +15848,167 @@ fn nidl_e6_runtime_adapters_are_compat_only() {
         "E6 query/rf thrift adapters must be compat-only in the default build:\n{}",
         violations.join("\n")
     );
+}
+
+#[test]
+fn psm_8_optimizer_output_vocabulary_is_explicit() {
+    let optimizer = src_dir().join("sql/optimizer");
+    let retired_type = ["Optimizer", "PhysicalNode"].concat();
+    let retired_module = ["physical", "_tree"].concat();
+    assert!(
+        optimizer.join("optimized_tree.rs").is_file(),
+        "optimizer/optimized_tree.rs must own the extracted optimizer tree"
+    );
+    assert!(
+        !optimizer.join(format!("{retired_module}.rs")).exists(),
+        "optimizer/{retired_module}.rs must be retired"
+    );
+
+    let root = fs::read_to_string(optimizer.join("mod.rs")).unwrap();
+    assert!(has_non_comment_line(
+        &root,
+        "pub(crate) mod optimized_tree;"
+    ));
+    assert!(has_non_comment_line(
+        &root,
+        "pub(crate) use optimized_tree::OptimizedOperatorNode;"
+    ));
+
+    let optimized_tree = fs::read_to_string(optimizer.join("optimized_tree.rs")).unwrap();
+    assert!(optimized_tree.contains("struct OptimizedOperatorNode"));
+    assert!(optimized_tree.contains("children: Vec<OptimizedOperatorNode>"));
+    assert!(root.contains("Result<OptimizedOperatorNode, String>"));
+
+    for root in [src_dir(), Path::new(manifest_dir()).join("tests")] {
+        for file in rs_files(&root) {
+            let text = fs::read_to_string(&file).unwrap();
+            assert!(
+                !text.contains(&retired_type),
+                "{} uses {retired_type}",
+                rel(&file)
+            );
+            assert!(
+                !text.contains(&retired_module),
+                "{} uses {retired_module}",
+                rel(&file)
+            );
+        }
+    }
+}
+
+#[test]
+fn psm_8_logical_optimizer_bridge_vocabulary_is_explicit() {
+    let bridge = src_dir().join("sql/planner/optimizer_bridge");
+    assert!(
+        bridge.join("logical.rs").is_file(),
+        "optimizer_bridge/logical.rs must own LogicalPlanNode and OptExpr conversion"
+    );
+    assert!(
+        !bridge.join("plan.rs").exists(),
+        "optimizer_bridge/plan.rs must be retired"
+    );
+
+    let root = fs::read_to_string(bridge.join("mod.rs")).unwrap();
+    let expected_modules = BTreeSet::from([
+        "id_binding".to_string(),
+        "logical".to_string(),
+        "physical".to_string(),
+        "property".to_string(),
+        "scalar".to_string(),
+    ]);
+    let expected_imports = vec![
+        "private|crate::sql::optimizer::OptimizedOperatorNode",
+        "private|crate::sql::planner::physical::PhysicalPlanNode",
+    ];
+    assert_eq!(
+        rust_module_item_declarations(&root),
+        expected_modules,
+        "optimizer_bridge/mod.rs module surface must stay closed"
+    );
+    assert_eq!(
+        rust_production_use_statements(&root),
+        expected_imports,
+        "optimizer_bridge/mod.rs import and re-export surface must stay closed"
+    );
+
+    let forwarding_alias = format!("{root}\npub use logical as plan;\n");
+    assert_ne!(
+        rust_production_use_statements(&forwarding_alias),
+        expected_imports,
+        "a public logical-as-plan forwarding alias must violate the closed import surface"
+    );
+    let inline_plan_module = format!("{root}\nmod plan {{ pub use super::logical::*; }}\n");
+    assert_ne!(
+        rust_module_item_declarations(&inline_plan_module),
+        expected_modules,
+        "an inline plan forwarding module must violate the closed module surface"
+    );
+
+    let logical = fs::read_to_string(bridge.join("logical.rs")).unwrap();
+    for signature in [
+        "pub(crate) fn try_to_optimizer_expr(",
+        "pub(crate) fn to_optimizer_expr(",
+        "pub(crate) fn to_logical_plan(",
+    ] {
+        assert!(
+            logical.contains(signature),
+            "missing logical bridge API {signature}"
+        );
+    }
+
+    let retired_module_path = ["optimizer_bridge::", "plan"].concat();
+    let retired_functions = [
+        ["try_logical_plan", "_to_opt_expr"].concat(),
+        ["logical_plan", "_to_opt_expr"].concat(),
+        ["opt_expr", "_to_logical_plan"].concat(),
+    ];
+    for root in [src_dir(), Path::new(manifest_dir()).join("tests")] {
+        for file in rs_files(&root) {
+            let text = fs::read_to_string(&file).unwrap();
+            assert!(
+                !text.contains(&retired_module_path),
+                "{} uses {retired_module_path}",
+                rel(&file)
+            );
+            for retired_function in &retired_functions {
+                assert!(
+                    !text.contains(retired_function),
+                    "{} uses {retired_function}",
+                    rel(&file)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn psm_8_physical_bridge_vocabulary_is_explicit() {
+    let bridge = src_dir().join("sql/planner/optimizer_bridge");
+    let root = fs::read_to_string(bridge.join("mod.rs")).unwrap();
+    let id_binding = fs::read_to_string(bridge.join("id_binding.rs")).unwrap();
+    let physical = fs::read_to_string(bridge.join("physical.rs")).unwrap();
+
+    assert!(root.contains("optimized: &OptimizedOperatorNode"));
+    assert!(root.contains("verify_optimized_tree_id_binding(optimized)?"));
+    assert!(root.contains("materialize_physical_plan(optimized)"));
+    assert!(id_binding.contains("fn verify_optimized_tree_id_binding("));
+    assert!(physical.contains("fn materialize_physical_plan("));
+
+    let retired_verify = ["verify_optimizer", "_id_binding"].concat();
+    let retired_materialize = ["optimizer_physical", "_to_plan"].concat();
+    for root in [src_dir(), Path::new(manifest_dir()).join("tests")] {
+        for file in rs_files(&root) {
+            let text = fs::read_to_string(&file).unwrap();
+            assert!(
+                !text.contains(&retired_verify),
+                "{} uses {retired_verify}",
+                rel(&file)
+            );
+            assert!(
+                !text.contains(&retired_materialize),
+                "{} uses {retired_materialize}",
+                rel(&file)
+            );
+        }
+    }
 }

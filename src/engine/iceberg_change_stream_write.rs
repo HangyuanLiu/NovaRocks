@@ -26,7 +26,7 @@ use crate::engine::write_transaction::{
 use crate::runtime::coordinator::CoordinatedQueryResult;
 use crate::runtime::write_coordinator::WriteCommitInput;
 use crate::sql::common::ChangeStreamBranchKind;
-use crate::sql::optimizer::OptimizerPhysicalNode;
+use crate::sql::optimizer::OptimizedOperatorNode;
 use crate::sql::planner::distributed::FragmentId;
 use crate::sql::planner::distributed::write::change_stream::{
     ChangeStreamWriteDagSpec, IcebergChangeStreamWriteTopology,
@@ -232,7 +232,7 @@ pub(crate) struct ChangeStreamPhysicalBuildInput {
     pub(crate) state: Arc<StandaloneState>,
     pub(crate) current_catalog: Option<String>,
     pub(crate) current_database: String,
-    pub(crate) physical_plan: OptimizerPhysicalNode,
+    pub(crate) optimized_tree: OptimizedOperatorNode,
     pub(crate) dag: ChangeStreamWriteDagSpec,
     pub(crate) query_opts: Option<StandaloneQueryOptions>,
     pub(crate) mv_refresh_ctx:
@@ -273,7 +273,7 @@ impl IcebergWriteTransactionExecutor for ChangeStreamWriteTransactionExecutor {
             &build_input.state,
             build_input.current_catalog.as_deref(),
             &build_input.current_database,
-            &build_input.physical_plan,
+            &build_input.optimized_tree,
             &mut build_input.dag,
             build_input.mv_refresh_ctx.as_deref(),
         )?;

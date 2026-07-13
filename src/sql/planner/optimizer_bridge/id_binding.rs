@@ -24,7 +24,7 @@ use crate::sql::optimizer::operator::{
     PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalNestLoopJoinOp, ProjectOp, RepeatOp,
     TableFunctionOp, WindowOp,
 };
-use crate::sql::optimizer::physical_tree::OptimizerPhysicalNode;
+use crate::sql::optimizer::optimized_tree::OptimizedOperatorNode;
 use crate::sql::optimizer::property::DistributionSpec;
 use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::planner::optimizer_bridge::scalar::{
@@ -32,20 +32,20 @@ use crate::sql::planner::optimizer_bridge::scalar::{
     materialize_sort_keys, materialize_window_exprs,
 };
 
-pub(crate) fn verify_optimizer_id_binding(plan: &OptimizerPhysicalNode) -> Result<(), String> {
+pub(crate) fn verify_optimized_tree_id_binding(plan: &OptimizedOperatorNode) -> Result<(), String> {
     let scalars = plan
         .execution_props
         .scalar_arena
         .as_deref()
         .ok_or_else(|| {
-            "OptimizerPhysicalNode missing scalar arena for optimizer id binding verification"
+            "OptimizedOperatorNode missing scalar arena for optimizer id binding verification"
                 .to_string()
         })?;
     verify_node(plan, scalars).map(|_| ())
 }
 
 fn verify_node(
-    node: &OptimizerPhysicalNode,
+    node: &OptimizedOperatorNode,
     scalars: &ScalarArena,
 ) -> Result<HashSet<ColumnId>, String> {
     let child_outputs = node
@@ -551,13 +551,13 @@ fn output_ids(ids: impl IntoIterator<Item = ColumnId>) -> HashSet<ColumnId> {
         .collect()
 }
 
-fn declared_node_output_ids(node: &OptimizerPhysicalNode) -> Result<HashSet<ColumnId>, String> {
+fn declared_node_output_ids(node: &OptimizedOperatorNode) -> Result<HashSet<ColumnId>, String> {
     let mut out = HashSet::new();
     for column in &node.output_columns {
         verify_output_id(
             column.column_id,
             &format!(
-                "OptimizerPhysicalNode output `{}` on {:?}",
+                "OptimizedOperatorNode output `{}` on {:?}",
                 column.name, node.op
             ),
         )?;
@@ -649,7 +649,7 @@ mod tests {
         AggMode, AggregateOutputLayout, CTEConsumeOp, PhysicalHashAggregateOp, ProjectOp, RepeatOp,
         ValuesOp,
     };
-    use crate::sql::optimizer::physical_tree::{PlanExecutionProps, attach_scalar_arena};
+    use crate::sql::optimizer::optimized_tree::{PlanExecutionProps, attach_scalar_arena};
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::Statistics;
     use crate::sql::planner::optimizer_bridge::scalar::{
@@ -679,25 +679,25 @@ mod tests {
         }
     }
 
-    fn values_node(columns: Vec<OutputColumn>) -> OptimizerPhysicalNode {
-        OptimizerPhysicalNode {
+    fn values_node(columns: Vec<OutputColumn>) -> OptimizedOperatorNode {
+        OptimizedOperatorNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: vec![],
                 columns: columns.clone(),
             }),
             children: vec![],
             stats: Statistics::default(),
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+            explain_stats: crate::sql::optimizer::optimized_tree::OptimizerExplainStats::default(),
             output_columns: columns,
             execution_props: PlanExecutionProps::default(),
         }
     }
 
     fn project_over(
-        child: OptimizerPhysicalNode,
+        child: OptimizedOperatorNode,
         expr: TypedExpr,
         output_id: ColumnId,
-    ) -> OptimizerPhysicalNode {
+    ) -> OptimizedOperatorNode {
         let mut scalars = child
             .execution_props
             .scalar_arena
@@ -709,14 +709,14 @@ mod tests {
             output_name: "p".to_string(),
             output_column_id: output_id,
         }];
-        let mut plan = OptimizerPhysicalNode {
+        let mut plan = OptimizedOperatorNode {
             op: Operator::PhysicalProject(ProjectOp {
                 items: intern_project_items(&mut scalars, &items),
                 output_qualifier: None,
             }),
             children: vec![child],
             stats: Statistics::default(),
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+            explain_stats: crate::sql::optimizer::optimized_tree::OptimizerExplainStats::default(),
             output_columns: vec![int_col(output_id, "p")],
             execution_props: PlanExecutionProps::default(),
         };
@@ -725,10 +725,10 @@ mod tests {
     }
 
     fn hash_aggregate_over(
-        child: OptimizerPhysicalNode,
+        child: OptimizedOperatorNode,
         aggregate_output_id: ColumnId,
         declared_visible_id: ColumnId,
-    ) -> OptimizerPhysicalNode {
+    ) -> OptimizedOperatorNode {
         let mut scalars = child
             .execution_props
             .scalar_arena
@@ -743,7 +743,7 @@ mod tests {
             order_by: vec![],
             output_column_id: aggregate_output_id,
         }];
-        let mut plan = OptimizerPhysicalNode {
+        let mut plan = OptimizedOperatorNode {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
                 mode: AggMode::Single,
                 group_by: vec![],
@@ -757,7 +757,7 @@ mod tests {
             }),
             children: vec![child],
             stats: Statistics::default(),
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+            explain_stats: crate::sql::optimizer::optimized_tree::OptimizerExplainStats::default(),
             output_columns: vec![int_col(declared_visible_id, "sum(a) + 1")],
             execution_props: PlanExecutionProps::default(),
         };
@@ -766,11 +766,11 @@ mod tests {
     }
 
     fn repeat_over(
-        child: OptimizerPhysicalNode,
+        child: OptimizedOperatorNode,
         grouping_output_id: ColumnId,
-    ) -> OptimizerPhysicalNode {
+    ) -> OptimizedOperatorNode {
         let rollup_id = ColumnId::new_for_test(1);
-        OptimizerPhysicalNode {
+        OptimizedOperatorNode {
             op: Operator::PhysicalRepeat(RepeatOp {
                 repeat_column_ref_list: vec![vec!["a".to_string()], vec![]],
                 repeat_column_ref_ids: vec![vec![rollup_id], vec![]],
@@ -784,14 +784,14 @@ mod tests {
             }),
             children: vec![child],
             stats: Statistics::default(),
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+            explain_stats: crate::sql::optimizer::optimized_tree::OptimizerExplainStats::default(),
             output_columns: vec![int_col(rollup_id, "a")],
             execution_props: PlanExecutionProps::default(),
         }
     }
 
     #[test]
-    fn p3_verify_optimizer_id_binding_rejects_unset_columnref() {
+    fn p3_verify_optimized_tree_id_binding_rejects_unset_columnref() {
         let err = verify_expr(
             &column_ref(ColumnId::UNSET, "a"),
             &std::collections::HashSet::new(),
@@ -802,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn p3_verify_optimizer_id_binding_rejects_missing_input_binding() {
+    fn p3_verify_optimized_tree_id_binding_rejects_missing_input_binding() {
         let input_id = ColumnId::new_for_test(1);
         let missing_id = ColumnId::new_for_test(99);
         let output_id = ColumnId::new_for_test(2);
@@ -812,7 +812,7 @@ mod tests {
             output_id,
         );
 
-        let err = verify_optimizer_id_binding(&plan).expect_err("missing ColumnId must fail");
+        let err = verify_optimized_tree_id_binding(&plan).expect_err("missing ColumnId must fail");
         assert!(
             err.contains("not produced by child scope"),
             "unexpected err={err}"
@@ -820,7 +820,7 @@ mod tests {
     }
 
     #[test]
-    fn p3_verify_optimizer_id_binding_rejects_logical_operator_with_planner_bridge_label() {
+    fn p3_verify_optimized_tree_id_binding_rejects_logical_operator_with_planner_bridge_label() {
         let mut plan = values_node(vec![]);
         plan.op = Operator::LogicalValues(ValuesOp {
             rows: vec![],
@@ -828,7 +828,7 @@ mod tests {
         });
         attach_scalar_arena(&mut plan, Arc::new(ScalarArena::new()));
 
-        let err = verify_optimizer_id_binding(&plan).expect_err("logical op must fail");
+        let err = verify_optimized_tree_id_binding(&plan).expect_err("logical op must fail");
         assert!(
             err.contains("optimizer id binding verifier"),
             "unexpected err={err}"
@@ -854,11 +854,12 @@ mod tests {
             project_output_id,
         );
 
-        verify_optimizer_id_binding(&plan).expect("project should bind aggregate call output id");
+        verify_optimized_tree_id_binding(&plan)
+            .expect("project should bind aggregate call output id");
     }
 
     #[test]
-    fn p3_verify_optimizer_id_binding_accepts_hidden_group_key_layout_output() {
+    fn p3_verify_optimized_tree_id_binding_accepts_hidden_group_key_layout_output() {
         let input_id = ColumnId::new_for_test(1);
         let group_output_id = ColumnId::new_for_test(4);
         let aggregate_output_id = ColumnId::new_for_test(5);
@@ -873,7 +874,7 @@ mod tests {
             order_by: vec![],
             output_column_id: aggregate_output_id,
         }];
-        let mut aggregate = OptimizerPhysicalNode {
+        let mut aggregate = OptimizedOperatorNode {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
                 mode: AggMode::Single,
                 group_by: intern_exprs(&mut scalars, &[column_ref(input_id, "a")]),
@@ -887,7 +888,7 @@ mod tests {
             }),
             children: vec![child],
             stats: Statistics::default(),
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+            explain_stats: crate::sql::optimizer::optimized_tree::OptimizerExplainStats::default(),
             output_columns: vec![int_col(aggregate_output_id, "sum(a)")],
             execution_props: PlanExecutionProps::default(),
         };
@@ -898,7 +899,7 @@ mod tests {
             project_output_id,
         );
 
-        verify_optimizer_id_binding(&plan)
+        verify_optimized_tree_id_binding(&plan)
             .expect("project should bind hidden group layout output id");
     }
 
@@ -917,7 +918,8 @@ mod tests {
             project_output_id,
         );
 
-        verify_optimizer_id_binding(&plan).expect("project should bind Repeat grouping output id");
+        verify_optimized_tree_id_binding(&plan)
+            .expect("project should bind Repeat grouping output id");
     }
 
     #[test]
@@ -928,13 +930,13 @@ mod tests {
             values_node(vec![int_col(input_id, "a")]),
             grouping_output_id,
         );
-        let distribution = OptimizerPhysicalNode {
+        let distribution = OptimizedOperatorNode {
             op: Operator::PhysicalDistribution(PhysicalDistributionOp {
                 spec: DistributionSpec::Gather,
             }),
             children: vec![repeat],
             stats: Statistics::default(),
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+            explain_stats: crate::sql::optimizer::optimized_tree::OptimizerExplainStats::default(),
             output_columns: vec![int_col(input_id, "a")],
             execution_props: PlanExecutionProps::default(),
         };
@@ -943,7 +945,7 @@ mod tests {
             int_col(input_id, "a"),
             int_col(grouping_output_id, "__grouping_fn_0"),
         ];
-        let mut aggregate = OptimizerPhysicalNode {
+        let mut aggregate = OptimizedOperatorNode {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
                 mode: AggMode::Single,
                 group_by: intern_exprs(
@@ -960,7 +962,7 @@ mod tests {
             }),
             children: vec![distribution],
             stats: Statistics::default(),
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+            explain_stats: crate::sql::optimizer::optimized_tree::OptimizerExplainStats::default(),
             output_columns: vec![
                 int_col(input_id, "a"),
                 int_col(grouping_output_id, "__grouping_fn_0"),
@@ -969,7 +971,7 @@ mod tests {
         };
         attach_scalar_arena(&mut aggregate, Arc::new(scalars));
 
-        verify_optimizer_id_binding(&aggregate)
+        verify_optimized_tree_id_binding(&aggregate)
             .expect("distribution must preserve Repeat grouping output id for aggregate grouping");
     }
 
@@ -979,7 +981,7 @@ mod tests {
         let consumer_b = ColumnId::new_for_test(2);
         let producer_a = ColumnId::new_for_test(11);
         let output_columns = vec![int_col(consumer_a, "a"), int_col(consumer_b, "b")];
-        let mut plan = OptimizerPhysicalNode {
+        let mut plan = OptimizedOperatorNode {
             op: Operator::PhysicalCTEConsume(CTEConsumeOp {
                 cte_id: 9,
                 alias: "cte9".to_string(),
@@ -988,14 +990,14 @@ mod tests {
             }),
             children: vec![],
             stats: Statistics::default(),
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+            explain_stats: crate::sql::optimizer::optimized_tree::OptimizerExplainStats::default(),
             output_columns,
             execution_props: PlanExecutionProps::default(),
         };
         attach_scalar_arena(&mut plan, Arc::new(ScalarArena::new()));
 
-        let err =
-            verify_optimizer_id_binding(&plan).expect_err("CTEConsume arity mismatch must fail");
+        let err = verify_optimized_tree_id_binding(&plan)
+            .expect_err("CTEConsume arity mismatch must fail");
         assert!(
             err.contains("CTEConsume output/producers arity mismatch for cte_id=9"),
             "unexpected err={err}"

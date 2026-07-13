@@ -1284,7 +1284,7 @@ mod column_id_helper_tests {
         join_plan: &LogicalPlanNode,
     ) -> (Vec<ScalarJoinEquiKey>, ScalarArena) {
         let mut arena = ScalarArena::new();
-        let expr = crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr(
+        let expr = crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr(
             join_plan, &mut arena,
         );
         let Operator::LogicalJoin(join) = &expr.op else {

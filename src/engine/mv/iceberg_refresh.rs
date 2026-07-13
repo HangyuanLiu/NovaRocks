@@ -11061,7 +11061,7 @@ fn repartition_iceberg_join_mv_overwrite(
         target_table.clone(),
         Arc::clone(&collector),
         ImvRefreshPlannedChangeStream {
-            physical_plan: planned_query.physical_plan,
+            optimized_tree: planned_query.optimized_tree,
             output_columns: planned_query.output_columns,
             change_stream: change_stream_override.unwrap_or(planned_query.change_stream),
             producer_branches: vec![ImvChangeStreamProducerBranch::FreshData],
@@ -11275,7 +11275,7 @@ fn first_refresh_iceberg_join_mv(
         target_table.clone(),
         Arc::clone(&collector),
         ImvRefreshPlannedChangeStream {
-            physical_plan: planned_query.physical_plan,
+            optimized_tree: planned_query.optimized_tree,
             output_columns: planned_query.output_columns,
             change_stream: change_stream_override.unwrap_or(planned_query.change_stream),
             producer_branches: vec![ImvChangeStreamProducerBranch::FreshData],
@@ -13595,7 +13595,7 @@ fn execute_join_delta_branches_logical(
         target_table.clone(),
         Arc::clone(&collector),
         ImvRefreshPlannedChangeStream {
-            physical_plan: planned_query.physical_plan,
+            optimized_tree: planned_query.optimized_tree,
             output_columns: planned_query.output_columns,
             change_stream: change_stream_override.unwrap_or(planned_query.change_stream),
             producer_branches,
@@ -13927,7 +13927,7 @@ fn execute_append_only_join_delta_branches(
             target_table.clone(),
             Arc::clone(&collector),
             ImvRefreshPlannedChangeStream {
-                physical_plan: planned_query.physical_plan,
+                optimized_tree: planned_query.optimized_tree,
                 output_columns: planned_query.output_columns,
                 change_stream: planned_query.change_stream,
                 producer_branches: vec![ImvChangeStreamProducerBranch::FreshData],
@@ -14245,7 +14245,7 @@ fn execute_join_delta_branches(
         target_table.clone(),
         Arc::clone(&collector),
         ImvRefreshPlannedChangeStream {
-            physical_plan: planned_query.physical_plan,
+            optimized_tree: planned_query.optimized_tree,
             output_columns: planned_query.output_columns,
             change_stream: planned_query.change_stream,
             producer_branches: vec![
@@ -14667,7 +14667,7 @@ enum ImvChangeStreamProducerBranch {
 const IMV_CHANGE_STREAM_DATA_ROUTE_COLUMN: &str = "__change_data_route";
 
 struct ImvRefreshPlannedChangeStream<'a> {
-    physical_plan: crate::sql::optimizer::OptimizerPhysicalNode,
+    optimized_tree: crate::sql::optimizer::OptimizedOperatorNode,
     output_columns: Vec<OutputColumn>,
     change_stream: crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
     producer_branches: Vec<ImvChangeStreamProducerBranch>,
@@ -14712,7 +14712,7 @@ fn execute_imv_change_stream_write(
         state,
         Some(&target.catalog),
         &target.namespace,
-        &refresh_plan.physical_plan,
+        &refresh_plan.optimized_tree,
         &mut dag,
         refresh_plan.mv_refresh_ctx,
     )?;
@@ -14774,15 +14774,15 @@ fn ensure_imv_change_stream_data_route(
 
     let route_output = imv_data_route_output_column(&refresh_plan.output_columns);
     let route_output_ordinal = refresh_plan.output_columns.len();
-    let physical_plan = add_imv_data_route_project(
-        refresh_plan.physical_plan,
+    let optimized_tree = add_imv_data_route_project(
+        refresh_plan.optimized_tree,
         &refresh_plan.output_columns,
         action_output.as_ref(),
         row_lineage_output.as_ref(),
         route_mode,
         route_output.clone(),
     )?;
-    refresh_plan.physical_plan = physical_plan;
+    refresh_plan.optimized_tree = optimized_tree;
     refresh_plan.output_columns.push(route_output);
 
     Ok((refresh_plan, Some(route_output_ordinal)))
@@ -14831,15 +14831,15 @@ fn imv_data_route_output_column(existing: &[OutputColumn]) -> OutputColumn {
 }
 
 fn add_imv_data_route_project(
-    child: crate::sql::optimizer::OptimizerPhysicalNode,
+    child: crate::sql::optimizer::OptimizedOperatorNode,
     child_output_columns: &[OutputColumn],
     action_output: Option<&OutputColumn>,
     row_lineage_output: Option<&OutputColumn>,
     route_mode: ImvDataRouteMode,
     route_output: OutputColumn,
-) -> Result<crate::sql::optimizer::OptimizerPhysicalNode, String> {
+) -> Result<crate::sql::optimizer::OptimizedOperatorNode, String> {
     use crate::sql::optimizer::operator::{Operator, ProjectOp, ScalarProjectItem};
-    use crate::sql::optimizer::physical_tree::{PlanExecutionProps, attach_scalar_arena};
+    use crate::sql::optimizer::optimized_tree::{PlanExecutionProps, attach_scalar_arena};
     use crate::sql::optimizer::scalar::ScalarNode;
 
     let existing_arena =
@@ -14878,14 +14878,14 @@ fn add_imv_data_route_project(
     let mut output_columns = child_output_columns.to_vec();
     output_columns.push(route_output);
     let arena = Arc::new(arena);
-    let mut plan = crate::sql::optimizer::OptimizerPhysicalNode {
+    let mut plan = crate::sql::optimizer::OptimizedOperatorNode {
         op: Operator::PhysicalProject(ProjectOp {
             items,
             output_qualifier: None,
         }),
         children: vec![child],
         stats,
-        explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+        explain_stats: crate::sql::optimizer::optimized_tree::OptimizerExplainStats::default(),
         output_columns,
         execution_props: PlanExecutionProps {
             output_property: output_property.clone(),
@@ -15708,7 +15708,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
         target_table.clone(),
         Arc::clone(&collector),
         ImvRefreshPlannedChangeStream {
-            physical_plan: planned_query.physical_plan,
+            optimized_tree: planned_query.optimized_tree,
             output_columns: planned_query.output_columns,
             change_stream: planned_query.change_stream,
             producer_branches,
@@ -16074,7 +16074,7 @@ mod tests {
     use crate::engine::mv::refresh_property::PartitionPruningPolicy;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::logical::*;
-    use crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr;
+    use crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr;
     use crate::sql::planner::payload::*;
     use arrow::array::{BinaryArray, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -16210,7 +16210,7 @@ mod tests {
         );
 
         let mut arena = ScalarArena::new();
-        try_logical_plan_to_opt_expr(&normalized, &mut arena)
+        try_to_optimizer_expr(&normalized, &mut arena)
             .expect("normalized aggregate must satisfy optimizer bridge contract");
     }
 

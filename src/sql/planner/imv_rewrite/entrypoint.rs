@@ -32,9 +32,7 @@ use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
 use crate::sql::planner::imv_rewrite::pipeline::build_imv_pipeline;
 use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
-use crate::sql::planner::optimizer_bridge::plan::{
-    opt_expr_to_logical_plan, try_logical_plan_to_opt_expr,
-};
+use crate::sql::planner::optimizer_bridge::logical::{to_logical_plan, try_to_optimizer_expr};
 use crate::sql::planner::payload::{AggregateCall, WindowExpr};
 
 pub(crate) struct ImvRewriteInput {
@@ -77,7 +75,7 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
     // pipeline operates on OptExpr. This is not a production rewrite
     // round-trip inside the optimizer.
     let scalars = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
-    let opt_in = try_logical_plan_to_opt_expr(&plan, &mut scalars.borrow_mut())?;
+    let opt_in = try_to_optimizer_expr(&plan, &mut scalars.borrow_mut())?;
     ctx_rw.set_scalar_arena(std::rc::Rc::clone(&scalars));
 
     let pipeline = build_imv_pipeline();
@@ -86,7 +84,7 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
     // Boundary materialization for ImvRewriteOutcome: callers outside the
     // optimizer still consume LogicalPlanNode. This is the optimizer-to-engine
     // exit, not an internal optimizer rewrite round-trip.
-    let plan_out = opt_expr_to_logical_plan(opt_out, &scalars.borrow());
+    let plan_out = to_logical_plan(opt_out, &scalars.borrow());
 
     let ext = ctx_rw
         .extension::<ImvExtension>()
@@ -416,7 +414,7 @@ mod tests {
     fn plan_to_opt_expr_with_arena(plan: &LogicalPlanNode, ctx: &mut RewriteContext) -> OptExpr {
         let arena = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
         ctx.set_scalar_arena(std::rc::Rc::clone(&arena));
-        crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr(
+        crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr(
             plan,
             &mut arena.borrow_mut(),
         )
@@ -440,16 +438,16 @@ mod tests {
 
     fn optimize_logical_for_test(
         plan: LogicalPlanNode,
-    ) -> crate::sql::optimizer::OptimizerPhysicalNode {
+    ) -> crate::sql::optimizer::OptimizedOperatorNode {
         let mut scalar_arena = ScalarArena::new();
-        let opt_expr = crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr(
+        let optimizer_expr = crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr(
             &plan,
             &mut scalar_arena,
         );
         let mut factory = crate::sql::column_id::ColumnRefFactory::new();
         factory.reserve_until(300);
         crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
-            opt_expr,
+            optimizer_expr,
             scalar_arena,
             &HashMap::new(),
             factory,
@@ -2702,12 +2700,15 @@ mod tests {
             );
         }
 
-        let physical = optimize_logical_for_test(outcome.plan.clone());
-        assert_physical_project_refs_resolve_to_child_outputs(&physical);
+        let optimized_tree = optimize_logical_for_test(outcome.plan.clone());
+        assert_physical_project_refs_resolve_to_child_outputs(&optimized_tree);
         assert!(
-            !physical.output_columns.iter().any(ImvRowIdColumn::matches),
+            !optimized_tree
+                .output_columns
+                .iter()
+                .any(ImvRowIdColumn::matches),
             "physical root must not advertise raw base _row_id columns as change-stream outputs: {:?}",
-            physical.output_columns
+            optimized_tree.output_columns
         );
     }
 
@@ -2787,7 +2788,7 @@ mod tests {
     }
 
     #[test]
-    fn pure_join_refresh_physical_tree_keeps_project_refs_in_child_scope() {
+    fn pure_join_refresh_optimized_tree_keeps_project_refs_in_child_scope() {
         std::thread::Builder::new()
             .name("imv-join-physical-scope-test".to_string())
             .stack_size(16 * 1024 * 1024)
@@ -2825,9 +2826,9 @@ mod tests {
                     )
                 }
                 .expect("join projection coalesce plan");
-                let physical = optimize_logical_for_test(coalesce);
+                let optimized_tree = optimize_logical_for_test(coalesce);
 
-                assert_physical_project_refs_resolve_to_child_outputs(&physical);
+                assert_physical_project_refs_resolve_to_child_outputs(&optimized_tree);
             })
             .expect("spawn physical scope test")
             .join()
@@ -2835,7 +2836,7 @@ mod tests {
     }
 
     #[test]
-    fn pure_join_refresh_filter_physical_tree_keeps_action_refs_in_child_scope() {
+    fn pure_join_refresh_filter_optimized_tree_keeps_action_refs_in_child_scope() {
         std::thread::Builder::new()
             .name("imv-join-filter-physical-scope-test".to_string())
             .stack_size(16 * 1024 * 1024)
@@ -2873,13 +2874,13 @@ mod tests {
                     )
                 }
                 .expect("join projection/filter coalesce plan");
-                let physical = optimize_logical_for_test(coalesce);
+                let optimized_tree = optimize_logical_for_test(coalesce);
 
-                crate::sql::planner::optimizer_bridge::id_binding::verify_optimizer_id_binding(
-                    &physical,
+                crate::sql::planner::optimizer_bridge::id_binding::verify_optimized_tree_id_binding(
+                    &optimized_tree,
                 )
-                    .expect("join projection/filter physical coalesce plan must bind ids");
-                assert_physical_project_refs_resolve_to_child_outputs(&physical);
+                .expect("join projection/filter physical coalesce plan must bind ids");
+                assert_physical_project_refs_resolve_to_child_outputs(&optimized_tree);
             })
             .expect("spawn join filter physical scope test")
             .join()
@@ -2887,7 +2888,7 @@ mod tests {
     }
 
     #[test]
-    fn pure_join_refresh_side_filter_physical_tree_keeps_action_refs_in_child_scope() {
+    fn pure_join_refresh_side_filter_optimized_tree_keeps_action_refs_in_child_scope() {
         std::thread::Builder::new()
             .name("imv-join-side-filter-physical-scope-test".to_string())
             .stack_size(16 * 1024 * 1024)
@@ -2925,9 +2926,9 @@ mod tests {
                     )
                 }
                 .expect("join side-filter coalesce plan");
-                let physical = optimize_logical_for_test(coalesce);
+                let optimized_tree = optimize_logical_for_test(coalesce);
 
-                assert_physical_project_refs_resolve_to_child_outputs(&physical);
+                assert_physical_project_refs_resolve_to_child_outputs(&optimized_tree);
             })
             .expect("spawn join side-filter physical scope test")
             .join()
@@ -2975,20 +2976,22 @@ mod tests {
                     )
                 }
                 .expect("join projection coalesce plan");
-                let physical = optimize_logical_for_test(coalesce);
+                let optimized_tree = optimize_logical_for_test(coalesce);
                 let catalog = crate::engine::catalog::InMemoryCatalog::default();
                 let mut connectors = crate::connector::ConnectorRegistry::default();
                 connectors.register_scan_planner(Arc::new(
                     crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
                 ));
 
-                let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&physical)
-                    .expect("convert optimizer physical plan");
-                let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)
+                let physical_plan =
+                    crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                        .expect("convert optimizer physical plan");
+                let distributed_plan =
+                    crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
                     .expect("build DistributedPlan");
                 crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
                     crate::sql::codegen::FragmentBuildRequest::result(
-                        &dp,
+                        &distributed_plan,
                         &catalog,
                         &connectors,
                         Some(&refresh_ctx),
@@ -3088,7 +3091,7 @@ mod tests {
         let opt_out = pipeline
             .rewrite(opt_in, &mut ctx)
             .expect("query rewrite must preserve join aggregate delta action");
-        let rewritten = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+        let rewritten = crate::sql::planner::optimizer_bridge::logical::to_logical_plan(
             opt_out,
             &ctx.scalar_arena().borrow(),
         );
@@ -3180,7 +3183,7 @@ mod tests {
     }
 
     fn assert_physical_project_refs_resolve_to_child_outputs(
-        plan: &crate::sql::optimizer::OptimizerPhysicalNode,
+        plan: &crate::sql::optimizer::OptimizedOperatorNode,
     ) {
         if matches!(
             &plan.op,

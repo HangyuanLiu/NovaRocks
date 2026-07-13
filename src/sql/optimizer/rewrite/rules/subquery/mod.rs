@@ -93,7 +93,7 @@ mod tests {
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::stats_input::OptimizerStatsInput;
     use crate::sql::planner::logical::{LogicalApplyNode, LogicalPlanKind};
-    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
+    use crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr;
     use crate::sql::planner::payload::{PlanLimitNode, PlanValuesNode};
 
     fn ctx_with_arena() -> RewriteContext {
@@ -106,7 +106,7 @@ mod tests {
     }
 
     fn to_opt_expr(plan: &LogicalPlanNode, ctx: &mut RewriteContext) -> OptExpr {
-        logical_plan_to_opt_expr(plan, &mut ctx.scalar_arena().borrow_mut())
+        to_optimizer_expr(plan, &mut ctx.scalar_arena().borrow_mut())
     }
 
     fn empty_values() -> LogicalPlanNode {

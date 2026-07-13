@@ -270,9 +270,7 @@ mod tests {
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
-    use crate::sql::planner::optimizer_bridge::plan::{
-        logical_plan_to_opt_expr, opt_expr_to_logical_plan,
-    };
+    use crate::sql::planner::optimizer_bridge::logical::{to_logical_plan, to_optimizer_expr};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -392,7 +390,7 @@ mod tests {
         let mut ctx = build_ctx();
         let plan = project_root(delta_scan_with_row_id(ColumnId(101)), ColumnId(101));
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         drop(arena_rc);
         assert!(rule.matches(&expr, &ctx));
         let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("apply")
@@ -400,7 +398,7 @@ mod tests {
             panic!("expected Changed(Project)");
         };
         let arena_rc = ctx.scalar_arena();
-        let changed = opt_expr_to_logical_plan(changed_expr, &arena_rc.borrow());
+        let changed = to_logical_plan(changed_expr, &arena_rc.borrow());
         let LogicalPlanKind::Project(root) = changed.kind else {
             panic!("expected Changed(Project)");
         };
@@ -431,7 +429,7 @@ mod tests {
             });
         }
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&expr, &ctx));
     }
 
@@ -455,7 +453,7 @@ mod tests {
             None,
         );
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         drop(arena_rc);
         assert!(rule.matches(&expr, &ctx));
         let err = rule

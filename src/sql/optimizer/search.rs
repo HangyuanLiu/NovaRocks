@@ -559,7 +559,7 @@ mod tests {
     use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::MExpr;
-    use crate::sql::optimizer::physical_tree::OptimizerPhysicalNode;
+    use crate::sql::optimizer::optimized_tree::OptimizedOperatorNode;
     use crate::sql::optimizer::statistics::TableStatistics;
     use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use arrow::datatypes::DataType;
@@ -939,7 +939,7 @@ mod tests {
         (memo, root)
     }
 
-    fn find_hash_join_for_test(plan: &OptimizerPhysicalNode) -> Option<&PhysicalHashJoinOp> {
+    fn find_hash_join_for_test(plan: &OptimizedOperatorNode) -> Option<&PhysicalHashJoinOp> {
         if let Operator::PhysicalHashJoin(join) = &plan.op {
             return Some(join);
         }
