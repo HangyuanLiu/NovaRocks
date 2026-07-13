@@ -19,7 +19,7 @@
 //!
 //! Translates the ColumnId-based `required_output_columns` set (written by the
 //! Phase-1 tagging pass) into the string-name-based `required_columns` list
-//! that codegen / fragment_builder reads.
+//! that fragment materialization reads.
 //!
 //! Also unions in any columns referenced by pushed-down predicates so that
 //! predicate evaluation is not broken by column pruning.

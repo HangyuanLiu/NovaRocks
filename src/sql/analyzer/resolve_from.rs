@@ -162,8 +162,8 @@ impl<'a> super::AnalyzerContext<'a> {
             // the outer scope — the other side is consumed by the join itself
             // and is not visible to WHERE/SELECT or downstream joins. The ON
             // condition above was already analyzed against the merged scope.
-            // This must match `fragment_builder::merged_scope` so that
-            // analyzer-emitted projections agree with codegen scope.
+            // This must match the physical join output scope so that
+            // analyzer-emitted projections agree with fragment materialization.
             match join_kind {
                 JoinKind::LeftSemi | JoinKind::LeftAnti => {
                     // outer scope = left scope unchanged. USING-clause

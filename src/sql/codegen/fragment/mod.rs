@@ -15,21 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Feature-neutral entry point for the native fragment builder.
+mod boundary_schema;
+mod build;
+mod request;
+mod result;
+mod runtime_filter;
 
-use crate::sql::codegen::{FragmentBuildRequest, MultiFragmentBuildResult};
-
-pub(crate) struct PlanFragmentBuilder;
-
-impl PlanFragmentBuilder {
-    pub(crate) fn build(
-        request: FragmentBuildRequest<'_>,
-    ) -> Result<MultiFragmentBuildResult, String> {
-        crate::sql::codegen::ir::lower_distributed_plan(
-            request.distributed_plan,
-            request.catalog,
-            request.connectors,
-            request.mv_refresh_ctx,
-        )
-    }
-}
+pub(crate) use boundary_schema::BoundarySchemaReport;
+pub(crate) use build::build;
+pub(crate) use request::FragmentBuildRequest;
+pub(crate) use result::{
+    FragmentOutputKind, FragmentSchedulingMetadata, MultiFragmentBuildResult, OutputColumn,
+    RuntimeFilterPlanResult,
+};

@@ -43,8 +43,8 @@ pub(super) fn build_window_and_project(
         // The analytic operator requires input sorted by (partition_by, order_by).
         // Insert a Sort node before the Window node using the first window
         // function's sort keys.  When window functions have different
-        // partition/order signatures, the physical emitter splits them into
-        // separate Sort + Analytic nodes (see fragment_builder.rs::visit_window_multi_group).
+        // partition/order signatures, `build_distributed_plan` splits them into
+        // separate Sort + Analytic nodes in planner/distributed/build/lowering.rs.
         let first_win = &window_exprs[0];
         let mut sort_items = Vec::new();
         for p in &first_win.partition_by {
