@@ -126,11 +126,18 @@ fn prepare_scan_node(
                     "scan source {source_kind} node_id={node_id} requires scan binding resolver"
                 )
             })?;
-            resolver.resolve_scan(node_id, scan)?.ok_or_else(|| {
-                format!(
-                    "scan binding resolver returned no binding for required source {source_kind} node_id={node_id}"
-                )
-            })?
+            resolver
+                .resolve_scan(node_id, scan)
+                .map_err(|err| {
+                    format!(
+                        "scan binding resolver failed for required source {source_kind} node_id={node_id}: {err}"
+                    )
+                })?
+                .ok_or_else(|| {
+                    format!(
+                        "scan binding resolver returned no binding for required source {source_kind} node_id={node_id}"
+                    )
+                })?
         }
         source => {
             return Err(format!(
@@ -418,6 +425,10 @@ fn resolve_effective_required_reads(
         None => scan.required_columns.clone().unwrap_or_else(|| {
             scan.columns
                 .iter()
+                .filter(|column| {
+                    !matches!(scan.table.source, ScanSource::IcebergVersionTable { .. })
+                        || resolved_source_column(scan, &column.name).is_some()
+                })
                 .map(|column| column.name.clone())
                 .collect()
         }),
@@ -495,7 +506,7 @@ pub(crate) fn merge_required_columns_with_projected(
         .cloned()
         .chain(existing.unwrap_or_default())
     {
-        if seen.insert(name.to_ascii_lowercase()) {
+        if seen.insert(name.to_lowercase()) {
             out.push(name);
         }
     }
@@ -964,6 +975,18 @@ mod tests {
         }
     }
 
+    struct ErrorResolver;
+
+    impl ScanBindingResolver for ErrorResolver {
+        fn resolve_scan(
+            &self,
+            _node_id: i32,
+            _scan: &PlanScanNode,
+        ) -> Result<Option<ResolvedScanExecution>, String> {
+            Err("boom".to_string())
+        }
+    }
+
     fn column(id: u32, name: &str, data_type: DataType, nullable: bool) -> OutputColumn {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
@@ -1383,23 +1406,51 @@ mod tests {
     }
 
     #[test]
-    fn version_scan_keeps_only_planner_outputs_mappable_to_resolved_table() {
+    fn resolver_error_reports_source_kind_node_id_and_cause() {
+        let mut root = scan_node(47, IcebergDataFileBinding::ExplicitFiles);
+        replace_scan_source(
+            &mut root,
+            ScanSource::IcebergVersionTable {
+                table: iceberg_table(),
+                snapshot_id: 6,
+            },
+        );
+
+        let err = match prepare_scan_bindings(
+            &plan(root),
+            &ConnectorRegistry::new(),
+            Some(&ErrorResolver),
+        ) {
+            Ok(_) => panic!("resolver error must fail preparation"),
+            Err(err) => err,
+        };
+
+        assert!(err.contains("IcebergVersionTable"), "{err}");
+        assert!(err.contains("node_id=47"), "{err}");
+        assert!(err.contains("boom"), "{err}");
+    }
+
+    #[test]
+    fn version_scan_without_required_columns_reads_only_mappable_outputs_immutably() {
         let mut root = scan_node(37, IcebergDataFileBinding::ExplicitFiles);
         let DistributedNodeKind::Scan(scan) = &mut root.payload else {
             panic!("test root must be a scan");
         };
+        scan.required_columns = None;
         scan.columns
             .push(column(99, "stale_planner_only", DataType::Utf8, true));
         scan.table.source = ScanSource::IcebergVersionTable {
             table: iceberg_table(),
             snapshot_id: 6,
         };
+        let plan = plan(root);
+        let before = format!("{plan:#?}");
         let resolver = StaticResolver {
             execution: resolved_files(vec![data_file("s3://bucket/version-6.parquet")]),
         };
 
         let bindings = prepare_scan_bindings(
-            &plan(root),
+            &plan,
             &registry(vec![data_file("s3://bucket/version-6.parquet")]),
             Some(&resolver),
         )
@@ -1412,6 +1463,23 @@ mod tests {
             ColumnId::new_for_test(1)
         );
         assert_eq!(binding.physical_columns[0].source.name, "id");
+        assert_eq!(binding.required_reads.len(), 1);
+        assert_eq!(binding.required_reads[0].source.name, "id");
+        assert_eq!(
+            binding.required_reads[0].planner_column_id,
+            Some(ColumnId::new_for_test(1))
+        );
+        assert_eq!(format!("{plan:#?}"), before);
+    }
+
+    #[test]
+    fn projected_required_column_merge_preserves_unicode_case_deduplication() {
+        let merged = super::merge_required_columns_with_projected(
+            Some(vec!["äpfel".to_string()]),
+            &["ÄPFEL".to_string()],
+        );
+
+        assert_eq!(merged, vec!["ÄPFEL"]);
     }
 
     #[test]

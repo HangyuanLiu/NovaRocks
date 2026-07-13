@@ -92,11 +92,19 @@ pub(crate) struct ResolvedScanBinding {
 impl ResolvedScanBinding {
     fn validate(&self) -> Result<(), String> {
         let mut physical_planner_ids = BTreeSet::new();
+        let mut physical_source_names = BTreeSet::new();
         for column in &self.physical_columns {
             if !physical_planner_ids.insert(column.planner.column_id) {
                 return Err(format!(
                     "scan binding node_id={} has duplicate physical planner column id {}",
                     self.node_id, column.planner.column_id
+                ));
+            }
+            let source_key = column.source.name.to_ascii_lowercase();
+            if !physical_source_names.insert(source_key) {
+                return Err(format!(
+                    "scan binding node_id={} has duplicate physical source name '{}'",
+                    self.node_id, column.source.name
                 ));
             }
             if column.planner.data_type != column.source.data_type {
@@ -389,6 +397,33 @@ mod tests {
 
         assert!(err.contains("node_id=52"));
         assert!(err.contains("duplicate physical planner column id c7"));
+    }
+
+    #[test]
+    fn duplicate_physical_source_name_fails_fast_case_insensitively() {
+        let mut bindings = ScanExecutionBindings::default();
+        let err = bindings
+            .insert_binding(binding(
+                56,
+                vec![
+                    ResolvedScanColumn {
+                        planner: planner_column(7, "first", DataType::Int64, false),
+                        source: source_column("Tenant_ID", DataType::Int64, false, None),
+                        kind: ResolvedScanColumnKind::PhysicalTableColumn,
+                    },
+                    ResolvedScanColumn {
+                        planner: planner_column(8, "second", DataType::Int64, false),
+                        source: source_column("tenant_id", DataType::Int64, false, None),
+                        kind: ResolvedScanColumnKind::PhysicalTableColumn,
+                    },
+                ],
+                Vec::new(),
+            ))
+            .expect_err("duplicate physical source name");
+
+        assert!(err.contains("node_id=56"), "{err}");
+        assert!(err.contains("duplicate physical source name"), "{err}");
+        assert!(err.contains("tenant_id"), "{err}");
     }
 
     #[test]
