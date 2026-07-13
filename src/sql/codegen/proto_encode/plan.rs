@@ -29,7 +29,6 @@ use super::types::encode_type;
 use crate::proto::{common, plan};
 use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, TypedExpr};
 use crate::sql::catalog;
-use crate::sql::codegen::agg_type_infer::infer_agg_function_types;
 use crate::sql::codegen::connector_scan_planning::{
     StarRocksColumnSchemaDescriptor, StarRocksKeysTypeDescriptor, StarRocksScanSourceDescriptor,
     StarRocksTabletSchemaDescriptor,
@@ -53,6 +52,7 @@ use crate::sql::planner::physical::{
     AggMode, HashSource, JoinDistribution, JoinExecutionMode, PhysicalHashAggregateNode,
     PhysicalPlanKind, PlanSetOpKind, RedistributeMode, TopNPhase,
 };
+use crate::types::aggregate::infer_agg_function_types;
 
 pub(crate) struct NativePlanEncodeContext<'a> {
     pub(crate) mv_refresh_ctx:

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) mod aggregate;
 mod arithmetic;
 pub(crate) mod arrow_primitive;
 #[cfg(feature = "compat")]

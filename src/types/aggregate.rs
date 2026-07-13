@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Canonical aggregate output and intermediate Arrow type contracts.
+
 use std::sync::Arc;
 
 use arrow::datatypes::DataType;
@@ -289,4 +291,114 @@ fn list_output_type(item_type: DataType) -> DataType {
     DataType::List(Arc::new(arrow::datatypes::Field::new(
         "item", item_type, true,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field, Fields};
+
+    use super::infer_agg_function_types;
+
+    #[test]
+    fn infers_core_numeric_aggregate_types() {
+        assert_eq!(
+            infer_agg_function_types("count", &[], false).unwrap(),
+            (DataType::Int64, Some(DataType::Int64))
+        );
+        assert_eq!(
+            infer_agg_function_types("sum", &[DataType::Int32], false).unwrap(),
+            (DataType::Int64, Some(DataType::Int64))
+        );
+        assert_eq!(
+            infer_agg_function_types("avg", &[DataType::Float64], false).unwrap(),
+            (DataType::Float64, Some(DataType::Utf8))
+        );
+    }
+
+    #[test]
+    fn infers_decimal_and_distinct_sum_contracts() {
+        let input = DataType::Decimal128(20, 2);
+        let sum = crate::types::canonical_agg_decimal_type("sum", &input).unwrap();
+        let distinct =
+            crate::types::canonical_agg_decimal_type("multi_distinct_sum", &input).unwrap();
+        assert_eq!(
+            infer_agg_function_types("sum", &[input.clone()], false).unwrap(),
+            (sum.clone(), Some(sum))
+        );
+        assert_eq!(
+            infer_agg_function_types("multi_distinct_sum", &[input], true).unwrap(),
+            (distinct, Some(DataType::Binary))
+        );
+    }
+
+    #[test]
+    fn infers_state_collection_and_fallback_contracts() {
+        assert_eq!(
+            infer_agg_function_types("sum_state_merge", &[DataType::Int64], false).unwrap(),
+            (DataType::Binary, Some(DataType::Binary))
+        );
+        let list = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        assert_eq!(
+            infer_agg_function_types("array_agg", &[DataType::Utf8], false).unwrap(),
+            (list.clone(), Some(list))
+        );
+        assert_eq!(
+            infer_agg_function_types("unknown_zero_arg", &[], false).unwrap(),
+            (DataType::Int64, Some(DataType::Int64))
+        );
+    }
+
+    #[test]
+    fn preserves_nested_collection_type_structure() {
+        let map = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    Arc::new(Field::new("key", DataType::Utf8, true)),
+                    Arc::new(Field::new("value", DataType::Int32, true)),
+                ])),
+                false,
+            )),
+            false,
+        );
+        assert_eq!(
+            infer_agg_function_types("map_agg", &[DataType::Utf8, DataType::Int32], false,)
+                .unwrap(),
+            (map.clone(), Some(map))
+        );
+
+        let top_k = DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Struct(Fields::from(vec![
+                Arc::new(Field::new("item", DataType::Utf8, true)),
+                Arc::new(Field::new("count", DataType::Int64, true)),
+            ])),
+            true,
+        )));
+        assert_eq!(
+            infer_agg_function_types("approx_top_k", &[DataType::Utf8], false).unwrap(),
+            (top_k, Some(DataType::Binary))
+        );
+
+        let output = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        let intermediate = DataType::Struct(Fields::from(vec![
+            Arc::new(Field::new(
+                "c0",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            )),
+            Arc::new(Field::new(
+                "c1",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                true,
+            )),
+        ]));
+        assert_eq!(
+            infer_agg_function_types("array_agg", &[DataType::Utf8, DataType::Int64], false,)
+                .unwrap(),
+            (output, Some(intermediate))
+        );
+    }
 }

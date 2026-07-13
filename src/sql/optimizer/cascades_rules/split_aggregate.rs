@@ -17,7 +17,6 @@
 
 use arrow::datatypes::DataType;
 
-use crate::sql::codegen::agg_type_infer::infer_agg_function_types;
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::OutputColumn;
 use crate::sql::optimizer::memo::{MExpr, Memo};
@@ -27,6 +26,7 @@ use crate::sql::optimizer::operator::{
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::sql::optimizer::scalar_expr;
+use crate::types::aggregate::infer_agg_function_types;
 
 pub(crate) struct SplitAggregateRule;
 
