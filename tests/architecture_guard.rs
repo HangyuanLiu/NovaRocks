@@ -3456,11 +3456,6 @@ fn planner_stage_first_dependency_violations_in(source_rel: &str, text: &str) ->
             let optimizer_dependency = starts_with(path, &["crate", "sql", "optimizer"]);
             let optimizer_options = starts_with(path, &["crate", "sql", "optimizer", "options"]);
             let codegen = starts_with(path, &["crate", "sql", "codegen"]);
-            // CGO-2 owns moving aggregate type inference out of codegen. Keep this
-            // exception exact so that follow-up can delete it without reopening
-            // any other optimizer -> codegen dependency.
-            let optimizer_codegen_agg_type_infer_owner_exception =
-                starts_with(path, &["crate", "sql", "codegen", "agg_type_infer"]);
             let imv_fragment_builder = starts_with(
                 path,
                 &[
@@ -3482,7 +3477,7 @@ fn planner_stage_first_dependency_violations_in(source_rel: &str, text: &str) ->
                     || (planner_bridge && !planner_bridge_property)
                     || codegen
             } else if optimizer {
-                codegen && !optimizer_codegen_agg_type_infer_owner_exception
+                codegen
             } else if imv_rewrite {
                 codegen && !imv_fragment_builder && !imv_fragment_request
             } else if physical {
@@ -5001,6 +4996,10 @@ fn planner_stage_first_dependency_detector_covers_bypasses() {
             "type Leak = crate::sql::codegen::proto_encode::Encoder;",
         ),
         (
+            "src/sql/optimizer/cascades_rules/split_aggregate.rs",
+            "use crate::sql::codegen::agg_type_infer::infer_agg_function_types;",
+        ),
+        (
             "src/sql/planner/imv_rewrite/entrypoint.rs",
             "use crate::sql::codegen::helpers::display_name;",
         ),
@@ -5114,7 +5113,7 @@ enum Demo {
     let valid = [
         (
             "src/sql/optimizer/cascades_rules/split_aggregate.rs",
-            "use crate::sql::codegen::agg_type_infer::infer_agg_function_types;",
+            "use crate::types::aggregate::infer_agg_function_types;",
         ),
         (
             "src/sql/planner/logical/node.rs",
