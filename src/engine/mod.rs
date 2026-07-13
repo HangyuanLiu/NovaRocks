@@ -3809,16 +3809,10 @@ fn coordinated_execution_services() -> Result<
         ClusterRole::Fe | ClusterRole::AllInOne => {
             let entries = backend_ops::live_backend_dispatch_entries()?;
             let snapshot = crate::coordinator::scheduler::LiveBackendSnapshot::new(entries);
-            let dispatcher = Arc::new(
-                crate::service::grpc_fragment_dispatcher::RemoteDispatcher::new_with_backend_ids(
-                    snapshot.entries(),
-                )?,
-            );
-            let scheduler = Arc::new(
-                crate::coordinator::scheduler::FragmentScheduler::from_live_backend_snapshot(
-                    snapshot,
-                ),
-            );
+            let (dispatcher, scheduler) =
+                dispatch_and_scheduler_from_live_backend_snapshot(snapshot)?;
+            let dispatcher = Arc::new(dispatcher);
+            let scheduler = Arc::new(scheduler);
             (
                 dispatcher as Arc<dyn crate::coordinator::dispatch::FragmentDispatcher>,
                 scheduler,
@@ -3837,6 +3831,24 @@ fn coordinated_execution_services() -> Result<
         observer,
     );
     Ok((execution_ports, scheduler))
+}
+
+fn dispatch_and_scheduler_from_live_backend_snapshot(
+    snapshot: crate::coordinator::scheduler::LiveBackendSnapshot,
+) -> Result<
+    (
+        crate::service::grpc_fragment_dispatcher::RemoteDispatcher,
+        crate::coordinator::scheduler::FragmentScheduler,
+    ),
+    String,
+> {
+    let dispatcher =
+        crate::service::grpc_fragment_dispatcher::RemoteDispatcher::new_with_backend_ids(
+            snapshot.entries(),
+        )?;
+    let scheduler =
+        crate::coordinator::scheduler::FragmentScheduler::from_live_backend_snapshot(snapshot);
+    Ok((dispatcher, scheduler))
 }
 
 /// Select a `FragmentDispatcher` implementation based on the effective cluster role.
@@ -8768,6 +8780,26 @@ path = "meta/operations.sqlite"
         assert_eq!(
             scheduler.live_backend_snapshot().entries(),
             &[(2usize, endpoint)]
+        );
+    }
+
+    #[test]
+    fn coordinated_execution_services_preserve_exact_snapshot_entries() {
+        let first = "127.0.0.1:19073".parse().unwrap();
+        let second = "127.0.0.1:19079".parse().unwrap();
+        let entries = vec![(2usize, first), (11usize, second)];
+        let snapshot = crate::coordinator::scheduler::LiveBackendSnapshot::new(entries.clone());
+
+        let (dispatcher, scheduler) =
+            super::dispatch_and_scheduler_from_live_backend_snapshot(snapshot)
+                .expect("construct dispatcher and scheduler from one snapshot");
+
+        assert_eq!(dispatcher.addr_of(2), Some(first));
+        assert_eq!(dispatcher.addr_of(11), Some(second));
+        assert_eq!(dispatcher.addr_of(0), None);
+        assert_eq!(
+            scheduler.live_backend_snapshot().entries(),
+            entries.as_slice()
         );
     }
 

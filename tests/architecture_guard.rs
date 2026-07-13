@@ -17350,3 +17350,166 @@ fn coor_2_thrift_audit_scans_coordinator_owners() {
         );
     }
 }
+
+#[test]
+fn coor_2_final_control_plane_ownership_is_non_vacuous() {
+    let repo = Path::new(manifest_dir());
+    let coordinator_root = repo.join("src/coordinator");
+    let coordinator_files = rs_files(&coordinator_root);
+    assert_eq!(
+        coordinator_files.len(),
+        8,
+        "COOR-2 must audit the complete eight-file coordinator production tree"
+    );
+
+    let required_owners = [
+        (
+            "src/coordinator/execution.rs",
+            "pub(crate) struct ExecutionCoordinator",
+        ),
+        (
+            "src/coordinator/scheduler/mod.rs",
+            "pub(crate) struct FragmentScheduler",
+        ),
+        (
+            "src/coordinator/profile/mod.rs",
+            "struct StandaloneQueryProfileRegistry",
+        ),
+        (
+            "src/coordinator/report.rs",
+            "struct StandaloneQueryFailureRegistry",
+        ),
+        (
+            "src/coordinator/report.rs",
+            "struct CoordinatorExecStatusReportHandler",
+        ),
+    ];
+    for (owner, symbol) in required_owners {
+        let text = rust_sanitized_production_text(
+            &fs::read_to_string(repo.join(owner))
+                .unwrap_or_else(|err| panic!("read {owner}: {err}")),
+        );
+        assert!(!text.trim().is_empty(), "owner {owner} must be non-empty");
+        assert!(text.contains(symbol), "owner {owner} missing {symbol}");
+    }
+    let profile_correlation = rust_sanitized_production_text(
+        &fs::read_to_string(repo.join("src/coordinator/profile/correlate.rs"))
+            .expect("read coordinator profile correlation"),
+    );
+    assert!(!profile_correlation.trim().is_empty());
+    assert!(profile_correlation.contains("collect_actuals_by_plan_node_id_from_profile_trees"));
+
+    for retired in [
+        ["src/runtime/", "coordinator.rs"].concat(),
+        ["src/runtime/", "scheduler.rs"].concat(),
+        ["src/runtime/", "profile_correlate.rs"].concat(),
+    ] {
+        assert!(
+            !repo.join(&retired).exists(),
+            "retired owner still exists: {retired}"
+        );
+    }
+    assert!(!repo.join("src/coordinator/write.rs").exists());
+    assert!(!repo.join("src/coordinator/write").exists());
+
+    let retired_paths = [
+        ["crate::runtime::", "coordinator"].concat(),
+        ["runtime::", "coordinator"].concat(),
+        ["crate::runtime::", "scheduler"].concat(),
+        ["runtime::", "scheduler"].concat(),
+        ["crate::runtime::", "profile_correlate"].concat(),
+        ["runtime::", "profile_correlate"].concat(),
+    ];
+    let forbidden_types = [
+        ["Query", "Coordinator"].concat(),
+        ["LegacyCoordinator", "ReportHandler"].concat(),
+    ];
+    let unique_symbols = [
+        "struct ExecutionCoordinator",
+        "struct FragmentScheduler",
+        "struct StandaloneQueryFailureRegistry",
+        "struct StandaloneQueryProfileRegistry",
+        "struct CoordinatorExecStatusReportHandler",
+    ];
+    let mut unique_counts = BTreeMap::from(unique_symbols.map(|symbol| (symbol, 0usize)));
+    let mut production_files = 0usize;
+    for path in rs_files(&repo.join("src")) {
+        production_files += 1;
+        let relative = rel(&path);
+        let production = rust_sanitized_production_text(
+            &fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {relative}: {err}")),
+        );
+        for retired in &retired_paths {
+            assert!(
+                !production.contains(retired),
+                "{relative} references retired module path {retired}"
+            );
+        }
+        for forbidden in &forbidden_types {
+            assert!(
+                !production.contains(forbidden),
+                "{relative} defines or forwards forbidden controller {forbidden}"
+            );
+        }
+        for (symbol, count) in &mut unique_counts {
+            *count += production.matches(symbol).count();
+        }
+
+        if relative.starts_with("src/coordinator/") {
+            assert!(
+                !production.contains("crate::service"),
+                "{relative} imports a service concrete"
+            );
+            let uses_transitional_write = production.contains("runtime::write_coordinator")
+                || production.contains("runtime::write_report");
+            if uses_transitional_write {
+                assert!(
+                    matches!(
+                        relative.as_str(),
+                        "src/coordinator/execution.rs" | "src/coordinator/report.rs"
+                    ),
+                    "{relative} references a transitional write owner outside execution/report"
+                );
+            }
+        }
+    }
+    assert!(
+        production_files > 0,
+        "production Rust scan must be non-empty"
+    );
+    for (symbol, count) in unique_counts {
+        assert_eq!(count, 1, "{symbol} must have exactly one production owner");
+    }
+
+    let audit_path = repo.join("tools/dev/audit_thrift_boundaries.py");
+    let output = std::process::Command::new("python3")
+        .arg(&audit_path)
+        .args(["--strict", "--json"])
+        .current_dir(repo)
+        .output()
+        .expect("run strict thrift boundary audit");
+    assert!(
+        output.status.success(),
+        "strict audit failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse strict audit JSON");
+    assert_eq!(summary["errors"].as_array().map(Vec::len), Some(0));
+    assert_eq!(summary["scanned_by_root"]["src/coordinator"], 8);
+    let coordinator_hits = summary["files"]
+        .as_array()
+        .expect("audit JSON files")
+        .iter()
+        .filter(|entry| {
+            entry["path"]
+                .as_str()
+                .is_some_and(|path| path.starts_with("src/coordinator/"))
+        })
+        .count();
+    assert_eq!(
+        coordinator_hits, 0,
+        "all eight coordinator production files must have zero audited thrift hits"
+    );
+}
