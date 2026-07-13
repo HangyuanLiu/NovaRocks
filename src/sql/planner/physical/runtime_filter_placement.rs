@@ -27,7 +27,7 @@ pub(crate) const RUNTIME_FILTER_RULE: &str = "RuntimeFilterPushDown";
 
 /// RF placement config, derived from the session optimizer settings that the
 /// engine installs before `optimize()` and that remain live on the same thread
-/// through `optimizer_physical_to_distributed_plan`.
+/// through optimizer-to-physical conversion and the planner pipeline.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RuntimeFilterPlacementConfig {
     pub enabled: bool,

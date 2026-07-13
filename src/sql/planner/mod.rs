@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Planner — converts analyzed SQL into logical plans and distributed Bridge 2 IR.
+//! Planner — builds logical plans, materializes optimizer output into planner
+//! physical IR, and plans distributed fragment topology.
 //!
-//! This is a structural transformation that builds a relational algebra tree
-//! from the analyzed query IR. It also owns Bridge 2, which materializes
-//! physical optimizer plans into planner-side distributed plan fragments before
-//! codegen encodes them into NovaRocks native fragments.
+//! The stage transitions are explicit: optimizer bridge produces
+//! `PhysicalPlanNode`; the planner pipeline applies physical placement passes
+//! before distributed planning cuts fragments and wires cross-fragment state.
 
 pub(crate) mod distributed;
 pub(crate) mod imv_rewrite;
@@ -29,4 +29,5 @@ pub(crate) mod optimizer_bridge;
 pub(crate) mod ordering;
 pub(crate) mod payload;
 pub(crate) mod physical;
+pub(crate) mod pipeline;
 pub(crate) use logical::build::{plan_output_columns, plan_query};

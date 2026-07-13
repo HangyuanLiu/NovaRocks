@@ -2982,10 +2982,9 @@ mod tests {
                     crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
                 ));
 
-                let dp =
-                    crate::sql::planner::optimizer_bridge::distributed::optimizer_physical_to_distributed_plan(
-                        &physical,
-                    )
+                let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&physical)
+                    .expect("convert optimizer physical plan");
+                let dp = crate::sql::planner::pipeline::build_distributed_plan(physical)
                     .expect("build DistributedPlan");
                 crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
                     crate::sql::codegen::FragmentBuildRequest::result(
