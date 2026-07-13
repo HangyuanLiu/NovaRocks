@@ -2549,6 +2549,11 @@ fn planner_path_module_attribute_violations_in(text: &str) -> Vec<String> {
         let Some(close) = matching_paren(meta, 1) else {
             return false;
         };
+        if cfg_predicate_requires_test(meta, 2)
+            .is_some_and(|(predicate_requires_test, _)| predicate_requires_test)
+        {
+            return false;
+        }
         let mut arguments = Vec::<std::ops::Range<usize>>::new();
         let mut argument_start = 2usize;
         let mut depth = 0usize;
@@ -3360,13 +3365,33 @@ fn codegen_explain_owner_detector_covers_paths_aliases_relative_and_test_noise()
         ("src/sql/codegen/ir/mod.rs", "pub(crate) use crate::*;"),
         (
             "src/sql/codegen/ir/mod.rs",
-            "#[path = \"../explain/distributed.rs\"]\nmod presentation;",
+            "#[path = \"../../explain/distributed.rs\"]\nmod presentation;",
         ),
         (
             "src/sql/codegen/ir/mod.rs",
             "pub(crate) fn explain_distributed_plan() {}",
         ),
         ("src/sql/codegen/ir/mod.rs", "mod explain;"),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            "mod safe { pub mod explain { pub(crate) fn explain_distributed_plan() {} } }",
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            "mod presentation { pub(crate) fn explain_distributed_plan() {} }",
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            "mod presentation { include!(\"../../explain/distributed.rs\"); }",
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            "extern crate self as owner; use owner::sql::explain::distributed::explain_distributed_plan;",
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            "use std::include as inject; inject!(\"../../explain/distributed.rs\");",
+        ),
     ];
     let missed_invalid = invalid
         .into_iter()
@@ -3404,10 +3429,10 @@ mod left {
 }
 mod right {
     mod safe {
-        pub mod explain { pub struct X; }
+        pub mod presentation { pub struct X; }
     }
     use self::safe as owner;
-    use owner::explain::X;
+    use owner::presentation::X;
 }
 "#,
         ),
@@ -3416,6 +3441,19 @@ mod right {
             r#"
 #[cfg(all(feature = "some-test-helper", test))]
 fn explain_distributed_plan() {}
+"#,
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            r#"
+#[cfg(test)]
+mod presentation {
+    pub(crate) fn explain_distributed_plan() {}
+    include!("../../explain/distributed.rs");
+    extern crate self as owner;
+    use std::include as inject;
+    inject!("../../explain/distributed.rs");
+}
 "#,
         ),
     ];
@@ -3490,23 +3528,42 @@ fn codegen_explain_owner_violations_in(source_rel: &str, text: &str) -> Vec<Stri
     );
 
     let production = rust_sanitized_production_text(text);
+    let production_tokens = rust_use_tokens(&production);
+    if production_tokens
+        .windows(2)
+        .any(|tokens| tokens == ["extern", "crate"])
+    {
+        violations.push("codegen production declares `extern crate`".to_string());
+    }
+    if production_tokens
+        .windows(2)
+        .any(|tokens| tokens == ["include", "!"])
+    {
+        violations.push("codegen production invokes `include!`".to_string());
+    }
+    if rust_raw_production_use_statements(&production)
+        .iter()
+        .any(|import| {
+            import
+                .path
+                .segments
+                .last()
+                .is_some_and(|leaf| leaf == "include")
+        })
+    {
+        violations.push("codegen production imports the `include` macro".to_string());
+    }
     if rust_module_items(&production)
         .iter()
-        .any(|item| item.inline_modules.is_empty() && item.name == "explain")
+        .any(|item| item.name == "explain")
     {
         violations.push("codegen production declares `mod explain`".to_string());
     }
 
-    violations.extend(
-        top_level_production_functions(&production)
-            .into_iter()
-            .filter_map(|function| {
-                let name = top_level_production_function_name(&function)?;
-                EXPLAIN_ENTRY_NAMES.contains(&name.as_str()).then(|| {
-                    format!("codegen production defines distributed EXPLAIN entry: {function}")
-                })
-            }),
-    );
+    violations.extend(EXPLAIN_ENTRY_NAMES.iter().filter_map(|entry| {
+        (rust_named_function_declaration_count(&production, entry) > 0)
+            .then(|| format!("codegen production defines distributed EXPLAIN entry `{entry}`"))
+    }));
 
     violations
 }
@@ -4299,6 +4356,8 @@ fn planner_path_module_attribute_detector_rejects_bypasses() {
         "mod stage { #[cfg_attr(feature = \"compat\", path = \"legacy.rs\")] mod legacy; }",
         "#[cfg_attr(any(feature = \"a\", feature = \"b\"), allow(dead_code), path = \"legacy.rs\")] pub(super) mod legacy;",
         "#[cfg_attr(feature = \"compat\", cfg_attr(feature = \"nested\", path = \"legacy.rs\"))] mod nested_legacy;",
+        "#[cfg_attr(any(test, feature = \"compat\"), path = \"legacy.rs\")] mod maybe_production_legacy;",
+        "#[cfg_attr(feature = \"compat\", cfg_attr(any(test, feature = \"nested\"), path = \"legacy.rs\"))] mod nested_maybe_production_legacy;",
         "#[cfg(test_feature)] #[path = \"legacy.rs\"] mod production_legacy;",
         "#[path = \"redirected\"] mod redirected_inline { mod hidden; }",
     ];
@@ -4325,6 +4384,14 @@ mod documented;
 mod predicate_only;
 #[cfg_attr(feature = "compat", derive(path::Trait))]
 mod derived;
+#[cfg_attr(test, path = "test_fixture.rs")]
+mod cfg_attr_test_fixture;
+#[cfg_attr(all(test, feature = "compat"), path = "test_fixture.rs")]
+mod cfg_attr_all_test_fixture;
+#[cfg_attr(feature = "compat", cfg_attr(test, path = "test_fixture.rs"))]
+mod nested_cfg_attr_test_fixture;
+#[cfg_attr(test, cfg_attr(feature = "compat", path = "test_fixture.rs"))]
+mod test_cfg_attr_nested_fixture;
 // #[path = "comment.rs"] mod comment;
 const TEXT: &str = "#[path = fake.rs] mod string_fake;";
 const RAW: &str = r#"#[cfg_attr(x, path = fake.rs)] mod raw_fake;"#;
