@@ -15,10 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// RFD-3 Task 3 consumes this staged Core through the Service facade.
-#[allow(dead_code)]
-pub(crate) mod core;
-// RFD-3/RFD-5A will consume this staged planner/runtime seam; remove the allowance then.
-#[allow(dead_code)]
-pub(crate) mod model;
-pub(crate) mod port;
+pub(crate) mod channel;
+pub(crate) mod coverage;
+pub(crate) mod error;
+pub(crate) mod reducer;
+pub(crate) mod state;

@@ -90,6 +90,7 @@ pub(crate) enum RuntimeContractViolationKind {
     InvalidPartitionCount,
     PartitionCountConflict,
     InvalidPartition,
+    InvalidContributionLease,
     TypeMismatch,
     ConflictingReplay,
     ConflictingTerminalSequence,
@@ -213,6 +214,7 @@ mod tests {
             RuntimeContractViolationKind::InvalidPartitionCount => "invalid-partition-count",
             RuntimeContractViolationKind::PartitionCountConflict => "partition-count-conflict",
             RuntimeContractViolationKind::InvalidPartition => "invalid-partition",
+            RuntimeContractViolationKind::InvalidContributionLease => "invalid-contribution-lease",
             RuntimeContractViolationKind::TypeMismatch => "type-mismatch",
             RuntimeContractViolationKind::ConflictingReplay => "conflicting-replay",
             RuntimeContractViolationKind::ConflictingTerminalSequence => {

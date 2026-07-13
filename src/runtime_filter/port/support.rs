@@ -94,6 +94,32 @@ pub(crate) struct RetainedMemoryReservation {
     bytes: usize,
 }
 
+pub(crate) struct RetainedReservationAbsorbFailure {
+    error: RetainedReservationError,
+    incoming: RetainedMemoryReservation,
+}
+
+impl RetainedReservationAbsorbFailure {
+    #[cfg(test)]
+    pub(crate) const fn error(&self) -> RetainedReservationError {
+        self.error
+    }
+
+    pub(crate) fn into_parts(self) -> (RetainedReservationError, RetainedMemoryReservation) {
+        (self.error, self.incoming)
+    }
+}
+
+impl fmt::Debug for RetainedReservationAbsorbFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetainedReservationAbsorbFailure")
+            .field("error", &self.error)
+            .field("incoming_bytes", &self.incoming.bytes())
+            .finish()
+    }
+}
+
 impl RetainedMemoryReservation {
     pub(crate) const fn empty() -> Self {
         Self {
@@ -113,7 +139,10 @@ impl RetainedMemoryReservation {
         }
     }
 
-    pub(crate) fn absorb(&mut self, mut incoming: Self) -> Result<(), RetainedReservationError> {
+    pub(crate) fn absorb(
+        &mut self,
+        mut incoming: Self,
+    ) -> Result<(), RetainedReservationAbsorbFailure> {
         if incoming.bytes == 0 {
             return Ok(());
         }
@@ -133,12 +162,17 @@ impl RetainedMemoryReservation {
             .as_ref()
             .expect("non-empty incoming reservation account");
         if !Arc::ptr_eq(account, incoming_account) {
-            return Err(RetainedReservationError::AccountMismatch);
+            return Err(RetainedReservationAbsorbFailure {
+                error: RetainedReservationError::AccountMismatch,
+                incoming,
+            });
         }
-        let bytes = self
-            .bytes
-            .checked_add(incoming.bytes)
-            .ok_or(RetainedReservationError::SizeOverflow)?;
+        let Some(bytes) = self.bytes.checked_add(incoming.bytes) else {
+            return Err(RetainedReservationAbsorbFailure {
+                error: RetainedReservationError::SizeOverflow,
+                incoming,
+            });
+        };
 
         self.bytes = bytes;
         incoming.bytes = 0;
@@ -253,10 +287,11 @@ mod tests {
         let account = Arc::new(CountingMemoryAccount::default());
         let mut retained = RetainedMemoryReservation::new(account.clone(), usize::MAX);
 
-        assert_eq!(
-            retained.absorb(RetainedMemoryReservation::new(account.clone(), 1)),
-            Err(RetainedReservationError::SizeOverflow)
-        );
+        let failure = retained
+            .absorb(RetainedMemoryReservation::new(account.clone(), 1))
+            .unwrap_err();
+        assert_eq!(failure.error(), RetainedReservationError::SizeOverflow);
+        drop(failure);
         assert_eq!(retained.bytes(), usize::MAX);
         assert_eq!(account.0.load(Ordering::SeqCst), usize::MAX);
         drop(retained);
@@ -269,10 +304,11 @@ mod tests {
         let right_account = Arc::new(CountingMemoryAccount::default());
         let mut retained = RetainedMemoryReservation::new(left_account.clone(), 11);
 
-        assert_eq!(
-            retained.absorb(RetainedMemoryReservation::new(right_account.clone(), 13)),
-            Err(RetainedReservationError::AccountMismatch)
-        );
+        let failure = retained
+            .absorb(RetainedMemoryReservation::new(right_account.clone(), 13))
+            .unwrap_err();
+        assert_eq!(failure.error(), RetainedReservationError::AccountMismatch);
+        drop(failure);
         assert_eq!(retained.bytes(), 11);
         assert_eq!(left_account.0.load(Ordering::SeqCst), 11);
         assert_eq!(right_account.0.load(Ordering::SeqCst), 0);

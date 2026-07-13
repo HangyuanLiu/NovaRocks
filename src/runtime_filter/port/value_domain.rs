@@ -344,26 +344,28 @@ impl MembershipValues {
         }
     }
 
-    pub(crate) fn supports_data_type(data_type: &DataType) -> bool {
-        match data_type {
-            DataType::Boolean
-            | DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Utf8
-            | DataType::Date32
-            | DataType::Timestamp(_, _) => true,
-            DataType::Decimal128(precision, scale) => {
-                *precision != 0
-                    && *precision <= DECIMAL128_MAX_PRECISION
-                    && decimal_scale_is_valid(*precision, *scale)
+    pub(crate) fn empty_for_data_type(data_type: &DataType) -> Option<Self> {
+        Some(match data_type {
+            DataType::Boolean => Self::boolean([]),
+            DataType::Int8 => Self::int8([]),
+            DataType::Int16 => Self::int16([]),
+            DataType::Int32 => Self::int32([]),
+            DataType::Int64 => Self::int64([]),
+            DataType::FixedSizeBinary(width) if *width == LARGEINT_BYTE_WIDTH => {
+                Self::large_int([])
             }
-            DataType::FixedSizeBinary(width) => *width == LARGEINT_BYTE_WIDTH,
-            _ => false,
-        }
+            DataType::Float32 => Self::float32([]),
+            DataType::Float64 => Self::float64([]),
+            DataType::Utf8 => Self::utf8::<[String; 0], String>([]),
+            DataType::Date32 => Self::date32([]),
+            DataType::Timestamp(unit, timezone) => {
+                Self::timestamp(unit.clone(), timezone.clone(), [])
+            }
+            DataType::Decimal128(precision, scale) => {
+                Self::decimal128(*precision, *scale, []).ok()?
+            }
+            _ => return None,
+        })
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -553,6 +555,19 @@ pub(crate) struct ReducedMembershipDomain {
     contains_null: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MembershipUnionError {
+    TypeMismatch,
+}
+
+impl fmt::Display for MembershipUnionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "membership union type mismatch")
+    }
+}
+
+impl Error for MembershipUnionError {}
+
 impl ReducedMembershipDomain {
     pub(crate) fn new(values: MembershipValues, contains_null: bool) -> Self {
         Self {
@@ -579,6 +594,65 @@ impl ReducedMembershipDomain {
                 .checked_add(usize::from(self.contains_null))
                 .ok_or(ContributionSizeError::SizeOverflow)
         })
+    }
+
+    pub(crate) fn union_prevalidated(
+        &mut self,
+        incoming: &MembershipValues,
+        retain_null: bool,
+    ) -> Result<(), MembershipUnionError> {
+        if self.data_type() != incoming.data_type() {
+            return Err(MembershipUnionError::TypeMismatch);
+        }
+
+        macro_rules! extend_same {
+            ($left:expr, $right:expr) => {{
+                $left.extend($right.iter().cloned());
+            }};
+        }
+        match (&mut self.values, incoming) {
+            (MembershipValues::Boolean(left), MembershipValues::Boolean(right)) => {
+                extend_same!(left, right)
+            }
+            (MembershipValues::Int8(left), MembershipValues::Int8(right)) => {
+                extend_same!(left, right)
+            }
+            (MembershipValues::Int16(left), MembershipValues::Int16(right)) => {
+                extend_same!(left, right)
+            }
+            (MembershipValues::Int32(left), MembershipValues::Int32(right)) => {
+                extend_same!(left, right)
+            }
+            (MembershipValues::Int64(left), MembershipValues::Int64(right)) => {
+                extend_same!(left, right)
+            }
+            (MembershipValues::LargeInt(left), MembershipValues::LargeInt(right)) => {
+                extend_same!(left, right)
+            }
+            (MembershipValues::Float32(left), MembershipValues::Float32(right)) => {
+                extend_same!(left, right)
+            }
+            (MembershipValues::Float64(left), MembershipValues::Float64(right)) => {
+                extend_same!(left, right)
+            }
+            (MembershipValues::Utf8(left), MembershipValues::Utf8(right)) => {
+                extend_same!(left, right)
+            }
+            (MembershipValues::Date32(left), MembershipValues::Date32(right)) => {
+                extend_same!(left, right)
+            }
+            (
+                MembershipValues::Timestamp { values: left, .. },
+                MembershipValues::Timestamp { values: right, .. },
+            ) => extend_same!(left, right),
+            (MembershipValues::Decimal128(left), MembershipValues::Decimal128(right)) => {
+                left.union(right)
+                    .expect("matching Decimal128 data type must preserve precision and scale");
+            }
+            _ => unreachable!("equal membership data types must use the same variant"),
+        }
+        self.contains_null |= retain_null;
+        Ok(())
     }
 }
 
@@ -704,7 +778,8 @@ mod tests {
     use arrow::datatypes::{DataType, TimeUnit};
 
     use super::{
-        Decimal128UnionError, Decimal128ValidationError, MembershipValues, ValueDomainDelta,
+        Decimal128UnionError, Decimal128ValidationError, MembershipUnionError, MembershipValues,
+        ReducedMembershipDomain, ValueDomainDelta,
     };
     use crate::runtime_filter::model::contract::NullSemantics;
 
@@ -755,6 +830,18 @@ mod tests {
     }
 
     #[test]
+    fn reduced_domain_union_rejects_type_mismatch_without_mutation() {
+        let mut domain = ReducedMembershipDomain::new(MembershipValues::int64([1]), false);
+
+        assert_eq!(
+            domain.union_prevalidated(&MembershipValues::int32([2]), true),
+            Err(MembershipUnionError::TypeMismatch)
+        );
+        assert_eq!(domain.values(), &MembershipValues::int64([1]));
+        assert!(!domain.contains_null());
+    }
+
+    #[test]
     fn supported_membership_types_round_trip_with_distinct_canonical_encodings() {
         let cases = vec![
             (MembershipValues::boolean([true]), DataType::Boolean),
@@ -796,10 +883,19 @@ mod tests {
         for (values, expected_type) in cases {
             let delta = ValueDomainDelta::new(values, true);
             assert_eq!(delta.data_type(), expected_type);
-            assert!(MembershipValues::supports_data_type(&expected_type));
+            assert!(MembershipValues::empty_for_data_type(&expected_type).is_some());
             assert!(delta.estimated_contribution_bytes().unwrap() > 0);
             assert!(fingerprints.insert(delta.fingerprint().bytes()));
         }
+    }
+
+    #[test]
+    fn port_constructs_typed_empty_largeint_without_exposing_width_to_core() {
+        let data_type = DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH);
+        let values = MembershipValues::empty_for_data_type(&data_type).unwrap();
+
+        assert_eq!(values.data_type(), data_type);
+        assert!(values.is_empty());
     }
 
     #[test]
@@ -881,12 +977,8 @@ mod tests {
             })
         );
         assert!(MembershipValues::decimal128(3, -2, [-999, 999]).is_ok());
-        assert!(!MembershipValues::supports_data_type(
-            &DataType::Decimal128(0, 0)
-        ));
-        assert!(!MembershipValues::supports_data_type(
-            &DataType::Decimal128(4, 5)
-        ));
+        assert!(MembershipValues::empty_for_data_type(&DataType::Decimal128(0, 0)).is_none());
+        assert!(MembershipValues::empty_for_data_type(&DataType::Decimal128(4, 5)).is_none());
     }
 
     #[test]

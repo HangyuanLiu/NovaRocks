@@ -15,10 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// RFD-3 Task 3 consumes this staged Core through the Service facade.
-#[allow(dead_code)]
-pub(crate) mod core;
-// RFD-3/RFD-5A will consume this staged planner/runtime seam; remove the allowance then.
-#[allow(dead_code)]
-pub(crate) mod model;
-pub(crate) mod port;
+use std::fmt;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChannelBuildError {
+    UnsupportedContract,
+    UnsupportedMembershipType,
+    MissingCoverageWitness,
+}
+
+impl fmt::Display for ChannelBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "runtime filter channel build failed: {self:?}")
+    }
+}
+
+impl std::error::Error for ChannelBuildError {}
