@@ -52,7 +52,7 @@ use crate::coordinator::scheduler::{
     FragmentInstancePlacement, FragmentScheduler, topological_sort_bottom_up,
 };
 use crate::coordinator::write::report::{WriteAbortInput, WriteCommitInput, WriterKey};
-use crate::coordinator::write::{WriteCoordinator, register_query, unregister_query};
+use crate::coordinator::write::{RegisteredWriteCoordinator, WriteCoordinator};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::novarocks_logging::debug;
 use crate::runtime::profile::RuntimeProfileTree;
@@ -456,12 +456,17 @@ impl ExecutionCoordinator {
             ));
         }
 
-        let (write_coordinator, _write_registration) = if expected_writers.is_empty() {
-            (None, None)
+        let write_registration = if expected_writers.is_empty() {
+            None
         } else {
-            let write = register_query(query_id, expected_writers)?;
-            (Some(write), Some(RegisteredWriteCoordinator::new(query_id)))
+            Some(RegisteredWriteCoordinator::register(
+                query_id,
+                expected_writers,
+            )?)
         };
+        let write_coordinator = write_registration
+            .as_ref()
+            .map(RegisteredWriteCoordinator::coordinator);
 
         let timeout_ms = query_options
             .as_ref()
@@ -489,7 +494,7 @@ impl ExecutionCoordinator {
             root_uses_result_buffer,
             timeout_ms,
             expected_root_chunk_schema.as_ref(),
-            write_coordinator.as_ref(),
+            write_coordinator,
             collect_profiles,
             observer.as_ref(),
         )?;
@@ -775,22 +780,6 @@ fn group_router_edges_by_source<'a>(
     }
 
     Ok(grouped)
-}
-
-struct RegisteredWriteCoordinator {
-    query_id: UniqueId,
-}
-
-impl RegisteredWriteCoordinator {
-    fn new(query_id: UniqueId) -> Self {
-        Self { query_id }
-    }
-}
-
-impl Drop for RegisteredWriteCoordinator {
-    fn drop(&mut self) {
-        unregister_query(&self.query_id);
-    }
 }
 
 fn validate_write_commit_ready(

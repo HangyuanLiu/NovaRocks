@@ -17327,6 +17327,24 @@ fn coor_4_write_control_plane_has_one_top_level_owner() {
 }
 
 #[test]
+fn coor_4_write_registration_lifetime_belongs_to_write_owner() {
+    let repo = Path::new(manifest_dir());
+    let write = rust_sanitized_production_text(
+        &fs::read_to_string(repo.join("src/coordinator/write/mod.rs"))
+            .expect("read coordinator write owner"),
+    );
+    let execution = rust_sanitized_production_text(
+        &fs::read_to_string(repo.join("src/coordinator/execution.rs"))
+            .expect("read coordinator execution"),
+    );
+    assert!(write.contains("pub(crate) struct RegisteredWriteCoordinator"));
+    assert!(write.contains("impl Drop for RegisteredWriteCoordinator"));
+    assert!(write.contains("pub(crate) fn register("));
+    assert!(!execution.contains("struct RegisteredWriteCoordinator"));
+    assert!(!execution.contains("unregister_query"));
+}
+
+#[test]
 fn coor_2_thrift_audit_scans_coordinator_owners() {
     let repo = Path::new(manifest_dir());
     let audit_path = repo.join("tools/dev/audit_thrift_boundaries.py");
