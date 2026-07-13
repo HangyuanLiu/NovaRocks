@@ -34,13 +34,13 @@ use super::{
 
 pub(crate) fn join_execution_distribution_for_alternative(
     alt_kind: &PropertyAlternativeKind,
-) -> Option<crate::sql::optimizer::physical_tree::JoinExecutionDistribution> {
+) -> Option<crate::sql::optimizer::optimized_tree::JoinExecutionDistribution> {
     match alt_kind {
         PropertyAlternativeKind::BroadcastJoin => {
-            Some(crate::sql::optimizer::physical_tree::JoinExecutionDistribution::Broadcast)
+            Some(crate::sql::optimizer::optimized_tree::JoinExecutionDistribution::Broadcast)
         }
         PropertyAlternativeKind::ShuffleJoin => {
-            Some(crate::sql::optimizer::physical_tree::JoinExecutionDistribution::Partitioned)
+            Some(crate::sql::optimizer::optimized_tree::JoinExecutionDistribution::Partitioned)
         }
         PropertyAlternativeKind::Default => None,
     }

@@ -14667,7 +14667,7 @@ enum ImvChangeStreamProducerBranch {
 const IMV_CHANGE_STREAM_DATA_ROUTE_COLUMN: &str = "__change_data_route";
 
 struct ImvRefreshPlannedChangeStream<'a> {
-    physical_plan: crate::sql::optimizer::OptimizerPhysicalNode,
+    physical_plan: crate::sql::optimizer::OptimizedOperatorNode,
     output_columns: Vec<OutputColumn>,
     change_stream: crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
     producer_branches: Vec<ImvChangeStreamProducerBranch>,
@@ -14831,15 +14831,15 @@ fn imv_data_route_output_column(existing: &[OutputColumn]) -> OutputColumn {
 }
 
 fn add_imv_data_route_project(
-    child: crate::sql::optimizer::OptimizerPhysicalNode,
+    child: crate::sql::optimizer::OptimizedOperatorNode,
     child_output_columns: &[OutputColumn],
     action_output: Option<&OutputColumn>,
     row_lineage_output: Option<&OutputColumn>,
     route_mode: ImvDataRouteMode,
     route_output: OutputColumn,
-) -> Result<crate::sql::optimizer::OptimizerPhysicalNode, String> {
+) -> Result<crate::sql::optimizer::OptimizedOperatorNode, String> {
     use crate::sql::optimizer::operator::{Operator, ProjectOp, ScalarProjectItem};
-    use crate::sql::optimizer::physical_tree::{PlanExecutionProps, attach_scalar_arena};
+    use crate::sql::optimizer::optimized_tree::{PlanExecutionProps, attach_scalar_arena};
     use crate::sql::optimizer::scalar::ScalarNode;
 
     let existing_arena =
@@ -14878,14 +14878,14 @@ fn add_imv_data_route_project(
     let mut output_columns = child_output_columns.to_vec();
     output_columns.push(route_output);
     let arena = Arc::new(arena);
-    let mut plan = crate::sql::optimizer::OptimizerPhysicalNode {
+    let mut plan = crate::sql::optimizer::OptimizedOperatorNode {
         op: Operator::PhysicalProject(ProjectOp {
             items,
             output_qualifier: None,
         }),
         children: vec![child],
         stats,
-        explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+        explain_stats: crate::sql::optimizer::optimized_tree::OptimizerExplainStats::default(),
         output_columns,
         execution_props: PlanExecutionProps {
             output_property: output_property.clone(),

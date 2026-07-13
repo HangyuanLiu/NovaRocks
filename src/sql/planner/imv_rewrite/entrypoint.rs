@@ -440,7 +440,7 @@ mod tests {
 
     fn optimize_logical_for_test(
         plan: LogicalPlanNode,
-    ) -> crate::sql::optimizer::OptimizerPhysicalNode {
+    ) -> crate::sql::optimizer::OptimizedOperatorNode {
         let mut scalar_arena = ScalarArena::new();
         let opt_expr = crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr(
             &plan,
@@ -2787,7 +2787,7 @@ mod tests {
     }
 
     #[test]
-    fn pure_join_refresh_physical_tree_keeps_project_refs_in_child_scope() {
+    fn pure_join_refresh_optimized_tree_keeps_project_refs_in_child_scope() {
         std::thread::Builder::new()
             .name("imv-join-physical-scope-test".to_string())
             .stack_size(16 * 1024 * 1024)
@@ -2835,7 +2835,7 @@ mod tests {
     }
 
     #[test]
-    fn pure_join_refresh_filter_physical_tree_keeps_action_refs_in_child_scope() {
+    fn pure_join_refresh_filter_optimized_tree_keeps_action_refs_in_child_scope() {
         std::thread::Builder::new()
             .name("imv-join-filter-physical-scope-test".to_string())
             .stack_size(16 * 1024 * 1024)
@@ -2887,7 +2887,7 @@ mod tests {
     }
 
     #[test]
-    fn pure_join_refresh_side_filter_physical_tree_keeps_action_refs_in_child_scope() {
+    fn pure_join_refresh_side_filter_optimized_tree_keeps_action_refs_in_child_scope() {
         std::thread::Builder::new()
             .name("imv-join-side-filter-physical-scope-test".to_string())
             .stack_size(16 * 1024 * 1024)
@@ -3180,7 +3180,7 @@ mod tests {
     }
 
     fn assert_physical_project_refs_resolve_to_child_outputs(
-        plan: &crate::sql::optimizer::OptimizerPhysicalNode,
+        plan: &crate::sql::optimizer::OptimizedOperatorNode,
     ) {
         if matches!(
             &plan.op,

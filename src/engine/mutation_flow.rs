@@ -400,16 +400,16 @@ fn update_change_stream_target_sql(
 }
 
 fn build_update_mor_change_event_expand_plan(
-    physical: crate::sql::optimizer::OptimizerPhysicalNode,
+    physical: crate::sql::optimizer::OptimizedOperatorNode,
     target_columns: &[crate::engine::catalog::ColumnDef],
     new_sequence_number: i64,
-) -> Result<crate::sql::optimizer::OptimizerPhysicalNode, String> {
+) -> Result<crate::sql::optimizer::OptimizedOperatorNode, String> {
     use crate::sql::optimizer::operator::{
         ChangeEventExpandOp, ChangeEventOutputExpr, ChangeEventSpec, Operator,
         PhysicalDistributionOp,
     };
-    use crate::sql::optimizer::physical_tree::{
-        OptimizerExplainStats, OptimizerPhysicalNode, PlanExecutionProps,
+    use crate::sql::optimizer::optimized_tree::{
+        OptimizedOperatorNode, OptimizerExplainStats, PlanExecutionProps,
     };
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::scalar::{HashableLiteral, ScalarNode};
@@ -425,7 +425,7 @@ fn build_update_mor_change_event_expand_plan(
     let hash_distribution = DistributionSpec::shuffle_agg([row_id_input.column_id]);
 
     let child_stats = physical.stats.clone();
-    let distributed = OptimizerPhysicalNode {
+    let distributed = OptimizedOperatorNode {
         op: Operator::PhysicalDistribution(PhysicalDistributionOp {
             spec: hash_distribution,
         }),
@@ -587,7 +587,7 @@ fn build_update_mor_change_event_expand_plan(
 
     let mut stats = child_stats;
     stats.output_row_count *= 2.0;
-    let mut root = OptimizerPhysicalNode {
+    let mut root = OptimizedOperatorNode {
         op: Operator::PhysicalChangeEventExpand(ChangeEventExpandOp {
             events: vec![
                 ChangeEventSpec {
@@ -613,25 +613,25 @@ fn build_update_mor_change_event_expand_plan(
         output_columns,
         execution_props: PlanExecutionProps::default(),
     };
-    crate::sql::optimizer::physical_tree::attach_scalar_arena(&mut root, Arc::new(scalar_arena));
+    crate::sql::optimizer::optimized_tree::attach_scalar_arena(&mut root, Arc::new(scalar_arena));
     Ok(root)
 }
 
 fn build_merge_mor_change_event_expand_plan(
-    physical: crate::sql::optimizer::OptimizerPhysicalNode,
+    physical: crate::sql::optimizer::OptimizedOperatorNode,
     target_columns: &[crate::engine::catalog::ColumnDef],
     new_sequence_number: i64,
     matched_update: bool,
     matched_delete: bool,
     not_matched_insert: bool,
-) -> Result<crate::sql::optimizer::OptimizerPhysicalNode, String> {
+) -> Result<crate::sql::optimizer::OptimizedOperatorNode, String> {
     use crate::sql::common::BinOp;
     use crate::sql::optimizer::operator::{
         ChangeEventExpandOp, ChangeEventOutputExpr, ChangeEventSpec, Operator,
         PhysicalDistributionOp,
     };
-    use crate::sql::optimizer::physical_tree::{
-        OptimizerExplainStats, OptimizerPhysicalNode, PlanExecutionProps,
+    use crate::sql::optimizer::optimized_tree::{
+        OptimizedOperatorNode, OptimizerExplainStats, PlanExecutionProps,
     };
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::scalar::{HashableLiteral, ScalarNode};
@@ -648,7 +648,7 @@ fn build_merge_mor_change_event_expand_plan(
     let hash_distribution = DistributionSpec::shuffle_agg([assert_key_input.column_id]);
 
     let child_stats = physical.stats.clone();
-    let distributed = OptimizerPhysicalNode {
+    let distributed = OptimizedOperatorNode {
         op: Operator::PhysicalDistribution(PhysicalDistributionOp {
             spec: hash_distribution,
         }),
@@ -887,7 +887,7 @@ fn build_merge_mor_change_event_expand_plan(
     if matched_update {
         stats.output_row_count *= 2.0;
     }
-    let mut root = OptimizerPhysicalNode {
+    let mut root = OptimizedOperatorNode {
         op: Operator::PhysicalChangeEventExpand(ChangeEventExpandOp {
             events,
             output_columns: output_columns.clone(),
@@ -900,7 +900,7 @@ fn build_merge_mor_change_event_expand_plan(
         output_columns,
         execution_props: PlanExecutionProps::default(),
     };
-    crate::sql::optimizer::physical_tree::attach_scalar_arena(&mut root, Arc::new(scalar_arena));
+    crate::sql::optimizer::optimized_tree::attach_scalar_arena(&mut root, Arc::new(scalar_arena));
     Ok(root)
 }
 
@@ -948,7 +948,7 @@ fn child_column_expr(
     ))
 }
 
-fn max_physical_column_id(node: &crate::sql::optimizer::OptimizerPhysicalNode) -> u32 {
+fn max_physical_column_id(node: &crate::sql::optimizer::OptimizedOperatorNode) -> u32 {
     node.output_columns
         .iter()
         .map(|column| column.column_id.0)
@@ -3637,10 +3637,10 @@ mod tests {
         }
     }
 
-    fn update_mor_expand_child_plan_for_test() -> crate::sql::optimizer::OptimizerPhysicalNode {
+    fn update_mor_expand_child_plan_for_test() -> crate::sql::optimizer::OptimizedOperatorNode {
         use crate::sql::optimizer::operator::{Operator, ValuesOp};
-        use crate::sql::optimizer::physical_tree::{
-            OptimizerExplainStats, OptimizerPhysicalNode, PlanExecutionProps,
+        use crate::sql::optimizer::optimized_tree::{
+            OptimizedOperatorNode, OptimizerExplainStats, PlanExecutionProps,
         };
         use crate::sql::optimizer::statistics::Statistics;
 
@@ -3652,7 +3652,7 @@ mod tests {
             optimizer_output_column("qty", 5, DataType::Int64, true, false),
             optimizer_output_column("__nr_new_qty", 6, DataType::Int64, true, true),
         ];
-        let mut node = OptimizerPhysicalNode {
+        let mut node = OptimizedOperatorNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: Vec::new(),
                 columns: output_columns.clone(),
@@ -3667,7 +3667,7 @@ mod tests {
             output_columns,
             execution_props: PlanExecutionProps::default(),
         };
-        crate::sql::optimizer::physical_tree::attach_scalar_arena(
+        crate::sql::optimizer::optimized_tree::attach_scalar_arena(
             &mut node,
             Arc::new(crate::sql::optimizer::scalar::ScalarArena::new()),
         );
@@ -3676,10 +3676,10 @@ mod tests {
 
     fn merge_mor_expand_child_plan_for_test(
         include_insert_qty: bool,
-    ) -> crate::sql::optimizer::OptimizerPhysicalNode {
+    ) -> crate::sql::optimizer::OptimizedOperatorNode {
         use crate::sql::optimizer::operator::{Operator, ValuesOp};
-        use crate::sql::optimizer::physical_tree::{
-            OptimizerExplainStats, OptimizerPhysicalNode, PlanExecutionProps,
+        use crate::sql::optimizer::optimized_tree::{
+            OptimizedOperatorNode, OptimizerExplainStats, PlanExecutionProps,
         };
         use crate::sql::optimizer::statistics::Statistics;
 
@@ -3704,7 +3704,7 @@ mod tests {
             ));
         }
 
-        let mut node = OptimizerPhysicalNode {
+        let mut node = OptimizedOperatorNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: Vec::new(),
                 columns: output_columns.clone(),
@@ -3719,7 +3719,7 @@ mod tests {
             output_columns,
             execution_props: PlanExecutionProps::default(),
         };
-        crate::sql::optimizer::physical_tree::attach_scalar_arena(
+        crate::sql::optimizer::optimized_tree::attach_scalar_arena(
             &mut node,
             Arc::new(crate::sql::optimizer::scalar::ScalarArena::new()),
         );

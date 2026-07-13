@@ -1547,8 +1547,8 @@ mod tests {
         PhysicalHashAggregateOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp, ProjectOp,
         ScanOp, ValuesOp,
     };
-    use crate::sql::optimizer::physical_tree::{
-        JoinExecutionDistribution, OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
+    use crate::sql::optimizer::optimized_tree::{
+        JoinExecutionDistribution, OptimizedOperatorNode, PlanExecutionProps, attach_scalar_arena,
     };
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::scalar::ScalarArena;
@@ -1566,7 +1566,7 @@ mod tests {
         PhysicalPlanStats, PlannerBroadcastDecision, PlannerConfidence,
     };
 
-    fn prepare_bridge2_test_props(node: &mut OptimizerPhysicalNode) {
+    fn prepare_bridge2_test_props(node: &mut OptimizedOperatorNode) {
         for child in &mut node.children {
             prepare_bridge2_test_props(child);
         }
@@ -2277,7 +2277,7 @@ mod tests {
         );
     }
 
-    fn scan_plan() -> OptimizerPhysicalNode {
+    fn scan_plan() -> OptimizedOperatorNode {
         let k = output_col(1, "k", DataType::Int64, false);
         let v = output_col(2, "v", DataType::Int64, true);
         physical_node(
@@ -2297,7 +2297,7 @@ mod tests {
         )
     }
 
-    fn alias_collision_scan_plan() -> OptimizerPhysicalNode {
+    fn alias_collision_scan_plan() -> OptimizedOperatorNode {
         let id = output_col(1, "id", DataType::Int64, false);
         let v = output_col(2, "v", DataType::Int64, true);
         physical_node(
@@ -2328,7 +2328,7 @@ mod tests {
         )
     }
 
-    fn project_alias_collision_plan(child: OptimizerPhysicalNode) -> OptimizerPhysicalNode {
+    fn project_alias_collision_plan(child: OptimizedOperatorNode) -> OptimizedOperatorNode {
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let output_columns = vec![output_col(3, "id", DataType::Int64, true)];
         let items = vec![ProjectItem {
@@ -2347,7 +2347,7 @@ mod tests {
         )
     }
 
-    fn project_plan(child: OptimizerPhysicalNode) -> OptimizerPhysicalNode {
+    fn project_plan(child: OptimizedOperatorNode) -> OptimizedOperatorNode {
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let output_columns = vec![output_col(1, "k", DataType::Int64, false)];
         let items = vec![ProjectItem {
@@ -2366,7 +2366,7 @@ mod tests {
         )
     }
 
-    fn aggregate_count_plan(child: OptimizerPhysicalNode) -> OptimizerPhysicalNode {
+    fn aggregate_count_plan(child: OptimizedOperatorNode) -> OptimizedOperatorNode {
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let k = output_col(1, "k", DataType::Int64, false);
         let count = output_col(3, "count(*)", DataType::Int64, true);
@@ -2396,7 +2396,7 @@ mod tests {
         )
     }
 
-    fn aggregate_count_on_projected_id_plan(child: OptimizerPhysicalNode) -> OptimizerPhysicalNode {
+    fn aggregate_count_on_projected_id_plan(child: OptimizedOperatorNode) -> OptimizedOperatorNode {
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let id = output_col(3, "id", DataType::Int64, true);
         let count = output_col(4, "count(*)", DataType::Int64, true);
@@ -2434,7 +2434,7 @@ mod tests {
         )
     }
 
-    fn sort_with_partition_limit_plan(child: OptimizerPhysicalNode) -> OptimizerPhysicalNode {
+    fn sort_with_partition_limit_plan(child: OptimizedOperatorNode) -> OptimizedOperatorNode {
         let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let output_columns = child.output_columns.clone();
         physical_node_with_scalars(
@@ -2458,9 +2458,9 @@ mod tests {
     }
 
     fn distribution_plan(
-        child: OptimizerPhysicalNode,
+        child: OptimizedOperatorNode,
         spec: DistributionSpec,
-    ) -> OptimizerPhysicalNode {
+    ) -> OptimizedOperatorNode {
         let output_columns = child.output_columns.clone();
         physical_node(
             Operator::PhysicalDistribution(PhysicalDistributionOp { spec }),
@@ -2469,7 +2469,7 @@ mod tests {
         )
     }
 
-    fn inner_join_two_values() -> OptimizerPhysicalNode {
+    fn inner_join_two_values() -> OptimizedOperatorNode {
         let left_col = output_col(1, "left_key", DataType::Int64, false);
         let right_col = output_col(2, "right_key", DataType::Int64, false);
         let left = physical_node(
@@ -2516,27 +2516,27 @@ mod tests {
 
     fn physical_node(
         op: Operator,
-        children: Vec<OptimizerPhysicalNode>,
+        children: Vec<OptimizedOperatorNode>,
         output_columns: Vec<OutputColumn>,
-    ) -> OptimizerPhysicalNode {
+    ) -> OptimizedOperatorNode {
         let scalars = scalars_from_children(&children);
         physical_node_with_scalars(op, children, output_columns, scalars)
     }
 
     fn physical_node_with_scalars(
         op: Operator,
-        children: Vec<OptimizerPhysicalNode>,
+        children: Vec<OptimizedOperatorNode>,
         output_columns: Vec<OutputColumn>,
         scalars: ScalarArena,
-    ) -> OptimizerPhysicalNode {
-        let mut plan = OptimizerPhysicalNode {
+    ) -> OptimizedOperatorNode {
+        let mut plan = OptimizedOperatorNode {
             op,
             children,
             stats: Statistics {
                 output_row_count: 3.0,
                 ..Default::default()
             },
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+            explain_stats: crate::sql::optimizer::optimized_tree::OptimizerExplainStats::default(),
             output_columns,
             execution_props: PlanExecutionProps::default(),
         };
@@ -2544,7 +2544,7 @@ mod tests {
         plan
     }
 
-    fn scalars_from_children(children: &[OptimizerPhysicalNode]) -> ScalarArena {
+    fn scalars_from_children(children: &[OptimizedOperatorNode]) -> ScalarArena {
         children
             .iter()
             .find_map(|child| child.execution_props.scalar_arena.as_deref().cloned())

@@ -3270,7 +3270,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
     state: &Arc<StandaloneState>,
     _current_catalog: Option<&str>,
     current_database: &str,
-    physical_plan: &crate::sql::optimizer::OptimizerPhysicalNode,
+    physical_plan: &crate::sql::optimizer::OptimizedOperatorNode,
     dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
 ) -> Result<PlannedIcebergChangeStreamWrite, String> {
@@ -3290,7 +3290,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_native_pla
     state: &Arc<StandaloneState>,
     _current_catalog: Option<&str>,
     current_database: &str,
-    physical_plan: &crate::sql::optimizer::OptimizerPhysicalNode,
+    physical_plan: &crate::sql::optimizer::OptimizedOperatorNode,
     dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
     native_plan_mutation: Option<ChangeStreamNativePlanMutation<'_>>,
@@ -3359,7 +3359,7 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
     current_database: &str,
-    physical_plan: &crate::sql::optimizer::OptimizerPhysicalNode,
+    physical_plan: &crate::sql::optimizer::OptimizedOperatorNode,
     dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
     query_opts: Option<StandaloneQueryOptions>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
@@ -3507,7 +3507,7 @@ pub(crate) fn execute_preexpanded_mv_refresh_query_with_options(
 }
 
 pub(crate) struct PlannedIcebergChangeStreamRefreshQuery {
-    pub(crate) physical_plan: crate::sql::optimizer::OptimizerPhysicalNode,
+    pub(crate) physical_plan: crate::sql::optimizer::OptimizedOperatorNode,
     pub(crate) output_columns: Vec<crate::sql::analysis::OutputColumn>,
     pub(crate) change_stream:
         crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
@@ -9006,8 +9006,8 @@ path = "meta/operations.sqlite"
         use crate::sql::column_id::ColumnId;
         use crate::sql::common::ChangeStreamBranchKind;
         use crate::sql::optimizer::operator::{Operator, ValuesOp};
-        use crate::sql::optimizer::physical_tree::{
-            OptimizerPhysicalNode, PlanExecutionProps, attach_scalar_arena,
+        use crate::sql::optimizer::optimized_tree::{
+            OptimizedOperatorNode, PlanExecutionProps, attach_scalar_arena,
         };
         use crate::sql::optimizer::scalar::ScalarArena;
         use crate::sql::optimizer::statistics::Statistics;
@@ -9040,7 +9040,7 @@ path = "meta/operations.sqlite"
                 is_internal: false,
             },
         ];
-        let mut physical_plan = OptimizerPhysicalNode {
+        let mut physical_plan = OptimizedOperatorNode {
             op: Operator::PhysicalValues(ValuesOp {
                 rows: Vec::new(),
                 columns: output_columns.clone(),
@@ -9051,7 +9051,7 @@ path = "meta/operations.sqlite"
                 column_statistics: Default::default(),
                 ..Default::default()
             },
-            explain_stats: crate::sql::optimizer::physical_tree::OptimizerExplainStats::default(),
+            explain_stats: crate::sql::optimizer::optimized_tree::OptimizerExplainStats::default(),
             output_columns,
             execution_props: PlanExecutionProps::default(),
         };
