@@ -15149,7 +15149,6 @@ const NIDL_E0_COMPAT_SCOPE: &[&str] = &[
     "src/lower/compat",
     "src/runtime/descriptor_snapshot_thrift.rs",
     "src/runtime/sink_commit_wire.rs",
-    "src/runtime/write_coordinator_compat.rs",
     "src/service/backend_service.rs",
     "src/service/heartbeat_service.rs",
     "src/service/internal_service.rs",
@@ -15611,13 +15610,13 @@ fn nidl_e9_native_fragment_wire_has_no_starrocks_thrift_aliases() {
 
 #[test]
 fn nidl_e9_write_coordinator_uses_native_report_types() {
-    let coordinator = nidl_e9_read("src/runtime/write_coordinator.rs");
+    let coordinator = nidl_e9_read("src/coordinator/write/mod.rs");
     let coordinator_region = nidl_e9_text_region_between(
         &coordinator,
-        "pub(crate) use crate::runtime::write_report",
+        "use crate::coordinator::write::report",
         "impl WriteCoordinator",
     );
-    let write_report = nidl_e9_read("src/runtime/write_report.rs");
+    let write_report = nidl_e9_read("src/coordinator/write/report.rs");
     let write_report_region = nidl_e9_text_region_between(
         &write_report,
         "pub(crate) struct WriterKey",
@@ -17260,10 +17259,11 @@ fn coor_2_report_handler_is_query_control_plane() {
     assert!(fragment_control.contains("pub fn cancel"));
     assert!(!fragment_control.contains("mark_query_failed_from_report"));
 
-    assert!(repo.join("src/runtime/write_coordinator.rs").is_file());
-    assert!(repo.join("src/runtime/write_report.rs").is_file());
+    assert!(repo.join("src/coordinator/write/mod.rs").is_file());
+    assert!(repo.join("src/coordinator/write/report.rs").is_file());
     assert!(!repo.join("src/coordinator/write.rs").exists());
-    assert!(!repo.join("src/coordinator/write").exists());
+    assert!(report.contains("crate::coordinator::write::report::report_from_native"));
+    assert!(report.contains("crate::coordinator::write::{"));
 
     let mut scanned = 0usize;
     for path in rs_files(&repo.join("src/coordinator")) {
@@ -17433,6 +17433,253 @@ fn coor_4_write_operation_mapping_is_engine_owned() {
 }
 
 #[test]
+fn coor_4_final_write_control_plane_ownership_is_non_vacuous() {
+    let repo = Path::new(manifest_dir());
+    let write_files = [
+        "src/coordinator/write/mod.rs",
+        "src/coordinator/write/report.rs",
+    ];
+    for owner in write_files {
+        let text = rust_sanitized_production_text(
+            &fs::read_to_string(repo.join(owner))
+                .unwrap_or_else(|err| panic!("read {owner}: {err}")),
+        );
+        assert!(!text.trim().is_empty(), "{owner} must be non-empty");
+        for forbidden in ["crate::service", "crate::engine", "crate::thrift"] {
+            assert!(
+                !text.contains(forbidden),
+                "{owner} imports forbidden concrete {forbidden}"
+            );
+        }
+    }
+
+    for retired in [
+        ["src/runtime/", "write_coordinator.rs"].concat(),
+        ["src/runtime/", "write_report.rs"].concat(),
+        ["src/runtime/", "write_coordinator_compat.rs"].concat(),
+        ["src/runtime/", "write_operation_lifecycle.rs"].concat(),
+    ] {
+        assert!(
+            !repo.join(&retired).exists(),
+            "retired owner remains: {retired}"
+        );
+    }
+    for retained in [
+        "src/runtime/sink_commit.rs",
+        "src/runtime/sink_commit_wire.rs",
+        "src/service/fe_report.rs",
+        "src/service/exec_status_report.rs",
+        "src/service/exec_state_reporter.rs",
+        "src/service/report_worker.rs",
+        "src/service/standalone_exec_state_reporter.rs",
+    ] {
+        assert!(
+            repo.join(retained).is_file(),
+            "BE-local owner moved or deleted: {retained}"
+        );
+    }
+
+    let sources = rs_files(&repo.join("src"))
+        .into_iter()
+        .map(|path| {
+            (
+                rel(&path),
+                fs::read_to_string(&path)
+                    .unwrap_or_else(|err| panic!("read {}: {err}", rel(&path))),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (symbol, owner) in [
+        (
+            "WriteCoordinatorRegistry",
+            "src/coordinator/write/mod.rs (1)",
+        ),
+        ("WriteCoordinator", "src/coordinator/write/mod.rs (1)"),
+        (
+            "RegisteredWriteCoordinator",
+            "src/coordinator/write/mod.rs (1)",
+        ),
+        ("WriterKey", "src/coordinator/write/report.rs (1)"),
+        ("WriteCommitInput", "src/coordinator/write/report.rs (1)"),
+        ("WriteAbortInput", "src/coordinator/write/report.rs (1)"),
+    ] {
+        assert_eq!(
+            rust_named_declaration_owners(&sources, symbol, rust_named_type_declaration_count),
+            vec![owner],
+            "{symbol} must have exactly one production owner"
+        );
+    }
+
+    let write_owner = rust_sanitized_production_text(
+        &fs::read_to_string(repo.join("src/coordinator/write/mod.rs"))
+            .expect("read coordinator write owner"),
+    );
+    assert_eq!(
+        rust_named_function_declaration_count(&write_owner, "register_query"),
+        1,
+        "raw register_query must be a single write-owner implementation detail"
+    );
+    assert_eq!(
+        rust_named_function_declaration_count(&write_owner, "unregister_query"),
+        1,
+        "raw unregister_query must be a single write-owner implementation detail"
+    );
+    for raw_api in ["register_query", "unregister_query"] {
+        assert!(
+            !write_owner.contains(&format!("pub fn {raw_api}"))
+                && !write_owner.contains(&format!("pub(crate) fn {raw_api}"))
+                && !write_owner.contains(&format!("pub(super) fn {raw_api}")),
+            "raw {raw_api} must remain private to coordinator::write"
+        );
+    }
+    let drop_owners = sources
+        .iter()
+        .filter_map(|(path, text)| {
+            let count = rust_sanitized_production_text(text)
+                .matches("impl Drop for RegisteredWriteCoordinator")
+                .count();
+            (count > 0).then(|| format!("{path} ({count})"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        drop_owners,
+        vec!["src/coordinator/write/mod.rs (1)"],
+        "RegisteredWriteCoordinator cleanup must have one exact Drop owner"
+    );
+
+    let retired_module_paths = [
+        ["crate::runtime::", "write_coordinator"].concat(),
+        ["runtime::", "write_coordinator"].concat(),
+        ["crate::runtime::", "write_report"].concat(),
+        ["runtime::", "write_report"].concat(),
+        ["crate::runtime::", "write_coordinator_compat"].concat(),
+        ["runtime::", "write_coordinator_compat"].concat(),
+        ["crate::runtime::", "write_operation_lifecycle"].concat(),
+        ["runtime::", "write_operation_lifecycle"].concat(),
+    ];
+    for (path, text) in &sources {
+        let production = rust_sanitized_production_text(text);
+        for retired in &retired_module_paths {
+            assert!(
+                !production.contains(retired),
+                "{path} references or forwards retired module path {retired}"
+            );
+        }
+    }
+
+    assert_eq!(
+        rs_files(&repo.join("src/coordinator")).len(),
+        10,
+        "final coordinator owner tree must contain exactly ten Rust files"
+    );
+    assert!(
+        !NIDL_E0_COMPAT_SCOPE.contains(
+            &["src/runtime/", "write_coordinator_compat.rs"]
+                .concat()
+                .as_str()
+        ),
+        "dead compat ingress must not remain in NIDL compat scope"
+    );
+
+    let fe_report = rust_sanitized_production_text(
+        &fs::read_to_string(repo.join("src/service/fe_report.rs"))
+            .expect("read FE report producer"),
+    );
+    for relation in [
+        "ReportDestination::StarRocksFrontend(coord) =>",
+        "exec_status_report::build_report_params(ExecStatusReportInput",
+        "enqueue_final_report(ExecStateReportTask",
+        "ReportDestination::NovaRocksCoordinator(coord) =>",
+        "build_native_report(NativeExecStatusReportInput",
+        "enqueue_standalone_final_report(StandaloneExecStateReportTask",
+    ] {
+        assert!(
+            fe_report.contains(relation),
+            "sanitized FE destination-to-builder-to-reporter path missing {relation}"
+        );
+    }
+    let fe_encoder = rust_sanitized_production_text(
+        &fs::read_to_string(repo.join("src/service/exec_status_report.rs"))
+            .expect("read FE report encoder"),
+    );
+    assert!(fe_encoder.contains("frontend_service::TReportExecStatusParams"));
+    let fe_reporter = rust_sanitized_production_text(
+        &fs::read_to_string(repo.join("src/service/exec_state_reporter.rs"))
+            .expect("read FE report transport"),
+    );
+    assert!(fe_reporter.contains("FrontendRpcKind::ExecStatus"));
+    assert!(fe_reporter.contains("report_exec_status(task.params.clone())"));
+
+    let audit_path = repo.join("tools/dev/audit_thrift_boundaries.py");
+    let audit = fs::read_to_string(&audit_path).expect("read thrift boundary audit");
+    let compact = audit.lines().map(compact_line).collect::<String>();
+    for expected in [
+        "\"src/coordinator/write/mod.rs\": BaselineEntry(\"domain-leak\", \"control-plane\", 0, \"Coordinator write control plane owns native writer state and registry\"),",
+        "\"src/coordinator/write/report.rs\": BaselineEntry(\"domain-leak\", \"control-plane\", 0, \"Coordinator write report model consumes native exec-status payloads\"),",
+        "\"src/engine/write_operation_lifecycle.rs\": BaselineEntry(\"domain-leak\", \"B2\", 0, \"Engine owns write operation mapping and persistence\"),",
+    ] {
+        assert!(
+            compact.contains(&compact_line(expected)),
+            "final write owner missing exact audit entry: {expected}"
+        );
+    }
+    for retired in [
+        ["src/runtime/", "write_coordinator.rs"].concat(),
+        ["src/runtime/", "write_report.rs"].concat(),
+        ["src/runtime/", "write_coordinator_compat.rs"].concat(),
+        ["src/runtime/", "write_operation_lifecycle.rs"].concat(),
+    ] {
+        assert!(
+            !compact.contains(&format!("\"{retired}\":BaselineEntry(")),
+            "retired owner retains audit entry: {retired}"
+        );
+    }
+
+    let output = std::process::Command::new("python3")
+        .arg(&audit_path)
+        .args(["--strict", "--json"])
+        .current_dir(repo)
+        .output()
+        .expect("run strict thrift boundary audit");
+    assert!(
+        output.status.success(),
+        "strict audit failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse strict audit JSON");
+    assert_eq!(summary["errors"].as_array().map(Vec::len), Some(0));
+    assert_eq!(summary["scanned_by_root"]["src/coordinator"], 10);
+    let scanned_files = summary["scanned_files"]
+        .as_array()
+        .expect("strict audit JSON scanned files")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<BTreeSet<_>>();
+    for owner in write_files {
+        assert!(
+            scanned_files.contains(owner),
+            "strict audit did not scan coordinator write owner {owner}"
+        );
+    }
+    let write_hit_files = summary["files"]
+        .as_array()
+        .expect("strict audit JSON hit files")
+        .iter()
+        .filter(|entry| {
+            entry["path"]
+                .as_str()
+                .is_some_and(|path| write_files.contains(&path))
+        })
+        .count();
+    assert_eq!(
+        write_hit_files, 0,
+        "coordinator write owners must have zero thrift hits"
+    );
+}
+
+#[test]
 fn coor_2_thrift_audit_scans_coordinator_owners() {
     let repo = Path::new(manifest_dir());
     let audit_path = repo.join("tools/dev/audit_thrift_boundaries.py");
@@ -17480,6 +17727,8 @@ fn coor_2_thrift_audit_scans_coordinator_owners() {
         "src/coordinator/scheduler/mod.rs",
         "src/coordinator/profile/mod.rs",
         "src/coordinator/profile/correlate.rs",
+        "src/coordinator/write/mod.rs",
+        "src/coordinator/write/report.rs",
     ] {
         assert!(
             scanned_files.contains(owner),
@@ -17495,8 +17744,8 @@ fn coor_2_final_control_plane_ownership_is_non_vacuous() {
     let coordinator_files = rs_files(&coordinator_root);
     assert_eq!(
         coordinator_files.len(),
-        8,
-        "COOR-2 must audit the complete eight-file coordinator production tree"
+        10,
+        "COOR-4 must audit the complete ten-file coordinator production tree"
     );
 
     let required_owners = [
@@ -17547,7 +17796,7 @@ fn coor_2_final_control_plane_ownership_is_non_vacuous() {
         );
     }
     assert!(!repo.join("src/coordinator/write.rs").exists());
-    assert!(!repo.join("src/coordinator/write").exists());
+    assert!(repo.join("src/coordinator/write").is_dir());
 
     let retired_paths = [
         ["crate::runtime::", "coordinator"].concat(),
@@ -17556,6 +17805,14 @@ fn coor_2_final_control_plane_ownership_is_non_vacuous() {
         ["runtime::", "scheduler"].concat(),
         ["crate::runtime::", "profile_correlate"].concat(),
         ["runtime::", "profile_correlate"].concat(),
+        ["crate::runtime::", "write_coordinator"].concat(),
+        ["runtime::", "write_coordinator"].concat(),
+        ["crate::runtime::", "write_report"].concat(),
+        ["runtime::", "write_report"].concat(),
+        ["crate::runtime::", "write_coordinator_compat"].concat(),
+        ["runtime::", "write_coordinator_compat"].concat(),
+        ["crate::runtime::", "write_operation_lifecycle"].concat(),
+        ["runtime::", "write_operation_lifecycle"].concat(),
     ];
     let forbidden_types = [
         ["Query", "Coordinator"].concat(),
@@ -17597,15 +17854,14 @@ fn coor_2_final_control_plane_ownership_is_non_vacuous() {
                 !production.contains("crate::service"),
                 "{relative} imports a service concrete"
             );
-            let uses_transitional_write = production.contains("runtime::write_coordinator")
-                || production.contains("runtime::write_report");
-            if uses_transitional_write {
+            let uses_sibling_write = production.contains("coordinator::write");
+            if uses_sibling_write && !relative.starts_with("src/coordinator/write/") {
                 assert!(
                     matches!(
                         relative.as_str(),
                         "src/coordinator/execution.rs" | "src/coordinator/report.rs"
                     ),
-                    "{relative} references a transitional write owner outside execution/report"
+                    "{relative} references the sibling write owner outside execution/report"
                 );
             }
         }
@@ -17634,7 +17890,7 @@ fn coor_2_final_control_plane_ownership_is_non_vacuous() {
     let summary: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("parse strict audit JSON");
     assert_eq!(summary["errors"].as_array().map(Vec::len), Some(0));
-    assert_eq!(summary["scanned_by_root"]["src/coordinator"], 8);
+    assert_eq!(summary["scanned_by_root"]["src/coordinator"], 10);
     let coordinator_hits = summary["files"]
         .as_array()
         .expect("audit JSON files")
@@ -17647,6 +17903,6 @@ fn coor_2_final_control_plane_ownership_is_non_vacuous() {
         .count();
     assert_eq!(
         coordinator_hits, 0,
-        "all eight coordinator production files must have zero audited thrift hits"
+        "all ten coordinator production files must have zero audited thrift hits"
     );
 }

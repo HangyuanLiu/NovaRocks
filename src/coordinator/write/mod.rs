@@ -1242,6 +1242,32 @@ mod tests {
     }
 
     #[test]
+    fn production_registration_is_cleaned_up_after_error_scope() {
+        let _test_guard = write_registry_test_guard();
+        let query_id = id(92, 93);
+        let writer = key(92, 93, 94, 95, 0);
+
+        let result = (|| -> Result<(), String> {
+            let _registration =
+                RegisteredWriteCoordinator::register(query_id.clone(), vec![writer.clone()])?;
+            assert_eq!(
+                lookup_native_writer_report(&native_report(&writer)).unwrap(),
+                WriterReportLookup::Expected
+            );
+            Err("execution failed after write registration".to_string())
+        })();
+
+        assert_eq!(
+            result.unwrap_err(),
+            "execution failed after write registration"
+        );
+        assert_eq!(
+            lookup_native_writer_report(&native_report(&writer)).unwrap(),
+            WriterReportLookup::UnknownQuery { query_id }
+        );
+    }
+
+    #[test]
     fn duplicate_raii_registration_keeps_original_registration() {
         let _test_guard = write_registry_test_guard();
         let query_id = id(94, 95);
