@@ -3404,6 +3404,70 @@ fn rust_production_canonical_paths(text: &str, source_rel: &str) -> Vec<Vec<Stri
     canonical.into_iter().collect()
 }
 
+fn native_lowering_codegen_dependency_violations_in(source_rel: &str, text: &str) -> Vec<String> {
+    let source_rel = source_rel.replace('\\', "/");
+    if !source_rel.starts_with("src/lower/novarocks/") {
+        return Vec::new();
+    }
+    rust_production_canonical_paths(text, &source_rel)
+        .into_iter()
+        .filter(|path| path.len() >= 3 && path[..3] == ["crate", "sql", "codegen"])
+        .map(|path| path.join("::"))
+        .collect()
+}
+
+#[test]
+fn native_lowering_codegen_dependency_detector_covers_bypasses() {
+    let invalid = [
+        (
+            "src/lower/novarocks/mod.rs",
+            "use crate::sql::codegen::proto_encode::types::decode_type;",
+        ),
+        (
+            "src/lower/novarocks/node/filter.rs",
+            "use crate::sql::{codegen as writer}; type Leak = writer::Codegen;",
+        ),
+        (
+            "src/lower/novarocks/node/filter.rs",
+            "type Leak = super::super::super::super::sql::codegen::Codegen;",
+        ),
+    ];
+    for (source_rel, source) in invalid {
+        assert!(!native_lowering_codegen_dependency_violations_in(source_rel, source).is_empty());
+    }
+
+    let valid = [
+        (
+            "src/lower/novarocks/mod.rs",
+            "use crate::types::native_proto::decode_type;",
+        ),
+        (
+            "src/lower/novarocks/node/filter.rs",
+            "#[cfg(test)] use crate::sql::codegen::proto_encode::types::encode_type;",
+        ),
+    ];
+    for (source_rel, source) in valid {
+        assert!(native_lowering_codegen_dependency_violations_in(source_rel, source).is_empty());
+    }
+}
+
+#[test]
+fn native_lowering_does_not_import_sql_codegen() {
+    let mut violations = Vec::new();
+    for file in production_rs_files(&src_dir().join("lower/novarocks")) {
+        let source_rel = rel(&file);
+        let text = fs::read_to_string(&file).unwrap();
+        for path in native_lowering_codegen_dependency_violations_in(&source_rel, &text) {
+            violations.push(format!("{source_rel}: {path}"));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "native lowering must not import sql::codegen:\n{}",
+        violations.join("\n")
+    );
+}
+
 fn planner_stage_first_dependency_violations_in(source_rel: &str, text: &str) -> Vec<String> {
     fn starts_with(path: &[String], prefix: &[&str]) -> bool {
         path.len() >= prefix.len()
