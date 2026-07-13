@@ -31,6 +31,8 @@ use crate::sql::optimizer::operator::*;
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::sql::optimizer::scalar_expr;
+#[cfg(test)]
+use crate::sql::planner::payload::WindowExpr;
 use crate::types::wider_type;
 
 pub(super) fn get_group_column_ids(memo: &Memo, group_id: GroupId) -> HashSet<ColumnId> {
@@ -792,17 +794,34 @@ impl Rule for TopNToPhysical {
 // ---------------------------------------------------------------------------
 
 /// Split a LogicalWindow's expressions into groups sharing the same
-/// (partition_by, order_by) signature. Preserves first-seen order.
+/// (partition_by, order_by, frame) signature. Preserves first-seen order.
 #[cfg(test)]
 #[allow(dead_code)]
-fn split_window_exprs_by_signature(
-    exprs: &[crate::sql::planner::payload::WindowExpr],
-) -> Vec<Vec<crate::sql::planner::payload::WindowExpr>> {
-    let index_groups = crate::sql::codegen::helpers::group_win_exprs_by_sig(exprs);
-    index_groups
-        .into_iter()
-        .map(|idxs| idxs.into_iter().map(|i| exprs[i].clone()).collect())
-        .collect()
+fn split_window_exprs_by_signature(exprs: &[WindowExpr]) -> Vec<Vec<WindowExpr>> {
+    let signature = |expr: &WindowExpr| {
+        format!(
+            "{:?}|{:?}|{:?}",
+            expr.partition_by
+                .iter()
+                .map(|item| format!("{:?}", item.kind))
+                .collect::<Vec<_>>(),
+            expr.order_by
+                .iter()
+                .map(|item| format!("{:?}:{}", item.expr.kind, item.asc))
+                .collect::<Vec<_>>(),
+            expr.window_frame,
+        )
+    };
+    let mut groups: Vec<(String, Vec<WindowExpr>)> = Vec::new();
+    for expr in exprs {
+        let key = signature(expr);
+        if let Some((_, group)) = groups.iter_mut().find(|(existing, _)| *existing == key) {
+            group.push(expr.clone());
+        } else {
+            groups.push((key, vec![expr.clone()]));
+        }
+    }
+    groups.into_iter().map(|(_, group)| group).collect()
 }
 
 /// Derive sort items for a window's partition_by + order_by.
@@ -1959,12 +1978,10 @@ mod window_split_tests {
 
     #[test]
     fn split_separates_different_signatures() {
-        let exprs = vec![
-            mk_window_expr("w1", vec![col("a")]),
-            mk_window_expr("w2", vec![col("b")]),
-            mk_window_expr("w3", vec![col("a")]),
-        ];
-        let groups = split_window_exprs_by_signature(&exprs);
+        let a1 = mk_window_expr("w1", vec![col("a")]);
+        let b = mk_window_expr("w2", vec![col("b")]);
+        let a2 = mk_window_expr("w3", vec![col("a")]);
+        let groups = split_window_exprs_by_signature(&[a1, b, a2]);
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].len(), 2);
         assert_eq!(groups[0][0].name, "w1");
