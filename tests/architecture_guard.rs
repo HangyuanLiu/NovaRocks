@@ -16989,16 +16989,10 @@ fn coor_1_runtime_coordinator_has_only_injected_service_ports() {
     let runtime = fs::read_to_string(repo.join("src/runtime/coordinator.rs"))
         .expect("read runtime coordinator");
     let runtime = rust_sanitized_production_text(&runtime);
-    for forbidden in [
-        "crate::service::grpc_client",
-        "crate::service::grpc_server",
-        "crate::service::metrics_http",
-    ] {
-        assert!(
-            !runtime.contains(forbidden),
-            "runtime coordinator imports {forbidden}"
-        );
-    }
+    assert!(
+        !runtime.contains("crate::service"),
+        "runtime coordinator must not depend on service modules"
+    );
 
     let ports =
         fs::read_to_string(repo.join("src/coordinator/ports.rs")).expect("read coordinator ports");

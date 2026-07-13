@@ -29,8 +29,52 @@ impl CoordinatorObserver for PrometheusCoordinatorObserver {
 pub(crate) fn coordinator_report_endpoint() -> Result<RuntimeEndpoint, String> {
     let cfg = crate::novarocks_config::config()
         .map_err(|e| format!("cannot read coordinator config: {e}"))?;
-    let host = crate::common::network::advertise_host().unwrap_or_else(|_| cfg.server.host.clone());
-    let port =
-        crate::service::grpc_server::grpc_server_bound_port().unwrap_or(cfg.server.grpc_port);
-    RuntimeEndpoint::new(host, port as i32)
+    let advertised_host = crate::common::network::advertise_host().ok();
+    let bound_port = crate::service::grpc_server::grpc_server_bound_port().ok();
+    select_coordinator_report_endpoint(
+        &cfg.server.host,
+        cfg.server.grpc_port,
+        advertised_host.as_deref(),
+        bound_port,
+    )
+}
+
+fn select_coordinator_report_endpoint(
+    configured_host: &str,
+    configured_port: u16,
+    advertised_host: Option<&str>,
+    bound_port: Option<u16>,
+) -> Result<RuntimeEndpoint, String> {
+    RuntimeEndpoint::new(
+        advertised_host.unwrap_or(configured_host),
+        i32::from(bound_port.unwrap_or(configured_port)),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_endpoint_prefers_advertised_host_and_bound_port() {
+        let endpoint = select_coordinator_report_endpoint(
+            "configured.internal",
+            9070,
+            Some("advertised.internal"),
+            Some(19070),
+        )
+        .expect("report endpoint");
+
+        assert_eq!(endpoint.host(), "advertised.internal");
+        assert_eq!(endpoint.port(), 19070);
+    }
+
+    #[test]
+    fn report_endpoint_falls_back_to_configured_host_and_port() {
+        let endpoint = select_coordinator_report_endpoint("configured.internal", 9070, None, None)
+            .expect("report endpoint");
+
+        assert_eq!(endpoint.host(), "configured.internal");
+        assert_eq!(endpoint.port(), 9070);
+    }
 }
