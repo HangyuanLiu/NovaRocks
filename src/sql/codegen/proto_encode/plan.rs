@@ -2005,6 +2005,9 @@ fn encode_table_def_with_context(
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::TableDef, String> {
     let (columns, metadata_columns) = match binding {
+        Some(binding) if scan_source_requires_resolved_binding(&src.source) => {
+            resolved_binding_table_columns(binding)
+        }
         Some(binding) => merged_bound_table_columns(src, scan_columns.unwrap_or_default(), binding),
         None => (
             src.columns.clone(),
@@ -2023,6 +2026,43 @@ fn encode_table_def_with_context(
             .collect::<Result<Vec<_>, _>>()?,
         source: Some(encode_scan_source(&src.source, scan_node_id, binding, ctx)?),
     })
+}
+
+fn scan_source_requires_resolved_binding(source: &catalog::ScanSource) -> bool {
+    matches!(
+        source,
+        catalog::ScanSource::IcebergDeltaTable { .. }
+            | catalog::ScanSource::IcebergVersionTable { .. }
+            | catalog::ScanSource::IcebergMvTargetState(_)
+            | catalog::ScanSource::IcebergMvTargetLocator(_)
+    )
+}
+
+fn resolved_binding_table_columns(
+    binding: &ResolvedScanBinding,
+) -> (Vec<catalog::ColumnDef>, Vec<catalog::ColumnDef>) {
+    let mut columns = Vec::new();
+    let mut metadata_columns = Vec::new();
+    let mut seen = HashSet::new();
+
+    for bound in &binding.physical_columns {
+        if !seen.insert(bound.source.name.to_ascii_lowercase()) {
+            continue;
+        }
+        match bound.kind {
+            ResolvedScanColumnKind::PhysicalTableColumn => columns.push(bound.source.clone()),
+            ResolvedScanColumnKind::IcebergMetadataColumn => {
+                metadata_columns.push(bound.source.clone())
+            }
+        }
+    }
+    for read in &binding.required_reads {
+        if seen.insert(read.source.name.to_ascii_lowercase()) {
+            columns.push(read.source.clone());
+        }
+    }
+
+    (columns, metadata_columns)
 }
 
 fn merged_bound_table_columns(
@@ -2237,13 +2277,7 @@ fn scan_binding_for_source<'a>(
     let binding = ctx
         .scan_bindings
         .and_then(|bindings| bindings.binding(node_id));
-    let required = matches!(
-        source,
-        catalog::ScanSource::IcebergDeltaTable { .. }
-            | catalog::ScanSource::IcebergVersionTable { .. }
-            | catalog::ScanSource::IcebergMvTargetState(_)
-            | catalog::ScanSource::IcebergMvTargetLocator(_)
-    );
+    let required = scan_source_requires_resolved_binding(source);
     if required && binding.is_none() {
         return Err(match source {
             catalog::ScanSource::IcebergDeltaTable {
@@ -3658,6 +3692,16 @@ mod tests {
             write_default: None,
             logical_type: None,
         };
+        let mut plan = plan;
+        root_scan_for_test(&mut plan)
+            .table
+            .columns
+            .push(column_def_for_test(
+                "stale_unprojected",
+                DataType::Utf8,
+                true,
+            ));
+        let hidden_equality_column = column_def_for_test("tenant_id", DataType::Int64, false);
         let mut bindings = ScanExecutionBindings::default();
         bindings
             .insert_binding(ResolvedScanBinding {
@@ -3679,11 +3723,18 @@ mod tests {
                     source: source_column.clone(),
                     kind: ResolvedScanColumnKind::PhysicalTableColumn,
                 }],
-                required_reads: vec![ResolvedReadColumn {
-                    planner_column_id: Some(ColumnId::new_for_test(1)),
-                    source: source_column,
-                    reason: ResolvedReadReason::PlannerRequiredOrOutput,
-                }],
+                required_reads: vec![
+                    ResolvedReadColumn {
+                        planner_column_id: Some(ColumnId::new_for_test(1)),
+                        source: source_column,
+                        reason: ResolvedReadReason::PlannerRequiredOrOutput,
+                    },
+                    ResolvedReadColumn {
+                        planner_column_id: None,
+                        source: hidden_equality_column,
+                        reason: ResolvedReadReason::EqualityDeleteKey,
+                    },
+                ],
             })
             .expect("insert prepared delta binding");
 
@@ -3705,9 +3756,20 @@ mod tests {
             panic!("expected scan root");
         };
         assert_eq!(scan.columns[0].name, "physical_order_id");
-        assert_eq!(scan.required_columns, vec!["physical_order_id"]);
+        assert_eq!(
+            scan.required_columns,
+            vec!["physical_order_id", "tenant_id"]
+        );
         let table = scan.table.as_ref().expect("bound table");
-        assert_eq!(table.columns[0].name, "physical_order_id");
+        assert_eq!(
+            table
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["physical_order_id", "tenant_id"]
+        );
+        assert!(table.iceberg_row_lineage_metadata_columns.is_empty());
         let Some(crate::proto::plan::scan_source::Kind::IcebergDeltaTable(delta)) = table
             .source
             .as_ref()
@@ -3809,7 +3871,10 @@ mod tests {
             let mut plan = iceberg_delta_distributed_plan_for_test();
             let scan = root_scan_for_test(&mut plan);
             scan.table.source = source;
-            scan.table.columns = vec![column_def_for_test("stale", DataType::Utf8, true)];
+            scan.table.columns = vec![
+                column_def_for_test("stale", DataType::Utf8, true),
+                column_def_for_test("stale_unprojected", DataType::Utf8, true),
+            ];
             scan.columns = vec![
                 output_column(1, "stale", DataType::Utf8),
                 output_column(2, "stale_meta", DataType::Int64),
@@ -3884,20 +3949,23 @@ mod tests {
                 vec!["physical_order_id", "tenant_id"]
             );
             let table = scan.table.as_ref().expect("bound table");
-            assert!(
+            assert_eq!(
                 table
                     .columns
                     .iter()
-                    .any(|column| column.name == "physical_order_id")
+                    .map(|column| column.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["physical_order_id", "tenant_id"],
+                "resolver-required sources must encode only binding-owned physical columns and hidden reads"
             );
-            assert!(
+            assert_eq!(
                 table
-                    .columns
+                    .iceberg_row_lineage_metadata_columns
                     .iter()
-                    .any(|column| column.name == "tenant_id"),
-                "hidden equality read must be present in bound table definitions"
+                    .map(|column| column.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["_file"]
             );
-            assert_eq!(table.iceberg_row_lineage_metadata_columns[0].name, "_file");
             let Some(crate::proto::plan::scan_source::Kind::IcebergDataFiles(files)) = table
                 .source
                 .as_ref()

@@ -28,7 +28,7 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::FragmentId;
 use crate::sql::planner::payload::PlanScanNode;
 
-pub(crate) trait ScanBindingResolver {
+pub(crate) trait ScanBindingResolver: Send + Sync {
     fn resolve_scan(
         &self,
         node_id: i32,
@@ -242,6 +242,13 @@ mod tests {
 
     use super::*;
     use crate::sql::SqlType;
+
+    #[test]
+    fn resolver_trait_object_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync + ?Sized>() {}
+
+        assert_send_sync::<dyn ScanBindingResolver>();
+    }
 
     fn planner_column(id: u32, name: &str, data_type: DataType, nullable: bool) -> OutputColumn {
         OutputColumn {

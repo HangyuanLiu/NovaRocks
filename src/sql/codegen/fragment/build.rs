@@ -896,8 +896,8 @@ fn fragment_output_kind(sink: &crate::sql::planner::distributed::DataSink) -> Fr
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use arrow::datatypes::DataType;
 
@@ -1376,7 +1376,7 @@ mod tests {
     }
 
     struct SentinelDeltaResolver {
-        calls: Cell<usize>,
+        calls: AtomicUsize,
     }
 
     impl crate::sql::codegen::scan::binding::ScanBindingResolver for SentinelDeltaResolver {
@@ -1386,7 +1386,7 @@ mod tests {
             scan: &PlanScanNode,
         ) -> Result<Option<crate::sql::codegen::scan::binding::ResolvedScanExecution>, String>
         {
-            self.calls.set(self.calls.get() + 1);
+            self.calls.fetch_add(1, Ordering::Relaxed);
             assert_eq!(node_id, 10);
             assert!(matches!(
                 scan.table.source,
@@ -1426,7 +1426,7 @@ mod tests {
         };
         let before = format!("{plan:#?}");
         let resolver = SentinelDeltaResolver {
-            calls: Cell::new(0),
+            calls: AtomicUsize::new(0),
         };
 
         let result = build(FragmentBuildRequest {
@@ -1437,7 +1437,11 @@ mod tests {
         })
         .expect("build prepared delta fragment");
 
-        assert_eq!(resolver.calls.get(), 1, "delta binding must resolve once");
+        assert_eq!(
+            resolver.calls.load(Ordering::Relaxed),
+            1,
+            "delta binding must resolve once"
+        );
         assert_eq!(format!("{plan:#?}"), before);
         let ranges = result.fragment_schedules[0]
             .native_scan_ranges
