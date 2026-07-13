@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// RFD-3/RFD-5A will consume this staged planner/runtime seam; remove the allowance then.
-#[allow(dead_code)]
-pub(crate) mod model;
-pub(crate) mod port;
+pub(crate) mod events;
+pub(crate) mod identity;
+pub(crate) mod install;
+pub(crate) mod producer;
+pub(crate) mod subscription;
+pub(crate) mod support;
+pub(crate) mod value_domain;

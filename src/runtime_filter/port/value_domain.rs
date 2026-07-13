@@ -1,0 +1,929 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::cmp::Ordering;
+use std::collections::BTreeSet;
+use std::error::Error;
+use std::fmt;
+use std::sync::Arc;
+
+use arrow::datatypes::{DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, TimeUnit};
+use sha2::{Digest, Sha256};
+
+use crate::common::largeint::LARGEINT_BYTE_WIDTH;
+use crate::runtime_filter::model::contract::{ChannelId, NullSemantics};
+
+use super::identity::LogicalVersion;
+use super::support::RetainedMemoryReservation;
+
+const FINGERPRINT_VERSION_TAG: &[u8] = b"novarocks.runtime-filter.value-domain-delta.v1";
+const CANONICAL_F32_NAN: u32 = 0x7fc0_0000;
+const CANONICAL_F64_NAN: u64 = 0x7ff8_0000_0000_0000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ContributionSizeError {
+    LengthExceedsCanonicalRange,
+    SizeOverflow,
+}
+
+impl fmt::Display for ContributionSizeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LengthExceedsCanonicalRange => {
+                write!(formatter, "canonical contribution length exceeds u64")
+            }
+            Self::SizeOverflow => write!(formatter, "canonical contribution size overflows usize"),
+        }
+    }
+}
+
+impl Error for ContributionSizeError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Decimal128ValidationError {
+    InvalidPrecision { precision: u8 },
+    InvalidScale { precision: u8, scale: i8 },
+    ValueOutOfRange { precision: u8, value: i128 },
+}
+
+impl fmt::Display for Decimal128ValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPrecision { precision } => {
+                write!(formatter, "invalid Decimal128 precision {precision}")
+            }
+            Self::InvalidScale { precision, scale } => write!(
+                formatter,
+                "invalid Decimal128 scale {scale} for precision {precision}"
+            ),
+            Self::ValueOutOfRange { precision, value } => write!(
+                formatter,
+                "Decimal128 value {value} exceeds precision {precision}"
+            ),
+        }
+    }
+}
+
+impl Error for Decimal128ValidationError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Decimal128UnionError {
+    TypeMismatch {
+        expected_precision: u8,
+        expected_scale: i8,
+        actual_precision: u8,
+        actual_scale: i8,
+    },
+}
+
+impl fmt::Display for Decimal128UnionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TypeMismatch {
+                expected_precision,
+                expected_scale,
+                actual_precision,
+                actual_scale,
+            } => write!(
+                formatter,
+                "Decimal128 union type mismatch: expected ({expected_precision}, {expected_scale}), got ({actual_precision}, {actual_scale})"
+            ),
+        }
+    }
+}
+
+impl Error for Decimal128UnionError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Decimal128Values {
+    precision: u8,
+    scale: i8,
+    values: BTreeSet<i128>,
+}
+
+impl Decimal128Values {
+    fn new_validated(precision: u8, scale: i8, values: BTreeSet<i128>) -> Self {
+        Self {
+            precision,
+            scale,
+            values,
+        }
+    }
+
+    pub(crate) const fn precision(&self) -> u8 {
+        self.precision
+    }
+
+    pub(crate) const fn scale(&self) -> i8 {
+        self.scale
+    }
+
+    pub(crate) const fn values(&self) -> &BTreeSet<i128> {
+        &self.values
+    }
+
+    pub(crate) fn union(&mut self, incoming: &Self) -> Result<usize, Decimal128UnionError> {
+        if self.precision != incoming.precision || self.scale != incoming.scale {
+            return Err(Decimal128UnionError::TypeMismatch {
+                expected_precision: self.precision,
+                expected_scale: self.scale,
+                actual_precision: incoming.precision,
+                actual_scale: incoming.scale,
+            });
+        }
+        let previous_len = self.values.len();
+        self.values.extend(incoming.values.iter().copied());
+        Ok(self.values.len() - previous_len)
+    }
+}
+
+trait CanonicalOutput {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), ContributionSizeError>;
+}
+
+struct DigestOutput(Sha256);
+
+impl CanonicalOutput for DigestOutput {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), ContributionSizeError> {
+        self.0.update(bytes);
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct SizeOutput(usize);
+
+impl CanonicalOutput for SizeOutput {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), ContributionSizeError> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .ok_or(ContributionSizeError::SizeOverflow)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalF32(u32);
+
+impl CanonicalF32 {
+    fn new(value: f32) -> Self {
+        let bits = if value == 0.0 {
+            0
+        } else if value.is_nan() {
+            CANONICAL_F32_NAN
+        } else {
+            value.to_bits()
+        };
+        Self(bits)
+    }
+}
+
+impl Ord for CanonicalF32 {
+    fn cmp(&self, other: &Self) -> Ordering {
+        f32::from_bits(self.0).total_cmp(&f32::from_bits(other.0))
+    }
+}
+
+impl PartialOrd for CanonicalF32 {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalF64(u64);
+
+impl CanonicalF64 {
+    fn new(value: f64) -> Self {
+        let bits = if value == 0.0 {
+            0
+        } else if value.is_nan() {
+            CANONICAL_F64_NAN
+        } else {
+            value.to_bits()
+        };
+        Self(bits)
+    }
+}
+
+impl Ord for CanonicalF64 {
+    fn cmp(&self, other: &Self) -> Ordering {
+        f64::from_bits(self.0).total_cmp(&f64::from_bits(other.0))
+    }
+}
+
+impl PartialOrd for CanonicalF64 {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MembershipValues {
+    Boolean(BTreeSet<bool>),
+    Int8(BTreeSet<i8>),
+    Int16(BTreeSet<i16>),
+    Int32(BTreeSet<i32>),
+    Int64(BTreeSet<i64>),
+    LargeInt(BTreeSet<i128>),
+    Float32(BTreeSet<CanonicalF32>),
+    Float64(BTreeSet<CanonicalF64>),
+    Utf8(BTreeSet<String>),
+    Date32(BTreeSet<i32>),
+    Timestamp {
+        unit: TimeUnit,
+        timezone: Option<Arc<str>>,
+        values: BTreeSet<i64>,
+    },
+    Decimal128(Decimal128Values),
+}
+
+macro_rules! membership_constructor {
+    ($name:ident, $variant:ident, $value:ty) => {
+        pub(crate) fn $name(values: impl IntoIterator<Item = $value>) -> Self {
+            Self::$variant(values.into_iter().collect())
+        }
+    };
+}
+
+impl MembershipValues {
+    membership_constructor!(boolean, Boolean, bool);
+    membership_constructor!(int8, Int8, i8);
+    membership_constructor!(int16, Int16, i16);
+    membership_constructor!(int32, Int32, i32);
+    membership_constructor!(int64, Int64, i64);
+    membership_constructor!(large_int, LargeInt, i128);
+    membership_constructor!(date32, Date32, i32);
+
+    pub(crate) fn float32(values: impl IntoIterator<Item = f32>) -> Self {
+        Self::Float32(values.into_iter().map(CanonicalF32::new).collect())
+    }
+
+    pub(crate) fn float64(values: impl IntoIterator<Item = f64>) -> Self {
+        Self::Float64(values.into_iter().map(CanonicalF64::new).collect())
+    }
+
+    pub(crate) fn utf8<I, S>(values: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::Utf8(values.into_iter().map(Into::into).collect())
+    }
+
+    pub(crate) fn timestamp(
+        unit: TimeUnit,
+        timezone: Option<Arc<str>>,
+        values: impl IntoIterator<Item = i64>,
+    ) -> Self {
+        Self::Timestamp {
+            unit,
+            timezone,
+            values: values.into_iter().collect(),
+        }
+    }
+
+    pub(crate) fn decimal128(
+        precision: u8,
+        scale: i8,
+        values: impl IntoIterator<Item = i128>,
+    ) -> Result<Self, Decimal128ValidationError> {
+        if precision == 0 || precision > DECIMAL128_MAX_PRECISION {
+            return Err(Decimal128ValidationError::InvalidPrecision { precision });
+        }
+        if !decimal_scale_is_valid(precision, scale) {
+            return Err(Decimal128ValidationError::InvalidScale { precision, scale });
+        }
+        let values = values.into_iter().collect::<BTreeSet<_>>();
+        let exclusive_bound = 10_i128
+            .checked_pow(u32::from(precision))
+            .expect("Decimal128 maximum precision fits i128");
+        if let Some(value) = values
+            .iter()
+            .copied()
+            .find(|value| *value <= -exclusive_bound || *value >= exclusive_bound)
+        {
+            return Err(Decimal128ValidationError::ValueOutOfRange { precision, value });
+        }
+        Ok(Self::Decimal128(Decimal128Values::new_validated(
+            precision, scale, values,
+        )))
+    }
+
+    pub(crate) fn data_type(&self) -> DataType {
+        match self {
+            Self::Boolean(_) => DataType::Boolean,
+            Self::Int8(_) => DataType::Int8,
+            Self::Int16(_) => DataType::Int16,
+            Self::Int32(_) => DataType::Int32,
+            Self::Int64(_) => DataType::Int64,
+            Self::LargeInt(_) => DataType::FixedSizeBinary(LARGEINT_BYTE_WIDTH),
+            Self::Float32(_) => DataType::Float32,
+            Self::Float64(_) => DataType::Float64,
+            Self::Utf8(_) => DataType::Utf8,
+            Self::Date32(_) => DataType::Date32,
+            Self::Timestamp { unit, timezone, .. } => {
+                DataType::Timestamp(unit.clone(), timezone.clone())
+            }
+            Self::Decimal128(values) => DataType::Decimal128(values.precision(), values.scale()),
+        }
+    }
+
+    pub(crate) fn supports_data_type(data_type: &DataType) -> bool {
+        match data_type {
+            DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::Date32
+            | DataType::Timestamp(_, _) => true,
+            DataType::Decimal128(precision, scale) => {
+                *precision != 0
+                    && *precision <= DECIMAL128_MAX_PRECISION
+                    && decimal_scale_is_valid(*precision, *scale)
+            }
+            DataType::FixedSizeBinary(width) => *width == LARGEINT_BYTE_WIDTH,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Boolean(values) => values.len(),
+            Self::Int8(values) => values.len(),
+            Self::Int16(values) => values.len(),
+            Self::Int32(values) | Self::Date32(values) => values.len(),
+            Self::Int64(values) => values.len(),
+            Self::LargeInt(values) => values.len(),
+            Self::Float32(values) => values.len(),
+            Self::Float64(values) => values.len(),
+            Self::Utf8(values) => values.len(),
+            Self::Timestamp { values, .. } => values.len(),
+            Self::Decimal128(values) => values.values().len(),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub(crate) fn estimated_value_bytes(&self) -> Result<usize, ContributionSizeError> {
+        let fixed = |len: usize, width: usize| {
+            len.checked_mul(width)
+                .ok_or(ContributionSizeError::SizeOverflow)
+        };
+        match self {
+            Self::Boolean(values) => fixed(values.len(), size_of::<bool>()),
+            Self::Int8(values) => fixed(values.len(), size_of::<i8>()),
+            Self::Int16(values) => fixed(values.len(), size_of::<i16>()),
+            Self::Int32(values) | Self::Date32(values) => fixed(values.len(), size_of::<i32>()),
+            Self::Int64(values) => fixed(values.len(), size_of::<i64>()),
+            Self::LargeInt(values) => fixed(values.len(), size_of::<i128>()),
+            Self::Float32(values) => fixed(values.len(), size_of::<u32>()),
+            Self::Float64(values) => fixed(values.len(), size_of::<u64>()),
+            Self::Utf8(values) => values.iter().try_fold(0usize, |total, value| {
+                total
+                    .checked_add(value.len())
+                    .ok_or(ContributionSizeError::SizeOverflow)
+            }),
+            Self::Timestamp { values, .. } => fixed(values.len(), size_of::<i64>()),
+            Self::Decimal128(values) => fixed(values.values().len(), size_of::<i128>()),
+        }
+    }
+
+    pub(crate) fn float32_bits(&self) -> Option<Vec<u32>> {
+        match self {
+            Self::Float32(values) => Some(values.iter().map(|value| value.0).collect()),
+            _ => None,
+        }
+    }
+
+    fn encode_canonical(
+        &self,
+        output: &mut impl CanonicalOutput,
+    ) -> Result<(), ContributionSizeError> {
+        match self {
+            Self::Boolean(values) => {
+                encode_fixed_values(output, 1, values, |value| [u8::from(*value)])?
+            }
+            Self::Int8(values) => {
+                encode_fixed_values(output, 2, values, |value| value.to_be_bytes())?
+            }
+            Self::Int16(values) => {
+                encode_fixed_values(output, 3, values, |value| value.to_be_bytes())?
+            }
+            Self::Int32(values) => {
+                encode_fixed_values(output, 4, values, |value| value.to_be_bytes())?
+            }
+            Self::Int64(values) => {
+                encode_fixed_values(output, 5, values, |value| value.to_be_bytes())?
+            }
+            Self::LargeInt(values) => {
+                encode_fixed_values(output, 6, values, |value| value.to_be_bytes())?
+            }
+            Self::Float32(values) => {
+                encode_fixed_values(output, 7, values, |value| value.0.to_be_bytes())?
+            }
+            Self::Float64(values) => {
+                encode_fixed_values(output, 8, values, |value| value.0.to_be_bytes())?
+            }
+            Self::Utf8(values) => {
+                output.write(&[9])?;
+                encode_cardinality(output, values.len())?;
+                for value in values {
+                    encode_length_delimited(output, value.as_bytes())?;
+                }
+            }
+            Self::Date32(values) => {
+                encode_fixed_values(output, 10, values, |value| value.to_be_bytes())?
+            }
+            Self::Timestamp {
+                unit,
+                timezone,
+                values,
+            } => {
+                output.write(&[11, time_unit_tag(unit)])?;
+                match timezone {
+                    Some(timezone) => {
+                        output.write(&[1])?;
+                        encode_length_delimited(output, timezone.as_bytes())?;
+                    }
+                    None => output.write(&[0])?,
+                }
+                encode_cardinality(output, values.len())?;
+                for value in values {
+                    output.write(&value.to_be_bytes())?;
+                }
+            }
+            Self::Decimal128(values) => {
+                output.write(&[12, values.precision(), values.scale() as u8])?;
+                encode_cardinality(output, values.values().len())?;
+                for value in values.values() {
+                    output.write(&value.to_be_bytes())?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn encode_fixed_values<T, const N: usize>(
+    output: &mut impl CanonicalOutput,
+    type_tag: u8,
+    values: &BTreeSet<T>,
+    encode: impl Fn(&T) -> [u8; N],
+) -> Result<(), ContributionSizeError>
+where
+    T: Ord,
+{
+    output.write(&[type_tag])?;
+    encode_cardinality(output, values.len())?;
+    for value in values {
+        output.write(&encode(value))?;
+    }
+    Ok(())
+}
+
+fn encode_cardinality(
+    output: &mut impl CanonicalOutput,
+    len: usize,
+) -> Result<(), ContributionSizeError> {
+    let len = u64::try_from(len).map_err(|_| ContributionSizeError::LengthExceedsCanonicalRange)?;
+    output.write(&len.to_be_bytes())
+}
+
+fn encode_length_delimited(
+    output: &mut impl CanonicalOutput,
+    bytes: &[u8],
+) -> Result<(), ContributionSizeError> {
+    encode_cardinality(output, bytes.len())?;
+    output.write(bytes)
+}
+
+fn time_unit_tag(unit: &TimeUnit) -> u8 {
+    match unit {
+        TimeUnit::Second => 1,
+        TimeUnit::Millisecond => 2,
+        TimeUnit::Microsecond => 3,
+        TimeUnit::Nanosecond => 4,
+    }
+}
+
+fn decimal_scale_is_valid(precision: u8, scale: i8) -> bool {
+    scale <= DECIMAL128_MAX_SCALE && (scale <= 0 || scale as u8 <= precision)
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ContributionFingerprint([u8; 32]);
+
+impl ContributionFingerprint {
+    pub(crate) const fn bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ValueDomainDelta {
+    values: MembershipValues,
+    contains_null: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReducedMembershipDomain {
+    values: MembershipValues,
+    contains_null: bool,
+}
+
+impl ReducedMembershipDomain {
+    pub(crate) fn new(values: MembershipValues, contains_null: bool) -> Self {
+        Self {
+            values,
+            contains_null,
+        }
+    }
+
+    pub(crate) const fn values(&self) -> &MembershipValues {
+        &self.values
+    }
+
+    pub(crate) const fn contains_null(&self) -> bool {
+        self.contains_null
+    }
+
+    pub(crate) fn data_type(&self) -> DataType {
+        self.values.data_type()
+    }
+
+    pub(crate) fn estimated_retained_bytes(&self) -> Result<usize, ContributionSizeError> {
+        self.values.estimated_value_bytes().and_then(|bytes| {
+            bytes
+                .checked_add(usize::from(self.contains_null))
+                .ok_or(ContributionSizeError::SizeOverflow)
+        })
+    }
+}
+
+pub(crate) struct LogicalSnapshot {
+    channel_id: ChannelId,
+    version: LogicalVersion,
+    domain: ReducedMembershipDomain,
+    retained_memory_reservation: RetainedMemoryReservation,
+}
+
+impl LogicalSnapshot {
+    pub(crate) fn first(
+        channel_id: ChannelId,
+        domain: ReducedMembershipDomain,
+        retained_memory_reservation: RetainedMemoryReservation,
+    ) -> Self {
+        Self {
+            channel_id,
+            version: LogicalVersion::FIRST,
+            domain,
+            retained_memory_reservation,
+        }
+    }
+
+    pub(crate) const fn channel_id(&self) -> ChannelId {
+        self.channel_id
+    }
+
+    pub(crate) const fn version(&self) -> LogicalVersion {
+        self.version
+    }
+
+    pub(crate) const fn domain(&self) -> &ReducedMembershipDomain {
+        &self.domain
+    }
+
+    pub(crate) const fn retained_memory_bytes(&self) -> usize {
+        self.retained_memory_reservation.bytes()
+    }
+}
+
+impl std::fmt::Debug for LogicalSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LogicalSnapshot")
+            .field("channel_id", &self.channel_id)
+            .field("version", &self.version)
+            .field("domain", &self.domain)
+            .field(
+                "retained_memory_bytes",
+                &self.retained_memory_reservation.bytes(),
+            )
+            .finish()
+    }
+}
+
+impl ValueDomainDelta {
+    pub(crate) fn new(values: MembershipValues, contains_null: bool) -> Self {
+        Self {
+            values,
+            contains_null,
+        }
+    }
+
+    pub(crate) fn values(&self) -> &MembershipValues {
+        &self.values
+    }
+
+    pub(crate) fn data_type(&self) -> DataType {
+        self.values.data_type()
+    }
+
+    pub(crate) fn matches_data_type(&self, expected: &DataType) -> bool {
+        self.data_type() == *expected
+    }
+
+    pub(crate) const fn contains_null(&self) -> bool {
+        self.contains_null
+    }
+
+    pub(crate) const fn retains_null(&self, null_semantics: NullSemantics) -> bool {
+        self.contains_null && matches!(null_semantics, NullSemantics::NullSafeEqual)
+    }
+
+    pub(crate) fn estimated_retained_bytes(
+        &self,
+        null_semantics: NullSemantics,
+    ) -> Result<usize, ContributionSizeError> {
+        self.values
+            .estimated_value_bytes()?
+            .checked_add(usize::from(self.retains_null(null_semantics)))
+            .ok_or(ContributionSizeError::SizeOverflow)
+    }
+
+    pub(crate) fn estimated_contribution_bytes(&self) -> Result<usize, ContributionSizeError> {
+        let mut output = SizeOutput::default();
+        self.encode_canonical(&mut output)?;
+        Ok(output.0)
+    }
+
+    pub(crate) fn fingerprint(&self) -> ContributionFingerprint {
+        let mut output = DigestOutput(Sha256::new());
+        self.encode_canonical(&mut output)
+            .expect("addressable contribution lengths fit the canonical u64 format");
+        ContributionFingerprint(output.0.finalize().into())
+    }
+
+    fn encode_canonical(
+        &self,
+        output: &mut impl CanonicalOutput,
+    ) -> Result<(), ContributionSizeError> {
+        encode_length_delimited(output, FINGERPRINT_VERSION_TAG)?;
+        self.values.encode_canonical(output)?;
+        output.write(&[u8::from(self.contains_null)])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, TimeUnit};
+
+    use super::{
+        Decimal128UnionError, Decimal128ValidationError, MembershipValues, ValueDomainDelta,
+    };
+    use crate::runtime_filter::model::contract::NullSemantics;
+
+    #[test]
+    fn membership_values_preserve_supported_type_and_null_contract() {
+        let delta = ValueDomainDelta::new(MembershipValues::int64([2, 1, 2]), true);
+
+        assert_eq!(delta.data_type(), DataType::Int64);
+        assert!(delta.matches_data_type(&DataType::Int64));
+        assert!(!delta.matches_data_type(&DataType::Int32));
+        assert!(delta.contains_null());
+        assert!(!delta.retains_null(NullSemantics::NeverMatches));
+        assert!(delta.retains_null(NullSemantics::NullSafeEqual));
+    }
+
+    #[test]
+    fn float_membership_values_canonicalize_zero_and_nan_without_losing_infinity() {
+        let values = MembershipValues::float32([
+            -0.0,
+            0.0,
+            f32::from_bits(0x7fc0_0001),
+            f32::from_bits(0xffc0_0002),
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ]);
+
+        assert_eq!(
+            values.float32_bits().unwrap(),
+            vec![
+                f32::NEG_INFINITY.to_bits(),
+                0,
+                f32::INFINITY.to_bits(),
+                0x7fc0_0000,
+            ]
+        );
+    }
+
+    #[test]
+    fn value_domain_fingerprint_is_deterministic_and_payload_sensitive() {
+        let left = ValueDomainDelta::new(MembershipValues::utf8(["b", "a", "a"]), true);
+        let reordered = ValueDomainDelta::new(MembershipValues::utf8(["a", "b"]), true);
+        let different_value = ValueDomainDelta::new(MembershipValues::utf8(["a", "c"]), true);
+        let different_null = ValueDomainDelta::new(MembershipValues::utf8(["a", "b"]), false);
+
+        assert_eq!(left.fingerprint(), reordered.fingerprint());
+        assert_ne!(left.fingerprint(), different_value.fingerprint());
+        assert_ne!(left.fingerprint(), different_null.fingerprint());
+    }
+
+    #[test]
+    fn supported_membership_types_round_trip_with_distinct_canonical_encodings() {
+        let cases = vec![
+            (MembershipValues::boolean([true]), DataType::Boolean),
+            (MembershipValues::int8([1]), DataType::Int8),
+            (MembershipValues::int16([1]), DataType::Int16),
+            (MembershipValues::int32([1]), DataType::Int32),
+            (MembershipValues::int64([1]), DataType::Int64),
+            (
+                MembershipValues::large_int([1]),
+                DataType::FixedSizeBinary(16),
+            ),
+            (MembershipValues::float32([1.0]), DataType::Float32),
+            (MembershipValues::float64([1.0]), DataType::Float64),
+            (MembershipValues::utf8(["1"]), DataType::Utf8),
+            (MembershipValues::date32([1]), DataType::Date32),
+            (
+                MembershipValues::timestamp(TimeUnit::Second, Some(Arc::from("UTC")), [1]),
+                DataType::Timestamp(TimeUnit::Second, Some(Arc::from("UTC"))),
+            ),
+            (
+                MembershipValues::timestamp(TimeUnit::Millisecond, Some(Arc::from("UTC")), [1]),
+                DataType::Timestamp(TimeUnit::Millisecond, Some(Arc::from("UTC"))),
+            ),
+            (
+                MembershipValues::timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC")), [1]),
+                DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))),
+            ),
+            (
+                MembershipValues::timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC")), [1]),
+                DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
+            ),
+            (
+                MembershipValues::decimal128(19, 4, [1]).unwrap(),
+                DataType::Decimal128(19, 4),
+            ),
+        ];
+        let mut fingerprints = BTreeSet::new();
+
+        for (values, expected_type) in cases {
+            let delta = ValueDomainDelta::new(values, true);
+            assert_eq!(delta.data_type(), expected_type);
+            assert!(MembershipValues::supports_data_type(&expected_type));
+            assert!(delta.estimated_contribution_bytes().unwrap() > 0);
+            assert!(fingerprints.insert(delta.fingerprint().bytes()));
+        }
+    }
+
+    #[test]
+    fn canonical_size_includes_type_parameters_framing_and_null_marker() {
+        let utc = ValueDomainDelta::new(
+            MembershipValues::timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC")), [7]),
+            false,
+        );
+        let shanghai = ValueDomainDelta::new(
+            MembershipValues::timestamp(
+                TimeUnit::Microsecond,
+                Some(Arc::from("Asia/Shanghai")),
+                [7],
+            ),
+            false,
+        );
+        let decimal_scale_two =
+            ValueDomainDelta::new(MembershipValues::decimal128(20, 2, [7]).unwrap(), false);
+        let decimal_scale_three =
+            ValueDomainDelta::new(MembershipValues::decimal128(20, 3, [7]).unwrap(), false);
+
+        assert!(
+            shanghai.estimated_contribution_bytes().unwrap()
+                > utc.estimated_contribution_bytes().unwrap()
+        );
+        assert_ne!(utc.fingerprint(), shanghai.fingerprint());
+        assert_eq!(
+            decimal_scale_two.estimated_contribution_bytes().unwrap(),
+            decimal_scale_three.estimated_contribution_bytes().unwrap()
+        );
+        assert_ne!(
+            decimal_scale_two.fingerprint(),
+            decimal_scale_three.fingerprint()
+        );
+    }
+
+    #[test]
+    fn null_only_never_matches_still_has_nonzero_temporary_encoded_bytes() {
+        let delta = ValueDomainDelta::new(MembershipValues::int64([]), true);
+
+        assert!(delta.estimated_contribution_bytes().unwrap() > 0);
+        assert_eq!(
+            delta
+                .estimated_retained_bytes(NullSemantics::NeverMatches)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn decimal128_rejects_invalid_precision_scale_and_values() {
+        assert_eq!(
+            MembershipValues::decimal128(0, 0, [0]),
+            Err(Decimal128ValidationError::InvalidPrecision { precision: 0 })
+        );
+        assert_eq!(
+            MembershipValues::decimal128(39, 0, [0]),
+            Err(Decimal128ValidationError::InvalidPrecision { precision: 39 })
+        );
+        assert_eq!(
+            MembershipValues::decimal128(4, 5, [0]),
+            Err(Decimal128ValidationError::InvalidScale {
+                precision: 4,
+                scale: 5,
+            })
+        );
+        assert_eq!(
+            MembershipValues::decimal128(38, 39, [0]),
+            Err(Decimal128ValidationError::InvalidScale {
+                precision: 38,
+                scale: 39,
+            })
+        );
+        assert_eq!(
+            MembershipValues::decimal128(3, 0, [1_000]),
+            Err(Decimal128ValidationError::ValueOutOfRange {
+                precision: 3,
+                value: 1_000,
+            })
+        );
+        assert!(MembershipValues::decimal128(3, -2, [-999, 999]).is_ok());
+        assert!(!MembershipValues::supports_data_type(
+            &DataType::Decimal128(0, 0)
+        ));
+        assert!(!MembershipValues::supports_data_type(
+            &DataType::Decimal128(4, 5)
+        ));
+    }
+
+    #[test]
+    fn decimal128_value_object_exposes_read_only_validated_union_boundary() {
+        let mut left = MembershipValues::decimal128(5, 2, [123, 456]).unwrap();
+        let right = MembershipValues::decimal128(5, 2, [456, 789]).unwrap();
+        let mismatched = MembershipValues::decimal128(6, 2, [999]).unwrap();
+
+        let MembershipValues::Decimal128(left_values) = &mut left else {
+            panic!("expected Decimal128 values");
+        };
+        let MembershipValues::Decimal128(right_values) = &right else {
+            panic!("expected Decimal128 values");
+        };
+        let MembershipValues::Decimal128(mismatched_values) = &mismatched else {
+            panic!("expected Decimal128 values");
+        };
+
+        assert_eq!(left_values.precision(), 5);
+        assert_eq!(left_values.scale(), 2);
+        assert_eq!(
+            left_values.values().iter().copied().collect::<Vec<_>>(),
+            vec![123, 456]
+        );
+        assert_eq!(left_values.union(right_values), Ok(1));
+        assert_eq!(
+            left_values.values().iter().copied().collect::<Vec<_>>(),
+            vec![123, 456, 789]
+        );
+        assert_eq!(
+            left_values.union(mismatched_values),
+            Err(Decimal128UnionError::TypeMismatch {
+                expected_precision: 5,
+                expected_scale: 2,
+                actual_precision: 6,
+                actual_scale: 2,
+            })
+        );
+    }
+}
