@@ -5013,6 +5013,10 @@ fn planner_stage_first_dependency_detector_covers_bypasses() {
             "use crate::sql::codegen as lowering; type Leak = lowering::helpers::DisplayName;",
         ),
         (
+            "src/sql/planner/imv_rewrite/entrypoint.rs",
+            "type Leak = crate::sql::codegen::proto_encode::Encoder;",
+        ),
+        (
             "src/sql/planner/physical/node.rs",
             "use crate::sql::planner::{logical::Node, distributed::Plan};",
         ),
