@@ -7166,6 +7166,88 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
 }
 
 #[test]
+fn runtime_filter_graph_model_has_planner_neutral_boundaries() {
+    let repo = Path::new(manifest_dir());
+    let model = repo.join("src/runtime_filter/model");
+    let contract_path = model.join("contract.rs");
+    let graph_path = model.join("graph.rs");
+    let fragment_path = repo.join("src/sql/planner/distributed/fragment.rs");
+    let proto_encode = repo.join("src/sql/codegen/proto_encode");
+
+    assert!(contract_path.is_file());
+    assert!(graph_path.is_file());
+
+    let contract_text = rust_sanitized_production_text(
+        &fs::read_to_string(&contract_path)
+            .expect("runtime-filter contract source must be readable"),
+    );
+    let graph_text = rust_sanitized_production_text(
+        &fs::read_to_string(&graph_path).expect("runtime-filter graph source must be readable"),
+    );
+    let fragment_text = rust_sanitized_production_text(
+        &fs::read_to_string(&fragment_path).expect("distributed fragment source must be readable"),
+    );
+    let proto_text = rs_files(&proto_encode)
+        .into_iter()
+        .map(|path| {
+            rust_sanitized_production_text(
+                &fs::read_to_string(path).expect("proto encoder source must be readable"),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(!contract_text.contains("crate::sql"));
+    assert!(!graph_text.contains("crate::sql::planner"));
+    assert!(fragment_text.contains("runtime_filter_graph: RuntimeFilterGraph"));
+    assert!(!proto_text.contains("runtime_filter_graph"));
+
+    let mut violations = Vec::new();
+    for path in rs_files(&model) {
+        let source_rel = rel(&path);
+        let text = fs::read_to_string(&path).expect("runtime-filter model source must be readable");
+        for canonical in rust_production_canonical_paths(&text, &source_rel) {
+            let forbidden_dependency = [
+                &["crate", "service"][..],
+                &["crate", "runtime"][..],
+                &["crate", "connector"][..],
+                &["crate", "catalog"][..],
+                &["crate", "sql", "catalog"][..],
+                &["crate", "proto"][..],
+                &["crate", "thrift"][..],
+            ]
+            .into_iter()
+            .any(|prefix| {
+                canonical.len() >= prefix.len()
+                    && canonical
+                        .iter()
+                        .zip(prefix)
+                        .all(|(actual, expected)| actual == expected)
+                    || canonical.last().is_some_and(|segment| segment == "*")
+                        && canonical.len() <= prefix.len()
+                        && canonical[..canonical.len() - 1]
+                            .iter()
+                            .zip(prefix)
+                            .all(|(actual, expected)| actual == expected)
+            });
+            let sql_dependency = canonical.len() >= 2
+                && canonical[..2] == ["crate", "sql"]
+                && !(source_rel == "src/runtime_filter/model/graph.rs"
+                    && canonical == ["crate", "sql", "analysis", "TypedExpr"]);
+            if forbidden_dependency || sql_dependency {
+                violations.push(format!("{source_rel}: {}", canonical.join("::")));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "runtime-filter model must stay planner-, wire-, service-, runtime-, connector-, and catalog-neutral except for graph TypedExpr:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
 fn planner_logical_ir_and_payload_have_stage_owners() {
     let repo = Path::new(manifest_dir());
     let planner = repo.join("src/sql/planner");
