@@ -2709,22 +2709,23 @@ fn explain_analyze_query(
     let planning_start = std::time::Instant::now();
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
-    let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
+    let logical_plan = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let mut opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
-        &logical,
+    let mut optimizer_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
+        &logical_plan,
         &mut scalar_arena,
     )?;
     let providers = mv_rewrite_state
         .map(query_stats::QueryStatsProviders::from_standalone_state)
         .unwrap_or_else(|| query_stats::QueryStatsProviders::from_connectors(connectors));
-    let mut query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut opt_expr);
+    let mut query_stats =
+        query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
     let mv_candidates = match mv_rewrite_state {
         Some(state) => crate::engine::mv_rewrite_prep::prepare_mv_rewrite_candidates(
             state,
             analyzer_catalog,
             current_database,
-            &logical,
+            &logical_plan,
             &mut factory,
             &mut query_stats,
         ),
@@ -2732,7 +2733,7 @@ fn explain_analyze_query(
     };
     snapshot_effective_backend_count_into_session();
     let optimized_tree = crate::sql::optimizer::optimize(
-        opt_expr,
+        optimizer_expr,
         scalar_arena,
         &query_stats.snapshot,
         factory,
@@ -2864,8 +2865,8 @@ fn explain_logical_query(
 ) -> Result<QueryResult, String> {
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
-    let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
-    let lines = crate::sql::explain::explain_plan_checked(&logical, level)?;
+    let logical_plan = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
+    let lines = crate::sql::explain::explain_plan_checked(&logical_plan, level)?;
     build_string_query_result("Explain String", lines)
 }
 
@@ -2884,16 +2885,17 @@ fn explain_query(
 
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
-    let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
+    let logical_plan = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let mut opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
-        &logical,
+    let mut optimizer_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
+        &logical_plan,
         &mut scalar_arena,
     )?;
     let providers = mv_rewrite_state
         .map(query_stats::QueryStatsProviders::from_standalone_state)
         .unwrap_or_else(|| query_stats::QueryStatsProviders::from_connectors(connectors));
-    let mut query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut opt_expr);
+    let mut query_stats =
+        query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
     // MV query rewrite candidate prep (plain EXPLAIN has no MV refresh
     // context, so the gate is only `mv_rewrite_state.is_some()`).
     let mv_candidates = match mv_rewrite_state {
@@ -2901,7 +2903,7 @@ fn explain_query(
             state,
             analyzer_catalog,
             current_database,
-            &logical,
+            &logical_plan,
             &mut factory,
             &mut query_stats,
         ),
@@ -2910,7 +2912,7 @@ fn explain_query(
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
     snapshot_effective_backend_count_into_session();
     let optimized_tree = crate::sql::optimizer::optimize(
-        opt_expr,
+        optimizer_expr,
         scalar_arena,
         &query_stats.snapshot,
         factory,
@@ -3090,29 +3092,29 @@ pub(crate) fn execute_query_as_iceberg_write(
 
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(&prepared, &analyzer_provider, current_database)?;
-    let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
+    let logical_plan = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let root_distribution = match root_distribution_resolver {
-        Some(resolve_root_distribution) => resolve_root_distribution(&logical)?,
+        Some(resolve_root_distribution) => resolve_root_distribution(&logical_plan)?,
         None => None,
     };
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let mut opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
-        &logical,
+    let mut optimizer_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
+        &logical_plan,
         &mut scalar_arena,
     )?;
     let providers = query_stats::QueryStatsProviders::from_standalone_state(state);
-    let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut opt_expr);
+    let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
     snapshot_effective_backend_count_into_session();
     let optimized_tree = match root_distribution {
         Some(root_distribution) => crate::sql::optimizer::optimize_with_root_distribution(
-            opt_expr,
+            optimizer_expr,
             scalar_arena,
             &query_stats.snapshot,
             factory,
             root_distribution,
         )?,
         None => crate::sql::optimizer::optimize(
-            opt_expr,
+            optimizer_expr,
             scalar_arena,
             &query_stats.snapshot,
             factory,
@@ -3530,17 +3532,18 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
 ) -> Result<PlannedIcebergChangeStreamRefreshQuery, String> {
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
-    let mut logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
+    let mut logical_plan = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let mut change_stream =
         crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor::default();
     if run_imv_rewrite {
         let mv_ctx =
             mv_refresh_ctx.ok_or_else(|| "IMV rewrite requires MV refresh context".to_string())?;
-        logical = crate::engine::mv::iceberg_refresh::normalize_imv_rewrite_root_project(logical);
+        logical_plan =
+            crate::engine::mv::iceberg_refresh::normalize_imv_rewrite_root_project(logical_plan);
         let factory_cell = std::rc::Rc::new(std::cell::RefCell::new(factory));
         let outcome = crate::sql::planner::imv_rewrite::entrypoint::run_imv_rewrite(
             crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteInput {
-                plan: logical,
+                plan: logical_plan,
                 disabled_rules: crate::sql::optimizer::options::current_session_optimizer_settings(
                 )
                 .disabled_rules
@@ -3558,21 +3561,21 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
             .map_err(|_| "IMV rewrite leaked ColumnRefFactory references".to_string())?
             .into_inner();
         change_stream = outcome.annotation.change_stream.clone();
-        logical = outcome.plan;
+        logical_plan = outcome.plan;
     } else if imv_rewrite_validator.is_some() {
         return Err("IMV rewrite validator requires MV refresh context".to_string());
     }
 
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let mut opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
-        &logical,
+    let mut optimizer_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
+        &logical_plan,
         &mut scalar_arena,
     )?;
     let providers = query_stats::QueryStatsProviders::from_connectors(connectors);
-    let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut opt_expr);
+    let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
     snapshot_effective_backend_count_into_session();
     let optimized_tree = crate::sql::optimizer::optimize(
-        opt_expr,
+        optimizer_expr,
         scalar_arena,
         &query_stats.snapshot,
         factory,
@@ -3588,22 +3591,24 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
 }
 
 pub(crate) fn plan_logical_for_iceberg_change_stream_refresh(
-    logical: crate::sql::planner::logical::LogicalPlanNode,
+    logical_plan: crate::sql::planner::logical::LogicalPlanNode,
     factory: crate::sql::column_id::ColumnRefFactory,
     connectors: &crate::connector::ConnectorRegistry,
 ) -> Result<PlannedIcebergChangeStreamRefreshQuery, String> {
     let change_stream =
-        crate::sql::planner::imv_rewrite::change_stream::build_change_stream_descriptor(&logical);
+        crate::sql::planner::imv_rewrite::change_stream::build_change_stream_descriptor(
+            &logical_plan,
+        );
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let mut opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
-        &logical,
+    let mut optimizer_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
+        &logical_plan,
         &mut scalar_arena,
     )?;
     let providers = query_stats::QueryStatsProviders::from_connectors(connectors);
-    let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut opt_expr);
+    let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
     snapshot_effective_backend_count_into_session();
     let optimized_tree = crate::sql::optimizer::optimize(
-        opt_expr,
+        optimizer_expr,
         scalar_arena,
         &query_stats.snapshot,
         factory,
@@ -3636,15 +3641,16 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
 ) -> Result<QueryResult, String> {
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
-    let mut logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
+    let mut logical_plan = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     if run_imv_rewrite {
         let mv_ctx =
             mv_refresh_ctx.ok_or_else(|| "IMV rewrite requires MV refresh context".to_string())?;
-        logical = crate::engine::mv::iceberg_refresh::normalize_imv_rewrite_root_project(logical);
+        logical_plan =
+            crate::engine::mv::iceberg_refresh::normalize_imv_rewrite_root_project(logical_plan);
         let factory_cell = std::rc::Rc::new(std::cell::RefCell::new(factory));
         let outcome = crate::sql::planner::imv_rewrite::entrypoint::run_imv_rewrite(
             crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteInput {
-                plan: logical,
+                plan: logical_plan,
                 disabled_rules: crate::sql::optimizer::options::current_session_optimizer_settings(
                 )
                 .disabled_rules
@@ -3661,19 +3667,20 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         factory = std::rc::Rc::try_unwrap(factory_cell)
             .map_err(|_| "IMV rewrite leaked ColumnRefFactory references".to_string())?
             .into_inner();
-        logical = outcome.plan;
+        logical_plan = outcome.plan;
     } else if imv_rewrite_validator.is_some() {
         return Err("IMV rewrite validator requires MV refresh context".to_string());
     }
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let mut opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
-        &logical,
+    let mut optimizer_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
+        &logical_plan,
         &mut scalar_arena,
     )?;
     let providers = mv_rewrite_state
         .map(query_stats::QueryStatsProviders::from_standalone_state)
         .unwrap_or_else(|| query_stats::QueryStatsProviders::from_connectors(connectors));
-    let mut query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut opt_expr);
+    let mut query_stats =
+        query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
     // MV query rewrite: discover fresh Iceberg MV candidates and inject their
     // target-table stats. Gated on a standalone-rewrite path (`Some(state)`)
     // and disabled during MV refresh (`mv_refresh_ctx.is_some()`) so refresh
@@ -3684,7 +3691,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
                 state,
                 analyzer_catalog,
                 current_database,
-                &logical,
+                &logical_plan,
                 &mut factory,
                 &mut query_stats,
             )
@@ -3694,7 +3701,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
     snapshot_effective_backend_count_into_session();
     let optimized_tree = crate::sql::optimizer::optimize(
-        opt_expr,
+        optimizer_expr,
         scalar_arena,
         &query_stats.snapshot,
         factory,
@@ -3730,7 +3737,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_logical_plan_with_options(
-    logical: crate::sql::planner::logical::LogicalPlanNode,
+    logical_plan: crate::sql::planner::logical::LogicalPlanNode,
     factory: crate::sql::column_id::ColumnRefFactory,
     codegen_catalog: &InMemoryCatalog,
     connectors: &crate::connector::ConnectorRegistry,
@@ -3743,17 +3750,17 @@ pub(crate) fn execute_logical_plan_with_options(
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let mut opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
-        &logical,
+    let mut optimizer_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
+        &logical_plan,
         &mut scalar_arena,
     )?;
     let providers = mv_rewrite_state
         .map(query_stats::QueryStatsProviders::from_standalone_state)
         .unwrap_or_else(|| query_stats::QueryStatsProviders::from_connectors(connectors));
-    let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut opt_expr);
+    let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
     snapshot_effective_backend_count_into_session();
     let optimized_tree = crate::sql::optimizer::optimize(
-        opt_expr,
+        optimizer_expr,
         scalar_arena,
         &query_stats.snapshot,
         factory,
@@ -5413,14 +5420,15 @@ mysql_port = 47892
 
         let (resolved, cte_registry, mut factory) =
             crate::sql::analyzer::analyze(&query, &catalog, "default").expect("analyze query");
-        let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
+        let logical_plan = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
             .expect("plan query");
         let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-        let mut opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
-            &logical,
-            &mut scalar_arena,
-        )
-        .expect("logical to opt expr");
+        let mut optimizer_expr =
+            crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
+                &logical_plan,
+                &mut scalar_arena,
+            )
+            .expect("logical to opt expr");
         let stats_state = Arc::new(super::StandaloneState::default());
         super::statistics::replace_catalog_stats_for_test(
             &stats_state,
@@ -5439,9 +5447,9 @@ mysql_port = 47892
         let providers =
             super::query_stats::QueryStatsProviders::from_standalone_state(&stats_state);
         let query_stats =
-            super::query_stats::QueryStatsCollector::new(providers).collect(&mut opt_expr);
+            super::query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
         let optimized_tree = crate::sql::optimizer::optimize(
-            opt_expr,
+            optimizer_expr,
             scalar_arena,
             &query_stats.snapshot,
             factory,
@@ -8945,9 +8953,9 @@ path = "meta/operations.sqlite"
         };
         let (resolved, cte_registry, mut factory) =
             crate::sql::analyzer::analyze(&query, &EmptyCatalog, "default").expect("analyze query");
-        let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
+        let logical_plan = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
             .expect("plan query");
-        let planned_file_col = crate::sql::planner::plan_output_columns(&logical)
+        let planned_file_col = crate::sql::planner::plan_output_columns(&logical_plan)
             .expect("planned output columns")
             .into_iter()
             .find(|column| column.name == "_file")
@@ -8955,7 +8963,7 @@ path = "meta/operations.sqlite"
             .column_id;
         assert_ne!(planned_file_col, ColumnId::UNSET);
 
-        let distribution = super::iceberg_write_shuffle_by_output_name("_file")(&logical)
+        let distribution = super::iceberg_write_shuffle_by_output_name("_file")(&logical_plan)
             .expect("resolve root distribution")
             .expect("root distribution");
 

@@ -440,14 +440,14 @@ mod tests {
         plan: LogicalPlanNode,
     ) -> crate::sql::optimizer::OptimizedOperatorNode {
         let mut scalar_arena = ScalarArena::new();
-        let opt_expr = crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr(
+        let optimizer_expr = crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr(
             &plan,
             &mut scalar_arena,
         );
         let mut factory = crate::sql::column_id::ColumnRefFactory::new();
         factory.reserve_until(300);
         crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
-            opt_expr,
+            optimizer_expr,
             scalar_arena,
             &HashMap::new(),
             factory,

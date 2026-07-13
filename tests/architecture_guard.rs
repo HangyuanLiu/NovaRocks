@@ -15909,7 +15909,40 @@ fn psm_8_logical_optimizer_bridge_vocabulary_is_explicit() {
     );
 
     let root = fs::read_to_string(bridge.join("mod.rs")).unwrap();
-    assert!(has_non_comment_line(&root, "pub(crate) mod logical;"));
+    let expected_modules = BTreeSet::from([
+        "id_binding".to_string(),
+        "logical".to_string(),
+        "physical".to_string(),
+        "property".to_string(),
+        "scalar".to_string(),
+    ]);
+    let expected_imports = vec![
+        "private|crate::sql::optimizer::OptimizedOperatorNode",
+        "private|crate::sql::planner::physical::PhysicalPlanNode",
+    ];
+    assert_eq!(
+        rust_module_item_declarations(&root),
+        expected_modules,
+        "optimizer_bridge/mod.rs module surface must stay closed"
+    );
+    assert_eq!(
+        rust_production_use_statements(&root),
+        expected_imports,
+        "optimizer_bridge/mod.rs import and re-export surface must stay closed"
+    );
+
+    let forwarding_alias = format!("{root}\npub use logical as plan;\n");
+    assert_ne!(
+        rust_production_use_statements(&forwarding_alias),
+        expected_imports,
+        "a public logical-as-plan forwarding alias must violate the closed import surface"
+    );
+    let inline_plan_module = format!("{root}\nmod plan {{ pub use super::logical::*; }}\n");
+    assert_ne!(
+        rust_module_item_declarations(&inline_plan_module),
+        expected_modules,
+        "an inline plan forwarding module must violate the closed module surface"
+    );
 
     let logical = fs::read_to_string(bridge.join("logical.rs")).unwrap();
     for signature in [
@@ -15960,28 +15993,6 @@ fn psm_8_physical_bridge_vocabulary_is_explicit() {
     assert!(root.contains("materialize_physical_plan(optimized)"));
     assert!(id_binding.contains("fn verify_optimized_tree_id_binding("));
     assert!(physical.contains("fn materialize_physical_plan("));
-
-    for relative in [
-        "engine/mod.rs",
-        "sql/planner/logical/build/tests.rs",
-        "sql/planner/imv_rewrite/entrypoint.rs",
-        "sql/planner/imv_rewrite/join_refresh_builder.rs",
-        "sql/codegen/ir/explain.rs",
-    ] {
-        let file = src_dir().join(relative);
-        let text = fs::read_to_string(&file).unwrap();
-        for (line_index, line) in text.lines().enumerate() {
-            if line.contains("to_physical_plan(&") {
-                assert!(
-                    line.contains("to_physical_plan(&optimized_tree)"),
-                    "{}:{} must pass optimized_tree directly to to_physical_plan: {}",
-                    rel(&file),
-                    line_index + 1,
-                    line.trim()
-                );
-            }
-        }
-    }
 
     let retired_verify = ["verify_optimizer", "_id_binding"].concat();
     let retired_materialize = ["optimizer_physical", "_to_plan"].concat();

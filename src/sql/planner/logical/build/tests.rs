@@ -1134,15 +1134,16 @@ fn p3_cube_without_grouping_survives_optimizer_id_binding() {
                    SELECT a, b FROM t GROUP BY CUBE(a, b) ORDER BY a, b";
     let (resolved, cte_registry, mut factory) =
         parse_analyze_query(sql).expect("analyzer should succeed");
-    let logical = plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
+    let logical_plan =
+        plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
-        &logical,
+    let optimizer_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
+        &logical_plan,
         &mut scalar_arena,
     )
     .expect("logical to opt expr");
     let optimized_tree = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
-        opt_expr,
+        optimizer_expr,
         scalar_arena,
         &std::collections::HashMap::new(),
         factory,
@@ -1163,15 +1164,16 @@ fn p3_rollup_order_by_only_key_survives_optimizer_id_binding() {
                    FROM t GROUP BY ROLLUP(a) ORDER BY a";
     let (resolved, cte_registry, mut factory) =
         parse_analyze_query(sql).expect("analyzer should succeed");
-    let logical = plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
+    let logical_plan =
+        plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
-        &logical,
+    let optimizer_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
+        &logical_plan,
         &mut scalar_arena,
     )
     .expect("logical to opt expr");
     let optimized_tree = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
-        opt_expr,
+        optimizer_expr,
         scalar_arena,
         &std::collections::HashMap::new(),
         factory,
@@ -1205,15 +1207,16 @@ fn p3_rollup_window_order_by_alias_extra_survives_optimizer_id_binding() {
                    LIMIT 10";
     let (resolved, cte_registry, mut factory) =
         parse_analyze_query(sql).expect("analyzer should succeed");
-    let logical = plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
+    let logical_plan =
+        plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
-        &logical,
+    let optimizer_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
+        &logical_plan,
         &mut scalar_arena,
     )
     .expect("logical to opt expr");
     let optimized_tree = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
-        opt_expr,
+        optimizer_expr,
         scalar_arena,
         &std::collections::HashMap::new(),
         factory,
@@ -1237,15 +1240,16 @@ fn p3_aggregate_order_by_alias_topn_survives_optimizer_id_binding() {
                    LIMIT 10";
     let (resolved, cte_registry, mut factory) =
         parse_analyze_query(sql).expect("analyzer should succeed");
-    let logical = plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
+    let logical_plan =
+        plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
-        &logical,
+    let optimizer_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
+        &logical_plan,
         &mut scalar_arena,
     )
     .expect("logical to opt expr");
     let optimized_tree = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
-        opt_expr,
+        optimizer_expr,
         scalar_arena,
         &std::collections::HashMap::new(),
         factory,
