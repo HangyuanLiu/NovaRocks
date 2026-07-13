@@ -1539,8 +1539,8 @@ mod tests {
         ExprKind, JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr,
     };
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
-    use crate::sql::codegen::ir::explain_distributed_plan;
     use crate::sql::column_id::ColumnId;
+    use crate::sql::explain::distributed::explain_distributed_plan;
     use crate::sql::explain::{ExplainLevel, PlanNodeExplainStage};
     use crate::sql::optimizer::operator::{
         AggMode, AggregateOutputLayout, JoinDistribution, Operator, PhysicalDistributionOp,

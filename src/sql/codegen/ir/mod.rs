@@ -17,11 +17,9 @@
 
 //! Planner-owned DistributedPlan IR and native fragment builder.
 
-pub(crate) mod explain;
 pub(crate) mod fragment_build;
 pub(crate) mod kind;
 
-pub(crate) use explain::{explain_distributed_plan, explain_distributed_plan_analyze};
 pub(crate) use fragment_build::lower_distributed_plan;
 
 fn validate_global_node_ids(

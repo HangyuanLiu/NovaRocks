@@ -17,6 +17,8 @@
 
 //! EXPLAIN plan formatter for logical plans and shared expression formatting.
 
+pub(crate) mod distributed;
+
 use std::fmt::Write;
 
 use crate::sql::analysis::{
