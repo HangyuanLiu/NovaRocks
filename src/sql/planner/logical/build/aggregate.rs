@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::sql::analysis::expr_display::{
+    agg_call_display_name_from_parts, typed_expr_display_name,
+};
 use crate::sql::analysis::*;
-use crate::sql::codegen::helpers::typed_expr_display_name;
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use crate::sql::planner::logical::*;
 use crate::sql::planner::payload::*;
@@ -435,7 +437,8 @@ pub(super) fn split_projection_for_aggregate(
         output_columns.push(output_column);
     }
     output_columns.extend(agg_calls.iter().map(|call| {
-        let name = crate::sql::codegen::helpers::agg_call_display_name(call);
+        let name =
+            agg_call_display_name_from_parts(&call.name, &call.args, call.distinct, &call.order_by);
         OutputColumn {
             column_id: call.output_column_id,
             name,
@@ -502,7 +505,12 @@ pub(super) fn ensure_aggregate_output_columns(agg: &mut LogicalAggregateNode) {
         existing.insert(call.output_column_id);
         agg.output_columns.push(OutputColumn {
             column_id: call.output_column_id,
-            name: crate::sql::codegen::helpers::agg_call_display_name(call),
+            name: agg_call_display_name_from_parts(
+                &call.name,
+                &call.args,
+                call.distinct,
+                &call.order_by,
+            ),
             data_type: call.result_type.clone(),
             nullable: true,
             is_internal: true,
@@ -634,9 +642,7 @@ pub(super) fn rewrite_agg_calls_to_refs(
             .iter()
             .find(|call| aggregate_call_matches(call, name, args, *distinct, order_by))
     {
-        let display = crate::sql::codegen::helpers::agg_call_display_name_from_parts(
-            name, args, *distinct, order_by,
-        );
+        let display = agg_call_display_name_from_parts(name, args, *distinct, order_by);
         return TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: call.output_column_id,
@@ -1172,9 +1178,7 @@ pub(super) fn collect_aggregates(
                     })
             });
             if !already {
-                let display = crate::sql::codegen::helpers::agg_call_display_name_from_parts(
-                    name, args, *distinct, order_by,
-                );
+                let display = agg_call_display_name_from_parts(name, args, *distinct, order_by);
                 let output_column_id =
                     factory.create(None, display, expr.data_type.clone(), expr.nullable);
                 out.push(AggregateCall {
