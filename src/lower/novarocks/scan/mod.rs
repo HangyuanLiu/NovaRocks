@@ -114,6 +114,28 @@ fn unsupported_scan_source(source: &str) -> Result<LoweredNode, String> {
 }
 
 #[cfg(test)]
+pub(crate) fn scan_read_binding_for_test(
+    scan: &plan::ScanNode,
+    table: &plan::IcebergTableInfo,
+    output_columns: &[crate::proto::common::OutputColumn],
+) -> Result<(Vec<String>, Vec<(u32, u32)>), String> {
+    let read_plan = read_plan::scan_read_plan(scan, table, output_columns)?;
+    Ok((
+        read_plan.read_columns,
+        read_plan
+            .variant_path_columns
+            .iter()
+            .map(|variant| {
+                (
+                    variant.source_slot_id.as_u32(),
+                    variant.output_slot_id.as_u32(),
+                )
+            })
+            .collect(),
+    ))
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};

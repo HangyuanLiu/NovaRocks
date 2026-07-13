@@ -27,6 +27,7 @@ use crate::sql::codegen::scan::connector::{
     ConnectorScanContext, PlannedNativeStarRocksScan, plan_native_starrocks_scan_node,
     to_native_file_scan,
 };
+use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::{
     DistributedNode, DistributedNodeKind, DistributedPlan, FragmentId,
 };
@@ -326,6 +327,7 @@ fn resolve_physical_columns(
     let keep_only_resolved = matches!(scan.table.source, ScanSource::IcebergVersionTable { .. });
     scan.columns
         .iter()
+        .filter(|planner| !is_variant_synthetic_column(scan, planner.column_id))
         .filter_map(|planner| {
             let Some((source, kind)) = resolved_source_column(scan, &planner.name) else {
                 return if keep_only_resolved {
@@ -432,7 +434,10 @@ fn resolve_effective_required_reads(
                 .map(|column| column.name.clone())
                 .collect()
         }),
-    };
+    }
+    .into_iter()
+    .filter(|name| !is_variant_synthetic_name(scan, name))
+    .collect::<Vec<_>>();
     let mut reads = required_names
         .into_iter()
         .map(|name| {
@@ -860,12 +865,33 @@ pub(crate) fn effective_scan_column_names(scan: &PlanScanNode) -> Vec<String> {
     if let Some(projected) = refresh_scan_projected_names(&scan.table.source) {
         return merge_required_columns_with_projected(scan.required_columns.clone(), &projected);
     }
-    scan.required_columns.clone().unwrap_or_else(|| {
+    let mut names = scan.required_columns.clone().unwrap_or_else(|| {
         scan.table
             .columns
             .iter()
             .map(|column| column.name.clone())
             .collect()
+    });
+    names.retain(|name| !is_variant_synthetic_name(scan, name));
+    for variant in &scan.variant_columns {
+        push_unique_projected_name(&mut names, &variant.source_column);
+    }
+    names
+}
+
+fn is_variant_synthetic_column(scan: &PlanScanNode, column_id: ColumnId) -> bool {
+    scan.variant_columns
+        .iter()
+        .any(|variant| variant.synthetic_column_id == column_id)
+}
+
+fn is_variant_synthetic_name(scan: &PlanScanNode, name: &str) -> bool {
+    scan.variant_columns.iter().any(|variant| {
+        variant.synthetic_column.eq_ignore_ascii_case(name)
+            || scan.columns.iter().any(|column| {
+                column.column_id == variant.synthetic_column_id
+                    && column.name.eq_ignore_ascii_case(name)
+            })
     })
 }
 
@@ -1703,6 +1729,64 @@ mod tests {
                 .last()
                 .cloned(),
             Some(vec!["id".to_string(), "category".to_string()])
+        );
+    }
+
+    #[test]
+    fn variant_synthetic_output_is_not_prepared_as_a_physical_column() {
+        let mut root = scan_node(10, IcebergDataFileBinding::ExplicitFiles);
+        let DistributedNodeKind::Scan(scan) = &mut root.payload else {
+            panic!("test root must be a scan");
+        };
+        scan.table.columns = vec![source_column("v", DataType::LargeBinary, false)];
+        let ScanSource::IcebergDataFiles { table, .. } = &mut scan.table.source else {
+            panic!("expected Iceberg data-file source");
+        };
+        table.schema.fields = vec![IcebergSchemaFieldDef {
+            field_id: 101,
+            name: "v".to_string(),
+            initial_default: None,
+            write_default: None,
+            initial_default_json: None,
+            write_default_json: None,
+            children: Vec::new(),
+        }];
+        scan.columns = vec![
+            column(1, "v", DataType::LargeBinary, false),
+            OutputColumn {
+                column_id: ColumnId::new_for_test(2),
+                name: "__nr_var_v_0".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                is_internal: true,
+            },
+        ];
+        scan.required_columns = Some(vec!["__nr_var_v_0".to_string()]);
+        scan.variant_columns = vec![crate::sql::common::ScanVariantColumn {
+            source_column_id: ColumnId::new_for_test(1),
+            source_column: "v".to_string(),
+            synthetic_column_id: ColumnId::new_for_test(2),
+            synthetic_column: "__nr_var_v_0".to_string(),
+            canonical_path: "$.a.b".to_string(),
+            requested_type: DataType::Int64,
+            strict: true,
+        }];
+
+        let (registry, seen_column_names) =
+            recording_registry(vec![data_file("s3://bucket/variant.parquet")]);
+        let bindings = prepare_scan_bindings(&plan(root), &registry, None)
+            .expect("prepare bound VARIANT scan");
+        let binding = bindings.binding(10).expect("binding");
+        assert_eq!(binding.physical_columns.len(), 1);
+        assert_eq!(binding.physical_columns[0].source.name, "v");
+        assert!(binding.required_reads.is_empty());
+        assert_eq!(
+            seen_column_names
+                .lock()
+                .expect("seen column names lock")
+                .last()
+                .cloned(),
+            Some(vec!["v".to_string()])
         );
     }
 
