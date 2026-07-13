@@ -7177,19 +7177,21 @@ fn runtime_filter_dependency_path(canonical: &[String], source_rel: &str) -> Vec
 
 fn runtime_filter_model_local_roots(text: &str) -> BTreeSet<String> {
     let mut roots = BTreeSet::from(["Self".to_string()]);
-    roots.extend(
-        rust_production_scoped_aliases(text)
-            .into_keys()
-            .map(|(_, local_name)| local_name),
-    );
-
-    let tokens = rust_use_tokens(&rust_sanitized_production_text(text));
-    for pair in tokens.windows(2) {
-        if matches!(
-            pair[0].as_str(),
-            "const" | "enum" | "fn" | "mod" | "static" | "struct" | "trait" | "type" | "union"
-        ) {
-            roots.insert(pair[1].clone());
+    let production = rust_sanitized_production_text(text);
+    let file = syn::parse_file(&production)
+        .expect("runtime-filter model production source must parse as Rust");
+    for item in file.items {
+        let ident = match item {
+            syn::Item::Enum(item) => Some(item.ident),
+            syn::Item::Mod(item) => Some(item.ident),
+            syn::Item::Struct(item) => Some(item.ident),
+            syn::Item::Trait(item) => Some(item.ident),
+            syn::Item::Type(item) => Some(item.ident),
+            syn::Item::Union(item) => Some(item.ident),
+            _ => None,
+        };
+        if let Some(ident) = ident {
+            roots.insert(ident.to_string());
         }
     }
     roots
@@ -7397,6 +7399,10 @@ fn runtime_filter_model_dependency_allowlist_rejects_forbidden_synthetic_imports
         "use std::net::TcpStream;",
         "use reqwest::Client;",
         "use serde::Serialize;",
+        "fn reqwest() {} use reqwest::Client;",
+        "const reqwest: () = (); use reqwest::Client;",
+        "static serde: () = (); use serde::Serialize;",
+        "fn f() { struct serde; } use serde::Serialize;",
     ] {
         assert!(
             !runtime_filter_model_dependency_violations(source_rel, source).is_empty(),
@@ -7408,6 +7414,16 @@ fn runtime_filter_model_dependency_allowlist_rejects_forbidden_synthetic_imports
         runtime_filter_model_dependency_violations(source_rel, "use arrow::datatypes::DataType;")
             .is_empty()
     );
+    for source in [
+        "enum LocalDomain { Empty } type Domain = LocalDomain;",
+        "struct LocalContract; impl LocalContract { fn make() -> Self { Self } }",
+        "mod local { pub struct Item; } use local::Item;",
+    ] {
+        assert!(
+            runtime_filter_model_dependency_violations(source_rel, source).is_empty(),
+            "file-top-level local type/module path must remain allowed: {source}"
+        );
+    }
 }
 
 #[test]
