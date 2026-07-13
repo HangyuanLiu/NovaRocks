@@ -2755,12 +2755,12 @@ fn explain_analyze_query(
 
     let mut query_opts = query_opts.unwrap_or_default();
     query_opts.enable_profile = true;
-    let (dispatcher, scheduler) = coordinated_execution_services()?;
+    let (execution_ports, scheduler) = coordinated_execution_services()?;
     let execution_start = std::time::Instant::now();
     let query_opts = query_opts.to_runtime();
     let outcome = crate::runtime::coordinator::ExecutionCoordinator::new(
         build_result,
-        dispatcher,
+        execution_ports,
         scheduler,
         Some(query_opts),
     )
@@ -3140,10 +3140,10 @@ pub(crate) fn execute_query_as_iceberg_write(
             None,
         ),
     )?;
-    let (dispatcher, scheduler) = coordinated_execution_services()?;
+    let (execution_ports, scheduler) = coordinated_execution_services()?;
     crate::runtime::coordinator::ExecutionCoordinator::new(
         build_result,
-        dispatcher,
+        execution_ports,
         scheduler,
         StandaloneQueryOptions::optional_to_runtime(query_opts.as_ref()),
     )
@@ -3350,11 +3350,11 @@ pub(crate) fn execute_planned_iceberg_change_stream_write(
     build_result: crate::sql::codegen::fragment::MultiFragmentBuildResult,
     query_opts: Option<StandaloneQueryOptions>,
 ) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
-    let (dispatcher, scheduler) = coordinated_execution_services()?;
+    let (execution_ports, scheduler) = coordinated_execution_services()?;
     let query_options = StandaloneQueryOptions::optional_to_runtime(query_opts.as_ref());
     crate::runtime::coordinator::ExecutionCoordinator::new(
         build_result,
-        dispatcher,
+        execution_ports,
         scheduler,
         query_options,
     )
@@ -3725,10 +3725,10 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
             mv_refresh_ctx,
         ),
     )?;
-    let (dispatcher, scheduler) = coordinated_execution_services()?;
+    let (execution_ports, scheduler) = coordinated_execution_services()?;
     crate::runtime::coordinator::ExecutionCoordinator::new(
         build_result,
-        dispatcher,
+        execution_ports,
         scheduler,
         StandaloneQueryOptions::optional_to_runtime(query_opts.as_ref()),
     )
@@ -3783,10 +3783,10 @@ pub(crate) fn execute_logical_plan_with_options(
             mv_refresh_ctx,
         ),
     )?;
-    let (dispatcher, scheduler) = coordinated_execution_services()?;
+    let (execution_ports, scheduler) = coordinated_execution_services()?;
     crate::runtime::coordinator::ExecutionCoordinator::new(
         build_result,
-        dispatcher,
+        execution_ports,
         scheduler,
         StandaloneQueryOptions::optional_to_runtime(query_opts.as_ref()),
     )
@@ -3795,7 +3795,7 @@ pub(crate) fn execute_logical_plan_with_options(
 
 fn coordinated_execution_services() -> Result<
     (
-        Arc<dyn crate::coordinator::dispatch::FragmentDispatcher>,
+        crate::coordinator::ports::CoordinatorExecutionPorts,
         Arc<crate::runtime::scheduler::FragmentScheduler>,
     ),
     String,
@@ -3824,7 +3824,15 @@ fn coordinated_execution_services() -> Result<
             return Err("role=be must not enter standalone coordinator".into());
         }
     };
-    Ok((dispatcher, scheduler))
+    let report_endpoint = crate::service::grpc_coordinator_adapter::coordinator_report_endpoint()?;
+    let observer =
+        Arc::new(crate::service::grpc_coordinator_adapter::PrometheusCoordinatorObserver);
+    let execution_ports = crate::coordinator::ports::CoordinatorExecutionPorts::new(
+        dispatcher,
+        report_endpoint,
+        observer,
+    );
+    Ok((execution_ports, scheduler))
 }
 
 /// Select a `FragmentDispatcher` implementation based on the effective cluster role.
@@ -8749,10 +8757,10 @@ path = "meta/operations.sqlite"
         registry.restore_backend(2, endpoint, BackendState::Live);
         crate::runtime::backend_registry::replace_backend_registry_for_test(Some(registry));
 
-        let (dispatcher, scheduler) =
+        let (execution_ports, scheduler) =
             super::coordinated_execution_services().expect("coordinated services");
 
-        assert_eq!(dispatcher.backend_count(), 1);
+        assert_eq!(execution_ports.dispatcher.backend_count(), 1);
         assert_eq!(scheduler.live_backend_entries(), &[(2usize, endpoint)]);
     }
 

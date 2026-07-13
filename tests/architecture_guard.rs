@@ -16982,3 +16982,28 @@ fn coor_1_dispatch_port_and_grpc_adapter_own_layers() {
     assert!(adapter.contains("impl FragmentDispatcher for RemoteDispatcher"));
     assert!(adapter.contains("NovaRocksGrpcRemoteClient"));
 }
+
+#[test]
+fn coor_1_runtime_coordinator_has_only_injected_service_ports() {
+    let repo = Path::new(manifest_dir());
+    let runtime = fs::read_to_string(repo.join("src/runtime/coordinator.rs"))
+        .expect("read runtime coordinator");
+    let runtime = rust_sanitized_production_text(&runtime);
+    for forbidden in [
+        "crate::service::grpc_client",
+        "crate::service::grpc_server",
+        "crate::service::metrics_http",
+    ] {
+        assert!(
+            !runtime.contains(forbidden),
+            "runtime coordinator imports {forbidden}"
+        );
+    }
+
+    let ports =
+        fs::read_to_string(repo.join("src/coordinator/ports.rs")).expect("read coordinator ports");
+    let ports = rust_sanitized_production_text(&ports);
+    assert!(!ports.contains("crate::service"));
+    assert!(ports.contains("pub(crate) struct CoordinatorExecutionPorts"));
+    assert!(ports.contains("pub(crate) trait CoordinatorObserver"));
+}

@@ -15,5 +15,31 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod dispatch;
-pub(crate) mod ports;
+use std::sync::Arc;
+
+use crate::coordinator::dispatch::FragmentDispatcher;
+use crate::runtime::endpoint::RuntimeEndpoint;
+
+pub(crate) trait CoordinatorObserver: Send + Sync + 'static {
+    fn fragment_scheduled(&self);
+}
+
+pub(crate) struct CoordinatorExecutionPorts {
+    pub(crate) dispatcher: Arc<dyn FragmentDispatcher>,
+    pub(crate) report_endpoint: RuntimeEndpoint,
+    pub(crate) observer: Arc<dyn CoordinatorObserver>,
+}
+
+impl CoordinatorExecutionPorts {
+    pub(crate) fn new(
+        dispatcher: Arc<dyn FragmentDispatcher>,
+        report_endpoint: RuntimeEndpoint,
+        observer: Arc<dyn CoordinatorObserver>,
+    ) -> Self {
+        Self {
+            dispatcher,
+            report_endpoint,
+            observer,
+        }
+    }
+}
