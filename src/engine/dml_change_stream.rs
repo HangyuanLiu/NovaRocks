@@ -888,6 +888,7 @@ fn output_ordinal_by_name(
 #[cfg(test)]
 mod native_mutation_tests {
     use super::*;
+    use crate::runtime_filter::model::RuntimeFilterGraph;
 
     struct EmptyCatalog;
 
@@ -1004,6 +1005,7 @@ mod native_mutation_tests {
             }],
             root_fragment_id: 0,
             edges: Vec::new(),
+            runtime_filter_graph: RuntimeFilterGraph::default(),
         }
     }
 

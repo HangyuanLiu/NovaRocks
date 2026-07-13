@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::runtime_filter::model::RuntimeFilterGraph;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
@@ -139,4 +140,5 @@ pub(crate) struct DistributedPlan {
     pub fragments: Vec<PlanFragment>,
     pub root_fragment_id: FragmentId,
     pub edges: Vec<FragmentEdge>,
+    pub runtime_filter_graph: RuntimeFilterGraph,
 }

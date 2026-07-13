@@ -32,6 +32,7 @@ mod tests {
     use super::expr::encode_expr;
     use super::{instance, plan};
     use crate::proto::{common, expr};
+    use crate::runtime_filter::model::RuntimeFilterGraph;
     use crate::sql::analysis::{ExprKind, SortItem, SubqueryKind, TypedExpr};
     use crate::sql::codegen::scan::connector as connector_scan;
     use crate::sql::column_id::ColumnId;
@@ -669,6 +670,7 @@ mod tests {
         let plan = crate::sql::planner::distributed::DistributedPlan {
             fragments: vec![source, target],
             root_fragment_id: 1,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: vec![crate::sql::planner::distributed::FragmentEdge {
                 source_fragment_id: 0,
                 target_fragment_id: 1,
@@ -803,6 +805,7 @@ mod tests {
         let plan = crate::sql::planner::distributed::DistributedPlan {
             fragments: vec![source, target],
             root_fragment_id: 1,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: vec![crate::sql::planner::distributed::FragmentEdge {
                 source_fragment_id: 0,
                 target_fragment_id: 1,
@@ -907,6 +910,7 @@ mod tests {
         let plan = crate::sql::planner::distributed::DistributedPlan {
             fragments: vec![source, target],
             root_fragment_id: 1,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: vec![crate::sql::planner::distributed::FragmentEdge {
                 source_fragment_id: 0,
                 target_fragment_id: 1,
@@ -1020,6 +1024,7 @@ mod tests {
         let plan = crate::sql::planner::distributed::DistributedPlan {
             fragments: vec![source, target],
             root_fragment_id: 1,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: vec![crate::sql::planner::distributed::FragmentEdge {
                 source_fragment_id: 0,
                 target_fragment_id: 1,
@@ -1102,6 +1107,7 @@ mod tests {
         let plan = crate::sql::planner::distributed::DistributedPlan {
             fragments: vec![source, target],
             root_fragment_id: 1,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: vec![crate::sql::planner::distributed::FragmentEdge {
                 source_fragment_id: 0,
                 target_fragment_id: 1,

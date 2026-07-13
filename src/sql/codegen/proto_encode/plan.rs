@@ -3056,13 +3056,80 @@ mod tests {
 
     use super::*;
     use crate::proto::expr::expr;
+    use crate::runtime_filter::model::RuntimeFilterGraph;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed::DataPartition;
     use crate::sql::planner::distributed::write::change_stream::{
         IcebergChangeStreamBranchRoute, IcebergChangeStreamRouterSink,
     };
+    use crate::sql::planner::physical::runtime_filter::{
+        RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
+    };
     use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
+
+    #[test]
+    fn empty_runtime_filter_graph_is_wire_neutral_and_bound_node_filters_still_encode() {
+        let mut source = single_fragment_router_plan_for_test();
+        let build_expr = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::new_for_test(3),
+                qualifier: None,
+                column: "bucket".to_string(),
+            },
+            data_type: DataType::Int32,
+            nullable: false,
+        };
+        let probe_expr = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::new_for_test(2),
+                qualifier: None,
+                column: "route".to_string(),
+            },
+            data_type: DataType::Int32,
+            nullable: false,
+        };
+        source.fragments[0]
+            .root
+            .build_runtime_filters
+            .push(BoundRuntimeFilterBuild {
+                intent: RuntimeFilterBuildIntent {
+                    filter_id: 41,
+                    build_expr: build_expr.clone(),
+                    probe_expr: probe_expr.clone(),
+                    expr_order: 2,
+                    execution_mode: JoinExecutionMode::Partitioned,
+                },
+                source_fragment_id: 0,
+                target_fragment_ids: vec![0],
+            });
+        source.fragments[0]
+            .root
+            .probe_runtime_filters
+            .push(BoundRuntimeFilterProbe {
+                intent: RuntimeFilterProbeIntent {
+                    filter_id: 41,
+                    probe_expr,
+                },
+                source_fragment_id: 0,
+            });
+
+        let encoded_source = encode_distributed_plan(&source).expect("encode source plan");
+        let mut reset_graph = source.clone();
+        reset_graph.runtime_filter_graph = RuntimeFilterGraph::default();
+        // RFD-1 keeps the graph planner-only until RFD-5A/CGO-13 defines wire lowering.
+        let encoded_reset = encode_distributed_plan(&reset_graph).expect("encode reset graph plan");
+
+        assert_eq!(encoded_reset, encoded_source);
+        let root = encoded_reset.fragments[0].root.as_ref().expect("root node");
+        assert_eq!(root.build_runtime_filters.len(), 1);
+        assert_eq!(root.build_runtime_filters[0].filter_id, 41);
+        assert_eq!(root.build_runtime_filters[0].source_fragment_id, 0);
+        assert_eq!(root.build_runtime_filters[0].target_fragment_ids, vec![0]);
+        assert_eq!(root.probe_runtime_filters.len(), 1);
+        assert_eq!(root.probe_runtime_filters[0].filter_id, 41);
+        assert_eq!(root.probe_runtime_filters[0].source_fragment_id, 0);
+    }
 
     #[test]
     fn change_stream_router_encoder_materializes_partition_exprs() {
@@ -3283,6 +3350,7 @@ mod tests {
         let plan = DistributedPlan {
             fragments: vec![source, target],
             root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: vec![FragmentEdge {
                 source_fragment_id: 1,
                 target_fragment_id: 0,
@@ -3438,6 +3506,7 @@ mod tests {
                 cte_exchange_nodes: Vec::new(),
             }],
             root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: Vec::new(),
         }
     }
@@ -4126,6 +4195,7 @@ mod tests {
         let plan = DistributedPlan {
             fragments: vec![source, target],
             root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: vec![FragmentEdge {
                 source_fragment_id: 1,
                 target_fragment_id: 0,
@@ -4423,6 +4493,7 @@ mod tests {
                 },
             ],
             root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: vec![FragmentEdge {
                 source_fragment_id: 1,
                 target_fragment_id: 0,
@@ -4501,6 +4572,7 @@ mod tests {
                 },
             ],
             root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: vec![FragmentEdge {
                 source_fragment_id: 1,
                 target_fragment_id: 0,
@@ -4573,6 +4645,7 @@ mod tests {
                 },
             ],
             root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: vec![FragmentEdge {
                 source_fragment_id: 1,
                 target_fragment_id: 0,
@@ -4650,6 +4723,7 @@ mod tests {
                 },
             ],
             root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: vec![FragmentEdge {
                 source_fragment_id: 1,
                 target_fragment_id: 0,
@@ -4709,6 +4783,7 @@ mod tests {
                 cte_exchange_nodes: Vec::new(),
             }],
             root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: Vec::new(),
         }
     }
