@@ -21,9 +21,10 @@
 
 use crate::common::engine_error::EngineError;
 use crate::common::types::UniqueId;
+use crate::coordinator::write::report::FragmentExecStatusReport;
+use crate::coordinator::write::{self as write_coordinator, ReportOutcome};
 use crate::proto::common;
 use crate::runtime::sink_commit_wire;
-use crate::runtime::write_coordinator::{self, FragmentExecStatusReport, ReportOutcome};
 use crate::thrift::frontend_service;
 
 pub(crate) fn report_from_thrift(
@@ -114,7 +115,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::runtime::write_coordinator::{self, WriterKey};
+    use crate::coordinator::write::report::WriterKey;
     use crate::thrift::{status, status_code, types};
 
     fn id(hi: i64, lo: i64) -> UniqueId {

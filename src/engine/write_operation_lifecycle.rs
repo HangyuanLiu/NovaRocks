@@ -19,8 +19,8 @@
 
 use std::sync::Arc;
 
+use crate::coordinator::write::report::{WriteAbortInput, WriteCommitInput};
 use crate::engine::StandaloneState;
-use crate::runtime::write_coordinator::{WriteAbortInput, WriteCommitInput};
 use crate::runtime::write_operation_lifecycle::{
     WriteOperationContext, operation_fact_update_from_write_abort,
     operation_request_from_write_commit,
@@ -76,10 +76,10 @@ pub(crate) mod test_support {
     use std::collections::BTreeMap;
 
     use crate::common::types::UniqueId;
-    use crate::proto::novarocks;
-    use crate::runtime::write_coordinator::{
+    use crate::coordinator::write::report::{
         WriteAbortInput, WriteCommitInput, WriterCommitInput, WriterKey,
     };
+    use crate::proto::novarocks;
 
     fn staging_writer_key() -> WriterKey {
         let query_id = UniqueId { hi: 10, lo: 20 };
@@ -140,13 +140,13 @@ mod tests {
 
     use crate::common::types::UniqueId;
     use crate::connector::iceberg::commit::CommitOpKind;
+    use crate::coordinator::write::report::{WriteAbortInput, WriterCommitInput, WriterKey};
     use crate::meta::repository::iceberg_operation::{
         IcebergOperationFailureKind, IcebergOperationKind, IcebergOperationNextAction,
         IcebergOperationState, IcebergOperationTarget,
     };
     use crate::meta::{MetaStoreProvider, SqliteMetaStoreProvider};
     use crate::proto::novarocks;
-    use crate::runtime::write_coordinator::{WriteAbortInput, WriterCommitInput, WriterKey};
 
     struct WriterOperationTestState {
         state: Arc<StandaloneState>,

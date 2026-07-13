@@ -53,6 +53,7 @@ use crate::connector::iceberg::position_delete_descriptor::{
     PositionDeleteDescriptorInput, PositionDeleteOutputField, PositionDeletePartitionSourceField,
 };
 use crate::coordinator::execution::CoordinatedQueryResult;
+use crate::coordinator::write::report::WriteCommitInput;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::mv::refresh_io::query_result_to_chunks;
 use crate::engine::write_transaction::{
@@ -63,7 +64,6 @@ use crate::engine::write_transaction::{
 use crate::engine::{StandaloneState, StatementResult};
 use crate::exec::chunk::Chunk;
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
-use crate::runtime::write_coordinator::WriteCommitInput;
 use crate::sql::catalog::{
     ColumnDef, IcebergDataFileBinding, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
     ScanSource, TableDef,

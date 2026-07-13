@@ -1538,7 +1538,7 @@ mod tests {
         let execution = DmlChangeStreamWriteExecution {
             result: CoordinatedQueryResult {
                 query_result: crate::runtime::query_result::QueryResult::empty(),
-                write_commit: Some(crate::runtime::write_coordinator::WriteCommitInput {
+                write_commit: Some(crate::coordinator::write::report::WriteCommitInput {
                     write_id: crate::common::types::UniqueId { hi: 1, lo: 2 },
                     writers: Vec::new(),
                 }),
@@ -1555,8 +1555,8 @@ mod tests {
         assert!(execution.commit_plan.is_empty());
     }
 
-    fn empty_writer_commit_for_test() -> crate::runtime::write_coordinator::WriteCommitInput {
-        crate::runtime::write_coordinator::WriteCommitInput {
+    fn empty_writer_commit_for_test() -> crate::coordinator::write::report::WriteCommitInput {
+        crate::coordinator::write::report::WriteCommitInput {
             write_id: crate::common::types::UniqueId { hi: 1, lo: 2 },
             writers: Vec::new(),
         }

@@ -17296,6 +17296,37 @@ fn coor_2_report_handler_is_query_control_plane() {
 }
 
 #[test]
+fn coor_4_write_control_plane_has_one_top_level_owner() {
+    let repo = Path::new(manifest_dir());
+    let owner = repo.join("src/coordinator/write/mod.rs");
+    let report = repo.join("src/coordinator/write/report.rs");
+    assert!(owner.is_file(), "coordinator write owner must exist");
+    assert!(
+        report.is_file(),
+        "coordinator write report model must exist"
+    );
+    for retired in [
+        ["src/runtime/", "write_coordinator.rs"].concat(),
+        ["src/runtime/", "write_report.rs"].concat(),
+    ] {
+        assert!(
+            !repo.join(retired).exists(),
+            "retired runtime write owner remains"
+        );
+    }
+    let owner_text = rust_sanitized_production_text(
+        &fs::read_to_string(owner).expect("read coordinator write owner"),
+    );
+    let report_text = rust_sanitized_production_text(
+        &fs::read_to_string(report).expect("read coordinator write report"),
+    );
+    assert!(owner_text.contains("struct WriteCoordinatorRegistry"));
+    assert!(owner_text.contains("pub(crate) struct WriteCoordinator"));
+    assert!(report_text.contains("pub(crate) struct WriterKey"));
+    assert!(report_text.contains("pub(crate) struct WriteCommitInput"));
+}
+
+#[test]
 fn coor_2_thrift_audit_scans_coordinator_owners() {
     let repo = Path::new(manifest_dir());
     let audit_path = repo.join("tools/dev/audit_thrift_boundaries.py");

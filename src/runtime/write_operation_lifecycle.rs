@@ -21,12 +21,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::connector::iceberg::commit::CommitOpKind;
+use crate::coordinator::write::report::{WriteAbortInput, WriteCommitInput, WriterCommitInput};
 use crate::meta::repository::iceberg_operation::{
     CreateIcebergOperationRequest, IcebergCleanupOutcomeRecord, IcebergOperationFactUpdate,
     IcebergOperationFailureKind, IcebergOperationFailureRecord, IcebergOperationKind,
     IcebergOperationNextAction, IcebergOperationState, IcebergOperationTarget,
 };
-use crate::runtime::write_coordinator::{WriteAbortInput, WriteCommitInput, WriterCommitInput};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WriteOperationContext {
@@ -148,11 +148,11 @@ mod tests {
     use super::*;
 
     use crate::common::types::UniqueId;
+    use crate::coordinator::write::report::{WriteAbortInput, WriterKey};
     use crate::meta::repository::iceberg_operation::{
         IcebergOperationFailureKind, IcebergOperationNextAction, IcebergOperationState,
     };
     use crate::proto::novarocks;
-    use crate::runtime::write_coordinator::{WriteAbortInput, WriterKey};
 
     fn id(hi: i64, lo: i64) -> UniqueId {
         UniqueId { hi, lo }

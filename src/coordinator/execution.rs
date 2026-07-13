@@ -51,15 +51,13 @@ use crate::coordinator::report::{StandaloneQueryFailureGuard, take_standalone_qu
 use crate::coordinator::scheduler::{
     FragmentInstancePlacement, FragmentScheduler, topological_sort_bottom_up,
 };
+use crate::coordinator::write::report::{WriteAbortInput, WriteCommitInput, WriterKey};
+use crate::coordinator::write::{WriteCoordinator, register_query, unregister_query};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::novarocks_logging::debug;
 use crate::runtime::profile::RuntimeProfileTree;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::query_state::QueryState;
-use crate::runtime::write_coordinator::{
-    WriteAbortInput, WriteCommitInput, WriteCoordinator, WriterKey, register_query,
-    unregister_query,
-};
 use crate::sql::analysis::cte::CteId;
 use crate::sql::codegen::fragment::{
     FragmentOutputKind, FragmentSchedulingMetadata, MultiFragmentBuildResult, OutputColumn,
@@ -1843,8 +1841,8 @@ mod native_contract_tests {
     use arrow::array::{Array, Decimal128Array, Int32Array};
 
     use crate::coordinator::ports::CoordinatorObserver;
+    use crate::coordinator::write::report::FragmentExecStatusReport;
     use crate::proto::plan as native_plan;
-    use crate::runtime::write_coordinator::FragmentExecStatusReport;
 
     #[derive(Default)]
     struct CountingCoordinatorObserver(AtomicUsize);

@@ -21,6 +21,11 @@ use std::sync::{Mutex, OnceLock};
 use crate::common::engine_error::EngineError;
 use crate::common::types::UniqueId;
 use crate::coordinator::ports::CoordinatorReportHandler;
+use crate::coordinator::write::report::report_from_native;
+use crate::coordinator::write::{
+    WriterReportLookup, handle_fragment_report_exec_status, lookup_native_writer_report,
+    mark_query_failed,
+};
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::{exchange, result_buffer};
 
@@ -36,15 +41,11 @@ impl CoordinatorReportHandler for CoordinatorExecStatusReportHandler {
         let profile_report_accepted =
             crate::coordinator::profile::record_native_standalone_query_profile_report(&report)
                 .map_err(EngineError::protocol_decode)?;
-        match crate::runtime::write_coordinator::lookup_native_writer_report(&report)
-            .map_err(EngineError::protocol_decode)?
-        {
-            crate::runtime::write_coordinator::WriterReportLookup::Expected => {
-                let result = crate::runtime::write_report::report_from_native(report)
+        match lookup_native_writer_report(&report).map_err(EngineError::protocol_decode)? {
+            WriterReportLookup::Expected => {
+                let result = report_from_native(report)
                     .map_err(EngineError::protocol_decode)
-                    .and_then(
-                        crate::runtime::write_coordinator::handle_fragment_report_exec_status,
-                    );
+                    .and_then(handle_fragment_report_exec_status);
                 match result {
                     Ok(_) => Ok(()),
                     Err(err) => {
@@ -55,7 +56,7 @@ impl CoordinatorReportHandler for CoordinatorExecStatusReportHandler {
                     }
                 }
             }
-            crate::runtime::write_coordinator::WriterReportLookup::UnknownWriter { query_id } => {
+            WriterReportLookup::UnknownWriter { query_id } => {
                 if !report.iceberg_commits.is_empty() {
                     let message = format!(
                         "unknown writer report with write metadata for query {}/{}, fragment {}/{}, backend {}",
@@ -73,25 +74,19 @@ impl CoordinatorReportHandler for CoordinatorExecStatusReportHandler {
                             .unwrap_or_default(),
                         report.backend_num,
                     );
-                    crate::runtime::write_coordinator::mark_query_failed(
-                        &query_id,
-                        message.clone(),
-                    );
+                    mark_query_failed(&query_id, message.clone());
                     return Err(EngineError::distributed_write_output_mismatch(
                         "reportExecStatus",
                         message,
                     ));
                 }
                 if let Some(failure) = failure {
-                    crate::runtime::write_coordinator::mark_query_failed(
-                        &query_id,
-                        failure.error.clone(),
-                    );
+                    mark_query_failed(&query_id, failure.error.clone());
                     mark_failed_query_report(failure);
                 }
                 Ok(())
             }
-            crate::runtime::write_coordinator::WriterReportLookup::UnknownQuery { query_id } => {
+            WriterReportLookup::UnknownQuery { query_id } => {
                 if let Some(failure) = failure {
                     mark_failed_query_report(failure);
                     Ok(())
