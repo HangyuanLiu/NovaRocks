@@ -7169,14 +7169,30 @@ fn runtime_filter_dependency_path(canonical: &[String], source_rel: &str) -> Vec
     let Some(source_module) = rust_source_module_segments(source_rel) else {
         return canonical.to_vec();
     };
-    if canonical.starts_with(&source_module)
-        && canonical
-            .get(source_module.len())
-            .is_some_and(|root| matches!(root.as_str(), "arrow" | "opendal" | "std" | "tokio"))
-    {
+    if canonical.starts_with(&source_module) && canonical.len() > source_module.len() {
         return canonical[source_module.len()..].to_vec();
     }
     canonical.to_vec()
+}
+
+fn runtime_filter_model_local_roots(text: &str) -> BTreeSet<String> {
+    let mut roots = BTreeSet::from(["Self".to_string()]);
+    roots.extend(
+        rust_production_scoped_aliases(text)
+            .into_keys()
+            .map(|(_, local_name)| local_name),
+    );
+
+    let tokens = rust_use_tokens(&rust_sanitized_production_text(text));
+    for pair in tokens.windows(2) {
+        if matches!(
+            pair[0].as_str(),
+            "const" | "enum" | "fn" | "mod" | "static" | "struct" | "trait" | "type" | "union"
+        ) {
+            roots.insert(pair[1].clone());
+        }
+    }
+    roots
 }
 
 fn runtime_filter_model_dependency_violations(source_rel: &str, text: &str) -> Vec<String> {
@@ -7204,15 +7220,15 @@ fn runtime_filter_model_dependency_violations(source_rel: &str, text: &str) -> V
         ],
         _ => return vec![format!("{source_rel}: unrecognized model source")],
     };
+    let local_roots = runtime_filter_model_local_roots(text);
 
-    let source_module = rust_source_module_segments(source_rel);
     rust_production_canonical_paths(text, source_rel)
         .into_iter()
         .map(|canonical| runtime_filter_dependency_path(&canonical, source_rel))
         .filter(|canonical| {
-            !source_module
-                .as_ref()
-                .is_some_and(|module| canonical.starts_with(module))
+            !canonical
+                .first()
+                .is_some_and(|root| local_roots.contains(root))
                 && !allowed_prefixes.iter().any(|prefix| {
                     canonical.len() >= prefix.len()
                         && canonical
@@ -7226,37 +7242,47 @@ fn runtime_filter_model_dependency_violations(source_rel: &str, text: &str) -> V
 }
 
 fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> Vec<String> {
-    let graph_owned_root_items = [
-        "ApplyPoint",
-        "ConsumerRequirement",
-        "GraphBuildError",
-        "PlanLocation",
-        "ProducerRequirement",
-        "RuntimeFilterBindingRole",
-        "RuntimeFilterBindingSpec",
-        "RuntimeFilterChannelSpec",
-        "RuntimeFilterGraph",
-    ];
-
     rust_production_canonical_paths(text, source_rel)
         .into_iter()
         .filter(|canonical| {
-            canonical.starts_with(&[
+            let planner_dependency = canonical.starts_with(&[
                 "crate".to_string(),
                 "sql".to_string(),
                 "planner".to_string(),
-            ]) || canonical.starts_with(&[
+            ]);
+            let model_prefix = [
                 "crate".to_string(),
                 "runtime_filter".to_string(),
                 "model".to_string(),
-                "graph".to_string(),
-            ]) || canonical.as_slice() == ["crate", "runtime_filter", "model", "*"]
-                || (canonical.len() == 4
-                    && canonical[..3] == ["crate", "runtime_filter", "model"]
-                    && graph_owned_root_items.contains(&canonical[3].as_str()))
+            ];
+            let forbidden_model_dependency = canonical.starts_with(&model_prefix)
+                && !matches!(
+                    canonical.get(model_prefix.len()).map(String::as_str),
+                    Some("contract" | "coverage")
+                );
+            planner_dependency || forbidden_model_dependency
         })
         .map(|canonical| format!("{source_rel}: {}", canonical.join("::")))
         .collect()
+}
+
+fn runtime_filter_model_root_surface_violations(text: &str) -> Vec<String> {
+    const EXPECTED: &str = r#"
+pub(crate) mod contract;
+pub(crate) mod coverage;
+pub(crate) mod graph;
+pub(crate) mod validation;
+"#;
+
+    let actual = rust_use_tokens(&rust_sanitized_production_text(text));
+    let expected = rust_use_tokens(EXPECTED);
+    if actual == expected {
+        Vec::new()
+    } else {
+        vec![format!(
+            "runtime-filter model root production tokens differ; expected {expected:?}, actual {actual:?}"
+        )]
+    }
 }
 
 #[test]
@@ -7273,15 +7299,11 @@ fn runtime_filter_graph_model_has_planner_neutral_boundaries() {
 
     let model_mod = fs::read_to_string(model.join("mod.rs"))
         .expect("runtime-filter model module source must be readable");
-    for namespace in ["contract", "coverage", "graph", "validation"] {
-        assert!(
-            has_non_comment_line(&model_mod, &format!("pub(crate) mod {namespace};")),
-            "runtime-filter model namespace {namespace} must be explicit"
-        );
-    }
+    let model_root_violations = runtime_filter_model_root_surface_violations(&model_mod);
     assert!(
-        !rust_sanitized_production_text(&model_mod).contains("pub(crate) use"),
-        "runtime-filter model root must not flatten namespace ownership"
+        model_root_violations.is_empty(),
+        "runtime-filter model root production surface must stay exact:\n{}",
+        model_root_violations.join("\n")
     );
 
     let runtime_filter_mod = fs::read_to_string(repo.join("src/runtime_filter/mod.rs"))
@@ -7373,6 +7395,8 @@ fn runtime_filter_model_dependency_allowlist_rejects_forbidden_synthetic_imports
         "use tokio::sync::Mutex;",
         "use opendal::Operator;",
         "use std::net::TcpStream;",
+        "use reqwest::Client;",
+        "use serde::Serialize;",
     ] {
         assert!(
             !runtime_filter_model_dependency_violations(source_rel, source).is_empty(),
@@ -7387,12 +7411,40 @@ fn runtime_filter_model_dependency_allowlist_rejects_forbidden_synthetic_imports
 }
 
 #[test]
-fn runtime_filter_runtime_boundary_detector_rejects_graph_and_planner_imports() {
+fn runtime_filter_model_root_surface_rejects_extra_production_items() {
+    const EXACT_ROOT: &str = r#"
+pub(crate) mod contract;
+pub(crate) mod coverage;
+pub(crate) mod graph;
+pub(crate) mod validation;
+"#;
+
+    assert!(runtime_filter_model_root_surface_violations(EXACT_ROOT).is_empty());
+    for source in [
+        format!("{EXACT_ROOT}\npub use graph::*;"),
+        format!("{EXACT_ROOT}\npub(in crate) use graph::*;"),
+        format!("#[allow(dead_code)]\n{EXACT_ROOT}"),
+        format!("{EXACT_ROOT}\nconst EXTRA: () = ();"),
+    ] {
+        assert!(
+            !runtime_filter_model_root_surface_violations(&source).is_empty(),
+            "model root surface detector must reject extra production item:\n{source}"
+        );
+    }
+}
+
+#[test]
+fn runtime_filter_runtime_boundary_detector_defaults_model_dependencies_to_deny() {
     let source_rel = "src/runtime_filter/core/channel.rs";
     for source in [
         "use crate::runtime_filter::model::graph::RuntimeFilterGraph;",
+        "use crate::runtime_filter::model::validation::GraphValidationError;",
         "use crate::runtime_filter::model::RuntimeFilterChannelSpec;",
+        "use crate::runtime_filter::model::FutureGraphType;",
+        "use crate::runtime_filter::model;",
         "use crate::runtime_filter::model as model_root; use model_root::RuntimeFilterBindingSpec;",
+        "use crate::runtime_filter::model::graph as graph_owner; use graph_owner::RuntimeFilterGraph;",
+        "use crate::runtime_filter as rf; use rf::model::FutureGraphType;",
         "use crate::sql::planner::distributed::DistributedPlan;",
     ] {
         assert!(
@@ -7405,6 +7457,20 @@ fn runtime_filter_runtime_boundary_detector_rejects_graph_and_planner_imports() 
         runtime_filter_runtime_boundary_violations(
             source_rel,
             "use crate::runtime_filter::model::contract::ChannelId;"
+        )
+        .is_empty()
+    );
+    assert!(
+        runtime_filter_runtime_boundary_violations(
+            source_rel,
+            "use crate::runtime_filter::model::coverage::Coverage;"
+        )
+        .is_empty()
+    );
+    assert!(
+        runtime_filter_runtime_boundary_violations(
+            source_rel,
+            "use crate::runtime_filter::model::contract as owner; use owner::ChannelId;"
         )
         .is_empty()
     );
