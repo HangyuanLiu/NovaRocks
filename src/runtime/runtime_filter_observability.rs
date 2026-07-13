@@ -22,11 +22,19 @@
 //! `RfLifecycleRecorder` directly; apply hot paths can cache an
 //! `RfLifecycleHandle` and update counters with relaxed atomics only.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use crate::common::types::UniqueId;
 use crate::runtime::profile::RuntimeProfile;
+use crate::runtime_filter::port::events::{
+    ConsumerEventIdentity, ProducerEventIdentity, RouteEventIdentity, RuntimeFilterEvent,
+    RuntimeFilterEventIdentity, RuntimeFilterEventSink,
+};
+use crate::runtime_filter::port::identity::{
+    ContributionIdentity, DeploymentEpoch, RuntimeFilterParticipantId,
+};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct QueryKey {
@@ -75,6 +83,12 @@ impl RuntimeFilterLifecycleRegistry {
     pub fn recorder(&self, query: QueryKey) -> RfLifecycleRecorder {
         RfLifecycleRecorder {
             query,
+            lifecycle: self.query_entry(query),
+        }
+    }
+
+    fn event_sink(&self, query: QueryKey) -> RegistryRuntimeFilterEventSink {
+        RegistryRuntimeFilterEventSink {
             lifecycle: self.query_entry(query),
         }
     }
@@ -148,6 +162,7 @@ fn runtime_filter_lifecycle_registry() -> &'static RuntimeFilterLifecycleRegistr
 #[derive(Default)]
 struct QueryRfLifecycle {
     filters: RwLock<HashMap<i32, Arc<RfLifecycleRecord>>>,
+    channel_events: Mutex<BTreeMap<RuntimeFilterChannelEventCoordinate, Vec<RuntimeFilterEvent>>>,
 }
 
 impl QueryRfLifecycle {
@@ -160,7 +175,10 @@ impl QueryRfLifecycle {
             .iter()
             .map(|(filter_id, record)| (*filter_id, record.snapshot()))
             .collect();
-        QueryRfSnapshot { filters }
+        QueryRfSnapshot {
+            filters,
+            channel_events: mutex_lock(&self.channel_events).clone(),
+        }
     }
 
     fn record(&self, filter_id: i32) -> Arc<RfLifecycleRecord> {
@@ -177,6 +195,76 @@ impl QueryRfLifecycle {
                 .entry(filter_id)
                 .or_insert_with(|| Arc::new(RfLifecycleRecord::new())),
         )
+    }
+
+    fn record_channel_event(&self, event: RuntimeFilterEvent) {
+        mutex_lock(&self.channel_events)
+            .entry(RuntimeFilterChannelEventCoordinate::from(&event))
+            .or_default()
+            .push(event);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum RuntimeFilterChannelEventCoordinate {
+    Deployment {
+        query_id: UniqueId,
+        participant_id: RuntimeFilterParticipantId,
+        epoch: DeploymentEpoch,
+    },
+    Channel(RuntimeFilterEventIdentity),
+    Contribution(ContributionIdentity),
+    Producer(ProducerEventIdentity),
+    Route(RouteEventIdentity),
+    Consumer(ConsumerEventIdentity),
+}
+
+impl From<&RuntimeFilterEvent> for RuntimeFilterChannelEventCoordinate {
+    fn from(event: &RuntimeFilterEvent) -> Self {
+        match event {
+            RuntimeFilterEvent::DeploymentInstalled {
+                query_id,
+                participant_id,
+                epoch,
+            } => Self::Deployment {
+                query_id: *query_id,
+                participant_id: *participant_id,
+                epoch: *epoch,
+            },
+            RuntimeFilterEvent::ChannelPlanned { identity }
+            | RuntimeFilterEvent::ChannelCompleted { identity, .. }
+            | RuntimeFilterEvent::ChannelUnavailable { identity, .. }
+            | RuntimeFilterEvent::ChannelCancelled { identity } => Self::Channel(*identity),
+            RuntimeFilterEvent::DeltaAccepted { identity }
+            | RuntimeFilterEvent::DeltaDuplicateIgnored { identity }
+            | RuntimeFilterEvent::SequenceGapObserved { identity } => Self::Contribution(*identity),
+            RuntimeFilterEvent::ProducerInstanceClosed { identity }
+            | RuntimeFilterEvent::ProducerInstanceFailed { identity, .. } => {
+                Self::Producer(*identity)
+            }
+            RuntimeFilterEvent::LoopbackDelivered { identity, .. } => Self::Route(*identity),
+            RuntimeFilterEvent::SubscriptionAcquired { identity, .. }
+            | RuntimeFilterEvent::SubscriptionTimedOut { identity }
+            | RuntimeFilterEvent::SubscriptionUnavailable { identity, .. }
+            | RuntimeFilterEvent::SubscriptionCancelled { identity } => Self::Consumer(*identity),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct RegistryRuntimeFilterEventSink {
+    lifecycle: Arc<QueryRfLifecycle>,
+}
+
+impl RegistryRuntimeFilterEventSink {
+    pub(crate) fn new(registry: &RuntimeFilterLifecycleRegistry, query: QueryKey) -> Self {
+        registry.event_sink(query)
+    }
+}
+
+impl RuntimeFilterEventSink for RegistryRuntimeFilterEventSink {
+    fn record(&self, event: RuntimeFilterEvent) {
+        self.lifecycle.record_channel_event(event);
     }
 }
 
@@ -345,6 +433,8 @@ impl RfLifecycleHandle {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct QueryRfSnapshot {
     pub filters: HashMap<i32, RfRecordView>,
+    pub(crate) channel_events:
+        BTreeMap<RuntimeFilterChannelEventCoordinate, Vec<RuntimeFilterEvent>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -422,8 +512,114 @@ fn format_drop_reasons(reasons: &[RfDropReason]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::types::UniqueId;
     use crate::runtime::profile::RuntimeProfile;
+    use crate::runtime_filter::model::contract::{BindingId, ChannelId};
+    use crate::runtime_filter::port::events::{
+        RouteEventIdentity, RuntimeFilterEvent, RuntimeFilterEventIdentity, RuntimeFilterEventSink,
+    };
+    use crate::runtime_filter::port::identity::{
+        DeploymentEpoch, LogicalVersion, RouteEdgeId, RuntimeFilterParticipantId,
+    };
     use std::thread;
+
+    fn channel_identity(query: QueryKey) -> RuntimeFilterEventIdentity {
+        RuntimeFilterEventIdentity::new(
+            UniqueId {
+                hi: query.hi,
+                lo: query.lo,
+            },
+            RuntimeFilterParticipantId::new(3),
+            ChannelId::new(4),
+            DeploymentEpoch::new(5),
+        )
+    }
+
+    fn channel_events(snapshot: &QueryRfSnapshot) -> Vec<RuntimeFilterEvent> {
+        snapshot
+            .channel_events
+            .values()
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn channel_events_share_existing_query_lifecycle_registry() {
+        let registry = RuntimeFilterLifecycleRegistry::new();
+        let query = QueryKey::from_hi_lo(11, 12);
+        registry.recorder(query).planned(7);
+        let sink = RegistryRuntimeFilterEventSink::new(&registry, query);
+        let event = RuntimeFilterEvent::ChannelPlanned {
+            identity: channel_identity(query),
+        };
+
+        sink.record(event.clone());
+
+        let snapshot = registry.snapshot(query).expect("query snapshot");
+        assert!(snapshot.filters.get(&7).expect("legacy filter").planned);
+        assert_eq!(channel_events(&snapshot), vec![event]);
+    }
+
+    #[test]
+    fn channel_event_snapshot_preserves_full_stable_identity() {
+        let registry = RuntimeFilterLifecycleRegistry::new();
+        let query = QueryKey::from_hi_lo(21, 22);
+        let sink = RegistryRuntimeFilterEventSink::new(&registry, query);
+        let identity = RouteEventIdentity::new(
+            channel_identity(query),
+            BindingId::new(6),
+            UniqueId { hi: 7, lo: 8 },
+            RouteEdgeId::new(9),
+        );
+        let event = RuntimeFilterEvent::LoopbackDelivered {
+            identity,
+            version: LogicalVersion::FIRST,
+        };
+
+        sink.record(event.clone());
+
+        let snapshot = registry.snapshot(query).expect("query snapshot");
+        assert_eq!(channel_events(&snapshot), vec![event]);
+    }
+
+    #[test]
+    fn legacy_filter_records_remain_unchanged_by_channel_events() {
+        let registry = RuntimeFilterLifecycleRegistry::new();
+        let query = QueryKey::from_hi_lo(31, 32);
+        let recorder = registry.recorder(query);
+        recorder.planned(13);
+        recorder.built(13, 3, 128);
+        let before = registry.snapshot(query).expect("legacy snapshot").filters;
+        let sink = RegistryRuntimeFilterEventSink::new(&registry, query);
+
+        sink.record(RuntimeFilterEvent::ChannelPlanned {
+            identity: channel_identity(query),
+        });
+
+        assert_eq!(
+            registry.snapshot(query).expect("combined snapshot").filters,
+            before
+        );
+    }
+
+    #[test]
+    fn removing_query_removes_legacy_and_channel_records_together() {
+        let registry = RuntimeFilterLifecycleRegistry::new();
+        let query = QueryKey::from_hi_lo(41, 42);
+        registry.recorder(query).planned(17);
+        let sink = RegistryRuntimeFilterEventSink::new(&registry, query);
+        sink.record(RuntimeFilterEvent::ChannelPlanned {
+            identity: channel_identity(query),
+        });
+
+        registry.remove_query(query);
+        sink.record(RuntimeFilterEvent::ChannelCancelled {
+            identity: channel_identity(query),
+        });
+
+        assert!(registry.snapshot(query).is_none());
+    }
 
     #[test]
     fn lifecycle_record_accumulates_and_exports() {
