@@ -17294,3 +17294,59 @@ fn coor_2_report_handler_is_query_control_plane() {
         "coordinator report owner must have an exact native-only audit baseline"
     );
 }
+
+#[test]
+fn coor_2_thrift_audit_scans_coordinator_owners() {
+    let repo = Path::new(manifest_dir());
+    let audit_path = repo.join("tools/dev/audit_thrift_boundaries.py");
+    let audit = fs::read_to_string(&audit_path).expect("read thrift boundary audit");
+    assert!(
+        audit
+            .lines()
+            .any(|line| compact_line(line) == "\"src/coordinator\","),
+        "thrift audit SCAN_ROOTS must include src/coordinator"
+    );
+
+    let output = std::process::Command::new("python3")
+        .arg(&audit_path)
+        .args(["--strict", "--json"])
+        .current_dir(repo)
+        .output()
+        .expect("run strict thrift boundary audit");
+    assert!(
+        output.status.success(),
+        "strict thrift audit failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse strict thrift audit JSON");
+    assert_eq!(
+        summary["errors"].as_array().map(Vec::len),
+        Some(0),
+        "strict thrift audit JSON must contain no errors"
+    );
+    let scanned_files = summary["scanned_files"]
+        .as_array()
+        .expect("strict thrift audit JSON must list every scanned production file");
+    assert!(
+        !scanned_files.is_empty(),
+        "strict thrift audit scanned file list must be non-empty"
+    );
+    let scanned_files = scanned_files
+        .iter()
+        .map(|value| value.as_str().expect("scanned file path must be a string"))
+        .collect::<BTreeSet<_>>();
+    for owner in [
+        "src/coordinator/report.rs",
+        "src/coordinator/execution.rs",
+        "src/coordinator/scheduler/mod.rs",
+        "src/coordinator/profile/mod.rs",
+        "src/coordinator/profile/correlate.rs",
+    ] {
+        assert!(
+            scanned_files.contains(owner),
+            "strict thrift audit did not scan coordinator owner {owner}"
+        );
+    }
+}
