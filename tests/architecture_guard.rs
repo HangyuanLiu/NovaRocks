@@ -3404,6 +3404,142 @@ fn rust_production_canonical_paths(text: &str, source_rel: &str) -> Vec<Vec<Stri
     canonical.into_iter().collect()
 }
 
+#[test]
+fn codegen_explain_owner_detector_covers_paths_aliases_relative_and_test_noise() {
+    let invalid = [
+        (
+            "src/sql/codegen/ir/explain.rs",
+            "use crate::sql::explain::distributed::explain_distributed_plan;",
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            "use crate::sql::explain as presentation;\npub(crate) use presentation::distributed::explain_distributed_plan;",
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            "use super::super::explain::distributed::explain_distributed_plan;",
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            "pub(crate) fn explain_distributed_plan() {}",
+        ),
+        ("src/sql/codegen/ir/mod.rs", "mod explain;"),
+    ];
+    for (source_rel, source) in invalid {
+        assert!(
+            !codegen_explain_owner_violations_in(source_rel, source).is_empty(),
+            "codegen EXPLAIN ownership backedge must be rejected: {source_rel}: {source}"
+        );
+    }
+
+    let valid = [
+        (
+            "src/sql/explain/distributed.rs",
+            "use crate::sql::explain::profile::QueryProfile;\npub(crate) fn explain_distributed_plan() {}",
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            "use crate::sql::planner::distributed::DistributedPlan;\npub(crate) fn lower_distributed_plan() {}",
+        ),
+        (
+            "src/sql/codegen/ir/mod.rs",
+            r#"
+#[cfg(test)]
+mod explain;
+#[cfg(test)]
+use crate::sql::explain::distributed::explain_distributed_plan;
+#[cfg(test)]
+fn explain_distributed_plan_analyze() {}
+"#,
+        ),
+    ];
+    for (source_rel, source) in valid {
+        assert!(
+            codegen_explain_owner_violations_in(source_rel, source).is_empty(),
+            "final owner, unrelated codegen, and test-only noise must be accepted: {source_rel}: {source}"
+        );
+    }
+}
+
+fn codegen_explain_owner_violations_in(source_rel: &str, text: &str) -> Vec<String> {
+    const EXPLAIN_NAMESPACE: &[&str] = &["crate", "sql", "explain"];
+    const EXPLAIN_ENTRY_NAMES: &[&str] = &[
+        "explain_distributed_plan",
+        "explain_distributed_plan_analyze",
+    ];
+
+    let source_rel = source_rel.replace('\\', "/");
+    if !source_rel.starts_with("src/sql/codegen/") {
+        return Vec::new();
+    }
+
+    let mut violations = Vec::new();
+    let source_path = Path::new(&source_rel);
+    let has_explain_component = source_path
+        .components()
+        .any(|component| component.as_os_str() == "explain");
+    let has_explain_stem = source_path
+        .file_stem()
+        .is_some_and(|stem| stem == "explain");
+    if has_explain_component || has_explain_stem {
+        violations.push(format!(
+            "codegen source path must not own an `explain` module: {source_rel}"
+        ));
+    }
+
+    violations.extend(
+        rust_production_canonical_paths(text, &source_rel)
+            .into_iter()
+            .filter(|path| {
+                path.len() >= EXPLAIN_NAMESPACE.len()
+                    && path
+                        .iter()
+                        .zip(EXPLAIN_NAMESPACE)
+                        .all(|(actual, expected)| actual == expected)
+            })
+            .map(|path| format!("codegen production imports `{}`", path.join("::"))),
+    );
+
+    if rust_module_item_declarations(text).contains("explain") {
+        violations.push("codegen production declares `mod explain`".to_string());
+    }
+
+    violations.extend(
+        top_level_production_functions(text)
+            .into_iter()
+            .filter_map(|function| {
+                let name = top_level_production_function_name(&function)?;
+                EXPLAIN_ENTRY_NAMES.contains(&name.as_str()).then(|| {
+                    format!("codegen production defines distributed EXPLAIN entry: {function}")
+                })
+            }),
+    );
+
+    violations
+}
+
+#[test]
+fn codegen_production_cannot_own_or_import_distributed_explain() {
+    assert!(
+        !src_dir().join("sql/codegen/ir/explain.rs").exists(),
+        "the retired codegen EXPLAIN owner source must stay deleted"
+    );
+
+    let mut violations = Vec::new();
+    for file in production_rs_files(&src_dir().join("sql/codegen")) {
+        let source_rel = rel(&file);
+        let text = fs::read_to_string(&file).unwrap();
+        for violation in codegen_explain_owner_violations_in(&source_rel, &text) {
+            violations.push(format!("{source_rel}: {violation}"));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "codegen production must not own or import distributed EXPLAIN:\n{}",
+        violations.join("\n")
+    );
+}
+
 fn native_lowering_codegen_dependency_violations_in(source_rel: &str, text: &str) -> Vec<String> {
     const FORBIDDEN: &[&str] = &["crate", "sql", "codegen"];
 
@@ -3715,11 +3851,11 @@ fn distributed_build_surface_detector_covers_paths_aliases_scopes_and_noise() {
         "use crate::sql::planner::distributed_plan_build as legacy;\nfn f() { legacy::build_distributed_plan(); }",
         "use crate::sql::planner as planner;\nfn f() { planner::build_distributed_plan(); }",
         "fn f() { crate::sql::planner::union_distinct_must_be_rewritten_error(); }",
-        "fn f() { super::super::super::planner::build_distributed_plan(); }",
+        "fn f() { super::super::planner::build_distributed_plan(); }",
         "mod nested { fn f() { crate::sql::planner::distributed_plan_build::build_distributed_plan(); } }",
     ] {
         assert!(
-            !distributed_build_surface_violations_in("src/sql/codegen/ir/explain.rs", source)
+            !distributed_build_surface_violations_in("src/sql/explain/distributed.rs", source)
                 .is_empty(),
             "legacy/grouped/alias/relative/FQ/inline build path must be detected: {source}"
         );
@@ -3734,7 +3870,7 @@ mod tests {
 }
 "###;
     assert!(
-        distributed_build_surface_violations_in("src/sql/codegen/ir/explain.rs", noise).is_empty(),
+        distributed_build_surface_violations_in("src/sql/explain/distributed.rs", noise).is_empty(),
         "comments, strings, and cfg(test) items must be ignored"
     );
 }
@@ -4626,7 +4762,7 @@ fn planner_physical_legacy_owner_detector_distinguishes_sibling_and_unrelated_pa
     ));
     assert!(rust_use_imports_legacy_planner_owner(
         "private|crate::sql::planner::plan::PhysicalPlanNode",
-        "src/sql/codegen/ir/explain.rs",
+        "src/sql/explain/distributed.rs",
     ));
     assert!(!rust_use_imports_legacy_planner_owner(
         "pub(crate)|stats::*",
