@@ -559,7 +559,7 @@ mod tests {
     use crate::sql::planner::logical::{
         LogicalAggregateNode, LogicalApplyNode, LogicalJoinNode, LogicalPlanKind, LogicalPlanNode,
     };
-    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
+    use crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr;
     use crate::sql::planner::payload::{
         AggregateCall, PlanFilterNode, PlanLimitNode, PlanProjectNode, PlanScanNode,
     };
@@ -583,7 +583,7 @@ mod tests {
             None,
         );
         let mut arena = ScalarArena::new();
-        let opt = logical_plan_to_opt_expr(&plan, &mut arena);
+        let opt = to_optimizer_expr(&plan, &mut arena);
         let Operator::LogicalFilter(filter) = &opt.op else {
             return None;
         };
@@ -1049,7 +1049,7 @@ mod tests {
     }
 
     fn to_opt_expr(plan: &LogicalPlanNode, ctx: &mut RewriteContext) -> OptExpr {
-        logical_plan_to_opt_expr(plan, &mut ctx.scalar_arena().borrow_mut())
+        to_optimizer_expr(plan, &mut ctx.scalar_arena().borrow_mut())
     }
 
     fn mat_plan(expr: &OptExpr, ctx: &RewriteContext) -> LogicalPlanNode {
@@ -1442,7 +1442,7 @@ mod tests {
     fn precond_reads_inner_aggregate_output_from_layout_when_group_key_is_hidden() {
         let plan = winmagic_filter_apply();
         let mut arena = ScalarArena::new();
-        let opt = logical_plan_to_opt_expr(&plan, &mut arena);
+        let opt = to_optimizer_expr(&plan, &mut arena);
         let Operator::LogicalFilter(filter) = &opt.op else {
             panic!("expected Filter");
         };

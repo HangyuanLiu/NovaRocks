@@ -189,9 +189,7 @@ mod tests {
     use crate::sql::planner::logical::{
         LogicalAggregateNode, LogicalJoinNode, LogicalPlanKind, LogicalUnionNode,
     };
-    use crate::sql::planner::optimizer_bridge::plan::{
-        logical_plan_to_opt_expr, opt_expr_to_logical_plan,
-    };
+    use crate::sql::planner::optimizer_bridge::logical::{to_logical_plan, to_optimizer_expr};
     use crate::sql::planner::payload::{PlanFilterNode, PlanProjectNode, PlanScanNode};
 
     fn ctx_with_arena() -> (RewriteContext, Rc<RefCell<ScalarArena>>) {
@@ -343,13 +341,13 @@ mod tests {
         let rule = PushDeltaThroughUnaryRule;
         let (mut ctx, arena) = ctx_with_arena();
         let plan = delta(project_over(leaf_scan()));
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let result = rule.apply(expr, &mut ctx).expect("apply must succeed");
         let RewriteResult::Changed(rewritten_expr) = result else {
             panic!("expected Changed(Project)");
         };
-        let rewritten = opt_expr_to_logical_plan(rewritten_expr, &arena.borrow());
+        let rewritten = to_logical_plan(rewritten_expr, &arena.borrow());
         let LogicalPlanKind::Project(_) = &rewritten.kind else {
             panic!("expected Changed(Project), got {rewritten:?}");
         };
@@ -369,13 +367,13 @@ mod tests {
         let rule = PushDeltaThroughUnaryRule;
         let (mut ctx, arena) = ctx_with_arena();
         let plan = delta(filter_over(leaf_scan()));
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let result = rule.apply(expr, &mut ctx).expect("apply must succeed");
         let RewriteResult::Changed(rewritten_expr) = result else {
             panic!("expected Changed(Filter)");
         };
-        let rewritten = opt_expr_to_logical_plan(rewritten_expr, &arena.borrow());
+        let rewritten = to_logical_plan(rewritten_expr, &arena.borrow());
         let LogicalPlanKind::Filter(_) = &rewritten.kind else {
             panic!("expected Changed(Filter), got {rewritten:?}");
         };
@@ -397,7 +395,7 @@ mod tests {
         let plan = delta(leaf_scan());
         // matches() is false because the direct child is a Scan, not a
         // pushable unary node.
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena.borrow_mut());
         assert!(!rule.matches(&expr, &ctx));
         // apply() is also a no-op defensively.
         let result = rule.apply(expr, &mut ctx).expect("apply must succeed");
@@ -409,7 +407,7 @@ mod tests {
         let rule = PushDeltaThroughUnaryRule;
         let (mut ctx, arena) = ctx_with_arena();
         let plan = delta(aggregate_over(leaf_scan()));
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let err = rule.apply(expr, &mut ctx).expect_err("Aggregate must fail");
         assert!(
@@ -423,7 +421,7 @@ mod tests {
         let rule = PushDeltaThroughUnaryRule;
         let (mut ctx, arena) = ctx_with_arena();
         let plan = delta(join_over(leaf_scan(), leaf_scan()));
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let result = rule
             .apply(expr, &mut ctx)
@@ -439,7 +437,7 @@ mod tests {
         let rule = PushDeltaThroughUnaryRule;
         let (mut ctx, arena) = ctx_with_arena();
         let plan = delta(union_over(vec![leaf_scan()]));
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let err = rule.apply(expr, &mut ctx).expect_err("Union must fail");
         assert!(
@@ -459,13 +457,13 @@ mod tests {
         let plan = delta(project_over(filter_over(leaf_scan())));
 
         // First apply: push through Project.
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena.borrow_mut());
         let RewriteResult::Changed(after1_expr) =
             rule.apply(expr, &mut ctx).expect("apply must succeed")
         else {
             panic!("expected Changed after first apply");
         };
-        let after1 = opt_expr_to_logical_plan(after1_expr, &arena.borrow());
+        let after1 = to_logical_plan(after1_expr, &arena.borrow());
         let LogicalPlanKind::Project(_) = &after1.kind else {
             panic!("expected Project at root");
         };
@@ -476,14 +474,14 @@ mod tests {
         };
 
         // Second apply on the nested Delta(Filter(Scan)): push through Filter.
-        let nested_expr = logical_plan_to_opt_expr(&nested_delta, &mut arena.borrow_mut());
+        let nested_expr = to_optimizer_expr(&nested_delta, &mut arena.borrow_mut());
         let RewriteResult::Changed(after2_expr) = rule
             .apply(nested_expr, &mut ctx)
             .expect("apply must succeed")
         else {
             panic!("expected Changed after second apply");
         };
-        let after2 = opt_expr_to_logical_plan(after2_expr, &arena.borrow());
+        let after2 = to_logical_plan(after2_expr, &arena.borrow());
         let LogicalPlanKind::Filter(_) = &after2.kind else {
             panic!("expected Filter");
         };
@@ -508,19 +506,19 @@ mod tests {
         let (mut ctx, arena) = ctx_with_arena();
         let plan = delta(project_over(aggregate_over(leaf_scan())));
 
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena.borrow_mut());
         let RewriteResult::Changed(after1_expr) =
             rule.apply(expr, &mut ctx).expect("apply must succeed")
         else {
             panic!("expected Changed after first apply");
         };
-        let after1 = opt_expr_to_logical_plan(after1_expr, &arena.borrow());
+        let after1 = to_logical_plan(after1_expr, &arena.borrow());
         let LogicalPlanKind::Project(_) = &after1.kind else {
             panic!("expected Project at root");
         };
         // Second apply on Delta(Aggregate(Scan)) must fail-fast.
         let nested_delta = after1.unary_input().clone();
-        let nested_expr = logical_plan_to_opt_expr(&nested_delta, &mut arena.borrow_mut());
+        let nested_expr = to_optimizer_expr(&nested_delta, &mut arena.borrow_mut());
         let err = rule
             .apply(nested_expr, &mut ctx)
             .expect_err("aggregate must fail");

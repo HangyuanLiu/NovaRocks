@@ -1015,8 +1015,8 @@ mod is_known_rule_name_tests {
         StatsSource,
     };
     use crate::sql::planner::logical::{LogicalAggregateNode, LogicalPlanKind, LogicalPlanNode};
-    use crate::sql::planner::optimizer_bridge::plan::{
-        logical_plan_to_opt_expr, opt_expr_to_logical_plan, try_logical_plan_to_opt_expr,
+    use crate::sql::planner::optimizer_bridge::logical::{
+        to_logical_plan, to_optimizer_expr, try_to_optimizer_expr,
     };
     use crate::sql::planner::payload::{AggregateCall, PlanScanNode};
 
@@ -1028,7 +1028,7 @@ mod is_known_rule_name_tests {
         mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
     ) -> Result<OptimizedOperatorNode, String> {
         let mut scalar_arena = ScalarArena::new();
-        let plan_expr = try_logical_plan_to_opt_expr(&plan, &mut scalar_arena)?;
+        let plan_expr = try_to_optimizer_expr(&plan, &mut scalar_arena)?;
         optimize_with_legacy_table_stats_for_migration(
             plan_expr,
             scalar_arena,
@@ -1046,7 +1046,7 @@ mod is_known_rule_name_tests {
         root_distribution: DistributionSpec,
     ) -> Result<OptimizedOperatorNode, String> {
         let mut scalar_arena = ScalarArena::new();
-        let plan_expr = try_logical_plan_to_opt_expr(&plan, &mut scalar_arena)?;
+        let plan_expr = try_to_optimizer_expr(&plan, &mut scalar_arena)?;
         optimize_with_root_distribution_and_legacy_table_stats_for_migration(
             plan_expr,
             scalar_arena,
@@ -1501,12 +1501,12 @@ mod is_known_rule_name_tests {
         );
         let pipeline = query_rewrite_pipeline();
         let mut scalars = ScalarArena::new();
-        let opt_plan = logical_plan_to_opt_expr(&agg_over_string_scan(), &mut scalars);
+        let opt_plan = to_optimizer_expr(&agg_over_string_scan(), &mut scalars);
         let arena_rc = Rc::new(RefCell::new(scalars));
         ctx.set_scalar_arena(arena_rc.clone());
         let opt_result = pipeline.rewrite(opt_plan, &mut ctx).unwrap();
         let arena = arena_rc.borrow();
-        opt_expr_to_logical_plan(opt_result, &arena)
+        to_logical_plan(opt_result, &arena)
     }
 
     fn assert_no_native_dict_rewrite(rewritten: &LogicalPlanNode, context: &str) {
@@ -1826,7 +1826,7 @@ mod is_known_rule_name_tests {
         let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
             .expect("plan query");
         let mut scalars = crate::sql::optimizer::scalar::ScalarArena::new();
-        let opt_plan = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+        let opt_plan = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
             &logical,
             &mut scalars,
         )
@@ -1843,11 +1843,10 @@ mod is_known_rule_name_tests {
         let rewritten_expr = crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline()
             .rewrite(opt_plan, &mut rewrite_ctx)
             .expect("rewrite pipeline");
-        let rewritten_logical =
-            crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
-                rewritten_expr,
-                &arena.borrow(),
-            );
+        let rewritten_logical = crate::sql::planner::optimizer_bridge::logical::to_logical_plan(
+            rewritten_expr,
+            &arena.borrow(),
+        );
         assert!(
             logical_has_rank_partition_topn_sort(&rewritten_logical),
             "expected query rewrite pipeline to set ranking partition-topn, trace: {:#?}, got: {rewritten_logical:#?}",

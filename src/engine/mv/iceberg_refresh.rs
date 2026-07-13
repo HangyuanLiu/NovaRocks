@@ -16074,7 +16074,7 @@ mod tests {
     use crate::engine::mv::refresh_property::PartitionPruningPolicy;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::logical::*;
-    use crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr;
+    use crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr;
     use crate::sql::planner::payload::*;
     use arrow::array::{BinaryArray, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -16210,7 +16210,7 @@ mod tests {
         );
 
         let mut arena = ScalarArena::new();
-        try_logical_plan_to_opt_expr(&normalized, &mut arena)
+        try_to_optimizer_expr(&normalized, &mut arena)
             .expect("normalized aggregate must satisfy optimizer bridge contract");
     }
 

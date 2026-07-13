@@ -15895,3 +15895,55 @@ fn psm_8_optimizer_output_vocabulary_is_explicit() {
         }
     }
 }
+
+#[test]
+fn psm_8_logical_optimizer_bridge_vocabulary_is_explicit() {
+    let bridge = src_dir().join("sql/planner/optimizer_bridge");
+    assert!(
+        bridge.join("logical.rs").is_file(),
+        "optimizer_bridge/logical.rs must own LogicalPlanNode and OptExpr conversion"
+    );
+    assert!(
+        !bridge.join("plan.rs").exists(),
+        "optimizer_bridge/plan.rs must be retired"
+    );
+
+    let root = fs::read_to_string(bridge.join("mod.rs")).unwrap();
+    assert!(has_non_comment_line(&root, "pub(crate) mod logical;"));
+
+    let logical = fs::read_to_string(bridge.join("logical.rs")).unwrap();
+    for signature in [
+        "pub(crate) fn try_to_optimizer_expr(",
+        "pub(crate) fn to_optimizer_expr(",
+        "pub(crate) fn to_logical_plan(",
+    ] {
+        assert!(
+            logical.contains(signature),
+            "missing logical bridge API {signature}"
+        );
+    }
+
+    let retired_module_path = ["optimizer_bridge::", "plan"].concat();
+    let retired_functions = [
+        ["try_logical_plan", "_to_opt_expr"].concat(),
+        ["logical_plan", "_to_opt_expr"].concat(),
+        ["opt_expr", "_to_logical_plan"].concat(),
+    ];
+    for root in [src_dir(), Path::new(manifest_dir()).join("tests")] {
+        for file in rs_files(&root) {
+            let text = fs::read_to_string(&file).unwrap();
+            assert!(
+                !text.contains(&retired_module_path),
+                "{} uses {retired_module_path}",
+                rel(&file)
+            );
+            for retired_function in &retired_functions {
+                assert!(
+                    !text.contains(retired_function),
+                    "{} uses {retired_function}",
+                    rel(&file)
+                );
+            }
+        }
+    }
+}

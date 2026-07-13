@@ -2711,7 +2711,7 @@ fn explain_analyze_query(
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let mut opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+    let mut opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical,
         &mut scalar_arena,
     )?;
@@ -2881,7 +2881,7 @@ fn explain_query(
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let mut opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+    let mut opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical,
         &mut scalar_arena,
     )?;
@@ -3091,7 +3091,7 @@ pub(crate) fn execute_query_as_iceberg_write(
         None => None,
     };
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let mut opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+    let mut opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical,
         &mut scalar_arena,
     )?;
@@ -3559,7 +3559,7 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
     }
 
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let mut opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+    let mut opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical,
         &mut scalar_arena,
     )?;
@@ -3590,7 +3590,7 @@ pub(crate) fn plan_logical_for_iceberg_change_stream_refresh(
     let change_stream =
         crate::sql::planner::imv_rewrite::change_stream::build_change_stream_descriptor(&logical);
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let mut opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+    let mut opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical,
         &mut scalar_arena,
     )?;
@@ -3661,7 +3661,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         return Err("IMV rewrite validator requires MV refresh context".to_string());
     }
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let mut opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+    let mut opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical,
         &mut scalar_arena,
     )?;
@@ -3738,7 +3738,7 @@ pub(crate) fn execute_logical_plan_with_options(
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let mut opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+    let mut opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical,
         &mut scalar_arena,
     )?;
@@ -5411,12 +5411,11 @@ mysql_port = 47892
         let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
             .expect("plan query");
         let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-        let mut opt_expr =
-            crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
-                &logical,
-                &mut scalar_arena,
-            )
-            .expect("logical to opt expr");
+        let mut opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
+            &logical,
+            &mut scalar_arena,
+        )
+        .expect("logical to opt expr");
         let stats_state = Arc::new(super::StandaloneState::default());
         super::statistics::replace_catalog_stats_for_test(
             &stats_state,

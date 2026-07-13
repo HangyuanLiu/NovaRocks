@@ -244,7 +244,7 @@ mod tests {
         AggregateOutputLayout, LogicalAggregateOp, ScalarAggregateSpec, ValuesOp,
     };
     use crate::sql::optimizer::scalar::ScalarNode;
-    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
+    use crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr;
     use arrow::datatypes::DataType;
 
     fn output_column(id: u32, name: &str) -> OutputColumn {
@@ -294,7 +294,7 @@ mod tests {
 
         let plan = opt_expr_to_plan(&aggregate, &arena);
         let mut round_trip_arena = ScalarArena::new();
-        let round_tripped = logical_plan_to_opt_expr(&plan, &mut round_trip_arena);
+        let round_tripped = to_optimizer_expr(&plan, &mut round_trip_arena);
         let Operator::LogicalAggregate(round_tripped_agg) = round_tripped.op else {
             panic!("expected LogicalAggregate after round trip");
         };

@@ -199,7 +199,7 @@ fn build_candidate(
     let mv_logical = crate::sql::planner::plan_query(resolved, ctes, &mut returned)?;
     *factory = returned;
     let mut mv_scalars = crate::sql::optimizer::scalar::ScalarArena::new();
-    let mv_opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+    let mv_opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &mv_logical,
         &mut mv_scalars,
     )?;

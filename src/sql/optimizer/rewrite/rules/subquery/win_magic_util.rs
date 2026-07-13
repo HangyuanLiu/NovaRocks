@@ -253,7 +253,7 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::scalar::{self, ScalarArena};
     use crate::sql::planner::logical::{LogicalJoinNode, LogicalPlanKind, LogicalPlanNode};
-    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
+    use crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr;
     use crate::sql::planner::payload::PlanScanNode;
 
     fn make_scan(table_id: i64, cols: Vec<(ColumnId, &str)>) -> LogicalPlanNode {
@@ -321,7 +321,7 @@ mod tests {
 
     fn collect_table_ids(plan: &LogicalPlanNode) -> Vec<TableIdentity> {
         let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(plan, &mut arena);
+        let expr = to_optimizer_expr(plan, &mut arena);
         super::collect_table_ids(&expr)
     }
 
@@ -329,7 +329,7 @@ mod tests {
         plan: &LogicalPlanNode,
     ) -> HashMap<ColumnId, (TableIdentity, String)> {
         let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(plan, &mut arena);
+        let expr = to_optimizer_expr(plan, &mut arena);
         super::collect_scan_column_map(&expr)
     }
 
@@ -369,7 +369,7 @@ mod tests {
         };
         let plan = LogicalPlanNode::new(LogicalPlanKind::Scan(scan_node), vec![], None);
         let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let expr = to_optimizer_expr(&plan, &mut arena);
         let Operator::LogicalScan(scan) = &expr.op else {
             panic!("expected scan")
         };

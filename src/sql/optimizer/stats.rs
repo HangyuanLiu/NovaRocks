@@ -2465,12 +2465,11 @@ mod tests {
     use arrow::datatypes::DataType;
 
     fn logical_plan_to_memo_for_test(plan: &LogicalPlanNode, memo: &mut Memo) -> GroupId {
-        let mut opt_expr =
-            crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
-                plan,
-                &mut memo.scalars,
-            )
-            .expect("logical plan to opt expr");
+        let mut opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
+            plan,
+            &mut memo.scalars,
+        )
+        .expect("logical plan to opt expr");
         bind_test_scan_refs(&mut opt_expr);
         crate::sql::optimizer::memo_copy::opt_expr_to_memo(&opt_expr, memo)
     }

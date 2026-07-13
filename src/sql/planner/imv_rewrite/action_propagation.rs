@@ -781,9 +781,7 @@ mod tests {
     use crate::sql::planner::logical::{
         LogicalAggregateNode, LogicalJoinNode, LogicalPlanKind, LogicalPlanNode, LogicalUnionNode,
     };
-    use crate::sql::planner::optimizer_bridge::plan::{
-        logical_plan_to_opt_expr, opt_expr_to_logical_plan,
-    };
+    use crate::sql::planner::optimizer_bridge::logical::{to_logical_plan, to_optimizer_expr};
     use crate::sql::planner::payload::{PlanFilterNode, PlanScanNode};
 
     fn build_ctx() -> RewriteContext {
@@ -875,13 +873,13 @@ mod tests {
         let mut ctx = build_ctx();
         let plan = scan_plan(delta_scan());
         let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let expr = to_optimizer_expr(&plan, &mut arena);
         assert!(rule.matches(&expr, &ctx));
         let result = rule.apply(expr, &mut ctx).expect("apply must succeed");
         let RewriteResult::Changed(changed_expr) = result else {
             panic!("expected Changed(Scan), got {:?}", result);
         };
-        let changed = opt_expr_to_logical_plan(changed_expr, &arena);
+        let changed = to_logical_plan(changed_expr, &arena);
         let LogicalPlanKind::Scan(scan) = changed.kind else {
             panic!("expected Changed(Scan)");
         };
@@ -922,13 +920,13 @@ mod tests {
         let plan = scan_plan(scan);
 
         let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let expr = to_optimizer_expr(&plan, &mut arena);
         assert!(rule.matches(&expr, &ctx));
         let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("apply")
         else {
             panic!("expected Changed(Scan)");
         };
-        let changed = opt_expr_to_logical_plan(changed_expr, &arena);
+        let changed = to_logical_plan(changed_expr, &arena);
         let LogicalPlanKind::Scan(scan) = changed.kind else {
             panic!("expected Changed(Scan)");
         };
@@ -948,7 +946,7 @@ mod tests {
         let ctx = build_ctx();
         let plan = scan_plan(version_scan());
         let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let expr = to_optimizer_expr(&plan, &mut arena);
         assert!(!rule.matches(&expr, &ctx));
     }
 
@@ -961,7 +959,7 @@ mod tests {
             .push(ImvActionColumn::output_column(ColumnId(9)));
         let plan = scan_plan(scan);
         let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let expr = to_optimizer_expr(&plan, &mut arena);
         assert!(!rule.matches(&expr, &ctx));
     }
 
@@ -971,7 +969,7 @@ mod tests {
         let ctx = build_ctx();
         let plan = scan_plan(starrocks_scan());
         let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let expr = to_optimizer_expr(&plan, &mut arena);
         assert!(!rule.matches(&expr, &ctx));
     }
 
@@ -1297,13 +1295,13 @@ mod tests {
         let scan = scan_plan(delta_scan_with_action(ColumnId(100)));
         let plan = project_over(scan, ColumnId(1));
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let result = rule.apply(expr, &mut ctx).expect("apply must succeed");
         let RewriteResult::Changed(changed_expr) = result else {
             panic!("expected Changed(Project)");
         };
-        let changed = opt_expr_to_logical_plan(changed_expr, &arena_rc.borrow());
+        let changed = to_logical_plan(changed_expr, &arena_rc.borrow());
         let LogicalPlanKind::Project(project) = changed.kind else {
             panic!("expected Changed(Project)");
         };
@@ -1340,7 +1338,7 @@ mod tests {
             });
         }
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&expr, &ctx));
     }
 
@@ -1351,7 +1349,7 @@ mod tests {
         let ctx = build_ctx();
         let plan = scan_plan(delta_scan_with_action(ColumnId(100)));
         let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let expr = to_optimizer_expr(&plan, &mut arena);
         assert!(!rule.matches(&expr, &ctx));
     }
 
@@ -1371,7 +1369,7 @@ mod tests {
             None,
         );
         let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let expr = to_optimizer_expr(&plan, &mut arena);
         assert!(rule.matches(&expr, &ctx));
         let err = rule.apply(expr, &mut ctx).expect_err("Aggregate must fail");
         assert!(err.contains("Phase 4"), "unexpected error: {err}");
@@ -1393,7 +1391,7 @@ mod tests {
             None,
         );
         let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let expr = to_optimizer_expr(&plan, &mut arena);
         assert!(rule.matches(&expr, &ctx));
         let err = rule.apply(expr, &mut ctx).expect_err("Join must fail");
         assert!(
@@ -1419,7 +1417,7 @@ mod tests {
             None,
         );
         let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let expr = to_optimizer_expr(&plan, &mut arena);
         assert!(rule.matches(&expr, &ctx));
         let err = rule.apply(expr, &mut ctx).expect_err("Union must fail");
         assert!(err.contains("Phase 6"), "unexpected error: {err}");
@@ -1456,7 +1454,7 @@ mod tests {
             "recursive join-delta union should classify as the delta-like side"
         );
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(
             !rule.matches(&expr, &ctx),
             "supported recursive join-delta branch must not be rejected"
@@ -1490,7 +1488,7 @@ mod tests {
         );
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&union, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&union, &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&expr, &ctx));
     }
 
@@ -1512,7 +1510,7 @@ mod tests {
         );
 
         let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&union, &mut arena);
+        let expr = to_optimizer_expr(&union, &mut arena);
         assert!(!rule.matches(&expr, &ctx));
     }
 
@@ -1533,7 +1531,7 @@ mod tests {
         );
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&union, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&union, &mut arena_rc.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let err = rule.apply(expr, &mut ctx).expect_err("Union must fail");
         assert!(err.contains("Phase 6"), "unexpected error: {err}");
@@ -1557,7 +1555,7 @@ mod tests {
         );
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&union, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&union, &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&expr, &ctx));
     }
 
@@ -1588,7 +1586,7 @@ mod tests {
         );
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&union, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&union, &mut arena_rc.borrow_mut());
         drop(arena_rc);
         assert!(rule.matches(&expr, &ctx));
         let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("apply")
@@ -1597,7 +1595,7 @@ mod tests {
         };
 
         let arena_rc = ctx.scalar_arena();
-        let changed = opt_expr_to_logical_plan(changed_expr, &arena_rc.borrow());
+        let changed = to_logical_plan(changed_expr, &arena_rc.borrow());
         let LogicalPlanKind::Union(union) = &changed.kind else {
             panic!("expected Changed(Union)");
         };
@@ -1682,7 +1680,7 @@ mod tests {
         );
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         drop(arena_rc);
         assert!(rule.matches(&expr, &ctx));
         let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("apply")
@@ -1691,7 +1689,7 @@ mod tests {
         };
 
         let arena_rc = ctx.scalar_arena();
-        let changed = opt_expr_to_logical_plan(changed_expr, &arena_rc.borrow());
+        let changed = to_logical_plan(changed_expr, &arena_rc.borrow());
         let LogicalPlanKind::Project(project) = &changed.kind else {
             panic!("expected Changed(Project)");
         };
@@ -1740,7 +1738,7 @@ mod tests {
         );
 
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&union, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&union, &mut arena_rc.borrow_mut());
         drop(arena_rc);
         assert!(rule.matches(&expr, &ctx));
         let err = rule.apply(expr, &mut ctx).expect_err("Union must fail");
@@ -1759,7 +1757,7 @@ mod tests {
             .push(ImvRowIdColumn::output_column(ColumnId(101)));
         let plan = project_over(scan_plan(scan), ColumnId(1));
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         drop(arena_rc);
         assert!(rule.matches(&expr, &ctx));
         let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("apply")
@@ -1767,7 +1765,7 @@ mod tests {
             panic!("expected Changed(Project)");
         };
         let arena_rc = ctx.scalar_arena();
-        let changed = opt_expr_to_logical_plan(changed_expr, &arena_rc.borrow());
+        let changed = to_logical_plan(changed_expr, &arena_rc.borrow());
         let LogicalPlanKind::Project(project) = changed.kind else {
             panic!("expected Changed(Project)");
         };
@@ -1798,13 +1796,13 @@ mod tests {
         );
         let arena_rc = ctx.scalar_arena();
         // Filter itself must not match (schema-passthrough, no work).
-        let filter_expr = logical_plan_to_opt_expr(&filter, &mut arena_rc.borrow_mut());
+        let filter_expr = to_optimizer_expr(&filter, &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&filter_expr, &ctx));
         // first_propagated_action_column traverses the Filter to the Scan.
         assert!(first_propagated_action_column(&filter).is_some());
         // Project over the Filter propagates the action column.
         let project = project_over(filter, ColumnId(1));
-        let project_expr = logical_plan_to_opt_expr(&project, &mut arena_rc.borrow_mut());
+        let project_expr = to_optimizer_expr(&project, &mut arena_rc.borrow_mut());
         drop(arena_rc);
         assert!(rule.matches(&project_expr, &ctx));
         let result = rule
@@ -1814,7 +1812,7 @@ mod tests {
             panic!("expected Changed(Project)");
         };
         let arena_rc = ctx.scalar_arena();
-        let changed = opt_expr_to_logical_plan(changed_expr, &arena_rc.borrow());
+        let changed = to_logical_plan(changed_expr, &arena_rc.borrow());
         let LogicalPlanKind::Project(p) = changed.kind else {
             panic!("expected Changed(Project)");
         };

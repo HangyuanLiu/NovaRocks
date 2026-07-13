@@ -165,7 +165,7 @@ mod tests {
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
-    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
+    use crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr;
     use crate::sql::planner::payload::PlanScanNode;
 
     fn build_ctx() -> RewriteContext {
@@ -257,14 +257,14 @@ mod tests {
         let mut ctx = build_ctx();
         let plan = scan_plan(delta_scan());
         let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let expr = to_optimizer_expr(&plan, &mut arena);
         assert!(rule.matches(&expr, &ctx));
         let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("apply")
         else {
             panic!("expected Changed(Scan)");
         };
         let arena = ctx.scalar_arena();
-        let changed = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+        let changed = crate::sql::planner::optimizer_bridge::logical::to_logical_plan(
             changed_expr,
             &arena.borrow(),
         );
@@ -286,14 +286,14 @@ mod tests {
         let mut ctx = build_ctx();
         let plan = scan_plan(version_scan());
         let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let expr = to_optimizer_expr(&plan, &mut arena);
         assert!(rule.matches(&expr, &ctx));
         let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("apply")
         else {
             panic!("expected Changed(Scan)");
         };
         let arena = ctx.scalar_arena();
-        let changed = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+        let changed = crate::sql::planner::optimizer_bridge::logical::to_logical_plan(
             changed_expr,
             &arena.borrow(),
         );
@@ -318,7 +318,7 @@ mod tests {
             .cloned()
             .expect("build_ctx must install ColumnRefFactory");
         let plan = scan_plan(delta_scan());
-        let expr = logical_plan_to_opt_expr(&plan, &mut ctx.scalar_arena().borrow_mut());
+        let expr = to_optimizer_expr(&plan, &mut ctx.scalar_arena().borrow_mut());
 
         let result = rule.apply(expr, &mut ctx).expect("apply");
         assert!(matches!(result, RewriteResult::Changed(_)));
@@ -351,14 +351,14 @@ mod tests {
         let plan = scan_plan(scan);
 
         let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let expr = to_optimizer_expr(&plan, &mut arena);
         assert!(rule.matches(&expr, &ctx));
         let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("apply")
         else {
             panic!("expected Changed(Scan)");
         };
         let arena = ctx.scalar_arena();
-        let changed = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+        let changed = crate::sql::planner::optimizer_bridge::logical::to_logical_plan(
             changed_expr,
             &arena.borrow(),
         );
@@ -384,7 +384,7 @@ mod tests {
             .push(ImvRowIdColumn::output_column(ColumnId(9)));
         let plan = scan_plan(scan);
         let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let expr = to_optimizer_expr(&plan, &mut arena);
         assert!(!rule.matches(&expr, &ctx));
     }
 }

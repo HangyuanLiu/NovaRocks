@@ -1136,7 +1136,7 @@ fn p3_cube_without_grouping_survives_optimizer_id_binding() {
         parse_analyze_query(sql).expect("analyzer should succeed");
     let logical = plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+    let opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical,
         &mut scalar_arena,
     )
@@ -1163,7 +1163,7 @@ fn p3_rollup_order_by_only_key_survives_optimizer_id_binding() {
         parse_analyze_query(sql).expect("analyzer should succeed");
     let logical = plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+    let opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical,
         &mut scalar_arena,
     )
@@ -1203,7 +1203,7 @@ fn p3_rollup_window_order_by_alias_extra_survives_optimizer_id_binding() {
         parse_analyze_query(sql).expect("analyzer should succeed");
     let logical = plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+    let opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical,
         &mut scalar_arena,
     )
@@ -1233,7 +1233,7 @@ fn p3_aggregate_order_by_alias_topn_survives_optimizer_id_binding() {
         parse_analyze_query(sql).expect("analyzer should succeed");
     let logical = plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+    let opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical,
         &mut scalar_arena,
     )

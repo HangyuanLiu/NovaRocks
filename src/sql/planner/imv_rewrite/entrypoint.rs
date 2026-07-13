@@ -32,9 +32,7 @@ use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
 use crate::sql::planner::imv_rewrite::pipeline::build_imv_pipeline;
 use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
-use crate::sql::planner::optimizer_bridge::plan::{
-    opt_expr_to_logical_plan, try_logical_plan_to_opt_expr,
-};
+use crate::sql::planner::optimizer_bridge::logical::{to_logical_plan, try_to_optimizer_expr};
 use crate::sql::planner::payload::{AggregateCall, WindowExpr};
 
 pub(crate) struct ImvRewriteInput {
@@ -77,7 +75,7 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
     // pipeline operates on OptExpr. This is not a production rewrite
     // round-trip inside the optimizer.
     let scalars = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
-    let opt_in = try_logical_plan_to_opt_expr(&plan, &mut scalars.borrow_mut())?;
+    let opt_in = try_to_optimizer_expr(&plan, &mut scalars.borrow_mut())?;
     ctx_rw.set_scalar_arena(std::rc::Rc::clone(&scalars));
 
     let pipeline = build_imv_pipeline();
@@ -86,7 +84,7 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
     // Boundary materialization for ImvRewriteOutcome: callers outside the
     // optimizer still consume LogicalPlanNode. This is the optimizer-to-engine
     // exit, not an internal optimizer rewrite round-trip.
-    let plan_out = opt_expr_to_logical_plan(opt_out, &scalars.borrow());
+    let plan_out = to_logical_plan(opt_out, &scalars.borrow());
 
     let ext = ctx_rw
         .extension::<ImvExtension>()
@@ -416,7 +414,7 @@ mod tests {
     fn plan_to_opt_expr_with_arena(plan: &LogicalPlanNode, ctx: &mut RewriteContext) -> OptExpr {
         let arena = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
         ctx.set_scalar_arena(std::rc::Rc::clone(&arena));
-        crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr(
+        crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr(
             plan,
             &mut arena.borrow_mut(),
         )
@@ -442,7 +440,7 @@ mod tests {
         plan: LogicalPlanNode,
     ) -> crate::sql::optimizer::OptimizedOperatorNode {
         let mut scalar_arena = ScalarArena::new();
-        let opt_expr = crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr(
+        let opt_expr = crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr(
             &plan,
             &mut scalar_arena,
         );
@@ -3088,7 +3086,7 @@ mod tests {
         let opt_out = pipeline
             .rewrite(opt_in, &mut ctx)
             .expect("query rewrite must preserve join aggregate delta action");
-        let rewritten = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
+        let rewritten = crate::sql::planner::optimizer_bridge::logical::to_logical_plan(
             opt_out,
             &ctx.scalar_arena().borrow(),
         );

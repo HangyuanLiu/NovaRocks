@@ -1172,9 +1172,7 @@ mod tests {
         JoinRefreshOutputSource,
     };
     use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode, LogicalUnionNode};
-    use crate::sql::planner::optimizer_bridge::plan::{
-        logical_plan_to_opt_expr, opt_expr_to_logical_plan,
-    };
+    use crate::sql::planner::optimizer_bridge::logical::{to_logical_plan, to_optimizer_expr};
     use crate::sql::planner::payload::PlanValuesNode;
 
     #[test]
@@ -1717,19 +1715,19 @@ mod tests {
             ),
         );
         let mut scalars = ScalarArena::new();
-        let opt_plan = logical_plan_to_opt_expr(&plan, &mut scalars);
+        let opt_plan = to_optimizer_expr(&plan, &mut scalars);
         let arena_rc = Rc::new(RefCell::new(scalars));
         ctx.set_scalar_arena(arena_rc.clone());
         let opt_result = pipeline
             .rewrite(opt_plan, &mut ctx)
             .expect("query rewrite pipeline");
         let arena = arena_rc.borrow();
-        opt_expr_to_logical_plan(opt_result, &arena)
+        to_logical_plan(opt_result, &arena)
     }
 
     fn optimize_for_test(plan: LogicalPlanNode) -> crate::sql::optimizer::OptimizedOperatorNode {
         let mut scalar_arena = ScalarArena::new();
-        let opt_expr = logical_plan_to_opt_expr(&plan, &mut scalar_arena);
+        let opt_expr = to_optimizer_expr(&plan, &mut scalar_arena);
         let mut factory = crate::sql::column_id::ColumnRefFactory::new();
         factory.reserve_until(200);
         crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(

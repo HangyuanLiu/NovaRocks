@@ -147,7 +147,7 @@ mod tests {
     use crate::sql::optimizer::rewrite::tree_binder::bind_tree;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::logical::{LogicalApplyNode, LogicalJoinNode, LogicalPlanKind};
-    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
+    use crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr;
     use crate::sql::planner::payload::{PlanFilterNode, PlanProjectNode, PlanScanNode};
 
     const OUTER_K: ColumnId = ColumnId(1);
@@ -162,7 +162,7 @@ mod tests {
     }
 
     fn to_opt_expr(plan: &LogicalPlanNode, ctx: &mut RewriteContext) -> OptExpr {
-        logical_plan_to_opt_expr(plan, &mut ctx.scalar_arena().borrow_mut())
+        to_optimizer_expr(plan, &mut ctx.scalar_arena().borrow_mut())
     }
 
     fn output_column(id: ColumnId, name: &str, data_type: DataType) -> OutputColumn {

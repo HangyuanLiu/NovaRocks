@@ -1182,7 +1182,7 @@ mod tests {
         plan: &LogicalPlanNode,
     ) -> Result<(SpjgDescriptor, ScalarArena), String> {
         let mut arena = ScalarArena::new();
-        let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+        let opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
             plan, &mut arena,
         )?;
         let descriptor = SpjgDescriptor::from_opt_expr(&opt_expr, &mut arena)?;
@@ -1580,7 +1580,7 @@ mod tests {
     /// group (cloned) plus the memo, ready for `from_memo`.
     fn memo_root(plan: &LogicalPlanNode) -> (crate::sql::optimizer::memo::Memo, MExpr) {
         let mut memo = crate::sql::optimizer::memo::Memo::new();
-        let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+        let opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
             plan,
             &mut memo.scalars,
         )
@@ -1761,7 +1761,7 @@ mod tests {
         let scan_op = scan(&[a.clone(), v.clone()]);
         let plan = LogicalPlanNode::new(LogicalPlanKind::Scan(scan_op), vec![], None);
         let mut memo = crate::sql::optimizer::memo::Memo::new();
-        let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+        let opt_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
             &plan,
             &mut memo.scalars,
         )

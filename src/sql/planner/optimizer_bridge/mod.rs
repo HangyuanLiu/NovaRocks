@@ -16,8 +16,8 @@
 // under the License.
 
 pub(crate) mod id_binding;
+pub(crate) mod logical;
 mod physical;
-pub(crate) mod plan;
 pub(crate) mod property;
 pub(crate) mod scalar;
 

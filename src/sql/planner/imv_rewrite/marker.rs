@@ -192,9 +192,7 @@ mod tests {
     use crate::sql::common::ImvVersionRef;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::logical::*;
-    use crate::sql::planner::optimizer_bridge::plan::{
-        logical_plan_to_opt_expr, opt_expr_to_logical_plan,
-    };
+    use crate::sql::planner::optimizer_bridge::logical::{to_logical_plan, to_optimizer_expr};
     use crate::sql::planner::payload::*;
 
     #[test]
@@ -214,9 +212,9 @@ mod tests {
 
         let arena = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
         ctx.set_scalar_arena(std::rc::Rc::clone(&arena));
-        let opt_in = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        let opt_in = to_optimizer_expr(&plan, &mut arena.borrow_mut());
         let opt_out = pipeline.rewrite(opt_in, &mut ctx).unwrap();
-        let out = opt_expr_to_logical_plan(opt_out, &arena.borrow());
+        let out = to_logical_plan(opt_out, &arena.borrow());
 
         let LogicalPlanKind::ImvDelta(delta) = &out.kind else {
             panic!("expected ImvDelta at root");
@@ -252,9 +250,9 @@ mod tests {
 
         let arena = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
         ctx.set_scalar_arena(std::rc::Rc::clone(&arena));
-        let opt_in = logical_plan_to_opt_expr(&already, &mut arena.borrow_mut());
+        let opt_in = to_optimizer_expr(&already, &mut arena.borrow_mut());
         let opt_out = pipeline.rewrite(opt_in, &mut ctx).unwrap();
-        let out = opt_expr_to_logical_plan(opt_out, &arena.borrow());
+        let out = to_logical_plan(opt_out, &arena.borrow());
         assert_eq!(format!("{out:?}"), before, "wrap must not double-wrap");
     }
 
@@ -293,9 +291,9 @@ mod tests {
         let mut ctx1 = RewriteContext::for_mv_refresh(Vec::<String>::new());
         let arena1 = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
         ctx1.set_scalar_arena(std::rc::Rc::clone(&arena1));
-        let opt_in1 = logical_plan_to_opt_expr(&plan1, &mut arena1.borrow_mut());
+        let opt_in1 = to_optimizer_expr(&plan1, &mut arena1.borrow_mut());
         let opt_out1 = make_pipeline().rewrite(opt_in1, &mut ctx1).unwrap();
-        let out1 = opt_expr_to_logical_plan(opt_out1, &arena1.borrow());
+        let out1 = to_logical_plan(opt_out1, &arena1.borrow());
         assert!(
             matches!(
                 &out1.kind,
@@ -311,9 +309,9 @@ mod tests {
         let mut ctx2 = RewriteContext::for_mv_refresh(Vec::<String>::new());
         let arena2 = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
         ctx2.set_scalar_arena(std::rc::Rc::clone(&arena2));
-        let opt_in2 = logical_plan_to_opt_expr(&plan2, &mut arena2.borrow_mut());
+        let opt_in2 = to_optimizer_expr(&plan2, &mut arena2.borrow_mut());
         let opt_out2 = make_pipeline().rewrite(opt_in2, &mut ctx2).unwrap();
-        let out2 = opt_expr_to_logical_plan(opt_out2, &arena2.borrow());
+        let out2 = to_logical_plan(opt_out2, &arena2.borrow());
         assert!(
             matches!(
                 &out2.kind,
@@ -439,7 +437,7 @@ mod tests {
         let arena = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
         ctx.set_scalar_arena(std::rc::Rc::clone(&arena));
         let plan = empty_values_plan();
-        let opt_in = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        let opt_in = to_optimizer_expr(&plan, &mut arena.borrow_mut());
         let err = pipeline
             .rewrite(opt_in, &mut ctx)
             .expect_err("Validation must reject the wrapped-but-unconsumed plan");
@@ -474,11 +472,11 @@ mod tests {
         let arena = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
         ctx.set_scalar_arena(std::rc::Rc::clone(&arena));
         let plan = empty_values_plan();
-        let opt_in = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        let opt_in = to_optimizer_expr(&plan, &mut arena.borrow_mut());
         let opt_out = pipeline
             .rewrite(opt_in, &mut ctx)
             .expect("plain plan must pass validation");
-        let out = opt_expr_to_logical_plan(opt_out, &arena.borrow());
+        let out = to_logical_plan(opt_out, &arena.borrow());
         assert!(matches!(&out.kind, LogicalPlanKind::Values(_)));
     }
 
@@ -499,11 +497,11 @@ mod tests {
         let arena = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
         ctx.set_scalar_arena(std::rc::Rc::clone(&arena));
         let plan = empty_values_plan();
-        let opt_in = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        let opt_in = to_optimizer_expr(&plan, &mut arena.borrow_mut());
         let opt_out = pipeline
             .rewrite(opt_in, &mut ctx)
             .expect("query pipeline must not error on plain plan");
-        let out = opt_expr_to_logical_plan(opt_out, &arena.borrow());
+        let out = to_logical_plan(opt_out, &arena.borrow());
         assert!(
             !plan_contains_imv_marker(&out),
             "non-IMV pipeline must not emit markers, got {out:?}"
