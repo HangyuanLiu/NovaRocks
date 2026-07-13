@@ -17064,4 +17064,20 @@ fn coor_2_scheduler_owner_is_top_level_and_snapshot_is_shared() {
     ] {
         assert!(scheduler.contains(required), "missing {required}");
     }
+
+    let audit = fs::read_to_string(repo.join("tools/dev/audit_thrift_boundaries.py"))
+        .expect("read thrift boundary audit");
+    let compact = audit.lines().map(compact_line).collect::<String>();
+    let expected = compact_line(
+        "\"src/coordinator/scheduler/mod.rs\": BaselineEntry(\"domain-leak\", \"control-plane\", 0, \"Coordinator scheduler consumes native scheduling metadata\"),",
+    );
+    assert!(
+        compact.contains(&expected),
+        "coordinator scheduler must have an exact native-only audit baseline"
+    );
+    let legacy_owner = ["src/runtime/", "scheduler.rs"].concat();
+    assert!(
+        !compact.contains(&format!("\"{legacy_owner}\":BaselineEntry(")),
+        "retired runtime scheduler must not retain an audit baseline"
+    );
 }

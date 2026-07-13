@@ -151,7 +151,7 @@ BASELINE: dict[str, BaselineEntry] = {
     "src/runtime/change_op.rs": BaselineEntry("legal-boundary", "B5-wire", 2, "Runtime change-op adapter extracts FE-compatible HDFS extended-column payloads"),
     "src/runtime/endpoint.rs": BaselineEntry("legal-boundary", "control-plane-wire", 2, "Runtime endpoint adapter decodes external FE network addresses"),
     "src/runtime/fragment_exec_params.rs": BaselineEntry("domain-leak", "control-plane", 0, "Fragment exec params are native runtime scheduling metadata"),
-    "src/coordinator/scheduler/mod.rs": BaselineEntry("legal-boundary", "control-plane-wire", 13, "Coordinator scheduler transports FE-compatible control-plane payloads"),
+    "src/coordinator/scheduler/mod.rs": BaselineEntry("domain-leak", "control-plane", 0, "Coordinator scheduler consumes native scheduling metadata"),
     "src/coordinator/dispatch.rs": BaselineEntry("domain-leak", "control-plane", 0, "Coordinator dispatcher port owns native fragment submissions"),
     "src/service/grpc_fragment_dispatcher.rs": BaselineEntry("domain-leak", "control-plane", 0, "gRPC dispatcher sends native fragment requests"),
     "src/runtime/profile.rs": BaselineEntry("legal-boundary", "control-plane-wire", 1, "Runtime profile stores FE-compatible profile metadata"),
