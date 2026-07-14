@@ -17,7 +17,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::runtime_filter::model::contract::{BindingId, ChannelId, ConsumerActivation};
 use crate::sql::planner::distributed::{FragmentEdge, FragmentId};
+
+use super::DeploymentError;
 
 /// Query-level fragment execution dependency graph.
 ///
@@ -106,9 +109,52 @@ impl ExecutionDependencyGraph {
     }
 }
 
+/// One consumer binding's wait-for input, projected from the runtime-filter
+/// graph model (channels/bindings) by the compiler and validated against the
+/// `ExecutionDependencyGraph`.
+#[derive(Clone, Debug)]
+pub(crate) struct ConsumerWaitInput {
+    pub channel: ChannelId,
+    pub binding: BindingId,
+    /// Fragment the consumer executes on.
+    pub consumer_fragment: FragmentId,
+    pub activation: ConsumerActivation,
+    /// Fragments the channel's producers execute on.
+    pub producer_fragments: Vec<FragmentId>,
+}
+
+/// Reject any `BlockingSnapshot` consumer whose wait edge closes an execution
+/// cycle: a producer fragment that transitively depends on the consumer fragment.
+/// `NonBlockingLive` consumers add no wait edge and always pass.
+pub(crate) fn validate_wait_for(
+    deps: &ExecutionDependencyGraph,
+    consumers: &[ConsumerWaitInput],
+) -> Result<(), DeploymentError> {
+    for c in consumers {
+        if c.activation != ConsumerActivation::BlockingSnapshot {
+            continue;
+        }
+        for producer_fragment in &c.producer_fragments {
+            // Blocking wait: consumer waits for the producer's first version. If
+            // the producer fragment depends (transitively) on the consumer
+            // fragment, the producer can't run until the consumer does, but the
+            // consumer is blocked on the producer → cycle.
+            if deps.reaches(*producer_fragment, c.consumer_fragment) {
+                return Err(DeploymentError::BlockingFeedbackCycle {
+                    channel: c.channel,
+                    binding: c.binding,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::DeploymentError;
     use super::*;
+    use crate::runtime_filter::model::contract::{ConsumerActivation, LateApplyGranularity};
     use crate::sql::planner::distributed::{
         DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind, PartitionKind,
     };
@@ -125,6 +171,21 @@ mod tests {
             stream_kind: FragmentStreamKind::Gather,
             edge_kind: FragmentEdgeKind::Stream,
             output_slot_ids: Vec::new(),
+        }
+    }
+
+    fn wait(
+        binding: u32,
+        consumer_frag: u32,
+        activation: ConsumerActivation,
+        producers: Vec<u32>,
+    ) -> ConsumerWaitInput {
+        ConsumerWaitInput {
+            channel: ChannelId::new(7),
+            binding: BindingId::new(binding),
+            consumer_fragment: consumer_frag,
+            activation,
+            producer_fragments: producers,
         }
     }
 
@@ -165,5 +226,46 @@ mod tests {
     fn empty_edges_yields_empty_graph() {
         let g = ExecutionDependencyGraph::from_fragment_edges(&[]).unwrap();
         assert!(!g.reaches(1, 1));
+    }
+
+    #[test]
+    fn blocking_consumer_upstream_of_producer_is_a_cycle() {
+        // scan(2) -> topn(1): producer topn(1) depends on consumer scan(2).
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&[edge(2, 1)]).unwrap();
+        let c = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![1]);
+        let err = validate_wait_for(&deps, &[c]).unwrap_err();
+        assert!(matches!(err, DeploymentError::BlockingFeedbackCycle { .. }));
+    }
+
+    #[test]
+    fn non_blocking_same_shape_is_allowed() {
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&[edge(2, 1)]).unwrap();
+        let c = wait(
+            10,
+            2,
+            ConsumerActivation::NonBlockingLive {
+                late_apply: LateApplyGranularity::Split,
+            },
+            vec![1],
+        );
+        assert!(validate_wait_for(&deps, &[c]).is_ok());
+    }
+
+    #[test]
+    fn blocking_consumer_downstream_of_producer_is_fine() {
+        // build(2) -> probe(1): consumer probe(1) depends on producer build(2). No cycle.
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&[edge(2, 1)]).unwrap();
+        let c = wait(10, 1, ConsumerActivation::BlockingSnapshot, vec![2]);
+        assert!(validate_wait_for(&deps, &[c]).is_ok());
+    }
+
+    #[test]
+    fn blocking_consumer_with_one_cyclic_producer_among_many_is_rejected() {
+        // consumer on fragment 2; producers on fragment 9 (unrelated, not in the
+        // graph) and fragment 1 (depends on 2 via edge(2,1) → closes a cycle).
+        let deps = ExecutionDependencyGraph::from_fragment_edges(&[edge(2, 1)]).unwrap();
+        let c = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![9, 1]);
+        let err = validate_wait_for(&deps, &[c]).unwrap_err();
+        assert!(matches!(err, DeploymentError::BlockingFeedbackCycle { .. }));
     }
 }
