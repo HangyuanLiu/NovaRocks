@@ -21,3 +21,4 @@ pub(crate) mod ports;
 pub(crate) mod profile;
 pub(crate) mod report;
 pub(crate) mod scheduler;
+pub(crate) mod write;
