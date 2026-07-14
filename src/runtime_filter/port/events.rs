@@ -17,12 +17,13 @@
 
 use crate::common::types::UniqueId;
 use crate::runtime_filter::model::contract::{BindingId, ChannelId};
+use crate::runtime_filter::port::artifact::{ArtifactKind, ConsumerProfileId};
 
 use super::identity::{
     ContributionIdentity, DeploymentEpoch, LogicalVersion, RouteEdgeId, RuntimeFilterParticipantId,
 };
 use super::producer::ProducerFailureReason;
-use super::subscription::UnavailableReason;
+use super::subscription::{ArtifactUnsupportedReason, UnavailableReason};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct RuntimeFilterEventIdentity {
@@ -127,6 +128,39 @@ pub(crate) struct RouteEventIdentity {
     route_edge_id: RouteEdgeId,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct ArtifactMaterializationIdentity {
+    common: RuntimeFilterEventIdentity,
+    profile_id: ConsumerProfileId,
+    version: LogicalVersion,
+}
+
+impl ArtifactMaterializationIdentity {
+    pub(crate) const fn new(
+        common: RuntimeFilterEventIdentity,
+        profile_id: ConsumerProfileId,
+        version: LogicalVersion,
+    ) -> Self {
+        Self {
+            common,
+            profile_id,
+            version,
+        }
+    }
+
+    pub(crate) const fn common(self) -> RuntimeFilterEventIdentity {
+        self.common
+    }
+
+    pub(crate) const fn profile_id(self) -> ConsumerProfileId {
+        self.profile_id
+    }
+
+    pub(crate) const fn version(self) -> LogicalVersion {
+        self.version
+    }
+}
+
 impl RouteEventIdentity {
     pub(crate) const fn new(
         common: RuntimeFilterEventIdentity,
@@ -190,6 +224,32 @@ pub(crate) enum RuntimeFilterEvent {
     ChannelCancelled {
         identity: RuntimeFilterEventIdentity,
     },
+    MaterializationStarted {
+        identity: ArtifactMaterializationIdentity,
+    },
+    ArtifactMaterialized {
+        identity: ArtifactMaterializationIdentity,
+        kind: ArtifactKind,
+        bytes: usize,
+        digest: [u8; 32],
+    },
+    ArtifactPublished {
+        identity: ArtifactMaterializationIdentity,
+        kind: ArtifactKind,
+        bytes: usize,
+        digest: [u8; 32],
+    },
+    ArtifactPublishStaleSkipped {
+        identity: ArtifactMaterializationIdentity,
+    },
+    ArtifactUnsupported {
+        identity: ArtifactMaterializationIdentity,
+        reason: ArtifactUnsupportedReason,
+    },
+    ArtifactUnavailable {
+        identity: ArtifactMaterializationIdentity,
+        reason: UnavailableReason,
+    },
     LoopbackDelivered {
         identity: RouteEventIdentity,
         version: LogicalVersion,
@@ -204,6 +264,10 @@ pub(crate) enum RuntimeFilterEvent {
     SubscriptionUnavailable {
         identity: ConsumerEventIdentity,
         reason: UnavailableReason,
+    },
+    SubscriptionUnsupported {
+        identity: ConsumerEventIdentity,
+        reason: ArtifactUnsupportedReason,
     },
     SubscriptionCancelled {
         identity: ConsumerEventIdentity,

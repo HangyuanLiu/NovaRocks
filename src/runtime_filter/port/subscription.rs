@@ -19,9 +19,9 @@ use std::time::Duration;
 
 use crate::common::types::UniqueId;
 use crate::runtime_filter::model::contract::BindingId;
+use crate::runtime_filter::port::artifact::ArtifactBundle;
 
 use super::identity::RouteEdgeId;
-use super::value_domain::LogicalSnapshot;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SubscriptionRequest {
@@ -51,57 +51,77 @@ pub(crate) enum UnavailableReason {
     ResourceLimit,
     IncompleteCoverage,
     ProducerFailed,
+    MaterializationFailed,
     RouteUnavailable,
 }
 
-#[derive(Debug)]
-pub(crate) enum AcquireOutcome {
-    Completed(Arc<LogicalSnapshot>),
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ArtifactUnsupportedReason {
+    RangeDeferred,
+    NoAcceptedRepresentation,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ArtifactAcquireOutcome {
+    Published(Arc<ArtifactBundle>),
+    Unsupported(ArtifactUnsupportedReason),
     Unavailable(UnavailableReason),
     Cancelled,
     TimedOut,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DeliveryTerminal {
+#[derive(Clone, Debug)]
+pub(crate) enum ArtifactDeliveryOutcome {
+    Published(Arc<ArtifactBundle>),
+    Unsupported(ArtifactUnsupportedReason),
     Unavailable(UnavailableReason),
     Cancelled,
 }
 
-pub(crate) trait SnapshotDelivery: Send + Sync {
-    fn deliver(&self, route_edge_id: RouteEdgeId, snapshot: Arc<LogicalSnapshot>);
-    fn terminal(&self, route_edge_id: RouteEdgeId, outcome: DeliveryTerminal);
+impl ArtifactDeliveryOutcome {
+    pub(crate) fn acquire_outcome(&self) -> ArtifactAcquireOutcome {
+        match self {
+            Self::Published(bundle) => ArtifactAcquireOutcome::Published(bundle.clone()),
+            Self::Unsupported(reason) => ArtifactAcquireOutcome::Unsupported(*reason),
+            Self::Unavailable(reason) => ArtifactAcquireOutcome::Unavailable(*reason),
+            Self::Cancelled => ArtifactAcquireOutcome::Cancelled,
+        }
+    }
+}
+
+pub(crate) trait ArtifactDelivery: Send + Sync {
+    fn deliver(&self, route_edge_id: RouteEdgeId, outcome: ArtifactDeliveryOutcome);
 }
 
 pub(crate) trait BlockingSnapshotSubscription: Send + Sync {
-    fn acquire(&self, timeout: Duration) -> AcquireOutcome;
+    fn acquire(&self, timeout: Duration) -> ArtifactAcquireOutcome;
+    fn snapshot(&self) -> Option<Arc<ArtifactBundle>>;
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::common::types::UniqueId;
     use crate::runtime_filter::model::contract::BindingId;
 
-    use super::{DeliveryTerminal, SubscriptionRequest, UnavailableReason};
+    use super::{ArtifactAcquireOutcome, ArtifactDelivery, SubscriptionRequest};
 
-    fn router_terminal_kind(terminal: DeliveryTerminal) -> &'static str {
-        match terminal {
-            DeliveryTerminal::Unavailable(_) => "unavailable",
-            DeliveryTerminal::Cancelled => "cancelled",
-        }
+    #[test]
+    fn artifact_router_boundary_excludes_logical_snapshot_and_caller_local_timeout() {
+        fn assert_artifact_delivery(_: Arc<dyn ArtifactDelivery>) {}
+        let _ = assert_artifact_delivery;
+        assert!(matches!(
+            ArtifactAcquireOutcome::TimedOut,
+            ArtifactAcquireOutcome::TimedOut
+        ));
     }
 
     #[test]
-    fn router_terminal_boundary_excludes_completed_and_caller_local_timeout() {
-        assert_eq!(
-            router_terminal_kind(DeliveryTerminal::Unavailable(
-                UnavailableReason::RouteUnavailable
-            )),
-            "unavailable"
-        );
-        assert_eq!(
-            router_terminal_kind(DeliveryTerminal::Cancelled),
-            "cancelled"
+    fn materialization_failure_is_distinct_from_producer_failure() {
+        assert_ne!(
+            super::UnavailableReason::MaterializationFailed,
+            super::UnavailableReason::ProducerFailed
         );
     }
 

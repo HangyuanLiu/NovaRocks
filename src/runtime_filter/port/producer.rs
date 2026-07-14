@@ -95,6 +95,7 @@ pub(crate) enum RuntimeContractViolationKind {
     TypeMismatch,
     ConflictingReplay,
     ConflictingTerminalSequence,
+    ConflictingArtifactPublish,
     SequenceOutsideTerminalRange,
     ServiceUnavailable,
 }
@@ -219,6 +220,9 @@ mod tests {
             RuntimeContractViolationKind::InvalidContributionLease => "invalid-contribution-lease",
             RuntimeContractViolationKind::TypeMismatch => "type-mismatch",
             RuntimeContractViolationKind::ConflictingReplay => "conflicting-replay",
+            RuntimeContractViolationKind::ConflictingArtifactPublish => {
+                "conflicting-artifact-publish"
+            }
             RuntimeContractViolationKind::ConflictingTerminalSequence => {
                 "conflicting-terminal-sequence"
             }

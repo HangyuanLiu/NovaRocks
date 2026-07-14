@@ -16,6 +16,8 @@
 // under the License.
 
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -25,21 +27,21 @@ use crate::runtime_filter::port::events::{
 };
 use crate::runtime_filter::port::identity::RouteEdgeId;
 use crate::runtime_filter::port::subscription::{
-    AcquireOutcome, BlockingSnapshotSubscription, DeliveryTerminal, SnapshotDelivery,
+    ArtifactAcquireOutcome, ArtifactDelivery, ArtifactDeliveryOutcome, BlockingSnapshotSubscription,
 };
-use crate::runtime_filter::port::value_domain::LogicalSnapshot;
+
+use super::EventBatchCompletion;
 
 enum SubscriptionState {
     Pending,
-    Completed(Arc<LogicalSnapshot>),
-    Unavailable(crate::runtime_filter::port::subscription::UnavailableReason),
-    Cancelled,
+    Terminal(ArtifactDeliveryOutcome),
 }
 
 pub(super) struct SubscriptionSlot {
     identity: ConsumerEventIdentity,
     events: Arc<dyn RuntimeFilterEventSink>,
     state: Mutex<SubscriptionState>,
+    cancellation_event_barrier: Mutex<Option<Arc<EventBatchCompletion>>>,
     changed: Condvar,
 }
 
@@ -52,65 +54,77 @@ impl SubscriptionSlot {
             identity,
             events,
             state: Mutex::new(SubscriptionState::Pending),
+            cancellation_event_barrier: Mutex::new(None),
             changed: Condvar::new(),
         }
     }
 
-    fn deliver(&self, snapshot: Arc<LogicalSnapshot>) {
+    fn deliver(&self, outcome: ArtifactDeliveryOutcome) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if matches!(*state, SubscriptionState::Pending) {
-            *state = SubscriptionState::Completed(snapshot);
+            *state = SubscriptionState::Terminal(outcome);
         }
         drop(state);
         self.changed.notify_all();
     }
 
-    fn terminal(&self, terminal: DeliveryTerminal) {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if matches!(*state, SubscriptionState::Pending) {
-            *state = match terminal {
-                DeliveryTerminal::Unavailable(reason) => SubscriptionState::Unavailable(reason),
-                DeliveryTerminal::Cancelled => SubscriptionState::Cancelled,
-            };
-        }
-        drop(state);
-        self.changed.notify_all();
-    }
-
-    fn current_outcome(state: &SubscriptionState) -> Option<AcquireOutcome> {
+    fn current_outcome(state: &SubscriptionState) -> Option<ArtifactAcquireOutcome> {
         match state {
             SubscriptionState::Pending => None,
-            SubscriptionState::Completed(snapshot) => {
-                Some(AcquireOutcome::Completed(snapshot.clone()))
-            }
-            SubscriptionState::Unavailable(reason) => Some(AcquireOutcome::Unavailable(*reason)),
-            SubscriptionState::Cancelled => Some(AcquireOutcome::Cancelled),
+            SubscriptionState::Terminal(outcome) => Some(outcome.acquire_outcome()),
         }
     }
 
-    fn emit_outcome(&self, outcome: &AcquireOutcome) {
+    fn arm_cancellation_event(&self, barrier: Arc<EventBatchCompletion>) {
+        *self
+            .cancellation_event_barrier
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(barrier);
+    }
+
+    fn emit_outcome(&self, outcome: &ArtifactAcquireOutcome) {
         let event = match outcome {
-            AcquireOutcome::Completed(snapshot) => RuntimeFilterEvent::SubscriptionAcquired {
+            ArtifactAcquireOutcome::Published(bundle) => RuntimeFilterEvent::SubscriptionAcquired {
                 identity: self.identity,
-                version: snapshot.version(),
+                version: bundle.version(),
             },
-            AcquireOutcome::Unavailable(reason) => RuntimeFilterEvent::SubscriptionUnavailable {
+            ArtifactAcquireOutcome::Unsupported(reason) => {
+                RuntimeFilterEvent::SubscriptionUnsupported {
+                    identity: self.identity,
+                    reason: *reason,
+                }
+            }
+            ArtifactAcquireOutcome::Unavailable(reason) => {
+                RuntimeFilterEvent::SubscriptionUnavailable {
+                    identity: self.identity,
+                    reason: *reason,
+                }
+            }
+            ArtifactAcquireOutcome::Cancelled => RuntimeFilterEvent::SubscriptionCancelled {
                 identity: self.identity,
-                reason: *reason,
             },
-            AcquireOutcome::Cancelled => RuntimeFilterEvent::SubscriptionCancelled {
-                identity: self.identity,
-            },
-            AcquireOutcome::TimedOut => RuntimeFilterEvent::SubscriptionTimedOut {
+            ArtifactAcquireOutcome::TimedOut => RuntimeFilterEvent::SubscriptionTimedOut {
                 identity: self.identity,
             },
         };
+        if matches!(outcome, ArtifactAcquireOutcome::Cancelled) {
+            let barrier = self
+                .cancellation_event_barrier
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            if let Some(barrier) = barrier {
+                let events = self.events.clone();
+                barrier.on_complete(move || events.record(event));
+                return;
+            }
+        }
         self.events.record(event);
     }
 }
 
 impl BlockingSnapshotSubscription for SubscriptionSlot {
-    fn acquire(&self, timeout: Duration) -> AcquireOutcome {
+    fn acquire(&self, timeout: Duration) -> ArtifactAcquireOutcome {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let (state, _) = self
             .changed
@@ -118,16 +132,30 @@ impl BlockingSnapshotSubscription for SubscriptionSlot {
                 matches!(state, SubscriptionState::Pending)
             })
             .unwrap_or_else(|error| error.into_inner());
-        let outcome = Self::current_outcome(&state).unwrap_or(AcquireOutcome::TimedOut);
+        let outcome = Self::current_outcome(&state).unwrap_or(ArtifactAcquireOutcome::TimedOut);
         drop(state);
         self.emit_outcome(&outcome);
         outcome
+    }
+
+    fn snapshot(&self) -> Option<Arc<crate::runtime_filter::port::artifact::ArtifactBundle>> {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        match &*state {
+            SubscriptionState::Terminal(ArtifactDeliveryOutcome::Published(bundle)) => {
+                Some(bundle.clone())
+            }
+            SubscriptionState::Pending | SubscriptionState::Terminal(_) => None,
+        }
     }
 }
 
 pub(super) struct SubscriptionGroup {
     route_edge_id: RouteEdgeId,
     slots: BTreeMap<UniqueId, Arc<SubscriptionSlot>>,
+    #[cfg(test)]
+    before_deliver: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    delivery_call_count: AtomicUsize,
 }
 
 impl SubscriptionGroup {
@@ -153,30 +181,54 @@ impl SubscriptionGroup {
         Self {
             route_edge_id,
             slots,
+            #[cfg(test)]
+            before_deliver: Mutex::new(None),
+            #[cfg(test)]
+            delivery_call_count: AtomicUsize::new(0),
         }
     }
 
     pub(super) fn slot(&self, instance: UniqueId) -> Option<Arc<SubscriptionSlot>> {
         self.slots.get(&instance).cloned()
     }
-}
 
-impl SnapshotDelivery for SubscriptionGroup {
-    fn deliver(&self, route_edge_id: RouteEdgeId, snapshot: Arc<LogicalSnapshot>) {
+    pub(super) fn arm_cancellation_event(
+        &self,
+        route_edge_id: RouteEdgeId,
+        barrier: Arc<EventBatchCompletion>,
+    ) {
         if route_edge_id != self.route_edge_id {
             return;
         }
         for slot in self.slots.values() {
-            slot.deliver(snapshot.clone());
+            slot.arm_cancellation_event(barrier.clone());
         }
     }
 
-    fn terminal(&self, route_edge_id: RouteEdgeId, outcome: DeliveryTerminal) {
+    #[cfg(test)]
+    pub(super) fn set_before_deliver_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.before_deliver.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(super) fn delivery_call_count(&self) -> usize {
+        self.delivery_call_count.load(Ordering::SeqCst)
+    }
+}
+
+impl ArtifactDelivery for SubscriptionGroup {
+    fn deliver(&self, route_edge_id: RouteEdgeId, outcome: ArtifactDeliveryOutcome) {
         if route_edge_id != self.route_edge_id {
             return;
         }
+        #[cfg(test)]
+        self.delivery_call_count.fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        if let Some(hook) = self.before_deliver.lock().unwrap().take() {
+            hook();
+        }
         for slot in self.slots.values() {
-            slot.terminal(outcome);
+            slot.deliver(outcome.clone());
         }
     }
 }

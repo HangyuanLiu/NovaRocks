@@ -25,11 +25,115 @@ use crate::runtime_filter::model::contract::{
 };
 use crate::runtime_filter::model::coverage::Coverage;
 
+use super::artifact::ConsumerArtifactProfile;
 use super::identity::{DeploymentEpoch, RouteEdgeId, RuntimeFilterParticipantId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeFilterCoreBudget {
     max_reducer_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MaterializationPolicy {
+    bloom_bits_per_key: u64,
+    bloom_hash_count: u32,
+    bloom_seed: u64,
+    bloom_algorithm_version: u16,
+    max_total_retained_bytes: u64,
+    max_scratch_bytes_per_job: u64,
+    max_concurrent_jobs: usize,
+}
+
+impl MaterializationPolicy {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        bloom_bits_per_key: u64,
+        bloom_hash_count: u32,
+        bloom_seed: u64,
+        bloom_algorithm_version: u16,
+        max_total_retained_bytes: u64,
+        max_scratch_bytes_per_job: u64,
+        max_concurrent_jobs: usize,
+    ) -> Result<Self, MaterializationPolicyError> {
+        if bloom_bits_per_key == 0 || bloom_hash_count == 0 || bloom_algorithm_version != 1 {
+            return Err(MaterializationPolicyError::InvalidBloomContract);
+        }
+        if max_total_retained_bytes == 0
+            || max_scratch_bytes_per_job == 0
+            || max_concurrent_jobs == 0
+        {
+            return Err(MaterializationPolicyError::ZeroResourceLimit);
+        }
+        usize::try_from(max_total_retained_bytes)
+            .map_err(|_| MaterializationPolicyError::PlatformSizeOverflow)?;
+        usize::try_from(max_scratch_bytes_per_job)
+            .map_err(|_| MaterializationPolicyError::PlatformSizeOverflow)?;
+        let aggregate_scratch = max_scratch_bytes_per_job
+            .checked_mul(
+                u64::try_from(max_concurrent_jobs)
+                    .map_err(|_| MaterializationPolicyError::PlatformSizeOverflow)?,
+            )
+            .ok_or(MaterializationPolicyError::AggregateScratchOverflow)?;
+        max_total_retained_bytes
+            .checked_add(aggregate_scratch)
+            .ok_or(MaterializationPolicyError::AggregateScratchOverflow)?;
+        Ok(Self {
+            bloom_bits_per_key,
+            bloom_hash_count,
+            bloom_seed,
+            bloom_algorithm_version,
+            max_total_retained_bytes,
+            max_scratch_bytes_per_job,
+            max_concurrent_jobs,
+        })
+    }
+
+    pub(crate) const fn bloom_bits_per_key(self) -> u64 {
+        self.bloom_bits_per_key
+    }
+    pub(crate) const fn bloom_hash_count(self) -> u32 {
+        self.bloom_hash_count
+    }
+    pub(crate) const fn bloom_seed(self) -> u64 {
+        self.bloom_seed
+    }
+    pub(crate) const fn bloom_algorithm_version(self) -> u16 {
+        self.bloom_algorithm_version
+    }
+    pub(crate) const fn max_total_retained_bytes(self) -> u64 {
+        self.max_total_retained_bytes
+    }
+    pub(crate) const fn max_scratch_bytes_per_job(self) -> u64 {
+        self.max_scratch_bytes_per_job
+    }
+    pub(crate) const fn max_concurrent_jobs(self) -> usize {
+        self.max_concurrent_jobs
+    }
+
+    pub(crate) fn aggregate_scratch_bytes(self) -> Result<usize, MaterializationPolicyError> {
+        let total = self
+            .max_scratch_bytes_per_job
+            .checked_mul(
+                u64::try_from(self.max_concurrent_jobs)
+                    .map_err(|_| MaterializationPolicyError::PlatformSizeOverflow)?,
+            )
+            .ok_or(MaterializationPolicyError::AggregateScratchOverflow)?;
+        usize::try_from(total).map_err(|_| MaterializationPolicyError::PlatformSizeOverflow)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self::new(8, 5, 17, 1, 1 << 20, 1 << 16, 1)
+            .expect("built-in materialization test policy is valid")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MaterializationPolicyError {
+    InvalidBloomContract,
+    ZeroResourceLimit,
+    PlatformSizeOverflow,
+    AggregateScratchOverflow,
 }
 
 impl RuntimeFilterCoreBudget {
@@ -72,20 +176,42 @@ impl ProducerDeployment {
 pub(crate) struct ConsumerDeployment {
     activation: ConsumerActivation,
     capabilities: BTreeSet<ArtifactCapability>,
+    artifact_profile: ConsumerArtifactProfile,
     loopback_route_edge_id: RouteEdgeId,
     expected_fragment_instances: BTreeSet<UniqueId>,
 }
 
 impl ConsumerDeployment {
+    #[cfg(test)]
     pub(crate) fn new(
         activation: ConsumerActivation,
+        mut capabilities: BTreeSet<ArtifactCapability>,
+        loopback_route_edge_id: RouteEdgeId,
+        expected_fragment_instances: BTreeSet<UniqueId>,
+    ) -> Self {
+        if capabilities.contains(&ArtifactCapability::Membership) {
+            capabilities.insert(ArtifactCapability::EmptyDomain);
+        }
+        Self::with_profile(
+            activation,
+            capabilities,
+            ConsumerArtifactProfile::m1_test_default(),
+            loopback_route_edge_id,
+            expected_fragment_instances,
+        )
+    }
+
+    pub(crate) fn with_profile(
+        activation: ConsumerActivation,
         capabilities: BTreeSet<ArtifactCapability>,
+        artifact_profile: ConsumerArtifactProfile,
         loopback_route_edge_id: RouteEdgeId,
         expected_fragment_instances: BTreeSet<UniqueId>,
     ) -> Self {
         Self {
             activation,
             capabilities,
+            artifact_profile,
             loopback_route_edge_id,
             expected_fragment_instances,
         }
@@ -97,6 +223,10 @@ impl ConsumerDeployment {
 
     pub(crate) const fn capabilities(&self) -> &BTreeSet<ArtifactCapability> {
         &self.capabilities
+    }
+
+    pub(crate) const fn artifact_profile(&self) -> &ConsumerArtifactProfile {
+        &self.artifact_profile
     }
 
     pub(crate) const fn loopback_route_edge_id(&self) -> RouteEdgeId {
@@ -120,6 +250,7 @@ pub(crate) struct CompleteOnceChannelDeployment {
     completion_requirement: CompletionRequirement,
     policy: RuntimeFilterPolicyRequirement,
     core_budget: RuntimeFilterCoreBudget,
+    materialization_policy: MaterializationPolicy,
     producers: BTreeMap<BindingId, ProducerDeployment>,
     consumers: BTreeMap<BindingId, ConsumerDeployment>,
 }
@@ -137,6 +268,7 @@ impl CompleteOnceChannelDeployment {
         completion_requirement: CompletionRequirement,
         policy: RuntimeFilterPolicyRequirement,
         core_budget: RuntimeFilterCoreBudget,
+        materialization_policy: MaterializationPolicy,
         producers: BTreeMap<BindingId, ProducerDeployment>,
         consumers: BTreeMap<BindingId, ConsumerDeployment>,
     ) -> Self {
@@ -151,6 +283,7 @@ impl CompleteOnceChannelDeployment {
             completion_requirement,
             policy,
             core_budget,
+            materialization_policy,
             producers,
             consumers,
         }
@@ -185,6 +318,9 @@ impl CompleteOnceChannelDeployment {
     }
     pub(crate) const fn core_budget(&self) -> RuntimeFilterCoreBudget {
         self.core_budget
+    }
+    pub(crate) const fn materialization_policy(&self) -> MaterializationPolicy {
+        self.materialization_policy
     }
     pub(crate) const fn producers(&self) -> &BTreeMap<BindingId, ProducerDeployment> {
         &self.producers
@@ -273,6 +409,7 @@ mod tests {
                 max_retries: 7,
             },
             RuntimeFilterCoreBudget::new(512),
+            MaterializationPolicy::for_test(),
             BTreeMap::from([(
                 producer_binding_id,
                 ProducerDeployment::new(witness_id, producer_instances.clone()),

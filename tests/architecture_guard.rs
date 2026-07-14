@@ -7356,6 +7356,7 @@ fn runtime_filter_path_is_rust_prelude(path: &[String]) -> bool {
             root.as_str(),
             "Box"
                 | "Into"
+                | "Ord"
                 | "Option"
                 | "Result"
                 | "String"
@@ -7378,6 +7379,16 @@ fn runtime_filter_path_is_rust_prelude(path: &[String]) -> bool {
                 | "usize"
         )
     })
+}
+
+fn runtime_filter_runtime_extern_crates(text: &str) -> BTreeSet<Vec<String>> {
+    let tokens = rust_use_tokens(&rust_sanitized_production_text(text));
+    tokens
+        .windows(3)
+        .filter(|window| window[0] == "extern" && window[1] == "crate")
+        .filter(|window| window[2].chars().all(is_ident_char))
+        .map(|window| vec![window[2].clone()])
+        .collect()
 }
 
 fn runtime_filter_is_allowed_query_context_export(tree: &syn::UseTree) -> bool {
@@ -7521,6 +7532,12 @@ fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> V
         })
         .map(|canonical| format!("{source_rel}: {}", canonical.join("::")))
         .collect::<BTreeSet<_>>();
+    violations.extend(
+        runtime_filter_runtime_extern_crates(text)
+            .into_iter()
+            .filter(|path| !runtime_filter_path_is_allowlisted(path, &allowed_prefixes))
+            .map(|path| format!("{source_rel}: external {}", path.join("::"))),
+    );
     let production_tokens = rust_use_tokens(&rust_sanitized_production_text(text));
     let production_source_tokens = rust_source_tokens(&rust_sanitized_production_text(text));
     let has_path_attribute = production_source_tokens
@@ -7565,9 +7582,13 @@ fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> V
         ));
     }
     violations.extend(runtime_filter_global_registry_violations(source_rel, text));
+    violations.extend(runtime_filter_materializer_semantic_violations(
+        source_rel, text,
+    ));
     if matches!(
         source_rel,
         "src/runtime_filter/core/mod.rs"
+            | "src/runtime_filter/materializer/mod.rs"
             | "src/runtime_filter/port/mod.rs"
             | "src/runtime_filter/router/mod.rs"
             | "src/runtime_filter/service/mod.rs"
@@ -7676,10 +7697,61 @@ fn runtime_filter_runtime_dependency_allowlist(
                 "ContributionFingerprint",
             ],
         ],
+        "src/runtime_filter/materializer/mod.rs" => vec![
+            &["std", "sync", "Arc"],
+            &["crate", "runtime_filter", "model", "contract"],
+            &["crate", "runtime_filter", "port", "artifact"],
+            &["crate", "runtime_filter", "port", "identity"],
+            &["crate", "runtime_filter", "port", "install"],
+            &["crate", "runtime_filter", "port", "support"],
+            &["crate", "runtime_filter", "port", "value_domain"],
+            &["crate", "runtime_filter", "materializer", "bitset"],
+            &["crate", "runtime_filter", "materializer", "bloom"],
+            &["crate", "runtime_filter", "materializer", "codec"],
+        ],
+        "src/runtime_filter/materializer/bitset.rs" => vec![
+            &["arrow", "datatypes", "DataType"],
+            &["crate", "runtime_filter", "port", "value_domain"],
+        ],
+        "src/runtime_filter/materializer/bloom.rs" => vec![
+            &["sha2"],
+            &["crate", "runtime_filter", "port", "artifact"],
+            &["crate", "runtime_filter", "port", "install"],
+            &["crate", "runtime_filter", "port", "value_domain"],
+        ],
+        "src/runtime_filter/materializer/codec.rs" => vec![
+            &["std", "cmp", "Ordering"],
+            &["std", "error", "Error"],
+            &["std", "fmt"],
+            &["std", "str", "from_utf8"],
+            &["std", "sync", "Arc"],
+            &["arrow", "datatypes", "DECIMAL128_MAX_PRECISION"],
+            &["crate", "runtime_filter", "model", "contract"],
+            &["crate", "runtime_filter", "port", "artifact"],
+            &["crate", "runtime_filter", "port", "identity"],
+            &["crate", "runtime_filter", "port", "support"],
+            &["crate", "runtime_filter", "port", "value_domain"],
+            &["crate", "runtime_filter", "materializer", "bloom"],
+        ],
         "src/runtime_filter/port/mod.rs" => vec![],
+        "src/runtime_filter/port/artifact.rs" => vec![
+            &["std", "collections", "BTreeSet"],
+            &["std", "error", "Error"],
+            &["std", "fmt"],
+            &["std", "mem", "size_of"],
+            &["std", "str", "from_utf8"],
+            &["std", "sync", "Arc"],
+            &["arrow", "datatypes"],
+            &["sha2"],
+            &["crate", "common", "largeint", "LARGEINT_BYTE_WIDTH"],
+            &["crate", "runtime_filter", "model", "contract"],
+            &["crate", "runtime_filter", "port", "identity"],
+            &["crate", "runtime_filter", "port", "support"],
+        ],
         "src/runtime_filter/port/events.rs" => vec![
             &["crate", "common", "types", "UniqueId"],
             &["crate", "runtime_filter", "model", "contract"],
+            &["crate", "runtime_filter", "port", "artifact"],
             &["crate", "runtime_filter", "port", "identity"],
             &[
                 "crate",
@@ -7695,6 +7767,13 @@ fn runtime_filter_runtime_dependency_allowlist(
                 "subscription",
                 "UnavailableReason",
             ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "subscription",
+                "ArtifactUnsupportedReason",
+            ],
         ],
         "src/runtime_filter/port/identity.rs" => vec![
             &["crate", "common", "types", "UniqueId"],
@@ -7705,6 +7784,7 @@ fn runtime_filter_runtime_dependency_allowlist(
             &["crate", "common", "types", "UniqueId"],
             &["crate", "runtime_filter", "model", "contract"],
             &["crate", "runtime_filter", "model", "coverage", "Coverage"],
+            &["crate", "runtime_filter", "port", "artifact"],
             &["crate", "runtime_filter", "port", "identity"],
         ],
         "src/runtime_filter/port/producer.rs" => vec![
@@ -7726,19 +7806,20 @@ fn runtime_filter_runtime_dependency_allowlist(
             &["std", "time", "Duration"],
             &["crate", "common", "types", "UniqueId"],
             &["crate", "runtime_filter", "model", "contract", "BindingId"],
-            &["crate", "runtime_filter", "port", "identity", "RouteEdgeId"],
             &[
                 "crate",
                 "runtime_filter",
                 "port",
-                "value_domain",
-                "LogicalSnapshot",
+                "artifact",
+                "ArtifactBundle",
             ],
+            &["crate", "runtime_filter", "port", "identity", "RouteEdgeId"],
         ],
         "src/runtime_filter/port/support.rs" => vec![
             &["std", "error", "Error"],
             &["std", "fmt"],
             &["std", "sync", "Arc"],
+            &["std", "sync", "atomic"],
             &["std", "time", "Instant"],
         ],
         "src/runtime_filter/port/value_domain.rs" => vec![
@@ -7770,18 +7851,12 @@ fn runtime_filter_runtime_dependency_allowlist(
         "src/runtime_filter/router/loopback.rs" => vec![
             &["std", "collections", "BTreeMap"],
             &["std", "sync", "Arc"],
-            &[
-                "crate",
-                "runtime_filter",
-                "core",
-                "channel",
-                "ChannelAction",
-            ],
             &["crate", "runtime_filter", "port", "identity", "RouteEdgeId"],
             &["crate", "runtime_filter", "port", "subscription"],
         ],
         "src/runtime_filter/service/mod.rs" => vec![
             &["std", "collections"],
+            &["std", "mem", "take"],
             &["std", "panic"],
             &["std", "sync"],
             &["std", "thread"],
@@ -7838,6 +7913,7 @@ fn runtime_filter_runtime_dependency_allowlist(
             &["std", "collections"],
             &["std", "sync"],
             &["std", "time"],
+            &["arrow", "datatypes", "DataType"],
             &["crate", "common", "types", "UniqueId"],
             &[
                 "crate",
@@ -7846,6 +7922,7 @@ fn runtime_filter_runtime_dependency_allowlist(
                 "channel",
                 "RuntimeFilterChannel",
             ],
+            &["crate", "runtime_filter", "materializer", "bloom"],
             &["crate", "runtime_filter", "model", "contract"],
             &["crate", "runtime_filter", "model", "coverage", "Coverage"],
             &["crate", "runtime_filter", "port"],
@@ -7857,7 +7934,26 @@ fn runtime_filter_runtime_dependency_allowlist(
                 "LoopbackRouter",
             ],
             &["crate", "runtime_filter", "service", "EventEmitter"],
+            &["crate", "runtime_filter", "service", "EventBatchCompletion"],
+            &["crate", "runtime_filter", "service", "materialization"],
             &["crate", "runtime_filter", "service", "subscription"],
+        ],
+        "src/runtime_filter/service/materialization.rs" => vec![
+            &["std", "collections", "BTreeMap"],
+            &["std", "mem", "take"],
+            &["std", "panic"],
+            &["std", "sync"],
+            &["std", "thread"],
+            &["crate", "runtime_filter", "materializer"],
+            &["crate", "runtime_filter", "model", "contract", "ChannelId"],
+            &["crate", "runtime_filter", "port", "artifact"],
+            &["crate", "runtime_filter", "port", "events"],
+            &["crate", "runtime_filter", "port", "identity"],
+            &["crate", "runtime_filter", "port", "producer"],
+            &["crate", "runtime_filter", "port", "subscription"],
+            &["crate", "runtime_filter", "port", "support"],
+            &["crate", "runtime_filter", "port", "value_domain"],
+            &["crate", "runtime_filter", "service", "registry"],
         ],
         "src/runtime_filter/service/subscription.rs" => vec![
             &["std", "collections", "BTreeMap"],
@@ -7866,6 +7962,7 @@ fn runtime_filter_runtime_dependency_allowlist(
             &["crate", "common", "types", "UniqueId"],
             &["crate", "runtime_filter", "model", "contract", "BindingId"],
             &["crate", "runtime_filter", "port"],
+            &["crate", "runtime_filter", "service", "EventBatchCompletion"],
         ],
         _ => return None,
     };
@@ -8528,8 +8625,30 @@ fn runtime_filter_query_context_lock_discipline_violations(text: &str) -> Vec<St
 fn runtime_filter_action_dispatch_boundary_violations(producer: &str) -> Vec<String> {
     let production = rust_sanitized_production_text(producer);
     let mut violations = Vec::new();
-    if !production
-        .contains("fn finish(&self, action: crate::runtime_filter::core::channel::ChannelAction)")
+    let finish_tokens = runtime_filter_function_tokens(&production, "finish").unwrap_or_default();
+    if runtime_filter_token_sequence(
+        &finish_tokens,
+        &[
+            "fn",
+            "finish",
+            "(",
+            "&",
+            "self",
+            ",",
+            "action",
+            ":",
+            "crate",
+            "::",
+            "runtime_filter",
+            "::",
+            "core",
+            "::",
+            "channel",
+            "::",
+            "ChannelAction",
+        ],
+    )
+    .is_none()
     {
         violations
             .push("Service producer finish must receive the returned ChannelAction".to_string());
@@ -8539,7 +8658,6 @@ fn runtime_filter_action_dispatch_boundary_violations(producer: &str) -> Vec<Str
         .windows(4)
         .filter(|window| window == &["dispatcher", ".", "dispatch", "("])
         .count();
-    let finish_tokens = runtime_filter_function_tokens(&production, "finish").unwrap_or_default();
     if !finish_tokens
         .windows(4)
         .any(|window| window == ["dispatcher", ".", "dispatch", "("])
@@ -8583,13 +8701,16 @@ fn runtime_filter_action_dispatch_boundary_violations(producer: &str) -> Vec<Str
                 continue;
             };
             let suffix = &tokens[close + 1..];
-            if runtime_filter_token_sequence(
-                suffix,
-                &[
-                    ".", "map", "(", "|", "action", "|", "self", ".", "finish", "(", "action", ")",
-                ],
-            ) == Some(0)
-            {
+            let finishes_action = ["map", "and_then"].into_iter().any(|combinator| {
+                runtime_filter_token_sequence(
+                    suffix,
+                    &[
+                        ".", combinator, "(", "|", "action", "|", "self", ".", "finish", "(",
+                        "action", ")",
+                    ],
+                ) == Some(0)
+            });
+            if finishes_action {
                 finished_actions += 1;
             }
         }
@@ -8613,6 +8734,36 @@ fn runtime_filter_attribute_allows_dead_code(attribute: &str) -> bool {
                     .any(|token| token.text == "dead_code")
             })
     })
+}
+
+fn runtime_filter_any_dead_code_violations(source_rel: &str, text: &str) -> Vec<String> {
+    let tokens = rust_source_tokens(&rust_sanitized_production_text(text));
+    let mut violations = Vec::new();
+    for index in 0..tokens.len().saturating_sub(2) {
+        if tokens[index].text != "#" {
+            continue;
+        }
+        let open = if tokens[index + 1].text == "[" {
+            index + 1
+        } else if tokens[index + 1].text == "!" && tokens[index + 2].text == "[" {
+            index + 2
+        } else {
+            continue;
+        };
+        if let Some(close) = rust_matching_token(&tokens, open, "[", "]") {
+            let attribute = tokens[open + 1..close]
+                .iter()
+                .map(|token| token.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if runtime_filter_attribute_allows_dead_code(&format!("#[{attribute}]")) {
+                violations.push(format!(
+                    "{source_rel}: materializer source must not hide production behind dead_code"
+                ));
+            }
+        }
+    }
+    violations
 }
 
 fn runtime_filter_inner_dead_code_violations(source_rel: &str, text: &str) -> Vec<String> {
@@ -8639,11 +8790,13 @@ fn runtime_filter_runtime_root_dead_code_violations(text: &str) -> Vec<String> {
     let mut violations =
         runtime_filter_inner_dead_code_violations("src/runtime_filter/mod.rs", text);
     for item in rust_module_items(text) {
-        if matches!(item.name.as_str(), "core" | "port" | "router" | "service")
-            && item
-                .attributes
-                .iter()
-                .any(|attribute| runtime_filter_attribute_allows_dead_code(attribute))
+        if matches!(
+            item.name.as_str(),
+            "core" | "materializer" | "port" | "router" | "service"
+        ) && item
+            .attributes
+            .iter()
+            .any(|attribute| runtime_filter_attribute_allows_dead_code(attribute))
         {
             violations.push(format!(
                 "runtime-filter {} namespace must not carry a dead_code allowance",
@@ -8671,6 +8824,582 @@ pub(crate) mod validation;
             "runtime-filter model root production tokens differ; expected {expected:?}, actual {actual:?}"
         )]
     }
+}
+
+fn runtime_filter_type_is_arc_artifact_bundle(ty: &syn::Type) -> bool {
+    let syn::Type::Path(path) = ty else {
+        return false;
+    };
+    if path.qself.is_some() || path.path.leading_colon.is_some() || path.path.segments.len() != 1 {
+        return false;
+    }
+    let Some(arc) = path.path.segments.last() else {
+        return false;
+    };
+    let syn::PathArguments::AngleBracketed(arguments) = &arc.arguments else {
+        return false;
+    };
+    arc.ident == "Arc"
+        && arguments.args.len() == 1
+        && matches!(
+            arguments.args.first(),
+            Some(syn::GenericArgument::Type(syn::Type::Path(bundle)))
+                if bundle.qself.is_none()
+                    && bundle.path.leading_colon.is_none()
+                    && bundle.path.segments.len() == 1
+                    && bundle.path.segments.last().is_some_and(|segment| segment.ident == "ArtifactBundle")
+        )
+}
+
+fn runtime_filter_type_is_option_arc_artifact_bundle(ty: &syn::Type) -> bool {
+    let syn::Type::Path(path) = ty else {
+        return false;
+    };
+    if path.qself.is_some() || path.path.leading_colon.is_some() || path.path.segments.len() != 1 {
+        return false;
+    }
+    let Some(option) = path.path.segments.last() else {
+        return false;
+    };
+    let syn::PathArguments::AngleBracketed(arguments) = &option.arguments else {
+        return false;
+    };
+    option.ident == "Option"
+        && arguments.args.len() == 1
+        && matches!(
+            arguments.args.first(),
+            Some(syn::GenericArgument::Type(ty))
+                if runtime_filter_type_is_arc_artifact_bundle(ty)
+        )
+}
+
+fn runtime_filter_subscription_artifact_surface_violations(text: &str) -> Vec<String> {
+    let production = rust_sanitized_production_text(text);
+    let Ok(file) = syn::parse_file(&production) else {
+        return vec!["artifact subscription production source must parse".to_string()];
+    };
+    let mut violations = Vec::new();
+    let local_roots = runtime_filter_model_local_roots(text);
+    for shadowed in ["Arc", "ArtifactBundle", "LogicalSnapshot"] {
+        if local_roots.contains(shadowed) {
+            violations.push(format!(
+                "artifact subscription must not shadow contract type {shadowed}"
+            ));
+        }
+    }
+    let canonical =
+        rust_production_canonical_paths(text, "src/runtime_filter/port/subscription.rs")
+            .into_iter()
+            .map(|path| {
+                runtime_filter_dependency_path(&path, "src/runtime_filter/port/subscription.rs")
+            })
+            .collect::<Vec<_>>();
+    for required in [
+        &["std", "sync", "Arc"][..],
+        &[
+            "crate",
+            "runtime_filter",
+            "port",
+            "artifact",
+            "ArtifactBundle",
+        ][..],
+    ] {
+        if !canonical.iter().any(|path| {
+            path.len() == required.len()
+                && path
+                    .iter()
+                    .zip(required)
+                    .all(|(actual, expected)| actual == expected)
+        }) {
+            violations.push(format!(
+                "artifact subscription must import canonical {}",
+                required.join("::")
+            ));
+        }
+    }
+    for expected in ["ArtifactAcquireOutcome", "ArtifactDeliveryOutcome"] {
+        let Some(item) = file.items.iter().find_map(|item| match item {
+            syn::Item::Enum(item) if item.ident == expected => Some(item),
+            _ => None,
+        }) else {
+            violations.push(format!("missing {expected}"));
+            continue;
+        };
+        let Some(published) = item
+            .variants
+            .iter()
+            .find(|variant| variant.ident == "Published")
+        else {
+            violations.push(format!("{expected} is missing Published"));
+            continue;
+        };
+        let syn::Fields::Unnamed(fields) = &published.fields else {
+            violations.push(format!("{expected}::Published must have one tuple payload"));
+            continue;
+        };
+        if fields.unnamed.len() != 1
+            || !runtime_filter_type_is_arc_artifact_bundle(&fields.unnamed[0].ty)
+        {
+            violations.push(format!(
+                "{expected}::Published must carry Arc<ArtifactBundle>"
+            ));
+        }
+    }
+    let snapshot_returns_artifact = file.items.iter().find_map(|item| match item {
+        syn::Item::Trait(item) if item.ident == "BlockingSnapshotSubscription" => {
+            item.items.iter().find_map(|item| match item {
+                syn::TraitItem::Fn(method) if method.sig.ident == "snapshot" => {
+                    Some(&method.sig.output)
+                }
+                _ => None,
+            })
+        }
+        _ => None,
+    });
+    if !matches!(
+        snapshot_returns_artifact,
+        Some(syn::ReturnType::Type(_, ty))
+            if runtime_filter_type_is_option_arc_artifact_bundle(ty)
+    ) {
+        violations.push(
+            "BlockingSnapshotSubscription::snapshot must return Option<Arc<ArtifactBundle>>"
+                .to_string(),
+        );
+    }
+    let tokens = rust_use_tokens(&production);
+    if tokens.iter().any(|token| token == "LogicalSnapshot") {
+        violations.push("artifact subscription must not expose LogicalSnapshot".to_string());
+    }
+    violations
+}
+
+fn runtime_filter_router_artifact_surface_violations(text: &str) -> Vec<String> {
+    let production = rust_sanitized_production_text(text);
+    let tokens = rust_use_tokens(&production);
+    let mut violations = Vec::new();
+    let file = syn::parse_file(&production);
+    let local_roots = runtime_filter_model_local_roots(text);
+    if local_roots.contains("ArtifactDeliveryOutcome") {
+        violations.push(
+            "artifact router must not shadow port::subscription::ArtifactDeliveryOutcome"
+                .to_string(),
+        );
+    }
+    for forbidden in ["LogicalSnapshot", "ChannelAction"] {
+        if tokens.iter().any(|token| token == forbidden) {
+            violations.push(format!(
+                "artifact router must not declare or reference {forbidden}"
+            ));
+        }
+    }
+    let route_accepts_canonical_outcome = file.as_ref().is_ok_and(|file| {
+        file.items.iter().any(|item| {
+            let syn::Item::Impl(item) = item else {
+                return false;
+            };
+            item.items.iter().any(|item| {
+                let syn::ImplItem::Fn(method) = item else {
+                    return false;
+                };
+                method.sig.ident == "route"
+                    && method.sig.inputs.iter().any(|input| {
+                        let syn::FnArg::Typed(argument) = input else {
+                            return false;
+                        };
+                        let syn::Type::Reference(reference) = argument.ty.as_ref() else {
+                            return false;
+                        };
+                        matches!(
+                            reference.elem.as_ref(),
+                            syn::Type::Path(path)
+                                if path.qself.is_none()
+                                    && path.path.leading_colon.is_none()
+                                    && path.path.segments.len() == 1
+                                    && path.path.segments[0].ident == "ArtifactDeliveryOutcome"
+                        )
+                    })
+            })
+        })
+    });
+    if !route_accepts_canonical_outcome {
+        violations.push("artifact router must route ArtifactDeliveryOutcome".to_string());
+    }
+    let canonical = rust_production_canonical_paths(text, "src/runtime_filter/router/loopback.rs");
+    if !canonical.iter().any(|path| {
+        path == &[
+            "crate".to_string(),
+            "runtime_filter".to_string(),
+            "port".to_string(),
+            "subscription".to_string(),
+            "ArtifactDeliveryOutcome".to_string(),
+        ]
+    }) {
+        violations
+            .push("artifact router must import canonical ArtifactDeliveryOutcome".to_string());
+    }
+    violations
+}
+
+fn runtime_filter_m2_live_namespace_is_monitored(source_rel: &str) -> bool {
+    source_rel.starts_with("src/exec/")
+        || source_rel.starts_with("src/sql/")
+        || source_rel.starts_with("src/lower/")
+        || source_rel.starts_with("src/service/")
+        || matches!(
+            source_rel,
+            "src/runtime/runtime_filter_hub.rs"
+                | "src/runtime/runtime_filter_worker.rs"
+                | "src/runtime/runtime_filter_params.rs"
+        )
+}
+
+fn runtime_filter_m2_live_source_indirection(source_rel: &str, text: &str) -> bool {
+    if !runtime_filter_m2_live_namespace_is_monitored(source_rel) {
+        return false;
+    }
+    let production = rust_sanitized_production_text(text);
+    let tokens = rust_use_tokens(&production);
+    let source_tokens = rust_source_tokens(&production);
+    let has_path_attribute = source_tokens.iter().enumerate().any(|(index, token)| {
+        if token.text != "#" {
+            return false;
+        }
+        let open = if source_tokens
+            .get(index + 1)
+            .is_some_and(|token| token.text == "[")
+        {
+            index + 1
+        } else if source_tokens
+            .get(index + 1)
+            .is_some_and(|token| token.text == "!")
+            && source_tokens
+                .get(index + 2)
+                .is_some_and(|token| token.text == "[")
+        {
+            index + 2
+        } else {
+            return false;
+        };
+        rust_matching_token(&source_tokens, open, "[", "]").is_some_and(|close| {
+            source_tokens[open + 1..close]
+                .windows(2)
+                .any(|window| window[0].text == "path" && window[1].text == "=")
+        })
+    });
+    has_path_attribute
+        || tokens.windows(3).any(|window| {
+            window[0] == "include"
+                && window[1] == "!"
+                && matches!(window[2].as_str(), "(" | "[" | "{")
+        })
+}
+
+fn runtime_filter_m2_live_boundary_violations(source_rel: &str, text: &str) -> Vec<String> {
+    if source_rel.starts_with("src/runtime_filter/") {
+        return Vec::new();
+    }
+    let canonical = rust_production_canonical_paths(text, source_rel);
+    let forbidden_path = canonical.iter().any(|path| {
+        path.starts_with(&[
+            "crate".to_string(),
+            "runtime_filter".to_string(),
+            "materializer".to_string(),
+        ]) || path.starts_with(&[
+            "crate".to_string(),
+            "runtime_filter".to_string(),
+            "port".to_string(),
+            "artifact".to_string(),
+        ]) || path.starts_with(&[
+            "crate".to_string(),
+            "runtime_filter".to_string(),
+            "service".to_string(),
+            "materialization".to_string(),
+        ])
+    });
+    (forbidden_path || runtime_filter_m2_live_source_indirection(source_rel, text))
+        .then(|| format!("{source_rel}: M2 artifact APIs remain Service-owned and harness-only"))
+        .into_iter()
+        .collect()
+}
+
+fn runtime_filter_syn_path_is(path: &syn::Path, expected: &[&str]) -> bool {
+    path.leading_colon.is_none()
+        && path.segments.len() == expected.len()
+        && path
+            .segments
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| actual.ident == expected)
+}
+
+fn runtime_filter_expr_is_err_variant(expr: &syn::Expr, owner: &str, variant: &str) -> bool {
+    let expr = match expr {
+        syn::Expr::Return(return_expr) => {
+            let Some(expr) = return_expr.expr.as_deref() else {
+                return false;
+            };
+            expr
+        }
+        _ => expr,
+    };
+    let syn::Expr::Call(call) = expr else {
+        return false;
+    };
+    if !matches!(
+        call.func.as_ref(),
+        syn::Expr::Path(path) if runtime_filter_syn_path_is(&path.path, &["Err"])
+    ) || call.args.len() != 1
+    {
+        return false;
+    }
+    matches!(
+        call.args.first(),
+        Some(syn::Expr::Path(path))
+            if runtime_filter_syn_path_is(&path.path, &[owner, variant])
+    )
+}
+
+fn runtime_filter_materializer_has_exact_range_rejection(source_rel: &str, text: &str) -> bool {
+    let Ok(file) = syn::parse_file(&rust_sanitized_production_text(text)) else {
+        return false;
+    };
+    match source_rel {
+        "src/runtime_filter/materializer/mod.rs" => file.items.iter().any(|item| {
+            let syn::Item::Fn(function) = item else {
+                return false;
+            };
+            if function.sig.ident != "validate_membership_kind" || function.block.stmts.len() != 1 {
+                return false;
+            }
+            let syn::Stmt::Expr(syn::Expr::If(if_expr), None) = &function.block.stmts[0] else {
+                return false;
+            };
+            let syn::Expr::Macro(condition) = if_expr.cond.as_ref() else {
+                return false;
+            };
+            let condition_tokens = rust_use_tokens(&condition.mac.tokens.to_string());
+            let then_rejects = matches!(
+                if_expr.then_branch.stmts.as_slice(),
+                [syn::Stmt::Expr(expr, None)]
+                    if runtime_filter_expr_is_err_variant(
+                        expr,
+                        "MaterializationError",
+                        "UnsupportedRange",
+                    )
+            );
+            condition.mac.path.is_ident("matches")
+                && condition_tokens == ["kind", ",", "ArtifactKind", "::", "Range"]
+                && then_rejects
+                && if_expr.else_branch.is_some()
+        }),
+        "src/runtime_filter/materializer/codec.rs" => {
+            #[derive(Default)]
+            struct RangeRejectionAudit {
+                exact_arms: usize,
+            }
+            impl<'ast> syn::visit::Visit<'ast> for RangeRejectionAudit {
+                fn visit_expr_match(&mut self, expr: &'ast syn::ExprMatch) {
+                    for arm in &expr.arms {
+                        if matches!(
+                            &arm.pat,
+                            syn::Pat::Path(path)
+                                if runtime_filter_syn_path_is(
+                                    &path.path,
+                                    &["ArtifactKind", "Range"],
+                                )
+                        ) && runtime_filter_expr_is_err_variant(
+                            &arm.body,
+                            "ArtifactCodecError",
+                            "UnsupportedKind",
+                        ) {
+                            self.exact_arms += 1;
+                        }
+                    }
+                    syn::visit::visit_expr_match(self, expr);
+                }
+            }
+            let Some(function) = file.items.iter().find_map(|item| match item {
+                syn::Item::Fn(function) if function.sig.ident == "decode_leaf" => Some(function),
+                _ => None,
+            }) else {
+                return false;
+            };
+            let mut audit = RangeRejectionAudit::default();
+            syn::visit::Visit::visit_block(&mut audit, &function.block);
+            audit.exact_arms == 1
+        }
+        _ => false,
+    }
+}
+
+fn runtime_filter_eval_const_u128(expr: &syn::Expr) -> Option<u128> {
+    match expr {
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Int(value),
+            ..
+        }) => value.base10_parse().ok(),
+        syn::Expr::Paren(expr) => runtime_filter_eval_const_u128(&expr.expr),
+        syn::Expr::Group(expr) => runtime_filter_eval_const_u128(&expr.expr),
+        syn::Expr::Binary(expr) => {
+            let left = runtime_filter_eval_const_u128(&expr.left)?;
+            let right = runtime_filter_eval_const_u128(&expr.right)?;
+            match expr.op {
+                syn::BinOp::Mul(_) => left.checked_mul(right),
+                syn::BinOp::Shl(_) => left.checked_shl(u32::try_from(right).ok()?),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn runtime_filter_contains_magic_16_mib(text: &str) -> bool {
+    #[derive(Default)]
+    struct MagicBudgetAudit {
+        found: bool,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for MagicBudgetAudit {
+        fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+            if runtime_filter_eval_const_u128(expr) == Some(16 * 1024 * 1024) {
+                self.found = true;
+            }
+            syn::visit::visit_expr(self, expr);
+        }
+    }
+
+    let Ok(file) = syn::parse_file(&rust_sanitized_production_text(text)) else {
+        return false;
+    };
+    let mut audit = MagicBudgetAudit::default();
+    syn::visit::Visit::visit_file(&mut audit, &file);
+    audit.found
+}
+
+fn runtime_filter_materialization_executor_violations(source_rel: &str, text: &str) -> Vec<String> {
+    if !source_rel.starts_with("src/runtime_filter/materializer/")
+        && source_rel != "src/runtime_filter/service/materialization.rs"
+    {
+        return Vec::new();
+    }
+    let mut violations = BTreeSet::new();
+    for path in rust_production_canonical_paths(text, source_rel) {
+        let dependency = runtime_filter_dependency_path(&path, source_rel);
+        let forbidden_thread_dependency = dependency
+            .starts_with(&["std".to_string(), "thread".to_string()])
+            && !matches!(
+                dependency.get(2).map(String::as_str),
+                Some("scope" | "ScopedJoinHandle")
+            );
+        if forbidden_thread_dependency
+            || dependency
+                .first()
+                .is_some_and(|root| root == "tokio" || root == "rayon")
+        {
+            violations.insert(format!(
+                "{source_rel}: detached materialization executor dependency {}",
+                dependency.join("::")
+            ));
+        }
+    }
+    for path in runtime_filter_runtime_extern_crates(text) {
+        if path
+            .first()
+            .is_some_and(|root| root == "tokio" || root == "rayon")
+        {
+            violations.insert(format!(
+                "{source_rel}: detached materialization executor dependency {}",
+                path.join("::")
+            ));
+        }
+    }
+    let tokens = rust_use_tokens(&rust_sanitized_production_text(text));
+    for pair in tokens.windows(2) {
+        if matches!(
+            pair[0].as_str(),
+            "struct" | "enum" | "type" | "trait" | "union"
+        ) && ["Pool", "Executor", "Queue", "Scheduler", "Workers"]
+            .into_iter()
+            .any(|suffix| pair[1].ends_with(suffix))
+        {
+            violations.insert(format!(
+                "{source_rel}: materialization must not own second {}",
+                pair[1]
+            ));
+        }
+    }
+    violations.into_iter().collect()
+}
+
+fn runtime_filter_materializer_semantic_violations(source_rel: &str, text: &str) -> Vec<String> {
+    let is_materializer = source_rel.starts_with("src/runtime_filter/materializer/");
+    let is_service_owner = source_rel == "src/runtime_filter/service/materialization.rs";
+    if !is_materializer && !is_service_owner {
+        return Vec::new();
+    }
+    let mut violations = runtime_filter_materialization_executor_violations(source_rel, text);
+    if is_service_owner {
+        return violations;
+    }
+    let production = rust_sanitized_production_text(text);
+    let tokens = rust_use_tokens(&production);
+
+    for forbidden in [
+        "standalone",
+        "backend_count",
+        "be_count",
+        "be_num",
+        "backend_num",
+        "cluster_nodes",
+        "cluster_size",
+        "executor_count",
+        "num_backends",
+        "num_nodes",
+        "num_workers",
+        "live_backends",
+        "node_count",
+        "worker_count",
+        "worker_nodes",
+    ] {
+        if tokens.iter().any(|token| token == forbidden) {
+            violations.push(format!(
+                "{source_rel}: forbidden topology fallback {forbidden}"
+            ));
+        }
+    }
+    if runtime_filter_contains_magic_16_mib(text) {
+        violations.push(format!(
+            "{source_rel}: materializer budget must come from install policy"
+        ));
+    }
+    let canonical_range_count = rust_production_canonical_paths(text, source_rel)
+        .into_iter()
+        .filter(|path| {
+            path == &[
+                "crate".to_string(),
+                "runtime_filter".to_string(),
+                "port".to_string(),
+                "artifact".to_string(),
+                "ArtifactKind".to_string(),
+                "Range".to_string(),
+            ]
+        })
+        .count();
+    let direct_range_count = tokens
+        .windows(3)
+        .filter(|window| window == &["ArtifactKind", "::", "Range"])
+        .count();
+    let range_count = canonical_range_count.max(direct_range_count);
+    let allowed_range_count = usize::from(runtime_filter_materializer_has_exact_range_rejection(
+        source_rel, text,
+    ));
+    if range_count != allowed_range_count {
+        violations.push(format!(
+            "{source_rel}: Membership must not materialize ArtifactKind::Range"
+        ));
+    }
+    violations.extend(runtime_filter_global_registry_violations(source_rel, text));
+    violations.extend(runtime_filter_any_dead_code_violations(source_rel, text));
+    violations
 }
 
 #[test]
@@ -8757,7 +9486,7 @@ fn runtime_filter_channel_service_boundaries_are_default_deny_and_harness_only()
     let mut violations = Vec::new();
     for path in rs_files(&runtime_filter) {
         let source_rel = rel(&path);
-        if ["core", "port", "router", "service"]
+        if ["core", "materializer", "port", "router", "service"]
             .into_iter()
             .any(|namespace| {
                 source_rel == format!("src/runtime_filter/{namespace}.rs")
@@ -8778,6 +9507,21 @@ fn runtime_filter_channel_service_boundaries_are_default_deny_and_harness_only()
         violations.join("\n")
     );
 
+    let actual_materializer_sources = rs_files(&runtime_filter.join("materializer"))
+        .into_iter()
+        .map(|path| rel(&path))
+        .collect::<BTreeSet<_>>();
+    let expected_materializer_sources = BTreeSet::from([
+        "src/runtime_filter/materializer/bitset.rs".to_string(),
+        "src/runtime_filter/materializer/bloom.rs".to_string(),
+        "src/runtime_filter/materializer/codec.rs".to_string(),
+        "src/runtime_filter/materializer/mod.rs".to_string(),
+    ]);
+    assert_eq!(
+        actual_materializer_sources, expected_materializer_sources,
+        "materializer source inventory is explicit and unknown files default-deny"
+    );
+
     let src = repo.join("src");
     for path in rs_files(&src) {
         if path.starts_with(&runtime_filter) {
@@ -8786,6 +9530,10 @@ fn runtime_filter_channel_service_boundaries_are_default_deny_and_harness_only()
         let source_rel = rel(&path);
         let text = fs::read_to_string(&path).expect("production source must be readable");
         violations.extend(runtime_filter_runtime_boundary_violations(
+            &source_rel,
+            &text,
+        ));
+        violations.extend(runtime_filter_m2_live_boundary_violations(
             &source_rel,
             &text,
         ));
@@ -8822,6 +9570,24 @@ fn runtime_filter_channel_service_boundaries_are_default_deny_and_harness_only()
         !rust_sanitized_production_text(&service_sources)
             .contains("RuntimeFilterLifecycleRegistry"),
         "Service may depend on the event sink trait, not the lifecycle registry concrete"
+    );
+
+    let router = fs::read_to_string(runtime_filter.join("router/loopback.rs"))
+        .expect("artifact router source must be readable");
+    let router_violations = runtime_filter_router_artifact_surface_violations(&router);
+    assert!(
+        router_violations.is_empty(),
+        "Router must expose only the physical artifact delivery API:\n{}",
+        router_violations.join("\n")
+    );
+    let subscription = fs::read_to_string(runtime_filter.join("port/subscription.rs"))
+        .expect("artifact subscription source must be readable");
+    let subscription_violations =
+        runtime_filter_subscription_artifact_surface_violations(&subscription);
+    assert!(
+        subscription_violations.is_empty(),
+        "Subscription Published must carry ArtifactBundle, never LogicalSnapshot:\n{}",
+        subscription_violations.join("\n")
     );
 
     let query_context = fs::read_to_string(repo.join("src/runtime/query_context.rs"))
@@ -8968,6 +9734,363 @@ fn runtime_filter_core_boundary_detector_rejects_forbidden_synthetic_imports() {
             "core boundary detector must reject {source}"
         );
     }
+}
+
+#[test]
+fn runtime_filter_materializer_boundary_detector_rejects_synthetic_bypasses() {
+    let source_rel = "src/runtime_filter/materializer/codec.rs";
+    for source in [
+        "use crate::exec::{runtime_filter::RuntimeFilter, operators::*};",
+        "use crate::runtime::{runtime_filter_hub as hub, runtime_filter_worker::*};",
+        "pub use crate::runtime::runtime_filter_params as params;",
+        "use crate::runtime::query_context::QueryContext;",
+        "use crate::sql::{planner as p, codegen::*};",
+        "use crate::{lower::fragment, service::grpc_client};",
+        "use crate::runtime_filter::model::{graph::*, validation as checked};",
+        "use crate::runtime_filter::{router::loopback, service as coordinator};",
+        "use crate::runtime_filter::service::subscription::*;",
+        "use crate::{connector, formats};",
+        "use crate::proto as wire; use wire::runtime_filter::Artifact;",
+        "use crate::thrift::runtime_filter::TRuntimeFilterDescription;",
+        "#[path = \"../../../runtime/runtime_filter_hub.rs\"] mod hidden;",
+        "include!(\"../../../runtime/runtime_filter_worker.rs\");",
+        "pub use crate::exec::operators as neutral;",
+        "fn decoy() { if false { crate::runtime_filter::service::RuntimeFilterService::default(); } }",
+        "extern crate tokio;",
+        "fn spawn() { std::thread::spawn(|| {}); }",
+        "use rayon::ThreadPoolBuilder;",
+    ] {
+        assert!(
+            !runtime_filter_runtime_boundary_violations(source_rel, source).is_empty(),
+            "materializer detector must reject dependency/source bypass: {source}"
+        );
+    }
+
+    for (source_rel, source) in [
+        (
+            "src/runtime_filter/materializer/codec.rs",
+            "use std::sync::Arc;",
+        ),
+        (
+            "src/runtime_filter/materializer/bloom.rs",
+            "use sha2::{Digest, Sha256};",
+        ),
+        (
+            "src/runtime_filter/materializer/bitset.rs",
+            "use arrow::datatypes::DataType;",
+        ),
+        (
+            "src/runtime_filter/materializer/codec.rs",
+            "use crate::runtime_filter::port::artifact::ArtifactBundle;",
+        ),
+        (
+            "src/runtime_filter/materializer/codec.rs",
+            "use crate::runtime_filter::port::value_domain::LogicalSnapshot;",
+        ),
+        (
+            "src/runtime_filter/materializer/codec.rs",
+            "use crate::runtime_filter::port::support::ArtifactRetention;",
+        ),
+    ] {
+        assert!(
+            runtime_filter_runtime_boundary_violations(source_rel, source).is_empty(),
+            "materializer detector must allow neutral/pure contract dependency: {source}"
+        );
+    }
+    assert!(
+        !runtime_filter_runtime_boundary_violations(
+            "src/runtime_filter/materializer/unknown.rs",
+            "use std::sync::Arc;",
+        )
+        .is_empty(),
+        "unknown materializer source must default-deny"
+    );
+}
+
+#[test]
+fn runtime_filter_m2_live_boundary_detector_rejects_alias_glob_reexport_and_decoy_calls() {
+    for (source_rel, source) in [
+        (
+            "src/exec/operators/hash_join/build.rs",
+            "use crate::runtime_filter::materializer as m; fn build() { m::Materializer::plan(); }",
+        ),
+        (
+            "src/runtime/runtime_filter_worker.rs",
+            "use crate::runtime_filter::port::artifact::*; fn send(bundle: ArtifactBundle) {}",
+        ),
+        (
+            "src/service/grpc_server.rs",
+            "pub use crate::runtime_filter::materializer::codec::decode_leaf as decode;",
+        ),
+        (
+            "src/sql/codegen/proto_encode/runtime_filter.rs",
+            "fn decoy() { if false { crate::runtime_filter::materializer::Materializer::plan(); } }",
+        ),
+        (
+            "src/lower/fragment.rs",
+            "use crate::runtime_filter::service::materialization::run_materialization_jobs;",
+        ),
+    ] {
+        assert!(
+            !runtime_filter_m2_live_boundary_violations(source_rel, source).is_empty(),
+            "live M2 boundary detector must reject {source_rel}: {source}"
+        );
+    }
+    assert!(
+        runtime_filter_m2_live_boundary_violations(
+            "src/runtime/query_context.rs",
+            "use crate::runtime_filter::service::RuntimeFilterService;",
+        )
+        .is_empty(),
+        "QueryContext retains only Service lifecycle ownership"
+    );
+    for source in [
+        "struct ArtifactBundle; fn consume(_: ArtifactBundle) {}",
+        "struct Materializer; impl Materializer { fn plan() {} }",
+        "fn decode_leaf() {} fn run_materialization_jobs() {}",
+    ] {
+        assert!(
+            runtime_filter_m2_live_boundary_violations(
+                "src/exec/operators/hash_join/build.rs",
+                source,
+            )
+            .is_empty(),
+            "local names must not be mistaken for canonical M2 dependencies: {source}"
+        );
+    }
+}
+
+#[test]
+fn runtime_filter_m2_live_boundary_detector_rejects_source_indirection() {
+    for (source_rel, source) in [
+        (
+            "src/exec/operators/hash_join/build.rs",
+            "#[path = \"../../../../runtime_filter/materializer/mod.rs\"] mod hidden;",
+        ),
+        (
+            "src/sql/codegen/proto_encode/runtime_filter.rs",
+            "#[cfg_attr(unix, path = \"../../../../runtime_filter/port/artifact.rs\")] mod hidden;",
+        ),
+        (
+            "src/runtime/runtime_filter_hub.rs",
+            "include!(\"../runtime_filter/materializer/mod.rs\");",
+        ),
+        (
+            "src/service/grpc_server.rs",
+            "include!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/runtime_filter/materializer/mod.rs\"));",
+        ),
+    ] {
+        assert!(
+            !runtime_filter_m2_live_boundary_violations(source_rel, source).is_empty(),
+            "monitored live namespace must reject source indirection: {source_rel}: {source}"
+        );
+    }
+    assert!(
+        runtime_filter_m2_live_boundary_violations(
+            "src/lower/fragment.rs",
+            "#[cfg(test)] mod tests { include!(\"../../runtime_filter/materializer/mod.rs\"); }",
+        )
+        .is_empty(),
+        "cfg(test) source indirection is removed before the production audit"
+    );
+}
+
+#[test]
+fn runtime_filter_artifact_router_and_subscription_surface_reject_logical_and_shadow_decoys() {
+    const GOOD_SUBSCRIPTION: &str = r#"
+use std::sync::Arc;
+use crate::runtime_filter::port::artifact::ArtifactBundle;
+enum ArtifactAcquireOutcome { Published(Arc<ArtifactBundle>) }
+enum ArtifactDeliveryOutcome { Published(Arc<ArtifactBundle>) }
+trait BlockingSnapshotSubscription {
+    fn snapshot(&self) -> Option<Arc<ArtifactBundle>>;
+}
+"#;
+    let good_subscription_violations =
+        runtime_filter_subscription_artifact_surface_violations(GOOD_SUBSCRIPTION);
+    assert!(
+        good_subscription_violations.is_empty(),
+        "valid artifact subscription surface rejected: {good_subscription_violations:#?}"
+    );
+    for bad in [
+        GOOD_SUBSCRIPTION.replace("ArtifactBundle", "LogicalSnapshot"),
+        format!("struct ArtifactBundle;\n{GOOD_SUBSCRIPTION}"),
+        GOOD_SUBSCRIPTION.replace("use std::sync::Arc;", "type Arc<T> = Box<T>;"),
+        GOOD_SUBSCRIPTION.replace("Arc<ArtifactBundle>", "evil::Arc<evil::ArtifactBundle>"),
+        GOOD_SUBSCRIPTION.replace(
+            "fn snapshot(&self) -> Option<Arc<ArtifactBundle>>;",
+            "fn snapshot(&self) -> Option<LogicalSnapshot>;",
+        ),
+    ] {
+        assert!(
+            !runtime_filter_subscription_artifact_surface_violations(&bad).is_empty(),
+            "subscription surface must reject logical/shadow decoy:\n{bad}"
+        );
+    }
+
+    const GOOD_ROUTER: &str = r#"
+use crate::runtime_filter::port::subscription::ArtifactDeliveryOutcome;
+struct LoopbackRouter;
+impl LoopbackRouter {
+    fn route(&self, outcome: &ArtifactDeliveryOutcome) {}
+}
+"#;
+    assert!(runtime_filter_router_artifact_surface_violations(GOOD_ROUTER).is_empty());
+    for bad in [
+        GOOD_ROUTER.replace("ArtifactDeliveryOutcome", "LogicalSnapshot"),
+        format!("enum ArtifactDeliveryOutcome {{ Cancelled }}\n{GOOD_ROUTER}"),
+        GOOD_ROUTER.replace(
+            "outcome: &ArtifactDeliveryOutcome",
+            "outcome: &evil::ArtifactDeliveryOutcome",
+        ),
+        GOOD_ROUTER.replace(
+            "fn route(&self, outcome: &ArtifactDeliveryOutcome)",
+            "fn route(&self, action: &ChannelAction)",
+        ),
+    ] {
+        assert!(
+            !runtime_filter_router_artifact_surface_violations(&bad).is_empty(),
+            "router surface must reject logical/action/shadow decoy:\n{bad}"
+        );
+    }
+}
+
+#[test]
+fn runtime_filter_materializer_semantic_detector_rejects_range_magic_fallback_and_second_queue() {
+    for (source_rel, source) in [
+        (
+            "src/runtime_filter/materializer/mod.rs",
+            "fn build() { let kind = ArtifactKind::Range; encode_membership_leaf(kind); }",
+        ),
+        (
+            "src/runtime_filter/materializer/mod.rs",
+            "use crate::runtime_filter::port::artifact::ArtifactKind as Kind; fn build() { let _ = Kind::Range; }",
+        ),
+        (
+            "src/runtime_filter/materializer/mod.rs",
+            "use crate::runtime_filter::port::artifact::*; fn build() { let _ = ArtifactKind::Range; }",
+        ),
+        (
+            "src/runtime_filter/materializer/mod.rs",
+            "fn build() { let _ = crate::runtime_filter::port::artifact::ArtifactKind::Range; }",
+        ),
+        (
+            "src/runtime_filter/materializer/mod.rs",
+            "const DEFAULT: usize = 16 * 1024 * 1024;",
+        ),
+        (
+            "src/runtime_filter/materializer/mod.rs",
+            "const DEFAULT: usize = 16_777_216;",
+        ),
+        (
+            "src/runtime_filter/materializer/mod.rs",
+            "const DEFAULT: usize = 0x0100_0000;",
+        ),
+        (
+            "src/runtime_filter/materializer/mod.rs",
+            "const DEFAULT: usize = 1 << 24;",
+        ),
+        (
+            "src/runtime_filter/materializer/mod.rs",
+            "const DEFAULT: usize = 16 << 20;",
+        ),
+        (
+            "src/runtime_filter/materializer/mod.rs",
+            "const DEFAULT: usize = (16 * 1024) * 1024;",
+        ),
+        (
+            "src/runtime_filter/materializer/mod.rs",
+            "fn budget() { let standalone = true; let backend_count = 1; }",
+        ),
+        (
+            "src/runtime_filter/materializer/mod.rs",
+            "fn budget() { let cluster_size = 1; let worker_count = 1; let num_workers = 1; }",
+        ),
+        (
+            "src/runtime_filter/materializer/mod.rs",
+            "struct MaterializerExecutor; struct ArtifactJobQueue;",
+        ),
+        (
+            "src/runtime_filter/materializer/mod.rs",
+            "struct MaterializationThreadPool; struct MaterializationQueue;",
+        ),
+        (
+            "src/runtime_filter/materializer/mod.rs",
+            "static REGISTRY: () = ();",
+        ),
+        (
+            "src/runtime_filter/materializer/mod.rs",
+            "#[allow(dead_code)] fn hidden() { crate::exec::operators::run(); }",
+        ),
+    ] {
+        assert!(
+            !runtime_filter_materializer_semantic_violations(source_rel, source).is_empty(),
+            "materializer semantic detector must reject: {source}"
+        );
+    }
+    assert!(
+        runtime_filter_materializer_semantic_violations(
+            "src/runtime_filter/materializer/mod.rs",
+            "fn budget(hash_count: usize, artifact_count: usize) { let _ = (hash_count, artifact_count); }",
+        )
+        .is_empty(),
+        "legitimate representation counts are not topology fallbacks"
+    );
+}
+
+#[test]
+fn runtime_filter_materialization_owner_detector_rejects_second_executor_and_detached_spawn() {
+    for (source_rel, source) in [
+        (
+            "src/runtime_filter/materializer/mod.rs",
+            "fn launch() { std::thread::spawn(|| {}); }",
+        ),
+        (
+            "src/runtime_filter/service/materialization.rs",
+            "fn launch() { std::thread::spawn(|| {}); }",
+        ),
+        (
+            "src/runtime_filter/service/materialization.rs",
+            "use std::thread as detached; fn launch() { detached::spawn(|| {}); }",
+        ),
+        (
+            "src/runtime_filter/service/materialization.rs",
+            "use std::thread::*; fn launch() { spawn(|| {}); }",
+        ),
+        (
+            "src/runtime_filter/service/materialization.rs",
+            "use tokio::task::spawn; fn launch() { spawn(async {}); }",
+        ),
+        (
+            "src/runtime_filter/service/materialization.rs",
+            "use rayon::ThreadPoolBuilder; fn launch() { ThreadPoolBuilder::new(); }",
+        ),
+        (
+            "src/runtime_filter/service/materialization.rs",
+            "struct MaterializationPool; struct MaterializationExecutor; struct MaterializationQueue; struct MaterializationScheduler; struct MaterializationWorkers;",
+        ),
+    ] {
+        assert!(
+            !runtime_filter_materializer_semantic_violations(source_rel, source).is_empty(),
+            "materialization owner must reject a second executor/queue: {source_rel}: {source}"
+        );
+    }
+    assert!(
+        runtime_filter_materializer_semantic_violations(
+            "src/runtime_filter/service/materialization.rs",
+            "fn run() { std::thread::scope(|scope| { scope.spawn(|| {}); }); }",
+        )
+        .is_empty(),
+        "Service materialization keeps scoped threads without a detached executor"
+    );
+    assert!(
+        runtime_filter_materializer_semantic_violations(
+            "src/runtime_filter/service/mod.rs",
+            "struct EventEmitter { pending: std::collections::VecDeque<()> }",
+        )
+        .is_empty(),
+        "the existing Service EventEmitter queue is outside materialization ownership"
+    );
 }
 
 #[test]
@@ -9389,7 +10512,7 @@ fn runtime_filter_root_dead_code_detector_rejects_attribute_bypasses() {
 
 #[test]
 fn runtime_filter_namespace_roots_reject_inner_dead_code_attributes() {
-    for namespace in ["core", "port", "router", "service"] {
+    for namespace in ["core", "materializer", "port", "router", "service"] {
         for source in [
             "#![allow(dead_code)]\npub(crate) mod child;",
             "#![ allow ( unused, dead_code ) ]\npub(crate) mod child;",

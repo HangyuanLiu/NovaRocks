@@ -21,12 +21,16 @@ use std::time::{Duration, Instant};
 
 use crate::common::types::UniqueId;
 use crate::runtime_filter::core::channel::RuntimeFilterChannel;
+use crate::runtime_filter::materializer::bloom::BloomHashContract;
 use crate::runtime_filter::model::contract::{
     ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
     ContributionKind, CoverageWitnessId, ReductionRequirement, RuntimeFilterLifecycle,
     RuntimeFilterLogicalDomain,
 };
 use crate::runtime_filter::model::coverage::Coverage;
+use crate::runtime_filter::port::artifact::{
+    ArtifactKind, ArtifactMembershipSchema, ConsumerArtifactProfile, ConsumerProfileId,
+};
 use crate::runtime_filter::port::events::{
     RouteEventIdentity, RuntimeFilterEvent, RuntimeFilterEventIdentity, RuntimeFilterEventSink,
 };
@@ -37,12 +41,15 @@ use crate::runtime_filter::port::install::{
 use crate::runtime_filter::port::producer::{
     InstallContractError, InstallContractErrorKind, InstallOutcome,
 };
-use crate::runtime_filter::port::support::{RuntimeFilterClock, RuntimeFilterMemoryAccount};
+use crate::runtime_filter::port::support::{
+    ArtifactRetainedBudget, ArtifactScratchBudget, RuntimeFilterClock, RuntimeFilterMemoryAccount,
+};
 use crate::runtime_filter::port::value_domain::MembershipValues;
 use crate::runtime_filter::router::loopback::LoopbackRouter;
 
-use super::EventEmitter;
+use super::materialization::{ArtifactPublishGate, ArtifactPublishKey};
 use super::subscription::{SubscriptionGroup, SubscriptionSlot};
+use super::{EventBatchCompletion, EventEmitter};
 
 #[derive(Debug)]
 pub(super) struct RegistryInstallResult {
@@ -71,6 +78,68 @@ pub(super) struct ProducerRoute {
     pub(super) expected_instances: BTreeSet<UniqueId>,
 }
 
+#[derive(Clone)]
+pub(super) struct CapabilityGroup {
+    key: ArtifactPublishKey,
+    common: RuntimeFilterEventIdentity,
+    profile: ConsumerArtifactProfile,
+    route_edges: Arc<[RouteEdgeId]>,
+}
+
+impl CapabilityGroup {
+    pub(super) const fn key(&self) -> ArtifactPublishKey {
+        self.key
+    }
+
+    pub(super) const fn common(&self) -> RuntimeFilterEventIdentity {
+        self.common
+    }
+
+    pub(super) const fn profile(&self) -> &ConsumerArtifactProfile {
+        &self.profile
+    }
+
+    pub(super) fn route_edges(&self) -> &[RouteEdgeId] {
+        &self.route_edges
+    }
+}
+
+pub(super) struct ChannelArtifactPlan {
+    schema: ArtifactMembershipSchema,
+    policy: crate::runtime_filter::port::install::MaterializationPolicy,
+    max_artifact_bytes: usize,
+    max_concurrent_jobs: usize,
+    retained_budget: Arc<ArtifactRetainedBudget>,
+    scratch_budget: Arc<ArtifactScratchBudget>,
+    groups: Arc<[CapabilityGroup]>,
+}
+
+impl ChannelArtifactPlan {
+    pub(super) const fn schema(&self) -> &ArtifactMembershipSchema {
+        &self.schema
+    }
+    pub(super) const fn policy(
+        &self,
+    ) -> crate::runtime_filter::port::install::MaterializationPolicy {
+        self.policy
+    }
+    pub(super) const fn max_artifact_bytes(&self) -> usize {
+        self.max_artifact_bytes
+    }
+    pub(super) const fn max_concurrent_jobs(&self) -> usize {
+        self.max_concurrent_jobs
+    }
+    pub(super) fn retained_budget(&self) -> Arc<ArtifactRetainedBudget> {
+        self.retained_budget.clone()
+    }
+    pub(super) fn scratch_budget(&self) -> Arc<ArtifactScratchBudget> {
+        self.scratch_budget.clone()
+    }
+    pub(super) fn groups(&self) -> &[CapabilityGroup] {
+        &self.groups
+    }
+}
+
 pub(super) struct InstalledDeployment {
     view: RuntimeFilterInstallView,
     committed_at: Instant,
@@ -81,6 +150,43 @@ pub(super) struct InstalledDeployment {
     router: Arc<LoopbackRouter>,
     channel_routes: BTreeMap<ChannelId, Vec<RouteEdgeId>>,
     route_event_identities: BTreeMap<RouteEdgeId, Vec<RouteEventIdentity>>,
+    artifact_channels: BTreeMap<ChannelId, ChannelArtifactPlan>,
+    publish_gate: ArtifactPublishGate,
+}
+
+pub(super) struct CancelledDeployment {
+    installed: Arc<InstalledDeployment>,
+    cancelled_routes: BTreeMap<ChannelId, Vec<RouteEdgeId>>,
+}
+
+impl CancelledDeployment {
+    pub(super) fn installed(&self) -> &Arc<InstalledDeployment> {
+        &self.installed
+    }
+
+    pub(super) fn deliver_artifact_cancellation(&self) {
+        for routes in self.cancelled_routes.values() {
+            self.installed.router.route(
+                routes,
+                &crate::runtime_filter::port::subscription::ArtifactDeliveryOutcome::Cancelled,
+            );
+        }
+    }
+
+    pub(super) fn arm_artifact_cancellation(
+        &self,
+        channel_id: ChannelId,
+        barrier: Arc<EventBatchCompletion>,
+    ) {
+        let Some(routes) = self.cancelled_routes.get(&channel_id) else {
+            return;
+        };
+        for route in routes {
+            for subscription in self.installed.subscriptions.values() {
+                subscription.arm_cancellation_event(*route, barrier.clone());
+            }
+        }
+    }
 }
 
 impl InstalledDeployment {
@@ -102,6 +208,26 @@ impl InstalledDeployment {
         self.subscriptions.contains_key(&binding_id)
     }
 
+    #[cfg(test)]
+    pub(super) fn set_subscription_delivery_hook(
+        &self,
+        binding_id: BindingId,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        self.subscriptions
+            .get(&binding_id)
+            .expect("test consumer binding is installed")
+            .set_before_deliver_hook(hook);
+    }
+
+    #[cfg(test)]
+    pub(super) fn subscription_delivery_call_count(&self, binding_id: BindingId) -> usize {
+        self.subscriptions
+            .get(&binding_id)
+            .expect("test consumer binding is installed")
+            .delivery_call_count()
+    }
+
     pub(super) fn channels(
         &self,
     ) -> impl Iterator<Item = (ChannelId, Arc<RuntimeFilterChannel>)> + '_ {
@@ -119,6 +245,50 @@ impl InstalledDeployment {
             .get(&channel_id)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    pub(super) fn artifact_plan(&self, channel_id: ChannelId) -> Option<&ChannelArtifactPlan> {
+        self.artifact_channels.get(&channel_id)
+    }
+
+    pub(super) const fn publish_gate(&self) -> &ArtifactPublishGate {
+        &self.publish_gate
+    }
+
+    pub(super) fn routes_for_profile(
+        &self,
+        channel_id: ChannelId,
+        profile_id: ConsumerProfileId,
+    ) -> &[RouteEdgeId] {
+        self.artifact_channels
+            .get(&channel_id)
+            .and_then(|plan| {
+                plan.groups()
+                    .iter()
+                    .find(|group| group.profile().id() == profile_id)
+            })
+            .map(CapabilityGroup::route_edges)
+            .unwrap_or(&[])
+    }
+
+    fn invalidate_artifact_publication(&self) -> BTreeMap<ChannelId, Vec<RouteEdgeId>> {
+        let keys = self
+            .artifact_channels
+            .values()
+            .flat_map(|plan| plan.groups().iter().map(CapabilityGroup::key))
+            .collect::<Vec<_>>();
+        let mut routes = BTreeMap::<ChannelId, Vec<RouteEdgeId>>::new();
+        for key in self.publish_gate.cancel_all(keys) {
+            routes
+                .entry(key.channel_id())
+                .or_default()
+                .extend_from_slice(self.routes_for_profile(key.channel_id(), key.profile_id()));
+        }
+        for channel_routes in routes.values_mut() {
+            channel_routes.sort_unstable();
+            channel_routes.dedup();
+        }
+        routes
     }
 
     pub(super) fn route_event_identities(
@@ -352,6 +522,12 @@ impl DeploymentRegistry {
                 )
                 .expect("unanchored candidate deadline initializes exactly once");
         }
+        let publish_gate = ArtifactPublishGate::default();
+        for plan in routing.artifact_channels.values() {
+            for group in plan.groups() {
+                publish_gate.generation(group.key());
+            }
+        }
         let candidate = Arc::new(InstalledDeployment {
             view: view.clone(),
             committed_at,
@@ -362,6 +538,8 @@ impl DeploymentRegistry {
             router: Arc::new(LoopbackRouter::new(routing.routes)),
             channel_routes: routing.channel_routes,
             route_event_identities: routing.route_event_identities,
+            artifact_channels: routing.artifact_channels,
+            publish_gate,
         });
 
         let committed = {
@@ -408,21 +586,28 @@ impl DeploymentRegistry {
         })
     }
 
-    pub(super) fn cancel(&self) -> Option<Arc<InstalledDeployment>> {
+    pub(super) fn cancel(&self) -> Option<CancelledDeployment> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let (installed, flight) = match &*state {
             RegistryState::Installed(installed) => (Some(installed.clone()), None),
             RegistryState::Publishing { installed, .. } => (Some(installed.clone()), None),
             RegistryState::Installing(flight) => (None, Some(flight.clone())),
-            RegistryState::Cancelled(installed) => return installed.clone(),
+            RegistryState::Cancelled(_) => return None,
             RegistryState::Uninstalled => (None, None),
         };
+        let cancelled_routes = installed
+            .as_ref()
+            .map(|installed| installed.invalidate_artifact_publication())
+            .unwrap_or_default();
         *state = RegistryState::Cancelled(installed.clone());
         drop(state);
         if let Some(flight) = flight {
             flight.complete(Err(cancelled_install()));
         }
-        installed
+        installed.map(|installed| CancelledDeployment {
+            cancelled_routes,
+            installed,
+        })
     }
 
     pub(super) fn active_installation(&self) -> Option<Arc<InstalledDeployment>> {
@@ -539,7 +724,7 @@ fn compare_installed(
     })
 }
 
-fn validate_view(view: &RuntimeFilterInstallView) -> Result<(), InstallContractError> {
+fn validate_view<'a>(view: &'a RuntimeFilterInstallView) -> Result<(), InstallContractError> {
     if view.epoch().get() == 0 {
         return Err(install_error(
             InstallContractErrorKind::InvalidEpoch,
@@ -577,8 +762,9 @@ fn validate_view(view: &RuntimeFilterInstallView) -> Result<(), InstallContractE
         }
     }
 
+    let mut profile_encodings = BTreeMap::<ConsumerProfileId, &'a [u8]>::new();
     for channel in view.channels().values() {
-        validate_channel(channel)?;
+        validate_channel(channel, &mut profile_encodings)?;
     }
     Ok(())
 }
@@ -587,9 +773,10 @@ struct RoutingBuild {
     producers: BTreeMap<BindingId, ProducerRoute>,
     subscriptions: BTreeMap<BindingId, Arc<SubscriptionGroup>>,
     routes:
-        BTreeMap<RouteEdgeId, Arc<dyn crate::runtime_filter::port::subscription::SnapshotDelivery>>,
+        BTreeMap<RouteEdgeId, Arc<dyn crate::runtime_filter::port::subscription::ArtifactDelivery>>,
     channel_routes: BTreeMap<ChannelId, Vec<RouteEdgeId>>,
     route_event_identities: BTreeMap<RouteEdgeId, Vec<RouteEventIdentity>>,
+    artifact_channels: BTreeMap<ChannelId, ChannelArtifactPlan>,
 }
 
 fn build_routing(
@@ -604,6 +791,7 @@ fn build_routing(
         routes: BTreeMap::new(),
         channel_routes: BTreeMap::new(),
         route_event_identities: BTreeMap::new(),
+        artifact_channels: BTreeMap::new(),
     };
     for (channel_id, deployment) in view.channels() {
         let common = RuntimeFilterEventIdentity::new(
@@ -618,6 +806,8 @@ fn build_routing(
                 "temporary installed graph is missing a validated channel",
             )
         })?;
+        let mut capability_routes =
+            BTreeMap::<ConsumerProfileId, (ConsumerArtifactProfile, Vec<RouteEdgeId>)>::new();
         for (binding_id, producer) in deployment.producers() {
             build.producers.insert(
                 *binding_id,
@@ -655,13 +845,101 @@ fn build_routing(
                     })
                     .collect(),
             );
+            let entry = capability_routes
+                .entry(consumer.artifact_profile().id())
+                .or_insert_with(|| (consumer.artifact_profile().clone(), Vec::new()));
+            if entry.0.canonical_bytes() != consumer.artifact_profile().canonical_bytes() {
+                return Err(install_error(
+                    InstallContractErrorKind::ConflictingDeployment,
+                    "consumer profile digest collision carried different canonical bytes",
+                ));
+            }
+            entry.1.push(route_edge_id);
         }
+        let RuntimeFilterLogicalDomain::Membership {
+            value_type,
+            null_semantics,
+        } = deployment.logical_domain()
+        else {
+            unreachable!("validated deployment is membership-only")
+        };
+        let schema = ArtifactMembershipSchema::new(value_type, *null_semantics).map_err(|_| {
+            install_error(
+                InstallContractErrorKind::UnsupportedMembershipType,
+                "membership schema has no canonical artifact encoding",
+            )
+        })?;
+        let policy = deployment.materialization_policy();
+        let retained_bytes = usize::try_from(policy.max_total_retained_bytes()).map_err(|_| {
+            install_error(
+                InstallContractErrorKind::InvalidBudget,
+                "materialization retained budget does not fit this platform",
+            )
+        })?;
+        let scratch_per_job =
+            usize::try_from(policy.max_scratch_bytes_per_job()).map_err(|_| {
+                install_error(
+                    InstallContractErrorKind::InvalidBudget,
+                    "materialization scratch budget does not fit this platform",
+                )
+            })?;
+        let scratch_total = policy.aggregate_scratch_bytes().map_err(|_| {
+            install_error(
+                InstallContractErrorKind::InvalidBudget,
+                "materialization aggregate scratch budget overflows",
+            )
+        })?;
+        let groups = capability_routes
+            .into_iter()
+            .map(|(profile_id, (profile, mut route_edges))| {
+                route_edges.sort_unstable();
+                route_edges.dedup();
+                CapabilityGroup {
+                    key: ArtifactPublishKey::new(*channel_id, view.epoch(), profile_id),
+                    common,
+                    profile,
+                    route_edges: route_edges.into(),
+                }
+            })
+            .collect::<Vec<_>>();
+        build.artifact_channels.insert(
+            *channel_id,
+            ChannelArtifactPlan {
+                schema,
+                policy,
+                max_artifact_bytes: usize::try_from(deployment.policy().max_artifact_bytes)
+                    .map_err(|_| {
+                        install_error(
+                            InstallContractErrorKind::InvalidBudget,
+                            "artifact byte budget does not fit this platform",
+                        )
+                    })?,
+                max_concurrent_jobs: policy.max_concurrent_jobs(),
+                retained_budget: Arc::new(ArtifactRetainedBudget::new(retained_bytes)),
+                scratch_budget: Arc::new(
+                    ArtifactScratchBudget::new(scratch_per_job, scratch_total).map_err(|_| {
+                        install_error(
+                            InstallContractErrorKind::InvalidBudget,
+                            "materialization scratch budget is inconsistent",
+                        )
+                    })?,
+                ),
+                groups: groups.into(),
+            },
+        );
     }
     Ok(build)
 }
 
-fn validate_channel(channel: &CompleteOnceChannelDeployment) -> Result<(), InstallContractError> {
-    let RuntimeFilterLogicalDomain::Membership { value_type, .. } = channel.logical_domain() else {
+fn validate_channel<'a>(
+    channel: &'a CompleteOnceChannelDeployment,
+    profile_encodings: &mut BTreeMap<ConsumerProfileId, &'a [u8]>,
+) -> Result<(), InstallContractError> {
+    let RuntimeFilterLogicalDomain::Membership {
+        value_type,
+        null_semantics,
+    } = channel.logical_domain()
+    else {
         return Err(install_error(
             InstallContractErrorKind::UnsupportedChannelContract,
             "M1 supports only Membership logical domains",
@@ -708,6 +986,33 @@ fn validate_channel(channel: &CompleteOnceChannelDeployment) -> Result<(), Insta
             "max reducer bytes must be non-zero",
         ));
     }
+    let materialization_policy = channel.materialization_policy();
+    usize::try_from(materialization_policy.max_total_retained_bytes()).map_err(|_| {
+        install_error(
+            InstallContractErrorKind::InvalidBudget,
+            "materialization retained budget does not fit this platform",
+        )
+    })?;
+    usize::try_from(materialization_policy.max_scratch_bytes_per_job()).map_err(|_| {
+        install_error(
+            InstallContractErrorKind::InvalidBudget,
+            "materialization scratch budget does not fit this platform",
+        )
+    })?;
+    materialization_policy
+        .aggregate_scratch_bytes()
+        .map_err(|_| {
+            install_error(
+                InstallContractErrorKind::InvalidBudget,
+                "materialization aggregate scratch budget overflows",
+            )
+        })?;
+    let schema = ArtifactMembershipSchema::new(value_type, *null_semantics).map_err(|_| {
+        install_error(
+            InstallContractErrorKind::UnsupportedMembershipType,
+            "membership schema has no canonical artifact encoding",
+        )
+    })?;
     let mut producer_witnesses = BTreeSet::new();
     if channel
         .producers()
@@ -739,6 +1044,7 @@ fn validate_channel(channel: &CompleteOnceChannelDeployment) -> Result<(), Insta
             ));
         }
     }
+    let mut unique_profiles = BTreeSet::new();
     for consumer in channel.consumers().values() {
         if consumer.expected_fragment_instances().is_empty() {
             return Err(install_error(
@@ -752,17 +1058,108 @@ fn validate_channel(channel: &CompleteOnceChannelDeployment) -> Result<(), Insta
                 "M1 consumers must use BlockingSnapshot activation",
             ));
         }
-        if !consumer
-            .capabilities()
-            .contains(&ArtifactCapability::Membership)
+        let capabilities = consumer.capabilities();
+        let profile = consumer.artifact_profile();
+        unique_profiles.insert((profile.id(), profile.canonical_bytes()));
+        if !capabilities.contains(&ArtifactCapability::Membership)
+            || !capabilities.contains(&ArtifactCapability::EmptyDomain)
         {
             return Err(install_error(
                 InstallContractErrorKind::MissingMembershipCapability,
-                "M1 consumers must support Membership artifacts",
+                "M2 Membership consumers must declare Membership and EmptyDomain semantics",
             ));
         }
+        if !profile.accepts(ArtifactKind::EmptyDomain) {
+            return Err(install_error(
+                InstallContractErrorKind::UnsupportedChannelContract,
+                "M2 Membership profile must accept EmptyDomain",
+            ));
+        }
+        let value_set = profile.accepts(ArtifactKind::ValueSet);
+        let bitset = profile.accepts(ArtifactKind::Bitset) && bitset_schema_is_feasible(value_type);
+        let bloom = profile.accepts(ArtifactKind::Bloom);
+        if !value_set && !bitset && !bloom {
+            return Err(install_error(
+                InstallContractErrorKind::UnsupportedChannelContract,
+                "M2 Membership profile has no statically feasible membership representation",
+            ));
+        }
+        if matches!(
+            null_semantics,
+            crate::runtime_filter::model::contract::NullSemantics::NullSafeEqual
+        ) && !value_set
+        {
+            return Err(install_error(
+                InstallContractErrorKind::UnsupportedChannelContract,
+                "NullSafeEqual Membership profile must accept ValueSet",
+            ));
+        }
+        if profile.accepts(ArtifactKind::Range)
+            && !capabilities.contains(&ArtifactCapability::OrderedRange)
+        {
+            return Err(install_error(
+                InstallContractErrorKind::UnsupportedChannelContract,
+                "Range physical kind requires OrderedRange semantic capability",
+            ));
+        }
+        if profile.accepted_kinds().iter().any(|kind| {
+            matches!(
+                kind,
+                ArtifactKind::ValueSet | ArtifactKind::Bloom | ArtifactKind::Bitset
+            )
+        }) && !capabilities.contains(&ArtifactCapability::Membership)
+        {
+            return Err(install_error(
+                InstallContractErrorKind::UnsupportedChannelContract,
+                "membership physical kinds require Membership semantic capability",
+            ));
+        }
+        if let Some(existing) = profile_encodings.insert(profile.id(), profile.canonical_bytes())
+            && existing != profile.canonical_bytes()
+        {
+            return Err(install_error(
+                InstallContractErrorKind::ConflictingDeployment,
+                "consumer profile digest collision carried different canonical bytes",
+            ));
+        }
+        if profile.accepts(ArtifactKind::Bloom) {
+            let expected = BloomHashContract::new(&schema, materialization_policy)
+                .map_err(|_| {
+                    install_error(
+                        InstallContractErrorKind::InvalidPolicy,
+                        "materialization Bloom policy is not supported",
+                    )
+                })?
+                .digest();
+            if profile.bloom_hash_contract() != Some(expected) {
+                return Err(install_error(
+                    InstallContractErrorKind::UnsupportedChannelContract,
+                    "Bloom profile hash contract does not match channel schema and policy",
+                ));
+            }
+        }
+    }
+    if materialization_policy.max_concurrent_jobs() > unique_profiles.len() {
+        return Err(install_error(
+            InstallContractErrorKind::InvalidPolicy,
+            "max concurrent materialization jobs exceeds normalized unique profile count",
+        ));
     }
     Ok(())
+}
+
+fn bitset_schema_is_feasible(data_type: &arrow::datatypes::DataType) -> bool {
+    use arrow::datatypes::DataType;
+    matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Date32
+            | DataType::Decimal128(1..=18, _)
+    )
 }
 
 fn validate_coverage(
@@ -893,6 +1290,7 @@ fn channels_equivalent(
         && left.completion_requirement() == right.completion_requirement()
         && left.policy() == right.policy()
         && left.core_budget() == right.core_budget()
+        && left.materialization_policy() == right.materialization_policy()
         && left.producers() == right.producers()
         && left.consumers() == right.consumers()
 }
@@ -921,8 +1319,12 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use crate::common::types::UniqueId;
+    use crate::runtime_filter::materializer::bloom::BloomHashContract;
     use crate::runtime_filter::model::contract::*;
     use crate::runtime_filter::model::coverage::Coverage;
+    use crate::runtime_filter::port::artifact::{
+        ArtifactKind, ArtifactMembershipSchema, ConsumerArtifactProfile, ConsumerProfileId,
+    };
     use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
     use crate::runtime_filter::port::identity::*;
     use crate::runtime_filter::port::install::*;
@@ -1021,6 +1423,7 @@ mod tests {
                 max_retries: 3,
             },
             RuntimeFilterCoreBudget::new(4096),
+            crate::runtime_filter::port::install::MaterializationPolicy::for_test(),
             BTreeMap::from([(
                 BindingId::new(producer),
                 ProducerDeployment::new(
@@ -1181,6 +1584,7 @@ mod tests {
             completion,
             policy,
             budget,
+            base.materialization_policy(),
             producers,
             consumers,
         )
@@ -1196,6 +1600,39 @@ mod tests {
                 .into_iter()
                 .map(|(key, value)| (ChannelId::new(key), value))
                 .collect(),
+        )
+    }
+
+    fn with_consumer_contract(
+        base: CompleteOnceChannelDeployment,
+        logical_domain: RuntimeFilterLogicalDomain,
+        capabilities: BTreeSet<ArtifactCapability>,
+        profile: ConsumerArtifactProfile,
+    ) -> CompleteOnceChannelDeployment {
+        let consumer = base.consumers().values().next().unwrap();
+        CompleteOnceChannelDeployment::new(
+            base.channel_id(),
+            logical_domain,
+            base.lifecycle(),
+            base.availability_coverage().clone(),
+            base.terminal_coverage().clone(),
+            base.reduction_requirement(),
+            base.allowed_contribution_kinds().clone(),
+            base.completion_requirement(),
+            base.policy(),
+            base.core_budget(),
+            base.materialization_policy(),
+            base.producers().clone(),
+            BTreeMap::from([(
+                *base.consumers().keys().next().unwrap(),
+                ConsumerDeployment::with_profile(
+                    consumer.activation(),
+                    capabilities,
+                    profile,
+                    consumer.loopback_route_edge_id(),
+                    consumer.expected_fragment_instances().clone(),
+                ),
+            )]),
         )
     }
 
@@ -1222,6 +1659,239 @@ mod tests {
             .unwrap();
         assert_eq!(result.outcome(), InstallOutcome::Installed);
         assert_eq!(registry.installed_epoch(), Some(DeploymentEpoch::new(9)));
+    }
+
+    #[test]
+    fn install_rejects_membership_without_empty_domain_semantics_or_kind() {
+        let base = channel(1, 10, 20, 30, 40);
+        let logical_domain = base.logical_domain().clone();
+        let missing_semantic = with_consumer_contract(
+            base,
+            logical_domain,
+            BTreeSet::from([ArtifactCapability::Membership]),
+            ConsumerArtifactProfile::new(
+                BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
+                None,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            registry()
+                .install(view([(1, missing_semantic)]))
+                .unwrap_err()
+                .kind(),
+            InstallContractErrorKind::MissingMembershipCapability
+        );
+
+        let base = channel(1, 10, 20, 30, 40);
+        let logical_domain = base.logical_domain().clone();
+        let missing_kind = with_consumer_contract(
+            base,
+            logical_domain,
+            BTreeSet::from([
+                ArtifactCapability::Membership,
+                ArtifactCapability::EmptyDomain,
+            ]),
+            ConsumerArtifactProfile::new(BTreeSet::from([ArtifactKind::ValueSet]), None).unwrap(),
+        );
+        assert_eq!(
+            registry()
+                .install(view([(1, missing_kind)]))
+                .unwrap_err()
+                .kind(),
+            InstallContractErrorKind::UnsupportedChannelContract
+        );
+    }
+
+    #[test]
+    fn install_rejects_schema_and_null_incompatible_profiles() {
+        let base = channel(1, 10, 20, 30, 40);
+        let bitset_only = with_consumer_contract(
+            base,
+            RuntimeFilterLogicalDomain::Membership {
+                value_type: DataType::Utf8,
+                null_semantics: NullSemantics::NeverMatches,
+            },
+            BTreeSet::from([
+                ArtifactCapability::Membership,
+                ArtifactCapability::EmptyDomain,
+            ]),
+            ConsumerArtifactProfile::new(
+                BTreeSet::from([ArtifactKind::Bitset, ArtifactKind::EmptyDomain]),
+                None,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            registry()
+                .install(view([(1, bitset_only)]))
+                .unwrap_err()
+                .kind(),
+            InstallContractErrorKind::UnsupportedChannelContract
+        );
+
+        let base = channel(1, 10, 20, 30, 40);
+        let null_without_value_set = with_consumer_contract(
+            base,
+            RuntimeFilterLogicalDomain::Membership {
+                value_type: DataType::Int64,
+                null_semantics: NullSemantics::NullSafeEqual,
+            },
+            BTreeSet::from([
+                ArtifactCapability::Membership,
+                ArtifactCapability::EmptyDomain,
+            ]),
+            ConsumerArtifactProfile::new(
+                BTreeSet::from([ArtifactKind::Bitset, ArtifactKind::EmptyDomain]),
+                None,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            registry()
+                .install(view([(1, null_without_value_set)]))
+                .unwrap_err()
+                .kind(),
+            InstallContractErrorKind::UnsupportedChannelContract
+        );
+    }
+
+    #[test]
+    fn install_recomputes_bloom_contract_and_bounds_jobs_by_unique_profiles() {
+        let base = channel(1, 10, 20, 30, 40);
+        let too_many_jobs = CompleteOnceChannelDeployment::new(
+            base.channel_id(),
+            base.logical_domain().clone(),
+            base.lifecycle(),
+            base.availability_coverage().clone(),
+            base.terminal_coverage().clone(),
+            base.reduction_requirement(),
+            base.allowed_contribution_kinds().clone(),
+            base.completion_requirement(),
+            base.policy(),
+            base.core_budget(),
+            crate::runtime_filter::port::install::MaterializationPolicy::new(
+                8,
+                5,
+                17,
+                1,
+                1 << 20,
+                1 << 16,
+                2,
+            )
+            .unwrap(),
+            base.producers().clone(),
+            base.consumers().clone(),
+        );
+        assert_eq!(
+            registry()
+                .install(view([(1, too_many_jobs)]))
+                .unwrap_err()
+                .kind(),
+            InstallContractErrorKind::InvalidPolicy
+        );
+
+        let wrong_bloom = with_consumer_contract(
+            base.clone(),
+            base.logical_domain().clone(),
+            BTreeSet::from([
+                ArtifactCapability::Membership,
+                ArtifactCapability::EmptyDomain,
+            ]),
+            ConsumerArtifactProfile::new(
+                BTreeSet::from([
+                    ArtifactKind::Bloom,
+                    ArtifactKind::ValueSet,
+                    ArtifactKind::EmptyDomain,
+                ]),
+                Some(crate::runtime_filter::port::artifact::HashContractDigest::new([7; 32])),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            registry()
+                .install(view([(1, wrong_bloom)]))
+                .unwrap_err()
+                .kind(),
+            InstallContractErrorKind::UnsupportedChannelContract
+        );
+
+        let RuntimeFilterLogicalDomain::Membership {
+            value_type,
+            null_semantics,
+        } = base.logical_domain()
+        else {
+            unreachable!()
+        };
+        let schema = ArtifactMembershipSchema::new(value_type, *null_semantics).unwrap();
+        let digest = BloomHashContract::new(&schema, base.materialization_policy())
+            .unwrap()
+            .digest();
+        let valid_bloom = with_consumer_contract(
+            base.clone(),
+            base.logical_domain().clone(),
+            BTreeSet::from([
+                ArtifactCapability::Membership,
+                ArtifactCapability::EmptyDomain,
+            ]),
+            ConsumerArtifactProfile::new(
+                BTreeSet::from([
+                    ArtifactKind::Bloom,
+                    ArtifactKind::ValueSet,
+                    ArtifactKind::EmptyDomain,
+                ]),
+                Some(digest),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            registry()
+                .install(view([(1, valid_bloom)]))
+                .unwrap()
+                .outcome(),
+            InstallOutcome::Installed
+        );
+    }
+
+    #[test]
+    fn install_rejects_profile_digest_collision_across_channels() {
+        let collision_id = ConsumerProfileId::for_test([9; 32]);
+        let semantics = BTreeSet::from([
+            ArtifactCapability::Membership,
+            ArtifactCapability::EmptyDomain,
+        ]);
+        let first_base = channel(1, 10, 20, 30, 40);
+        let first = with_consumer_contract(
+            first_base.clone(),
+            first_base.logical_domain().clone(),
+            semantics.clone(),
+            ConsumerArtifactProfile::new(
+                BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
+                None,
+            )
+            .unwrap()
+            .with_test_identity(collision_id),
+        );
+        let second_base = channel(2, 11, 21, 31, 41);
+        let second = with_consumer_contract(
+            second_base.clone(),
+            second_base.logical_domain().clone(),
+            semantics,
+            ConsumerArtifactProfile::new(
+                BTreeSet::from([ArtifactKind::Bitset, ArtifactKind::EmptyDomain]),
+                None,
+            )
+            .unwrap()
+            .with_test_identity(collision_id),
+        );
+
+        assert_eq!(
+            registry()
+                .install(view([(1, first), (2, second)]))
+                .unwrap_err()
+                .kind(),
+            InstallContractErrorKind::ConflictingDeployment
+        );
     }
 
     #[test]
@@ -1353,6 +2023,7 @@ mod tests {
             second.completion_requirement(),
             second.policy(),
             second.core_budget(),
+            second.materialization_policy(),
             BTreeMap::from([(
                 BindingId::new(11),
                 ProducerDeployment::new(CoverageWitnessId::new(20), BTreeSet::from([uid(11)])),
@@ -1394,6 +2065,33 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_value_set_install_rejects_materialization_policy_mismatch() {
+        let registry = registry();
+        let base = channel(1, 10, 20, 30, 40);
+        registry.install(view([(1, base.clone())])).unwrap();
+        let changed = CompleteOnceChannelDeployment::new(
+            base.channel_id(),
+            base.logical_domain().clone(),
+            base.lifecycle(),
+            base.availability_coverage().clone(),
+            base.terminal_coverage().clone(),
+            base.reduction_requirement(),
+            base.allowed_contribution_kinds().clone(),
+            base.completion_requirement(),
+            base.policy(),
+            base.core_budget(),
+            MaterializationPolicy::new(8, 5, 19, 1, 1 << 20, 1 << 16, 1).unwrap(),
+            base.producers().clone(),
+            base.consumers().clone(),
+        );
+
+        assert_eq!(
+            registry.install(view([(1, changed)])).unwrap_err().kind(),
+            InstallContractErrorKind::ConflictingDeployment
+        );
+    }
+
+    #[test]
     fn equivalent_install_is_order_independent() {
         let registry = registry();
         let base = channel(1, 10, 20, 30, 40);
@@ -1419,6 +2117,7 @@ mod tests {
                 base.completion_requirement(),
                 base.policy(),
                 base.core_budget(),
+                base.materialization_policy(),
                 producers.clone(),
                 base.consumers().clone(),
             )
@@ -1463,6 +2162,7 @@ mod tests {
             base.completion_requirement(),
             policy,
             base.core_budget(),
+            base.materialization_policy(),
             base.producers().clone(),
             base.consumers().clone(),
         );
@@ -1561,6 +2261,7 @@ mod tests {
             invalid.completion_requirement(),
             invalid.policy(),
             invalid.core_budget(),
+            invalid.materialization_policy(),
             invalid.producers().clone(),
             invalid.consumers().clone(),
         );
@@ -1619,6 +2320,7 @@ mod tests {
                         base.completion_requirement(),
                         base.policy(),
                         base.core_budget(),
+                        base.materialization_policy(),
                         base.producers().clone(),
                         base.consumers().clone(),
                     ),
@@ -1646,6 +2348,7 @@ mod tests {
                         base.completion_requirement(),
                         base.policy(),
                         base.core_budget(),
+                        base.materialization_policy(),
                         base.producers().clone(),
                         base.consumers().clone(),
                     ),
@@ -1791,6 +2494,7 @@ mod tests {
             base.completion_requirement(),
             policy,
             base.core_budget(),
+            base.materialization_policy(),
             base.producers().clone(),
             base.consumers().clone(),
         );
@@ -1813,6 +2517,7 @@ mod tests {
             base.completion_requirement(),
             base.policy(),
             RuntimeFilterCoreBudget::new(0),
+            base.materialization_policy(),
             base.producers().clone(),
             base.consumers().clone(),
         );
@@ -1838,6 +2543,7 @@ mod tests {
             duplicate.completion_requirement(),
             duplicate_policy,
             duplicate.core_budget(),
+            duplicate.materialization_policy(),
             duplicate.producers().clone(),
             duplicate.consumers().clone(),
         );

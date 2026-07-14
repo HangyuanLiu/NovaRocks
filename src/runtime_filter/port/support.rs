@@ -17,6 +17,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 pub(crate) trait RuntimeFilterClock: Send + Sync {
@@ -31,6 +32,238 @@ pub(crate) enum MemoryAccountError {
 pub(crate) trait RuntimeFilterMemoryAccount: Send + Sync {
     fn try_consume(&self, bytes: usize) -> Result<(), MemoryAccountError>;
     fn release(&self, bytes: usize);
+}
+
+#[derive(Debug)]
+pub(crate) struct ArtifactRetainedBudget {
+    max_bytes: usize,
+    retained_bytes: AtomicUsize,
+}
+
+impl ArtifactRetainedBudget {
+    pub(crate) fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            retained_bytes: AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn try_acquire(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> Result<ArtifactRetainedLease, RetainedReservationError> {
+        let mut retained = self.retained_bytes.load(Ordering::Acquire);
+        loop {
+            let next = retained
+                .checked_add(bytes)
+                .ok_or(RetainedReservationError::SizeOverflow)?;
+            if next > self.max_bytes {
+                return Err(RetainedReservationError::CapacityExceeded);
+            }
+            match self.retained_bytes.compare_exchange_weak(
+                retained,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(ArtifactRetainedLease {
+                        budget: self.clone(),
+                        bytes,
+                    });
+                }
+                Err(actual) => retained = actual,
+            }
+        }
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.retained_bytes.load(Ordering::Acquire)
+    }
+}
+
+pub(crate) struct ArtifactRetainedLease {
+    budget: Arc<ArtifactRetainedBudget>,
+    bytes: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct ArtifactScratchBudget {
+    max_bytes_per_job: usize,
+    max_total_bytes: usize,
+    retained_bytes: AtomicUsize,
+}
+
+impl ArtifactScratchBudget {
+    pub(crate) fn new(
+        max_bytes_per_job: usize,
+        max_total_bytes: usize,
+    ) -> Result<Self, RetainedReservationError> {
+        if max_bytes_per_job == 0 || max_total_bytes == 0 || max_bytes_per_job > max_total_bytes {
+            return Err(RetainedReservationError::CapacityExceeded);
+        }
+        Ok(Self {
+            max_bytes_per_job,
+            max_total_bytes,
+            retained_bytes: AtomicUsize::new(0),
+        })
+    }
+
+    pub(crate) fn try_acquire(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> Result<ArtifactScratchLease, RetainedReservationError> {
+        if bytes > self.max_bytes_per_job {
+            return Err(RetainedReservationError::CapacityExceeded);
+        }
+        let mut retained = self.retained_bytes.load(Ordering::Acquire);
+        loop {
+            let next = retained
+                .checked_add(bytes)
+                .ok_or(RetainedReservationError::SizeOverflow)?;
+            if next > self.max_total_bytes {
+                return Err(RetainedReservationError::CapacityExceeded);
+            }
+            match self.retained_bytes.compare_exchange_weak(
+                retained,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(ArtifactScratchLease {
+                        budget: self.clone(),
+                        bytes,
+                    });
+                }
+                Err(actual) => retained = actual,
+            }
+        }
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.retained_bytes.load(Ordering::Acquire)
+    }
+}
+
+pub(crate) struct ArtifactScratchLease {
+    budget: Arc<ArtifactScratchBudget>,
+    bytes: usize,
+}
+
+impl ArtifactScratchLease {
+    pub(crate) const fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for ArtifactScratchLease {
+    fn drop(&mut self) {
+        if self.bytes != 0 {
+            let previous = self
+                .budget
+                .retained_bytes
+                .fetch_sub(self.bytes, Ordering::AcqRel);
+            debug_assert!(previous >= self.bytes);
+        }
+    }
+}
+
+impl fmt::Debug for ArtifactScratchLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ArtifactScratchLease")
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+pub(crate) struct ArtifactScratchReservation {
+    budget: ArtifactScratchLease,
+    memory: MemoryLease,
+}
+
+impl fmt::Debug for ArtifactScratchReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ArtifactScratchReservation")
+            .field("bytes", &self.bytes())
+            .finish()
+    }
+}
+
+impl ArtifactScratchReservation {
+    pub(crate) fn try_new(
+        bytes: usize,
+        budget: Arc<ArtifactScratchBudget>,
+        account: Arc<dyn RuntimeFilterMemoryAccount>,
+    ) -> Result<Self, RetainedReservationError> {
+        let budget = budget.try_acquire(bytes)?;
+        let memory = MemoryLease::try_new(account, bytes)
+            .map_err(|_| RetainedReservationError::CapacityExceeded)?;
+        Ok(Self { budget, memory })
+    }
+
+    pub(crate) const fn bytes(&self) -> usize {
+        self.memory.bytes
+    }
+
+    pub(crate) fn budget_bytes(&self) -> usize {
+        self.budget.bytes()
+    }
+}
+
+impl ArtifactRetainedLease {
+    pub(crate) const fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for ArtifactRetainedLease {
+    fn drop(&mut self) {
+        if self.bytes != 0 {
+            let previous = self
+                .budget
+                .retained_bytes
+                .fetch_sub(self.bytes, Ordering::AcqRel);
+            debug_assert!(previous >= self.bytes);
+        }
+    }
+}
+
+impl fmt::Debug for ArtifactRetainedLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ArtifactRetainedLease")
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ArtifactRetention {
+    budget: ArtifactRetainedLease,
+    memory: RetainedMemoryReservation,
+}
+
+impl ArtifactRetention {
+    pub(crate) fn try_new(
+        bytes: usize,
+        budget: Arc<ArtifactRetainedBudget>,
+        account: Arc<dyn RuntimeFilterMemoryAccount>,
+    ) -> Result<Self, RetainedReservationError> {
+        let budget = budget.try_acquire(bytes)?;
+        let memory = RetainedMemoryReservation::try_new(account, bytes)?;
+        Ok(Self { budget, memory })
+    }
+
+    pub(crate) const fn bytes(&self) -> usize {
+        self.memory.bytes()
+    }
+
+    pub(crate) fn budget_bytes(&self) -> usize {
+        self.budget.bytes()
+    }
 }
 
 struct MemoryLease {
@@ -275,6 +508,79 @@ mod tests {
         let account = Arc::new(RejectingMemoryAccount);
         assert!(TemporaryContributionLease::try_new(account.clone(), 1).is_err());
         assert!(RetainedMemoryReservation::try_new(account, 1).is_err());
+    }
+
+    #[test]
+    fn artifact_budget_is_atomic_and_combined_reservation_rolls_back() {
+        let budget = Arc::new(ArtifactRetainedBudget::new(64));
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let leases = (0..2)
+            .map(|_| {
+                let budget = budget.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    budget.try_acquire(40)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let mut accepted = Vec::new();
+        let mut rejected = 0;
+        for lease in leases {
+            match lease.join().unwrap() {
+                Ok(lease) => accepted.push(lease),
+                Err(RetainedReservationError::CapacityExceeded) => rejected += 1,
+                Err(error) => panic!("unexpected artifact budget error: {error:?}"),
+            }
+        }
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(rejected, 1);
+        assert_eq!(budget.retained_bytes(), 40);
+        drop(accepted);
+        assert_eq!(budget.retained_bytes(), 0);
+
+        assert!(
+            ArtifactRetention::try_new(32, budget.clone(), Arc::new(RejectingMemoryAccount))
+                .is_err()
+        );
+        assert_eq!(budget.retained_bytes(), 0);
+    }
+
+    #[test]
+    fn scratch_budget_enforces_per_job_aggregate_and_memory_account_raii() {
+        assert!(ArtifactScratchBudget::new(0, 64).is_err());
+        assert!(ArtifactScratchBudget::new(65, 64).is_err());
+        let budget = Arc::new(ArtifactScratchBudget::new(40, 64).unwrap());
+        assert!(budget.try_acquire(41).is_err());
+
+        let first = budget.try_acquire(40).unwrap();
+        assert_eq!(budget.retained_bytes(), 40);
+        assert!(budget.try_acquire(25).is_err());
+        drop(first);
+        assert_eq!(budget.retained_bytes(), 0);
+
+        assert!(
+            ArtifactScratchReservation::try_new(
+                32,
+                budget.clone(),
+                Arc::new(RejectingMemoryAccount),
+            )
+            .is_err()
+        );
+        assert_eq!(budget.retained_bytes(), 0);
+
+        let account = Arc::new(CountingMemoryAccount::default());
+        {
+            let reservation =
+                ArtifactScratchReservation::try_new(32, budget.clone(), account.clone()).unwrap();
+            assert_eq!(reservation.bytes(), 32);
+            assert_eq!(reservation.budget_bytes(), 32);
+            assert_eq!(budget.retained_bytes(), 32);
+            assert_eq!(account.0.load(Ordering::SeqCst), 32);
+        }
+        assert_eq!(budget.retained_bytes(), 0);
+        assert_eq!(account.0.load(Ordering::SeqCst), 0);
     }
 
     #[test]

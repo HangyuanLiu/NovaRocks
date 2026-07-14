@@ -18,16 +18,15 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::runtime_filter::core::channel::ChannelAction;
 use crate::runtime_filter::port::identity::RouteEdgeId;
-use crate::runtime_filter::port::subscription::{DeliveryTerminal, SnapshotDelivery};
+use crate::runtime_filter::port::subscription::{ArtifactDelivery, ArtifactDeliveryOutcome};
 
 pub(crate) struct LoopbackRouter {
-    routes: BTreeMap<RouteEdgeId, Arc<dyn SnapshotDelivery>>,
+    routes: BTreeMap<RouteEdgeId, Arc<dyn ArtifactDelivery>>,
 }
 
 impl LoopbackRouter {
-    pub(crate) fn new(routes: BTreeMap<RouteEdgeId, Arc<dyn SnapshotDelivery>>) -> Self {
+    pub(crate) fn new(routes: BTreeMap<RouteEdgeId, Arc<dyn ArtifactDelivery>>) -> Self {
         Self { routes }
     }
 
@@ -38,7 +37,7 @@ impl LoopbackRouter {
     pub(crate) fn route(
         &self,
         route_edge_ids: &[RouteEdgeId],
-        action: &ChannelAction,
+        outcome: &ArtifactDeliveryOutcome,
     ) -> Vec<RouteEdgeId> {
         let deliveries = route_edge_ids
             .iter()
@@ -49,23 +48,8 @@ impl LoopbackRouter {
                     .map(|delivery| (*route_edge_id, delivery))
             })
             .collect::<Vec<_>>();
-        match action {
-            ChannelAction::Completed { snapshot, .. } => {
-                for (route_edge_id, delivery) in &deliveries {
-                    delivery.deliver(*route_edge_id, snapshot.clone());
-                }
-            }
-            ChannelAction::Unavailable { reason, .. } => {
-                for (route_edge_id, delivery) in &deliveries {
-                    delivery.terminal(*route_edge_id, DeliveryTerminal::Unavailable(*reason));
-                }
-            }
-            ChannelAction::Cancelled { .. } => {
-                for (route_edge_id, delivery) in &deliveries {
-                    delivery.terminal(*route_edge_id, DeliveryTerminal::Cancelled);
-                }
-            }
-            ChannelAction::None | ChannelAction::Progress { .. } => return Vec::new(),
+        for (route_edge_id, delivery) in &deliveries {
+            delivery.deliver(*route_edge_id, outcome.clone());
         }
         deliveries
             .into_iter()
@@ -80,11 +64,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, Weak};
 
-    use crate::runtime_filter::core::channel::ChannelAction;
     use crate::runtime_filter::port::identity::RouteEdgeId;
-    use crate::runtime_filter::port::producer::SubmitOutcome;
-    use crate::runtime_filter::port::subscription::{DeliveryTerminal, SnapshotDelivery};
-    use crate::runtime_filter::port::value_domain::LogicalSnapshot;
+    use crate::runtime_filter::port::subscription::{
+        ArtifactDelivery, ArtifactDeliveryOutcome, UnavailableReason,
+    };
 
     use super::LoopbackRouter;
 
@@ -94,14 +77,8 @@ mod tests {
         reentered: AtomicBool,
     }
 
-    impl SnapshotDelivery for ReentrantDelivery {
-        fn deliver(&self, _route_edge_id: RouteEdgeId, _snapshot: Arc<LogicalSnapshot>) {
-            if let Some(router) = self.router.lock().unwrap().upgrade() {
-                assert!(router.contains_route(RouteEdgeId::new(1)));
-            }
-        }
-
-        fn terminal(&self, _route_edge_id: RouteEdgeId, _outcome: DeliveryTerminal) {
+    impl ArtifactDelivery for ReentrantDelivery {
+        fn deliver(&self, _route_edge_id: RouteEdgeId, _outcome: ArtifactDeliveryOutcome) {
             self.terminal_calls.fetch_add(1, Ordering::SeqCst);
             if let Some(router) = self.router.lock().unwrap().upgrade() {
                 assert!(router.contains_route(RouteEdgeId::new(1)));
@@ -111,7 +88,7 @@ mod tests {
     }
 
     #[test]
-    fn reentrant_delivery_runs_without_router_lock_and_progress_is_not_broadcast() {
+    fn reentrant_cancel_delivery_runs_without_router_lock() {
         let delivery = Arc::new(ReentrantDelivery {
             router: Mutex::new(Weak::new()),
             terminal_calls: AtomicUsize::new(0),
@@ -119,17 +96,11 @@ mod tests {
         });
         let router = Arc::new(LoopbackRouter::new(BTreeMap::from([(
             RouteEdgeId::new(1),
-            delivery.clone() as Arc<dyn SnapshotDelivery>,
+            delivery.clone() as Arc<dyn ArtifactDelivery>,
         )])));
         *delivery.router.lock().unwrap() = Arc::downgrade(&router);
         assert_eq!(
-            router.route(
-                &[RouteEdgeId::new(1)],
-                &ChannelAction::Cancelled {
-                    order: 0,
-                    events: Vec::new(),
-                },
-            ),
+            router.route(&[RouteEdgeId::new(1)], &ArtifactDeliveryOutcome::Cancelled,),
             vec![RouteEdgeId::new(1)]
         );
         assert!(router.contains_route(RouteEdgeId::new(1)));
@@ -138,12 +109,8 @@ mod tests {
         assert!(
             router
                 .route(
-                    &[RouteEdgeId::new(1)],
-                    &ChannelAction::Progress {
-                        order: None,
-                        outcome: SubmitOutcome::Applied,
-                        events: Vec::new(),
-                    },
+                    &[],
+                    &ArtifactDeliveryOutcome::Unavailable(UnavailableReason::RouteUnavailable,),
                 )
                 .is_empty()
         );
