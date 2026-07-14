@@ -276,6 +276,7 @@ impl IcebergWriteTransactionExecutor for ChangeStreamWriteTransactionExecutor {
             &build_input.optimized_tree,
             &mut build_input.dag,
             build_input.mv_refresh_ctx.as_deref(),
+            None,
         )?;
         let crate::engine::PlannedIcebergChangeStreamWrite {
             build_result,

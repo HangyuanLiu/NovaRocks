@@ -22127,3 +22127,952 @@ fn cgo_8_immutable_scan_preparation_boundaries_hold_in_production() {
         violations.join("\n")
     );
 }
+
+fn cgo_9a_is_distributed_plan_path(path: &[String]) -> bool {
+    path.iter().map(String::as_str).eq([
+        "crate",
+        "sql",
+        "planner",
+        "distributed",
+        "DistributedPlan",
+    ]) || path.iter().map(String::as_str).eq([
+        "crate",
+        "sql",
+        "planner",
+        "distributed",
+        "fragment",
+        "DistributedPlan",
+    ]) || (path.len() > 5
+        && path[..4]
+            .iter()
+            .map(String::as_str)
+            .eq(["crate", "sql", "planner", "distributed"])
+        && path
+            .last()
+            .is_some_and(|segment| segment == "DistributedPlan"))
+}
+
+fn cgo_9a_single_pattern_ident(pattern: &syn::Pat) -> Option<String> {
+    match pattern {
+        syn::Pat::Ident(ident) if ident.subpat.is_none() => Some(cgo_8_ident_text(&ident.ident)),
+        syn::Pat::Type(typed) => cgo_9a_single_pattern_ident(&typed.pat),
+        syn::Pat::Paren(paren) => cgo_9a_single_pattern_ident(&paren.pat),
+        syn::Pat::Reference(reference) => cgo_9a_single_pattern_ident(&reference.pat),
+        _ => None,
+    }
+}
+
+fn cgo_9a_single_expr_ident(expr: &syn::Expr) -> Option<String> {
+    match expr {
+        syn::Expr::Path(path) if path.qself.is_none() && path.path.segments.len() == 1 => {
+            Some(cgo_8_ident_text(&path.path.segments[0].ident))
+        }
+        syn::Expr::Group(group) => cgo_9a_single_expr_ident(&group.expr),
+        syn::Expr::Paren(paren) => cgo_9a_single_expr_ident(&paren.expr),
+        _ => None,
+    }
+}
+
+fn cgo_9a_clone_source(expr: &syn::Expr) -> Option<String> {
+    let syn::Expr::MethodCall(call) = expr else {
+        return None;
+    };
+    (cgo_8_ident_text(&call.method) == "clone" && call.args.is_empty())
+        .then(|| cgo_9a_single_expr_ident(&call.receiver))
+        .flatten()
+}
+
+fn cgo_9a_deref_target(expr: &syn::Expr) -> Option<String> {
+    let syn::Expr::Unary(unary) = expr else {
+        return None;
+    };
+    matches!(unary.op, syn::UnOp::Deref(_))
+        .then(|| cgo_9a_single_expr_ident(&unary.expr))
+        .flatten()
+}
+
+fn cgo_9a_has_external_child_module(items: &[syn::Item]) -> bool {
+    items.iter().any(|item| {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+            return false;
+        }
+        let syn::Item::Mod(module) = item else {
+            return false;
+        };
+        match &module.content {
+            None => true,
+            Some((_, inline_items)) => cgo_9a_has_external_child_module(inline_items),
+        }
+    })
+}
+
+fn cgo_9a_mutable_reference_target(ty: &syn::Type) -> Option<&syn::Type> {
+    match ty {
+        syn::Type::Reference(reference) if reference.mutability.is_some() => Some(&reference.elem),
+        syn::Type::Group(group) => cgo_9a_mutable_reference_target(&group.elem),
+        syn::Type::Paren(paren) => cgo_9a_mutable_reference_target(&paren.elem),
+        _ => None,
+    }
+}
+
+struct Cgo9aDistributedPlanSealVisitor<'a> {
+    source_rel: &'a str,
+    construction_owner: bool,
+    scopes: Vec<Cgo8AstScope>,
+    module_has_external_children: Vec<bool>,
+    binding_scopes: Vec<Cgo9aValueScope>,
+    violations: Vec<String>,
+}
+
+#[derive(Default)]
+struct Cgo9aValueScope {
+    shadows: BTreeSet<String>,
+    mutable_plans: BTreeSet<String>,
+    cloned_plans: BTreeMap<String, String>,
+}
+
+impl Cgo9aDistributedPlanSealVisitor<'_> {
+    fn scope(&self) -> &Cgo8AstScope {
+        self.scopes.last().expect("CGO-9A AST scope must exist")
+    }
+
+    fn resolve_segments(&self, segments: &[String]) -> Vec<Vec<String>> {
+        let Some(first) = segments.first() else {
+            return Vec::new();
+        };
+        if first == "crate" {
+            return vec![segments.to_vec()];
+        }
+        let mut index = 0usize;
+        let mut module_path = self.scope().module_path.clone();
+        let explicit_module = if first == "self" {
+            index = 1;
+            true
+        } else {
+            while segments
+                .get(index)
+                .is_some_and(|segment| segment == "super")
+            {
+                module_path.pop();
+                index += 1;
+            }
+            index > 0
+        };
+        if explicit_module {
+            let remainder = &segments[index..];
+            if remainder.is_empty() {
+                return vec![module_path];
+            }
+            if let Some(module_scope) = self
+                .scopes
+                .iter()
+                .rev()
+                .find(|scope| scope.module_scope && scope.module_path == module_path)
+            {
+                return module_scope.resolve_unqualified(remainder, Cgo8Namespace::Type, true);
+            }
+            module_path.extend_from_slice(remainder);
+            return vec![module_path];
+        }
+        self.scope()
+            .resolve_unqualified(segments, Cgo8Namespace::Type, true)
+    }
+
+    fn resolve_path(&self, path: &syn::Path) -> Vec<Vec<String>> {
+        self.resolve_segments(
+            &path
+                .segments
+                .iter()
+                .map(|segment| cgo_8_ident_text(&segment.ident))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn type_is_distributed_plan(&self, ty: &syn::Type) -> bool {
+        let Some(path) = cgo_8_type_path(ty) else {
+            return false;
+        };
+        self.resolve_path(&path.path)
+            .iter()
+            .any(|path| cgo_9a_is_distributed_plan_path(path))
+    }
+
+    fn type_is_mutable_distributed_plan_reference(&self, ty: &syn::Type) -> bool {
+        cgo_9a_mutable_reference_target(ty).is_some_and(|ty| self.type_is_distributed_plan(ty))
+    }
+
+    fn register_item_declaration(&mut self, item: &syn::Item) {
+        let ident = match item {
+            syn::Item::Enum(item) => Some(&item.ident),
+            syn::Item::Mod(item) => Some(&item.ident),
+            syn::Item::Struct(item) => Some(&item.ident),
+            syn::Item::Trait(item) => Some(&item.ident),
+            syn::Item::TraitAlias(item) => Some(&item.ident),
+            syn::Item::Union(item) => Some(&item.ident),
+            _ => None,
+        };
+        if let Some(ident) = ident {
+            let local = cgo_8_ident_text(ident);
+            let scope = self.scopes.last_mut().unwrap();
+            scope.type_bindings.remove(&local);
+            scope.type_shadows.insert(local);
+        }
+    }
+
+    fn register_use(&mut self, item: &syn::ItemUse) {
+        let mut raw = Vec::new();
+        cgo_8_expand_use_tree(&item.tree, &mut Vec::new(), &mut raw);
+        for binding in raw {
+            let targets = self.resolve_segments(&binding.target);
+            let aliases_distributed_plan = targets
+                .iter()
+                .any(|target| cgo_9a_is_distributed_plan_path(target));
+            let is_reexport = !matches!(item.vis, syn::Visibility::Inherited);
+            let is_renamed = binding
+                .local
+                .as_deref()
+                .is_some_and(|local| local != "DistributedPlan");
+            let leaks_to_external_child = self.scope().module_scope
+                && self
+                    .module_has_external_children
+                    .last()
+                    .copied()
+                    .unwrap_or(false);
+            if aliases_distributed_plan
+                && (is_reexport
+                    || (leaks_to_external_child && (!self.construction_owner || is_renamed)))
+            {
+                self.violations.push(format!(
+                    "distributed-plan-alias: {} exposes DistributedPlan through a cross-file import surface",
+                    self.source_rel
+                ));
+            }
+            let scope = self.scopes.last_mut().unwrap();
+            if binding.glob {
+                scope.glob_imports.extend(targets);
+            } else if let Some(local) = binding.local {
+                scope.type_shadows.remove(&local);
+                scope.type_bindings.insert(local, targets);
+            }
+        }
+    }
+
+    fn register_type_alias(&mut self, item: &syn::ItemType) {
+        let local = cgo_8_ident_text(&item.ident);
+        let targets = cgo_8_type_path(&item.ty)
+            .map(|path| self.resolve_path(&path.path))
+            .unwrap_or_default();
+        if targets
+            .iter()
+            .any(|target| cgo_9a_is_distributed_plan_path(target))
+            && (!matches!(item.vis, syn::Visibility::Inherited)
+                || (self.scope().module_scope
+                    && self
+                        .module_has_external_children
+                        .last()
+                        .copied()
+                        .unwrap_or(false)))
+        {
+            self.violations.push(format!(
+                "distributed-plan-alias: {} exposes DistributedPlan through a cross-file type alias",
+                self.source_rel
+            ));
+        }
+        let scope = self.scopes.last_mut().unwrap();
+        if targets.is_empty() {
+            scope.type_bindings.remove(&local);
+            scope.type_shadows.insert(local);
+        } else {
+            scope.type_shadows.remove(&local);
+            scope.type_bindings.insert(local, targets);
+        }
+    }
+
+    fn register_items<'a>(&mut self, items: impl IntoIterator<Item = &'a syn::Item>) {
+        let items = items
+            .into_iter()
+            .filter(|item| !nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)))
+            .collect::<Vec<_>>();
+        for item in &items {
+            self.register_item_declaration(item);
+        }
+        let aliases = items
+            .iter()
+            .filter(|item| matches!(item, syn::Item::Use(_) | syn::Item::Type(_)))
+            .copied()
+            .collect::<Vec<_>>();
+        for _ in 0..=aliases.len() {
+            let before = self.scope().clone();
+            for item in &aliases {
+                match item {
+                    syn::Item::Use(item) => self.register_use(item),
+                    syn::Item::Type(item) => self.register_type_alias(item),
+                    _ => unreachable!(),
+                }
+            }
+            let scope = self.scopes.last_mut().unwrap();
+            for targets in scope.type_bindings.values_mut() {
+                targets.sort();
+                targets.dedup();
+            }
+            scope.glob_imports.sort();
+            scope.glob_imports.dedup();
+            if *self.scope() == before {
+                break;
+            }
+        }
+    }
+
+    fn push_mutable_surface_violation(&mut self) {
+        self.violations.push(format!(
+            "mutable-callback: {} obtains mutable access to DistributedPlan",
+            self.source_rel
+        ));
+    }
+
+    fn binding_is_mutable_plan(&self, name: &str) -> bool {
+        for scope in self.binding_scopes.iter().rev() {
+            if scope.mutable_plans.contains(name) {
+                return true;
+            }
+            if scope.shadows.contains(name) {
+                return false;
+            }
+        }
+        false
+    }
+
+    fn cloned_plan_source(&self, name: &str) -> Option<&str> {
+        for scope in self.binding_scopes.iter().rev() {
+            if let Some(source) = scope.cloned_plans.get(name) {
+                return Some(source);
+            }
+            if scope.shadows.contains(name) {
+                return None;
+            }
+        }
+        None
+    }
+
+    fn push_pattern_scope(&mut self) {
+        self.scopes.push(self.scope().nested());
+        self.binding_scopes.push(Cgo9aValueScope::default());
+    }
+
+    fn pop_pattern_scope(&mut self) {
+        self.binding_scopes.pop();
+        self.scopes.pop();
+    }
+
+    fn register_pattern_shadow(&mut self, pattern: &syn::Pat) {
+        cgo_8_pattern_bindings(pattern, &mut self.scopes.last_mut().unwrap().value_shadows);
+        cgo_8_pattern_bindings(
+            pattern,
+            &mut self.binding_scopes.last_mut().unwrap().shadows,
+        );
+    }
+
+    fn visit_condition_with_bindings(&mut self, condition: &syn::Expr) {
+        use syn::visit::Visit;
+
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_expr_attrs(condition)) {
+            return;
+        }
+        match condition {
+            syn::Expr::Binary(binary) if matches!(binary.op, syn::BinOp::And(_)) => {
+                self.visit_condition_with_bindings(&binary.left);
+                self.visit_condition_with_bindings(&binary.right);
+            }
+            syn::Expr::Let(let_expr) => {
+                self.visit_expr(&let_expr.expr);
+                self.visit_pat(&let_expr.pat);
+                self.register_pattern_shadow(&let_expr.pat);
+            }
+            syn::Expr::Group(group) => self.visit_condition_with_bindings(&group.expr),
+            syn::Expr::Paren(paren) => self.visit_condition_with_bindings(&paren.expr),
+            _ => self.visit_expr(condition),
+        }
+    }
+
+    fn enter_function(&mut self, signature: &syn::Signature) {
+        use syn::visit::Visit;
+
+        let mut ast_scope = self.scope().nested();
+        for parameter in &signature.generics.params {
+            if let syn::GenericParam::Type(parameter) = parameter
+                && !nfe_4_syn_attrs_require_test(&parameter.attrs)
+            {
+                let name = cgo_8_ident_text(&parameter.ident);
+                ast_scope.type_bindings.remove(&name);
+                ast_scope.type_shadows.insert(name);
+            }
+        }
+        let mut binding_scope = Cgo9aValueScope::default();
+        for input in &signature.inputs {
+            let syn::FnArg::Typed(input) = input else {
+                continue;
+            };
+            cgo_8_pattern_bindings(&input.pat, &mut ast_scope.value_shadows);
+            cgo_8_pattern_bindings(&input.pat, &mut binding_scope.shadows);
+        }
+        self.scopes.push(ast_scope);
+        for input in &signature.inputs {
+            let syn::FnArg::Typed(input) = input else {
+                continue;
+            };
+            if self.type_is_mutable_distributed_plan_reference(&input.ty) {
+                cgo_8_pattern_bindings(&input.pat, &mut binding_scope.mutable_plans);
+                if self.construction_owner {
+                    self.visit_type(
+                        cgo_9a_mutable_reference_target(&input.ty)
+                            .expect("direct mutable plan parameter must be a reference"),
+                    );
+                    continue;
+                }
+            }
+            self.visit_type(&input.ty);
+        }
+        self.visit_generics(&signature.generics);
+        self.visit_return_type(&signature.output);
+        self.binding_scopes.push(binding_scope);
+    }
+
+    fn leave_function(&mut self) {
+        self.binding_scopes.pop();
+        self.scopes.pop();
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for Cgo9aDistributedPlanSealVisitor<'_> {
+    fn visit_file(&mut self, file: &'ast syn::File) {
+        if nfe_4_syn_attrs_require_test(&file.attrs) {
+            return;
+        }
+        self.module_has_external_children
+            .push(cgo_9a_has_external_child_module(&file.items));
+        self.register_items(&file.items);
+        for item in &file.items {
+            self.visit_item(item);
+        }
+        self.module_has_external_children.pop();
+    }
+
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+            return;
+        }
+        match item {
+            syn::Item::Use(_) => {}
+            syn::Item::Mod(module) => {
+                if let Some((_, items)) = &module.content {
+                    let mut scope = Cgo8AstScope {
+                        module_path: {
+                            let mut path = self.scope().module_path.clone();
+                            path.push(cgo_8_ident_text(&module.ident));
+                            path
+                        },
+                        module_scope: true,
+                        ..Default::default()
+                    };
+                    scope.type_shadows.insert(cgo_8_ident_text(&module.ident));
+                    self.scopes.push(scope);
+                    self.module_has_external_children
+                        .push(cgo_9a_has_external_child_module(items));
+                    self.register_items(items);
+                    for item in items {
+                        self.visit_item(item);
+                    }
+                    self.module_has_external_children.pop();
+                    self.scopes.pop();
+                }
+            }
+            _ => syn::visit::visit_item(self, item),
+        }
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        if nfe_4_syn_attrs_require_test(&item.attrs) {
+            return;
+        }
+        self.enter_function(&item.sig);
+        self.visit_block(&item.block);
+        self.leave_function();
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        if nfe_4_syn_attrs_require_test(&item.attrs) {
+            return;
+        }
+        self.enter_function(&item.sig);
+        self.visit_block(&item.block);
+        self.leave_function();
+    }
+
+    fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
+        if nfe_4_syn_attrs_require_test(&item.attrs) {
+            return;
+        }
+        self.enter_function(&item.sig);
+        if let Some(block) = &item.default {
+            self.visit_block(block);
+        }
+        self.leave_function();
+    }
+
+    fn visit_block(&mut self, block: &'ast syn::Block) {
+        self.scopes.push(self.scope().nested());
+        self.binding_scopes.push(Cgo9aValueScope::default());
+        let items = block.stmts.iter().filter_map(|statement| match statement {
+            syn::Stmt::Item(item) => Some(item),
+            _ => None,
+        });
+        self.register_items(items);
+        for statement in &block.stmts {
+            if !nfe_4_syn_attrs_require_test(nfe_4_syn_stmt_attrs(statement)) {
+                self.visit_stmt(statement);
+            }
+        }
+        self.binding_scopes.pop();
+        self.scopes.pop();
+    }
+
+    fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_expr_attrs(expr)) {
+            return;
+        }
+        syn::visit::visit_expr(self, expr);
+    }
+
+    fn visit_type_reference(&mut self, reference: &'ast syn::TypeReference) {
+        if reference.mutability.is_some() && self.type_is_distributed_plan(&reference.elem) {
+            self.push_mutable_surface_violation();
+        }
+        syn::visit::visit_type_reference(self, reference);
+    }
+
+    fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+        if cgo_8_ident_text(ident) == "ChangeStreamNativePlanMutation" {
+            self.violations.push(format!(
+                "retired-mutation-type: {} references ChangeStreamNativePlanMutation",
+                self.source_rel
+            ));
+        }
+    }
+
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        if nfe_4_syn_attrs_require_test(&local.attrs) {
+            return;
+        }
+        let binding = cgo_9a_single_pattern_ident(&local.pat);
+        let mutable_plan = matches!(&local.pat, syn::Pat::Type(typed)
+            if self.type_is_mutable_distributed_plan_reference(&typed.ty));
+        let cloned_source = local
+            .init
+            .as_ref()
+            .and_then(|init| cgo_9a_clone_source(&init.expr))
+            .filter(|source| self.binding_is_mutable_plan(source));
+        syn::visit::visit_local(self, local);
+        let Some(scope) = self.binding_scopes.last_mut() else {
+            return;
+        };
+        cgo_8_pattern_bindings(&local.pat, &mut scope.shadows);
+        if let Some(binding) = binding {
+            if mutable_plan {
+                scope.mutable_plans.insert(binding.clone());
+            }
+            if let Some(source) = cloned_source {
+                scope.cloned_plans.insert(binding, source);
+            }
+        }
+    }
+
+    fn visit_expr_assign(&mut self, assign: &'ast syn::ExprAssign) {
+        if nfe_4_syn_attrs_require_test(&assign.attrs) {
+            return;
+        }
+        if let (Some(target), Some(replacement)) = (
+            cgo_9a_deref_target(&assign.left),
+            cgo_9a_single_expr_ident(&assign.right),
+        ) && self.cloned_plan_source(&replacement) == Some(target.as_str())
+            && self.binding_is_mutable_plan(&target)
+        {
+            self.violations.push(format!(
+                "clone-and-patch: {} clones and overwrites a sealed plan",
+                self.source_rel
+            ));
+        }
+        syn::visit::visit_expr_assign(self, assign);
+    }
+
+    fn visit_expr_closure(&mut self, closure: &'ast syn::ExprClosure) {
+        let mut ast_scope = self.scope().nested();
+        let mut binding_scope = Cgo9aValueScope::default();
+        for input in &closure.inputs {
+            cgo_8_pattern_bindings(input, &mut ast_scope.value_shadows);
+            cgo_8_pattern_bindings(input, &mut binding_scope.shadows);
+            if let syn::Pat::Type(typed) = input
+                && self.type_is_mutable_distributed_plan_reference(&typed.ty)
+            {
+                cgo_8_pattern_bindings(input, &mut binding_scope.mutable_plans);
+            }
+        }
+        self.scopes.push(ast_scope);
+        self.binding_scopes.push(binding_scope);
+        syn::visit::visit_expr_closure(self, closure);
+        self.binding_scopes.pop();
+        self.scopes.pop();
+    }
+
+    fn visit_expr_if(&mut self, if_expr: &'ast syn::ExprIf) {
+        self.push_pattern_scope();
+        self.visit_condition_with_bindings(&if_expr.cond);
+        self.visit_block(&if_expr.then_branch);
+        self.pop_pattern_scope();
+        if let Some((_, otherwise)) = &if_expr.else_branch {
+            self.visit_expr(otherwise);
+        }
+    }
+
+    fn visit_expr_while(&mut self, while_expr: &'ast syn::ExprWhile) {
+        self.push_pattern_scope();
+        self.visit_condition_with_bindings(&while_expr.cond);
+        self.visit_block(&while_expr.body);
+        self.pop_pattern_scope();
+    }
+
+    fn visit_expr_for_loop(&mut self, for_loop: &'ast syn::ExprForLoop) {
+        self.visit_expr(&for_loop.expr);
+        self.push_pattern_scope();
+        self.visit_pat(&for_loop.pat);
+        self.register_pattern_shadow(&for_loop.pat);
+        self.visit_block(&for_loop.body);
+        self.pop_pattern_scope();
+    }
+
+    fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+        if nfe_4_syn_attrs_require_test(&arm.attrs) {
+            return;
+        }
+        self.push_pattern_scope();
+        self.visit_pat(&arm.pat);
+        self.register_pattern_shadow(&arm.pat);
+        if let Some((_, guard)) = &arm.guard {
+            self.visit_expr(guard);
+        }
+        self.visit_expr(&arm.body);
+        self.pop_pattern_scope();
+    }
+}
+
+fn distributed_plan_seal_task1_violations_in(source_rel: &str, source: &str) -> Vec<String> {
+    use syn::visit::Visit;
+
+    let file = match syn::parse_file(source) {
+        Ok(file) => file,
+        Err(error) => {
+            return vec![format!(
+                "ast-parse: {source_rel} production Rust AST parse failed: {error}"
+            )];
+        }
+    };
+    let mut visitor = Cgo9aDistributedPlanSealVisitor {
+        source_rel,
+        construction_owner: source_rel.starts_with("src/sql/planner/distributed/"),
+        scopes: vec![Cgo8AstScope {
+            module_path: rust_source_module_segments(source_rel)
+                .unwrap_or_else(|| vec!["crate".to_string()]),
+            module_scope: true,
+            ..Default::default()
+        }],
+        module_has_external_children: Vec::new(),
+        binding_scopes: Vec::new(),
+        violations: Vec::new(),
+    };
+    visitor.visit_file(&file);
+    visitor.violations.sort();
+    visitor.violations.dedup();
+    visitor.violations
+}
+
+fn distributed_plan_seal_task1_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
+    let mut violations = sources
+        .iter()
+        .flat_map(|source| distributed_plan_seal_task1_violations_in(&source.path, &source.text))
+        .collect::<Vec<_>>();
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+#[test]
+fn distributed_plan_seal_task1_detector_rejects_retired_mutation_surfaces() {
+    let cases = [
+        (
+            "type ChangeStreamNativePlanMutation<'a> = Box<dyn FnOnce()>;",
+            "retired-mutation-type",
+        ),
+        (
+            "use crate::sql::planner::distributed::DistributedPlan; fn mutate(plan: &mut DistributedPlan) {}",
+            "mutable-callback",
+        ),
+        (
+            "use crate::sql::planner::distributed::DistributedPlan as Sealed; type Mutation = Box<dyn FnMut(&mut Sealed)>;",
+            "mutable-callback",
+        ),
+        (
+            "use crate::sql::planner::distributed::DistributedPlan as DP; fn install(cb: impl FnMut(&mut DP)) {}",
+            "mutable-callback",
+        ),
+        (
+            "use crate::sql::planner::distributed::DistributedPlan; fn patch(plan: &mut DistributedPlan) { let mut revised = plan.clone(); *plan = revised; }",
+            "clone-and-patch",
+        ),
+    ];
+
+    for (source, expected) in cases {
+        let violations = distributed_plan_seal_task1_violations_in("src/fixture.rs", source);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "fixture must be rejected as {expected}: {violations:?}"
+        );
+    }
+
+    assert!(
+        distributed_plan_seal_task1_violations_in(
+            "src/clean.rs",
+            "use crate::sql::planner::distributed::DistributedPlan; fn inspect(plan: &DistributedPlan) { encode(plan); }"
+        )
+        .is_empty(),
+        "immutable readers must remain legal"
+    );
+    assert!(
+        distributed_plan_seal_task1_violations_in(
+            "src/unrelated.rs",
+            "#[derive(Clone)] struct OtherPlan; fn patch(plan: &mut OtherPlan) { let mut candidate = plan.clone(); *plan = candidate; }"
+        )
+        .is_empty(),
+        "clone-and-overwrite on an unrelated type must remain legal"
+    );
+    assert!(
+        distributed_plan_seal_task1_violations_in(
+            "src/sql/planner/distributed/build/owner.rs",
+            "use crate::sql::planner::distributed::DistributedPlan; fn build(plan: &mut DistributedPlan) { plan.fragments.clear(); }"
+        )
+        .is_empty(),
+        "the distributed construction owner may mutate its direct plan parameter"
+    );
+    let owner_callback = distributed_plan_seal_task1_violations_in(
+        "src/sql/planner/distributed/build/owner.rs",
+        "use crate::sql::planner::distributed::DistributedPlan as DP; fn install(cb: impl FnOnce(&mut DP)) {}",
+    );
+    assert!(
+        owner_callback
+            .iter()
+            .any(|violation| violation.contains("mutable-callback")),
+        "construction-owner callback surfaces must still be rejected: {owner_callback:?}"
+    );
+    assert!(
+        distributed_plan_seal_task1_violations_in(
+            "src/shadow.rs",
+            "use crate::sql::planner::distributed::DistributedPlan; #[derive(Clone)] struct OtherPlan; fn patch(plan: &mut DistributedPlan) { { let plan: &mut OtherPlan = todo!(); let revised = plan.clone(); *plan = revised; } inspect(plan); }"
+        )
+        .iter()
+        .all(|violation| !violation.contains("clone-and-patch")),
+        "an inner unrelated binding must shadow the outer mutable plan identity"
+    );
+
+    for (name, body) in [
+        (
+            "if-let",
+            "if let Some(plan) = maybe_other() { let revised = plan.clone(); *plan = revised; }",
+        ),
+        (
+            "match-arm-guard",
+            "match maybe_other() { Some(plan) if { let revised = plan.clone(); *plan = revised; true } => {}, _ => {} }",
+        ),
+        (
+            "for-pattern",
+            "for plan in other_plans() { let revised = plan.clone(); *plan = revised; }",
+        ),
+        (
+            "while-let",
+            "while let Some(plan) = maybe_other() { let revised = plan.clone(); *plan = revised; break; }",
+        ),
+    ] {
+        let source = format!(
+            "use crate::sql::planner::distributed::DistributedPlan; #[derive(Clone)] struct OtherPlan; fn patch(plan: &mut DistributedPlan) {{ {body} inspect(plan); }}"
+        );
+        let violations = distributed_plan_seal_task1_violations_in(
+            "src/sql/planner/distributed/build/pattern_fixture.rs",
+            &source,
+        );
+        assert!(
+            violations.is_empty(),
+            "{name} must lexically shadow the outer mutable plan only in its guard/body: {violations:?}"
+        );
+    }
+
+    for (name, body) in [
+        (
+            "if-let-condition",
+            "if let Some(plan) = { let revised = plan.clone(); *plan = revised; maybe_other() } { inspect(plan); }",
+        ),
+        (
+            "match-scrutinee",
+            "match { let revised = plan.clone(); *plan = revised; maybe_other() } { Some(plan) => inspect(plan), _ => {} }",
+        ),
+        (
+            "for-iterator",
+            "for plan in { let revised = plan.clone(); *plan = revised; other_plans() } { inspect(plan); }",
+        ),
+        (
+            "while-let-condition",
+            "while let Some(plan) = { let revised = plan.clone(); *plan = revised; maybe_other() } { inspect(plan); break; }",
+        ),
+    ] {
+        let source = format!(
+            "use crate::sql::planner::distributed::DistributedPlan; fn patch(plan: &mut DistributedPlan) {{ {body} }}"
+        );
+        let violations = distributed_plan_seal_task1_violations_in(
+            "src/sql/planner/distributed/build/pattern_fixture.rs",
+            &source,
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("clone-and-patch")),
+            "{name} must still analyze its condition/scrutinee/iterator in the outer plan scope: {violations:?}"
+        );
+    }
+
+    for (name, source) in [
+        (
+            "private renamed import",
+            "use crate::sql::planner::distributed::DistributedPlan as ReadPlan; fn inspect(plan: &ReadPlan) {}",
+        ),
+        (
+            "private type alias",
+            "use crate::sql::planner::distributed::DistributedPlan; type ReadPlan = DistributedPlan; fn inspect(plan: &ReadPlan) {}",
+        ),
+    ] {
+        let violations = distributed_plan_seal_task1_violations_in("src/leaf_alias.rs", source);
+        assert!(
+            violations.is_empty(),
+            "a leaf {name} used only immutably must remain legal: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn distributed_plan_seal_task1_rejects_cross_file_alias_surfaces() {
+    let sources = [
+        Cgo8GuardSource::new(
+            "src/planning/mod.rs",
+            "use crate::sql::planner::distributed::DistributedPlan; pub(super) type MutablePlan = DistributedPlan; mod callback;",
+        ),
+        Cgo8GuardSource::new(
+            "src/planning/callback.rs",
+            "use super::MutablePlan; pub(crate) fn install(cb: impl FnMut(&mut MutablePlan)) {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/ancestor/mod.rs",
+            "use crate::sql::planner::distributed::DistributedPlan; mod worker;",
+        ),
+        Cgo8GuardSource::new(
+            "src/ancestor/worker.rs",
+            "use super::DistributedPlan; fn mutate(plan: &mut DistributedPlan) {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/build/fixture.rs",
+            "use crate::sql::planner::distributed::DistributedPlan; mod worker;",
+        ),
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/build/fixture/worker.rs",
+            "use super::DistributedPlan; fn install(cb: impl FnOnce(&mut DistributedPlan)) {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/deep_import/mod.rs",
+            "use crate::sql::planner::distributed::DistributedPlan as ReadPlan; mod inline { mod worker; }",
+        ),
+        Cgo8GuardSource::new(
+            "src/deep_import/inline/worker.rs",
+            "use super::super::ReadPlan; fn mutate(plan: &mut ReadPlan) {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/deep_type/mod.rs",
+            "use crate::sql::planner::distributed::DistributedPlan; type ReadPlan = DistributedPlan; mod inline { mod worker; }",
+        ),
+        Cgo8GuardSource::new(
+            "src/deep_type/inline/worker.rs",
+            "use super::super::ReadPlan; fn mutate(plan: &mut ReadPlan) {}",
+        ),
+    ];
+    let violations = distributed_plan_seal_task1_violations(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("distributed-plan-alias")),
+        "cross-file DistributedPlan alias surface must be rejected: {violations:?}"
+    );
+    assert!(
+        violations.iter().any(|violation| {
+            violation.contains("distributed-plan-alias")
+                && violation.contains("src/ancestor/mod.rs")
+        }),
+        "an unchanged private parent import must not leak DistributedPlan to a child file: {violations:?}"
+    );
+    assert!(
+        violations.iter().any(|violation| {
+            violation.contains("mutable-callback")
+                && violation.contains("distributed/build/fixture/worker.rs")
+        }),
+        "an owner child callback must not bypass detection through a parent import: {violations:?}"
+    );
+    for ancestor in ["src/deep_import/mod.rs", "src/deep_type/mod.rs"] {
+        assert!(
+            violations.iter().any(|violation| {
+                violation.contains("distributed-plan-alias") && violation.contains(ancestor)
+            }),
+            "an inline module must not hide an external-descendant alias leak from {ancestor}: {violations:?}"
+        );
+    }
+    assert!(
+        distributed_plan_seal_task1_violations_in(
+            "src/leaf.rs",
+            "use crate::sql::planner::distributed::DistributedPlan; fn inspect(plan: &DistributedPlan) {}",
+        )
+        .is_empty(),
+        "an immutable direct import in a leaf module must remain legal"
+    );
+    assert!(
+        distributed_plan_seal_task1_violations_in(
+            "src/test_only_descendant.rs",
+            "use crate::sql::planner::distributed::DistributedPlan as ReadPlan; #[cfg(test)] mod inline { mod worker; } fn inspect(plan: &ReadPlan) {}",
+        )
+        .is_empty(),
+        "a test-only inline subtree must not turn a leaf private alias into a production leak"
+    );
+}
+
+#[test]
+fn distributed_plan_seal_task1_rejects_post_distribution_keyed_assert_mutation() {
+    let mut violations = Vec::new();
+    let src = src_dir();
+    for path in production_rs_files_from_entries(&src, &[src.join("lib.rs"), src.join("main.rs")]) {
+        let source = fs::read_to_string(&path).unwrap();
+        violations.extend(distributed_plan_seal_task1_violations_in(
+            &rel(&path),
+            &source,
+        ));
+    }
+    violations.sort();
+    violations.dedup();
+
+    assert!(
+        violations.is_empty(),
+        "CGO-9A Task 1 distributed-plan seal guard failed:\n{}",
+        violations.join("\n")
+    );
+}

@@ -14715,6 +14715,7 @@ fn execute_imv_change_stream_write(
         &refresh_plan.optimized_tree,
         &mut dag,
         refresh_plan.mv_refresh_ctx,
+        None,
     )?;
     #[cfg(test)]
     if let Some(result) =

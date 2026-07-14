@@ -3269,10 +3269,6 @@ pub(crate) struct PlannedIcebergChangeStreamWrite {
         crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamWriteTopology,
 }
 
-type ChangeStreamNativePlanMutation<'a> = Box<
-    dyn FnOnce(&mut crate::sql::planner::distributed::DistributedPlan) -> Result<(), String> + 'a,
->;
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
     state: &Arc<StandaloneState>,
@@ -3281,27 +3277,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
     optimized_tree: &crate::sql::optimizer::OptimizedOperatorNode,
     dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
-) -> Result<PlannedIcebergChangeStreamWrite, String> {
-    build_physical_plan_as_iceberg_change_stream_write_with_native_plan_mutation(
-        state,
-        _current_catalog,
-        current_database,
-        optimized_tree,
-        dag,
-        mv_refresh_ctx,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_native_plan_mutation(
-    state: &Arc<StandaloneState>,
-    _current_catalog: Option<&str>,
-    current_database: &str,
-    optimized_tree: &crate::sql::optimizer::OptimizedOperatorNode,
-    dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
-    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
-    native_plan_mutation: Option<ChangeStreamNativePlanMutation<'_>>,
+    pre_expand_keyed_assert: Option<crate::sql::planner::physical::PreExpandKeyedAssertSpec>,
 ) -> Result<PlannedIcebergChangeStreamWrite, String> {
     let catalog_snapshot = state
         .catalog
@@ -3315,18 +3291,22 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_native_pla
         .clone();
     snapshot_effective_backend_count_into_session();
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(optimized_tree)?;
-    let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)?;
+    let distributed_plan = if let Some(keyed_assert) = pre_expand_keyed_assert {
+        crate::sql::planner::pipeline::build_distributed_plan_with_pre_expand_keyed_assert(
+            physical_plan,
+            keyed_assert,
+        )?
+    } else {
+        crate::sql::planner::pipeline::build_distributed_plan(physical_plan)?
+    };
     let planned_dp =
         crate::sql::planner::distributed::write::plan::with_iceberg_change_stream_write(
             distributed_plan,
             current_database,
             dag.clone(),
         )?;
-    let mut distributed_plan = planned_dp.distributed_plan;
+    let distributed_plan = planned_dp.distributed_plan;
     let topology = planned_dp.topology;
-    if let Some(mutate_native_plan) = native_plan_mutation {
-        mutate_native_plan(&mut distributed_plan)?;
-    }
     let build_result = crate::sql::codegen::fragment::build(
         crate::sql::codegen::fragment::FragmentBuildRequest::result(
             &distributed_plan,
@@ -3380,6 +3360,7 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
         optimized_tree,
         dag,
         mv_refresh_ctx,
+        None,
     )?;
     #[cfg(test)]
     if let Some(result) = observe_change_stream_write_build_for_test(&planned.topology) {
