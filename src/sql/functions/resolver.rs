@@ -147,10 +147,14 @@ pub(crate) fn resolve_scalar_function_signature(
 
     Err(ResolveError::NoMatchingSignature {
         candidates: candidates.len(),
-        binding_enforced: candidates
-            .iter()
-            .any(|sig| sig.argument_binding.is_enforced()),
+        binding_enforced: binding_enforced_for_arity(candidates, arg_types.len()),
     })
+}
+
+fn binding_enforced_for_arity(candidates: &[Signature], n_args: usize) -> bool {
+    candidates
+        .iter()
+        .any(|sig| check_arity(sig, n_args) && sig.argument_binding.is_enforced())
 }
 
 /// Resolve a scalar function call to its return type.
@@ -481,5 +485,23 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn binding_enforcement_only_considers_candidates_for_the_call_arity() {
+        let candidates = vec![
+            Signature::new(vec![TypeSpec::Utf8], TypeSpec::Utf8),
+            Signature::new(vec![TypeSpec::Utf8, TypeSpec::Int32], TypeSpec::Utf8)
+                .with_argument_coercion(),
+        ];
+
+        assert!(
+            !binding_enforced_for_arity(&candidates, 1),
+            "an unrelated enforced two-argument overload must not block the one-argument legacy fallback"
+        );
+        assert!(
+            binding_enforced_for_arity(&candidates, 2),
+            "the matching-arity enforced overload must still block legacy fallback"
+        );
     }
 }

@@ -3597,14 +3597,27 @@ fn coerce_function_argument(expr: TypedExpr, target: &DataType) -> Result<TypedE
             nullable: true,
         });
     }
+    let nullable = expr.nullable || narrowing_integer_cast_can_return_null(&expr.data_type, target);
     Ok(TypedExpr {
-        nullable: expr.nullable,
+        nullable,
         kind: ExprKind::Cast {
             expr: Box::new(expr),
             target: target.clone(),
         },
         data_type: target.clone(),
     })
+}
+
+fn narrowing_integer_cast_can_return_null(source: &DataType, target: &DataType) -> bool {
+    matches!(
+        (source, target),
+        (DataType::Int16, DataType::Int8)
+            | (DataType::Int32, DataType::Int8 | DataType::Int16)
+            | (
+                DataType::Int64,
+                DataType::Int8 | DataType::Int16 | DataType::Int32
+            )
+    )
 }
 
 fn bind_scalar_function_call(
@@ -5352,42 +5365,95 @@ mod tests {
 
     #[test]
     fn substring_function_syntax_binds_integer_literals_to_int32() {
-        assert_substring_int32_arguments("select substring('STARROCKS', 2, 3)", 3);
-        assert_substring_int32_arguments("select substring('x', 2147483647)", 2);
-        assert_substring_int32_arguments("select substring('x', -2147483648)", 2);
+        for (sql, values) in [
+            ("select substring('STARROCKS', 2, 3)", &[2, 3][..]),
+            ("select substring('x', 2147483647)", &[2147483647][..]),
+            ("select substring('x', -2147483648)", &[-2147483648][..]),
+        ] {
+            let expr = analyze_projection_expr(sql).expect("in-range literals should analyze");
+            let crate::sql::analysis::ExprKind::FunctionCall { args, .. } = expr.kind else {
+                panic!("expected FunctionCall, got {:?}", expr.kind);
+            };
+            assert_eq!(args.len(), values.len() + 1);
+            for (arg, expected) in args.iter().skip(1).zip(values) {
+                assert_eq!(arg.data_type, DataType::Int32);
+                assert!(!arg.nullable);
+                assert!(matches!(
+                    arg.kind,
+                    crate::sql::analysis::ExprKind::Literal(
+                        crate::sql::analysis::LiteralValue::Int(value)
+                    ) if value == *expected
+                ));
+            }
+        }
     }
 
     #[test]
-    fn ordinary_function_comma_syntax_reaches_the_scalar_binder() {
-        let stmt = crate::sql::parser::parse_sql_raw("select concat(1, 2)")
-            .expect("function query should parse");
-        let sqlparser::ast::Statement::Query(query) = &stmt else {
-            panic!("expected query");
+    fn substring_normal_and_special_syntax_bind_identical_arguments() {
+        let normal = super::bind_scalar_function_call(
+            "substring",
+            vec![
+                crate::sql::analysis::TypedExpr {
+                    kind: crate::sql::analysis::ExprKind::Literal(
+                        crate::sql::analysis::LiteralValue::String("x".to_string()),
+                    ),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                },
+                crate::sql::analysis::TypedExpr {
+                    kind: crate::sql::analysis::ExprKind::Literal(
+                        crate::sql::analysis::LiteralValue::Int(2),
+                    ),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                },
+                crate::sql::analysis::TypedExpr {
+                    kind: crate::sql::analysis::ExprKind::Literal(
+                        crate::sql::analysis::LiteralValue::Int(3),
+                    ),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                },
+            ],
+        )
+        .expect("ordinary function call should bind");
+        let special = analyze_projection_expr("select substring('x' from 2 for 3)")
+            .expect("special function syntax should analyze");
+        let crate::sql::analysis::ExprKind::FunctionCall {
+            name: special_name,
+            args: special_args,
+            ..
+        } = special.kind
+        else {
+            panic!("expected special FunctionCall, got {:?}", special.kind);
         };
-        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
-            panic!("expected select");
-        };
-        assert!(matches!(
-            select.projection.as_slice(),
-            [sqlparser::ast::SelectItem::UnnamedExpr(
-                sqlparser::ast::Expr::Function(_)
-            )]
-        ));
 
-        let expr = analyze_projection_expr("select concat(1, 2)")
-            .expect("ordinary function should analyze");
-        let crate::sql::analysis::ExprKind::FunctionCall { args, .. } = expr.kind else {
-            panic!("expected FunctionCall, got {:?}", expr.kind);
-        };
-        assert!(args.iter().all(|arg| {
-            matches!(
-                &arg.kind,
-                crate::sql::analysis::ExprKind::Cast {
-                    target: DataType::Utf8,
-                    ..
-                }
-            ) && arg.data_type == DataType::Utf8
-        }));
+        assert_eq!(special_name, "substring");
+        assert_eq!(normal.return_type, DataType::Utf8);
+        assert_eq!(normal.args.len(), special_args.len());
+        for (normal, special) in normal.args.iter().zip(special_args.iter()) {
+            assert_eq!(normal.data_type, special.data_type);
+            assert_eq!(normal.nullable, special.nullable);
+            match (&normal.kind, &special.kind) {
+                (
+                    crate::sql::analysis::ExprKind::Literal(
+                        crate::sql::analysis::LiteralValue::String(normal_value),
+                    ),
+                    crate::sql::analysis::ExprKind::Literal(
+                        crate::sql::analysis::LiteralValue::String(special_value),
+                    ),
+                ) => assert_eq!(normal_value, special_value),
+                (
+                    crate::sql::analysis::ExprKind::Literal(
+                        crate::sql::analysis::LiteralValue::Int(normal_value),
+                    ),
+                    crate::sql::analysis::ExprKind::Literal(
+                        crate::sql::analysis::LiteralValue::Int(special_value),
+                    ),
+                ) => assert_eq!(normal_value, special_value),
+                other => panic!("expected equivalent normalized literal arguments, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -5428,6 +5494,48 @@ mod tests {
     }
 
     #[test]
+    fn scalar_binder_marks_narrowing_nonnull_bigint_column_cast_nullable() {
+        let bound = super::bind_scalar_function_call(
+            "substring",
+            vec![
+                crate::sql::analysis::TypedExpr {
+                    kind: crate::sql::analysis::ExprKind::Literal(
+                        crate::sql::analysis::LiteralValue::String("x".to_string()),
+                    ),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                },
+                crate::sql::analysis::TypedExpr {
+                    kind: crate::sql::analysis::ExprKind::ColumnRef {
+                        column_id: crate::sql::column_id::ColumnId(42),
+                        qualifier: None,
+                        column: "offset".to_string(),
+                    },
+                    data_type: DataType::Int64,
+                    nullable: false,
+                },
+            ],
+        )
+        .expect("non-null BIGINT column should bind to substring INT32 offset");
+
+        let offset = &bound.args[1];
+        assert_eq!(offset.data_type, DataType::Int32);
+        assert!(offset.nullable);
+        let crate::sql::analysis::ExprKind::Cast {
+            expr,
+            target: DataType::Int32,
+        } = &offset.kind
+        else {
+            panic!("expected a BIGINT-to-INT32 runtime cast");
+        };
+        assert!(!expr.nullable);
+        assert!(matches!(
+            expr.kind,
+            crate::sql::analysis::ExprKind::ColumnRef { .. }
+        ));
+    }
+
+    #[test]
     fn substring_bigint_column_offset_gets_runtime_int32_cast() {
         let stmt = crate::sql::parser::parse_sql_raw("select substring('x', offset) from offsets")
             .expect("substring query should parse");
@@ -5450,12 +5558,24 @@ mod tests {
         };
         let offset = args.into_iter().nth(1).expect("expected offset argument");
         assert_eq!(offset.data_type, DataType::Int32);
+        assert!(
+            offset.nullable,
+            "a narrowing runtime cast can produce NULL when BIGINT overflows INT32"
+        );
+        let crate::sql::analysis::ExprKind::Cast {
+            expr,
+            target: DataType::Int32,
+        } = offset.kind
+        else {
+            panic!("expected BIGINT offset runtime cast");
+        };
+        assert!(
+            !expr.nullable,
+            "test setup must use a genuinely non-null BIGINT ColumnRef"
+        );
         assert!(matches!(
-            offset.kind,
-            crate::sql::analysis::ExprKind::Cast {
-                expr,
-                target: DataType::Int32,
-            } if matches!(expr.kind, crate::sql::analysis::ExprKind::ColumnRef { .. })
+            expr.kind,
+            crate::sql::analysis::ExprKind::ColumnRef { .. }
         ));
     }
 
