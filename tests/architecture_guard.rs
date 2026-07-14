@@ -8029,6 +8029,21 @@ fn runtime_filter_expr_manager_lock_count(expr: &syn::Expr) -> usize {
     counter.0
 }
 
+fn runtime_filter_block_manager_lock_count(block: &syn::Block) -> usize {
+    struct Counter(usize);
+    impl<'ast> syn::visit::Visit<'ast> for Counter {
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if runtime_filter_expr_is_manager_lock(&syn::Expr::MethodCall(call.clone())) {
+                self.0 += 1;
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+    }
+    let mut counter = Counter(0);
+    syn::visit::Visit::visit_block(&mut counter, block);
+    counter.0
+}
+
 fn runtime_filter_pattern_idents(pattern: &syn::Pat, out: &mut BTreeSet<String>) {
     match pattern {
         syn::Pat::Ident(ident) => {
@@ -8215,6 +8230,14 @@ impl RuntimeFilterManagerLockAudit {
             }
             syn::Expr::If(expr_if) => {
                 self.audit_expr(&expr_if.cond, guards);
+                if matches!(expr_if.cond.as_ref(), syn::Expr::Lit(lit) if matches!(&lit.lit, syn::Lit::Bool(value) if !value.value))
+                {
+                    if let Some((_, else_expr)) = &expr_if.else_branch {
+                        let mut branch = guards.clone();
+                        self.audit_expr(else_expr, &mut branch);
+                    }
+                    return;
+                }
                 let mut branch = guards.clone();
                 self.audit_block(&expr_if.then_branch, &mut branch);
                 if let Some((_, else_expr)) = &expr_if.else_branch {
@@ -8460,7 +8483,8 @@ fn runtime_filter_query_context_lock_discipline_violations(text: &str) -> Vec<St
         }
         let mut audit = RuntimeFilterManagerLockAudit::default();
         audit.audit_block(&entries[0].block, &mut BTreeSet::new());
-        if audit.lock_count != 1 {
+        if audit.lock_count != 1 || runtime_filter_block_manager_lock_count(&entries[0].block) != 1
+        {
             audit.violations.push(format!(
                 "QueryContextManager::{name} must acquire self.inner exactly once"
             ));
@@ -9244,6 +9268,15 @@ impl QueryContextManager {
     );
 
     let bad_sources = [
+        GOOD.replace(
+            "if let Some(service) = service { service.cancel(); }",
+            "if false { service.cancel(); }",
+        ),
+        GOOD.replacen(
+            "let (service, finsts) = { let guard = self.inner.lock(); let service = guard.context().runtime_filter_service(); (service, finsts) };\n        if let Some(service) = service { service.cancel(); }",
+            "let (service, finsts) = { let guard = self.inner.lock(); let service = guard.context().runtime_filter_service(); (service, finsts) };\n        self.inner.lock().unwrap().runtime_filter_service().cancel();",
+            1,
+        ),
         GOOD.replace(
             "(service, finsts) };",
             "service.cancel(); (service, finsts) };",
