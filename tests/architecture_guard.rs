@@ -6584,19 +6584,21 @@ fn planner_distributed_core_has_stage_namespace() {
             "build".to_string(),
             "fragment".to_string(),
             "node".to_string(),
+            "output".to_string(),
             "runtime_filter".to_string(),
             "seal".to_string(),
             "topology".to_string(),
             "validation".to_string(),
             "write".to_string(),
         ]),
-        "distributed/mod.rs must declare exactly boundary, build, fragment, node, runtime_filter, seal, topology, validation, and write"
+        "distributed/mod.rs must declare exactly boundary, build, fragment, node, output, runtime_filter, seal, topology, validation, and write"
     );
     for declaration in [
         "pub(crate) mod boundary;",
         "pub(crate) mod build;",
         "mod fragment;",
         "mod node;",
+        "pub(crate) mod output;",
         "pub(crate) mod runtime_filter;",
         "mod seal;",
         "pub(crate) mod topology;",
@@ -6631,6 +6633,8 @@ fn planner_distributed_core_has_stage_namespace() {
             "pub(crate)|node::ExchangeReceiver".to_string(),
             "pub(crate)|node::distributed_kind_from_physical".to_string(),
             "pub(crate)|node::distributed_kind_to_physical".to_string(),
+            "pub(crate)|output::NodeExecutionColumn".to_string(),
+            "pub(crate)|output::NodeOutputCatalog".to_string(),
             "pub(crate)|seal::DistributedPlan".to_string(),
         ]),
         "distributed/mod.rs must expose exactly the distributed core surface"

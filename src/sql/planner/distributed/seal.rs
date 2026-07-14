@@ -24,6 +24,7 @@ use super::boundary::{
     BoundaryCatalog, BoundaryError, ExecutionColumnIdAllocator, build_boundary_catalog,
 };
 use super::fragment::{DistributedPlanDraft, FragmentEdge, FragmentId, PlanFragment};
+use super::output::{NodeOutputCatalog, NodeOutputError, build_node_output_catalog};
 use super::topology::{TopologyContract, TopologyError, build_topology_contract};
 use super::validation::{self, DistributedPlanValidationError};
 
@@ -38,10 +39,12 @@ struct DistributedPlanData {
     // Authoritative boundary membership catalog derived at seal time.
     boundaries: BoundaryCatalog,
     // Final state of the single query-scoped occurrence allocator. Preserved so
-    // CGO-9C can resume allocating internal occurrences without rebuilding it.
+    // later stages can resume allocating internal occurrences without rebuilding it.
     execution_column_id_allocator: ExecutionColumnIdAllocator,
     // Authoritative fragment-graph execution shape derived at seal time.
     topology: TopologyContract,
+    // Authoritative non-aggregate node execution outputs derived at seal time.
+    node_outputs: NodeOutputCatalog,
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +86,13 @@ impl DistributedPlan {
     pub(crate) fn topology(&self) -> &TopologyContract {
         &self.data.topology
     }
+
+    // Consumed by the native encoder (CGO-9C Task 1), which reads each covered
+    // node's execution output from this catalog instead of re-deriving it, and
+    // by later CGO-9C tasks that thread the occurrence mapping.
+    pub(crate) fn node_outputs(&self) -> &NodeOutputCatalog {
+        &self.data.node_outputs
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -94,6 +104,7 @@ pub(in crate::sql::planner::distributed) enum DistributedPlanSealError {
     RuntimeFilterGraph(GraphValidationError),
     Boundary(BoundaryError),
     Topology(TopologyError),
+    NodeOutput(NodeOutputError),
 }
 
 impl fmt::Display for DistributedPlanSealError {
@@ -111,6 +122,7 @@ impl fmt::Display for DistributedPlanSealError {
             Self::RuntimeFilterGraph(error) => error.fmt(formatter),
             Self::Boundary(error) => error.fmt(formatter),
             Self::Topology(error) => error.fmt(formatter),
+            Self::NodeOutput(error) => error.fmt(formatter),
         }
     }
 }
@@ -164,6 +176,14 @@ pub(in crate::sql::planner::distributed) fn seal_draft(
         &mut execution_column_id_allocator,
     )
     .map_err(DistributedPlanSealError::Boundary)?;
+    // Finalize the non-aggregate node execution outputs. This reads each covered
+    // node's planner-computed output columns, fails fast on any missing or
+    // inconsistent output, and numbers each occurrence from the SAME allocator
+    // (reusing boundary occurrences for boundary-participating root outputs).
+    // Runs after boundary derivation so the allocator continues from there.
+    let node_outputs =
+        build_node_output_catalog(&fragments, &boundaries, &mut execution_column_id_allocator)
+            .map_err(DistributedPlanSealError::NodeOutput)?;
     Ok(DistributedPlan {
         data: DistributedPlanData {
             fragments,
@@ -173,6 +193,7 @@ pub(in crate::sql::planner::distributed) fn seal_draft(
             boundaries,
             execution_column_id_allocator,
             topology,
+            node_outputs,
         },
     })
 }
