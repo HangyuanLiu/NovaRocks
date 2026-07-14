@@ -235,7 +235,8 @@ pub(crate) fn compile(
         &consumer_facts,
         &instances,
         policy.core_budget,
-    );
+        policy.materialization,
+    )?;
 
     let participants: BTreeSet<RuntimeFilterParticipantId> = backends
         .entries()
@@ -270,7 +271,7 @@ mod tests {
         ApplyPoint, ConsumerRequirement, PlanLocation, ProducerRequirement,
         RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
     };
-    use crate::runtime_filter::port::install::RuntimeFilterCoreBudget;
+    use crate::runtime_filter::port::install::{MaterializationPolicy, RuntimeFilterCoreBudget};
     use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
     use crate::sql::planner::distributed::{
         DataPartition, FragmentEdgeKind, FragmentStreamKind, PartitionKind,
@@ -393,7 +394,13 @@ mod tests {
             expression: sample_typed_expr(),
             apply_point: ApplyPoint::NodeInput,
             role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
-                capabilities: BTreeSet::from([ArtifactCapability::Membership]),
+                // M2 install requires Membership consumers to also declare
+                // EmptyDomain (RFD-3/M2 §158 收紧); the derived physical profile
+                // then accepts {ValueSet, EmptyDomain}.
+                capabilities: BTreeSet::from([
+                    ArtifactCapability::Membership,
+                    ArtifactCapability::EmptyDomain,
+                ]),
                 activation,
             }),
         }
@@ -432,6 +439,7 @@ mod tests {
         let policy = RuntimeFilterDeploymentPolicy {
             core_budget: RuntimeFilterCoreBudget::new(1024),
             replica_redundancy: 1,
+            materialization: MaterializationPolicy::for_test(),
         };
 
         let plan = compile(
@@ -486,6 +494,7 @@ mod tests {
         let policy = RuntimeFilterDeploymentPolicy {
             core_budget: RuntimeFilterCoreBudget::new(1024),
             replica_redundancy: 1,
+            materialization: MaterializationPolicy::for_test(),
         };
 
         let err = compile(

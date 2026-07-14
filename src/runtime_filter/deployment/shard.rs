@@ -18,6 +18,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::common::types::UniqueId;
+use crate::runtime_filter::deployment::DeploymentError;
 use crate::runtime_filter::deployment::role_graph::{RoleGraph, RouteKind};
 use crate::runtime_filter::model::contract::{
     ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
@@ -25,12 +26,13 @@ use crate::runtime_filter::model::contract::{
     RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
 };
 use crate::runtime_filter::model::coverage::Coverage;
+use crate::runtime_filter::port::artifact::{ArtifactKind, ConsumerArtifactProfile};
 use crate::runtime_filter::port::identity::{
     DeploymentEpoch, RouteEdgeId, RuntimeFilterParticipantId,
 };
 use crate::runtime_filter::port::install::{
-    CompleteOnceChannelDeployment, ConsumerDeployment, ProducerDeployment, RuntimeFilterCoreBudget,
-    RuntimeFilterInstallView,
+    CompleteOnceChannelDeployment, ConsumerDeployment, MaterializationPolicy, ProducerDeployment,
+    RuntimeFilterCoreBudget, RuntimeFilterInstallView,
 };
 
 /// Channel-level facts the projection stamps into each shard (mirrors the model
@@ -60,6 +62,27 @@ pub(crate) struct ConsumerBindingFacts {
 type InstanceIndex =
     BTreeMap<(ChannelId, BindingId, RuntimeFilterParticipantId), BTreeSet<UniqueId>>;
 
+/// Lower a consumer's semantic `ArtifactCapability` set into the physical
+/// `ConsumerArtifactProfile` the M2 install contract requires (RFD-3/M2 §159-162):
+/// `Membership` → `ValueSet` (statically feasible for every M2 Membership Arrow
+/// schema), `EmptyDomain` → `EmptyDomain` (install requires the profile accept
+/// it). `OrderedRange` → `Range` is deferred to M3 (materializer returns typed
+/// unsupported today), so RFD-2's Membership scope never emits it; Bloom/Bitset
+/// are not selected, so no `bloom_hash_contract` is needed. The BE-side
+/// `validate_channel` re-checks capability↔profile consistency at install time.
+fn consumer_artifact_profile(
+    capabilities: &BTreeSet<ArtifactCapability>,
+) -> Result<ConsumerArtifactProfile, DeploymentError> {
+    let mut accepted = BTreeSet::new();
+    if capabilities.contains(&ArtifactCapability::Membership) {
+        accepted.insert(ArtifactKind::ValueSet);
+    }
+    if capabilities.contains(&ArtifactCapability::EmptyDomain) {
+        accepted.insert(ArtifactKind::EmptyDomain);
+    }
+    ConsumerArtifactProfile::new(accepted, None).map_err(DeploymentError::InvalidArtifactProfile)
+}
+
 /// Project the role graph + placement into per-participant install views.
 ///
 /// LOOPBACK ONLY (RFD-2 range decision): only consumers reachable via a
@@ -73,6 +96,9 @@ type InstanceIndex =
 /// missing entry is logged (`tracing::warn!`) and the offending binding/channel
 /// is skipped rather than panicking; there is no downstream "all consumers
 /// present" check, so a silent drop here would be invisible.
+///
+/// Fails with [`DeploymentError::InvalidArtifactProfile`] if a consumer's
+/// semantic capabilities cannot form a valid M2 physical artifact profile.
 pub(crate) fn project_install_views(
     epoch: DeploymentEpoch,
     role_graph: &RoleGraph,
@@ -80,7 +106,8 @@ pub(crate) fn project_install_views(
     consumer_facts: &BTreeMap<BindingId, ConsumerBindingFacts>,
     instances: &InstanceIndex,
     core_budget: RuntimeFilterCoreBudget,
-) -> BTreeMap<RuntimeFilterParticipantId, RuntimeFilterInstallView> {
+    materialization: MaterializationPolicy,
+) -> Result<BTreeMap<RuntimeFilterParticipantId, RuntimeFilterInstallView>, DeploymentError> {
     // participant -> channel -> (producers, consumers)
     #[allow(clippy::type_complexity)]
     let mut per_participant: BTreeMap<
@@ -148,6 +175,7 @@ pub(crate) fn project_install_views(
                     );
                     continue;
                 };
+                let profile = consumer_artifact_profile(&facts.capabilities)?;
                 let expected = instances
                     .get(&(*channel_id, *binding, *participant))
                     .cloned()
@@ -160,9 +188,10 @@ pub(crate) fn project_install_views(
                     .1
                     .insert(
                         *binding,
-                        ConsumerDeployment::new(
+                        ConsumerDeployment::with_profile(
                             facts.activation,
                             facts.capabilities.clone(),
+                            profile,
                             route_edge_id,
                             expected,
                         ),
@@ -196,6 +225,7 @@ pub(crate) fn project_install_views(
                     spec.completion_requirement,
                     spec.policy,
                     core_budget,
+                    materialization,
                     producers,
                     consumers,
                 ),
@@ -206,7 +236,7 @@ pub(crate) fn project_install_views(
             RuntimeFilterInstallView::new(epoch, participant, channel_deployments),
         );
     }
-    views
+    Ok(views)
 }
 
 #[cfg(test)]
@@ -246,6 +276,22 @@ mod tests {
             },
             producer_witness: BTreeMap::from([(BindingId::new(10), CoverageWitnessId::new(1))]),
         }
+    }
+
+    /// M2 Membership consumers must declare both `Membership` and `EmptyDomain`
+    /// semantics (RFD-3/M2 install收紧 §158); the derived profile then accepts
+    /// `{ValueSet, EmptyDomain}`.
+    fn membership_consumer_facts(binding: u32) -> (BindingId, ConsumerBindingFacts) {
+        (
+            BindingId::new(binding),
+            ConsumerBindingFacts {
+                activation: ConsumerActivation::BlockingSnapshot,
+                capabilities: BTreeSet::from([
+                    ArtifactCapability::Membership,
+                    ArtifactCapability::EmptyDomain,
+                ]),
+            },
+        )
     }
 
     #[test]
@@ -289,13 +335,7 @@ mod tests {
         let mut channel_specs = BTreeMap::new();
         channel_specs.insert(ChannelId::new(5), membership_channel(5));
 
-        let consumer_facts = BTreeMap::from([(
-            BindingId::new(11),
-            ConsumerBindingFacts {
-                activation: ConsumerActivation::BlockingSnapshot,
-                capabilities: BTreeSet::from([ArtifactCapability::Membership]),
-            },
-        )]);
+        let consumer_facts = BTreeMap::from([membership_consumer_facts(11)]);
 
         let views = project_install_views(
             DeploymentEpoch::new(9),
@@ -304,7 +344,9 @@ mod tests {
             &consumer_facts,
             &instances,
             crate::runtime_filter::port::install::RuntimeFilterCoreBudget::new(512),
-        );
+            MaterializationPolicy::for_test(),
+        )
+        .expect("projection succeeds");
         let view = views.get(&part).expect("participant has a view");
         // Reuse the BE-side validator to prove the shard is well-formed.
         crate::runtime_filter::service::registry::validate_view_for_test(view)
@@ -347,13 +389,7 @@ mod tests {
         let mut channel_specs = BTreeMap::new();
         channel_specs.insert(ChannelId::new(5), membership_channel(5));
 
-        let consumer_facts = BTreeMap::from([(
-            BindingId::new(11),
-            ConsumerBindingFacts {
-                activation: ConsumerActivation::BlockingSnapshot,
-                capabilities: BTreeSet::from([ArtifactCapability::Membership]),
-            },
-        )]);
+        let consumer_facts = BTreeMap::from([membership_consumer_facts(11)]);
 
         let views = project_install_views(
             DeploymentEpoch::new(9),
@@ -362,7 +398,9 @@ mod tests {
             &consumer_facts,
             &instances,
             crate::runtime_filter::port::install::RuntimeFilterCoreBudget::new(512),
-        );
+            MaterializationPolicy::for_test(),
+        )
+        .expect("projection succeeds");
 
         // The remote consumer must never be silently promoted into a view.
         assert!(

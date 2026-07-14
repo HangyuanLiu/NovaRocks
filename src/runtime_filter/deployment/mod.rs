@@ -27,8 +27,11 @@ use std::fmt;
 use crate::runtime_filter::deployment::role_graph::RoleGraph;
 use crate::runtime_filter::model::contract::{BindingId, ChannelId, PlanFragmentId};
 use crate::runtime_filter::model::validation::GraphValidationError;
+use crate::runtime_filter::port::artifact::ArtifactContractError;
 use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
-use crate::runtime_filter::port::install::{RuntimeFilterCoreBudget, RuntimeFilterInstallView};
+use crate::runtime_filter::port::install::{
+    MaterializationPolicy, RuntimeFilterCoreBudget, RuntimeFilterInstallView,
+};
 
 /// Deployment-time resource / routing policy. Read-only input to the compiler.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,6 +41,10 @@ pub(crate) struct RuntimeFilterDeploymentPolicy {
     /// How many redundant replica producers an `AnyOf` channel may use.
     /// Never hardcode a fixed fanout; the compiler clamps this to the live topology.
     pub replica_redundancy: u32,
+    /// Physical materialization contract (bloom parameters + resource limits)
+    /// stamped into every channel deployment. A resource-policy input supplied by
+    /// the caller (RFD-6 / query options), never a magic default.
+    pub materialization: MaterializationPolicy,
 }
 
 /// Static contract failures. Every variant is caught before fragment submission.
@@ -62,6 +69,9 @@ pub(crate) enum DeploymentError {
     EmptyCoverage { channel: ChannelId },
     /// M1 install only supports Membership logical domains.
     UnsupportedLogicalDomain { channel: ChannelId },
+    /// A consumer's semantic capabilities could not be lowered into a valid
+    /// physical `ConsumerArtifactProfile` (M2 artifact contract).
+    InvalidArtifactProfile(ArtifactContractError),
 }
 
 impl fmt::Display for DeploymentError {
@@ -93,6 +103,9 @@ impl fmt::Display for DeploymentError {
                     channel.get()
                 )
             }
+            Self::InvalidArtifactProfile(e) => {
+                write!(f, "invalid consumer artifact profile: {e:?}")
+            }
         }
     }
 }
@@ -114,13 +127,14 @@ pub(crate) struct RuntimeFilterDeploymentPlan {
 mod tests {
     use super::*;
     use crate::runtime_filter::model::contract::{BindingId, ChannelId};
-    use crate::runtime_filter::port::install::RuntimeFilterCoreBudget;
+    use crate::runtime_filter::port::install::{MaterializationPolicy, RuntimeFilterCoreBudget};
 
     #[test]
     fn policy_and_error_are_constructible() {
         let policy = RuntimeFilterDeploymentPolicy {
             core_budget: RuntimeFilterCoreBudget::new(4096),
             replica_redundancy: 2,
+            materialization: MaterializationPolicy::for_test(),
         };
         assert_eq!(policy.core_budget.max_reducer_bytes(), 4096);
         assert_eq!(policy.replica_redundancy, 2);
