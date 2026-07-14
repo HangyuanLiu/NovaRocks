@@ -294,8 +294,8 @@ run_contract() {
     native_proto_contract)
       (
         cd "$REPO_ROOT"
-        cargo test --lib runtime::dispatcher::native_submission_contract_tests -- --nocapture
-        cargo test --lib runtime::dispatcher::native_submission_contract_tests --features compat -- --nocapture
+        cargo test --lib coordinator::dispatch::tests::fragment_submission_requires_native_plan_and_instance_params -- --nocapture
+        cargo test --lib coordinator::dispatch::tests::fragment_submission_requires_native_plan_and_instance_params --features compat -- --nocapture
       ) 2>&1 | tee "$log"
       ;;
     raw_source_guard)

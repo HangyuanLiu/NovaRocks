@@ -21,7 +21,6 @@ pub(crate) mod coordinator;
 pub(crate) mod descriptor_snapshot;
 #[cfg(feature = "compat")]
 pub(crate) mod descriptor_snapshot_thrift;
-pub(crate) mod dispatcher;
 pub(crate) mod endpoint;
 pub mod exchange;
 pub mod exchange_scan;

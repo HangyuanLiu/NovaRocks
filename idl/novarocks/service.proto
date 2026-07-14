@@ -31,8 +31,9 @@ import "plan.proto";
 
 // FE<->BE control + data-plane RPC surface. One service, all cluster-internal
 // traffic. Consumers: src/service/grpc_server.rs (server), src/service/
-// grpc_client.rs + src/runtime/dispatcher.rs + src/runtime/heartbeat_mgr.rs +
-// src/service/standalone_exec_state_reporter.rs (clients).
+// grpc_client.rs + src/service/grpc_fragment_dispatcher.rs (implementing the
+// src/coordinator/dispatch.rs port) + src/runtime/heartbeat_mgr.rs + src/service/
+// standalone_exec_state_reporter.rs (clients).
 service NovaRocksGrpc {
   // Streaming exchange shuffle: sender streams chunk payloads to a receiver
   // fragment instance. Producer: src/service/exchange_sender.rs. Consumer:

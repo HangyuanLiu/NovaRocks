@@ -2755,12 +2755,12 @@ fn explain_analyze_query(
 
     let mut query_opts = query_opts.unwrap_or_default();
     query_opts.enable_profile = true;
-    let (dispatcher, scheduler) = coordinated_execution_services()?;
+    let (execution_ports, scheduler) = coordinated_execution_services()?;
     let execution_start = std::time::Instant::now();
     let query_opts = query_opts.to_runtime();
     let outcome = crate::runtime::coordinator::ExecutionCoordinator::new(
         build_result,
-        dispatcher,
+        execution_ports,
         scheduler,
         Some(query_opts),
     )
@@ -3140,10 +3140,10 @@ pub(crate) fn execute_query_as_iceberg_write(
             None,
         ),
     )?;
-    let (dispatcher, scheduler) = coordinated_execution_services()?;
+    let (execution_ports, scheduler) = coordinated_execution_services()?;
     crate::runtime::coordinator::ExecutionCoordinator::new(
         build_result,
-        dispatcher,
+        execution_ports,
         scheduler,
         StandaloneQueryOptions::optional_to_runtime(query_opts.as_ref()),
     )
@@ -3350,11 +3350,11 @@ pub(crate) fn execute_planned_iceberg_change_stream_write(
     build_result: crate::sql::codegen::fragment::MultiFragmentBuildResult,
     query_opts: Option<StandaloneQueryOptions>,
 ) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
-    let (dispatcher, scheduler) = coordinated_execution_services()?;
+    let (execution_ports, scheduler) = coordinated_execution_services()?;
     let query_options = StandaloneQueryOptions::optional_to_runtime(query_opts.as_ref());
     crate::runtime::coordinator::ExecutionCoordinator::new(
         build_result,
-        dispatcher,
+        execution_ports,
         scheduler,
         query_options,
     )
@@ -3725,10 +3725,10 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
             mv_refresh_ctx,
         ),
     )?;
-    let (dispatcher, scheduler) = coordinated_execution_services()?;
+    let (execution_ports, scheduler) = coordinated_execution_services()?;
     crate::runtime::coordinator::ExecutionCoordinator::new(
         build_result,
-        dispatcher,
+        execution_ports,
         scheduler,
         StandaloneQueryOptions::optional_to_runtime(query_opts.as_ref()),
     )
@@ -3783,10 +3783,10 @@ pub(crate) fn execute_logical_plan_with_options(
             mv_refresh_ctx,
         ),
     )?;
-    let (dispatcher, scheduler) = coordinated_execution_services()?;
+    let (execution_ports, scheduler) = coordinated_execution_services()?;
     crate::runtime::coordinator::ExecutionCoordinator::new(
         build_result,
-        dispatcher,
+        execution_ports,
         scheduler,
         StandaloneQueryOptions::optional_to_runtime(query_opts.as_ref()),
     )
@@ -3795,7 +3795,7 @@ pub(crate) fn execute_logical_plan_with_options(
 
 fn coordinated_execution_services() -> Result<
     (
-        Arc<dyn crate::runtime::dispatcher::FragmentDispatcher>,
+        crate::coordinator::ports::CoordinatorExecutionPorts,
         Arc<crate::runtime::scheduler::FragmentScheduler>,
     ),
     String,
@@ -3808,13 +3808,15 @@ fn coordinated_execution_services() -> Result<
         ClusterRole::Fe | ClusterRole::AllInOne => {
             let entries = backend_ops::live_backend_dispatch_entries()?;
             let dispatcher = Arc::new(
-                crate::runtime::dispatcher::RemoteDispatcher::new_with_backend_ids(&entries)?,
+                crate::service::grpc_fragment_dispatcher::RemoteDispatcher::new_with_backend_ids(
+                    &entries,
+                )?,
             );
             let scheduler = Arc::new(
                 crate::runtime::scheduler::FragmentScheduler::new_with_backend_ids(entries),
             );
             (
-                dispatcher as Arc<dyn crate::runtime::dispatcher::FragmentDispatcher>,
+                dispatcher as Arc<dyn crate::coordinator::dispatch::FragmentDispatcher>,
                 scheduler,
             )
         }
@@ -3822,7 +3824,15 @@ fn coordinated_execution_services() -> Result<
             return Err("role=be must not enter standalone coordinator".into());
         }
     };
-    Ok((dispatcher, scheduler))
+    let report_endpoint = crate::service::grpc_coordinator_adapter::coordinator_report_endpoint()?;
+    let observer =
+        Arc::new(crate::service::grpc_coordinator_adapter::PrometheusCoordinatorObserver);
+    let execution_ports = crate::coordinator::ports::CoordinatorExecutionPorts::new(
+        dispatcher,
+        report_endpoint,
+        observer,
+    );
+    Ok((execution_ports, scheduler))
 }
 
 /// Select a `FragmentDispatcher` implementation based on the effective cluster role.
@@ -3833,7 +3843,7 @@ fn coordinated_execution_services() -> Result<
 /// - `Be`: standalone coordinator must not be entered when the process is a pure BE.
 pub(crate) fn dispatcher_for_role(
     role: crate::common::app_config::ClusterRole,
-) -> Result<Arc<dyn crate::runtime::dispatcher::FragmentDispatcher>, String> {
+) -> Result<Arc<dyn crate::coordinator::dispatch::FragmentDispatcher>, String> {
     use crate::common::app_config::ClusterRole;
     match role {
         ClusterRole::Fe => {
@@ -3841,7 +3851,9 @@ pub(crate) fn dispatcher_for_role(
                 configured_fe_dispatch_entries_and_live_fallback()?;
             if let Some(entries) = configured {
                 return Ok(Arc::new(
-                    crate::runtime::dispatcher::RemoteDispatcher::new_with_backend_ids(&entries)?,
+                    crate::service::grpc_fragment_dispatcher::RemoteDispatcher::new_with_backend_ids(
+                        &entries,
+                    )?,
                 ));
             }
             if !may_use_live_registry {
@@ -3852,13 +3864,17 @@ pub(crate) fn dispatcher_for_role(
             let entries = backend_ops::live_backend_dispatch_entries()
                 .map_err(|e| with_fe_error_context(e))?;
             Ok(Arc::new(
-                crate::runtime::dispatcher::RemoteDispatcher::new_with_backend_ids(&entries)?,
+                crate::service::grpc_fragment_dispatcher::RemoteDispatcher::new_with_backend_ids(
+                    &entries,
+                )?,
             ))
         }
         ClusterRole::AllInOne => {
             let entries = backend_ops::live_backend_dispatch_entries()?;
             Ok(Arc::new(
-                crate::runtime::dispatcher::RemoteDispatcher::new_with_backend_ids(&entries)?,
+                crate::service::grpc_fragment_dispatcher::RemoteDispatcher::new_with_backend_ids(
+                    &entries,
+                )?,
             ))
         }
         ClusterRole::Be => Err("role=be must not enter standalone coordinator".to_string()),
@@ -3898,20 +3914,6 @@ fn with_fe_error_context(err: String) -> String {
         err
     } else {
         format!("role=fe: {err}")
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn dispatcher_kind_for_test(
-    dispatcher: &Arc<dyn crate::runtime::dispatcher::FragmentDispatcher>,
-) -> &'static str {
-    if dispatcher
-        .as_any()
-        .is::<crate::runtime::dispatcher::RemoteDispatcher>()
-    {
-        "remote"
-    } else {
-        "unknown"
     }
 }
 
@@ -8736,7 +8738,6 @@ path = "meta/operations.sqlite"
 
         let dispatcher = super::dispatcher_for_role(ClusterRole::AllInOne).expect("dispatcher");
 
-        assert_eq!(super::dispatcher_kind_for_test(&dispatcher), "remote");
         assert_eq!(dispatcher.backend_count(), 1);
     }
 
@@ -8756,11 +8757,10 @@ path = "meta/operations.sqlite"
         registry.restore_backend(2, endpoint, BackendState::Live);
         crate::runtime::backend_registry::replace_backend_registry_for_test(Some(registry));
 
-        let (dispatcher, scheduler) =
+        let (execution_ports, scheduler) =
             super::coordinated_execution_services().expect("coordinated services");
 
-        assert_eq!(super::dispatcher_kind_for_test(&dispatcher), "remote");
-        assert_eq!(dispatcher.backend_count(), 1);
+        assert_eq!(execution_ports.dispatcher.backend_count(), 1);
         assert_eq!(scheduler.live_backend_entries(), &[(2usize, endpoint)]);
     }
 

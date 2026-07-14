@@ -42,9 +42,10 @@ use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
+use crate::coordinator::dispatch::{FetchOutcome, FragmentDispatcher, FragmentSubmission};
+use crate::coordinator::ports::{CoordinatorExecutionPorts, CoordinatorObserver};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::novarocks_logging::debug;
-use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher, FragmentSubmission};
 use crate::runtime::profile::RuntimeProfileTree;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::query_state::QueryState;
@@ -85,7 +86,7 @@ pub(crate) struct CoordinatedQueryResult {
 /// polling the dispatcher for the root fragment's chunks.
 pub(crate) struct ExecutionCoordinator {
     build_result: MultiFragmentBuildResult,
-    dispatcher: Arc<dyn FragmentDispatcher>,
+    execution_ports: CoordinatorExecutionPorts,
     scheduler: Arc<FragmentScheduler>,
     query_options: Option<QueryOptions>,
 }
@@ -93,13 +94,13 @@ pub(crate) struct ExecutionCoordinator {
 impl ExecutionCoordinator {
     pub(crate) fn new(
         build_result: MultiFragmentBuildResult,
-        dispatcher: Arc<dyn FragmentDispatcher>,
+        execution_ports: CoordinatorExecutionPorts,
         scheduler: Arc<FragmentScheduler>,
         query_options: Option<QueryOptions>,
     ) -> Self {
         Self {
             build_result,
-            dispatcher,
+            execution_ports,
             scheduler,
             query_options,
         }
@@ -127,7 +128,11 @@ impl ExecutionCoordinator {
             ..
         } = self.build_result;
         let query_options = self.query_options;
-        let dispatcher = self.dispatcher;
+        let CoordinatorExecutionPorts {
+            dispatcher,
+            report_endpoint,
+            observer,
+        } = self.execution_ports;
         let scheduler = self.scheduler;
         let native_fragments_by_id = native_fragments;
         // ---------------------------------------------------------------
@@ -267,7 +272,6 @@ impl ExecutionCoordinator {
         // ---------------------------------------------------------------
         let needs_fragment_status_report =
             dispatcher.needs_fragment_status_report() || collect_profiles;
-        let mut novarocks_report_endpoint: Option<crate::runtime::endpoint::RuntimeEndpoint> = None;
 
         // Snapshot the per-consumer-fragment instance destinations for CTE
         // multicast sub-sinks (each consumer fans out to all of its instances).
@@ -360,10 +364,7 @@ impl ExecutionCoordinator {
                 let fragment_has_write_sink = is_terminal_write;
                 let fragment_report_endpoint =
                     if fragment_has_write_sink || needs_fragment_status_report {
-                        if novarocks_report_endpoint.is_none() {
-                            novarocks_report_endpoint = Some(local_coordinator_report_endpoint()?);
-                        }
-                        novarocks_report_endpoint.clone()
+                        Some(report_endpoint.clone())
                     } else {
                         None
                     };
@@ -485,6 +486,7 @@ impl ExecutionCoordinator {
             expected_root_chunk_schema.as_ref(),
             write_coordinator.as_ref(),
             collect_profiles,
+            observer.as_ref(),
         )?;
         if let Some(commit) = fetch_result.write_commit.as_ref() {
             tracing::info!(
@@ -790,16 +792,6 @@ fn validate_write_commit_ready(
     write: &Arc<Mutex<WriteCoordinator>>,
 ) -> Result<WriteCommitInput, String> {
     write.lock().expect("write coordinator lock").commit_input()
-}
-
-fn local_coordinator_report_endpoint() -> Result<crate::runtime::endpoint::RuntimeEndpoint, String>
-{
-    let cfg = crate::novarocks_config::config()
-        .map_err(|e| format!("cannot read coordinator config: {e}"))?;
-    let host = crate::common::network::advertise_host().unwrap_or_else(|_| cfg.server.host.clone());
-    let port =
-        crate::service::grpc_server::grpc_server_bound_port().unwrap_or(cfg.server.grpc_port);
-    crate::runtime::endpoint::RuntimeEndpoint::new(host, port as i32)
 }
 
 fn ensure_native_fragment_sink_supported(
@@ -1669,6 +1661,7 @@ pub(crate) fn submit_and_fetch_loop(
     expected_root_chunk_schema: Option<&ChunkSchemaRef>,
     write_coordinator: Option<&Arc<Mutex<WriteCoordinator>>>,
     collect_profiles: bool,
+    observer: &dyn CoordinatorObserver,
 ) -> Result<SubmitAndFetchResult, String> {
     const REMOTE_FETCH_POLL_INTERVAL_MS: i64 = 300;
     let runtime_query_id = crate::runtime::query_context::QueryId {
@@ -1693,7 +1686,7 @@ pub(crate) fn submit_and_fetch_loop(
             tracker.cancel_all(dispatcher.as_ref());
             return Err(e);
         }
-        crate::service::metrics_http::observe_fragment_scheduled();
+        observer.fragment_scheduled();
         if let Some(registry) = crate::runtime::backend_registry::backend_registry() {
             registry
                 .record_scheduled_fragment(backend_idx as crate::runtime::backend_registry::BeId);
@@ -1995,8 +1988,18 @@ mod native_contract_tests {
 
     use arrow::array::{Array, Decimal128Array, Int32Array};
 
+    use crate::coordinator::ports::CoordinatorObserver;
     use crate::proto::plan as native_plan;
     use crate::runtime::write_coordinator::FragmentExecStatusReport;
+
+    #[derive(Default)]
+    struct CountingCoordinatorObserver(AtomicUsize);
+
+    impl CoordinatorObserver for CountingCoordinatorObserver {
+        fn fragment_scheduled(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     fn schedule(fragment_id: FragmentId) -> FragmentSchedulingMetadata {
         FragmentSchedulingMetadata {
@@ -2209,10 +2212,6 @@ mod native_contract_tests {
     }
 
     impl FragmentDispatcher for CapturingDispatcher {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
         fn submit_fragment(
             &self,
             backend_idx: usize,
@@ -2520,6 +2519,7 @@ mod native_contract_tests {
     fn submit_loop_uses_native_submission_in_default_and_compat() {
         let inner = CapturingDispatcher::new(None);
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+        let observer = CountingCoordinatorObserver::default();
         let query_id = UniqueId {
             hi: 91_000,
             lo: 91_001,
@@ -2543,6 +2543,7 @@ mod native_contract_tests {
             None,
             None,
             false,
+            &observer,
         )
         .expect("native submissions execute");
 
@@ -2554,12 +2555,14 @@ mod native_contract_tests {
                 (0, 7, UniqueId { hi: 91_000, lo: 2 }),
             ]
         );
+        assert_eq!(observer.0.load(Ordering::SeqCst), 2);
     }
 
     #[test]
     fn submit_failure_cancels_only_native_instances_already_accepted() {
         let inner = CapturingDispatcher::new(Some(2));
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+        let observer = CountingCoordinatorObserver::default();
         let query_id = UniqueId {
             hi: 92_000,
             lo: 92_001,
@@ -2582,6 +2585,7 @@ mod native_contract_tests {
             None,
             None,
             false,
+            &observer,
         )
         .expect_err("second native submit must fail");
 
@@ -2590,6 +2594,7 @@ mod native_contract_tests {
             *inner.cancellations.lock().unwrap(),
             vec![UniqueId { hi: 92_000, lo: 1 }]
         );
+        assert_eq!(observer.0.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -2631,6 +2636,7 @@ mod native_contract_tests {
             None,
             None,
             false,
+            &CountingCoordinatorObserver::default(),
         )
         .expect_err("malformed later submission must fail before dispatch");
 
@@ -2705,6 +2711,7 @@ mod native_contract_tests {
                 None,
                 None,
                 false,
+                &CountingCoordinatorObserver::default(),
             )
             .expect_err("invalid submission ids must fail");
             assert!(err.contains(expected), "{err}");
@@ -2761,6 +2768,7 @@ mod native_contract_tests {
                     None,
                     None,
                     false,
+                    &CountingCoordinatorObserver::default(),
                 )
                 .expect_err("invalid submission query id must fail before dispatch");
 
@@ -2820,6 +2828,7 @@ mod native_contract_tests {
                 None,
                 None,
                 false,
+                &CountingCoordinatorObserver::default(),
             )
             .expect_err("root submission identity drift must fail before dispatch");
 
@@ -2874,6 +2883,7 @@ mod native_contract_tests {
                 None,
                 None,
                 false,
+                &CountingCoordinatorObserver::default(),
             )
             .expect_err("native lifecycle failure must surface");
             assert!(err.contains(expected), "{err}");
@@ -2913,6 +2923,7 @@ mod native_contract_tests {
                 None,
                 None,
                 false,
+                &CountingCoordinatorObserver::default(),
             )
         })
         .expect_err("disconnect must surface");
@@ -2970,6 +2981,7 @@ mod native_contract_tests {
             None,
             Some(&write),
             false,
+            &CountingCoordinatorObserver::default(),
         )
         .expect("writer failure returns structured abort");
         assert!(result.write_commit.is_none());
@@ -3029,6 +3041,7 @@ mod native_contract_tests {
                 None,
                 Some(&write),
                 false,
+                &CountingCoordinatorObserver::default(),
             )
             .expect("post-EOF write outcome");
             report_thread.join().unwrap();
@@ -3081,6 +3094,7 @@ mod native_contract_tests {
             None,
             Some(&write),
             false,
+            &CountingCoordinatorObserver::default(),
         )
         .expect("write-only root commits");
         assert!(result.write_commit.is_some());
@@ -3131,6 +3145,7 @@ mod native_contract_tests {
             None,
             None,
             true,
+            &CountingCoordinatorObserver::default(),
         )
         .expect("native profiles collected");
         assert_eq!(result.fragment_profiles.len(), 1);

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Fragment dispatcher abstraction.
+//! gRPC fragment dispatcher adapter.
 //!
 //! `FragmentDispatcher` decouples coordinator from where fragments actually
 //! run. `RemoteDispatcher` talks to one or more BEs over gRPC by index;
@@ -31,6 +31,8 @@ use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
+use crate::coordinator::dispatch::{FetchOutcome, FragmentDispatcher, FragmentSubmission};
+#[cfg(test)]
 use crate::exec::chunk::Chunk;
 #[cfg(test)]
 use crate::exec::chunk::ChunkSchema;
@@ -49,115 +51,6 @@ use tracing::warn;
 
 static REMOTE_SUBMIT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static REMOTE_FETCH_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-/// Outcome of a single `fetch_result` call.
-pub enum FetchOutcome {
-    /// A result chunk is available.
-    Ready(Chunk),
-    /// No chunk available yet; fragment is still running.
-    NotReady,
-    /// All chunks have been delivered; the root fragment is complete.
-    Eof,
-    /// Fragment execution failed.
-    Err(String),
-}
-
-/// Fragment dispatcher trait.
-///
-/// Implementations choose where and how fragments run.  The coordinator
-/// calls `submit_fragment` for each fragment (non-blocking), then polls
-/// `fetch_result` for the root fragment instance until `Eof` or `Err`.
-pub trait FragmentDispatcher: Send + Sync + 'static {
-    #[cfg(test)]
-    fn as_any(&self) -> &dyn std::any::Any;
-
-    /// Submit a fragment for asynchronous execution to the given backend.
-    /// Returns immediately.
-    fn submit_fragment(
-        &self,
-        backend_idx: usize,
-        submission: FragmentSubmission,
-    ) -> Result<(), String>;
-
-    /// Poll for the next result chunk from the root fragment on the given
-    /// backend.
-    fn fetch_result(
-        &self,
-        backend_idx: usize,
-        finst_id: UniqueId,
-        max_wait_ms: i64,
-        expected_chunk_schema: Option<&ChunkSchemaRef>,
-    ) -> Result<FetchOutcome, String>;
-
-    /// Cancel all listed fragment instances on the given backend.  Idempotent.
-    fn cancel_fragments(&self, backend_idx: usize, finst_ids: &[UniqueId]);
-
-    /// Number of backends this dispatcher can route to.
-    fn backend_count(&self) -> usize;
-
-    /// Whether non-write fragments need final status reports back to the
-    /// standalone coordinator.
-    fn needs_fragment_status_report(&self) -> bool {
-        false
-    }
-}
-
-pub(crate) struct FragmentSubmission {
-    plan: crate::proto::plan::PlanFragment,
-    instance_params: crate::proto::novarocks::InstanceParams,
-}
-
-impl FragmentSubmission {
-    pub(crate) fn new(
-        plan: crate::proto::plan::PlanFragment,
-        instance_params: crate::proto::novarocks::InstanceParams,
-    ) -> Self {
-        Self {
-            plan,
-            instance_params,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn plan_for_test(&self) -> &crate::proto::plan::PlanFragment {
-        &self.plan
-    }
-
-    pub(crate) fn fragment_id(&self) -> u32 {
-        self.plan.fragment_id
-    }
-
-    pub(crate) fn query_id(&self) -> Result<UniqueId, String> {
-        let id = self
-            .instance_params
-            .query_id
-            .as_ref()
-            .ok_or_else(|| "fragment submission missing query_id".to_string())?;
-        Ok(UniqueId {
-            hi: id.hi,
-            lo: id.lo,
-        })
-    }
-
-    pub(crate) fn fragment_instance_id(&self) -> Result<UniqueId, String> {
-        let id = self
-            .instance_params
-            .fragment_instance_id
-            .as_ref()
-            .ok_or_else(|| "fragment submission missing fragment_instance_id".to_string())?;
-        Ok(UniqueId {
-            hi: id.hi,
-            lo: id.lo,
-        })
-    }
-
-    fn into_submit_fragment_request(self) -> SubmitFragmentRequest {
-        SubmitFragmentRequest {
-            plan: Some(self.plan),
-            instance_params: Some(self.instance_params),
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // RemoteDispatcher
@@ -232,11 +125,6 @@ impl RemoteDispatcher {
 }
 
 impl FragmentDispatcher for RemoteDispatcher {
-    #[cfg(test)]
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn submit_fragment(
         &self,
         backend_idx: usize,
@@ -253,7 +141,11 @@ impl FragmentDispatcher for RemoteDispatcher {
             let _ = std::io::Write::flush(&mut std::io::stdout());
             return Err(format!("debug submit fault injected on call {call_index}"));
         }
-        let request = submission.into_submit_fragment_request();
+        let (plan, instance_params) = submission.into_parts();
+        let request = SubmitFragmentRequest {
+            plan: Some(plan),
+            instance_params: Some(instance_params),
+        };
         let resp = client
             .blocking_submit_fragment(request)
             .map_err(|e| format!("BE[{backend_idx}] ({addr}): {e}"))?;
@@ -378,45 +270,6 @@ impl FragmentDispatcher for RemoteDispatcher {
 
     fn needs_fragment_status_report(&self) -> bool {
         true
-    }
-}
-
-#[cfg(test)]
-mod native_submission_contract_tests {
-    use super::*;
-
-    #[test]
-    fn fragment_submission_requires_native_plan_and_instance_params() {
-        let submission = FragmentSubmission::new(
-            crate::proto::plan::PlanFragment {
-                fragment_id: 9,
-                ..Default::default()
-            },
-            crate::proto::novarocks::InstanceParams {
-                query_id: Some(ProtoUniqueId { hi: 7, lo: 9 }),
-                fragment_instance_id: Some(ProtoUniqueId { hi: 7, lo: 11 }),
-                backend_num: 3,
-                ..Default::default()
-            },
-        );
-
-        assert_eq!(
-            submission.query_id().expect("native query id"),
-            UniqueId { hi: 7, lo: 9 }
-        );
-        assert_eq!(
-            submission.fragment_instance_id().expect("native finst id"),
-            UniqueId { hi: 7, lo: 11 }
-        );
-        let request = submission.into_submit_fragment_request();
-        assert_eq!(request.plan.expect("native plan").fragment_id, 9);
-        assert_eq!(
-            request
-                .instance_params
-                .expect("native instance params")
-                .backend_num,
-            3
-        );
     }
 }
 
@@ -803,7 +656,7 @@ mod tests {
 
     #[test]
     fn remote_dispatcher_source_has_no_native_cancel_thread_spawn() {
-        let source = include_str!("dispatcher.rs");
+        let source = include_str!("grpc_fragment_dispatcher.rs");
         let needle = ["remote", "-cancel", "-fragment"].concat();
         assert!(
             !source.contains(&needle),
@@ -813,7 +666,7 @@ mod tests {
 
     #[test]
     fn remote_dispatcher_cancel_async_path_does_not_call_connect_blocking() {
-        let source = include_str!("dispatcher.rs");
+        let source = include_str!("grpc_fragment_dispatcher.rs");
         let impl_source = source
             .split_once("// Tests")
             .map(|(before, _)| before)
@@ -830,7 +683,7 @@ mod tests {
 
     #[test]
     fn dispatcher_source_has_no_local_dispatcher_legacy() {
-        let source = include_str!("dispatcher.rs");
+        let source = include_str!("grpc_fragment_dispatcher.rs");
         let legacy_type_name = ["In", "Process", "Dispatcher"].concat();
         assert!(
             !source.contains(&legacy_type_name),
