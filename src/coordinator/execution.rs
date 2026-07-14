@@ -1849,7 +1849,6 @@ mod native_contract_tests {
             output_kind: FragmentOutputKind::Result,
             native_scan_ranges: BTreeMap::new(),
             output_columns: Vec::new(),
-            boundary_schemas: Vec::new(),
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
         }

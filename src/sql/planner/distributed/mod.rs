@@ -28,6 +28,7 @@ pub(crate) mod write;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+pub(crate) use boundary::{BoundaryColumn, BoundaryContract, BoundaryKind, ExecutionColumnId};
 pub(crate) use fragment::{
     DataPartition, DataSink, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind,
     PartitionKind, PlanFragment,

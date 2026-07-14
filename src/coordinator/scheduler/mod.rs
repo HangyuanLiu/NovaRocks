@@ -778,7 +778,6 @@ mod tests {
             output_kind: FragmentOutputKind::NonTerminal,
             native_scan_ranges,
             output_columns: vec![],
-            boundary_schemas: vec![],
             cte_id: None,
             cte_exchange_nodes: vec![],
         }

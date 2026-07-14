@@ -54,7 +54,6 @@ pub(crate) struct FragmentSchedulingMetadata {
     pub native_scan_ranges:
         std::collections::BTreeMap<i32, Vec<crate::runtime::scan_range::ScanRangeParams>>,
     pub output_columns: Vec<OutputColumn>,
-    pub boundary_schemas: Vec<BoundarySchemaReport>,
     pub cte_id: Option<CteId>,
     pub cte_exchange_nodes: Vec<(CteId, i32, Vec<ColumnId>)>,
 }
@@ -66,6 +65,9 @@ pub(crate) struct MultiFragmentBuildResult {
     pub root_fragment_id: FragmentId,
     /// Fragment-to-fragment data edges.
     pub edges: Vec<FragmentEdge>,
+    /// Read-only projection of the sealed planner boundary catalog, in the
+    /// planner's canonical derivation order (one report per boundary contract).
+    /// See `boundary_schema::project_boundary_reports`.
     pub boundary_schemas: Vec<BoundarySchemaReport>,
     /// Runtime filter planning result (populated for standalone mode).
     pub rf_plan: Option<RuntimeFilterPlanResult>,
