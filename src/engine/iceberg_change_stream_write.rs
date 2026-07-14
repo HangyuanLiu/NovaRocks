@@ -18,12 +18,12 @@ use iceberg::spec::TableMetadata;
 use crate::connector::iceberg::commit::{
     CleanupAttempt, CommitOutcome, CommitServiceError, IcebergCommitCollector, WrittenFile,
 };
+use crate::coordinator::execution::CoordinatedQueryResult;
 use crate::engine::StandaloneState;
 use crate::engine::query_options::StandaloneQueryOptions;
 use crate::engine::write_transaction::{
     IcebergWriteCommitExecutor, IcebergWriteTransactionExecutor, IcebergWriteTransactionSpec,
 };
-use crate::runtime::coordinator::CoordinatedQueryResult;
 use crate::runtime::write_coordinator::WriteCommitInput;
 use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::optimizer::OptimizedOperatorNode;

@@ -187,7 +187,7 @@ fn run_priority_worker(reporter: &'static StandaloneExecStateReporter) {
             handle_final_report_exhaustion_with(
                 task,
                 err,
-                crate::service::fragment_control::mark_query_failed_from_report,
+                crate::coordinator::report::mark_query_failed_from_report,
             );
         }
     }

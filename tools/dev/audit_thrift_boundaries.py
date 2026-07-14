@@ -28,6 +28,7 @@ import sys
 SCAN_ROOTS = (
     "src/exec",
     "src/connector",
+    "src/coordinator",
     "src/engine",
     "src/formats",
     "src/runtime",
@@ -147,15 +148,17 @@ BASELINE: dict[str, BaselineEntry] = {
     "src/connector/starrocks/table/mv_ddl.rs": BaselineEntry("legal-boundary", "B6-wire", 0, "StarRocks MV DDL is a protocol adapter boundary"),
     "src/connector/starrocks/scan/reader.rs": BaselineEntry("legal-boundary", "B6-wire", 1, "StarRocks scan reader is a StarRocks protocol adapter boundary"),
     "src/connector/schema/context.rs": BaselineEntry("legal-boundary", "B6-wire", 1, "Schema context exposes StarRocks-compatible metadata"),
-    "src/runtime/coordinator.rs": BaselineEntry("domain-leak", "control-plane", 0, "Runtime coordinator orchestrates native fragment scheduling metadata"),
+    "src/coordinator/execution.rs": BaselineEntry("domain-leak", "control-plane", 0, "Coordinator execution orchestrates native fragment scheduling metadata"),
     "src/runtime/change_op.rs": BaselineEntry("legal-boundary", "B5-wire", 2, "Runtime change-op adapter extracts FE-compatible HDFS extended-column payloads"),
     "src/runtime/endpoint.rs": BaselineEntry("legal-boundary", "control-plane-wire", 2, "Runtime endpoint adapter decodes external FE network addresses"),
     "src/runtime/fragment_exec_params.rs": BaselineEntry("domain-leak", "control-plane", 0, "Fragment exec params are native runtime scheduling metadata"),
-    "src/runtime/scheduler.rs": BaselineEntry("legal-boundary", "control-plane-wire", 13, "Runtime scheduler transports FE-compatible control-plane payloads"),
+    "src/coordinator/scheduler/mod.rs": BaselineEntry("domain-leak", "control-plane", 0, "Coordinator scheduler consumes native scheduling metadata"),
     "src/coordinator/dispatch.rs": BaselineEntry("domain-leak", "control-plane", 0, "Coordinator dispatcher port owns native fragment submissions"),
     "src/service/grpc_fragment_dispatcher.rs": BaselineEntry("domain-leak", "control-plane", 0, "gRPC dispatcher sends native fragment requests"),
     "src/runtime/profile.rs": BaselineEntry("legal-boundary", "control-plane-wire", 1, "Runtime profile stores FE-compatible profile metadata"),
-    "src/runtime/profile_correlate.rs": BaselineEntry("legal-boundary", "control-plane-wire", 1, "Runtime profile correlation reads FE-compatible profile trees"),
+    "src/coordinator/profile/mod.rs": BaselineEntry("domain-leak", "control-plane", 0, "Coordinator query profile registry decodes native profile reports"),
+    "src/coordinator/profile/correlate.rs": BaselineEntry("domain-leak", "control-plane", 0, "Coordinator profile correlation consumes native runtime profile trees"),
+    "src/coordinator/report.rs": BaselineEntry("domain-leak", "control-plane", 0, "Coordinator report handling consumes native exec-status reports"),
     "src/runtime/result_buffer.rs": BaselineEntry("legal-boundary", "control-plane-wire", 3, "Result buffer exports FE-compatible result metadata"),
     "src/runtime/runtime_state.rs": BaselineEntry("legal-boundary", "control-plane-wire", 7, "Runtime state carries FE-compatible payload references"),
     "src/runtime/native_fragment_wire.rs": BaselineEntry("domain-leak", "control-plane", 0, "Native fragment wire adapter consumes NovaRocks Proto only"),
@@ -456,7 +459,7 @@ def evaluate(hits: dict[str, list[Hit]], include_tests: bool) -> AuditResult:
     return AuditResult(hits=hits, errors=errors, warnings=warnings)
 
 
-def summarize(result: AuditResult) -> dict[str, object]:
+def summarize(result: AuditResult, scanned_files: list[str]) -> dict[str, object]:
     by_category: dict[str, int] = {}
     by_owner: dict[str, int] = {}
     files: list[dict[str, object]] = []
@@ -477,9 +480,17 @@ def summarize(result: AuditResult) -> dict[str, object]:
             }
         )
 
+    scanned_by_root = {
+        scan_root: sum(path == scan_root or path.startswith(f"{scan_root}/") for path in scanned_files)
+        for scan_root in SCAN_ROOTS
+    }
+
     return {
         "total_hits": sum(len(hits) for hits in result.hits.values()),
         "file_count": len(result.hits),
+        "scanned_file_count": len(scanned_files),
+        "scanned_files": scanned_files,
+        "scanned_by_root": scanned_by_root,
         "by_category": dict(sorted(by_category.items())),
         "by_owner": dict(sorted(by_owner.items())),
         "files": files,
@@ -497,6 +508,10 @@ def print_summary(summary: dict[str, object]) -> None:
 
     print(f"total_hits: {summary['total_hits']}")
     print(f"file_count: {summary['file_count']}")
+    print(f"scanned_file_count: {summary['scanned_file_count']}")
+    print("scanned_by_root:")
+    for scan_root, count in summary["scanned_by_root"].items():
+        print(f"  {scan_root}: {count}")
     print("by_category:")
     for category, count in by_category.items():
         print(f"  {category}: {count}")
@@ -545,9 +560,10 @@ def main() -> int:
         )
         return 1
 
+    scanned_files = [path.relative_to(root).as_posix() for path in iter_rust_files(root)]
     hits = collect_hits(root, include_tests=args.include_tests)
     result = evaluate(hits, include_tests=args.include_tests)
-    summary = summarize(result)
+    summary = summarize(result, scanned_files)
 
     if args.json:
         print(json.dumps(summary, indent=2, sort_keys=True))

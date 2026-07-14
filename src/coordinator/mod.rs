@@ -16,4 +16,8 @@
 // under the License.
 
 pub(crate) mod dispatch;
+pub(crate) mod execution;
 pub(crate) mod ports;
+pub(crate) mod profile;
+pub(crate) mod report;
+pub(crate) mod scheduler;

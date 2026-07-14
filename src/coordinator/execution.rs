@@ -34,7 +34,7 @@
 //! wiring exactly.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -44,14 +44,18 @@ use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
 use crate::coordinator::dispatch::{FetchOutcome, FragmentDispatcher, FragmentSubmission};
 use crate::coordinator::ports::{CoordinatorExecutionPorts, CoordinatorObserver};
+use crate::coordinator::profile::{
+    StandaloneQueryProfileGuard, standalone_query_profile_count, take_standalone_query_profiles,
+};
+use crate::coordinator::report::{StandaloneQueryFailureGuard, take_standalone_query_failure};
+use crate::coordinator::scheduler::{
+    FragmentInstancePlacement, FragmentScheduler, topological_sort_bottom_up,
+};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::novarocks_logging::debug;
 use crate::runtime::profile::RuntimeProfileTree;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::query_state::QueryState;
-use crate::runtime::scheduler::{
-    FragmentInstancePlacement, FragmentScheduler, topological_sort_bottom_up,
-};
 use crate::runtime::write_coordinator::{
     WriteAbortInput, WriteCommitInput, WriteCoordinator, WriterKey, register_query,
     unregister_query,
@@ -63,6 +67,9 @@ use crate::sql::codegen::fragment::{
 };
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::{FragmentEdge, FragmentEdgeKind, FragmentId};
+
+#[cfg(test)]
+use crate::coordinator::profile::record_native_standalone_query_profile_report;
 
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 
@@ -179,12 +186,12 @@ impl ExecutionCoordinator {
             root_fragment_id,
             &boundary_schemas,
         )?;
-        let live = scheduler.live_backend_entries().to_vec();
+        let live = scheduler.live_backend_snapshot().entries();
         let mut plan =
-            scheduler.assign_with_live(&fragment_schedules, &edges, query_id.clone(), &live)?;
-        scheduler.fill_destinations_with_live(&mut plan, &edges, &live)?;
+            scheduler.assign_with_live(&fragment_schedules, &edges, query_id.clone(), live)?;
+        scheduler.fill_destinations_with_live(&mut plan, &edges, live)?;
         if let Some(rf) = rf_plan.as_ref() {
-            scheduler.fill_runtime_filter_params_with_live(&mut plan, rf, &live)?;
+            scheduler.fill_runtime_filter_params_with_live(&mut plan, rf, live)?;
         }
         scheduler.fill_per_exch_num_senders(&mut plan, &edges);
         validate_native_scheduling_plan(&fragment_schedules, &native_fragments_by_id, &plan)?;
@@ -898,7 +905,7 @@ fn validate_fragment_schedule_payloads(
 fn validate_native_scheduling_plan(
     fragment_schedules: &[FragmentSchedulingMetadata],
     native_fragments: &BTreeMap<FragmentId, crate::proto::plan::PlanFragment>,
-    plan: &crate::runtime::scheduler::SchedulingPlan,
+    plan: &crate::coordinator::scheduler::SchedulingPlan,
 ) -> Result<(), String> {
     let schedule_ids: BTreeSet<FragmentId> =
         fragment_schedules.iter().map(|fr| fr.fragment_id).collect();
@@ -1396,159 +1403,6 @@ pub(crate) fn poll_write_failure_and_cancel(
         .expect("write coordinator lock")
         .mark_canceled_except_finished(reason.clone());
     Err(reason)
-}
-
-#[derive(Default)]
-struct StandaloneQueryFailureRegistry {
-    active: BTreeSet<(i64, i64)>,
-    failures: BTreeMap<(i64, i64), String>,
-}
-
-fn standalone_query_failures() -> &'static Mutex<StandaloneQueryFailureRegistry> {
-    static REGISTRY: OnceLock<Mutex<StandaloneQueryFailureRegistry>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(StandaloneQueryFailureRegistry::default()))
-}
-
-fn query_failure_key(query_id: &UniqueId) -> (i64, i64) {
-    (query_id.hi, query_id.lo)
-}
-
-pub(crate) fn record_standalone_query_failure(
-    query_id: crate::runtime::query_context::QueryId,
-    error: String,
-) {
-    let key = (query_id.hi, query_id.lo);
-    let mut guard = standalone_query_failures()
-        .lock()
-        .expect("standalone query failure registry lock");
-    if guard.active.contains(&key) {
-        guard.failures.entry(key).or_insert(error);
-    }
-}
-
-fn take_standalone_query_failure(query_id: &UniqueId) -> Option<String> {
-    standalone_query_failures()
-        .lock()
-        .expect("standalone query failure registry lock")
-        .failures
-        .remove(&query_failure_key(query_id))
-}
-
-struct StandaloneQueryFailureGuard {
-    key: (i64, i64),
-}
-
-impl StandaloneQueryFailureGuard {
-    fn register(query_id: &UniqueId) -> Self {
-        let key = query_failure_key(query_id);
-        let mut guard = standalone_query_failures()
-            .lock()
-            .expect("standalone query failure registry lock");
-        guard.failures.remove(&key);
-        guard.active.insert(key);
-        Self { key }
-    }
-}
-
-impl Drop for StandaloneQueryFailureGuard {
-    fn drop(&mut self) {
-        let mut guard = standalone_query_failures()
-            .lock()
-            .expect("standalone query failure registry lock");
-        guard.active.remove(&self.key);
-        guard.failures.remove(&self.key);
-    }
-}
-
-#[derive(Default)]
-struct StandaloneQueryProfileRegistry {
-    active: BTreeSet<(i64, i64)>,
-    profiles: BTreeMap<(i64, i64), BTreeMap<(i64, i64), RuntimeProfileTree>>,
-}
-
-fn standalone_query_profiles() -> &'static Mutex<StandaloneQueryProfileRegistry> {
-    static REGISTRY: OnceLock<Mutex<StandaloneQueryProfileRegistry>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(StandaloneQueryProfileRegistry::default()))
-}
-
-pub(crate) fn record_native_standalone_query_profile_report(
-    report: &crate::proto::novarocks::ExecStatusReport,
-) -> Result<bool, String> {
-    let Some(query_id) = report.query_id.as_ref() else {
-        return Ok(false);
-    };
-    let key = (query_id.hi, query_id.lo);
-    let mut guard = standalone_query_profiles()
-        .lock()
-        .expect("standalone query profile registry lock");
-    if !guard.active.contains(&key) {
-        return Ok(false);
-    }
-
-    let Some(status) = report.status.as_ref() else {
-        return Err("ExecStatusReport missing status".to_string());
-    };
-    if report.done
-        && status.code == 0
-        && let Some(profile) = report.profile.as_ref()
-    {
-        let Some(finst_id) = report.fragment_instance_id.as_ref() else {
-            return Err("ExecStatusReport missing fragment_instance_id".to_string());
-        };
-        let native = RuntimeProfileTree::from_proto(profile)?;
-        guard
-            .profiles
-            .entry(key)
-            .or_default()
-            .insert((finst_id.hi, finst_id.lo), native);
-    }
-    Ok(true)
-}
-
-fn standalone_query_profile_count(query_id: &UniqueId) -> usize {
-    standalone_query_profiles()
-        .lock()
-        .expect("standalone query profile registry lock")
-        .profiles
-        .get(&query_failure_key(query_id))
-        .map(BTreeMap::len)
-        .unwrap_or(0)
-}
-
-fn take_standalone_query_profiles(query_id: &UniqueId) -> Vec<RuntimeProfileTree> {
-    standalone_query_profiles()
-        .lock()
-        .expect("standalone query profile registry lock")
-        .profiles
-        .remove(&query_failure_key(query_id))
-        .map(|profiles| profiles.into_values().collect())
-        .unwrap_or_default()
-}
-
-struct StandaloneQueryProfileGuard {
-    key: (i64, i64),
-}
-
-impl StandaloneQueryProfileGuard {
-    fn register(query_id: &UniqueId) -> Self {
-        let key = query_failure_key(query_id);
-        let mut guard = standalone_query_profiles()
-            .lock()
-            .expect("standalone query profile registry lock");
-        guard.profiles.remove(&key);
-        guard.active.insert(key);
-        Self { key }
-    }
-}
-
-impl Drop for StandaloneQueryProfileGuard {
-    fn drop(&mut self) {
-        let mut guard = standalone_query_profiles()
-            .lock()
-            .expect("standalone query profile registry lock");
-        guard.active.remove(&self.key);
-        guard.profiles.remove(&self.key);
-    }
 }
 
 #[derive(Debug)]
@@ -2437,7 +2291,7 @@ mod native_contract_tests {
                 },
             ),
         ]);
-        let plan = crate::runtime::scheduler::SchedulingPlan {
+        let plan = crate::coordinator::scheduler::SchedulingPlan {
             root_fragment_id: 7,
             by_fragment: BTreeMap::from([(7, vec![placement(7, 7)])]),
             root_finst_id: UniqueId { hi: 92_000, lo: 7 },
@@ -2472,7 +2326,7 @@ mod native_contract_tests {
                 },
             ),
         ]);
-        let plan = crate::runtime::scheduler::SchedulingPlan {
+        let plan = crate::coordinator::scheduler::SchedulingPlan {
             root_fragment_id: 7,
             by_fragment: BTreeMap::from([(3, Vec::new()), (7, vec![placement(7, 7)])]),
             root_finst_id: UniqueId { hi: 92_000, lo: 7 },
@@ -2498,7 +2352,7 @@ mod native_contract_tests {
                 ..Default::default()
             },
         )]);
-        let plan = crate::runtime::scheduler::SchedulingPlan {
+        let plan = crate::coordinator::scheduler::SchedulingPlan {
             root_fragment_id: 7,
             by_fragment: BTreeMap::from([(7, vec![placement(8, 7)])]),
             root_finst_id: UniqueId { hi: 92_000, lo: 7 },

@@ -17,7 +17,6 @@
 pub mod backend_id;
 pub mod backend_registry;
 pub(crate) mod change_op;
-pub(crate) mod coordinator;
 pub(crate) mod descriptor_snapshot;
 #[cfg(feature = "compat")]
 pub(crate) mod descriptor_snapshot_thrift;
@@ -36,7 +35,6 @@ pub mod lookup;
 pub mod mem_tracker;
 pub(crate) mod native_fragment_wire;
 pub mod profile;
-pub(crate) mod profile_correlate;
 pub(crate) mod query_cancel;
 pub mod query_context;
 pub(crate) mod query_options;
@@ -57,7 +55,6 @@ pub mod runtime_filter_worker;
 pub mod runtime_state;
 pub mod scan_executor;
 pub(crate) mod scan_range;
-pub(crate) mod scheduler;
 pub mod sink_commit;
 #[cfg(feature = "compat")]
 pub(crate) mod sink_commit_wire;

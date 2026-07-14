@@ -59,7 +59,8 @@ service NovaRocksGrpc {
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 
   // BE -> coordinator exec-status report (distributed write). Producer:
-  // src/service/standalone_exec_state_reporter.rs. Consumer: grpc_server.rs.
+  // src/service/standalone_exec_state_reporter.rs. Control-plane owner:
+  // src/coordinator/report.rs. Transport consumer: src/service/grpc_server.rs.
   rpc ReportExecStatus(ReportExecStatusRequest)
       returns (ReportExecStatusResponse);
   // Batched variant of ReportExecStatus.
@@ -422,8 +423,9 @@ message IcebergCommitInfo {
   optional bool is_rewrite = 3;
 }
 
-// Native BE -> coordinator exec-status report. Used only on the pure
-// NovaRocksCoordinator gRPC path; StarRocksFrontend compatibility keeps thrift.
+// Native BE -> coordinator exec-status report. Control-plane owner:
+// src/coordinator/report.rs. Used only on the pure NovaRocksCoordinator gRPC
+// path; StarRocksFrontend compatibility keeps thrift.
 message ExecStatusReport {
   novarocks.common.UniqueId query_id = 1;
   novarocks.common.UniqueId fragment_instance_id = 2;

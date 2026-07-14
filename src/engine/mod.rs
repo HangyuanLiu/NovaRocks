@@ -2758,7 +2758,7 @@ fn explain_analyze_query(
     let (execution_ports, scheduler) = coordinated_execution_services()?;
     let execution_start = std::time::Instant::now();
     let query_opts = query_opts.to_runtime();
-    let outcome = crate::runtime::coordinator::ExecutionCoordinator::new(
+    let outcome = crate::coordinator::execution::ExecutionCoordinator::new(
         build_result,
         execution_ports,
         scheduler,
@@ -2774,16 +2774,17 @@ fn explain_analyze_query(
     }
 
     let actuals =
-        crate::runtime::profile_correlate::collect_actuals_by_plan_node_id_from_profile_trees(
+        crate::coordinator::profile::correlate::collect_actuals_by_plan_node_id_from_profile_trees(
             &outcome.fragment_profiles,
         );
     let profile_summary =
-        crate::runtime::profile_correlate::collect_distributed_profile_summary_from_profile_trees(
+        crate::coordinator::profile::correlate::collect_distributed_profile_summary_from_profile_trees(
             &outcome.fragment_profiles,
         );
-    let per_fragment = crate::runtime::profile_correlate::collect_per_fragment_profile_summaries(
-        &outcome.fragment_profiles,
-    );
+    let per_fragment =
+        crate::coordinator::profile::correlate::collect_per_fragment_profile_summaries(
+            &outcome.fragment_profiles,
+        );
     let mut lines = Vec::new();
     lines.push(format!(
         "Planning: {} / Execution: {} / Rows: {}",
@@ -2793,7 +2794,7 @@ fn explain_analyze_query(
     ));
     lines.push(format_distributed_profile_summary(&profile_summary));
     if let Some(counters) =
-        crate::runtime::profile_correlate::format_counter_sums_from_profile_trees(
+        crate::coordinator::profile::correlate::format_counter_sums_from_profile_trees(
             &outcome.fragment_profiles,
             ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES,
             "ProfileCounters",
@@ -2820,7 +2821,7 @@ const ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES: &[&str] = &[
 ];
 
 fn format_distributed_profile_summary(
-    summary: &crate::runtime::profile_correlate::DistributedProfileSummary,
+    summary: &crate::coordinator::profile::correlate::DistributedProfileSummary,
 ) -> String {
     format!(
         "Profile: fragments={} fragment_wall_max={} fragment_wall_sum={} driver_total={} driver_blocked={} source_wait={} sink_wait={} dependency_wait={} operator_active={} exchange_wait={} exchange_process={} network={} scan_io={}",
@@ -3057,7 +3058,7 @@ pub(crate) fn execute_query_as_iceberg_write(
     sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
     query_opts: Option<StandaloneQueryOptions>,
     root_distribution_resolver: Option<IcebergWriteRootDistributionResolver>,
-) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
+) -> Result<crate::coordinator::execution::CoordinatedQueryResult, String> {
     // Time-travel: a branch DML write's scan carries `FOR VERSION AS OF '<branch>'`
     // (delete_flow's DV position scan; the MOR-UPDATE branch row scan). Resolve those
     // version-bearing refs to synthetic per-snapshot tables bound to the BRANCH head
@@ -3141,7 +3142,7 @@ pub(crate) fn execute_query_as_iceberg_write(
         ),
     )?;
     let (execution_ports, scheduler) = coordinated_execution_services()?;
-    crate::runtime::coordinator::ExecutionCoordinator::new(
+    crate::coordinator::execution::ExecutionCoordinator::new(
         build_result,
         execution_ports,
         scheduler,
@@ -3227,7 +3228,7 @@ pub(crate) fn install_change_stream_write_test_observer(
 #[cfg(test)]
 pub(crate) fn observe_change_stream_write_build_for_test(
     topology: &crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamWriteTopology,
-) -> Option<crate::runtime::coordinator::CoordinatedQueryResult> {
+) -> Option<crate::coordinator::execution::CoordinatedQueryResult> {
     let mut observer = change_stream_write_test_observer()
         .lock()
         .expect("change-stream write test observer lock");
@@ -3248,7 +3249,7 @@ pub(crate) fn observe_change_stream_write_build_for_test(
                 .collect(),
         });
     if observer.short_circuit_after_build {
-        Some(crate::runtime::coordinator::CoordinatedQueryResult {
+        Some(crate::coordinator::execution::CoordinatedQueryResult {
             query_result: crate::runtime::query_result::QueryResult::empty(),
             write_commit: None,
             write_abort: None,
@@ -3349,10 +3350,10 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_native_pla
 pub(crate) fn execute_planned_iceberg_change_stream_write(
     build_result: crate::sql::codegen::fragment::MultiFragmentBuildResult,
     query_opts: Option<StandaloneQueryOptions>,
-) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
+) -> Result<crate::coordinator::execution::CoordinatedQueryResult, String> {
     let (execution_ports, scheduler) = coordinated_execution_services()?;
     let query_options = StandaloneQueryOptions::optional_to_runtime(query_opts.as_ref());
-    crate::runtime::coordinator::ExecutionCoordinator::new(
+    crate::coordinator::execution::ExecutionCoordinator::new(
         build_result,
         execution_ports,
         scheduler,
@@ -3370,7 +3371,7 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
     dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
     query_opts: Option<StandaloneQueryOptions>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
-) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
+) -> Result<crate::coordinator::execution::CoordinatedQueryResult, String> {
     let planned = build_physical_plan_as_iceberg_change_stream_write(
         state,
         current_catalog,
@@ -3726,7 +3727,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         ),
     )?;
     let (execution_ports, scheduler) = coordinated_execution_services()?;
-    crate::runtime::coordinator::ExecutionCoordinator::new(
+    crate::coordinator::execution::ExecutionCoordinator::new(
         build_result,
         execution_ports,
         scheduler,
@@ -3784,7 +3785,7 @@ pub(crate) fn execute_logical_plan_with_options(
         ),
     )?;
     let (execution_ports, scheduler) = coordinated_execution_services()?;
-    crate::runtime::coordinator::ExecutionCoordinator::new(
+    crate::coordinator::execution::ExecutionCoordinator::new(
         build_result,
         execution_ports,
         scheduler,
@@ -3796,7 +3797,7 @@ pub(crate) fn execute_logical_plan_with_options(
 fn coordinated_execution_services() -> Result<
     (
         crate::coordinator::ports::CoordinatorExecutionPorts,
-        Arc<crate::runtime::scheduler::FragmentScheduler>,
+        Arc<crate::coordinator::scheduler::FragmentScheduler>,
     ),
     String,
 > {
@@ -3807,14 +3808,11 @@ fn coordinated_execution_services() -> Result<
     let (dispatcher, scheduler) = match role {
         ClusterRole::Fe | ClusterRole::AllInOne => {
             let entries = backend_ops::live_backend_dispatch_entries()?;
-            let dispatcher = Arc::new(
-                crate::service::grpc_fragment_dispatcher::RemoteDispatcher::new_with_backend_ids(
-                    &entries,
-                )?,
-            );
-            let scheduler = Arc::new(
-                crate::runtime::scheduler::FragmentScheduler::new_with_backend_ids(entries),
-            );
+            let snapshot = crate::coordinator::scheduler::LiveBackendSnapshot::new(entries);
+            let (dispatcher, scheduler) =
+                dispatch_and_scheduler_from_live_backend_snapshot(snapshot)?;
+            let dispatcher = Arc::new(dispatcher);
+            let scheduler = Arc::new(scheduler);
             (
                 dispatcher as Arc<dyn crate::coordinator::dispatch::FragmentDispatcher>,
                 scheduler,
@@ -3833,6 +3831,24 @@ fn coordinated_execution_services() -> Result<
         observer,
     );
     Ok((execution_ports, scheduler))
+}
+
+fn dispatch_and_scheduler_from_live_backend_snapshot(
+    snapshot: crate::coordinator::scheduler::LiveBackendSnapshot,
+) -> Result<
+    (
+        crate::service::grpc_fragment_dispatcher::RemoteDispatcher,
+        crate::coordinator::scheduler::FragmentScheduler,
+    ),
+    String,
+> {
+    let dispatcher =
+        crate::service::grpc_fragment_dispatcher::RemoteDispatcher::new_with_backend_ids(
+            snapshot.entries(),
+        )?;
+    let scheduler =
+        crate::coordinator::scheduler::FragmentScheduler::from_live_backend_snapshot(snapshot);
+    Ok((dispatcher, scheduler))
 }
 
 /// Select a `FragmentDispatcher` implementation based on the effective cluster role.
@@ -8761,7 +8777,30 @@ path = "meta/operations.sqlite"
             super::coordinated_execution_services().expect("coordinated services");
 
         assert_eq!(execution_ports.dispatcher.backend_count(), 1);
-        assert_eq!(scheduler.live_backend_entries(), &[(2usize, endpoint)]);
+        assert_eq!(
+            scheduler.live_backend_snapshot().entries(),
+            &[(2usize, endpoint)]
+        );
+    }
+
+    #[test]
+    fn coordinated_execution_services_preserve_exact_snapshot_entries() {
+        let first = "127.0.0.1:19073".parse().unwrap();
+        let second = "127.0.0.1:19079".parse().unwrap();
+        let entries = vec![(2usize, first), (11usize, second)];
+        let snapshot = crate::coordinator::scheduler::LiveBackendSnapshot::new(entries.clone());
+
+        let (dispatcher, scheduler) =
+            super::dispatch_and_scheduler_from_live_backend_snapshot(snapshot)
+                .expect("construct dispatcher and scheduler from one snapshot");
+
+        assert_eq!(dispatcher.addr_of(2), Some(first));
+        assert_eq!(dispatcher.addr_of(11), Some(second));
+        assert_eq!(dispatcher.addr_of(0), None);
+        assert_eq!(
+            scheduler.live_backend_snapshot().entries(),
+            entries.as_slice()
+        );
     }
 
     fn install_optimizer_backend_count_config(

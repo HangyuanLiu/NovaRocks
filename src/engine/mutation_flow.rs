@@ -32,6 +32,7 @@ use crate::connector::iceberg::commit::{
     IcebergCommitCollector, IcebergUpdateMode, ensure_iceberg_write_supported,
     select_iceberg_update_mode,
 };
+use crate::coordinator::execution::CoordinatedQueryResult;
 use crate::engine::write_transaction::{
     IcebergWriteCommitExecutor, IcebergWriteCommitPolicy, IcebergWriteSource,
     IcebergWriteTransactionExecutor, IcebergWriteTransactionRunner, IcebergWriteTransactionSpec,
@@ -39,7 +40,6 @@ use crate::engine::write_transaction::{
 };
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
-use crate::runtime::coordinator::CoordinatedQueryResult;
 use crate::runtime::query_result::QueryResult;
 use crate::runtime::write_coordinator::WriteCommitInput;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};

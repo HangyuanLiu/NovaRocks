@@ -18,6 +18,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::common::types::UniqueId;
+use crate::coordinator::scheduler::FragmentInstancePlacement;
 use crate::proto::{common, novarocks};
 use crate::runtime::endpoint::{
     FragmentDestination, RuntimeEndpoint, RuntimeFilterProberDestination,
@@ -25,7 +26,6 @@ use crate::runtime::endpoint::{
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 use crate::runtime::scan_range;
-use crate::runtime::scheduler::FragmentInstancePlacement;
 
 pub(crate) fn encode_instance_params(
     query_id: &UniqueId,

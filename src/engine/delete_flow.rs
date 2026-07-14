@@ -48,6 +48,7 @@ use crate::connector::iceberg::commit::{
     CommitOpKind, CommitOutcome, CommitServiceError, IcebergCommitCollector,
     IcebergSqlDeleteStrategy, classify_sql_delete_strategy,
 };
+use crate::coordinator::execution::CoordinatedQueryResult;
 use crate::engine::backend_resolver::{TargetBackend, resolve_existing_table_target};
 use crate::engine::write_transaction::{
     IcebergWriteCommitExecutor, IcebergWriteCommitPolicy, IcebergWriteSource,
@@ -56,7 +57,6 @@ use crate::engine::write_transaction::{
 };
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
-use crate::runtime::coordinator::CoordinatedQueryResult;
 use crate::runtime::write_coordinator::WriteCommitInput;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::catalog::ColumnDef;
