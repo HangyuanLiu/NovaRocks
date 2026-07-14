@@ -175,22 +175,26 @@ fn validate_global_node_ids(fragments: &[PlanFragment]) -> Result<(), String> {
 /// single sink, so it may drive at most one plain stream edge and must not also
 /// drive a router edge; CTE multicast is exempt because fanning one producer out
 /// to many receivers is its entire purpose. A router source addresses exactly
-/// one router group, and its routes — keyed on the full (source fragment, group,
-/// branch, kind, target fragment, target exchange node) tuple — must be unique
-/// (two identical router edges would both match the same branch route and
-/// otherwise pass silently).
+/// one router group, and within that group every branch edge must be uniquely
+/// addressable per field: no two edges may repeat the same `branch_id`, the same
+/// `branch_kind`, or the same target exchange (`target_fragment_id`,
+/// `target_exchange_node_id`). This per-field uniqueness is strictly stronger
+/// than full-tuple route uniqueness (it also rejects, e.g., two edges that share
+/// a `branch_id` but differ in `branch_kind` or target), so the execution
+/// coordinator can trust the sealed shape instead of re-validating any of these
+/// facts at dispatch time.
 fn validate_source_edge_shape(edges: &[FragmentEdge]) -> Result<(), String> {
     let mut plain_stream_sources: BTreeSet<FragmentId> = BTreeSet::new();
     let mut router_sources: BTreeSet<FragmentId> = BTreeSet::new();
     let mut router_groups_by_source: BTreeMap<FragmentId, BTreeSet<i32>> = BTreeMap::new();
-    let mut seen_router_routes: BTreeSet<(
-        FragmentId,
-        i32,
-        i32,
-        ChangeStreamBranchKind,
-        FragmentId,
-        i32,
-    )> = BTreeSet::new();
+    // Per-(source, group) uniqueness ledgers. Keying on the router group id keeps
+    // this aligned with the router sink template even though a source is limited
+    // to a single group by the check above.
+    let mut branch_ids_by_group: BTreeMap<(FragmentId, i32), BTreeSet<i32>> = BTreeMap::new();
+    let mut branch_kinds_by_group: BTreeMap<(FragmentId, i32), BTreeSet<ChangeStreamBranchKind>> =
+        BTreeMap::new();
+    let mut target_exchanges_by_group: BTreeMap<(FragmentId, i32), BTreeSet<(FragmentId, i32)>> =
+        BTreeMap::new();
 
     for edge in edges {
         match &edge.edge_kind {
@@ -221,21 +225,41 @@ fn validate_source_edge_shape(edges: &[FragmentEdge]) -> Result<(), String> {
                         edge.source_fragment_id
                     ));
                 }
-                let route = (
-                    edge.source_fragment_id,
-                    *router_group_id,
-                    *branch_id,
-                    *branch_kind,
-                    edge.target_fragment_id,
-                    edge.target_exchange_node_id,
-                );
-                if !seen_router_routes.insert(route) {
+                // Per-field uniqueness within the (source, group). Each check is
+                // strictly stronger than full-tuple route uniqueness, so the
+                // coordinator can trust the sealed shape rather than re-checking
+                // branch id / kind / target exchange at dispatch time.
+                let group_key = (edge.source_fragment_id, *router_group_id);
+                if !branch_ids_by_group
+                    .entry(group_key)
+                    .or_default()
+                    .insert(*branch_id)
+                {
                     return Err(format!(
-                        "lower_distributed_plan duplicate router branch route source_fragment_id={} router_group_id={} branch_id={} branch_kind={:?} target_fragment_id={} target_exchange_node_id={}",
+                        "lower_distributed_plan router group source_fragment_id={} router_group_id={} repeats branch_id={}",
+                        edge.source_fragment_id, router_group_id, branch_id
+                    ));
+                }
+                if !branch_kinds_by_group
+                    .entry(group_key)
+                    .or_default()
+                    .insert(*branch_kind)
+                {
+                    return Err(format!(
+                        "lower_distributed_plan router group source_fragment_id={} router_group_id={} repeats branch_kind={:?}",
+                        edge.source_fragment_id, router_group_id, branch_kind
+                    ));
+                }
+                let target_exchange = (edge.target_fragment_id, edge.target_exchange_node_id);
+                if !target_exchanges_by_group
+                    .entry(group_key)
+                    .or_default()
+                    .insert(target_exchange)
+                {
+                    return Err(format!(
+                        "lower_distributed_plan router group source_fragment_id={} router_group_id={} repeats target exchange target_fragment_id={} target_exchange_node_id={}",
                         edge.source_fragment_id,
                         router_group_id,
-                        branch_id,
-                        branch_kind,
                         edge.target_fragment_id,
                         edge.target_exchange_node_id
                     ));
@@ -384,6 +408,14 @@ fn validate_finalized_edge(
                 "router route partition",
                 &route_partition,
             )?;
+            // Defense-in-depth only: this conflicting-partition backstop is now
+            // subsumed by `validate_source_edge_shape`'s per-(source, router
+            // group) target-exchange uniqueness. An exchange node has a single
+            // fixed source and a source drives at most one router group, so two
+            // router edges can never reach one target exchange to begin with;
+            // the shape check rejects that up front, before this per-edge loop
+            // runs. Retained inside the seal so a future reordering cannot let a
+            // partition conflict slip through unnoticed.
             let target_key = (edge.target_fragment_id, edge.target_exchange_node_id);
             if let Some(existing) = router_target_partitions.get(&target_key)
                 && !partition_equivalent(existing, &edge.output_partition)
@@ -1180,7 +1212,14 @@ mod tests {
     }
 
     #[test]
-    fn finalized_router_validation_rejects_conflicting_partitions_for_one_receiver() {
+    fn finalized_router_shape_rejects_two_edges_to_one_receiver() {
+        // Two router edges in one group point at the same target exchange while
+        // differing in branch_id and branch_kind. Full-tuple route uniqueness
+        // would accept this and lean on the "conflicting partitions for the same
+        // target Exchange" backstop in `validate_finalized_edge`; the seal's
+        // per-source target-exchange uniqueness now rejects a second edge to one
+        // receiver up front (an exchange node has a single source and a source
+        // has one group), so that backstop is subsumed and never reached.
         let planned = finalized_router_plan();
         let first_edge = planned.edges()[0].clone();
         let mut builder = draft_builder_from_plan(&planned);
@@ -1195,6 +1234,9 @@ mod tests {
             };
             let mut second_route = router.branches[0].clone();
             second_route.branch_id += 1;
+            // A distinct branch_kind clears the branch_id and branch_kind ledgers
+            // so the target-exchange ledger is what rejects the duplicate receiver.
+            second_route.branch_kind = ChangeStreamBranchKind::ReuseData;
             second_route.output_ordinals = vec![1];
             second_route.output_partition_ordinals = vec![1];
             let router_group_id = router.group_id;
@@ -1228,13 +1270,16 @@ mod tests {
 
         let err = builder
             .seal()
-            .expect_err("one router receiver cannot accept conflicting partitions");
+            .expect_err("one router receiver cannot accept two router edges");
         assert!(
-            err.contains("router edges have conflicting partitions for the same target Exchange"),
+            err.contains(&format!(
+                "repeats target exchange target_fragment_id={} target_exchange_node_id={}",
+                first_edge.target_fragment_id, first_edge.target_exchange_node_id
+            )),
             "{err}"
         );
         assert!(err.contains("source_fragment_id="), "{err}");
-        assert!(err.contains("target_exchange_node_id="), "{err}");
+        assert!(err.contains("router_group_id="), "{err}");
     }
 
     #[test]
@@ -1472,24 +1517,74 @@ mod tests {
     }
 
     #[test]
-    fn structural_validation_rejects_duplicate_router_branch_route() {
-        // Two identical router edges share the same (group, branch, kind,
-        // target) tuple; each would match the same branch route and pass the
-        // per-edge checks, so only the shape check rejects the duplicate.
+    fn structural_validation_rejects_repeated_router_branch_id() {
+        // Two router edges in one group repeat branch_id=0 while differing in
+        // branch_kind and target. Full-tuple route uniqueness would accept this;
+        // the seal's per-field branch_id uniqueness rejects it (strictly
+        // stronger), so the coordinator no longer needs to.
+        let fragments = vec![
+            plain_fragment(0, 10, DataSink::Result),
+            plain_fragment(1, 11, DataSink::Noop),
+            plain_fragment(2, 12, DataSink::Noop),
+        ];
+        let edges = vec![
+            router_edge(1, 0, 100, 0, 0, ChangeStreamBranchKind::DeleteDv),
+            router_edge(1, 2, 101, 0, 0, ChangeStreamBranchKind::ReuseData),
+        ];
+
+        let err =
+            seal_shape(fragments, edges).expect_err("repeated router branch_id must not seal");
+        assert!(err.contains("repeats branch_id=0"), "{err}");
+        assert!(err.contains("source_fragment_id=1"), "{err}");
+        assert!(err.contains("router_group_id=0"), "{err}");
+    }
+
+    #[test]
+    fn structural_validation_rejects_repeated_router_branch_kind() {
+        // Distinct branch_ids (0, 1) but a repeated branch_kind within the group:
+        // the branch_id ledger passes, the branch_kind ledger rejects. Full-tuple
+        // uniqueness would accept this.
+        let fragments = vec![
+            plain_fragment(0, 10, DataSink::Result),
+            plain_fragment(1, 11, DataSink::Noop),
+            plain_fragment(2, 12, DataSink::Noop),
+        ];
+        let edges = vec![
+            router_edge(1, 0, 100, 0, 0, ChangeStreamBranchKind::DeleteDv),
+            router_edge(1, 2, 101, 0, 1, ChangeStreamBranchKind::DeleteDv),
+        ];
+
+        let err =
+            seal_shape(fragments, edges).expect_err("repeated router branch_kind must not seal");
+        assert!(err.contains("repeats branch_kind=DeleteDv"), "{err}");
+        assert!(err.contains("source_fragment_id=1"), "{err}");
+        assert!(err.contains("router_group_id=0"), "{err}");
+    }
+
+    #[test]
+    fn structural_validation_rejects_repeated_router_target_exchange() {
+        // Distinct branch_ids and branch_kinds, but both edges target the same
+        // exchange (fragment 0, node 100): the target-exchange ledger rejects.
+        // Full-tuple uniqueness would accept this.
         let fragments = vec![
             plain_fragment(0, 10, DataSink::Result),
             plain_fragment(1, 11, DataSink::Noop),
         ];
         let edges = vec![
             router_edge(1, 0, 100, 0, 0, ChangeStreamBranchKind::DeleteDv),
-            router_edge(1, 0, 100, 0, 0, ChangeStreamBranchKind::DeleteDv),
+            router_edge(1, 0, 100, 0, 1, ChangeStreamBranchKind::ReuseData),
         ];
 
-        let err =
-            seal_shape(fragments, edges).expect_err("duplicate router branch route must not seal");
-        assert!(err.contains("duplicate router branch route"), "{err}");
+        let err = seal_shape(fragments, edges)
+            .expect_err("repeated router target exchange must not seal");
+        assert!(
+            err.contains(
+                "repeats target exchange target_fragment_id=0 target_exchange_node_id=100"
+            ),
+            "{err}"
+        );
         assert!(err.contains("source_fragment_id=1"), "{err}");
-        assert!(err.contains("branch_kind=DeleteDv"), "{err}");
+        assert!(err.contains("router_group_id=0"), "{err}");
     }
 
     #[test]

@@ -203,21 +203,19 @@ impl ExecutionCoordinator {
         // 2. Build per-edge / CTE consumer indices used for sink wiring.
         // ---------------------------------------------------------------
         // Stream producer fragment id -> its single outgoing plain stream edge.
-        let stream_edge_by_source = build_stream_edge_by_source(&edges)?;
-        let router_edge_groups = group_router_edges_by_source(&edges)?;
-        let mut router_edges_by_source: BTreeMap<FragmentId, (i32, Vec<&FragmentEdge>)> =
-            BTreeMap::new();
-        for ((source_fragment_id, router_group_id), branch_edges) in router_edge_groups {
-            if router_edges_by_source
-                .insert(source_fragment_id, (router_group_id, branch_edges))
-                .is_some()
-            {
-                return Err(format!(
-                    "fragment {source_fragment_id} has multiple Iceberg change-stream router groups; \
-                     one source fragment can only use one router sink template"
-                ));
-            }
-        }
+        // Both edge indices are infallible map-builders: the planner seal
+        // (`validate_source_edge_shape`) already owns plain-stream fan-out,
+        // plain/router mix, and per-(source, group) router branch/kind/target
+        // uniqueness, and guarantees at most one router group per source fragment.
+        // Grouping the router edges by source therefore never collides here.
+        let stream_edge_by_source = build_stream_edge_by_source(&edges);
+        let router_edges_by_source: BTreeMap<FragmentId, (i32, Vec<&FragmentEdge>)> =
+            group_router_edges_by_source(&edges)
+                .into_iter()
+                .map(|((source_fragment_id, router_group_id), branch_edges)| {
+                    (source_fragment_id, (router_group_id, branch_edges))
+                })
+                .collect();
         // CTE id -> native consumer sidecars: (consumer_fragment_id, exchange_node_id,
         // native partition, output_slot_ids, logical producer column ids).
         let mut cte_consumers: BTreeMap<
@@ -679,112 +677,49 @@ fn same_unit_timestamp_metadata_mismatch(expected: &DataType, actual: &DataType)
     )
 }
 
+// Index each plain `Stream` producer fragment to its single outgoing stream
+// edge. This is an infallible projection of the sealed edge set: the planner
+// seal (`validate_source_edge_shape`) already rejects plain-stream fan-out and
+// any plain/router mix, so at most one plain stream edge exists per source and
+// the insert never overwrites. Re-adding a shape check here would duplicate a
+// planner-owned decision (guarded by `planner_topology_contract`).
 fn build_stream_edge_by_source<'a>(
     edges: &'a [FragmentEdge],
-) -> Result<BTreeMap<FragmentId, &'a FragmentEdge>, String> {
-    let router_sources: BTreeSet<FragmentId> = edges
-        .iter()
-        .filter_map(|edge| {
-            matches!(
-                edge.edge_kind,
-                FragmentEdgeKind::IcebergChangeStreamRouter { .. }
-            )
-            .then_some(edge.source_fragment_id)
-        })
-        .collect();
+) -> BTreeMap<FragmentId, &'a FragmentEdge> {
     let mut stream_edge_by_source = BTreeMap::new();
     for edge in edges {
         if !matches!(edge.edge_kind, FragmentEdgeKind::Stream) {
             continue;
         }
-        if router_sources.contains(&edge.source_fragment_id) {
-            return Err(format!(
-                "fragment {} has both plain Stream and Iceberg change-stream router edges",
-                edge.source_fragment_id
-            ));
-        }
-        if stream_edge_by_source
-            .insert(edge.source_fragment_id, edge)
-            .is_some()
-        {
-            return Err(format!(
-                "fragment {} has multiple outgoing stream edges; stream fan-out is not supported",
-                edge.source_fragment_id
-            ));
-        }
+        stream_edge_by_source.insert(edge.source_fragment_id, edge);
     }
-    Ok(stream_edge_by_source)
+    stream_edge_by_source
 }
 
+// Group Iceberg change-stream router edges by (source fragment, router group).
+// This is an infallible projection of the sealed edge set: the planner seal
+// (`validate_source_edge_shape`) already owns plain/router mix rejection and the
+// per-(source, group) branch_id / branch_kind / target-exchange uniqueness that
+// this used to re-check, so grouping here only collects the sealed branches. Re-
+// adding a shape check here would duplicate a planner-owned decision (guarded by
+// `planner_topology_contract`).
 fn group_router_edges_by_source<'a>(
     edges: &'a [FragmentEdge],
-) -> Result<BTreeMap<(FragmentId, i32), Vec<&'a FragmentEdge>>, String> {
-    let stream_sources: BTreeSet<FragmentId> = edges
-        .iter()
-        .filter_map(|edge| {
-            matches!(edge.edge_kind, FragmentEdgeKind::Stream).then_some(edge.source_fragment_id)
-        })
-        .collect();
+) -> BTreeMap<(FragmentId, i32), Vec<&'a FragmentEdge>> {
     let mut grouped: BTreeMap<(FragmentId, i32), Vec<&FragmentEdge>> = BTreeMap::new();
-    let mut branch_ids_by_group: BTreeMap<(FragmentId, i32), BTreeSet<i32>> = BTreeMap::new();
-    let mut branch_kinds_by_group = BTreeMap::new();
-    let mut target_exchanges_by_group = BTreeMap::new();
-
     for edge in edges {
         let FragmentEdgeKind::IcebergChangeStreamRouter {
-            router_group_id,
-            branch_id,
-            branch_kind,
+            router_group_id, ..
         } = edge.edge_kind
         else {
             continue;
         };
-        if stream_sources.contains(&edge.source_fragment_id) {
-            return Err(format!(
-                "fragment {} has both plain Stream and Iceberg change-stream router edges",
-                edge.source_fragment_id
-            ));
-        }
-        let key = (edge.source_fragment_id, router_group_id);
-        if !branch_ids_by_group
-            .entry(key)
+        grouped
+            .entry((edge.source_fragment_id, router_group_id))
             .or_default()
-            .insert(branch_id)
-        {
-            return Err(format!(
-                "Iceberg change-stream router group source={} group={} repeats branch_id {}",
-                edge.source_fragment_id, router_group_id, branch_id
-            ));
-        }
-        if !branch_kinds_by_group
-            .entry(key)
-            .or_insert_with(BTreeSet::new)
-            .insert(branch_kind)
-        {
-            return Err(format!(
-                "Iceberg change-stream router group source={} group={} repeats branch_kind {:?}",
-                edge.source_fragment_id, router_group_id, branch_kind
-            ));
-        }
-        let target_exchange = (edge.target_fragment_id, edge.target_exchange_node_id);
-        if !target_exchanges_by_group
-            .entry(key)
-            .or_insert_with(BTreeSet::new)
-            .insert(target_exchange)
-        {
-            return Err(format!(
-                "Iceberg change-stream router group source={} group={} repeats target exchange \
-                 fragment={} node={}",
-                edge.source_fragment_id,
-                router_group_id,
-                edge.target_fragment_id,
-                edge.target_exchange_node_id
-            ));
-        }
-        grouped.entry(key).or_default().push(edge);
+            .push(edge);
     }
-
-    Ok(grouped)
+    grouped
 }
 
 fn validate_write_commit_ready(

@@ -26934,3 +26934,232 @@ fn planner_boundary_contract() {
         violations.join("\n")
     );
 }
+
+// ---------------------------------------------------------------------------
+// CGO-9B Task 5: static topology / edge-shape decisions are planner-owned; the
+// execution coordinator consumes the sealed shape and never re-decides it.
+//
+// The planner seal owns every static fragment-graph shape decision:
+//   * `validate_source_edge_shape` (distributed/validation.rs) rejects plain-
+//     stream fan-out, plain/router mix, more-than-one router group per source,
+//     and per-(source, group) router branch_id / branch_kind / target-exchange
+//     duplication;
+//   * `build_topology_contract` (distributed/topology.rs) derives the leaves-
+//     first topological order, detects cycles, and selects the single execution
+//     anchor.
+// Task 5 deleted the redundant re-checks the coordinator used to run, so its
+// edge indices `build_stream_edge_by_source` / `group_router_edges_by_source`
+// are now infallible map-builders: they return a `BTreeMap`, not a `Result`,
+// and carry no shape-validation error return.
+//
+// This guard fails closed if (a) the planner stops owning either decider,
+// (b) the coordinator re-implements either named decider, or (c) either
+// coordinator edge index re-acquires a `Result` return -- the signal that it has
+// re-taken a shape decision the seal now owns. The signature scan keys on the
+// `fn <name>` token up to the body's opening brace; parameters and the
+// `BTreeMap<...>` return type never contain `{`, so the first `{` reliably ends
+// the signature, and whitespace is collapsed so a re-introduced `-> Result` is
+// caught regardless of line wrapping. Text is sanitized (comments/strings
+// stripped, `#[cfg(test)]` items blanked) so fixtures never trip the production
+// guard and prose that merely names the deciders is not matched.
+// ---------------------------------------------------------------------------
+
+const PLANNER_TOPOLOGY_CONTRACT_PLANNER_ROOT: &str = "src/sql/planner/distributed/";
+const PLANNER_TOPOLOGY_CONTRACT_COORDINATOR_ROOT: &str = "src/coordinator/";
+const PLANNER_TOPOLOGY_EDGE_SHAPE_DEF: &str = "fn validate_source_edge_shape(";
+const PLANNER_TOPOLOGY_CONTRACT_DEF: &str = "fn build_topology_contract(";
+const COORDINATOR_STREAM_EDGE_BUILDER_DEF: &str = "fn build_stream_edge_by_source";
+const COORDINATOR_ROUTER_GROUP_BUILDER_DEF: &str = "fn group_router_edges_by_source";
+
+/// If a coordinator edge-index builder is defined and its signature returns
+/// `Result`, return the collapsed signature slice so the guard can report it.
+/// The signature runs from the `fn <name>` token to the body's opening brace;
+/// whitespace is stripped so a re-introduced `-> Result` is detected regardless
+/// of line wrapping.
+///
+/// The match keys on bare `-> Result`, matching this codebase's convention of
+/// returning `Result<_, String>` unqualified. It would intentionally not catch a
+/// qualified `-> anyhow::Result<_>` / `-> std::result::Result<_, _>`; that is
+/// acceptable given the convention and documented here so the limitation is
+/// explicit rather than a silent gap.
+fn coordinator_builder_result_signature(production: &str, builder_def: &str) -> Option<String> {
+    let start = production.find(builder_def)?;
+    let rest = &production[start..];
+    let brace = rest.find('{')?;
+    let signature = compact_line(&rest[..brace]);
+    signature.contains("->Result").then_some(signature)
+}
+
+fn planner_topology_contract_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut planner_owns_edge_shape = false;
+    let mut planner_owns_topology = false;
+
+    for source in sources {
+        let production = rust_sanitized_production_text(&source.text);
+        if source
+            .path
+            .starts_with(PLANNER_TOPOLOGY_CONTRACT_PLANNER_ROOT)
+        {
+            if production.contains(PLANNER_TOPOLOGY_EDGE_SHAPE_DEF) {
+                planner_owns_edge_shape = true;
+            }
+            if production.contains(PLANNER_TOPOLOGY_CONTRACT_DEF) {
+                planner_owns_topology = true;
+            }
+        }
+        if source
+            .path
+            .starts_with(PLANNER_TOPOLOGY_CONTRACT_COORDINATOR_ROOT)
+        {
+            if production.contains(PLANNER_TOPOLOGY_EDGE_SHAPE_DEF) {
+                violations.push(format!(
+                    "coordinator-owns-edge-shape: {} defines `validate_source_edge_shape`; per-source edge-shape validation (fan-out, plain/router mix, router branch/kind/target uniqueness) is planner-owned",
+                    source.path
+                ));
+            }
+            if production.contains(PLANNER_TOPOLOGY_CONTRACT_DEF) {
+                violations.push(format!(
+                    "coordinator-owns-topology: {} defines `build_topology_contract`; topological order, cycle detection, and execution-anchor selection are planner-owned",
+                    source.path
+                ));
+            }
+            for builder in [
+                COORDINATOR_STREAM_EDGE_BUILDER_DEF,
+                COORDINATOR_ROUTER_GROUP_BUILDER_DEF,
+            ] {
+                if let Some(signature) = coordinator_builder_result_signature(&production, builder)
+                {
+                    violations.push(format!(
+                        "coordinator-edge-index-fallible: {} `{}` returns Result (`{}`); it must stay an infallible map-builder because edge-shape validation is sealed by the planner",
+                        source.path, builder, signature
+                    ));
+                }
+            }
+        }
+    }
+
+    if !planner_owns_edge_shape {
+        violations.push(format!(
+            "missing-planner-edge-shape: no {PLANNER_TOPOLOGY_CONTRACT_PLANNER_ROOT} source defines `{PLANNER_TOPOLOGY_EDGE_SHAPE_DEF}`"
+        ));
+    }
+    if !planner_owns_topology {
+        violations.push(format!(
+            "missing-planner-topology: no {PLANNER_TOPOLOGY_CONTRACT_PLANNER_ROOT} source defines `{PLANNER_TOPOLOGY_CONTRACT_DEF}`"
+        ));
+    }
+
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+#[test]
+fn planner_topology_contract_detector_accepts_sealed_ownership() {
+    let sources = [
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/validation.rs",
+            "fn validate_source_edge_shape(edges: &[FragmentEdge]) -> Result<(), String> { Ok(()) }",
+        ),
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/topology.rs",
+            "pub(in crate::sql::planner::distributed) fn build_topology_contract() {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/coordinator/execution.rs",
+            "fn build_stream_edge_by_source<'a>(edges: &'a [FragmentEdge]) -> BTreeMap<FragmentId, &'a FragmentEdge> { BTreeMap::new() }\n\
+             fn group_router_edges_by_source<'a>(edges: &'a [FragmentEdge]) -> BTreeMap<(FragmentId, i32), Vec<&'a FragmentEdge>> { BTreeMap::new() }",
+        ),
+    ];
+    let violations = planner_topology_contract_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "planner-owned topology contract with infallible coordinator indices must pass: {violations:?}"
+    );
+}
+
+#[test]
+fn planner_topology_contract_detector_rejects_coordinator_reacquisition() {
+    let planner = [
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/validation.rs",
+            "fn validate_source_edge_shape(edges: &[FragmentEdge]) -> Result<(), String> { Ok(()) }",
+        ),
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/topology.rs",
+            "pub(in crate::sql::planner::distributed) fn build_topology_contract() {}",
+        ),
+    ];
+
+    for (coordinator_text, marker) in [
+        (
+            "fn build_stream_edge_by_source<'a>(edges: &'a [FragmentEdge]) -> Result<BTreeMap<FragmentId, &'a FragmentEdge>, String> { Ok(BTreeMap::new()) }",
+            "coordinator-edge-index-fallible",
+        ),
+        (
+            "fn group_router_edges_by_source<'a>(edges: &'a [FragmentEdge])\n    -> Result<BTreeMap<(FragmentId, i32), Vec<&'a FragmentEdge>>, String> { Ok(BTreeMap::new()) }",
+            "coordinator-edge-index-fallible",
+        ),
+        (
+            "fn validate_source_edge_shape(edges: &[FragmentEdge]) -> Result<(), String> { Ok(()) }",
+            "coordinator-owns-edge-shape",
+        ),
+        (
+            "pub(crate) fn build_topology_contract(frags: &[PlanFragment]) {}",
+            "coordinator-owns-topology",
+        ),
+    ] {
+        let mut sources = planner.to_vec();
+        sources.push(Cgo8GuardSource::new(
+            "src/coordinator/execution.rs",
+            coordinator_text,
+        ));
+        let violations = planner_topology_contract_violations(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(marker)),
+            "coordinator re-acquiring a static topology decision must fail closed for `{coordinator_text}`: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn planner_topology_contract_detector_requires_planner_owner() {
+    // Coordinator indices are infallible, but no planner source owns either
+    // decider: both must fail closed.
+    let sources = [Cgo8GuardSource::new(
+        "src/coordinator/execution.rs",
+        "fn build_stream_edge_by_source<'a>(edges: &'a [FragmentEdge]) -> BTreeMap<FragmentId, &'a FragmentEdge> { BTreeMap::new() }",
+    )];
+    let violations = planner_topology_contract_violations(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("missing-planner-edge-shape")),
+        "a tree with no planner-owned edge-shape validator must fail closed: {violations:?}"
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("missing-planner-topology")),
+        "a tree with no planner-owned topology contract must fail closed: {violations:?}"
+    );
+}
+
+#[test]
+fn planner_topology_contract() {
+    let src = src_dir();
+    let sources =
+        production_rs_files_from_entries(&src, &[src.join("lib.rs"), src.join("main.rs")])
+            .into_iter()
+            .map(|path| Cgo8GuardSource::new(rel(&path), fs::read_to_string(path).unwrap()))
+            .collect::<Vec<_>>();
+    let violations = planner_topology_contract_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "CGO-9B Task 5 planner-owned topology-contract guard failed:\n{}",
+        violations.join("\n")
+    );
+}
