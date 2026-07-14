@@ -921,6 +921,7 @@ mod tests {
         BeginScanContext, ConnectorScanPlanner, ScanHandle, Split, SplitPlanningContext,
         TableHandle,
     };
+    use crate::runtime_filter::model::graph::RuntimeFilterGraph;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::catalog::{
         ColumnDef, IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef,
@@ -1219,6 +1220,7 @@ mod tests {
                 cte_exchange_nodes: Vec::new(),
             }],
             root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: Vec::new(),
         }
     }

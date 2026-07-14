@@ -29,6 +29,7 @@ use crate::connector::iceberg::operation_lifecycle::{
     IcebergOperationFact, operation_fact_from_commit_result, operation_fact_from_finalize_failure,
 };
 use crate::coordinator::execution::CoordinatedQueryResult;
+use crate::coordinator::write::report::WriteCommitInput;
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::iceberg_change_stream_write::{
@@ -39,7 +40,6 @@ use crate::meta::repository::iceberg_operation::{
     IcebergOperationState, IcebergOperationTarget,
 };
 use crate::runtime::query_result::QueryResult;
-use crate::runtime::write_coordinator::WriteCommitInput;
 
 /// How the runner should commit the collected writer output.
 pub(crate) struct IcebergWriteCommitPolicy {
@@ -416,9 +416,9 @@ mod tests {
     use super::*;
     use crate::common::types::UniqueId;
     use crate::connector::iceberg::commit::{CommitOutcome, CommitServiceError};
+    use crate::coordinator::write::report::{WriteCommitInput, WriterCommitInput, WriterKey};
     use crate::meta::repository::iceberg_operation::IcebergOperationState;
     use crate::runtime::query_result::QueryResult;
-    use crate::runtime::write_coordinator::{WriteCommitInput, WriterCommitInput, WriterKey};
     use std::cell::RefCell;
 
     struct TestEnv {
@@ -533,7 +533,7 @@ mod tests {
         }
     }
 
-    fn one_writer_abort() -> crate::runtime::write_coordinator::WriteAbortInput {
+    fn one_writer_abort() -> crate::coordinator::write::report::WriteAbortInput {
         crate::engine::write_operation_lifecycle::test_support::write_abort_with_data_file()
     }
 

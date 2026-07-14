@@ -20,16 +20,17 @@
 //! Lifecycle: register expected writers, apply final status reports, produce
 //! exactly one commit or abort input, then unregister the query.
 
+pub(crate) mod report;
+
 use std::collections::{BTreeMap, HashMap, hash_map::Entry};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::common::engine_error::EngineError;
 use crate::common::types::UniqueId;
-use crate::proto::novarocks;
-use crate::runtime::write_report;
-pub(crate) use crate::runtime::write_report::{
+use crate::coordinator::write::report::{
     FragmentExecStatusReport, WriteAbortInput, WriteCommitInput, WriterCommitInput, WriterKey,
 };
+use crate::proto::novarocks;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ReportOutcome {
@@ -348,7 +349,7 @@ fn query_key(query_id: &UniqueId) -> (i64, i64) {
     (query_id.hi, query_id.lo)
 }
 
-pub(crate) fn register_query(
+fn register_query(
     query_id: UniqueId,
     writers: Vec<WriterKey>,
 ) -> Result<Arc<Mutex<WriteCoordinator>>, String> {
@@ -372,12 +373,38 @@ pub(crate) fn register_query(
     }
 }
 
-pub(crate) fn unregister_query(query_id: &UniqueId) {
+fn unregister_query(query_id: &UniqueId) {
     registry()
         .queries
         .lock()
         .expect("write coordinator registry lock")
         .remove(&query_key(query_id));
+}
+
+#[derive(Debug)]
+pub(crate) struct RegisteredWriteCoordinator {
+    query_id: UniqueId,
+    coordinator: Arc<Mutex<WriteCoordinator>>,
+}
+
+impl RegisteredWriteCoordinator {
+    pub(crate) fn register(query_id: UniqueId, writers: Vec<WriterKey>) -> Result<Self, String> {
+        let coordinator = register_query(query_id.clone(), writers)?;
+        Ok(Self {
+            query_id,
+            coordinator,
+        })
+    }
+
+    pub(crate) fn coordinator(&self) -> &Arc<Mutex<WriteCoordinator>> {
+        &self.coordinator
+    }
+}
+
+impl Drop for RegisteredWriteCoordinator {
+    fn drop(&mut self) {
+        unregister_query(&self.query_id);
+    }
 }
 
 pub(crate) fn handle_fragment_report_exec_status(
@@ -417,11 +444,11 @@ pub(crate) enum WriterReportLookup {
 pub(crate) fn lookup_native_writer_report(
     report: &novarocks::ExecStatusReport,
 ) -> Result<WriterReportLookup, String> {
-    let query_id = write_report::unique_id_from_native(
+    let query_id = report::unique_id_from_native(
         report.query_id.clone(),
         "ExecStatusReport missing query_id",
     )?;
-    let fragment_instance_id = write_report::unique_id_from_native(
+    let fragment_instance_id = report::unique_id_from_native(
         report.fragment_instance_id.clone(),
         "ExecStatusReport missing fragment_instance_id",
     )?;
@@ -1079,8 +1106,7 @@ mod tests {
     fn report_from_native_preserves_iceberg_commit_metadata() {
         let writer = key(25, 35, 126, 226, 2);
 
-        let report =
-            write_report::report_from_native(native_report(&writer)).expect("native report");
+        let report = report::report_from_native(native_report(&writer)).expect("native report");
 
         assert_eq!(report.query_id, writer.query_id);
         assert_eq!(report.fragment_instance_id, writer.fragment_instance_id);
@@ -1189,6 +1215,73 @@ mod tests {
         let err = register_query(query_id.clone(), vec![writer])
             .expect_err("duplicate query registration must fail");
         assert!(err.contains("already registered"), "{err}");
+    }
+
+    #[test]
+    fn registered_write_coordinator_unregisters_on_drop() {
+        let _test_guard = write_registry_test_guard();
+        let query_id = id(90, 91);
+        let writer = key(90, 91, 92, 93, 0);
+        {
+            let registered =
+                RegisteredWriteCoordinator::register(query_id.clone(), vec![writer.clone()])
+                    .expect("register write coordinator");
+            assert_eq!(
+                lookup_native_writer_report(&native_report(&writer)).unwrap(),
+                WriterReportLookup::Expected
+            );
+            assert_eq!(
+                registered.coordinator().lock().unwrap().failed_reason(),
+                None
+            );
+        }
+        assert_eq!(
+            lookup_native_writer_report(&native_report(&writer)).unwrap(),
+            WriterReportLookup::UnknownQuery { query_id }
+        );
+    }
+
+    #[test]
+    fn production_registration_is_cleaned_up_after_error_scope() {
+        let _test_guard = write_registry_test_guard();
+        let query_id = id(92, 93);
+        let writer = key(92, 93, 94, 95, 0);
+
+        let result = (|| -> Result<(), String> {
+            let _registration =
+                RegisteredWriteCoordinator::register(query_id.clone(), vec![writer.clone()])?;
+            assert_eq!(
+                lookup_native_writer_report(&native_report(&writer)).unwrap(),
+                WriterReportLookup::Expected
+            );
+            Err("execution failed after write registration".to_string())
+        })();
+
+        assert_eq!(
+            result.unwrap_err(),
+            "execution failed after write registration"
+        );
+        assert_eq!(
+            lookup_native_writer_report(&native_report(&writer)).unwrap(),
+            WriterReportLookup::UnknownQuery { query_id }
+        );
+    }
+
+    #[test]
+    fn duplicate_raii_registration_keeps_original_registration() {
+        let _test_guard = write_registry_test_guard();
+        let query_id = id(94, 95);
+        let writer = key(94, 95, 96, 97, 0);
+        let first =
+            RegisteredWriteCoordinator::register(query_id.clone(), vec![writer.clone()]).unwrap();
+        let err = RegisteredWriteCoordinator::register(query_id, vec![writer.clone()])
+            .expect_err("duplicate registration must fail");
+        assert!(err.contains("already registered"), "{err}");
+        assert_eq!(
+            lookup_native_writer_report(&native_report(&writer)).unwrap(),
+            WriterReportLookup::Expected
+        );
+        drop(first);
     }
 
     #[test]

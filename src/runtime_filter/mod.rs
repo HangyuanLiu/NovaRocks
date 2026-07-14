@@ -15,10 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod dispatch;
-pub(crate) mod execution;
-pub(crate) mod ports;
-pub(crate) mod profile;
-pub(crate) mod report;
-pub(crate) mod scheduler;
-pub(crate) mod write;
+// RFD-3/RFD-5A will consume this staged planner/runtime seam; remove the allowance then.
+#[allow(dead_code)]
+pub(crate) mod model;

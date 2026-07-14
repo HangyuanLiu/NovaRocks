@@ -7165,6 +7165,427 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
     );
 }
 
+fn runtime_filter_dependency_path(canonical: &[String], source_rel: &str) -> Vec<String> {
+    let Some(source_module) = rust_source_module_segments(source_rel) else {
+        return canonical.to_vec();
+    };
+    if canonical.starts_with(&source_module) && canonical.len() > source_module.len() {
+        return canonical[source_module.len()..].to_vec();
+    }
+    canonical.to_vec()
+}
+
+fn runtime_filter_model_local_roots(text: &str) -> BTreeSet<String> {
+    let mut roots = BTreeSet::from(["Self".to_string()]);
+    let production = rust_sanitized_production_text(text);
+    let file = syn::parse_file(&production)
+        .expect("runtime-filter model production source must parse as Rust");
+    for item in file.items {
+        let ident = match item {
+            syn::Item::Enum(item) => Some(item.ident),
+            syn::Item::Mod(item) => Some(item.ident),
+            syn::Item::Struct(item) => Some(item.ident),
+            syn::Item::Trait(item) => Some(item.ident),
+            syn::Item::Type(item) => Some(item.ident),
+            syn::Item::Union(item) => Some(item.ident),
+            _ => None,
+        };
+        if let Some(ident) = ident {
+            roots.insert(ident.to_string());
+        }
+    }
+    roots
+}
+
+#[derive(Default)]
+struct RuntimeFilterExternalPathAudit {
+    paths: BTreeSet<Vec<String>>,
+}
+
+impl RuntimeFilterExternalPathAudit {
+    fn collect_use_tree(&mut self, tree: &syn::UseTree, prefix: &mut Vec<String>) {
+        match tree {
+            syn::UseTree::Path(path) => {
+                prefix.push(path.ident.to_string());
+                self.collect_use_tree(&path.tree, prefix);
+                prefix.pop();
+            }
+            syn::UseTree::Name(name) => {
+                let mut path = prefix.clone();
+                path.push(name.ident.to_string());
+                self.paths.insert(path);
+            }
+            syn::UseTree::Rename(rename) => {
+                let mut path = prefix.clone();
+                path.push(rename.ident.to_string());
+                self.paths.insert(path);
+            }
+            syn::UseTree::Glob(_) => {
+                let mut path = prefix.clone();
+                path.push("*".to_string());
+                self.paths.insert(path);
+            }
+            syn::UseTree::Group(group) => {
+                for item in &group.items {
+                    self.collect_use_tree(item, prefix);
+                }
+            }
+        }
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterExternalPathAudit {
+    fn visit_item_extern_crate(&mut self, item: &'ast syn::ItemExternCrate) {
+        self.paths.insert(vec![item.ident.to_string()]);
+        syn::visit::visit_item_extern_crate(self, item);
+    }
+
+    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        if item.leading_colon.is_some() {
+            self.collect_use_tree(&item.tree, &mut Vec::new());
+        }
+        syn::visit::visit_item_use(self, item);
+    }
+
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        if path.leading_colon.is_some() {
+            self.paths.insert(
+                path.segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect(),
+            );
+        }
+        syn::visit::visit_path(self, path);
+    }
+}
+
+fn runtime_filter_external_paths(text: &str) -> BTreeSet<Vec<String>> {
+    let production = rust_sanitized_production_text(text);
+    let file = syn::parse_file(&production)
+        .expect("runtime-filter model production source must parse as Rust");
+    let mut audit = RuntimeFilterExternalPathAudit::default();
+    syn::visit::Visit::visit_file(&mut audit, &file);
+    audit.paths
+}
+
+fn runtime_filter_path_is_allowlisted(canonical: &[String], allowed_prefixes: &[&[&str]]) -> bool {
+    allowed_prefixes.iter().any(|prefix| {
+        canonical.len() >= prefix.len()
+            && canonical
+                .iter()
+                .zip(prefix.iter())
+                .all(|(actual, expected)| actual == expected)
+    })
+}
+
+fn runtime_filter_model_dependency_violations(source_rel: &str, text: &str) -> Vec<String> {
+    let allowed_prefixes: &[&[&str]] = match source_rel {
+        "src/runtime_filter/model/mod.rs" => &[],
+        "src/runtime_filter/model/contract.rs" => &[&["arrow", "datatypes", "DataType"]],
+        "src/runtime_filter/model/coverage.rs" => &[
+            &["std", "collections", "BTreeSet"],
+            &["crate", "runtime_filter", "model", "contract"],
+        ],
+        "src/runtime_filter/model/graph.rs" => &[
+            &["std", "collections", "BTreeMap"],
+            &["std", "collections", "BTreeSet"],
+            &["crate", "sql", "analysis", "TypedExpr"],
+            &["crate", "runtime_filter", "model", "contract"],
+            &["crate", "runtime_filter", "model", "coverage", "Coverage"],
+        ],
+        "src/runtime_filter/model/validation.rs" => &[
+            &["std", "collections", "BTreeSet"],
+            &["std", "error", "Error"],
+            &["std", "fmt"],
+            &["crate", "runtime_filter", "model", "contract"],
+            &["crate", "runtime_filter", "model", "coverage"],
+            &["crate", "runtime_filter", "model", "graph"],
+        ],
+        _ => return vec![format!("{source_rel}: unrecognized model source")],
+    };
+    let local_roots = runtime_filter_model_local_roots(text);
+
+    let mut violations = rust_production_canonical_paths(text, source_rel)
+        .into_iter()
+        .map(|canonical| runtime_filter_dependency_path(&canonical, source_rel))
+        .filter(|canonical| {
+            !canonical
+                .first()
+                .is_some_and(|root| local_roots.contains(root))
+                && !runtime_filter_path_is_allowlisted(canonical, allowed_prefixes)
+        })
+        .map(|canonical| format!("{source_rel}: {}", canonical.join("::")))
+        .collect::<BTreeSet<_>>();
+    violations.extend(
+        runtime_filter_external_paths(text)
+            .into_iter()
+            .filter(|path| !runtime_filter_path_is_allowlisted(path, allowed_prefixes))
+            .map(|path| format!("{source_rel}: external {}", path.join("::"))),
+    );
+    violations.into_iter().collect()
+}
+
+fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> Vec<String> {
+    rust_production_canonical_paths(text, source_rel)
+        .into_iter()
+        .filter(|canonical| {
+            let planner_dependency = canonical.starts_with(&[
+                "crate".to_string(),
+                "sql".to_string(),
+                "planner".to_string(),
+            ]);
+            let model_prefix = [
+                "crate".to_string(),
+                "runtime_filter".to_string(),
+                "model".to_string(),
+            ];
+            let forbidden_model_dependency = canonical.starts_with(&model_prefix)
+                && !matches!(
+                    canonical.get(model_prefix.len()).map(String::as_str),
+                    Some("contract" | "coverage")
+                );
+            planner_dependency || forbidden_model_dependency
+        })
+        .map(|canonical| format!("{source_rel}: {}", canonical.join("::")))
+        .collect()
+}
+
+fn runtime_filter_model_root_surface_violations(text: &str) -> Vec<String> {
+    const EXPECTED: &str = r#"
+pub(crate) mod contract;
+pub(crate) mod coverage;
+pub(crate) mod graph;
+pub(crate) mod validation;
+"#;
+
+    let actual = rust_use_tokens(&rust_sanitized_production_text(text));
+    let expected = rust_use_tokens(EXPECTED);
+    if actual == expected {
+        Vec::new()
+    } else {
+        vec![format!(
+            "runtime-filter model root production tokens differ; expected {expected:?}, actual {actual:?}"
+        )]
+    }
+}
+
+#[test]
+fn runtime_filter_graph_model_has_planner_neutral_boundaries() {
+    let repo = Path::new(manifest_dir());
+    let model = repo.join("src/runtime_filter/model");
+    let contract_path = model.join("contract.rs");
+    let graph_path = model.join("graph.rs");
+    let fragment_path = repo.join("src/sql/planner/distributed/fragment.rs");
+    let proto_encode = repo.join("src/sql/codegen/proto_encode");
+
+    assert!(contract_path.is_file());
+    assert!(graph_path.is_file());
+
+    let model_mod = fs::read_to_string(model.join("mod.rs"))
+        .expect("runtime-filter model module source must be readable");
+    let model_root_violations = runtime_filter_model_root_surface_violations(&model_mod);
+    assert!(
+        model_root_violations.is_empty(),
+        "runtime-filter model root production surface must stay exact:\n{}",
+        model_root_violations.join("\n")
+    );
+
+    let runtime_filter_mod = fs::read_to_string(repo.join("src/runtime_filter/mod.rs"))
+        .expect("runtime-filter root source must be readable");
+    assert!(
+        runtime_filter_mod.contains("RFD-3/RFD-5A")
+            && runtime_filter_mod.contains("#[allow(dead_code)]\npub(crate) mod model;"),
+        "the staged model seam needs one documented, removable dead_code allowance"
+    );
+
+    let contract_text = rust_sanitized_production_text(
+        &fs::read_to_string(&contract_path)
+            .expect("runtime-filter contract source must be readable"),
+    );
+    let graph_text = rust_sanitized_production_text(
+        &fs::read_to_string(&graph_path).expect("runtime-filter graph source must be readable"),
+    );
+    let fragment_source =
+        fs::read_to_string(&fragment_path).expect("distributed fragment source must be readable");
+    let fragment_text = rust_sanitized_production_text(&fragment_source);
+    let proto_text = rs_files(&proto_encode)
+        .into_iter()
+        .map(|path| {
+            rust_sanitized_production_text(
+                &fs::read_to_string(path).expect("proto encoder source must be readable"),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(!contract_text.contains("crate::sql"));
+    assert!(!graph_text.contains("crate::sql::planner"));
+    assert!(fragment_text.contains("runtime_filter_graph: RuntimeFilterGraph"));
+    assert!(
+        fragment_source.contains("RFD-5A")
+            && fragment_source
+                .contains("#[allow(dead_code)]\n    pub runtime_filter_graph: RuntimeFilterGraph"),
+        "the DistributedPlan staged graph slot needs a field-local dead_code allowance"
+    );
+    assert!(!proto_text.contains("runtime_filter_graph"));
+
+    let mut violations = Vec::new();
+    for path in rs_files(&model) {
+        let source_rel = rel(&path);
+        let text = fs::read_to_string(&path).expect("runtime-filter model source must be readable");
+        violations.extend(runtime_filter_model_dependency_violations(
+            &source_rel,
+            &text,
+        ));
+    }
+
+    assert!(
+        violations.is_empty(),
+        "runtime-filter model must stay planner-, wire-, service-, runtime-, connector-, and catalog-neutral except for graph TypedExpr:\n{}",
+        violations.join("\n")
+    );
+
+    let runtime_filter = repo.join("src/runtime_filter");
+    for path in rs_files(&runtime_filter) {
+        let source_rel = rel(&path);
+        if source_rel == "src/runtime_filter/core.rs"
+            || source_rel.starts_with("src/runtime_filter/core/")
+            || source_rel == "src/runtime_filter/service.rs"
+            || source_rel.starts_with("src/runtime_filter/service/")
+        {
+            let text = fs::read_to_string(&path)
+                .expect("runtime-filter core/service source must be readable");
+            violations.extend(runtime_filter_runtime_boundary_violations(
+                &source_rel,
+                &text,
+            ));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "runtime-filter core/service must not depend on graph-owned or planner types:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn runtime_filter_model_dependency_allowlist_rejects_forbidden_synthetic_imports() {
+    let source_rel = "src/runtime_filter/model/contract.rs";
+    for source in [
+        "use crate::fs::FsAccessHandle;",
+        "use crate::engine::StandaloneNovaRocks;",
+        "use crate::exec::ExecPlan;",
+        "use tokio::sync::Mutex;",
+        "use opendal::Operator;",
+        "use std::net::TcpStream;",
+        "use reqwest::Client;",
+        "use serde::Serialize;",
+        "fn reqwest() {} use reqwest::Client;",
+        "const reqwest: () = (); use reqwest::Client;",
+        "static serde: () = (); use serde::Serialize;",
+        "fn f() { struct serde; } use serde::Serialize;",
+        "mod std {} use ::std::net::TcpStream;",
+        "extern crate reqwest;",
+        "extern crate reqwest as http; use http::Client;",
+    ] {
+        assert!(
+            !runtime_filter_model_dependency_violations(source_rel, source).is_empty(),
+            "model dependency detector must reject {source}"
+        );
+    }
+
+    assert!(
+        runtime_filter_model_dependency_violations(source_rel, "use arrow::datatypes::DataType;")
+            .is_empty()
+    );
+    assert!(
+        runtime_filter_model_dependency_violations(
+            source_rel,
+            "mod arrow {} use ::arrow::datatypes::DataType;"
+        )
+        .is_empty(),
+        "allowlisted absolute dependency must not be rejected or confused with a local root"
+    );
+    for source in [
+        "enum LocalDomain { Empty } type Domain = LocalDomain;",
+        "struct LocalContract; impl LocalContract { fn make() -> Self { Self } }",
+        "mod local { pub struct Item; } use local::Item;",
+    ] {
+        assert!(
+            runtime_filter_model_dependency_violations(source_rel, source).is_empty(),
+            "file-top-level local type/module path must remain allowed: {source}"
+        );
+    }
+}
+
+#[test]
+fn runtime_filter_model_root_surface_rejects_extra_production_items() {
+    const EXACT_ROOT: &str = r#"
+pub(crate) mod contract;
+pub(crate) mod coverage;
+pub(crate) mod graph;
+pub(crate) mod validation;
+"#;
+
+    assert!(runtime_filter_model_root_surface_violations(EXACT_ROOT).is_empty());
+    for source in [
+        format!("{EXACT_ROOT}\npub use graph::*;"),
+        format!("{EXACT_ROOT}\npub(in crate) use graph::*;"),
+        format!("#[allow(dead_code)]\n{EXACT_ROOT}"),
+        format!("{EXACT_ROOT}\nconst EXTRA: () = ();"),
+    ] {
+        assert!(
+            !runtime_filter_model_root_surface_violations(&source).is_empty(),
+            "model root surface detector must reject extra production item:\n{source}"
+        );
+    }
+}
+
+#[test]
+fn runtime_filter_runtime_boundary_detector_defaults_model_dependencies_to_deny() {
+    let source_rel = "src/runtime_filter/core/channel.rs";
+    for source in [
+        "use crate::runtime_filter::model::graph::RuntimeFilterGraph;",
+        "use crate::runtime_filter::model::validation::GraphValidationError;",
+        "use crate::runtime_filter::model::RuntimeFilterChannelSpec;",
+        "use crate::runtime_filter::model::FutureGraphType;",
+        "use crate::runtime_filter::model;",
+        "use crate::runtime_filter::model as model_root; use model_root::RuntimeFilterBindingSpec;",
+        "use crate::runtime_filter::model::graph as graph_owner; use graph_owner::RuntimeFilterGraph;",
+        "use crate::runtime_filter as rf; use rf::model::FutureGraphType;",
+        "use crate::sql::planner::distributed::DistributedPlan;",
+    ] {
+        assert!(
+            !runtime_filter_runtime_boundary_violations(source_rel, source).is_empty(),
+            "runtime boundary detector must reject {source}"
+        );
+    }
+
+    assert!(
+        runtime_filter_runtime_boundary_violations(
+            source_rel,
+            "use crate::runtime_filter::model::contract::ChannelId;"
+        )
+        .is_empty()
+    );
+    assert!(
+        runtime_filter_runtime_boundary_violations(
+            source_rel,
+            "use crate::runtime_filter::model::coverage::Coverage;"
+        )
+        .is_empty()
+    );
+    assert!(
+        runtime_filter_runtime_boundary_violations(
+            source_rel,
+            "use crate::runtime_filter::model::contract as owner; use owner::ChannelId;"
+        )
+        .is_empty()
+    );
+}
+
 #[test]
 fn planner_logical_ir_and_payload_have_stage_owners() {
     let repo = Path::new(manifest_dir());
@@ -15128,7 +15549,6 @@ const NIDL_E0_COMPAT_SCOPE: &[&str] = &[
     "src/lower/compat",
     "src/runtime/descriptor_snapshot_thrift.rs",
     "src/runtime/sink_commit_wire.rs",
-    "src/runtime/write_coordinator_compat.rs",
     "src/service/backend_service.rs",
     "src/service/heartbeat_service.rs",
     "src/service/internal_service.rs",
@@ -15590,13 +16010,13 @@ fn nidl_e9_native_fragment_wire_has_no_starrocks_thrift_aliases() {
 
 #[test]
 fn nidl_e9_write_coordinator_uses_native_report_types() {
-    let coordinator = nidl_e9_read("src/runtime/write_coordinator.rs");
+    let coordinator = nidl_e9_read("src/coordinator/write/mod.rs");
     let coordinator_region = nidl_e9_text_region_between(
         &coordinator,
-        "pub(crate) use crate::runtime::write_report",
+        "use crate::coordinator::write::report",
         "impl WriteCoordinator",
     );
-    let write_report = nidl_e9_read("src/runtime/write_report.rs");
+    let write_report = nidl_e9_read("src/coordinator/write/report.rs");
     let write_report_region = nidl_e9_text_region_between(
         &write_report,
         "pub(crate) struct WriterKey",
@@ -17239,10 +17659,11 @@ fn coor_2_report_handler_is_query_control_plane() {
     assert!(fragment_control.contains("pub fn cancel"));
     assert!(!fragment_control.contains("mark_query_failed_from_report"));
 
-    assert!(repo.join("src/runtime/write_coordinator.rs").is_file());
-    assert!(repo.join("src/runtime/write_report.rs").is_file());
+    assert!(repo.join("src/coordinator/write/mod.rs").is_file());
+    assert!(repo.join("src/coordinator/write/report.rs").is_file());
     assert!(!repo.join("src/coordinator/write.rs").exists());
-    assert!(!repo.join("src/coordinator/write").exists());
+    assert!(report.contains("crate::coordinator::write::report::report_from_native"));
+    assert!(report.contains("crate::coordinator::write::{"));
 
     let mut scanned = 0usize;
     for path in rs_files(&repo.join("src/coordinator")) {
@@ -17271,6 +17692,390 @@ fn coor_2_report_handler_is_query_control_plane() {
     assert!(
         compact.contains(&expected),
         "coordinator report owner must have an exact native-only audit baseline"
+    );
+}
+
+#[test]
+fn coor_4_write_control_plane_has_one_top_level_owner() {
+    let repo = Path::new(manifest_dir());
+    let owner = repo.join("src/coordinator/write/mod.rs");
+    let report = repo.join("src/coordinator/write/report.rs");
+    assert!(owner.is_file(), "coordinator write owner must exist");
+    assert!(
+        report.is_file(),
+        "coordinator write report model must exist"
+    );
+    for retired in [
+        ["src/runtime/", "write_coordinator.rs"].concat(),
+        ["src/runtime/", "write_report.rs"].concat(),
+    ] {
+        assert!(
+            !repo.join(retired).exists(),
+            "retired runtime write owner remains"
+        );
+    }
+    let owner_text = rust_sanitized_production_text(
+        &fs::read_to_string(owner).expect("read coordinator write owner"),
+    );
+    let report_text = rust_sanitized_production_text(
+        &fs::read_to_string(report).expect("read coordinator write report"),
+    );
+    assert!(owner_text.contains("struct WriteCoordinatorRegistry"));
+    assert!(owner_text.contains("pub(crate) struct WriteCoordinator"));
+    assert!(report_text.contains("pub(crate) struct WriterKey"));
+    assert!(report_text.contains("pub(crate) struct WriteCommitInput"));
+}
+
+#[test]
+fn coor_4_write_registration_lifetime_belongs_to_write_owner() {
+    let repo = Path::new(manifest_dir());
+    let write = rust_sanitized_production_text(
+        &fs::read_to_string(repo.join("src/coordinator/write/mod.rs"))
+            .expect("read coordinator write owner"),
+    );
+    let execution = rust_sanitized_production_text(
+        &fs::read_to_string(repo.join("src/coordinator/execution.rs"))
+            .expect("read coordinator execution"),
+    );
+    assert!(write.contains("pub(crate) struct RegisteredWriteCoordinator"));
+    assert!(write.contains("impl Drop for RegisteredWriteCoordinator"));
+    assert!(write.contains("pub(crate) fn register("));
+    assert!(!execution.contains("struct RegisteredWriteCoordinator"));
+    assert!(!execution.contains("unregister_query"));
+}
+
+#[test]
+fn coor_4_dead_write_compat_ingress_is_deleted_and_real_fe_path_remains() {
+    let repo = Path::new(manifest_dir());
+    let retired = repo.join(["src/runtime/", "write_coordinator_compat.rs"].concat());
+    assert!(
+        !retired.exists(),
+        "dead compat write ingress must be deleted"
+    );
+
+    let runtime_mod = rust_sanitized_production_text(
+        &fs::read_to_string(repo.join("src/runtime/mod.rs")).expect("read runtime modules"),
+    );
+    assert!(!runtime_mod.contains("mod write_coordinator_compat"));
+
+    let fe_report =
+        fs::read_to_string(repo.join("src/service/fe_report.rs")).expect("read FE report producer");
+    let exec_status = fs::read_to_string(repo.join("src/service/exec_status_report.rs"))
+        .expect("read FE report encoder");
+    let exec_state = fs::read_to_string(repo.join("src/service/exec_state_reporter.rs"))
+        .expect("read FE report transport");
+    assert!(fe_report.contains("StarRocksFrontend"));
+    assert!(fe_report.contains("ExecStatusReportInput"));
+    assert!(exec_status.contains("TReportExecStatusParams"));
+    assert!(exec_state.contains("report_exec_status"));
+}
+
+#[test]
+fn coor_4_write_operation_mapping_is_engine_owned() {
+    let repo = Path::new(manifest_dir());
+    let engine_path = repo.join("src/engine/write_operation_lifecycle.rs");
+    let retired = repo.join(["src/runtime/", "write_operation_lifecycle.rs"].concat());
+    assert!(
+        !retired.exists(),
+        "runtime operation mapping owner must be retired"
+    );
+    let engine = rust_sanitized_production_text(
+        &fs::read_to_string(engine_path).expect("read engine write lifecycle"),
+    );
+    for required in [
+        "pub(crate) struct WriteOperationContext",
+        "pub(crate) fn operation_request_from_write_commit",
+        "pub(crate) fn operation_fact_update_from_write_abort",
+        "pub(crate) fn create_writer_operation_from_commit",
+        "pub(crate) fn record_writer_abort_fact",
+    ] {
+        assert!(
+            engine.contains(required),
+            "engine lifecycle missing {required}"
+        );
+    }
+
+    let coordinator_write_files = rs_files(&repo.join("src/coordinator/write"));
+    assert_eq!(
+        coordinator_write_files.len(),
+        2,
+        "coordinator write metadata scan must cover the exact owner tree"
+    );
+    for path in coordinator_write_files {
+        let relative = rel(&path);
+        let production = rust_sanitized_production_text(
+            &fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {relative}: {err}")),
+        );
+        for forbidden in [
+            "CreateIcebergOperationRequest",
+            "IcebergOperationFactUpdate",
+            "IcebergOperationRepository",
+            "metadata_provider",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "{relative} leaks engine metadata lifecycle term {forbidden}"
+            );
+        }
+    }
+
+    let retired_module = ["runtime::", "write_operation_lifecycle"].concat();
+    for path in rs_files(&repo.join("src")) {
+        let relative = rel(&path);
+        let production = rust_sanitized_production_text(
+            &fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {relative}: {err}")),
+        );
+        assert!(
+            !production.contains(&retired_module),
+            "{relative} references retired module path {retired_module}"
+        );
+    }
+}
+
+#[test]
+fn coor_4_final_write_control_plane_ownership_is_non_vacuous() {
+    let repo = Path::new(manifest_dir());
+    let write_files = [
+        "src/coordinator/write/mod.rs",
+        "src/coordinator/write/report.rs",
+    ];
+    for owner in write_files {
+        let text = rust_sanitized_production_text(
+            &fs::read_to_string(repo.join(owner))
+                .unwrap_or_else(|err| panic!("read {owner}: {err}")),
+        );
+        assert!(!text.trim().is_empty(), "{owner} must be non-empty");
+        for forbidden in ["crate::service", "crate::engine", "crate::thrift"] {
+            assert!(
+                !text.contains(forbidden),
+                "{owner} imports forbidden concrete {forbidden}"
+            );
+        }
+    }
+
+    for retired in [
+        ["src/runtime/", "write_coordinator.rs"].concat(),
+        ["src/runtime/", "write_report.rs"].concat(),
+        ["src/runtime/", "write_coordinator_compat.rs"].concat(),
+        ["src/runtime/", "write_operation_lifecycle.rs"].concat(),
+    ] {
+        assert!(
+            !repo.join(&retired).exists(),
+            "retired owner remains: {retired}"
+        );
+    }
+    for retained in [
+        "src/runtime/sink_commit.rs",
+        "src/runtime/sink_commit_wire.rs",
+        "src/service/fe_report.rs",
+        "src/service/exec_status_report.rs",
+        "src/service/exec_state_reporter.rs",
+        "src/service/report_worker.rs",
+        "src/service/standalone_exec_state_reporter.rs",
+    ] {
+        assert!(
+            repo.join(retained).is_file(),
+            "BE-local owner moved or deleted: {retained}"
+        );
+    }
+
+    let sources = rs_files(&repo.join("src"))
+        .into_iter()
+        .map(|path| {
+            (
+                rel(&path),
+                fs::read_to_string(&path)
+                    .unwrap_or_else(|err| panic!("read {}: {err}", rel(&path))),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (symbol, owner) in [
+        (
+            "WriteCoordinatorRegistry",
+            "src/coordinator/write/mod.rs (1)",
+        ),
+        ("WriteCoordinator", "src/coordinator/write/mod.rs (1)"),
+        (
+            "RegisteredWriteCoordinator",
+            "src/coordinator/write/mod.rs (1)",
+        ),
+        ("WriterKey", "src/coordinator/write/report.rs (1)"),
+        ("WriteCommitInput", "src/coordinator/write/report.rs (1)"),
+        ("WriteAbortInput", "src/coordinator/write/report.rs (1)"),
+    ] {
+        assert_eq!(
+            rust_named_declaration_owners(&sources, symbol, rust_named_type_declaration_count),
+            vec![owner],
+            "{symbol} must have exactly one production owner"
+        );
+    }
+
+    let write_owner = rust_sanitized_production_text(
+        &fs::read_to_string(repo.join("src/coordinator/write/mod.rs"))
+            .expect("read coordinator write owner"),
+    );
+    assert_eq!(
+        rust_named_function_declaration_count(&write_owner, "register_query"),
+        1,
+        "raw register_query must be a single write-owner implementation detail"
+    );
+    assert_eq!(
+        rust_named_function_declaration_count(&write_owner, "unregister_query"),
+        1,
+        "raw unregister_query must be a single write-owner implementation detail"
+    );
+    for raw_api in ["register_query", "unregister_query"] {
+        assert!(
+            !write_owner.contains(&format!("pub fn {raw_api}"))
+                && !write_owner.contains(&format!("pub(crate) fn {raw_api}"))
+                && !write_owner.contains(&format!("pub(super) fn {raw_api}")),
+            "raw {raw_api} must remain private to coordinator::write"
+        );
+    }
+    let drop_owners = sources
+        .iter()
+        .filter_map(|(path, text)| {
+            let count = rust_sanitized_production_text(text)
+                .matches("impl Drop for RegisteredWriteCoordinator")
+                .count();
+            (count > 0).then(|| format!("{path} ({count})"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        drop_owners,
+        vec!["src/coordinator/write/mod.rs (1)"],
+        "RegisteredWriteCoordinator cleanup must have one exact Drop owner"
+    );
+
+    let retired_module_paths = [
+        ["crate::runtime::", "write_coordinator"].concat(),
+        ["runtime::", "write_coordinator"].concat(),
+        ["crate::runtime::", "write_report"].concat(),
+        ["runtime::", "write_report"].concat(),
+        ["crate::runtime::", "write_coordinator_compat"].concat(),
+        ["runtime::", "write_coordinator_compat"].concat(),
+        ["crate::runtime::", "write_operation_lifecycle"].concat(),
+        ["runtime::", "write_operation_lifecycle"].concat(),
+    ];
+    for (path, text) in &sources {
+        let production = rust_sanitized_production_text(text);
+        for retired in &retired_module_paths {
+            assert!(
+                !production.contains(retired),
+                "{path} references or forwards retired module path {retired}"
+            );
+        }
+    }
+
+    assert_eq!(
+        rs_files(&repo.join("src/coordinator")).len(),
+        10,
+        "final coordinator owner tree must contain exactly ten Rust files"
+    );
+    assert!(
+        !NIDL_E0_COMPAT_SCOPE.contains(
+            &["src/runtime/", "write_coordinator_compat.rs"]
+                .concat()
+                .as_str()
+        ),
+        "dead compat ingress must not remain in NIDL compat scope"
+    );
+
+    let fe_report = rust_sanitized_production_text(
+        &fs::read_to_string(repo.join("src/service/fe_report.rs"))
+            .expect("read FE report producer"),
+    );
+    for relation in [
+        "ReportDestination::StarRocksFrontend(coord) =>",
+        "exec_status_report::build_report_params(ExecStatusReportInput",
+        "enqueue_final_report(ExecStateReportTask",
+        "ReportDestination::NovaRocksCoordinator(coord) =>",
+        "build_native_report(NativeExecStatusReportInput",
+        "enqueue_standalone_final_report(StandaloneExecStateReportTask",
+    ] {
+        assert!(
+            fe_report.contains(relation),
+            "sanitized FE destination-to-builder-to-reporter path missing {relation}"
+        );
+    }
+    let fe_encoder = rust_sanitized_production_text(
+        &fs::read_to_string(repo.join("src/service/exec_status_report.rs"))
+            .expect("read FE report encoder"),
+    );
+    assert!(fe_encoder.contains("frontend_service::TReportExecStatusParams"));
+    let fe_reporter = rust_sanitized_production_text(
+        &fs::read_to_string(repo.join("src/service/exec_state_reporter.rs"))
+            .expect("read FE report transport"),
+    );
+    assert!(fe_reporter.contains("FrontendRpcKind::ExecStatus"));
+    assert!(fe_reporter.contains("report_exec_status(task.params.clone())"));
+
+    let audit_path = repo.join("tools/dev/audit_thrift_boundaries.py");
+    let audit = fs::read_to_string(&audit_path).expect("read thrift boundary audit");
+    let compact = audit.lines().map(compact_line).collect::<String>();
+    for expected in [
+        "\"src/coordinator/write/mod.rs\": BaselineEntry(\"domain-leak\", \"control-plane\", 0, \"Coordinator write control plane owns native writer state and registry\"),",
+        "\"src/coordinator/write/report.rs\": BaselineEntry(\"domain-leak\", \"control-plane\", 0, \"Coordinator write report model consumes native exec-status payloads\"),",
+        "\"src/engine/write_operation_lifecycle.rs\": BaselineEntry(\"domain-leak\", \"B2\", 0, \"Engine owns write operation mapping and persistence\"),",
+    ] {
+        assert!(
+            compact.contains(&compact_line(expected)),
+            "final write owner missing exact audit entry: {expected}"
+        );
+    }
+    for retired in [
+        ["src/runtime/", "write_coordinator.rs"].concat(),
+        ["src/runtime/", "write_report.rs"].concat(),
+        ["src/runtime/", "write_coordinator_compat.rs"].concat(),
+        ["src/runtime/", "write_operation_lifecycle.rs"].concat(),
+    ] {
+        assert!(
+            !compact.contains(&format!("\"{retired}\":BaselineEntry(")),
+            "retired owner retains audit entry: {retired}"
+        );
+    }
+
+    let output = std::process::Command::new("python3")
+        .arg(&audit_path)
+        .args(["--strict", "--json"])
+        .current_dir(repo)
+        .output()
+        .expect("run strict thrift boundary audit");
+    assert!(
+        output.status.success(),
+        "strict audit failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse strict audit JSON");
+    assert_eq!(summary["errors"].as_array().map(Vec::len), Some(0));
+    assert_eq!(summary["scanned_by_root"]["src/coordinator"], 10);
+    let scanned_files = summary["scanned_files"]
+        .as_array()
+        .expect("strict audit JSON scanned files")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<BTreeSet<_>>();
+    for owner in write_files {
+        assert!(
+            scanned_files.contains(owner),
+            "strict audit did not scan coordinator write owner {owner}"
+        );
+    }
+    let write_hit_files = summary["files"]
+        .as_array()
+        .expect("strict audit JSON hit files")
+        .iter()
+        .filter(|entry| {
+            entry["path"]
+                .as_str()
+                .is_some_and(|path| write_files.contains(&path))
+        })
+        .count();
+    assert_eq!(
+        write_hit_files, 0,
+        "coordinator write owners must have zero thrift hits"
     );
 }
 
@@ -17322,6 +18127,8 @@ fn coor_2_thrift_audit_scans_coordinator_owners() {
         "src/coordinator/scheduler/mod.rs",
         "src/coordinator/profile/mod.rs",
         "src/coordinator/profile/correlate.rs",
+        "src/coordinator/write/mod.rs",
+        "src/coordinator/write/report.rs",
     ] {
         assert!(
             scanned_files.contains(owner),
@@ -17337,8 +18144,8 @@ fn coor_2_final_control_plane_ownership_is_non_vacuous() {
     let coordinator_files = rs_files(&coordinator_root);
     assert_eq!(
         coordinator_files.len(),
-        8,
-        "COOR-2 must audit the complete eight-file coordinator production tree"
+        10,
+        "COOR-4 must audit the complete ten-file coordinator production tree"
     );
 
     let required_owners = [
@@ -17389,7 +18196,7 @@ fn coor_2_final_control_plane_ownership_is_non_vacuous() {
         );
     }
     assert!(!repo.join("src/coordinator/write.rs").exists());
-    assert!(!repo.join("src/coordinator/write").exists());
+    assert!(repo.join("src/coordinator/write").is_dir());
 
     let retired_paths = [
         ["crate::runtime::", "coordinator"].concat(),
@@ -17398,6 +18205,14 @@ fn coor_2_final_control_plane_ownership_is_non_vacuous() {
         ["runtime::", "scheduler"].concat(),
         ["crate::runtime::", "profile_correlate"].concat(),
         ["runtime::", "profile_correlate"].concat(),
+        ["crate::runtime::", "write_coordinator"].concat(),
+        ["runtime::", "write_coordinator"].concat(),
+        ["crate::runtime::", "write_report"].concat(),
+        ["runtime::", "write_report"].concat(),
+        ["crate::runtime::", "write_coordinator_compat"].concat(),
+        ["runtime::", "write_coordinator_compat"].concat(),
+        ["crate::runtime::", "write_operation_lifecycle"].concat(),
+        ["runtime::", "write_operation_lifecycle"].concat(),
     ];
     let forbidden_types = [
         ["Query", "Coordinator"].concat(),
@@ -17439,15 +18254,14 @@ fn coor_2_final_control_plane_ownership_is_non_vacuous() {
                 !production.contains("crate::service"),
                 "{relative} imports a service concrete"
             );
-            let uses_transitional_write = production.contains("runtime::write_coordinator")
-                || production.contains("runtime::write_report");
-            if uses_transitional_write {
+            let uses_sibling_write = production.contains("coordinator::write");
+            if uses_sibling_write && !relative.starts_with("src/coordinator/write/") {
                 assert!(
                     matches!(
                         relative.as_str(),
                         "src/coordinator/execution.rs" | "src/coordinator/report.rs"
                     ),
-                    "{relative} references a transitional write owner outside execution/report"
+                    "{relative} references the sibling write owner outside execution/report"
                 );
             }
         }
@@ -17476,7 +18290,7 @@ fn coor_2_final_control_plane_ownership_is_non_vacuous() {
     let summary: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("parse strict audit JSON");
     assert_eq!(summary["errors"].as_array().map(Vec::len), Some(0));
-    assert_eq!(summary["scanned_by_root"]["src/coordinator"], 8);
+    assert_eq!(summary["scanned_by_root"]["src/coordinator"], 10);
     let coordinator_hits = summary["files"]
         .as_array()
         .expect("audit JSON files")
@@ -17489,7 +18303,7 @@ fn coor_2_final_control_plane_ownership_is_non_vacuous() {
         .count();
     assert_eq!(
         coordinator_hits, 0,
-        "all eight coordinator production files must have zero audited thrift hits"
+        "all ten coordinator production files must have zero audited thrift hits"
     );
 }
 

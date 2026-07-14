@@ -3344,10 +3344,24 @@ fn usize_to_u32(value: usize) -> Result<u32, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use arrow::datatypes::DataType;
 
     use super::*;
     use crate::proto::expr::expr;
+    use crate::runtime_filter::model::contract::{
+        ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
+        ContributionKind, CoverageWitnessId, NullSemantics, PlanFragmentId, PlanNodeId,
+        ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
+        RuntimeFilterPolicyRequirement,
+    };
+    use crate::runtime_filter::model::coverage::Coverage;
+    use crate::runtime_filter::model::graph::{
+        ApplyPoint, ConsumerRequirement, PlanLocation, ProducerRequirement,
+        RuntimeFilterBindingRole, RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
+        RuntimeFilterGraph,
+    };
     use crate::sql::analysis::OutputColumn;
     use crate::sql::codegen::scan::binding::{
         ResolvedIcebergDeltaScan, ResolvedIcebergFileScan, ResolvedReadColumn, ResolvedReadReason,
@@ -3360,7 +3374,179 @@ mod tests {
     use crate::sql::planner::distributed::write::change_stream::{
         IcebergChangeStreamBranchRoute, IcebergChangeStreamRouterSink,
     };
+    use crate::sql::planner::physical::runtime_filter::{
+        RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
+    };
     use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
+
+    #[test]
+    fn nonempty_runtime_filter_graph_is_wire_neutral_and_bound_node_filters_still_encode() {
+        let mut source = two_fragment_stream_plan_for_test();
+        let mut second_target = source.fragments[1].clone();
+        second_target.fragment_id = 2;
+        second_target.root.fragment_id = 2;
+        second_target.root.node_id = 21;
+        source.fragments.push(second_target);
+        let build_expr = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::new_for_test(2),
+                qualifier: None,
+                column: "delta".to_string(),
+            },
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+        let probe_expr = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::new_for_test(1),
+                qualifier: None,
+                column: "old".to_string(),
+            },
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+        source.fragments[0]
+            .root
+            .build_runtime_filters
+            .push(BoundRuntimeFilterBuild {
+                intent: RuntimeFilterBuildIntent {
+                    filter_id: 41,
+                    build_expr: build_expr.clone(),
+                    probe_expr: probe_expr.clone(),
+                    expr_order: 2,
+                    execution_mode: JoinExecutionMode::Partitioned,
+                },
+                source_fragment_id: 1,
+                target_fragment_ids: vec![0, 2],
+            });
+        source.fragments[0]
+            .root
+            .probe_runtime_filters
+            .push(BoundRuntimeFilterProbe {
+                intent: RuntimeFilterProbeIntent {
+                    filter_id: 41,
+                    probe_expr: probe_expr.clone(),
+                },
+                source_fragment_id: 1,
+            });
+
+        let mut empty_graph = source.clone();
+        empty_graph.runtime_filter_graph = RuntimeFilterGraph::default();
+        assert!(empty_graph.runtime_filter_graph.is_empty());
+        let encoded_empty = encode_distributed_plan(&empty_graph).expect("encode empty graph plan");
+
+        let mut nonempty_graph = source.clone();
+        nonempty_graph
+            .runtime_filter_graph
+            .insert_channel(RuntimeFilterChannelSpec {
+                channel_id: ChannelId::new(1),
+                logical_domain: RuntimeFilterLogicalDomain::Membership {
+                    value_type: DataType::Int64,
+                    null_semantics: NullSemantics::NeverMatches,
+                },
+                lifecycle: RuntimeFilterLifecycle::CompleteOnce,
+                availability_coverage: Coverage::Leaf(CoverageWitnessId::new(1)),
+                terminal_coverage: Coverage::Leaf(CoverageWitnessId::new(1)),
+                reduction_requirement: ReductionRequirement::SetUnion,
+                allowed_contribution_kinds: BTreeSet::from([
+                    ContributionKind::ValueDomainDelta,
+                    ContributionKind::ProducerClosed,
+                ]),
+                required_consumer_capabilities: BTreeSet::from([
+                    ArtifactCapability::Membership,
+                    ArtifactCapability::EmptyDomain,
+                ]),
+                policy: RuntimeFilterPolicyRequirement {
+                    max_contribution_bytes: 1024,
+                    max_artifact_bytes: 4096,
+                    deadline_ms: 30_000,
+                    max_retries: 3,
+                },
+            })
+            .expect("insert channel");
+        nonempty_graph
+            .runtime_filter_graph
+            .insert_binding(RuntimeFilterBindingSpec {
+                binding_id: BindingId::new(1),
+                channel_id: ChannelId::new(1),
+                coverage_witness_id: Some(CoverageWitnessId::new(1)),
+                location: PlanLocation {
+                    fragment_id: PlanFragmentId::new(1),
+                    node_id: PlanNodeId::new(21),
+                },
+                expression: build_expr.clone(),
+                apply_point: ApplyPoint::NodeOutput,
+                role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
+                    contribution_kinds: BTreeSet::from([
+                        ContributionKind::ValueDomainDelta,
+                        ContributionKind::ProducerClosed,
+                    ]),
+                    completion_requirement: CompletionRequirement::ProducerClosed,
+                }),
+            })
+            .expect("insert producer binding");
+        nonempty_graph
+            .runtime_filter_graph
+            .insert_binding(RuntimeFilterBindingSpec {
+                binding_id: BindingId::new(2),
+                channel_id: ChannelId::new(1),
+                coverage_witness_id: None,
+                location: PlanLocation {
+                    fragment_id: PlanFragmentId::new(0),
+                    node_id: PlanNodeId::new(0),
+                },
+                expression: probe_expr.clone(),
+                apply_point: ApplyPoint::NodeInput,
+                role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
+                    capabilities: BTreeSet::from([
+                        ArtifactCapability::Membership,
+                        ArtifactCapability::EmptyDomain,
+                    ]),
+                    activation: ConsumerActivation::BlockingSnapshot,
+                }),
+            })
+            .expect("insert consumer binding");
+        assert!(!nonempty_graph.runtime_filter_graph.is_empty());
+        nonempty_graph
+            .runtime_filter_graph
+            .validate()
+            .expect("nonempty graph fixture must be structurally valid");
+        // RFD-1 keeps the graph planner-only until RFD-5A/CGO-13 defines wire lowering.
+        let encoded_nonempty =
+            encode_distributed_plan(&nonempty_graph).expect("encode nonempty graph plan");
+
+        assert_eq!(encoded_nonempty, encoded_empty);
+        let root = encoded_nonempty.fragments[0]
+            .root
+            .as_ref()
+            .expect("root node");
+        assert_eq!(root.build_runtime_filters.len(), 1);
+        let encoded_build = &root.build_runtime_filters[0];
+        assert_eq!(encoded_build.filter_id, 41);
+        assert_eq!(
+            encoded_build.build_expr,
+            Some(encode_expr(&build_expr).expect("encode expected build expr"))
+        );
+        assert_eq!(
+            encoded_build.probe_expr,
+            Some(encode_expr(&probe_expr).expect("encode expected probe expr"))
+        );
+        assert_eq!(encoded_build.expr_order, 2);
+        assert_eq!(
+            encoded_build.execution_mode,
+            plan::JoinExecutionMode::Partitioned as i32
+        );
+        assert_eq!(encoded_build.source_fragment_id, 1);
+        assert_eq!(encoded_build.target_fragment_ids, vec![0, 2]);
+        assert_eq!(root.probe_runtime_filters.len(), 1);
+        let encoded_probe = &root.probe_runtime_filters[0];
+        assert_eq!(encoded_probe.filter_id, 41);
+        assert_eq!(
+            encoded_probe.probe_expr,
+            Some(encode_expr(&probe_expr).expect("encode expected probe expr"))
+        );
+        assert_eq!(encoded_probe.source_fragment_id, 1);
+    }
 
     #[test]
     fn change_stream_router_encoder_materializes_partition_exprs() {
@@ -3581,6 +3767,7 @@ mod tests {
         let plan = DistributedPlan {
             fragments: vec![source, target],
             root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: vec![FragmentEdge {
                 source_fragment_id: 1,
                 target_fragment_id: 0,
@@ -4267,6 +4454,7 @@ mod tests {
                 cte_exchange_nodes: Vec::new(),
             }],
             root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: Vec::new(),
         }
     }
@@ -4959,6 +5147,7 @@ mod tests {
         let plan = DistributedPlan {
             fragments: vec![source, target],
             root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: vec![FragmentEdge {
                 source_fragment_id: 1,
                 target_fragment_id: 0,
@@ -5256,6 +5445,7 @@ mod tests {
                 },
             ],
             root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: vec![FragmentEdge {
                 source_fragment_id: 1,
                 target_fragment_id: 0,
@@ -5334,6 +5524,7 @@ mod tests {
                 },
             ],
             root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: vec![FragmentEdge {
                 source_fragment_id: 1,
                 target_fragment_id: 0,
@@ -5406,6 +5597,7 @@ mod tests {
                 },
             ],
             root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: vec![FragmentEdge {
                 source_fragment_id: 1,
                 target_fragment_id: 0,
@@ -5483,6 +5675,7 @@ mod tests {
                 },
             ],
             root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: vec![FragmentEdge {
                 source_fragment_id: 1,
                 target_fragment_id: 0,
@@ -5542,6 +5735,7 @@ mod tests {
                 cte_exchange_nodes: Vec::new(),
             }],
             root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: Vec::new(),
         }
     }

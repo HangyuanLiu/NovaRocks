@@ -903,6 +903,7 @@ mod tests {
 
     use super::*;
     use crate::connector::ConnectorRegistry;
+    use crate::runtime_filter::model::graph::RuntimeFilterGraph;
     use crate::sql::analysis::cte::CteId;
     use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, TypedExpr};
     use crate::sql::catalog::{CatalogProvider, IcebergDataFileBinding, ScanSource, TableDef};
@@ -985,6 +986,7 @@ mod tests {
         let plan = DistributedPlan {
             fragments,
             root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: Vec::new(),
         };
 
@@ -1295,6 +1297,7 @@ mod tests {
                 cte_exchange_nodes: Vec::new(),
             }],
             root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: Vec::new(),
         }
     }
@@ -2047,6 +2050,7 @@ mod tests {
         DistributedPlan {
             fragments: vec![producer_fragment, consumer_fragment],
             root_fragment_id: consumer_fragment_id,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: vec![FragmentEdge {
                 source_fragment_id: producer_fragment_id,
                 target_fragment_id: consumer_fragment_id,
@@ -2181,6 +2185,7 @@ mod tests {
                 cte_exchange_nodes: Vec::new(),
             }],
             root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: Vec::new(),
         };
         let mut branch =
@@ -2497,6 +2502,7 @@ mod tests {
         let plan = DistributedPlan {
             fragments: vec![fragment],
             root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: Vec::new(),
         };
 
@@ -2625,6 +2631,7 @@ mod tests {
         let dp = DistributedPlan {
             fragments: vec![producer_fragment, consumer_fragment],
             root_fragment_id: consumer_fragment_id,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: vec![FragmentEdge {
                 source_fragment_id: producer_fragment_id,
                 target_fragment_id: consumer_fragment_id,

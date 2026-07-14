@@ -1726,13 +1726,13 @@ mod pr3_tests {
 
     #[tokio::test]
     async fn report_exec_status_updates_registered_write_coordinator() {
-        let mut guard = crate::runtime::write_coordinator::write_registry_test_guard();
+        let mut guard = crate::coordinator::write::write_registry_test_guard();
         let query = id(701, 801);
         let finst = id(702, 802);
         guard
             .register_query(
                 query,
-                vec![crate::runtime::write_coordinator::WriterKey {
+                vec![crate::coordinator::write::report::WriterKey {
                     query_id: query,
                     fragment_instance_id: finst,
                     backend_num: 0,
@@ -1755,14 +1755,14 @@ mod pr3_tests {
 
     #[tokio::test]
     async fn report_exec_status_ignores_non_writer_ok_for_registered_write_query() {
-        let mut guard = crate::runtime::write_coordinator::write_registry_test_guard();
+        let mut guard = crate::coordinator::write::write_registry_test_guard();
         let query = id(711, 811);
         let writer_finst = id(712, 812);
         let ordinary_finst = id(713, 813);
         let coord = guard
             .register_query(
                 query,
-                vec![crate::runtime::write_coordinator::WriterKey {
+                vec![crate::coordinator::write::report::WriterKey {
                     query_id: query,
                     fragment_instance_id: writer_finst,
                     backend_num: 0,
@@ -1805,14 +1805,14 @@ mod pr3_tests {
 
     #[tokio::test]
     async fn report_exec_status_rejects_unknown_writer_with_write_metadata() {
-        let mut guard = crate::runtime::write_coordinator::write_registry_test_guard();
+        let mut guard = crate::coordinator::write::write_registry_test_guard();
         let query = id(714, 814);
         let writer_finst = id(715, 815);
         let unknown_writer_finst = id(716, 816);
         let coord = guard
             .register_query(
                 query,
-                vec![crate::runtime::write_coordinator::WriterKey {
+                vec![crate::coordinator::write::report::WriterKey {
                     query_id: query,
                     fragment_instance_id: writer_finst,
                     backend_num: 0,
@@ -1844,14 +1844,14 @@ mod pr3_tests {
 
     #[tokio::test]
     async fn report_exec_status_non_writer_error_fails_registered_write_query() {
-        let mut guard = crate::runtime::write_coordinator::write_registry_test_guard();
+        let mut guard = crate::coordinator::write::write_registry_test_guard();
         let query = id(721, 821);
         let writer_finst = id(722, 822);
         let ordinary_finst = id(723, 823);
         let coord = guard
             .register_query(
                 query,
-                vec![crate::runtime::write_coordinator::WriterKey {
+                vec![crate::coordinator::write::report::WriterKey {
                     query_id: query,
                     fragment_instance_id: writer_finst,
                     backend_num: 0,
@@ -1881,7 +1881,7 @@ mod pr3_tests {
 
     #[tokio::test]
     async fn report_exec_status_query_gone_returns_terminal_code() {
-        let _guard = crate::runtime::write_coordinator::write_registry_test_guard();
+        let _guard = crate::coordinator::write::write_registry_test_guard();
         let query = id(801, 901);
         let finst = id(802, 902);
         let report = write_report(query, finst);
@@ -1912,7 +1912,7 @@ mod pr3_tests {
         use crate::runtime::query_context::{QueryId, query_context_manager};
         use crate::runtime::result_buffer::{self, FetchErrorKind, TryFetchResult};
 
-        let _guard = crate::runtime::write_coordinator::write_registry_test_guard();
+        let _guard = crate::coordinator::write::write_registry_test_guard();
         let query = id(811, 911);
         let finst = id(812, 912);
         let query_id = QueryId {

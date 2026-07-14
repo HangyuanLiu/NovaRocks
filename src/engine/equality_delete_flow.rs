@@ -33,6 +33,7 @@ use crate::connector::iceberg::commit::{
     ensure_equality_delete_single_partition_spec,
 };
 use crate::coordinator::execution::CoordinatedQueryResult;
+use crate::coordinator::write::report::WriteCommitInput;
 use crate::engine::backend_resolver::resolve_existing_table_target;
 use crate::engine::parquet::{parse_date_string_to_days, parse_datetime_string_to_micros};
 use crate::engine::statement::AddEqualityDeleteStmt;
@@ -43,7 +44,6 @@ use crate::engine::write_transaction::{
 };
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
-use crate::runtime::write_coordinator::WriteCommitInput;
 use crate::sql::catalog::ColumnDef;
 use crate::sql::parser::ast::Literal;
 use crate::sql::planner::distributed::write::sink::{IcebergWriteSinkMode, IcebergWriteSinkSpec};

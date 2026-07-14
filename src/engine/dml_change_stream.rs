@@ -888,6 +888,7 @@ fn output_ordinal_by_name(
 #[cfg(test)]
 mod native_mutation_tests {
     use super::*;
+    use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 
     struct EmptyCatalog;
 
@@ -1004,6 +1005,7 @@ mod native_mutation_tests {
             }],
             root_fragment_id: 0,
             edges: Vec::new(),
+            runtime_filter_graph: RuntimeFilterGraph::default(),
         }
     }
 
@@ -1538,7 +1540,7 @@ mod tests {
         let execution = DmlChangeStreamWriteExecution {
             result: CoordinatedQueryResult {
                 query_result: crate::runtime::query_result::QueryResult::empty(),
-                write_commit: Some(crate::runtime::write_coordinator::WriteCommitInput {
+                write_commit: Some(crate::coordinator::write::report::WriteCommitInput {
                     write_id: crate::common::types::UniqueId { hi: 1, lo: 2 },
                     writers: Vec::new(),
                 }),
@@ -1555,8 +1557,8 @@ mod tests {
         assert!(execution.commit_plan.is_empty());
     }
 
-    fn empty_writer_commit_for_test() -> crate::runtime::write_coordinator::WriteCommitInput {
-        crate::runtime::write_coordinator::WriteCommitInput {
+    fn empty_writer_commit_for_test() -> crate::coordinator::write::report::WriteCommitInput {
+        crate::coordinator::write::report::WriteCommitInput {
             write_id: crate::common::types::UniqueId { hi: 1, lo: 2 },
             writers: Vec::new(),
         }

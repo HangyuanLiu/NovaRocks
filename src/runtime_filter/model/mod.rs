@@ -15,10 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod dispatch;
-pub(crate) mod execution;
-pub(crate) mod ports;
-pub(crate) mod profile;
-pub(crate) mod report;
-pub(crate) mod scheduler;
-pub(crate) mod write;
+pub(crate) mod contract;
+pub(crate) mod coverage;
+pub(crate) mod graph;
+pub(crate) mod validation;

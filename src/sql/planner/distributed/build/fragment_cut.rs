@@ -18,6 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
@@ -90,6 +91,7 @@ pub(super) fn cut(plan: &PhysicalPlanNode) -> Result<FragmentCutResult, String> 
             fragments,
             root_fragment_id,
             edges: builder.edges,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
         },
         bindings,
     })

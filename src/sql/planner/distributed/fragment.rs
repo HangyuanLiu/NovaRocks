@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
@@ -139,4 +140,7 @@ pub(crate) struct DistributedPlan {
     pub fragments: Vec<PlanFragment>,
     pub root_fragment_id: FragmentId,
     pub edges: Vec<FragmentEdge>,
+    // RFD-5A will populate and consume this slot; remove the allowance at that cutover.
+    #[allow(dead_code)]
+    pub runtime_filter_graph: RuntimeFilterGraph,
 }
