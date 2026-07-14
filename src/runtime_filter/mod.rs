@@ -16,6 +16,7 @@
 // under the License.
 
 pub(crate) mod core;
+pub(crate) mod materializer;
 // RFD-3/RFD-5A will consume this staged planner/runtime seam; remove the allowance then.
 #[allow(dead_code)]
 pub(crate) mod model;

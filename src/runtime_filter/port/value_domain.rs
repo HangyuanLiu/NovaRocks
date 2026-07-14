@@ -40,6 +40,12 @@ pub(crate) enum ContributionSizeError {
     SizeOverflow,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IntegralProjectionError {
+    UnsupportedType,
+    ValueOutOfRange,
+}
+
 impl fmt::Display for ContributionSizeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -151,7 +157,7 @@ impl Decimal128Values {
     }
 }
 
-trait CanonicalOutput {
+pub(super) trait CanonicalOutput {
     fn write(&mut self, bytes: &[u8]) -> Result<(), ContributionSizeError>;
 }
 
@@ -416,6 +422,75 @@ impl MembershipValues {
         match self {
             Self::Float32(values) => Some(values.iter().map(|value| value.0).collect()),
             _ => None,
+        }
+    }
+
+    pub(crate) fn canonical_encoded_len(&self) -> Result<usize, ContributionSizeError> {
+        let mut output = SizeOutput::default();
+        self.encode_canonical(&mut output)?;
+        Ok(output.0)
+    }
+
+    pub(crate) fn encode_canonical_into(
+        &self,
+        output: &mut Vec<u8>,
+    ) -> Result<(), ContributionSizeError> {
+        struct VecOutput<'a>(&'a mut Vec<u8>);
+        impl CanonicalOutput for VecOutput<'_> {
+            fn write(&mut self, bytes: &[u8]) -> Result<(), ContributionSizeError> {
+                self.0
+                    .try_reserve(bytes.len())
+                    .map_err(|_| ContributionSizeError::SizeOverflow)?;
+                self.0.extend_from_slice(bytes);
+                Ok(())
+            }
+        }
+        self.encode_canonical(&mut VecOutput(output))
+    }
+
+    pub(crate) fn visit_lossless_i64(
+        &self,
+        mut visit: impl FnMut(i64),
+    ) -> Result<(), IntegralProjectionError> {
+        macro_rules! visit_values {
+            ($values:expr) => {{
+                for value in $values {
+                    visit(i64::from(*value));
+                }
+                Ok(())
+            }};
+        }
+        match self {
+            Self::Boolean(values) => {
+                for value in values {
+                    visit(i64::from(*value));
+                }
+                Ok(())
+            }
+            Self::Int8(values) => visit_values!(values),
+            Self::Int16(values) => visit_values!(values),
+            Self::Int32(values) | Self::Date32(values) => visit_values!(values),
+            Self::Int64(values) => {
+                for value in values {
+                    visit(*value);
+                }
+                Ok(())
+            }
+            Self::Decimal128(values) if values.precision() <= 18 => {
+                for value in values.values() {
+                    visit(
+                        i64::try_from(*value)
+                            .map_err(|_| IntegralProjectionError::ValueOutOfRange)?,
+                    );
+                }
+                Ok(())
+            }
+            Self::LargeInt(_)
+            | Self::Float32(_)
+            | Self::Float64(_)
+            | Self::Utf8(_)
+            | Self::Timestamp { .. }
+            | Self::Decimal128(_) => Err(IntegralProjectionError::UnsupportedType),
         }
     }
 
@@ -778,8 +853,8 @@ mod tests {
     use arrow::datatypes::{DataType, TimeUnit};
 
     use super::{
-        Decimal128UnionError, Decimal128ValidationError, MembershipUnionError, MembershipValues,
-        ReducedMembershipDomain, ValueDomainDelta,
+        Decimal128UnionError, Decimal128ValidationError, IntegralProjectionError,
+        MembershipUnionError, MembershipValues, ReducedMembershipDomain, ValueDomainDelta,
     };
     use crate::runtime_filter::model::contract::NullSemantics;
 
@@ -887,6 +962,32 @@ mod tests {
             assert!(delta.estimated_contribution_bytes().unwrap() > 0);
             assert!(fingerprints.insert(delta.fingerprint().bytes()));
         }
+    }
+
+    #[test]
+    fn lossless_integral_projection_is_explicitly_whitelisted() {
+        let mut projected = Vec::new();
+        MembershipValues::date32([-2, 3])
+            .visit_lossless_i64(|value| projected.push(value))
+            .unwrap();
+        assert_eq!(projected, [-2, 3]);
+
+        let mut decimal = Vec::new();
+        MembershipValues::decimal128(18, 2, [-123, 456])
+            .unwrap()
+            .visit_lossless_i64(|value| decimal.push(value))
+            .unwrap();
+        assert_eq!(decimal, [-123, 456]);
+        assert_eq!(
+            MembershipValues::utf8(["7"]).visit_lossless_i64(|_| {}),
+            Err(IntegralProjectionError::UnsupportedType)
+        );
+        assert_eq!(
+            MembershipValues::decimal128(19, 0, [1])
+                .unwrap()
+                .visit_lossless_i64(|_| {}),
+            Err(IntegralProjectionError::UnsupportedType)
+        );
     }
 
     #[test]

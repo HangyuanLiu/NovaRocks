@@ -25,6 +25,7 @@ use crate::runtime_filter::model::contract::{
 };
 use crate::runtime_filter::model::coverage::Coverage;
 
+use super::artifact::ConsumerArtifactProfile;
 use super::identity::{DeploymentEpoch, RouteEdgeId, RuntimeFilterParticipantId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,20 +73,42 @@ impl ProducerDeployment {
 pub(crate) struct ConsumerDeployment {
     activation: ConsumerActivation,
     capabilities: BTreeSet<ArtifactCapability>,
+    artifact_profile: ConsumerArtifactProfile,
     loopback_route_edge_id: RouteEdgeId,
     expected_fragment_instances: BTreeSet<UniqueId>,
 }
 
 impl ConsumerDeployment {
+    #[cfg(test)]
     pub(crate) fn new(
         activation: ConsumerActivation,
+        mut capabilities: BTreeSet<ArtifactCapability>,
+        loopback_route_edge_id: RouteEdgeId,
+        expected_fragment_instances: BTreeSet<UniqueId>,
+    ) -> Self {
+        if capabilities.contains(&ArtifactCapability::Membership) {
+            capabilities.insert(ArtifactCapability::EmptyDomain);
+        }
+        Self::with_profile(
+            activation,
+            capabilities,
+            ConsumerArtifactProfile::m1_test_default(),
+            loopback_route_edge_id,
+            expected_fragment_instances,
+        )
+    }
+
+    pub(crate) fn with_profile(
+        activation: ConsumerActivation,
         capabilities: BTreeSet<ArtifactCapability>,
+        artifact_profile: ConsumerArtifactProfile,
         loopback_route_edge_id: RouteEdgeId,
         expected_fragment_instances: BTreeSet<UniqueId>,
     ) -> Self {
         Self {
             activation,
             capabilities,
+            artifact_profile,
             loopback_route_edge_id,
             expected_fragment_instances,
         }
@@ -97,6 +120,10 @@ impl ConsumerDeployment {
 
     pub(crate) const fn capabilities(&self) -> &BTreeSet<ArtifactCapability> {
         &self.capabilities
+    }
+
+    pub(crate) const fn artifact_profile(&self) -> &ConsumerArtifactProfile {
+        &self.artifact_profile
     }
 
     pub(crate) const fn loopback_route_edge_id(&self) -> RouteEdgeId {

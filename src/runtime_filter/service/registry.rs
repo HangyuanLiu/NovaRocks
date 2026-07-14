@@ -27,6 +27,7 @@ use crate::runtime_filter::model::contract::{
     RuntimeFilterLogicalDomain,
 };
 use crate::runtime_filter::model::coverage::Coverage;
+use crate::runtime_filter::port::artifact::{ArtifactKind, ConsumerProfileId};
 use crate::runtime_filter::port::events::{
     RouteEventIdentity, RuntimeFilterEvent, RuntimeFilterEventIdentity, RuntimeFilterEventSink,
 };
@@ -539,7 +540,7 @@ fn compare_installed(
     })
 }
 
-fn validate_view(view: &RuntimeFilterInstallView) -> Result<(), InstallContractError> {
+fn validate_view<'a>(view: &'a RuntimeFilterInstallView) -> Result<(), InstallContractError> {
     if view.epoch().get() == 0 {
         return Err(install_error(
             InstallContractErrorKind::InvalidEpoch,
@@ -577,8 +578,9 @@ fn validate_view(view: &RuntimeFilterInstallView) -> Result<(), InstallContractE
         }
     }
 
+    let mut profile_encodings = BTreeMap::<ConsumerProfileId, &'a [u8]>::new();
     for channel in view.channels().values() {
-        validate_channel(channel)?;
+        validate_channel(channel, &mut profile_encodings)?;
     }
     Ok(())
 }
@@ -660,8 +662,15 @@ fn build_routing(
     Ok(build)
 }
 
-fn validate_channel(channel: &CompleteOnceChannelDeployment) -> Result<(), InstallContractError> {
-    let RuntimeFilterLogicalDomain::Membership { value_type, .. } = channel.logical_domain() else {
+fn validate_channel<'a>(
+    channel: &'a CompleteOnceChannelDeployment,
+    profile_encodings: &mut BTreeMap<ConsumerProfileId, &'a [u8]>,
+) -> Result<(), InstallContractError> {
+    let RuntimeFilterLogicalDomain::Membership {
+        value_type,
+        null_semantics,
+    } = channel.logical_domain()
+    else {
         return Err(install_error(
             InstallContractErrorKind::UnsupportedChannelContract,
             "M1 supports only Membership logical domains",
@@ -752,17 +761,85 @@ fn validate_channel(channel: &CompleteOnceChannelDeployment) -> Result<(), Insta
                 "M1 consumers must use BlockingSnapshot activation",
             ));
         }
-        if !consumer
-            .capabilities()
-            .contains(&ArtifactCapability::Membership)
+        let capabilities = consumer.capabilities();
+        let profile = consumer.artifact_profile();
+        if !capabilities.contains(&ArtifactCapability::Membership)
+            || !capabilities.contains(&ArtifactCapability::EmptyDomain)
         {
             return Err(install_error(
                 InstallContractErrorKind::MissingMembershipCapability,
-                "M1 consumers must support Membership artifacts",
+                "M2 Membership consumers must declare Membership and EmptyDomain semantics",
+            ));
+        }
+        if !profile.accepts(ArtifactKind::EmptyDomain) {
+            return Err(install_error(
+                InstallContractErrorKind::UnsupportedChannelContract,
+                "M2 Membership profile must accept EmptyDomain",
+            ));
+        }
+        let value_set = profile.accepts(ArtifactKind::ValueSet);
+        let bitset = profile.accepts(ArtifactKind::Bitset) && bitset_schema_is_feasible(value_type);
+        let bloom = profile.accepts(ArtifactKind::Bloom);
+        if !value_set && !bitset && !bloom {
+            return Err(install_error(
+                InstallContractErrorKind::UnsupportedChannelContract,
+                "M2 Membership profile has no statically feasible membership representation",
+            ));
+        }
+        if matches!(
+            null_semantics,
+            crate::runtime_filter::model::contract::NullSemantics::NullSafeEqual
+        ) && !value_set
+        {
+            return Err(install_error(
+                InstallContractErrorKind::UnsupportedChannelContract,
+                "NullSafeEqual Membership profile must accept ValueSet",
+            ));
+        }
+        if profile.accepts(ArtifactKind::Range)
+            && !capabilities.contains(&ArtifactCapability::OrderedRange)
+        {
+            return Err(install_error(
+                InstallContractErrorKind::UnsupportedChannelContract,
+                "Range physical kind requires OrderedRange semantic capability",
+            ));
+        }
+        if profile.accepted_kinds().iter().any(|kind| {
+            matches!(
+                kind,
+                ArtifactKind::ValueSet | ArtifactKind::Bloom | ArtifactKind::Bitset
+            )
+        }) && !capabilities.contains(&ArtifactCapability::Membership)
+        {
+            return Err(install_error(
+                InstallContractErrorKind::UnsupportedChannelContract,
+                "membership physical kinds require Membership semantic capability",
+            ));
+        }
+        if let Some(existing) = profile_encodings.insert(profile.id(), profile.canonical_bytes())
+            && existing != profile.canonical_bytes()
+        {
+            return Err(install_error(
+                InstallContractErrorKind::ConflictingDeployment,
+                "consumer profile digest collision carried different canonical bytes",
             ));
         }
     }
     Ok(())
+}
+
+fn bitset_schema_is_feasible(data_type: &arrow::datatypes::DataType) -> bool {
+    use arrow::datatypes::DataType;
+    matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Date32
+            | DataType::Decimal128(1..=18, _)
+    )
 }
 
 fn validate_coverage(
@@ -923,6 +1000,9 @@ mod tests {
     use crate::common::types::UniqueId;
     use crate::runtime_filter::model::contract::*;
     use crate::runtime_filter::model::coverage::Coverage;
+    use crate::runtime_filter::port::artifact::{
+        ArtifactKind, ConsumerArtifactProfile, ConsumerProfileId,
+    };
     use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
     use crate::runtime_filter::port::identity::*;
     use crate::runtime_filter::port::install::*;
@@ -1199,6 +1279,38 @@ mod tests {
         )
     }
 
+    fn with_consumer_contract(
+        base: CompleteOnceChannelDeployment,
+        logical_domain: RuntimeFilterLogicalDomain,
+        capabilities: BTreeSet<ArtifactCapability>,
+        profile: ConsumerArtifactProfile,
+    ) -> CompleteOnceChannelDeployment {
+        let consumer = base.consumers().values().next().unwrap();
+        CompleteOnceChannelDeployment::new(
+            base.channel_id(),
+            logical_domain,
+            base.lifecycle(),
+            base.availability_coverage().clone(),
+            base.terminal_coverage().clone(),
+            base.reduction_requirement(),
+            base.allowed_contribution_kinds().clone(),
+            base.completion_requirement(),
+            base.policy(),
+            base.core_budget(),
+            base.producers().clone(),
+            BTreeMap::from([(
+                *base.consumers().keys().next().unwrap(),
+                ConsumerDeployment::with_profile(
+                    consumer.activation(),
+                    capabilities,
+                    profile,
+                    consumer.loopback_route_edge_id(),
+                    consumer.expected_fragment_instances().clone(),
+                ),
+            )]),
+        )
+    }
+
     fn registry() -> DeploymentRegistry {
         let started = Instant::now();
         DeploymentRegistry::new(
@@ -1222,6 +1334,142 @@ mod tests {
             .unwrap();
         assert_eq!(result.outcome(), InstallOutcome::Installed);
         assert_eq!(registry.installed_epoch(), Some(DeploymentEpoch::new(9)));
+    }
+
+    #[test]
+    fn install_rejects_membership_without_empty_domain_semantics_or_kind() {
+        let base = channel(1, 10, 20, 30, 40);
+        let logical_domain = base.logical_domain().clone();
+        let missing_semantic = with_consumer_contract(
+            base,
+            logical_domain,
+            BTreeSet::from([ArtifactCapability::Membership]),
+            ConsumerArtifactProfile::new(
+                BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
+                None,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            registry()
+                .install(view([(1, missing_semantic)]))
+                .unwrap_err()
+                .kind(),
+            InstallContractErrorKind::MissingMembershipCapability
+        );
+
+        let base = channel(1, 10, 20, 30, 40);
+        let logical_domain = base.logical_domain().clone();
+        let missing_kind = with_consumer_contract(
+            base,
+            logical_domain,
+            BTreeSet::from([
+                ArtifactCapability::Membership,
+                ArtifactCapability::EmptyDomain,
+            ]),
+            ConsumerArtifactProfile::new(BTreeSet::from([ArtifactKind::ValueSet]), None).unwrap(),
+        );
+        assert_eq!(
+            registry()
+                .install(view([(1, missing_kind)]))
+                .unwrap_err()
+                .kind(),
+            InstallContractErrorKind::UnsupportedChannelContract
+        );
+    }
+
+    #[test]
+    fn install_rejects_schema_and_null_incompatible_profiles() {
+        let base = channel(1, 10, 20, 30, 40);
+        let bitset_only = with_consumer_contract(
+            base,
+            RuntimeFilterLogicalDomain::Membership {
+                value_type: DataType::Utf8,
+                null_semantics: NullSemantics::NeverMatches,
+            },
+            BTreeSet::from([
+                ArtifactCapability::Membership,
+                ArtifactCapability::EmptyDomain,
+            ]),
+            ConsumerArtifactProfile::new(
+                BTreeSet::from([ArtifactKind::Bitset, ArtifactKind::EmptyDomain]),
+                None,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            registry()
+                .install(view([(1, bitset_only)]))
+                .unwrap_err()
+                .kind(),
+            InstallContractErrorKind::UnsupportedChannelContract
+        );
+
+        let base = channel(1, 10, 20, 30, 40);
+        let null_without_value_set = with_consumer_contract(
+            base,
+            RuntimeFilterLogicalDomain::Membership {
+                value_type: DataType::Int64,
+                null_semantics: NullSemantics::NullSafeEqual,
+            },
+            BTreeSet::from([
+                ArtifactCapability::Membership,
+                ArtifactCapability::EmptyDomain,
+            ]),
+            ConsumerArtifactProfile::new(
+                BTreeSet::from([ArtifactKind::Bitset, ArtifactKind::EmptyDomain]),
+                None,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            registry()
+                .install(view([(1, null_without_value_set)]))
+                .unwrap_err()
+                .kind(),
+            InstallContractErrorKind::UnsupportedChannelContract
+        );
+    }
+
+    #[test]
+    fn install_rejects_profile_digest_collision_across_channels() {
+        let collision_id = ConsumerProfileId::for_test([9; 32]);
+        let semantics = BTreeSet::from([
+            ArtifactCapability::Membership,
+            ArtifactCapability::EmptyDomain,
+        ]);
+        let first_base = channel(1, 10, 20, 30, 40);
+        let first = with_consumer_contract(
+            first_base.clone(),
+            first_base.logical_domain().clone(),
+            semantics.clone(),
+            ConsumerArtifactProfile::new(
+                BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
+                None,
+            )
+            .unwrap()
+            .with_test_identity(collision_id),
+        );
+        let second_base = channel(2, 11, 21, 31, 41);
+        let second = with_consumer_contract(
+            second_base.clone(),
+            second_base.logical_domain().clone(),
+            semantics,
+            ConsumerArtifactProfile::new(
+                BTreeSet::from([ArtifactKind::Bitset, ArtifactKind::EmptyDomain]),
+                None,
+            )
+            .unwrap()
+            .with_test_identity(collision_id),
+        );
+
+        assert_eq!(
+            registry()
+                .install(view([(1, first), (2, second)]))
+                .unwrap_err()
+                .kind(),
+            InstallContractErrorKind::ConflictingDeployment
+        );
     }
 
     #[test]
