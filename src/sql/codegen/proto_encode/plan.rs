@@ -3388,6 +3388,11 @@ mod tests {
         second_target.fragment_id = 2;
         second_target.root.fragment_id = 2;
         second_target.root.node_id = 21;
+        // The clone inherits the root consumer's `Result` sink, but fragment 2 is
+        // a non-root fragment; seal only accepts a noop or Iceberg-write sink
+        // there. This fixture exists to exercise runtime-filter encoding, not
+        // sink placement, so give it a structurally valid noop sink.
+        second_target.sink = DataSink::Noop;
         source.fragments_mut().push(second_target);
         let build_expr = TypedExpr {
             kind: ExprKind::ColumnRef {

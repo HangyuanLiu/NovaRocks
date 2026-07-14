@@ -663,7 +663,7 @@ mod tests {
             data_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
             output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
             sink: crate::sql::planner::distributed::DataSink::Result,
-            output_exprs: Some(vec![column_expr(10, "v", DataType::Int64)]),
+            output_exprs: None,
             output_columns: output,
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
@@ -712,7 +712,10 @@ mod tests {
             .iter()
             .find(|fragment| fragment.fragment_id == 1)
             .expect("root fragment");
-        assert_eq!(root_fragment.output_exprs.len(), 1);
+        // Sealed plans never carry fragment `output_exprs` (rejected by
+        // structural validation), so the round-trip only covers the shapes a
+        // production plan can actually hold: fragments, edges, partitions, and
+        // the exchange receiver.
         let root = root_fragment.root.as_ref().expect("root node");
         let Some(crate::proto::plan::distributed_node::Payload::Exchange(exchange)) =
             root.payload.as_ref()
