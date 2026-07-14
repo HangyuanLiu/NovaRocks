@@ -5350,6 +5350,36 @@ mod tests {
             .ok_or_else(|| "expected projection".to_string())
     }
 
+    fn analyze_manually_constructed_scalar_function(
+        name: &str,
+        sql: &str,
+    ) -> Result<crate::sql::analysis::TypedExpr, String> {
+        let mut stmt = crate::sql::parser::parse_sql_raw(sql)?;
+        let sqlparser::ast::Statement::Query(query) = &mut stmt else {
+            return Err("expected query".to_string());
+        };
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else {
+            return Err("expected select".to_string());
+        };
+        let Some(sqlparser::ast::SelectItem::UnnamedExpr(sqlparser::ast::Expr::Function(func))) =
+            select.projection.first_mut()
+        else {
+            return Err("expected ordinary scalar function".to_string());
+        };
+        func.name = sqlparser::ast::ObjectName::from(sqlparser::ast::Ident::new(name));
+
+        let (resolved, _registry, _factory) = analyze(query, &EmptyCatalog, "default")?;
+        let QueryBody::Select(select) = resolved.body else {
+            return Err("expected select".to_string());
+        };
+        select
+            .projection
+            .into_iter()
+            .next()
+            .map(|item| item.expr)
+            .ok_or_else(|| "expected projection".to_string())
+    }
+
     fn assert_substring_int32_arguments(sql: &str, expected_arity: usize) {
         let expr = analyze_projection_expr(sql).expect("substring should analyze");
         let crate::sql::analysis::ExprKind::FunctionCall { name, args, .. } = expr.kind else {
@@ -5460,6 +5490,22 @@ mod tests {
     fn substring_special_syntax_uses_the_same_binding() {
         assert_substring_int32_arguments("select substring('STARROCKS' from 2 for 3)", 3);
         assert_substring_int32_arguments("select substring('STARROCKS' from 2)", 2);
+    }
+
+    #[test]
+    fn substring_and_substr_reject_wrong_arity_during_analysis() {
+        for name in ["substring", "substr"] {
+            let err = analyze_projection_expr(&format!("select {name}('x')"))
+                .expect_err("wrong arity must fail during analysis");
+            assert!(err.contains("No matching function"), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn ordinary_function_ast_enforces_substring_arity_binding() {
+        let err = analyze_manually_constructed_scalar_function("substring", "select concat('x')")
+            .expect_err("ordinary Expr::Function must reach the scalar binder");
+        assert!(err.contains("No matching function"), "{err}");
     }
 
     #[test]

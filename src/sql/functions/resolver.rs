@@ -152,9 +152,21 @@ pub(crate) fn resolve_scalar_function_signature(
 }
 
 fn binding_enforced_for_arity(candidates: &[Signature], n_args: usize) -> bool {
-    candidates
-        .iter()
-        .any(|sig| check_arity(sig, n_args) && sig.argument_binding.is_enforced())
+    let mut has_relevant_candidate = false;
+    let mut binding_enforced = false;
+
+    for signature in candidates.iter().filter(|sig| check_arity(sig, n_args)) {
+        has_relevant_candidate = true;
+        binding_enforced |= signature.argument_binding.is_enforced();
+    }
+
+    if has_relevant_candidate {
+        binding_enforced
+    } else {
+        candidates
+            .iter()
+            .all(|signature| signature.argument_binding.is_enforced())
+    }
 }
 
 /// Resolve a scalar function call to its return type.
@@ -463,6 +475,20 @@ mod tests {
     fn resolve_substring_reports_enforced_no_match() {
         let err = resolve_scalar_function_signature("substring", &[DataType::Utf8, DataType::Utf8])
             .expect_err("a string offset must not fall through to legacy inference");
+
+        assert!(matches!(
+            err,
+            ResolveError::NoMatchingSignature {
+                candidates: 2,
+                binding_enforced: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn resolve_substring_wrong_arity_reports_enforced_no_match() {
+        let err = resolve_scalar_function_signature("substring", &[DataType::Utf8])
+            .expect_err("an enforced function with no matching arity must not fall back");
 
         assert!(matches!(
             err,
