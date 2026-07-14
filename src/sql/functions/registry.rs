@@ -228,27 +228,30 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
         );
     }
 
-    // substring(str, start) / substring(str, start, length) — overloaded
-    for name in [
-        "substr",
-        "substring",
-        "left",
-        "right",
-        "strleft",
-        "strright",
-    ] {
+    // substring(str, start) / substring(str, start, length) — overloaded.
+    for name in ["substr", "substring"] {
         add(
             m,
             name,
-            Signature::new(vec![TypeSpec::Utf8, TypeSpec::Int64], TypeSpec::Utf8),
+            Signature::new(vec![TypeSpec::Utf8, TypeSpec::Int32], TypeSpec::Utf8)
+                .with_argument_coercion(),
         );
         add(
             m,
             name,
             Signature::new(
-                vec![TypeSpec::Utf8, TypeSpec::Int64, TypeSpec::Int64],
+                vec![TypeSpec::Utf8, TypeSpec::Int32, TypeSpec::Int32],
                 TypeSpec::Utf8,
-            ),
+            )
+            .with_argument_coercion(),
+        );
+    }
+
+    for name in ["left", "right", "strleft", "strright"] {
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::Utf8, TypeSpec::Int64], TypeSpec::Utf8),
         );
     }
 

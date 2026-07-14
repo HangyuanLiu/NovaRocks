@@ -86,3 +86,19 @@ select SUBSTRING('', v, id) from t1;
 -- query 16
 USE ${case_db};
 select SUBSTRING('STARROCKS', v, id) from t1;
+
+-- query 17
+-- @result_contains=TAR
+select SUBSTRING('STARROCKS' FROM 2 FOR 3) AS substring_result;
+
+-- query 18
+-- @result_contains=ROCKS
+select SUBSTRING('STARROCKS' FROM 5) AS substring_result;
+
+-- query 19
+-- @expect_error=Cast argument 9223372036854775807 to int type failed
+select SUBSTRING('' FROM 9223372036854775807);
+
+-- query 20
+-- @expect_error=Cast argument -9223372036854775807 to int type failed
+select SUBSTRING('' FROM -9223372036854775807 FOR 1);
