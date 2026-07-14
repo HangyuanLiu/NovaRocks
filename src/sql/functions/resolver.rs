@@ -417,8 +417,12 @@ mod tests {
         let actual = DataType::Decimal128(18, 4);
         let signature = Signature::new(vec![TypeSpec::AnyDecimal128], TypeSpec::Boolean);
 
-        let resolved = resolved_signature(&signature, &[actual.clone()], &Bindings::default())
-            .expect("AnyDecimal128 argument targets should preserve precision and scale");
+        let resolved = resolved_signature(
+            &signature,
+            std::slice::from_ref(&actual),
+            &Bindings::default(),
+        )
+        .expect("AnyDecimal128 argument targets should preserve precision and scale");
 
         assert_eq!(resolved.argument_types, vec![actual]);
     }

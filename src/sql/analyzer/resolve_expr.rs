@@ -3618,7 +3618,12 @@ fn bind_scalar_function_call(
         .collect::<Vec<_>>();
 
     match crate::sql::functions::resolve_scalar_function_signature(name, &arg_types) {
-        Ok(resolved) if resolved.enforce_argument_binding => {
+        Ok(
+            resolved @ crate::sql::functions::ResolvedScalarFunction {
+                enforce_argument_binding: true,
+                ..
+            },
+        ) => {
             let args = args
                 .into_iter()
                 .zip(resolved.argument_types.iter())
