@@ -30,8 +30,10 @@
 //!    to bind. The first signature whose every spec unifies wins; its
 //!    parameter and return types are then realised by substituting the
 //!    bindings.
-//! 3. **Concrete cast match.** Only signatures that opt in to argument
-//!    coercion can use an explicit anchor cast.
+//! 3. **Limited concrete cast match.** Only signatures that opt in to
+//!    argument coercion can use an explicit anchor cast. The current policy
+//!    only accepts integral or NULL arguments for an `Int32` target; it is
+//!    not a general implicit-cast pass.
 //! 4. **Polymorphic widening.** Signatures that opt in to widening can
 //!    merge repeated `Any(name)` bindings through `wider_type`.
 
@@ -43,14 +45,19 @@ use super::signature::{BindMode, Bindings, Signature, TypeSpec, anchor_matches, 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResolvedScalarFunction {
     pub(crate) return_type: DataType,
+    /// Instantiated target type for each argument position.
     pub(crate) argument_types: Vec<DataType>,
+    /// When true, callers must bind each argument to `argument_types` before
+    /// continuing with the resolved function.
     pub(crate) enforce_argument_binding: bool,
 }
 
 /// Why a function call could not be resolved against the registry.
 ///
-/// Callers (analyzer / codegen) use this to decide whether to surface an
-/// error or fall back to the legacy hand-written `infer_*` path.
+/// Callers use this to decide whether to surface an error or retain a legacy
+/// hand-written `infer_*` fallback. A caller that supports argument binding
+/// must inspect `NoMatchingSignature::binding_enforced` before taking a
+/// fallback path, so an opt-in signature policy cannot be bypassed.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum ResolveError {
     /// The function name is not registered. The caller should fall back to
@@ -58,13 +65,14 @@ pub(crate) enum ResolveError {
     /// functions.
     UnknownFunction,
     /// The function name is registered but no signature matches the given
-    /// argument types. The caller should also fall back, because cast
-    /// match (which Step A does not implement) might still succeed.
+    /// argument types. A legacy fallback remains available for candidates
+    /// without enforced binding; callers must inspect `binding_enforced`
+    /// before using that fallback for an opt-in candidate.
     NoMatchingSignature {
         /// All registered signatures for this name, for diagnostic output.
         candidates: usize,
-        /// Whether at least one candidate requires callers to bind arguments
-        /// to its resolved target types.
+        /// Whether at least one candidate requires argument binding. Callers
+        /// must check this before applying a legacy fallback.
         binding_enforced: bool,
     },
     /// The signature matched but its return type referenced an unbound
@@ -87,9 +95,10 @@ impl std::fmt::Display for ResolveError {
 
 /// Resolve a scalar function call to its instantiated signature.
 ///
-/// Returns `Err(ResolveError::UnknownFunction)` for names not yet
-/// registered, so callers can transparently fall back to the legacy
-/// `infer_*` path during the gradual Step A → Step B migration.
+/// When `enforce_argument_binding` is true, callers must bind each argument
+/// to `argument_types`. `UnknownFunction` still permits the legacy
+/// `infer_*` fallback; callers must inspect `NoMatchingSignature` before
+/// using that fallback for a registered function.
 pub(crate) fn resolve_scalar_function_signature(
     name: &str,
     arg_types: &[DataType],
@@ -112,8 +121,8 @@ pub(crate) fn resolve_scalar_function_signature(
         }
     }
 
-    // Pass 3: concrete casts for signatures that explicitly require the
-    // resulting parameter targets to be enforced by the caller.
+    // Pass 3: limited concrete casts for signatures that explicitly require
+    // the resulting parameter targets to be enforced by the caller.
     for sig in candidates {
         if concrete_cast_matches(sig, arg_types) {
             return resolved_signature(sig, arg_types, &Bindings::default());
@@ -146,8 +155,9 @@ pub(crate) fn resolve_scalar_function_signature(
 
 /// Resolve a scalar function call to its return type.
 ///
-/// This compatibility wrapper preserves the existing resolver API for
-/// callers that do not yet bind arguments to signature targets.
+/// This compatibility wrapper preserves the existing return-type-only API.
+/// It retains the underlying `ResolveError`, so callers using a legacy
+/// fallback can still honor `NoMatchingSignature::binding_enforced`.
 pub(crate) fn resolve_scalar_function(
     name: &str,
     arg_types: &[DataType],
@@ -229,6 +239,8 @@ fn concrete_cast_matches(sig: &Signature, arg_types: &[DataType]) -> bool {
     })
 }
 
+/// Return the target of the resolver's intentionally limited concrete cast.
+/// This is not a general range check or implicit-casting framework.
 fn implicit_anchor_cast_target(spec: &TypeSpec, actual: &DataType) -> Option<DataType> {
     match (spec, actual) {
         (
@@ -398,6 +410,17 @@ mod tests {
             ],
         );
         assert_eq!(r, Ok(DataType::Utf8));
+    }
+
+    #[test]
+    fn resolved_signature_preserves_any_decimal128_argument_precision_and_scale() {
+        let actual = DataType::Decimal128(18, 4);
+        let signature = Signature::new(vec![TypeSpec::AnyDecimal128], TypeSpec::Boolean);
+
+        let resolved = resolved_signature(&signature, &[actual.clone()], &Bindings::default())
+            .expect("AnyDecimal128 argument targets should preserve precision and scale");
+
+        assert_eq!(resolved.argument_types, vec![actual]);
     }
 
     #[test]
