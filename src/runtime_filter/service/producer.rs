@@ -68,14 +68,22 @@ impl ServiceProducerAdapter {
         *self.before_dispatch.lock().unwrap() = Some(hook);
     }
 
-    fn finish(&self, action: crate::runtime_filter::core::channel::ChannelAction) -> SubmitOutcome {
+    fn finish(
+        &self,
+        action: crate::runtime_filter::core::channel::ChannelAction,
+    ) -> Result<SubmitOutcome, RuntimeContractViolation> {
         let outcome = action.outcome();
         #[cfg(test)]
-        if let Some(hook) = self.before_dispatch.lock().unwrap().take() {
+        self.dispatcher
+            .reserve_core_before_hook(self.channel_id, &action);
+        #[cfg(test)]
+        let hook = self.before_dispatch.lock().unwrap().take();
+        #[cfg(test)]
+        if let Some(hook) = hook {
             hook();
         }
-        self.dispatcher.dispatch(self.channel_id, action);
-        outcome
+        self.dispatcher.dispatch(self.channel_id, action)?;
+        Ok(outcome)
     }
 }
 
@@ -98,7 +106,7 @@ impl ProducerAdapter for ServiceProducerAdapter {
                     sequence,
                     &delta,
                 )
-                .map(|action| self.finish(action));
+                .and_then(|action| self.finish(action));
         };
         let Ok(lease) = TemporaryContributionLease::try_new(self.memory_account.clone(), bytes)
         else {
@@ -111,7 +119,7 @@ impl ProducerAdapter for ServiceProducerAdapter {
                     sequence,
                     &delta,
                 )
-                .map(|action| self.finish(action));
+                .and_then(|action| self.finish(action));
         };
         self.channel
             .submit(
@@ -122,7 +130,7 @@ impl ProducerAdapter for ServiceProducerAdapter {
                 delta,
                 lease,
             )
-            .map(|action| self.finish(action))
+            .and_then(|action| self.finish(action))
     }
 
     fn close_partition(
@@ -137,7 +145,7 @@ impl ProducerAdapter for ServiceProducerAdapter {
                 partition_id,
                 terminal_sequence,
             )
-            .map(|action| self.finish(action))
+            .and_then(|action| self.finish(action))
     }
 
     fn fail(
@@ -146,6 +154,6 @@ impl ProducerAdapter for ServiceProducerAdapter {
     ) -> Result<SubmitOutcome, RuntimeContractViolation> {
         self.channel
             .fail_instance(self.binding_id, self.fragment_instance_id, reason)
-            .map(|action| self.finish(action))
+            .and_then(|action| self.finish(action))
     }
 }

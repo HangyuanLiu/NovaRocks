@@ -29,8 +29,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLoc
 use crate::common::types::UniqueId;
 use crate::runtime::profile::RuntimeProfile;
 use crate::runtime_filter::port::events::{
-    ConsumerEventIdentity, ProducerEventIdentity, RouteEventIdentity, RuntimeFilterEvent,
-    RuntimeFilterEventIdentity, RuntimeFilterEventSink,
+    ArtifactMaterializationIdentity, ConsumerEventIdentity, ProducerEventIdentity,
+    RouteEventIdentity, RuntimeFilterEvent, RuntimeFilterEventIdentity, RuntimeFilterEventSink,
 };
 use crate::runtime_filter::port::identity::{
     ContributionIdentity, DeploymentEpoch, RuntimeFilterParticipantId,
@@ -215,6 +215,7 @@ pub(crate) enum RuntimeFilterChannelEventCoordinate {
     Channel(RuntimeFilterEventIdentity),
     Contribution(ContributionIdentity),
     Producer(ProducerEventIdentity),
+    Materialization(ArtifactMaterializationIdentity),
     Route(RouteEventIdentity),
     Consumer(ConsumerEventIdentity),
 }
@@ -242,10 +243,19 @@ impl From<&RuntimeFilterEvent> for RuntimeFilterChannelEventCoordinate {
             | RuntimeFilterEvent::ProducerInstanceFailed { identity, .. } => {
                 Self::Producer(*identity)
             }
+            RuntimeFilterEvent::MaterializationStarted { identity }
+            | RuntimeFilterEvent::ArtifactMaterialized { identity, .. }
+            | RuntimeFilterEvent::ArtifactPublished { identity, .. }
+            | RuntimeFilterEvent::ArtifactPublishStaleSkipped { identity }
+            | RuntimeFilterEvent::ArtifactUnsupported { identity, .. }
+            | RuntimeFilterEvent::ArtifactUnavailable { identity, .. } => {
+                Self::Materialization(*identity)
+            }
             RuntimeFilterEvent::LoopbackDelivered { identity, .. } => Self::Route(*identity),
             RuntimeFilterEvent::SubscriptionAcquired { identity, .. }
             | RuntimeFilterEvent::SubscriptionTimedOut { identity }
             | RuntimeFilterEvent::SubscriptionUnavailable { identity, .. }
+            | RuntimeFilterEvent::SubscriptionUnsupported { identity, .. }
             | RuntimeFilterEvent::SubscriptionCancelled { identity } => Self::Consumer(*identity),
         }
     }

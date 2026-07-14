@@ -65,6 +65,7 @@ pub(crate) enum UnsupportedReason {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UnavailableReason {
     ResourceLimit,
+    MaterializationFailed,
 }
 
 #[derive(Debug)]
@@ -125,6 +126,24 @@ pub(crate) struct MaterializationPlan<'a> {
     leaf_encoded_bytes: usize,
     payload_bytes: usize,
     max_scalar_frame_bytes: usize,
+}
+
+pub(crate) enum MaterializationAdmission<'a> {
+    Ready(AdmittedMaterialization<'a>),
+    Complete(MaterializationOutcome),
+}
+
+pub(crate) struct AdmittedMaterialization<'a> {
+    plan: MaterializationPlan<'a>,
+    _scratch: ArtifactScratchReservation,
+    artifact_footprint: usize,
+    total_footprint: usize,
+    retained: Arc<ArtifactRetention>,
+}
+
+enum PreparationFailure {
+    ResourceLimit,
+    Internal,
 }
 
 pub(crate) struct Materializer;
@@ -272,34 +291,60 @@ impl Materializer {
         scratch_budget: Arc<ArtifactScratchBudget>,
         memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
     ) -> MaterializationOutcome {
-        match &plan.selected {
-            SelectedRepresentation::Unsupported(reason) => {
-                return MaterializationOutcome::Unsupported(*reason);
-            }
-            SelectedRepresentation::ResourceLimit => {
-                return MaterializationOutcome::Unavailable(UnavailableReason::ResourceLimit);
-            }
-            _ => {}
-        }
-        match Self::materialize_selected(plan, retained_budget, scratch_budget, memory_account) {
-            Ok(bundle) => MaterializationOutcome::Published(bundle),
-            Err(()) => MaterializationOutcome::Unavailable(UnavailableReason::ResourceLimit),
+        match Self::admit(plan, retained_budget, scratch_budget, memory_account) {
+            MaterializationAdmission::Complete(outcome) => outcome,
+            MaterializationAdmission::Ready(prepared) => match Self::encode(prepared) {
+                Ok(bundle) => MaterializationOutcome::Published(bundle),
+                Err(()) => {
+                    MaterializationOutcome::Unavailable(UnavailableReason::MaterializationFailed)
+                }
+            },
         }
     }
 
-    fn materialize_selected(
-        plan: MaterializationPlan<'_>,
+    pub(crate) fn admit<'a>(
+        plan: MaterializationPlan<'a>,
         retained_budget: Arc<ArtifactRetainedBudget>,
         scratch_budget: Arc<ArtifactScratchBudget>,
         memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
-    ) -> Result<Arc<ArtifactBundle>, ()> {
+    ) -> MaterializationAdmission<'a> {
+        match &plan.selected {
+            SelectedRepresentation::Unsupported(reason) => {
+                return MaterializationAdmission::Complete(MaterializationOutcome::Unsupported(
+                    *reason,
+                ));
+            }
+            SelectedRepresentation::ResourceLimit => {
+                return MaterializationAdmission::Complete(MaterializationOutcome::Unavailable(
+                    UnavailableReason::ResourceLimit,
+                ));
+            }
+            _ => {}
+        }
+        match Self::admit_selected(plan, retained_budget, scratch_budget, memory_account) {
+            Ok(prepared) => MaterializationAdmission::Ready(prepared),
+            Err(PreparationFailure::ResourceLimit) => MaterializationAdmission::Complete(
+                MaterializationOutcome::Unavailable(UnavailableReason::ResourceLimit),
+            ),
+            Err(PreparationFailure::Internal) => MaterializationAdmission::Complete(
+                MaterializationOutcome::Unavailable(UnavailableReason::MaterializationFailed),
+            ),
+        }
+    }
+
+    fn admit_selected<'a>(
+        plan: MaterializationPlan<'a>,
+        retained_budget: Arc<ArtifactRetainedBudget>,
+        scratch_budget: Arc<ArtifactScratchBudget>,
+        memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
+    ) -> Result<AdmittedMaterialization<'a>, PreparationFailure> {
         let bits_bytes = match &plan.selected {
             SelectedRepresentation::Bitset(bitset) => bitset.byte_count(),
             SelectedRepresentation::Bloom(contract) => contract
                 .bit_count(plan.snapshot.domain().values().len())
                 .ok()
                 .and_then(|bits| usize::try_from(bits / 8).ok())
-                .ok_or(())?,
+                .ok_or(PreparationFailure::Internal)?,
             _ => 0,
         };
         let scratch_bytes = plan
@@ -308,27 +353,49 @@ impl Materializer {
             .and_then(|bytes| bytes.checked_add(plan.payload_bytes))
             .and_then(|bytes| bytes.checked_add(bits_bytes))
             .and_then(|bytes| bytes.checked_add(plan.max_scalar_frame_bytes))
-            .ok_or(())?;
-        if u64::try_from(scratch_bytes).map_err(|_| ())? > plan.policy.max_scratch_bytes_per_job() {
-            return Err(());
+            .ok_or(PreparationFailure::Internal)?;
+        if u64::try_from(scratch_bytes).map_err(|_| PreparationFailure::Internal)?
+            > plan.policy.max_scratch_bytes_per_job()
+        {
+            return Err(PreparationFailure::ResourceLimit);
         }
-        let _scratch = ArtifactScratchReservation::try_new(
+        let scratch = ArtifactScratchReservation::try_new(
             scratch_bytes,
             scratch_budget,
             memory_account.clone(),
         )
-        .map_err(|_| ())?;
+        .map_err(|_| PreparationFailure::ResourceLimit)?;
 
         let artifact_footprint =
             PhysicalArtifact::accounted_resident_component_bytes(plan.leaf_encoded_bytes)
-                .map_err(|_| ())?;
-        let bundle_footprint =
-            ArtifactBundle::accounted_resident_overhead(&plan.profile, 1).map_err(|_| ())?;
-        let total_footprint = artifact_footprint.checked_add(bundle_footprint).ok_or(())?;
+                .map_err(|_| PreparationFailure::Internal)?;
+        let bundle_footprint = ArtifactBundle::accounted_resident_overhead(&plan.profile, 1)
+            .map_err(|_| PreparationFailure::Internal)?;
+        let total_footprint = artifact_footprint
+            .checked_add(bundle_footprint)
+            .ok_or(PreparationFailure::Internal)?;
         let retained = Arc::new(
             ArtifactRetention::try_new(total_footprint, retained_budget, memory_account)
-                .map_err(|_| ())?,
+                .map_err(|_| PreparationFailure::ResourceLimit)?,
         );
+
+        Ok(AdmittedMaterialization {
+            plan,
+            _scratch: scratch,
+            artifact_footprint,
+            total_footprint,
+            retained,
+        })
+    }
+
+    pub(crate) fn encode(prepared: AdmittedMaterialization<'_>) -> Result<Arc<ArtifactBundle>, ()> {
+        let AdmittedMaterialization {
+            plan,
+            _scratch,
+            artifact_footprint,
+            total_footprint,
+            retained,
+        } = prepared;
 
         let values = plan.snapshot.domain().values();
         let contains_null = plan.snapshot.domain().contains_null();

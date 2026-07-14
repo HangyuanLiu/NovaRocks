@@ -29,7 +29,7 @@ use crate::runtime_filter::model::contract::{
 };
 use crate::runtime_filter::model::coverage::Coverage;
 use crate::runtime_filter::port::artifact::{
-    ArtifactKind, ArtifactMembershipSchema, ConsumerProfileId,
+    ArtifactKind, ArtifactMembershipSchema, ConsumerArtifactProfile, ConsumerProfileId,
 };
 use crate::runtime_filter::port::events::{
     RouteEventIdentity, RuntimeFilterEvent, RuntimeFilterEventIdentity, RuntimeFilterEventSink,
@@ -41,12 +41,15 @@ use crate::runtime_filter::port::install::{
 use crate::runtime_filter::port::producer::{
     InstallContractError, InstallContractErrorKind, InstallOutcome,
 };
-use crate::runtime_filter::port::support::{RuntimeFilterClock, RuntimeFilterMemoryAccount};
+use crate::runtime_filter::port::support::{
+    ArtifactRetainedBudget, ArtifactScratchBudget, RuntimeFilterClock, RuntimeFilterMemoryAccount,
+};
 use crate::runtime_filter::port::value_domain::MembershipValues;
 use crate::runtime_filter::router::loopback::LoopbackRouter;
 
-use super::EventEmitter;
+use super::materialization::{ArtifactPublishGate, ArtifactPublishKey};
 use super::subscription::{SubscriptionGroup, SubscriptionSlot};
+use super::{EventBatchCompletion, EventEmitter};
 
 #[derive(Debug)]
 pub(super) struct RegistryInstallResult {
@@ -75,6 +78,68 @@ pub(super) struct ProducerRoute {
     pub(super) expected_instances: BTreeSet<UniqueId>,
 }
 
+#[derive(Clone)]
+pub(super) struct CapabilityGroup {
+    key: ArtifactPublishKey,
+    common: RuntimeFilterEventIdentity,
+    profile: ConsumerArtifactProfile,
+    route_edges: Arc<[RouteEdgeId]>,
+}
+
+impl CapabilityGroup {
+    pub(super) const fn key(&self) -> ArtifactPublishKey {
+        self.key
+    }
+
+    pub(super) const fn common(&self) -> RuntimeFilterEventIdentity {
+        self.common
+    }
+
+    pub(super) const fn profile(&self) -> &ConsumerArtifactProfile {
+        &self.profile
+    }
+
+    pub(super) fn route_edges(&self) -> &[RouteEdgeId] {
+        &self.route_edges
+    }
+}
+
+pub(super) struct ChannelArtifactPlan {
+    schema: ArtifactMembershipSchema,
+    policy: crate::runtime_filter::port::install::MaterializationPolicy,
+    max_artifact_bytes: usize,
+    max_concurrent_jobs: usize,
+    retained_budget: Arc<ArtifactRetainedBudget>,
+    scratch_budget: Arc<ArtifactScratchBudget>,
+    groups: Arc<[CapabilityGroup]>,
+}
+
+impl ChannelArtifactPlan {
+    pub(super) const fn schema(&self) -> &ArtifactMembershipSchema {
+        &self.schema
+    }
+    pub(super) const fn policy(
+        &self,
+    ) -> crate::runtime_filter::port::install::MaterializationPolicy {
+        self.policy
+    }
+    pub(super) const fn max_artifact_bytes(&self) -> usize {
+        self.max_artifact_bytes
+    }
+    pub(super) const fn max_concurrent_jobs(&self) -> usize {
+        self.max_concurrent_jobs
+    }
+    pub(super) fn retained_budget(&self) -> Arc<ArtifactRetainedBudget> {
+        self.retained_budget.clone()
+    }
+    pub(super) fn scratch_budget(&self) -> Arc<ArtifactScratchBudget> {
+        self.scratch_budget.clone()
+    }
+    pub(super) fn groups(&self) -> &[CapabilityGroup] {
+        &self.groups
+    }
+}
+
 pub(super) struct InstalledDeployment {
     view: RuntimeFilterInstallView,
     committed_at: Instant,
@@ -85,6 +150,43 @@ pub(super) struct InstalledDeployment {
     router: Arc<LoopbackRouter>,
     channel_routes: BTreeMap<ChannelId, Vec<RouteEdgeId>>,
     route_event_identities: BTreeMap<RouteEdgeId, Vec<RouteEventIdentity>>,
+    artifact_channels: BTreeMap<ChannelId, ChannelArtifactPlan>,
+    publish_gate: ArtifactPublishGate,
+}
+
+pub(super) struct CancelledDeployment {
+    installed: Arc<InstalledDeployment>,
+    cancelled_routes: BTreeMap<ChannelId, Vec<RouteEdgeId>>,
+}
+
+impl CancelledDeployment {
+    pub(super) fn installed(&self) -> &Arc<InstalledDeployment> {
+        &self.installed
+    }
+
+    pub(super) fn deliver_artifact_cancellation(&self) {
+        for routes in self.cancelled_routes.values() {
+            self.installed.router.route(
+                routes,
+                &crate::runtime_filter::port::subscription::ArtifactDeliveryOutcome::Cancelled,
+            );
+        }
+    }
+
+    pub(super) fn arm_artifact_cancellation(
+        &self,
+        channel_id: ChannelId,
+        barrier: Arc<EventBatchCompletion>,
+    ) {
+        let Some(routes) = self.cancelled_routes.get(&channel_id) else {
+            return;
+        };
+        for route in routes {
+            for subscription in self.installed.subscriptions.values() {
+                subscription.arm_cancellation_event(*route, barrier.clone());
+            }
+        }
+    }
 }
 
 impl InstalledDeployment {
@@ -106,6 +208,26 @@ impl InstalledDeployment {
         self.subscriptions.contains_key(&binding_id)
     }
 
+    #[cfg(test)]
+    pub(super) fn set_subscription_delivery_hook(
+        &self,
+        binding_id: BindingId,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        self.subscriptions
+            .get(&binding_id)
+            .expect("test consumer binding is installed")
+            .set_before_deliver_hook(hook);
+    }
+
+    #[cfg(test)]
+    pub(super) fn subscription_delivery_call_count(&self, binding_id: BindingId) -> usize {
+        self.subscriptions
+            .get(&binding_id)
+            .expect("test consumer binding is installed")
+            .delivery_call_count()
+    }
+
     pub(super) fn channels(
         &self,
     ) -> impl Iterator<Item = (ChannelId, Arc<RuntimeFilterChannel>)> + '_ {
@@ -123,6 +245,50 @@ impl InstalledDeployment {
             .get(&channel_id)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    pub(super) fn artifact_plan(&self, channel_id: ChannelId) -> Option<&ChannelArtifactPlan> {
+        self.artifact_channels.get(&channel_id)
+    }
+
+    pub(super) const fn publish_gate(&self) -> &ArtifactPublishGate {
+        &self.publish_gate
+    }
+
+    pub(super) fn routes_for_profile(
+        &self,
+        channel_id: ChannelId,
+        profile_id: ConsumerProfileId,
+    ) -> &[RouteEdgeId] {
+        self.artifact_channels
+            .get(&channel_id)
+            .and_then(|plan| {
+                plan.groups()
+                    .iter()
+                    .find(|group| group.profile().id() == profile_id)
+            })
+            .map(CapabilityGroup::route_edges)
+            .unwrap_or(&[])
+    }
+
+    fn invalidate_artifact_publication(&self) -> BTreeMap<ChannelId, Vec<RouteEdgeId>> {
+        let keys = self
+            .artifact_channels
+            .values()
+            .flat_map(|plan| plan.groups().iter().map(CapabilityGroup::key))
+            .collect::<Vec<_>>();
+        let mut routes = BTreeMap::<ChannelId, Vec<RouteEdgeId>>::new();
+        for key in self.publish_gate.cancel_all(keys) {
+            routes
+                .entry(key.channel_id())
+                .or_default()
+                .extend_from_slice(self.routes_for_profile(key.channel_id(), key.profile_id()));
+        }
+        for channel_routes in routes.values_mut() {
+            channel_routes.sort_unstable();
+            channel_routes.dedup();
+        }
+        routes
     }
 
     pub(super) fn route_event_identities(
@@ -356,6 +522,12 @@ impl DeploymentRegistry {
                 )
                 .expect("unanchored candidate deadline initializes exactly once");
         }
+        let publish_gate = ArtifactPublishGate::default();
+        for plan in routing.artifact_channels.values() {
+            for group in plan.groups() {
+                publish_gate.generation(group.key());
+            }
+        }
         let candidate = Arc::new(InstalledDeployment {
             view: view.clone(),
             committed_at,
@@ -366,6 +538,8 @@ impl DeploymentRegistry {
             router: Arc::new(LoopbackRouter::new(routing.routes)),
             channel_routes: routing.channel_routes,
             route_event_identities: routing.route_event_identities,
+            artifact_channels: routing.artifact_channels,
+            publish_gate,
         });
 
         let committed = {
@@ -412,21 +586,28 @@ impl DeploymentRegistry {
         })
     }
 
-    pub(super) fn cancel(&self) -> Option<Arc<InstalledDeployment>> {
+    pub(super) fn cancel(&self) -> Option<CancelledDeployment> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let (installed, flight) = match &*state {
             RegistryState::Installed(installed) => (Some(installed.clone()), None),
             RegistryState::Publishing { installed, .. } => (Some(installed.clone()), None),
             RegistryState::Installing(flight) => (None, Some(flight.clone())),
-            RegistryState::Cancelled(installed) => return installed.clone(),
+            RegistryState::Cancelled(_) => return None,
             RegistryState::Uninstalled => (None, None),
         };
+        let cancelled_routes = installed
+            .as_ref()
+            .map(|installed| installed.invalidate_artifact_publication())
+            .unwrap_or_default();
         *state = RegistryState::Cancelled(installed.clone());
         drop(state);
         if let Some(flight) = flight {
             flight.complete(Err(cancelled_install()));
         }
-        installed
+        installed.map(|installed| CancelledDeployment {
+            cancelled_routes,
+            installed,
+        })
     }
 
     pub(super) fn active_installation(&self) -> Option<Arc<InstalledDeployment>> {
@@ -592,9 +773,10 @@ struct RoutingBuild {
     producers: BTreeMap<BindingId, ProducerRoute>,
     subscriptions: BTreeMap<BindingId, Arc<SubscriptionGroup>>,
     routes:
-        BTreeMap<RouteEdgeId, Arc<dyn crate::runtime_filter::port::subscription::SnapshotDelivery>>,
+        BTreeMap<RouteEdgeId, Arc<dyn crate::runtime_filter::port::subscription::ArtifactDelivery>>,
     channel_routes: BTreeMap<ChannelId, Vec<RouteEdgeId>>,
     route_event_identities: BTreeMap<RouteEdgeId, Vec<RouteEventIdentity>>,
+    artifact_channels: BTreeMap<ChannelId, ChannelArtifactPlan>,
 }
 
 fn build_routing(
@@ -609,6 +791,7 @@ fn build_routing(
         routes: BTreeMap::new(),
         channel_routes: BTreeMap::new(),
         route_event_identities: BTreeMap::new(),
+        artifact_channels: BTreeMap::new(),
     };
     for (channel_id, deployment) in view.channels() {
         let common = RuntimeFilterEventIdentity::new(
@@ -623,6 +806,8 @@ fn build_routing(
                 "temporary installed graph is missing a validated channel",
             )
         })?;
+        let mut capability_routes =
+            BTreeMap::<ConsumerProfileId, (ConsumerArtifactProfile, Vec<RouteEdgeId>)>::new();
         for (binding_id, producer) in deployment.producers() {
             build.producers.insert(
                 *binding_id,
@@ -660,7 +845,88 @@ fn build_routing(
                     })
                     .collect(),
             );
+            let entry = capability_routes
+                .entry(consumer.artifact_profile().id())
+                .or_insert_with(|| (consumer.artifact_profile().clone(), Vec::new()));
+            if entry.0.canonical_bytes() != consumer.artifact_profile().canonical_bytes() {
+                return Err(install_error(
+                    InstallContractErrorKind::ConflictingDeployment,
+                    "consumer profile digest collision carried different canonical bytes",
+                ));
+            }
+            entry.1.push(route_edge_id);
         }
+        let RuntimeFilterLogicalDomain::Membership {
+            value_type,
+            null_semantics,
+        } = deployment.logical_domain()
+        else {
+            unreachable!("validated deployment is membership-only")
+        };
+        let schema = ArtifactMembershipSchema::new(value_type, *null_semantics).map_err(|_| {
+            install_error(
+                InstallContractErrorKind::UnsupportedMembershipType,
+                "membership schema has no canonical artifact encoding",
+            )
+        })?;
+        let policy = deployment.materialization_policy();
+        let retained_bytes = usize::try_from(policy.max_total_retained_bytes()).map_err(|_| {
+            install_error(
+                InstallContractErrorKind::InvalidBudget,
+                "materialization retained budget does not fit this platform",
+            )
+        })?;
+        let scratch_per_job =
+            usize::try_from(policy.max_scratch_bytes_per_job()).map_err(|_| {
+                install_error(
+                    InstallContractErrorKind::InvalidBudget,
+                    "materialization scratch budget does not fit this platform",
+                )
+            })?;
+        let scratch_total = policy.aggregate_scratch_bytes().map_err(|_| {
+            install_error(
+                InstallContractErrorKind::InvalidBudget,
+                "materialization aggregate scratch budget overflows",
+            )
+        })?;
+        let groups = capability_routes
+            .into_iter()
+            .map(|(profile_id, (profile, mut route_edges))| {
+                route_edges.sort_unstable();
+                route_edges.dedup();
+                CapabilityGroup {
+                    key: ArtifactPublishKey::new(*channel_id, view.epoch(), profile_id),
+                    common,
+                    profile,
+                    route_edges: route_edges.into(),
+                }
+            })
+            .collect::<Vec<_>>();
+        build.artifact_channels.insert(
+            *channel_id,
+            ChannelArtifactPlan {
+                schema,
+                policy,
+                max_artifact_bytes: usize::try_from(deployment.policy().max_artifact_bytes)
+                    .map_err(|_| {
+                        install_error(
+                            InstallContractErrorKind::InvalidBudget,
+                            "artifact byte budget does not fit this platform",
+                        )
+                    })?,
+                max_concurrent_jobs: policy.max_concurrent_jobs(),
+                retained_budget: Arc::new(ArtifactRetainedBudget::new(retained_bytes)),
+                scratch_budget: Arc::new(
+                    ArtifactScratchBudget::new(scratch_per_job, scratch_total).map_err(|_| {
+                        install_error(
+                            InstallContractErrorKind::InvalidBudget,
+                            "materialization scratch budget is inconsistent",
+                        )
+                    })?,
+                ),
+                groups: groups.into(),
+            },
+        );
     }
     Ok(build)
 }
