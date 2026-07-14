@@ -21,11 +21,14 @@ pub(crate) mod role_graph;
 pub(crate) mod shard;
 pub(crate) mod wait_for;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use crate::runtime_filter::deployment::role_graph::RoleGraph;
 use crate::runtime_filter::model::contract::{BindingId, ChannelId, PlanFragmentId};
 use crate::runtime_filter::model::validation::GraphValidationError;
-use crate::runtime_filter::port::install::RuntimeFilterCoreBudget;
+use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
+use crate::runtime_filter::port::install::{RuntimeFilterCoreBudget, RuntimeFilterInstallView};
 
 /// Deployment-time resource / routing policy. Read-only input to the compiler.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,6 +49,9 @@ pub(crate) enum DeploymentError {
     MissingPlacement { fragment: PlanFragmentId },
     /// A placement referenced a backend id absent from the live snapshot.
     UnknownBackend { backend_idx: usize },
+    /// The fragment edges supplied to the compiler formed a cycle; the
+    /// execution dependency graph could not be built.
+    FragmentCycle,
     /// A `BlockingSnapshot` consumer would wait on a producer that (transitively)
     /// depends on the consumer's own fragment — an execution cycle.
     BlockingFeedbackCycle {
@@ -68,6 +74,9 @@ impl fmt::Display for DeploymentError {
             Self::UnknownBackend { backend_idx } => {
                 write!(f, "unknown backend index {backend_idx}")
             }
+            Self::FragmentCycle => {
+                write!(f, "fragment execution dependency graph contains a cycle")
+            }
             Self::BlockingFeedbackCycle { channel, binding } => write!(
                 f,
                 "blocking-snapshot consumer binding {} on channel {} forms an execution cycle",
@@ -89,6 +98,17 @@ impl fmt::Display for DeploymentError {
 }
 
 impl std::error::Error for DeploymentError {}
+
+/// The compiler's output. Coordinator-side; `role_graph` carries the full
+/// (including remote) topology for RFD-4 to consume, while `install_views`
+/// carries the loopback shards each participant BE installs today.
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeFilterDeploymentPlan {
+    pub epoch: DeploymentEpoch,
+    pub participants: BTreeSet<RuntimeFilterParticipantId>,
+    pub install_views: BTreeMap<RuntimeFilterParticipantId, RuntimeFilterInstallView>,
+    pub role_graph: RoleGraph,
+}
 
 #[cfg(test)]
 mod tests {
