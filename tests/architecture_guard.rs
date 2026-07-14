@@ -25190,3 +25190,141 @@ fn distributed_plan_seal_task2_enforces_private_draft_and_single_typed_seal() {
         violations.join("\n")
     );
 }
+
+// ---------------------------------------------------------------------------
+// CGO-9A Task 3: distributed-plan structural validation lives in the planner
+// seal, never in codegen.
+//
+// Task 3 moved `validate_distributed_plan` (and its helpers) out of
+// `src/sql/codegen/fragment/build.rs` into
+// `crate::sql::planner::distributed::validation`, where it runs inside
+// `seal_draft`. These guards keep it there: codegen must not (re)own the
+// structural validator, and the planner distributed module must define it.
+//
+// The detector keys on function *definitions* (`fn validate_distributed_plan`
+// / `fn validate_distributed_structure`), so codegen helpers that legitimately
+// stay (e.g. `validate_native_fragment_ownership`, `target_exchange_for_edge`)
+// and prose comments referencing the planner module are not matched.
+// ---------------------------------------------------------------------------
+
+const CGO_9A_TASK3_CODEGEN_ROOT: &str = "src/sql/codegen/";
+const CGO_9A_TASK3_PLANNER_DISTRIBUTED_ROOT: &str = "src/sql/planner/distributed/";
+const CGO_9A_TASK3_STRUCTURAL_VALIDATOR_ENTRY: &str = "fn validate_distributed_structure(";
+const CGO_9A_TASK3_FORBIDDEN_CODEGEN_DEFS: [&str; 2] = [
+    "fn validate_distributed_structure(",
+    "fn validate_distributed_plan(",
+];
+
+fn distributed_plan_seal_task3_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut planner_defines_structural_validator = false;
+
+    for source in sources {
+        if source.path.starts_with(CGO_9A_TASK3_CODEGEN_ROOT) {
+            for needle in CGO_9A_TASK3_FORBIDDEN_CODEGEN_DEFS {
+                if source.text.contains(needle) {
+                    let function = needle.trim_start_matches("fn ").trim_end_matches('(');
+                    violations.push(format!(
+                        "codegen-owns-structural-validator: {} defines `{function}`; distributed-plan structural validation must live under {}",
+                        source.path, CGO_9A_TASK3_PLANNER_DISTRIBUTED_ROOT
+                    ));
+                }
+            }
+        }
+        if source
+            .path
+            .starts_with(CGO_9A_TASK3_PLANNER_DISTRIBUTED_ROOT)
+            && source
+                .text
+                .contains(CGO_9A_TASK3_STRUCTURAL_VALIDATOR_ENTRY)
+        {
+            planner_defines_structural_validator = true;
+        }
+    }
+
+    if !planner_defines_structural_validator {
+        violations.push(format!(
+            "missing-planner-structural-validator: no {} source defines `{}`",
+            CGO_9A_TASK3_PLANNER_DISTRIBUTED_ROOT, CGO_9A_TASK3_STRUCTURAL_VALIDATOR_ENTRY
+        ));
+    }
+
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+#[test]
+fn distributed_plan_seal_task3_detector_accepts_planner_owned_validator() {
+    let sources = [
+        Cgo8GuardSource::new(
+            "src/sql/codegen/fragment/build.rs",
+            "fn build() {} fn target_exchange_for_edge() {} fn validate_native_fragment_ownership() {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/validation.rs",
+            "pub(in crate::sql::planner::distributed) fn validate_distributed_structure() {}",
+        ),
+    ];
+    let violations = distributed_plan_seal_task3_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "planner-owned structural validator with clean codegen must pass: {violations:?}"
+    );
+}
+
+#[test]
+fn distributed_plan_seal_task3_detector_rejects_codegen_owned_validator() {
+    let planner_owner = Cgo8GuardSource::new(
+        "src/sql/planner/distributed/validation.rs",
+        "pub(in crate::sql::planner::distributed) fn validate_distributed_structure() {}",
+    );
+
+    for forbidden in [
+        "fn validate_distributed_plan(dp: &DistributedPlan) -> Result<(), String> { Ok(()) }",
+        "pub(crate) fn validate_distributed_structure(dp: &DistributedPlan) { let _ = dp; }",
+    ] {
+        let sources = [
+            Cgo8GuardSource::new("src/sql/codegen/fragment/build.rs", forbidden),
+            planner_owner.clone(),
+        ];
+        let violations = distributed_plan_seal_task3_violations(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("codegen-owns-structural-validator")),
+            "codegen re-owning the structural validator must fail closed for `{forbidden}`: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn distributed_plan_seal_task3_detector_requires_planner_owner() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/codegen/fragment/build.rs",
+        "fn build() {} fn validate_native_fragment_ownership() {}",
+    )];
+    let violations = distributed_plan_seal_task3_violations(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("missing-planner-structural-validator")),
+        "a tree with no planner-owned structural validator must fail closed: {violations:?}"
+    );
+}
+
+#[test]
+fn distributed_plan_seal_task3_source_tree_keeps_structural_validation_in_planner() {
+    let src = src_dir();
+    let sources =
+        production_rs_files_from_entries(&src, &[src.join("lib.rs"), src.join("main.rs")])
+            .into_iter()
+            .map(|path| Cgo8GuardSource::new(rel(&path), fs::read_to_string(path).unwrap()))
+            .collect::<Vec<_>>();
+    let violations = distributed_plan_seal_task3_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "CGO-9A Task 3 structural-validation ownership guard failed:\n{}",
+        violations.join("\n")
+    );
+}

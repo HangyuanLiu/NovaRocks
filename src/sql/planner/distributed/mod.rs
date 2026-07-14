@@ -20,6 +20,7 @@ mod fragment;
 mod node;
 pub(crate) mod runtime_filter;
 mod seal;
+mod validation;
 pub(crate) mod write;
 
 #[cfg(test)]

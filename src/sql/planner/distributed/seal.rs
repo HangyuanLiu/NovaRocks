@@ -20,6 +20,7 @@ use std::fmt;
 use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 
 use super::fragment::{DistributedPlanDraft, FragmentEdge, FragmentId, PlanFragment};
+use super::validation::{self, DistributedPlanValidationError};
 
 #[derive(Clone, Debug)]
 struct DistributedPlanData {
@@ -59,6 +60,7 @@ pub(in crate::sql::planner::distributed) enum DistributedPlanSealError {
     EmptyFragments,
     MissingRootFragmentId,
     RootFragmentNotFound { root_fragment_id: FragmentId },
+    Structural(DistributedPlanValidationError),
 }
 
 impl fmt::Display for DistributedPlanSealError {
@@ -72,6 +74,7 @@ impl fmt::Display for DistributedPlanSealError {
                 formatter,
                 "distributed plan root fragment id={root_fragment_id} was not found"
             ),
+            Self::Structural(error) => error.fmt(formatter),
         }
     }
 }
@@ -96,6 +99,10 @@ pub(in crate::sql::planner::distributed) fn seal_draft(
     {
         return Err(DistributedPlanSealError::RootFragmentNotFound { root_fragment_id });
     }
+    validation::validate_distributed_structure(&fragments, root_fragment_id, &edges)
+        .map_err(DistributedPlanSealError::Structural)?;
+    // CGO-9A Task 4 will insert `runtime_filter_graph.validate()` here, between
+    // structural validation and immutable construction.
     Ok(DistributedPlan {
         data: DistributedPlanData {
             fragments,
