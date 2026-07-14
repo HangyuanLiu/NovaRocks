@@ -42,5 +42,8 @@ pub(crate) mod registry;
 pub(crate) mod resolver;
 pub(crate) mod signature;
 
-pub(crate) use resolver::{ResolveError, resolve_scalar_function};
+pub(crate) use resolver::{
+    ResolveError, ResolvedScalarFunction, resolve_scalar_function,
+    resolve_scalar_function_signature,
+};
 pub(crate) use signature::{Signature, TypeSpec};

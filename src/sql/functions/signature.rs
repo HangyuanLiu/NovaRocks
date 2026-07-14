@@ -69,6 +69,18 @@ pub(crate) enum TypeSpec {
     Any(&'static str),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ArgumentBindingPolicy {
+    Legacy,
+    CoerceAndEnforce,
+}
+
+impl ArgumentBindingPolicy {
+    pub(crate) fn is_enforced(self) -> bool {
+        matches!(self, Self::CoerceAndEnforce)
+    }
+}
+
 /// A single function signature record.
 ///
 /// `args` is the parameter list. If `variadic` is true, the last element of
@@ -89,6 +101,7 @@ pub(crate) struct Signature {
     pub(crate) ret: TypeSpec,
     pub(crate) variadic: bool,
     pub(crate) widening: bool,
+    pub(crate) argument_binding: ArgumentBindingPolicy,
 }
 
 impl Signature {
@@ -98,6 +111,7 @@ impl Signature {
             ret,
             variadic: false,
             widening: false,
+            argument_binding: ArgumentBindingPolicy::Legacy,
         }
     }
 
@@ -107,6 +121,7 @@ impl Signature {
             ret,
             variadic: true,
             widening: false,
+            argument_binding: ArgumentBindingPolicy::Legacy,
         }
     }
 
@@ -118,6 +133,11 @@ impl Signature {
     /// `array_append(List<T>, T)`.
     pub(crate) fn with_widening(mut self) -> Self {
         self.widening = true;
+        self
+    }
+
+    pub(crate) fn with_argument_coercion(mut self) -> Self {
+        self.argument_binding = ArgumentBindingPolicy::CoerceAndEnforce;
         self
     }
 }
