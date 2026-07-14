@@ -18,6 +18,7 @@
 use std::fmt;
 
 use crate::runtime_filter::model::graph::RuntimeFilterGraph;
+use crate::runtime_filter::model::validation::GraphValidationError;
 
 use super::fragment::{DistributedPlanDraft, FragmentEdge, FragmentId, PlanFragment};
 use super::validation::{self, DistributedPlanValidationError};
@@ -61,6 +62,7 @@ pub(in crate::sql::planner::distributed) enum DistributedPlanSealError {
     MissingRootFragmentId,
     RootFragmentNotFound { root_fragment_id: FragmentId },
     Structural(DistributedPlanValidationError),
+    RuntimeFilterGraph(GraphValidationError),
 }
 
 impl fmt::Display for DistributedPlanSealError {
@@ -75,6 +77,7 @@ impl fmt::Display for DistributedPlanSealError {
                 "distributed plan root fragment id={root_fragment_id} was not found"
             ),
             Self::Structural(error) => error.fmt(formatter),
+            Self::RuntimeFilterGraph(error) => error.fmt(formatter),
         }
     }
 }
@@ -101,8 +104,13 @@ pub(in crate::sql::planner::distributed) fn seal_draft(
     }
     validation::validate_distributed_structure(&fragments, root_fragment_id, &edges)
         .map_err(DistributedPlanSealError::Structural)?;
-    // CGO-9A Task 4 will insert `runtime_filter_graph.validate()` here, between
-    // structural validation and immutable construction.
+    // RFD-1 read-only structural validation of the runtime filter graph, run after
+    // non-RF structural validation and before immutable construction. The graph is
+    // validated here, never populated; CGO-9A stays agnostic to whether nodes still
+    // carry build/probe runtime filters (RFD-5A owns population and exact binding).
+    runtime_filter_graph
+        .validate()
+        .map_err(DistributedPlanSealError::RuntimeFilterGraph)?;
     Ok(DistributedPlan {
         data: DistributedPlanData {
             fragments,
@@ -166,10 +174,143 @@ pub(super) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use crate::runtime_filter::model::graph::RuntimeFilterGraph;
+    use std::collections::BTreeSet;
+
+    use arrow::datatypes::DataType;
+
+    use crate::runtime_filter::model::contract::{
+        ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
+        ContributionKind, CoverageWitnessId, NullSemantics, PlanFragmentId, PlanNodeId,
+        ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
+        RuntimeFilterPolicyRequirement,
+    };
+    use crate::runtime_filter::model::coverage::Coverage;
+    use crate::runtime_filter::model::graph::{
+        ApplyPoint, ConsumerRequirement, PlanLocation, ProducerRequirement,
+        RuntimeFilterBindingRole, RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
+        RuntimeFilterGraph,
+    };
+    use crate::runtime_filter::model::validation::GraphValidationErrorKind;
+    use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
     use crate::sql::planner::distributed::fragment::DistributedPlanDraft;
+    use crate::sql::planner::distributed::runtime_filter::BoundRuntimeFilterProbe;
+    use crate::sql::planner::physical::runtime_filter::RuntimeFilterProbeIntent;
 
     use super::{DistributedPlanSealError, seal_draft};
+
+    /// Minimal `TypedExpr` used to populate binding expressions. The seal only
+    /// inspects the graph's structural contract, never the bound expression.
+    fn expression() -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Int(1)),
+            data_type: DataType::Int64,
+            nullable: false,
+        }
+    }
+
+    /// Value-domain (Join) membership channel mirroring the RFD-1 `join_channel`
+    /// fixture so a sealed graph exercises the same contract the model validates.
+    fn join_channel_spec(channel_id: ChannelId) -> RuntimeFilterChannelSpec {
+        RuntimeFilterChannelSpec {
+            channel_id,
+            logical_domain: RuntimeFilterLogicalDomain::Membership {
+                value_type: DataType::Int64,
+                null_semantics: NullSemantics::NeverMatches,
+            },
+            lifecycle: RuntimeFilterLifecycle::CompleteOnce,
+            availability_coverage: Coverage::Leaf(CoverageWitnessId::new(1)),
+            terminal_coverage: Coverage::Leaf(CoverageWitnessId::new(1)),
+            reduction_requirement: ReductionRequirement::SetUnion,
+            allowed_contribution_kinds: BTreeSet::from([
+                ContributionKind::ValueDomainDelta,
+                ContributionKind::ProducerClosed,
+            ]),
+            required_consumer_capabilities: BTreeSet::from([
+                ArtifactCapability::Membership,
+                ArtifactCapability::EmptyDomain,
+            ]),
+            policy: RuntimeFilterPolicyRequirement {
+                max_contribution_bytes: 1024,
+                max_artifact_bytes: 4096,
+                deadline_ms: 30_000,
+                max_retries: 3,
+            },
+        }
+    }
+
+    fn join_producer_binding(
+        binding_id: BindingId,
+        channel_id: ChannelId,
+    ) -> RuntimeFilterBindingSpec {
+        RuntimeFilterBindingSpec {
+            binding_id,
+            channel_id,
+            coverage_witness_id: Some(CoverageWitnessId::new(1)),
+            location: PlanLocation {
+                fragment_id: PlanFragmentId::new(0),
+                node_id: PlanNodeId::new(1),
+            },
+            expression: expression(),
+            apply_point: ApplyPoint::NodeOutput,
+            role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
+                contribution_kinds: BTreeSet::from([
+                    ContributionKind::ValueDomainDelta,
+                    ContributionKind::ProducerClosed,
+                ]),
+                completion_requirement: CompletionRequirement::ProducerClosed,
+            }),
+        }
+    }
+
+    fn join_consumer_binding(
+        binding_id: BindingId,
+        channel_id: ChannelId,
+    ) -> RuntimeFilterBindingSpec {
+        RuntimeFilterBindingSpec {
+            binding_id,
+            channel_id,
+            coverage_witness_id: None,
+            location: PlanLocation {
+                fragment_id: PlanFragmentId::new(0),
+                node_id: PlanNodeId::new(2),
+            },
+            expression: expression(),
+            apply_point: ApplyPoint::NodeInput,
+            role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
+                capabilities: BTreeSet::from([
+                    ArtifactCapability::Membership,
+                    ArtifactCapability::EmptyDomain,
+                ]),
+                activation: ConsumerActivation::BlockingSnapshot,
+            }),
+        }
+    }
+
+    /// A structurally valid, non-empty graph: one channel with a matched
+    /// producer/consumer pair. `RuntimeFilterGraph::validate` accepts it.
+    fn valid_non_empty_graph() -> RuntimeFilterGraph {
+        let mut graph = RuntimeFilterGraph::default();
+        graph
+            .insert_channel(join_channel_spec(ChannelId::new(1)))
+            .unwrap();
+        graph
+            .insert_binding(join_producer_binding(BindingId::new(1), ChannelId::new(1)))
+            .unwrap();
+        graph
+            .insert_binding(join_consumer_binding(BindingId::new(2), ChannelId::new(1)))
+            .unwrap();
+        graph
+    }
+
+    /// A non-empty but structurally invalid graph: a producer binding points at a
+    /// channel that was never inserted. `validate` rejects it with `UnknownChannel`.
+    fn graph_with_binding_to_unknown_channel() -> RuntimeFilterGraph {
+        let mut graph = RuntimeFilterGraph::default();
+        graph
+            .insert_binding(join_producer_binding(BindingId::new(1), ChannelId::new(99)))
+            .unwrap();
+        graph
+    }
 
     #[test]
     fn minimal_seal_rejects_empty_fragments_before_root_state() {
@@ -229,5 +370,85 @@ mod tests {
         assert_eq!(plan.root_fragment_id(), 0);
         assert!(plan.edges().is_empty());
         assert!(plan.runtime_filter_graph().is_empty());
+    }
+
+    #[test]
+    fn seal_validates_and_accepts_an_empty_runtime_filter_graph() {
+        let draft = super::test_support::single_fragment_draft(Some(0));
+        assert!(draft.runtime_filter_graph.is_empty());
+
+        let plan = seal_draft(draft).expect("an empty runtime filter graph is legal and validates");
+
+        assert!(plan.runtime_filter_graph().is_empty());
+    }
+
+    #[test]
+    fn seal_validates_and_accepts_a_valid_non_empty_runtime_filter_graph() {
+        let mut draft = super::test_support::single_fragment_draft(Some(0));
+        draft.runtime_filter_graph = valid_non_empty_graph();
+
+        let plan =
+            seal_draft(draft).expect("a structurally valid non-empty graph must seal successfully");
+
+        assert_eq!(plan.runtime_filter_graph().channel_count(), 1);
+        assert_eq!(plan.runtime_filter_graph().binding_count(), 2);
+    }
+
+    #[test]
+    fn seal_rejects_a_structurally_invalid_runtime_filter_graph() {
+        let mut draft = super::test_support::single_fragment_draft(Some(0));
+        draft.runtime_filter_graph = graph_with_binding_to_unknown_channel();
+
+        let error = seal_draft(draft).expect_err("a graph that fails validation must not seal");
+
+        let DistributedPlanSealError::RuntimeFilterGraph(graph_error) = error else {
+            panic!("expected a runtime filter graph seal error, got {error:?}");
+        };
+        // The typed `GraphValidationError` is preserved verbatim through the seal.
+        assert_eq!(graph_error.kind, GraphValidationErrorKind::UnknownChannel);
+    }
+
+    #[test]
+    fn seal_reports_the_structural_error_before_the_runtime_filter_graph_error() {
+        // A draft that is BOTH structurally invalid (root fragment carries a
+        // non-result, non-write sink) AND carries an invalid runtime filter graph
+        // must surface the structural error first: RF-graph validation runs only
+        // after `validate_distributed_structure` succeeds.
+        let mut draft = super::test_support::single_fragment_draft(Some(0));
+        draft.fragments[0].sink = crate::sql::planner::distributed::fragment::DataSink::Noop;
+        draft.runtime_filter_graph = graph_with_binding_to_unknown_channel();
+
+        let error = seal_draft(draft).expect_err("a structurally invalid draft must not seal");
+
+        assert!(
+            matches!(error, DistributedPlanSealError::Structural(_)),
+            "structural validation must precede runtime filter graph validation, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn seal_is_agnostic_to_node_carried_runtime_filters() {
+        // Transitional form: plan nodes still carry build/probe runtime filters
+        // while the top-level graph is empty. The CGO-9A seal must not read,
+        // require, or freeze that node-carried shape; it seals fine and does not
+        // require the graph to be populated to mirror them (RFD-5A owns that).
+        let mut draft = super::test_support::single_fragment_draft(Some(0));
+        draft.fragments[0]
+            .root
+            .probe_runtime_filters
+            .push(BoundRuntimeFilterProbe {
+                intent: RuntimeFilterProbeIntent {
+                    filter_id: 1,
+                    probe_expr: expression(),
+                },
+                source_fragment_id: 0,
+            });
+        assert!(draft.runtime_filter_graph.is_empty());
+
+        let plan = seal_draft(draft)
+            .expect("node-carried runtime filters must not block sealing with an empty graph");
+
+        assert!(plan.runtime_filter_graph().is_empty());
+        assert_eq!(plan.fragments()[0].root.probe_runtime_filters.len(), 1);
     }
 }

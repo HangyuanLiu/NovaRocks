@@ -140,5 +140,8 @@ pub(in crate::sql::planner::distributed) struct DistributedPlanDraft {
     pub(in crate::sql::planner::distributed) fragments: Vec<PlanFragment>,
     pub(in crate::sql::planner::distributed) root_fragment_id: Option<FragmentId>,
     pub(in crate::sql::planner::distributed) edges: Vec<FragmentEdge>,
+    // Mutable pre-seal runtime filter graph. `seal_draft` runs RFD-1's
+    // `RuntimeFilterGraph::validate` on it before moving it into the sealed plan,
+    // so (unlike the sealed slot) it is consumed here and carries no allowance.
     pub(in crate::sql::planner::distributed) runtime_filter_graph: RuntimeFilterGraph,
 }

@@ -3855,7 +3855,42 @@ fn top_level_production_function_is_pub_crate(item: &str) -> bool {
     })
 }
 
+/// Whether a top-level function item is scoped `pub(in crate::sql::planner::distributed)`.
+/// This is intentionally tighter than `pub(crate)`: CGO-9A keeps the draft builder
+/// from leaking beyond the `distributed` module (spec section 3.1).
+fn top_level_production_function_is_pub_in_distributed(item: &str) -> bool {
+    const VISIBILITY: [&str; 11] = [
+        "pub",
+        "(",
+        "in",
+        "crate",
+        "::",
+        "sql",
+        "::",
+        "planner",
+        "::",
+        "distributed",
+        ")",
+    ];
+    let tokens = rust_use_tokens(item);
+    let Some(function_index) = tokens.iter().position(|token| token == "fn") else {
+        return false;
+    };
+    tokens[..function_index]
+        .windows(VISIBILITY.len())
+        .any(|window| {
+            window
+                .iter()
+                .zip(VISIBILITY)
+                .all(|(token, expected)| token.as_str() == expected)
+        })
+}
+
 fn distributed_build_mod_surface_violations(text: &str) -> Vec<String> {
+    // CGO-9A build/mod.rs surface: the pass entrypoint and the shared error helper
+    // stay `pub(crate)`, while Task 2's draft builder is deliberately scoped to
+    // `pub(in crate::sql::planner::distributed)` so it cannot leak to `sql::planner`.
+    const DRAFT_BUILDER: &str = "build_distributed_plan_draft";
     let functions = top_level_production_functions(text);
     let mut names = functions
         .iter()
@@ -3865,6 +3900,7 @@ fn distributed_build_mod_surface_violations(text: &str) -> Vec<String> {
     let mut violations = Vec::new();
     let expected = vec![
         "build_distributed_plan".to_string(),
+        DRAFT_BUILDER.to_string(),
         "union_distinct_must_be_rewritten_error".to_string(),
     ];
     if names != expected || names.len() != functions.len() {
@@ -3873,7 +3909,15 @@ fn distributed_build_mod_surface_violations(text: &str) -> Vec<String> {
         ));
     }
     for function in &functions {
-        if !top_level_production_function_is_pub_crate(function) {
+        let is_draft_builder =
+            top_level_production_function_name(function).as_deref() == Some(DRAFT_BUILDER);
+        if is_draft_builder {
+            if !top_level_production_function_is_pub_in_distributed(function) {
+                violations.push(format!(
+                    "the draft builder must use pub(in crate::sql::planner::distributed) visibility so it cannot leak to sql::planner: {function}"
+                ));
+            }
+        } else if !top_level_production_function_is_pub_crate(function) {
             violations.push(format!(
                 "top-level build function must use pub(crate) visibility: {function}"
             ));
@@ -3933,6 +3977,7 @@ mod lowering;
 mod runtime_filter_binding;
 
 pub(crate) fn build_distributed_plan() {}
+pub(in crate::sql::planner::distributed) fn build_distributed_plan_draft() {}
 pub(crate) fn union_distinct_must_be_rewritten_error() {}
 
 #[cfg(test)]
@@ -3956,10 +4001,17 @@ fn test_only_helper() {}
             "pub(super) fn union_distinct_must_be_rewritten_error",
             1,
         ),
+        // The draft builder must stay module-scoped; widening it to pub(crate)
+        // (so it could leak to sql::planner) must be rejected.
+        valid.replacen(
+            "pub(in crate::sql::planner::distributed) fn build_distributed_plan_draft",
+            "pub(crate) fn build_distributed_plan_draft",
+            1,
+        ),
     ] {
         assert!(
             !distributed_build_mod_surface_violations(&invalid).is_empty(),
-            "extra function or non-pub(crate) entry must be rejected: {invalid}"
+            "extra function or wrong-visibility entry must be rejected: {invalid}"
         );
     }
 }
@@ -6154,6 +6206,7 @@ fn planner_distributed_core_has_stage_namespace() {
         "distributed/node.rs",
         "distributed/fragment.rs",
         "distributed/seal.rs",
+        "distributed/validation.rs",
         "distributed/runtime_filter.rs",
         "distributed/build/mod.rs",
     ] {
@@ -6278,9 +6331,10 @@ fn planner_distributed_core_has_stage_namespace() {
             "node".to_string(),
             "runtime_filter".to_string(),
             "seal".to_string(),
+            "validation".to_string(),
             "write".to_string(),
         ]),
-        "distributed/mod.rs must declare exactly build, fragment, node, runtime_filter, seal, and write"
+        "distributed/mod.rs must declare exactly build, fragment, node, runtime_filter, seal, validation, and write"
     );
     for declaration in [
         "pub(crate) mod build;",
@@ -6288,6 +6342,7 @@ fn planner_distributed_core_has_stage_namespace() {
         "mod node;",
         "pub(crate) mod runtime_filter;",
         "mod seal;",
+        "mod validation;",
         "pub(crate) mod write;",
     ] {
         assert!(
@@ -6799,17 +6854,10 @@ fn planner_distributed_write_surface_has_stage_namespace() {
     }
 
     let distributed_mod = fs::read_to_string(&distributed_mod_path).unwrap();
-    assert_eq!(
-        planner_namespace_module_declarations(&distributed_mod),
-        BTreeSet::from([
-            "build".to_string(),
-            "fragment".to_string(),
-            "node".to_string(),
-            "runtime_filter".to_string(),
-            "write".to_string(),
-        ]),
-        "distributed/mod.rs must declare exactly build, fragment, node, runtime_filter, and write"
-    );
+    // The exhaustive distributed module-set assertion is owned solely by
+    // `planner_distributed_core_has_stage_namespace`; a second copy here is what
+    // drifted stale, so this write-surface guard keeps only its own concern: the
+    // write namespace's visibility.
     assert!(
         has_non_comment_line(&distributed_mod, "pub(crate) mod write;"),
         "distributed write namespace must use pub(crate) visibility"
@@ -8684,6 +8732,7 @@ fn runtime_filter_graph_model_has_planner_neutral_boundaries() {
     let contract_path = model.join("contract.rs");
     let graph_path = model.join("graph.rs");
     let fragment_path = repo.join("src/sql/planner/distributed/fragment.rs");
+    let seal_path = repo.join("src/sql/planner/distributed/seal.rs");
     let proto_encode = repo.join("src/sql/codegen/proto_encode");
 
     assert!(contract_path.is_file());
@@ -8716,6 +8765,8 @@ fn runtime_filter_graph_model_has_planner_neutral_boundaries() {
     let fragment_source =
         fs::read_to_string(&fragment_path).expect("distributed fragment source must be readable");
     let fragment_text = rust_sanitized_production_text(&fragment_source);
+    let seal_source =
+        fs::read_to_string(&seal_path).expect("distributed seal source must be readable");
     let proto_text = rs_files(&proto_encode)
         .into_iter()
         .map(|path| {
@@ -8729,11 +8780,17 @@ fn runtime_filter_graph_model_has_planner_neutral_boundaries() {
     assert!(!contract_text.contains("crate::sql"));
     assert!(!graph_text.contains("crate::sql::planner"));
     assert!(fragment_text.contains("runtime_filter_graph: RuntimeFilterGraph"));
+    // The staged graph slot moved from the draft (fragment.rs) into the sealed
+    // `DistributedPlanData` (seal.rs) when distributed plans became sealed at
+    // construction. The draft field is consumed (and, since CGO-9A Task 4,
+    // validated) by `seal_draft`, so it is live and carries no allowance; the
+    // sealed field is only read through the test-only accessor, so it keeps the
+    // documented, removable dead_code allowance for RFD-5A to retire at cutover.
     assert!(
-        fragment_source.contains("RFD-5A")
-            && fragment_source
-                .contains("#[allow(dead_code)]\n    pub runtime_filter_graph: RuntimeFilterGraph"),
-        "the DistributedPlan staged graph slot needs a field-local dead_code allowance"
+        seal_source.contains("RFD-5A")
+            && seal_source
+                .contains("#[allow(dead_code)]\n    runtime_filter_graph: RuntimeFilterGraph"),
+        "the sealed DistributedPlan staged graph slot needs a field-local dead_code allowance"
     );
     assert!(!proto_text.contains("runtime_filter_graph"));
 
@@ -25326,5 +25383,195 @@ fn distributed_plan_seal_task3_source_tree_keeps_structural_validation_in_planne
         violations.is_empty(),
         "CGO-9A Task 3 structural-validation ownership guard failed:\n{}",
         violations.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CGO-9A Task 4: the seal validates the runtime filter graph and stays agnostic
+// to node-carried runtime filters.
+//
+// `seal_draft` runs RFD-1's read-only `RuntimeFilterGraph::validate()` after
+// non-RF structural validation and before immutable construction, mapping a
+// failure to `DistributedPlanSealError::RuntimeFilterGraph`. This is a thin,
+// read-only seam: CGO-9A never populates the graph, never compares it against
+// build/probe runtime filters still carried on plan nodes, and never freezes
+// that node-carried shape (RFD-5A owns population and exact binding). Two
+// guards keep both facts true in the source tree.
+//
+// The detectors read production text (comments, strings, and `#[cfg(test)]`
+// items are stripped), so the seal's own test fixtures -- which do construct
+// node runtime filters -- never trip the node-carrier guard. The validation
+// detector collapses whitespace so a rustfmt-wrapped method chain still matches
+// the `runtime_filter_graph.validate()` needle.
+// ---------------------------------------------------------------------------
+
+const CGO_9A_TASK4_SEAL_SOURCE: &str = "src/sql/planner/distributed/seal.rs";
+const CGO_9A_TASK4_GRAPH_VALIDATION_CALL: &str = "runtime_filter_graph.validate()";
+const CGO_9A_TASK4_GRAPH_ERROR_VARIANT: &str = "DistributedPlanSealError::RuntimeFilterGraph";
+const CGO_9A_TASK4_NODE_CARRIED_RF_MARKERS: [&str; 2] =
+    ["build_runtime_filters", "probe_runtime_filters"];
+
+fn cgo_9a_task4_seal_graph_validation_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut seal_seen = false;
+
+    for source in sources {
+        if source.path != CGO_9A_TASK4_SEAL_SOURCE {
+            continue;
+        }
+        seal_seen = true;
+        // Collapse whitespace so a rustfmt-wrapped chain
+        // (`runtime_filter_graph\n    .validate()`) still matches the needle.
+        let production: String = rust_sanitized_production_text(&source.text)
+            .split_whitespace()
+            .collect();
+        if !production.contains(CGO_9A_TASK4_GRAPH_VALIDATION_CALL) {
+            violations.push(format!(
+                "seal-missing-graph-validation: {} does not call `{}`",
+                source.path, CGO_9A_TASK4_GRAPH_VALIDATION_CALL
+            ));
+        }
+        if !production.contains(CGO_9A_TASK4_GRAPH_ERROR_VARIANT) {
+            violations.push(format!(
+                "seal-missing-graph-error-wiring: {} does not map failures to `{}`",
+                source.path, CGO_9A_TASK4_GRAPH_ERROR_VARIANT
+            ));
+        }
+    }
+
+    if !seal_seen {
+        violations.push(format!(
+            "missing-seal-source: no source matched `{CGO_9A_TASK4_SEAL_SOURCE}`"
+        ));
+    }
+
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+fn cgo_9a_task4_node_carried_rf_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
+    let mut violations = Vec::new();
+
+    for source in sources {
+        if source.path != CGO_9A_TASK4_SEAL_SOURCE {
+            continue;
+        }
+        let production = rust_sanitized_production_text(&source.text);
+        for marker in CGO_9A_TASK4_NODE_CARRIED_RF_MARKERS {
+            if production.contains(marker) {
+                violations.push(format!(
+                    "seal-reads-node-carried-runtime-filters: {} references `{marker}`; the CGO-9A seal must stay agnostic to node-carried build/probe runtime filters",
+                    source.path
+                ));
+            }
+        }
+    }
+
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+#[test]
+fn distributed_plan_seal_task4_detector_accepts_graph_validating_seal() {
+    let sources = [Cgo8GuardSource::new(
+        CGO_9A_TASK4_SEAL_SOURCE,
+        "fn seal_draft(draft: DistributedPlanDraft) -> Result<DistributedPlan, DistributedPlanSealError> { let DistributedPlanDraft { runtime_filter_graph, .. } = draft; runtime_filter_graph\n        .validate()\n        .map_err(DistributedPlanSealError::RuntimeFilterGraph)?; Ok(unimplemented!()) }",
+    )];
+    let violations = cgo_9a_task4_seal_graph_validation_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "a seal that validates the runtime filter graph must pass, even when rustfmt wraps the chain: {violations:?}"
+    );
+}
+
+#[test]
+fn distributed_plan_seal_task4_detector_rejects_seal_without_graph_validation() {
+    let sources = [Cgo8GuardSource::new(
+        CGO_9A_TASK4_SEAL_SOURCE,
+        "fn seal_draft(draft: DistributedPlanDraft) -> Result<DistributedPlan, DistributedPlanSealError> { let DistributedPlanDraft { runtime_filter_graph, .. } = draft; Ok(unimplemented!()) }",
+    )];
+    let violations = cgo_9a_task4_seal_graph_validation_violations(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("seal-missing-graph-validation")),
+        "a seal that skips runtime filter graph validation must fail closed: {violations:?}"
+    );
+}
+
+#[test]
+fn distributed_plan_seal_task4_detector_requires_a_seal_source() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/planner/distributed/validation.rs",
+        "pub(in crate::sql::planner::distributed) fn validate_distributed_structure() {}",
+    )];
+    let violations = cgo_9a_task4_seal_graph_validation_violations(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("missing-seal-source")),
+        "a tree without the seal source must fail closed: {violations:?}"
+    );
+}
+
+#[test]
+fn distributed_plan_seal_task4_detector_accepts_seal_agnostic_to_node_carried_runtime_filters() {
+    // Production seal logic never reads node-carried runtime filters, even though
+    // a `#[cfg(test)]` fixture constructs them. The detector reads production text
+    // only, so the test-module reference must be ignored.
+    let sources = [Cgo8GuardSource::new(
+        CGO_9A_TASK4_SEAL_SOURCE,
+        "fn seal_draft(draft: DistributedPlanDraft) { let _ = draft; }\n#[cfg(test)]\nmod tests {\n    fn probe() { let mut node = node(); node.probe_runtime_filters.push(bound()); }\n}",
+    )];
+    let violations = cgo_9a_task4_node_carried_rf_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "a seal that ignores node-carried runtime filters in production must pass: {violations:?}"
+    );
+}
+
+#[test]
+fn distributed_plan_seal_task4_detector_rejects_seal_reading_node_carried_runtime_filters() {
+    for marker in CGO_9A_TASK4_NODE_CARRIED_RF_MARKERS {
+        let sources = [Cgo8GuardSource::new(
+            CGO_9A_TASK4_SEAL_SOURCE,
+            format!(
+                "fn seal_draft(draft: DistributedPlanDraft) {{ for fragment in draft.fragments {{ let _ = fragment.root.{marker}; }} }}"
+            ),
+        )];
+        let violations = cgo_9a_task4_node_carried_rf_violations(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("seal-reads-node-carried-runtime-filters")),
+            "a seal that reads `{marker}` in production must fail closed: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn distributed_plan_seal_task4_source_tree_validates_runtime_filter_graph_without_rf_carrier_assumptions()
+ {
+    let src = src_dir();
+    let sources =
+        production_rs_files_from_entries(&src, &[src.join("lib.rs"), src.join("main.rs")])
+            .into_iter()
+            .map(|path| Cgo8GuardSource::new(rel(&path), fs::read_to_string(path).unwrap()))
+            .collect::<Vec<_>>();
+
+    let validation_violations = cgo_9a_task4_seal_graph_validation_violations(&sources);
+    assert!(
+        validation_violations.is_empty(),
+        "CGO-9A Task 4 seal runtime-filter-graph validation guard failed:\n{}",
+        validation_violations.join("\n")
+    );
+
+    let node_carrier_violations = cgo_9a_task4_node_carried_rf_violations(&sources);
+    assert!(
+        node_carrier_violations.is_empty(),
+        "CGO-9A Task 4 seal must stay agnostic to node-carried runtime filters:\n{}",
+        node_carrier_violations.join("\n")
     );
 }
