@@ -21,9 +21,17 @@ mod lowering;
 mod runtime_filter_binding;
 
 use crate::sql::planner::distributed::DistributedPlan;
+use crate::sql::planner::distributed::fragment::DistributedPlanDraft;
 use crate::sql::planner::physical::PhysicalPlanNode;
 
 pub(crate) fn build_distributed_plan(plan: &PhysicalPlanNode) -> Result<DistributedPlan, String> {
+    let draft = build_distributed_plan_draft(plan)?;
+    super::seal::seal_draft(draft).map_err(|error| error.to_string())
+}
+
+pub(in crate::sql::planner::distributed) fn build_distributed_plan_draft(
+    plan: &PhysicalPlanNode,
+) -> Result<DistributedPlanDraft, String> {
     let mut cut = fragment_cut::cut(plan)?;
     runtime_filter_binding::bind_runtime_filters(&mut cut.plan.fragments, cut.bindings);
     Ok(cut.plan)

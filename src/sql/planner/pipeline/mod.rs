@@ -28,12 +28,34 @@ pub(crate) fn build_distributed_plan(
     crate::sql::planner::distributed::build::build_distributed_plan(&physical)
 }
 
-pub(crate) fn build_distributed_plan_with_pre_expand_keyed_assert(
+pub(crate) fn build_iceberg_write_distributed_plan(
     mut physical: PhysicalPlanNode,
-    keyed_assert: PreExpandKeyedAssertSpec,
+    sink: crate::sql::planner::distributed::write::sink::IcebergWriteFragmentSink,
 ) -> Result<DistributedPlan, String> {
-    insert_pre_expand_keyed_assert(&mut physical, &keyed_assert)?;
-    build_distributed_plan(physical)
+    crate::sql::planner::physical::runtime_filter_placement::place_runtime_filters(&mut physical);
+    crate::sql::planner::distributed::write::plan::build_iceberg_write_distributed_plan(
+        &physical, sink,
+    )
+}
+
+pub(crate) fn build_iceberg_change_stream_distributed_plan(
+    mut physical: PhysicalPlanNode,
+    descriptor_database: &str,
+    dag: crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
+    keyed_assert: Option<PreExpandKeyedAssertSpec>,
+) -> Result<
+    crate::sql::planner::distributed::write::plan::PlannedIcebergChangeStreamDistributedPlan,
+    String,
+> {
+    if let Some(keyed_assert) = keyed_assert {
+        insert_pre_expand_keyed_assert(&mut physical, &keyed_assert)?;
+    }
+    crate::sql::planner::physical::runtime_filter_placement::place_runtime_filters(&mut physical);
+    crate::sql::planner::distributed::write::plan::build_iceberg_change_stream_distributed_plan(
+        &physical,
+        descriptor_database,
+        dag,
+    )
 }
 
 fn insert_pre_expand_keyed_assert(

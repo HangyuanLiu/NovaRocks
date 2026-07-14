@@ -668,7 +668,7 @@ mod tests {
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
         };
-        let plan = crate::sql::planner::distributed::DistributedPlan {
+        let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
             fragments: vec![source, target],
             root_fragment_id: 1,
             runtime_filter_graph: RuntimeFilterGraph::default(),
@@ -803,7 +803,7 @@ mod tests {
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
         };
-        let plan = crate::sql::planner::distributed::DistributedPlan {
+        let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
             fragments: vec![source, target],
             root_fragment_id: 1,
             runtime_filter_graph: RuntimeFilterGraph::default(),
@@ -908,7 +908,7 @@ mod tests {
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
         };
-        let plan = crate::sql::planner::distributed::DistributedPlan {
+        let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
             fragments: vec![source, target],
             root_fragment_id: 1,
             runtime_filter_graph: RuntimeFilterGraph::default(),
@@ -1022,7 +1022,7 @@ mod tests {
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
         };
-        let plan = crate::sql::planner::distributed::DistributedPlan {
+        let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
             fragments: vec![source, target],
             root_fragment_id: 1,
             runtime_filter_graph: RuntimeFilterGraph::default(),
@@ -1105,7 +1105,7 @@ mod tests {
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
         };
-        let plan = crate::sql::planner::distributed::DistributedPlan {
+        let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
             fragments: vec![source, target],
             root_fragment_id: 1,
             runtime_filter_graph: RuntimeFilterGraph::default(),

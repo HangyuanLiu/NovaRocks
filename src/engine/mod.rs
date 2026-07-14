@@ -3124,9 +3124,8 @@ pub(crate) fn execute_query_as_iceberg_write(
         )?,
     };
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
-    let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)?;
-    let distributed_plan = crate::sql::planner::distributed::write::plan::with_iceberg_write_sink(
-        distributed_plan,
+    let distributed_plan = crate::sql::planner::pipeline::build_iceberg_write_distributed_plan(
+        physical_plan,
         crate::sql::planner::distributed::write::sink::IcebergWriteFragmentSink {
             descriptor_database: current_database.to_string(),
             spec: sink_spec,
@@ -3291,20 +3290,12 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
         .clone();
     snapshot_effective_backend_count_into_session();
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(optimized_tree)?;
-    let distributed_plan = if let Some(keyed_assert) = pre_expand_keyed_assert {
-        crate::sql::planner::pipeline::build_distributed_plan_with_pre_expand_keyed_assert(
-            physical_plan,
-            keyed_assert,
-        )?
-    } else {
-        crate::sql::planner::pipeline::build_distributed_plan(physical_plan)?
-    };
-    let planned_dp =
-        crate::sql::planner::distributed::write::plan::with_iceberg_change_stream_write(
-            distributed_plan,
-            current_database,
-            dag.clone(),
-        )?;
+    let planned_dp = crate::sql::planner::pipeline::build_iceberg_change_stream_distributed_plan(
+        physical_plan,
+        current_database,
+        dag.clone(),
+        pre_expand_keyed_assert,
+    )?;
     let distributed_plan = planned_dp.distributed_plan;
     let topology = planned_dp.topology;
     let build_result = crate::sql::codegen::fragment::build(

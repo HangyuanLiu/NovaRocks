@@ -54,12 +54,12 @@ fn build_distributed_plan_values_shapes_root_fragment() {
 
     let dp = build_distributed_plan(&plan).expect("build_distributed_plan");
 
-    assert!(dp.runtime_filter_graph.is_empty());
-    assert_eq!(dp.fragments.len(), 1);
-    assert_eq!(dp.root_fragment_id, 0);
-    assert!(dp.edges.is_empty());
+    assert!(dp.runtime_filter_graph().is_empty());
+    assert_eq!(dp.fragments().len(), 1);
+    assert_eq!(dp.root_fragment_id(), 0);
+    assert!(dp.edges().is_empty());
 
-    let fragment = &dp.fragments[0];
+    let fragment = &dp.fragments()[0];
     assert_eq!(fragment.fragment_id, 0);
     assert!(matches!(fragment.sink, DataSink::Result));
     assert!(matches!(
@@ -172,8 +172,8 @@ fn build_distributed_plan_scan_project_shapes_one_fragment() {
 
     let dp = build_distributed_plan(&project).expect("build_distributed_plan");
 
-    assert_eq!(dp.fragments.len(), 1);
-    let root = &dp.fragments[0].root;
+    assert_eq!(dp.fragments().len(), 1);
+    let root = &dp.fragments()[0].root;
     assert!(matches!(&root.payload, DistributedNodeKind::Project(_)));
     assert_eq!(root.node_id, 2);
     assert_eq!(root.tuple_ids, vec![2]);
@@ -219,7 +219,7 @@ fn build_distributed_plan_preserves_filter_over_scan_without_mutating_scan() {
 
     let dp = build_distributed_plan(&filter).expect("build_distributed_plan");
 
-    let root = &dp.fragments[0].root;
+    let root = &dp.fragments()[0].root;
     let root_filter = match &root.payload {
         DistributedNodeKind::Filter(filter) => filter,
         other => panic!("expected Filter root, got {other:?}"),
@@ -288,7 +288,7 @@ fn build_distributed_plan_preserves_filter_over_project() {
 
     let dp = build_distributed_plan(&filter).expect("build_distributed_plan");
 
-    let root = &dp.fragments[0].root;
+    let root = &dp.fragments()[0].root;
     let root_filter = match &root.payload {
         DistributedNodeKind::Filter(filter) => filter,
         other => panic!("expected Filter root, got {other:?}"),
@@ -325,7 +325,7 @@ fn build_distributed_plan_sort_reuses_child_tuple() {
 
     let dp = build_distributed_plan(&sort).expect("build_distributed_plan");
 
-    let root = &dp.fragments[0].root;
+    let root = &dp.fragments()[0].root;
     assert!(matches!(&root.payload, DistributedNodeKind::Sort(_)));
     assert_eq!(root.node_id, 2);
     assert_eq!(root.tuple_ids, vec![1]);
@@ -357,7 +357,7 @@ fn build_distributed_plan_hash_aggregate_allocates_new_tuple() {
 
     let dp = build_distributed_plan(&aggregate).expect("build_distributed_plan");
 
-    let root = &dp.fragments[0].root;
+    let root = &dp.fragments()[0].root;
     assert!(matches!(
         &root.payload,
         DistributedNodeKind::HashAggregate(_)
@@ -394,7 +394,7 @@ fn build_distributed_plan_hash_join_combines_child_tuples() {
 
     let dp = build_distributed_plan(&join).expect("build_distributed_plan");
 
-    let root = &dp.fragments[0].root;
+    let root = &dp.fragments()[0].root;
     assert!(matches!(&root.payload, DistributedNodeKind::HashJoin(_)));
     assert_eq!(root.node_id, 3);
     assert_eq!(root.tuple_ids, vec![1, 2]);
@@ -505,19 +505,19 @@ fn build_distributed_plan_binds_runtime_filters_across_redistribute_fragment() {
 
     let dp = build_distributed_plan(&join).expect("build_distributed_plan");
 
-    assert_eq!(dp.fragments.len(), 2);
+    assert_eq!(dp.fragments().len(), 2);
     let root_fragment = dp
-        .fragments
+        .fragments()
         .iter()
-        .find(|fragment| fragment.fragment_id == dp.root_fragment_id)
+        .find(|fragment| fragment.fragment_id == dp.root_fragment_id())
         .expect("root fragment");
     let probe_fragment = dp
-        .fragments
+        .fragments()
         .iter()
-        .find(|fragment| fragment.fragment_id != dp.root_fragment_id)
+        .find(|fragment| fragment.fragment_id != dp.root_fragment_id())
         .expect("probe fragment");
     let join_node = &root_fragment.root;
-    assert_eq!(join_node.fragment_id, dp.root_fragment_id);
+    assert_eq!(join_node.fragment_id, dp.root_fragment_id());
     assert!(matches!(
         &join_node.payload,
         DistributedNodeKind::HashJoin(_)
@@ -601,8 +601,8 @@ fn build_distributed_plan_keeps_runtime_filter_probe_on_filter() {
 
     let dp = build_distributed_plan(&join).expect("build_distributed_plan");
 
-    assert_eq!(dp.fragments.len(), 1);
-    let join_node = &dp.fragments[0].root;
+    assert_eq!(dp.fragments().len(), 1);
+    let join_node = &dp.fragments()[0].root;
     assert_eq!(join_node.build_runtime_filters.len(), 1);
     assert_eq!(
         join_node.build_runtime_filters[0].target_fragment_ids,
@@ -734,7 +734,7 @@ fn build_distributed_plan_nest_loop_join_combines_child_tuples() {
 
     let dp = build_distributed_plan(&join).expect("build_distributed_plan");
 
-    let root = &dp.fragments[0].root;
+    let root = &dp.fragments()[0].root;
     assert!(matches!(
         &root.payload,
         DistributedNodeKind::NestLoopJoin(_)
@@ -760,7 +760,7 @@ fn build_distributed_plan_assert_one_row_reuses_child_tuple() {
 
     let dp = build_distributed_plan(&assert_one_row).expect("build_distributed_plan");
 
-    let root = &dp.fragments[0].root;
+    let root = &dp.fragments()[0].root;
     assert!(matches!(
         &root.payload,
         DistributedNodeKind::AssertOneRow(_)
@@ -794,7 +794,7 @@ fn build_distributed_plan_change_event_expand_allocates_new_tuple() {
 
     let dp = build_distributed_plan(&expand).expect("build_distributed_plan");
 
-    let root = &dp.fragments[0].root;
+    let root = &dp.fragments()[0].root;
     assert!(matches!(
         &root.payload,
         DistributedNodeKind::ChangeEventExpand(_)
@@ -817,7 +817,7 @@ fn build_distributed_plan_repeat_appends_virtual_tuple_only_when_grouping_fn_arg
 
     let dp = build_distributed_plan(&repeat).expect("build_distributed_plan");
 
-    let root = &dp.fragments[0].root;
+    let root = &dp.fragments()[0].root;
     let repeat = match &root.payload {
         DistributedNodeKind::Repeat(repeat) => repeat,
         other => panic!("expected Repeat root, got {other:?}"),
@@ -837,7 +837,7 @@ fn build_distributed_plan_repeat_appends_virtual_tuple_only_when_grouping_fn_arg
 
     let dp = build_distributed_plan(&repeat).expect("build_distributed_plan");
 
-    let root = &dp.fragments[0].root;
+    let root = &dp.fragments()[0].root;
     let repeat = match &root.payload {
         DistributedNodeKind::Repeat(repeat) => repeat,
         other => panic!("expected Repeat root, got {other:?}"),
@@ -867,7 +867,7 @@ fn build_distributed_plan_generate_series_replicates_dummy_allocations() {
 
     let dp = build_distributed_plan(&generate_series).expect("build_distributed_plan");
 
-    let root = &dp.fragments[0].root;
+    let root = &dp.fragments()[0].root;
     assert!(matches!(
         &root.payload,
         DistributedNodeKind::GenerateSeries(_)
@@ -897,7 +897,7 @@ fn build_distributed_plan_table_function_replicates_dummy_allocations() {
 
     let dp = build_distributed_plan(&table_function).expect("build_distributed_plan");
 
-    let root = &dp.fragments[0].root;
+    let root = &dp.fragments()[0].root;
     assert!(matches!(
         &root.payload,
         DistributedNodeKind::TableFunction(_)
@@ -927,7 +927,7 @@ fn build_distributed_plan_window_single_group_allocates_analytic_ids() {
 
     let dp = build_distributed_plan(&window).expect("build_distributed_plan");
 
-    let root = &dp.fragments[0].root;
+    let root = &dp.fragments()[0].root;
     assert!(matches!(&root.payload, DistributedNodeKind::Window(_)));
     assert_eq!(root.node_id, 2);
     assert_eq!(root.tuple_ids, vec![1, 3]);
@@ -989,7 +989,7 @@ fn build_distributed_plan_window_multi_group_allocates_sort_when_ordering_change
 
     let dp = build_distributed_plan(&project).expect("build_distributed_plan");
 
-    let root = &dp.fragments[0].root;
+    let root = &dp.fragments()[0].root;
     assert!(matches!(&root.payload, DistributedNodeKind::Project(_)));
     assert_eq!(root.node_id, 6);
     assert_eq!(root.tuple_ids, vec![6]);
@@ -1059,13 +1059,13 @@ fn build_distributed_plan_hash_redistribute_creates_exchange_edge() {
 
     let dp = build_distributed_plan(&project).expect("build_distributed_plan");
 
-    assert_eq!(dp.fragments.len(), 2);
-    assert_eq!(dp.root_fragment_id, 0);
-    assert_eq!(dp.fragments[0].fragment_id, 1);
-    assert_eq!(dp.fragments[1].fragment_id, 0);
-    assert_eq!(dp.edges.len(), 1);
+    assert_eq!(dp.fragments().len(), 2);
+    assert_eq!(dp.root_fragment_id(), 0);
+    assert_eq!(dp.fragments()[0].fragment_id, 1);
+    assert_eq!(dp.fragments()[1].fragment_id, 0);
+    assert_eq!(dp.edges().len(), 1);
 
-    let root = &dp.fragments[1].root;
+    let root = &dp.fragments()[1].root;
     assert!(matches!(&root.payload, DistributedNodeKind::Project(_)));
     assert_eq!(root.fragment_id, 0);
     assert_eq!(root.children.len(), 1);
@@ -1094,7 +1094,7 @@ fn build_distributed_plan_hash_redistribute_creates_exchange_edge() {
     );
     assert_eq!(exchange_receiver.output_columns[0].name, "k");
 
-    let edge = &dp.edges[0];
+    let edge = &dp.edges()[0];
     assert_eq!(edge.source_fragment_id, 1);
     assert_eq!(edge.target_fragment_id, 0);
     assert_eq!(edge.target_exchange_node_id, exchange.node_id);
@@ -1102,7 +1102,7 @@ fn build_distributed_plan_hash_redistribute_creates_exchange_edge() {
     assert!(matches!(edge.edge_kind, FragmentEdgeKind::Stream));
     assert_eq!(edge.output_slot_ids, vec![1]);
 
-    let child_fragment = &dp.fragments[0];
+    let child_fragment = &dp.fragments()[0];
     assert_ne!(exchange.tuple_ids, child_fragment.root.tuple_ids);
     assert_eq!(exchange.tuple_ids.len(), 1);
     assert!(matches!(child_fragment.sink, DataSink::Noop));
@@ -1185,7 +1185,7 @@ fn fragment_cut_seam_preserves_exchange_topology_before_rf_binding() {
 
     let cut = cut(&join).expect("cut HashJoin and Redistribute topology");
 
-    assert_eq!(cut.plan.root_fragment_id, 0);
+    assert_eq!(cut.plan.root_fragment_id, Some(0));
     assert_eq!(cut.plan.fragments.len(), 2);
     assert_eq!(cut.plan.fragments[0].fragment_id, 1);
     assert_eq!(cut.plan.fragments[1].fragment_id, 0);
@@ -1246,10 +1246,10 @@ fn build_distributed_plan_stream_edge_carries_exchange_output_slot_order() {
 
     let dp = build_distributed_plan(&redistribute).expect("build_distributed_plan");
 
-    let edge = &dp.edges[0];
+    let edge = &dp.edges()[0];
     assert_eq!(edge.output_slot_ids, vec![2, 1]);
 
-    let root = &dp.fragments[1].root;
+    let root = &dp.fragments()[1].root;
     let receiver = match &root.payload {
         DistributedNodeKind::Exchange(receiver) => receiver,
         other => panic!("expected Exchange root, got {other:?}"),
@@ -1263,7 +1263,7 @@ fn build_distributed_plan_stream_edge_carries_exchange_output_slot_order() {
         vec![ColumnId::new_for_test(2), ColumnId::new_for_test(1)]
     );
 
-    let child_fragment = &dp.fragments[0];
+    let child_fragment = &dp.fragments()[0];
     assert_eq!(
         child_fragment
             .output_columns
@@ -1311,10 +1311,10 @@ fn build_distributed_plan_redistribute_drops_non_child_output_columns() {
 
     let dp = build_distributed_plan(&redistribute).expect("build_distributed_plan");
 
-    let edge = &dp.edges[0];
+    let edge = &dp.edges()[0];
     assert_eq!(edge.output_slot_ids, vec![2, 1]);
 
-    let root = &dp.fragments[1].root;
+    let root = &dp.fragments()[1].root;
     let receiver = match &root.payload {
         DistributedNodeKind::Exchange(receiver) => receiver,
         other => panic!("expected Exchange root, got {other:?}"),
@@ -1328,7 +1328,7 @@ fn build_distributed_plan_redistribute_drops_non_child_output_columns() {
         vec![ColumnId::new_for_test(2), ColumnId::new_for_test(1)]
     );
 
-    let child_fragment = &dp.fragments[0];
+    let child_fragment = &dp.fragments()[0];
     assert_eq!(
         child_fragment
             .output_columns
@@ -1370,10 +1370,10 @@ fn build_distributed_plan_stream_edge_drops_scan_columns_pruned_from_required() 
 
     let dp = build_distributed_plan(&redistribute).expect("build_distributed_plan");
 
-    let edge = &dp.edges[0];
+    let edge = &dp.edges()[0];
     assert_eq!(edge.output_slot_ids, vec![1, 2, 4]);
 
-    let child_fragment = &dp.fragments[0];
+    let child_fragment = &dp.fragments()[0];
     assert_eq!(
         child_fragment
             .output_columns
@@ -1435,8 +1435,8 @@ fn build_distributed_plan_stream_edge_drops_join_columns_pruned_from_child_sourc
 
     let dp = build_distributed_plan(&redistribute).expect("build_distributed_plan");
 
-    assert_eq!(dp.edges[0].output_slot_ids, vec![1, 4]);
-    let receiver = match &dp.fragments[1].root.payload {
+    assert_eq!(dp.edges()[0].output_slot_ids, vec![1, 4]);
+    let receiver = match &dp.fragments()[1].root.payload {
         DistributedNodeKind::Exchange(receiver) => receiver,
         other => panic!("expected Exchange root, got {other:?}"),
     };
@@ -1449,7 +1449,7 @@ fn build_distributed_plan_stream_edge_drops_join_columns_pruned_from_child_sourc
         vec![ColumnId::new_for_test(1), ColumnId::new_for_test(4)]
     );
     assert_eq!(
-        dp.fragments[0]
+        dp.fragments()[0]
             .output_columns
             .iter()
             .map(|column| column.column_id)
@@ -1528,10 +1528,10 @@ fn build_distributed_plan_stream_edge_drops_redistribute_child_columns_pruned_fr
 
     let dp = build_distributed_plan(&redistribute).expect("build_distributed_plan");
 
-    assert_eq!(dp.edges.len(), 2);
-    assert_eq!(dp.edges[0].output_slot_ids, vec![9, 10, 12]);
-    assert_eq!(dp.edges[1].output_slot_ids, vec![1, 10]);
-    let receiver = match &dp.fragments[2].root.payload {
+    assert_eq!(dp.edges().len(), 2);
+    assert_eq!(dp.edges()[0].output_slot_ids, vec![9, 10, 12]);
+    assert_eq!(dp.edges()[1].output_slot_ids, vec![1, 10]);
+    let receiver = match &dp.fragments()[2].root.payload {
         DistributedNodeKind::Exchange(receiver) => receiver,
         other => panic!("expected Exchange root, got {other:?}"),
     };
@@ -1594,8 +1594,8 @@ fn build_distributed_plan_stream_edge_uses_project_item_outputs() {
 
     let dp = build_distributed_plan(&redistribute).expect("build_distributed_plan");
 
-    assert_eq!(dp.edges[0].output_slot_ids, vec![1, 3]);
-    let receiver = match &dp.fragments[1].root.payload {
+    assert_eq!(dp.edges()[0].output_slot_ids, vec![1, 3]);
+    let receiver = match &dp.fragments()[1].root.payload {
         DistributedNodeKind::Exchange(receiver) => receiver,
         other => panic!("expected Exchange root, got {other:?}"),
     };
@@ -1608,7 +1608,7 @@ fn build_distributed_plan_stream_edge_uses_project_item_outputs() {
         vec![ColumnId::new_for_test(1), ColumnId::new_for_test(3)]
     );
     assert_eq!(
-        dp.fragments[0]
+        dp.fragments()[0]
             .output_columns
             .iter()
             .map(|column| column.column_id)
@@ -1664,8 +1664,8 @@ fn build_distributed_plan_local_aggregate_stream_uses_layout_output_types() {
 
     let dp = build_distributed_plan(&redistribute).expect("build_distributed_plan");
 
-    assert_eq!(dp.edges[0].output_slot_ids, vec![20]);
-    let receiver = match &dp.fragments[1].root.payload {
+    assert_eq!(dp.edges()[0].output_slot_ids, vec![20]);
+    let receiver = match &dp.fragments()[1].root.payload {
         DistributedNodeKind::Exchange(receiver) => receiver,
         other => panic!("expected Exchange root, got {other:?}"),
     };
@@ -1675,12 +1675,15 @@ fn build_distributed_plan_local_aggregate_stream_uses_layout_output_types() {
         local_avg_state.column_id
     );
     assert_eq!(receiver.output_columns[0].data_type, DataType::Utf8);
-    assert_eq!(dp.fragments[0].output_columns.len(), 1);
+    assert_eq!(dp.fragments()[0].output_columns.len(), 1);
     assert_eq!(
-        dp.fragments[0].output_columns[0].column_id,
+        dp.fragments()[0].output_columns[0].column_id,
         local_avg_state.column_id
     );
-    assert_eq!(dp.fragments[0].output_columns[0].data_type, DataType::Utf8);
+    assert_eq!(
+        dp.fragments()[0].output_columns[0].data_type,
+        DataType::Utf8
+    );
 }
 
 #[test]
@@ -1743,9 +1746,9 @@ fn build_distributed_plan_broadcast_redistribute_creates_broadcast_edge() {
 
     let dp = build_distributed_plan(&project).expect("build_distributed_plan");
 
-    assert_eq!(dp.fragments.len(), 2);
-    assert_eq!(dp.edges.len(), 1);
-    let root = &dp.fragments[1].root;
+    assert_eq!(dp.fragments().len(), 2);
+    assert_eq!(dp.edges().len(), 1);
+    let root = &dp.fragments()[1].root;
     let exchange = &root.children[0];
     let exchange_receiver = match &exchange.payload {
         DistributedNodeKind::Exchange(exchange_receiver) => exchange_receiver,
@@ -1756,10 +1759,10 @@ fn build_distributed_plan_broadcast_redistribute_creates_broadcast_edge() {
         PartitionKind::Unpartitioned
     ));
     assert!(exchange_receiver.partition.exprs.is_empty());
-    assert_eq!(dp.edges[0].stream_kind, FragmentStreamKind::Broadcast);
-    assert!(matches!(dp.edges[0].edge_kind, FragmentEdgeKind::Stream));
+    assert_eq!(dp.edges()[0].stream_kind, FragmentStreamKind::Broadcast);
+    assert!(matches!(dp.edges()[0].edge_kind, FragmentEdgeKind::Stream));
     assert!(matches!(
-        dp.edges[0].output_partition.kind,
+        dp.edges()[0].output_partition.kind,
         PartitionKind::Unpartitioned
     ));
 }
@@ -1781,9 +1784,9 @@ fn build_distributed_plan_root_gather_is_skipped() {
 
     let dp = build_distributed_plan(&redistribute).expect("build_distributed_plan");
 
-    assert_eq!(dp.fragments.len(), 1);
-    assert!(dp.edges.is_empty());
-    let root = &dp.fragments[0].root;
+    assert_eq!(dp.fragments().len(), 1);
+    assert!(dp.edges().is_empty());
+    let root = &dp.fragments()[0].root;
     assert!(matches!(&root.payload, DistributedNodeKind::Scan(_)));
 }
 
@@ -1825,12 +1828,12 @@ fn build_distributed_plan_cte_anchor_splits_produce_fragment_and_consume_exchang
 
     let dp = build_distributed_plan(&anchor).expect("build_distributed_plan");
 
-    assert_eq!(dp.fragments.len(), 2);
-    assert_eq!(dp.root_fragment_id, 0);
-    assert_eq!(dp.edges.len(), 1);
+    assert_eq!(dp.fragments().len(), 2);
+    assert_eq!(dp.root_fragment_id(), 0);
+    assert_eq!(dp.edges().len(), 1);
 
     let produce_fragment = dp
-        .fragments
+        .fragments()
         .iter()
         .find(|fragment| fragment.cte_id == Some(cte_id))
         .expect("produce fragment");
@@ -1851,9 +1854,9 @@ fn build_distributed_plan_cte_anchor_splits_produce_fragment_and_consume_exchang
     ));
 
     let root_fragment = dp
-        .fragments
+        .fragments()
         .iter()
-        .find(|fragment| fragment.fragment_id == dp.root_fragment_id)
+        .find(|fragment| fragment.fragment_id == dp.root_fragment_id())
         .expect("root fragment");
     assert!(matches!(root_fragment.sink, DataSink::Result));
     assert_eq!(root_fragment.cte_id, None);
@@ -1884,7 +1887,7 @@ fn build_distributed_plan_cte_anchor_splits_produce_fragment_and_consume_exchang
         DistributedNodeKind::Exchange(receiver) => receiver,
         other => panic!("expected CTE consume Exchange child, got {other:?}"),
     };
-    assert_eq!(exchange.fragment_id, dp.root_fragment_id);
+    assert_eq!(exchange.fragment_id, dp.root_fragment_id());
     assert_eq!(exchange.tuple_ids.len(), 1);
     assert!(
         exchange.stats.cost_estimate.is_none(),
@@ -1917,9 +1920,9 @@ fn build_distributed_plan_cte_anchor_splits_produce_fragment_and_consume_exchang
         &vec![producer_columns[0].column_id]
     );
 
-    let edge = &dp.edges[0];
+    let edge = &dp.edges()[0];
     assert_eq!(edge.source_fragment_id, produce_fragment.fragment_id);
-    assert_eq!(edge.target_fragment_id, dp.root_fragment_id);
+    assert_eq!(edge.target_fragment_id, dp.root_fragment_id());
     assert_eq!(edge.target_exchange_node_id, exchange.node_id);
     assert_eq!(edge.stream_kind, FragmentStreamKind::Broadcast);
     assert!(matches!(
@@ -1995,14 +1998,14 @@ fn build_distributed_plan_cte_consume_remaps_pruned_producer_columns_with_projec
 
     let dp = build_distributed_plan(&anchor).expect("build_distributed_plan");
     let produce_fragment = dp
-        .fragments
+        .fragments()
         .iter()
         .find(|fragment| fragment.cte_id == Some(cte_id))
         .expect("produce fragment");
     let root_fragment = dp
-        .fragments
+        .fragments()
         .iter()
-        .find(|fragment| fragment.fragment_id == dp.root_fragment_id)
+        .find(|fragment| fragment.fragment_id == dp.root_fragment_id())
         .expect("root fragment");
 
     let project = &root_fragment.root;
@@ -2052,7 +2055,7 @@ fn build_distributed_plan_cte_consume_remaps_pruned_producer_columns_with_projec
         vec![producer_columns[0].column_id, producer_columns[2].column_id]
     );
 
-    let edge = &dp.edges[0];
+    let edge = &dp.edges()[0];
     assert_eq!(edge.target_exchange_node_id, exchange.node_id);
     assert_eq!(edge.output_slot_ids, vec![1, 3]);
     match &edge.edge_kind {
@@ -2271,13 +2274,13 @@ fn build_distributed_plan_collects_multiple_cte_exchange_nodes_in_root_tree() {
 
     let dp = build_distributed_plan(&anchor).expect("build_distributed_plan");
     let root_fragment = dp
-        .fragments
+        .fragments()
         .iter()
-        .find(|fragment| fragment.fragment_id == dp.root_fragment_id)
+        .find(|fragment| fragment.fragment_id == dp.root_fragment_id())
         .expect("root fragment");
 
     assert_eq!(root_fragment.cte_exchange_nodes.len(), 2);
-    assert_eq!(dp.edges.len(), 2);
+    assert_eq!(dp.edges().len(), 2);
     assert!(
         root_fragment
             .cte_exchange_nodes
@@ -2304,13 +2307,13 @@ fn build_distributed_plan_limit_offset_over_scan_creates_gather_exchange() {
 
     let dp = build_distributed_plan(&limit).expect("build_distributed_plan");
 
-    assert_eq!(dp.fragments.len(), 2);
-    assert_eq!(dp.edges.len(), 1);
+    assert_eq!(dp.fragments().len(), 2);
+    assert_eq!(dp.edges().len(), 1);
 
     let root_fragment = dp
-        .fragments
+        .fragments()
         .iter()
-        .find(|fragment| fragment.fragment_id == dp.root_fragment_id)
+        .find(|fragment| fragment.fragment_id == dp.root_fragment_id())
         .expect("root fragment");
     let exchange = &root_fragment.root;
     let receiver = match &exchange.payload {
@@ -2342,9 +2345,9 @@ fn build_distributed_plan_limit_offset_over_scan_creates_gather_exchange() {
         other => panic!("expected LimitOffset exchange flavor, got {other:?}"),
     }
 
-    let edge = &dp.edges[0];
+    let edge = &dp.edges()[0];
     assert_eq!(edge.source_fragment_id, receiver.source_fragment_id);
-    assert_eq!(edge.target_fragment_id, dp.root_fragment_id);
+    assert_eq!(edge.target_fragment_id, dp.root_fragment_id());
     assert_eq!(edge.target_exchange_node_id, exchange.node_id);
     assert_eq!(edge.stream_kind, FragmentStreamKind::Gather);
     assert!(matches!(edge.edge_kind, FragmentEdgeKind::Stream));
@@ -2355,7 +2358,7 @@ fn build_distributed_plan_limit_offset_over_scan_creates_gather_exchange() {
     assert!(edge.output_slot_ids.is_empty());
 
     let child_fragment = dp
-        .fragments
+        .fragments()
         .iter()
         .find(|fragment| fragment.fragment_id == receiver.source_fragment_id)
         .expect("child fragment");
@@ -2391,13 +2394,13 @@ fn build_distributed_plan_topn_final_split_creates_topn_exchange() {
 
     let dp = build_distributed_plan(&topn).expect("build_distributed_plan");
 
-    assert_eq!(dp.fragments.len(), 2);
-    assert_eq!(dp.edges.len(), 1);
+    assert_eq!(dp.fragments().len(), 2);
+    assert_eq!(dp.edges().len(), 1);
 
     let root_fragment = dp
-        .fragments
+        .fragments()
         .iter()
-        .find(|fragment| fragment.fragment_id == dp.root_fragment_id)
+        .find(|fragment| fragment.fragment_id == dp.root_fragment_id())
         .expect("root fragment");
     let exchange = &root_fragment.root;
     let receiver = match &exchange.payload {
@@ -2437,9 +2440,9 @@ fn build_distributed_plan_topn_final_split_creates_topn_exchange() {
         other => panic!("expected TopNSplit exchange flavor, got {other:?}"),
     }
 
-    let edge = &dp.edges[0];
+    let edge = &dp.edges()[0];
     assert_eq!(edge.source_fragment_id, receiver.source_fragment_id);
-    assert_eq!(edge.target_fragment_id, dp.root_fragment_id);
+    assert_eq!(edge.target_fragment_id, dp.root_fragment_id());
     assert_eq!(edge.target_exchange_node_id, exchange.node_id);
     assert_eq!(edge.stream_kind, FragmentStreamKind::Gather);
     assert!(matches!(edge.edge_kind, FragmentEdgeKind::Stream));
@@ -2448,7 +2451,7 @@ fn build_distributed_plan_topn_final_split_creates_topn_exchange() {
         PartitionKind::Unpartitioned
     ));
     let child_fragment = dp
-        .fragments
+        .fragments()
         .iter()
         .find(|fragment| fragment.fragment_id == receiver.source_fragment_id)
         .expect("child fragment");
@@ -2490,9 +2493,9 @@ fn build_distributed_plan_limit_over_sort_collapses_into_local_sort() {
 
     let dp = build_distributed_plan(&limit).expect("build_distributed_plan");
 
-    assert_eq!(dp.fragments.len(), 1);
-    assert!(dp.edges.is_empty());
-    let root = &dp.fragments[0].root;
+    assert_eq!(dp.fragments().len(), 1);
+    assert!(dp.edges().is_empty());
+    let root = &dp.fragments()[0].root;
     let sort = match &root.payload {
         DistributedNodeKind::Sort(sort) => sort,
         other => panic!("expected Sort root, got {other:?}"),
@@ -2536,9 +2539,9 @@ fn build_distributed_plan_limit_over_topn_collapses_into_local_topn() {
 
     let dp = build_distributed_plan(&limit).expect("build_distributed_plan");
 
-    assert_eq!(dp.fragments.len(), 1);
-    assert!(dp.edges.is_empty());
-    let root = &dp.fragments[0].root;
+    assert_eq!(dp.fragments().len(), 1);
+    assert!(dp.edges().is_empty());
+    let root = &dp.fragments()[0].root;
     let topn = match &root.payload {
         DistributedNodeKind::TopN(topn) => topn,
         other => panic!("expected TopN root, got {other:?}"),
@@ -2569,9 +2572,9 @@ fn build_distributed_plan_topn_non_split_stays_in_fragment() {
 
     let dp = build_distributed_plan(&topn).expect("build_distributed_plan");
 
-    assert_eq!(dp.fragments.len(), 1);
-    assert!(dp.edges.is_empty());
-    let root = &dp.fragments[0].root;
+    assert_eq!(dp.fragments().len(), 1);
+    assert!(dp.edges().is_empty());
+    let root = &dp.fragments()[0].root;
     assert_eq!(root.limit, 3);
     assert_eq!(root.node_id, 2);
     assert_eq!(root.tuple_ids, vec![1]);
@@ -2642,9 +2645,9 @@ fn build_distributed_plan_union_all_passes_through_same_fragment() {
 
     let dp = build_distributed_plan(&set_op).expect("build_distributed_plan");
 
-    assert_eq!(dp.fragments.len(), 1);
-    assert!(dp.edges.is_empty());
-    let root = &dp.fragments[0].root;
+    assert_eq!(dp.fragments().len(), 1);
+    assert!(dp.edges().is_empty());
+    let root = &dp.fragments()[0].root;
     let union_all = match &root.payload {
         DistributedNodeKind::SetOp(set_op) => set_op,
         other => panic!("expected SetOp root, got {other:?}"),
@@ -2657,10 +2660,10 @@ fn build_distributed_plan_union_all_passes_through_same_fragment() {
     );
     assert_eq!(root.node_id, 3);
     assert_eq!(root.tuple_ids, vec![3]);
-    assert_eq!(root.fragment_id, dp.root_fragment_id);
+    assert_eq!(root.fragment_id, dp.root_fragment_id());
     assert_eq!(root.children.len(), 2);
-    assert_eq!(root.children[0].fragment_id, dp.root_fragment_id);
-    assert_eq!(root.children[1].fragment_id, dp.root_fragment_id);
+    assert_eq!(root.children[0].fragment_id, dp.root_fragment_id());
+    assert_eq!(root.children[1].fragment_id, dp.root_fragment_id());
     assert!(matches!(
         &root.children[0].payload,
         DistributedNodeKind::Values(_)
@@ -2690,9 +2693,9 @@ fn build_distributed_plan_intersect_passes_through_same_fragment() {
 
     let dp = build_distributed_plan(&set_op).expect("build_distributed_plan");
 
-    assert_eq!(dp.fragments.len(), 1);
-    assert!(dp.edges.is_empty());
-    let root = &dp.fragments[0].root;
+    assert_eq!(dp.fragments().len(), 1);
+    assert!(dp.edges().is_empty());
+    let root = &dp.fragments()[0].root;
     let intersect = match &root.payload {
         DistributedNodeKind::SetOp(set_op) => set_op,
         other => panic!("expected SetOp root, got {other:?}"),
@@ -2704,8 +2707,8 @@ fn build_distributed_plan_intersect_passes_through_same_fragment() {
         output_columns[0].column_id
     );
     assert_eq!(root.children.len(), 2);
-    assert_eq!(root.children[0].fragment_id, dp.root_fragment_id);
-    assert_eq!(root.children[1].fragment_id, dp.root_fragment_id);
+    assert_eq!(root.children[0].fragment_id, dp.root_fragment_id());
+    assert_eq!(root.children[1].fragment_id, dp.root_fragment_id());
 }
 
 #[test]

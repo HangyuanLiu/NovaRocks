@@ -212,8 +212,68 @@ fn pipeline_builds_distributed_plan_from_physical_values() {
     };
 
     let distributed = build_distributed_plan(physical).expect("build DistributedPlan");
-    assert_eq!(distributed.fragments.len(), 1);
-    assert_eq!(distributed.root_fragment_id, 0);
+    assert_eq!(distributed.fragments().len(), 1);
+    assert_eq!(distributed.root_fragment_id(), 0);
+}
+
+fn assert_sealed_plan(_: &crate::sql::planner::distributed::DistributedPlan) {}
+
+#[test]
+fn plain_write_and_change_stream_entrypoints_return_sealed_plans() {
+    let id = OutputColumn {
+        column_id: ColumnId::new_for_test(1),
+        name: "id".to_string(),
+        data_type: DataType::Int32,
+        nullable: false,
+        is_internal: false,
+    };
+
+    let plain = build_distributed_plan(physical_values_node(vec![id.clone()]))
+        .expect("plain entrypoint seals");
+    assert_sealed_plan(&plain);
+    assert!(matches!(
+        plain.fragments()[0].sink,
+        crate::sql::planner::distributed::DataSink::Result
+    ));
+
+    let write = build_iceberg_write_distributed_plan(
+        physical_values_node(vec![id.clone()]),
+        crate::sql::planner::distributed::write::sink::IcebergWriteFragmentSink {
+            descriptor_database: "test_db".to_string(),
+            spec: crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec(),
+            input: crate::sql::planner::distributed::write::sink::IcebergWriteInputBinding::RootOutputByOrdinal,
+        },
+    )
+    .expect("write entrypoint seals after sink decoration");
+    assert_sealed_plan(&write);
+    assert!(matches!(
+        write.fragments()[0].sink,
+        crate::sql::planner::distributed::DataSink::IcebergWrite(_)
+    ));
+
+    let change = build_iceberg_change_stream_distributed_plan(
+        physical_values_node(vec![id]),
+        "test_db",
+        crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec::for_test(
+            Some(0),
+            None,
+            vec![crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![0])],
+        ),
+        None,
+    )
+    .expect("change-stream entrypoint seals after router decoration");
+    assert_sealed_plan(&change.distributed_plan);
+    assert_eq!(change.distributed_plan.fragments().len(), 2);
+    let root = change
+        .distributed_plan
+        .fragments()
+        .iter()
+        .find(|fragment| fragment.fragment_id == change.distributed_plan.root_fragment_id())
+        .expect("change-stream root");
+    assert!(matches!(
+        root.sink,
+        crate::sql::planner::distributed::DataSink::IcebergChangeStreamRouter(_)
+    ));
 }
 
 #[test]
@@ -222,7 +282,7 @@ fn pipeline_places_runtime_filters_before_distributed_build() {
     let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
         .expect("convert optimizer physical plan");
     let distributed = build_distributed_plan(physical).expect("build DistributedPlan");
-    let root = &distributed.fragments[distributed.root_fragment_id as usize].root;
+    let root = &distributed.fragments()[distributed.root_fragment_id() as usize].root;
 
     assert!(
         has_build_rf(root),
@@ -270,17 +330,24 @@ fn keyed_change_stream_assert_is_planned_before_expand_and_distributed_normally(
         probe_runtime_filters: vec![],
     };
 
-    let distributed = build_distributed_plan_with_pre_expand_keyed_assert(
+    let planned = build_iceberg_change_stream_distributed_plan(
         physical,
-        PreExpandKeyedAssertSpec {
+        "test_db",
+        crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec::for_test(
+            Some(2),
+            None,
+            vec![crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![0])],
+        ),
+        Some(PreExpandKeyedAssertSpec {
             key_column_name: "__nr_row_id".to_string(),
             key_label: "_row_id".to_string(),
             message_prefix: "MOR UPDATE matched target row".to_string(),
-        },
+        }),
     )
-    .expect("plan keyed assertion before distributed construction");
+    .expect("plan keyed assertion through the real change-stream entrypoint");
 
-    let root = &distributed.fragments[distributed.root_fragment_id as usize].root;
+    let distributed = &planned.distributed_plan;
+    let root = &distributed.fragments()[distributed.root_fragment_id() as usize].root;
     assert!(matches!(
         root.payload,
         crate::sql::planner::distributed::DistributedNodeKind::ChangeEventExpand(_)
@@ -315,6 +382,8 @@ fn keyed_change_stream_assert_is_planned_before_expand_and_distributed_normally(
             .map(|column| column.column_id)
             .collect::<Vec<_>>()
     );
+    assert_eq!(planned.topology.writer_branches.len(), 1);
+    assert_eq!(distributed.fragments().len(), 2);
 }
 
 #[test]

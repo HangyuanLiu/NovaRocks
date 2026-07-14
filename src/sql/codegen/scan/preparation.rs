@@ -40,7 +40,7 @@ pub(crate) fn prepare_scan_bindings(
 ) -> Result<ScanExecutionBindings, String> {
     let mut bindings = ScanExecutionBindings::default();
     let mut seen_scan_node_ids = std::collections::BTreeSet::new();
-    for fragment in &plan.fragments {
+    for fragment in plan.fragments() {
         collect_scan_bindings(
             fragment.fragment_id,
             &fragment.root,
@@ -1207,7 +1207,7 @@ mod tests {
     }
 
     fn plan(root: DistributedNode) -> DistributedPlan {
-        DistributedPlan {
+        crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
             fragments: vec![PlanFragment {
                 fragment_id: 0,
                 root,
@@ -1341,11 +1341,16 @@ mod tests {
                 metadata_payload: None,
             },
         );
-        let mut duplicate_across_fragments = plan(metadata_root);
-        let mut second = duplicate_across_fragments.fragments[0].clone();
-        second.fragment_id = 1;
-        second.root.fragment_id = 1;
-        duplicate_across_fragments.fragments.push(second);
+        let duplicate_across_fragments =
+            crate::sql::planner::distributed::test_support::rebuild_test_plan(
+                plan(metadata_root),
+                |draft| {
+                    let mut second = draft.fragments()[0].clone();
+                    second.fragment_id = 1;
+                    second.root.fragment_id = 1;
+                    draft.fragments_mut().push(second);
+                },
+            );
 
         let err = match prepare_scan_bindings(
             &duplicate_across_fragments,

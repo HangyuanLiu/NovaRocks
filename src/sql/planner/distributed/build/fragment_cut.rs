@@ -22,8 +22,9 @@ use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
+use crate::sql::planner::distributed::fragment::DistributedPlanDraft;
 use crate::sql::planner::distributed::{
-    DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor,
+    DataPartition, DataSink, DistributedNode, DistributedNodeKind, ExchangeFlavor,
     ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind, PlanFragment,
 };
 use crate::sql::planner::payload::PlanProjectNode;
@@ -40,7 +41,7 @@ use super::runtime_filter_binding::RuntimeFilterBindings;
 use super::union_distinct_must_be_rewritten_error;
 
 pub(super) struct FragmentCutResult {
-    pub(super) plan: DistributedPlan,
+    pub(super) plan: DistributedPlanDraft,
     pub(super) bindings: RuntimeFilterBindings,
 }
 
@@ -87,9 +88,9 @@ pub(super) fn cut(plan: &PhysicalPlanNode) -> Result<FragmentCutResult, String> 
         cte_exchange_nodes: root_cte_exchange_nodes,
     });
     Ok(FragmentCutResult {
-        plan: DistributedPlan {
+        plan: DistributedPlanDraft {
             fragments,
-            root_fragment_id,
+            root_fragment_id: Some(root_fragment_id),
             edges: builder.edges,
             runtime_filter_graph: RuntimeFilterGraph::default(),
         },
