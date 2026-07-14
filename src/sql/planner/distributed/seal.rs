@@ -78,9 +78,8 @@ impl DistributedPlan {
         &self.data.execution_column_id_allocator
     }
 
-    // CGO-9B/Task 4 (scheduler swap) consumes the topology contract; unused
-    // within Task 2 outside tests.
-    #[allow(dead_code)]
+    // Consumed on the production path by codegen `build()` (CGO-9B/Task 4),
+    // which projects the sealed order/anchor into the scheduler's topology.
     pub(crate) fn topology(&self) -> &TopologyContract {
         &self.data.topology
     }

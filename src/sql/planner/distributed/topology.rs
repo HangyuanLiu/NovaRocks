@@ -31,11 +31,11 @@
 //! purely from already-constructed planner artifacts (`PlanFragment`,
 //! `FragmentEdge`, `DataSink`).
 //!
-//! The order and anchor algorithms are reproduced faithfully from the execution
-//! coordinator's scheduler (`topological_sort_bottom_up` /
-//! `select_execution_root_fragment`) so a later task can swap the scheduler onto
-//! this contract with zero behavior change. The error strings are kept identical
-//! to the coordinator's for the same reason.
+//! The order and anchor algorithms reproduce the former execution coordinator
+//! scheduler's `topological_sort_bottom_up` / `select_execution_root_fragment`
+//! (retired in CGO-9B/Task 4, which swapped the scheduler onto this contract with
+//! zero behavior change). The error strings match those former coordinator
+//! diagnostics for the same continuity reason.
 //!
 //! The contract is deliberately runtime-independent: it carries no backend
 //! count, address, destination, placement, or `force_single_instance`. Those
@@ -262,8 +262,9 @@ fn is_terminal_write(sink: &DataSink) -> bool {
 
 /// Return the fragment ids in topological order (leaves first, root last).
 ///
-/// Kahn's algorithm, bottom-up, reproduced faithfully from the coordinator's
-/// `topological_sort_bottom_up`: in-degree is the number of incoming edges;
+/// Kahn's algorithm, bottom-up, reproducing the former coordinator scheduler's
+/// `topological_sort_bottom_up` (retired in CGO-9B/Task 4): in-degree is the
+/// number of incoming edges;
 /// zero-in-degree fragments are processed in ascending id order (`BTreeMap`
 /// seeds the queue in key order). A produced order shorter than the fragment
 /// count means a cycle.
@@ -338,15 +339,16 @@ fn verify_edge_direction(
     Ok(())
 }
 
-/// Select the single execution anchor, reproduced faithfully from the
-/// coordinator's `select_execution_root_fragment`:
+/// Select the single execution anchor, reproducing the former coordinator
+/// scheduler's `select_execution_root_fragment` (retired in CGO-9B/Task 4):
 /// - exactly one terminal fragment -> that fragment;
 /// - zero terminal fragments -> [`TopologyError::NoExecutionAnchor`];
 /// - many terminals, all terminal writes -> the minimum fragment id;
 /// - otherwise -> [`TopologyError::AmbiguousExecutionAnchor`].
 ///
-/// The coordinator additionally derives `force_single_instance` from the
-/// anchor's sink; that stays a runtime concern and is intentionally absent here.
+/// The scheduler derives `force_single_instance` from the anchor's output kind
+/// at placement time; that stays a runtime concern and is intentionally absent
+/// here.
 fn select_execution_anchor(
     fragments_by_id: &BTreeMap<FragmentId, &PlanFragment>,
     terminal_fragment_ids: &[FragmentId],

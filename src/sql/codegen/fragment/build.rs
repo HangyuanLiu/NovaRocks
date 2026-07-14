@@ -20,8 +20,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use super::boundary_schema::project_boundary_reports;
 use super::request::FragmentBuildRequest;
 use super::result::{
-    FragmentOutputKind, FragmentSchedulingMetadata, MultiFragmentBuildResult, OutputColumn,
-    RuntimeFilterPlanResult,
+    FragmentOutputKind, FragmentSchedulingMetadata, FragmentTopology, MultiFragmentBuildResult,
+    OutputColumn, RuntimeFilterPlanResult,
 };
 use super::runtime_filter::PlannedRuntimeFilter;
 use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
@@ -100,10 +100,19 @@ pub(crate) fn build(request: FragmentBuildRequest<'_>) -> Result<MultiFragmentBu
         dp.root_fragment_id(),
     )?;
 
+    // Project the planner's sealed topology (Task 2) read-only. The scheduler
+    // and coordinator consume this order/anchor instead of rederiving the DAG
+    // shape from edges.
+    let topology = FragmentTopology::new(
+        dp.topology().topological_fragment_order().to_vec(),
+        dp.topology().execution_anchor_fragment_id(),
+    );
+
     Ok(MultiFragmentBuildResult {
         fragment_schedules,
         native_fragments,
         root_fragment_id: dp.root_fragment_id(),
+        topology,
         edges: dp.edges().to_vec(),
         boundary_schemas,
         rf_plan: runtime_filter_plan(dp),
@@ -1218,6 +1227,7 @@ mod tests {
             .assign(
                 &result.fragment_schedules,
                 &result.edges,
+                &result.topology,
                 crate::common::types::UniqueId { hi: 1, lo: 7 },
             )
             .expect("schedule broadcast plan");

@@ -48,9 +48,7 @@ use crate::coordinator::profile::{
     StandaloneQueryProfileGuard, standalone_query_profile_count, take_standalone_query_profiles,
 };
 use crate::coordinator::report::{StandaloneQueryFailureGuard, take_standalone_query_failure};
-use crate::coordinator::scheduler::{
-    FragmentInstancePlacement, FragmentScheduler, topological_sort_bottom_up,
-};
+use crate::coordinator::scheduler::{FragmentInstancePlacement, FragmentScheduler};
 use crate::coordinator::write::report::{WriteAbortInput, WriteCommitInput, WriterKey};
 use crate::coordinator::write::{RegisteredWriteCoordinator, WriteCoordinator};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
@@ -127,6 +125,7 @@ impl ExecutionCoordinator {
             fragment_schedules,
             native_fragments,
             root_fragment_id,
+            topology,
             edges,
             boundary_schemas,
             rf_plan,
@@ -185,8 +184,13 @@ impl ExecutionCoordinator {
             &boundary_schemas,
         )?;
         let live = scheduler.live_backend_snapshot().entries();
-        let mut plan =
-            scheduler.assign_with_live(&fragment_schedules, &edges, query_id.clone(), live)?;
+        let mut plan = scheduler.assign_with_live(
+            &fragment_schedules,
+            &edges,
+            &topology,
+            query_id.clone(),
+            live,
+        )?;
         scheduler.fill_destinations_with_live(&mut plan, &edges, live)?;
         if let Some(rf) = rf_plan.as_ref() {
             scheduler.fill_runtime_filter_params_with_live(&mut plan, rf, live)?;
@@ -440,11 +444,12 @@ impl ExecutionCoordinator {
         if !submissions_by_fragment.contains_key(&execution_root_fragment_id) {
             return Err("root fragment produced no placement".to_string());
         }
+        // Submit consumers before producers: iterate the sealed leaves-first
+        // topological order in reverse (root first) so downstream exchange
+        // receivers / result buffers register before any upstream producer can
+        // send. The order is the planner-sealed projection, not recomputed here.
         let mut submissions: Vec<(usize, FragmentSubmission)> = Vec::new();
-        for fragment_id in topological_sort_bottom_up(&fragment_schedules, &edges)?
-            .into_iter()
-            .rev()
-        {
+        for &fragment_id in topology.topological_fragment_order().iter().rev() {
             if let Some(mut fragment_submissions) = submissions_by_fragment.remove(&fragment_id) {
                 submissions.append(&mut fragment_submissions);
             }

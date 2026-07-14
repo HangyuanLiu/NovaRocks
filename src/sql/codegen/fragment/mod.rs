@@ -25,6 +25,6 @@ pub(crate) use boundary_schema::BoundarySchemaReport;
 pub(crate) use build::build;
 pub(crate) use request::FragmentBuildRequest;
 pub(crate) use result::{
-    FragmentOutputKind, FragmentSchedulingMetadata, MultiFragmentBuildResult, OutputColumn,
-    RuntimeFilterPlanResult,
+    FragmentOutputKind, FragmentSchedulingMetadata, FragmentTopology, MultiFragmentBuildResult,
+    OutputColumn, RuntimeFilterPlanResult,
 };
