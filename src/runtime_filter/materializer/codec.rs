@@ -31,6 +31,8 @@ use crate::runtime_filter::port::support::{
 };
 use crate::runtime_filter::port::value_domain::{ContributionSizeError, ReducedMembershipDomain};
 
+use super::bloom::{BLOOM_METADATA_BYTES, BloomHashContract};
+
 const MAGIC: &[u8; 4] = b"NRFL";
 const FLAG_CONTAINS_NULL: u8 = 1;
 
@@ -100,21 +102,72 @@ pub(crate) fn encode_membership_leaf(
     };
     let schema = ArtifactMembershipSchema::new(&domain.data_type(), null_semantics)
         .map_err(|_| ArtifactCodecError::NonCanonicalPayload)?;
-    let schema_len = u16::try_from(schema.canonical_bytes().len())
+    let mut payload = Vec::new();
+    if kind == ArtifactKind::ValueSet {
+        let payload_len = domain.values().canonical_encoded_len()?;
+        payload
+            .try_reserve_exact(payload_len)
+            .map_err(|_| ArtifactCodecError::ResourceLimit)?;
+        domain.values().encode_canonical_into(&mut payload)?;
+    }
+    encode_physical_leaf(
+        kind,
+        &schema,
+        logical_version,
+        contains_null,
+        None,
+        &payload,
+    )
+}
+
+pub(crate) fn encoded_leaf_len(
+    schema: &ArtifactMembershipSchema,
+    hash_contract: Option<HashContractDigest>,
+    payload_len: usize,
+) -> Result<usize, ArtifactCodecError> {
+    u16::try_from(schema.canonical_bytes().len())
         .map_err(|_| ArtifactCodecError::LengthOverflow)?;
-    let payload_len = match kind {
-        ArtifactKind::ValueSet => domain.values().canonical_encoded_len()?,
-        ArtifactKind::EmptyDomain => 0,
-        _ => unreachable!("membership leaf encoder selects only Task 1 kinds"),
-    };
-    let capacity = 4usize
+    u64::try_from(payload_len).map_err(|_| ArtifactCodecError::LengthOverflow)?;
+    4usize
         .checked_add(2)
         .and_then(|size| {
-            size.checked_add(1 + 32 + 2 + schema.canonical_bytes().len() + 8 + 1 + 1 + 8)
+            size.checked_add(
+                1 + 32
+                    + 2
+                    + schema.canonical_bytes().len()
+                    + 8
+                    + 1
+                    + 1
+                    + hash_contract.map_or(0, |_| 32)
+                    + 8,
+            )
         })
         .and_then(|size| size.checked_add(payload_len))
-        .ok_or(ArtifactCodecError::LengthOverflow)?;
-    let payload_len = u64::try_from(payload_len).map_err(|_| ArtifactCodecError::LengthOverflow)?;
+        .ok_or(ArtifactCodecError::LengthOverflow)
+}
+
+pub(crate) fn encode_physical_leaf(
+    kind: ArtifactKind,
+    schema: &ArtifactMembershipSchema,
+    logical_version: LogicalVersion,
+    contains_null: bool,
+    hash_contract: Option<HashContractDigest>,
+    payload: &[u8],
+) -> Result<Vec<u8>, ArtifactCodecError> {
+    if contains_null && schema.null_semantics() != NullSemantics::NullSafeEqual {
+        return Err(ArtifactCodecError::NonCanonicalPayload);
+    }
+    if matches!(kind, ArtifactKind::Bloom) != hash_contract.is_some() {
+        return Err(ArtifactCodecError::InvalidHashContract);
+    }
+    if kind == ArtifactKind::EmptyDomain && (contains_null || !payload.is_empty()) {
+        return Err(ArtifactCodecError::NonCanonicalPayload);
+    }
+    let schema_len = u16::try_from(schema.canonical_bytes().len())
+        .map_err(|_| ArtifactCodecError::LengthOverflow)?;
+    let capacity = encoded_leaf_len(schema, hash_contract, payload.len())?;
+    let payload_len =
+        u64::try_from(payload.len()).map_err(|_| ArtifactCodecError::LengthOverflow)?;
     let mut encoded = Vec::with_capacity(capacity);
     encoded.extend_from_slice(MAGIC);
     encoded.extend_from_slice(&LEAF_CODEC_VERSION.to_be_bytes());
@@ -124,11 +177,15 @@ pub(crate) fn encode_membership_leaf(
     encoded.extend_from_slice(schema.canonical_bytes());
     encoded.extend_from_slice(&logical_version.get().to_be_bytes());
     encoded.push(u8::from(contains_null) * FLAG_CONTAINS_NULL);
-    encoded.push(0); // Task 1 ValueSet/EmptyDomain have no hash contract.
-    encoded.extend_from_slice(&payload_len.to_be_bytes());
-    if kind == ArtifactKind::ValueSet {
-        domain.values().encode_canonical_into(&mut encoded)?;
+    match hash_contract {
+        Some(digest) => {
+            encoded.push(1);
+            encoded.extend_from_slice(&digest.bytes());
+        }
+        None => encoded.push(0),
     }
+    encoded.extend_from_slice(&payload_len.to_be_bytes());
+    encoded.extend_from_slice(payload);
     debug_assert_eq!(encoded.len(), capacity);
     Ok(encoded)
 }
@@ -156,6 +213,9 @@ pub(crate) fn decode_leaf(
     if header.hash_contract != expectations.expected_hash_contract {
         return Err(ArtifactCodecError::HashContractMismatch);
     }
+    if header.contains_null && header.schema.null_semantics() != NullSemantics::NullSafeEqual {
+        return Err(ArtifactCodecError::NonCanonicalPayload);
+    }
     match header.kind {
         ArtifactKind::EmptyDomain => {
             if header.contains_null || !header.payload.is_empty() {
@@ -165,12 +225,24 @@ pub(crate) fn decode_leaf(
         ArtifactKind::ValueSet => {
             validate_value_set(header.payload, header.contains_null, &header.schema)?
         }
-        ArtifactKind::Bloom | ArtifactKind::Bitset | ArtifactKind::Range => {
-            return Err(ArtifactCodecError::UnsupportedKind);
+        ArtifactKind::Bitset => {
+            validate_bitset(header.payload, header.contains_null, header.schema)?
         }
+        ArtifactKind::Bloom => validate_bloom(
+            header.payload,
+            header.contains_null,
+            header.schema,
+            header
+                .hash_contract
+                .ok_or(ArtifactCodecError::InvalidHashContract)?,
+        )?,
+        ArtifactKind::Range => return Err(ArtifactCodecError::UnsupportedKind),
     }
 
-    let retention = ArtifactRetention::try_new(encoded.len(), retained_budget, memory_account)?;
+    let accounted_resident_bytes = PhysicalArtifact::accounted_resident_bytes(encoded.len())
+        .map_err(|_| ArtifactCodecError::LengthOverflow)?;
+    let retention =
+        ArtifactRetention::try_new(accounted_resident_bytes, retained_budget, memory_account)?;
     let bytes: Arc<[u8]> = Arc::from(encoded);
     let artifact = PhysicalArtifact::from_retained_bytes(
         header.kind,
@@ -178,6 +250,7 @@ pub(crate) fn decode_leaf(
         header.logical_version,
         header.contains_null,
         bytes,
+        accounted_resident_bytes,
         retention,
     )
     .map_err(|_| ArtifactCodecError::ResourceLimit)?;
@@ -221,8 +294,7 @@ fn parse_header(encoded: &[u8]) -> Result<ParsedHeader<'_>, ArtifactCodecError> 
         1 => Some(HashContractDigest::new(reader.read_array::<32>()?)),
         _ => return Err(ArtifactCodecError::InvalidHashContract),
     };
-    if matches!(kind, ArtifactKind::ValueSet | ArtifactKind::EmptyDomain) && hash_contract.is_some()
-    {
+    if matches!(kind, ArtifactKind::Bloom) != hash_contract.is_some() {
         return Err(ArtifactCodecError::InvalidHashContract);
     }
     let payload_len =
@@ -288,6 +360,123 @@ fn validate_value_set(
         return Err(ArtifactCodecError::NonCanonicalPayload);
     }
     if contains_null && schema.null_semantics() != NullSemantics::NullSafeEqual {
+        return Err(ArtifactCodecError::NonCanonicalPayload);
+    }
+    Ok(())
+}
+
+fn validate_bitset(
+    payload: &[u8],
+    _contains_null: bool,
+    schema: ArtifactMembershipSchemaView<'_>,
+) -> Result<(), ArtifactCodecError> {
+    let mut reader = Reader::new(payload);
+    let type_tag = reader.read_u8()?;
+    if type_tag != schema.payload_tag()
+        || !matches!(type_tag, 1 | 2 | 3 | 4 | 5 | 10 | 12)
+        || (type_tag == 12 && !matches!(schema.decimal_contract(), Some((1..=18, _))))
+    {
+        return Err(ArtifactCodecError::NonCanonicalPayload);
+    }
+    let min = reader.read_i64()?;
+    let max = reader.read_i64()?;
+    let endpoints_representable = match type_tag {
+        1 => min >= 0 && max <= 1,
+        2 => min >= i64::from(i8::MIN) && max <= i64::from(i8::MAX),
+        3 => min >= i64::from(i16::MIN) && max <= i64::from(i16::MAX),
+        4 | 10 => min >= i64::from(i32::MIN) && max <= i64::from(i32::MAX),
+        5 => true,
+        12 => schema.decimal_contract().is_some_and(|(precision, _)| {
+            10_i64
+                .checked_pow(u32::from(precision))
+                .is_some_and(|limit| min > -limit && max < limit)
+        }),
+        _ => false,
+    };
+    if min > max || !endpoints_representable {
+        return Err(ArtifactCodecError::NonCanonicalPayload);
+    }
+    let bit_count = reader.read_u64()?;
+    let expected = i128::from(max)
+        .checked_sub(i128::from(min))
+        .and_then(|span| span.checked_add(1))
+        .and_then(|span| u64::try_from(span).ok())
+        .ok_or(ArtifactCodecError::LengthOverflow)?;
+    if bit_count == 0 || bit_count != expected {
+        return Err(ArtifactCodecError::NonCanonicalPayload);
+    }
+    let byte_count = usize::try_from(
+        bit_count
+            .checked_add(7)
+            .ok_or(ArtifactCodecError::LengthOverflow)?
+            / 8,
+    )
+    .map_err(|_| ArtifactCodecError::LengthOverflow)?;
+    if reader.remaining_len() != byte_count {
+        return Err(ArtifactCodecError::NonCanonicalPayload);
+    }
+    let bits = reader.read_exact(byte_count)?;
+    if bits.first().is_none_or(|byte| byte & 1 == 0) {
+        return Err(ArtifactCodecError::NonCanonicalPayload);
+    }
+    let last_index = bit_count - 1;
+    let last_byte =
+        usize::try_from(last_index / 8).map_err(|_| ArtifactCodecError::LengthOverflow)?;
+    if bits[last_byte] & (1 << (last_index % 8)) == 0 {
+        return Err(ArtifactCodecError::NonCanonicalPayload);
+    }
+    let used_in_last = bit_count % 8;
+    if used_in_last != 0 {
+        let padding_mask = !((1u8 << used_in_last) - 1);
+        if bits.last().is_some_and(|byte| byte & padding_mask != 0) {
+            return Err(ArtifactCodecError::NonCanonicalPayload);
+        }
+    }
+    Ok(())
+}
+
+fn validate_bloom(
+    payload: &[u8],
+    _contains_null: bool,
+    schema: ArtifactMembershipSchemaView<'_>,
+    expected_digest: HashContractDigest,
+) -> Result<(), ArtifactCodecError> {
+    if payload.len() < BLOOM_METADATA_BYTES {
+        return Err(ArtifactCodecError::Truncated);
+    }
+    let mut reader = Reader::new(payload);
+    let algorithm_version = reader.read_u16()?;
+    let scalar_framing_version = reader.read_u16()?;
+    let seed = reader.read_u64()?;
+    let bits_per_key = reader.read_u64()?;
+    let hash_count = reader.read_u32()?;
+    let cardinality = reader.read_u64()?;
+    let bit_count = reader.read_u64()?;
+    let contract = BloomHashContract::from_fields(
+        schema.digest(),
+        algorithm_version,
+        scalar_framing_version,
+        seed,
+        bits_per_key,
+        hash_count,
+    )
+    .map_err(|_| ArtifactCodecError::InvalidHashContract)?;
+    if contract.digest() != expected_digest
+        || contract
+            .bit_count_u64(cardinality)
+            .map_err(|_| ArtifactCodecError::NonCanonicalPayload)?
+            != bit_count
+        || bit_count % 64 != 0
+    {
+        return Err(ArtifactCodecError::NonCanonicalPayload);
+    }
+    let byte_count =
+        usize::try_from(bit_count / 8).map_err(|_| ArtifactCodecError::LengthOverflow)?;
+    if reader.remaining_len() != byte_count {
+        return Err(ArtifactCodecError::NonCanonicalPayload);
+    }
+    let bits = reader.read_exact(byte_count)?;
+    if bits.iter().all(|byte| *byte == 0) {
         return Err(ArtifactCodecError::NonCanonicalPayload);
     }
     Ok(())
@@ -514,7 +703,10 @@ fn decode_leaf_unretained_for_test(
             expected_hash_contract: None,
         },
         encoded.len(),
-        Arc::new(ArtifactRetainedBudget::new(encoded.len())),
+        Arc::new(ArtifactRetainedBudget::new(
+            PhysicalArtifact::accounted_resident_bytes(encoded.len())
+                .map_err(|_| ArtifactCodecError::LengthOverflow)?,
+        )),
         Arc::new(Unlimited),
     )
 }
@@ -528,17 +720,20 @@ mod tests {
 
     use crate::runtime_filter::model::contract::NullSemantics;
     use crate::runtime_filter::port::artifact::{
-        ArtifactKind, ArtifactSchemaDigest, HashContractDigest,
+        ArtifactKind, ArtifactMembershipSchema, ArtifactSchemaDigest, HashContractDigest,
+        PhysicalArtifact,
     };
     use crate::runtime_filter::port::identity::LogicalVersion;
+    use crate::runtime_filter::port::install::MaterializationPolicy;
     use crate::runtime_filter::port::support::{
         ArtifactRetainedBudget, MemoryAccountError, RuntimeFilterMemoryAccount,
     };
     use crate::runtime_filter::port::value_domain::{MembershipValues, ReducedMembershipDomain};
 
+    use super::super::bloom::{BloomHashContract, build_bits};
     use super::{
         ArtifactCodecError, ArtifactDecodeExpectations, decode_leaf,
-        decode_leaf_unretained_for_test, encode_membership_leaf,
+        decode_leaf_unretained_for_test, encode_membership_leaf, encode_physical_leaf,
     };
 
     #[derive(Default)]
@@ -675,7 +870,9 @@ mod tests {
     #[test]
     fn decode_requires_typed_kind_schema_version_and_hash_expectations() {
         let encoded = int64_leaf([1, 2], false);
-        let budget = Arc::new(ArtifactRetainedBudget::new(encoded.len() * 4));
+        let budget = Arc::new(ArtifactRetainedBudget::new(
+            PhysicalArtifact::accounted_resident_bytes(encoded.len()).unwrap() * 4,
+        ));
         let account = Arc::new(CountingAccount::default());
         let baseline = int64_expectations(false);
 
@@ -742,7 +939,8 @@ mod tests {
         let encoded = int64_leaf([1, 2], false);
         let expectations = int64_expectations(false);
         let account = Arc::new(CountingAccount::default());
-        let budget = Arc::new(ArtifactRetainedBudget::new(encoded.len()));
+        let footprint = PhysicalArtifact::accounted_resident_bytes(encoded.len()).unwrap();
+        let budget = Arc::new(ArtifactRetainedBudget::new(footprint));
         assert_eq!(
             decode_leaf(
                 &encoded,
@@ -762,8 +960,8 @@ mod tests {
             account.clone(),
         )
         .unwrap();
-        assert_eq!(budget.retained_bytes(), encoded.len());
-        assert_eq!(account.retained.load(Ordering::SeqCst), encoded.len());
+        assert_eq!(budget.retained_bytes(), footprint);
+        assert_eq!(account.retained.load(Ordering::SeqCst), footprint);
         assert_eq!(
             decode_leaf(
                 &encoded,
@@ -864,5 +1062,225 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn decode_test_leaf(
+        encoded: &[u8],
+        kind: ArtifactKind,
+        schema: &ArtifactMembershipSchema,
+        hash_contract: Option<HashContractDigest>,
+    ) -> Result<Arc<PhysicalArtifact>, ArtifactCodecError> {
+        decode_leaf(
+            encoded,
+            ArtifactDecodeExpectations {
+                expected_kind: kind,
+                expected_schema_digest: schema.digest(),
+                expected_logical_version: LogicalVersion::FIRST,
+                expected_hash_contract: hash_contract,
+            },
+            encoded.len(),
+            Arc::new(ArtifactRetainedBudget::new(
+                PhysicalArtifact::accounted_resident_bytes(encoded.len()).unwrap(),
+            )),
+            Arc::new(CountingAccount::default()),
+        )
+    }
+
+    #[test]
+    fn bitset_decoder_rejects_span_padding_endpoint_and_schema_violations() {
+        let schema =
+            ArtifactMembershipSchema::new(&DataType::Int64, NullSemantics::NeverMatches).unwrap();
+        let payload = |min: i64, max: i64, bit_count: u64, bits: &[u8]| {
+            let mut payload = vec![5];
+            payload.extend_from_slice(&min.to_be_bytes());
+            payload.extend_from_slice(&max.to_be_bytes());
+            payload.extend_from_slice(&bit_count.to_be_bytes());
+            payload.extend_from_slice(bits);
+            payload
+        };
+        let encode = |payload: &[u8]| {
+            encode_physical_leaf(
+                ArtifactKind::Bitset,
+                &schema,
+                LogicalVersion::FIRST,
+                false,
+                None,
+                payload,
+            )
+            .unwrap()
+        };
+        let valid = encode(&payload(5, 7, 3, &[0b0000_0101]));
+        assert!(decode_test_leaf(&valid, ArtifactKind::Bitset, &schema, None).is_ok());
+        for malformed in [
+            payload(7, 5, 3, &[0b0000_0101]),
+            payload(5, 7, 2, &[0b0000_0011]),
+            payload(5, 7, 3, &[0b1000_0101]),
+            payload(5, 7, 3, &[0b0000_0100]),
+            payload(5, 7, 3, &[0b0000_0001]),
+            payload(i64::MIN, i64::MAX, u64::MAX, &[1]),
+        ] {
+            let encoded = encode(&malformed);
+            assert!(decode_test_leaf(&encoded, ArtifactKind::Bitset, &schema, None).is_err());
+        }
+
+        let boolean =
+            ArtifactMembershipSchema::new(&DataType::Boolean, NullSemantics::NeverMatches).unwrap();
+        let mut boolean_payload = vec![1];
+        boolean_payload.extend_from_slice(&0_i64.to_be_bytes());
+        boolean_payload.extend_from_slice(&2_i64.to_be_bytes());
+        boolean_payload.extend_from_slice(&3_u64.to_be_bytes());
+        boolean_payload.push(0b0000_0101);
+        let encoded = encode_physical_leaf(
+            ArtifactKind::Bitset,
+            &boolean,
+            LogicalVersion::FIRST,
+            false,
+            None,
+            &boolean_payload,
+        )
+        .unwrap();
+        assert!(decode_test_leaf(&encoded, ArtifactKind::Bitset, &boolean, None).is_err());
+
+        let decimal = ArtifactMembershipSchema::new(
+            &DataType::Decimal128(19, 0),
+            NullSemantics::NeverMatches,
+        )
+        .unwrap();
+        let mut decimal_payload = vec![12];
+        decimal_payload.extend_from_slice(&0_i64.to_be_bytes());
+        decimal_payload.extend_from_slice(&0_i64.to_be_bytes());
+        decimal_payload.extend_from_slice(&1_u64.to_be_bytes());
+        decimal_payload.push(1);
+        let encoded = encode_physical_leaf(
+            ArtifactKind::Bitset,
+            &decimal,
+            LogicalVersion::FIRST,
+            false,
+            None,
+            &decimal_payload,
+        )
+        .unwrap();
+        assert!(decode_test_leaf(&encoded, ArtifactKind::Bitset, &decimal, None).is_err());
+    }
+
+    #[test]
+    fn bitset_decoder_rejects_endpoints_outside_lossless_schema_range() {
+        let malformed = [
+            (
+                DataType::Int8,
+                2,
+                i64::from(i8::MAX),
+                i64::from(i8::MAX) + 1,
+            ),
+            (
+                DataType::Int16,
+                3,
+                i64::from(i16::MAX),
+                i64::from(i16::MAX) + 1,
+            ),
+            (
+                DataType::Int32,
+                4,
+                i64::from(i32::MAX),
+                i64::from(i32::MAX) + 1,
+            ),
+            (
+                DataType::Date32,
+                10,
+                i64::from(i32::MAX),
+                i64::from(i32::MAX) + 1,
+            ),
+            (DataType::Decimal128(2, 0), 12, 99, 100),
+            (DataType::Decimal128(2, 0), 12, -101, -99),
+        ];
+        for (data_type, type_tag, min, max) in malformed {
+            let schema =
+                ArtifactMembershipSchema::new(&data_type, NullSemantics::NeverMatches).unwrap();
+            let bit_count = u64::try_from(i128::from(max) - i128::from(min) + 1).unwrap();
+            let mut payload = vec![type_tag];
+            payload.extend_from_slice(&min.to_be_bytes());
+            payload.extend_from_slice(&max.to_be_bytes());
+            payload.extend_from_slice(&bit_count.to_be_bytes());
+            let mut bits = vec![0; usize::try_from((bit_count + 7) / 8).unwrap()];
+            bits[0] |= 1;
+            let last = bit_count - 1;
+            bits[usize::try_from(last / 8).unwrap()] |= 1 << (last % 8);
+            payload.extend_from_slice(&bits);
+            let encoded = encode_physical_leaf(
+                ArtifactKind::Bitset,
+                &schema,
+                LogicalVersion::FIRST,
+                false,
+                None,
+                &payload,
+            )
+            .unwrap();
+
+            assert!(
+                decode_test_leaf(&encoded, ArtifactKind::Bitset, &schema, None).is_err(),
+                "accepted out-of-range endpoints {min}..={max} for {data_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bloom_decoder_rebuilds_and_validates_full_contract_metadata() {
+        let schema =
+            ArtifactMembershipSchema::new(&DataType::Int64, NullSemantics::NeverMatches).unwrap();
+        let policy = MaterializationPolicy::new(8, 5, 17, 1, 1 << 20, 1 << 16, 1).unwrap();
+        let contract = BloomHashContract::new(&schema, policy).unwrap();
+        let values = MembershipValues::int64([1, 7, 42]);
+        let (bit_count, bits) = build_bits(&values, &contract, &mut Vec::new()).unwrap();
+        let payload = |algorithm: u16, cardinality: u64, bit_count: u64, bits: &[u8]| {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&algorithm.to_be_bytes());
+            payload.extend_from_slice(&contract.scalar_framing_version().to_be_bytes());
+            payload.extend_from_slice(&contract.seed().to_be_bytes());
+            payload.extend_from_slice(&contract.bits_per_key().to_be_bytes());
+            payload.extend_from_slice(&contract.hash_count().to_be_bytes());
+            payload.extend_from_slice(&cardinality.to_be_bytes());
+            payload.extend_from_slice(&bit_count.to_be_bytes());
+            payload.extend_from_slice(bits);
+            payload
+        };
+        let encode = |payload: &[u8]| {
+            encode_physical_leaf(
+                ArtifactKind::Bloom,
+                &schema,
+                LogicalVersion::FIRST,
+                false,
+                Some(contract.digest()),
+                payload,
+            )
+            .unwrap()
+        };
+        let valid = encode(&payload(1, 3, bit_count, &bits));
+        assert!(
+            decode_test_leaf(
+                &valid,
+                ArtifactKind::Bloom,
+                &schema,
+                Some(contract.digest())
+            )
+            .is_ok()
+        );
+        for malformed in [
+            payload(2, 3, bit_count, &bits),
+            payload(1, 0, bit_count, &bits),
+            payload(1, 3, bit_count + 64, &bits),
+            payload(1, 3, bit_count, &vec![0; bits.len()]),
+            payload(1, 3, bit_count, &bits[..bits.len() - 1]),
+        ] {
+            let encoded = encode(&malformed);
+            assert!(
+                decode_test_leaf(
+                    &encoded,
+                    ArtifactKind::Bloom,
+                    &schema,
+                    Some(contract.digest())
+                )
+                .is_err()
+            );
+        }
     }
 }

@@ -21,13 +21,16 @@ use std::time::{Duration, Instant};
 
 use crate::common::types::UniqueId;
 use crate::runtime_filter::core::channel::RuntimeFilterChannel;
+use crate::runtime_filter::materializer::bloom::BloomHashContract;
 use crate::runtime_filter::model::contract::{
     ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
     ContributionKind, CoverageWitnessId, ReductionRequirement, RuntimeFilterLifecycle,
     RuntimeFilterLogicalDomain,
 };
 use crate::runtime_filter::model::coverage::Coverage;
-use crate::runtime_filter::port::artifact::{ArtifactKind, ConsumerProfileId};
+use crate::runtime_filter::port::artifact::{
+    ArtifactKind, ArtifactMembershipSchema, ConsumerProfileId,
+};
 use crate::runtime_filter::port::events::{
     RouteEventIdentity, RuntimeFilterEvent, RuntimeFilterEventIdentity, RuntimeFilterEventSink,
 };
@@ -717,6 +720,33 @@ fn validate_channel<'a>(
             "max reducer bytes must be non-zero",
         ));
     }
+    let materialization_policy = channel.materialization_policy();
+    usize::try_from(materialization_policy.max_total_retained_bytes()).map_err(|_| {
+        install_error(
+            InstallContractErrorKind::InvalidBudget,
+            "materialization retained budget does not fit this platform",
+        )
+    })?;
+    usize::try_from(materialization_policy.max_scratch_bytes_per_job()).map_err(|_| {
+        install_error(
+            InstallContractErrorKind::InvalidBudget,
+            "materialization scratch budget does not fit this platform",
+        )
+    })?;
+    materialization_policy
+        .aggregate_scratch_bytes()
+        .map_err(|_| {
+            install_error(
+                InstallContractErrorKind::InvalidBudget,
+                "materialization aggregate scratch budget overflows",
+            )
+        })?;
+    let schema = ArtifactMembershipSchema::new(value_type, *null_semantics).map_err(|_| {
+        install_error(
+            InstallContractErrorKind::UnsupportedMembershipType,
+            "membership schema has no canonical artifact encoding",
+        )
+    })?;
     let mut producer_witnesses = BTreeSet::new();
     if channel
         .producers()
@@ -748,6 +778,7 @@ fn validate_channel<'a>(
             ));
         }
     }
+    let mut unique_profiles = BTreeSet::new();
     for consumer in channel.consumers().values() {
         if consumer.expected_fragment_instances().is_empty() {
             return Err(install_error(
@@ -763,6 +794,7 @@ fn validate_channel<'a>(
         }
         let capabilities = consumer.capabilities();
         let profile = consumer.artifact_profile();
+        unique_profiles.insert((profile.id(), profile.canonical_bytes()));
         if !capabilities.contains(&ArtifactCapability::Membership)
             || !capabilities.contains(&ArtifactCapability::EmptyDomain)
         {
@@ -824,6 +856,28 @@ fn validate_channel<'a>(
                 "consumer profile digest collision carried different canonical bytes",
             ));
         }
+        if profile.accepts(ArtifactKind::Bloom) {
+            let expected = BloomHashContract::new(&schema, materialization_policy)
+                .map_err(|_| {
+                    install_error(
+                        InstallContractErrorKind::InvalidPolicy,
+                        "materialization Bloom policy is not supported",
+                    )
+                })?
+                .digest();
+            if profile.bloom_hash_contract() != Some(expected) {
+                return Err(install_error(
+                    InstallContractErrorKind::UnsupportedChannelContract,
+                    "Bloom profile hash contract does not match channel schema and policy",
+                ));
+            }
+        }
+    }
+    if materialization_policy.max_concurrent_jobs() > unique_profiles.len() {
+        return Err(install_error(
+            InstallContractErrorKind::InvalidPolicy,
+            "max concurrent materialization jobs exceeds normalized unique profile count",
+        ));
     }
     Ok(())
 }
@@ -970,6 +1024,7 @@ fn channels_equivalent(
         && left.completion_requirement() == right.completion_requirement()
         && left.policy() == right.policy()
         && left.core_budget() == right.core_budget()
+        && left.materialization_policy() == right.materialization_policy()
         && left.producers() == right.producers()
         && left.consumers() == right.consumers()
 }
@@ -998,10 +1053,11 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use crate::common::types::UniqueId;
+    use crate::runtime_filter::materializer::bloom::BloomHashContract;
     use crate::runtime_filter::model::contract::*;
     use crate::runtime_filter::model::coverage::Coverage;
     use crate::runtime_filter::port::artifact::{
-        ArtifactKind, ConsumerArtifactProfile, ConsumerProfileId,
+        ArtifactKind, ArtifactMembershipSchema, ConsumerArtifactProfile, ConsumerProfileId,
     };
     use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
     use crate::runtime_filter::port::identity::*;
@@ -1101,6 +1157,7 @@ mod tests {
                 max_retries: 3,
             },
             RuntimeFilterCoreBudget::new(4096),
+            crate::runtime_filter::port::install::MaterializationPolicy::for_test(),
             BTreeMap::from([(
                 BindingId::new(producer),
                 ProducerDeployment::new(
@@ -1261,6 +1318,7 @@ mod tests {
             completion,
             policy,
             budget,
+            base.materialization_policy(),
             producers,
             consumers,
         )
@@ -1297,6 +1355,7 @@ mod tests {
             base.completion_requirement(),
             base.policy(),
             base.core_budget(),
+            base.materialization_policy(),
             base.producers().clone(),
             BTreeMap::from([(
                 *base.consumers().keys().next().unwrap(),
@@ -1428,6 +1487,103 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             InstallContractErrorKind::UnsupportedChannelContract
+        );
+    }
+
+    #[test]
+    fn install_recomputes_bloom_contract_and_bounds_jobs_by_unique_profiles() {
+        let base = channel(1, 10, 20, 30, 40);
+        let too_many_jobs = CompleteOnceChannelDeployment::new(
+            base.channel_id(),
+            base.logical_domain().clone(),
+            base.lifecycle(),
+            base.availability_coverage().clone(),
+            base.terminal_coverage().clone(),
+            base.reduction_requirement(),
+            base.allowed_contribution_kinds().clone(),
+            base.completion_requirement(),
+            base.policy(),
+            base.core_budget(),
+            crate::runtime_filter::port::install::MaterializationPolicy::new(
+                8,
+                5,
+                17,
+                1,
+                1 << 20,
+                1 << 16,
+                2,
+            )
+            .unwrap(),
+            base.producers().clone(),
+            base.consumers().clone(),
+        );
+        assert_eq!(
+            registry()
+                .install(view([(1, too_many_jobs)]))
+                .unwrap_err()
+                .kind(),
+            InstallContractErrorKind::InvalidPolicy
+        );
+
+        let wrong_bloom = with_consumer_contract(
+            base.clone(),
+            base.logical_domain().clone(),
+            BTreeSet::from([
+                ArtifactCapability::Membership,
+                ArtifactCapability::EmptyDomain,
+            ]),
+            ConsumerArtifactProfile::new(
+                BTreeSet::from([
+                    ArtifactKind::Bloom,
+                    ArtifactKind::ValueSet,
+                    ArtifactKind::EmptyDomain,
+                ]),
+                Some(crate::runtime_filter::port::artifact::HashContractDigest::new([7; 32])),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            registry()
+                .install(view([(1, wrong_bloom)]))
+                .unwrap_err()
+                .kind(),
+            InstallContractErrorKind::UnsupportedChannelContract
+        );
+
+        let RuntimeFilterLogicalDomain::Membership {
+            value_type,
+            null_semantics,
+        } = base.logical_domain()
+        else {
+            unreachable!()
+        };
+        let schema = ArtifactMembershipSchema::new(value_type, *null_semantics).unwrap();
+        let digest = BloomHashContract::new(&schema, base.materialization_policy())
+            .unwrap()
+            .digest();
+        let valid_bloom = with_consumer_contract(
+            base.clone(),
+            base.logical_domain().clone(),
+            BTreeSet::from([
+                ArtifactCapability::Membership,
+                ArtifactCapability::EmptyDomain,
+            ]),
+            ConsumerArtifactProfile::new(
+                BTreeSet::from([
+                    ArtifactKind::Bloom,
+                    ArtifactKind::ValueSet,
+                    ArtifactKind::EmptyDomain,
+                ]),
+                Some(digest),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            registry()
+                .install(view([(1, valid_bloom)]))
+                .unwrap()
+                .outcome(),
+            InstallOutcome::Installed
         );
     }
 
@@ -1601,6 +1757,7 @@ mod tests {
             second.completion_requirement(),
             second.policy(),
             second.core_budget(),
+            second.materialization_policy(),
             BTreeMap::from([(
                 BindingId::new(11),
                 ProducerDeployment::new(CoverageWitnessId::new(20), BTreeSet::from([uid(11)])),
@@ -1642,6 +1799,33 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_value_set_install_rejects_materialization_policy_mismatch() {
+        let registry = registry();
+        let base = channel(1, 10, 20, 30, 40);
+        registry.install(view([(1, base.clone())])).unwrap();
+        let changed = CompleteOnceChannelDeployment::new(
+            base.channel_id(),
+            base.logical_domain().clone(),
+            base.lifecycle(),
+            base.availability_coverage().clone(),
+            base.terminal_coverage().clone(),
+            base.reduction_requirement(),
+            base.allowed_contribution_kinds().clone(),
+            base.completion_requirement(),
+            base.policy(),
+            base.core_budget(),
+            MaterializationPolicy::new(8, 5, 19, 1, 1 << 20, 1 << 16, 1).unwrap(),
+            base.producers().clone(),
+            base.consumers().clone(),
+        );
+
+        assert_eq!(
+            registry.install(view([(1, changed)])).unwrap_err().kind(),
+            InstallContractErrorKind::ConflictingDeployment
+        );
+    }
+
+    #[test]
     fn equivalent_install_is_order_independent() {
         let registry = registry();
         let base = channel(1, 10, 20, 30, 40);
@@ -1667,6 +1851,7 @@ mod tests {
                 base.completion_requirement(),
                 base.policy(),
                 base.core_budget(),
+                base.materialization_policy(),
                 producers.clone(),
                 base.consumers().clone(),
             )
@@ -1711,6 +1896,7 @@ mod tests {
             base.completion_requirement(),
             policy,
             base.core_budget(),
+            base.materialization_policy(),
             base.producers().clone(),
             base.consumers().clone(),
         );
@@ -1809,6 +1995,7 @@ mod tests {
             invalid.completion_requirement(),
             invalid.policy(),
             invalid.core_budget(),
+            invalid.materialization_policy(),
             invalid.producers().clone(),
             invalid.consumers().clone(),
         );
@@ -1867,6 +2054,7 @@ mod tests {
                         base.completion_requirement(),
                         base.policy(),
                         base.core_budget(),
+                        base.materialization_policy(),
                         base.producers().clone(),
                         base.consumers().clone(),
                     ),
@@ -1894,6 +2082,7 @@ mod tests {
                         base.completion_requirement(),
                         base.policy(),
                         base.core_budget(),
+                        base.materialization_policy(),
                         base.producers().clone(),
                         base.consumers().clone(),
                     ),
@@ -2039,6 +2228,7 @@ mod tests {
             base.completion_requirement(),
             policy,
             base.core_budget(),
+            base.materialization_policy(),
             base.producers().clone(),
             base.consumers().clone(),
         );
@@ -2061,6 +2251,7 @@ mod tests {
             base.completion_requirement(),
             base.policy(),
             RuntimeFilterCoreBudget::new(0),
+            base.materialization_policy(),
             base.producers().clone(),
             base.consumers().clone(),
         );
@@ -2086,6 +2277,7 @@ mod tests {
             duplicate.completion_requirement(),
             duplicate_policy,
             duplicate.core_budget(),
+            duplicate.materialization_policy(),
             duplicate.producers().clone(),
             duplicate.consumers().clone(),
         );

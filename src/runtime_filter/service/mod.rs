@@ -835,6 +835,7 @@ mod tests {
                 max_retries: 2,
             },
             RuntimeFilterCoreBudget::new(8192),
+            crate::runtime_filter::port::install::MaterializationPolicy::for_test(),
             BTreeMap::from([(
                 BindingId::new(producer_binding),
                 ProducerDeployment::new(witness, producer_instances.into_iter().map(uid).collect()),

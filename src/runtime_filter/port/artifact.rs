@@ -18,6 +18,7 @@
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
+use std::mem::size_of;
 use std::sync::Arc;
 
 use arrow::datatypes::{DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, TimeUnit};
@@ -434,6 +435,7 @@ pub(crate) enum ArtifactContractError {
     EncodedSizeOverflow,
     EncodedSizeExceeded,
     RetentionSizeMismatch,
+    ResidentSizeOverflow,
 }
 
 impl fmt::Display for ArtifactContractError {
@@ -455,20 +457,70 @@ pub(crate) struct PhysicalArtifact {
     contains_null: bool,
     canonical_bytes: Arc<[u8]>,
     canonical_digest: [u8; 32],
-    retained_memory: Option<ArtifactRetention>,
+    retained_memory: Option<Arc<ArtifactRetention>>,
 }
 
 impl PhysicalArtifact {
+    pub(crate) fn accounted_resident_component_bytes(
+        encoded_bytes: usize,
+    ) -> Result<usize, ArtifactContractError> {
+        encoded_bytes
+            .checked_add(size_of::<Self>())
+            .and_then(|bytes| bytes.checked_add(size_of::<Arc<[u8]>>()))
+            .ok_or(ArtifactContractError::ResidentSizeOverflow)
+    }
+
+    pub(crate) fn accounted_resident_bytes(
+        encoded_bytes: usize,
+    ) -> Result<usize, ArtifactContractError> {
+        Self::accounted_resident_component_bytes(encoded_bytes)?
+            .checked_add(size_of::<ArtifactRetention>())
+            .ok_or(ArtifactContractError::ResidentSizeOverflow)
+    }
+
     pub(crate) fn from_retained_bytes(
         kind: ArtifactKind,
         schema_digest: ArtifactSchemaDigest,
         version: LogicalVersion,
         contains_null: bool,
         canonical_bytes: Arc<[u8]>,
+        accounted_resident_bytes: usize,
         retained_memory: ArtifactRetention,
     ) -> Result<Self, ArtifactContractError> {
-        if retained_memory.bytes() != canonical_bytes.len()
-            || retained_memory.budget_bytes() != canonical_bytes.len()
+        if accounted_resident_bytes != Self::accounted_resident_bytes(canonical_bytes.len())?
+            || retained_memory.bytes() != accounted_resident_bytes
+            || retained_memory.budget_bytes() != accounted_resident_bytes
+        {
+            return Err(ArtifactContractError::RetentionSizeMismatch);
+        }
+        let canonical_digest = Sha256::digest(&canonical_bytes).into();
+        Ok(Self {
+            kind,
+            codec_version: LEAF_CODEC_VERSION,
+            schema_digest,
+            version,
+            contains_null,
+            canonical_bytes,
+            canonical_digest,
+            retained_memory: Some(Arc::new(retained_memory)),
+        })
+    }
+
+    pub(crate) fn from_shared_retained_bytes(
+        kind: ArtifactKind,
+        schema_digest: ArtifactSchemaDigest,
+        version: LogicalVersion,
+        contains_null: bool,
+        canonical_bytes: Arc<[u8]>,
+        accounted_resident_component_bytes: usize,
+        total_accounted_resident_bytes: usize,
+        retained_memory: Arc<ArtifactRetention>,
+    ) -> Result<Self, ArtifactContractError> {
+        if accounted_resident_component_bytes
+            != Self::accounted_resident_component_bytes(canonical_bytes.len())?
+            || accounted_resident_component_bytes > total_accounted_resident_bytes
+            || retained_memory.bytes() != total_accounted_resident_bytes
+            || retained_memory.budget_bytes() != total_accounted_resident_bytes
         {
             return Err(ArtifactContractError::RetentionSizeMismatch);
         }
@@ -530,7 +582,13 @@ impl PhysicalArtifact {
     pub(crate) fn retained_memory_bytes(&self) -> usize {
         self.retained_memory
             .as_ref()
-            .map_or(0, ArtifactRetention::bytes)
+            .map_or(0, |retention| retention.bytes())
+    }
+
+    fn shares_retention(&self, retention: &Arc<ArtifactRetention>) -> bool {
+        self.retained_memory
+            .as_ref()
+            .is_some_and(|owned| Arc::ptr_eq(owned, retention))
     }
 }
 
@@ -558,12 +616,13 @@ pub(crate) struct ArtifactBundle {
     artifacts: Box<[(ArtifactKind, Arc<PhysicalArtifact>)]>,
     canonical_digest: [u8; 32],
     encoded_bytes: usize,
+    retained_memory: Option<Arc<ArtifactRetention>>,
 }
 
 impl ArtifactBundle {
     const CANONICAL_HEADER_BYTES: usize = 4 + 1 + 8 + 8 + 32 + 2;
 
-    fn canonical_encoded_len(
+    pub(crate) fn canonical_encoded_len(
         artifacts: &[(ArtifactKind, Arc<PhysicalArtifact>)],
     ) -> Result<usize, ArtifactContractError> {
         u16::try_from(artifacts.len()).map_err(|_| ArtifactContractError::EncodedSizeOverflow)?;
@@ -579,12 +638,90 @@ impl ArtifactBundle {
             })
     }
 
+    pub(crate) fn canonical_encoded_len_for_single_artifact(
+        artifact_encoded_bytes: usize,
+    ) -> Result<usize, ArtifactContractError> {
+        Self::CANONICAL_HEADER_BYTES
+            .checked_add(1 + 8)
+            .and_then(|bytes| bytes.checked_add(artifact_encoded_bytes))
+            .ok_or(ArtifactContractError::EncodedSizeOverflow)
+    }
+
+    pub(crate) fn accounted_resident_overhead(
+        profile: &ConsumerArtifactProfile,
+        artifact_count: usize,
+    ) -> Result<usize, ArtifactContractError> {
+        let refs = artifact_count
+            .checked_mul(size_of::<(ArtifactKind, Arc<PhysicalArtifact>)>())
+            .ok_or(ArtifactContractError::ResidentSizeOverflow)?;
+        size_of::<Self>()
+            .checked_add(profile.canonical_bytes().len())
+            .and_then(|bytes| bytes.checked_add(refs))
+            .and_then(|bytes| bytes.checked_add(size_of::<ArtifactRetention>()))
+            .ok_or(ArtifactContractError::ResidentSizeOverflow)
+    }
+
     pub(crate) fn new(
+        channel_id: ChannelId,
+        version: LogicalVersion,
+        profile: &ConsumerArtifactProfile,
+        artifacts: Vec<(ArtifactKind, Arc<PhysicalArtifact>)>,
+        max_artifact_bytes: usize,
+    ) -> Result<Self, ArtifactContractError> {
+        Self::new_inner(
+            channel_id,
+            version,
+            profile,
+            artifacts,
+            max_artifact_bytes,
+            None,
+        )
+    }
+
+    pub(crate) fn new_retained(
+        channel_id: ChannelId,
+        version: LogicalVersion,
+        profile: &ConsumerArtifactProfile,
+        artifacts: Vec<(ArtifactKind, Arc<PhysicalArtifact>)>,
+        max_artifact_bytes: usize,
+        retained_memory: Arc<ArtifactRetention>,
+    ) -> Result<Self, ArtifactContractError> {
+        let expected = artifacts.iter().try_fold(
+            Self::accounted_resident_overhead(profile, artifacts.len())?,
+            |bytes, (_, artifact)| {
+                bytes
+                    .checked_add(PhysicalArtifact::accounted_resident_component_bytes(
+                        artifact.canonical_bytes().len(),
+                    )?)
+                    .ok_or(ArtifactContractError::ResidentSizeOverflow)
+            },
+        )?;
+        if retained_memory.bytes() != expected || retained_memory.budget_bytes() != expected {
+            return Err(ArtifactContractError::RetentionSizeMismatch);
+        }
+        if artifacts
+            .iter()
+            .any(|(_, artifact)| !artifact.shares_retention(&retained_memory))
+        {
+            return Err(ArtifactContractError::RetentionSizeMismatch);
+        }
+        Self::new_inner(
+            channel_id,
+            version,
+            profile,
+            artifacts,
+            max_artifact_bytes,
+            Some(retained_memory),
+        )
+    }
+
+    fn new_inner(
         channel_id: ChannelId,
         version: LogicalVersion,
         profile: &ConsumerArtifactProfile,
         mut artifacts: Vec<(ArtifactKind, Arc<PhysicalArtifact>)>,
         max_artifact_bytes: usize,
+        retained_memory: Option<Arc<ArtifactRetention>>,
     ) -> Result<Self, ArtifactContractError> {
         if artifacts.is_empty() {
             return Err(ArtifactContractError::EmptyBundle);
@@ -643,6 +780,7 @@ impl ArtifactBundle {
             artifacts: artifacts.into_boxed_slice(),
             canonical_digest,
             encoded_bytes,
+            retained_memory,
         })
     }
 
@@ -664,11 +802,18 @@ impl ArtifactBundle {
     pub(crate) const fn encoded_bytes(&self) -> usize {
         self.encoded_bytes
     }
+
+    pub(crate) fn retained_memory_bytes(&self) -> usize {
+        self.retained_memory
+            .as_ref()
+            .map_or(0, |retention| retention.bytes())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::mem::size_of;
     use std::sync::Arc;
 
     use arrow::datatypes::DataType;
@@ -849,11 +994,107 @@ mod tests {
             LogicalVersion::FIRST,
             false,
             Arc::from([1_u8, 2]),
+            PhysicalArtifact::accounted_resident_bytes(2).unwrap(),
             retention,
         )
         .unwrap_err();
 
         assert_eq!(error, ArtifactContractError::RetentionSizeMismatch);
+        assert_eq!(budget.retained_bytes(), 0);
+    }
+
+    #[test]
+    fn accounted_artifact_footprint_includes_shared_retention_owner_metadata() {
+        let encoded_bytes = 17;
+        let accounted = PhysicalArtifact::accounted_resident_bytes(encoded_bytes).unwrap();
+        assert!(
+            accounted
+                >= encoded_bytes + size_of::<PhysicalArtifact>() + size_of::<ArtifactRetention>()
+        );
+    }
+
+    #[test]
+    fn two_artifact_bundle_accounts_one_shared_owner_at_the_exact_boundary() {
+        let profile = ConsumerArtifactProfile::new(
+            BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
+            None,
+        )
+        .unwrap();
+        let first_bytes: Arc<[u8]> = Arc::from([1_u8, 2]);
+        let second_bytes: Arc<[u8]> = Arc::from([3_u8]);
+        let first_component =
+            PhysicalArtifact::accounted_resident_component_bytes(first_bytes.len()).unwrap();
+        let second_component =
+            PhysicalArtifact::accounted_resident_component_bytes(second_bytes.len()).unwrap();
+        let total = ArtifactBundle::accounted_resident_overhead(&profile, 2)
+            .unwrap()
+            .checked_add(first_component)
+            .and_then(|bytes| bytes.checked_add(second_component))
+            .unwrap();
+        let short_budget = Arc::new(ArtifactRetainedBudget::new(total - 1));
+        assert!(
+            ArtifactRetention::try_new(
+                total,
+                short_budget.clone(),
+                Arc::new(AcceptingMemoryAccount)
+            )
+            .is_err()
+        );
+        assert_eq!(short_budget.retained_bytes(), 0);
+
+        let budget = Arc::new(ArtifactRetainedBudget::new(total));
+        let retention = Arc::new(
+            ArtifactRetention::try_new(total, budget.clone(), Arc::new(AcceptingMemoryAccount))
+                .unwrap(),
+        );
+        let schema =
+            ArtifactSchemaDigest::for_membership(&DataType::Int64, NullSemantics::NeverMatches)
+                .unwrap();
+        let first = Arc::new(
+            PhysicalArtifact::from_shared_retained_bytes(
+                ArtifactKind::ValueSet,
+                schema,
+                LogicalVersion::FIRST,
+                false,
+                first_bytes,
+                first_component,
+                total,
+                retention.clone(),
+            )
+            .unwrap(),
+        );
+        let second = Arc::new(
+            PhysicalArtifact::from_shared_retained_bytes(
+                ArtifactKind::EmptyDomain,
+                schema,
+                LogicalVersion::FIRST,
+                false,
+                second_bytes,
+                second_component,
+                total,
+                retention.clone(),
+            )
+            .unwrap(),
+        );
+        let bundle = ArtifactBundle::new_retained(
+            ChannelId::new(8),
+            LogicalVersion::FIRST,
+            &profile,
+            vec![
+                (ArtifactKind::ValueSet, first.clone()),
+                (ArtifactKind::EmptyDomain, second.clone()),
+            ],
+            usize::MAX,
+            retention,
+        )
+        .unwrap();
+        assert_eq!(bundle.retained_memory_bytes(), total);
+        assert_eq!(budget.retained_bytes(), total);
+        drop(bundle);
+        assert_eq!(budget.retained_bytes(), total);
+        drop(first);
+        assert_eq!(budget.retained_bytes(), total);
+        drop(second);
         assert_eq!(budget.retained_bytes(), 0);
     }
 

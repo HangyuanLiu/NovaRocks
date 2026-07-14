@@ -494,6 +494,79 @@ impl MembershipValues {
         }
     }
 
+    pub(crate) fn canonical_scalar_max_frame_len(&self) -> Result<usize, ContributionSizeError> {
+        let payload = match self {
+            Self::Boolean(_) | Self::Int8(_) => 1,
+            Self::Int16(_) => 2,
+            Self::Int32(_) | Self::Float32(_) | Self::Date32(_) => 4,
+            Self::Int64(_) | Self::Float64(_) | Self::Timestamp { .. } => 8,
+            Self::LargeInt(_) | Self::Decimal128(_) => 16,
+            Self::Utf8(values) => values.iter().map(String::len).max().unwrap_or(0),
+        };
+        1usize
+            .checked_add(8)
+            .and_then(|size| size.checked_add(payload))
+            .ok_or(ContributionSizeError::SizeOverflow)
+    }
+
+    pub(crate) fn visit_canonical_scalar_frames(
+        &self,
+        frame: &mut Vec<u8>,
+        mut visit: impl FnMut(&[u8]),
+    ) -> Result<(), ContributionSizeError> {
+        let max_len = self.canonical_scalar_max_frame_len()?;
+        if frame.capacity() < max_len {
+            frame
+                .try_reserve(
+                    max_len
+                        .checked_sub(frame.len())
+                        .ok_or(ContributionSizeError::SizeOverflow)?,
+                )
+                .map_err(|_| ContributionSizeError::SizeOverflow)?;
+        }
+        macro_rules! visit_fixed {
+            ($tag:expr, $values:expr, $encode:expr) => {{
+                for value in $values {
+                    let bytes = $encode(value);
+                    write_scalar_frame(frame, $tag, &bytes)?;
+                    visit(frame);
+                }
+            }};
+        }
+        match self {
+            Self::Boolean(values) => visit_fixed!(1, values, |value: &bool| [u8::from(*value)]),
+            Self::Int8(values) => visit_fixed!(2, values, |value: &i8| value.to_be_bytes()),
+            Self::Int16(values) => visit_fixed!(3, values, |value: &i16| value.to_be_bytes()),
+            Self::Int32(values) => visit_fixed!(4, values, |value: &i32| value.to_be_bytes()),
+            Self::Int64(values) => visit_fixed!(5, values, |value: &i64| value.to_be_bytes()),
+            Self::LargeInt(values) => {
+                visit_fixed!(6, values, |value: &i128| value.to_be_bytes())
+            }
+            Self::Float32(values) => {
+                visit_fixed!(7, values, |value: &CanonicalF32| value.0.to_be_bytes())
+            }
+            Self::Float64(values) => {
+                visit_fixed!(8, values, |value: &CanonicalF64| value.0.to_be_bytes())
+            }
+            Self::Utf8(values) => {
+                for value in values {
+                    write_scalar_frame(frame, 9, value.as_bytes())?;
+                    visit(frame);
+                }
+            }
+            Self::Date32(values) => {
+                visit_fixed!(10, values, |value: &i32| value.to_be_bytes())
+            }
+            Self::Timestamp { values, .. } => {
+                visit_fixed!(11, values, |value: &i64| value.to_be_bytes())
+            }
+            Self::Decimal128(values) => {
+                visit_fixed!(12, values.values(), |value: &i128| value.to_be_bytes())
+            }
+        }
+        Ok(())
+    }
+
     fn encode_canonical(
         &self,
         output: &mut impl CanonicalOutput,
@@ -561,6 +634,20 @@ impl MembershipValues {
         }
         Ok(())
     }
+}
+
+fn write_scalar_frame(
+    frame: &mut Vec<u8>,
+    schema_tag: u8,
+    scalar: &[u8],
+) -> Result<(), ContributionSizeError> {
+    let len = u64::try_from(scalar.len())
+        .map_err(|_| ContributionSizeError::LengthExceedsCanonicalRange)?;
+    frame.clear();
+    frame.push(schema_tag);
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(scalar);
+    Ok(())
 }
 
 fn encode_fixed_values<T, const N: usize>(
@@ -1031,6 +1118,27 @@ mod tests {
             decimal_scale_two.fingerprint(),
             decimal_scale_three.fingerprint()
         );
+    }
+
+    #[test]
+    fn canonical_scalar_visitor_fully_reserves_a_partially_preallocated_frame() {
+        let empty = MembershipValues::utf8(std::iter::empty::<String>());
+        let max_len = empty.canonical_scalar_max_frame_len().unwrap();
+        let mut frame = Vec::with_capacity(max_len - 4);
+        frame.push(0xff);
+
+        empty
+            .visit_canonical_scalar_frames(&mut frame, |_| unreachable!())
+            .unwrap();
+        assert!(frame.capacity() >= max_len);
+        let reserved_capacity = frame.capacity();
+
+        MembershipValues::utf8([""])
+            .visit_canonical_scalar_frames(&mut frame, |scalar| {
+                assert_eq!(scalar.len(), max_len);
+            })
+            .unwrap();
+        assert_eq!(frame.capacity(), reserved_capacity);
     }
 
     #[test]

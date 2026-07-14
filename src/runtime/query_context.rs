@@ -1580,6 +1580,7 @@ mod runtime_filter_service_lifecycle_tests {
                 max_retries: 0,
             },
             RuntimeFilterCoreBudget::new(8192),
+            crate::runtime_filter::port::install::MaterializationPolicy::for_test(),
             BTreeMap::from([(
                 BindingId::new(3),
                 ProducerDeployment::new(witness_id, BTreeSet::from([uid(30)])),

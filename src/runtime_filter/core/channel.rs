@@ -1324,6 +1324,7 @@ mod tests {
                 max_retries: 0,
             },
             RuntimeFilterCoreBudget::new(budget),
+            crate::runtime_filter::port::install::MaterializationPolicy::for_test(),
             producers,
             BTreeMap::new(),
         )
@@ -1408,6 +1409,7 @@ mod tests {
                 max_retries: 0,
             },
             RuntimeFilterCoreBudget::new(4096),
+            crate::runtime_filter::port::install::MaterializationPolicy::for_test(),
             BTreeMap::from([(
                 BindingId::new(10),
                 ProducerDeployment::new(witness, BTreeSet::from([uid(10), uid(11)])),
