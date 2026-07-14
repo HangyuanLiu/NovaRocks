@@ -35,6 +35,7 @@ CI_FROM_RUN_DIR=""
 ALL_DISCOVERED_REQUESTED="false"
 KEEP_RUNTIME="false"
 SKIP_CARGO_TEST="false"
+WITH_COMPAT="false"
 REQUESTED_SUITES=()
 CI_RUNTIME_PREPARED="false"
 NOVA_CI_CARGO_PROFILE="${NOVA_CI_CARGO_PROFILE:-dev-opt}"
@@ -66,6 +67,7 @@ Options:
   --tier <name>         Stable tier: smoke, targeted, or full. Default: full.
   --from <run-dir>      Reclassify an existing logs/ci-full run without rerun.
   --skip-cargo-test     Skip cargo test. Intended only for runner debugging.
+  --with-compat         Append StarRocks compat clippy, build, and test gates.
   --cluster-mode <mode> SQL runner cluster mode: all-in-one or cross-process.
   --cluster-size <n>    Number of BE processes for cross-process mode.
   --keep-runtime        Keep this worktree's docker/iceberg-rest runtime entry.
@@ -146,6 +148,10 @@ parse_args() {
         ;;
       --skip-cargo-test)
         SKIP_CARGO_TEST="true"
+        shift
+        ;;
+      --with-compat)
+        WITH_COMPAT="true"
         shift
         ;;
       --cluster-mode)
@@ -294,6 +300,7 @@ prepare_runtime() {
     echo "NOVAROCKS_ICEBERG_REST_URI=$NOVAROCKS_ICEBERG_REST_URI"
     echo "NOVAROCKS_SPARK_DEFAULTS=${NOVAROCKS_SPARK_DEFAULTS:-}"
     echo "NOVA_CI_CARGO_PROFILE=$NOVA_CI_CARGO_PROFILE"
+    echo "WITH_COMPAT=$WITH_COMPAT"
     echo "NOVA_CI_NATIVE_CROSS_PROCESS_CORE=$NOVA_CI_NATIVE_CROSS_PROCESS_CORE"
     echo "NOVA_CI_NATIVE_CROSS_PROCESS_FULL=$NOVA_CI_NATIVE_CROSS_PROCESS_FULL"
     echo "NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED=$NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED"
@@ -375,16 +382,31 @@ run_cargo_gates() {
     scripts/audit_fs_access_boundary.sh
   run_fail_fast_stage "cargo fmt" "cargo-fmt.log" cargo fmt --check
   run_fail_fast_stage "cargo clippy" "cargo-clippy.log" cargo clippy --all-targets
-  run_fail_fast_stage "cargo clippy compat" "cargo-clippy-compat.log" cargo clippy --all-targets --features compat
   run_fail_fast_stage "cargo build" "cargo-build.log" cargo build --profile "$NOVA_CI_CARGO_PROFILE"
-  run_fail_fast_stage "cargo build compat" "cargo-build-compat.log" cargo build --profile "$NOVA_CI_CARGO_PROFILE" --features compat
 
   if [ "$SKIP_CARGO_TEST" = "true" ]; then
     ci_record_stage "cargo test" "SKIP" "0" ""
-    ci_record_stage "cargo test compat" "SKIP" "0" ""
     ci_render_summary "RUNNING"
   else
     run_fail_fast_stage "cargo test" "cargo-test.log" cargo test --profile "$NOVA_CI_CARGO_PROFILE" -- --test-threads=1
+  fi
+}
+
+run_compat_gates() {
+  if [ "$WITH_COMPAT" != "true" ]; then
+    ci_record_stage "cargo clippy compat" "SKIP" "0" ""
+    ci_record_stage "cargo build compat" "SKIP" "0" ""
+    ci_record_stage "cargo test compat" "SKIP" "0" ""
+    ci_render_summary "RUNNING"
+    return
+  fi
+
+  run_fail_fast_stage "cargo clippy compat" "cargo-clippy-compat.log" cargo clippy --all-targets --features compat
+  run_fail_fast_stage "cargo build compat" "cargo-build-compat.log" cargo build --profile "$NOVA_CI_CARGO_PROFILE" --features compat
+  if [ "$SKIP_CARGO_TEST" = "true" ]; then
+    ci_record_stage "cargo test compat" "SKIP" "0" ""
+    ci_render_summary "RUNNING"
+  else
     run_fail_fast_stage "cargo test compat" "cargo-test-compat.log" cargo test --profile "$NOVA_CI_CARGO_PROFILE" --features compat -- --test-threads=1
   fi
 }
@@ -1033,6 +1055,7 @@ main() {
   fi
   run_sql_suites
   run_native_cross_process_sql_suites
+  run_compat_gates
 
   ci_render_summary "PASS"
   echo "PASS: $CI_SUMMARY"

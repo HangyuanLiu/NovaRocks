@@ -188,28 +188,93 @@ if rg -n -- "$retired_plan_wire_flag|$retired_proto_env" "$REPO_ROOT/tools/ci" >
   echo "tools/ci must not contain the retired plan-wire flag or retired Proto matrix variables" >&2
   exit 1
 fi
-if ! grep -q 'run_fail_fast_stage "cargo clippy compat"' <<<"$local_full_ci_text"; then
-  echo "local-full-ci must run a compat clippy stage" >&2
+if [ "${WITH_COMPAT:-}" != "false" ]; then
+  echo "local-full-ci must disable compat gates by default" >&2
   exit 1
 fi
-if ! grep -q -- 'cargo clippy --all-targets --features compat' <<<"$local_full_ci_text"; then
-  echo "compat clippy stage must pass --features compat" >&2
+
+if ! usage | grep -q -- '--with-compat'; then
+  echo "local-full-ci help must document --with-compat" >&2
   exit 1
 fi
-if ! grep -q 'run_fail_fast_stage "cargo build compat"' <<<"$local_full_ci_text"; then
-  echo "local-full-ci must run a compat build stage" >&2
+
+if ! (
+  WITH_COMPAT="false"
+  SQL_CLUSTER_MODE="all-in-one"
+  SQL_CLUSTER_SIZE="1"
+  REQUESTED_SUITES=()
+  parse_args --with-compat
+  [ "$WITH_COMPAT" = "true" ]
+); then
+  echo "--with-compat must explicitly enable compat gates" >&2
   exit 1
 fi
-if ! grep -q -- 'cargo build --profile "$NOVA_CI_CARGO_PROFILE" --features compat' <<<"$local_full_ci_text"; then
-  echo "compat build stage must pass --features compat" >&2
+
+run_cargo_gates_text="$(declare -f run_cargo_gates)"
+if grep -q -- '--features compat' <<<"$run_cargo_gates_text"; then
+  echo "default cargo gates must not build or test compat" >&2
   exit 1
 fi
-if ! grep -q 'run_fail_fast_stage "cargo test compat"' <<<"$local_full_ci_text"; then
-  echo "local-full-ci must run a compat test stage" >&2
+
+if ! declare -F run_compat_gates >/dev/null; then
+  echo "local-full-ci must define explicit compat gates" >&2
   exit 1
 fi
-if ! grep -q -- 'cargo test --profile "$NOVA_CI_CARGO_PROFILE" --features compat' <<<"$local_full_ci_text"; then
-  echo "compat test stage must pass --features compat" >&2
+
+run_compat_gates_text="$(declare -f run_compat_gates)"
+for expected in \
+  'cargo clippy --all-targets --features compat' \
+  'cargo build --profile "$NOVA_CI_CARGO_PROFILE" --features compat' \
+  'cargo test --profile "$NOVA_CI_CARGO_PROFILE" --features compat'; do
+  if ! grep -q -- "$expected" <<<"$run_compat_gates_text"; then
+    echo "explicit compat gates must include: $expected" >&2
+    exit 1
+  fi
+done
+
+default_compat_output="$({
+  WITH_COMPAT="false"
+  ci_record_stage() { printf 'record:%s:%s\n' "$1" "$2"; }
+  ci_render_summary() { :; }
+  run_fail_fast_stage() { printf 'run:%s\n' "$1"; }
+  run_compat_gates
+})"
+if grep -q '^run:' <<<"$default_compat_output"; then
+  echo "default local-full-ci must not execute compat gates" >&2
+  exit 1
+fi
+for stage in "cargo clippy compat" "cargo build compat" "cargo test compat"; do
+  if ! grep -qx "record:$stage:SKIP" <<<"$default_compat_output"; then
+    echo "default local-full-ci must record $stage as SKIP" >&2
+    exit 1
+  fi
+done
+
+explicit_compat_output="$({
+  WITH_COMPAT="true"
+  SKIP_CARGO_TEST="false"
+  ci_record_stage() { printf 'record:%s:%s\n' "$1" "$2"; }
+  ci_render_summary() { :; }
+  run_fail_fast_stage() { printf 'run:%s\n' "$1"; }
+  run_compat_gates
+})"
+for stage in "cargo clippy compat" "cargo build compat" "cargo test compat"; do
+  if ! grep -qx "run:$stage" <<<"$explicit_compat_output"; then
+    echo "--with-compat must execute $stage" >&2
+    exit 1
+  fi
+done
+
+main_text="$(declare -f main)"
+sql_line="$(grep -n 'run_sql_suites' <<<"$main_text" | tail -1 | cut -d: -f1)"
+native_cross_process_line="$(grep -n 'run_native_cross_process_sql_suites' <<<"$main_text" | tail -1 | cut -d: -f1)"
+compat_line="$(grep -n 'run_compat_gates' <<<"$main_text" | tail -1 | cut -d: -f1)"
+if [ -z "$sql_line" ] \
+  || [ -z "$native_cross_process_line" ] \
+  || [ -z "$compat_line" ] \
+  || [ "$native_cross_process_line" -le "$sql_line" ] \
+  || [ "$compat_line" -le "$native_cross_process_line" ]; then
+  echo "explicit compat gates must run after regular and cross-process native SQL coverage" >&2
   exit 1
 fi
 
