@@ -769,6 +769,14 @@ fn validate_view<'a>(view: &'a RuntimeFilterInstallView) -> Result<(), InstallCo
     Ok(())
 }
 
+/// Test-only shim so RFD-2 deployment-compiler tests (a different module) can
+/// prove their projected `RuntimeFilterInstallView` satisfies this BE-side
+/// install contract without duplicating `validate_view`'s logic.
+#[cfg(test)]
+pub(crate) fn validate_view_for_test(view: &RuntimeFilterInstallView) -> Result<(), String> {
+    validate_view(view).map_err(|e| format!("{e}"))
+}
+
 struct RoutingBuild {
     producers: BTreeMap<BindingId, ProducerRoute>,
     subscriptions: BTreeMap<BindingId, Arc<SubscriptionGroup>>,

@@ -18,7 +18,11 @@
 mod materialization;
 mod memory;
 mod producer;
-mod registry;
+// `registry` is `pub(crate)` (rather than private) solely so RFD-2's
+// deployment-compiler tests can reach `registry::validate_view_for_test`
+// (see registry.rs) to prove compiler output satisfies the BE install
+// contract. Item-level privacy inside `registry.rs` is unaffected.
+pub(crate) mod registry;
 mod subscription;
 
 use std::collections::{BTreeMap, VecDeque};

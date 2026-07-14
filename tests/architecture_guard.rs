@@ -27163,3 +27163,44 @@ fn planner_topology_contract() {
         violations.join("\n")
     );
 }
+
+#[test]
+fn rfd2_deployment_module_stays_a_leaf() {
+    // RFD-2's DeploymentCompiler consumes a SchedulingPlan; it must NOT rebuild a
+    // generic query controller, scheduler, or dispatcher — those belong to
+    // coordinator::*. This guards the umbrella's "RFD does not create a second
+    // query controller" boundary at the source level.
+    let deployment_dir = src_dir().join("runtime_filter").join("deployment");
+    assert!(
+        deployment_dir.is_dir(),
+        "RFD-2 deployment module must exist at {}",
+        rel(&deployment_dir)
+    );
+
+    let files = production_rs_files(&deployment_dir);
+    // Guard against a vacuous pass: the module has mod.rs + five submodules.
+    assert!(
+        files.len() >= 5,
+        "expected to scan the RFD-2 deployment module files, only found {}",
+        files.len()
+    );
+
+    let banned = [
+        "struct FragmentScheduler",
+        "trait FragmentDispatcher",
+        "struct ExecutionCoordinator",
+        "struct RuntimeFilterDeploymentController",
+        "fn schedule_fragments",
+    ];
+    for file in files {
+        for needle in &banned {
+            let hits = non_test_line_hits(&file, |line| line.contains(needle));
+            assert!(
+                hits.is_empty(),
+                "{}: RFD-2 deployment must not declare `{needle}` \
+                 (owned by coordinator::*): {hits:?}",
+                rel(&file)
+            );
+        }
+    }
+}
