@@ -24,6 +24,7 @@ use super::boundary::{
     BoundaryCatalog, BoundaryError, ExecutionColumnIdAllocator, build_boundary_catalog,
 };
 use super::fragment::{DistributedPlanDraft, FragmentEdge, FragmentId, PlanFragment};
+use super::topology::{TopologyContract, TopologyError, build_topology_contract};
 use super::validation::{self, DistributedPlanValidationError};
 
 #[derive(Clone, Debug)]
@@ -39,6 +40,8 @@ struct DistributedPlanData {
     // Final state of the single query-scoped occurrence allocator. Preserved so
     // CGO-9C can resume allocating internal occurrences without rebuilding it.
     execution_column_id_allocator: ExecutionColumnIdAllocator,
+    // Authoritative fragment-graph execution shape derived at seal time.
+    topology: TopologyContract,
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +77,13 @@ impl DistributedPlan {
     pub(crate) fn execution_column_id_allocator(&self) -> &ExecutionColumnIdAllocator {
         &self.data.execution_column_id_allocator
     }
+
+    // CGO-9B/Task 4 (scheduler swap) consumes the topology contract; unused
+    // within Task 2 outside tests.
+    #[allow(dead_code)]
+    pub(crate) fn topology(&self) -> &TopologyContract {
+        &self.data.topology
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -84,6 +94,7 @@ pub(in crate::sql::planner::distributed) enum DistributedPlanSealError {
     Structural(DistributedPlanValidationError),
     RuntimeFilterGraph(GraphValidationError),
     Boundary(BoundaryError),
+    Topology(TopologyError),
 }
 
 impl fmt::Display for DistributedPlanSealError {
@@ -100,6 +111,7 @@ impl fmt::Display for DistributedPlanSealError {
             Self::Structural(error) => error.fmt(formatter),
             Self::RuntimeFilterGraph(error) => error.fmt(formatter),
             Self::Boundary(error) => error.fmt(formatter),
+            Self::Topology(error) => error.fmt(formatter),
         }
     }
 }
@@ -126,6 +138,14 @@ pub(in crate::sql::planner::distributed) fn seal_draft(
     }
     validation::validate_distributed_structure(&fragments, root_fragment_id, &edges)
         .map_err(DistributedPlanSealError::Structural)?;
+    // Finalize the fragment-graph execution shape as an extension of structural
+    // validation: this derives the topological order, execution anchor, and the
+    // producer/terminal-write/result sets, and fails fast on the graph-level
+    // invariants (acyclicity, order consistency, anchor determinacy) that
+    // structural validation does not cover. Runs before construction and before
+    // the runtime-filter graph check.
+    let topology = build_topology_contract(&fragments, root_fragment_id, &edges)
+        .map_err(DistributedPlanSealError::Topology)?;
     // RFD-1 read-only structural validation of the runtime filter graph, run after
     // non-RF structural validation and before immutable construction. The graph is
     // validated here, never populated; CGO-9A stays agnostic to whether nodes still
@@ -153,6 +173,7 @@ pub(in crate::sql::planner::distributed) fn seal_draft(
             runtime_filter_graph,
             boundaries,
             execution_column_id_allocator,
+            topology,
         },
     })
 }

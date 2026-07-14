@@ -21,6 +21,7 @@ mod fragment;
 mod node;
 pub(crate) mod runtime_filter;
 mod seal;
+pub(crate) mod topology;
 mod validation;
 pub(crate) mod write;
 

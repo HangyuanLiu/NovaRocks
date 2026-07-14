@@ -24,11 +24,12 @@
 //! finalized stream/router/CTE edge contracts) so codegen only ever observes a
 //! plan whose shape is already sound.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::ChangeStreamBranchKind;
 
 use super::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, ExchangeFlavor,
@@ -114,6 +115,8 @@ fn validate_structure(
         }
     }
 
+    validate_source_edge_shape(edges)?;
+
     let mut router_target_partitions = BTreeMap::new();
     for edge in edges {
         if !fragments_by_id.contains_key(&edge.source_fragment_id) {
@@ -161,6 +164,92 @@ fn validate_global_node_ids(fragments: &[PlanFragment]) -> Result<(), String> {
     let mut owners = HashMap::new();
     for fragment in fragments {
         visit(&fragment.root, fragment.fragment_id, &mut owners)?;
+    }
+    Ok(())
+}
+
+/// Validate the per-source shape of the edge multiset.
+///
+/// These are graph-level invariants that the per-edge finalized checks cannot
+/// see because they inspect one edge at a time. A plain `Stream` source has a
+/// single sink, so it may drive at most one plain stream edge and must not also
+/// drive a router edge; CTE multicast is exempt because fanning one producer out
+/// to many receivers is its entire purpose. A router source addresses exactly
+/// one router group, and its routes — keyed on the full (source fragment, group,
+/// branch, kind, target fragment, target exchange node) tuple — must be unique
+/// (two identical router edges would both match the same branch route and
+/// otherwise pass silently).
+fn validate_source_edge_shape(edges: &[FragmentEdge]) -> Result<(), String> {
+    let mut plain_stream_sources: BTreeSet<FragmentId> = BTreeSet::new();
+    let mut router_sources: BTreeSet<FragmentId> = BTreeSet::new();
+    let mut router_groups_by_source: BTreeMap<FragmentId, BTreeSet<i32>> = BTreeMap::new();
+    let mut seen_router_routes: BTreeSet<(
+        FragmentId,
+        i32,
+        i32,
+        ChangeStreamBranchKind,
+        FragmentId,
+        i32,
+    )> = BTreeSet::new();
+
+    for edge in edges {
+        match &edge.edge_kind {
+            FragmentEdgeKind::Stream => {
+                if !plain_stream_sources.insert(edge.source_fragment_id) {
+                    return Err(format!(
+                        "lower_distributed_plan source fragment id={} has ambiguous plain stream fan-out (more than one outgoing stream edge)",
+                        edge.source_fragment_id
+                    ));
+                }
+            }
+            // CTE multicast is an intentional one-producer-to-many-receivers
+            // fan-out, so it is exempt from the plain-stream fan-out rule.
+            FragmentEdgeKind::CteMulticast { .. } => {}
+            FragmentEdgeKind::IcebergChangeStreamRouter {
+                router_group_id,
+                branch_id,
+                branch_kind,
+            } => {
+                router_sources.insert(edge.source_fragment_id);
+                let groups = router_groups_by_source
+                    .entry(edge.source_fragment_id)
+                    .or_default();
+                groups.insert(*router_group_id);
+                if groups.len() > 1 {
+                    return Err(format!(
+                        "lower_distributed_plan source fragment id={} uses more than one router group",
+                        edge.source_fragment_id
+                    ));
+                }
+                let route = (
+                    edge.source_fragment_id,
+                    *router_group_id,
+                    *branch_id,
+                    *branch_kind,
+                    edge.target_fragment_id,
+                    edge.target_exchange_node_id,
+                );
+                if !seen_router_routes.insert(route) {
+                    return Err(format!(
+                        "lower_distributed_plan duplicate router branch route source_fragment_id={} router_group_id={} branch_id={} branch_kind={:?} target_fragment_id={} target_exchange_node_id={}",
+                        edge.source_fragment_id,
+                        router_group_id,
+                        branch_id,
+                        branch_kind,
+                        edge.target_fragment_id,
+                        edge.target_exchange_node_id
+                    ));
+                }
+            }
+        }
+        if plain_stream_sources.contains(&edge.source_fragment_id)
+            && router_sources.contains(&edge.source_fragment_id)
+        {
+            return Err(format!(
+                "lower_distributed_plan source fragment id={} mixes plain stream and router edges",
+                edge.source_fragment_id
+            ));
+        }
     }
     Ok(())
 }
@@ -643,8 +732,10 @@ mod tests {
     use crate::sql::analysis::cte::CteId;
     use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::common::ChangeStreamBranchKind;
     use crate::sql::planner::distributed::test_support::{
-        distributed_plan_draft_builder_for_test, distributed_plan_for_test, draft_builder_from_plan,
+        DistributedPlanDraftBuilder, distributed_plan_draft_builder_for_test,
+        distributed_plan_for_test, draft_builder_from_plan,
     };
     use crate::sql::planner::distributed::{
         DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan,
@@ -1261,5 +1352,176 @@ mod tests {
             .seal()
             .expect_err("CTE output slot mismatch must fail");
         assert!(err.contains("CTE output_slot_ids mismatch"), "{err}");
+    }
+
+    fn plain_fragment(id: u32, node_id: i32, sink: DataSink) -> PlanFragment {
+        PlanFragment {
+            fragment_id: id,
+            root: physical_values_node(id, node_id, Vec::new()),
+            data_partition: DataPartition::unpartitioned(),
+            output_partition: DataPartition::unpartitioned(),
+            sink,
+            output_exprs: None,
+            output_columns: Vec::new(),
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        }
+    }
+
+    fn stream_edge(source: u32, target: u32, node: i32) -> FragmentEdge {
+        FragmentEdge {
+            source_fragment_id: source,
+            target_fragment_id: target,
+            target_exchange_node_id: node,
+            output_partition: DataPartition::unpartitioned(),
+            stream_kind: FragmentStreamKind::Gather,
+            edge_kind: FragmentEdgeKind::Stream,
+            output_slot_ids: Vec::new(),
+        }
+    }
+
+    fn router_edge(
+        source: u32,
+        target: u32,
+        node: i32,
+        group: i32,
+        branch: i32,
+        kind: ChangeStreamBranchKind,
+    ) -> FragmentEdge {
+        FragmentEdge {
+            source_fragment_id: source,
+            target_fragment_id: target,
+            target_exchange_node_id: node,
+            output_partition: DataPartition::unpartitioned(),
+            stream_kind: FragmentStreamKind::Gather,
+            edge_kind: FragmentEdgeKind::IcebergChangeStreamRouter {
+                router_group_id: group,
+                branch_id: branch,
+                branch_kind: kind,
+            },
+            output_slot_ids: Vec::new(),
+        }
+    }
+
+    fn seal_shape(
+        fragments: Vec<PlanFragment>,
+        edges: Vec<FragmentEdge>,
+    ) -> Result<DistributedPlan, String> {
+        DistributedPlanDraftBuilder::new(fragments, Some(0), edges, RuntimeFilterGraph::default())
+            .seal()
+    }
+
+    #[test]
+    fn structural_validation_rejects_plain_stream_fan_out() {
+        // Source fragment 1 drives two plain stream edges: an ambiguous fan-out
+        // for a single-sink fragment. Both edges are well-formed on their own,
+        // so only the per-source shape check can catch this.
+        let fragments = vec![
+            plain_fragment(0, 10, DataSink::Result),
+            plain_fragment(1, 11, DataSink::Noop),
+            plain_fragment(2, 12, DataSink::Noop),
+        ];
+        let edges = vec![stream_edge(1, 0, 100), stream_edge(1, 2, 101)];
+
+        let err = seal_shape(fragments, edges).expect_err("plain stream fan-out must not seal");
+        assert!(
+            err.contains("source fragment id=1 has ambiguous plain stream fan-out"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn structural_validation_rejects_plain_stream_and_router_mix() {
+        // Source fragment 1 drives both a plain stream edge and a router edge,
+        // mixing two incompatible sink shapes on one fragment.
+        let fragments = vec![
+            plain_fragment(0, 10, DataSink::Result),
+            plain_fragment(1, 11, DataSink::Noop),
+            plain_fragment(2, 12, DataSink::Noop),
+        ];
+        let edges = vec![
+            stream_edge(1, 0, 100),
+            router_edge(1, 2, 101, 0, 0, ChangeStreamBranchKind::DeleteDv),
+        ];
+
+        let err = seal_shape(fragments, edges).expect_err("plain/router mix must not seal");
+        assert!(
+            err.contains("source fragment id=1 mixes plain stream and router edges"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn structural_validation_rejects_more_than_one_router_group_per_source() {
+        let fragments = vec![
+            plain_fragment(0, 10, DataSink::Result),
+            plain_fragment(1, 11, DataSink::Noop),
+            plain_fragment(2, 12, DataSink::Noop),
+        ];
+        let edges = vec![
+            router_edge(1, 0, 100, 0, 0, ChangeStreamBranchKind::DeleteDv),
+            router_edge(1, 2, 101, 1, 0, ChangeStreamBranchKind::DeleteDv),
+        ];
+
+        let err = seal_shape(fragments, edges)
+            .expect_err("multiple router groups per source must not seal");
+        assert!(
+            err.contains("source fragment id=1 uses more than one router group"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn structural_validation_rejects_duplicate_router_branch_route() {
+        // Two identical router edges share the same (group, branch, kind,
+        // target) tuple; each would match the same branch route and pass the
+        // per-edge checks, so only the shape check rejects the duplicate.
+        let fragments = vec![
+            plain_fragment(0, 10, DataSink::Result),
+            plain_fragment(1, 11, DataSink::Noop),
+        ];
+        let edges = vec![
+            router_edge(1, 0, 100, 0, 0, ChangeStreamBranchKind::DeleteDv),
+            router_edge(1, 0, 100, 0, 0, ChangeStreamBranchKind::DeleteDv),
+        ];
+
+        let err =
+            seal_shape(fragments, edges).expect_err("duplicate router branch route must not seal");
+        assert!(err.contains("duplicate router branch route"), "{err}");
+        assert!(err.contains("source_fragment_id=1"), "{err}");
+        assert!(err.contains("branch_kind=DeleteDv"), "{err}");
+    }
+
+    #[test]
+    fn structural_validation_allows_cte_multicast_fan_out() {
+        // One CTE producer feeding two receivers is legal fan-out and must not
+        // trip the plain-stream fan-out rule. The shape check exempts it; the
+        // edges then fail later for unrelated wiring reasons, never for shape.
+        let fragments = vec![
+            plain_fragment(0, 10, DataSink::Result),
+            plain_fragment(1, 11, DataSink::Noop),
+            plain_fragment(2, 12, DataSink::Noop),
+        ];
+        let cte_id: CteId = 3;
+        let multicast = |target: u32, node: i32| FragmentEdge {
+            source_fragment_id: 1,
+            target_fragment_id: target,
+            target_exchange_node_id: node,
+            output_partition: DataPartition::unpartitioned(),
+            stream_kind: FragmentStreamKind::Gather,
+            edge_kind: FragmentEdgeKind::CteMulticast {
+                cte_id,
+                receive_producer_column_ids: Vec::new(),
+            },
+            output_slot_ids: Vec::new(),
+        };
+        let edges = vec![multicast(0, 100), multicast(2, 101)];
+
+        let err = seal_shape(fragments, edges)
+            .expect_err("unwired multicast edges still fail later, but not for fan-out");
+        assert!(
+            !err.contains("fan-out"),
+            "CTE multicast must be exempt from the plain-stream fan-out rule: {err}"
+        );
     }
 }
