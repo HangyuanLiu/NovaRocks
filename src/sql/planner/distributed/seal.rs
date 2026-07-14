@@ -66,8 +66,8 @@ impl DistributedPlan {
         &self.data.runtime_filter_graph
     }
 
-    // CGO-9C/Task 3 consumes the boundary catalog; unused within Task 1.
-    #[allow(dead_code)]
+    // Consumed on the production codegen path (`project_boundary_reports` in
+    // `sql::codegen::fragment`) and, later, by CGO-9C occurrence allocation.
     pub(crate) fn boundaries(&self) -> &BoundaryCatalog {
         &self.data.boundaries
     }
