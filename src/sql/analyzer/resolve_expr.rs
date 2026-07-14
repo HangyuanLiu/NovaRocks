@@ -660,13 +660,14 @@ impl<'a> super::AnalyzerContext<'a> {
                 if let Some(for_expr) = substring_for {
                     args.push(self.analyze_expr(for_expr, scope)?);
                 }
+                let bound = bind_scalar_function_call("substring", args)?;
                 Ok(TypedExpr {
                     kind: ExprKind::FunctionCall {
                         name: "substring".to_string(),
-                        args,
+                        args: bound.args,
                         distinct: false,
                     },
-                    data_type: DataType::Utf8,
+                    data_type: bound.return_type,
                     nullable: true,
                 })
             }
@@ -2024,11 +2025,15 @@ impl<'a> super::AnalyzerContext<'a> {
             arg_types = args_typed.iter().map(|a| a.data_type.clone()).collect();
         }
 
+        let mut bound_scalar = None;
         self.validate_percentile_arguments(&name, &args_typed)?;
         if is_aggregate_function(&name) {
             validate_aggregate_function_call(&name, &arg_types)?;
         } else {
-            validate_scalar_function_call_typed(&name, &args_typed)?;
+            let bound = bind_scalar_function_call(&name, args_typed)?;
+            arg_types = bound.args.iter().map(|arg| arg.data_type.clone()).collect();
+            args_typed = bound.args.clone();
+            bound_scalar = Some(bound);
         }
 
         match original_name.as_str() {
@@ -2101,7 +2106,10 @@ impl<'a> super::AnalyzerContext<'a> {
             })
         } else {
             // Scalar function
-            let mut return_type = infer_scalar_return_type(&name, &arg_types);
+            let mut return_type = bound_scalar
+                .as_ref()
+                .map(|bound| bound.return_type.clone())
+                .unwrap_or_else(|| infer_scalar_return_type(&name, &arg_types));
             // `named_struct(name0, val0, name1, val1, …)` needs to carry the
             // user-supplied field *names* in its returned STRUCT schema.
             // `infer_scalar_return_type` only sees arg types and falls back
@@ -3519,6 +3527,138 @@ fn apply_implicit_string_function_casts(name: &str, args: &mut [TypedExpr]) -> b
         | "ltrim" | "repeat" | "reverse" | "right" | "rtrim" | "strleft" | "strright"
         | "substr" | "substring" | "trim" | "upper" => cast_utf8_args(args, &[0]),
         _ => false,
+    }
+}
+
+struct BoundScalarCall {
+    args: Vec<TypedExpr>,
+    return_type: DataType,
+}
+
+fn signed_int_literal_value(expr: &TypedExpr) -> Option<i64> {
+    match &expr.kind {
+        ExprKind::Literal(LiteralValue::Int(value)) => Some(*value),
+        ExprKind::UnaryOp {
+            op: UnOp::Negate,
+            expr: inner,
+        } => signed_int_literal_value(inner).and_then(i64::checked_neg),
+        _ => None,
+    }
+}
+
+fn checked_int_literal_for_target(value: i64, target: &DataType) -> Result<(), String> {
+    let fits = match target {
+        DataType::Int8 => i8::try_from(value).is_ok(),
+        DataType::Int16 => i16::try_from(value).is_ok(),
+        DataType::Int32 => i32::try_from(value).is_ok(),
+        DataType::Int64 => true,
+        _ => return Ok(()),
+    };
+    if fits {
+        Ok(())
+    } else {
+        let target_name = match target {
+            DataType::Int8 => "tinyint",
+            DataType::Int16 => "smallint",
+            DataType::Int32 => "int",
+            DataType::Int64 => "bigint",
+            _ => unreachable!(),
+        };
+        Err(format!(
+            "Cast argument {value} to {target_name} type failed"
+        ))
+    }
+}
+
+fn coerce_function_argument(expr: TypedExpr, target: &DataType) -> Result<TypedExpr, String> {
+    if expr.data_type == *target {
+        return Ok(expr);
+    }
+    if let Some(value) = signed_int_literal_value(&expr)
+        && matches!(
+            target,
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+        )
+    {
+        checked_int_literal_for_target(value, target)?;
+        return Ok(TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Int(value)),
+            data_type: target.clone(),
+            nullable: expr.nullable,
+        });
+    }
+    if matches!(expr.data_type, DataType::Null) {
+        return Ok(TypedExpr {
+            kind: ExprKind::Cast {
+                expr: Box::new(expr),
+                target: target.clone(),
+            },
+            data_type: target.clone(),
+            nullable: true,
+        });
+    }
+    Ok(TypedExpr {
+        nullable: expr.nullable,
+        kind: ExprKind::Cast {
+            expr: Box::new(expr),
+            target: target.clone(),
+        },
+        data_type: target.clone(),
+    })
+}
+
+fn bind_scalar_function_call(
+    name: &str,
+    mut args: Vec<TypedExpr>,
+) -> Result<BoundScalarCall, String> {
+    apply_implicit_string_function_casts(name, &mut args);
+    let arg_types = args
+        .iter()
+        .map(|arg| arg.data_type.clone())
+        .collect::<Vec<_>>();
+
+    match crate::sql::functions::resolve_scalar_function_signature(name, &arg_types) {
+        Ok(resolved) if resolved.enforce_argument_binding => {
+            let args = args
+                .into_iter()
+                .zip(resolved.argument_types.iter())
+                .map(|(arg, target)| coerce_function_argument(arg, target))
+                .collect::<Result<Vec<_>, _>>()?;
+            validate_scalar_function_call_typed(name, &args)?;
+            Ok(BoundScalarCall {
+                args,
+                return_type: resolved.return_type,
+            })
+        }
+        Ok(resolved) => {
+            validate_scalar_function_call_typed(name, &args)?;
+            Ok(BoundScalarCall {
+                args,
+                return_type: resolved.return_type,
+            })
+        }
+        Err(crate::sql::functions::ResolveError::NoMatchingSignature {
+            binding_enforced: true,
+            ..
+        }) => Err(no_matching_signature(name, &arg_types)),
+        Err(crate::sql::functions::ResolveError::BadSignature(message)) => Err(message),
+        Err(crate::sql::functions::ResolveError::UnknownFunction) => {
+            validate_scalar_function_call_typed(name, &args)?;
+            Ok(BoundScalarCall {
+                return_type: infer_scalar_return_type(name, &arg_types),
+                args,
+            })
+        }
+        Err(crate::sql::functions::ResolveError::NoMatchingSignature {
+            binding_enforced: false,
+            ..
+        }) => {
+            validate_scalar_function_call_typed(name, &args)?;
+            Ok(BoundScalarCall {
+                return_type: infer_scalar_return_type(name, &arg_types),
+                args,
+            })
+        }
     }
 }
 
@@ -5161,6 +5301,91 @@ mod tests {
             .next()
             .map(|item| item.expr)
             .ok_or_else(|| "expected projection".to_string())
+    }
+
+    fn assert_substring_int32_arguments(sql: &str, expected_arity: usize) {
+        let expr = analyze_projection_expr(sql).expect("substring should analyze");
+        let crate::sql::analysis::ExprKind::FunctionCall { name, args, .. } = expr.kind else {
+            panic!("expected FunctionCall, got {:?}", expr.kind);
+        };
+        assert_eq!(name, "substring");
+        assert_eq!(args.len(), expected_arity);
+        assert_eq!(args[0].data_type, DataType::Utf8);
+        for arg in &args[1..] {
+            assert_eq!(arg.data_type, DataType::Int32);
+        }
+    }
+
+    #[test]
+    fn substring_function_syntax_binds_integer_literals_to_int32() {
+        assert_substring_int32_arguments("select substring('STARROCKS', 2, 3)", 3);
+        assert_substring_int32_arguments("select substring('x', 2147483647)", 2);
+        assert_substring_int32_arguments("select substring('x', -2147483648)", 2);
+    }
+
+    #[test]
+    fn substring_special_syntax_uses_the_same_binding() {
+        assert_substring_int32_arguments("select substring('STARROCKS' from 2 for 3)", 3);
+        assert_substring_int32_arguments("select substring('STARROCKS' from 2)", 2);
+    }
+
+    #[test]
+    fn substring_rejects_positive_literal_outside_int32() {
+        let err = analyze_projection_expr("select substring('x', 2147483648)")
+            .expect_err("overflowing literal must fail during analysis");
+        assert_eq!(err, "Cast argument 2147483648 to int type failed");
+    }
+
+    #[test]
+    fn substring_special_syntax_rejects_negative_literal_outside_int32() {
+        let err = analyze_projection_expr("select substring('x' from -2147483649 for 1)")
+            .expect_err("overflowing negative literal must fail during analysis");
+        assert_eq!(err, "Cast argument -2147483649 to int type failed");
+    }
+
+    #[test]
+    fn substring_non_literal_bigint_gets_runtime_int32_cast() {
+        let expr = analyze_projection_expr("select substring('x', cast(1 as bigint))")
+            .expect("BIGINT expression should bind through a runtime cast");
+        let crate::sql::analysis::ExprKind::FunctionCall { args, .. } = expr.kind else {
+            panic!("expected FunctionCall, got {:?}", expr.kind);
+        };
+        assert_eq!(args[1].data_type, DataType::Int32);
+        assert!(matches!(
+            args[1].kind,
+            crate::sql::analysis::ExprKind::Cast {
+                target: DataType::Int32,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn substring_does_not_constant_fold_arithmetic_for_literal_range_checking() {
+        let expr = analyze_projection_expr("select substring('x', 2147483647 + 1)")
+            .expect("arithmetic expression should bind through a runtime cast");
+        let crate::sql::analysis::ExprKind::FunctionCall { args, .. } = expr.kind else {
+            panic!("expected FunctionCall, got {:?}", expr.kind);
+        };
+        assert_eq!(args[1].data_type, DataType::Int32);
+        assert!(matches!(
+            args[1].kind,
+            crate::sql::analysis::ExprKind::Cast {
+                target: DataType::Int32,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn substring_null_offset_binds_to_nullable_int32() {
+        let expr = analyze_projection_expr("select substring('x', NULL)")
+            .expect("NULL should bind to the signature target");
+        let crate::sql::analysis::ExprKind::FunctionCall { args, .. } = expr.kind else {
+            panic!("expected FunctionCall, got {:?}", expr.kind);
+        };
+        assert_eq!(args[1].data_type, DataType::Int32);
+        assert!(args[1].nullable);
     }
 
     #[test]

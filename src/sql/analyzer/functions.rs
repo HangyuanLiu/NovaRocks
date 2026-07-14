@@ -101,7 +101,7 @@ fn format_signature_type(data_type: &DataType, map_value_context: bool) -> Strin
     }
 }
 
-fn no_matching_signature(name: &str, arg_types: &[DataType]) -> String {
+pub(super) fn no_matching_signature(name: &str, arg_types: &[DataType]) -> String {
     format!(
         "No matching function with signature: {}({}).",
         name,
