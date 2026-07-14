@@ -54,6 +54,7 @@ fn build_distributed_plan_values_shapes_root_fragment() {
 
     let dp = build_distributed_plan(&plan).expect("build_distributed_plan");
 
+    assert!(dp.runtime_filter_graph.is_empty());
     assert_eq!(dp.fragments.len(), 1);
     assert_eq!(dp.root_fragment_id, 0);
     assert!(dp.edges.is_empty());
