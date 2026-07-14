@@ -7197,6 +7197,30 @@ fn runtime_filter_model_local_roots(text: &str) -> BTreeSet<String> {
     roots
 }
 
+fn runtime_filter_runtime_local_roots(text: &str) -> BTreeSet<String> {
+    let production = rust_sanitized_production_text(text);
+    if syn::parse_file(&production).is_ok() {
+        return runtime_filter_model_local_roots(text);
+    }
+
+    // Production sanitization can leave an incomplete expression when a cfg(test)
+    // field or branch is removed. Fall back to declaration heads; dependency paths
+    // still have to match a per-file allowlist unless their first segment is a type
+    // declared by this file.
+    let mut roots = BTreeSet::from(["Self".to_string()]);
+    let tokens = rust_use_tokens(&production);
+    for pair in tokens.windows(2) {
+        if matches!(
+            pair[0].as_str(),
+            "enum" | "mod" | "struct" | "trait" | "type" | "union"
+        ) && pair[1].chars().all(is_ident_char)
+        {
+            roots.insert(pair[1].clone());
+        }
+    }
+    roots
+}
+
 #[derive(Default)]
 struct RuntimeFilterExternalPathAudit {
     paths: BTreeSet<Vec<String>>,
@@ -7326,29 +7350,1308 @@ fn runtime_filter_model_dependency_violations(source_rel: &str, text: &str) -> V
     violations.into_iter().collect()
 }
 
+fn runtime_filter_path_is_rust_prelude(path: &[String]) -> bool {
+    path.first().is_some_and(|root| {
+        matches!(
+            root.as_str(),
+            "Box"
+                | "Into"
+                | "Option"
+                | "Result"
+                | "String"
+                | "Vec"
+                | "bool"
+                | "clippy"
+                | "f32"
+                | "f64"
+                | "i8"
+                | "i16"
+                | "i32"
+                | "i64"
+                | "i128"
+                | "isize"
+                | "u8"
+                | "u16"
+                | "u32"
+                | "u64"
+                | "u128"
+                | "usize"
+        )
+    })
+}
+
+fn runtime_filter_is_allowed_query_context_export(tree: &syn::UseTree) -> bool {
+    let syn::UseTree::Path(crate_path) = tree else {
+        return false;
+    };
+    let syn::UseTree::Path(runtime_path) = crate_path.tree.as_ref() else {
+        return false;
+    };
+    let syn::UseTree::Path(options_path) = runtime_path.tree.as_ref() else {
+        return false;
+    };
+    let syn::UseTree::Name(name) = options_path.tree.as_ref() else {
+        return false;
+    };
+    crate_path.ident == "crate"
+        && runtime_path.ident == "runtime"
+        && options_path.ident == "query_options"
+        && name.ident == "query_expire_durations"
+}
+
+fn runtime_filter_query_context_export_surface_violations(text: &str) -> Vec<String> {
+    let production = rust_sanitized_production_text(text);
+    let Ok(file) = syn::parse_file(&production).or_else(|_| syn::parse_file(text)) else {
+        return vec!["QueryContext export surface must parse".to_string()];
+    };
+    let mut violations = Vec::new();
+    for item in file.items {
+        match item {
+            syn::Item::Use(item_use)
+                if !matches!(item_use.vis, syn::Visibility::Inherited)
+                    && !runtime_filter_is_allowed_query_context_export(&item_use.tree) =>
+            {
+                violations.push("QueryContext has an unexpected public use".to_string());
+            }
+            syn::Item::Type(item_type) if !matches!(item_type.vis, syn::Visibility::Inherited) => {
+                violations.push("QueryContext has an unexpected public type alias".to_string());
+            }
+            _ => {}
+        }
+    }
+    violations
+}
+
 fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> Vec<String> {
-    rust_production_canonical_paths(text, source_rel)
+    if !source_rel.starts_with("src/runtime_filter/") {
+        let production = rust_sanitized_production_text(text);
+        let canonical = rust_production_canonical_paths(text, source_rel);
+        let references_service = production.contains("RuntimeFilterService")
+            || production.contains("runtime_filter_service")
+            || canonical.iter().any(|path| {
+                path.starts_with(&[
+                    "crate".to_string(),
+                    "runtime_filter".to_string(),
+                    "service".to_string(),
+                ])
+            });
+        let references_data_plane_port = [
+            "RuntimeFilterInstallView",
+            "CompleteOnceChannelDeployment",
+            "ProducerAdapter",
+            "BlockingSnapshotSubscription",
+            "ValueDomainDelta",
+            "LogicalSnapshot",
+        ]
         .into_iter()
-        .filter(|canonical| {
-            let planner_dependency = canonical.starts_with(&[
-                "crate".to_string(),
-                "sql".to_string(),
-                "planner".to_string(),
-            ]);
-            let model_prefix = [
+        .any(|owner| production.contains(owner));
+        let references_concrete_event_sink = production.contains("RegistryRuntimeFilterEventSink")
+            || canonical.iter().any(|path| {
+                path.last()
+                    .is_some_and(|name| name == "RegistryRuntimeFilterEventSink")
+            });
+        let production_tokens = rust_use_tokens(&production);
+        let references_event_port = production_tokens.iter().any(|token| {
+            matches!(
+                token.as_str(),
+                "RuntimeFilterEventSink" | "RuntimeFilterEvent"
+            )
+        }) || canonical.iter().any(|path| {
+            path.starts_with(&[
                 "crate".to_string(),
                 "runtime_filter".to_string(),
-                "model".to_string(),
-            ];
-            let forbidden_model_dependency = canonical.starts_with(&model_prefix)
-                && !matches!(
-                    canonical.get(model_prefix.len()).map(String::as_str),
-                    Some("contract" | "coverage")
-                );
-            planner_dependency || forbidden_model_dependency
+                "port".to_string(),
+                "events".to_string(),
+            ])
+        });
+        let allowed_owner = matches!(
+            source_rel,
+            "src/runtime/query_context.rs" | "src/runtime/runtime_filter_observability.rs"
+        );
+        let references_runtime_surface = references_service
+            || references_data_plane_port
+            || references_event_port
+            || references_concrete_event_sink;
+        let calls_data_plane = production_tokens.windows(3).any(|window| {
+            matches!(window[0].as_str(), "." | "::")
+                && matches!(
+                    window[1].as_str(),
+                    "install" | "open_producer" | "open_subscription" | "subscribe"
+                )
+                && window[2] == "("
+        });
+        let export_surface_violations = (source_rel == "src/runtime/query_context.rs")
+            .then(|| runtime_filter_query_context_export_surface_violations(text))
+            .unwrap_or_default();
+        let allowed_reference = match source_rel {
+            "src/runtime/query_context.rs" => {
+                (references_service || references_concrete_event_sink)
+                    && !references_data_plane_port
+                    && !references_event_port
+                    && !calls_data_plane
+            }
+            "src/runtime/runtime_filter_observability.rs" => {
+                !references_service && !references_data_plane_port && !calls_data_plane
+            }
+            _ => false,
+        };
+        return ((references_runtime_surface && (!allowed_owner || !allowed_reference))
+            || (source_rel == "src/runtime/query_context.rs" && calls_data_plane)
+            || !export_surface_violations.is_empty())
+        .then(|| format!("{source_rel}: runtime-filter Service is harness-only before RFD-6"))
+        .into_iter()
+        .collect();
+    }
+
+    let Some(allowed_prefixes) = runtime_filter_runtime_dependency_allowlist(source_rel) else {
+        return vec![format!(
+            "{source_rel}: unrecognized runtime-filter Core/Port/Router/Service source"
+        )];
+    };
+    let local_roots = runtime_filter_runtime_local_roots(text);
+    let mut violations = rust_production_canonical_paths(text, source_rel)
+        .into_iter()
+        .map(|canonical| runtime_filter_dependency_path(&canonical, source_rel))
+        .filter(|canonical| {
+            !canonical
+                .first()
+                .is_some_and(|root| local_roots.contains(root))
+                && !runtime_filter_path_is_rust_prelude(canonical)
+                && !runtime_filter_path_is_allowlisted(canonical, &allowed_prefixes)
         })
         .map(|canonical| format!("{source_rel}: {}", canonical.join("::")))
-        .collect()
+        .collect::<BTreeSet<_>>();
+    let production_tokens = rust_use_tokens(&rust_sanitized_production_text(text));
+    let production_source_tokens = rust_source_tokens(&rust_sanitized_production_text(text));
+    let has_path_attribute = production_source_tokens
+        .iter()
+        .enumerate()
+        .any(|(index, token)| {
+            if token.text != "#" {
+                return false;
+            }
+            let open = if production_source_tokens
+                .get(index + 1)
+                .is_some_and(|token| token.text == "[")
+            {
+                index + 1
+            } else if production_source_tokens
+                .get(index + 1)
+                .is_some_and(|token| token.text == "!")
+                && production_source_tokens
+                    .get(index + 2)
+                    .is_some_and(|token| token.text == "[")
+            {
+                index + 2
+            } else {
+                return false;
+            };
+            rust_matching_token(&production_source_tokens, open, "[", "]").is_some_and(|close| {
+                production_source_tokens[open + 1..close]
+                    .windows(2)
+                    .any(|window| window[0].text == "path" && window[1].text == "=")
+            })
+        });
+    if has_path_attribute {
+        violations.insert(format!(
+            "{source_rel}: #[path] source indirection is forbidden in runtime-filter namespaces"
+        ));
+    }
+    if production_tokens.windows(3).any(|window| {
+        window[0] == "include" && window[1] == "!" && matches!(window[2].as_str(), "(" | "[" | "{")
+    }) {
+        violations.insert(format!(
+            "{source_rel}: include! source indirection is forbidden in runtime-filter namespaces"
+        ));
+    }
+    violations.extend(runtime_filter_global_registry_violations(source_rel, text));
+    if matches!(
+        source_rel,
+        "src/runtime_filter/core/mod.rs"
+            | "src/runtime_filter/port/mod.rs"
+            | "src/runtime_filter/router/mod.rs"
+            | "src/runtime_filter/service/mod.rs"
+    ) {
+        violations.extend(runtime_filter_inner_dead_code_violations(source_rel, text));
+    }
+    violations.into_iter().collect()
+}
+
+fn runtime_filter_runtime_dependency_allowlist(
+    source_rel: &str,
+) -> Option<Vec<&'static [&'static str]>> {
+    let allowed: Vec<&'static [&'static str]> = match source_rel {
+        "src/runtime_filter/core/mod.rs" => vec![],
+        "src/runtime_filter/core/channel.rs" => vec![
+            &["std", "collections", "BTreeMap"],
+            &["std", "mem", "replace"],
+            &["std", "sync", "Arc"],
+            &["std", "sync", "Mutex"],
+            &["std", "sync", "OnceLock"],
+            &["std", "time", "Instant"],
+            &["arrow", "datatypes", "DataType"],
+            &["crate", "common", "types", "UniqueId"],
+            &["crate", "runtime_filter", "model", "contract"],
+            &["crate", "runtime_filter", "model", "coverage", "Coverage"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "events",
+                "ProducerEventIdentity",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "events",
+                "RuntimeFilterEvent",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "events",
+                "RuntimeFilterEventIdentity",
+            ],
+            &["crate", "runtime_filter", "port", "identity"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "install",
+                "CompleteOnceChannelDeployment",
+            ],
+            &["crate", "runtime_filter", "port", "producer"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "subscription",
+                "UnavailableReason",
+            ],
+            &["crate", "runtime_filter", "port", "support"],
+            &["crate", "runtime_filter", "port", "value_domain"],
+            &["crate", "runtime_filter", "core", "coverage"],
+            &["crate", "runtime_filter", "core", "error"],
+            &["crate", "runtime_filter", "core", "reducer"],
+            &["crate", "runtime_filter", "core", "state"],
+        ],
+        "src/runtime_filter/core/coverage.rs" => vec![
+            &["std", "collections", "BTreeMap"],
+            &[
+                "crate",
+                "runtime_filter",
+                "model",
+                "contract",
+                "CoverageWitnessId",
+            ],
+            &["crate", "runtime_filter", "model", "coverage", "Coverage"],
+        ],
+        "src/runtime_filter/core/error.rs" => {
+            vec![&["std", "error", "Error"], &["std", "fmt"]]
+        }
+        "src/runtime_filter/core/reducer.rs" => vec![
+            &["std", "collections", "BTreeSet"],
+            &["std", "fmt"],
+            &["std", "error", "Error"],
+            &["arrow", "datatypes", "DataType"],
+            &[
+                "crate",
+                "runtime_filter",
+                "model",
+                "contract",
+                "NullSemantics",
+            ],
+            &["crate", "runtime_filter", "port", "value_domain"],
+        ],
+        "src/runtime_filter/core/state.rs" => vec![
+            &["std", "collections", "BTreeMap"],
+            &["crate", "runtime_filter", "port", "identity"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "value_domain",
+                "ContributionFingerprint",
+            ],
+        ],
+        "src/runtime_filter/port/mod.rs" => vec![],
+        "src/runtime_filter/port/events.rs" => vec![
+            &["crate", "common", "types", "UniqueId"],
+            &["crate", "runtime_filter", "model", "contract"],
+            &["crate", "runtime_filter", "port", "identity"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "producer",
+                "ProducerFailureReason",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "subscription",
+                "UnavailableReason",
+            ],
+        ],
+        "src/runtime_filter/port/identity.rs" => vec![
+            &["crate", "common", "types", "UniqueId"],
+            &["crate", "runtime_filter", "model", "contract"],
+        ],
+        "src/runtime_filter/port/install.rs" => vec![
+            &["std", "collections"],
+            &["crate", "common", "types", "UniqueId"],
+            &["crate", "runtime_filter", "model", "contract"],
+            &["crate", "runtime_filter", "model", "coverage", "Coverage"],
+            &["crate", "runtime_filter", "port", "identity"],
+        ],
+        "src/runtime_filter/port/producer.rs" => vec![
+            &["std", "error", "Error"],
+            &["std", "fmt"],
+            &["crate", "common", "types", "UniqueId"],
+            &["crate", "runtime_filter", "model", "contract", "BindingId"],
+            &["crate", "runtime_filter", "port", "identity"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "value_domain",
+                "ValueDomainDelta",
+            ],
+        ],
+        "src/runtime_filter/port/subscription.rs" => vec![
+            &["std", "sync", "Arc"],
+            &["std", "time", "Duration"],
+            &["crate", "common", "types", "UniqueId"],
+            &["crate", "runtime_filter", "model", "contract", "BindingId"],
+            &["crate", "runtime_filter", "port", "identity", "RouteEdgeId"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "value_domain",
+                "LogicalSnapshot",
+            ],
+        ],
+        "src/runtime_filter/port/support.rs" => vec![
+            &["std", "error", "Error"],
+            &["std", "fmt"],
+            &["std", "sync", "Arc"],
+            &["std", "time", "Instant"],
+        ],
+        "src/runtime_filter/port/value_domain.rs" => vec![
+            &["std", "cmp", "Ordering"],
+            &["std", "collections", "BTreeSet"],
+            &["std", "error", "Error"],
+            &["std", "fmt"],
+            &["std", "sync", "Arc"],
+            &["arrow", "datatypes"],
+            &["sha2"],
+            &["crate", "common", "largeint", "LARGEINT_BYTE_WIDTH"],
+            &["crate", "runtime_filter", "model", "contract"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "identity",
+                "LogicalVersion",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "support",
+                "RetainedMemoryReservation",
+            ],
+        ],
+        "src/runtime_filter/router/mod.rs" => vec![],
+        "src/runtime_filter/router/loopback.rs" => vec![
+            &["std", "collections", "BTreeMap"],
+            &["std", "sync", "Arc"],
+            &[
+                "crate",
+                "runtime_filter",
+                "core",
+                "channel",
+                "ChannelAction",
+            ],
+            &["crate", "runtime_filter", "port", "identity", "RouteEdgeId"],
+            &["crate", "runtime_filter", "port", "subscription"],
+        ],
+        "src/runtime_filter/service/mod.rs" => vec![
+            &["std", "collections"],
+            &["std", "panic"],
+            &["std", "sync"],
+            &["std", "thread"],
+            &["std", "time", "Instant"],
+            &["crate", "common", "types", "UniqueId"],
+            &[
+                "crate",
+                "runtime_filter",
+                "core",
+                "channel",
+                "ChannelAction",
+            ],
+            &["crate", "runtime_filter", "model", "contract"],
+            &["crate", "runtime_filter", "port"],
+            &[
+                "crate",
+                "runtime_filter",
+                "service",
+                "producer",
+                "ServiceProducerAdapter",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "service",
+                "registry",
+                "DeploymentRegistry",
+            ],
+        ],
+        "src/runtime_filter/service/memory.rs" => vec![
+            &["std", "sync"],
+            &["std", "time", "Instant"],
+            &["crate", "common", "types", "UniqueId"],
+            &["crate", "runtime", "mem_tracker", "MemTracker"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "events",
+                "RuntimeFilterEventSink",
+            ],
+            &["crate", "runtime_filter", "port", "support"],
+            &["crate", "runtime_filter", "service", "RuntimeFilterService"],
+        ],
+        "src/runtime_filter/service/producer.rs" => vec![
+            &["std", "sync", "Arc"],
+            &["crate", "common", "types", "UniqueId"],
+            &["crate", "runtime_filter", "core", "channel"],
+            &["crate", "runtime_filter", "model", "contract"],
+            &["crate", "runtime_filter", "port"],
+            &["crate", "runtime_filter", "service", "ActionDispatcher"],
+        ],
+        "src/runtime_filter/service/registry.rs" => vec![
+            &["std", "collections"],
+            &["std", "sync"],
+            &["std", "time"],
+            &["crate", "common", "types", "UniqueId"],
+            &[
+                "crate",
+                "runtime_filter",
+                "core",
+                "channel",
+                "RuntimeFilterChannel",
+            ],
+            &["crate", "runtime_filter", "model", "contract"],
+            &["crate", "runtime_filter", "model", "coverage", "Coverage"],
+            &["crate", "runtime_filter", "port"],
+            &[
+                "crate",
+                "runtime_filter",
+                "router",
+                "loopback",
+                "LoopbackRouter",
+            ],
+            &["crate", "runtime_filter", "service", "EventEmitter"],
+            &["crate", "runtime_filter", "service", "subscription"],
+        ],
+        "src/runtime_filter/service/subscription.rs" => vec![
+            &["std", "collections", "BTreeMap"],
+            &["std", "sync"],
+            &["std", "time", "Duration"],
+            &["crate", "common", "types", "UniqueId"],
+            &["crate", "runtime_filter", "model", "contract", "BindingId"],
+            &["crate", "runtime_filter", "port"],
+        ],
+        _ => return None,
+    };
+    Some(allowed)
+}
+
+#[derive(Default)]
+struct RuntimeFilterGlobalRegistryAudit {
+    statics: Vec<String>,
+    global_macros: Vec<String>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterGlobalRegistryAudit {
+    fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
+        self.statics.push(item.ident.to_string());
+        syn::visit::visit_item_static(self, item);
+    }
+
+    fn visit_macro(&mut self, item: &'ast syn::Macro) {
+        if let Some(name) = item
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string())
+            && matches!(name.as_str(), "thread_local" | "lazy_static")
+        {
+            self.global_macros.push(name);
+        }
+        syn::visit::visit_macro(self, item);
+    }
+}
+
+fn runtime_filter_global_registry_violations(source_rel: &str, text: &str) -> BTreeSet<String> {
+    let production = rust_sanitized_production_text(text);
+    let mut audit = RuntimeFilterGlobalRegistryAudit::default();
+    if let Ok(file) = syn::parse_file(&production) {
+        syn::visit::Visit::visit_file(&mut audit, &file);
+    }
+    // Always audit tokens as well: syn intentionally treats macro_rules! bodies as
+    // opaque, so a static emitted by a locally defined macro would otherwise evade
+    // an AST-only pass even when the surrounding file parses successfully.
+    let tokens = rust_use_tokens(&production);
+    for (index, pair) in tokens.windows(2).enumerate() {
+        if pair[0] == "static" && pair[1].chars().all(is_ident_char) {
+            if index > 0 && tokens[index - 1] == "'" {
+                continue;
+            }
+            audit.statics.push(pair[1].clone());
+        }
+    }
+    for triple in tokens.windows(3) {
+        if matches!(triple[0].as_str(), "thread_local" | "lazy_static") && triple[1] == "!" {
+            audit.global_macros.push(triple[0].clone());
+        }
+    }
+    let mut violations = audit
+        .statics
+        .into_iter()
+        .map(|name| format!("{source_rel}: forbidden static lifecycle state {name}"))
+        .collect::<BTreeSet<_>>();
+    for name in audit.global_macros {
+        violations.insert(format!("{source_rel}: forbidden {name} lifecycle state"));
+    }
+    violations
+}
+
+fn runtime_filter_function_tokens(text: &str, name: &str) -> Option<Vec<String>> {
+    let lines = nidl_e4_code_line_entries(text);
+    let pattern = format!("fn {name}(");
+    let start = lines.iter().position(|(_, line)| line.contains(&pattern))?;
+    let mut depth = 0isize;
+    let mut seen_open = false;
+    let mut source = String::new();
+    for (_, line) in lines.iter().skip(start) {
+        source.push_str(line);
+        source.push('\n');
+        if line.contains('{') {
+            seen_open = true;
+        }
+        depth += brace_delta(line);
+        if seen_open && depth <= 0 {
+            return Some(rust_use_tokens(&source));
+        }
+    }
+    None
+}
+
+fn runtime_filter_token_sequence(tokens: &[String], expected: &[&str]) -> Option<usize> {
+    tokens.windows(expected.len()).position(|window| {
+        window
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| actual == expected)
+    })
+}
+
+fn runtime_filter_matching_delimiter(
+    tokens: &[String],
+    open: usize,
+    left: &str,
+    right: &str,
+) -> Option<usize> {
+    (tokens.get(open)? == left).then_some(())?;
+    let mut depth = 0isize;
+    for (index, token) in tokens.iter().enumerate().skip(open) {
+        if token == left {
+            depth += 1;
+        } else if token == right {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+fn runtime_filter_expr_is_manager_lock(expr: &syn::Expr) -> bool {
+    let syn::Expr::MethodCall(call) = expr else {
+        return false;
+    };
+    if call.method != "lock" {
+        return false;
+    }
+    let syn::Expr::Field(field) = call.receiver.as_ref() else {
+        return false;
+    };
+    let syn::Member::Named(member) = &field.member else {
+        return false;
+    };
+    let syn::Expr::Path(base) = field.base.as_ref() else {
+        return false;
+    };
+    member == "inner" && base.path.is_ident("self")
+}
+
+fn runtime_filter_expr_is_manager_lock_binding(expr: &syn::Expr) -> bool {
+    if runtime_filter_expr_is_manager_lock(expr) {
+        return true;
+    }
+    matches!(
+        expr,
+        syn::Expr::MethodCall(call)
+            if matches!(call.method.to_string().as_str(), "expect" | "unwrap")
+                && runtime_filter_expr_is_manager_lock_binding(&call.receiver)
+    )
+}
+
+fn runtime_filter_expr_manager_lock_count(expr: &syn::Expr) -> usize {
+    struct Counter(usize);
+    impl<'ast> syn::visit::Visit<'ast> for Counter {
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if runtime_filter_expr_is_manager_lock(&syn::Expr::MethodCall(call.clone())) {
+                self.0 += 1;
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+    }
+    let mut counter = Counter(0);
+    syn::visit::Visit::visit_expr(&mut counter, expr);
+    counter.0
+}
+
+fn runtime_filter_block_manager_lock_count(block: &syn::Block) -> usize {
+    struct Counter(usize);
+    impl<'ast> syn::visit::Visit<'ast> for Counter {
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if runtime_filter_expr_is_manager_lock(&syn::Expr::MethodCall(call.clone())) {
+                self.0 += 1;
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+    }
+    let mut counter = Counter(0);
+    syn::visit::Visit::visit_block(&mut counter, block);
+    counter.0
+}
+
+fn runtime_filter_pattern_idents(pattern: &syn::Pat, out: &mut BTreeSet<String>) {
+    match pattern {
+        syn::Pat::Ident(ident) => {
+            out.insert(ident.ident.to_string());
+        }
+        syn::Pat::Tuple(tuple) => {
+            for element in &tuple.elems {
+                runtime_filter_pattern_idents(element, out);
+            }
+        }
+        syn::Pat::TupleStruct(tuple) => {
+            for element in &tuple.elems {
+                runtime_filter_pattern_idents(element, out);
+            }
+        }
+        syn::Pat::Type(typed) => runtime_filter_pattern_idents(&typed.pat, out),
+        _ => {}
+    }
+}
+
+fn runtime_filter_expr_is_guard_path(expr: &syn::Expr, guards: &BTreeSet<String>) -> bool {
+    match expr {
+        syn::Expr::Path(path) => path
+            .path
+            .get_ident()
+            .is_some_and(|ident| guards.contains(&ident.to_string())),
+        syn::Expr::Paren(paren) => runtime_filter_expr_is_guard_path(&paren.expr, guards),
+        syn::Expr::Reference(reference) => {
+            runtime_filter_expr_is_guard_path(&reference.expr, guards)
+        }
+        syn::Expr::Tuple(tuple) => tuple
+            .elems
+            .iter()
+            .any(|expr| runtime_filter_expr_is_guard_path(expr, guards)),
+        _ => false,
+    }
+}
+
+fn runtime_filter_expr_moves_guard(expr: &syn::Expr, guards: &BTreeSet<String>) -> bool {
+    match expr {
+        syn::Expr::Path(_) => runtime_filter_expr_is_guard_path(expr, guards),
+        syn::Expr::Paren(paren) => runtime_filter_expr_moves_guard(&paren.expr, guards),
+        syn::Expr::Reference(reference) => runtime_filter_expr_moves_guard(&reference.expr, guards),
+        syn::Expr::Tuple(tuple) => tuple
+            .elems
+            .iter()
+            .any(|element| runtime_filter_expr_moves_guard(element, guards)),
+        syn::Expr::Struct(struct_expr) => struct_expr
+            .fields
+            .iter()
+            .any(|field| runtime_filter_expr_moves_guard(&field.expr, guards)),
+        syn::Expr::Call(call) => call
+            .args
+            .iter()
+            .any(|argument| runtime_filter_expr_moves_guard(argument, guards)),
+        syn::Expr::MethodCall(call) => call
+            .args
+            .iter()
+            .any(|argument| runtime_filter_expr_moves_guard(argument, guards)),
+        syn::Expr::Array(array) => array
+            .elems
+            .iter()
+            .any(|element| runtime_filter_expr_moves_guard(element, guards)),
+        syn::Expr::Closure(closure) => runtime_filter_expr_moves_guard(&closure.body, guards),
+        syn::Expr::Group(group) => runtime_filter_expr_moves_guard(&group.expr, guards),
+        syn::Expr::Repeat(repeat) => runtime_filter_expr_moves_guard(&repeat.expr, guards),
+        _ => false,
+    }
+}
+
+fn runtime_filter_expr_is_service_receiver(expr: &syn::Expr) -> bool {
+    match expr {
+        syn::Expr::Path(path) => path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "service"),
+        syn::Expr::MethodCall(call) => call.method == "runtime_filter_service",
+        syn::Expr::Paren(paren) => runtime_filter_expr_is_service_receiver(&paren.expr),
+        _ => false,
+    }
+}
+
+#[derive(Default)]
+struct RuntimeFilterManagerLockAudit {
+    lock_count: usize,
+    service_aliases: BTreeSet<String>,
+    sensitive_calls: BTreeMap<String, usize>,
+    violations: Vec<String>,
+}
+
+impl RuntimeFilterManagerLockAudit {
+    fn audit_block(&mut self, block: &syn::Block, guards: &mut BTreeSet<String>) {
+        for statement in &block.stmts {
+            match statement {
+                syn::Stmt::Local(local) => {
+                    if let Some(init) = &local.init {
+                        self.audit_expr(&init.expr, guards);
+                        if runtime_filter_expr_is_manager_lock_binding(&init.expr) {
+                            let mut bindings = BTreeSet::new();
+                            runtime_filter_pattern_idents(&local.pat, &mut bindings);
+                            self.lock_count += 1;
+                            guards.extend(bindings);
+                        } else if matches!(init.expr.as_ref(), syn::Expr::MethodCall(call) if call.method == "runtime_filter_service")
+                            && !guards.is_empty()
+                        {
+                            runtime_filter_pattern_idents(&local.pat, &mut self.service_aliases);
+                        } else if runtime_filter_expr_is_guard_path(&init.expr, guards) {
+                            self.violations
+                                .push("manager lock guard escapes through a local".to_string());
+                        }
+                    }
+                }
+                syn::Stmt::Expr(expr, _) => self.audit_expr(expr, guards),
+                syn::Stmt::Macro(_) => self
+                    .violations
+                    .push("macros are forbidden in lifecycle-critical methods".to_string()),
+                syn::Stmt::Item(_) => {}
+            }
+        }
+        if let Some(syn::Stmt::Expr(tail, None)) = block.stmts.last()
+            && runtime_filter_expr_moves_guard(tail, guards)
+        {
+            self.violations
+                .push("manager lock guard escapes through block tail".to_string());
+        }
+    }
+
+    fn audit_expr(&mut self, expr: &syn::Expr, guards: &mut BTreeSet<String>) {
+        match expr {
+            syn::Expr::Block(block) => {
+                let mut nested = guards.clone();
+                self.audit_block(&block.block, &mut nested);
+            }
+            syn::Expr::Call(call) => {
+                let is_drop = matches!(call.func.as_ref(), syn::Expr::Path(path) if path.path.is_ident("drop"));
+                if is_drop {
+                    if let Some(argument) = call.args.first()
+                        && let syn::Expr::Path(path) = argument
+                        && let Some(ident) = path.path.get_ident()
+                        && guards.remove(&ident.to_string())
+                    {
+                        *self.sensitive_calls.entry("drop".to_string()).or_default() += 1;
+                        return;
+                    }
+                    let drops_context = call.args.first().is_some_and(
+                        |argument| matches!(argument, syn::Expr::Path(path) if path.path.is_ident("ctx")),
+                    );
+                    if drops_context {
+                        *self.sensitive_calls.entry("drop".to_string()).or_default() += 1;
+                    }
+                    if drops_context && !guards.is_empty() {
+                        self.violations.push(
+                            "drop of non-guard state runs while the QueryContext manager lock is held"
+                                .to_string(),
+                        );
+                    }
+                }
+                self.audit_expr(&call.func, guards);
+                for argument in &call.args {
+                    self.audit_expr(argument, guards);
+                }
+            }
+            syn::Expr::MethodCall(call) => {
+                self.audit_expr(&call.receiver, guards);
+                for argument in &call.args {
+                    self.audit_expr(argument, guards);
+                }
+                let name = call.method.to_string();
+                let sensitive_name = matches!(
+                    name.as_str(),
+                    "cancel" | "shutdown" | "record" | "record_all" | "publish" | "emit"
+                );
+                if sensitive_name && !guards.is_empty() {
+                    self.violations.push(format!(
+                        "{name} runs while the QueryContext manager lock is held"
+                    ));
+                }
+                let lifecycle_receiver = runtime_filter_expr_is_service_receiver(&call.receiver)
+                    || matches!(call.receiver.as_ref(), syn::Expr::Path(path) if path.path.get_ident().is_some_and(|ident| self.service_aliases.contains(&ident.to_string())));
+                if matches!(name.as_str(), "cancel" | "shutdown") && lifecycle_receiver {
+                    *self.sensitive_calls.entry(name).or_default() += 1;
+                }
+            }
+            syn::Expr::If(expr_if) => {
+                self.audit_expr(&expr_if.cond, guards);
+                if matches!(expr_if.cond.as_ref(), syn::Expr::Lit(lit) if matches!(&lit.lit, syn::Lit::Bool(value) if !value.value))
+                {
+                    if let Some((_, else_expr)) = &expr_if.else_branch {
+                        let mut branch = guards.clone();
+                        self.audit_expr(else_expr, &mut branch);
+                    }
+                    return;
+                }
+                let mut branch = guards.clone();
+                self.audit_block(&expr_if.then_branch, &mut branch);
+                if let Some((_, else_expr)) = &expr_if.else_branch {
+                    let mut branch = guards.clone();
+                    self.audit_expr(else_expr, &mut branch);
+                }
+            }
+            syn::Expr::ForLoop(loop_expr) => {
+                self.audit_expr(&loop_expr.expr, guards);
+                let mut nested = guards.clone();
+                self.audit_block(&loop_expr.body, &mut nested);
+            }
+            syn::Expr::While(loop_expr) => {
+                self.audit_expr(&loop_expr.cond, guards);
+                let mut nested = guards.clone();
+                self.audit_block(&loop_expr.body, &mut nested);
+            }
+            syn::Expr::Loop(loop_expr) => {
+                let mut nested = guards.clone();
+                self.audit_block(&loop_expr.body, &mut nested);
+            }
+            syn::Expr::Closure(closure) => {
+                let mut nested = guards.clone();
+                self.audit_expr(&closure.body, &mut nested);
+            }
+            syn::Expr::Return(ret) => {
+                if ret
+                    .expr
+                    .as_deref()
+                    .is_some_and(|expr| runtime_filter_expr_moves_guard(expr, guards))
+                {
+                    self.violations
+                        .push("manager lock guard escapes through return".to_string());
+                }
+                if let Some(expr) = &ret.expr {
+                    self.audit_expr(expr, guards);
+                }
+            }
+            syn::Expr::Reference(reference) => self.audit_expr(&reference.expr, guards),
+            syn::Expr::Match(expr_match) => {
+                self.audit_expr(&expr_match.expr, guards);
+                for arm in &expr_match.arms {
+                    let mut nested = guards.clone();
+                    if let Some((_, guard)) = &arm.guard {
+                        self.audit_expr(guard, &mut nested);
+                    }
+                    self.audit_expr(&arm.body, &mut nested);
+                }
+            }
+            syn::Expr::Macro(_) => self
+                .violations
+                .push("macros are forbidden in lifecycle-critical methods".to_string()),
+            _ => syn::visit::visit_expr(
+                &mut RuntimeFilterNestedExprAudit {
+                    audit: self,
+                    guards,
+                },
+                expr,
+            ),
+        }
+    }
+}
+
+struct RuntimeFilterNestedExprAudit<'a> {
+    audit: &'a mut RuntimeFilterManagerLockAudit,
+    guards: &'a mut BTreeSet<String>,
+}
+
+fn runtime_filter_local_pattern_contains(local: &syn::Local, name: &str) -> bool {
+    let mut bindings = BTreeSet::new();
+    runtime_filter_pattern_idents(&local.pat, &mut bindings);
+    bindings.contains(name)
+}
+
+fn runtime_filter_expr_contains_any_ident(expr: &syn::Expr, names: &BTreeSet<String>) -> bool {
+    struct Finder<'a> {
+        found: bool,
+        names: &'a BTreeSet<String>,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for Finder<'_> {
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            if path
+                .path
+                .get_ident()
+                .is_some_and(|ident| self.names.contains(&ident.to_string()))
+            {
+                self.found = true;
+            }
+            syn::visit::visit_expr_path(self, path);
+        }
+    }
+    let mut finder = Finder {
+        found: false,
+        names,
+    };
+    syn::visit::Visit::visit_expr(&mut finder, expr);
+    finder.found
+}
+
+fn runtime_filter_lock_block_output_depends_on_guard(block: &syn::Block, output: &str) -> bool {
+    let mut guards = BTreeSet::new();
+    for statement in &block.stmts {
+        let syn::Stmt::Local(local) = statement else {
+            continue;
+        };
+        let Some(init) = &local.init else {
+            continue;
+        };
+        if runtime_filter_expr_is_manager_lock_binding(&init.expr) {
+            runtime_filter_pattern_idents(&local.pat, &mut guards);
+        }
+    }
+    if guards.is_empty() {
+        return false;
+    }
+    let local_output_depends = block.stmts.iter().any(|statement| {
+        let syn::Stmt::Local(local) = statement else {
+            return false;
+        };
+        runtime_filter_local_pattern_contains(local, output)
+            && local
+                .init
+                .as_ref()
+                .is_some_and(|init| runtime_filter_expr_contains_any_ident(&init.expr, &guards))
+    });
+    let tail_depends = matches!(block.stmts.last(), Some(syn::Stmt::Expr(expr, None)) if runtime_filter_expr_contains_any_ident(expr, &guards));
+    local_output_depends || tail_depends
+}
+
+fn runtime_filter_method_has_scoped_lock_output(method: &syn::ImplItemFn, output: &str) -> bool {
+    method.block.stmts.iter().any(|statement| {
+        let syn::Stmt::Local(local) = statement else {
+            return false;
+        };
+        runtime_filter_local_pattern_contains(local, output)
+            && local
+                .init
+                .as_ref()
+                .is_some_and(|init| match init.expr.as_ref() {
+                    syn::Expr::Block(block) => {
+                        runtime_filter_expr_manager_lock_count(&init.expr) == 1
+                            && runtime_filter_lock_block_output_depends_on_guard(
+                                &block.block,
+                                output,
+                            )
+                    }
+                    _ => false,
+                })
+    })
+}
+
+fn runtime_filter_finish_has_guard_and_context_flow(method: &syn::ImplItemFn) -> bool {
+    let mut saw_guard_lock = false;
+    let mut saw_context = false;
+    for statement in &method.block.stmts {
+        let syn::Stmt::Local(local) = statement else {
+            continue;
+        };
+        if runtime_filter_local_pattern_contains(local, "guard")
+            && local
+                .init
+                .as_ref()
+                .is_some_and(|init| runtime_filter_expr_is_manager_lock_binding(&init.expr))
+        {
+            saw_guard_lock = true;
+        }
+        if saw_guard_lock
+            && runtime_filter_local_pattern_contains(local, "ctx")
+            && local.init.as_ref().is_some_and(|init| {
+                runtime_filter_expr_contains_any_ident(
+                    &init.expr,
+                    &BTreeSet::from(["guard".to_string()]),
+                )
+            })
+        {
+            saw_context = true;
+        }
+    }
+    saw_guard_lock && saw_context
+}
+
+impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterNestedExprAudit<'_> {
+    fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+        self.audit.audit_expr(expr, self.guards);
+    }
+}
+
+fn runtime_filter_query_context_lock_discipline_violations(text: &str) -> Vec<String> {
+    let production = rust_sanitized_production_text(text);
+    // Prefer production-sanitized syntax. The shared sanitizer can leave an
+    // incomplete expression when it removes a cfg(test) branch; the original
+    // Rust file is still safe to audit because test-only duplicate methods make
+    // this default-deny check fail rather than hide a production owner.
+    let file = match syn::parse_file(&production).or_else(|_| syn::parse_file(text)) {
+        Ok(file) => file,
+        Err(error) => {
+            return vec![format!(
+                "QueryContext source must parse for AST lock audit: {error}"
+            )];
+        }
+    };
+    let mut methods = BTreeMap::new();
+    for item in &file.items {
+        let syn::Item::Impl(item_impl) = item else {
+            continue;
+        };
+        if item_impl.trait_.is_some()
+            || !matches!(item_impl.self_ty.as_ref(), syn::Type::Path(path) if path.path.segments.last().is_some_and(|segment| segment.ident == "QueryContextManager"))
+        {
+            continue;
+        }
+        for item in &item_impl.items {
+            if let syn::ImplItem::Fn(method) = item
+                && matches!(
+                    method.sig.ident.to_string().as_str(),
+                    "abort_query" | "cancel_query" | "clean_expired" | "finish_fragment_internal"
+                )
+            {
+                methods
+                    .entry(method.sig.ident.to_string())
+                    .or_insert_with(Vec::new)
+                    .push(method);
+            }
+        }
+    }
+
+    let mut violations = Vec::new();
+    for name in [
+        "abort_query",
+        "cancel_query",
+        "clean_expired",
+        "finish_fragment_internal",
+    ] {
+        let Some(entries) = methods.get(name) else {
+            violations.push(format!("missing QueryContextManager::{name}"));
+            continue;
+        };
+        if entries.len() != 1 {
+            violations.push(format!(
+                "QueryContextManager::{name} must have exactly one inherent implementation"
+            ));
+            continue;
+        }
+        let mut audit = RuntimeFilterManagerLockAudit::default();
+        audit.audit_block(&entries[0].block, &mut BTreeSet::new());
+        if audit.lock_count != 1 || runtime_filter_block_manager_lock_count(&entries[0].block) != 1
+        {
+            audit.violations.push(format!(
+                "QueryContextManager::{name} must acquire self.inner exactly once"
+            ));
+        }
+        let expected = match name {
+            "abort_query" | "cancel_query" => ("cancel", 1usize),
+            "clean_expired" | "finish_fragment_internal" => ("shutdown", 1usize),
+            _ => unreachable!(),
+        };
+        if audit.sensitive_calls.get(expected.0).copied().unwrap_or(0) != expected.1 {
+            audit.violations.push(format!(
+                "QueryContextManager::{name} must call {} exactly once",
+                expected.0
+            ));
+        }
+        let data_flow_ok = match name {
+            "abort_query" | "cancel_query" => {
+                runtime_filter_method_has_scoped_lock_output(entries[0], "service")
+            }
+            "clean_expired" => runtime_filter_method_has_scoped_lock_output(entries[0], "expired"),
+            "finish_fragment_internal" => {
+                runtime_filter_finish_has_guard_and_context_flow(entries[0])
+            }
+            _ => unreachable!(),
+        };
+        if !data_flow_ok {
+            audit.violations.push(format!(
+                "QueryContextManager::{name} lifecycle output must be bound to its unique manager-lock scope"
+            ));
+        }
+        violations.extend(
+            audit
+                .violations
+                .into_iter()
+                .map(|violation| format!("QueryContextManager::{name}: {violation}")),
+        );
+    }
+    violations
+}
+
+fn runtime_filter_action_dispatch_boundary_violations(producer: &str) -> Vec<String> {
+    let production = rust_sanitized_production_text(producer);
+    let mut violations = Vec::new();
+    if !production
+        .contains("fn finish(&self, action: crate::runtime_filter::core::channel::ChannelAction)")
+    {
+        violations
+            .push("Service producer finish must receive the returned ChannelAction".to_string());
+    }
+    let all_tokens = rust_use_tokens(&production);
+    let dispatch_count = all_tokens
+        .windows(4)
+        .filter(|window| window == &["dispatcher", ".", "dispatch", "("])
+        .count();
+    let finish_tokens = runtime_filter_function_tokens(&production, "finish").unwrap_or_default();
+    if !finish_tokens
+        .windows(4)
+        .any(|window| window == ["dispatcher", ".", "dispatch", "("])
+        || dispatch_count != 1
+    {
+        violations.push("Service producer must dispatch the returned ChannelAction".to_string());
+    }
+
+    for (function, action_methods) in [
+        (
+            "submit",
+            &["submit", "reject_submit_resource_exhausted"][..],
+        ),
+        ("close_partition", &["close_partition"][..]),
+        ("fail", &["fail_instance"][..]),
+    ] {
+        let Some(tokens) = runtime_filter_function_tokens(&production, function) else {
+            violations.push(format!("Service producer is missing {function}"));
+            continue;
+        };
+        let mut action_calls = 0usize;
+        let mut finished_actions = 0usize;
+        for index in 0..tokens.len().saturating_sub(2) {
+            if !action_methods.contains(&tokens[index].as_str())
+                || tokens[index + 1] != "("
+                || index == 0
+                || !matches!(tokens[index - 1].as_str(), "." | "::")
+            {
+                continue;
+            }
+            action_calls += 1;
+            let owned_receiver =
+                index >= 4 && tokens[index - 4..index] == ["self", ".", "channel", "."];
+            if !owned_receiver {
+                violations.push(format!(
+                    "Service producer {function} mutation must use receiver self.channel"
+                ));
+            }
+            let Some(close) = runtime_filter_matching_delimiter(&tokens, index + 1, "(", ")")
+            else {
+                continue;
+            };
+            let suffix = &tokens[close + 1..];
+            if runtime_filter_token_sequence(
+                suffix,
+                &[
+                    ".", "map", "(", "|", "action", "|", "self", ".", "finish", "(", "action", ")",
+                ],
+            ) == Some(0)
+            {
+                finished_actions += 1;
+            }
+        }
+        if action_calls == 0 || action_calls != finished_actions {
+            violations.push(format!(
+                "Service producer {function} must pass every returned ChannelAction to finish"
+            ));
+        }
+    }
+    violations
+}
+
+fn runtime_filter_attribute_allows_dead_code(attribute: &str) -> bool {
+    let tokens = rust_source_tokens(attribute);
+    tokens.iter().enumerate().any(|(index, token)| {
+        token.text == "allow"
+            && tokens.get(index + 1).is_some_and(|token| token.text == "(")
+            && rust_matching_token(&tokens, index + 1, "(", ")").is_some_and(|close| {
+                tokens[index + 2..close]
+                    .iter()
+                    .any(|token| token.text == "dead_code")
+            })
+    })
+}
+
+fn runtime_filter_inner_dead_code_violations(source_rel: &str, text: &str) -> Vec<String> {
+    let tokens = rust_source_tokens(text);
+    let mut violations = Vec::new();
+    for index in 0..tokens.len().saturating_sub(2) {
+        if tokens[index].text == "#"
+            && tokens[index + 1].text == "!"
+            && tokens[index + 2].text == "["
+            && let Some(close) = rust_matching_token(&tokens, index + 2, "[", "]")
+        {
+            let attribute = &text[tokens[index].start..tokens[close].end];
+            if runtime_filter_attribute_allows_dead_code(attribute) {
+                violations.push(format!(
+                    "{source_rel}: namespace root must not carry an inner dead_code allowance"
+                ));
+            }
+        }
+    }
+    violations
+}
+
+fn runtime_filter_runtime_root_dead_code_violations(text: &str) -> Vec<String> {
+    let mut violations =
+        runtime_filter_inner_dead_code_violations("src/runtime_filter/mod.rs", text);
+    for item in rust_module_items(text) {
+        if matches!(item.name.as_str(), "core" | "port" | "router" | "service")
+            && item
+                .attributes
+                .iter()
+                .any(|attribute| runtime_filter_attribute_allows_dead_code(attribute))
+        {
+            violations.push(format!(
+                "runtime-filter {} namespace must not carry a dead_code allowance",
+                item.name
+            ));
+        }
+    }
+    violations
 }
 
 fn runtime_filter_model_root_surface_violations(text: &str) -> Vec<String> {
@@ -7445,28 +8748,89 @@ fn runtime_filter_graph_model_has_planner_neutral_boundaries() {
         "runtime-filter model must stay planner-, wire-, service-, runtime-, connector-, and catalog-neutral except for graph TypedExpr:\n{}",
         violations.join("\n")
     );
+}
 
+#[test]
+fn runtime_filter_channel_service_boundaries_are_default_deny_and_harness_only() {
+    let repo = Path::new(manifest_dir());
     let runtime_filter = repo.join("src/runtime_filter");
+    let mut violations = Vec::new();
     for path in rs_files(&runtime_filter) {
         let source_rel = rel(&path);
-        if source_rel == "src/runtime_filter/core.rs"
-            || source_rel.starts_with("src/runtime_filter/core/")
-            || source_rel == "src/runtime_filter/service.rs"
-            || source_rel.starts_with("src/runtime_filter/service/")
+        if ["core", "port", "router", "service"]
+            .into_iter()
+            .any(|namespace| {
+                source_rel == format!("src/runtime_filter/{namespace}.rs")
+                    || source_rel.starts_with(&format!("src/runtime_filter/{namespace}/"))
+            })
         {
             let text = fs::read_to_string(&path)
-                .expect("runtime-filter core/service source must be readable");
+                .expect("runtime-filter runtime namespace source must be readable");
             violations.extend(runtime_filter_runtime_boundary_violations(
                 &source_rel,
                 &text,
             ));
         }
     }
-
     assert!(
         violations.is_empty(),
-        "runtime-filter core/service must not depend on graph-owned or planner types:\n{}",
+        "runtime-filter runtime namespaces must remain default-deny:\n{}",
         violations.join("\n")
+    );
+
+    let src = repo.join("src");
+    for path in rs_files(&src) {
+        if path.starts_with(&runtime_filter) {
+            continue;
+        }
+        let source_rel = rel(&path);
+        let text = fs::read_to_string(&path).expect("production source must be readable");
+        violations.extend(runtime_filter_runtime_boundary_violations(
+            &source_rel,
+            &text,
+        ));
+    }
+    assert!(
+        violations.is_empty(),
+        "the RFD-3/M1 Service and ports must stay harness-only before RFD-6:\n{}",
+        violations.join("\n")
+    );
+
+    let root = fs::read_to_string(runtime_filter.join("mod.rs"))
+        .expect("runtime-filter root source must be readable");
+    let dead_code_violations = runtime_filter_runtime_root_dead_code_violations(&root);
+    assert!(
+        dead_code_violations.is_empty(),
+        "live M1 namespaces must not carry subtree-wide dead_code suppression:\n{}",
+        dead_code_violations.join("\n")
+    );
+
+    let producer = fs::read_to_string(runtime_filter.join("service/producer.rs"))
+        .expect("Service producer source must be readable");
+    let dispatch_violations = runtime_filter_action_dispatch_boundary_violations(&producer);
+    assert!(
+        dispatch_violations.is_empty(),
+        "Service dispatch must consume a ChannelAction returned after Core mutation:\n{}",
+        dispatch_violations.join("\n")
+    );
+    let service_sources = rs_files(&runtime_filter.join("service"))
+        .into_iter()
+        .map(|path| fs::read_to_string(path).expect("Service source must be readable"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !rust_sanitized_production_text(&service_sources)
+            .contains("RuntimeFilterLifecycleRegistry"),
+        "Service may depend on the event sink trait, not the lifecycle registry concrete"
+    );
+
+    let query_context = fs::read_to_string(repo.join("src/runtime/query_context.rs"))
+        .expect("QueryContext source must be readable");
+    let lock_violations = runtime_filter_query_context_lock_discipline_violations(&query_context);
+    assert!(
+        lock_violations.is_empty(),
+        "QueryContext must release manager locks before Service cancel/shutdown/drop:\n{}",
+        lock_violations.join("\n")
     );
 }
 
@@ -7584,6 +8948,460 @@ fn runtime_filter_runtime_boundary_detector_defaults_model_dependencies_to_deny(
         )
         .is_empty()
     );
+}
+
+#[test]
+fn runtime_filter_core_boundary_detector_rejects_forbidden_synthetic_imports() {
+    let source_rel = "src/runtime_filter/core/channel.rs";
+    for source in [
+        "use crate::thrift::runtime_filter::TRuntimeFilterDescription;",
+        "use crate::proto::{runtime_filter, exchange};",
+        "use crate::service as rpc; use rpc::grpc_client::GrpcClient;",
+        "use crate::exec::{node::ExecNode, operators::Operator};",
+        "extern crate reqwest as network; use network::Client;",
+        "fn f() { crate::connector::ConnectorRegistry::default(); }",
+        "use crate::runtime_filter::port::events::RuntimeFilterEventSink;",
+        "#[cfg(feature = \"compat\")] use crate::runtime::runtime_filter_params::RuntimeFilterParams;",
+    ] {
+        assert!(
+            !runtime_filter_runtime_boundary_violations(source_rel, source).is_empty(),
+            "core boundary detector must reject {source}"
+        );
+    }
+}
+
+#[test]
+fn runtime_filter_service_boundary_detector_rejects_legacy_wire_and_registry_imports() {
+    let source_rel = "src/runtime_filter/service/registry.rs";
+    for source in [
+        "use crate::runtime::runtime_filter_hub::RuntimeFilterHub;",
+        "use crate::runtime::{runtime_filter_worker, runtime_filter_params};",
+        "use crate::runtime::runtime_filter_observability::RuntimeFilterLifecycleRegistry;",
+        "use crate::sql::codegen::proto_encode as wire;",
+        "use crate::engine::StandaloneNovaRocks;",
+        "use crate::connector::ConnectorRegistry;",
+    ] {
+        assert!(
+            !runtime_filter_runtime_boundary_violations(source_rel, source).is_empty(),
+            "service boundary detector must reject {source}"
+        );
+    }
+}
+
+#[test]
+fn runtime_filter_harness_detector_rejects_concrete_event_sink_outside_owners() {
+    let source =
+        "use crate::runtime::runtime_filter_observability::RegistryRuntimeFilterEventSink;";
+    assert!(
+        !runtime_filter_runtime_boundary_violations("src/runtime/other.rs", source).is_empty(),
+        "the concrete registry adapter must be owned only by QueryContext/observability"
+    );
+    for owner in [
+        "src/runtime/query_context.rs",
+        "src/runtime/runtime_filter_observability.rs",
+    ] {
+        assert!(
+            runtime_filter_runtime_boundary_violations(owner, source).is_empty(),
+            "{owner} is an explicit concrete event-sink owner"
+        );
+    }
+}
+
+#[test]
+fn runtime_filter_boundary_detector_covers_port_and_router_namespaces() {
+    for (source_rel, source) in [
+        (
+            "src/runtime_filter/port/events.rs",
+            "use crate::service::grpc_server::GrpcServer;",
+        ),
+        (
+            "src/runtime_filter/router/loopback.rs",
+            "use crate::runtime::runtime_filter_worker::RuntimeFilterWorker;",
+        ),
+        (
+            "src/runtime_filter/port/future.rs",
+            "use crate::runtime_filter::model::contract::ChannelId;",
+        ),
+    ] {
+        assert!(
+            !runtime_filter_runtime_boundary_violations(source_rel, source).is_empty(),
+            "runtime boundary detector must reject {source_rel}: {source}"
+        );
+    }
+}
+
+#[test]
+fn runtime_filter_service_detector_rejects_second_global_registry() {
+    let source_rel = "src/runtime_filter/service/registry.rs";
+    for source in [
+        "static REGISTRY: std::sync::OnceLock<()> = std::sync::OnceLock::new();",
+        "thread_local! { static REGISTRY: std::cell::RefCell<()> = const { std::cell::RefCell::new(()) }; }",
+        "use std::sync::OnceLock as Cell; static REGISTRY: Cell<()> = Cell::new();",
+        "lazy_static! { static ref REGISTRY: std::sync::Mutex<()> = std::sync::Mutex::new(()); }",
+        "macro_rules! registry { () => { static REGISTRY: std::sync::OnceLock<()> = std::sync::OnceLock::new(); } }",
+    ] {
+        assert!(
+            !runtime_filter_runtime_boundary_violations(source_rel, source).is_empty(),
+            "service detector must reject a second lifecycle registry: {source}"
+        );
+    }
+    assert!(
+        runtime_filter_runtime_boundary_violations(
+            source_rel,
+            "fn borrowed(value: &'static str) -> &'static str { value }",
+        )
+        .is_empty(),
+        "a static lifetime is not a static lifecycle registry"
+    );
+}
+
+#[test]
+fn runtime_filter_runtime_namespaces_reject_source_indirection() {
+    for source in [
+        "#[path = \"../../../runtime/runtime_filter_hub.rs\"] mod hidden;",
+        "#[ path = \"../../../runtime/runtime_filter_hub.rs\" ] pub(crate) mod hidden;",
+        "#[cfg_attr(unix, path = \"../../../runtime/runtime_filter_hub.rs\")] mod hidden;",
+        "include!(\"../../../runtime/runtime_filter_hub.rs\");",
+        "include![\"../../../runtime/runtime_filter_hub.rs\"];",
+        "include!{\"../../../runtime/runtime_filter_hub.rs\"}",
+    ] {
+        assert!(
+            !runtime_filter_runtime_boundary_violations(
+                "src/runtime_filter/service/registry.rs",
+                source,
+            )
+            .is_empty(),
+            "runtime namespace detector must reject source indirection: {source}"
+        );
+    }
+}
+
+#[test]
+fn runtime_filter_harness_only_detector_rejects_operator_rpc_and_encoder_calls() {
+    for (source_rel, source) in [
+        (
+            "src/exec/operators/hash_join/build.rs",
+            "fn build(service: &RuntimeFilterService, view: RuntimeFilterInstallView) { service.install(view); }",
+        ),
+        (
+            "src/service/grpc_server.rs",
+            "fn receive(service: &RuntimeFilterService) { service.open_producer(); }",
+        ),
+        (
+            "src/sql/codegen/proto_encode/runtime_filter.rs",
+            "fn encode(service: &RuntimeFilterService) { service.open_subscription(); }",
+        ),
+        (
+            "src/exec/pipeline/builder.rs",
+            "fn wire(view: RuntimeFilterInstallView) { query.runtime_filter_service().install(view); }",
+        ),
+        (
+            "src/runtime/runtime_filter_worker.rs",
+            "fn wire(adapter: &dyn ProducerAdapter) { adapter.close_partition(); }",
+        ),
+        (
+            "src/service/grpc_client.rs",
+            "fn wire(subscription: &dyn BlockingSnapshotSubscription) { service.subscribe(subscription); }",
+        ),
+    ] {
+        assert!(
+            !runtime_filter_runtime_boundary_violations(source_rel, source).is_empty(),
+            "harness-only detector must reject {source_rel}: {source}"
+        );
+    }
+}
+
+#[test]
+fn runtime_filter_harness_only_detector_rejects_alias_reexports_and_call_decoys() {
+    for (source_rel, source) in [
+        (
+            "src/exec/operators/hash_join/build.rs",
+            "pub use crate::runtime_filter::service::RuntimeFilterService as HiddenService;",
+        ),
+        (
+            "src/exec/operators/hash_join/build.rs",
+            "fn wire() { query.runtime_filter_service().install(view); }",
+        ),
+        (
+            "src/runtime/query_context.rs",
+            "use crate::runtime_filter::service::RuntimeFilterService; fn decoy() {} fn wire(service: &RuntimeFilterService) { service.install(view); }",
+        ),
+        (
+            "src/runtime/query_context.rs",
+            "use crate::runtime_filter::service as rf; fn wire(service: &rf::RuntimeFilterService) { service.install(view); }",
+        ),
+        (
+            "src/runtime/query_context.rs",
+            "use crate::runtime_filter::service::RuntimeFilterService; fn wire(service: &RuntimeFilterService) { RuntimeFilterService::install(service, view); }",
+        ),
+        (
+            "src/runtime/query_context.rs",
+            "use crate::runtime_filter::service::RuntimeFilterService as S; fn wire(service: &S) { S::install(service, view); }",
+        ),
+        (
+            "src/runtime/query_context.rs",
+            "pub use crate::runtime_filter::service::RuntimeFilterService as Exported; type Hidden = Exported; fn runtime_filter_service() -> Hidden { todo!() }",
+        ),
+        (
+            "src/runtime/query_context.rs",
+            "pub(crate) use crate::runtime_filter::port::install::RuntimeFilterInstallView as ExportedView;",
+        ),
+        (
+            "src/runtime/query_context.rs",
+            "use crate::runtime_filter::service as private_rf; pub use private_rf::RuntimeFilterService as Exported;",
+        ),
+        (
+            "src/runtime/query_context.rs",
+            "pub type PublicAlias = usize;",
+        ),
+    ] {
+        assert!(
+            !runtime_filter_runtime_boundary_violations(source_rel, source).is_empty(),
+            "canonical harness detector must reject {source_rel}: {source}"
+        );
+    }
+    assert!(
+        runtime_filter_runtime_boundary_violations(
+            "src/engine/unrelated.rs",
+            "fn configure(registry: &Registry) { registry.install(plugin); }",
+        )
+        .is_empty(),
+        "ordinary install methods outside the runtime-filter surface stay legal"
+    );
+    assert!(
+        runtime_filter_runtime_boundary_violations(
+            "src/runtime/query_context.rs",
+            "type PrivateAlias = usize;",
+        )
+        .is_empty(),
+        "an unrelated private type alias stays legal"
+    );
+}
+
+#[test]
+fn runtime_filter_query_context_lock_detector_rejects_shutdown_under_manager_lock() {
+    const GOOD: &str = r#"
+impl QueryContextManager {
+fn abort_query() {
+    let (service, finsts) = { let guard = self.inner.lock(); let service = guard.context().runtime_filter_service(); (service, finsts) };
+    if let Some(service) = service { service.cancel(); }
+}
+fn cancel_query() {
+    let (service, finsts, completions) = { let guard = self.inner.lock(); let service = guard.context().runtime_filter_service(); (service, finsts, completions) };
+    if let Some(service) = service { service.cancel(); }
+}
+fn clean_expired() {
+    let expired = { let guard = self.inner.lock(); let expired = collect(&guard); expired };
+    for (qid, ctx) in expired { ctx.runtime_filter_service().shutdown(); drop(ctx); }
+}
+fn finish_fragment_internal() {
+    let mut guard = self.inner.lock();
+    let Some(mut ctx) = guard.active.remove() else { return; };
+    if ctx.is_dead() { drop(guard); ctx.runtime_filter_service().shutdown(); drop(ctx); }
+}
+}
+"#;
+    let good_violations = runtime_filter_query_context_lock_discipline_violations(GOOD);
+    assert!(
+        good_violations.is_empty(),
+        "GOOD lock fixture must pass:\n{}",
+        good_violations.join("\n")
+    );
+
+    for bad in [
+        GOOD.replace(
+            "(service, finsts) };\n    if let Some(service) = service { service.cancel(); }",
+            "service.cancel(); (service, finsts) };",
+        ),
+        GOOD.replace(
+            "expired };\n    for (qid, ctx) in expired { ctx.runtime_filter_service().shutdown(); drop(ctx); }",
+            "ctx.runtime_filter_service().shutdown(); expired };",
+        ),
+        GOOD.replace(
+            "drop(guard); ctx.runtime_filter_service().shutdown(); drop(ctx);",
+            "ctx.runtime_filter_service().shutdown(); drop(guard); drop(ctx);",
+        ),
+    ] {
+        assert!(
+            !runtime_filter_query_context_lock_discipline_violations(&bad).is_empty(),
+            "lock-discipline detector must reject shutdown/cancel before manager-lock release"
+        );
+    }
+}
+
+#[test]
+fn runtime_filter_query_context_lock_detector_rejects_decoys_escape_and_relock() {
+    const GOOD: &str = r#"
+impl QueryContextManager {
+    fn abort_query() {
+        let (service, finsts) = { let guard = self.inner.lock(); let service = guard.context().runtime_filter_service(); (service, finsts) };
+        if let Some(service) = service { service.cancel(); }
+    }
+    fn cancel_query() {
+        let (service, finsts, completions) = { let guard = self.inner.lock(); let service = guard.context().runtime_filter_service(); (service, finsts, completions) };
+        if let Some(service) = service { service.cancel(); }
+    }
+    fn clean_expired() {
+        let expired = { let guard = self.inner.lock(); let expired = collect(&guard); expired };
+        for (qid, ctx) in expired { ctx.runtime_filter_service().shutdown(); drop(ctx); }
+    }
+    fn finish_fragment_internal() {
+        let mut guard = self.inner.lock();
+        let Some(mut ctx) = guard.active.remove() else { return; };
+        if ctx.is_dead() { drop(guard); ctx.runtime_filter_service().shutdown(); drop(ctx); }
+    }
+}
+"#;
+    let good_violations = runtime_filter_query_context_lock_discipline_violations(GOOD);
+    assert!(
+        good_violations.is_empty(),
+        "GOOD lock fixture must pass:\n{}",
+        good_violations.join("\n")
+    );
+    let unrelated = GOOD.replace(
+        "(service, finsts) };",
+        "other.clone(); drop(other); (service, finsts) };",
+    );
+    assert!(
+        runtime_filter_query_context_lock_discipline_violations(&unrelated).is_empty(),
+        "unrelated cancel/drop calls are outside the runtime-filter lifecycle contract"
+    );
+
+    let bad_sources = [
+        GOOD.replace(
+            "if let Some(service) = service { service.cancel(); }",
+            "if false { service.cancel(); }",
+        ),
+        GOOD.replacen(
+            "let (service, finsts) = { let guard = self.inner.lock(); let service = guard.context().runtime_filter_service(); (service, finsts) };\n        if let Some(service) = service { service.cancel(); }",
+            "let (service, finsts) = { let guard = self.inner.lock(); let service = guard.context().runtime_filter_service(); (service, finsts) };\n        self.inner.lock().unwrap().runtime_filter_service().cancel();",
+            1,
+        ),
+        GOOD.replace(
+            "(service, finsts) };",
+            "service.cancel(); (service, finsts) };",
+        ),
+        GOOD.replace("expired };", "events.record(event); expired };"),
+        GOOD.replace("expired };", "drop(ctx); expired };"),
+        GOOD.replace("expired };", "(&guard, expired) };"),
+        GOOD.replace("expired };", "GuardBox { guard } };"),
+        GOOD.replace("expired };", "[Some(GuardBox { guard })] };"),
+        GOOD.replace("expired };", "(|| GuardBox { guard }) };"),
+        GOOD.replace(
+            "(service, finsts) };",
+            "let svc = ctx.runtime_filter_service(); svc.cancel(); (service, finsts) };",
+        ),
+        GOOD.replace(
+            "(service, finsts) };",
+            "let svc = Arc::clone(&service); svc.cancel(); (service, finsts) };",
+        ),
+        GOOD.replace(
+            "let (service, finsts) = { let guard = self.inner.lock(); let service = guard.context().runtime_filter_service(); (service, finsts) };",
+            "let (service, finsts) = { if false { let guard = self.inner.lock(); drop(guard); } let service = make_service(); (service, finsts) };",
+        ),
+        GOOD.replace(
+            "let (service, finsts) = { let guard = self.inner.lock(); let service = guard.context().runtime_filter_service(); (service, finsts) };",
+            "let (service, finsts) = (service, finsts); if false { let guard = self.inner.lock(); drop(guard); }",
+        ),
+        GOOD.replace(
+            "let (service, finsts) = { let guard = self.inner.lock(); let service = guard.context().runtime_filter_service(); (service, finsts) };",
+            "let acquire = || { let guard = self.inner.lock(); drop(guard); }; let (service, finsts) = (service, finsts);",
+        ),
+        GOOD.replace(
+            "let (service, finsts) = { let guard = self.inner.lock(); let service = guard.context().runtime_filter_service(); (service, finsts) };",
+            "let (service, finsts) = { manager_access!(); (service, finsts) };",
+        ),
+        GOOD.replace(
+            "drop(guard); ctx.runtime_filter_service().shutdown();",
+            "if false { drop(guard); } ctx.runtime_filter_service().shutdown();",
+        ),
+        GOOD.replace(
+            "drop(guard); ctx.runtime_filter_service().shutdown();",
+            "drop(guard); let guard = self.inner.lock(); ctx.runtime_filter_service().shutdown();",
+        ),
+        format!(
+            "fn abort_query() {{ service.cancel(); }}\n{}",
+            GOOD.replace(
+                "(service, finsts) };",
+                "service.cancel(); (service, finsts) };",
+            )
+        ),
+    ];
+    for bad in bad_sources {
+        assert!(
+            !runtime_filter_query_context_lock_discipline_violations(&bad).is_empty(),
+            "lock detector must reject manager-lock decoy/escape/relock:\n{bad}"
+        );
+    }
+}
+
+#[test]
+fn runtime_filter_action_dispatch_detector_requires_returned_channel_action() {
+    let good = r#"
+fn finish(&self, action: crate::runtime_filter::core::channel::ChannelAction) {
+    self.dispatcher.dispatch(self.channel_id, action);
+}
+fn submit(&self) { self.channel.submit().map(|action| self.finish(action)); }
+fn close_partition(&self) { self.channel.close_partition().map(|action| self.finish(action)); }
+fn fail(&self) { self.channel.fail_instance().map(|action| self.finish(action)); }
+"#;
+    assert!(runtime_filter_action_dispatch_boundary_violations(good).is_empty());
+    for bad in [
+        good.replace("ChannelAction", "SubmitOutcome"),
+        good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "self.dispatcher.flush();",
+        ),
+        good.replace(
+            "self.channel.submit().map(|action| self.finish(action))",
+            "self.channel.submit().map(|action| action.outcome())",
+        ),
+        format!(
+            "{good}\nfn bypass(&self, action: ChannelAction) {{ self.dispatcher.dispatch(self.channel_id, action); }}"
+        ),
+        good.replace("self.channel.submit()", "decoy.submit()"),
+        good.replace(
+            "self.channel.submit()",
+            "RuntimeFilterChannel::submit(&self.channel)",
+        ),
+    ] {
+        assert!(
+            !runtime_filter_action_dispatch_boundary_violations(&bad).is_empty(),
+            "dispatch detector must reject mutation-callback or action-free dispatch"
+        );
+    }
+}
+
+#[test]
+fn runtime_filter_root_dead_code_detector_rejects_attribute_bypasses() {
+    for source in [
+        "#![allow(dead_code)]\npub(crate) mod core; pub(crate) mod port; pub(crate) mod router; pub(crate) mod service;",
+        "#[ allow ( dead_code ) ] pub(crate) mod core; pub(crate) mod port; pub(crate) mod router; pub(crate) mod service;",
+        "#[allow(unused, dead_code)] pub(crate) mod core; pub(crate) mod port; pub(crate) mod router; pub(crate) mod service;",
+        "#[cfg_attr(unix, allow(dead_code))] pub(crate) mod core; pub(crate) mod port; pub(crate) mod router; pub(crate) mod service;",
+    ] {
+        assert!(
+            !runtime_filter_runtime_root_dead_code_violations(source).is_empty(),
+            "dead-code detector must reject inner/spaced/combined attributes: {source}"
+        );
+    }
+}
+
+#[test]
+fn runtime_filter_namespace_roots_reject_inner_dead_code_attributes() {
+    for namespace in ["core", "port", "router", "service"] {
+        for source in [
+            "#![allow(dead_code)]\npub(crate) mod child;",
+            "#![ allow ( unused, dead_code ) ]\npub(crate) mod child;",
+            "#![cfg_attr(unix, allow(dead_code))]\npub(crate) mod child;",
+        ] {
+            let source_rel = format!("src/runtime_filter/{namespace}/mod.rs");
+            assert!(
+                !runtime_filter_runtime_boundary_violations(&source_rel, source).is_empty(),
+                "{source_rel} must reject inner dead_code suppression: {source}"
+            );
+        }
+    }
 }
 
 #[test]

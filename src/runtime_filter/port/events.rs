@@ -1,0 +1,253 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use crate::common::types::UniqueId;
+use crate::runtime_filter::model::contract::{BindingId, ChannelId};
+
+use super::identity::{
+    ContributionIdentity, DeploymentEpoch, LogicalVersion, RouteEdgeId, RuntimeFilterParticipantId,
+};
+use super::producer::ProducerFailureReason;
+use super::subscription::UnavailableReason;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct RuntimeFilterEventIdentity {
+    query_id: UniqueId,
+    participant_id: RuntimeFilterParticipantId,
+    channel_id: ChannelId,
+    epoch: DeploymentEpoch,
+}
+
+impl RuntimeFilterEventIdentity {
+    pub(crate) const fn new(
+        query_id: UniqueId,
+        participant_id: RuntimeFilterParticipantId,
+        channel_id: ChannelId,
+        epoch: DeploymentEpoch,
+    ) -> Self {
+        Self {
+            query_id,
+            participant_id,
+            channel_id,
+            epoch,
+        }
+    }
+
+    pub(crate) const fn query_id(self) -> UniqueId {
+        self.query_id
+    }
+    pub(crate) const fn participant_id(self) -> RuntimeFilterParticipantId {
+        self.participant_id
+    }
+    pub(crate) const fn channel_id(self) -> ChannelId {
+        self.channel_id
+    }
+    pub(crate) const fn epoch(self) -> DeploymentEpoch {
+        self.epoch
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct ProducerEventIdentity {
+    common: RuntimeFilterEventIdentity,
+    producer_binding_id: BindingId,
+    fragment_instance_id: UniqueId,
+}
+
+impl ProducerEventIdentity {
+    pub(crate) const fn new(
+        common: RuntimeFilterEventIdentity,
+        producer_binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+    ) -> Self {
+        Self {
+            common,
+            producer_binding_id,
+            fragment_instance_id,
+        }
+    }
+    pub(crate) const fn common(self) -> RuntimeFilterEventIdentity {
+        self.common
+    }
+    pub(crate) const fn producer_binding_id(self) -> BindingId {
+        self.producer_binding_id
+    }
+    pub(crate) const fn fragment_instance_id(self) -> UniqueId {
+        self.fragment_instance_id
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct ConsumerEventIdentity {
+    common: RuntimeFilterEventIdentity,
+    consumer_binding_id: BindingId,
+    fragment_instance_id: UniqueId,
+}
+
+impl ConsumerEventIdentity {
+    pub(crate) const fn new(
+        common: RuntimeFilterEventIdentity,
+        consumer_binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+    ) -> Self {
+        Self {
+            common,
+            consumer_binding_id,
+            fragment_instance_id,
+        }
+    }
+    pub(crate) const fn common(self) -> RuntimeFilterEventIdentity {
+        self.common
+    }
+    pub(crate) const fn consumer_binding_id(self) -> BindingId {
+        self.consumer_binding_id
+    }
+    pub(crate) const fn fragment_instance_id(self) -> UniqueId {
+        self.fragment_instance_id
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct RouteEventIdentity {
+    consumer: ConsumerEventIdentity,
+    route_edge_id: RouteEdgeId,
+}
+
+impl RouteEventIdentity {
+    pub(crate) const fn new(
+        common: RuntimeFilterEventIdentity,
+        consumer_binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        route_edge_id: RouteEdgeId,
+    ) -> Self {
+        Self {
+            consumer: ConsumerEventIdentity::new(common, consumer_binding_id, fragment_instance_id),
+            route_edge_id,
+        }
+    }
+    pub(crate) const fn common(self) -> RuntimeFilterEventIdentity {
+        self.consumer.common()
+    }
+    pub(crate) const fn consumer_binding_id(self) -> BindingId {
+        self.consumer.consumer_binding_id()
+    }
+    pub(crate) const fn fragment_instance_id(self) -> UniqueId {
+        self.consumer.fragment_instance_id()
+    }
+    pub(crate) const fn route_edge_id(self) -> RouteEdgeId {
+        self.route_edge_id
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeFilterEvent {
+    DeploymentInstalled {
+        query_id: UniqueId,
+        participant_id: RuntimeFilterParticipantId,
+        epoch: DeploymentEpoch,
+    },
+    ChannelPlanned {
+        identity: RuntimeFilterEventIdentity,
+    },
+    DeltaAccepted {
+        identity: ContributionIdentity,
+    },
+    DeltaDuplicateIgnored {
+        identity: ContributionIdentity,
+    },
+    SequenceGapObserved {
+        identity: ContributionIdentity,
+    },
+    ProducerInstanceClosed {
+        identity: ProducerEventIdentity,
+    },
+    ProducerInstanceFailed {
+        identity: ProducerEventIdentity,
+        reason: ProducerFailureReason,
+    },
+    ChannelCompleted {
+        identity: RuntimeFilterEventIdentity,
+        version: LogicalVersion,
+    },
+    ChannelUnavailable {
+        identity: RuntimeFilterEventIdentity,
+        reason: UnavailableReason,
+    },
+    ChannelCancelled {
+        identity: RuntimeFilterEventIdentity,
+    },
+    LoopbackDelivered {
+        identity: RouteEventIdentity,
+        version: LogicalVersion,
+    },
+    SubscriptionAcquired {
+        identity: ConsumerEventIdentity,
+        version: LogicalVersion,
+    },
+    SubscriptionTimedOut {
+        identity: ConsumerEventIdentity,
+    },
+    SubscriptionUnavailable {
+        identity: ConsumerEventIdentity,
+        reason: UnavailableReason,
+    },
+    SubscriptionCancelled {
+        identity: ConsumerEventIdentity,
+    },
+}
+
+pub(crate) trait RuntimeFilterEventSink: Send + Sync {
+    fn record(&self, event: RuntimeFilterEvent);
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::common::types::UniqueId;
+    use crate::runtime_filter::model::contract::{BindingId, ChannelId};
+    use crate::runtime_filter::port::identity::*;
+
+    use super::*;
+
+    #[test]
+    fn event_identity_keeps_query_participant_channel_epoch_and_route_coordinates() {
+        let common = RuntimeFilterEventIdentity::new(
+            UniqueId { hi: 1, lo: 2 },
+            RuntimeFilterParticipantId::new(3),
+            ChannelId::new(4),
+            DeploymentEpoch::new(5),
+        );
+        let route = RouteEventIdentity::new(
+            common,
+            BindingId::new(6),
+            UniqueId { hi: 7, lo: 8 },
+            RouteEdgeId::new(9),
+        );
+        let event = RuntimeFilterEvent::LoopbackDelivered {
+            identity: route,
+            version: LogicalVersion::FIRST,
+        };
+
+        let RuntimeFilterEvent::LoopbackDelivered { identity, version } = event else {
+            panic!("expected loopback delivery event");
+        };
+        assert_eq!(identity.common(), common);
+        assert_eq!(identity.consumer_binding_id().get(), 6);
+        assert_eq!(identity.fragment_instance_id(), UniqueId { hi: 7, lo: 8 });
+        assert_eq!(identity.route_edge_id().get(), 9);
+        assert_eq!(version, LogicalVersion::FIRST);
+    }
+}

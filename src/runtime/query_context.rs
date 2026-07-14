@@ -45,9 +45,12 @@ use crate::runtime::lookup::GlobalLateMaterializationContext;
 use crate::runtime::mem_tracker::{self, MemTracker};
 pub(crate) use crate::runtime::query_options::query_expire_durations;
 use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
-use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
+use crate::runtime::runtime_filter_observability::{
+    QueryKey, RegistryRuntimeFilterEventSink, RuntimeFilterLifecycleRegistry,
+};
 use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 use crate::runtime::runtime_filter_worker::{RuntimeFilterWorker, RuntimeFilterWorkerParams};
+use crate::runtime_filter::service::RuntimeFilterService;
 #[cfg(feature = "compat")]
 use crate::thrift::descriptors;
 #[cfg(feature = "compat")]
@@ -89,6 +92,7 @@ pub(crate) struct QueryContext {
     pub(crate) runtime_filter_worker_params: Option<RuntimeFilterWorkerParams>,
     pub(crate) runtime_filter_worker: Option<Arc<RuntimeFilterWorker>>,
     pub(crate) pending_runtime_filters: Vec<PendingRuntimeFilter>,
+    runtime_filter_service: Arc<RuntimeFilterService>,
     pub(crate) row_pos_descs: HashMap<i32, RowPositionDescriptor>,
     pub(crate) glm_contexts: HashMap<SlotId, GlobalLateMaterializationContext>,
     #[cfg(feature = "compat")]
@@ -115,6 +119,19 @@ impl QueryContext {
         let process = mem_tracker::process_mem_tracker();
         let query_label = format!("query_{:x}_{:x}", query_id.hi, query_id.lo);
         let mem_tracker = MemTracker::new_child(query_label, &process);
+        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+        let event_sink = Arc::new(RegistryRuntimeFilterEventSink::new(
+            RuntimeFilterLifecycleRegistry::global(),
+            query_key,
+        ));
+        let runtime_filter_service = Arc::new(RuntimeFilterService::new_for_query(
+            UniqueId {
+                hi: query_id.hi,
+                lo: query_id.lo,
+            },
+            event_sink,
+            &mem_tracker,
+        ));
         Self {
             query_id,
             cache_options: None,
@@ -135,6 +152,7 @@ impl QueryContext {
             runtime_filter_worker_params: None,
             runtime_filter_worker: None,
             pending_runtime_filters: Vec::new(),
+            runtime_filter_service,
             row_pos_descs: HashMap::new(),
             glm_contexts: HashMap::new(),
             #[cfg(feature = "compat")]
@@ -232,6 +250,10 @@ impl QueryContext {
         self.runtime_filter_worker.clone()
     }
 
+    pub(crate) fn runtime_filter_service(&self) -> Arc<RuntimeFilterService> {
+        self.runtime_filter_service.clone()
+    }
+
     pub(crate) fn set_row_pos_descs(&mut self, descs: HashMap<i32, RowPositionDescriptor>) {
         self.row_pos_descs = descs;
     }
@@ -323,6 +345,12 @@ impl QueryContext {
 
     pub(crate) fn lake_tablet_paths(&self, cache_key: &str) -> Option<HashMap<i64, String>> {
         self.lake_tablet_paths.get(cache_key).cloned()
+    }
+}
+
+impl Drop for QueryContext {
+    fn drop(&mut self) {
+        self.runtime_filter_service.shutdown();
     }
 }
 
@@ -514,16 +542,31 @@ impl QueryContextManager {
     }
 
     fn clean_expired(&self) {
-        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-        let mut to_remove = Vec::new();
-        for (qid, ctx) in &guard.second_chance {
-            if ctx.has_no_active_instances() && ctx.is_delivery_expired() {
-                to_remove.push(*qid);
-            }
+        let expired = {
+            let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+            let to_remove = guard
+                .second_chance
+                .iter()
+                .filter_map(|(qid, ctx)| {
+                    (ctx.has_no_active_instances() && ctx.is_delivery_expired()).then_some(*qid)
+                })
+                .collect::<Vec<_>>();
+            to_remove
+                .into_iter()
+                .filter_map(|qid| guard.second_chance.remove(&qid).map(|ctx| (qid, ctx)))
+                .collect::<Vec<_>>()
+        };
+        for (qid, ctx) in expired {
+            ctx.runtime_filter_service().shutdown();
+            drop(ctx);
+            self.remove_runtime_filter_lifecycle_if_context_absent(qid);
         }
-        for qid in to_remove {
-            guard.second_chance.remove(&qid);
-            remove_runtime_filter_lifecycle(qid);
+    }
+
+    fn remove_runtime_filter_lifecycle_if_context_absent(&self, query_id: QueryId) {
+        let guard = self.inner.lock().expect("query_ctx_manager lock");
+        if !guard.active.contains_key(&query_id) && !guard.second_chance.contains_key(&query_id) {
+            remove_runtime_filter_lifecycle(query_id);
         }
     }
 
@@ -1067,29 +1110,42 @@ impl QueryContextManager {
 
     #[allow(dead_code)]
     pub(crate) fn abort_query(&self, query_id: QueryId) -> Vec<UniqueId> {
-        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-        if let Some(ctx) = guard.active.get_mut(&query_id) {
-            ctx.cancelled_by_fe = true;
+        let (service, finsts) = {
+            let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+            let service = if let Some(ctx) = guard.active.get_mut(&query_id) {
+                ctx.cancelled_by_fe = true;
+                Some(ctx.runtime_filter_service())
+            } else if let Some(ctx) = guard.second_chance.get_mut(&query_id) {
+                ctx.cancelled_by_fe = true;
+                Some(ctx.runtime_filter_service())
+            } else {
+                None
+            };
+            let finsts = guard
+                .finst_to_query
+                .iter()
+                .filter_map(|(finst_id, qid)| (*qid == query_id).then_some(*finst_id))
+                .collect();
+            (service, finsts)
+        };
+        if let Some(service) = service {
+            service.cancel();
         }
-        if let Some(ctx) = guard.second_chance.get_mut(&query_id) {
-            ctx.cancelled_by_fe = true;
-        }
-        guard
-            .finst_to_query
-            .iter()
-            .filter_map(|(finst_id, qid)| (*qid == query_id).then_some(*finst_id))
-            .collect()
+        finsts
     }
 
     pub(crate) fn cancel_query(&self, query_id: QueryId, err: String) -> Vec<UniqueId> {
-        let (finsts, completions) = {
+        let (service, finsts, completions) = {
             let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-            if let Some(ctx) = guard.active.get_mut(&query_id) {
+            let service = if let Some(ctx) = guard.active.get_mut(&query_id) {
                 ctx.cancelled_by_fe = true;
-            }
-            if let Some(ctx) = guard.second_chance.get_mut(&query_id) {
+                Some(ctx.runtime_filter_service())
+            } else if let Some(ctx) = guard.second_chance.get_mut(&query_id) {
                 ctx.cancelled_by_fe = true;
-            }
+                Some(ctx.runtime_filter_service())
+            } else {
+                None
+            };
 
             let mut finsts = Vec::new();
             let mut completions = Vec::new();
@@ -1110,9 +1166,12 @@ impl QueryContextManager {
             for finst_id in stale {
                 guard.fragment_completions.remove(&finst_id);
             }
-            (finsts, completions)
+            (service, finsts, completions)
         };
 
+        if let Some(service) = service {
+            service.cancel();
+        }
         for completion in completions {
             completion.abort_from_query(err.clone());
         }
@@ -1140,7 +1199,7 @@ impl QueryContextManager {
     pub(crate) fn finish_fragment(&self, query_id: QueryId) {
         let decision = self.finish_fragment_internal(query_id);
         if decision.remove_runtime_filter_lifecycle_after_report {
-            remove_runtime_filter_lifecycle(query_id);
+            self.remove_runtime_filter_lifecycle_if_context_absent(query_id);
         }
     }
 
@@ -1157,7 +1216,7 @@ impl QueryContextManager {
         decision: FragmentFinishReportDecision,
     ) {
         if decision.remove_runtime_filter_lifecycle_after_report {
-            remove_runtime_filter_lifecycle(query_id);
+            self.remove_runtime_filter_lifecycle_if_context_absent(query_id);
         }
     }
 
@@ -1175,10 +1234,14 @@ impl QueryContextManager {
             return FragmentFinishReportDecision::default();
         }
         if ctx.is_dead() {
-            return FragmentFinishReportDecision {
+            let decision = FragmentFinishReportDecision {
                 include_runtime_filter_profile: true,
                 remove_runtime_filter_lifecycle_after_report: true,
             };
+            drop(guard);
+            ctx.runtime_filter_service().shutdown();
+            drop(ctx);
+            return decision;
         }
         ctx.extend_delivery_lifetime();
         guard.second_chance.insert(query_id, ctx);
@@ -1378,6 +1441,52 @@ mod runtime_filter_lifecycle_cleanup_tests {
     }
 
     #[test]
+    fn report_cleanup_preserves_lifecycle_for_recreated_context() {
+        let mgr = test_manager();
+        let query_id = QueryId {
+            hi: 4_181,
+            lo: 4_182,
+        };
+        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+        let registry = RuntimeFilterLifecycleRegistry::global();
+        registry.remove_query(query_key);
+
+        mgr.get_or_register(
+            query_id,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        )
+        .expect("old query context");
+        {
+            let mut guard = mgr.inner.lock().expect("query ctx manager lock");
+            guard
+                .active
+                .get_mut(&query_id)
+                .expect("active query")
+                .total_fragments = Some(1);
+        }
+
+        let decision = mgr.finish_fragment_for_report(query_id);
+        assert!(decision.remove_runtime_filter_lifecycle_after_report);
+        mgr.ensure_context(
+            query_id,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        )
+        .expect("replacement query context");
+
+        mgr.cleanup_after_fragment_report(query_id, decision);
+
+        assert!(
+            registry.snapshot(query_key).is_some(),
+            "old report cleanup must preserve the replacement context lifecycle"
+        );
+        registry.remove_query(query_key);
+    }
+
+    #[test]
     fn clean_expired_removes_runtime_filter_lifecycle_for_second_chance_query() {
         let mgr = test_manager();
         let query_id = QueryId {
@@ -1399,6 +1508,422 @@ mod runtime_filter_lifecycle_cleanup_tests {
         mgr.clean_expired();
 
         assert!(registry.snapshot(query_key).is_none());
+    }
+}
+
+#[cfg(test)]
+mod runtime_filter_service_lifecycle_tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex, Weak, mpsc};
+    use std::time::{Duration, Instant};
+
+    use arrow::datatypes::DataType;
+
+    use super::{QueryContext, QueryContextManager, QueryContextManagerInner, QueryId};
+    use crate::common::types::UniqueId;
+    use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
+    use crate::runtime_filter::model::contract::{
+        ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
+        ContributionKind, CoverageWitnessId, NullSemantics, ReductionRequirement,
+        RuntimeFilterLifecycle, RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
+    };
+    use crate::runtime_filter::model::coverage::Coverage;
+    use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
+    use crate::runtime_filter::port::identity::{
+        DeploymentEpoch, RouteEdgeId, RuntimeFilterParticipantId,
+    };
+    use crate::runtime_filter::port::install::{
+        CompleteOnceChannelDeployment, ConsumerDeployment, ProducerDeployment,
+        RuntimeFilterCoreBudget, RuntimeFilterInstallView,
+    };
+    use crate::runtime_filter::port::producer::{InstallContractErrorKind, InstallOutcome};
+    use crate::runtime_filter::service::RuntimeFilterService;
+
+    fn test_manager() -> Arc<QueryContextManager> {
+        Arc::new(QueryContextManager {
+            inner: Mutex::new(QueryContextManagerInner::default()),
+            stopped: AtomicBool::new(false),
+        })
+    }
+
+    fn query_id(lo: i64) -> QueryId {
+        QueryId { hi: 70, lo }
+    }
+
+    fn uid(lo: i64) -> UniqueId {
+        UniqueId { hi: 70, lo }
+    }
+
+    fn install_view() -> RuntimeFilterInstallView {
+        let channel_id = ChannelId::new(1);
+        let witness_id = CoverageWitnessId::new(2);
+        let deployment = CompleteOnceChannelDeployment::new(
+            channel_id,
+            RuntimeFilterLogicalDomain::Membership {
+                value_type: DataType::Int64,
+                null_semantics: NullSemantics::NeverMatches,
+            },
+            RuntimeFilterLifecycle::CompleteOnce,
+            Coverage::Leaf(witness_id),
+            Coverage::Leaf(witness_id),
+            ReductionRequirement::SetUnion,
+            BTreeSet::from([
+                ContributionKind::ValueDomainDelta,
+                ContributionKind::ProducerClosed,
+            ]),
+            CompletionRequirement::ProducerClosed,
+            RuntimeFilterPolicyRequirement {
+                max_contribution_bytes: 1024,
+                max_artifact_bytes: 1024,
+                deadline_ms: 100,
+                max_retries: 0,
+            },
+            RuntimeFilterCoreBudget::new(8192),
+            BTreeMap::from([(
+                BindingId::new(3),
+                ProducerDeployment::new(witness_id, BTreeSet::from([uid(30)])),
+            )]),
+            BTreeMap::from([(
+                BindingId::new(4),
+                ConsumerDeployment::new(
+                    ConsumerActivation::BlockingSnapshot,
+                    BTreeSet::from([ArtifactCapability::Membership]),
+                    RouteEdgeId::new(5),
+                    BTreeSet::from([uid(40)]),
+                ),
+            )]),
+        );
+        RuntimeFilterInstallView::new(
+            DeploymentEpoch::new(6),
+            RuntimeFilterParticipantId::new(7),
+            BTreeMap::from([(channel_id, deployment)]),
+        )
+    }
+
+    fn register(manager: &QueryContextManager, query_id: QueryId) {
+        manager
+            .get_or_register(
+                query_id,
+                false,
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            )
+            .expect("query context");
+    }
+
+    fn service(manager: &QueryContextManager, query_id: QueryId) -> Arc<RuntimeFilterService> {
+        let guard = manager.inner.lock().expect("query manager");
+        guard
+            .active
+            .get(&query_id)
+            .or_else(|| guard.second_chance.get(&query_id))
+            .expect("query context")
+            .runtime_filter_service()
+    }
+
+    struct LockProbeSink {
+        manager: Weak<QueryContextManager>,
+        terminal_probe: Mutex<Option<mpsc::SyncSender<bool>>>,
+    }
+
+    struct BlockingShutdownSink {
+        entered: mpsc::SyncSender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl RuntimeFilterEventSink for BlockingShutdownSink {
+        fn record(&self, event: RuntimeFilterEvent) {
+            if !matches!(event, RuntimeFilterEvent::ChannelCancelled { .. }) {
+                return;
+            }
+            self.entered.send(()).expect("shutdown entered");
+            self.release
+                .lock()
+                .expect("shutdown release")
+                .recv_timeout(Duration::from_secs(5))
+                .expect("shutdown released");
+        }
+    }
+
+    impl RuntimeFilterEventSink for LockProbeSink {
+        fn record(&self, event: RuntimeFilterEvent) {
+            if !matches!(event, RuntimeFilterEvent::ChannelCancelled { .. }) {
+                return;
+            }
+            let lock_was_free = self
+                .manager
+                .upgrade()
+                .is_some_and(|manager| manager.inner.try_lock().is_ok());
+            if let Some(sender) = self.terminal_probe.lock().expect("probe sender").take() {
+                let _ = sender.send(lock_was_free);
+            }
+        }
+    }
+
+    fn install_probed_service(
+        manager: &Arc<QueryContextManager>,
+        query_id: QueryId,
+    ) -> (Arc<RuntimeFilterService>, mpsc::Receiver<bool>) {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let sink = Arc::new(LockProbeSink {
+            manager: Arc::downgrade(manager),
+            terminal_probe: Mutex::new(Some(sender)),
+        });
+        let service = {
+            let mut guard = manager.inner.lock().expect("query manager");
+            let context = guard.active.get_mut(&query_id).expect("active query");
+            let service = Arc::new(RuntimeFilterService::new_for_query(
+                uid(query_id.lo),
+                sink,
+                &context.mem_tracker,
+            ));
+            context.runtime_filter_service = service.clone();
+            service
+        };
+        assert_eq!(
+            service.install(install_view()).expect("valid install"),
+            InstallOutcome::Installed
+        );
+        (service, receiver)
+    }
+
+    fn assert_terminal_probe(receiver: mpsc::Receiver<bool>) {
+        assert!(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("shutdown event"),
+            "runtime filter shutdown must run after releasing the manager lock"
+        );
+    }
+
+    #[test]
+    fn query_context_constructs_exactly_one_runtime_filter_service() {
+        let context = QueryContext::new(query_id(1), Duration::ZERO, Duration::ZERO);
+        let first = context.runtime_filter_service();
+        let second = context.runtime_filter_service();
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn second_chance_round_trip_preserves_runtime_filter_service() {
+        let manager = test_manager();
+        let query_id = query_id(2);
+        register(&manager, query_id);
+        let before = service(&manager, query_id);
+
+        manager.finish_fragment(query_id);
+        manager
+            .get_or_register(
+                query_id,
+                true,
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            )
+            .expect("second-chance query context");
+
+        assert!(Arc::ptr_eq(&before, &service(&manager, query_id)));
+        assert_eq!(
+            before
+                .install(install_view())
+                .expect("service remains open"),
+            InstallOutcome::Installed
+        );
+    }
+
+    #[test]
+    fn empty_query_service_creates_no_channel_or_event() {
+        let query_id = query_id(3);
+        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+        let registry = RuntimeFilterLifecycleRegistry::global();
+        registry.remove_query(query_key);
+        let context = QueryContext::new(query_id, Duration::ZERO, Duration::ZERO);
+        let service = context.runtime_filter_service();
+        assert_eq!(
+            service
+                .install(RuntimeFilterInstallView::new(
+                    DeploymentEpoch::new(0),
+                    RuntimeFilterParticipantId::new(0),
+                    BTreeMap::new(),
+                ))
+                .expect("empty view"),
+            InstallOutcome::IgnoredEmpty
+        );
+        let snapshot = registry.snapshot(query_key).expect("query lifecycle entry");
+        assert!(snapshot.filters.is_empty());
+        assert!(snapshot.channel_events.is_empty());
+        registry.remove_query(query_key);
+    }
+
+    #[test]
+    fn cancel_query_cancels_service_after_releasing_manager_lock() {
+        let manager = test_manager();
+        let query_id = query_id(4);
+        register(&manager, query_id);
+        let (_service, receiver) = install_probed_service(&manager, query_id);
+
+        manager.cancel_query(query_id, "cancelled".to_string());
+
+        assert_terminal_probe(receiver);
+    }
+
+    #[test]
+    fn abort_query_cancels_service_after_releasing_manager_lock() {
+        let manager = test_manager();
+        let query_id = query_id(5);
+        register(&manager, query_id);
+        let (_service, receiver) = install_probed_service(&manager, query_id);
+
+        manager.abort_query(query_id);
+
+        assert_terminal_probe(receiver);
+    }
+
+    #[test]
+    fn dead_finish_shuts_down_and_drops_context_after_releasing_manager_lock() {
+        let manager = test_manager();
+        let query_id = query_id(6);
+        register(&manager, query_id);
+        let (_service, receiver) = install_probed_service(&manager, query_id);
+        manager
+            .inner
+            .lock()
+            .expect("query manager")
+            .active
+            .get_mut(&query_id)
+            .expect("active query")
+            .total_fragments = Some(1);
+
+        manager.finish_fragment(query_id);
+
+        assert_terminal_probe(receiver);
+        assert!(
+            !manager
+                .inner
+                .lock()
+                .expect("query manager")
+                .active
+                .contains_key(&query_id)
+        );
+    }
+
+    #[test]
+    fn clean_expired_shuts_down_second_chance_context_after_releasing_manager_lock() {
+        let manager = test_manager();
+        let query_id = query_id(7);
+        register(&manager, query_id);
+        let (_service, receiver) = install_probed_service(&manager, query_id);
+        {
+            let mut guard = manager.inner.lock().expect("query manager");
+            let mut context = guard.active.remove(&query_id).expect("active query");
+            context.num_active_fragments = 0;
+            context.delivery_deadline = Instant::now() - Duration::from_millis(1);
+            guard.second_chance.insert(query_id, context);
+        }
+
+        manager.clean_expired();
+
+        assert_terminal_probe(receiver);
+        assert!(
+            !manager
+                .inner
+                .lock()
+                .expect("query manager")
+                .second_chance
+                .contains_key(&query_id)
+        );
+    }
+
+    #[test]
+    fn clean_expired_preserves_lifecycle_recreated_while_old_context_shuts_down() {
+        let manager = test_manager();
+        let query_id = query_id(71);
+        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+        let registry = RuntimeFilterLifecycleRegistry::global();
+        registry.remove_query(query_key);
+        register(&manager, query_id);
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let sink = Arc::new(BlockingShutdownSink {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        });
+        {
+            let mut guard = manager.inner.lock().expect("query manager");
+            let context = guard.active.get_mut(&query_id).expect("active query");
+            let old_service = Arc::new(RuntimeFilterService::new_for_query(
+                uid(query_id.lo),
+                sink,
+                &context.mem_tracker,
+            ));
+            context.runtime_filter_service = old_service.clone();
+            assert_eq!(
+                old_service.install(install_view()).expect("valid install"),
+                InstallOutcome::Installed
+            );
+
+            let mut context = guard.active.remove(&query_id).expect("active query");
+            context.num_active_fragments = 0;
+            context.delivery_deadline = Instant::now() - Duration::from_millis(1);
+            guard.second_chance.insert(query_id, context);
+        }
+
+        let cleaner = {
+            let manager = Arc::clone(&manager);
+            std::thread::spawn(move || manager.clean_expired())
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("old shutdown must block in the sink");
+
+        manager
+            .ensure_context(
+                query_id,
+                false,
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            )
+            .expect("replacement query context");
+        release_tx.send(()).expect("release old shutdown");
+        cleaner.join().expect("cleaner");
+
+        assert!(
+            registry.snapshot(query_key).is_some(),
+            "old cleanup must not remove the replacement context lifecycle"
+        );
+        registry.remove_query(query_key);
+    }
+
+    #[test]
+    fn late_service_handle_cannot_recreate_deployment_after_shutdown() {
+        let manager = test_manager();
+        let query_id = query_id(8);
+        register(&manager, query_id);
+        let (service, receiver) = install_probed_service(&manager, query_id);
+        manager.cancel_query(query_id, "cancelled".to_string());
+        assert_terminal_probe(receiver);
+
+        let error = service.install(install_view()).expect_err("closed service");
+        assert_eq!(error.kind(), InstallContractErrorKind::ServiceClosed);
+    }
+
+    #[test]
+    fn query_context_drop_shuts_down_service_retained_by_external_handle() {
+        let context = QueryContext::new(query_id(9), Duration::ZERO, Duration::ZERO);
+        let service = context.runtime_filter_service();
+        assert_eq!(
+            service.install(install_view()).expect("valid install"),
+            InstallOutcome::Installed
+        );
+
+        drop(context);
+
+        let error = service
+            .install(install_view())
+            .expect_err("context drop must close retained service");
+        assert_eq!(error.kind(), InstallContractErrorKind::ServiceClosed);
     }
 }
 
