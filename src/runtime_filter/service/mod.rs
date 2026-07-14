@@ -370,6 +370,10 @@ struct ActionDispatcher {
         Option<Arc<dyn Fn(crate::runtime_filter::port::artifact::ConsumerProfileId) + Send + Sync>>,
     >,
     #[cfg(test)]
+    after_encode: Mutex<
+        Option<Arc<dyn Fn(crate::runtime_filter::port::artifact::ConsumerProfileId) + Send + Sync>>,
+    >,
+    #[cfg(test)]
     before_owner_finish: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     after_owner_finish: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -715,6 +719,19 @@ impl ActionDispatcher {
                             None
                         }
                     },
+                    {
+                        #[cfg(test)]
+                        {
+                            self.after_encode
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .clone()
+                        }
+                        #[cfg(not(test))]
+                        {
+                            None
+                        }
+                    },
                 ) {
                     let identity =
                         crate::runtime_filter::port::events::ArtifactMaterializationIdentity::new(
@@ -855,6 +872,8 @@ impl RuntimeFilterService {
             after_claim: Mutex::new(None),
             #[cfg(test)]
             before_encode: Mutex::new(None),
+            #[cfg(test)]
+            after_encode: Mutex::new(None),
             #[cfg(test)]
             before_owner_finish: Mutex::new(None),
             #[cfg(test)]
@@ -1044,6 +1063,18 @@ impl RuntimeFilterService {
     }
 
     #[cfg(test)]
+    fn set_after_encode_hook(
+        &self,
+        hook: Arc<dyn Fn(crate::runtime_filter::port::artifact::ConsumerProfileId) + Send + Sync>,
+    ) {
+        *self
+            .dispatcher
+            .after_encode
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(hook);
+    }
+
+    #[cfg(test)]
     fn set_before_owner_finish_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         *self
             .dispatcher
@@ -1101,16 +1132,17 @@ fn violation(
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier, Mutex, Weak, mpsc};
+    use std::sync::{Arc, Barrier, Condvar, Mutex, Weak, mpsc};
     use std::time::{Duration, Instant};
 
     use arrow::datatypes::DataType;
 
     use crate::common::types::UniqueId;
+    use crate::runtime_filter::materializer::codec::{ArtifactDecodeExpectations, decode_leaf};
     use crate::runtime_filter::model::contract::*;
     use crate::runtime_filter::model::coverage::Coverage;
     use crate::runtime_filter::port::artifact::{
-        ArtifactBundle, ArtifactKind, ConsumerArtifactProfile, PhysicalArtifact,
+        ArtifactBundle, ArtifactKind, ConsumerArtifactProfile, ConsumerProfileId, PhysicalArtifact,
     };
     use crate::runtime_filter::port::events::{
         ConsumerEventIdentity, RuntimeFilterEvent, RuntimeFilterEventIdentity,
@@ -1122,17 +1154,23 @@ mod tests {
         InstallOutcome, ProducerAdapter, RuntimeContractViolationKind, SubmitOutcome,
     };
     use crate::runtime_filter::port::subscription::{
-        ArtifactAcquireOutcome, BlockingSnapshotSubscription, UnavailableReason,
+        ArtifactAcquireOutcome, ArtifactDelivery, ArtifactDeliveryOutcome,
+        BlockingSnapshotSubscription, UnavailableReason,
     };
     use crate::runtime_filter::port::support::{
         MemoryAccountError, RuntimeFilterClock, RuntimeFilterMemoryAccount,
     };
-    use crate::runtime_filter::port::value_domain::{MembershipValues, ValueDomainDelta};
+    use crate::runtime_filter::port::value_domain::{
+        LogicalSnapshot, MembershipValues, ReducedMembershipDomain, ValueDomainDelta,
+    };
+    use crate::runtime_filter::router::loopback::LoopbackRouter;
 
+    use super::materialization::MaterializationWorkClaim;
     use super::memory::MemTrackerMemoryAccount;
+    use super::subscription::SubscriptionGroup;
     use super::{
         ActionDispatcher, ChannelAction, EventBatchCompletion, EventEmitter, PendingDispatch,
-        RuntimeFilterService,
+        RuntimeFilterService, run_materialization_jobs,
     };
 
     #[derive(Default)]
@@ -1226,12 +1264,45 @@ mod tests {
         recorded: Mutex<Vec<RuntimeFilterEvent>>,
     }
 
+    struct MaterializationLifecycleEvents {
+        subscription: Mutex<Option<Weak<dyn BlockingSnapshotSubscription>>>,
+        panicked: AtomicBool,
+        reentered: AtomicBool,
+        recorded: Mutex<Vec<RuntimeFilterEvent>>,
+    }
+
     impl RuntimeFilterEventSink for PanicOnceEvents {
         fn record(&self, event: RuntimeFilterEvent) {
             if !self.panicked.swap(true, Ordering::SeqCst) {
                 panic!("intentional event sink panic");
             }
             self.recorded.lock().unwrap().push(event);
+        }
+    }
+
+    impl RuntimeFilterEventSink for MaterializationLifecycleEvents {
+        fn record(&self, event: RuntimeFilterEvent) {
+            self.recorded.lock().unwrap().push(event.clone());
+            if matches!(event, RuntimeFilterEvent::MaterializationStarted { .. })
+                && !self.panicked.swap(true, Ordering::SeqCst)
+            {
+                panic!("intentional materialization event panic");
+            }
+            if matches!(event, RuntimeFilterEvent::ArtifactPublished { .. })
+                && !self.reentered.swap(true, Ordering::SeqCst)
+            {
+                let subscription = self
+                    .subscription
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                    .expect("subscription remains live for materialization reentry");
+                assert!(matches!(
+                    subscription.acquire(Duration::ZERO),
+                    ArtifactAcquireOutcome::Published(_)
+                ));
+            }
         }
     }
 
@@ -1267,6 +1338,13 @@ mod tests {
         armed: AtomicBool,
     }
 
+    #[derive(Default)]
+    struct RejectSecondWhenArmedMemoryAccount {
+        armed: AtomicBool,
+        armed_calls: AtomicUsize,
+        current: AtomicUsize,
+    }
+
     impl RuntimeFilterMemoryAccount for PanicWhenArmedMemoryAccount {
         fn try_consume(&self, bytes: usize) -> Result<(), MemoryAccountError> {
             assert!(
@@ -1277,6 +1355,23 @@ mod tests {
         }
 
         fn release(&self, _bytes: usize) {}
+    }
+
+    impl RuntimeFilterMemoryAccount for RejectSecondWhenArmedMemoryAccount {
+        fn try_consume(&self, bytes: usize) -> Result<(), MemoryAccountError> {
+            if self.armed.load(Ordering::SeqCst)
+                && self.armed_calls.fetch_add(1, Ordering::SeqCst) == 1
+            {
+                return Err(MemoryAccountError::CapacityExceeded);
+            }
+            self.current.fetch_add(bytes, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn release(&self, bytes: usize) {
+            let previous = self.current.fetch_sub(bytes, Ordering::SeqCst);
+            assert!(previous >= bytes);
+        }
     }
 
     impl RuntimeFilterMemoryAccount for BlockingFirstRejectingMemoryAccount {
@@ -1427,6 +1522,19 @@ mod tests {
     fn deployment_with_profiles(
         consumers: impl IntoIterator<Item = (u32, u32, i64, ConsumerArtifactProfile)>,
     ) -> CompleteOnceChannelDeployment {
+        let consumers = consumers.into_iter().collect::<Vec<_>>();
+        let max_concurrent_jobs = consumers
+            .iter()
+            .map(|(_, _, _, profile)| profile.id())
+            .collect::<BTreeSet<_>>()
+            .len();
+        deployment_with_profiles_and_concurrency(consumers, max_concurrent_jobs)
+    }
+
+    fn deployment_with_profiles_and_concurrency(
+        consumers: impl IntoIterator<Item = (u32, u32, i64, ConsumerArtifactProfile)>,
+        max_concurrent_jobs: usize,
+    ) -> CompleteOnceChannelDeployment {
         let base = deployment(1, 10, 30, 40, [10], [30], 100);
         let consumers = consumers
             .into_iter()
@@ -1446,12 +1554,6 @@ mod tests {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let max_concurrent_jobs = consumers
-            .values()
-            .map(ConsumerDeployment::artifact_profile)
-            .map(ConsumerArtifactProfile::id)
-            .collect::<BTreeSet<_>>()
-            .len();
         CompleteOnceChannelDeployment::new(
             base.channel_id(),
             base.logical_domain().clone(),
@@ -1983,6 +2085,138 @@ mod tests {
     }
 
     #[test]
+    fn codec_hop_leaf_fixture_matches_direct_bundle_through_real_router_subscriptions() {
+        let fixture = fixture();
+        install_one(&fixture);
+        let (producer, source_subscription) = open_and_subscribe(&fixture);
+        complete(&producer, 37);
+        let ArtifactAcquireOutcome::Published(direct_bundle) =
+            source_subscription.acquire(Duration::ZERO)
+        else {
+            panic!("direct materialization must publish");
+        };
+        let installed = fixture.service.registry.active_installation().unwrap();
+        let plan = installed.artifact_plan(ChannelId::new(1)).unwrap();
+        let profile = plan.groups()[0].profile().clone();
+        let max_artifact_bytes = plan.max_artifact_bytes();
+        let retained_budget = plan.retained_budget();
+        let direct_budget_baseline = retained_budget.retained_bytes();
+        let direct_account_baseline = fixture.tracker.current();
+        assert_eq!(
+            direct_budget_baseline,
+            direct_bundle.retained_memory_bytes()
+        );
+        drop(installed);
+        let (kind, direct_artifact) = &direct_bundle.artifacts()[0];
+        let decoded_artifact = decode_leaf(
+            direct_artifact.canonical_bytes(),
+            ArtifactDecodeExpectations {
+                expected_kind: *kind,
+                expected_schema_digest: direct_artifact.schema_digest(),
+                expected_logical_version: direct_bundle.version(),
+                expected_hash_contract: profile.bloom_hash_contract(),
+            },
+            max_artifact_bytes,
+            retained_budget.clone(),
+            fixture.tracker.clone(),
+        )
+        .unwrap();
+        let decoded_leaf_retained = decoded_artifact.retained_memory_bytes();
+        assert_eq!(
+            retained_budget.retained_bytes(),
+            direct_budget_baseline + decoded_leaf_retained
+        );
+        assert_eq!(
+            fixture.tracker.current(),
+            direct_account_baseline + i64::try_from(decoded_leaf_retained).unwrap()
+        );
+        let decoded_bundle = Arc::new(
+            ArtifactBundle::new(
+                direct_bundle.channel_id(),
+                direct_bundle.version(),
+                &profile,
+                vec![(*kind, decoded_artifact)],
+                max_artifact_bytes,
+            )
+            .unwrap(),
+        );
+
+        let common = RuntimeFilterEventIdentity::new(
+            uid(0),
+            RuntimeFilterParticipantId::new(3),
+            ChannelId::new(1),
+            DeploymentEpoch::new(9),
+        );
+        let direct_events = Arc::new(Events::default());
+        let direct_group = Arc::new(SubscriptionGroup::new(
+            common,
+            BindingId::new(50),
+            RouteEdgeId::new(70),
+            [uid(50)],
+            direct_events,
+        ));
+        let direct_slot = direct_group.slot(uid(50)).unwrap();
+        let direct_router = LoopbackRouter::new(BTreeMap::from([(
+            RouteEdgeId::new(70),
+            direct_group as Arc<dyn ArtifactDelivery>,
+        )]));
+        direct_router.route(
+            &[RouteEdgeId::new(70)],
+            &ArtifactDeliveryOutcome::Published(direct_bundle.clone()),
+        );
+
+        let codec_events = Arc::new(Events::default());
+        let codec_group = Arc::new(SubscriptionGroup::new(
+            common,
+            BindingId::new(51),
+            RouteEdgeId::new(71),
+            [uid(51)],
+            codec_events,
+        ));
+        let codec_slot = codec_group.slot(uid(51)).unwrap();
+        let codec_router = LoopbackRouter::new(BTreeMap::from([(
+            RouteEdgeId::new(71),
+            codec_group as Arc<dyn ArtifactDelivery>,
+        )]));
+        codec_router.route(
+            &[RouteEdgeId::new(71)],
+            &ArtifactDeliveryOutcome::Published(decoded_bundle.clone()),
+        );
+
+        let (
+            ArtifactAcquireOutcome::Published(direct_acquired),
+            ArtifactAcquireOutcome::Published(codec_acquired),
+        ) = (
+            direct_slot.acquire(Duration::ZERO),
+            codec_slot.acquire(Duration::ZERO),
+        )
+        else {
+            panic!("both leaf fixtures must deliver a published bundle");
+        };
+        assert_eq!(direct_acquired.channel_id(), codec_acquired.channel_id());
+        assert_eq!(direct_acquired.version(), codec_acquired.version());
+        assert_eq!(direct_acquired.profile_id(), codec_acquired.profile_id());
+        assert_eq!(
+            direct_acquired.artifacts()[0].0,
+            codec_acquired.artifacts()[0].0
+        );
+        assert_eq!(
+            direct_acquired.canonical_digest(),
+            codec_acquired.canonical_digest()
+        );
+        assert_eq!(
+            direct_acquired.artifacts()[0].1.canonical_digest(),
+            codec_acquired.artifacts()[0].1.canonical_digest()
+        );
+        drop(codec_acquired);
+        drop(codec_slot);
+        drop(codec_router);
+        drop(decoded_bundle);
+        assert_eq!(retained_budget.retained_bytes(), direct_budget_baseline);
+        assert_eq!(fixture.tracker.current(), direct_account_baseline);
+    }
+
+    #[test]
     fn same_profile_consumers_share_one_bundle_arc() {
         let fixture = fixture();
         let profile = ConsumerArtifactProfile::new(
@@ -2022,6 +2256,167 @@ mod tests {
         };
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(first.version(), LogicalVersion::FIRST);
+    }
+
+    #[test]
+    fn concurrent_real_materialization_jobs_single_flight_one_encode_and_share_terminal_arc() {
+        struct ReleaseOnDrop(Arc<(Mutex<bool>, Condvar)>);
+
+        impl ReleaseOnDrop {
+            fn release(&self) {
+                let (lock, changed) = &*self.0;
+                *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                changed.notify_all();
+            }
+        }
+
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.release();
+            }
+        }
+
+        let fixture = fixture();
+        let profile = ConsumerArtifactProfile::new(
+            BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
+            None,
+        )
+        .unwrap();
+        fixture
+            .service
+            .install(view([deployment_with_profiles([(30, 40, 30, profile)])]))
+            .unwrap();
+        let installed = fixture.service.registry.active_installation().unwrap();
+        let plan = installed.artifact_plan(ChannelId::new(1)).unwrap();
+        let key = plan.groups()[0].key();
+        let snapshot = Arc::new(LogicalSnapshot::first(
+            ChannelId::new(1),
+            ReducedMembershipDomain::new(MembershipValues::int64([41]), false),
+            Default::default(),
+        ));
+        let start = Arc::new((Mutex::new(false), Condvar::new()));
+        let encode_release = Arc::new((Mutex::new(false), Condvar::new()));
+        let start_release = ReleaseOnDrop(start.clone());
+        let encode_release_on_drop = ReleaseOnDrop(encode_release.clone());
+        let encode_count = Arc::new(AtomicUsize::new(0));
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (encode_entered_tx, encode_entered_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let before_encode: Arc<dyn Fn(ConsumerProfileId) + Send + Sync> = Arc::new({
+            let encode_release = encode_release.clone();
+            let encode_count = encode_count.clone();
+            move |_| {
+                encode_count.fetch_add(1, Ordering::SeqCst);
+                encode_entered_tx.send(()).unwrap();
+                let (lock, changed) = &*encode_release;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = changed.wait(released).unwrap();
+                }
+            }
+        });
+        let threads = (0..2)
+            .map(|_| {
+                let installed = installed.clone();
+                let snapshot = snapshot.clone();
+                let account = fixture.tracker.clone();
+                let start = start.clone();
+                let ready_tx = ready_tx.clone();
+                let result_tx = result_tx.clone();
+                let before_encode = before_encode.clone();
+                std::thread::spawn(move || {
+                    ready_tx.send(()).unwrap();
+                    let (lock, changed) = &*start;
+                    let mut started = lock.lock().unwrap();
+                    while !*started {
+                        started = changed.wait(started).unwrap();
+                    }
+                    drop(started);
+                    let plan = installed.artifact_plan(ChannelId::new(1)).unwrap();
+                    let mut results = run_materialization_jobs(
+                        plan,
+                        installed.publish_gate(),
+                        &snapshot,
+                        account,
+                        Some(before_encode),
+                        None,
+                    );
+                    assert_eq!(results.len(), 1);
+                    let work = results.pop().unwrap();
+                    let started_events = work
+                        .events
+                        .iter()
+                        .filter(|event| {
+                            matches!(event, RuntimeFilterEvent::MaterializationStarted { .. })
+                        })
+                        .count();
+                    let outcome = work.outcome.expect("same-key job must be terminal");
+                    let owner = match work.claim {
+                        MaterializationWorkClaim::Owner(owner) => {
+                            assert_eq!(
+                                owner.finish(outcome.clone()).unwrap(),
+                                super::PublishCommitOutcome::Published
+                            );
+                            true
+                        }
+                        MaterializationWorkClaim::Follower => false,
+                        MaterializationWorkClaim::Stale => {
+                            panic!("same-version concurrent job cannot be stale")
+                        }
+                    };
+                    result_tx.send((owner, outcome, started_events)).unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for _ in 0..2 {
+            ready_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("both real job invocations must reach the start gate");
+        }
+        start_release.release();
+        encode_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("one owner must enter the real encoder");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while installed
+            .publish_gate()
+            .in_flight_follower_count(key, LogicalVersion::FIRST)
+            != 1
+        {
+            assert!(
+                Instant::now() < deadline,
+                "second real job invocation must claim the in-flight key as follower"
+            );
+            std::thread::yield_now();
+        }
+        encode_release_on_drop.release();
+        let results = (0..2)
+            .map(|_| {
+                result_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("both real materialization invocations must finish")
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(encode_count.load(Ordering::SeqCst), 1);
+        assert_eq!(results.iter().filter(|(owner, _, _)| *owner).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .map(|(_, _, started_events)| *started_events)
+                .sum::<usize>(),
+            1
+        );
+        let published = results
+            .iter()
+            .map(|(_, outcome, _)| match outcome {
+                ArtifactDeliveryOutcome::Published(bundle) => bundle,
+                _ => panic!("both real jobs must observe Published"),
+            })
+            .collect::<Vec<_>>();
+        assert!(Arc::ptr_eq(published[0], published[1]));
     }
 
     #[test]
@@ -2143,6 +2538,150 @@ mod tests {
     }
 
     #[test]
+    fn three_profiles_respect_job_bound_and_commit_canonically_after_reverse_completion() {
+        let fixture = fixture();
+        let profiles = [
+            ConsumerArtifactProfile::new(
+                BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
+                None,
+            )
+            .unwrap(),
+            ConsumerArtifactProfile::new(
+                BTreeSet::from([ArtifactKind::Bitset, ArtifactKind::EmptyDomain]),
+                None,
+            )
+            .unwrap(),
+            ConsumerArtifactProfile::new(
+                BTreeSet::from([
+                    ArtifactKind::ValueSet,
+                    ArtifactKind::Bitset,
+                    ArtifactKind::EmptyDomain,
+                ]),
+                None,
+            )
+            .unwrap(),
+        ];
+        fixture
+            .service
+            .install(view([deployment_with_profiles_and_concurrency(
+                [
+                    (30, 40, 30, profiles[0].clone()),
+                    (31, 41, 31, profiles[1].clone()),
+                    (32, 42, 32, profiles[2].clone()),
+                ],
+                2,
+            )]))
+            .unwrap();
+        let installed = fixture.service.registry.active_installation().unwrap();
+        let canonical = installed
+            .artifact_plan(ChannelId::new(1))
+            .unwrap()
+            .groups()
+            .iter()
+            .map(|group| group.profile().id())
+            .collect::<Vec<_>>();
+        assert_eq!(canonical.len(), 3);
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let (second_started_tx, second_started_rx) = mpsc::channel();
+        let second_started_rx = Arc::new(Mutex::new(second_started_rx));
+        let (second_completed_tx, second_completed_rx) = mpsc::channel();
+        let second_completed_rx = Arc::new(Mutex::new(second_completed_rx));
+        let (first_completed_tx, first_completed_rx) = mpsc::channel();
+        let first_completed_rx = Arc::new(Mutex::new(first_completed_rx));
+        fixture.service.set_before_encode_hook(Arc::new({
+            let active = active.clone();
+            let peak = peak.clone();
+            let started = started.clone();
+            let canonical = canonical.clone();
+            move |profile_id| {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                started.lock().unwrap().push(profile_id);
+                if profile_id == canonical[1] {
+                    second_started_tx.send(()).unwrap();
+                } else if profile_id == canonical[0] {
+                    second_started_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("the second bounded worker must start");
+                }
+            }
+        }));
+        fixture.service.set_after_encode_hook(Arc::new({
+            let active = active.clone();
+            let completed = completed.clone();
+            let canonical = canonical.clone();
+            move |profile_id| {
+                if profile_id == canonical[1] {
+                    completed.lock().unwrap().push(profile_id);
+                    second_completed_tx.send(()).unwrap();
+                    first_completed_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("the first worker must acknowledge reverse completion");
+                } else if profile_id == canonical[0] {
+                    second_completed_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("the second worker must complete first");
+                    completed.lock().unwrap().push(profile_id);
+                    first_completed_tx.send(()).unwrap();
+                } else {
+                    completed.lock().unwrap().push(profile_id);
+                }
+                active.fetch_sub(1, Ordering::SeqCst);
+            }
+        }));
+
+        let producer = fixture
+            .service
+            .open_producer(BindingId::new(10), uid(10), 1)
+            .unwrap();
+        complete(&producer, 19);
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        let starts = started.lock().unwrap().clone();
+        assert_eq!(starts.len(), 3);
+        assert_eq!(starts[2], canonical[2]);
+        assert_eq!(
+            BTreeSet::from([starts[0], starts[1]]),
+            BTreeSet::from([canonical[0], canonical[1]])
+        );
+        assert_eq!(
+            *completed.lock().unwrap(),
+            vec![canonical[1], canonical[0], canonical[2]]
+        );
+        let materialization_profiles = fixture
+            .events
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeFilterEvent::MaterializationStarted { identity }
+                | RuntimeFilterEvent::ArtifactMaterialized { identity, .. }
+                | RuntimeFilterEvent::ArtifactPublished { identity, .. } => {
+                    Some(identity.profile_id())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            materialization_profiles,
+            canonical
+                .iter()
+                .flat_map(|profile_id| [*profile_id; 3])
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn accepted_publish_before_cancel_remains_the_only_route_winner() {
         let fixture = fixture();
         install_one(&fixture);
@@ -2252,6 +2791,147 @@ mod tests {
             RuntimeFilterEvent::ArtifactPublished { .. }
                 | RuntimeFilterEvent::LoopbackDelivered { .. }
         )));
+    }
+
+    #[test]
+    fn shutdown_during_scoped_encode_invalidates_jobs_and_drop_leaves_no_orphan() {
+        struct ReleaseOnDrop(Arc<(Mutex<bool>, Condvar)>);
+
+        impl ReleaseOnDrop {
+            fn release(&self) {
+                let (lock, changed) = &*self.0;
+                *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                changed.notify_all();
+            }
+        }
+
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.release();
+            }
+        }
+
+        let Fixture {
+            service,
+            events,
+            tracker,
+            ..
+        } = fixture();
+        let value_set = ConsumerArtifactProfile::new(
+            BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
+            None,
+        )
+        .unwrap();
+        let bitset = ConsumerArtifactProfile::new(
+            BTreeSet::from([ArtifactKind::Bitset, ArtifactKind::EmptyDomain]),
+            None,
+        )
+        .unwrap();
+        service
+            .install(view([deployment_with_profiles([
+                (30, 40, 30, value_set.clone()),
+                (31, 41, 31, bitset.clone()),
+            ])]))
+            .unwrap();
+        let subscriptions = [
+            service.subscribe(BindingId::new(30), uid(30)).unwrap(),
+            service.subscribe(BindingId::new(31), uid(31)).unwrap(),
+        ];
+        let producer = service
+            .open_producer(BindingId::new(10), uid(10), 1)
+            .unwrap();
+        producer
+            .submit(
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                ValueDomainDelta::new(MembershipValues::int64([25]), false),
+            )
+            .unwrap();
+
+        let profile_binding = BTreeMap::from([
+            (value_set.id(), (BindingId::new(30), uid(30))),
+            (bitset.id(), (BindingId::new(31), uid(31))),
+        ]);
+        let weak_service = Arc::downgrade(&service);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_on_drop = ReleaseOnDrop(release.clone());
+        let active = Arc::new(AtomicUsize::new(0));
+        let reentered = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        service.set_before_encode_hook(Arc::new({
+            let weak_service = weak_service.clone();
+            let release = release.clone();
+            let active = active.clone();
+            let reentered = reentered.clone();
+            move |profile_id| {
+                active.fetch_add(1, Ordering::SeqCst);
+                let service = weak_service
+                    .upgrade()
+                    .expect("service is live before shutdown");
+                let (binding_id, instance_id) = profile_binding[&profile_id];
+                service.subscribe(binding_id, instance_id).unwrap();
+                reentered.fetch_add(1, Ordering::SeqCst);
+                drop(service);
+                entered_tx.send(()).unwrap();
+                let (lock, changed) = &*release;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = changed.wait(released).unwrap();
+                }
+            }
+        }));
+        service.set_after_encode_hook(Arc::new({
+            let active = active.clone();
+            move |_| {
+                active.fetch_sub(1, Ordering::SeqCst);
+            }
+        }));
+
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let close_thread = std::thread::spawn(move || {
+            closed_tx
+                .send(producer.close_partition(PartitionId::new(0), ProducerSequence::new(1)))
+                .unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(active.load(Ordering::SeqCst), 2);
+        assert_eq!(reentered.load(Ordering::SeqCst), 2);
+        assert!(tracker.current() > 0);
+
+        service.shutdown();
+        for subscription in &subscriptions {
+            assert!(matches!(
+                subscription.acquire(Duration::ZERO),
+                ArtifactAcquireOutcome::Cancelled
+            ));
+        }
+        let service_dropped = Arc::downgrade(&service);
+        let dispatcher_dropped = Arc::downgrade(&service.dispatcher);
+        let registry_dropped = Arc::downgrade(&service.registry);
+        drop(service);
+        assert!(service_dropped.upgrade().is_none());
+        assert_eq!(active.load(Ordering::SeqCst), 2);
+
+        release_on_drop.release();
+        assert_eq!(
+            closed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap(),
+            SubmitOutcome::Completed
+        );
+        close_thread.join().unwrap();
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert!(dispatcher_dropped.upgrade().is_none());
+        assert!(registry_dropped.upgrade().is_none());
+        assert!(!events.0.lock().unwrap().iter().any(|event| matches!(
+            event,
+            RuntimeFilterEvent::ArtifactPublished { .. }
+                | RuntimeFilterEvent::LoopbackDelivered { .. }
+        )));
+        drop(subscriptions);
+        assert_eq!(tracker.current(), 0);
     }
 
     #[test]
@@ -2438,6 +3118,130 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn profile_local_memory_rejection_preserves_sibling_and_releases_every_failed_reservation() {
+        let account = Arc::new(RejectSecondWhenArmedMemoryAccount::default());
+        let events = Arc::new(Events::default());
+        let service = Arc::new(RuntimeFilterService::new_with_dependencies(
+            uid(0),
+            Arc::new(Clock(Instant::now())),
+            events.clone(),
+            account.clone(),
+        ));
+        let value_set = ConsumerArtifactProfile::new(
+            BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
+            None,
+        )
+        .unwrap();
+        let bitset = ConsumerArtifactProfile::new(
+            BTreeSet::from([ArtifactKind::Bitset, ArtifactKind::EmptyDomain]),
+            None,
+        )
+        .unwrap();
+        service
+            .install(view([deployment_with_profiles([
+                (30, 40, 30, value_set),
+                (31, 41, 31, bitset),
+            ])]))
+            .unwrap();
+        let subscriptions = [
+            service.subscribe(BindingId::new(30), uid(30)).unwrap(),
+            service.subscribe(BindingId::new(31), uid(31)).unwrap(),
+        ];
+        let producer = service
+            .open_producer(BindingId::new(10), uid(10), 1)
+            .unwrap();
+        producer
+            .submit(
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                ValueDomainDelta::new(MembershipValues::int64([29]), false),
+            )
+            .unwrap();
+        let installed = service.registry.active_installation().unwrap();
+        let plan = installed.artifact_plan(ChannelId::new(1)).unwrap();
+        let retained_budget = plan.retained_budget();
+        let scratch_budget = plan.scratch_budget();
+        drop(installed);
+        account.armed.store(true, Ordering::SeqCst);
+
+        assert_eq!(
+            producer
+                .close_partition(PartitionId::new(0), ProducerSequence::new(1))
+                .unwrap(),
+            SubmitOutcome::Completed
+        );
+        let outcomes = subscriptions
+            .iter()
+            .map(|subscription| subscription.acquire(Duration::ZERO))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    ArtifactAcquireOutcome::Unavailable(UnavailableReason::ResourceLimit)
+                ))
+                .count(),
+            1
+        );
+        let published = outcomes
+            .iter()
+            .find_map(|outcome| match outcome {
+                ArtifactAcquireOutcome::Published(bundle) => Some(bundle.clone()),
+                _ => None,
+            })
+            .expect("one sibling profile must still publish");
+        let logical_retained = service
+            .registry
+            .channel(ChannelId::new(1))
+            .unwrap()
+            .terminal_action()
+            .snapshot()
+            .unwrap()
+            .retained_memory_bytes();
+        assert_eq!(
+            account.current.load(Ordering::SeqCst),
+            logical_retained + published.retained_memory_bytes()
+        );
+        assert_eq!(scratch_budget.retained_bytes(), 0);
+        assert_eq!(
+            retained_budget.retained_bytes(),
+            published.retained_memory_bytes()
+        );
+        let recorded = events.0.lock().unwrap();
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    RuntimeFilterEvent::ArtifactUnavailable {
+                        reason: UnavailableReason::ResourceLimit,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|event| matches!(event, RuntimeFilterEvent::ArtifactPublished { .. }))
+                .count(),
+            1
+        );
+        drop(recorded);
+
+        drop(outcomes);
+        drop(published);
+        drop(subscriptions);
+        drop(producer);
+        drop(service);
+        assert_eq!(scratch_budget.retained_bytes(), 0);
+        assert_eq!(retained_budget.retained_bytes(), 0);
+        assert_eq!(account.current.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -3192,6 +3996,59 @@ mod tests {
         assert!(events.iter().any(|event| matches!(event, RuntimeFilterEvent::DeltaAccepted { identity } if identity.query_id() == uid(0) && identity.participant_id().get() == 3 && identity.channel_id().get() == 1 && identity.epoch().get() == 9 && identity.stream().binding_id().get() == 10 && identity.stream().fragment_instance_id() == uid(10) && identity.stream().partition_id().get() == 0 && identity.sequence().get() == 0)));
         assert!(events.iter().any(|event| matches!(event, RuntimeFilterEvent::LoopbackDelivered { identity, version } if identity.common().query_id() == uid(0) && identity.consumer_binding_id().get() == 30 && identity.fragment_instance_id() == uid(30) && identity.route_edge_id().get() == 40 && *version == LogicalVersion::FIRST)));
         assert!(events.iter().any(|event| matches!(event, RuntimeFilterEvent::SubscriptionAcquired { identity, version } if identity.consumer_binding_id().get() == 30 && *version == LogicalVersion::FIRST)));
+    }
+
+    #[test]
+    fn materialization_event_panic_and_reentry_preserve_the_full_causal_chain() {
+        let sink = Arc::new(MaterializationLifecycleEvents {
+            subscription: Mutex::new(None),
+            panicked: AtomicBool::new(false),
+            reentered: AtomicBool::new(false),
+            recorded: Mutex::new(Vec::new()),
+        });
+        let service = Arc::new(RuntimeFilterService::new_with_dependencies(
+            uid(0),
+            Arc::new(Clock(Instant::now())),
+            sink.clone(),
+            MemTrackerMemoryAccount::new_root_for_test("materialization-event-reentry"),
+        ));
+        service
+            .install(view([deployment(1, 10, 30, 40, [10], [30], 100)]))
+            .unwrap();
+        let subscription = service.subscribe(BindingId::new(30), uid(30)).unwrap();
+        *sink.subscription.lock().unwrap() = Some(Arc::downgrade(&subscription));
+        let producer = service
+            .open_producer(BindingId::new(10), uid(10), 1)
+            .unwrap();
+        complete(&producer, 41);
+        assert!(sink.panicked.load(Ordering::SeqCst));
+        assert!(sink.reentered.load(Ordering::SeqCst));
+        assert!(subscription.snapshot().is_some());
+
+        let events = sink.recorded.lock().unwrap();
+        let position = |predicate: fn(&RuntimeFilterEvent) -> bool| {
+            events
+                .iter()
+                .position(predicate)
+                .expect("expected materialization lifecycle event")
+        };
+        let channel_completed =
+            position(|event| matches!(event, RuntimeFilterEvent::ChannelCompleted { .. }));
+        let started =
+            position(|event| matches!(event, RuntimeFilterEvent::MaterializationStarted { .. }));
+        let materialized =
+            position(|event| matches!(event, RuntimeFilterEvent::ArtifactMaterialized { .. }));
+        let published =
+            position(|event| matches!(event, RuntimeFilterEvent::ArtifactPublished { .. }));
+        let delivered =
+            position(|event| matches!(event, RuntimeFilterEvent::LoopbackDelivered { .. }));
+        let acquired =
+            position(|event| matches!(event, RuntimeFilterEvent::SubscriptionAcquired { .. }));
+        assert!(channel_completed < started);
+        assert!(started < materialized);
+        assert!(materialized < published);
+        assert!(published < delivered);
+        assert!(delivered < acquired);
     }
 
     struct ReentrantSink {

@@ -16,6 +16,8 @@
 // under the License.
 
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use crate::runtime_filter::model::contract::ChannelId;
@@ -92,6 +94,8 @@ struct GateState {
 struct JobFlight {
     outcome: Mutex<Option<ArtifactDeliveryOutcome>>,
     changed: Condvar,
+    #[cfg(test)]
+    followers: AtomicUsize,
 }
 
 impl JobFlight {
@@ -99,6 +103,8 @@ impl JobFlight {
         Arc::new(Self {
             outcome: Mutex::new(Some(outcome)),
             changed: Condvar::new(),
+            #[cfg(test)]
+            followers: AtomicUsize::new(0),
         })
     }
 
@@ -234,6 +240,8 @@ impl ArtifactPublishGate {
         }
         let generation = key_state.generation;
         if let Some(flight) = key_state.in_flight.get(&(version, generation)) {
+            #[cfg(test)]
+            flight.followers.fetch_add(1, Ordering::SeqCst);
             return ArtifactJobClaim::Follower(ArtifactJobFollower {
                 flight: flight.clone(),
             });
@@ -250,6 +258,22 @@ impl ArtifactPublishGate {
             flight,
             finished: false,
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn in_flight_follower_count(
+        &self,
+        key: ArtifactPublishKey,
+        version: LogicalVersion,
+    ) -> usize {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(key_state) = state.keys.get(&key) else {
+            return 0;
+        };
+        let Some(flight) = key_state.in_flight.get(&(version, key_state.generation)) else {
+            return 0;
+        };
+        flight.followers.load(Ordering::SeqCst)
     }
 
     pub(super) fn commit_published(
@@ -421,6 +445,7 @@ pub(super) fn run_materialization_jobs(
     snapshot: &Arc<LogicalSnapshot>,
     memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
     before_encode: Option<Arc<dyn Fn(ConsumerProfileId) + Send + Sync>>,
+    after_encode: Option<Arc<dyn Fn(ConsumerProfileId) + Send + Sync>>,
 ) -> Vec<MaterializationWorkResult> {
     let groups = plan.groups();
     if groups.is_empty() {
@@ -458,6 +483,7 @@ pub(super) fn run_materialization_jobs(
                         events,
                     } => {
                         let before_encode = before_encode.clone();
+                        let after_encode = after_encode.clone();
                         jobs.push(ScopedJob::Running(scope.spawn(move || {
                             let outcome =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -474,6 +500,9 @@ pub(super) fn run_materialization_jobs(
                                         MaterializerUnavailableReason::MaterializationFailed,
                                     ),
                                 );
+                            if let Some(hook) = after_encode {
+                                hook(group.profile().id());
+                            }
                             complete_group(group, owner, identity, events, outcome)
                         })));
                     }
@@ -641,7 +670,9 @@ fn complete_group(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
+    use std::time::Duration;
 
     use arrow::datatypes::DataType;
 
@@ -654,6 +685,9 @@ mod tests {
     use crate::runtime_filter::port::producer::RuntimeContractViolationKind;
     use crate::runtime_filter::port::subscription::{
         ArtifactDeliveryOutcome, ArtifactUnsupportedReason, UnavailableReason,
+    };
+    use crate::runtime_filter::port::support::{
+        ArtifactRetainedBudget, ArtifactRetention, MemoryAccountError, RuntimeFilterMemoryAccount,
     };
 
     use super::{ArtifactJobClaim, ArtifactPublishGate, ArtifactPublishKey, PublishCommitOutcome};
@@ -691,6 +725,72 @@ mod tests {
             ChannelId::new(1),
             DeploymentEpoch::new(2),
             ConsumerProfileId::for_test([profile; 32]),
+        )
+    }
+
+    #[derive(Default)]
+    struct CountingMemory {
+        current: AtomicUsize,
+    }
+
+    impl RuntimeFilterMemoryAccount for CountingMemory {
+        fn try_consume(&self, bytes: usize) -> Result<(), MemoryAccountError> {
+            self.current.fetch_add(bytes, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn release(&self, bytes: usize) {
+            let previous = self.current.fetch_sub(bytes, Ordering::SeqCst);
+            assert!(previous >= bytes);
+        }
+    }
+
+    fn retained_bundle(
+        version: LogicalVersion,
+        byte: u8,
+        retained_budget: Arc<ArtifactRetainedBudget>,
+        account: Arc<CountingMemory>,
+    ) -> Arc<ArtifactBundle> {
+        let profile = ConsumerArtifactProfile::new(
+            BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
+            None,
+        )
+        .unwrap();
+        let schema =
+            ArtifactSchemaDigest::for_membership(&DataType::Int64, NullSemantics::NeverMatches)
+                .unwrap();
+        let encoded: Arc<[u8]> = Arc::from([byte]);
+        let component_bytes =
+            PhysicalArtifact::accounted_resident_component_bytes(encoded.len()).unwrap();
+        let retained_bytes = ArtifactBundle::accounted_resident_overhead(&profile, 1)
+            .unwrap()
+            .checked_add(component_bytes)
+            .unwrap();
+        let retention =
+            Arc::new(ArtifactRetention::try_new(retained_bytes, retained_budget, account).unwrap());
+        let artifact = Arc::new(
+            PhysicalArtifact::from_shared_retained_bytes(
+                ArtifactKind::ValueSet,
+                schema,
+                version,
+                false,
+                encoded,
+                component_bytes,
+                retained_bytes,
+                retention.clone(),
+            )
+            .unwrap(),
+        );
+        Arc::new(
+            ArtifactBundle::new_retained(
+                ChannelId::new(1),
+                version,
+                &profile,
+                vec![(ArtifactKind::ValueSet, artifact)],
+                usize::MAX,
+                retention,
+            )
+            .unwrap(),
         )
     }
 
@@ -790,6 +890,200 @@ mod tests {
                 ArtifactUnsupportedReason::NoAcceptedRepresentation
             )
         ));
+    }
+
+    #[test]
+    fn concurrent_same_profile_followers_reuse_one_owner_terminal_outcome() {
+        struct ReleaseOnDrop(Arc<(Mutex<bool>, Condvar)>);
+
+        impl ReleaseOnDrop {
+            fn release(&self) {
+                let (lock, changed) = &*self.0;
+                *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                changed.notify_all();
+            }
+        }
+
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.release();
+            }
+        }
+
+        const CLAIMANTS: usize = 5;
+        let gate = ArtifactPublishGate::default();
+
+        let success_key = key(13);
+        let start = Arc::new((Mutex::new(false), Condvar::new()));
+        let finish_claim = Arc::new((Mutex::new(false), Condvar::new()));
+        let start_release = ReleaseOnDrop(start.clone());
+        let finish_claim_release = ReleaseOnDrop(finish_claim.clone());
+        let published = bundle(LogicalVersion::FIRST, 4);
+        let (sent, received) = mpsc::channel();
+        let (ready_sent, ready_received) = mpsc::channel();
+        let (claimed_sent, claimed_received) = mpsc::channel();
+        let threads = (0..CLAIMANTS)
+            .map(|_| {
+                let gate = gate.clone();
+                let start = start.clone();
+                let finish_claim = finish_claim.clone();
+                let published = published.clone();
+                let sent = sent.clone();
+                let ready_sent = ready_sent.clone();
+                let claimed_sent = claimed_sent.clone();
+                std::thread::spawn(move || {
+                    ready_sent.send(()).unwrap();
+                    let (lock, changed) = &*start;
+                    let mut started = lock.lock().unwrap();
+                    while !*started {
+                        started = changed.wait(started).unwrap();
+                    }
+                    drop(started);
+                    let job = gate.claim(success_key, LogicalVersion::FIRST);
+                    claimed_sent.send(()).unwrap();
+                    let (lock, changed) = &*finish_claim;
+                    let mut may_finish = lock.lock().unwrap();
+                    while !*may_finish {
+                        may_finish = changed.wait(may_finish).unwrap();
+                    }
+                    drop(may_finish);
+                    match job {
+                        ArtifactJobClaim::Owner(owner) => {
+                            owner
+                                .finish(ArtifactDeliveryOutcome::Published(published.clone()))
+                                .unwrap();
+                            sent.send((true, published)).unwrap();
+                        }
+                        ArtifactJobClaim::Follower(follower) => {
+                            let ArtifactDeliveryOutcome::Published(reused) = follower.wait() else {
+                                panic!("success follower must reuse the published bundle");
+                            };
+                            sent.send((false, reused)).unwrap();
+                        }
+                        ArtifactJobClaim::Stale => panic!("first-version claim cannot be stale"),
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for _ in 0..CLAIMANTS {
+            ready_received
+                .recv_timeout(Duration::from_secs(5))
+                .expect("every claimant must reach the start gate");
+        }
+        start_release.release();
+        for _ in 0..CLAIMANTS {
+            claimed_received
+                .recv_timeout(Duration::from_secs(5))
+                .expect("every claimant must claim before the owner finishes");
+        }
+        finish_claim_release.release();
+        let mut owners = 0;
+        for _ in 0..CLAIMANTS {
+            let (owner, reused) = received
+                .recv_timeout(Duration::from_secs(5))
+                .expect("success claimant must finish");
+            owners += usize::from(owner);
+            assert!(Arc::ptr_eq(&published, &reused));
+        }
+        assert_eq!(owners, 1);
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let unavailable_key = key(14);
+        let ArtifactJobClaim::Owner(owner) = gate.claim(unavailable_key, LogicalVersion::FIRST)
+        else {
+            panic!("first claimant must own the unavailable job");
+        };
+        let followers = (0..CLAIMANTS - 1)
+            .map(|_| {
+                let ArtifactJobClaim::Follower(follower) =
+                    gate.claim(unavailable_key, LogicalVersion::FIRST)
+                else {
+                    panic!("same-version claimant must follow");
+                };
+                follower
+            })
+            .collect::<Vec<_>>();
+        owner
+            .finish(ArtifactDeliveryOutcome::Unavailable(
+                UnavailableReason::ResourceLimit,
+            ))
+            .unwrap();
+        assert!(followers.into_iter().all(|follower| matches!(
+            follower.wait(),
+            ArtifactDeliveryOutcome::Unavailable(UnavailableReason::ResourceLimit)
+        )));
+    }
+
+    #[test]
+    fn late_lower_version_is_stale_and_releases_its_retained_candidate() {
+        let gate = ArtifactPublishGate::default();
+        let key = key(15);
+        let account = Arc::new(CountingMemory::default());
+        let profile = ConsumerArtifactProfile::new(
+            BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
+            None,
+        )
+        .unwrap();
+        let retained_per_bundle = ArtifactBundle::accounted_resident_overhead(&profile, 1)
+            .unwrap()
+            .checked_add(PhysicalArtifact::accounted_resident_component_bytes(1).unwrap())
+            .unwrap();
+        let retained_budget = Arc::new(ArtifactRetainedBudget::new(retained_per_bundle * 2));
+        let ArtifactJobClaim::Owner(lower_owner) = gate.claim(key, LogicalVersion::FIRST) else {
+            panic!("lower version must own its admitted job");
+        };
+        let ArtifactJobClaim::Owner(higher_owner) = gate.claim(key, LogicalVersion::new(2)) else {
+            panic!("higher version must be independently admitted");
+        };
+        let lower = retained_bundle(
+            LogicalVersion::FIRST,
+            1,
+            retained_budget.clone(),
+            account.clone(),
+        );
+        let higher = retained_bundle(
+            LogicalVersion::new(2),
+            2,
+            retained_budget.clone(),
+            account.clone(),
+        );
+        assert_eq!(lower.retained_memory_bytes(), retained_per_bundle);
+        assert_eq!(higher.retained_memory_bytes(), retained_per_bundle);
+        assert_eq!(
+            account.current.load(Ordering::SeqCst),
+            retained_per_bundle * 2
+        );
+        assert_eq!(retained_budget.retained_bytes(), retained_per_bundle * 2);
+
+        assert_eq!(
+            higher_owner
+                .finish(ArtifactDeliveryOutcome::Published(higher.clone()))
+                .unwrap(),
+            PublishCommitOutcome::Published
+        );
+        assert_eq!(
+            lower_owner
+                .finish(ArtifactDeliveryOutcome::Published(lower.clone()))
+                .unwrap(),
+            PublishCommitOutcome::Stale
+        );
+        drop(lower);
+        assert_eq!(account.current.load(Ordering::SeqCst), retained_per_bundle);
+        assert_eq!(retained_budget.retained_bytes(), retained_per_bundle);
+        let ArtifactJobClaim::Follower(latest) = gate.claim(key, LogicalVersion::new(2)) else {
+            panic!("published higher version must be reused");
+        };
+        let ArtifactDeliveryOutcome::Published(latest) = latest.wait() else {
+            panic!("higher version remains published");
+        };
+        assert!(Arc::ptr_eq(&higher, &latest));
+        drop(latest);
+        drop(gate);
+        drop(higher);
+        assert_eq!(account.current.load(Ordering::SeqCst), 0);
+        assert_eq!(retained_budget.retained_bytes(), 0);
     }
 
     #[test]

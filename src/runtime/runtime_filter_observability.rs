@@ -525,12 +525,15 @@ mod tests {
     use crate::common::types::UniqueId;
     use crate::runtime::profile::RuntimeProfile;
     use crate::runtime_filter::model::contract::{BindingId, ChannelId};
+    use crate::runtime_filter::port::artifact::{ArtifactKind, ConsumerProfileId};
     use crate::runtime_filter::port::events::{
-        RouteEventIdentity, RuntimeFilterEvent, RuntimeFilterEventIdentity, RuntimeFilterEventSink,
+        ArtifactMaterializationIdentity, ConsumerEventIdentity, RouteEventIdentity,
+        RuntimeFilterEvent, RuntimeFilterEventIdentity, RuntimeFilterEventSink,
     };
     use crate::runtime_filter::port::identity::{
         DeploymentEpoch, LogicalVersion, RouteEdgeId, RuntimeFilterParticipantId,
     };
+    use crate::runtime_filter::port::subscription::{ArtifactUnsupportedReason, UnavailableReason};
     use std::thread;
 
     fn channel_identity(query: QueryKey) -> RuntimeFilterEventIdentity {
@@ -591,6 +594,87 @@ mod tests {
 
         let snapshot = registry.snapshot(query).expect("query snapshot");
         assert_eq!(channel_events(&snapshot), vec![event]);
+    }
+
+    #[test]
+    fn materialization_adapter_preserves_terminal_reasons_and_cancel_coordinates() {
+        let registry = RuntimeFilterLifecycleRegistry::new();
+        let query = QueryKey::from_hi_lo(23, 24);
+        let sink = RegistryRuntimeFilterEventSink::new(&registry, query);
+        let common = channel_identity(query);
+        let materialization = ArtifactMaterializationIdentity::new(
+            common,
+            ConsumerProfileId::for_test([6; 32]),
+            LogicalVersion::new(7),
+        );
+        let consumer =
+            ConsumerEventIdentity::new(common, BindingId::new(8), UniqueId { hi: 9, lo: 10 });
+        let materialization_events = vec![
+            RuntimeFilterEvent::MaterializationStarted {
+                identity: materialization,
+            },
+            RuntimeFilterEvent::ArtifactMaterialized {
+                identity: materialization,
+                kind: ArtifactKind::Bitset,
+                bytes: 128,
+                digest: [11; 32],
+            },
+            RuntimeFilterEvent::ArtifactPublished {
+                identity: materialization,
+                kind: ArtifactKind::Bitset,
+                bytes: 128,
+                digest: [11; 32],
+            },
+            RuntimeFilterEvent::ArtifactPublishStaleSkipped {
+                identity: materialization,
+            },
+            RuntimeFilterEvent::ArtifactUnsupported {
+                identity: materialization,
+                reason: ArtifactUnsupportedReason::RangeDeferred,
+            },
+            RuntimeFilterEvent::ArtifactUnsupported {
+                identity: materialization,
+                reason: ArtifactUnsupportedReason::NoAcceptedRepresentation,
+            },
+            RuntimeFilterEvent::ArtifactUnavailable {
+                identity: materialization,
+                reason: UnavailableReason::ResourceLimit,
+            },
+            RuntimeFilterEvent::ArtifactUnavailable {
+                identity: materialization,
+                reason: UnavailableReason::MaterializationFailed,
+            },
+        ];
+        for event in &materialization_events {
+            sink.record(event.clone());
+        }
+        let channel_cancelled = RuntimeFilterEvent::ChannelCancelled { identity: common };
+        sink.record(channel_cancelled.clone());
+        let subscription_cancelled =
+            RuntimeFilterEvent::SubscriptionCancelled { identity: consumer };
+        sink.record(subscription_cancelled.clone());
+
+        let snapshot = registry.snapshot(query).expect("query snapshot");
+        assert_eq!(
+            snapshot
+                .channel_events
+                .get(&RuntimeFilterChannelEventCoordinate::Materialization(
+                    materialization
+                )),
+            Some(&materialization_events)
+        );
+        assert_eq!(
+            snapshot
+                .channel_events
+                .get(&RuntimeFilterChannelEventCoordinate::Channel(common)),
+            Some(&vec![channel_cancelled])
+        );
+        assert_eq!(
+            snapshot
+                .channel_events
+                .get(&RuntimeFilterChannelEventCoordinate::Consumer(consumer)),
+            Some(&vec![subscription_cancelled])
+        );
     }
 
     #[test]
