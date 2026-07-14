@@ -170,6 +170,11 @@ pub(crate) fn with_iceberg_change_stream_write(
             &source_fragment.output_columns,
             &branch.stream_output_ordinals,
         )?;
+        let output_slot_ids = output_slot_ids_for_ordinals(
+            &source_fragment.output_columns,
+            &branch.stream_output_ordinals,
+            &format!("branch {:?} output", branch.branch_kind),
+        )?;
         if writer_columns.len() != sink_spec.target_columns.len() {
             return Err(format!(
                 "Iceberg change-stream branch {:?} output column count {} does not match target column count {}",
@@ -236,7 +241,7 @@ pub(crate) fn with_iceberg_change_stream_write(
                 branch_id: branch.branch_id,
                 branch_kind: branch.branch_kind,
             },
-            output_slot_ids: Vec::new(),
+            output_slot_ids,
         });
 
         routes.push(IcebergChangeStreamBranchRoute {
@@ -349,6 +354,28 @@ fn output_columns_by_ordinals(
         .map(|ordinal| {
             output_columns.get(ordinal).cloned().ok_or_else(|| {
                 format!("Iceberg change-stream branch output ordinal {ordinal} is out of range")
+            })
+        })
+        .collect()
+}
+
+fn output_slot_ids_for_ordinals(
+    output_columns: &[OutputColumn],
+    ordinals: &[usize],
+    label: &str,
+) -> Result<Vec<i32>, String> {
+    ordinals
+        .iter()
+        .copied()
+        .map(|ordinal| {
+            let column = output_columns.get(ordinal).ok_or_else(|| {
+                format!("Iceberg change-stream {label} output ordinal {ordinal} is out of range")
+            })?;
+            i32::try_from(column.column_id.0).map_err(|_| {
+                format!(
+                    "Iceberg change-stream {label} column id {} cannot be encoded as stream output slot id",
+                    column.column_id
+                )
             })
         })
         .collect()
@@ -473,8 +500,12 @@ mod tests {
             ("delete_id", DataType::Int32),
             ("reuse_id", DataType::Int32),
         ]);
-        let mut delete_branch = ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![2]);
-        delete_branch.output_partition_ordinals = vec![2];
+        let mut delete_branch = ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![3, 2]);
+        delete_branch
+            .sink_spec
+            .target_columns
+            .push(delete_branch.sink_spec.target_columns[0].clone());
+        delete_branch.output_partition_ordinals = vec![1];
         let reuse_branch = ChangeStreamWriteBranchSpec::reuse_data_for_test(vec![3]);
         let dag =
             ChangeStreamWriteDagSpec::for_test(Some(0), Some(1), vec![delete_branch, reuse_branch]);
@@ -496,13 +527,15 @@ mod tests {
         assert_eq!(router.change_op_output_ordinal, 0);
         assert_eq!(router.data_route_output_ordinal, Some(1));
         assert_eq!(router.branches.len(), 2);
-        assert_eq!(router.branches[0].output_ordinals, vec![2]);
-        assert_eq!(router.branches[0].output_partition_ordinals, vec![2]);
+        assert_eq!(router.branches[0].output_ordinals, vec![3, 2]);
+        assert_eq!(router.branches[0].output_partition_ordinals, vec![1]);
 
         assert_eq!(planned.distributed_plan.edges.len(), 2);
         let first_edge = &planned.distributed_plan.edges[0];
         assert_eq!(first_edge.source_fragment_id, 0);
         assert_eq!(first_edge.target_fragment_id, 1);
+        assert_eq!(first_edge.output_slot_ids, vec![4, 3]);
+        assert_eq!(planned.distributed_plan.edges[1].output_slot_ids, vec![4]);
         assert_eq!(
             first_edge.stream_kind,
             crate::sql::planner::distributed::FragmentStreamKind::Partitioned
@@ -520,8 +553,8 @@ mod tests {
         else {
             panic!("expected native partition expr to be a column ref");
         };
-        assert_eq!(*column_id, ColumnId::new_for_test(3));
-        assert_eq!(column, "delete_id");
+        assert_eq!(*column_id, ColumnId::new_for_test(2));
+        assert_eq!(column, "route");
         assert!(matches!(
             first_edge.edge_kind,
             crate::sql::planner::distributed::FragmentEdgeKind::IcebergChangeStreamRouter {
@@ -537,8 +570,9 @@ mod tests {
             .find(|fragment| fragment.fragment_id == first_edge.target_fragment_id)
             .expect("writer fragment");
         assert!(matches!(writer.sink, DataSink::IcebergWrite(_)));
-        assert_eq!(writer.output_columns.len(), 1);
-        assert_eq!(writer.output_columns[0].name, "delete_id");
+        assert_eq!(writer.output_columns.len(), 2);
+        assert_eq!(writer.output_columns[0].name, "reuse_id");
+        assert_eq!(writer.output_columns[1].name, "delete_id");
         assert_eq!(planned.topology.writer_branches.len(), 2);
         assert_eq!(
             planned.topology.writer_branches[0]
@@ -567,6 +601,48 @@ mod tests {
             with_iceberg_change_stream_write(plan, "test_db", dag).expect_err("missing change_op");
 
         assert!(err.contains("requires change_op_output_ordinal"));
+    }
+
+    #[test]
+    fn change_stream_expander_rejects_out_of_range_branch_output_ordinal() {
+        let plan = single_fragment_plan_for_test();
+        let dag = ChangeStreamWriteDagSpec::for_test(
+            Some(0),
+            None,
+            vec![ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![7])],
+        );
+
+        let err = with_iceberg_change_stream_write(plan, "test_db", dag)
+            .expect_err("out-of-range branch output ordinal");
+
+        assert!(
+            err.contains("output ordinal 7 is out of range"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn change_stream_expander_rejects_branch_output_slot_id_overflow() {
+        let mut plan = single_fragment_plan_for_test();
+        let overflow_column_id = ColumnId::new_for_test(i32::MAX as u32 + 1);
+        plan.fragments[0].output_columns[0].column_id = overflow_column_id;
+        let DistributedNodeKind::Values(values) = &mut plan.fragments[0].root.payload else {
+            panic!("expected values root");
+        };
+        values.columns[0].column_id = overflow_column_id;
+        let dag = ChangeStreamWriteDagSpec::for_test(
+            Some(0),
+            None,
+            vec![ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![0])],
+        );
+
+        let err = with_iceberg_change_stream_write(plan, "test_db", dag)
+            .expect_err("branch output slot id overflow");
+
+        assert!(
+            err.contains("column id c2147483648 cannot be encoded as stream output slot id"),
+            "unexpected error: {err}"
+        );
     }
 
     fn single_fragment_plan_for_test() -> DistributedPlan {

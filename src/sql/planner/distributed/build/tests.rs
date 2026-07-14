@@ -1926,7 +1926,7 @@ fn build_distributed_plan_cte_anchor_splits_produce_fragment_and_consume_exchang
         edge.output_partition.kind,
         PartitionKind::Unpartitioned
     ));
-    assert!(edge.output_slot_ids.is_empty());
+    assert_eq!(edge.output_slot_ids, vec![1]);
     match &edge.edge_kind {
         FragmentEdgeKind::CteMulticast {
             cte_id: edge_cte_id,
@@ -2054,6 +2054,7 @@ fn build_distributed_plan_cte_consume_remaps_pruned_producer_columns_with_projec
 
     let edge = &dp.edges[0];
     assert_eq!(edge.target_exchange_node_id, exchange.node_id);
+    assert_eq!(edge.output_slot_ids, vec![1, 3]);
     match &edge.edge_kind {
         FragmentEdgeKind::CteMulticast {
             cte_id: edge_cte_id,
@@ -2074,6 +2075,33 @@ fn build_distributed_plan_cte_consume_remaps_pruned_producer_columns_with_projec
             exchange.node_id,
             vec![producer_columns[0].column_id, producer_columns[2].column_id]
         )]
+    );
+}
+
+#[test]
+fn build_distributed_plan_cte_consume_rejects_producer_slot_id_overflow() {
+    let cte_id: CteId = 9;
+    let producer_column = output_col(i32::MAX as u32 + 1, "p_k", DataType::Int64, false);
+    let producer_columns = vec![producer_column.clone()];
+    let produce = cte_produce_node(
+        cte_id,
+        producer_columns.clone(),
+        scan_node_with_columns(producer_columns),
+    );
+    let consume = cte_consume_node(cte_id, 2, vec![producer_column.column_id]);
+    let anchor = PhysicalPlanNode {
+        kind: PhysicalPlanKind::CTEAnchor(PlanCTEAnchorNode { cte_id }),
+        children: vec![produce, consume],
+        output_columns: vec![output_col(2, "c_k", DataType::Int64, false)],
+        stats: stats(),
+        probe_runtime_filters: vec![],
+    };
+
+    let err = build_distributed_plan(&anchor).expect_err("producer slot id overflow");
+
+    assert!(
+        err.contains("output column id c2147483648 cannot be encoded as stream output slot id"),
+        "unexpected error: {err}"
     );
 }
 

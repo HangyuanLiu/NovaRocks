@@ -13490,19 +13490,10 @@ fn nfe_3_native_planning_owners_are_named_explicitly() {
         }
     }
 
-    let delta_planning_path = repo.join("src/sql/codegen/scan/iceberg_delta.rs");
+    let delta_planning_path = repo.join("src/engine/mv/scan_binding.rs");
     let delta_encoder_path = repo.join("src/sql/codegen/proto_encode/iceberg_delta_scan.rs");
     if delta_planning_path.is_file() && delta_encoder_path.is_file() {
         let planning = fs::read_to_string(&delta_planning_path).unwrap();
-        let encoder = fs::read_to_string(&delta_encoder_path).unwrap();
-        if rust_named_function_declaration_count(&planning, "build_iceberg_delta_scan_runtime_plan")
-            != 1
-        {
-            violations.push(format!(
-                "{}: must own runtime-plan construction",
-                rel(&delta_planning_path)
-            ));
-        }
         if rust_named_function_declaration_count(&planning, "encode_iceberg_delta_scan_plan_native")
             != 0
         {
@@ -13511,15 +13502,10 @@ fn nfe_3_native_planning_owners_are_named_explicitly() {
                 rel(&delta_planning_path)
             ));
         }
-        if rust_named_function_declaration_count(&encoder, "encode_iceberg_delta_scan_plan_native")
-            != 1
-        {
-            violations.push(format!(
-                "{}: must own native Proto encoding",
-                rel(&delta_encoder_path)
-            ));
-        }
     }
+    violations.extend(cgo_8_delta_owner_violations(
+        &cgo_8_production_source_texts(repo),
+    ));
 
     let sql_sources = rs_files(&repo.join("src/sql"))
         .into_iter()
@@ -14268,16 +14254,9 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
             ));
         }
     }
-    let delta_owners = rust_named_declaration_owners(
-        &codegen_sources,
-        "build_iceberg_delta_scan_runtime_plan",
-        rust_named_function_declaration_count,
-    );
-    if delta_owners != ["src/sql/codegen/scan/iceberg_delta.rs (1)"] {
-        violations.push(format!(
-            "Iceberg delta runtime planner must have one final owner, got {delta_owners:?}"
-        ));
-    }
+    violations.extend(cgo_8_delta_owner_violations(
+        &cgo_8_production_source_texts(repo),
+    ));
 
     let fragment_build = fs::read_to_string(codegen_root.join("fragment/build.rs")).unwrap();
     let production = rust_sanitized_production_text(&fragment_build);
@@ -18325,5 +18304,2008 @@ fn coor_2_final_control_plane_ownership_is_non_vacuous() {
     assert_eq!(
         coordinator_hits, 0,
         "all ten coordinator production files must have zero audited thrift hits"
+    );
+}
+
+#[derive(Clone, Debug)]
+struct Cgo8GuardSource {
+    path: String,
+    text: String,
+}
+
+impl Cgo8GuardSource {
+    fn new(path: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            text: text.into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Cgo8Namespace {
+    Type,
+    Value,
+}
+
+fn cgo_8_ident_text(ident: &syn::Ident) -> String {
+    use syn::ext::IdentExt;
+    ident.unraw().to_string()
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Cgo8AstScope {
+    module_path: Vec<String>,
+    module_scope: bool,
+    type_bindings: BTreeMap<String, Vec<Vec<String>>>,
+    value_bindings: BTreeMap<String, Vec<Vec<String>>>,
+    glob_imports: Vec<Vec<String>>,
+    type_shadows: BTreeSet<String>,
+    value_shadows: BTreeSet<String>,
+}
+
+impl Cgo8AstScope {
+    fn nested(&self) -> Self {
+        let mut scope = self.clone();
+        scope.module_scope = false;
+        scope
+    }
+
+    fn resolve_unqualified(
+        &self,
+        segments: &[String],
+        namespace: Cgo8Namespace,
+        include_globs: bool,
+    ) -> Vec<Vec<String>> {
+        let Some(first) = segments.first() else {
+            return Vec::new();
+        };
+        let (bindings, shadows) = match namespace {
+            Cgo8Namespace::Type => (&self.type_bindings, &self.type_shadows),
+            Cgo8Namespace::Value => (&self.value_bindings, &self.value_shadows),
+        };
+        if shadows.contains(first) {
+            return Vec::new();
+        }
+        if let Some(targets) = bindings.get(first) {
+            return targets
+                .iter()
+                .map(|target| {
+                    let mut resolved = target.clone();
+                    resolved.extend_from_slice(&segments[1..]);
+                    resolved
+                })
+                .collect();
+        }
+        let mut resolved = vec![{
+            let mut path = self.module_path.clone();
+            path.extend_from_slice(segments);
+            path
+        }];
+        if include_globs {
+            resolved.extend(self.glob_imports.iter().map(|glob| {
+                let mut path = glob.clone();
+                path.extend_from_slice(segments);
+                path
+            }));
+        }
+        resolved
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Cgo8UseBinding {
+    local: Option<String>,
+    target: Vec<String>,
+    glob: bool,
+}
+
+fn cgo_8_expand_use_tree(
+    tree: &syn::UseTree,
+    prefix: &mut Vec<String>,
+    bindings: &mut Vec<Cgo8UseBinding>,
+) {
+    match tree {
+        syn::UseTree::Path(path) => {
+            prefix.push(cgo_8_ident_text(&path.ident));
+            cgo_8_expand_use_tree(&path.tree, prefix, bindings);
+            prefix.pop();
+        }
+        syn::UseTree::Name(name) => {
+            let is_self = cgo_8_ident_text(&name.ident) == "self";
+            let mut target = prefix.clone();
+            if !is_self {
+                target.push(cgo_8_ident_text(&name.ident));
+            }
+            bindings.push(Cgo8UseBinding {
+                local: Some(if is_self {
+                    prefix.last().cloned().unwrap_or_else(|| "self".to_string())
+                } else {
+                    cgo_8_ident_text(&name.ident)
+                }),
+                target,
+                glob: false,
+            });
+        }
+        syn::UseTree::Rename(rename) => {
+            let mut target = prefix.clone();
+            if cgo_8_ident_text(&rename.ident) != "self" {
+                target.push(cgo_8_ident_text(&rename.ident));
+            }
+            bindings.push(Cgo8UseBinding {
+                local: Some(cgo_8_ident_text(&rename.rename)),
+                target,
+                glob: false,
+            });
+        }
+        syn::UseTree::Glob(_) => bindings.push(Cgo8UseBinding {
+            local: None,
+            target: prefix.clone(),
+            glob: true,
+        }),
+        syn::UseTree::Group(group) => {
+            for item in &group.items {
+                cgo_8_expand_use_tree(item, prefix, bindings);
+            }
+        }
+    }
+}
+
+fn cgo_8_pattern_bindings(pattern: &syn::Pat, bindings: &mut BTreeSet<String>) {
+    match pattern {
+        syn::Pat::Ident(ident) => {
+            bindings.insert(cgo_8_ident_text(&ident.ident));
+            if let Some((_, subpat)) = &ident.subpat {
+                cgo_8_pattern_bindings(subpat, bindings);
+            }
+        }
+        syn::Pat::Reference(reference) => cgo_8_pattern_bindings(&reference.pat, bindings),
+        syn::Pat::Tuple(tuple) => {
+            for elem in &tuple.elems {
+                cgo_8_pattern_bindings(elem, bindings);
+            }
+        }
+        syn::Pat::TupleStruct(tuple) => {
+            for elem in &tuple.elems {
+                cgo_8_pattern_bindings(elem, bindings);
+            }
+        }
+        syn::Pat::Struct(item) => {
+            for field in &item.fields {
+                cgo_8_pattern_bindings(&field.pat, bindings);
+            }
+        }
+        syn::Pat::Slice(slice) => {
+            for elem in &slice.elems {
+                cgo_8_pattern_bindings(elem, bindings);
+            }
+        }
+        syn::Pat::Type(typed) => cgo_8_pattern_bindings(&typed.pat, bindings),
+        syn::Pat::Paren(paren) => cgo_8_pattern_bindings(&paren.pat, bindings),
+        syn::Pat::Or(or) => {
+            for case in &or.cases {
+                cgo_8_pattern_bindings(case, bindings);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn cgo_8_type_path(ty: &syn::Type) -> Option<&syn::TypePath> {
+    match ty {
+        syn::Type::Path(path) => Some(path),
+        syn::Type::Group(group) => cgo_8_type_path(&group.elem),
+        syn::Type::Paren(paren) => cgo_8_type_path(&paren.elem),
+        _ => None,
+    }
+}
+
+fn cgo_8_forbidden_mutable_canonical(path: &[String]) -> Option<&'static str> {
+    for (expected, name) in [
+        (
+            &["crate", "sql", "planner", "distributed", "DistributedPlan"][..],
+            "DistributedPlan",
+        ),
+        (
+            &["crate", "sql", "planner", "distributed", "DistributedNode"][..],
+            "DistributedNode",
+        ),
+        (
+            &["crate", "sql", "planner", "payload", "PlanScanNode"][..],
+            "PlanScanNode",
+        ),
+    ] {
+        if path.iter().map(String::as_str).eq(expected.iter().copied()) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+const CGO_8_FORBIDDEN_ENCODER_CALLS: &[&str] = &[
+    "build_iceberg_delta_scan_runtime_plan",
+    "plan_changes",
+    "load_table",
+    "version_scan_source",
+    "target_state_scan_source",
+    "target_locator_scan_source",
+];
+
+fn cgo_8_forbidden_encoder_call_name(name: &str) -> Option<&'static str> {
+    CGO_8_FORBIDDEN_ENCODER_CALLS
+        .iter()
+        .copied()
+        .find(|forbidden| *forbidden == name)
+}
+
+fn cgo_8_forbidden_call_canonical(path: &[String]) -> Option<&'static str> {
+    let leaf = path.last()?.as_str();
+    let owner = &path[..path.len() - 1];
+    match leaf {
+        "build_iceberg_delta_scan_runtime_plan"
+            if owner.ends_with(&[
+                "engine".to_string(),
+                "mv".to_string(),
+                "scan_binding".to_string(),
+            ]) =>
+        {
+            Some("build_iceberg_delta_scan_runtime_plan")
+        }
+        "plan_changes"
+            if owner.ends_with(&[
+                "connector".to_string(),
+                "iceberg".to_string(),
+                "changes".to_string(),
+            ]) =>
+        {
+            Some("plan_changes")
+        }
+        "version_scan_source" | "target_state_scan_source" | "target_locator_scan_source"
+            if owner.ends_with(&[
+                "engine".to_string(),
+                "mv".to_string(),
+                "refresh_context".to_string(),
+            ]) =>
+        {
+            Some(match leaf {
+                "version_scan_source" => "version_scan_source",
+                "target_state_scan_source" => "target_state_scan_source",
+                _ => "target_locator_scan_source",
+            })
+        }
+        "load_table" if owner.last().is_some_and(|segment| segment == "Catalog") => {
+            Some("load_table")
+        }
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct Cgo8MacroFindings {
+    identifiers: BTreeSet<String>,
+    paths: Vec<Vec<String>>,
+}
+
+fn cgo_8_scan_macro_cursor(mut cursor: syn::buffer::Cursor<'_>, findings: &mut Cgo8MacroFindings) {
+    let mut tokens = Vec::new();
+    let mut skip_metavariable_ident = false;
+    while !cursor.eof() {
+        if let Some((inside, _, _, after)) = cursor.any_group() {
+            cgo_8_scan_macro_cursor(inside, findings);
+            tokens.push("|".to_string());
+            skip_metavariable_ident = false;
+            cursor = after;
+        } else if let Some((_, after)) = cursor.lifetime() {
+            tokens.push("|".to_string());
+            skip_metavariable_ident = false;
+            cursor = after;
+        } else if let Some((ident, after)) = cursor.ident() {
+            let ident = cgo_8_ident_text(&ident);
+            if skip_metavariable_ident {
+                if ident == "crate" {
+                    findings.identifiers.insert(ident.clone());
+                    tokens.push(ident);
+                } else {
+                    tokens.push("|".to_string());
+                }
+            } else {
+                findings.identifiers.insert(ident.clone());
+                tokens.push(ident);
+            }
+            skip_metavariable_ident = false;
+            cursor = after;
+        } else if let Some((punct, after)) = cursor.punct() {
+            if punct.as_char() == '$' {
+                tokens.push("|".to_string());
+                skip_metavariable_ident = true;
+            } else {
+                tokens.push(punct.as_char().to_string());
+                skip_metavariable_ident = false;
+            }
+            cursor = after;
+        } else if let Some((_, after)) = cursor.literal() {
+            tokens.push("|".to_string());
+            skip_metavariable_ident = false;
+            cursor = after;
+        } else if let Some((_, after)) = cursor.token_tree() {
+            tokens.push("|".to_string());
+            skip_metavariable_ident = false;
+            cursor = after;
+        } else {
+            break;
+        }
+    }
+
+    let mut index = 0usize;
+    while index < tokens.len() {
+        if !tokens[index].chars().all(is_ident_char) {
+            index += 1;
+            continue;
+        }
+        let mut path = vec![tokens[index].clone()];
+        let mut next = index + 1;
+        while tokens.get(next).is_some_and(|token| token == ":")
+            && tokens.get(next + 1).is_some_and(|token| token == ":")
+            && tokens
+                .get(next + 2)
+                .is_some_and(|token| token.chars().all(is_ident_char))
+        {
+            path.push(tokens[next + 2].clone());
+            next += 3;
+        }
+        findings.paths.push(path);
+        index = next;
+    }
+}
+
+fn cgo_8_macro_findings(item: &syn::Macro) -> Cgo8MacroFindings {
+    let buffer = syn::buffer::TokenBuffer::new2(item.tokens.clone());
+    let mut findings = Cgo8MacroFindings::default();
+    cgo_8_scan_macro_cursor(buffer.begin(), &mut findings);
+    findings
+}
+
+#[derive(Default)]
+struct Cgo8AstResult {
+    violations: Vec<String>,
+    production_functions: usize,
+}
+
+struct Cgo8AstVisitor<'a> {
+    source: &'a str,
+    codegen: bool,
+    preparation: bool,
+    encoder: bool,
+    scopes: Vec<Cgo8AstScope>,
+    result: Cgo8AstResult,
+}
+
+impl<'a> Cgo8AstVisitor<'a> {
+    fn scope(&self) -> &Cgo8AstScope {
+        self.scopes.last().expect("CGO-8 AST scope must exist")
+    }
+
+    fn resolve_segments(&self, segments: &[String], namespace: Cgo8Namespace) -> Vec<Vec<String>> {
+        self.resolve_segments_with_globs(segments, namespace, true)
+    }
+
+    fn resolve_segments_with_globs(
+        &self,
+        segments: &[String],
+        namespace: Cgo8Namespace,
+        include_globs: bool,
+    ) -> Vec<Vec<String>> {
+        let Some(first) = segments.first() else {
+            return Vec::new();
+        };
+        if first == "crate" {
+            return vec![segments.to_vec()];
+        }
+        let mut index = 0usize;
+        let mut module_path = self.scope().module_path.clone();
+        let explicit_module = if first == "self" {
+            index = 1;
+            true
+        } else {
+            while segments
+                .get(index)
+                .is_some_and(|segment| segment == "super")
+            {
+                module_path.pop();
+                index += 1;
+            }
+            index > 0
+        };
+        if explicit_module {
+            let remainder = &segments[index..];
+            if remainder.is_empty() {
+                return vec![module_path];
+            }
+            if let Some(module_scope) = self
+                .scopes
+                .iter()
+                .rev()
+                .find(|scope| scope.module_scope && scope.module_path == module_path)
+            {
+                return module_scope.resolve_unqualified(remainder, namespace, include_globs);
+            }
+            module_path.extend_from_slice(remainder);
+            return vec![module_path];
+        }
+        self.scope()
+            .resolve_unqualified(segments, namespace, include_globs)
+    }
+
+    fn resolve_path(&self, path: &syn::Path, namespace: Cgo8Namespace) -> Vec<Vec<String>> {
+        self.resolve_segments(
+            &path
+                .segments
+                .iter()
+                .map(|segment| cgo_8_ident_text(&segment.ident))
+                .collect::<Vec<_>>(),
+            namespace,
+        )
+    }
+
+    fn normalize_scope_bindings(&mut self) {
+        let scope = self.scopes.last_mut().unwrap();
+        for targets in scope
+            .type_bindings
+            .values_mut()
+            .chain(scope.value_bindings.values_mut())
+        {
+            targets.sort();
+            targets.dedup();
+        }
+        scope.glob_imports.sort();
+        scope.glob_imports.dedup();
+    }
+
+    fn register_use(&mut self, item: &syn::ItemUse) {
+        let mut raw = Vec::new();
+        cgo_8_expand_use_tree(&item.tree, &mut Vec::new(), &mut raw);
+        for binding in raw {
+            let type_targets =
+                self.resolve_segments_with_globs(&binding.target, Cgo8Namespace::Type, false);
+            let value_targets =
+                self.resolve_segments_with_globs(&binding.target, Cgo8Namespace::Value, false);
+            let mut all_targets = type_targets
+                .iter()
+                .chain(&value_targets)
+                .cloned()
+                .collect::<Vec<_>>();
+            all_targets.sort();
+            all_targets.dedup();
+            for target in &all_targets {
+                if self.codegen
+                    && (cgo_8_refresh_context_path(target)
+                        || binding.glob && cgo_8_refresh_context_glob_ancestor(target))
+                {
+                    self.result.violations.push(format!(
+                        "refresh-context: {} imports `{}`",
+                        self.source,
+                        target.join("::")
+                    ));
+                }
+            }
+            let scope = self.scopes.last_mut().unwrap();
+            if binding.glob {
+                scope.glob_imports.extend(all_targets);
+            } else if let Some(local) = binding.local {
+                scope.type_shadows.remove(&local);
+                scope.value_shadows.remove(&local);
+                scope.type_bindings.insert(local.clone(), type_targets);
+                scope.value_bindings.insert(local, value_targets);
+            }
+        }
+    }
+
+    fn register_item_declaration(&mut self, item: &syn::Item) {
+        match item {
+            syn::Item::Struct(item) => {
+                self.scopes
+                    .last_mut()
+                    .unwrap()
+                    .type_shadows
+                    .insert(cgo_8_ident_text(&item.ident));
+            }
+            syn::Item::Enum(item) => {
+                self.scopes
+                    .last_mut()
+                    .unwrap()
+                    .type_shadows
+                    .insert(cgo_8_ident_text(&item.ident));
+            }
+            syn::Item::Union(item) => {
+                self.scopes
+                    .last_mut()
+                    .unwrap()
+                    .type_shadows
+                    .insert(cgo_8_ident_text(&item.ident));
+            }
+            syn::Item::Trait(item) => {
+                self.scopes
+                    .last_mut()
+                    .unwrap()
+                    .type_shadows
+                    .insert(cgo_8_ident_text(&item.ident));
+            }
+            syn::Item::Mod(item) => {
+                self.scopes
+                    .last_mut()
+                    .unwrap()
+                    .type_shadows
+                    .insert(cgo_8_ident_text(&item.ident));
+            }
+            syn::Item::Fn(item) => {
+                self.scopes
+                    .last_mut()
+                    .unwrap()
+                    .value_shadows
+                    .insert(cgo_8_ident_text(&item.sig.ident));
+            }
+            syn::Item::Const(item) => {
+                self.scopes
+                    .last_mut()
+                    .unwrap()
+                    .value_shadows
+                    .insert(cgo_8_ident_text(&item.ident));
+            }
+            syn::Item::Static(item) => {
+                self.scopes
+                    .last_mut()
+                    .unwrap()
+                    .value_shadows
+                    .insert(cgo_8_ident_text(&item.ident));
+            }
+            _ => {}
+        };
+    }
+
+    fn register_type_alias(&mut self, item: &syn::ItemType) {
+        let local = cgo_8_ident_text(&item.ident);
+        let targets = cgo_8_type_path(&item.ty)
+            .map(|path| self.resolve_path(&path.path, Cgo8Namespace::Type))
+            .unwrap_or_default();
+        for target in &targets {
+            if self.codegen && cgo_8_refresh_context_path(target) {
+                self.result.violations.push(format!(
+                    "refresh-context: {} references `{}`",
+                    self.source,
+                    target.join("::")
+                ));
+            }
+        }
+        let scope = self.scopes.last_mut().unwrap();
+        if targets.is_empty() {
+            scope.type_shadows.insert(local.clone());
+            scope.type_bindings.remove(&local);
+        } else {
+            scope.type_shadows.remove(&local);
+            scope.type_bindings.insert(local, targets);
+        }
+    }
+
+    fn register_items<'b>(&mut self, items: impl IntoIterator<Item = &'b syn::Item>) {
+        let items = items
+            .into_iter()
+            .filter(|item| !nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)))
+            .collect::<Vec<_>>();
+        for item in &items {
+            self.register_item_declaration(item);
+        }
+        let alias_items = items
+            .iter()
+            .filter(|item| matches!(item, syn::Item::Use(_) | syn::Item::Type(_)))
+            .copied()
+            .collect::<Vec<_>>();
+        for _ in 0..=alias_items.len() {
+            let before = self.scope().clone();
+            for item in &alias_items {
+                match item {
+                    syn::Item::Use(item) => self.register_use(item),
+                    syn::Item::Type(item) => self.register_type_alias(item),
+                    _ => unreachable!(),
+                }
+            }
+            self.normalize_scope_bindings();
+            if *self.scope() == before {
+                break;
+            }
+        }
+    }
+
+    fn analyze_signature(&mut self, signature: &syn::Signature) {
+        if !self.preparation {
+            return;
+        }
+        for input in &signature.inputs {
+            let syn::FnArg::Typed(input) = input else {
+                continue;
+            };
+            if nfe_4_syn_attrs_require_test(&input.attrs) {
+                continue;
+            }
+            let syn::Type::Reference(reference) = input.ty.as_ref() else {
+                continue;
+            };
+            if reference.mutability.is_none() {
+                continue;
+            }
+            let Some(path) = cgo_8_type_path(&reference.elem) else {
+                continue;
+            };
+            for canonical in self.resolve_path(&path.path, Cgo8Namespace::Type) {
+                if let Some(forbidden) = cgo_8_forbidden_mutable_canonical(&canonical) {
+                    self.result.violations.push(format!(
+                        "mutable-plan: {}: function `{}` accepts &mut {forbidden}",
+                        self.source,
+                        cgo_8_ident_text(&signature.ident)
+                    ));
+                }
+            }
+        }
+    }
+
+    fn enter_function(&mut self, signature: &syn::Signature) {
+        self.result.production_functions += 1;
+        let mut scope = self.scope().nested();
+        for parameter in &signature.generics.params {
+            if let syn::GenericParam::Type(parameter) = parameter
+                && !nfe_4_syn_attrs_require_test(&parameter.attrs)
+            {
+                let name = cgo_8_ident_text(&parameter.ident);
+                scope.type_bindings.remove(&name);
+                scope.type_shadows.insert(name);
+            }
+        }
+        for input in &signature.inputs {
+            if let syn::FnArg::Typed(input) = input
+                && !nfe_4_syn_attrs_require_test(&input.attrs)
+            {
+                cgo_8_pattern_bindings(&input.pat, &mut scope.value_shadows);
+            }
+        }
+        self.scopes.push(scope);
+        self.analyze_signature(signature);
+    }
+
+    fn analyze_call_path(&mut self, path: &syn::Path) {
+        if !self.encoder {
+            return;
+        }
+        for canonical in self.resolve_path(path, Cgo8Namespace::Value) {
+            if let Some(forbidden) = cgo_8_forbidden_call_canonical(&canonical) {
+                self.result.violations.push(format!(
+                    "encoder-planning: {} calls `{forbidden}`",
+                    self.source
+                ));
+            }
+        }
+    }
+
+    fn record_encoder_call(&mut self, forbidden: &str) {
+        self.result.violations.push(format!(
+            "encoder-planning: {} calls `{forbidden}`",
+            self.source
+        ));
+    }
+
+    fn analyze_refresh_path(&mut self, path: &syn::Path, namespace: Cgo8Namespace) {
+        if !self.codegen {
+            return;
+        }
+        for canonical in self.resolve_path(path, namespace) {
+            if cgo_8_refresh_context_path(&canonical) {
+                self.result.violations.push(format!(
+                    "refresh-context: {} references `{}`",
+                    self.source,
+                    canonical.join("::")
+                ));
+            }
+        }
+    }
+
+    fn visit_condition_with_bindings(&mut self, condition: &syn::Expr) {
+        use syn::visit::Visit;
+
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_expr_attrs(condition)) {
+            return;
+        }
+        match condition {
+            syn::Expr::Binary(binary) if matches!(binary.op, syn::BinOp::And(_)) => {
+                self.visit_condition_with_bindings(&binary.left);
+                self.visit_condition_with_bindings(&binary.right);
+            }
+            syn::Expr::Let(let_expr) => {
+                self.visit_expr(&let_expr.expr);
+                self.visit_pat(&let_expr.pat);
+                cgo_8_pattern_bindings(
+                    &let_expr.pat,
+                    &mut self.scopes.last_mut().unwrap().value_shadows,
+                );
+            }
+            syn::Expr::Group(group) => self.visit_condition_with_bindings(&group.expr),
+            syn::Expr::Paren(paren) => self.visit_condition_with_bindings(&paren.expr),
+            _ => self.visit_expr(condition),
+        }
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for Cgo8AstVisitor<'_> {
+    fn visit_file(&mut self, file: &'ast syn::File) {
+        if nfe_4_syn_attrs_require_test(&file.attrs) {
+            return;
+        }
+        self.register_items(&file.items);
+        for item in &file.items {
+            self.visit_item(item);
+        }
+    }
+
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+            return;
+        }
+        match item {
+            syn::Item::Use(_) | syn::Item::Type(_) => {}
+            syn::Item::Mod(module) => {
+                if let Some((_, items)) = &module.content {
+                    let mut scope = Cgo8AstScope {
+                        module_path: {
+                            let mut path = self.scope().module_path.clone();
+                            path.push(cgo_8_ident_text(&module.ident));
+                            path
+                        },
+                        module_scope: true,
+                        ..Default::default()
+                    };
+                    scope.type_shadows.insert(cgo_8_ident_text(&module.ident));
+                    self.scopes.push(scope);
+                    self.register_items(items);
+                    for item in items {
+                        self.visit_item(item);
+                    }
+                    self.scopes.pop();
+                }
+            }
+            _ => syn::visit::visit_item(self, item),
+        }
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        if nfe_4_syn_attrs_require_test(&item.attrs) {
+            return;
+        }
+        self.enter_function(&item.sig);
+        self.visit_block(&item.block);
+        self.scopes.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        if nfe_4_syn_attrs_require_test(&item.attrs) {
+            return;
+        }
+        self.enter_function(&item.sig);
+        self.visit_block(&item.block);
+        self.scopes.pop();
+    }
+
+    fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
+        if nfe_4_syn_attrs_require_test(&item.attrs) {
+            return;
+        }
+        self.enter_function(&item.sig);
+        if let Some(block) = &item.default {
+            self.visit_block(block);
+        }
+        self.scopes.pop();
+    }
+
+    fn visit_block(&mut self, block: &'ast syn::Block) {
+        self.scopes.push(self.scope().nested());
+        let items = block.stmts.iter().filter_map(|stmt| match stmt {
+            syn::Stmt::Item(item) => Some(item),
+            _ => None,
+        });
+        self.register_items(items);
+        for stmt in &block.stmts {
+            self.visit_stmt(stmt);
+            if let syn::Stmt::Local(local) = stmt {
+                if nfe_4_syn_attrs_require_test(&local.attrs) {
+                    continue;
+                }
+                cgo_8_pattern_bindings(
+                    &local.pat,
+                    &mut self.scopes.last_mut().unwrap().value_shadows,
+                );
+            }
+        }
+        self.scopes.pop();
+    }
+
+    fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_expr_attrs(expr)) {
+            return;
+        }
+        syn::visit::visit_expr(self, expr);
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_impl_item_attrs(item)) {
+            return;
+        }
+        syn::visit::visit_impl_item(self, item);
+    }
+
+    fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_trait_item_attrs(item)) {
+            return;
+        }
+        syn::visit::visit_trait_item(self, item);
+    }
+
+    fn visit_foreign_item(&mut self, item: &'ast syn::ForeignItem) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_foreign_item_attrs(item)) {
+            return;
+        }
+        syn::visit::visit_foreign_item(self, item);
+    }
+
+    fn visit_stmt(&mut self, stmt: &'ast syn::Stmt) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_stmt_attrs(stmt)) {
+            return;
+        }
+        syn::visit::visit_stmt(self, stmt);
+    }
+
+    fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+        if nfe_4_syn_attrs_require_test(&arm.attrs) {
+            return;
+        }
+        self.scopes.push(self.scope().nested());
+        cgo_8_pattern_bindings(&arm.pat, &mut self.scopes.last_mut().unwrap().value_shadows);
+        self.visit_pat(&arm.pat);
+        if let Some((_, guard)) = &arm.guard {
+            self.visit_expr(guard);
+        }
+        self.visit_expr(&arm.body);
+        self.scopes.pop();
+    }
+
+    fn visit_field(&mut self, field: &'ast syn::Field) {
+        if nfe_4_syn_attrs_require_test(&field.attrs) {
+            return;
+        }
+        syn::visit::visit_field(self, field);
+    }
+
+    fn visit_variant(&mut self, variant: &'ast syn::Variant) {
+        if nfe_4_syn_attrs_require_test(&variant.attrs) {
+            return;
+        }
+        syn::visit::visit_variant(self, variant);
+    }
+
+    fn visit_field_value(&mut self, field: &'ast syn::FieldValue) {
+        if nfe_4_syn_attrs_require_test(&field.attrs) {
+            return;
+        }
+        syn::visit::visit_field_value(self, field);
+    }
+
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(function) = call.func.as_ref() {
+            if (function.qself.is_some() || function.path.segments.len() > 1)
+                && let Some(leaf) = function.path.segments.last()
+                && let Some(forbidden) =
+                    cgo_8_forbidden_encoder_call_name(&cgo_8_ident_text(&leaf.ident))
+                && self.encoder
+            {
+                self.record_encoder_call(forbidden);
+            }
+            if function.qself.is_none() {
+                self.analyze_call_path(&function.path);
+            }
+        }
+        syn::visit::visit_expr_call(self, call);
+    }
+
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        self.analyze_refresh_path(path, Cgo8Namespace::Type);
+        self.analyze_refresh_path(path, Cgo8Namespace::Value);
+        syn::visit::visit_path(self, path);
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        if self.encoder {
+            let method = cgo_8_ident_text(&call.method);
+            if let Some(forbidden) = cgo_8_forbidden_encoder_call_name(&method) {
+                self.record_encoder_call(forbidden);
+            }
+        }
+        syn::visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_expr_closure(&mut self, closure: &'ast syn::ExprClosure) {
+        self.scopes.push(self.scope().nested());
+        for input in &closure.inputs {
+            cgo_8_pattern_bindings(input, &mut self.scopes.last_mut().unwrap().value_shadows);
+        }
+        syn::visit::visit_expr_closure(self, closure);
+        self.scopes.pop();
+    }
+
+    fn visit_expr_for_loop(&mut self, loop_expr: &'ast syn::ExprForLoop) {
+        self.visit_expr(&loop_expr.expr);
+        self.scopes.push(self.scope().nested());
+        cgo_8_pattern_bindings(
+            &loop_expr.pat,
+            &mut self.scopes.last_mut().unwrap().value_shadows,
+        );
+        self.visit_pat(&loop_expr.pat);
+        self.visit_block(&loop_expr.body);
+        self.scopes.pop();
+    }
+
+    fn visit_expr_if(&mut self, if_expr: &'ast syn::ExprIf) {
+        self.scopes.push(self.scope().nested());
+        self.visit_condition_with_bindings(&if_expr.cond);
+        self.visit_block(&if_expr.then_branch);
+        self.scopes.pop();
+        if let Some((_, otherwise)) = &if_expr.else_branch {
+            self.visit_expr(otherwise);
+        }
+    }
+
+    fn visit_expr_while(&mut self, while_expr: &'ast syn::ExprWhile) {
+        self.scopes.push(self.scope().nested());
+        self.visit_condition_with_bindings(&while_expr.cond);
+        self.visit_block(&while_expr.body);
+        self.scopes.pop();
+    }
+
+    fn visit_macro(&mut self, item: &'ast syn::Macro) {
+        let findings = cgo_8_macro_findings(item);
+        if self.codegen {
+            let exact_type = findings.identifiers.contains("IcebergMvRefreshContext");
+            let refresh_path = findings
+                .paths
+                .iter()
+                .any(|path| cgo_8_refresh_context_path(path));
+            if exact_type || refresh_path {
+                self.result.violations.push(format!(
+                    "refresh-context: {} references refresh context in macro tokens",
+                    self.source
+                ));
+            }
+        }
+        if self.encoder {
+            for path in &findings.paths {
+                for canonical in self.resolve_segments(path, Cgo8Namespace::Value) {
+                    if let Some(forbidden) = cgo_8_forbidden_call_canonical(&canonical) {
+                        self.record_encoder_call(forbidden);
+                    }
+                }
+            }
+            for &forbidden in CGO_8_FORBIDDEN_ENCODER_CALLS {
+                if findings.identifiers.contains(forbidden) {
+                    self.result.violations.push(format!(
+                        "encoder-planning: {} macro tokens reference `{forbidden}`",
+                        self.source
+                    ));
+                }
+            }
+        }
+        syn::visit::visit_macro(self, item);
+    }
+}
+
+fn cgo_8_ast_analysis(source: &Cgo8GuardSource) -> Result<Cgo8AstResult, String> {
+    use syn::visit::Visit;
+    let file = syn::parse_file(&source.text)
+        .map_err(|error| format!("{}: production Rust AST parse failed: {error}", source.path))?;
+    let mut visitor = Cgo8AstVisitor {
+        source: &source.path,
+        codegen: source.path.starts_with("src/sql/codegen/"),
+        preparation: source.path == "src/sql/codegen/scan/preparation.rs",
+        encoder: source.path.starts_with("src/sql/codegen/proto_encode/"),
+        scopes: vec![Cgo8AstScope {
+            module_path: rust_source_module_segments(&source.path)
+                .unwrap_or_else(|| vec!["crate".to_string()]),
+            module_scope: true,
+            ..Default::default()
+        }],
+        result: Cgo8AstResult::default(),
+    };
+    visitor.visit_file(&file);
+    if visitor.codegen
+        && rust_use_tokens(&rust_sanitized_production_text(&source.text))
+            .iter()
+            .any(|token| token == "IcebergMvRefreshContext")
+    {
+        visitor.result.violations.push(format!(
+            "refresh-context: {} references or declares `IcebergMvRefreshContext`",
+            source.path
+        ));
+    }
+    visitor.result.violations.sort();
+    visitor.result.violations.dedup();
+    Ok(visitor.result)
+}
+
+fn cgo_8_refresh_context_path(path: &[String]) -> bool {
+    const TARGET: &[&str] = &["crate", "engine", "mv", "refresh_context"];
+    let path = path.iter().map(String::as_str).collect::<Vec<_>>();
+    path.starts_with(TARGET)
+}
+
+fn cgo_8_refresh_context_glob_ancestor(path: &[String]) -> bool {
+    const TARGET: &[&str] = &["crate", "engine", "mv", "refresh_context"];
+    let path = path.iter().map(String::as_str).collect::<Vec<_>>();
+    TARGET.starts_with(&path)
+}
+
+fn cgo_8_production_source_texts(repo: &Path) -> Vec<(String, String)> {
+    let src = repo.join("src");
+    production_rs_files_from_entries(&src, &[src.join("lib.rs"), src.join("main.rs")])
+        .into_iter()
+        .map(|path| {
+            (
+                rel(&path),
+                fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("read {}: {error}", path.display())),
+            )
+        })
+        .collect()
+}
+
+fn cgo_8_delta_owner_violations(sources: &[(String, String)]) -> Vec<String> {
+    let mut violations = Vec::new();
+    for (symbol, expected, class) in [
+        (
+            "build_iceberg_delta_scan_runtime_plan",
+            "src/engine/mv/scan_binding.rs (1)",
+            "delta-planner-owner",
+        ),
+        (
+            "encode_iceberg_delta_scan_plan_native",
+            "src/sql/codegen/proto_encode/iceberg_delta_scan.rs (1)",
+            "delta-encoder-owner",
+        ),
+    ] {
+        let owners =
+            rust_named_declaration_owners(sources, symbol, rust_named_function_declaration_count);
+        if owners != [expected] {
+            violations.push(format!(
+                "{class}: `{symbol}` must have exactly one production owner `{expected}`, got {owners:?}"
+            ));
+        }
+    }
+    violations
+}
+
+fn cgo_8_immutable_scan_preparation_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
+    const RETIRED_NAMES: &[&str] = &[
+        "refresh_distributed_plan_for_fragment_build",
+        "refresh_distributed_node_scan_tables_for_native",
+        "refresh_scan_table_for_codegen",
+        "lower_native_fragment_edges",
+    ];
+    let codegen = sources
+        .iter()
+        .filter(|source| source.path.starts_with("src/sql/codegen/"))
+        .collect::<Vec<_>>();
+    let preparation = sources
+        .iter()
+        .filter(|source| source.path == "src/sql/codegen/scan/preparation.rs")
+        .collect::<Vec<_>>();
+    let encoders = sources
+        .iter()
+        .filter(|source| source.path.starts_with("src/sql/codegen/proto_encode/"))
+        .collect::<Vec<_>>();
+    let mut violations = Vec::new();
+    for (owner, collection) in [
+        ("production", sources.len()),
+        ("codegen", codegen.len()),
+        ("scan preparation", preparation.len()),
+        ("encoder", encoders.len()),
+    ] {
+        if collection == 0 {
+            violations.push(format!("{owner} owner set is empty"));
+        }
+    }
+
+    let prepared_sources = sources
+        .iter()
+        .map(|source| {
+            let production = rust_sanitized_production_text(&source.text);
+            let tokens = rust_use_tokens(&production);
+            (source, tokens)
+        })
+        .collect::<Vec<_>>();
+    let owner_sources = sources
+        .iter()
+        .map(|source| (source.path.clone(), source.text.clone()))
+        .collect::<Vec<_>>();
+    violations.extend(cgo_8_delta_owner_violations(&owner_sources));
+
+    for (source, tokens) in &prepared_sources {
+        for retired in RETIRED_NAMES {
+            if tokens.iter().any(|token| token == retired) {
+                violations.push(format!(
+                    "retired-name: {} references `{retired}`",
+                    source.path
+                ));
+            }
+        }
+    }
+
+    let mut preparation_functions = 0usize;
+    let mut encoder_functions = 0usize;
+    for source in sources {
+        match cgo_8_ast_analysis(source) {
+            Ok(result) => {
+                violations.extend(result.violations);
+                if source.path == "src/sql/codegen/scan/preparation.rs" {
+                    preparation_functions += result.production_functions;
+                }
+                if source.path.starts_with("src/sql/codegen/proto_encode/") {
+                    encoder_functions += result.production_functions;
+                }
+            }
+            Err(error) => violations.push(format!("ast-parse: {error}")),
+        }
+    }
+    if !sources.is_empty() && preparation_functions == 0 {
+        violations.push("scan preparation production function owner set is empty".to_string());
+    }
+
+    if !sources.is_empty() && encoder_functions == 0 {
+        violations.push("encoder production function owner set is empty".to_string());
+    }
+
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+fn cgo_8_fixture_sources(preparation: &str, encoder: &str, other: &str) -> Vec<Cgo8GuardSource> {
+    vec![
+        Cgo8GuardSource::new("src/sql/codegen/scan/preparation.rs", preparation),
+        Cgo8GuardSource::new("src/sql/codegen/proto_encode/plan.rs", encoder),
+        Cgo8GuardSource::new("src/lib.rs", other),
+        Cgo8GuardSource::new(
+            "src/engine/mv/scan_binding.rs",
+            "fn build_iceberg_delta_scan_runtime_plan() {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/sql/codegen/proto_encode/iceberg_delta_scan.rs",
+            "fn encode_iceberg_delta_scan_plan_native() {}",
+        ),
+    ]
+}
+
+#[test]
+fn cgo_8_detector_is_source_aware_and_covers_each_guard_class() {
+    let cases = [
+        (
+            "codegen refresh context dependency",
+            cgo_8_fixture_sources(
+                "use crate::engine::mv::refresh_context::IcebergMvRefreshContext;",
+                "pub(crate) fn encode() {}",
+                "pub fn root() {}",
+            ),
+            "refresh-context",
+        ),
+        (
+            "mutable scan preparation signature",
+            cgo_8_fixture_sources(
+                "use crate::sql::planner::distributed::DistributedPlan; pub(crate) fn prepare_scan_bindings(plan: &mut DistributedPlan) {}",
+                "pub(crate) fn encode() {}",
+                "pub fn root() {}",
+            ),
+            "mutable-plan",
+        ),
+        (
+            "retired production helper",
+            cgo_8_fixture_sources(
+                "pub(crate) fn prepare_scan_bindings() {}",
+                "pub(crate) fn encode() {}",
+                "fn lower_native_fragment_edges() {}",
+            ),
+            "retired-name",
+        ),
+        (
+            "encoder runtime planning call",
+            cgo_8_fixture_sources(
+                "pub(crate) fn prepare_scan_bindings() {}",
+                "use crate::engine::mv::scan_binding::build_iceberg_delta_scan_runtime_plan; pub(crate) fn encode() { build_iceberg_delta_scan_runtime_plan(); }",
+                "pub fn root() {}",
+            ),
+            "encoder-planning",
+        ),
+    ];
+
+    for (case, sources, expected_class) in cases {
+        let violations = cgo_8_immutable_scan_preparation_violations(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected_class)),
+            "{case} was not detected: {violations:?}"
+        );
+    }
+
+    for forbidden in ["DistributedPlan", "DistributedNode", "PlanScanNode"] {
+        let owner = if forbidden == "PlanScanNode" {
+            "payload"
+        } else {
+            "distributed"
+        };
+        let sources = cgo_8_fixture_sources(
+            &format!(
+                "use crate::sql::planner::{owner}::{forbidden}; fn prepare(value: &mut {forbidden}) {{}}"
+            ),
+            "fn encode() {}",
+            "fn root() {}",
+        );
+        assert!(
+            cgo_8_immutable_scan_preparation_violations(&sources)
+                .iter()
+                .any(|violation| violation.contains("mutable-plan")),
+            "mutable preparation parameter `{forbidden}` must be rejected"
+        );
+    }
+    for retired in [
+        "refresh_distributed_plan_for_fragment_build",
+        "refresh_distributed_node_scan_tables_for_native",
+        "refresh_scan_table_for_codegen",
+        "lower_native_fragment_edges",
+    ] {
+        let sources = cgo_8_fixture_sources(
+            "fn prepare() {}",
+            "fn encode() {}",
+            &format!("fn root() {{ {retired}(); }}"),
+        );
+        assert!(
+            cgo_8_immutable_scan_preparation_violations(&sources)
+                .iter()
+                .any(|violation| violation.contains("retired-name")),
+            "retired helper `{retired}` must be rejected"
+        );
+    }
+    for forbidden in [
+        "build_iceberg_delta_scan_runtime_plan",
+        "plan_changes",
+        "load_table",
+        "version_scan_source",
+        "target_state_scan_source",
+        "target_locator_scan_source",
+    ] {
+        let receiver = if forbidden == "load_table" {
+            "catalog"
+        } else {
+            "owner"
+        };
+        let sources = cgo_8_fixture_sources(
+            "fn prepare() {}",
+            &format!("fn encode() {{ {receiver}.{forbidden}(); }}"),
+            "fn root() {}",
+        );
+        assert!(
+            cgo_8_immutable_scan_preparation_violations(&sources)
+                .iter()
+                .any(|violation| violation.contains("encoder-planning")),
+            "encoder planning call `{forbidden}` must be rejected"
+        );
+    }
+
+    let clean = cgo_8_fixture_sources(
+        "pub(crate) fn prepare_scan_bindings(plan: &DistributedPlan) {}",
+        "pub(crate) fn encode(prepared: &PreparedScanBindings) {}",
+        "pub fn root() {}",
+    );
+    assert!(
+        cgo_8_immutable_scan_preparation_violations(&clean).is_empty(),
+        "clean fixture must pass"
+    );
+
+    let noise = cgo_8_fixture_sources(
+        r#"
+pub(crate) fn prepare_scan_bindings(plan: &DistributedPlan) {}
+// use crate::engine::mv::refresh_context::IcebergMvRefreshContext;
+// fn commented_out(plan: &mut PlanScanNode) {}
+const NOTE: &str = "IcebergMvRefreshContext fn prepare(plan: &mut DistributedPlan)";
+#[cfg(test)]
+use crate::engine::mv::refresh_context::IcebergMvRefreshContext;
+#[cfg(test)]
+fn prepare_for_test(node: &mut DistributedNode) {
+    refresh_distributed_plan_for_fragment_build();
+}
+"#,
+        r#"
+pub(crate) fn encode() {}
+// plan_changes();
+const NOTE: &str = "load_table";
+#[cfg(test)]
+fn test_only_encoder() {
+    build_iceberg_delta_scan_runtime_plan();
+}
+"#,
+        r#"
+pub fn root() {}
+// refresh_scan_table_for_codegen();
+const NOTE: &str = "lower_native_fragment_edges";
+#[cfg(test)]
+fn retired_test_helper() { lower_native_fragment_edges(); }
+"#,
+    );
+    let noise_violations = cgo_8_immutable_scan_preparation_violations(&noise);
+    assert!(
+        noise_violations.is_empty(),
+        "comments, strings, and cfg(test) items must not trip guards: {noise_violations:?}"
+    );
+}
+
+#[test]
+fn cgo_8_detector_rejects_vacuous_owner_sets() {
+    let violations = cgo_8_immutable_scan_preparation_violations(&[]);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("owner set is empty")),
+        "empty owner collections must fail closed: {violations:?}"
+    );
+
+    let missing_encoder = [Cgo8GuardSource::new(
+        "src/sql/codegen/scan/preparation.rs",
+        "fn prepare() {}",
+    )];
+    assert!(
+        cgo_8_immutable_scan_preparation_violations(&missing_encoder)
+            .iter()
+            .any(|violation| violation == "encoder owner set is empty"),
+        "missing encoder owners must fail closed"
+    );
+}
+
+#[test]
+fn cgo_8_detector_closes_alias_generic_and_owner_bypasses() {
+    let generic_bound_is_not_a_parameter = cgo_8_fixture_sources(
+        "use crate::sql::planner::distributed::DistributedPlan; fn prepare<F: Fn(&mut DistributedPlan)>(plan: &DistributedPlan) where F: Fn(&mut DistributedPlan) {}",
+        "fn encode() {}",
+        "fn root() {}",
+    );
+    assert!(
+        cgo_8_immutable_scan_preparation_violations(&generic_bound_is_not_a_parameter).is_empty(),
+        "generic bounds before the real parameter list must not be mistaken for parameters"
+    );
+
+    for (label, preparation) in [
+        (
+            "direct canonical type",
+            "fn prepare(plan: &mut crate::sql::planner::distributed::DistributedPlan) {}",
+        ),
+        (
+            "grouped type alias",
+            "use crate::sql::planner::distributed::{DistributedPlan as DP}; fn prepare(plan: &mut DP) {}",
+        ),
+        (
+            "module alias",
+            "use crate::sql::planner::distributed as dp; fn prepare(plan: &mut dp::DistributedNode) {}",
+        ),
+        (
+            "glob import",
+            "use crate::sql::planner::distributed::*; fn prepare(plan: &mut DistributedPlan) {}",
+        ),
+    ] {
+        let sources = cgo_8_fixture_sources(preparation, "fn encode() {}", "fn root() {}");
+        let violations = cgo_8_immutable_scan_preparation_violations(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("mutable-plan")),
+            "{label} bypassed mutable signature guard: {violations:?}"
+        );
+    }
+
+    let function_pointer_only = cgo_8_fixture_sources(
+        "use crate::sql::planner::distributed::DistributedPlan; type Prepare = fn(&mut DistributedPlan);",
+        "fn encode() {}",
+        "fn root() {}",
+    );
+    assert!(
+        cgo_8_immutable_scan_preparation_violations(&function_pointer_only)
+            .iter()
+            .any(|violation| violation == "scan preparation production function owner set is empty"),
+        "a function-pointer type must not satisfy the preparation function owner set"
+    );
+
+    for (label, codegen) in [
+        (
+            "grouped refresh module alias",
+            "use crate::engine::mv::{refresh_context as refresh}; type Leak = refresh::Hidden;",
+        ),
+        (
+            "refresh module alias chain",
+            "use crate::engine as engine_alias; use engine_alias::mv as mv_alias; use mv_alias::refresh_context as refresh; type Leak = refresh::Hidden;",
+        ),
+        (
+            "refresh wildcard",
+            "use crate::engine::*; type Leak = mv::refresh_context::Hidden;",
+        ),
+    ] {
+        let sources = cgo_8_fixture_sources("fn prepare() {}", "fn encode() {}", codegen)
+            .into_iter()
+            .map(|source| {
+                if source.path == "src/lib.rs" {
+                    Cgo8GuardSource::new("src/sql/codegen/alias_probe.rs", source.text)
+                } else {
+                    source
+                }
+            })
+            .collect::<Vec<_>>();
+        let violations = cgo_8_immutable_scan_preparation_violations(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("refresh-context")),
+            "{label} bypassed refresh-context guard: {violations:?}"
+        );
+    }
+
+    for (label, encoder) in [
+        (
+            "generic direct call",
+            "use crate::engine::mv::scan_binding::build_iceberg_delta_scan_runtime_plan; fn encode() { build_iceberg_delta_scan_runtime_plan::<Mode>(); }",
+        ),
+        (
+            "grouped imported alias call",
+            "use crate::engine::mv::scan_binding::{build_iceberg_delta_scan_runtime_plan as build_delta}; fn encode() { build_delta(); }",
+        ),
+        (
+            "qualified generic alias call",
+            "use crate::connector::iceberg::changes as changes; fn encode() { changes::plan_changes::<Mode>(); }",
+        ),
+        (
+            "multiline method call",
+            "fn encode() { catalog\n    .load_table\n    ::<Mode>\n    (); }",
+        ),
+    ] {
+        let sources = cgo_8_fixture_sources("fn prepare() {}", encoder, "fn root() {}");
+        let violations = cgo_8_immutable_scan_preparation_violations(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("encoder-planning")),
+            "{label} bypassed encoder call guard: {violations:?}"
+        );
+    }
+
+    let owners = cgo_8_fixture_sources("fn prepare() {}", "fn encode() {}", "fn root() {}");
+    let missing_owners = owners
+        .iter()
+        .filter(|source| {
+            !matches!(
+                source.path.as_str(),
+                "src/engine/mv/scan_binding.rs"
+                    | "src/sql/codegen/proto_encode/iceberg_delta_scan.rs"
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let missing_violations = cgo_8_immutable_scan_preparation_violations(&missing_owners);
+    assert!(
+        missing_violations
+            .iter()
+            .any(|violation| violation.contains("delta-planner-owner")),
+        "missing delta planner owner must fail closed"
+    );
+    assert!(
+        missing_violations
+            .iter()
+            .any(|violation| violation.contains("delta-encoder-owner")),
+        "missing delta encoder owner must fail closed"
+    );
+
+    let mut duplicate_owners = owners;
+    duplicate_owners.push(Cgo8GuardSource::new(
+        "src/engine/mv/duplicate.rs",
+        "fn build_iceberg_delta_scan_runtime_plan() {}",
+    ));
+    duplicate_owners.push(Cgo8GuardSource::new(
+        "src/sql/codegen/proto_encode/duplicate.rs",
+        "fn encode_iceberg_delta_scan_plan_native() {}",
+    ));
+    let duplicate_violations = cgo_8_immutable_scan_preparation_violations(&duplicate_owners);
+    assert!(
+        duplicate_violations
+            .iter()
+            .any(|violation| violation.contains("delta-planner-owner")),
+        "duplicate delta planner owner must be rejected"
+    );
+    assert!(
+        duplicate_violations
+            .iter()
+            .any(|violation| violation.contains("delta-encoder-owner")),
+        "duplicate delta encoder owner must be rejected"
+    );
+}
+
+#[test]
+fn cgo_8_syn_detector_handles_complex_syntax_scopes_and_shadows() {
+    let syntax_clean = cgo_8_fixture_sources(
+        r#"
+use crate::sql::planner::distributed::DistributedPlan;
+fn generic<F: Fn() -> Result<(), Error>>(plan: &DistributedPlan) {}
+fn const_generic<const N: usize = { if 3 > 2 { 1 } else { 0 } }>(plan: &DistributedPlan) {}
+"#,
+        "fn encode() {}",
+        "fn root() {}",
+    );
+    assert!(
+        cgo_8_immutable_scan_preparation_violations(&syntax_clean).is_empty(),
+        "complex generic syntax must resolve the actual parameter list"
+    );
+
+    let syntax_violation = cgo_8_fixture_sources(
+        r#"
+use crate::sql::planner::distributed::DistributedPlan;
+fn generic<F: Fn() -> Result<(), Error>>(plan: &mut DistributedPlan) {}
+"#,
+        r#"
+use crate::engine::mv::scan_binding::build_iceberg_delta_scan_runtime_plan as build;
+fn encode() { build::<Outer<Inner<Mode>>>(); }
+"#,
+        "fn root() {}",
+    );
+    let syntax_violations = cgo_8_immutable_scan_preparation_violations(&syntax_violation);
+    assert!(syntax_violations.iter().any(|v| v.contains("mutable-plan")));
+    assert!(
+        syntax_violations
+            .iter()
+            .any(|v| v.contains("encoder-planning"))
+    );
+
+    let scoped_aliases = cgo_8_fixture_sources(
+        r#"
+mod nested {
+    use crate::sql::planner::distributed::DistributedPlan as Plan;
+    type LocalPlan = Plan;
+    fn prepare(plan: &mut LocalPlan) {}
+}
+"#,
+        r#"
+fn encode() {
+    use crate::connector as connector_alias;
+    use connector_alias::iceberg as iceberg_alias;
+    use iceberg_alias::changes::plan_changes as plan;
+    plan::<Outer<Inner<Mode>>>();
+}
+"#,
+        "fn root() {}",
+    );
+    let scoped_violations = cgo_8_immutable_scan_preparation_violations(&scoped_aliases);
+    assert!(scoped_violations.iter().any(|v| v.contains("mutable-plan")));
+    assert!(
+        scoped_violations
+            .iter()
+            .any(|v| v.contains("encoder-planning"))
+    );
+
+    let shadows = cgo_8_fixture_sources(
+        r#"
+fn generic_shadow<DistributedPlan>(plan: &mut DistributedPlan) {}
+mod local { struct DistributedPlan; fn prepare(plan: &mut DistributedPlan) {} }
+"#,
+        r#"
+fn parameter_shadow(plan_changes: fn()) { plan_changes(); }
+fn local_let_shadow() { let plan_changes = || {}; plan_changes(); }
+fn local_fn_shadow() { fn plan_changes() {} plan_changes(); }
+"#,
+        "fn root() {}",
+    );
+    assert!(
+        cgo_8_immutable_scan_preparation_violations(&shadows).is_empty(),
+        "generic/local type and value shadows must stay clean"
+    );
+
+    for refresh in [
+        "struct IcebergMvRefreshContext;",
+        "type IcebergMvRefreshContext = ();",
+        "pub use crate::engine::mv::refresh_context::Context as IcebergMvRefreshContext;",
+        "use crate::engine::mv::refresh_context as refresh; type Leak = refresh::Context;",
+    ] {
+        let sources = cgo_8_fixture_sources("fn prepare() {}", "fn encode() {}", refresh)
+            .into_iter()
+            .map(|source| {
+                if source.path == "src/lib.rs" {
+                    Cgo8GuardSource::new("src/sql/codegen/refresh_probe.rs", source.text)
+                } else {
+                    source
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            cgo_8_immutable_scan_preparation_violations(&sources)
+                .iter()
+                .any(|v| v.contains("refresh-context")),
+            "refresh context syntax bypassed guard: {refresh}"
+        );
+    }
+
+    let parse_error = cgo_8_fixture_sources("fn prepare() {}", "fn encode( {", "fn root() {}");
+    let parse_violations = cgo_8_immutable_scan_preparation_violations(&parse_error);
+    assert!(
+        parse_violations.iter().any(|violation| {
+            violation.contains("ast-parse")
+                && violation.contains("src/sql/codegen/proto_encode/plan.rs")
+        }),
+        "invalid production Rust must fail closed with its source path: {parse_violations:?}"
+    );
+}
+
+#[test]
+fn cgo_8_encoder_load_table_method_is_always_forbidden() {
+    for encoder in [
+        "struct Catalog; impl Catalog { fn load_table(&self) {} } fn encode(renamed: Catalog) { renamed.load_table(); }",
+        "struct Catalog; impl Catalog { fn load_table(&self) {} } fn encode(catalog: Catalog) { let renamed = catalog; renamed.load_table(); }",
+        "struct Encoder; impl Encoder { fn load_table(&self) {} fn encode(&self) { self.load_table(); } }",
+    ] {
+        let sources = cgo_8_fixture_sources("fn prepare() {}", encoder, "fn root() {}");
+        let violations = cgo_8_immutable_scan_preparation_violations(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|v| { v.contains("encoder-planning") && v.contains("load_table") }),
+            "load_table method receiver bypassed guard: {encoder}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn cgo_8_scope_resolution_handles_parents_forward_aliases_and_patterns() {
+    for preparation in [
+        r#"
+use crate::sql::planner::distributed::DistributedPlan as Plan;
+mod nested { fn prepare(plan: &mut super::Plan) {} }
+"#,
+        r#"
+type LocalPlan = AliasPlan;
+use crate::sql::planner::distributed::DistributedPlan as Plan;
+type AliasPlan = Plan;
+fn prepare(plan: &mut LocalPlan) {}
+"#,
+        r#"
+use crate::sql::planner::distributed::{self as dist};
+fn prepare(plan: &mut dist::DistributedPlan) {}
+"#,
+        r#"
+use crate::sql::planner::distributed::{self};
+fn prepare(plan: &mut distributed::DistributedPlan) {}
+"#,
+    ] {
+        let sources = cgo_8_fixture_sources(preparation, "fn encode() {}", "fn root() {}");
+        let violations = cgo_8_immutable_scan_preparation_violations(&sources);
+        assert!(
+            violations.iter().any(|v| v.contains("mutable-plan")),
+            "parent/forward/self alias bypassed guard: {preparation}: {violations:?}"
+        );
+    }
+
+    let forward_encoder_aliases = cgo_8_fixture_sources(
+        "fn prepare() {}",
+        r#"
+use iceberg_alias::changes::plan_changes as plan;
+use connector_alias::iceberg as iceberg_alias;
+use crate::connector as connector_alias;
+fn encode() { plan(); }
+"#,
+        "fn root() {}",
+    );
+    assert!(
+        cgo_8_immutable_scan_preparation_violations(&forward_encoder_aliases)
+            .iter()
+            .any(|v| v.contains("encoder-planning")),
+        "forward use-alias chains must resolve independently of item order"
+    );
+
+    for clean_encoder in [
+        r#"
+use crate::connector::iceberg::changes::plan_changes;
+fn encode(local: fn()) { (|plan_changes: fn()| plan_changes())(local); }
+"#,
+        r#"
+use crate::connector::iceberg::changes::plan_changes;
+fn encode(items: Vec<fn()>) { for plan_changes in items { plan_changes(); } }
+"#,
+        r#"
+use crate::connector::iceberg::changes::plan_changes;
+fn encode(local: fn()) { match local { plan_changes => plan_changes() } }
+"#,
+        r#"
+use crate::connector::iceberg::changes::plan_changes;
+fn encode(local: Option<fn()>) { if let Some(plan_changes) = local { plan_changes(); } }
+"#,
+        r#"
+use crate::connector::iceberg::changes::plan_changes;
+fn encode(mut local: Option<fn()>) { while let Some(plan_changes) = local.take() { plan_changes(); } }
+"#,
+    ] {
+        let sources = cgo_8_fixture_sources("fn prepare() {}", clean_encoder, "fn root() {}");
+        let violations = cgo_8_immutable_scan_preparation_violations(&sources);
+        assert!(
+            violations.is_empty(),
+            "pattern binding must shadow only inside its lexical scope: {clean_encoder}: {violations:?}"
+        );
+
+        let outside = clean_encoder.replacen("fn encode", "fn local_encode", 1);
+        let outside = format!("{outside}\nfn encode() {{ plan_changes(); }}");
+        let sources = cgo_8_fixture_sources("fn prepare() {}", &outside, "fn root() {}");
+        assert!(
+            cgo_8_immutable_scan_preparation_violations(&sources)
+                .iter()
+                .any(|v| v.contains("encoder-planning")),
+            "pattern shadow must not escape its lexical scope: {clean_encoder}"
+        );
+    }
+}
+
+#[test]
+fn cgo_8_cfg_test_attributes_gate_every_relevant_ast_node() {
+    let sources = cgo_8_fixture_sources(
+        r#"
+use crate::sql::planner::distributed::DistributedPlan;
+fn prepare(#[cfg(test)] plan: &mut DistributedPlan) {}
+"#,
+        "fn encode() {}",
+        r#"
+struct Fields {
+    #[cfg(test)] leak: crate::engine::mv::refresh_context::Hidden,
+}
+enum Variants {
+    #[cfg(test)] Leak(crate::engine::mv::refresh_context::Hidden),
+}
+trait Trait {
+    #[cfg(test)] type Leak: crate::engine::mv::refresh_context::Hidden;
+}
+impl Trait for Fields {
+    #[cfg(test)] type Leak = crate::engine::mv::refresh_context::Hidden;
+}
+extern "C" {
+    #[cfg(test)] static LEAK: crate::engine::mv::refresh_context::Hidden;
+}
+fn probe() {
+    #[cfg(test)] let leak: crate::engine::mv::refresh_context::Hidden = todo!();
+    let _ = match 0 {
+        #[cfg(test)] 0 => crate::engine::mv::refresh_context::leak,
+        _ => 0,
+    };
+    let _ = Fields {
+        #[cfg(test)] leak: crate::engine::mv::refresh_context::leak,
+    };
+    #[cfg(test)] crate::engine::mv::refresh_context::leak;
+}
+"#,
+    )
+    .into_iter()
+    .map(|source| {
+        if source.path == "src/lib.rs" {
+            Cgo8GuardSource::new("src/sql/codegen/cfg_probe.rs", source.text)
+        } else {
+            source
+        }
+    })
+    .collect::<Vec<_>>();
+    let violations = cgo_8_immutable_scan_preparation_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "cfg(test) AST nodes and PatType parameters must be excluded: {violations:?}"
+    );
+}
+
+#[test]
+fn cgo_8_paths_globs_and_macro_tokens_cannot_bypass_guards() {
+    for codegen in [
+        "use crate::engine::mv::*; fn probe() {}",
+        "fn probe() { let _ = crate::engine::mv::refresh_context::Hidden {}; }",
+        "fn probe(value: Value) { if let crate::engine::mv::refresh_context::Hidden = value {} }",
+        "struct Local; impl crate::engine::mv::refresh_context::Hidden for Local {}",
+        "fn probe() { opaque!(crate::engine::mv::refresh_context::Hidden); }",
+        "fn probe() { opaque!(outer!(IcebergMvRefreshContext)); }",
+        "macro_rules! leak { () => { crate::engine::mv::refresh_context::Hidden } }",
+        "macro_rules! leak { () => { $crate::engine::mv::refresh_context::Hidden } }",
+    ] {
+        let sources = cgo_8_fixture_sources("fn prepare() {}", "fn encode() {}", codegen)
+            .into_iter()
+            .map(|source| {
+                if source.path == "src/lib.rs" {
+                    Cgo8GuardSource::new("src/sql/codegen/path_probe.rs", source.text)
+                } else {
+                    source
+                }
+            })
+            .collect::<Vec<_>>();
+        let violations = cgo_8_immutable_scan_preparation_violations(&sources);
+        assert!(
+            violations.iter().any(|v| v.contains("refresh-context")),
+            "refresh path/token bypassed guard: {codegen}: {violations:?}"
+        );
+    }
+
+    for forbidden in [
+        "build_iceberg_delta_scan_runtime_plan",
+        "plan_changes",
+        "load_table",
+        "version_scan_source",
+        "target_state_scan_source",
+        "target_locator_scan_source",
+    ] {
+        let call = if forbidden == "load_table" {
+            "receiver.load_table()".to_string()
+        } else {
+            format!("{forbidden}()")
+        };
+        let encoder = format!("fn encode() {{ opaque!(outer!({call})); }}");
+        let sources = cgo_8_fixture_sources("fn prepare() {}", &encoder, "fn root() {}");
+        let violations = cgo_8_immutable_scan_preparation_violations(&sources);
+        assert!(
+            violations.iter().any(|v| v.contains("encoder-planning")),
+            "macro token call bypassed encoder guard: {encoder}: {violations:?}"
+        );
+    }
+
+    let macro_definition = cgo_8_fixture_sources(
+        "fn prepare() {}",
+        "macro_rules! leak { () => { plan_changes() } } fn encode() {}",
+        "fn root() {}",
+    );
+    assert!(
+        cgo_8_immutable_scan_preparation_violations(&macro_definition)
+            .iter()
+            .any(|v| v.contains("encoder-planning")),
+        "production macro definitions must not hide encoder planning calls"
+    );
+
+    let macro_noise = cgo_8_fixture_sources(
+        "fn prepare() {}",
+        r#"
+fn encode() {
+    opaque!("plan_changes() crate::engine::mv::refresh_context");
+    #[cfg(test)] opaque!(plan_changes());
+}
+"#,
+        "fn root() {}",
+    );
+    assert!(
+        cgo_8_immutable_scan_preparation_violations(&macro_noise).is_empty(),
+        "macro strings and cfg(test) macro statements must stay clean"
+    );
+}
+
+#[test]
+fn cgo_8_raw_identifiers_ufcs_macro_aliases_and_let_chains_are_sound() {
+    for preparation in [
+        r#"
+use crate::sql::planner::distributed::DistributedPlan as r#Plan;
+fn prepare(plan: &mut r#Plan) {}
+"#,
+        r#"
+use crate::sql::planner::distributed::r#DistributedPlan;
+fn prepare(plan: &mut r#DistributedPlan) {}
+"#,
+    ] {
+        let sources = cgo_8_fixture_sources(preparation, "fn encode() {}", "fn root() {}");
+        let violations = cgo_8_immutable_scan_preparation_violations(&sources);
+        assert!(
+            violations.iter().any(|v| v.contains("mutable-plan")),
+            "raw mutable type/import alias bypassed guard: {preparation}: {violations:?}"
+        );
+    }
+
+    for encoder in [
+        r#"
+use crate::connector::iceberg::changes::r#plan_changes;
+fn encode() { r#plan_changes(); }
+"#,
+        r#"
+use crate::connector::iceberg::changes::plan_changes as r#plan;
+fn encode() { r#plan(); }
+"#,
+        "fn encode() { Catalog::load_table(); }",
+        "fn encode() { <Catalog as Trait>::load_table(); }",
+        "fn encode() { <Planner as Trait>::plan_changes(); }",
+    ] {
+        let sources = cgo_8_fixture_sources("fn prepare() {}", encoder, "fn root() {}");
+        let violations = cgo_8_immutable_scan_preparation_violations(&sources);
+        assert!(
+            violations.iter().any(|v| v.contains("encoder-planning")),
+            "raw/UFCS forbidden call bypassed guard: {encoder}: {violations:?}"
+        );
+    }
+
+    for encoder in [
+        r#"
+use crate::connector::iceberg::changes::plan_changes as planned;
+fn encode() { opaque!(outer!(planned())); }
+"#,
+        r#"
+use crate::connector::iceberg::changes as change_module;
+fn encode() { opaque!(outer!(change_module::plan_changes())); }
+"#,
+        r#"
+use crate::connector as connector_alias;
+use connector_alias::iceberg::changes::plan_changes as nested_plan;
+fn encode() { opaque!(outer!(inner!(nested_plan()))); }
+"#,
+    ] {
+        let sources = cgo_8_fixture_sources("fn prepare() {}", encoder, "fn root() {}");
+        let violations = cgo_8_immutable_scan_preparation_violations(&sources);
+        assert!(
+            violations.iter().any(|v| v.contains("encoder-planning")),
+            "macro alias path bypassed guard: {encoder}: {violations:?}"
+        );
+    }
+
+    for clean_encoder in [
+        r#"
+use crate::connector::iceberg::changes::plan_changes;
+fn encode(first: Option<fn() -> bool>, second: Option<()>) {
+    if let Some(plan_changes) = first && let Some(_) = second && plan_changes() {}
+}
+"#,
+        r#"
+use crate::connector::iceberg::changes::plan_changes;
+fn encode(mut first: Option<fn() -> bool>) {
+    while let Some(plan_changes) = first.take() && plan_changes() {}
+}
+"#,
+        r#"
+macro_rules! clean {
+    ($plan_changes:ident) => { $plan_changes() };
+    ($lifetime:lifetime) => { stringify!($lifetime) };
+}
+fn encode() { opaque!('plan_changes); }
+"#,
+    ] {
+        let sources = cgo_8_fixture_sources("fn prepare() {}", clean_encoder, "fn root() {}");
+        let violations = cgo_8_immutable_scan_preparation_violations(&sources);
+        assert!(
+            violations.is_empty(),
+            "let-chain or macro metavariable/lifetime noise caused a false positive: {clean_encoder}: {violations:?}"
+        );
+    }
+
+    let outside_let_chain = cgo_8_fixture_sources(
+        "fn prepare() {}",
+        r#"
+use crate::connector::iceberg::changes::plan_changes;
+fn encode(first: Option<fn() -> bool>) {
+    if let Some(plan_changes) = first && plan_changes() {}
+    plan_changes();
+}
+"#,
+        "fn root() {}",
+    );
+    assert!(
+        cgo_8_immutable_scan_preparation_violations(&outside_let_chain)
+            .iter()
+            .any(|v| v.contains("encoder-planning")),
+        "let-chain pattern shadow must not escape the condition/body scope"
+    );
+}
+
+#[test]
+fn cgo_8_immutable_scan_preparation_boundaries_hold_in_production() {
+    let sources = cgo_8_production_source_texts(Path::new(manifest_dir()))
+        .into_iter()
+        .map(|(path, text)| Cgo8GuardSource::new(path, text))
+        .collect::<Vec<_>>();
+    let violations = cgo_8_immutable_scan_preparation_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "CGO-8 immutable scan-preparation architecture guard failed:\n{}",
+        violations.join("\n")
     );
 }

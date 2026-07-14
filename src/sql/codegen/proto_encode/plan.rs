@@ -28,6 +28,9 @@ use super::expr::{encode_expr, encode_sort_items, encode_window_frame};
 use crate::proto::{common, plan};
 use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, TypedExpr};
 use crate::sql::catalog;
+use crate::sql::codegen::scan::binding::{
+    ResolvedScanBinding, ResolvedScanColumnKind, ResolvedScanExecution, ScanExecutionBindings,
+};
 use crate::sql::codegen::scan::connector::{
     StarRocksColumnSchemaDescriptor, StarRocksKeysTypeDescriptor, StarRocksScanSourceDescriptor,
     StarRocksTabletSchemaDescriptor,
@@ -55,9 +58,7 @@ use crate::types::aggregate::infer_agg_function_types;
 use crate::types::native_proto::encode_type;
 
 pub(crate) struct NativePlanEncodeContext<'a> {
-    pub(crate) mv_refresh_ctx:
-        Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
-    pub(crate) starrocks_scan_sources: Option<&'a BTreeMap<i32, StarRocksScanSourceDescriptor>>,
+    pub(crate) scan_bindings: Option<&'a ScanExecutionBindings>,
 }
 
 #[cfg(test)]
@@ -67,8 +68,7 @@ pub(crate) fn encode_distributed_plan(
     encode_distributed_plan_with_context(
         src,
         NativePlanEncodeContext {
-            mv_refresh_ctx: None,
-            starrocks_scan_sources: None,
+            scan_bindings: None,
         },
     )
 }
@@ -692,8 +692,7 @@ pub(crate) fn encode_plan_fragment(src: &PlanFragment) -> Result<plan::PlanFragm
     encode_plan_fragment_with_context(
         src,
         &NativePlanEncodeContext {
-            mv_refresh_ctx: None,
-            starrocks_scan_sources: None,
+            scan_bindings: None,
         },
     )
 }
@@ -860,8 +859,7 @@ pub(crate) fn encode_node(src: &DistributedNode) -> Result<plan::DistributedNode
     encode_node_with_context(
         src,
         &NativePlanEncodeContext {
-            mv_refresh_ctx: None,
-            starrocks_scan_sources: None,
+            scan_bindings: None,
         },
     )
 }
@@ -1664,17 +1662,28 @@ fn encode_scan_node(
     node_id: i32,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::ScanNode, String> {
+    let binding = scan_binding_for_source(node_id, &src.table.source, ctx)?;
+    let columns = match binding {
+        Some(binding) => encode_bound_scan_output_columns(src, binding)?,
+        None => encode_output_columns(&src.columns)?,
+    };
+    let required_columns = binding.map_or_else(
+        || src.required_columns.clone().unwrap_or_default(),
+        |binding| encode_bound_required_columns(src, binding),
+    );
     Ok(plan::ScanNode {
         database: src.database.clone(),
         table: Some(encode_table_def_with_context(
             &src.table,
             Some(node_id),
+            Some(&src.columns),
+            binding,
             ctx,
         )?),
         alias: src.alias.clone(),
-        columns: encode_output_columns(&src.columns)?,
+        columns,
         predicates: encode_exprs(&src.predicates)?,
-        required_columns: src.required_columns.clone().unwrap_or_default(),
+        required_columns,
         dict_columns: Vec::new(),
         variant_columns: src
             .variant_columns
@@ -1692,6 +1701,76 @@ fn encode_scan_node(
             })
             .collect::<Result<Vec<_>, String>>()?,
         mv_rewritten_from: src.mv_rewritten_from.clone(),
+    })
+}
+
+fn encode_bound_scan_output_columns(
+    src: &crate::sql::planner::payload::PlanScanNode,
+    binding: &ResolvedScanBinding,
+) -> Result<Vec<common::OutputColumn>, String> {
+    let physical_by_planner_id = binding
+        .physical_columns
+        .iter()
+        .map(|column| (column.planner.column_id, column))
+        .collect::<HashMap<_, _>>();
+    let synthetic_ids = src
+        .variant_columns
+        .iter()
+        .map(|column| column.synthetic_column_id)
+        .collect::<HashSet<_>>();
+    let mut encoded = Vec::with_capacity(src.columns.len());
+    let mut seen_physical_ids = HashSet::new();
+    for column in &src.columns {
+        if let Some(bound) = physical_by_planner_id.get(&column.column_id) {
+            encoded.push(encode_bound_scan_output_column(bound)?);
+            seen_physical_ids.insert(column.column_id);
+        } else if synthetic_ids.contains(&column.column_id) {
+            encoded.push(encode_output_column(column)?);
+        }
+    }
+    for bound in &binding.physical_columns {
+        if seen_physical_ids.insert(bound.planner.column_id) {
+            encoded.push(encode_bound_scan_output_column(bound)?);
+        }
+    }
+    Ok(encoded)
+}
+
+fn encode_bound_required_columns(
+    src: &crate::sql::planner::payload::PlanScanNode,
+    binding: &ResolvedScanBinding,
+) -> Vec<String> {
+    let mut required = binding
+        .required_reads
+        .iter()
+        .map(|read| read.source.name.clone())
+        .collect::<Vec<_>>();
+    for variant in &src.variant_columns {
+        let required_by_planner = src.required_columns.as_ref().is_none_or(|columns| {
+            columns
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&variant.synthetic_column))
+        });
+        if required_by_planner
+            && !required
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&variant.synthetic_column))
+        {
+            required.push(variant.synthetic_column.clone());
+        }
+    }
+    required
+}
+
+fn encode_bound_scan_output_column(
+    column: &crate::sql::codegen::scan::binding::ResolvedScanColumn,
+) -> Result<common::OutputColumn, String> {
+    Ok(common::OutputColumn {
+        column_id: column.planner.column_id.0,
+        name: column.source.name.clone(),
+        r#type: Some(encode_type(&column.source.data_type)?),
+        nullable: column.source.nullable,
+        is_internal: column.planner.is_internal,
     })
 }
 
@@ -1910,9 +1989,10 @@ fn encode_table_def(src: &catalog::TableDef) -> Result<plan::TableDef, String> {
     encode_table_def_with_context(
         src,
         None,
+        None,
+        None,
         &NativePlanEncodeContext {
-            mv_refresh_ctx: None,
-            starrocks_scan_sources: None,
+            scan_bindings: None,
         },
     )
 }
@@ -1920,22 +2000,131 @@ fn encode_table_def(src: &catalog::TableDef) -> Result<plan::TableDef, String> {
 fn encode_table_def_with_context(
     src: &catalog::TableDef,
     scan_node_id: Option<i32>,
+    scan_columns: Option<&[AnalysisOutputColumn]>,
+    binding: Option<&ResolvedScanBinding>,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::TableDef, String> {
+    let (columns, metadata_columns) = match binding {
+        Some(binding) if scan_source_requires_resolved_binding(&src.source) => {
+            resolved_binding_table_columns(binding)
+        }
+        Some(binding) => merged_bound_table_columns(src, scan_columns.unwrap_or_default(), binding),
+        None => (
+            src.columns.clone(),
+            src.iceberg_row_lineage_metadata_columns.clone(),
+        ),
+    };
     Ok(plan::TableDef {
         name: src.name.clone(),
-        columns: src
-            .columns
+        columns: columns
             .iter()
             .map(encode_column_def)
             .collect::<Result<Vec<_>, _>>()?,
-        iceberg_row_lineage_metadata_columns: src
-            .iceberg_row_lineage_metadata_columns
+        iceberg_row_lineage_metadata_columns: metadata_columns
             .iter()
             .map(encode_column_def)
             .collect::<Result<Vec<_>, _>>()?,
-        source: Some(encode_scan_source(&src.source, scan_node_id, ctx)?),
+        source: Some(encode_scan_source(&src.source, scan_node_id, binding, ctx)?),
     })
+}
+
+fn scan_source_requires_resolved_binding(source: &catalog::ScanSource) -> bool {
+    matches!(
+        source,
+        catalog::ScanSource::IcebergDeltaTable { .. }
+            | catalog::ScanSource::IcebergVersionTable { .. }
+            | catalog::ScanSource::IcebergMvTargetState(_)
+            | catalog::ScanSource::IcebergMvTargetLocator(_)
+    )
+}
+
+fn resolved_binding_table_columns(
+    binding: &ResolvedScanBinding,
+) -> (Vec<catalog::ColumnDef>, Vec<catalog::ColumnDef>) {
+    let mut columns = Vec::new();
+    let mut metadata_columns = Vec::new();
+    let mut seen = HashSet::new();
+
+    for bound in &binding.physical_columns {
+        if !seen.insert(bound.source.name.to_ascii_lowercase()) {
+            continue;
+        }
+        match bound.kind {
+            ResolvedScanColumnKind::PhysicalTableColumn => columns.push(bound.source.clone()),
+            ResolvedScanColumnKind::IcebergMetadataColumn => {
+                metadata_columns.push(bound.source.clone())
+            }
+        }
+    }
+    for read in &binding.required_reads {
+        if seen.insert(read.source.name.to_ascii_lowercase()) {
+            columns.push(read.source.clone());
+        }
+    }
+
+    (columns, metadata_columns)
+}
+
+fn merged_bound_table_columns(
+    src: &catalog::TableDef,
+    scan_columns: &[AnalysisOutputColumn],
+    binding: &ResolvedScanBinding,
+) -> (Vec<catalog::ColumnDef>, Vec<catalog::ColumnDef>) {
+    let mut columns = src.columns.clone();
+    let mut metadata_columns = src.iceberg_row_lineage_metadata_columns.clone();
+    for bound in &binding.physical_columns {
+        let target = match bound.kind {
+            ResolvedScanColumnKind::PhysicalTableColumn => &mut columns,
+            ResolvedScanColumnKind::IcebergMetadataColumn => &mut metadata_columns,
+        };
+        let planner_source_name = scan_columns
+            .iter()
+            .find(|column| column.column_id == bound.planner.column_id)
+            .map(|column| column.name.as_str());
+        overlay_bound_column(
+            target,
+            &bound.planner.name,
+            planner_source_name,
+            &bound.source,
+        );
+    }
+    for read in &binding.required_reads {
+        if replace_column_by_name(&mut columns, &read.source)
+            || replace_column_by_name(&mut metadata_columns, &read.source)
+        {
+            continue;
+        }
+        columns.push(read.source.clone());
+    }
+    (columns, metadata_columns)
+}
+
+fn overlay_bound_column(
+    columns: &mut Vec<catalog::ColumnDef>,
+    planner_name: &str,
+    planner_source_name: Option<&str>,
+    source: &catalog::ColumnDef,
+) {
+    if let Some(index) = columns.iter().position(|column| {
+        column.name.eq_ignore_ascii_case(planner_name)
+            || planner_source_name.is_some_and(|name| column.name.eq_ignore_ascii_case(name))
+            || column.name.eq_ignore_ascii_case(&source.name)
+    }) {
+        columns[index] = source.clone();
+    } else {
+        columns.push(source.clone());
+    }
+}
+
+fn replace_column_by_name(columns: &mut [catalog::ColumnDef], source: &catalog::ColumnDef) -> bool {
+    let Some(column) = columns
+        .iter_mut()
+        .find(|column| column.name.eq_ignore_ascii_case(&source.name))
+    else {
+        return false;
+    };
+    *column = source.clone();
+    true
 }
 
 fn encode_column_def(src: &catalog::ColumnDef) -> Result<plan::ColumnDef, String> {
@@ -2080,12 +2269,113 @@ fn arrow_field_id(field: &Field) -> Result<i32, String> {
     })
 }
 
+fn scan_binding_for_source<'a>(
+    node_id: i32,
+    source: &catalog::ScanSource,
+    ctx: &'a NativePlanEncodeContext<'_>,
+) -> Result<Option<&'a ResolvedScanBinding>, String> {
+    let binding = ctx
+        .scan_bindings
+        .and_then(|bindings| bindings.binding(node_id));
+    let required = scan_source_requires_resolved_binding(source);
+    if required && binding.is_none() {
+        return Err(match source {
+            catalog::ScanSource::IcebergDeltaTable {
+                from_snapshot_id,
+                to_snapshot_id,
+                ..
+            } => format!(
+                "native scan encoder missing prepared binding for node_id={node_id} source={} from_snapshot_id={from_snapshot_id} to_snapshot_id={to_snapshot_id}",
+                scan_source_kind(source)
+            ),
+            _ => format!(
+                "native scan encoder missing prepared binding for node_id={node_id} source={}",
+                scan_source_kind(source)
+            ),
+        });
+    }
+    let Some(binding) = binding else {
+        return Ok(None);
+    };
+    if binding.node_id != node_id {
+        return Err(format!(
+            "native scan encoder binding node mismatch: requested node_id={node_id}, binding node_id={}",
+            binding.node_id
+        ));
+    }
+    let valid_execution = match source {
+        catalog::ScanSource::IcebergDeltaTable { .. } => {
+            matches!(binding.execution, ResolvedScanExecution::IcebergDelta(_))
+        }
+        catalog::ScanSource::IcebergDataFiles { .. }
+        | catalog::ScanSource::IcebergVersionTable { .. }
+        | catalog::ScanSource::IcebergMvTargetState(_)
+        | catalog::ScanSource::IcebergMvTargetLocator(_) => {
+            matches!(binding.execution, ResolvedScanExecution::IcebergFiles(_))
+        }
+        catalog::ScanSource::IcebergMetadataTable { .. }
+        | catalog::ScanSource::StarRocks { .. } => false,
+    };
+    if !valid_execution {
+        return Err(format!(
+            "native scan encoder execution variant mismatch for node_id={node_id} source={}: binding={}",
+            scan_source_kind(source),
+            resolved_execution_kind(&binding.execution)
+        ));
+    }
+    Ok(Some(binding))
+}
+
+fn scan_source_kind(source: &catalog::ScanSource) -> &'static str {
+    match source {
+        catalog::ScanSource::StarRocks { .. } => "StarRocks",
+        catalog::ScanSource::IcebergDataFiles { .. } => "IcebergDataFiles",
+        catalog::ScanSource::IcebergMetadataTable { .. } => "IcebergMetadataTable",
+        catalog::ScanSource::IcebergDeltaTable { .. } => "IcebergDeltaTable",
+        catalog::ScanSource::IcebergVersionTable { .. } => "IcebergVersionTable",
+        catalog::ScanSource::IcebergMvTargetState(_) => "IcebergMvTargetState",
+        catalog::ScanSource::IcebergMvTargetLocator(_) => "IcebergMvTargetLocator",
+    }
+}
+
+fn resolved_execution_kind(execution: &ResolvedScanExecution) -> &'static str {
+    match execution {
+        ResolvedScanExecution::IcebergFiles(_) => "IcebergFiles",
+        ResolvedScanExecution::IcebergDelta(_) => "IcebergDelta",
+    }
+}
+
 fn encode_scan_source(
     src: &catalog::ScanSource,
     scan_node_id: Option<i32>,
+    binding: Option<&ResolvedScanBinding>,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::ScanSource, String> {
     use plan::scan_source::Kind;
+
+    if let Some(ResolvedScanExecution::IcebergFiles(files)) =
+        binding.map(|binding| &binding.execution)
+    {
+        return Ok(plan::ScanSource {
+            kind: Some(Kind::IcebergDataFiles(plan::IcebergDataFiles {
+                table: Some(encode_iceberg_table_info(&files.table)?),
+                files: files
+                    .files
+                    .iter()
+                    .map(encode_iceberg_data_file_info)
+                    .collect::<Result<Vec<_>, _>>()?,
+                cloud_properties: files.cloud_properties.clone().into_iter().collect(),
+                binding: match files.binding {
+                    catalog::IcebergDataFileBinding::CurrentSnapshot => {
+                        plan::IcebergDataFileBinding::CurrentSnapshot as i32
+                    }
+                    catalog::IcebergDataFileBinding::ExplicitFiles => {
+                        plan::IcebergDataFileBinding::ExplicitFiles as i32
+                    }
+                },
+            })),
+        });
+    }
 
     Ok(plan::ScanSource {
         kind: Some(match src {
@@ -2094,8 +2384,8 @@ fn encode_scan_source(
                     "StarRocks table source is only valid on a native ScanNode".to_string()
                 })?;
                 let descriptor = ctx
-                    .starrocks_scan_sources
-                    .and_then(|sources| sources.get(&node_id))
+                    .scan_bindings
+                    .and_then(|bindings| bindings.starrocks_source(node_id))
                     .ok_or_else(|| {
                         format!(
                             "StarRocks ScanNode node_id={node_id} missing native source descriptor"
@@ -2160,14 +2450,16 @@ fn encode_scan_source(
                 from_snapshot_id,
                 to_snapshot_id,
             } => {
-                let runtime_plan =
-                    crate::sql::codegen::scan::iceberg_delta::build_iceberg_delta_scan_runtime_plan(
-                        table,
-                        *from_snapshot_id,
-                        *to_snapshot_id,
-                        ctx.mv_refresh_ctx,
-                    )
-                    .map_err(|err| format!("Iceberg delta scan native sidecar: {err}"))?;
+                let Some(ResolvedScanExecution::IcebergDelta(delta)) =
+                    binding.map(|binding| &binding.execution)
+                else {
+                    return Err(format!(
+                        "native scan encoder missing prepared IcebergDelta binding for node_id={}",
+                        scan_node_id
+                            .map(|node_id| node_id.to_string())
+                            .unwrap_or_else(|| "<none>".to_string())
+                    ));
+                };
 
                 Kind::IcebergDeltaTable(plan::IcebergDeltaTable {
                     table: Some(encode_iceberg_table_info(table)?),
@@ -2175,7 +2467,7 @@ fn encode_scan_source(
                     to_snapshot_id: *to_snapshot_id,
                     delta_plan: Some(
                         super::iceberg_delta_scan::encode_iceberg_delta_scan_plan_native(
-                            &runtime_plan,
+                            &delta.runtime_plan,
                         )?,
                     ),
                 })
@@ -3071,6 +3363,12 @@ mod tests {
         RuntimeFilterGraph,
     };
     use crate::sql::analysis::OutputColumn;
+    use crate::sql::codegen::scan::binding::{
+        ResolvedIcebergDeltaScan, ResolvedIcebergFileScan, ResolvedReadColumn, ResolvedReadReason,
+        ResolvedScanBinding, ResolvedScanColumn, ResolvedScanColumnKind, ResolvedScanExecution,
+        ScanExecutionBindings,
+    };
+    use crate::sql::codegen::scan::iceberg_delta::IcebergDeltaScanRuntimePlan;
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed::DataPartition;
     use crate::sql::planner::distributed::write::change_stream::{
@@ -3570,22 +3868,553 @@ mod tests {
     }
 
     #[test]
-    fn iceberg_delta_table_encoder_requires_mv_refresh_context() {
+    fn iceberg_delta_table_encoder_consumes_prepared_binding_payload() {
         use crate::sql::codegen::proto_encode::plan;
 
         let plan = iceberg_delta_distributed_plan_for_test();
+        let source_column = catalog::ColumnDef {
+            name: "physical_order_id".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        };
+        let mut plan = plan;
+        root_scan_for_test(&mut plan)
+            .table
+            .columns
+            .push(column_def_for_test(
+                "stale_unprojected",
+                DataType::Utf8,
+                true,
+            ));
+        let hidden_equality_column = column_def_for_test("tenant_id", DataType::Int64, false);
+        let mut bindings = ScanExecutionBindings::default();
+        bindings
+            .insert_binding(ResolvedScanBinding {
+                node_id: 10,
+                execution: ResolvedScanExecution::IcebergDelta(ResolvedIcebergDeltaScan {
+                    runtime_plan: IcebergDeltaScanRuntimePlan {
+                        table_location: "s3://prepared/orders".to_string(),
+                        data_columns: Vec::new(),
+                        cloud_properties: BTreeMap::from([(
+                            "endpoint".to_string(),
+                            "http://prepared-minio".to_string(),
+                        )]),
+                        change_files: Vec::new(),
+                        delete_side: None,
+                    },
+                }),
+                physical_columns: vec![ResolvedScanColumn {
+                    planner: output_column(1, "bound_order_id", DataType::Int64),
+                    source: source_column.clone(),
+                    kind: ResolvedScanColumnKind::PhysicalTableColumn,
+                }],
+                required_reads: vec![
+                    ResolvedReadColumn {
+                        planner_column_id: Some(ColumnId::new_for_test(1)),
+                        source: source_column,
+                        reason: ResolvedReadReason::PlannerRequiredOrOutput,
+                    },
+                    ResolvedReadColumn {
+                        planner_column_id: None,
+                        source: hidden_equality_column,
+                        reason: ResolvedReadReason::EqualityDeleteKey,
+                    },
+                ],
+            })
+            .expect("insert prepared delta binding");
 
-        let err = plan::encode_distributed_plan_with_context(
+        let encoded = plan::encode_distributed_plan_with_context(
             &plan,
             plan::NativePlanEncodeContext {
-                mv_refresh_ctx: None,
-                starrocks_scan_sources: None,
+                scan_bindings: Some(&bindings),
             },
         )
-        .expect_err("Iceberg delta native sidecar must require MV refresh context");
+        .expect("encode prepared delta binding");
 
-        assert!(err.contains("Iceberg delta scan native sidecar"), "{err}");
-        assert!(err.contains("MV refresh context"), "{err}");
+        let root = encoded.fragments[0].root.as_ref().expect("encoded root");
+        let Some(crate::proto::plan::distributed_node::Payload::Physical(physical)) =
+            root.payload.as_ref()
+        else {
+            panic!("expected physical root");
+        };
+        let Some(crate::proto::plan::plan_node::Kind::Scan(scan)) = physical.kind.as_ref() else {
+            panic!("expected scan root");
+        };
+        assert_eq!(scan.columns[0].name, "physical_order_id");
+        assert_eq!(
+            scan.required_columns,
+            vec!["physical_order_id", "tenant_id"]
+        );
+        let table = scan.table.as_ref().expect("bound table");
+        assert_eq!(
+            table
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["physical_order_id", "tenant_id"]
+        );
+        assert!(table.iceberg_row_lineage_metadata_columns.is_empty());
+        let Some(crate::proto::plan::scan_source::Kind::IcebergDeltaTable(delta)) = table
+            .source
+            .as_ref()
+            .and_then(|source| source.kind.as_ref())
+        else {
+            panic!("expected encoded delta source");
+        };
+        let runtime = delta.delta_plan.as_ref().expect("prepared runtime payload");
+        assert_eq!(runtime.table_location, "s3://prepared/orders");
+        assert_eq!(
+            runtime.cloud_properties.get("endpoint").map(String::as_str),
+            Some("http://prepared-minio")
+        );
+    }
+
+    #[test]
+    fn ordinary_iceberg_binding_preserves_existing_encoding() {
+        let mut plan = iceberg_delta_distributed_plan_for_test();
+        let scan = root_scan_for_test(&mut plan);
+        scan.table.columns.push(column_def_for_test(
+            "unprojected_payload",
+            DataType::Utf8,
+            true,
+        ));
+        let table = iceberg_table_info_for_test();
+        scan.table.source = catalog::ScanSource::IcebergDataFiles {
+            table: table.clone(),
+            files: Vec::new(),
+            cloud_properties: BTreeMap::from([("region".to_string(), "test".to_string())]),
+            binding: catalog::IcebergDataFileBinding::CurrentSnapshot,
+        };
+        scan.required_columns = Some(vec!["order_id".to_string()]);
+
+        let without_binding = encode_distributed_plan(&plan).expect("encode ordinary Iceberg scan");
+        let mut bindings = ScanExecutionBindings::default();
+        bindings
+            .insert_binding(file_binding_for_test(
+                10,
+                table,
+                catalog::IcebergDataFileBinding::CurrentSnapshot,
+                vec![bound_column_for_test(
+                    1,
+                    "order_id",
+                    "order_id",
+                    ResolvedScanColumnKind::PhysicalTableColumn,
+                )],
+                vec![bound_read_for_test(Some(1), "order_id")],
+            ))
+            .expect("insert ordinary Iceberg binding");
+        let with_binding = encode_distributed_plan_with_context(
+            &plan,
+            NativePlanEncodeContext {
+                scan_bindings: Some(&bindings),
+            },
+        )
+        .expect("encode ordinary Iceberg binding");
+
+        assert_eq!(with_binding, without_binding);
+    }
+
+    #[test]
+    fn refresh_file_bindings_drive_source_projection_metadata_and_hidden_reads() {
+        let refresh_sources = [
+            catalog::ScanSource::IcebergVersionTable {
+                table: iceberg_table_info_for_test(),
+                snapshot_id: 1,
+            },
+            catalog::ScanSource::IcebergMvTargetLocator(catalog::IcebergMvTargetLocatorScan {
+                catalog: "ice".to_string(),
+                database: "db".to_string(),
+                table: "orders".to_string(),
+                target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
+                target_snapshot_id: Some(1),
+                apply_key_column: "bound_order_id".to_string(),
+                branch_id_column: None,
+            }),
+            catalog::ScanSource::IcebergMvTargetState(catalog::IcebergMvTargetStateScan {
+                catalog: "ice".to_string(),
+                database: "db".to_string(),
+                table: "orders".to_string(),
+                target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
+                target_snapshot_id: Some(1),
+                aggregate_state_layout_version: 1,
+                columns: Vec::new(),
+                group_key_names: vec!["bound_order_id".to_string()],
+                aggregate_state_names: Vec::new(),
+                physical_column_names: vec!["bound_order_id".to_string()],
+                row_id_column_name: "bound_order_id".to_string(),
+                row_filter: catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+                    row_id_column_name: "bound_order_id".to_string(),
+                    branch_scope: None,
+                },
+                partition_constraint:
+                    catalog::IcebergMvTargetStatePartitionConstraint::Unpartitioned,
+            }),
+        ];
+
+        for source in refresh_sources {
+            let mut plan = iceberg_delta_distributed_plan_for_test();
+            let scan = root_scan_for_test(&mut plan);
+            scan.table.source = source;
+            scan.table.columns = vec![
+                column_def_for_test("stale", DataType::Utf8, true),
+                column_def_for_test("stale_unprojected", DataType::Utf8, true),
+            ];
+            scan.columns = vec![
+                output_column(1, "stale", DataType::Utf8),
+                output_column(2, "stale_meta", DataType::Int64),
+            ];
+
+            let mut resolved_table = iceberg_table_info_for_test();
+            resolved_table.current_snapshot_id = Some(1);
+            resolved_table.location = "s3://resolved/orders".to_string();
+            resolved_table.schema.fields[0].name = "physical_order_id".to_string();
+            resolved_table
+                .schema
+                .fields
+                .push(catalog::IcebergSchemaFieldDef {
+                    field_id: 2,
+                    name: "tenant_id".to_string(),
+                    initial_default: None,
+                    write_default: None,
+                    initial_default_json: None,
+                    write_default_json: None,
+                    children: Vec::new(),
+                });
+            let mut bindings = ScanExecutionBindings::default();
+            bindings
+                .insert_binding(file_binding_for_test(
+                    10,
+                    resolved_table,
+                    catalog::IcebergDataFileBinding::ExplicitFiles,
+                    vec![
+                        ResolvedScanColumn {
+                            planner: output_column(1, "bound_order_id", DataType::Int64),
+                            source: column_def_for_test(
+                                "physical_order_id",
+                                DataType::Int64,
+                                false,
+                            ),
+                            kind: ResolvedScanColumnKind::PhysicalTableColumn,
+                        },
+                        ResolvedScanColumn {
+                            planner: output_column(2, "bound_file", DataType::Utf8),
+                            source: column_def_for_test("_file", DataType::Utf8, false),
+                            kind: ResolvedScanColumnKind::IcebergMetadataColumn,
+                        },
+                    ],
+                    vec![
+                        bound_read_for_test(Some(1), "physical_order_id"),
+                        ResolvedReadColumn {
+                            planner_column_id: None,
+                            source: column_def_for_test("tenant_id", DataType::Int64, false),
+                            reason: ResolvedReadReason::EqualityDeleteKey,
+                        },
+                    ],
+                ))
+                .expect("insert refresh file binding");
+
+            let encoded = encode_distributed_plan_with_context(
+                &plan,
+                NativePlanEncodeContext {
+                    scan_bindings: Some(&bindings),
+                },
+            )
+            .expect("encode refresh binding");
+            let scan = encoded_root_scan_for_test(&encoded);
+            assert_eq!(
+                scan.columns
+                    .iter()
+                    .map(|column| column.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["physical_order_id", "_file"]
+            );
+            assert_eq!(
+                scan.required_columns,
+                vec!["physical_order_id", "tenant_id"]
+            );
+            let table = scan.table.as_ref().expect("bound table");
+            assert_eq!(
+                table
+                    .columns
+                    .iter()
+                    .map(|column| column.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["physical_order_id", "tenant_id"],
+                "resolver-required sources must encode only binding-owned physical columns and hidden reads"
+            );
+            assert_eq!(
+                table
+                    .iceberg_row_lineage_metadata_columns
+                    .iter()
+                    .map(|column| column.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["_file"]
+            );
+            let Some(crate::proto::plan::scan_source::Kind::IcebergDataFiles(files)) = table
+                .source
+                .as_ref()
+                .and_then(|source| source.kind.as_ref())
+            else {
+                panic!("refresh source must encode as resolved IcebergDataFiles");
+            };
+            assert_eq!(
+                files.table.as_ref().expect("resolved table").location,
+                "s3://resolved/orders"
+            );
+            assert_eq!(
+                files.binding,
+                crate::proto::plan::IcebergDataFileBinding::ExplicitFiles as i32
+            );
+            let (read_columns, variants) = crate::lower::novarocks::scan_read_binding_for_test(
+                scan,
+                files.table.as_ref().expect("resolved table"),
+                &scan.columns,
+            )
+            .expect("lower bound refresh read plan");
+            assert!(
+                read_columns.iter().any(|column| column == "tenant_id"),
+                "native lowering must resolve hidden equality key from TableDef"
+            );
+            assert!(variants.is_empty());
+        }
+    }
+
+    #[test]
+    fn required_bindings_reject_missing_node_and_execution_variant_mismatch() {
+        let plan = iceberg_delta_distributed_plan_for_test();
+        let missing = encode_distributed_plan_with_context(
+            &plan,
+            NativePlanEncodeContext {
+                scan_bindings: Some(&ScanExecutionBindings::default()),
+            },
+        )
+        .expect_err("delta source without prepared binding must fail");
+        assert!(missing.contains("node_id=10"), "{missing}");
+        assert!(missing.contains("IcebergDeltaTable"), "{missing}");
+        assert!(missing.contains("from_snapshot_id=1"), "{missing}");
+        assert!(missing.contains("to_snapshot_id=2"), "{missing}");
+
+        let mut wrong_node = ScanExecutionBindings::default();
+        wrong_node
+            .insert_binding(delta_binding_for_test(11))
+            .expect("insert binding for wrong node");
+        let err = encode_distributed_plan_with_context(
+            &plan,
+            NativePlanEncodeContext {
+                scan_bindings: Some(&wrong_node),
+            },
+        )
+        .expect_err("binding at another node id must not be reused");
+        assert!(err.contains("node_id=10"), "{err}");
+
+        let mut wrong_execution = ScanExecutionBindings::default();
+        wrong_execution
+            .insert_binding(file_binding_for_test(
+                10,
+                iceberg_table_info_for_test(),
+                catalog::IcebergDataFileBinding::ExplicitFiles,
+                vec![bound_column_for_test(
+                    1,
+                    "order_id",
+                    "order_id",
+                    ResolvedScanColumnKind::PhysicalTableColumn,
+                )],
+                vec![bound_read_for_test(Some(1), "order_id")],
+            ))
+            .expect("insert wrong execution variant");
+        let err = encode_distributed_plan_with_context(
+            &plan,
+            NativePlanEncodeContext {
+                scan_bindings: Some(&wrong_execution),
+            },
+        )
+        .expect_err("delta source with file binding must fail");
+        assert!(err.contains("execution variant mismatch"), "{err}");
+        assert!(err.contains("IcebergFiles"), "{err}");
+    }
+
+    #[test]
+    fn binding_encoder_preserves_variant_synthetic_output_and_required_name() {
+        let mut plan = iceberg_delta_distributed_plan_for_test();
+        let scan = root_scan_for_test(&mut plan);
+        let mut table = iceberg_table_info_for_test();
+        table.schema.fields[0].name = "v".to_string();
+        scan.table.columns = vec![column_def_for_test("v", DataType::LargeBinary, false)];
+        scan.table.source = catalog::ScanSource::IcebergDataFiles {
+            table: table.clone(),
+            files: Vec::new(),
+            cloud_properties: BTreeMap::new(),
+            binding: catalog::IcebergDataFileBinding::ExplicitFiles,
+        };
+        scan.columns = vec![
+            output_column(1, "v", DataType::LargeBinary),
+            OutputColumn {
+                column_id: ColumnId::new_for_test(2),
+                name: "__nr_var_v_0".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                is_internal: true,
+            },
+        ];
+        scan.required_columns = Some(vec!["__nr_var_v_0".to_string()]);
+        scan.variant_columns = vec![crate::sql::common::ScanVariantColumn {
+            source_column_id: ColumnId::new_for_test(1),
+            source_column: "v".to_string(),
+            synthetic_column_id: ColumnId::new_for_test(2),
+            synthetic_column: "__nr_var_v_0".to_string(),
+            canonical_path: "$.a.b".to_string(),
+            requested_type: DataType::Int64,
+            strict: true,
+        }];
+        let mut bindings = ScanExecutionBindings::default();
+        bindings
+            .insert_binding(file_binding_for_test(
+                10,
+                table,
+                catalog::IcebergDataFileBinding::ExplicitFiles,
+                vec![ResolvedScanColumn {
+                    planner: output_column(1, "v", DataType::LargeBinary),
+                    source: column_def_for_test("v", DataType::LargeBinary, false),
+                    kind: ResolvedScanColumnKind::PhysicalTableColumn,
+                }],
+                Vec::new(),
+            ))
+            .expect("insert variant binding");
+
+        let encoded = encode_distributed_plan_with_context(
+            &plan,
+            NativePlanEncodeContext {
+                scan_bindings: Some(&bindings),
+            },
+        )
+        .expect("encode bound VARIANT scan");
+        let scan = encoded_root_scan_for_test(&encoded);
+        assert_eq!(
+            scan.columns
+                .iter()
+                .map(|column| (column.column_id, column.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "v"), (2, "__nr_var_v_0")]
+        );
+        assert_eq!(scan.required_columns, vec!["__nr_var_v_0"]);
+        assert_eq!(scan.variant_columns[0].synthetic_column_id, 2);
+        let table = scan.table.as_ref().expect("bound table");
+        let Some(crate::proto::plan::scan_source::Kind::IcebergDataFiles(files)) = table
+            .source
+            .as_ref()
+            .and_then(|source| source.kind.as_ref())
+        else {
+            panic!("variant binding must encode as IcebergDataFiles");
+        };
+        let (read_columns, variants) = crate::lower::novarocks::scan_read_binding_for_test(
+            scan,
+            files.table.as_ref().expect("resolved table"),
+            &scan.columns[1..],
+        )
+        .expect("lower encoded bound VARIANT scan");
+        assert_eq!(read_columns, vec!["v"]);
+        assert_eq!(variants, vec![(1, 2)]);
+    }
+
+    fn root_scan_for_test(
+        plan: &mut DistributedPlan,
+    ) -> &mut crate::sql::planner::payload::PlanScanNode {
+        let DistributedNodeKind::Scan(scan) = &mut plan.fragments[0].root.payload else {
+            panic!("expected root scan");
+        };
+        scan
+    }
+
+    fn encoded_root_scan_for_test(plan: &plan::DistributedPlan) -> &plan::ScanNode {
+        let root = plan.fragments[0].root.as_ref().expect("encoded root");
+        let Some(plan::distributed_node::Payload::Physical(physical)) = root.payload.as_ref()
+        else {
+            panic!("expected physical root");
+        };
+        let Some(plan::plan_node::Kind::Scan(scan)) = physical.kind.as_ref() else {
+            panic!("expected scan root");
+        };
+        scan
+    }
+
+    fn file_binding_for_test(
+        node_id: i32,
+        table: catalog::IcebergTableInfo,
+        file_binding: catalog::IcebergDataFileBinding,
+        physical_columns: Vec<ResolvedScanColumn>,
+        required_reads: Vec<ResolvedReadColumn>,
+    ) -> ResolvedScanBinding {
+        ResolvedScanBinding {
+            node_id,
+            execution: ResolvedScanExecution::IcebergFiles(ResolvedIcebergFileScan {
+                table,
+                files: Vec::new(),
+                cloud_properties: BTreeMap::from([("region".to_string(), "test".to_string())]),
+                binding: file_binding,
+            }),
+            physical_columns,
+            required_reads,
+        }
+    }
+
+    fn delta_binding_for_test(node_id: i32) -> ResolvedScanBinding {
+        ResolvedScanBinding {
+            node_id,
+            execution: ResolvedScanExecution::IcebergDelta(ResolvedIcebergDeltaScan {
+                runtime_plan: IcebergDeltaScanRuntimePlan {
+                    table_location: "s3://prepared/orders".to_string(),
+                    data_columns: Vec::new(),
+                    cloud_properties: BTreeMap::new(),
+                    change_files: Vec::new(),
+                    delete_side: None,
+                },
+            }),
+            physical_columns: vec![bound_column_for_test(
+                1,
+                "order_id",
+                "order_id",
+                ResolvedScanColumnKind::PhysicalTableColumn,
+            )],
+            required_reads: vec![bound_read_for_test(Some(1), "order_id")],
+        }
+    }
+
+    fn bound_column_for_test(
+        id: u32,
+        planner_name: &str,
+        source_name: &str,
+        kind: ResolvedScanColumnKind,
+    ) -> ResolvedScanColumn {
+        ResolvedScanColumn {
+            planner: output_column(id, planner_name, DataType::Int64),
+            source: column_def_for_test(source_name, DataType::Int64, false),
+            kind,
+        }
+    }
+
+    fn bound_read_for_test(planner_id: Option<u32>, source_name: &str) -> ResolvedReadColumn {
+        ResolvedReadColumn {
+            planner_column_id: planner_id.map(ColumnId::new_for_test),
+            source: column_def_for_test(source_name, DataType::Int64, false),
+            reason: if planner_id.is_some() {
+                ResolvedReadReason::PlannerRequiredOrOutput
+            } else {
+                ResolvedReadReason::EqualityDeleteKey
+            },
+        }
+    }
+
+    fn column_def_for_test(name: &str, data_type: DataType, nullable: bool) -> catalog::ColumnDef {
+        catalog::ColumnDef {
+            name: name.to_string(),
+            data_type,
+            nullable,
+            write_default: None,
+            logical_type: None,
+        }
     }
 
     fn iceberg_delta_distributed_plan_for_test() -> DistributedPlan {
@@ -3642,31 +4471,35 @@ mod tests {
             }],
             iceberg_row_lineage_metadata_columns: Vec::new(),
             source: catalog::ScanSource::IcebergDeltaTable {
-                table: catalog::IcebergTableInfo {
-                    catalog: "ice".to_string(),
-                    namespace: "db".to_string(),
-                    table: "orders".to_string(),
-                    table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
-                    current_snapshot_id: Some(2),
-                    schema_id: 1,
-                    location: "file:///warehouse/orders".to_string(),
-                    schema: catalog::IcebergSchemaDef {
-                        fields: vec![catalog::IcebergSchemaFieldDef {
-                            field_id: 1,
-                            name: "order_id".to_string(),
-                            initial_default: None,
-                            write_default: None,
-                            initial_default_json: None,
-                            write_default_json: None,
-                            children: Vec::new(),
-                        }],
-                    },
-                    serialized_metadata: None,
-                    serialized_metadata_rows: None,
-                },
+                table: iceberg_table_info_for_test(),
                 from_snapshot_id: 1,
                 to_snapshot_id: 2,
             },
+        }
+    }
+
+    fn iceberg_table_info_for_test() -> catalog::IcebergTableInfo {
+        catalog::IcebergTableInfo {
+            catalog: "ice".to_string(),
+            namespace: "db".to_string(),
+            table: "orders".to_string(),
+            table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
+            current_snapshot_id: Some(2),
+            schema_id: 1,
+            location: "file:///warehouse/orders".to_string(),
+            schema: catalog::IcebergSchemaDef {
+                fields: vec![catalog::IcebergSchemaFieldDef {
+                    field_id: 1,
+                    name: "order_id".to_string(),
+                    initial_default: None,
+                    write_default: None,
+                    initial_default_json: None,
+                    write_default_json: None,
+                    children: Vec::new(),
+                }],
+            },
+            serialized_metadata: None,
+            serialized_metadata_rows: None,
         }
     }
 

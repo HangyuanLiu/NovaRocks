@@ -513,6 +513,7 @@ impl FragmentCutBuilder {
         let receive_producer_column_ids = consume.producer_column_ids.clone();
         let exchange_output_columns =
             cte_consume_exchange_output_columns(consume, &producer_output_columns)?;
+        let output_slot_ids = output_slot_ids_for_exchange(&exchange_output_columns)?;
         let project_items = cte_consume_remap_project_items(consume, &exchange_output_columns)?;
 
         let exchange_node_id = self.ids.alloc_node();
@@ -531,7 +532,7 @@ impl FragmentCutBuilder {
                 cte_id: consume.cte_id,
                 receive_producer_column_ids: receive_producer_column_ids.clone(),
             },
-            output_slot_ids: Vec::new(),
+            output_slot_ids,
         });
 
         let exchange = DistributedNode {
