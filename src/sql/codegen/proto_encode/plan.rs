@@ -3394,6 +3394,36 @@ mod tests {
         // sink placement, so give it a structurally valid noop sink.
         second_target.sink = DataSink::Noop;
         source.fragments_mut().push(second_target);
+        // CGO-9B/Task 2 seals a `TopologyContract` that rejects a plan with more
+        // than one non-write terminal fragment. Fragment 2 must therefore be an
+        // interior fragment, not a second disconnected terminal. Wire it into a
+        // linear chain fragment 1 -> fragment 2 -> fragment 0 so fragment 0 is the
+        // single execution anchor while fragment 2 stays in the plan (keeping the
+        // build filter's multi-fragment target `[0, 2]` meaningful for multi-target
+        // encoding coverage). Fragment 2 keeps its cloned exchange receiver
+        // (source_fragment_id 1, node 21) to consume fragment 1's stream; repoint
+        // fragment 0's receiver (node 20) to consume fragment 2's stream instead.
+        let DistributedNodeKind::Exchange(anchor_receiver) =
+            &mut source.fragments_mut()[1].root.payload
+        else {
+            panic!("fragment 0 root must be an exchange receiver");
+        };
+        anchor_receiver.source_fragment_id = 2;
+        // Retarget the original 1 -> 0 stream edge to 1 -> 2 (fragment 2's receiver
+        // node 21), then add the 2 -> 0 stream edge into fragment 0's receiver
+        // node 20. Both edges keep the base fixture's unpartitioned/gather shape and
+        // `[delta, old]` slot order.
+        source.edges_mut()[0].target_fragment_id = 2;
+        source.edges_mut()[0].target_exchange_node_id = 21;
+        source.edges_mut().push(FragmentEdge {
+            source_fragment_id: 2,
+            target_fragment_id: 0,
+            target_exchange_node_id: 20,
+            output_partition: DataPartition::unpartitioned(),
+            stream_kind: FragmentStreamKind::Gather,
+            edge_kind: FragmentEdgeKind::Stream,
+            output_slot_ids: vec![2, 1],
+        });
         let build_expr = TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: ColumnId::new_for_test(2),
