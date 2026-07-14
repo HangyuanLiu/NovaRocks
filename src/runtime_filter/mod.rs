@@ -16,6 +16,9 @@
 // under the License.
 
 pub(crate) mod core;
+// RFD-6 live cutover will consume this deployment compiler; remove the allowance then.
+#[allow(dead_code)]
+pub(crate) mod deployment;
 pub(crate) mod materializer;
 // RFD-3/RFD-5A will consume this staged planner/runtime seam; remove the allowance then.
 #[allow(dead_code)]
