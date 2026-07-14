@@ -78,16 +78,16 @@ pub(crate) fn encode_distributed_plan_with_context(
     ctx: NativePlanEncodeContext<'_>,
 ) -> Result<plan::DistributedPlan, String> {
     let mut fragments = src
-        .fragments
+        .fragments()
         .iter()
         .map(|fragment| encode_plan_fragment_with_context(fragment, &ctx))
         .collect::<Result<Vec<_>, _>>()?;
     attach_stream_sinks(src, &mut fragments)?;
     Ok(plan::DistributedPlan {
         fragments,
-        root_fragment_id: src.root_fragment_id,
+        root_fragment_id: src.root_fragment_id(),
         edges: src
-            .edges
+            .edges()
             .iter()
             .map(encode_fragment_edge)
             .collect::<Result<Vec<_>, _>>()?,
@@ -104,12 +104,12 @@ fn attach_stream_sinks(
         .map(|(idx, fragment)| (fragment.fragment_id, idx))
         .collect::<HashMap<_, _>>();
     let source_fragment_by_id = src
-        .fragments
+        .fragments()
         .iter()
         .map(|fragment| (fragment.fragment_id, fragment))
         .collect::<HashMap<_, _>>();
 
-    for edge in &src.edges {
+    for edge in src.edges() {
         if !matches!(edge.edge_kind, FragmentEdgeKind::Stream) {
             continue;
         }
@@ -3381,12 +3381,19 @@ mod tests {
 
     #[test]
     fn nonempty_runtime_filter_graph_is_wire_neutral_and_bound_node_filters_still_encode() {
-        let mut source = two_fragment_stream_plan_for_test();
-        let mut second_target = source.fragments[1].clone();
+        let source = two_fragment_stream_plan_for_test();
+        let mut source =
+            crate::sql::planner::distributed::test_support::draft_builder_from_plan(&source);
+        let mut second_target = source.fragments()[1].clone();
         second_target.fragment_id = 2;
         second_target.root.fragment_id = 2;
         second_target.root.node_id = 21;
-        source.fragments.push(second_target);
+        // The clone inherits the root consumer's `Result` sink, but fragment 2 is
+        // a non-root fragment; seal only accepts a noop or Iceberg-write sink
+        // there. This fixture exists to exercise runtime-filter encoding, not
+        // sink placement, so give it a structurally valid noop sink.
+        second_target.sink = DataSink::Noop;
+        source.fragments_mut().push(second_target);
         let build_expr = TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: ColumnId::new_for_test(2),
@@ -3405,7 +3412,7 @@ mod tests {
             data_type: DataType::Int64,
             nullable: false,
         };
-        source.fragments[0]
+        source.fragments_mut()[0]
             .root
             .build_runtime_filters
             .push(BoundRuntimeFilterBuild {
@@ -3419,7 +3426,7 @@ mod tests {
                 source_fragment_id: 1,
                 target_fragment_ids: vec![0, 2],
             });
-        source.fragments[0]
+        source.fragments_mut()[0]
             .root
             .probe_runtime_filters
             .push(BoundRuntimeFilterProbe {
@@ -3430,14 +3437,14 @@ mod tests {
                 source_fragment_id: 1,
             });
 
-        let mut empty_graph = source.clone();
-        empty_graph.runtime_filter_graph = RuntimeFilterGraph::default();
-        assert!(empty_graph.runtime_filter_graph.is_empty());
+        let empty_graph = source.seal().expect("seal empty graph fixture");
+        assert!(empty_graph.runtime_filter_graph().is_empty());
         let encoded_empty = encode_distributed_plan(&empty_graph).expect("encode empty graph plan");
 
-        let mut nonempty_graph = source.clone();
+        let mut nonempty_graph =
+            crate::sql::planner::distributed::test_support::draft_builder_from_plan(&empty_graph);
         nonempty_graph
-            .runtime_filter_graph
+            .runtime_filter_graph_mut()
             .insert_channel(RuntimeFilterChannelSpec {
                 channel_id: ChannelId::new(1),
                 logical_domain: RuntimeFilterLogicalDomain::Membership {
@@ -3465,7 +3472,7 @@ mod tests {
             })
             .expect("insert channel");
         nonempty_graph
-            .runtime_filter_graph
+            .runtime_filter_graph_mut()
             .insert_binding(RuntimeFilterBindingSpec {
                 binding_id: BindingId::new(1),
                 channel_id: ChannelId::new(1),
@@ -3486,7 +3493,7 @@ mod tests {
             })
             .expect("insert producer binding");
         nonempty_graph
-            .runtime_filter_graph
+            .runtime_filter_graph_mut()
             .insert_binding(RuntimeFilterBindingSpec {
                 binding_id: BindingId::new(2),
                 channel_id: ChannelId::new(1),
@@ -3506,11 +3513,12 @@ mod tests {
                 }),
             })
             .expect("insert consumer binding");
-        assert!(!nonempty_graph.runtime_filter_graph.is_empty());
         nonempty_graph
-            .runtime_filter_graph
+            .runtime_filter_graph_mut()
             .validate()
             .expect("nonempty graph fixture must be structurally valid");
+        let nonempty_graph = nonempty_graph.seal().expect("seal nonempty graph fixture");
+        assert!(!nonempty_graph.runtime_filter_graph().is_empty());
         // RFD-1 keeps the graph planner-only until RFD-5A/CGO-13 defines wire lowering.
         let encoded_nonempty =
             encode_distributed_plan(&nonempty_graph).expect("encode nonempty graph plan");
@@ -3764,7 +3772,7 @@ mod tests {
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
         };
-        let plan = DistributedPlan {
+        let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
             fragments: vec![source, target],
             root_fragment_id: 0,
             runtime_filter_graph: RuntimeFilterGraph::default(),
@@ -3879,7 +3887,8 @@ mod tests {
             write_default: None,
             logical_type: None,
         };
-        let mut plan = plan;
+        let mut plan =
+            crate::sql::planner::distributed::test_support::draft_builder_from_plan(&plan);
         root_scan_for_test(&mut plan)
             .table
             .columns
@@ -3888,6 +3897,7 @@ mod tests {
                 DataType::Utf8,
                 true,
             ));
+        let plan = plan.seal().expect("seal prepared delta fixture");
         let hidden_equality_column = column_def_for_test("tenant_id", DataType::Int64, false);
         let mut bindings = ScanExecutionBindings::default();
         bindings
@@ -3974,7 +3984,9 @@ mod tests {
 
     #[test]
     fn ordinary_iceberg_binding_preserves_existing_encoding() {
-        let mut plan = iceberg_delta_distributed_plan_for_test();
+        let plan = iceberg_delta_distributed_plan_for_test();
+        let mut plan =
+            crate::sql::planner::distributed::test_support::draft_builder_from_plan(&plan);
         let scan = root_scan_for_test(&mut plan);
         scan.table.columns.push(column_def_for_test(
             "unprojected_payload",
@@ -3989,6 +4001,7 @@ mod tests {
             binding: catalog::IcebergDataFileBinding::CurrentSnapshot,
         };
         scan.required_columns = Some(vec!["order_id".to_string()]);
+        let plan = plan.seal().expect("seal ordinary Iceberg fixture");
 
         let without_binding = encode_distributed_plan(&plan).expect("encode ordinary Iceberg scan");
         let mut bindings = ScanExecutionBindings::default();
@@ -4055,7 +4068,9 @@ mod tests {
         ];
 
         for source in refresh_sources {
-            let mut plan = iceberg_delta_distributed_plan_for_test();
+            let plan = iceberg_delta_distributed_plan_for_test();
+            let mut plan =
+                crate::sql::planner::distributed::test_support::draft_builder_from_plan(&plan);
             let scan = root_scan_for_test(&mut plan);
             scan.table.source = source;
             scan.table.columns = vec![
@@ -4066,6 +4081,7 @@ mod tests {
                 output_column(1, "stale", DataType::Utf8),
                 output_column(2, "stale_meta", DataType::Int64),
             ];
+            let plan = plan.seal().expect("seal refresh-source fixture");
 
             let mut resolved_table = iceberg_table_info_for_test();
             resolved_table.current_snapshot_id = Some(1);
@@ -4238,7 +4254,9 @@ mod tests {
 
     #[test]
     fn binding_encoder_preserves_variant_synthetic_output_and_required_name() {
-        let mut plan = iceberg_delta_distributed_plan_for_test();
+        let plan = iceberg_delta_distributed_plan_for_test();
+        let mut plan =
+            crate::sql::planner::distributed::test_support::draft_builder_from_plan(&plan);
         let scan = root_scan_for_test(&mut plan);
         let mut table = iceberg_table_info_for_test();
         table.schema.fields[0].name = "v".to_string();
@@ -4269,6 +4287,7 @@ mod tests {
             requested_type: DataType::Int64,
             strict: true,
         }];
+        let plan = plan.seal().expect("seal variant fixture");
         let mut bindings = ScanExecutionBindings::default();
         bindings
             .insert_binding(file_binding_for_test(
@@ -4320,9 +4339,9 @@ mod tests {
     }
 
     fn root_scan_for_test(
-        plan: &mut DistributedPlan,
+        plan: &mut crate::sql::planner::distributed::test_support::DistributedPlanDraftBuilder,
     ) -> &mut crate::sql::planner::payload::PlanScanNode {
-        let DistributedNodeKind::Scan(scan) = &mut plan.fragments[0].root.payload else {
+        let DistributedNodeKind::Scan(scan) = &mut plan.fragments_mut()[0].root.payload else {
             panic!("expected root scan");
         };
         scan
@@ -4419,7 +4438,7 @@ mod tests {
 
     fn iceberg_delta_distributed_plan_for_test() -> DistributedPlan {
         let output_columns = vec![output_column(1, "order_id", DataType::Int64)];
-        DistributedPlan {
+        crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
             fragments: vec![PlanFragment {
                 fragment_id: 0,
                 root: DistributedNode {
@@ -5144,7 +5163,7 @@ mod tests {
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
         };
-        let plan = DistributedPlan {
+        let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
             fragments: vec![source, target],
             root_fragment_id: 0,
             runtime_filter_graph: RuntimeFilterGraph::default(),
@@ -5386,7 +5405,7 @@ mod tests {
             output_column(2, "delta", DataType::Int64),
         ];
         let receiver_columns = vec![source_columns[1].clone(), source_columns[0].clone()];
-        DistributedPlan {
+        crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
             fragments: vec![
                 PlanFragment {
                     fragment_id: 1,
@@ -5465,7 +5484,7 @@ mod tests {
             output_column(30, "title", DataType::Utf8),
         ];
         let receiver_columns = source_columns[..2].to_vec();
-        DistributedPlan {
+        crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
             fragments: vec![
                 PlanFragment {
                     fragment_id: 1,
@@ -5538,7 +5557,7 @@ mod tests {
     }
 
     fn two_fragment_zero_column_stream_plan_for_test() -> DistributedPlan {
-        DistributedPlan {
+        crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
             fragments: vec![
                 PlanFragment {
                     fragment_id: 1,
@@ -5612,7 +5631,7 @@ mod tests {
 
     fn two_fragment_generate_series_stream_plan_for_test() -> DistributedPlan {
         let output_columns = vec![output_column(7, "generate_series", DataType::Int64)];
-        DistributedPlan {
+        crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
             fragments: vec![
                 PlanFragment {
                     fragment_id: 1,
@@ -5694,7 +5713,7 @@ mod tests {
             output_column(2, "route", DataType::Int32),
             output_column(3, "bucket", DataType::Int32),
         ];
-        DistributedPlan {
+        crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
             fragments: vec![PlanFragment {
                 fragment_id: 0,
                 root: DistributedNode {

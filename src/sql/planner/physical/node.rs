@@ -123,6 +123,13 @@ pub(crate) struct DistributedChangeEventOutputExpr {
     pub(crate) expr: Option<TypedExpr>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PreExpandKeyedAssertSpec {
+    pub(crate) key_column_name: String,
+    pub(crate) key_label: String,
+    pub(crate) message_prefix: String,
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalPlanNode {

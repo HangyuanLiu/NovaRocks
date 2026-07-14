@@ -135,12 +135,13 @@ pub(crate) struct FragmentEdge {
     pub output_slot_ids: Vec<i32>,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct DistributedPlan {
-    pub fragments: Vec<PlanFragment>,
-    pub root_fragment_id: FragmentId,
-    pub edges: Vec<FragmentEdge>,
-    // RFD-5A will populate and consume this slot; remove the allowance at that cutover.
-    #[allow(dead_code)]
-    pub runtime_filter_graph: RuntimeFilterGraph,
+#[derive(Debug)]
+pub(in crate::sql::planner::distributed) struct DistributedPlanDraft {
+    pub(in crate::sql::planner::distributed) fragments: Vec<PlanFragment>,
+    pub(in crate::sql::planner::distributed) root_fragment_id: Option<FragmentId>,
+    pub(in crate::sql::planner::distributed) edges: Vec<FragmentEdge>,
+    // Mutable pre-seal runtime filter graph. `seal_draft` runs RFD-1's
+    // `RuntimeFilterGraph::validate` on it before moving it into the sealed plan,
+    // so (unlike the sealed slot) it is consumed here and carries no allowance.
+    pub(in crate::sql::planner::distributed) runtime_filter_graph: RuntimeFilterGraph,
 }

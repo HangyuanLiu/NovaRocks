@@ -101,9 +101,9 @@ fn explain_distributed_plan_inner(
                 "  PARTITION: {}",
                 fragment.data_partition.explain_label()
             ));
-            if fragment.fragment_id != dp.root_fragment_id {
+            if fragment.fragment_id != dp.root_fragment_id() {
                 let source_edges = dp
-                    .edges
+                    .edges()
                     .iter()
                     .filter(|edge| edge.source_fragment_id == fragment.fragment_id)
                     .collect::<Vec<_>>();
@@ -133,19 +133,19 @@ fn explain_distributed_plan_inner(
 }
 
 fn explain_fragment_order(dp: &DistributedPlan) -> Vec<&PlanFragment> {
-    let mut ordered = Vec::with_capacity(dp.fragments.len());
+    let mut ordered = Vec::with_capacity(dp.fragments().len());
     if let Some(root) = dp
-        .fragments
+        .fragments()
         .iter()
-        .find(|fragment| fragment.fragment_id == dp.root_fragment_id)
+        .find(|fragment| fragment.fragment_id == dp.root_fragment_id())
     {
         ordered.push(root);
     }
     ordered.extend(
-        dp.fragments
+        dp.fragments()
             .iter()
             .rev()
-            .filter(|fragment| fragment.fragment_id != dp.root_fragment_id),
+            .filter(|fragment| fragment.fragment_id != dp.root_fragment_id()),
     );
     ordered
 }
@@ -1642,9 +1642,9 @@ mod tests {
         let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
             .expect("build DistributedPlan");
         let root = &distributed_plan
-            .fragments
+            .fragments()
             .iter()
-            .find(|fragment| fragment.fragment_id == distributed_plan.root_fragment_id)
+            .find(|fragment| fragment.fragment_id == distributed_plan.root_fragment_id())
             .expect("root fragment")
             .root;
 

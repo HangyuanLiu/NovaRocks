@@ -19,16 +19,22 @@ pub(crate) mod build;
 mod fragment;
 mod node;
 pub(crate) mod runtime_filter;
+mod seal;
+mod validation;
 pub(crate) mod write;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub(crate) use fragment::{
-    DataPartition, DataSink, DistributedPlan, FragmentEdge, FragmentEdgeKind, FragmentId,
-    FragmentStreamKind, PartitionKind, PlanFragment,
+    DataPartition, DataSink, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind,
+    PartitionKind, PlanFragment,
 };
 pub(crate) use node::{
     DistributedNode, DistributedNodeKind, ExchangeFlavor, ExchangeReceiver,
     distributed_kind_from_physical, distributed_kind_to_physical,
 };
+pub(crate) use seal::DistributedPlan;
 
 #[cfg(test)]
 mod tests {

@@ -40,7 +40,7 @@ pub(crate) fn prepare_scan_bindings(
 ) -> Result<ScanExecutionBindings, String> {
     let mut bindings = ScanExecutionBindings::default();
     let mut seen_scan_node_ids = std::collections::BTreeSet::new();
-    for fragment in &plan.fragments {
+    for fragment in plan.fragments() {
         collect_scan_bindings(
             fragment.fragment_id,
             &fragment.root,
@@ -1207,7 +1207,7 @@ mod tests {
     }
 
     fn plan(root: DistributedNode) -> DistributedPlan {
-        DistributedPlan {
+        crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
             fragments: vec![PlanFragment {
                 fragment_id: 0,
                 root,
@@ -1313,50 +1313,18 @@ mod tests {
         assert_eq!(file.length, 128);
     }
 
-    #[test]
-    fn duplicate_scan_node_and_range_ids_fail_fast() {
-        let mut root = scan_node(10, IcebergDataFileBinding::ExplicitFiles);
-        root.children
-            .push(scan_node(10, IcebergDataFileBinding::ExplicitFiles));
-        let err = match prepare_scan_bindings(
-            &plan(root),
-            &registry(vec![data_file("s3://bucket/explicit.parquet")]),
-            None,
-        ) {
-            Ok(_) => panic!("duplicate scan id must fail"),
-            Err(err) => err,
-        };
-
-        assert!(err.contains("duplicate"), "{err}");
-        assert!(err.contains("node_id=10"), "{err}");
-
-        let mut metadata_root = scan_node(11, IcebergDataFileBinding::ExplicitFiles);
-        replace_scan_source(
-            &mut metadata_root,
-            ScanSource::IcebergMetadataTable {
-                table: iceberg_table(),
-                metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType::Snapshots,
-                serialized_table: "{}".to_string(),
-                cloud_properties: BTreeMap::new(),
-                metadata_payload: None,
-            },
-        );
-        let mut duplicate_across_fragments = plan(metadata_root);
-        let mut second = duplicate_across_fragments.fragments[0].clone();
-        second.fragment_id = 1;
-        second.root.fragment_id = 1;
-        duplicate_across_fragments.fragments.push(second);
-
-        let err = match prepare_scan_bindings(
-            &duplicate_across_fragments,
-            &ConnectorRegistry::new(),
-            None,
-        ) {
-            Ok(_) => panic!("duplicate metadata scan id across fragments must fail"),
-            Err(err) => err,
-        };
-        assert!(err.contains("duplicate scan node_id=11"), "{err}");
-    }
+    // Duplicate scan `node_id`s (both within one fragment and across fragments)
+    // can no longer reach scan preparation: node-id uniqueness is enforced at the
+    // seal boundary by `validate_global_node_ids`
+    // (src/sql/planner/distributed/validation.rs), so every `DistributedPlan` —
+    // including the ones built by the test helpers here — is already dedup'd
+    // before `prepare_scan_bindings` runs. That invariant is covered by
+    // `distributed_plan_rejects_duplicate_node_id_across_fragments`. Scan
+    // preparation keeps its own node-id dedup (`seen_scan_node_ids`, the
+    // "duplicate scan node_id" / "duplicate StarRocks scan planning" checks) as
+    // unreachable defense-in-depth; it has no scan-prep-unique duplicate (e.g. no
+    // range-id-level dedup) that a valid sealed plan could trigger, so there is
+    // nothing left for a scan-prep test to assert here.
 
     #[test]
     fn metadata_scan_uses_native_sentinel_range() {

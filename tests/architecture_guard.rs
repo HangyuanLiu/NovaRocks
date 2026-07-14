@@ -3855,7 +3855,42 @@ fn top_level_production_function_is_pub_crate(item: &str) -> bool {
     })
 }
 
+/// Whether a top-level function item is scoped `pub(in crate::sql::planner::distributed)`.
+/// This is intentionally tighter than `pub(crate)`: CGO-9A keeps the draft builder
+/// from leaking beyond the `distributed` module (spec section 3.1).
+fn top_level_production_function_is_pub_in_distributed(item: &str) -> bool {
+    const VISIBILITY: [&str; 11] = [
+        "pub",
+        "(",
+        "in",
+        "crate",
+        "::",
+        "sql",
+        "::",
+        "planner",
+        "::",
+        "distributed",
+        ")",
+    ];
+    let tokens = rust_use_tokens(item);
+    let Some(function_index) = tokens.iter().position(|token| token == "fn") else {
+        return false;
+    };
+    tokens[..function_index]
+        .windows(VISIBILITY.len())
+        .any(|window| {
+            window
+                .iter()
+                .zip(VISIBILITY)
+                .all(|(token, expected)| token.as_str() == expected)
+        })
+}
+
 fn distributed_build_mod_surface_violations(text: &str) -> Vec<String> {
+    // CGO-9A build/mod.rs surface: the pass entrypoint and the shared error helper
+    // stay `pub(crate)`, while Task 2's draft builder is deliberately scoped to
+    // `pub(in crate::sql::planner::distributed)` so it cannot leak to `sql::planner`.
+    const DRAFT_BUILDER: &str = "build_distributed_plan_draft";
     let functions = top_level_production_functions(text);
     let mut names = functions
         .iter()
@@ -3865,6 +3900,7 @@ fn distributed_build_mod_surface_violations(text: &str) -> Vec<String> {
     let mut violations = Vec::new();
     let expected = vec![
         "build_distributed_plan".to_string(),
+        DRAFT_BUILDER.to_string(),
         "union_distinct_must_be_rewritten_error".to_string(),
     ];
     if names != expected || names.len() != functions.len() {
@@ -3873,7 +3909,15 @@ fn distributed_build_mod_surface_violations(text: &str) -> Vec<String> {
         ));
     }
     for function in &functions {
-        if !top_level_production_function_is_pub_crate(function) {
+        let is_draft_builder =
+            top_level_production_function_name(function).as_deref() == Some(DRAFT_BUILDER);
+        if is_draft_builder {
+            if !top_level_production_function_is_pub_in_distributed(function) {
+                violations.push(format!(
+                    "the draft builder must use pub(in crate::sql::planner::distributed) visibility so it cannot leak to sql::planner: {function}"
+                ));
+            }
+        } else if !top_level_production_function_is_pub_crate(function) {
             violations.push(format!(
                 "top-level build function must use pub(crate) visibility: {function}"
             ));
@@ -3933,6 +3977,7 @@ mod lowering;
 mod runtime_filter_binding;
 
 pub(crate) fn build_distributed_plan() {}
+pub(in crate::sql::planner::distributed) fn build_distributed_plan_draft() {}
 pub(crate) fn union_distinct_must_be_rewritten_error() {}
 
 #[cfg(test)]
@@ -3956,10 +4001,17 @@ fn test_only_helper() {}
             "pub(super) fn union_distinct_must_be_rewritten_error",
             1,
         ),
+        // The draft builder must stay module-scoped; widening it to pub(crate)
+        // (so it could leak to sql::planner) must be rejected.
+        valid.replacen(
+            "pub(in crate::sql::planner::distributed) fn build_distributed_plan_draft",
+            "pub(crate) fn build_distributed_plan_draft",
+            1,
+        ),
     ] {
         assert!(
             !distributed_build_mod_surface_violations(&invalid).is_empty(),
-            "extra function or non-pub(crate) entry must be rejected: {invalid}"
+            "extra function or wrong-visibility entry must be rejected: {invalid}"
         );
     }
 }
@@ -6153,6 +6205,8 @@ fn planner_distributed_core_has_stage_namespace() {
         "distributed/mod.rs",
         "distributed/node.rs",
         "distributed/fragment.rs",
+        "distributed/seal.rs",
+        "distributed/validation.rs",
         "distributed/runtime_filter.rs",
         "distributed/build/mod.rs",
     ] {
@@ -6178,6 +6232,7 @@ fn planner_distributed_core_has_stage_namespace() {
 
     let fragment_path = planner.join("distributed/fragment.rs");
     let node_path = planner.join("distributed/node.rs");
+    let seal_path = planner.join("distributed/seal.rs");
     let mod_path = planner.join("distributed/mod.rs");
     let fragment = fs::read_to_string(&fragment_path).unwrap();
     let node = fs::read_to_string(&node_path).unwrap();
@@ -6198,13 +6253,13 @@ fn planner_distributed_core_has_stage_namespace() {
                 "DataPartition",
                 "DataSink",
                 "PlanFragment",
-                "DistributedPlan",
                 "FragmentId",
                 "FragmentEdgeKind",
                 "FragmentStreamKind",
                 "FragmentEdge",
             ][..],
         ),
+        (&seal_path, &["DistributedPlan"][..]),
         (
             &node_path,
             &[
@@ -6275,15 +6330,19 @@ fn planner_distributed_core_has_stage_namespace() {
             "fragment".to_string(),
             "node".to_string(),
             "runtime_filter".to_string(),
+            "seal".to_string(),
+            "validation".to_string(),
             "write".to_string(),
         ]),
-        "distributed/mod.rs must declare exactly build, fragment, node, runtime_filter, and write"
+        "distributed/mod.rs must declare exactly build, fragment, node, runtime_filter, seal, validation, and write"
     );
     for declaration in [
         "pub(crate) mod build;",
         "mod fragment;",
         "mod node;",
         "pub(crate) mod runtime_filter;",
+        "mod seal;",
+        "mod validation;",
         "pub(crate) mod write;",
     ] {
         assert!(
@@ -6298,7 +6357,6 @@ fn planner_distributed_core_has_stage_namespace() {
         BTreeSet::from([
             "pub(crate)|fragment::DataPartition".to_string(),
             "pub(crate)|fragment::DataSink".to_string(),
-            "pub(crate)|fragment::DistributedPlan".to_string(),
             "pub(crate)|fragment::FragmentEdge".to_string(),
             "pub(crate)|fragment::FragmentEdgeKind".to_string(),
             "pub(crate)|fragment::FragmentId".to_string(),
@@ -6311,6 +6369,7 @@ fn planner_distributed_core_has_stage_namespace() {
             "pub(crate)|node::ExchangeReceiver".to_string(),
             "pub(crate)|node::distributed_kind_from_physical".to_string(),
             "pub(crate)|node::distributed_kind_to_physical".to_string(),
+            "pub(crate)|seal::DistributedPlan".to_string(),
         ]),
         "distributed/mod.rs must expose exactly the distributed core surface"
     );
@@ -6795,17 +6854,10 @@ fn planner_distributed_write_surface_has_stage_namespace() {
     }
 
     let distributed_mod = fs::read_to_string(&distributed_mod_path).unwrap();
-    assert_eq!(
-        planner_namespace_module_declarations(&distributed_mod),
-        BTreeSet::from([
-            "build".to_string(),
-            "fragment".to_string(),
-            "node".to_string(),
-            "runtime_filter".to_string(),
-            "write".to_string(),
-        ]),
-        "distributed/mod.rs must declare exactly build, fragment, node, runtime_filter, and write"
-    );
+    // The exhaustive distributed module-set assertion is owned solely by
+    // `planner_distributed_core_has_stage_namespace`; a second copy here is what
+    // drifted stale, so this write-surface guard keeps only its own concern: the
+    // write namespace's visibility.
     assert!(
         has_non_comment_line(&distributed_mod, "pub(crate) mod write;"),
         "distributed write namespace must use pub(crate) visibility"
@@ -9409,6 +9461,7 @@ fn runtime_filter_graph_model_has_planner_neutral_boundaries() {
     let contract_path = model.join("contract.rs");
     let graph_path = model.join("graph.rs");
     let fragment_path = repo.join("src/sql/planner/distributed/fragment.rs");
+    let seal_path = repo.join("src/sql/planner/distributed/seal.rs");
     let proto_encode = repo.join("src/sql/codegen/proto_encode");
 
     assert!(contract_path.is_file());
@@ -9441,6 +9494,8 @@ fn runtime_filter_graph_model_has_planner_neutral_boundaries() {
     let fragment_source =
         fs::read_to_string(&fragment_path).expect("distributed fragment source must be readable");
     let fragment_text = rust_sanitized_production_text(&fragment_source);
+    let seal_source =
+        fs::read_to_string(&seal_path).expect("distributed seal source must be readable");
     let proto_text = rs_files(&proto_encode)
         .into_iter()
         .map(|path| {
@@ -9454,11 +9509,17 @@ fn runtime_filter_graph_model_has_planner_neutral_boundaries() {
     assert!(!contract_text.contains("crate::sql"));
     assert!(!graph_text.contains("crate::sql::planner"));
     assert!(fragment_text.contains("runtime_filter_graph: RuntimeFilterGraph"));
+    // The staged graph slot moved from the draft (fragment.rs) into the sealed
+    // `DistributedPlanData` (seal.rs) when distributed plans became sealed at
+    // construction. The draft field is consumed (and, since CGO-9A Task 4,
+    // validated) by `seal_draft`, so it is live and carries no allowance; the
+    // sealed field is only read through the test-only accessor, so it keeps the
+    // documented, removable dead_code allowance for RFD-5A to retire at cutover.
     assert!(
-        fragment_source.contains("RFD-5A")
-            && fragment_source
-                .contains("#[allow(dead_code)]\n    pub runtime_filter_graph: RuntimeFilterGraph"),
-        "the DistributedPlan staged graph slot needs a field-local dead_code allowance"
+        seal_source.contains("RFD-5A")
+            && seal_source
+                .contains("#[allow(dead_code)]\n    runtime_filter_graph: RuntimeFilterGraph"),
+        "the sealed DistributedPlan staged graph slot needs a field-local dead_code allowance"
     );
     assert!(!proto_text.contains("runtime_filter_graph"));
 
@@ -23248,5 +23309,3392 @@ fn cgo_8_immutable_scan_preparation_boundaries_hold_in_production() {
         violations.is_empty(),
         "CGO-8 immutable scan-preparation architecture guard failed:\n{}",
         violations.join("\n")
+    );
+}
+
+fn cgo_9a_is_distributed_plan_path(path: &[String]) -> bool {
+    path.iter().map(String::as_str).eq([
+        "crate",
+        "sql",
+        "planner",
+        "distributed",
+        "DistributedPlan",
+    ]) || path.iter().map(String::as_str).eq([
+        "crate",
+        "sql",
+        "planner",
+        "distributed",
+        "fragment",
+        "DistributedPlan",
+    ]) || (path.len() > 5
+        && path[..4]
+            .iter()
+            .map(String::as_str)
+            .eq(["crate", "sql", "planner", "distributed"])
+        && path
+            .last()
+            .is_some_and(|segment| segment == "DistributedPlan"))
+}
+
+fn cgo_9a_single_pattern_ident(pattern: &syn::Pat) -> Option<String> {
+    match pattern {
+        syn::Pat::Ident(ident) if ident.subpat.is_none() => Some(cgo_8_ident_text(&ident.ident)),
+        syn::Pat::Type(typed) => cgo_9a_single_pattern_ident(&typed.pat),
+        syn::Pat::Paren(paren) => cgo_9a_single_pattern_ident(&paren.pat),
+        syn::Pat::Reference(reference) => cgo_9a_single_pattern_ident(&reference.pat),
+        _ => None,
+    }
+}
+
+fn cgo_9a_single_expr_ident(expr: &syn::Expr) -> Option<String> {
+    match expr {
+        syn::Expr::Path(path) if path.qself.is_none() && path.path.segments.len() == 1 => {
+            Some(cgo_8_ident_text(&path.path.segments[0].ident))
+        }
+        syn::Expr::Group(group) => cgo_9a_single_expr_ident(&group.expr),
+        syn::Expr::Paren(paren) => cgo_9a_single_expr_ident(&paren.expr),
+        _ => None,
+    }
+}
+
+fn cgo_9a_clone_source(expr: &syn::Expr) -> Option<String> {
+    let syn::Expr::MethodCall(call) = expr else {
+        return None;
+    };
+    (cgo_8_ident_text(&call.method) == "clone" && call.args.is_empty())
+        .then(|| cgo_9a_single_expr_ident(&call.receiver))
+        .flatten()
+}
+
+fn cgo_9a_deref_target(expr: &syn::Expr) -> Option<String> {
+    let syn::Expr::Unary(unary) = expr else {
+        return None;
+    };
+    matches!(unary.op, syn::UnOp::Deref(_))
+        .then(|| cgo_9a_single_expr_ident(&unary.expr))
+        .flatten()
+}
+
+fn cgo_9a_has_external_child_module(items: &[syn::Item]) -> bool {
+    items.iter().any(|item| {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+            return false;
+        }
+        let syn::Item::Mod(module) = item else {
+            return false;
+        };
+        match &module.content {
+            None => true,
+            Some((_, inline_items)) => cgo_9a_has_external_child_module(inline_items),
+        }
+    })
+}
+
+fn cgo_9a_mutable_reference_target(ty: &syn::Type) -> Option<&syn::Type> {
+    match ty {
+        syn::Type::Reference(reference) if reference.mutability.is_some() => Some(&reference.elem),
+        syn::Type::Group(group) => cgo_9a_mutable_reference_target(&group.elem),
+        syn::Type::Paren(paren) => cgo_9a_mutable_reference_target(&paren.elem),
+        _ => None,
+    }
+}
+
+struct Cgo9aDistributedPlanSealVisitor<'a> {
+    source_rel: &'a str,
+    construction_owner: bool,
+    scopes: Vec<Cgo8AstScope>,
+    module_has_external_children: Vec<bool>,
+    binding_scopes: Vec<Cgo9aValueScope>,
+    violations: Vec<String>,
+}
+
+#[derive(Default)]
+struct Cgo9aValueScope {
+    shadows: BTreeSet<String>,
+    mutable_plans: BTreeSet<String>,
+    cloned_plans: BTreeMap<String, String>,
+}
+
+impl Cgo9aDistributedPlanSealVisitor<'_> {
+    fn scope(&self) -> &Cgo8AstScope {
+        self.scopes.last().expect("CGO-9A AST scope must exist")
+    }
+
+    fn resolve_segments(&self, segments: &[String]) -> Vec<Vec<String>> {
+        let Some(first) = segments.first() else {
+            return Vec::new();
+        };
+        if first == "crate" {
+            return vec![segments.to_vec()];
+        }
+        let mut index = 0usize;
+        let mut module_path = self.scope().module_path.clone();
+        let explicit_module = if first == "self" {
+            index = 1;
+            true
+        } else {
+            while segments
+                .get(index)
+                .is_some_and(|segment| segment == "super")
+            {
+                module_path.pop();
+                index += 1;
+            }
+            index > 0
+        };
+        if explicit_module {
+            let remainder = &segments[index..];
+            if remainder.is_empty() {
+                return vec![module_path];
+            }
+            if let Some(module_scope) = self
+                .scopes
+                .iter()
+                .rev()
+                .find(|scope| scope.module_scope && scope.module_path == module_path)
+            {
+                return module_scope.resolve_unqualified(remainder, Cgo8Namespace::Type, true);
+            }
+            module_path.extend_from_slice(remainder);
+            return vec![module_path];
+        }
+        self.scope()
+            .resolve_unqualified(segments, Cgo8Namespace::Type, true)
+    }
+
+    fn resolve_path(&self, path: &syn::Path) -> Vec<Vec<String>> {
+        self.resolve_segments(
+            &path
+                .segments
+                .iter()
+                .map(|segment| cgo_8_ident_text(&segment.ident))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn type_is_distributed_plan(&self, ty: &syn::Type) -> bool {
+        let Some(path) = cgo_8_type_path(ty) else {
+            return false;
+        };
+        self.resolve_path(&path.path)
+            .iter()
+            .any(|path| cgo_9a_is_distributed_plan_path(path))
+    }
+
+    fn type_is_mutable_distributed_plan_reference(&self, ty: &syn::Type) -> bool {
+        cgo_9a_mutable_reference_target(ty).is_some_and(|ty| self.type_is_distributed_plan(ty))
+    }
+
+    fn register_item_declaration(&mut self, item: &syn::Item) {
+        let ident = match item {
+            syn::Item::Enum(item) => Some(&item.ident),
+            syn::Item::Mod(item) => Some(&item.ident),
+            syn::Item::Struct(item) => Some(&item.ident),
+            syn::Item::Trait(item) => Some(&item.ident),
+            syn::Item::TraitAlias(item) => Some(&item.ident),
+            syn::Item::Union(item) => Some(&item.ident),
+            _ => None,
+        };
+        if let Some(ident) = ident {
+            let local = cgo_8_ident_text(ident);
+            let scope = self.scopes.last_mut().unwrap();
+            scope.type_bindings.remove(&local);
+            scope.type_shadows.insert(local);
+        }
+    }
+
+    fn register_use(&mut self, item: &syn::ItemUse) {
+        let mut raw = Vec::new();
+        cgo_8_expand_use_tree(&item.tree, &mut Vec::new(), &mut raw);
+        for binding in raw {
+            let targets = self.resolve_segments(&binding.target);
+            let aliases_distributed_plan = targets
+                .iter()
+                .any(|target| cgo_9a_is_distributed_plan_path(target));
+            let is_reexport = !matches!(item.vis, syn::Visibility::Inherited);
+            let is_renamed = binding
+                .local
+                .as_deref()
+                .is_some_and(|local| local != "DistributedPlan");
+            let leaks_to_external_child = self.scope().module_scope
+                && self
+                    .module_has_external_children
+                    .last()
+                    .copied()
+                    .unwrap_or(false);
+            if aliases_distributed_plan
+                && (is_reexport
+                    || (leaks_to_external_child && (!self.construction_owner || is_renamed)))
+            {
+                self.violations.push(format!(
+                    "distributed-plan-alias: {} exposes DistributedPlan through a cross-file import surface",
+                    self.source_rel
+                ));
+            }
+            let scope = self.scopes.last_mut().unwrap();
+            if binding.glob {
+                scope.glob_imports.extend(targets);
+            } else if let Some(local) = binding.local {
+                scope.type_shadows.remove(&local);
+                scope.type_bindings.insert(local, targets);
+            }
+        }
+    }
+
+    fn register_type_alias(&mut self, item: &syn::ItemType) {
+        let local = cgo_8_ident_text(&item.ident);
+        let targets = cgo_8_type_path(&item.ty)
+            .map(|path| self.resolve_path(&path.path))
+            .unwrap_or_default();
+        if targets
+            .iter()
+            .any(|target| cgo_9a_is_distributed_plan_path(target))
+            && (!matches!(item.vis, syn::Visibility::Inherited)
+                || (self.scope().module_scope
+                    && self
+                        .module_has_external_children
+                        .last()
+                        .copied()
+                        .unwrap_or(false)))
+        {
+            self.violations.push(format!(
+                "distributed-plan-alias: {} exposes DistributedPlan through a cross-file type alias",
+                self.source_rel
+            ));
+        }
+        let scope = self.scopes.last_mut().unwrap();
+        if targets.is_empty() {
+            scope.type_bindings.remove(&local);
+            scope.type_shadows.insert(local);
+        } else {
+            scope.type_shadows.remove(&local);
+            scope.type_bindings.insert(local, targets);
+        }
+    }
+
+    fn register_items<'a>(&mut self, items: impl IntoIterator<Item = &'a syn::Item>) {
+        let items = items
+            .into_iter()
+            .filter(|item| !nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)))
+            .collect::<Vec<_>>();
+        for item in &items {
+            self.register_item_declaration(item);
+        }
+        let aliases = items
+            .iter()
+            .filter(|item| matches!(item, syn::Item::Use(_) | syn::Item::Type(_)))
+            .copied()
+            .collect::<Vec<_>>();
+        for _ in 0..=aliases.len() {
+            let before = self.scope().clone();
+            for item in &aliases {
+                match item {
+                    syn::Item::Use(item) => self.register_use(item),
+                    syn::Item::Type(item) => self.register_type_alias(item),
+                    _ => unreachable!(),
+                }
+            }
+            let scope = self.scopes.last_mut().unwrap();
+            for targets in scope.type_bindings.values_mut() {
+                targets.sort();
+                targets.dedup();
+            }
+            scope.glob_imports.sort();
+            scope.glob_imports.dedup();
+            if *self.scope() == before {
+                break;
+            }
+        }
+    }
+
+    fn push_mutable_surface_violation(&mut self) {
+        self.violations.push(format!(
+            "mutable-callback: {} obtains mutable access to DistributedPlan",
+            self.source_rel
+        ));
+    }
+
+    fn binding_is_mutable_plan(&self, name: &str) -> bool {
+        for scope in self.binding_scopes.iter().rev() {
+            if scope.mutable_plans.contains(name) {
+                return true;
+            }
+            if scope.shadows.contains(name) {
+                return false;
+            }
+        }
+        false
+    }
+
+    fn cloned_plan_source(&self, name: &str) -> Option<&str> {
+        for scope in self.binding_scopes.iter().rev() {
+            if let Some(source) = scope.cloned_plans.get(name) {
+                return Some(source);
+            }
+            if scope.shadows.contains(name) {
+                return None;
+            }
+        }
+        None
+    }
+
+    fn push_pattern_scope(&mut self) {
+        self.scopes.push(self.scope().nested());
+        self.binding_scopes.push(Cgo9aValueScope::default());
+    }
+
+    fn pop_pattern_scope(&mut self) {
+        self.binding_scopes.pop();
+        self.scopes.pop();
+    }
+
+    fn register_pattern_shadow(&mut self, pattern: &syn::Pat) {
+        cgo_8_pattern_bindings(pattern, &mut self.scopes.last_mut().unwrap().value_shadows);
+        cgo_8_pattern_bindings(
+            pattern,
+            &mut self.binding_scopes.last_mut().unwrap().shadows,
+        );
+    }
+
+    fn visit_condition_with_bindings(&mut self, condition: &syn::Expr) {
+        use syn::visit::Visit;
+
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_expr_attrs(condition)) {
+            return;
+        }
+        match condition {
+            syn::Expr::Binary(binary) if matches!(binary.op, syn::BinOp::And(_)) => {
+                self.visit_condition_with_bindings(&binary.left);
+                self.visit_condition_with_bindings(&binary.right);
+            }
+            syn::Expr::Let(let_expr) => {
+                self.visit_expr(&let_expr.expr);
+                self.visit_pat(&let_expr.pat);
+                self.register_pattern_shadow(&let_expr.pat);
+            }
+            syn::Expr::Group(group) => self.visit_condition_with_bindings(&group.expr),
+            syn::Expr::Paren(paren) => self.visit_condition_with_bindings(&paren.expr),
+            _ => self.visit_expr(condition),
+        }
+    }
+
+    fn enter_function(&mut self, signature: &syn::Signature) {
+        use syn::visit::Visit;
+
+        let mut ast_scope = self.scope().nested();
+        for parameter in &signature.generics.params {
+            if let syn::GenericParam::Type(parameter) = parameter
+                && !nfe_4_syn_attrs_require_test(&parameter.attrs)
+            {
+                let name = cgo_8_ident_text(&parameter.ident);
+                ast_scope.type_bindings.remove(&name);
+                ast_scope.type_shadows.insert(name);
+            }
+        }
+        let mut binding_scope = Cgo9aValueScope::default();
+        for input in &signature.inputs {
+            let syn::FnArg::Typed(input) = input else {
+                continue;
+            };
+            cgo_8_pattern_bindings(&input.pat, &mut ast_scope.value_shadows);
+            cgo_8_pattern_bindings(&input.pat, &mut binding_scope.shadows);
+        }
+        self.scopes.push(ast_scope);
+        for input in &signature.inputs {
+            let syn::FnArg::Typed(input) = input else {
+                continue;
+            };
+            if self.type_is_mutable_distributed_plan_reference(&input.ty) {
+                cgo_8_pattern_bindings(&input.pat, &mut binding_scope.mutable_plans);
+                if self.construction_owner {
+                    self.visit_type(
+                        cgo_9a_mutable_reference_target(&input.ty)
+                            .expect("direct mutable plan parameter must be a reference"),
+                    );
+                    continue;
+                }
+            }
+            self.visit_type(&input.ty);
+        }
+        self.visit_generics(&signature.generics);
+        self.visit_return_type(&signature.output);
+        self.binding_scopes.push(binding_scope);
+    }
+
+    fn leave_function(&mut self) {
+        self.binding_scopes.pop();
+        self.scopes.pop();
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for Cgo9aDistributedPlanSealVisitor<'_> {
+    fn visit_file(&mut self, file: &'ast syn::File) {
+        if nfe_4_syn_attrs_require_test(&file.attrs) {
+            return;
+        }
+        self.module_has_external_children
+            .push(cgo_9a_has_external_child_module(&file.items));
+        self.register_items(&file.items);
+        for item in &file.items {
+            self.visit_item(item);
+        }
+        self.module_has_external_children.pop();
+    }
+
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+            return;
+        }
+        match item {
+            syn::Item::Use(_) => {}
+            syn::Item::Mod(module) => {
+                if let Some((_, items)) = &module.content {
+                    let mut scope = Cgo8AstScope {
+                        module_path: {
+                            let mut path = self.scope().module_path.clone();
+                            path.push(cgo_8_ident_text(&module.ident));
+                            path
+                        },
+                        module_scope: true,
+                        ..Default::default()
+                    };
+                    scope.type_shadows.insert(cgo_8_ident_text(&module.ident));
+                    self.scopes.push(scope);
+                    self.module_has_external_children
+                        .push(cgo_9a_has_external_child_module(items));
+                    self.register_items(items);
+                    for item in items {
+                        self.visit_item(item);
+                    }
+                    self.module_has_external_children.pop();
+                    self.scopes.pop();
+                }
+            }
+            _ => syn::visit::visit_item(self, item),
+        }
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        if nfe_4_syn_attrs_require_test(&item.attrs) {
+            return;
+        }
+        self.enter_function(&item.sig);
+        self.visit_block(&item.block);
+        self.leave_function();
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        if nfe_4_syn_attrs_require_test(&item.attrs) {
+            return;
+        }
+        self.enter_function(&item.sig);
+        self.visit_block(&item.block);
+        self.leave_function();
+    }
+
+    fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
+        if nfe_4_syn_attrs_require_test(&item.attrs) {
+            return;
+        }
+        self.enter_function(&item.sig);
+        if let Some(block) = &item.default {
+            self.visit_block(block);
+        }
+        self.leave_function();
+    }
+
+    fn visit_block(&mut self, block: &'ast syn::Block) {
+        self.scopes.push(self.scope().nested());
+        self.binding_scopes.push(Cgo9aValueScope::default());
+        let items = block.stmts.iter().filter_map(|statement| match statement {
+            syn::Stmt::Item(item) => Some(item),
+            _ => None,
+        });
+        self.register_items(items);
+        for statement in &block.stmts {
+            if !nfe_4_syn_attrs_require_test(nfe_4_syn_stmt_attrs(statement)) {
+                self.visit_stmt(statement);
+            }
+        }
+        self.binding_scopes.pop();
+        self.scopes.pop();
+    }
+
+    fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_expr_attrs(expr)) {
+            return;
+        }
+        syn::visit::visit_expr(self, expr);
+    }
+
+    fn visit_type_reference(&mut self, reference: &'ast syn::TypeReference) {
+        if reference.mutability.is_some() && self.type_is_distributed_plan(&reference.elem) {
+            self.push_mutable_surface_violation();
+        }
+        syn::visit::visit_type_reference(self, reference);
+    }
+
+    fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+        if cgo_8_ident_text(ident) == "ChangeStreamNativePlanMutation" {
+            self.violations.push(format!(
+                "retired-mutation-type: {} references ChangeStreamNativePlanMutation",
+                self.source_rel
+            ));
+        }
+    }
+
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        if nfe_4_syn_attrs_require_test(&local.attrs) {
+            return;
+        }
+        let binding = cgo_9a_single_pattern_ident(&local.pat);
+        let mutable_plan = matches!(&local.pat, syn::Pat::Type(typed)
+            if self.type_is_mutable_distributed_plan_reference(&typed.ty));
+        let cloned_source = local
+            .init
+            .as_ref()
+            .and_then(|init| cgo_9a_clone_source(&init.expr))
+            .filter(|source| self.binding_is_mutable_plan(source));
+        syn::visit::visit_local(self, local);
+        let Some(scope) = self.binding_scopes.last_mut() else {
+            return;
+        };
+        cgo_8_pattern_bindings(&local.pat, &mut scope.shadows);
+        if let Some(binding) = binding {
+            if mutable_plan {
+                scope.mutable_plans.insert(binding.clone());
+            }
+            if let Some(source) = cloned_source {
+                scope.cloned_plans.insert(binding, source);
+            }
+        }
+    }
+
+    fn visit_expr_assign(&mut self, assign: &'ast syn::ExprAssign) {
+        if nfe_4_syn_attrs_require_test(&assign.attrs) {
+            return;
+        }
+        if let (Some(target), Some(replacement)) = (
+            cgo_9a_deref_target(&assign.left),
+            cgo_9a_single_expr_ident(&assign.right),
+        ) && self.cloned_plan_source(&replacement) == Some(target.as_str())
+            && self.binding_is_mutable_plan(&target)
+        {
+            self.violations.push(format!(
+                "clone-and-patch: {} clones and overwrites a sealed plan",
+                self.source_rel
+            ));
+        }
+        syn::visit::visit_expr_assign(self, assign);
+    }
+
+    fn visit_expr_closure(&mut self, closure: &'ast syn::ExprClosure) {
+        let mut ast_scope = self.scope().nested();
+        let mut binding_scope = Cgo9aValueScope::default();
+        for input in &closure.inputs {
+            cgo_8_pattern_bindings(input, &mut ast_scope.value_shadows);
+            cgo_8_pattern_bindings(input, &mut binding_scope.shadows);
+            if let syn::Pat::Type(typed) = input
+                && self.type_is_mutable_distributed_plan_reference(&typed.ty)
+            {
+                cgo_8_pattern_bindings(input, &mut binding_scope.mutable_plans);
+            }
+        }
+        self.scopes.push(ast_scope);
+        self.binding_scopes.push(binding_scope);
+        syn::visit::visit_expr_closure(self, closure);
+        self.binding_scopes.pop();
+        self.scopes.pop();
+    }
+
+    fn visit_expr_if(&mut self, if_expr: &'ast syn::ExprIf) {
+        self.push_pattern_scope();
+        self.visit_condition_with_bindings(&if_expr.cond);
+        self.visit_block(&if_expr.then_branch);
+        self.pop_pattern_scope();
+        if let Some((_, otherwise)) = &if_expr.else_branch {
+            self.visit_expr(otherwise);
+        }
+    }
+
+    fn visit_expr_while(&mut self, while_expr: &'ast syn::ExprWhile) {
+        self.push_pattern_scope();
+        self.visit_condition_with_bindings(&while_expr.cond);
+        self.visit_block(&while_expr.body);
+        self.pop_pattern_scope();
+    }
+
+    fn visit_expr_for_loop(&mut self, for_loop: &'ast syn::ExprForLoop) {
+        self.visit_expr(&for_loop.expr);
+        self.push_pattern_scope();
+        self.visit_pat(&for_loop.pat);
+        self.register_pattern_shadow(&for_loop.pat);
+        self.visit_block(&for_loop.body);
+        self.pop_pattern_scope();
+    }
+
+    fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+        if nfe_4_syn_attrs_require_test(&arm.attrs) {
+            return;
+        }
+        self.push_pattern_scope();
+        self.visit_pat(&arm.pat);
+        self.register_pattern_shadow(&arm.pat);
+        if let Some((_, guard)) = &arm.guard {
+            self.visit_expr(guard);
+        }
+        self.visit_expr(&arm.body);
+        self.pop_pattern_scope();
+    }
+}
+
+fn distributed_plan_seal_task1_violations_in(source_rel: &str, source: &str) -> Vec<String> {
+    use syn::visit::Visit;
+
+    let file = match syn::parse_file(source) {
+        Ok(file) => file,
+        Err(error) => {
+            return vec![format!(
+                "ast-parse: {source_rel} production Rust AST parse failed: {error}"
+            )];
+        }
+    };
+    let mut visitor = Cgo9aDistributedPlanSealVisitor {
+        source_rel,
+        construction_owner: source_rel.starts_with("src/sql/planner/distributed/"),
+        scopes: vec![Cgo8AstScope {
+            module_path: rust_source_module_segments(source_rel)
+                .unwrap_or_else(|| vec!["crate".to_string()]),
+            module_scope: true,
+            ..Default::default()
+        }],
+        module_has_external_children: Vec::new(),
+        binding_scopes: Vec::new(),
+        violations: Vec::new(),
+    };
+    visitor.visit_file(&file);
+    visitor.violations.sort();
+    visitor.violations.dedup();
+    visitor.violations
+}
+
+fn distributed_plan_seal_task1_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
+    let mut violations = sources
+        .iter()
+        .flat_map(|source| distributed_plan_seal_task1_violations_in(&source.path, &source.text))
+        .collect::<Vec<_>>();
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+#[test]
+fn distributed_plan_seal_task1_detector_rejects_retired_mutation_surfaces() {
+    let cases = [
+        (
+            "type ChangeStreamNativePlanMutation<'a> = Box<dyn FnOnce()>;",
+            "retired-mutation-type",
+        ),
+        (
+            "use crate::sql::planner::distributed::DistributedPlan; fn mutate(plan: &mut DistributedPlan) {}",
+            "mutable-callback",
+        ),
+        (
+            "use crate::sql::planner::distributed::DistributedPlan as Sealed; type Mutation = Box<dyn FnMut(&mut Sealed)>;",
+            "mutable-callback",
+        ),
+        (
+            "use crate::sql::planner::distributed::DistributedPlan as DP; fn install(cb: impl FnMut(&mut DP)) {}",
+            "mutable-callback",
+        ),
+        (
+            "use crate::sql::planner::distributed::DistributedPlan; fn patch(plan: &mut DistributedPlan) { let mut revised = plan.clone(); *plan = revised; }",
+            "clone-and-patch",
+        ),
+    ];
+
+    for (source, expected) in cases {
+        let violations = distributed_plan_seal_task1_violations_in("src/fixture.rs", source);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "fixture must be rejected as {expected}: {violations:?}"
+        );
+    }
+
+    assert!(
+        distributed_plan_seal_task1_violations_in(
+            "src/clean.rs",
+            "use crate::sql::planner::distributed::DistributedPlan; fn inspect(plan: &DistributedPlan) { encode(plan); }"
+        )
+        .is_empty(),
+        "immutable readers must remain legal"
+    );
+    assert!(
+        distributed_plan_seal_task1_violations_in(
+            "src/unrelated.rs",
+            "#[derive(Clone)] struct OtherPlan; fn patch(plan: &mut OtherPlan) { let mut candidate = plan.clone(); *plan = candidate; }"
+        )
+        .is_empty(),
+        "clone-and-overwrite on an unrelated type must remain legal"
+    );
+    assert!(
+        distributed_plan_seal_task1_violations_in(
+            "src/sql/planner/distributed/build/owner.rs",
+            "use crate::sql::planner::distributed::DistributedPlan; fn build(plan: &mut DistributedPlan) { plan.fragments.clear(); }"
+        )
+        .is_empty(),
+        "the distributed construction owner may mutate its direct plan parameter"
+    );
+    let owner_callback = distributed_plan_seal_task1_violations_in(
+        "src/sql/planner/distributed/build/owner.rs",
+        "use crate::sql::planner::distributed::DistributedPlan as DP; fn install(cb: impl FnOnce(&mut DP)) {}",
+    );
+    assert!(
+        owner_callback
+            .iter()
+            .any(|violation| violation.contains("mutable-callback")),
+        "construction-owner callback surfaces must still be rejected: {owner_callback:?}"
+    );
+    assert!(
+        distributed_plan_seal_task1_violations_in(
+            "src/shadow.rs",
+            "use crate::sql::planner::distributed::DistributedPlan; #[derive(Clone)] struct OtherPlan; fn patch(plan: &mut DistributedPlan) { { let plan: &mut OtherPlan = todo!(); let revised = plan.clone(); *plan = revised; } inspect(plan); }"
+        )
+        .iter()
+        .all(|violation| !violation.contains("clone-and-patch")),
+        "an inner unrelated binding must shadow the outer mutable plan identity"
+    );
+
+    for (name, body) in [
+        (
+            "if-let",
+            "if let Some(plan) = maybe_other() { let revised = plan.clone(); *plan = revised; }",
+        ),
+        (
+            "match-arm-guard",
+            "match maybe_other() { Some(plan) if { let revised = plan.clone(); *plan = revised; true } => {}, _ => {} }",
+        ),
+        (
+            "for-pattern",
+            "for plan in other_plans() { let revised = plan.clone(); *plan = revised; }",
+        ),
+        (
+            "while-let",
+            "while let Some(plan) = maybe_other() { let revised = plan.clone(); *plan = revised; break; }",
+        ),
+    ] {
+        let source = format!(
+            "use crate::sql::planner::distributed::DistributedPlan; #[derive(Clone)] struct OtherPlan; fn patch(plan: &mut DistributedPlan) {{ {body} inspect(plan); }}"
+        );
+        let violations = distributed_plan_seal_task1_violations_in(
+            "src/sql/planner/distributed/build/pattern_fixture.rs",
+            &source,
+        );
+        assert!(
+            violations.is_empty(),
+            "{name} must lexically shadow the outer mutable plan only in its guard/body: {violations:?}"
+        );
+    }
+
+    for (name, body) in [
+        (
+            "if-let-condition",
+            "if let Some(plan) = { let revised = plan.clone(); *plan = revised; maybe_other() } { inspect(plan); }",
+        ),
+        (
+            "match-scrutinee",
+            "match { let revised = plan.clone(); *plan = revised; maybe_other() } { Some(plan) => inspect(plan), _ => {} }",
+        ),
+        (
+            "for-iterator",
+            "for plan in { let revised = plan.clone(); *plan = revised; other_plans() } { inspect(plan); }",
+        ),
+        (
+            "while-let-condition",
+            "while let Some(plan) = { let revised = plan.clone(); *plan = revised; maybe_other() } { inspect(plan); break; }",
+        ),
+    ] {
+        let source = format!(
+            "use crate::sql::planner::distributed::DistributedPlan; fn patch(plan: &mut DistributedPlan) {{ {body} }}"
+        );
+        let violations = distributed_plan_seal_task1_violations_in(
+            "src/sql/planner/distributed/build/pattern_fixture.rs",
+            &source,
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("clone-and-patch")),
+            "{name} must still analyze its condition/scrutinee/iterator in the outer plan scope: {violations:?}"
+        );
+    }
+
+    for (name, source) in [
+        (
+            "private renamed import",
+            "use crate::sql::planner::distributed::DistributedPlan as ReadPlan; fn inspect(plan: &ReadPlan) {}",
+        ),
+        (
+            "private type alias",
+            "use crate::sql::planner::distributed::DistributedPlan; type ReadPlan = DistributedPlan; fn inspect(plan: &ReadPlan) {}",
+        ),
+    ] {
+        let violations = distributed_plan_seal_task1_violations_in("src/leaf_alias.rs", source);
+        assert!(
+            violations.is_empty(),
+            "a leaf {name} used only immutably must remain legal: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn distributed_plan_seal_task1_rejects_cross_file_alias_surfaces() {
+    let sources = [
+        Cgo8GuardSource::new(
+            "src/planning/mod.rs",
+            "use crate::sql::planner::distributed::DistributedPlan; pub(super) type MutablePlan = DistributedPlan; mod callback;",
+        ),
+        Cgo8GuardSource::new(
+            "src/planning/callback.rs",
+            "use super::MutablePlan; pub(crate) fn install(cb: impl FnMut(&mut MutablePlan)) {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/ancestor/mod.rs",
+            "use crate::sql::planner::distributed::DistributedPlan; mod worker;",
+        ),
+        Cgo8GuardSource::new(
+            "src/ancestor/worker.rs",
+            "use super::DistributedPlan; fn mutate(plan: &mut DistributedPlan) {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/build/fixture.rs",
+            "use crate::sql::planner::distributed::DistributedPlan; mod worker;",
+        ),
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/build/fixture/worker.rs",
+            "use super::DistributedPlan; fn install(cb: impl FnOnce(&mut DistributedPlan)) {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/deep_import/mod.rs",
+            "use crate::sql::planner::distributed::DistributedPlan as ReadPlan; mod inline { mod worker; }",
+        ),
+        Cgo8GuardSource::new(
+            "src/deep_import/inline/worker.rs",
+            "use super::super::ReadPlan; fn mutate(plan: &mut ReadPlan) {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/deep_type/mod.rs",
+            "use crate::sql::planner::distributed::DistributedPlan; type ReadPlan = DistributedPlan; mod inline { mod worker; }",
+        ),
+        Cgo8GuardSource::new(
+            "src/deep_type/inline/worker.rs",
+            "use super::super::ReadPlan; fn mutate(plan: &mut ReadPlan) {}",
+        ),
+    ];
+    let violations = distributed_plan_seal_task1_violations(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("distributed-plan-alias")),
+        "cross-file DistributedPlan alias surface must be rejected: {violations:?}"
+    );
+    assert!(
+        violations.iter().any(|violation| {
+            violation.contains("distributed-plan-alias")
+                && violation.contains("src/ancestor/mod.rs")
+        }),
+        "an unchanged private parent import must not leak DistributedPlan to a child file: {violations:?}"
+    );
+    assert!(
+        violations.iter().any(|violation| {
+            violation.contains("mutable-callback")
+                && violation.contains("distributed/build/fixture/worker.rs")
+        }),
+        "an owner child callback must not bypass detection through a parent import: {violations:?}"
+    );
+    for ancestor in ["src/deep_import/mod.rs", "src/deep_type/mod.rs"] {
+        assert!(
+            violations.iter().any(|violation| {
+                violation.contains("distributed-plan-alias") && violation.contains(ancestor)
+            }),
+            "an inline module must not hide an external-descendant alias leak from {ancestor}: {violations:?}"
+        );
+    }
+    assert!(
+        distributed_plan_seal_task1_violations_in(
+            "src/leaf.rs",
+            "use crate::sql::planner::distributed::DistributedPlan; fn inspect(plan: &DistributedPlan) {}",
+        )
+        .is_empty(),
+        "an immutable direct import in a leaf module must remain legal"
+    );
+    assert!(
+        distributed_plan_seal_task1_violations_in(
+            "src/test_only_descendant.rs",
+            "use crate::sql::planner::distributed::DistributedPlan as ReadPlan; #[cfg(test)] mod inline { mod worker; } fn inspect(plan: &ReadPlan) {}",
+        )
+        .is_empty(),
+        "a test-only inline subtree must not turn a leaf private alias into a production leak"
+    );
+}
+
+#[test]
+fn distributed_plan_seal_task1_rejects_post_distribution_keyed_assert_mutation() {
+    let mut violations = Vec::new();
+    let src = src_dir();
+    for path in production_rs_files_from_entries(&src, &[src.join("lib.rs"), src.join("main.rs")]) {
+        let source = fs::read_to_string(&path).unwrap();
+        violations.extend(distributed_plan_seal_task1_violations_in(
+            &rel(&path),
+            &source,
+        ));
+    }
+    violations.sort();
+    violations.dedup();
+
+    assert!(
+        violations.is_empty(),
+        "CGO-9A Task 1 distributed-plan seal guard failed:\n{}",
+        violations.join("\n")
+    );
+}
+
+fn cgo_9a_task2_is_draft_path(path: &[String]) -> bool {
+    path.len() >= 5
+        && path[..4]
+            .iter()
+            .map(String::as_str)
+            .eq(["crate", "sql", "planner", "distributed"])
+        && path
+            .last()
+            .is_some_and(|segment| segment == "DistributedPlanDraft")
+}
+
+fn cgo_9a_task2_is_seal_path(path: &[String]) -> bool {
+    path.iter().map(String::as_str).eq([
+        "crate",
+        "sql",
+        "planner",
+        "distributed",
+        "seal",
+        "seal_draft",
+    ])
+}
+
+fn cgo_9a_task2_derive_contains(attrs: &[syn::Attribute], name: &str) -> bool {
+    attrs.iter().any(|attr| {
+        if !attr.path().is_ident("derive") {
+            return false;
+        }
+        attr.parse_args_with(
+            syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+        )
+        .is_ok_and(|paths| {
+            paths.iter().any(|path| {
+                path.segments
+                    .last()
+                    .is_some_and(|segment| cgo_8_ident_text(&segment.ident) == name)
+            })
+        })
+    })
+}
+
+fn cgo_9a_task2_is_exact_draft_visibility(visibility: &syn::Visibility) -> bool {
+    let syn::Visibility::Restricted(restricted) = visibility else {
+        return false;
+    };
+    restricted.in_token.is_some()
+        && restricted
+            .path
+            .segments
+            .iter()
+            .map(|segment| cgo_8_ident_text(&segment.ident))
+            .eq(["crate", "sql", "planner", "distributed"])
+}
+
+fn cgo_9a_task2_expr_path(expr: &syn::Expr) -> Option<&syn::Path> {
+    match expr {
+        syn::Expr::Path(path) if path.qself.is_none() => Some(&path.path),
+        syn::Expr::Cast(cast) => cgo_9a_task2_expr_path(&cast.expr),
+        syn::Expr::Group(group) => cgo_9a_task2_expr_path(&group.expr),
+        syn::Expr::Paren(paren) => cgo_9a_task2_expr_path(&paren.expr),
+        syn::Expr::Reference(reference) => cgo_9a_task2_expr_path(&reference.expr),
+        syn::Expr::Block(block) if block.label.is_none() && block.block.stmts.len() == 1 => {
+            match &block.block.stmts[0] {
+                syn::Stmt::Expr(expr, None) => cgo_9a_task2_expr_path(expr),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn cgo_9a_task2_output_is_mutable_reference(output: &syn::ReturnType) -> bool {
+    matches!(output, syn::ReturnType::Type(_, ty)
+        if cgo_9a_mutable_reference_target(ty).is_some())
+}
+
+fn cgo_9a_task2_output_is_self(output: &syn::ReturnType) -> bool {
+    let syn::ReturnType::Type(_, ty) = output else {
+        return false;
+    };
+    cgo_8_type_path(ty).is_some_and(|path| {
+        path.qself.is_none()
+            && path.path.segments.len() == 1
+            && cgo_8_ident_text(&path.path.segments[0].ident) == "Self"
+    })
+}
+
+fn cgo_9a_task2_canonicalize_path(module_path: &[String], segments: &[String]) -> Vec<String> {
+    let Some(first) = segments.first() else {
+        return Vec::new();
+    };
+    if first == "crate" {
+        return segments.to_vec();
+    }
+    let mut module = module_path.to_vec();
+    let mut index = 0usize;
+    if first == "self" {
+        index = 1;
+    } else {
+        while segments
+            .get(index)
+            .is_some_and(|segment| segment == "super")
+        {
+            module.pop();
+            index += 1;
+        }
+    }
+    module.extend_from_slice(&segments[index..]);
+    module
+}
+
+#[derive(Default)]
+struct Cgo9aTask2SourceModel {
+    files: BTreeMap<String, syn::File>,
+    type_aliases: BTreeMap<Vec<String>, Vec<Vec<String>>>,
+    type_alias_defs: BTreeMap<Vec<String>, Cgo9aTask2TypeAliasDef>,
+    value_aliases: BTreeMap<Vec<String>, Vec<Vec<String>>>,
+    glob_aliases: BTreeMap<Vec<String>, Vec<Vec<String>>>,
+    protected_alias_names: BTreeSet<String>,
+    draft_alias_names: BTreeSet<String>,
+    expansion_cache: std::cell::RefCell<BTreeMap<(bool, Vec<String>), Vec<Vec<String>>>>,
+}
+
+#[derive(Clone)]
+struct Cgo9aTask2TypeAliasDef {
+    type_params: Vec<String>,
+    rhs: syn::Type,
+}
+
+impl Cgo9aTask2SourceModel {
+    fn type_identifiers(ty: &syn::Type) -> BTreeSet<String> {
+        use syn::visit::Visit;
+
+        struct IdentifierVisitor {
+            identifiers: BTreeSet<String>,
+        }
+
+        impl<'ast> Visit<'ast> for IdentifierVisitor {
+            fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
+                if let Some(segment) = path.path.segments.last() {
+                    self.identifiers.insert(cgo_8_ident_text(&segment.ident));
+                }
+                syn::visit::visit_type_path(self, path);
+            }
+        }
+
+        let mut visitor = IdentifierVisitor {
+            identifiers: BTreeSet::new(),
+        };
+        visitor.visit_type(ty);
+        visitor.identifiers
+    }
+
+    fn expand_path(&self, path: &[String], namespace: Cgo8Namespace) -> Vec<Vec<String>> {
+        let cache_key = (matches!(namespace, Cgo8Namespace::Type), path.to_vec());
+        if let Some(cached) = self.expansion_cache.borrow().get(&cache_key) {
+            return cached.clone();
+        }
+        let aliases = match namespace {
+            Cgo8Namespace::Type => &self.type_aliases,
+            Cgo8Namespace::Value => &self.value_aliases,
+        };
+        let mut pending = vec![path.to_vec()];
+        let mut resolved = Vec::new();
+        let mut seen = BTreeSet::new();
+        while let Some(candidate) = pending.pop() {
+            if !seen.insert(candidate.clone()) {
+                continue;
+            }
+            let direct_replacement = (1..=candidate.len()).rev().find_map(|prefix_len| {
+                aliases
+                    .get(&candidate[..prefix_len])
+                    .map(|targets| (prefix_len, targets))
+            });
+            if let Some((prefix_len, targets)) = direct_replacement {
+                for target in targets {
+                    let mut expanded = target.clone();
+                    expanded.extend_from_slice(&candidate[prefix_len..]);
+                    pending.push(expanded);
+                }
+            } else if let Some((prefix_len, targets)) =
+                (1..candidate.len()).rev().find_map(|prefix_len| {
+                    self.glob_aliases
+                        .get(&candidate[..prefix_len])
+                        .map(|targets| (prefix_len, targets))
+                })
+            {
+                for target in targets {
+                    let mut expanded = target.clone();
+                    expanded.extend_from_slice(&candidate[prefix_len..]);
+                    pending.push(expanded);
+                }
+            } else {
+                resolved.push(candidate);
+            }
+        }
+        resolved.sort();
+        resolved.dedup();
+        self.expansion_cache
+            .borrow_mut()
+            .insert(cache_key, resolved.clone());
+        resolved
+    }
+
+    fn insert_alias(
+        aliases: &mut BTreeMap<Vec<String>, Vec<Vec<String>>>,
+        local: Vec<String>,
+        target: Vec<String>,
+    ) {
+        aliases.entry(local).or_default().push(target);
+    }
+
+    fn collect_items(&mut self, module_path: &[String], items: &[syn::Item]) {
+        for item in items {
+            if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+                continue;
+            }
+            match item {
+                syn::Item::Use(item) => {
+                    let mut raw = Vec::new();
+                    cgo_8_expand_use_tree(&item.tree, &mut Vec::new(), &mut raw);
+                    for binding in raw {
+                        if binding.glob {
+                            let target =
+                                cgo_9a_task2_canonicalize_path(module_path, &binding.target);
+                            self.glob_aliases
+                                .entry(module_path.to_vec())
+                                .or_default()
+                                .push(target);
+                            continue;
+                        }
+                        let Some(local) = binding.local else {
+                            continue;
+                        };
+                        let mut local_path = module_path.to_vec();
+                        local_path.push(local);
+                        let target = cgo_9a_task2_canonicalize_path(module_path, &binding.target);
+                        Self::insert_alias(
+                            &mut self.type_aliases,
+                            local_path.clone(),
+                            target.clone(),
+                        );
+                        Self::insert_alias(&mut self.value_aliases, local_path, target);
+                    }
+                }
+                syn::Item::Type(item) => {
+                    let mut local = module_path.to_vec();
+                    local.push(cgo_8_ident_text(&item.ident));
+                    self.type_alias_defs.insert(
+                        local.clone(),
+                        Cgo9aTask2TypeAliasDef {
+                            type_params: item
+                                .generics
+                                .params
+                                .iter()
+                                .filter_map(|param| match param {
+                                    syn::GenericParam::Type(param) => {
+                                        Some(cgo_8_ident_text(&param.ident))
+                                    }
+                                    _ => None,
+                                })
+                                .collect(),
+                            rhs: (*item.ty).clone(),
+                        },
+                    );
+                    if let Some(path) = cgo_8_type_path(&item.ty) {
+                        let segments = path
+                            .path
+                            .segments
+                            .iter()
+                            .map(|segment| cgo_8_ident_text(&segment.ident))
+                            .collect::<Vec<_>>();
+                        let target = cgo_9a_task2_canonicalize_path(module_path, &segments);
+                        Self::insert_alias(&mut self.type_aliases, local, target);
+                    }
+                }
+                syn::Item::Const(item) => {
+                    if let Some(path) = cgo_9a_task2_expr_path(&item.expr) {
+                        let segments = path
+                            .segments
+                            .iter()
+                            .map(|segment| cgo_8_ident_text(&segment.ident))
+                            .collect::<Vec<_>>();
+                        let mut local = module_path.to_vec();
+                        local.push(cgo_8_ident_text(&item.ident));
+                        let target = cgo_9a_task2_canonicalize_path(module_path, &segments);
+                        Self::insert_alias(&mut self.value_aliases, local, target);
+                    }
+                }
+                syn::Item::Static(item) => {
+                    if let Some(path) = cgo_9a_task2_expr_path(&item.expr) {
+                        let segments = path
+                            .segments
+                            .iter()
+                            .map(|segment| cgo_8_ident_text(&segment.ident))
+                            .collect::<Vec<_>>();
+                        let mut local = module_path.to_vec();
+                        local.push(cgo_8_ident_text(&item.ident));
+                        let target = cgo_9a_task2_canonicalize_path(module_path, &segments);
+                        Self::insert_alias(&mut self.value_aliases, local, target);
+                    }
+                }
+                syn::Item::Mod(module) => {
+                    if let Some((_, items)) = &module.content {
+                        let mut child = module_path.to_vec();
+                        child.push(cgo_8_ident_text(&module.ident));
+                        self.collect_items(&child, items);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn from_sources(sources: &[Cgo8GuardSource]) -> (Self, Vec<String>) {
+        let mut model = Self::default();
+        let mut violations = Vec::new();
+        for source in sources {
+            let file = match syn::parse_file(&source.text) {
+                Ok(file) => file,
+                Err(error) => {
+                    violations.push(format!(
+                        "ast-parse: {} production Rust AST parse failed: {error}",
+                        source.path
+                    ));
+                    continue;
+                }
+            };
+            let module_path = rust_source_module_segments(&source.path)
+                .unwrap_or_else(|| vec!["crate".to_string()]);
+            model.collect_items(&module_path, &file.items);
+            model.files.insert(source.path.clone(), file);
+        }
+        for targets in model
+            .type_aliases
+            .values_mut()
+            .chain(model.value_aliases.values_mut())
+            .chain(model.glob_aliases.values_mut())
+        {
+            targets.sort();
+            targets.dedup();
+        }
+        model.protected_alias_names.extend([
+            "DistributedPlan".to_string(),
+            "DistributedPlanDraft".to_string(),
+            "seal_draft".to_string(),
+            "from_draft".to_string(),
+            "DerefMut".to_string(),
+            "AsMut".to_string(),
+            "into_inner".to_string(),
+        ]);
+        let aliases = model
+            .type_aliases
+            .iter()
+            .chain(&model.value_aliases)
+            .map(|(local, targets)| (local.clone(), targets.clone()))
+            .collect::<Vec<_>>();
+        let mut protected_alias_paths = BTreeSet::new();
+        loop {
+            let mut changed = false;
+            for (local, targets) in &aliases {
+                if protected_alias_paths.contains(local) {
+                    continue;
+                }
+                let reaches_protected = targets.iter().any(|target| {
+                    cgo_9a_task2_is_protected_path(target)
+                        || (1..=target.len())
+                            .rev()
+                            .any(|prefix_len| protected_alias_paths.contains(&target[..prefix_len]))
+                });
+                if reaches_protected {
+                    protected_alias_paths.insert(local.clone());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        model.protected_alias_names.extend(
+            protected_alias_paths
+                .iter()
+                .filter_map(|path| path.last().cloned()),
+        );
+        model
+            .draft_alias_names
+            .insert("DistributedPlanDraft".to_string());
+        let type_alias_targets = model
+            .type_aliases
+            .iter()
+            .map(|(local, targets)| (local.clone(), targets.clone()))
+            .collect::<Vec<_>>();
+        let type_alias_def_identifiers = model
+            .type_alias_defs
+            .iter()
+            .map(|(local, definition)| {
+                (
+                    local.clone(),
+                    definition.type_params.clone(),
+                    Self::type_identifiers(&definition.rhs),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (local, type_params, identifiers) in &type_alias_def_identifiers {
+            if type_params
+                .iter()
+                .any(|parameter| identifiers.contains(parameter))
+                && let Some(name) = local.last()
+            {
+                model.draft_alias_names.insert(name.clone());
+            }
+        }
+        loop {
+            let mut changed = false;
+            for (local, targets) in &type_alias_targets {
+                let reaches_draft = targets.iter().any(|target| {
+                    cgo_9a_task2_is_draft_path(target)
+                        || target
+                            .last()
+                            .is_some_and(|name| model.draft_alias_names.contains(name))
+                });
+                if reaches_draft && let Some(name) = local.last() {
+                    changed |= model.draft_alias_names.insert(name.clone());
+                }
+            }
+            for (local, _, identifiers) in &type_alias_def_identifiers {
+                if identifiers
+                    .iter()
+                    .any(|name| model.draft_alias_names.contains(name))
+                    && let Some(name) = local.last()
+                {
+                    changed |= model.draft_alias_names.insert(name.clone());
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        (model, violations)
+    }
+}
+
+fn cgo_9a_task2_is_protected_path(path: &[String]) -> bool {
+    cgo_9a_is_distributed_plan_path(path)
+        || cgo_9a_task2_is_draft_path(path)
+        || cgo_9a_task2_is_seal_path(path)
+        || path.last().is_some_and(|name| {
+            matches!(
+                name.as_str(),
+                "from_draft" | "DerefMut" | "AsMut" | "into_inner"
+            )
+        })
+}
+
+#[derive(Default)]
+struct Cgo9aTask2Report {
+    violations: Vec<String>,
+    seal_definitions: Vec<String>,
+    seal_calls: Vec<String>,
+    sealed_constructions: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cgo9aTask2Cardinality {
+    Finite(usize),
+    Unbounded,
+}
+
+impl Cgo9aTask2Cardinality {
+    fn add(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Finite(left), Self::Finite(right)) => Self::Finite(left.saturating_add(right)),
+            _ => Self::Unbounded,
+        }
+    }
+
+    fn max(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Finite(left), Self::Finite(right)) => Self::Finite(left.max(right)),
+            _ => Self::Unbounded,
+        }
+    }
+
+    fn is_zero(self) -> bool {
+        self == Self::Finite(0)
+    }
+
+    fn unbounded_if_nonzero(self) -> Self {
+        if self.is_zero() {
+            self
+        } else {
+            Self::Unbounded
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Cgo9aTask2DraftFlow {
+    owned: Cgo9aTask2Cardinality,
+    borrowed: Cgo9aTask2Cardinality,
+}
+
+impl Cgo9aTask2DraftFlow {
+    const ZERO: Self = Self {
+        owned: Cgo9aTask2Cardinality::Finite(0),
+        borrowed: Cgo9aTask2Cardinality::Finite(0),
+    };
+
+    fn one(borrowed: bool) -> Self {
+        if borrowed {
+            Self {
+                owned: Cgo9aTask2Cardinality::Finite(0),
+                borrowed: Cgo9aTask2Cardinality::Finite(1),
+            }
+        } else {
+            Self {
+                owned: Cgo9aTask2Cardinality::Finite(1),
+                borrowed: Cgo9aTask2Cardinality::Finite(0),
+            }
+        }
+    }
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            owned: self.owned.add(other.owned),
+            borrowed: self.borrowed.add(other.borrowed),
+        }
+    }
+
+    fn max(self, other: Self) -> Self {
+        Self {
+            owned: self.owned.max(other.owned),
+            borrowed: self.borrowed.max(other.borrowed),
+        }
+    }
+
+    fn unbounded_if_nonzero(self) -> Self {
+        Self {
+            owned: self.owned.unbounded_if_nonzero(),
+            borrowed: self.borrowed.unbounded_if_nonzero(),
+        }
+    }
+}
+
+struct Cgo9aTask2Visitor<'a> {
+    source_rel: &'a str,
+    source_model: &'a Cgo9aTask2SourceModel,
+    scopes: Vec<Cgo8AstScope>,
+    function_stack: Vec<String>,
+    impl_plan_stack: Vec<bool>,
+    impl_draft_stack: Vec<bool>,
+    report: Cgo9aTask2Report,
+}
+
+impl Cgo9aTask2Visitor<'_> {
+    fn scope(&self) -> &Cgo8AstScope {
+        self.scopes.last().expect("CGO-9A Task2 scope must exist")
+    }
+
+    fn resolve_segments(&self, segments: &[String], namespace: Cgo8Namespace) -> Vec<Vec<String>> {
+        let Some(first) = segments.first() else {
+            return Vec::new();
+        };
+        if first == "crate" {
+            return self.source_model.expand_path(segments, namespace);
+        }
+        let mut index = 0usize;
+        let mut module_path = self.scope().module_path.clone();
+        let explicit_module = if first == "self" {
+            index = 1;
+            true
+        } else {
+            while segments
+                .get(index)
+                .is_some_and(|segment| segment == "super")
+            {
+                module_path.pop();
+                index += 1;
+            }
+            index > 0
+        };
+        if explicit_module {
+            let remainder = &segments[index..];
+            if remainder.is_empty() {
+                return vec![module_path];
+            }
+            module_path.extend_from_slice(remainder);
+            return self.source_model.expand_path(&module_path, namespace);
+        }
+        let resolved = self
+            .scope()
+            .resolve_unqualified(segments, namespace, true)
+            .into_iter()
+            .flat_map(|path| self.source_model.expand_path(&path, namespace))
+            .collect::<Vec<_>>();
+        resolved
+    }
+
+    fn resolve_path(&self, path: &syn::Path, namespace: Cgo8Namespace) -> Vec<Vec<String>> {
+        self.resolve_segments(
+            &path
+                .segments
+                .iter()
+                .map(|segment| cgo_8_ident_text(&segment.ident))
+                .collect::<Vec<_>>(),
+            namespace,
+        )
+    }
+
+    fn path_may_resolve_protected(&self, path: &syn::Path, namespace: Cgo8Namespace) -> bool {
+        let Some(last) = path.segments.last() else {
+            return false;
+        };
+        let leaf = cgo_8_ident_text(&last.ident);
+        if self.source_model.protected_alias_names.contains(&leaf) {
+            return true;
+        }
+        if path.segments.len() != 1 {
+            return false;
+        }
+        let bindings = match namespace {
+            Cgo8Namespace::Type => &self.scope().type_bindings,
+            Cgo8Namespace::Value => &self.scope().value_bindings,
+        };
+        bindings.get(&leaf).is_some_and(|targets| {
+            targets
+                .iter()
+                .any(|target| cgo_9a_task2_is_protected_path(target))
+        })
+    }
+
+    fn segments_may_resolve_protected(
+        &self,
+        segments: &[String],
+        namespace: Cgo8Namespace,
+    ) -> bool {
+        let Some(leaf) = segments.last() else {
+            return false;
+        };
+        if self.source_model.protected_alias_names.contains(leaf) {
+            return true;
+        }
+        if segments.len() != 1 {
+            return false;
+        }
+        let bindings = match namespace {
+            Cgo8Namespace::Type => &self.scope().type_bindings,
+            Cgo8Namespace::Value => &self.scope().value_bindings,
+        };
+        bindings.get(leaf).is_some_and(|targets| {
+            targets
+                .iter()
+                .any(|target| cgo_9a_task2_is_protected_path(target))
+        })
+    }
+
+    fn type_may_resolve_protected(&self, ty: &syn::Type) -> bool {
+        cgo_8_type_path(ty)
+            .is_some_and(|path| self.path_may_resolve_protected(&path.path, Cgo8Namespace::Type))
+    }
+
+    fn type_paths(&self, ty: &syn::Type) -> Vec<Vec<String>> {
+        let Some(path) = cgo_8_type_path(ty) else {
+            return Vec::new();
+        };
+        let segments = path
+            .path
+            .segments
+            .iter()
+            .map(|segment| cgo_8_ident_text(&segment.ident))
+            .collect::<Vec<_>>();
+        let mut resolved = self.resolve_segments(&segments, Cgo8Namespace::Type);
+        if segments.len() == 1 && self.scope().type_shadows.contains(&segments[0]) {
+            let mut local = self.scope().module_path.clone();
+            local.push(segments[0].clone());
+            resolved.push(local);
+        }
+        resolved
+    }
+
+    fn type_is_plan(&self, ty: &syn::Type) -> bool {
+        self.type_paths(ty)
+            .iter()
+            .any(|path| cgo_9a_is_distributed_plan_path(path))
+    }
+
+    fn type_is_draft(&self, ty: &syn::Type) -> bool {
+        self.type_paths(ty)
+            .iter()
+            .any(|path| cgo_9a_task2_is_draft_path(path))
+    }
+
+    fn path_is_draft(&self, path: &syn::Path) -> bool {
+        if path
+            .segments
+            .first()
+            .is_some_and(|segment| cgo_8_ident_text(&segment.ident) == "Self")
+            && self.impl_draft_stack.last() == Some(&true)
+        {
+            return true;
+        }
+        if !self.path_may_resolve_protected(path, Cgo8Namespace::Type) {
+            return false;
+        }
+        let segments = path
+            .segments
+            .iter()
+            .map(|segment| cgo_8_ident_text(&segment.ident))
+            .collect::<Vec<_>>();
+        let mut resolved = self.resolve_path(path, Cgo8Namespace::Type);
+        if segments.len() == 1 && self.scope().type_shadows.contains(&segments[0]) {
+            let mut local = self.scope().module_path.clone();
+            local.push(segments[0].clone());
+            resolved.push(local);
+        }
+        resolved
+            .iter()
+            .any(|resolved| cgo_9a_task2_is_draft_path(resolved))
+    }
+
+    fn type_alias_def_for_path(
+        &self,
+        path: &syn::Path,
+    ) -> Option<(Vec<String>, &Cgo9aTask2TypeAliasDef)> {
+        let segments = path
+            .segments
+            .iter()
+            .map(|segment| cgo_8_ident_text(&segment.ident))
+            .collect::<Vec<_>>();
+        let mut pending = Vec::new();
+        if segments.first().is_some_and(|segment| segment == "crate")
+            || segments.first().is_some_and(|segment| segment == "self")
+            || segments.first().is_some_and(|segment| segment == "super")
+        {
+            pending.push(cgo_9a_task2_canonicalize_path(
+                &self.scope().module_path,
+                &segments,
+            ));
+        } else {
+            let mut local = self.scope().module_path.clone();
+            local.extend_from_slice(&segments);
+            pending.push(local);
+            pending.extend(
+                self.scope()
+                    .resolve_unqualified(&segments, Cgo8Namespace::Type, true),
+            );
+        }
+        let mut seen = BTreeSet::new();
+        while let Some(candidate) = pending.pop() {
+            if !seen.insert(candidate.clone()) {
+                continue;
+            }
+            if let Some(definition) = self.source_model.type_alias_defs.get(&candidate) {
+                return Some((candidate, definition));
+            }
+            if let Some((prefix_len, targets)) =
+                (1..=candidate.len()).rev().find_map(|prefix_len| {
+                    self.source_model
+                        .type_aliases
+                        .get(&candidate[..prefix_len])
+                        .map(|targets| (prefix_len, targets))
+                })
+            {
+                for target in targets {
+                    let mut expanded = target.clone();
+                    expanded.extend_from_slice(&candidate[prefix_len..]);
+                    pending.push(expanded);
+                }
+                continue;
+            }
+            if let Some((prefix_len, targets)) = (1..candidate.len()).rev().find_map(|prefix_len| {
+                self.source_model
+                    .glob_aliases
+                    .get(&candidate[..prefix_len])
+                    .map(|targets| (prefix_len, targets))
+            }) {
+                for target in targets {
+                    let mut expanded = target.clone();
+                    expanded.extend_from_slice(&candidate[prefix_len..]);
+                    pending.push(expanded);
+                }
+            }
+        }
+        None
+    }
+
+    fn draft_flow_in_type(&self, ty: &syn::Type) -> Cgo9aTask2DraftFlow {
+        self.draft_flow_in_type_inner(ty, false, &[], &mut BTreeSet::new())
+    }
+
+    fn draft_flow_in_type_inner(
+        &self,
+        ty: &syn::Type,
+        borrowed: bool,
+        substitutions: &[BTreeMap<String, syn::Type>],
+        alias_stack: &mut BTreeSet<Vec<String>>,
+    ) -> Cgo9aTask2DraftFlow {
+        match ty {
+            syn::Type::Group(group) => {
+                self.draft_flow_in_type_inner(&group.elem, borrowed, substitutions, alias_stack)
+            }
+            syn::Type::Paren(paren) => {
+                self.draft_flow_in_type_inner(&paren.elem, borrowed, substitutions, alias_stack)
+            }
+            syn::Type::Reference(reference) => {
+                self.draft_flow_in_type_inner(&reference.elem, true, substitutions, alias_stack)
+            }
+            syn::Type::Ptr(pointer) => {
+                self.draft_flow_in_type_inner(&pointer.elem, true, substitutions, alias_stack)
+            }
+            syn::Type::Slice(slice) => self
+                .draft_flow_in_type_inner(&slice.elem, borrowed, substitutions, alias_stack)
+                .unbounded_if_nonzero(),
+            syn::Type::Array(array) => self
+                .draft_flow_in_type_inner(&array.elem, borrowed, substitutions, alias_stack)
+                .unbounded_if_nonzero(),
+            syn::Type::Tuple(tuple) => {
+                tuple
+                    .elems
+                    .iter()
+                    .fold(Cgo9aTask2DraftFlow::ZERO, |flow, element| {
+                        flow.add(self.draft_flow_in_type_inner(
+                            element,
+                            borrowed,
+                            substitutions,
+                            alias_stack,
+                        ))
+                    })
+            }
+            syn::Type::Path(type_path) if type_path.qself.is_none() => {
+                let path = &type_path.path;
+                if path.segments.len() == 1 {
+                    let ident = cgo_8_ident_text(&path.segments[0].ident);
+                    for (index, environment) in substitutions.iter().enumerate().rev() {
+                        if let Some(replacement) = environment.get(&ident) {
+                            return self.draft_flow_in_type_inner(
+                                replacement,
+                                borrowed,
+                                &substitutions[..index],
+                                alias_stack,
+                            );
+                        }
+                    }
+                }
+                if self.path_is_draft(path) {
+                    return Cgo9aTask2DraftFlow::one(borrowed);
+                }
+                let alias_candidate = path.segments.last().is_some_and(|segment| {
+                    self.source_model
+                        .draft_alias_names
+                        .contains(&cgo_8_ident_text(&segment.ident))
+                });
+                if alias_candidate
+                    && let Some((alias_path, definition)) = self.type_alias_def_for_path(path)
+                {
+                    if !alias_stack.insert(alias_path.clone()) {
+                        return Cgo9aTask2DraftFlow::ZERO;
+                    }
+                    let arguments = path
+                        .segments
+                        .last()
+                        .and_then(|segment| match &segment.arguments {
+                            syn::PathArguments::AngleBracketed(arguments) => Some(
+                                arguments
+                                    .args
+                                    .iter()
+                                    .filter_map(|argument| match argument {
+                                        syn::GenericArgument::Type(ty) => Some(ty.clone()),
+                                        _ => None,
+                                    })
+                                    .collect::<Vec<_>>(),
+                            ),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    let environment = definition
+                        .type_params
+                        .iter()
+                        .cloned()
+                        .zip(arguments)
+                        .collect::<BTreeMap<_, _>>();
+                    let mut nested_substitutions = substitutions.to_vec();
+                    nested_substitutions.push(environment);
+                    let flow = self.draft_flow_in_type_inner(
+                        &definition.rhs,
+                        borrowed,
+                        &nested_substitutions,
+                        alias_stack,
+                    );
+                    alias_stack.remove(&alias_path);
+                    return flow;
+                }
+                let leaf = path
+                    .segments
+                    .last()
+                    .map(|segment| cgo_8_ident_text(&segment.ident))
+                    .unwrap_or_default();
+                let arguments = path
+                    .segments
+                    .iter()
+                    .flat_map(|segment| match &segment.arguments {
+                        syn::PathArguments::AngleBracketed(arguments) => arguments
+                            .args
+                            .iter()
+                            .filter_map(|argument| match argument {
+                                syn::GenericArgument::Type(ty) => Some(ty),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>(),
+                        _ => Vec::new(),
+                    })
+                    .collect::<Vec<_>>();
+                let argument_flows = arguments
+                    .iter()
+                    .map(|argument| {
+                        self.draft_flow_in_type_inner(
+                            argument,
+                            borrowed,
+                            substitutions,
+                            alias_stack,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if matches!(leaf.as_str(), "Option") {
+                    return argument_flows
+                        .first()
+                        .copied()
+                        .unwrap_or(Cgo9aTask2DraftFlow::ZERO);
+                }
+                if matches!(leaf.as_str(), "Result") {
+                    return argument_flows
+                        .into_iter()
+                        .fold(Cgo9aTask2DraftFlow::ZERO, Cgo9aTask2DraftFlow::max);
+                }
+                let flow = argument_flows
+                    .into_iter()
+                    .fold(Cgo9aTask2DraftFlow::ZERO, Cgo9aTask2DraftFlow::add);
+                if matches!(
+                    leaf.as_str(),
+                    "Vec"
+                        | "VecDeque"
+                        | "HashMap"
+                        | "BTreeMap"
+                        | "HashSet"
+                        | "BTreeSet"
+                        | "BinaryHeap"
+                        | "SmallVec"
+                ) {
+                    flow.unbounded_if_nonzero()
+                } else {
+                    flow
+                }
+            }
+            _ => Cgo9aTask2DraftFlow::ZERO,
+        }
+    }
+
+    fn draft_producer_is_allowed(&self, name: &str) -> bool {
+        matches!(
+            (self.source_rel, name),
+            (
+                "src/sql/planner/distributed/build/mod.rs",
+                "build_distributed_plan_draft"
+            ) | ("src/sql/planner/distributed/test_support.rs", "into_draft")
+                | (
+                    "src/sql/planner/distributed/seal.rs",
+                    "single_fragment_draft"
+                )
+        )
+    }
+
+    fn register_items<'a>(&mut self, items: impl IntoIterator<Item = &'a syn::Item>) {
+        let items = items
+            .into_iter()
+            .filter(|item| !nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)))
+            .collect::<Vec<_>>();
+        for item in &items {
+            let (ident, namespace) = match item {
+                syn::Item::Const(item) => (Some(&item.ident), Some(Cgo8Namespace::Value)),
+                syn::Item::Enum(item) => (Some(&item.ident), Some(Cgo8Namespace::Type)),
+                syn::Item::Fn(item) => (Some(&item.sig.ident), Some(Cgo8Namespace::Value)),
+                syn::Item::Mod(item) => (Some(&item.ident), Some(Cgo8Namespace::Type)),
+                syn::Item::Static(item) => (Some(&item.ident), Some(Cgo8Namespace::Value)),
+                syn::Item::Struct(item) => (Some(&item.ident), Some(Cgo8Namespace::Type)),
+                syn::Item::Trait(item) => (Some(&item.ident), Some(Cgo8Namespace::Type)),
+                syn::Item::Union(item) => (Some(&item.ident), Some(Cgo8Namespace::Type)),
+                _ => (None, None),
+            };
+            if let (Some(ident), Some(namespace)) = (ident, namespace) {
+                let local = cgo_8_ident_text(ident);
+                let scope = self.scopes.last_mut().unwrap();
+                match namespace {
+                    Cgo8Namespace::Type => {
+                        scope.type_bindings.remove(&local);
+                        scope.type_shadows.insert(local);
+                    }
+                    Cgo8Namespace::Value => {
+                        scope.value_bindings.remove(&local);
+                        scope.value_shadows.insert(local);
+                    }
+                }
+            }
+        }
+        let aliases = items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    syn::Item::Use(_)
+                        | syn::Item::Type(_)
+                        | syn::Item::Const(_)
+                        | syn::Item::Static(_)
+                )
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        if self.scope().module_scope {
+            for item in aliases {
+                match item {
+                    syn::Item::Use(item) => {
+                        let mut raw = Vec::new();
+                        cgo_8_expand_use_tree(&item.tree, &mut Vec::new(), &mut raw);
+                        for binding in raw {
+                            if binding.glob {
+                                let target = cgo_9a_task2_canonicalize_path(
+                                    &self.scope().module_path,
+                                    &binding.target,
+                                );
+                                self.scopes.last_mut().unwrap().glob_imports.push(target);
+                            } else if let Some(local) = binding.local {
+                                if !self.source_model.protected_alias_names.contains(&local) {
+                                    continue;
+                                }
+                                let mut local_path = self.scope().module_path.clone();
+                                local_path.push(local.clone());
+                                let type_targets = self
+                                    .source_model
+                                    .expand_path(&local_path, Cgo8Namespace::Type);
+                                let value_targets = self
+                                    .source_model
+                                    .expand_path(&local_path, Cgo8Namespace::Value);
+                                let scope = self.scopes.last_mut().unwrap();
+                                scope.type_shadows.remove(&local);
+                                scope.value_shadows.remove(&local);
+                                scope.type_bindings.insert(local.clone(), type_targets);
+                                scope.value_bindings.insert(local, value_targets);
+                            }
+                        }
+                    }
+                    syn::Item::Type(item) => {
+                        let local = cgo_8_ident_text(&item.ident);
+                        if !self.source_model.protected_alias_names.contains(&local) {
+                            continue;
+                        }
+                        let mut local_path = self.scope().module_path.clone();
+                        local_path.push(local.clone());
+                        let targets = self
+                            .source_model
+                            .expand_path(&local_path, Cgo8Namespace::Type);
+                        let scope = self.scopes.last_mut().unwrap();
+                        scope.type_shadows.remove(&local);
+                        scope.type_bindings.insert(local, targets);
+                    }
+                    syn::Item::Const(item) => {
+                        let local = cgo_8_ident_text(&item.ident);
+                        if !self.source_model.protected_alias_names.contains(&local) {
+                            continue;
+                        }
+                        let mut local_path = self.scope().module_path.clone();
+                        local_path.push(local.clone());
+                        let targets = self
+                            .source_model
+                            .expand_path(&local_path, Cgo8Namespace::Value);
+                        let scope = self.scopes.last_mut().unwrap();
+                        scope.value_shadows.remove(&local);
+                        scope.value_bindings.insert(local, targets);
+                    }
+                    syn::Item::Static(item) => {
+                        let local = cgo_8_ident_text(&item.ident);
+                        if !self.source_model.protected_alias_names.contains(&local) {
+                            continue;
+                        }
+                        let mut local_path = self.scope().module_path.clone();
+                        local_path.push(local.clone());
+                        let targets = self
+                            .source_model
+                            .expand_path(&local_path, Cgo8Namespace::Value);
+                        let scope = self.scopes.last_mut().unwrap();
+                        scope.value_shadows.remove(&local);
+                        scope.value_bindings.insert(local, targets);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let scope = self.scopes.last_mut().unwrap();
+            scope.glob_imports.sort();
+            scope.glob_imports.dedup();
+            return;
+        }
+        for _ in 0..=aliases.len() {
+            let before = self.scope().clone();
+            for item in &aliases {
+                match item {
+                    syn::Item::Use(item) => {
+                        let mut raw = Vec::new();
+                        cgo_8_expand_use_tree(&item.tree, &mut Vec::new(), &mut raw);
+                        for binding in raw {
+                            if binding.glob {
+                                let target = cgo_9a_task2_canonicalize_path(
+                                    &self.scope().module_path,
+                                    &binding.target,
+                                );
+                                self.scopes.last_mut().unwrap().glob_imports.push(target);
+                            } else if let Some(local) = binding.local {
+                                let type_relevant = self.segments_may_resolve_protected(
+                                    &binding.target,
+                                    Cgo8Namespace::Type,
+                                );
+                                let value_relevant = self.segments_may_resolve_protected(
+                                    &binding.target,
+                                    Cgo8Namespace::Value,
+                                );
+                                if !type_relevant && !value_relevant {
+                                    continue;
+                                }
+                                let type_targets = type_relevant
+                                    .then(|| {
+                                        self.resolve_segments(&binding.target, Cgo8Namespace::Type)
+                                    })
+                                    .unwrap_or_default();
+                                let value_targets = value_relevant
+                                    .then(|| {
+                                        self.resolve_segments(&binding.target, Cgo8Namespace::Value)
+                                    })
+                                    .unwrap_or_default();
+                                let scope = self.scopes.last_mut().unwrap();
+                                scope.type_shadows.remove(&local);
+                                scope.value_shadows.remove(&local);
+                                scope.type_bindings.insert(local.clone(), type_targets);
+                                scope.value_bindings.insert(local, value_targets);
+                            }
+                        }
+                    }
+                    syn::Item::Type(item) => {
+                        let local = cgo_8_ident_text(&item.ident);
+                        let targets = cgo_8_type_path(&item.ty)
+                            .filter(|path| {
+                                self.path_may_resolve_protected(&path.path, Cgo8Namespace::Type)
+                            })
+                            .map(|path| self.resolve_path(&path.path, Cgo8Namespace::Type))
+                            .unwrap_or_default();
+                        let scope = self.scopes.last_mut().unwrap();
+                        if targets.is_empty() {
+                            scope.type_bindings.remove(&local);
+                            scope.type_shadows.insert(local);
+                        } else {
+                            scope.type_shadows.remove(&local);
+                            scope.type_bindings.insert(local, targets);
+                        }
+                    }
+                    syn::Item::Const(item) => {
+                        let local = cgo_8_ident_text(&item.ident);
+                        let targets = self.local_value_targets(&item.expr);
+                        let scope = self.scopes.last_mut().unwrap();
+                        if targets.is_empty() {
+                            scope.value_bindings.remove(&local);
+                            scope.value_shadows.insert(local);
+                        } else {
+                            scope.value_shadows.remove(&local);
+                            scope.value_bindings.insert(local, targets);
+                        }
+                    }
+                    syn::Item::Static(item) => {
+                        let local = cgo_8_ident_text(&item.ident);
+                        let targets = self.local_value_targets(&item.expr);
+                        let scope = self.scopes.last_mut().unwrap();
+                        if targets.is_empty() {
+                            scope.value_bindings.remove(&local);
+                            scope.value_shadows.insert(local);
+                        } else {
+                            scope.value_shadows.remove(&local);
+                            scope.value_bindings.insert(local, targets);
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let scope = self.scopes.last_mut().unwrap();
+            for targets in scope
+                .type_bindings
+                .values_mut()
+                .chain(scope.value_bindings.values_mut())
+            {
+                targets.sort();
+                targets.dedup();
+            }
+            scope.glob_imports.sort();
+            scope.glob_imports.dedup();
+            if *self.scope() == before {
+                break;
+            }
+        }
+    }
+
+    fn current_function(&self) -> &str {
+        self.function_stack
+            .last()
+            .map(String::as_str)
+            .unwrap_or("<module>")
+    }
+
+    fn location(&self) -> String {
+        format!("{}#{}", self.source_rel, self.current_function())
+    }
+
+    fn push_function_scope(&mut self, signature: &syn::Signature) {
+        let mut scope = self.scope().nested();
+        for parameter in &signature.generics.params {
+            if let syn::GenericParam::Type(parameter) = parameter {
+                let name = cgo_8_ident_text(&parameter.ident);
+                scope.type_bindings.remove(&name);
+                scope.type_shadows.insert(name);
+            }
+        }
+        for input in &signature.inputs {
+            if let syn::FnArg::Typed(input) = input {
+                cgo_8_pattern_bindings(&input.pat, &mut scope.value_shadows);
+            }
+        }
+        self.scopes.push(scope);
+    }
+
+    fn local_value_targets(&self, expr: &syn::Expr) -> Vec<Vec<String>> {
+        let Some(path) = cgo_9a_task2_expr_path(expr) else {
+            return Vec::new();
+        };
+        if !self.path_may_resolve_protected(path, Cgo8Namespace::Value) {
+            return Vec::new();
+        }
+        self.resolve_path(path, Cgo8Namespace::Value)
+    }
+
+    fn report_function(&mut self, signature: &syn::Signature, impl_method: bool) {
+        let name = cgo_8_ident_text(&signature.ident);
+        if name == "seal_draft" {
+            self.report
+                .seal_definitions
+                .push(format!("{}#{name}", self.source_rel));
+        }
+        if impl_method && self.impl_plan_stack.last() == Some(&true) {
+            let receiver = signature.receiver();
+            if receiver.is_some_and(|receiver| {
+                receiver.mutability.is_some()
+                    || receiver
+                        .reference
+                        .as_ref()
+                        .is_some_and(|(_, _)| receiver.mutability.is_some())
+            }) || cgo_9a_task2_output_is_mutable_reference(&signature.output)
+                || matches!(
+                    name.as_str(),
+                    "inner" | "inner_mut" | "into_inner" | "as_mut" | "get_mut"
+                )
+            {
+                self.report.violations.push(format!(
+                    "mutable-sealed-surface: {} defines `{name}`",
+                    self.location()
+                ));
+            }
+            if receiver.is_none()
+                && (cgo_9a_task2_output_is_self(&signature.output)
+                    || matches!(&signature.output, syn::ReturnType::Type(_, ty) if self.type_is_plan(ty)))
+            {
+                self.report.violations.push(format!(
+                    "alternate-sealed-constructor: {} defines `{name}`",
+                    self.location()
+                ));
+            }
+        }
+        let output_flow = match &signature.output {
+            syn::ReturnType::Default => Cgo9aTask2DraftFlow::ZERO,
+            syn::ReturnType::Type(_, ty) => self.draft_flow_in_type(ty),
+        };
+        if !output_flow.owned.is_zero() {
+            let mut input_flow = Cgo9aTask2DraftFlow::ZERO;
+            if impl_method && self.impl_draft_stack.last() == Some(&true) {
+                if let Some(receiver) = signature.receiver() {
+                    input_flow =
+                        input_flow.add(Cgo9aTask2DraftFlow::one(receiver.reference.is_some()));
+                }
+            }
+            for input in &signature.inputs {
+                if let syn::FnArg::Typed(input) = input {
+                    input_flow = input_flow.add(self.draft_flow_in_type(&input.ty));
+                }
+            }
+            let borrowed_input = !input_flow.borrowed.is_zero();
+            let cardinality_mismatch = match (input_flow.owned, output_flow.owned) {
+                (Cgo9aTask2Cardinality::Finite(0), Cgo9aTask2Cardinality::Finite(1))
+                    if self.draft_producer_is_allowed(&name)
+                        && input_flow.borrowed.is_zero()
+                        && output_flow.borrowed.is_zero() =>
+                {
+                    false
+                }
+                (Cgo9aTask2Cardinality::Finite(inputs), Cgo9aTask2Cardinality::Finite(outputs)) => {
+                    inputs != outputs
+                }
+                _ => true,
+            };
+            if borrowed_input || cardinality_mismatch {
+                self.report.violations.push(format!(
+                    "cloneable-draft: {} defines non-linear Draft producer `{name}` with input={input_flow:?} output={output_flow:?}",
+                    self.location(),
+                ));
+            }
+        }
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for Cgo9aTask2Visitor<'_> {
+    fn visit_file(&mut self, file: &'ast syn::File) {
+        if nfe_4_syn_attrs_require_test(&file.attrs) {
+            return;
+        }
+        self.register_items(&file.items);
+        for item in &file.items {
+            self.visit_item(item);
+        }
+    }
+
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+            return;
+        }
+        match item {
+            syn::Item::Use(_) => {}
+            syn::Item::Mod(module) => {
+                if let Some((_, items)) = &module.content {
+                    let mut path = self.scope().module_path.clone();
+                    path.push(cgo_8_ident_text(&module.ident));
+                    self.scopes.push(Cgo8AstScope {
+                        module_path: path,
+                        module_scope: true,
+                        ..Default::default()
+                    });
+                    self.register_items(items);
+                    for item in items {
+                        self.visit_item(item);
+                    }
+                    self.scopes.pop();
+                }
+            }
+            _ => syn::visit::visit_item(self, item),
+        }
+    }
+
+    fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+        let mut canonical = self.scope().module_path.clone();
+        canonical.push(cgo_8_ident_text(&item.ident));
+        if cgo_9a_task2_is_draft_path(&canonical)
+            && !cgo_9a_task2_is_exact_draft_visibility(&item.vis)
+        {
+            self.report.violations.push(format!(
+                "draft-visibility: {} must use pub(in crate::sql::planner::distributed)",
+                self.source_rel
+            ));
+        }
+        if cgo_9a_task2_is_draft_path(&canonical)
+            && (cgo_9a_task2_derive_contains(&item.attrs, "Clone")
+                || cgo_9a_task2_derive_contains(&item.attrs, "Copy"))
+        {
+            self.report.violations.push(format!(
+                "cloneable-draft: {} derives Clone for DistributedPlanDraft",
+                self.source_rel
+            ));
+        }
+        if cgo_9a_is_distributed_plan_path(&canonical) {
+            if self.source_rel != "src/sql/planner/distributed/seal.rs" {
+                self.report.violations.push(format!(
+                    "sealed-owner: {} defines DistributedPlan outside seal.rs",
+                    self.source_rel
+                ));
+            }
+            if item
+                .fields
+                .iter()
+                .any(|field| !matches!(field.vis, syn::Visibility::Inherited))
+            {
+                self.report.violations.push(format!(
+                    "sealed-data-visibility: {} exposes a DistributedPlan field",
+                    self.source_rel
+                ));
+            }
+        }
+        syn::visit::visit_item_struct(self, item);
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        if nfe_4_syn_attrs_require_test(&item.attrs) {
+            return;
+        }
+        self.function_stack.push(cgo_8_ident_text(&item.sig.ident));
+        self.report_function(&item.sig, false);
+        self.push_function_scope(&item.sig);
+        syn::visit::visit_item_fn(self, item);
+        self.scopes.pop();
+        self.function_stack.pop();
+    }
+
+    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+        if nfe_4_syn_attrs_require_test(&item.attrs) {
+            return;
+        }
+        let relevant_impl = self.type_may_resolve_protected(&item.self_ty);
+        let is_plan = relevant_impl && self.type_is_plan(&item.self_ty);
+        let is_draft = relevant_impl && self.type_is_draft(&item.self_ty);
+        if (is_plan || is_draft)
+            && let Some((_, trait_path, _)) = &item.trait_
+        {
+            let trait_names = self.resolve_path(trait_path, Cgo8Namespace::Type);
+            let forbidden = trait_names.iter().any(|path| {
+                path.last().is_some_and(|name| {
+                    (is_plan && matches!(name.as_str(), "DerefMut" | "AsMut"))
+                        || (is_draft && matches!(name.as_str(), "Clone" | "Copy"))
+                })
+            });
+            if forbidden {
+                self.report.violations.push(format!(
+                    "forbidden-seal-trait: {} implements a mutable/clone seal trait",
+                    self.source_rel
+                ));
+            }
+        }
+        self.impl_plan_stack.push(is_plan);
+        self.impl_draft_stack.push(is_draft);
+        syn::visit::visit_item_impl(self, item);
+        self.impl_draft_stack.pop();
+        self.impl_plan_stack.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        if nfe_4_syn_attrs_require_test(&item.attrs) {
+            return;
+        }
+        self.function_stack.push(cgo_8_ident_text(&item.sig.ident));
+        self.report_function(&item.sig, true);
+        self.push_function_scope(&item.sig);
+        syn::visit::visit_impl_item_fn(self, item);
+        self.scopes.pop();
+        self.function_stack.pop();
+    }
+
+    fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
+        if nfe_4_syn_attrs_require_test(&item.attrs) {
+            return;
+        }
+        self.function_stack.push(cgo_8_ident_text(&item.sig.ident));
+        self.report_function(&item.sig, false);
+        self.push_function_scope(&item.sig);
+        syn::visit::visit_trait_item_fn(self, item);
+        self.scopes.pop();
+        self.function_stack.pop();
+    }
+
+    fn visit_block(&mut self, block: &'ast syn::Block) {
+        self.scopes.push(self.scope().nested());
+        self.register_items(block.stmts.iter().filter_map(|statement| match statement {
+            syn::Stmt::Item(item) => Some(item),
+            _ => None,
+        }));
+        for statement in &block.stmts {
+            if !nfe_4_syn_attrs_require_test(nfe_4_syn_stmt_attrs(statement)) {
+                self.visit_stmt(statement);
+            }
+        }
+        self.scopes.pop();
+    }
+
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        if nfe_4_syn_attrs_require_test(&local.attrs) {
+            return;
+        }
+        let binding = cgo_9a_single_pattern_ident(&local.pat);
+        let targets = local
+            .init
+            .as_ref()
+            .map(|init| self.local_value_targets(&init.expr))
+            .unwrap_or_default();
+        syn::visit::visit_local(self, local);
+        let scope = self.scopes.last_mut().unwrap();
+        cgo_8_pattern_bindings(&local.pat, &mut scope.value_shadows);
+        if let Some(binding) = binding
+            && !targets.is_empty()
+        {
+            scope.value_shadows.remove(&binding);
+            scope.value_bindings.insert(binding, targets);
+        }
+    }
+
+    fn visit_expr_assign(&mut self, assign: &'ast syn::ExprAssign) {
+        let binding = cgo_9a_task2_expr_path(&assign.left).and_then(|path| {
+            (path.segments.len() == 1).then(|| cgo_8_ident_text(&path.segments[0].ident))
+        });
+        let targets = self.local_value_targets(&assign.right);
+        syn::visit::visit_expr_assign(self, assign);
+        if let Some(binding) = binding {
+            let scope = self.scopes.last_mut().unwrap();
+            scope.value_bindings.remove(&binding);
+            scope.value_shadows.insert(binding.clone());
+            if !targets.is_empty() {
+                scope.value_shadows.remove(&binding);
+                scope.value_bindings.insert(binding, targets);
+            }
+        }
+    }
+
+    fn visit_expr_closure(&mut self, closure: &'ast syn::ExprClosure) {
+        let mut scope = self.scope().nested();
+        for input in &closure.inputs {
+            cgo_8_pattern_bindings(input, &mut scope.value_shadows);
+        }
+        self.scopes.push(scope);
+        syn::visit::visit_expr_closure(self, closure);
+        self.scopes.pop();
+    }
+
+    fn visit_type_reference(&mut self, reference: &'ast syn::TypeReference) {
+        if reference.mutability.is_some()
+            && self.type_may_resolve_protected(&reference.elem)
+            && self.type_is_plan(&reference.elem)
+        {
+            self.report.violations.push(format!(
+                "mutable-sealed-reference: {} references &mut DistributedPlan",
+                self.location()
+            ));
+        }
+        syn::visit::visit_type_reference(self, reference);
+    }
+
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let Some(path) = cgo_9a_task2_expr_path(&call.func)
+            && self.path_may_resolve_protected(path, Cgo8Namespace::Value)
+        {
+            for resolved in self.resolve_path(path, Cgo8Namespace::Value) {
+                if cgo_9a_task2_is_seal_path(&resolved) {
+                    self.report.seal_calls.push(self.location());
+                }
+                if resolved.last().is_some_and(|name| name == "from_draft")
+                    && resolved[..resolved.len().saturating_sub(1)]
+                        .last()
+                        .is_some_and(|name| name == "DistributedPlan")
+                {
+                    self.report.violations.push(format!(
+                        "alternate-sealed-constructor-call: {} calls from_draft",
+                        self.location()
+                    ));
+                }
+            }
+        }
+        syn::visit::visit_expr_call(self, call);
+    }
+
+    fn visit_expr_struct(&mut self, item: &'ast syn::ExprStruct) {
+        if !self.path_may_resolve_protected(&item.path, Cgo8Namespace::Type) {
+            syn::visit::visit_expr_struct(self, item);
+            return;
+        }
+        let segments = item
+            .path
+            .segments
+            .iter()
+            .map(|segment| cgo_8_ident_text(&segment.ident))
+            .collect::<Vec<_>>();
+        let mut resolved = self.resolve_path(&item.path, Cgo8Namespace::Type);
+        if segments.len() == 1 && self.scope().type_shadows.contains(&segments[0]) {
+            let mut local = self.scope().module_path.clone();
+            local.push(segments[0].clone());
+            resolved.push(local);
+        }
+        if resolved
+            .iter()
+            .any(|path| cgo_9a_is_distributed_plan_path(path))
+        {
+            self.report.sealed_constructions.push(self.location());
+        }
+        syn::visit::visit_expr_struct(self, item);
+    }
+}
+
+fn cgo_9a_task2_report_with_model<'a>(
+    source_rel: &'a str,
+    source_model: &'a Cgo9aTask2SourceModel,
+) -> Cgo9aTask2Report {
+    use syn::visit::Visit;
+
+    let Some(file) = source_model.files.get(source_rel) else {
+        return Cgo9aTask2Report::default();
+    };
+    let module_path =
+        rust_source_module_segments(source_rel).unwrap_or_else(|| vec!["crate".to_string()]);
+    let mut visitor = Cgo9aTask2Visitor {
+        source_rel,
+        source_model,
+        scopes: vec![Cgo8AstScope {
+            module_path,
+            module_scope: true,
+            ..Default::default()
+        }],
+        function_stack: Vec::new(),
+        impl_plan_stack: Vec::new(),
+        impl_draft_stack: Vec::new(),
+        report: Cgo9aTask2Report::default(),
+    };
+    visitor.visit_file(file);
+    visitor.report
+}
+
+fn cgo_9a_task2_report_in(source_rel: &str, source: &str) -> Cgo9aTask2Report {
+    let sources = [Cgo8GuardSource::new(source_rel, source)];
+    let (source_model, parse_violations) = Cgo9aTask2SourceModel::from_sources(&sources);
+    let mut report = cgo_9a_task2_report_with_model(source_rel, &source_model);
+    report.violations.extend(parse_violations);
+    report
+}
+
+fn cgo_9a_task2_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
+    let (source_model, parse_violations) = Cgo9aTask2SourceModel::from_sources(sources);
+    let mut report = Cgo9aTask2Report {
+        violations: parse_violations,
+        ..Default::default()
+    };
+    for source in sources {
+        let next = cgo_9a_task2_report_with_model(&source.path, &source_model);
+        report.violations.extend(next.violations);
+        report.seal_definitions.extend(next.seal_definitions);
+        report.seal_calls.extend(next.seal_calls);
+        report
+            .sealed_constructions
+            .extend(next.sealed_constructions);
+    }
+    report.seal_definitions.sort();
+    report.seal_calls.sort();
+    report.sealed_constructions.sort();
+    let expected_definition = vec!["src/sql/planner/distributed/seal.rs#seal_draft".to_string()];
+    if report.seal_definitions != expected_definition {
+        report.violations.push(format!(
+            "seal-definition-set: expected {expected_definition:?}, got {:?}",
+            report.seal_definitions
+        ));
+    }
+    let mut expected_calls = vec![
+        "src/sql/planner/distributed/build/mod.rs#build_distributed_plan".to_string(),
+        "src/sql/planner/distributed/write/plan.rs#build_iceberg_change_stream_distributed_plan"
+            .to_string(),
+        "src/sql/planner/distributed/write/plan.rs#build_iceberg_write_distributed_plan"
+            .to_string(),
+    ];
+    expected_calls.sort();
+    if report.seal_calls != expected_calls {
+        report.violations.push(format!(
+            "seal-call-set: expected {expected_calls:?}, got {:?}",
+            report.seal_calls
+        ));
+    }
+    let expected_construction = vec!["src/sql/planner/distributed/seal.rs#seal_draft".to_string()];
+    if report.sealed_constructions != expected_construction {
+        report.violations.push(format!(
+            "sealed-construction-set: expected {expected_construction:?}, got {:?}",
+            report.sealed_constructions
+        ));
+    }
+    report.violations.sort();
+    report.violations.dedup();
+    report.violations
+}
+
+fn cgo_9a_task2_fixture_sources(
+    seal: &str,
+    build: &str,
+    write: &str,
+    extra: &[Cgo8GuardSource],
+) -> Vec<Cgo8GuardSource> {
+    let mut sources = vec![
+        Cgo8GuardSource::new("src/sql/planner/distributed/seal.rs", seal),
+        Cgo8GuardSource::new("src/sql/planner/distributed/build/mod.rs", build),
+        Cgo8GuardSource::new("src/sql/planner/distributed/write/plan.rs", write),
+    ];
+    sources.extend_from_slice(extra);
+    sources
+}
+
+#[test]
+fn distributed_plan_seal_task2_detector_accepts_only_the_three_construction_paths() {
+    let sources = cgo_9a_task2_fixture_sources(
+        "pub(crate) struct DistributedPlan { data: Data } struct Data; pub(in crate::sql::planner::distributed) struct DistributedPlanDraft; pub(in crate::sql::planner::distributed) fn seal_draft(draft: DistributedPlanDraft) -> DistributedPlan { let _ = draft; DistributedPlan { data: Data } } impl DistributedPlan { fn fragments(&self) -> &[u8] { &[] } }",
+        "fn build_distributed_plan(draft: crate::sql::planner::distributed::fragment::DistributedPlanDraft) -> crate::sql::planner::distributed::DistributedPlan { super::seal::seal_draft(draft) }",
+        "use crate::sql::planner::distributed::seal::seal_draft as finish; fn build_iceberg_write_distributed_plan(draft: super::fragment::DistributedPlanDraft) -> super::DistributedPlan { finish(draft) } fn build_iceberg_change_stream_distributed_plan(draft: super::fragment::DistributedPlanDraft) -> super::DistributedPlan { (crate::sql::planner::distributed::seal::seal_draft)(draft) }",
+        &[],
+    );
+    let violations = cgo_9a_task2_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "legal typed-seal paths must pass independent of aliases/formatting: {violations:?}"
+    );
+}
+
+#[test]
+fn distributed_plan_seal_task2_detector_rejects_repeat_construction_and_mutable_surfaces() {
+    let legal_seal = "pub(crate) struct DistributedPlan { data: Data } struct Data; pub(in crate::sql::planner::distributed) struct DistributedPlanDraft; pub(in crate::sql::planner::distributed) fn seal_draft(draft: DistributedPlanDraft) -> DistributedPlan { let _ = draft; DistributedPlan { data: Data } }";
+    let legal_build = "fn build_distributed_plan(draft: crate::sql::planner::distributed::fragment::DistributedPlanDraft) -> crate::sql::planner::distributed::DistributedPlan { super::seal::seal_draft(draft) }";
+    let legal_write = "fn build_iceberg_write_distributed_plan(draft: super::fragment::DistributedPlanDraft) -> super::DistributedPlan { super::seal::seal_draft(draft) } fn build_iceberg_change_stream_distributed_plan(draft: super::fragment::DistributedPlanDraft) -> super::DistributedPlan { super::seal::seal_draft(draft) }";
+
+    let cases = [
+        Cgo8GuardSource::new(
+            "src/extra.rs",
+            "use crate::sql::planner::distributed::seal::seal_draft as repeat; fn reseal(draft: crate::sql::planner::distributed::fragment::DistributedPlanDraft) { let _ = repeat(draft); }",
+        ),
+        Cgo8GuardSource::new(
+            "src/constructor.rs",
+            "use crate::sql::planner::distributed::DistributedPlan as DP; impl DP { fn from_draft() -> Self { todo!() } } fn bypass() { let _ = DP::from_draft(); }",
+        ),
+        Cgo8GuardSource::new(
+            "src/mutable.rs",
+            "use crate::sql::planner::distributed::DistributedPlan as DP; impl DP { fn inner_mut(&mut self) -> &mut u8 { todo!() } } fn mutate(value: &mut DP) {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/traits.rs",
+            "use crate::sql::planner::distributed::DistributedPlan as DP; impl std::ops::DerefMut for DP { fn deref_mut(&mut self) -> &mut Self::Target { todo!() } } impl AsMut<u8> for DP { fn as_mut(&mut self) -> &mut u8 { todo!() } }",
+        ),
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/fragment.rs",
+            "#[derive(Debug, Clone)] pub(in crate::sql::planner::distributed) struct DistributedPlanDraft;",
+        ),
+    ];
+    for fixture in cases {
+        let sources = cgo_9a_task2_fixture_sources(
+            legal_seal,
+            legal_build,
+            legal_write,
+            std::slice::from_ref(&fixture),
+        );
+        let violations = cgo_9a_task2_violations(&sources);
+        assert!(
+            !violations.is_empty(),
+            "forbidden fixture {} must fail closed",
+            fixture.path
+        );
+    }
+}
+
+#[test]
+fn distributed_plan_seal_task2_detector_enforces_linear_private_draft() {
+    let wrong_visibility = cgo_9a_task2_report_in(
+        "src/sql/planner/distributed/fragment.rs",
+        "pub(crate) struct DistributedPlanDraft;",
+    );
+    assert!(
+        wrong_visibility
+            .violations
+            .iter()
+            .any(|violation| violation.contains("draft-visibility")),
+        "Draft visibility must be exactly distributed-owner scoped: {:?}",
+        wrong_visibility.violations
+    );
+
+    for method in ["clone", "duplicate"] {
+        let source = format!(
+            "pub(in crate::sql::planner::distributed) struct DistributedPlanDraft; impl DistributedPlanDraft {{ fn {method}(&self) -> Self {{ todo!() }} }}"
+        );
+        let report = cgo_9a_task2_report_in("src/sql/planner/distributed/fragment.rs", &source);
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|violation| violation.contains("cloneable-draft")),
+            "Draft `{method}` duplicator must be rejected: {:?}",
+            report.violations
+        );
+    }
+}
+
+#[test]
+fn distributed_plan_seal_task2_detector_resolves_cross_file_reexports() {
+    let legal_seal = "pub(crate) struct DistributedPlan { data: Data } struct Data; pub(in crate::sql::planner::distributed) struct DistributedPlanDraft; pub(in crate::sql::planner::distributed) fn seal_draft(draft: DistributedPlanDraft) -> DistributedPlan { let _ = draft; DistributedPlan { data: Data } }";
+    let legal_build = "fn build_distributed_plan(draft: crate::sql::planner::distributed::fragment::DistributedPlanDraft) -> crate::sql::planner::distributed::DistributedPlan { super::seal::seal_draft(draft) }";
+    let legal_write = "fn build_iceberg_write_distributed_plan(draft: super::fragment::DistributedPlanDraft) -> super::DistributedPlan { super::seal::seal_draft(draft) } fn build_iceberg_change_stream_distributed_plan(draft: super::fragment::DistributedPlanDraft) -> super::DistributedPlan { super::seal::seal_draft(draft) }";
+    let extras = [
+        Cgo8GuardSource::new(
+            "src/reexport/mod.rs",
+            "pub use crate::sql::planner::distributed::seal::seal_draft as finish; pub use crate::sql::planner::distributed::fragment::DistributedPlanDraft as Draft; mod child;",
+        ),
+        Cgo8GuardSource::new(
+            "src/reexport/child.rs",
+            "use super::{finish, Draft}; fn reseal(draft: Draft) { let _ = finish(draft); }",
+        ),
+    ];
+    let violations = cgo_9a_task2_violations(&cgo_9a_task2_fixture_sources(
+        legal_seal,
+        legal_build,
+        legal_write,
+        &extras,
+    ));
+    assert!(
+        violations.iter().any(|violation| {
+            violation.contains("seal-call-set")
+                && violation.contains("src/reexport/child.rs#reseal")
+        }),
+        "cross-file reexported seal call must be detected: {violations:?}"
+    );
+}
+
+#[test]
+fn distributed_plan_seal_task2_detector_tracks_local_function_values() {
+    let legal_seal = "pub(crate) struct DistributedPlan { data: Data } struct Data; pub(in crate::sql::planner::distributed) struct DistributedPlanDraft; pub(in crate::sql::planner::distributed) fn seal_draft(draft: DistributedPlanDraft) -> DistributedPlan { let _ = draft; DistributedPlan { data: Data } }";
+    let legal_build = "fn build_distributed_plan(draft: crate::sql::planner::distributed::fragment::DistributedPlanDraft) -> crate::sql::planner::distributed::DistributedPlan { super::seal::seal_draft(draft) }";
+    let legal_write = "fn build_iceberg_write_distributed_plan(draft: super::fragment::DistributedPlanDraft) -> super::DistributedPlan { super::seal::seal_draft(draft) } fn build_iceberg_change_stream_distributed_plan(draft: super::fragment::DistributedPlanDraft) -> super::DistributedPlan { super::seal::seal_draft(draft) }";
+    for source in [
+        "use crate::sql::planner::distributed::seal::seal_draft; fn reseal(draft: crate::sql::planner::distributed::fragment::DistributedPlanDraft) { let finish = seal_draft; let _ = finish(draft); }",
+        "use crate::sql::planner::distributed::seal::seal_draft as imported; fn reseal(draft: crate::sql::planner::distributed::fragment::DistributedPlanDraft) { let finish = imported; let _ = finish(draft); }",
+    ] {
+        let extra = [Cgo8GuardSource::new("src/local_value.rs", source)];
+        let violations = cgo_9a_task2_violations(&cgo_9a_task2_fixture_sources(
+            legal_seal,
+            legal_build,
+            legal_write,
+            &extra,
+        ));
+        assert!(
+            violations.iter().any(|violation| {
+                violation.contains("seal-call-set")
+                    && violation.contains("src/local_value.rs#reseal")
+            }),
+            "locally rebound seal call must be detected: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn distributed_plan_seal_task2_detector_tracks_wrapped_static_and_assigned_seal_values() {
+    let legal_seal = "pub(crate) struct DistributedPlan { data: Data } struct Data; pub(in crate::sql::planner::distributed) struct DistributedPlanDraft; pub(in crate::sql::planner::distributed) fn seal_draft(draft: DistributedPlanDraft) -> DistributedPlan { let _ = draft; DistributedPlan { data: Data } }";
+    let legal_build = "fn build_distributed_plan(draft: crate::sql::planner::distributed::fragment::DistributedPlanDraft) -> crate::sql::planner::distributed::DistributedPlan { super::seal::seal_draft(draft) }";
+    let legal_write = "fn build_iceberg_write_distributed_plan(draft: super::fragment::DistributedPlanDraft) -> super::DistributedPlan { super::seal::seal_draft(draft) } fn build_iceberg_change_stream_distributed_plan(draft: super::fragment::DistributedPlanDraft) -> super::DistributedPlan { super::seal::seal_draft(draft) }";
+    for source in [
+        "use crate::sql::planner::distributed::seal::seal_draft; use crate::sql::planner::distributed::fragment::DistributedPlanDraft as Draft; fn reseal(draft: Draft) { let finish = seal_draft as fn(Draft) -> _; let _ = finish(draft); }",
+        "use crate::sql::planner::distributed::seal::seal_draft; fn reseal(draft: crate::sql::planner::distributed::fragment::DistributedPlanDraft) { let finish = &seal_draft; let _ = finish(draft); }",
+        "use crate::sql::planner::distributed::seal::seal_draft; fn reseal(draft: crate::sql::planner::distributed::fragment::DistributedPlanDraft) { let finish = { seal_draft }; let _ = finish(draft); }",
+        "use crate::sql::planner::distributed::seal::seal_draft; use crate::sql::planner::distributed::fragment::DistributedPlanDraft as Draft; use crate::sql::planner::distributed::DistributedPlan as Plan; const FINISH: fn(Draft) -> Plan = seal_draft; static OTHER_FINISH: fn(Draft) -> Plan = seal_draft; fn reseal(draft: Draft) { let _ = FINISH(draft); let _ = OTHER_FINISH(todo!()); }",
+        "use crate::sql::planner::distributed::seal::seal_draft; use crate::sql::planner::distributed::fragment::DistributedPlanDraft as Draft; use crate::sql::planner::distributed::DistributedPlan as Plan; fn identity(_: Draft) -> Plan { todo!() } fn reseal(draft: Draft) { let mut finish: fn(Draft) -> Plan = identity; finish = seal_draft; let _ = finish(draft); }",
+    ] {
+        let extra = [Cgo8GuardSource::new("src/wrapped_value.rs", source)];
+        let violations = cgo_9a_task2_violations(&cgo_9a_task2_fixture_sources(
+            legal_seal,
+            legal_build,
+            legal_write,
+            &extra,
+        ));
+        assert!(
+            violations.iter().any(|violation| {
+                violation.contains("seal-call-set")
+                    && violation.contains("src/wrapped_value.rs#reseal")
+            }),
+            "wrapped/static/assigned seal call must be detected: {violations:?}"
+        );
+    }
+
+    let shadowed = cgo_9a_task2_report_in(
+        "src/shadowed_value.rs",
+        "use crate::sql::planner::distributed::seal::seal_draft; fn clean(seal_draft: fn(u8) -> u8) { let _ = (&seal_draft)(1); }",
+    );
+    assert!(
+        shadowed.seal_calls.is_empty(),
+        "lexically shadowed seal name must not retain imported provenance: {:?}",
+        shadowed.seal_calls
+    );
+}
+
+#[test]
+fn distributed_plan_seal_task2_detector_resolves_glob_reexported_seal_values() {
+    let legal_seal = "pub(crate) struct DistributedPlan { data: Data } struct Data; pub(in crate::sql::planner::distributed) struct DistributedPlanDraft; pub(in crate::sql::planner::distributed) fn seal_draft(draft: DistributedPlanDraft) -> DistributedPlan { let _ = draft; DistributedPlan { data: Data } }";
+    let legal_build = "fn build_distributed_plan(draft: crate::sql::planner::distributed::fragment::DistributedPlanDraft) -> crate::sql::planner::distributed::DistributedPlan { super::seal::seal_draft(draft) }";
+    let legal_write = "fn build_iceberg_write_distributed_plan(draft: super::fragment::DistributedPlanDraft) -> super::DistributedPlan { super::seal::seal_draft(draft) } fn build_iceberg_change_stream_distributed_plan(draft: super::fragment::DistributedPlanDraft) -> super::DistributedPlan { super::seal::seal_draft(draft) }";
+    let extras = [
+        Cgo8GuardSource::new(
+            "src/reexport/mod.rs",
+            "pub(in crate::sql::planner::distributed) use crate::sql::planner::distributed::seal::*; mod child;",
+        ),
+        Cgo8GuardSource::new(
+            "src/reexport/child.rs",
+            "use super::*; fn reseal(draft: crate::sql::planner::distributed::fragment::DistributedPlanDraft) { let _ = seal_draft(draft); }",
+        ),
+    ];
+    let violations = cgo_9a_task2_violations(&cgo_9a_task2_fixture_sources(
+        legal_seal,
+        legal_build,
+        legal_write,
+        &extras,
+    ));
+    assert!(
+        violations.iter().any(|violation| {
+            violation.contains("seal-call-set")
+                && violation.contains("src/reexport/child.rs#reseal")
+        }),
+        "glob-reexported seal call must be detected: {violations:?}"
+    );
+}
+
+#[test]
+fn distributed_plan_seal_task2_detector_distinguishes_draft_duplication_from_linear_transform() {
+    for source in [
+        "pub(in crate::sql::planner::distributed) struct DistributedPlanDraft; impl DistributedPlanDraft { fn duplicate(&self) -> Option<Self> { todo!() } }",
+        "pub(in crate::sql::planner::distributed) struct DistributedPlanDraft; fn duplicate(draft: &DistributedPlanDraft) -> DistributedPlanDraft { todo!() }",
+        "pub(in crate::sql::planner::distributed) struct DistributedPlanDraft; type Draft = DistributedPlanDraft; struct Error; fn duplicate(draft: &Draft) -> Result<(Draft,), Error> { todo!() }",
+        "pub(in crate::sql::planner::distributed) struct DistributedPlanDraft; fn duplicate() -> Option<DistributedPlanDraft> { todo!() }",
+    ] {
+        let report = cgo_9a_task2_report_in("src/sql/planner/distributed/fragment.rs", source);
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|violation| violation.contains("cloneable-draft")),
+            "shared-input nested Draft duplicator must be rejected for `{source}`: {:?}",
+            report.violations,
+        );
+    }
+
+    let linear = cgo_9a_task2_report_in(
+        "src/sql/planner/distributed/fragment.rs",
+        "pub(in crate::sql::planner::distributed) struct DistributedPlanDraft; struct Error; fn decorate(draft: DistributedPlanDraft) -> Result<DistributedPlanDraft, Error> { todo!() }",
+    );
+    assert!(
+        linear.violations.is_empty(),
+        "owned Draft transformation must remain legal: {:?}",
+        linear.violations
+    );
+}
+
+#[test]
+fn distributed_plan_seal_task2_detector_enforces_draft_cardinality() {
+    for source in [
+        "pub(in crate::sql::planner::distributed) struct DistributedPlanDraft; fn split(draft: DistributedPlanDraft) -> (DistributedPlanDraft, DistributedPlanDraft) { todo!() }",
+        "pub(in crate::sql::planner::distributed) struct DistributedPlanDraft; fn split(borrowed: &DistributedPlanDraft, owned: DistributedPlanDraft) -> (DistributedPlanDraft, DistributedPlanDraft) { todo!() }",
+        "pub(in crate::sql::planner::distributed) struct DistributedPlanDraft; fn collect(draft: DistributedPlanDraft) -> Vec<DistributedPlanDraft> { todo!() }",
+    ] {
+        let report = cgo_9a_task2_report_in("src/sql/planner/distributed/fragment.rs", source);
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|violation| violation.contains("cloneable-draft")),
+            "non-linear Draft cardinality must be rejected for `{source}`: {:?}",
+            report.violations,
+        );
+    }
+
+    for source in [
+        "pub(in crate::sql::planner::distributed) struct DistributedPlanDraft; struct Error; fn decorate(draft: DistributedPlanDraft) -> Result<DistributedPlanDraft, Error> { todo!() }",
+        "pub(in crate::sql::planner::distributed) struct DistributedPlanDraft; fn maybe(draft: DistributedPlanDraft) -> Option<DistributedPlanDraft> { todo!() }",
+        "pub(in crate::sql::planner::distributed) struct DistributedPlanDraft; fn ordinary<T>(value: T) -> (T, T) { todo!() }",
+    ] {
+        let report = cgo_9a_task2_report_in("src/sql/planner/distributed/fragment.rs", source);
+        assert!(
+            report.violations.is_empty(),
+            "linear/ordinary transform must remain legal for `{source}`: {:?}",
+            report.violations,
+        );
+    }
+}
+
+#[test]
+fn distributed_plan_seal_task2_detector_restricts_draft_producer_allowlist_to_zero_to_one() {
+    for (source_rel, function_name) in [
+        (
+            "src/sql/planner/distributed/build/mod.rs",
+            "build_distributed_plan_draft",
+        ),
+        ("src/sql/planner/distributed/test_support.rs", "into_draft"),
+        (
+            "src/sql/planner/distributed/seal.rs",
+            "single_fragment_draft",
+        ),
+    ] {
+        for output in [
+            "(crate::sql::planner::distributed::fragment::DistributedPlanDraft, crate::sql::planner::distributed::fragment::DistributedPlanDraft)",
+            "Result<(crate::sql::planner::distributed::fragment::DistributedPlanDraft, crate::sql::planner::distributed::fragment::DistributedPlanDraft), Error>",
+            "(crate::sql::planner::distributed::fragment::DistributedPlanDraft, &'static crate::sql::planner::distributed::fragment::DistributedPlanDraft)",
+        ] {
+            let duplicated =
+                format!("struct Error; fn {function_name}() -> {output} {{ todo!() }}");
+            let report = cgo_9a_task2_report_in(source_rel, &duplicated);
+            assert!(
+                report
+                    .violations
+                    .iter()
+                    .any(|violation| violation.contains("cloneable-draft")),
+                "allowlisted Draft producer `{source_rel}#{function_name}` must reject output `{output}`: {:?}",
+                report.violations,
+            );
+        }
+
+        let linear = format!(
+            "fn {function_name}() -> crate::sql::planner::distributed::fragment::DistributedPlanDraft {{ todo!() }}"
+        );
+        let report = cgo_9a_task2_report_in(source_rel, &linear);
+        assert!(
+            report.violations.is_empty(),
+            "allowlisted Draft producer `{source_rel}#{function_name}` must retain 0->1: {:?}",
+            report.violations,
+        );
+    }
+}
+
+#[test]
+fn distributed_plan_seal_task2_detector_expands_nested_draft_aliases() {
+    for source in [
+        "pub(in crate::sql::planner::distributed) struct DistributedPlanDraft; type Draft = DistributedPlanDraft; type DraftOut = Option<Draft>; fn duplicate(draft: &Draft) -> DraftOut { todo!() }",
+        "pub(in crate::sql::planner::distributed) struct DistributedPlanDraft; type Draft = DistributedPlanDraft; type DraftRef<'a> = &'a Draft; fn duplicate(draft: DraftRef<'_>) -> Draft { todo!() }",
+        "pub(in crate::sql::planner::distributed) struct DistributedPlanDraft; type Draft = DistributedPlanDraft; type Pair = (Draft, Draft); fn split(draft: Draft) -> Pair { todo!() }",
+        "pub(in crate::sql::planner::distributed) struct DistributedPlanDraft; type Draft = DistributedPlanDraft; type Wrap<T> = Option<T>; type DraftOut = Wrap<Draft>; fn duplicate(draft: &Draft) -> DraftOut { todo!() }",
+    ] {
+        let report = cgo_9a_task2_report_in("src/sql/planner/distributed/fragment.rs", source);
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|violation| violation.contains("cloneable-draft")),
+            "nested/reference Draft alias must preserve cardinality for `{source}`: {:?}",
+            report.violations,
+        );
+    }
+}
+
+#[test]
+fn distributed_plan_seal_task2_detector_checks_trait_draft_contracts() {
+    for source in [
+        "pub(in crate::sql::planner::distributed) struct DistributedPlanDraft; trait Duplicate { fn duplicate(draft: &DistributedPlanDraft) -> Option<DistributedPlanDraft>; } struct Holder; impl Duplicate for Holder {}",
+        "pub(in crate::sql::planner::distributed) struct DistributedPlanDraft; trait Duplicate { fn duplicate(draft: &DistributedPlanDraft) -> Option<DistributedPlanDraft> { todo!() } }",
+    ] {
+        let report = cgo_9a_task2_report_in("src/sql/planner/distributed/fragment.rs", source);
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|violation| violation.contains("cloneable-draft")),
+            "trait Draft duplicator contract must be rejected for `{source}`: {:?}",
+            report.violations,
+        );
+    }
+
+    let ordinary = cgo_9a_task2_report_in(
+        "src/sql/planner/distributed/fragment.rs",
+        "pub(in crate::sql::planner::distributed) struct DistributedPlanDraft; trait Ordinary<T> { fn duplicate(value: &T) -> Option<T>; }",
+    );
+    assert!(
+        ordinary.violations.is_empty(),
+        "ordinary generic trait contract must remain legal: {:?}",
+        ordinary.violations,
+    );
+
+    let default_body = cgo_9a_task2_report_in(
+        "src/trait_default.rs",
+        "use crate::sql::planner::distributed::seal::seal_draft; use crate::sql::planner::distributed::fragment::DistributedPlanDraft as Draft; trait Reseal { fn reseal(draft: Draft) { let _ = seal_draft(draft); } }",
+    );
+    assert_eq!(
+        default_body.seal_calls,
+        ["src/trait_default.rs#reseal"],
+        "trait default body must be visited for seal provenance",
+    );
+}
+
+#[test]
+fn distributed_plan_seal_task2_detector_recurses_through_type_aliases() {
+    let mutable = cgo_9a_task2_report_in(
+        "src/mutable_alias.rs",
+        "use crate::sql::planner::distributed::DistributedPlan; type MutPlan<'a> = &'a mut (DistributedPlan); fn expose(_: MutPlan<'_>) {}",
+    );
+    assert!(
+        mutable
+            .violations
+            .iter()
+            .any(|violation| violation.contains("mutable-sealed")),
+        "mutable DistributedPlan alias must be rejected: {:?}",
+        mutable.violations
+    );
+
+    let immutable = cgo_9a_task2_report_in(
+        "src/immutable_alias.rs",
+        "use crate::sql::planner::distributed::DistributedPlan; type ReadPlan<'a> = &'a DistributedPlan; fn inspect(_: ReadPlan<'_>) {}",
+    );
+    assert!(
+        immutable.violations.is_empty(),
+        "immutable DistributedPlan alias must remain legal: {:?}",
+        immutable.violations
+    );
+}
+
+#[test]
+fn distributed_plan_seal_task2_enforces_private_draft_and_single_typed_seal() {
+    let src = src_dir();
+    let sources =
+        production_rs_files_from_entries(&src, &[src.join("lib.rs"), src.join("main.rs")])
+            .into_iter()
+            .map(|path| Cgo8GuardSource::new(rel(&path), fs::read_to_string(path).unwrap()))
+            .collect::<Vec<_>>();
+    let violations = cgo_9a_task2_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "CGO-9A Task 2 source-aware seal guard failed:\n{}",
+        violations.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CGO-9A Task 3: distributed-plan structural validation lives in the planner
+// seal, never in codegen.
+//
+// Task 3 moved `validate_distributed_plan` (and its helpers) out of
+// `src/sql/codegen/fragment/build.rs` into
+// `crate::sql::planner::distributed::validation`, where it runs inside
+// `seal_draft`. These guards keep it there: codegen must not (re)own the
+// structural validator, and the planner distributed module must define it.
+//
+// The detector keys on function *definitions* (`fn validate_distributed_plan`
+// / `fn validate_distributed_structure`), so codegen helpers that legitimately
+// stay (e.g. `validate_native_fragment_ownership`, `target_exchange_for_edge`)
+// and prose comments referencing the planner module are not matched.
+// ---------------------------------------------------------------------------
+
+const CGO_9A_TASK3_CODEGEN_ROOT: &str = "src/sql/codegen/";
+const CGO_9A_TASK3_PLANNER_DISTRIBUTED_ROOT: &str = "src/sql/planner/distributed/";
+const CGO_9A_TASK3_STRUCTURAL_VALIDATOR_ENTRY: &str = "fn validate_distributed_structure(";
+const CGO_9A_TASK3_FORBIDDEN_CODEGEN_DEFS: [&str; 2] = [
+    "fn validate_distributed_structure(",
+    "fn validate_distributed_plan(",
+];
+
+fn distributed_plan_seal_task3_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut planner_defines_structural_validator = false;
+
+    for source in sources {
+        if source.path.starts_with(CGO_9A_TASK3_CODEGEN_ROOT) {
+            for needle in CGO_9A_TASK3_FORBIDDEN_CODEGEN_DEFS {
+                if source.text.contains(needle) {
+                    let function = needle.trim_start_matches("fn ").trim_end_matches('(');
+                    violations.push(format!(
+                        "codegen-owns-structural-validator: {} defines `{function}`; distributed-plan structural validation must live under {}",
+                        source.path, CGO_9A_TASK3_PLANNER_DISTRIBUTED_ROOT
+                    ));
+                }
+            }
+        }
+        if source
+            .path
+            .starts_with(CGO_9A_TASK3_PLANNER_DISTRIBUTED_ROOT)
+            && source
+                .text
+                .contains(CGO_9A_TASK3_STRUCTURAL_VALIDATOR_ENTRY)
+        {
+            planner_defines_structural_validator = true;
+        }
+    }
+
+    if !planner_defines_structural_validator {
+        violations.push(format!(
+            "missing-planner-structural-validator: no {} source defines `{}`",
+            CGO_9A_TASK3_PLANNER_DISTRIBUTED_ROOT, CGO_9A_TASK3_STRUCTURAL_VALIDATOR_ENTRY
+        ));
+    }
+
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+#[test]
+fn distributed_plan_seal_task3_detector_accepts_planner_owned_validator() {
+    let sources = [
+        Cgo8GuardSource::new(
+            "src/sql/codegen/fragment/build.rs",
+            "fn build() {} fn target_exchange_for_edge() {} fn validate_native_fragment_ownership() {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/validation.rs",
+            "pub(in crate::sql::planner::distributed) fn validate_distributed_structure() {}",
+        ),
+    ];
+    let violations = distributed_plan_seal_task3_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "planner-owned structural validator with clean codegen must pass: {violations:?}"
+    );
+}
+
+#[test]
+fn distributed_plan_seal_task3_detector_rejects_codegen_owned_validator() {
+    let planner_owner = Cgo8GuardSource::new(
+        "src/sql/planner/distributed/validation.rs",
+        "pub(in crate::sql::planner::distributed) fn validate_distributed_structure() {}",
+    );
+
+    for forbidden in [
+        "fn validate_distributed_plan(dp: &DistributedPlan) -> Result<(), String> { Ok(()) }",
+        "pub(crate) fn validate_distributed_structure(dp: &DistributedPlan) { let _ = dp; }",
+    ] {
+        let sources = [
+            Cgo8GuardSource::new("src/sql/codegen/fragment/build.rs", forbidden),
+            planner_owner.clone(),
+        ];
+        let violations = distributed_plan_seal_task3_violations(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("codegen-owns-structural-validator")),
+            "codegen re-owning the structural validator must fail closed for `{forbidden}`: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn distributed_plan_seal_task3_detector_requires_planner_owner() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/codegen/fragment/build.rs",
+        "fn build() {} fn validate_native_fragment_ownership() {}",
+    )];
+    let violations = distributed_plan_seal_task3_violations(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("missing-planner-structural-validator")),
+        "a tree with no planner-owned structural validator must fail closed: {violations:?}"
+    );
+}
+
+#[test]
+fn distributed_plan_seal_task3_source_tree_keeps_structural_validation_in_planner() {
+    let src = src_dir();
+    let sources =
+        production_rs_files_from_entries(&src, &[src.join("lib.rs"), src.join("main.rs")])
+            .into_iter()
+            .map(|path| Cgo8GuardSource::new(rel(&path), fs::read_to_string(path).unwrap()))
+            .collect::<Vec<_>>();
+    let violations = distributed_plan_seal_task3_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "CGO-9A Task 3 structural-validation ownership guard failed:\n{}",
+        violations.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CGO-9A Task 4: the seal validates the runtime filter graph and stays agnostic
+// to node-carried runtime filters.
+//
+// `seal_draft` runs RFD-1's read-only `RuntimeFilterGraph::validate()` after
+// non-RF structural validation and before immutable construction, mapping a
+// failure to `DistributedPlanSealError::RuntimeFilterGraph`. This is a thin,
+// read-only seam: CGO-9A never populates the graph, never compares it against
+// build/probe runtime filters still carried on plan nodes, and never freezes
+// that node-carried shape (RFD-5A owns population and exact binding). Two
+// guards keep both facts true in the source tree.
+//
+// The detectors read production text (comments, strings, and `#[cfg(test)]`
+// items are stripped), so the seal's own test fixtures -- which do construct
+// node runtime filters -- never trip the node-carrier guard. The validation
+// detector collapses whitespace so a rustfmt-wrapped method chain still matches
+// the `runtime_filter_graph.validate()` needle.
+// ---------------------------------------------------------------------------
+
+const CGO_9A_TASK4_SEAL_SOURCE: &str = "src/sql/planner/distributed/seal.rs";
+const CGO_9A_TASK4_GRAPH_VALIDATION_CALL: &str = "runtime_filter_graph.validate()";
+const CGO_9A_TASK4_GRAPH_ERROR_VARIANT: &str = "DistributedPlanSealError::RuntimeFilterGraph";
+const CGO_9A_TASK4_NODE_CARRIED_RF_MARKERS: [&str; 2] =
+    ["build_runtime_filters", "probe_runtime_filters"];
+
+fn cgo_9a_task4_seal_graph_validation_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut seal_seen = false;
+
+    for source in sources {
+        if source.path != CGO_9A_TASK4_SEAL_SOURCE {
+            continue;
+        }
+        seal_seen = true;
+        // Collapse whitespace so a rustfmt-wrapped chain
+        // (`runtime_filter_graph\n    .validate()`) still matches the needle.
+        let production: String = rust_sanitized_production_text(&source.text)
+            .split_whitespace()
+            .collect();
+        if !production.contains(CGO_9A_TASK4_GRAPH_VALIDATION_CALL) {
+            violations.push(format!(
+                "seal-missing-graph-validation: {} does not call `{}`",
+                source.path, CGO_9A_TASK4_GRAPH_VALIDATION_CALL
+            ));
+        }
+        if !production.contains(CGO_9A_TASK4_GRAPH_ERROR_VARIANT) {
+            violations.push(format!(
+                "seal-missing-graph-error-wiring: {} does not map failures to `{}`",
+                source.path, CGO_9A_TASK4_GRAPH_ERROR_VARIANT
+            ));
+        }
+    }
+
+    if !seal_seen {
+        violations.push(format!(
+            "missing-seal-source: no source matched `{CGO_9A_TASK4_SEAL_SOURCE}`"
+        ));
+    }
+
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+fn cgo_9a_task4_node_carried_rf_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
+    let mut violations = Vec::new();
+
+    for source in sources {
+        if source.path != CGO_9A_TASK4_SEAL_SOURCE {
+            continue;
+        }
+        let production = rust_sanitized_production_text(&source.text);
+        for marker in CGO_9A_TASK4_NODE_CARRIED_RF_MARKERS {
+            if production.contains(marker) {
+                violations.push(format!(
+                    "seal-reads-node-carried-runtime-filters: {} references `{marker}`; the CGO-9A seal must stay agnostic to node-carried build/probe runtime filters",
+                    source.path
+                ));
+            }
+        }
+    }
+
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+#[test]
+fn distributed_plan_seal_task4_detector_accepts_graph_validating_seal() {
+    let sources = [Cgo8GuardSource::new(
+        CGO_9A_TASK4_SEAL_SOURCE,
+        "fn seal_draft(draft: DistributedPlanDraft) -> Result<DistributedPlan, DistributedPlanSealError> { let DistributedPlanDraft { runtime_filter_graph, .. } = draft; runtime_filter_graph\n        .validate()\n        .map_err(DistributedPlanSealError::RuntimeFilterGraph)?; Ok(unimplemented!()) }",
+    )];
+    let violations = cgo_9a_task4_seal_graph_validation_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "a seal that validates the runtime filter graph must pass, even when rustfmt wraps the chain: {violations:?}"
+    );
+}
+
+#[test]
+fn distributed_plan_seal_task4_detector_rejects_seal_without_graph_validation() {
+    let sources = [Cgo8GuardSource::new(
+        CGO_9A_TASK4_SEAL_SOURCE,
+        "fn seal_draft(draft: DistributedPlanDraft) -> Result<DistributedPlan, DistributedPlanSealError> { let DistributedPlanDraft { runtime_filter_graph, .. } = draft; Ok(unimplemented!()) }",
+    )];
+    let violations = cgo_9a_task4_seal_graph_validation_violations(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("seal-missing-graph-validation")),
+        "a seal that skips runtime filter graph validation must fail closed: {violations:?}"
+    );
+}
+
+#[test]
+fn distributed_plan_seal_task4_detector_requires_a_seal_source() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/planner/distributed/validation.rs",
+        "pub(in crate::sql::planner::distributed) fn validate_distributed_structure() {}",
+    )];
+    let violations = cgo_9a_task4_seal_graph_validation_violations(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("missing-seal-source")),
+        "a tree without the seal source must fail closed: {violations:?}"
+    );
+}
+
+#[test]
+fn distributed_plan_seal_task4_detector_accepts_seal_agnostic_to_node_carried_runtime_filters() {
+    // Production seal logic never reads node-carried runtime filters, even though
+    // a `#[cfg(test)]` fixture constructs them. The detector reads production text
+    // only, so the test-module reference must be ignored.
+    let sources = [Cgo8GuardSource::new(
+        CGO_9A_TASK4_SEAL_SOURCE,
+        "fn seal_draft(draft: DistributedPlanDraft) { let _ = draft; }\n#[cfg(test)]\nmod tests {\n    fn probe() { let mut node = node(); node.probe_runtime_filters.push(bound()); }\n}",
+    )];
+    let violations = cgo_9a_task4_node_carried_rf_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "a seal that ignores node-carried runtime filters in production must pass: {violations:?}"
+    );
+}
+
+#[test]
+fn distributed_plan_seal_task4_detector_rejects_seal_reading_node_carried_runtime_filters() {
+    for marker in CGO_9A_TASK4_NODE_CARRIED_RF_MARKERS {
+        let sources = [Cgo8GuardSource::new(
+            CGO_9A_TASK4_SEAL_SOURCE,
+            format!(
+                "fn seal_draft(draft: DistributedPlanDraft) {{ for fragment in draft.fragments {{ let _ = fragment.root.{marker}; }} }}"
+            ),
+        )];
+        let violations = cgo_9a_task4_node_carried_rf_violations(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("seal-reads-node-carried-runtime-filters")),
+            "a seal that reads `{marker}` in production must fail closed: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn distributed_plan_seal_task4_source_tree_validates_runtime_filter_graph_without_rf_carrier_assumptions()
+ {
+    let src = src_dir();
+    let sources =
+        production_rs_files_from_entries(&src, &[src.join("lib.rs"), src.join("main.rs")])
+            .into_iter()
+            .map(|path| Cgo8GuardSource::new(rel(&path), fs::read_to_string(path).unwrap()))
+            .collect::<Vec<_>>();
+
+    let validation_violations = cgo_9a_task4_seal_graph_validation_violations(&sources);
+    assert!(
+        validation_violations.is_empty(),
+        "CGO-9A Task 4 seal runtime-filter-graph validation guard failed:\n{}",
+        validation_violations.join("\n")
+    );
+
+    let node_carrier_violations = cgo_9a_task4_node_carried_rf_violations(&sources);
+    assert!(
+        node_carrier_violations.is_empty(),
+        "CGO-9A Task 4 seal must stay agnostic to node-carried runtime filters:\n{}",
+        node_carrier_violations.join("\n")
     );
 }
