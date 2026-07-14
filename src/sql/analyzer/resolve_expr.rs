@@ -5286,6 +5286,35 @@ mod tests {
         }
     }
 
+    struct BigintOffsetCatalog;
+
+    impl CatalogProvider for BigintOffsetCatalog {
+        fn get_table(
+            &self,
+            _database: &str,
+            table: &str,
+        ) -> Result<crate::sql::catalog::TableDef, String> {
+            if table != "offsets" {
+                return Err(format!("table not found: {table}"));
+            }
+            Ok(crate::sql::catalog::TableDef {
+                name: table.to_string(),
+                columns: vec![crate::sql::catalog::ColumnDef {
+                    name: "offset".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                }],
+                iceberg_row_lineage_metadata_columns: vec![],
+                source: crate::sql::catalog::ScanSource::StarRocks {
+                    db_id: 0,
+                    table_id: 0,
+                },
+            })
+        }
+    }
+
     fn analyze_projection_expr(sql: &str) -> Result<crate::sql::analysis::TypedExpr, String> {
         let stmt = crate::sql::parser::parse_sql_raw(sql)?;
         let sqlparser::ast::Statement::Query(query) = stmt else {
@@ -5324,6 +5353,39 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_function_comma_syntax_reaches_the_scalar_binder() {
+        let stmt = crate::sql::parser::parse_sql_raw("select concat(1, 2)")
+            .expect("function query should parse");
+        let sqlparser::ast::Statement::Query(query) = &stmt else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select");
+        };
+        assert!(matches!(
+            select.projection.as_slice(),
+            [sqlparser::ast::SelectItem::UnnamedExpr(
+                sqlparser::ast::Expr::Function(_)
+            )]
+        ));
+
+        let expr = analyze_projection_expr("select concat(1, 2)")
+            .expect("ordinary function should analyze");
+        let crate::sql::analysis::ExprKind::FunctionCall { args, .. } = expr.kind else {
+            panic!("expected FunctionCall, got {:?}", expr.kind);
+        };
+        assert!(args.iter().all(|arg| {
+            matches!(
+                &arg.kind,
+                crate::sql::analysis::ExprKind::Cast {
+                    target: DataType::Utf8,
+                    ..
+                }
+            ) && arg.data_type == DataType::Utf8
+        }));
+    }
+
+    #[test]
     fn substring_special_syntax_uses_the_same_binding() {
         assert_substring_int32_arguments("select substring('STARROCKS' from 2 for 3)", 3);
         assert_substring_int32_arguments("select substring('STARROCKS' from 2)", 2);
@@ -5358,6 +5420,60 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn substring_bigint_column_offset_gets_runtime_int32_cast() {
+        let stmt = crate::sql::parser::parse_sql_raw("select substring('x', offset) from offsets")
+            .expect("substring query should parse");
+        let sqlparser::ast::Statement::Query(query) = stmt else {
+            panic!("expected query");
+        };
+        let (resolved, _registry, _factory) = analyze(&query, &BigintOffsetCatalog, "default")
+            .expect("BIGINT column should bind through a runtime cast");
+        let QueryBody::Select(select) = resolved.body else {
+            panic!("expected select");
+        };
+        let expr = select
+            .projection
+            .into_iter()
+            .next()
+            .expect("expected projection")
+            .expr;
+        let crate::sql::analysis::ExprKind::FunctionCall { args, .. } = expr.kind else {
+            panic!("expected FunctionCall, got {:?}", expr.kind);
+        };
+        let offset = args.into_iter().nth(1).expect("expected offset argument");
+        assert_eq!(offset.data_type, DataType::Int32);
+        assert!(matches!(
+            offset.kind,
+            crate::sql::analysis::ExprKind::Cast {
+                expr,
+                target: DataType::Int32,
+            } if matches!(expr.kind, crate::sql::analysis::ExprKind::ColumnRef { .. })
+        ));
+    }
+
+    #[test]
+    fn group_concat_and_string_agg_keep_implicit_utf8_coercion() {
+        for name in ["group_concat", "string_agg"] {
+            let expr = analyze_projection_expr(&format!("select {name}(1, ',')"))
+                .expect("aggregate should preserve implicit string coercion");
+            let crate::sql::analysis::ExprKind::AggregateCall { args, .. } = expr.kind else {
+                panic!("expected AggregateCall, got {:?}", expr.kind);
+            };
+            assert!(!args.is_empty());
+            assert!(args.iter().all(|arg| arg.data_type == DataType::Utf8));
+            assert!(args.iter().all(|arg| matches!(
+                arg.kind,
+                crate::sql::analysis::ExprKind::Literal(
+                    crate::sql::analysis::LiteralValue::String(_)
+                ) | crate::sql::analysis::ExprKind::Cast {
+                    target: DataType::Utf8,
+                    ..
+                }
+            )));
+        }
     }
 
     #[test]
