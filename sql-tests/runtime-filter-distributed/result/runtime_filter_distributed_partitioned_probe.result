@@ -8,6 +8,10 @@ partitioned_probe	1000	1001000
 
 -- query 14
 Explain String
+RUNTIME FILTER GRAPH
+  runtime filter channel 0
+    producer binding 0, fragment = 1, node = 5, expr = (b.k)
+    consumer binding 1, fragment = 2, node = 1, expr = (p.k), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
@@ -24,8 +28,6 @@ PLAN FRAGMENT 1
 6:HASH AGGREGATE (LOCAL) stats={rows=1}
   aggregations: count(), sum(p.id)
   5:HASH JOIN (PARTITIONED, INNER, eq: [p.k = b.k]) stats={rows=405}
-    build runtime filters:
-    - filter_id = 0, build_expr = (b.k)
     2:HASH EXCHANGE stats={rows=1800}
     4:HASH EXCHANGE stats={rows=45}
 PLAN FRAGMENT 2
@@ -50,5 +52,3 @@ PLAN FRAGMENT 3
      columns: id, k
      min-max stats
      predicates: p.k IS NOT NULL
-    probe runtime filters:
-    - filter_id = 0, probe_expr = (p.k)

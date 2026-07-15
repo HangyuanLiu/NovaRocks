@@ -34,8 +34,8 @@ SET cbo_broadcast_node_mem_budget_bytes = 0;
 
 -- @explain_contains=HASH JOIN (PARTITIONED, INNER
 -- @explain_contains=PARTITION: HASH_PARTITIONED (k)
--- @explain_contains=probe runtime filters:
--- @explain_contains=probe_expr = (p.k)
+-- @explain_contains=consumer binding
+-- @explain_contains=expr = (p.k)
 -- @explain_not_contains=HASH JOIN (BROADCAST
 SELECT count(*) AS cnt
 FROM ${case_db}.rf_shuffle_probe p

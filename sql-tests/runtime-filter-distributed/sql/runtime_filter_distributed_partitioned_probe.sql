@@ -73,8 +73,8 @@ WHERE b.flag = 'Y';
 SET disable_optimizer_rules = '';
 -- @explain_contains=HASH JOIN (PARTITIONED
 -- @explain_contains=HASH_PARTITIONED (k)
--- @explain_contains=build runtime filters:
--- @explain_contains=probe runtime filters:
+-- @explain_contains=producer binding
+-- @explain_contains=consumer binding
 SELECT 'partitioned_probe' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_part_probe p
 JOIN ${case_db}.rf_dist_part_build b ON p.k = b.k

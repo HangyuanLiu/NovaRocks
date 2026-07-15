@@ -486,8 +486,7 @@ mod tests {
             tuple_ids: vec![node_id],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: Vec::new(),
             stats: stats(),
             payload: DistributedNodeKind::Values(PlanValuesNode {
@@ -550,8 +549,7 @@ mod tests {
                 tuple_ids: vec![exchange_node_id],
                 nullable_tuple_ids: Vec::new(),
                 limit: -1,
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
+                runtime_filter_binding_ids: Vec::new(),
                 children: Vec::new(),
                 stats: stats(),
                 payload: DistributedNodeKind::Exchange(ExchangeReceiver {
@@ -620,8 +618,7 @@ mod tests {
                 tuple_ids: vec![exchange_node_id],
                 nullable_tuple_ids: Vec::new(),
                 limit: -1,
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
+                runtime_filter_binding_ids: Vec::new(),
                 children: Vec::new(),
                 stats: stats(),
                 payload: DistributedNodeKind::Exchange(ExchangeReceiver {

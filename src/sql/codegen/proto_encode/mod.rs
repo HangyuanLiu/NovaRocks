@@ -554,8 +554,7 @@ mod tests {
             tuple_ids: vec![node_id],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
             payload: crate::sql::planner::distributed::DistributedNodeKind::Values(
@@ -641,8 +640,7 @@ mod tests {
             tuple_ids: vec![42],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
             payload: crate::sql::planner::distributed::DistributedNodeKind::Exchange(
@@ -747,8 +745,7 @@ mod tests {
             tuple_ids: vec![11],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
             payload: crate::sql::planner::distributed::DistributedNodeKind::Scan(
@@ -781,8 +778,7 @@ mod tests {
             tuple_ids: vec![42],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
             payload: crate::sql::planner::distributed::DistributedNodeKind::Exchange(
@@ -851,8 +847,7 @@ mod tests {
             tuple_ids: vec![11],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: vec![values_distributed_node(0, 10, vec![group_column.clone()])],
             stats: physical_stats(),
             payload: crate::sql::planner::distributed::DistributedNodeKind::HashAggregate(
@@ -886,8 +881,7 @@ mod tests {
             tuple_ids: vec![42],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
             payload: crate::sql::planner::distributed::DistributedNodeKind::Exchange(
@@ -954,8 +948,7 @@ mod tests {
             tuple_ids: vec![11],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: vec![values_distributed_node(
                 0,
                 10,
@@ -1000,8 +993,7 @@ mod tests {
             tuple_ids: vec![42],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
             payload: crate::sql::planner::distributed::DistributedNodeKind::Exchange(
@@ -1083,8 +1075,7 @@ mod tests {
             tuple_ids: vec![42],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
             payload: crate::sql::planner::distributed::DistributedNodeKind::Exchange(
@@ -1282,8 +1273,7 @@ mod tests {
             tuple_ids: Vec::new(),
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
             payload: crate::sql::planner::distributed::DistributedNodeKind::Scan(
@@ -1379,8 +1369,7 @@ mod tests {
             tuple_ids: Vec::new(),
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
             payload: crate::sql::planner::distributed::DistributedNodeKind::Scan(
@@ -1419,8 +1408,7 @@ mod tests {
             tuple_ids: Vec::new(),
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
             payload: crate::sql::planner::distributed::DistributedNodeKind::Scan(
@@ -1477,6 +1465,7 @@ mod tests {
                 node_outputs: None,
                 fragment_edge_outputs: None,
                 write_contracts: None,
+                runtime_filter_projection: None,
             },
         )
         .expect("encode StarRocks native scan source");
@@ -1537,8 +1526,7 @@ mod tests {
             tuple_ids: Vec::new(),
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
             payload: crate::sql::planner::distributed::DistributedNodeKind::Scan(
@@ -1588,6 +1576,7 @@ mod tests {
                 node_outputs: None,
                 fragment_edge_outputs: None,
                 write_contracts: None,
+                runtime_filter_projection: None,
             },
         )
         .expect_err("mismatched builder descriptor must fail");
@@ -1602,8 +1591,7 @@ mod tests {
             tuple_ids: Vec::new(),
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: Vec::new(),
             stats: physical_stats(),
             payload: crate::sql::planner::distributed::DistributedNodeKind::Scan(
@@ -1695,6 +1683,7 @@ mod tests {
                     node_outputs: None,
                     fragment_edge_outputs: None,
                     write_contracts: None,
+                    runtime_filter_projection: None,
                 },
             )
             .expect_err("invalid StarRocks source must fail");

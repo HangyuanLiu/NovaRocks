@@ -241,8 +241,7 @@ pub(in crate::sql::planner::distributed) fn with_iceberg_change_stream_write(
                 tuple_ids: vec![exchange_tuple_id],
                 nullable_tuple_ids: Vec::new(),
                 limit: -1,
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
+                runtime_filter_binding_ids: Vec::new(),
                 children: Vec::new(),
                 stats: source_fragment.root.stats.clone(),
                 payload: DistributedNodeKind::Exchange(ExchangeReceiver {
@@ -720,8 +719,7 @@ mod tests {
                     tuple_ids: vec![10],
                     nullable_tuple_ids: vec![],
                     limit: -1,
-                    build_runtime_filters: vec![],
-                    probe_runtime_filters: vec![],
+                    runtime_filter_binding_ids: Vec::new(),
                     children: vec![],
                     stats: stats(),
                     payload: DistributedNodeKind::Values(

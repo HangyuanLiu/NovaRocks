@@ -1,5 +1,15 @@
 -- query 15
 Explain String
+RUNTIME FILTER GRAPH
+  runtime filter channel 0
+    producer binding 0, fragment = 1, node = 4, expr = (a.k)
+    consumer binding 1, fragment = 1, node = 1, expr = (b.k), activation = BlockingSnapshot
+  runtime filter channel 1
+    producer binding 2, fragment = 3, node = 10, expr = (c.k)
+    consumer binding 3, fragment = 3, node = 7, expr = (d.k), activation = BlockingSnapshot
+  runtime filter channel 2
+    producer binding 4, fragment = 1, node = 14, expr = (t2.cv)
+    consumer binding 5, fragment = 1, node = 4, expr = (t1.av), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
@@ -16,20 +26,14 @@ PLAN FRAGMENT 1
 15:HASH AGGREGATE (LOCAL) stats={rows=1}
   aggregations: count()
   14:HASH JOIN (BROADCAST, INNER, eq: [t1.av = t2.cv]) bcast_verdict=feasible stats={rows=2}
-    build runtime filters:
-    - filter_id = 2, build_expr = (t2.cv)
     6:PROJECT [av] stats={rows=2}
       5:PROJECT [a.v AS av] stats={rows=2}
         4:HASH JOIN (BROADCAST, INNER, eq: [b.k = a.k]) bcast_verdict=feasible stats={rows=2}
-          build runtime filters:
-          - filter_id = 0, build_expr = (a.k)
           1:SCAN db_sqlt_c6f027b326bfa589.customer_demographics (alias=b) stats={rows=3}
                TABLE: db_sqlt_c6f027b326bfa589.customer_demographics
                columns: k
                min-max stats
                predicates: b.k IS NOT NULL
-              probe runtime filters:
-              - filter_id = 0, probe_expr = (b.k)
           3:GATHER stats={rows=2}
     13:GATHER stats={rows=2}
 PLAN FRAGMENT 2
@@ -41,15 +45,11 @@ PLAN FRAGMENT 2
 12:PROJECT [cv] stats={rows=2}
   11:PROJECT [c.v AS cv] stats={rows=2}
     10:HASH JOIN (BROADCAST, INNER, eq: [d.k = c.k]) bcast_verdict=feasible stats={rows=2}
-      build runtime filters:
-      - filter_id = 1, build_expr = (c.k)
       7:SCAN db_sqlt_c6f027b326bfa589.customer_demographics (alias=d) stats={rows=3}
            TABLE: db_sqlt_c6f027b326bfa589.customer_demographics
            columns: k
            min-max stats
            predicates: d.k IS NOT NULL
-          probe runtime filters:
-          - filter_id = 1, probe_expr = (d.k)
       9:GATHER stats={rows=2}
 PLAN FRAGMENT 3
   OUTPUT EXPRS: *
@@ -76,6 +76,10 @@ PLAN FRAGMENT 4
 
 -- query 16
 Explain String
+RUNTIME FILTER GRAPH
+  runtime filter channel 0
+    producer binding 0, fragment = 1, node = 4, expr = (b.k)
+    consumer binding 1, fragment = 1, node = 1, expr = (p.k), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
@@ -92,15 +96,11 @@ PLAN FRAGMENT 1
 5:HASH AGGREGATE (LOCAL) stats={rows=1}
   aggregations: count()
   4:HASH JOIN (BROADCAST, INNER, eq: [p.k = b.k]) bcast_verdict=feasible stats={rows=3}
-    build runtime filters:
-    - filter_id = 0, build_expr = (b.k)
     1:SCAN db_sqlt_c6f027b326bfa589.rf_x_probe (alias=p) stats={rows=90000}
          TABLE: db_sqlt_c6f027b326bfa589.rf_x_probe
          columns: k
          min-max stats
          predicates: p.k IS NOT NULL
-        probe runtime filters:
-        - filter_id = 0, probe_expr = (p.k)
     3:GATHER stats={rows=3}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *

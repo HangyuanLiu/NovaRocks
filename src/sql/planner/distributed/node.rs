@@ -15,12 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::runtime_filter::model::contract::BindingId;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{OutputColumn, SortItem};
 use crate::sql::column_id::ColumnId;
-use crate::sql::planner::distributed::runtime_filter::{
-    BoundRuntimeFilterBuild, BoundRuntimeFilterProbe,
-};
 use crate::sql::planner::payload::{
     PlanAssertOneRowNode, PlanFilterNode, PlanGenerateSeriesNode, PlanProjectNode, PlanRepeatNode,
     PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanValuesNode, PlanWindowNode,
@@ -122,8 +120,11 @@ fn non_distributable_payload(name: &str) -> String {
 }
 
 pub(crate) fn distributed_kind_from_physical(
-    kind: PhysicalPlanKind,
+    mut kind: PhysicalPlanKind,
 ) -> Result<DistributedNodeKind, String> {
+    if let PhysicalPlanKind::HashJoin(join) = &mut kind {
+        join.build_runtime_filters.clear();
+    }
     match kind {
         PhysicalPlanKind::Scan(node) => Ok(DistributedNodeKind::Scan(node)),
         PhysicalPlanKind::Filter(node) => Ok(DistributedNodeKind::Filter(node)),
@@ -189,8 +190,7 @@ pub(crate) struct DistributedNode {
     pub tuple_ids: Vec<i32>,
     pub nullable_tuple_ids: Vec<i32>,
     pub limit: i64,
-    pub build_runtime_filters: Vec<BoundRuntimeFilterBuild>,
-    pub probe_runtime_filters: Vec<BoundRuntimeFilterProbe>,
+    pub runtime_filter_binding_ids: Vec<BindingId>,
     pub children: Vec<DistributedNode>,
     pub stats: PhysicalPlanStats,
     pub payload: DistributedNodeKind,
@@ -212,8 +212,7 @@ mod tests {
             tuple_ids: vec![1],
             nullable_tuple_ids: vec![],
             limit: -1,
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
+            runtime_filter_binding_ids: Vec::new(),
             children: vec![],
             stats: PhysicalPlanStats {
                 output_row_count: 0.0,

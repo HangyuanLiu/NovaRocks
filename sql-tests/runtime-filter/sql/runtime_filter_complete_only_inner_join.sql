@@ -50,8 +50,8 @@ INSERT INTO ${case_db}.rf_co_orders VALUES
 
 SET disable_optimizer_rules = '';
 -- @explain_contains=HASH JOIN (
--- @explain_contains=build runtime filters:
--- @explain_contains=probe runtime filters:
+-- @explain_contains=producer binding
+-- @explain_contains=consumer binding
 SELECT o.oid, o.customer_id
 FROM ${case_db}.rf_co_orders o
 JOIN ${case_db}.rf_co_customers c ON o.customer_id = c.id

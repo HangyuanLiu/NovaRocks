@@ -8,6 +8,14 @@ bilateral_probe	1350	191925	191925
 
 -- query 19
 Explain String
+RUNTIME FILTER GRAPH
+  runtime filter channel 0
+    producer binding 0, fragment = 2, node = 5, expr = (t2.k)
+    consumer binding 1, fragment = 3, node = 1, expr = (t1.k), activation = BlockingSnapshot
+  runtime filter channel 1
+    producer binding 2, fragment = 1, node = 9, expr = (t3.k)
+    consumer binding 3, fragment = 3, node = 1, expr = (t1.k), activation = BlockingSnapshot
+    consumer binding 4, fragment = 4, node = 3, expr = (t2.k), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
@@ -24,8 +32,6 @@ PLAN FRAGMENT 1
 10:HASH AGGREGATE (LOCAL) stats={rows=1}
   aggregations: count(), sum(t1.v), sum(t2.v)
   9:HASH JOIN (PARTITIONED, INNER, eq: [t2.k = t3.k]) stats={rows=1355}
-    build runtime filters:
-    - filter_id = 1, build_expr = (t3.k)
     6:HASH EXCHANGE stats={rows=900}
     8:HASH EXCHANGE stats={rows=151}
 PLAN FRAGMENT 2
@@ -46,8 +52,6 @@ PLAN FRAGMENT 3
     EXCHANGE ID: 6
     PARTITION: HASH_PARTITIONED (k)
 5:HASH JOIN (PARTITIONED, INNER, eq: [t1.k = t2.k]) stats={rows=900}
-  build runtime filters:
-  - filter_id = 0, build_expr = (t2.k)
   2:HASH EXCHANGE stats={rows=300}
   4:HASH EXCHANGE stats={rows=300}
 PLAN FRAGMENT 4
@@ -60,8 +64,6 @@ PLAN FRAGMENT 4
      TABLE: db_sqlt_86a41c39f84a4228.rf_dist_bi_t2
      columns: k, v
      min-max stats
-    probe runtime filters:
-    - filter_id = 1, probe_expr = (t2.k)
 PLAN FRAGMENT 5
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
@@ -72,6 +74,3 @@ PLAN FRAGMENT 5
      TABLE: db_sqlt_86a41c39f84a4228.rf_dist_bi_t1
      columns: k, v
      min-max stats
-    probe runtime filters:
-    - filter_id = 0, probe_expr = (t1.k)
-    - filter_id = 1, probe_expr = (t1.k)

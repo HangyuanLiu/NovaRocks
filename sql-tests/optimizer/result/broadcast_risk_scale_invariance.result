@@ -4,6 +4,10 @@ cnt
 
 -- query 18
 Explain String
+RUNTIME FILTER GRAPH
+  runtime filter channel 0
+    producer binding 0, fragment = 1, node = 4, expr = (b.k)
+    consumer binding 1, fragment = 1, node = 1, expr = (p.k), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
@@ -20,15 +24,11 @@ PLAN FRAGMENT 1
 5:HASH AGGREGATE (LOCAL) stats={rows=1}
   aggregations: count()
   4:HASH JOIN (BROADCAST, INNER, eq: [p.k = b.k]) bcast_verdict=feasible stats={rows=9000}
-    build runtime filters:
-    - filter_id = 0, build_expr = (b.k)
     1:SCAN db_sqlt_91feb4643b0e4106.probe_1x (alias=p) stats={rows=90000}
          TABLE: db_sqlt_91feb4643b0e4106.probe_1x
          columns: k
          min-max stats
          predicates: p.k IS NOT NULL
-        probe runtime filters:
-        - filter_id = 0, probe_expr = (p.k)
     3:GATHER stats={rows=9000}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
@@ -48,6 +48,10 @@ cnt
 
 -- query 20
 Explain String
+RUNTIME FILTER GRAPH
+  runtime filter channel 0
+    producer binding 0, fragment = 1, node = 4, expr = (b.k)
+    consumer binding 1, fragment = 1, node = 1, expr = (p.k), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
@@ -64,15 +68,11 @@ PLAN FRAGMENT 1
 5:HASH AGGREGATE (LOCAL) stats={rows=1}
   aggregations: count()
   4:HASH JOIN (BROADCAST, INNER, eq: [p.k = b.k]) bcast_verdict=feasible stats={rows=90000}
-    build runtime filters:
-    - filter_id = 0, build_expr = (b.k)
     1:SCAN db_sqlt_91feb4643b0e4106.probe_10x (alias=p) stats={rows=900000}
          TABLE: db_sqlt_91feb4643b0e4106.probe_10x
          columns: k
          min-max stats
          predicates: p.k IS NOT NULL
-        probe runtime filters:
-        - filter_id = 0, probe_expr = (p.k)
     3:GATHER stats={rows=90000}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *

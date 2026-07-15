@@ -182,7 +182,7 @@ impl RuntimeFilterGraph {
     }
 
     #[cfg(test)]
-    pub(super) fn binding_mut_for_test(
+    pub(crate) fn binding_mut_for_test(
         &mut self,
         binding_id: BindingId,
     ) -> Option<&mut RuntimeFilterBindingSpec> {

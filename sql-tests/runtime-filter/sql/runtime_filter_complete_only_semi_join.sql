@@ -48,8 +48,8 @@ INSERT INTO ${case_db}.rf_co_r VALUES
 SET disable_optimizer_rules = '';
 -- @explain_contains=HASH JOIN (
 -- @explain_contains=LEFT SEMI
--- @explain_contains=build runtime filters:
--- @explain_contains=probe runtime filters:
+-- @explain_contains=producer binding
+-- @explain_contains=consumer binding
 SELECT l.id, l.k
 FROM ${case_db}.rf_co_l l
 WHERE l.k IN (SELECT k FROM ${case_db}.rf_co_r)

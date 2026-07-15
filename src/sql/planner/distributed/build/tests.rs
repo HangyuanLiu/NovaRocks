@@ -7,9 +7,11 @@ use super::fragment_cut::stream_exchange_output_columns;
 use super::lowering::{NodeIdAllocator, lower_fragment_local_node};
 use super::runtime_filter_binding::{
     RuntimeFilterBindings, RuntimeFilterBuildBinding as BuildBinding,
-    RuntimeFilterProbeBinding as ProbeBinding, bind_runtime_filters,
+    RuntimeFilterProbeBinding as ProbeBinding, populate_runtime_filter_graph,
 };
 use super::{build_distributed_plan, union_distinct_must_be_rewritten_error};
+use crate::runtime_filter::model::contract::{BindingId, ChannelId};
+use crate::runtime_filter::model::graph::{RuntimeFilterBindingRole, RuntimeFilterGraph};
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
@@ -99,8 +101,7 @@ fn lowering_materializes_fragment_local_node_without_topology() {
         tuple_ids: vec![4],
         nullable_tuple_ids: vec![],
         limit: -1,
-        build_runtime_filters: vec![],
-        probe_runtime_filters: vec![],
+        runtime_filter_binding_ids: Vec::new(),
         children: vec![],
         stats: stats_with_row_count(10.0),
         payload: DistributedNodeKind::Values(PlanValuesNode {
@@ -533,30 +534,263 @@ fn build_distributed_plan_binds_runtime_filters_across_redistribute_fragment() {
         &join_node.payload,
         DistributedNodeKind::HashJoin(_)
     ));
-    assert_eq!(join_node.build_runtime_filters.len(), 1);
-    let build = &join_node.build_runtime_filters[0];
-    assert_eq!(build.intent.filter_id, filter_id);
-    assert_column_ref(&build.intent.build_expr, 2, "r_k");
-    assert_column_ref(&build.intent.probe_expr, 1, "l_k");
-    assert_eq!(build.intent.expr_order, 3);
-    assert_eq!(build.intent.execution_mode, JoinExecutionMode::Partitioned);
-    assert_eq!(build.source_fragment_id, join_node.fragment_id);
-    assert_eq!(build.target_fragment_ids, vec![probe_fragment.fragment_id]);
+    let graph = dp.runtime_filter_graph();
+    assert_eq!(graph.channel_count(), 1);
+    assert_eq!(graph.binding_count(), 3);
+    let producer = graph
+        .bindings()
+        .find(|binding| matches!(binding.role, RuntimeFilterBindingRole::Producer(_)))
+        .expect("producer binding");
+    assert_eq!(producer.location.fragment_id.get(), join_node.fragment_id);
+    assert_eq!(producer.location.node_id.get(), join_node.node_id);
+    assert_column_ref(&producer.expression, 2, "r_k");
+    assert_eq!(
+        join_node.runtime_filter_binding_ids,
+        vec![producer.binding_id]
+    );
 
     let probe_project = &probe_fragment.root;
     assert_eq!(probe_project.fragment_id, probe_fragment.fragment_id);
-    assert_eq!(probe_project.probe_runtime_filters.len(), 1);
-    assert_eq!(
-        probe_project.probe_runtime_filters[0].source_fragment_id,
-        join_node.fragment_id
-    );
+    assert_eq!(probe_project.runtime_filter_binding_ids.len(), 1);
     let probe_scan = &probe_project.children[0];
     assert!(matches!(&probe_scan.payload, DistributedNodeKind::Scan(_)));
-    assert_eq!(probe_scan.probe_runtime_filters.len(), 1);
-    let probe = &probe_scan.probe_runtime_filters[0];
-    assert_eq!(probe.intent.filter_id, filter_id);
-    assert_column_ref(&probe.intent.probe_expr, 1, "l_k");
-    assert_eq!(probe.source_fragment_id, join_node.fragment_id);
+    assert_eq!(probe_scan.runtime_filter_binding_ids.len(), 1);
+    for binding_id in probe_project
+        .runtime_filter_binding_ids
+        .iter()
+        .chain(&probe_scan.runtime_filter_binding_ids)
+    {
+        let binding = graph.binding(*binding_id).expect("consumer binding");
+        assert!(matches!(
+            binding.role,
+            RuntimeFilterBindingRole::Consumer(_)
+        ));
+        assert_column_ref(&binding.expression, 1, "l_k");
+        assert_eq!(
+            binding.location.fragment_id.get(),
+            probe_fragment.fragment_id
+        );
+    }
+}
+
+#[test]
+fn rfd_5a_join_population_is_deterministic_and_node_carried_only_by_binding_id() {
+    let filter_id = 41;
+    let probe_expr = column_ref_expr(1, "probe", DataType::Int64, false);
+    let build_expr = column_ref_expr(2, "build", DataType::Int64, false);
+    let probe_output = vec![output_col(1, "probe", DataType::Int64, false)];
+    let probe = PhysicalPlanNode {
+        kind: PhysicalPlanKind::Values(PlanValuesNode {
+            rows: vec![],
+            columns: probe_output.clone(),
+        }),
+        children: vec![],
+        output_columns: probe_output,
+        stats: stats(),
+        probe_runtime_filters: vec![RuntimeFilterProbeIntent {
+            filter_id,
+            probe_expr: probe_expr.clone(),
+        }],
+    };
+    let build_output = vec![output_col(2, "build", DataType::Int64, false)];
+    let build = PhysicalPlanNode {
+        kind: PhysicalPlanKind::Values(PlanValuesNode {
+            rows: vec![],
+            columns: build_output.clone(),
+        }),
+        children: vec![],
+        output_columns: build_output,
+        stats: stats(),
+        probe_runtime_filters: vec![],
+    };
+    let join = PhysicalPlanNode {
+        kind: PhysicalPlanKind::HashJoin(Box::new(PhysicalHashJoinNode {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![PhysicalHashJoinEqCondition {
+                left: probe_expr.clone(),
+                right: build_expr.clone(),
+                null_safe: false,
+            }],
+            other_condition: None,
+            distribution: JoinDistribution::Broadcast,
+            execution_mode: Some(JoinExecutionMode::Broadcast),
+            build_runtime_filters: vec![RuntimeFilterBuildIntent {
+                filter_id,
+                build_expr,
+                probe_expr,
+                expr_order: 0,
+                execution_mode: JoinExecutionMode::Broadcast,
+            }],
+            output_columns: vec![
+                output_col(1, "probe", DataType::Int64, false),
+                output_col(2, "build", DataType::Int64, false),
+            ],
+        })),
+        children: vec![probe, build],
+        output_columns: vec![
+            output_col(1, "probe", DataType::Int64, false),
+            output_col(2, "build", DataType::Int64, false),
+        ],
+        stats: stats(),
+        probe_runtime_filters: vec![],
+    };
+
+    let distributed = build_distributed_plan(&join).expect("build RFD-5A join graph");
+    let graph = distributed.runtime_filter_graph();
+    assert_eq!(graph.channel_count(), 1);
+    assert_eq!(graph.binding_count(), 2);
+    assert_eq!(
+        graph.channels().next().unwrap().channel_id,
+        ChannelId::new(0)
+    );
+    let producer = graph
+        .bindings()
+        .find(|binding| matches!(binding.role, RuntimeFilterBindingRole::Producer(_)))
+        .expect("producer binding");
+    let consumer = graph
+        .bindings()
+        .find(|binding| matches!(binding.role, RuntimeFilterBindingRole::Consumer(_)))
+        .expect("consumer binding");
+    assert_eq!(producer.binding_id, BindingId::new(0));
+    assert_eq!(consumer.binding_id, BindingId::new(1));
+    assert!(distributed.fragments().iter().any(|fragment| {
+        fn has_binding(node: &DistributedNode, binding_id: BindingId) -> bool {
+            node.runtime_filter_binding_ids.contains(&binding_id)
+                || node
+                    .children
+                    .iter()
+                    .any(|child| has_binding(child, binding_id))
+        }
+        has_binding(&fragment.root, producer.binding_id)
+    }));
+    assert!(distributed.fragments().iter().any(|fragment| {
+        fn has_binding(node: &DistributedNode, binding_id: BindingId) -> bool {
+            node.runtime_filter_binding_ids.contains(&binding_id)
+                || node
+                    .children
+                    .iter()
+                    .any(|child| has_binding(child, binding_id))
+        }
+        has_binding(&fragment.root, consumer.binding_id)
+    }));
+
+    let projection =
+        crate::sql::planner::distributed::runtime_filter::project_runtime_filters(&distributed)
+            .expect("project Graph-derived runtime filters");
+    let builds = projection.builds_for(
+        producer.location.fragment_id.get(),
+        producer.location.node_id.get(),
+    );
+    let probes = projection.probes_for(
+        consumer.location.fragment_id.get(),
+        consumer.location.node_id.get(),
+    );
+    assert_eq!((builds.len(), probes.len()), (1, 1));
+    assert_eq!(builds[0].channel_id, producer.channel_id);
+    assert_eq!(probes[0].channel_id, consumer.channel_id);
+}
+
+#[test]
+fn rfd_5a_graph_projection_disambiguates_duplicate_build_expressions_by_channel_order() {
+    let probe_expr_1 = column_ref_expr(1, "probe_1", DataType::Int64, false);
+    let probe_expr_2 = column_ref_expr(2, "probe_2", DataType::Int64, false);
+    let build_expr = column_ref_expr(3, "build", DataType::Int64, false);
+    let probe_output = vec![
+        output_col(1, "probe_1", DataType::Int64, false),
+        output_col(2, "probe_2", DataType::Int64, false),
+    ];
+    let probe = PhysicalPlanNode {
+        kind: PhysicalPlanKind::Values(PlanValuesNode {
+            rows: vec![],
+            columns: probe_output.clone(),
+        }),
+        children: vec![],
+        output_columns: probe_output,
+        stats: stats(),
+        probe_runtime_filters: vec![
+            RuntimeFilterProbeIntent {
+                filter_id: 41,
+                probe_expr: probe_expr_1.clone(),
+            },
+            RuntimeFilterProbeIntent {
+                filter_id: 42,
+                probe_expr: probe_expr_2.clone(),
+            },
+        ],
+    };
+    let build_output = vec![output_col(3, "build", DataType::Int64, false)];
+    let build = PhysicalPlanNode {
+        kind: PhysicalPlanKind::Values(PlanValuesNode {
+            rows: vec![],
+            columns: build_output.clone(),
+        }),
+        children: vec![],
+        output_columns: build_output,
+        stats: stats(),
+        probe_runtime_filters: vec![],
+    };
+    let join = PhysicalPlanNode {
+        kind: PhysicalPlanKind::HashJoin(Box::new(PhysicalHashJoinNode {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![
+                PhysicalHashJoinEqCondition {
+                    left: probe_expr_1.clone(),
+                    right: build_expr.clone(),
+                    null_safe: false,
+                },
+                PhysicalHashJoinEqCondition {
+                    left: probe_expr_2.clone(),
+                    right: build_expr.clone(),
+                    null_safe: false,
+                },
+            ],
+            other_condition: None,
+            distribution: JoinDistribution::Broadcast,
+            execution_mode: Some(JoinExecutionMode::Broadcast),
+            build_runtime_filters: vec![
+                RuntimeFilterBuildIntent {
+                    filter_id: 41,
+                    build_expr: build_expr.clone(),
+                    probe_expr: probe_expr_1,
+                    expr_order: 0,
+                    execution_mode: JoinExecutionMode::Broadcast,
+                },
+                RuntimeFilterBuildIntent {
+                    filter_id: 42,
+                    build_expr,
+                    probe_expr: probe_expr_2,
+                    expr_order: 1,
+                    execution_mode: JoinExecutionMode::Broadcast,
+                },
+            ],
+            output_columns: vec![
+                output_col(1, "probe_1", DataType::Int64, false),
+                output_col(2, "probe_2", DataType::Int64, false),
+                output_col(3, "build", DataType::Int64, false),
+            ],
+        })),
+        children: vec![probe, build],
+        output_columns: vec![
+            output_col(1, "probe_1", DataType::Int64, false),
+            output_col(2, "probe_2", DataType::Int64, false),
+            output_col(3, "build", DataType::Int64, false),
+        ],
+        stats: stats(),
+        probe_runtime_filters: vec![],
+    };
+
+    let distributed = build_distributed_plan(&join).expect("build duplicate-key RF graph");
+    let projection =
+        crate::sql::planner::distributed::runtime_filter::project_runtime_filters(&distributed)
+            .expect("project duplicate-key runtime filters");
+    let join_node = &distributed.fragments()[0].root;
+    let builds = projection.builds_for(join_node.fragment_id, join_node.node_id);
+
+    assert_eq!(builds.len(), 2);
+    assert_eq!(builds[0].expr_order, 0);
+    assert_eq!(builds[1].expr_order, 1);
+    assert_column_ref(&builds[0].probe_expr, 1, "probe_1");
+    assert_column_ref(&builds[1].probe_expr, 2, "probe_2");
 }
 
 #[test]
@@ -614,26 +848,29 @@ fn build_distributed_plan_keeps_runtime_filter_probe_on_filter() {
 
     assert_eq!(dp.fragments().len(), 1);
     let join_node = &dp.fragments()[0].root;
-    assert_eq!(join_node.build_runtime_filters.len(), 1);
-    assert_eq!(
-        join_node.build_runtime_filters[0].target_fragment_ids,
-        vec![join_node.fragment_id]
-    );
+    let graph = dp.runtime_filter_graph();
+    assert_eq!(graph.channel_count(), 1);
+    assert_eq!(graph.binding_count(), 2);
+    assert_eq!(join_node.runtime_filter_binding_ids.len(), 1);
     let filter = &join_node.children[0];
     assert!(matches!(&filter.payload, DistributedNodeKind::Filter(_)));
-    assert_eq!(filter.probe_runtime_filters.len(), 1);
-    assert_eq!(filter.probe_runtime_filters[0].intent.filter_id, filter_id);
-    assert_eq!(
-        filter.probe_runtime_filters[0].source_fragment_id,
-        join_node.fragment_id
-    );
+    assert_eq!(filter.runtime_filter_binding_ids.len(), 1);
+    let binding = graph
+        .binding(filter.runtime_filter_binding_ids[0])
+        .expect("filter consumer binding");
+    assert!(matches!(
+        binding.role,
+        RuntimeFilterBindingRole::Consumer(_)
+    ));
+    assert_column_ref(&binding.expression, 1, "l_k");
+    assert_eq!(binding.location.fragment_id.get(), join_node.fragment_id);
     let scan = &filter.children[0];
     assert!(matches!(&scan.payload, DistributedNodeKind::Scan(_)));
-    assert!(scan.probe_runtime_filters.is_empty());
+    assert!(scan.runtime_filter_binding_ids.is_empty());
 }
 
 #[test]
-fn bind_runtime_filters_preserves_dedup_skip_empty_targets_and_target_order() {
+fn populate_runtime_filter_graph_deduplicates_and_skips_incomplete_channels() {
     let mut fragments = vec![
         test_fragment(distributed_values_node(1, 0)),
         test_fragment(distributed_values_node(2, 2)),
@@ -648,77 +885,23 @@ fn bind_runtime_filters_preserves_dedup_skip_empty_targets_and_target_order() {
         test_probe_binding(4, 3, 99),
     ];
 
-    bind_runtime_filters(
+    let mut graph = RuntimeFilterGraph::default();
+    populate_runtime_filter_graph(
         &mut fragments,
-        RuntimeFilterBindings {
+        &mut graph,
+        &RuntimeFilterBindings {
             builds: build_bindings,
             probes: probe_bindings,
         },
-    );
+    )
+    .expect("populate graph");
 
-    let build_node = &fragments[0].root;
-    assert_eq!(build_node.build_runtime_filters.len(), 2);
-    assert_eq!(build_node.build_runtime_filters[0].intent.filter_id, 10);
-    assert_eq!(
-        build_node.build_runtime_filters[0].target_fragment_ids,
-        vec![2, 1]
-    );
-    assert_eq!(build_node.build_runtime_filters[1].intent.filter_id, 11);
-    assert!(
-        build_node.build_runtime_filters[1]
-            .target_fragment_ids
-            .is_empty()
-    );
-
-    assert_eq!(fragments[1].root.probe_runtime_filters.len(), 1);
-    assert_eq!(
-        fragments[1].root.probe_runtime_filters[0].intent.filter_id,
-        10
-    );
-    assert_eq!(fragments[2].root.probe_runtime_filters.len(), 1);
-    assert!(fragments[3].root.probe_runtime_filters.is_empty());
-}
-
-#[test]
-fn runtime_filter_binding_seam_preserves_binding_contract() {
-    let mut fragments = vec![
-        test_fragment(distributed_values_node(1, 0)),
-        test_fragment(distributed_values_node(2, 2)),
-        test_fragment(distributed_values_node(3, 1)),
-        test_fragment(distributed_values_node(4, 3)),
-    ];
-    let bindings = RuntimeFilterBindings {
-        builds: vec![test_build_binding(1, 0, 10), test_build_binding(1, 0, 11)],
-        probes: vec![
-            test_probe_binding(2, 2, 10),
-            test_probe_binding(2, 2, 10),
-            test_probe_binding(3, 1, 10),
-            test_probe_binding(4, 3, 99),
-        ],
-    };
-
-    bind_runtime_filters(&mut fragments, bindings);
-
-    let build_node = &fragments[0].root;
-    assert_eq!(build_node.build_runtime_filters.len(), 2);
-    assert_eq!(build_node.build_runtime_filters[0].intent.filter_id, 10);
-    assert_eq!(
-        build_node.build_runtime_filters[0].target_fragment_ids,
-        vec![2, 1]
-    );
-    assert_eq!(build_node.build_runtime_filters[1].intent.filter_id, 11);
-    assert!(
-        build_node.build_runtime_filters[1]
-            .target_fragment_ids
-            .is_empty()
-    );
-    assert_eq!(fragments[1].root.probe_runtime_filters.len(), 1);
-    assert_eq!(
-        fragments[1].root.probe_runtime_filters[0].intent.filter_id,
-        10
-    );
-    assert_eq!(fragments[2].root.probe_runtime_filters.len(), 1);
-    assert!(fragments[3].root.probe_runtime_filters.is_empty());
+    assert_eq!(graph.channel_count(), 1);
+    assert_eq!(graph.binding_count(), 3);
+    assert_eq!(fragments[0].root.runtime_filter_binding_ids.len(), 1);
+    assert_eq!(fragments[1].root.runtime_filter_binding_ids.len(), 1);
+    assert_eq!(fragments[2].root.runtime_filter_binding_ids.len(), 1);
+    assert!(fragments[3].root.runtime_filter_binding_ids.is_empty());
 }
 
 #[test]
@@ -1221,8 +1404,7 @@ fn fragment_cut_seam_preserves_exchange_topology_before_rf_binding() {
     assert_eq!(cut.bindings.probes[0].fragment_id, 1);
 
     fn assert_runtime_filters_unbound(node: &DistributedNode) {
-        assert!(node.build_runtime_filters.is_empty());
-        assert!(node.probe_runtime_filters.is_empty());
+        assert!(node.runtime_filter_binding_ids.is_empty());
         for child in &node.children {
             assert_runtime_filters_unbound(child);
         }
@@ -2889,8 +3071,7 @@ fn distributed_values_node(node_id: i32, fragment_id: u32) -> DistributedNode {
         tuple_ids: vec![node_id],
         nullable_tuple_ids: vec![],
         limit: -1,
-        build_runtime_filters: vec![],
-        probe_runtime_filters: vec![],
+        runtime_filter_binding_ids: Vec::new(),
         children: vec![],
         stats: stats(),
         payload: DistributedNodeKind::Values(PlanValuesNode {

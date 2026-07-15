@@ -25,9 +25,12 @@ use super::result::{
 };
 use super::runtime_filter::PlannedRuntimeFilter;
 use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
-use crate::sql::planner::distributed::{
-    DistributedNode, DistributedNodeKind, DistributedPlan, FragmentId,
+#[cfg(test)]
+use crate::sql::planner::distributed::DistributedPlan;
+use crate::sql::planner::distributed::runtime_filter::{
+    RuntimeFilterGraphProjection, project_runtime_filters,
 };
+use crate::sql::planner::distributed::{DistributedNode, DistributedNodeKind, FragmentId};
 
 pub(crate) fn build(request: FragmentBuildRequest<'_>) -> Result<MultiFragmentBuildResult, String> {
     let FragmentBuildRequest {
@@ -76,6 +79,7 @@ pub(crate) fn build(request: FragmentBuildRequest<'_>) -> Result<MultiFragmentBu
     // planner's canonical derivation order.
     let boundary_schemas = boundary_reports;
 
+    let runtime_filter_projection = project_runtime_filters(dp)?;
     let encoded = crate::sql::codegen::proto_encode::plan::encode_distributed_plan_with_context(
         dp,
         crate::sql::codegen::proto_encode::plan::NativePlanEncodeContext {
@@ -87,6 +91,7 @@ pub(crate) fn build(request: FragmentBuildRequest<'_>) -> Result<MultiFragmentBu
             node_outputs: None,
             fragment_edge_outputs: None,
             write_contracts: None,
+            runtime_filter_projection: Some(&runtime_filter_projection),
         },
     )?;
     let mut native_fragments = BTreeMap::new();
@@ -119,7 +124,7 @@ pub(crate) fn build(request: FragmentBuildRequest<'_>) -> Result<MultiFragmentBu
         topology,
         edges: dp.edges().to_vec(),
         boundary_schemas,
-        rf_plan: runtime_filter_plan(dp),
+        rf_plan: runtime_filter_plan(&runtime_filter_projection)?,
     })
 }
 
@@ -157,104 +162,66 @@ fn output_column_for_boundary(column: &AnalysisOutputColumn) -> OutputColumn {
     }
 }
 
-fn runtime_filter_plan(dp: &DistributedPlan) -> Option<RuntimeFilterPlanResult> {
+fn runtime_filter_plan(
+    projection: &RuntimeFilterGraphProjection,
+) -> Result<Option<RuntimeFilterPlanResult>, String> {
     let mut all_filters = HashMap::new();
     let mut build_side_filters: HashMap<FragmentId, Vec<i32>> = HashMap::new();
     let mut probe_side_filters: HashMap<FragmentId, Vec<(i32, i32)>> = HashMap::new();
-    let mut probe_targets: HashMap<i32, Vec<(FragmentId, i32)>> = HashMap::new();
-
-    for fragment in dp.fragments() {
-        collect_runtime_filter_probe_targets(
-            fragment.fragment_id,
-            &fragment.root,
-            &mut probe_targets,
-        );
-    }
-    for fragment in dp.fragments() {
-        collect_runtime_filter_builds(
-            fragment.fragment_id,
-            &fragment.root,
-            &probe_targets,
-            &mut all_filters,
-            &mut build_side_filters,
-            &mut probe_side_filters,
-        );
+    for ((fragment_id, node_id), builds) in projection.builds() {
+        for build in builds {
+            let expr_order = i32::try_from(build.expr_order).map_err(|_| {
+                format!(
+                    "runtime filter channel {} expression order {} does not fit i32",
+                    build.channel_id.get(),
+                    build.expr_order
+                )
+            })?;
+            let mut targets = projection
+                .probes()
+                .flat_map(|((target_fragment_id, target_node_id), probes)| {
+                    probes
+                        .iter()
+                        .filter(|probe| probe.channel_id == build.channel_id)
+                        .map(move |_| (*target_fragment_id, *target_node_id))
+                })
+                .collect::<Vec<_>>();
+            targets.sort_unstable();
+            targets.dedup();
+            all_filters.insert(
+                build.filter_id,
+                PlannedRuntimeFilter {
+                    filter_id: build.filter_id,
+                    build_plan_node_id: *node_id,
+                    probe_target_node_ids: targets.iter().map(|(_, node_id)| *node_id).collect(),
+                    has_remote_targets: targets
+                        .iter()
+                        .any(|(target_fragment_id, _)| *target_fragment_id != *fragment_id),
+                    execution_mode: build.execution_mode,
+                    expr_order,
+                },
+            );
+            build_side_filters
+                .entry(*fragment_id)
+                .or_default()
+                .push(build.filter_id);
+            for (target_fragment_id, target_node_id) in targets {
+                probe_side_filters
+                    .entry(target_fragment_id)
+                    .or_default()
+                    .push((build.filter_id, target_node_id));
+            }
+        }
     }
 
     if all_filters.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(RuntimeFilterPlanResult {
+        Ok(Some(RuntimeFilterPlanResult {
             all_filters,
             build_side_filters,
             probe_side_filters,
-        })
-    }
-}
-
-fn collect_runtime_filter_probe_targets(
-    fragment_id: FragmentId,
-    node: &DistributedNode,
-    out: &mut HashMap<i32, Vec<(FragmentId, i32)>>,
-) {
-    for probe in &node.probe_runtime_filters {
-        out.entry(probe.intent.filter_id)
-            .or_default()
-            .push((fragment_id, node.node_id));
-    }
-    for child in &node.children {
-        collect_runtime_filter_probe_targets(fragment_id, child, out);
-    }
-}
-
-fn collect_runtime_filter_builds(
-    fragment_id: FragmentId,
-    node: &DistributedNode,
-    probe_targets: &HashMap<i32, Vec<(FragmentId, i32)>>,
-    all_filters: &mut HashMap<i32, PlannedRuntimeFilter>,
-    build_side_filters: &mut HashMap<FragmentId, Vec<i32>>,
-    probe_side_filters: &mut HashMap<FragmentId, Vec<(i32, i32)>>,
-) {
-    for build in &node.build_runtime_filters {
-        let targets = probe_targets
-            .get(&build.intent.filter_id)
-            .cloned()
-            .unwrap_or_default();
-        let probe_target_node_ids = targets.iter().map(|(_, node_id)| *node_id).collect();
-        let has_remote_targets = targets
-            .iter()
-            .any(|(target_fragment_id, _)| *target_fragment_id != fragment_id);
-        all_filters.insert(
-            build.intent.filter_id,
-            PlannedRuntimeFilter {
-                filter_id: build.intent.filter_id,
-                build_plan_node_id: node.node_id,
-                probe_target_node_ids,
-                has_remote_targets,
-                execution_mode: build.intent.execution_mode,
-                expr_order: i32::try_from(build.intent.expr_order).unwrap_or(i32::MAX),
-            },
-        );
-        build_side_filters
-            .entry(fragment_id)
-            .or_default()
-            .push(build.intent.filter_id);
-        for (target_fragment_id, target_node_id) in targets {
-            probe_side_filters
-                .entry(target_fragment_id)
-                .or_default()
-                .push((build.intent.filter_id, target_node_id));
-        }
-    }
-    for child in &node.children {
-        collect_runtime_filter_builds(
-            fragment_id,
-            child,
-            probe_targets,
-            all_filters,
-            build_side_filters,
-            probe_side_filters,
-        );
+        }))
     }
 }
 
@@ -353,8 +320,7 @@ mod tests {
             tuple_ids: vec![node_id],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: Vec::new(),
             stats: stats(),
             payload: DistributedNodeKind::Values(PlanValuesNode {
@@ -602,8 +568,7 @@ mod tests {
             tuple_ids: vec![10],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: Vec::new(),
             stats: stats(),
             payload: DistributedNodeKind::Scan(PlanScanNode {
@@ -1363,8 +1328,7 @@ mod tests {
                 tuple_ids: vec![exchange_node_id],
                 nullable_tuple_ids: Vec::new(),
                 limit: -1,
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
+                runtime_filter_binding_ids: Vec::new(),
                 children: Vec::new(),
                 stats: stats(),
                 payload: DistributedNodeKind::Exchange(ExchangeReceiver {
@@ -1711,8 +1675,7 @@ mod tests {
                 tuple_ids: vec![exchange_node_id],
                 nullable_tuple_ids: Vec::new(),
                 limit: -1,
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
+                runtime_filter_binding_ids: Vec::new(),
                 children: Vec::new(),
                 stats: stats(),
                 payload: DistributedNodeKind::Exchange(ExchangeReceiver {
@@ -1814,8 +1777,7 @@ mod tests {
                 tuple_ids: vec![exchange_node_id],
                 nullable_tuple_ids: Vec::new(),
                 limit: -1,
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
+                runtime_filter_binding_ids: Vec::new(),
                 children: Vec::new(),
                 stats: stats(),
                 payload: DistributedNodeKind::Exchange(ExchangeReceiver {

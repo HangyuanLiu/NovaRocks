@@ -33,8 +33,6 @@ PLAN FRAGMENT 1
     PARTITION: UNPARTITIONED
 12:PROJECT [l.k AS k, r.payload AS payload] stats={rows=3}
   11:HASH JOIN (BROADCAST, INNER, eq: [r.k = l.k]) bcast_verdict=feasible stats={rows=3}
-    build runtime filters:
-    - filter_id = 0, build_expr = (l.k)
     5:FILTER stats={rows=3}
       predicate: r.k IS NOT NULL
       4:PROJECT [r.k AS k, r.payload AS payload] stats={rows=3}

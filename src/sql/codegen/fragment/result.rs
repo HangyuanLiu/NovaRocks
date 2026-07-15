@@ -126,8 +126,7 @@ pub(crate) struct MultiFragmentBuildResult {
 
 /// Result of lowering runtime-filter annotations to execution wiring.
 ///
-/// Assembled directly from the planner-side runtime-filter annotations on the
-/// distributed plan. Consumed by the execution coordinator
+/// Projected from the query-global runtime-filter graph. Consumed by the execution coordinator
 /// (`setup_runtime_filter_params`).
 pub(crate) struct RuntimeFilterPlanResult {
     /// filter_id -> native RF descriptor for coordinator-side wiring.

@@ -32,15 +32,15 @@ ANALYZE TABLE ${case_db}.rf_side_l;
 ANALYZE TABLE ${case_db}.rf_side_r;
 
 -- @explain_contains=HASH JOIN (BROADCAST, LEFT SEMI
--- @explain_contains=build runtime filters:
--- @explain_contains=probe runtime filters:
+-- @explain_contains=producer binding
+-- @explain_contains=consumer binding
 SELECT count(*)
 FROM ${case_db}.rf_side_l l
 LEFT SEMI JOIN ${case_db}.rf_side_r r ON r.k = l.k;
 
 -- @explain_contains=HASH JOIN (BROADCAST, LEFT ANTI
--- @explain_not_contains=build runtime filters:
--- @explain_not_contains=probe runtime filters:
+-- @explain_not_contains=producer binding
+-- @explain_not_contains=consumer binding
 SELECT count(*)
 FROM ${case_db}.rf_side_l l
 LEFT ANTI JOIN ${case_db}.rf_side_r r ON r.k = l.k;

@@ -436,8 +436,7 @@ impl FragmentCutBuilder {
             tuple_ids: exchange_tuple_ids,
             nullable_tuple_ids: Vec::new(),
             limit,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: Vec::new(),
             stats: exchange_stats,
             payload: DistributedNodeKind::Exchange(ExchangeReceiver {
@@ -542,8 +541,7 @@ impl FragmentCutBuilder {
             tuple_ids: vec![exchange_tuple_id],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: Vec::new(),
             stats: synthetic_exchange_stats(&node.stats),
             payload: DistributedNodeKind::Exchange(ExchangeReceiver {
@@ -564,8 +562,7 @@ impl FragmentCutBuilder {
             tuple_ids: vec![project_tuple_id],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: vec![exchange],
             stats: node.stats.clone(),
             payload: DistributedNodeKind::Project(PlanProjectNode {

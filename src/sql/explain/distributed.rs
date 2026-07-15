@@ -20,6 +20,7 @@ use std::{collections::HashMap, fmt::Write};
 use arrow::datatypes::DataType;
 
 use crate::coordinator::profile::correlate::{ActualMetrics, DistributedProfileSummary};
+use crate::runtime_filter::model::graph::RuntimeFilterBindingRole;
 use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
 use crate::sql::catalog::{ScanSource, TableDef};
 use crate::sql::column_id::ColumnId;
@@ -27,9 +28,6 @@ use crate::sql::common::ScanVariantColumn;
 use crate::sql::explain::{
     ExplainLevel, PlanNodeExplainStage, format_assert_one_row_header, format_expr,
     format_project_item, format_sort_items, format_window_exprs,
-};
-use crate::sql::planner::distributed::runtime_filter::{
-    BoundRuntimeFilterBuild, BoundRuntimeFilterProbe,
 };
 use crate::sql::planner::distributed::{
     DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor, ExchangeReceiver,
@@ -73,6 +71,39 @@ fn explain_distributed_plan_inner(
     let mut out = Vec::new();
     let fragments = explain_fragment_order(dp);
     let detailed = is_detailed(level);
+
+    if detailed && !dp.runtime_filter_graph().is_empty() {
+        out.push("RUNTIME FILTER GRAPH".to_string());
+        for channel in dp.runtime_filter_graph().channels() {
+            out.push(format!(
+                "  runtime filter channel {}",
+                channel.channel_id.get()
+            ));
+            for binding in dp
+                .runtime_filter_graph()
+                .bindings()
+                .filter(|binding| binding.channel_id == channel.channel_id)
+            {
+                match &binding.role {
+                    RuntimeFilterBindingRole::Producer(_) => out.push(format!(
+                        "    producer binding {}, fragment = {}, node = {}, expr = ({})",
+                        binding.binding_id.get(),
+                        binding.location.fragment_id.get(),
+                        binding.location.node_id.get(),
+                        format_expr(&binding.expression)
+                    )),
+                    RuntimeFilterBindingRole::Consumer(requirement) => out.push(format!(
+                        "    consumer binding {}, fragment = {}, node = {}, expr = ({}), activation = {:?}",
+                        binding.binding_id.get(),
+                        binding.location.fragment_id.get(),
+                        binding.location.node_id.get(),
+                        format_expr(&binding.expression),
+                        requirement.activation
+                    )),
+                }
+            }
+        }
+    }
 
     for (display_id, fragment) in fragments.iter().enumerate() {
         if detailed {
@@ -259,12 +290,10 @@ fn format_distributed_node(
         }
         DistributedNodeKind::Project(project) => {
             format_project_node(node, project, &pad, &costs_suffix, &stats_suffix, out);
-            push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
             format_children(node, level, indent, actuals, out);
         }
         DistributedNodeKind::Filter(filter) => {
             format_filter_node(node, filter, &pad, &costs_suffix, &stats_suffix, out);
-            push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
             format_children(node, level, indent, actuals, out);
         }
         DistributedNodeKind::HashJoin(join) => {
@@ -277,7 +306,6 @@ fn format_distributed_node(
         }
         DistributedNodeKind::HashAggregate(agg) => {
             format_hash_aggregate_node(node, agg, &pad, &costs_suffix, &stats_suffix, out);
-            push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
             format_children(node, level, indent, actuals, out);
         }
         DistributedNodeKind::Sort(sort) => {
@@ -293,7 +321,6 @@ fn format_distributed_node(
         }
         DistributedNodeKind::Values(values) => {
             format_values_node(node, values, &pad, &costs_suffix, &stats_suffix, out);
-            push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
         }
         DistributedNodeKind::AssertOneRow(assert) => {
             format_assert_one_row_node(node, assert, &pad, &costs_suffix, &stats_suffix, out);
@@ -432,7 +459,6 @@ fn format_scan_node(
             .collect::<Vec<_>>();
         out.push(format!("{pad}     predicates: {}", preds.join(" AND ")));
     }
-    push_probe_rf_lines(&node.probe_runtime_filters, level, pad, out);
 }
 
 fn format_scan_predicate(expr: &TypedExpr, scan: &DistributedScanNode) -> String {
@@ -610,7 +636,6 @@ fn format_hash_join_node(
     if let Some(ref other) = join.other_condition {
         out.push(format!("{pad}  other: {}", format_expr(other)));
     }
-    push_build_rf_lines(&node.build_runtime_filters, level, pad, out);
 }
 
 fn format_nest_loop_join_node(
@@ -1266,44 +1291,6 @@ fn fmt_f64(v: f64) -> String {
     }
 }
 
-fn push_build_rf_lines(
-    filters: &[BoundRuntimeFilterBuild],
-    level: ExplainLevel,
-    pad: &str,
-    out: &mut Vec<String>,
-) {
-    if !is_detailed(level) || filters.is_empty() {
-        return;
-    }
-    out.push(format!("{pad}  build runtime filters:"));
-    for rf in filters {
-        out.push(format!(
-            "{pad}  - filter_id = {}, build_expr = ({})",
-            rf.intent.filter_id,
-            format_expr(&rf.intent.build_expr),
-        ));
-    }
-}
-
-fn push_probe_rf_lines(
-    filters: &[BoundRuntimeFilterProbe],
-    level: ExplainLevel,
-    pad: &str,
-    out: &mut Vec<String>,
-) {
-    if !is_detailed(level) || filters.is_empty() {
-        return;
-    }
-    out.push(format!("{pad}    probe runtime filters:"));
-    for rf in filters {
-        out.push(format!(
-            "{pad}    - filter_id = {}, probe_expr = ({})",
-            rf.intent.filter_id,
-            format_expr(&rf.intent.probe_expr),
-        ));
-    }
-}
-
 #[derive(Default)]
 struct LocalScanExplainHints {
     has_min_max_stats: bool,
@@ -1687,8 +1674,7 @@ mod tests {
             tuple_ids: vec![],
             nullable_tuple_ids: vec![],
             limit: -1,
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
+            runtime_filter_binding_ids: Vec::new(),
             children: vec![],
             stats: PhysicalPlanStats {
                 output_row_count: 0.0,
@@ -2005,7 +1991,7 @@ mod tests {
     }
 
     #[test]
-    fn detailed_ir_explain_shows_build_and_probe_rf_but_normal_hides_them() {
+    fn detailed_ir_explain_shows_graph_channels_and_bindings_but_normal_hides_them() {
         let mut optimized_tree = inner_join_two_values();
         prepare_bridge2_test_props(&mut optimized_tree);
         let physical_plan =
@@ -2021,23 +2007,23 @@ mod tests {
         ] {
             let text = explain_distributed_plan(&distributed_plan, level).join("\n");
             assert!(
-                text.contains("build runtime filters:"),
-                "missing build RF at {level:?}:\n{text}"
+                text.contains("RUNTIME FILTER GRAPH"),
+                "missing graph header at {level:?}:\n{text}"
             );
             assert!(
-                text.contains("filter_id = 0"),
-                "missing RF id at {level:?}:\n{text}"
+                text.contains("runtime filter channel 0"),
+                "missing channel id at {level:?}:\n{text}"
             );
             assert!(
-                text.contains("probe runtime filters:"),
-                "missing probe RF at {level:?}:\n{text}"
+                text.contains("producer binding 0") && text.contains("consumer binding 1"),
+                "missing graph bindings at {level:?}:\n{text}"
             );
         }
 
         let normal = explain_distributed_plan(&distributed_plan, ExplainLevel::Normal).join("\n");
         assert!(
-            !normal.contains("runtime filters:"),
-            "Normal must hide RF lines:\n{normal}"
+            !normal.contains("RUNTIME FILTER GRAPH"),
+            "Normal must hide RF graph lines:\n{normal}"
         );
     }
 

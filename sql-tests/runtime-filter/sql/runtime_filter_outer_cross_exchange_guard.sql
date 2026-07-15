@@ -50,10 +50,7 @@ INSERT INTO ${case_db}.rf_outer_dim VALUES (10), (30), (40);
 
 SET disable_optimizer_rules = '';
 -- @explain_contains=HASH JOIN (PARTITIONED, FULL OUTER
--- @explain_contains=build runtime filters:
--- @explain_contains=build_expr = (d.k)
--- @explain_not_contains=probe_expr = (l.k)
--- @explain_not_contains=probe_expr = (r.k)
+-- @explain_not_contains=RUNTIME FILTER GRAPH
 WITH x AS (
     SELECT l.id, l.k, r.k AS rk
     FROM ${case_db}.rf_outer_l l

@@ -58,8 +58,8 @@ JOIN ${case_db}.dict_rf_build_t b ON p.status = b.status
 WHERE b.flag = 'Y';
 
 SET disable_optimizer_rules = '';
--- @explain_contains=build runtime filters:
--- @explain_contains=probe runtime filters:
+-- @explain_contains=producer binding
+-- @explain_contains=consumer binding
 SELECT 'rf_on' AS mode, COUNT(*) AS c, COALESCE(SUM(p.payload), 0) AS payload_sum
 FROM ${case_db}.dict_rf_probe_t p
 JOIN ${case_db}.dict_rf_build_t b ON p.status = b.status
