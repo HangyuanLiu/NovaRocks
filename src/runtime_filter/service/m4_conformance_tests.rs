@@ -34,11 +34,11 @@ use crate::runtime_filter::materializer::codec::{
     ArtifactDecodeExpectations, decode_leaf, encode_physical_leaf,
 };
 use crate::runtime_filter::model::contract::{
-    ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
-    ContributionKind, CoverageWitnessId, LateApplyGranularity, NullOrder, NullSemantics,
-    OrderContract, OrderKeyContract, PlanFragmentId, PlanNodeId, ReductionRequirement,
-    RuntimeFilterLifecycle, RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
-    SortDirection, TopKSummaryRequirement,
+    ArtifactCapability, BindingId, ChannelId, CompletionFenceKind, CompletionRequirement,
+    ConsumerActivation, ContributionKind, CoverageWitnessId, LateApplyGranularity, NullOrder,
+    NullSemantics, OrderContract, OrderKeyContract, PlanFragmentId, PlanNodeId,
+    ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
+    RuntimeFilterPolicyRequirement, SortDirection, TopKSummaryRequirement,
 };
 use crate::runtime_filter::model::coverage::Coverage;
 use crate::runtime_filter::model::graph::{
@@ -50,8 +50,12 @@ use crate::runtime_filter::port::artifact::{
     PhysicalArtifact,
 };
 use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
+use crate::runtime_filter::port::final_domain::{
+    CollectingFinalDomainTestIssuer, FinalDomainTestIssuerTransition, FrozenFinalDomainTestIssuer,
+};
 use crate::runtime_filter::port::identity::{
-    DeploymentEpoch, LogicalVersion, PartitionId, ProducerSequence, RuntimeFilterParticipantId,
+    DeploymentEpoch, LogicalVersion, PartitionId, ProducerSequence, ProducerStreamId,
+    RuntimeFilterParticipantId,
 };
 use crate::runtime_filter::port::install::{
     MaterializationPolicy, RuntimeFilterCoreBudget, RuntimeFilterInstallView,
@@ -61,15 +65,16 @@ use crate::runtime_filter::port::ordered_bound::{
     RuntimeOrderContract, comparator_digest_for_test,
 };
 use crate::runtime_filter::port::producer::{
-    InstallOutcome, OrderedBoundProducerAdapter, ProducerAdapter, ProducerHandle, ProducerPortKind,
-    RuntimeContractViolation, SubmitOutcome, TopKSummaryProducerAdapter,
+    FinalDomainProducerAdapter, InstallOutcome, OrderedBoundProducerAdapter, ProducerAdapter,
+    ProducerHandle, ProducerPortKind, RuntimeContractViolation, RuntimeContractViolationKind,
+    SubmitOutcome, TopKSummaryProducerAdapter,
 };
 use crate::runtime_filter::port::subscription::{
     BlockingSnapshotSubscription, LivePollOutcome, LiveTerminal, NonBlockingLiveSubscription,
-    SubscriptionHandle, SubscriptionKind,
+    SubscriptionHandle, SubscriptionKind, UnavailableReason,
 };
 use crate::runtime_filter::port::support::{
-    ArtifactRetainedBudget, RuntimeFilterClock, RuntimeFilterMemoryAccount,
+    ArtifactRetainedBudget, MemoryAccountError, RuntimeFilterClock, RuntimeFilterMemoryAccount,
 };
 use crate::runtime_filter::port::topk_summary::{RuntimeTopKSummaryContract, TopKSummary};
 use crate::runtime_filter::port::value_domain::{MembershipValues, ValueDomainDelta};
@@ -269,6 +274,89 @@ fn membership_graph(
     graph
 }
 
+fn aggregate_graph(producers: &[ProducerFixture]) -> RuntimeFilterGraph {
+    let capabilities = BTreeSet::from([
+        ArtifactCapability::Membership,
+        ArtifactCapability::EmptyDomain,
+    ]);
+    let contributions = BTreeSet::from([
+        ContributionKind::FinalDomainShard,
+        ContributionKind::ProducerClosed,
+    ]);
+    let coverage = Coverage::AllOf(
+        producers
+            .iter()
+            .map(|producer| Coverage::Leaf(producer.witness))
+            .collect(),
+    );
+    let mut graph = RuntimeFilterGraph::default();
+    graph
+        .insert_channel(RuntimeFilterChannelSpec {
+            channel_id: CHANNEL,
+            logical_domain: RuntimeFilterLogicalDomain::Membership {
+                value_type: DataType::Int64,
+                null_semantics: NullSemantics::NullSafeEqual,
+            },
+            lifecycle: RuntimeFilterLifecycle::CompleteOnce,
+            availability_coverage: coverage.clone(),
+            terminal_coverage: coverage,
+            reduction_requirement: ReductionRequirement::SetUnion,
+            allowed_contribution_kinds: contributions.clone(),
+            required_consumer_capabilities: capabilities.clone(),
+            policy: RuntimeFilterPolicyRequirement {
+                max_contribution_bytes: 4096,
+                max_artifact_bytes: 4096,
+                deadline_ms: 1000,
+                max_retries: 1,
+            },
+        })
+        .unwrap();
+    for (index, producer) in producers.iter().enumerate() {
+        graph
+            .insert_binding(RuntimeFilterBindingSpec {
+                binding_id: producer.binding,
+                channel_id: CHANNEL,
+                coverage_witness_id: Some(producer.witness),
+                location: PlanLocation {
+                    fragment_id: producer.fragment,
+                    node_id: PlanNodeId::new(index as i32 + 1),
+                },
+                expression: expression(),
+                apply_point: ApplyPoint::NodeOutput,
+                role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
+                    contribution_kinds: contributions.clone(),
+                    completion_requirement: CompletionRequirement::FencedFinalDomain(
+                        CompletionFenceKind::CommittedDomainFrozen,
+                    ),
+                }),
+            })
+            .unwrap();
+    }
+    graph
+        .insert_binding(RuntimeFilterBindingSpec {
+            binding_id: CONSUMER,
+            channel_id: CHANNEL,
+            coverage_witness_id: None,
+            location: PlanLocation {
+                fragment_id: CONSUMER_FRAGMENT,
+                node_id: PlanNodeId::new(30),
+            },
+            expression: expression(),
+            apply_point: ApplyPoint::NodeInput,
+            role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
+                capabilities,
+                activation: ConsumerActivation::NonBlockingLive {
+                    late_apply: LateApplyGranularity::Batch,
+                },
+            }),
+        })
+        .unwrap();
+    graph
+        .validate()
+        .expect("Aggregate fixture graph must pass RFD-1 validation before compilation");
+    graph
+}
+
 fn placement(
     fragment: PlanFragmentId,
     instance_index: usize,
@@ -358,11 +446,21 @@ fn compile_install_view(
 }
 
 fn install_service(view: RuntimeFilterInstallView) -> Arc<RuntimeFilterService> {
+    install_service_with_memory(
+        view,
+        MemTrackerMemoryAccount::new_root_for_test("m4-conformance"),
+    )
+}
+
+fn install_service_with_memory(
+    view: RuntimeFilterInstallView,
+    memory: Arc<dyn RuntimeFilterMemoryAccount>,
+) -> Arc<RuntimeFilterService> {
     let service = Arc::new(RuntimeFilterService::new_with_dependencies(
         UniqueId { hi: 94, lo: 0 },
         Arc::new(DeterministicClock(Instant::now())),
         Arc::new(RecordingEvents::default()),
-        MemTrackerMemoryAccount::new_root_for_test("m4-join-conformance"),
+        memory,
     ));
     assert_eq!(service.install(view).unwrap(), InstallOutcome::Installed);
     service
@@ -1314,6 +1412,237 @@ fn assert_completed_without_new_unsound_version(
     assert_eq!(live.snapshot().unwrap().version(), version);
 }
 
+struct AggregateHarness {
+    service: Arc<RuntimeFilterService>,
+    producers: Vec<(BindingId, UniqueId, Arc<dyn FinalDomainProducerAdapter>)>,
+    live: Arc<dyn NonBlockingLiveSubscription>,
+}
+
+impl AggregateHarness {
+    fn producer(
+        &self,
+        binding: BindingId,
+        instance: UniqueId,
+    ) -> &Arc<dyn FinalDomainProducerAdapter> {
+        &self
+            .producers
+            .iter()
+            .find(|(installed_binding, installed_instance, _)| {
+                *installed_binding == binding && *installed_instance == instance
+            })
+            .expect("Aggregate fixture keeps every compiler-installed producer open")
+            .2
+    }
+
+    fn collecting_issuer(
+        &self,
+        binding: BindingId,
+        instance: UniqueId,
+        open_drivers: u32,
+    ) -> CollectingFinalDomainTestIssuer {
+        self.service
+            .final_domain_test_issuer(binding, instance, open_drivers)
+            .expect("opened final-domain producer owns the test-only fence authority")
+    }
+
+    fn freeze(
+        &self,
+        binding: BindingId,
+        instance: UniqueId,
+        open_drivers: u32,
+    ) -> FrozenFinalDomainTestIssuer {
+        let mut transition = FinalDomainTestIssuerTransition::Collecting(self.collecting_issuer(
+            binding,
+            instance,
+            open_drivers,
+        ));
+        loop {
+            transition = match transition {
+                FinalDomainTestIssuerTransition::Collecting(collecting) => {
+                    collecting.close_driver()
+                }
+                FinalDomainTestIssuerTransition::Frozen(frozen) => return frozen,
+            };
+        }
+    }
+
+    fn complete(
+        &self,
+        binding: BindingId,
+        instance: UniqueId,
+        sequence: u64,
+        issuer: &FrozenFinalDomainTestIssuer,
+        values: &[i64],
+    ) -> Result<SubmitOutcome, RuntimeContractViolation> {
+        let partition = PartitionId::new(0);
+        let sequence = ProducerSequence::new(sequence);
+        let shard = issuer
+            .issue_shard(
+                ProducerStreamId::new(binding, instance, partition),
+                sequence,
+                ValueDomainDelta::new(MembershipValues::int64(values.iter().copied()), false),
+            )
+            .expect("frozen Aggregate issuer signs only its installed producer stream");
+        self.producer(binding, instance)
+            .complete(partition, sequence, shard)
+    }
+
+    fn close(
+        &self,
+        binding: BindingId,
+        instance: UniqueId,
+        partition: u32,
+        terminal_sequence: u64,
+    ) -> Result<SubmitOutcome, RuntimeContractViolation> {
+        self.producer(binding, instance).close_partition(
+            PartitionId::new(partition),
+            ProducerSequence::new(terminal_sequence),
+        )
+    }
+}
+
+fn aggregate_harness_with_memory(
+    producers: &[ProducerFixture],
+    memory: Arc<dyn RuntimeFilterMemoryAccount>,
+) -> AggregateHarness {
+    let graph = aggregate_graph(producers);
+    let scheduling = scheduling_plan(producers);
+    let edges = fragment_edges(producers);
+    let service = install_service_with_memory(
+        compile_install_view(&graph, &scheduling, &edges, PARTICIPANT),
+        memory,
+    );
+    let mut opened = Vec::with_capacity(producers.len());
+    for producer in producers {
+        let error = service
+            .open_producer(
+                producer.binding,
+                producer.instance,
+                1,
+                ProducerPortKind::Membership,
+            )
+            .expect_err("fenced-final Aggregate graph must reject the Membership producer port");
+        assert_eq!(
+            error.kind(),
+            RuntimeContractViolationKind::ProducerPortMismatch
+        );
+        let ProducerHandle::FinalDomain(handle) = service
+            .open_producer(
+                producer.binding,
+                producer.instance,
+                1,
+                ProducerPortKind::FinalDomain,
+            )
+            .expect("compiler-installed Aggregate producer exposes FinalDomain")
+        else {
+            panic!("Aggregate graph must install only the FinalDomain producer port")
+        };
+        opened.push((producer.binding, producer.instance, handle));
+    }
+    let SubscriptionHandle::Live(live) = service
+        .subscribe(
+            CONSUMER,
+            CONSUMER_INSTANCE,
+            SubscriptionKind::NonBlockingLive,
+        )
+        .expect("compiler-installed Aggregate consumer is authorized")
+    else {
+        panic!("Aggregate graph consumer must install only NonBlockingLive")
+    };
+    AggregateHarness {
+        service,
+        producers: opened,
+        live,
+    }
+}
+
+fn aggregate_allof_harness() -> AggregateHarness {
+    let producers = producer_fixtures();
+    aggregate_harness_with_memory(
+        &producers,
+        MemTrackerMemoryAccount::new_root_for_test("m4-aggregate-allof"),
+    )
+}
+
+fn expect_collecting(
+    transition: FinalDomainTestIssuerTransition,
+) -> CollectingFinalDomainTestIssuer {
+    let FinalDomainTestIssuerTransition::Collecting(collecting) = transition else {
+        panic!("one local Aggregate driver must remain open")
+    };
+    collecting
+}
+
+fn expect_frozen(transition: FinalDomainTestIssuerTransition) -> FrozenFinalDomainTestIssuer {
+    let FinalDomainTestIssuerTransition::Frozen(frozen) = transition else {
+        panic!("Aggregate issuer freezes only after the last local driver closes")
+    };
+    frozen
+}
+
+fn expect_live_completed(outcome: LivePollOutcome) -> Arc<ArtifactBundle> {
+    let LivePollOutcome::Updated {
+        bundle,
+        terminal: Some(LiveTerminal::Completed),
+    } = outcome
+    else {
+        panic!("fenced-final AllOf must publish one terminal live artifact")
+    };
+    bundle
+}
+
+fn assert_explicit_empty_is_empty_domain() {
+    let producers = producer_fixtures();
+    let empty = aggregate_harness_with_memory(
+        &producers[..1],
+        MemTrackerMemoryAccount::new_root_for_test("m4-aggregate-explicit-empty"),
+    );
+    let frozen = empty.freeze(PRODUCER_A, INSTANCE_A, 1);
+    empty
+        .complete(PRODUCER_A, INSTANCE_A, 0, &frozen, &[])
+        .unwrap();
+    assert_eq!(
+        empty.close(PRODUCER_A, INSTANCE_A, 0, 1).unwrap(),
+        SubmitOutcome::Completed
+    );
+    let bundle = expect_live_completed(empty.live.poll_after(None));
+    assert_eq!(bundle.version(), LogicalVersion::FIRST);
+    let [(ArtifactKind::EmptyDomain, _)] = bundle.artifacts() else {
+        panic!("explicit empty Aggregate shard must publish exactly one EmptyDomain artifact")
+    };
+}
+
+struct RejectingMemoryAccount;
+
+impl RuntimeFilterMemoryAccount for RejectingMemoryAccount {
+    fn try_consume(&self, _bytes: usize) -> Result<(), MemoryAccountError> {
+        Err(MemoryAccountError::CapacityExceeded)
+    }
+
+    fn release(&self, _bytes: usize) {}
+}
+
+fn assert_resource_failure_is_unavailable() {
+    let producers = producer_fixtures();
+    let unavailable =
+        aggregate_harness_with_memory(&producers[..1], Arc::new(RejectingMemoryAccount));
+    let frozen = unavailable.freeze(PRODUCER_A, INSTANCE_A, 1);
+    assert_eq!(
+        unavailable
+            .complete(PRODUCER_A, INSTANCE_A, 0, &frozen, &[])
+            .unwrap(),
+        SubmitOutcome::TerminalNoop
+    );
+    assert!(unavailable.live.snapshot().is_none());
+    assert!(matches!(
+        unavailable.live.poll_after(None),
+        LivePollOutcome::Idle {
+            latest_version: None,
+            terminal: Some(LiveTerminal::Unavailable(UnavailableReason::ResourceLimit)),
+        }
+    ));
+}
+
 #[test]
 fn m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts() {
     let all_of = join_allof_harness();
@@ -1397,4 +1726,36 @@ fn m4_topk_summary_conformance_merges_incomplete_shards_only_after_allof() {
     assert_sound_topk_bound(&first, &[1, 2, 3]);
     harness.close_all().unwrap();
     assert_completed_without_new_unsound_version(&harness.live, first.version());
+}
+
+#[test]
+fn m4_aggregate_conformance_requires_frozen_allof_and_separates_empty_unavailable() {
+    let aggregate = aggregate_allof_harness();
+    let collecting = aggregate.collecting_issuer(PRODUCER_A, INSTANCE_A, 2);
+    let collecting = expect_collecting(collecting.close_driver());
+    assert!(aggregate.live.snapshot().is_none());
+    let frozen_a = expect_frozen(collecting.close_driver());
+    let frozen_b = aggregate.freeze(PRODUCER_B, INSTANCE_B, 1);
+    aggregate
+        .complete(PRODUCER_A, INSTANCE_A, 0, &frozen_a, &[1])
+        .unwrap();
+    aggregate.close(PRODUCER_A, INSTANCE_A, 0, 1).unwrap();
+    assert!(aggregate.live.snapshot().is_none());
+    aggregate
+        .complete(PRODUCER_B, INSTANCE_B, 0, &frozen_b, &[2])
+        .unwrap();
+    aggregate.close(PRODUCER_B, INSTANCE_B, 0, 1).unwrap();
+    let bundle = expect_live_completed(aggregate.live.poll_after(None));
+    assert_eq!(bundle.version(), LogicalVersion::FIRST);
+    assert_membership_values(&bundle, &[1, 2]);
+    assert!(matches!(
+        aggregate.live.poll_after(Some(bundle.version())),
+        LivePollOutcome::Idle {
+            latest_version: Some(LogicalVersion::FIRST),
+            terminal: Some(LiveTerminal::Completed),
+        }
+    ));
+
+    assert_explicit_empty_is_empty_domain();
+    assert_resource_failure_is_unavailable();
 }
