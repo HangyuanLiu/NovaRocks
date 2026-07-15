@@ -141,7 +141,7 @@ impl ContinuationToken {
     }
 
     pub fn resume_after(&self, request: &RangeRequest) -> Result<Key, StateStoreError> {
-        let mut reader = CheckedReader::new(self.as_bytes());
+        let mut reader = CheckedReader::new(self.as_bytes(), invalid_token);
         if reader.read_u8()? != CODEC_VERSION {
             return Err(invalid_token());
         }
@@ -207,7 +207,7 @@ impl ChangeCursor {
     }
 
     pub fn decode(&self, expected_store_id: Uuid) -> Result<(StoreRevision, u32), StateStoreError> {
-        let mut reader = CheckedReader::new(self.as_bytes());
+        let mut reader = CheckedReader::new(self.as_bytes(), invalid_cursor);
         if reader.read_u8()? != CODEC_VERSION {
             return Err(invalid_cursor());
         }
@@ -250,36 +250,41 @@ fn request_fingerprint(
 struct CheckedReader<'a> {
     bytes: &'a [u8],
     offset: usize,
+    invalid: fn() -> StateStoreError,
 }
 
 impl<'a> CheckedReader<'a> {
-    const fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
+    const fn new(bytes: &'a [u8], invalid: fn() -> StateStoreError) -> Self {
+        Self {
+            bytes,
+            offset: 0,
+            invalid,
+        }
     }
 
     fn read_u8(&mut self) -> Result<u8, StateStoreError> {
         let bytes = self.read_exact(1)?;
-        bytes.first().copied().ok_or_else(invalid_token)
+        bytes.first().copied().ok_or_else(self.invalid)
     }
 
     fn read_u32(&mut self) -> Result<u32, StateStoreError> {
         let bytes: [u8; 4] = self
             .read_exact(4)?
             .try_into()
-            .map_err(|_| invalid_token())?;
+            .map_err(|_| (self.invalid)())?;
         Ok(u32::from_be_bytes(bytes))
     }
 
     fn read_exact(&mut self, length: usize) -> Result<&'a [u8], StateStoreError> {
-        let end = self.offset.checked_add(length).ok_or_else(invalid_token)?;
-        let bytes = self.bytes.get(self.offset..end).ok_or_else(invalid_token)?;
+        let end = self.offset.checked_add(length).ok_or_else(self.invalid)?;
+        let bytes = self.bytes.get(self.offset..end).ok_or_else(self.invalid)?;
         self.offset = end;
         Ok(bytes)
     }
 
     fn finish(self) -> Result<(), StateStoreError> {
         if self.offset != self.bytes.len() {
-            return Err(invalid_token());
+            return Err((self.invalid)());
         }
         Ok(())
     }

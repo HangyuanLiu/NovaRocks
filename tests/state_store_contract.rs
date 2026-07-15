@@ -191,6 +191,48 @@ fn contract_codecs_reject_malformed_and_mismatched_tokens() {
 }
 
 #[test]
+fn contract_codecs_preserve_their_error_context() {
+    let request = RangeRequest {
+        range: KeyRange::new(key(&[]), key(&[255])).expect("range"),
+        direction: Direction::Forward,
+        page_size: 1,
+        continuation: None,
+    };
+    let token = request.continuation_after(&key(&[1])).expect("token");
+    let mut trailing_token = token.as_bytes().to_vec();
+    trailing_token.push(0);
+    for malformed in [
+        Bytes::copy_from_slice(&token.as_bytes()[..token.as_bytes().len() - 1]),
+        Bytes::from(trailing_token),
+    ] {
+        let error = ContinuationToken::try_from(malformed)
+            .expect("opaque token")
+            .resume_after(&request)
+            .expect_err("malformed token");
+        assert_eq!(
+            error.to_string(),
+            "InvalidRequest: invalid continuation token"
+        );
+    }
+
+    let store_id = Uuid::now_v7();
+    let revision = StoreRevision::try_from(Bytes::from_static(&[1])).expect("revision");
+    let cursor = ChangeCursor::new(store_id, revision, 1).expect("cursor");
+    let mut trailing_cursor = cursor.as_bytes().to_vec();
+    trailing_cursor.push(0);
+    for malformed in [
+        Bytes::copy_from_slice(&cursor.as_bytes()[..cursor.as_bytes().len() - 1]),
+        Bytes::from(trailing_cursor),
+    ] {
+        let error = ChangeCursor::try_from(malformed)
+            .expect("opaque cursor")
+            .decode(store_id)
+            .expect_err("malformed cursor");
+        assert_eq!(error.to_string(), "InvalidRequest: invalid change cursor");
+    }
+}
+
+#[test]
 fn contract_continuation_codec_has_the_stable_v1_layout() {
     let request = RangeRequest {
         range: KeyRange::new(key(&[0, 255]), key(&[2])).expect("range"),
