@@ -16,7 +16,17 @@
 // under the License.
 
 pub mod config;
+pub mod contract;
+pub mod error;
 pub mod limits;
+pub mod range;
 
 pub use config::{StateStoreConfig, StateStoreProviderConfig};
+pub use contract::{
+    ChangeHint, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution,
+    FeDeploymentView, Key, OperationId, Precondition, RangePage, ReadTransaction, StateRecord,
+    StateStore, StoreIdentity, StoreRevision, TransactionId, Value, VersionToken, WriteTransaction,
+};
+pub use error::{StateStoreError, StateStoreErrorKind};
 pub use limits::{StateStoreLimitOverrides, StateStoreLimits};
+pub use range::{ChangeCursor, ContinuationToken, Direction, KeyRange, RangeRequest};
