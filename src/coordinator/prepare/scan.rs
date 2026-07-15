@@ -22,8 +22,9 @@ use crate::sql::analysis::OutputColumn;
 use crate::sql::catalog::{
     ColumnDef, IcebergDataFileBinding, IcebergDataFileInfo, IcebergTableInfo,
 };
-use crate::sql::codegen::scan::connector::StarRocksScanSourceDescriptor;
-use crate::sql::codegen::scan::iceberg_delta::IcebergDeltaScanRuntimePlan;
+use crate::sql::codegen::scan::{
+    connector::StarRocksScanSourceDescriptor, iceberg_delta::IcebergDeltaScanRuntimePlan,
+};
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::FragmentId;
 use crate::sql::planner::payload::PlanScanNode;

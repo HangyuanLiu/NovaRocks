@@ -3304,7 +3304,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
             &catalog_snapshot,
             &connectors_snapshot,
             mv_refresh_ctx
-                .map(|ctx| ctx as &dyn crate::sql::codegen::scan::binding::ScanBindingResolver),
+                .map(|ctx| ctx as &dyn crate::coordinator::prepare::scan::ScanBindingResolver),
         ),
     )?;
     let commit_plan =
@@ -3697,7 +3697,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
             codegen_catalog,
             connectors,
             mv_refresh_ctx
-                .map(|ctx| ctx as &dyn crate::sql::codegen::scan::binding::ScanBindingResolver),
+                .map(|ctx| ctx as &dyn crate::coordinator::prepare::scan::ScanBindingResolver),
         ),
     )?;
     let (execution_ports, scheduler) = coordinated_execution_services()?;
@@ -3756,7 +3756,7 @@ pub(crate) fn execute_logical_plan_with_options(
             codegen_catalog,
             connectors,
             mv_refresh_ctx
-                .map(|ctx| ctx as &dyn crate::sql::codegen::scan::binding::ScanBindingResolver),
+                .map(|ctx| ctx as &dyn crate::coordinator::prepare::scan::ScanBindingResolver),
         ),
     )?;
     let (execution_ports, scheduler) = coordinated_execution_services()?;

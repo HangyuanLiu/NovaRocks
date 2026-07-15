@@ -17,12 +17,12 @@
 
 use crate::connector::ConnectorRegistry;
 use crate::connector::scan_planning::{BeginScanContext, SplitPlanningContext, TableHandle};
-use crate::sql::catalog::{IcebergDataFileBinding, ScanSource};
-use crate::sql::codegen::scan::binding::{
+use crate::coordinator::prepare::scan::{
     ResolvedIcebergFileScan, ResolvedReadColumn, ResolvedReadReason, ResolvedScanBinding,
     ResolvedScanColumn, ResolvedScanColumnKind, ResolvedScanExecution, ScanBindingResolver,
     ScanExecutionBindings,
 };
+use crate::sql::catalog::{IcebergDataFileBinding, ScanSource};
 use crate::sql::codegen::scan::connector::{
     ConnectorScanContext, PlannedNativeStarRocksScan, plan_native_starrocks_scan_node,
     to_native_file_scan,
@@ -921,15 +921,15 @@ mod tests {
         BeginScanContext, ConnectorScanPlanner, ScanHandle, Split, SplitPlanningContext,
         TableHandle,
     };
+    use crate::coordinator::prepare::scan::{
+        ResolvedIcebergDeltaScan, ResolvedIcebergFileScan, ResolvedReadReason,
+        ResolvedScanExecution, ScanBindingResolver,
+    };
     use crate::runtime_filter::model::graph::RuntimeFilterGraph;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::catalog::{
         ColumnDef, IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef,
         IcebergSchemaFieldDef, IcebergTableInfo, ScanSource, TableDef,
-    };
-    use crate::sql::codegen::scan::binding::{
-        ResolvedIcebergDeltaScan, ResolvedIcebergFileScan, ResolvedReadReason,
-        ResolvedScanExecution, ScanBindingResolver,
     };
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed::{
@@ -1970,7 +1970,7 @@ mod tests {
                 tablet_schema: test_starrocks_tablet_schema_descriptor(30, &storage_columns),
             },
         };
-        let mut bindings = crate::sql::codegen::scan::binding::ScanExecutionBindings::default();
+        let mut bindings = crate::coordinator::prepare::scan::ScanExecutionBindings::default();
 
         store_planned_starrocks_scan(0, 42, planned, &mut bindings)
             .expect("store StarRocks planning result");

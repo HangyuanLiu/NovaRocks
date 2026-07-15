@@ -31,10 +31,10 @@ mod tests {
 
     use super::expr::encode_expr;
     use super::{instance, plan};
+    use crate::coordinator::prepare::scan::ScanExecutionBindings;
     use crate::proto::{common, expr};
     use crate::runtime_filter::model::graph::RuntimeFilterGraph;
     use crate::sql::analysis::{ExprKind, SortItem, SubqueryKind, TypedExpr};
-    use crate::sql::codegen::scan::binding::ScanExecutionBindings;
     use crate::sql::codegen::scan::connector as connector_scan;
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::{

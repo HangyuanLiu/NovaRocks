@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::connector::ConnectorRegistry;
+use crate::coordinator::prepare::scan::ScanBindingResolver;
 use crate::sql::catalog::CatalogProvider;
-use crate::sql::codegen::scan::binding::ScanBindingResolver;
 use crate::sql::planner::distributed::DistributedPlan;
 
 pub(crate) struct FragmentBuildRequest<'a> {
