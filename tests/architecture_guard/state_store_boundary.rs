@@ -260,7 +260,7 @@ fn state_store_boundary_violations(sources: &[GuardSource]) -> Vec<String> {
             }
         }
 
-        if is_state_store_foundationdb_source(&source.path) {
+        if is_foundationdb_native_owner(&source.path) {
             for token in FOUNDATIONDB_FORBIDDEN_OWNER_TOKENS {
                 let is_member_api = matches!(*token, "run" | "transact" | "on_error");
                 let present = if is_member_api {
@@ -645,6 +645,31 @@ fn state_store_boundary_detector_rejects_foundationdb_owner_domain_and_forbidden
         assert!(
             violations.iter().any(|violation| violation.contains(token)),
             "forbidden FoundationDB owner token escaped: {token}; violations={violations:?}"
+        );
+    }
+}
+
+#[test]
+fn state_store_boundary_detector_rejects_foundationdb_runtime_forbidden_apis() {
+    let violations = state_store_boundary_violations(&[GuardSource::new(
+        "src/state_store/runtime.rs",
+        "fn bad(db: Database, tx: Transaction) { \
+         db.run(); Database::run(); db.transact(); tx.on_error(); tx.watch(); \
+         tuple(); directory(); fallback(); }",
+    )]);
+
+    for token in [
+        "run",
+        "transact",
+        "on_error",
+        "watch",
+        "tuple",
+        "directory",
+        "fallback",
+    ] {
+        assert!(
+            violations.iter().any(|violation| violation.contains(token)),
+            "forbidden FoundationDB runtime token escaped: {token}; violations={violations:?}"
         );
     }
 }

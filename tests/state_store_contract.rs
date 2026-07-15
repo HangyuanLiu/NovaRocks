@@ -148,6 +148,30 @@ fn foundationdb_config_rejects_empty_cluster_id_and_invalid_cluster_files() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn foundationdb_config_rejects_non_utf8_cluster_file_path() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let config = StateStoreConfig {
+        cluster_id: "cluster-a".to_owned(),
+        limits: StateStoreLimitOverrides::default(),
+        provider: StateStoreProviderConfig::Foundationdb {
+            cluster_file: PathBuf::from(OsString::from_vec(b"/tmp/fdb-\xff.cluster".to_vec())),
+            keyspace_id: Uuid::nil(),
+        },
+    };
+
+    let error = config
+        .validate()
+        .expect_err("non-UTF-8 FoundationDB cluster_file must fail closed");
+    assert_eq!(
+        error.to_string(),
+        "InvalidStateStoreConfig: cluster_file must be valid UTF-8"
+    );
+}
+
 #[test]
 fn foundationdb_config_rejects_invalid_client_configuration() -> anyhow::Result<()> {
     let cluster_file = tempfile::NamedTempFile::new()?;
@@ -261,20 +285,108 @@ fn foundationdb_config_client_debug_redacts_paths_and_password_environment_name(
     assert!(debug.contains("tls_password_env_configured: true"));
 }
 
+#[test]
+fn foundationdb_config_loads_complete_tls_client_configuration() -> anyhow::Result<()> {
+    let cluster_file = tempfile::NamedTempFile::new()?;
+    let tls_cert = tempfile::NamedTempFile::new()?;
+    let tls_key = tempfile::NamedTempFile::new()?;
+    let tls_ca = tempfile::NamedTempFile::new()?;
+    let config_path = tempfile::NamedTempFile::new()?;
+    let password_env = format!(
+        "NOVAROCKS_TEST_FDB_TLS_PASSWORD_{}",
+        Uuid::new_v4().simple()
+    );
+    let config_text = format!(
+        r#"
+[state_store]
+provider = "foundationdb"
+cluster_id = "cluster-a"
+cluster_file = "{}"
+keyspace_id = "22db595e-3031-48eb-8212-f56d3626ee41"
+
+[foundationdb_client]
+disable_multi_version_client = true
+tls_cert_path = "{}"
+tls_key_path = "{}"
+tls_ca_path = "{}"
+tls_verify_peers = "Check.Valid=1"
+tls_password_env = "{}"
+"#,
+        cluster_file.path().display(),
+        tls_cert.path().display(),
+        tls_key.path().display(),
+        tls_ca.path().display(),
+        password_env,
+    );
+    std::fs::write(config_path.path(), config_text)?;
+
+    // SAFETY: the unique variable name prevents interference with concurrently running tests.
+    unsafe { std::env::set_var(&password_env, "test-password") };
+    let load_result =
+        novarocks::common::app_config::NovaRocksConfig::load_from_file(config_path.path());
+    // SAFETY: restore the process environment immediately after the load that consumes it.
+    unsafe { std::env::remove_var(&password_env) };
+    let loaded = load_result?;
+
+    let state_store = loaded.state_store.expect("state store config");
+    assert!(matches!(
+        state_store.provider,
+        StateStoreProviderConfig::Foundationdb { cluster_file: loaded, keyspace_id }
+            if loaded == cluster_file.path()
+                && keyspace_id == Uuid::parse_str("22db595e-3031-48eb-8212-f56d3626ee41")?
+    ));
+
+    let client = loaded
+        .foundationdb_client
+        .expect("FoundationDB client config");
+    assert_eq!(client.tls_cert_path.as_deref(), Some(tls_cert.path()));
+    assert_eq!(client.tls_key_path.as_deref(), Some(tls_key.path()));
+    assert_eq!(client.tls_ca_path.as_deref(), Some(tls_ca.path()));
+    assert_eq!(client.tls_verify_peers.as_deref(), Some("Check.Valid=1"));
+    assert_eq!(
+        client.tls_password_env.as_deref(),
+        Some(password_env.as_str())
+    );
+
+    let debug = format!("{client:?}");
+    for secret in [
+        tls_cert.path().to_string_lossy().as_ref(),
+        tls_key.path().to_string_lossy().as_ref(),
+        tls_ca.path().to_string_lossy().as_ref(),
+        "Check.Valid=1",
+        password_env.as_str(),
+    ] {
+        assert!(!debug.contains(secret), "Debug leaked {secret}: {debug}");
+    }
+    Ok(())
+}
+
 #[cfg(not(feature = "foundationdb-provider"))]
 #[tokio::test]
 async fn foundationdb_config_feature_off_open_fails_without_fallback() {
     let cluster_file = tempfile::NamedTempFile::new().expect("cluster file");
+    let config_path = tempfile::NamedTempFile::new().expect("config file");
+    std::fs::write(
+        config_path.path(),
+        format!(
+            r#"
+[state_store]
+provider = "foundationdb"
+cluster_id = "cluster-a"
+cluster_file = "{}"
+keyspace_id = "22db595e-3031-48eb-8212-f56d3626ee41"
+
+[foundationdb_client]
+disable_multi_version_client = true
+"#,
+            cluster_file.path().display()
+        ),
+    )
+    .expect("write config");
+    let loaded = novarocks::common::app_config::NovaRocksConfig::load_from_file(config_path.path())
+        .expect("load FoundationDB config from TOML");
     let error = match open_state_store(
-        StateStoreConfig {
-            cluster_id: "cluster-a".to_owned(),
-            limits: StateStoreLimitOverrides::default(),
-            provider: StateStoreProviderConfig::Foundationdb {
-                cluster_file: cluster_file.path().to_path_buf(),
-                keyspace_id: Uuid::parse_str("22db595e-3031-48eb-8212-f56d3626ee41")
-                    .expect("valid keyspace id"),
-            },
-        },
+        loaded.state_store.expect("state store config"),
         FeDeploymentView {
             active_fe_count: NonZeroUsize::new(3).expect("three FEs"),
             topology_revision: Bytes::from_static(b"topology-r1"),
