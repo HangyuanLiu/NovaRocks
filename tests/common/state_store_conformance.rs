@@ -29,7 +29,7 @@ use novarocks::state_store::{
     StateStoreError, StateStoreErrorKind, StateStoreLimits, StoreIdentity, TransactionId, Value,
     WriteTransaction,
 };
-use tokio::sync::Barrier;
+use tokio::sync::{oneshot, watch};
 use uuid::Uuid;
 
 pub type StoreFuture =
@@ -732,29 +732,70 @@ pub enum ScriptedCommitResult {
 
 #[derive(Clone)]
 pub struct FaultGate {
-    reached: Arc<Barrier>,
-    release: Arc<Barrier>,
+    reached: watch::Sender<bool>,
+    armed: watch::Sender<bool>,
+    cancelled: watch::Sender<bool>,
+    release: watch::Sender<bool>,
 }
 
 impl FaultGate {
     pub fn new() -> Self {
+        let (reached, _) = watch::channel(false);
+        let (armed, _) = watch::channel(false);
+        let (cancelled, _) = watch::channel(false);
+        let (release, _) = watch::channel(false);
         Self {
-            reached: Arc::new(Barrier::new(2)),
-            release: Arc::new(Barrier::new(2)),
+            reached,
+            armed,
+            cancelled,
+            release,
         }
     }
 
     async fn pause(&self) {
-        self.reached.wait().await;
-        self.release.wait().await;
+        self.reached.send_replace(true);
+        let mut release = self.release.subscribe();
+        self.armed.send_replace(true);
+        release
+            .wait_for(|released| *released)
+            .await
+            .expect("fault gate release sender");
     }
 
     pub async fn wait_reached(&self) {
-        self.reached.wait().await;
+        let mut reached = self.reached.subscribe();
+        reached
+            .wait_for(|reached| *reached)
+            .await
+            .expect("fault gate reached sender");
+    }
+
+    pub async fn wait_armed(&self) {
+        let mut armed = self.armed.subscribe();
+        armed
+            .wait_for(|armed| *armed)
+            .await
+            .expect("fault gate armed sender");
+    }
+
+    pub async fn wait_cancelled(&self) {
+        let mut cancelled = self.cancelled.subscribe();
+        cancelled
+            .wait_for(|cancelled| *cancelled)
+            .await
+            .expect("fault gate cancellation sender");
+    }
+
+    fn publish_cancelled(&self) {
+        self.cancelled.send_replace(true);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        *self.cancelled.borrow()
     }
 
     pub async fn release(&self) {
-        self.release.wait().await;
+        self.release.send_replace(true);
     }
 }
 
@@ -892,6 +933,29 @@ fn scripted_failure(result: ScriptedCommitResult) -> CommitOutcome {
     }
 }
 
+struct FaultWaiterCancellation {
+    gate: FaultGate,
+    armed: bool,
+}
+
+impl FaultWaiterCancellation {
+    fn new(gate: FaultGate) -> Self {
+        Self { gate, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for FaultWaiterCancellation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.gate.publish_cancelled();
+        }
+    }
+}
+
 #[async_trait]
 impl WriteTransaction for FaultWriteTransaction {
     fn transaction_id(&self) -> &TransactionId {
@@ -938,21 +1002,34 @@ impl WriteTransaction for FaultWriteTransaction {
         let Some(gate) = post_dispatch else {
             return self.inner.commit().await;
         };
-        let mut commit = self.inner.commit();
-        let mut ready = None;
-        std::future::poll_fn(|context| {
-            match commit.as_mut().poll(context) {
-                Poll::Ready(outcome) => ready = Some(outcome),
-                Poll::Pending => {}
+        let (outcome_tx, outcome_rx) = oneshot::channel();
+        let supervisor_gate = gate.clone();
+        tokio::spawn(async move {
+            let mut commit = self.inner.commit();
+            let mut ready = None;
+            std::future::poll_fn(|context| {
+                match commit.as_mut().poll(context) {
+                    Poll::Ready(outcome) => ready = Some(outcome),
+                    Poll::Pending => {}
+                }
+                Poll::Ready(())
+            })
+            .await;
+            supervisor_gate.pause().await;
+            if supervisor_gate.is_cancelled() {
+                drop(commit);
+                return;
             }
-            Poll::Ready(())
-        })
-        .await;
-        gate.pause().await;
-        match ready {
-            Some(outcome) => outcome,
-            None => commit.await,
-        }
+            let outcome = match ready {
+                Some(outcome) => outcome,
+                None => commit.await,
+            };
+            let _ = outcome_tx.send(outcome);
+        });
+        let mut cancellation = FaultWaiterCancellation::new(gate);
+        let outcome = outcome_rx.await.expect("fault commit supervisor");
+        cancellation.disarm();
+        outcome
     }
 }
 

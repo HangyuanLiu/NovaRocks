@@ -313,6 +313,7 @@ async fn fault_injecting_state_store_scripts_all_contract_boundaries() {
     fault.pause_next_post_dispatch(gate.clone());
     let commit = tokio::spawn(async move { transaction.commit().await });
     gate.wait_reached().await;
+    gate.wait_armed().await;
     assert!(
         !commit.is_finished(),
         "post-dispatch reply must remain gated"

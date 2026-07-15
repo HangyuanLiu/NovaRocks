@@ -197,14 +197,17 @@ mod conformance {
     conformance_test!(limits_before_io);
     conformance_test!(arbitrary_binary_payloads);
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn commit_resolution_after_cancel() {
-        let temp = TempDir::new().expect("cancelled commit temp dir");
-        let path = temp.path().join("state-store.sqlite");
-        let store = open_store(&temp, "fe-a").await;
+    async fn assert_cancelled_commit_roundtrip(
+        store: &Arc<dyn StateStore>,
+        path: &std::path::Path,
+        iteration: u8,
+    ) {
         let fault = FaultInjectingStateStore::new(Arc::clone(&store));
         let transaction_id = transaction_id();
-        let keys = [key(b"cancelled-a".to_vec()), key(b"cancelled-b".to_vec())];
+        let keys = [
+            key(vec![b'c', iteration, b'a']),
+            key(vec![b'c', iteration, b'b']),
+        ];
         let mut transaction = fault
             .begin_write(transaction_id, "cancelled real commit")
             .await
@@ -221,6 +224,7 @@ mod conformance {
         fault.pause_next_post_dispatch(gate.clone());
         let waiter = tokio::spawn(async move { transaction.commit().await });
         gate.wait_reached().await;
+        gate.wait_armed().await;
         waiter.abort();
         assert!(
             waiter
@@ -228,6 +232,7 @@ mod conformance {
                 .expect_err("cancel commit waiter")
                 .is_cancelled()
         );
+        gate.wait_cancelled().await;
         for _ in 0..3 {
             assert_eq!(
                 store
@@ -248,6 +253,16 @@ mod conformance {
         assert_eq!(durable_counts(&path), (0, 0, 0));
         for item in keys {
             assert!(read_state_record(&store, &item).await.is_none());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn commit_resolution_after_cancel() {
+        let temp = TempDir::new().expect("cancelled commit temp dir");
+        let path = temp.path().join("state-store.sqlite");
+        let store = open_store(&temp, "fe-a").await;
+        for iteration in 0..64 {
+            assert_cancelled_commit_roundtrip(&store, &path, iteration).await;
         }
     }
 
@@ -275,6 +290,7 @@ mod conformance {
         fault.pause_next_post_dispatch(gate.clone());
         let waiter = tokio::spawn(async move { transaction.commit().await });
         gate.wait_reached().await;
+        gate.wait_armed().await;
         for _ in 0..3 {
             assert_eq!(
                 store
@@ -349,6 +365,46 @@ mod conformance {
         }
         assert_eq!(durable_counts(&path), (0, 0, 0));
         assert!(read_state_record(&store, &item).await.is_none());
+
+        let abort_temp = TempDir::new().expect("expired abort temp dir");
+        let abort_path = abort_temp.path().join("state-store.sqlite");
+        let abort_store = open_store_with_limits(
+            &abort_temp,
+            "fe-a",
+            StateStoreLimitOverrides {
+                transaction_deadline_ms: Some(20),
+                ..StateStoreLimitOverrides::default()
+            },
+        )
+        .await;
+        let abort_id = transaction_id();
+        let abort_key = key(b"expired-explicit-abort".to_vec());
+        let mut expired = abort_store
+            .begin_write(abort_id, "expired explicit abort")
+            .await
+            .expect("begin expired explicit abort");
+        expired
+            .put(
+                abort_key.clone(),
+                value(b"must-not-commit"),
+                Precondition::Any,
+            )
+            .await
+            .expect("stage expired explicit abort row");
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        let abort_error = tokio::time::timeout(std::time::Duration::from_secs(2), expired.abort())
+            .await
+            .expect("expired explicit abort must remain bounded")
+            .expect_err("expired explicit abort must report its deadline");
+        assert_eq!(abort_error.kind(), StateStoreErrorKind::DeadlineExceeded);
+        assert_eq!(durable_counts(&abort_path), (0, 0, 0));
+        assert_eq!(
+            abort_store
+                .resolve_commit(&abort_id)
+                .await
+                .expect("resolve expired explicit abort"),
+            CommitResolution::NotCommitted
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
