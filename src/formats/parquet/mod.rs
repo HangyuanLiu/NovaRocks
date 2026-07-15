@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 mod cache;
+pub(crate) mod local_io;
 mod page_selection;
 mod reader;
 mod row_group_selector;

@@ -30,7 +30,7 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
 use super::catalog::{ColumnDef, normalize_identifier};
-use super::parquet::normalize_map_entries_nullability;
+use crate::formats::parquet::local_io::normalize_map_entries_nullability;
 use crate::sql::literal::{
     latin1_string_to_bytes, literal_to_i128_for_integer, parse_date_string_to_days,
     parse_datetime_string_to_micros, parse_datetime_string_to_nanos,

@@ -76,7 +76,6 @@ pub(crate) mod mv_maintenance;
 pub(crate) mod mv_rewrite_prep;
 pub(crate) mod mv_scheduler;
 pub(crate) mod name_resolve;
-pub(crate) mod parquet;
 pub(crate) mod query_options;
 pub(crate) mod query_prep;
 mod query_stats;
@@ -6156,8 +6155,9 @@ mysql_port = 47892
             true,
         )]));
 
-        let casted = super::parquet::cast_batch_to_schema(&source_batch, &target_schema)
-            .expect("cast batch");
+        let casted =
+            crate::formats::parquet::local_io::cast_batch_to_schema(&source_batch, &target_schema)
+                .expect("cast batch");
         let casted_schema = casted.schema();
         let DataType::Map(entries_field, _) = casted_schema.field(0).data_type() else {
             panic!("expected MAP column");
@@ -6206,9 +6206,11 @@ mysql_port = 47892
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("map_round_trip.parquet");
 
-        super::parquet::write_parquet_to_path(&path, &batch).expect("write local parquet");
+        crate::formats::parquet::local_io::write_parquet_to_path(&path, &batch)
+            .expect("write local parquet");
         let round_tripped =
-            super::parquet::read_local_parquet_data(&path, &columns).expect("read local parquet");
+            crate::formats::parquet::local_io::read_local_parquet_data(&path, &batch.schema())
+                .expect("read local parquet");
         let map = round_tripped
             .column(0)
             .as_any()

@@ -241,7 +241,9 @@ fn align_query_result_to_target(
             .map(|c| {
                 Field::new(
                     &c.name,
-                    crate::engine::parquet::normalize_map_entries_nullability(&c.data_type),
+                    crate::formats::parquet::local_io::normalize_map_entries_nullability(
+                        &c.data_type,
+                    ),
                     c.nullable,
                 )
             })
@@ -262,8 +264,9 @@ fn align_query_result_to_target(
         let chunk_rows = batch.num_rows();
         for (target_idx, source_idx) in mapping.iter().enumerate() {
             let target_column = &target_columns[target_idx];
-            let target_type =
-                crate::engine::parquet::normalize_map_entries_nullability(&target_column.data_type);
+            let target_type = crate::formats::parquet::local_io::normalize_map_entries_nullability(
+                &target_column.data_type,
+            );
             let array: ArrayRef = match source_idx {
                 Some(idx) => {
                     let src = batch.column(*idx);
@@ -282,8 +285,9 @@ fn align_query_result_to_target(
     let mut final_columns: Vec<ArrayRef> = Vec::with_capacity(column_count);
     for (target_idx, arrays) in per_target_columns.into_iter().enumerate() {
         let target_column = &target_columns[target_idx];
-        let target_type =
-            crate::engine::parquet::normalize_map_entries_nullability(&target_column.data_type);
+        let target_type = crate::formats::parquet::local_io::normalize_map_entries_nullability(
+            &target_column.data_type,
+        );
         let merged: ArrayRef = if arrays.is_empty() {
             new_null_array(&target_type, 0)
         } else if arrays.len() == 1 {

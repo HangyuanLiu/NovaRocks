@@ -453,11 +453,6 @@ const ENGINE_FILE_OWNERS: &[EngineFileOwner] = &[
         migration_task: "EBD-4",
     },
     EngineFileOwner {
-        path: "src/engine/parquet.rs",
-        target_owner: "formats",
-        migration_task: "EBD-3A",
-    },
-    EngineFileOwner {
         path: "src/engine/query_options.rs",
         target_owner: "split:frontend,runtime",
         migration_task: "EBD-3B",
@@ -550,7 +545,6 @@ const ENGINE_MODULE_DECLARATIONS: &[&str] = &[
     "src/engine/mod.rs||external|path=default|mv_rewrite_prep",
     "src/engine/mod.rs||external|path=default|mv_scheduler",
     "src/engine/mod.rs||external|path=default|name_resolve",
-    "src/engine/mod.rs||external|path=default|parquet",
     "src/engine/mod.rs||external|path=default|query_options",
     "src/engine/mod.rs||external|path=default|query_prep",
     "src/engine/mod.rs||external|path=default|query_stats",
@@ -885,7 +879,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "crate::engine::dictionary::maintenance::mark_starrocks_table_stale",
             "crate::engine::execute_query",
             "crate::engine::mv::agg_state::mv_agg_state",
-            "crate::engine::parquet::normalize_map_entries_nullability",
             "crate::engine::record_batch_to_chunk",
             "crate::engine::reorder_insert_rows",
         ],
