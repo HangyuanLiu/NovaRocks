@@ -245,15 +245,16 @@ mod conformance {
         }
         assert_eq!(durable_counts(&path), (0, 0, 0));
 
-        blocker
-            .execute_batch("ROLLBACK")
-            .expect("release cancelled commit writer lock");
         gate.release().await;
+        gate.wait_inner_dropped().await;
         wait_for_resolution(&store, &transaction_id, CommitResolution::NotCommitted).await;
         assert_eq!(durable_counts(&path), (0, 0, 0));
         for item in keys {
             assert!(read_state_record(&store, &item).await.is_none());
         }
+        blocker
+            .execute_batch("ROLLBACK")
+            .expect("release cancelled commit writer lock");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

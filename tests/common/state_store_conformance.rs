@@ -735,6 +735,7 @@ pub struct FaultGate {
     reached: watch::Sender<bool>,
     armed: watch::Sender<bool>,
     cancelled: watch::Sender<bool>,
+    inner_dropped: watch::Sender<bool>,
     release: watch::Sender<bool>,
 }
 
@@ -743,11 +744,13 @@ impl FaultGate {
         let (reached, _) = watch::channel(false);
         let (armed, _) = watch::channel(false);
         let (cancelled, _) = watch::channel(false);
+        let (inner_dropped, _) = watch::channel(false);
         let (release, _) = watch::channel(false);
         Self {
             reached,
             armed,
             cancelled,
+            inner_dropped,
             release,
         }
     }
@@ -792,6 +795,18 @@ impl FaultGate {
 
     fn is_cancelled(&self) -> bool {
         *self.cancelled.borrow()
+    }
+
+    fn publish_inner_dropped(&self) {
+        self.inner_dropped.send_replace(true);
+    }
+
+    pub async fn wait_inner_dropped(&self) {
+        let mut inner_dropped = self.inner_dropped.subscribe();
+        inner_dropped
+            .wait_for(|inner_dropped| *inner_dropped)
+            .await
+            .expect("fault gate inner-drop sender");
     }
 
     pub async fn release(&self) {
@@ -1018,6 +1033,7 @@ impl WriteTransaction for FaultWriteTransaction {
             supervisor_gate.pause().await;
             if supervisor_gate.is_cancelled() {
                 drop(commit);
+                supervisor_gate.publish_inner_dropped();
                 return;
             }
             let outcome = match ready {
