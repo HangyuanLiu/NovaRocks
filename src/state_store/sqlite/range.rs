@@ -18,9 +18,11 @@
 use std::collections::VecDeque;
 use std::ops::Bound::{Excluded, Included};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use bytes::Bytes;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 
 use crate::state_store::{
     ChangeCursor, ChangeHint, ChangePage, ChangePollRequest, Direction, Key, RangePage,
@@ -29,9 +31,10 @@ use crate::state_store::{
 };
 
 use super::open_connection;
+use super::schema::load_change_retention_floor;
 use super::txn::{
-    Mutation, SqliteTxnState, load_current_revision, operation_error, revision_token,
-    revision_version,
+    Mutation, SqliteTxnState, load_current_revision, operation_error, range_refill_completed,
+    range_refill_started, revision_token, revision_version,
 };
 
 struct BaseWindow {
@@ -68,9 +71,14 @@ pub(super) fn range_page(
     let mut visible = Vec::with_capacity(wanted);
 
     while visible.len() < wanted {
+        ensure_range_active(state)?;
         if base.records.is_empty() && !base.exhausted {
+            ensure_range_active(state)?;
+            range_refill_started(state);
             refill_base_window(&state.connection, request, &mut base)?;
             state.snapshot_established = true;
+            range_refill_completed(state);
+            ensure_range_active(state)?;
         }
 
         let base_record = base.records.front().cloned();
@@ -301,14 +309,10 @@ fn poll_changes_blocking(
             operation_error(&error, "failed to begin SQLite change polling snapshot")
         })?;
     let high_watermark = load_current_revision(&connection)?;
+    let retention_floor = load_change_retention_floor(&connection, high_watermark)?;
     let start = decoded_after.unwrap_or((0, u32::MAX));
 
-    if let Some((next_revision, next_sequence)) =
-        earliest_change_after(&connection, start, high_watermark)?
-        && next_revision == start.0
-        && next_sequence > start.1.saturating_add(1)
-    {
-        let floor_sequence = next_sequence - 1;
+    if start < retention_floor {
         connection.execute_batch("ROLLBACK").map_err(|error| {
             operation_error(&error, "failed to finish SQLite change polling snapshot")
         })?;
@@ -316,8 +320,8 @@ fn poll_changes_blocking(
             hints: Vec::new(),
             next_cursor: ChangeCursor::new(
                 identity.store_id,
-                revision_token(next_revision),
-                floor_sequence,
+                revision_token(retention_floor.0),
+                retention_floor.1,
             )?,
             high_watermark: revision_token(high_watermark),
             resync_required: true,
@@ -399,34 +403,14 @@ fn poll_changes_blocking(
     })
 }
 
-fn earliest_change_after(
-    connection: &Connection,
-    after: (u64, u32),
-    high_watermark: u64,
-) -> Result<Option<(u64, u32)>, StateStoreError> {
-    let revision = i64::try_from(after.0).map_err(|_| invalid_change_request())?;
-    let sequence = i64::from(after.1);
-    let high_watermark = i64::try_from(high_watermark).map_err(|_| malformed_revision())?;
-    let row = connection
-        .query_row(
-            "SELECT revision, sequence FROM state_store_changes \
-             WHERE revision <= ?1 \
-               AND ((revision > ?2) OR (revision = ?2 AND sequence > ?3)) \
-             ORDER BY revision ASC, sequence ASC LIMIT 1",
-            params![high_watermark, revision, sequence],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-        )
-        .optional()
-        .map_err(|error| {
-            operation_error(&error, "failed to inspect SQLite change retention floor")
-        })?;
-    row.map(|(revision, sequence)| {
-        Ok((
-            u64::try_from(revision).map_err(|_| malformed_revision())?,
-            u32::try_from(sequence).map_err(|_| malformed_sequence())?,
-        ))
-    })
-    .transpose()
+fn ensure_range_active(state: &SqliteTxnState) -> Result<(), StateStoreError> {
+    if state.cancelled.load(Ordering::Acquire) || Instant::now() >= state.deadline {
+        return Err(StateStoreError::new(
+            StateStoreErrorKind::DeadlineExceeded,
+            "SQLite transaction deadline exceeded",
+        ));
+    }
+    Ok(())
 }
 
 fn decode_revision(revision: &StoreRevision) -> Result<u64, StateStoreError> {

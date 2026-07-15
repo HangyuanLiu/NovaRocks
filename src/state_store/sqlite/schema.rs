@@ -30,9 +30,11 @@ pub(super) const INITIAL_INCARNATION_KEY: &[u8] = b"initial_incarnation";
 pub(super) const DEPLOYMENT_OWNER_KEY: &[u8] = b"deployment_owner";
 pub(super) const DATABASE_PATH_KEY: &[u8] = b"database_path";
 pub(super) const CURRENT_REVISION_KEY: &[u8] = b"current_revision";
+pub(super) const CHANGE_RETENTION_FLOOR_KEY: &[u8] = b"change_retention_floor";
 
 const INITIAL_INCARNATION: u64 = 1;
 const INITIAL_REVISION: u64 = 0;
+const INITIAL_CHANGE_RETENTION_FLOOR: [u8; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff];
 
 pub(super) fn initialize(
     connection: &mut Connection,
@@ -145,6 +147,11 @@ fn initialize_identity(
         CURRENT_REVISION_KEY,
         &INITIAL_REVISION.to_be_bytes(),
     )?;
+    insert_meta(
+        transaction,
+        CHANGE_RETENTION_FLOOR_KEY,
+        &INITIAL_CHANGE_RETENTION_FLOOR,
+    )?;
 
     Ok(StoreIdentity {
         store_id,
@@ -199,10 +206,13 @@ fn load_identity(
             "SQLite initial incarnation has an unsupported value",
         ));
     }
-    decode_u64(
+    let current_revision = decode_u64(
         &load_required(transaction, CURRENT_REVISION_KEY)?,
         "SQLite current revision is malformed",
     )?;
+    let retention_floor =
+        decode_change_retention_floor(&load_required(transaction, CHANGE_RETENTION_FLOOR_KEY)?)?;
+    validate_change_retention_floor(retention_floor, current_revision)?;
 
     let cluster_id = String::from_utf8(stored_cluster_id)
         .map_err(|_| schema_error("SQLite cluster id is not UTF-8"))?;
@@ -211,6 +221,56 @@ fn load_identity(
         cluster_id,
         initial_incarnation,
     })
+}
+
+pub(super) fn load_change_retention_floor(
+    connection: &Connection,
+    current_revision: u64,
+) -> Result<(u64, u32), StateStoreError> {
+    let value = connection
+        .query_row(
+            "SELECT value FROM state_store_meta WHERE key = ?1",
+            params![CHANGE_RETENTION_FLOOR_KEY],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(|error| {
+            sqlite_error(
+                &error,
+                StateStoreErrorKind::Corruption,
+                "failed to read SQLite change retention floor",
+            )
+        })?
+        .ok_or_else(|| schema_error("SQLite change retention floor is missing"))?;
+    let retention_floor = decode_change_retention_floor(&value)?;
+    validate_change_retention_floor(retention_floor, current_revision)?;
+    Ok(retention_floor)
+}
+
+fn decode_change_retention_floor(value: &[u8]) -> Result<(u64, u32), StateStoreError> {
+    let bytes: [u8; 12] = value
+        .try_into()
+        .map_err(|_| schema_error("SQLite change retention floor is malformed"))?;
+    let revision = u64::from_be_bytes(bytes[..8].try_into().expect("fixed revision bytes"));
+    if i64::try_from(revision).is_err() {
+        return Err(schema_error(
+            "SQLite change retention floor revision is out of range",
+        ));
+    }
+    let sequence = u32::from_be_bytes(bytes[8..].try_into().expect("fixed sequence bytes"));
+    Ok((revision, sequence))
+}
+
+fn validate_change_retention_floor(
+    retention_floor: (u64, u32),
+    current_revision: u64,
+) -> Result<(), StateStoreError> {
+    if retention_floor.0 > current_revision {
+        return Err(schema_error(
+            "SQLite change retention floor is ahead of current revision",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_schema_version(value: &[u8]) -> Result<(), StateStoreError> {

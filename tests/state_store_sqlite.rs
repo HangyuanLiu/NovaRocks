@@ -720,24 +720,14 @@ async fn sqlite_pagination_change_cursor_reports_a_retention_gap_before_resuming
     let temp = TempDir::new().expect("temp dir");
     let store = open_store(&temp, "fe-a").await;
     let identity = store.identity().await.expect("store identity");
-    let mut writer = store
-        .begin_write(transaction_id(), "retention gap fixture")
-        .await
-        .expect("begin fixture write");
-    for number in 0_u32..12 {
-        writer
-            .put(
-                key(number.to_be_bytes().to_vec()),
-                value(b"v"),
-                Precondition::Any,
-            )
-            .await
-            .expect("stage fixture write");
-    }
-    let revision = match writer.commit().await {
-        CommitOutcome::Committed(receipt) => receipt.revision,
-        other => panic!("expected fixture commit, got {other:?}"),
-    };
+    let revision_one = commit_puts(
+        &store,
+        &(0_u8..5)
+            .map(|number| (key(vec![b'a', number]), value(b"v1")))
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .revision;
 
     let first = store
         .poll_changes(&ChangePollRequest {
@@ -751,26 +741,54 @@ async fn sqlite_pagination_change_cursor_reports_a_retention_gap_before_resuming
         .decode(identity.store_id)
         .expect("decode first cursor");
     assert_eq!(first_sequence, 4);
+    assert_eq!(first.high_watermark, revision_one);
 
-    let connection = rusqlite::Connection::open(temp.path().join("state-store.sqlite"))
+    let revision_two = commit_puts(
+        &store,
+        &(0_u8..3)
+            .map(|number| (key(vec![b'b', number]), value(b"v2")))
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .revision;
+
+    let mut connection = rusqlite::Connection::open(temp.path().join("state-store.sqlite"))
         .expect("open fixture database");
     let revision_i64 = i64::try_from(u64::from_be_bytes(
-        revision
+        revision_two
             .as_bytes()
             .try_into()
             .expect("SQLite revision encoding"),
     ))
     .expect("SQLite revision range");
+    let mut floor = Vec::with_capacity(12);
+    floor.extend_from_slice(
+        &u64::try_from(revision_i64)
+            .expect("positive revision")
+            .to_be_bytes(),
+    );
+    floor.extend_from_slice(&1_u32.to_be_bytes());
+    let transaction = connection.transaction().expect("begin retention fixture");
     assert_eq!(
-        connection
+        transaction
             .execute(
                 "DELETE FROM state_store_changes \
-                 WHERE revision = ?1 AND sequence >= ?2 AND sequence <= ?3",
-                params![revision_i64, 5_i64, 6_i64],
+                 WHERE revision = ?1 AND sequence <= ?2",
+                params![revision_i64, 1_i64],
             )
             .expect("delete retained fixture rows"),
         2
     );
+    assert_eq!(
+        transaction
+            .execute(
+                "UPDATE state_store_meta SET value = ?1 WHERE key = ?2",
+                params![floor, b"change_retention_floor".as_slice()],
+            )
+            .expect("advance retention floor"),
+        1
+    );
+    transaction.commit().expect("commit retention fixture");
     drop(connection);
 
     let gap = store
@@ -786,17 +804,75 @@ async fn sqlite_pagination_change_cursor_reports_a_retention_gap_before_resuming
         .next_cursor
         .decode(identity.store_id)
         .expect("decode gap floor");
-    assert_eq!(gap_revision, revision);
-    assert_eq!(gap_sequence, 6);
+    assert_eq!(gap_revision, revision_two);
+    assert_eq!(gap_sequence, 1);
+    assert_eq!(gap.high_watermark, revision_two);
 
     let resumed = store
         .poll_changes(&ChangePollRequest {
-            after: Some(gap.next_cursor),
+            after: Some(gap.next_cursor.clone()),
             page_size: 5,
         })
         .await
         .expect("resume after retention floor");
     assert!(!resumed.resync_required);
-    assert_eq!(resumed.hints.len(), 5);
-    assert_eq!(resumed.hints[0].key.as_bytes(), 7_u32.to_be_bytes());
+    assert_eq!(resumed.hints.len(), 1);
+    assert_eq!(resumed.hints[0].key.as_bytes(), &[b'b', 2]);
+
+    let mut connection = rusqlite::Connection::open(temp.path().join("state-store.sqlite"))
+        .expect("reopen fixture database");
+    let mut floor = Vec::with_capacity(12);
+    floor.extend_from_slice(
+        &u64::try_from(revision_i64)
+            .expect("positive revision")
+            .to_be_bytes(),
+    );
+    floor.extend_from_slice(&2_u32.to_be_bytes());
+    let transaction = connection.transaction().expect("begin tail fixture");
+    assert_eq!(
+        transaction
+            .execute(
+                "DELETE FROM state_store_changes WHERE revision = ?1 AND sequence = ?2",
+                params![revision_i64, 2_i64],
+            )
+            .expect("delete retained tail row"),
+        1
+    );
+    assert_eq!(
+        transaction
+            .execute(
+                "UPDATE state_store_meta SET value = ?1 WHERE key = ?2",
+                params![floor, b"change_retention_floor".as_slice()],
+            )
+            .expect("advance tail retention floor"),
+        1
+    );
+    transaction.commit().expect("commit tail retention fixture");
+    drop(connection);
+
+    let tail_gap = store
+        .poll_changes(&ChangePollRequest {
+            after: Some(gap.next_cursor),
+            page_size: 5,
+        })
+        .await
+        .expect("detect retained tail gap without survivors");
+    assert!(tail_gap.resync_required);
+    assert!(tail_gap.hints.is_empty());
+    let (tail_revision, tail_sequence) = tail_gap
+        .next_cursor
+        .decode(identity.store_id)
+        .expect("decode tail floor");
+    assert_eq!((tail_revision, tail_sequence), (revision_two, 2));
+
+    let empty_tail = store
+        .poll_changes(&ChangePollRequest {
+            after: Some(tail_gap.next_cursor.clone()),
+            page_size: 5,
+        })
+        .await
+        .expect("resume from empty retained tail");
+    assert!(!empty_tail.resync_required);
+    assert!(empty_tail.hints.is_empty());
+    assert_eq!(empty_tail.next_cursor, tail_gap.next_cursor);
 }

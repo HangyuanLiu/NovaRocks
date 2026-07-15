@@ -553,9 +553,20 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("database path identity row");
+        let retention_floor: Vec<u8> = connection
+            .query_row(
+                "SELECT value FROM state_store_meta WHERE key = ?1",
+                params![b"change_retention_floor".as_slice()],
+                |row| row.get(0),
+            )
+            .expect("change retention floor row");
         assert_eq!(cluster, b"cluster-a");
         assert_eq!(owner, b"fe-a");
         assert_eq!(database_path, database_path_bytes(&store.path).unwrap());
+        assert_eq!(
+            retention_floor,
+            [0_u8, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff]
+        );
     }
 
     #[test]
@@ -814,6 +825,51 @@ mod tests {
 
         let error = open_error(&runtime, config(&path, "cluster-a", "fe-a"), deployment(1));
         assert_eq!(error.kind(), StateStoreErrorKind::Corruption);
+    }
+
+    #[test]
+    fn sqlite_open_rejects_malformed_change_retention_floor() {
+        let malformed_values = [
+            b"short".to_vec(),
+            {
+                let mut value = (i64::MAX as u64 + 1).to_be_bytes().to_vec();
+                value.extend_from_slice(&0_u32.to_be_bytes());
+                value
+            },
+            {
+                let mut value = 1_u64.to_be_bytes().to_vec();
+                value.extend_from_slice(&0_u32.to_be_bytes());
+                value
+            },
+        ];
+
+        for malformed in malformed_values {
+            let temp = TempDir::new().expect("temp dir");
+            let path = temp.path().join("state-store.sqlite");
+            let runtime = runtime();
+            let first = runtime
+                .block_on(SqliteStateStore::open(
+                    config(&path, "cluster-a", "fe-a"),
+                    deployment(1),
+                ))
+                .expect("initialize SQLite store");
+            drop(first);
+
+            let connection = Connection::open(&path).expect("open seeded store");
+            assert_eq!(
+                connection
+                    .execute(
+                        "UPDATE state_store_meta SET value = ?1 WHERE key = ?2",
+                        params![malformed, b"change_retention_floor".as_slice()],
+                    )
+                    .expect("corrupt retention floor"),
+                1
+            );
+            drop(connection);
+
+            let error = open_error(&runtime, config(&path, "cluster-a", "fe-a"), deployment(1));
+            assert_eq!(error.kind(), StateStoreErrorKind::Corruption);
+        }
     }
 
     #[test]

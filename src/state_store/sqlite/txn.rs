@@ -17,6 +17,8 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -111,6 +113,8 @@ pub(super) type TestHooks = Arc<TestHookState>;
 pub(super) struct TestHookState {
     resolve_after_lookup: Mutex<Option<TestGate>>,
     commit_after_inflight: Mutex<Option<TestGate>>,
+    range_after_refill: Mutex<Option<TestGate>>,
+    range_refill_count: AtomicUsize,
 }
 
 #[cfg(test)]
@@ -172,6 +176,21 @@ impl TestHookState {
             gate.pause();
         }
     }
+
+    fn range_refill_started(&self) {
+        self.range_refill_count.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn pause_range_after_refill(&self) {
+        if let Some(gate) = self
+            .range_after_refill
+            .lock()
+            .expect("range test hook")
+            .take()
+        {
+            gate.pause();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -203,6 +222,8 @@ pub(super) struct SqliteTxnState {
     pub(super) range_frozen: bool,
     pub(super) interrupt_handle: Arc<InterruptHandle>,
     pub(super) snapshot_established: bool,
+    #[cfg(test)]
+    test_hooks: TestHooks,
     active: bool,
 }
 
@@ -230,7 +251,13 @@ pub(super) struct SqliteWriteTransaction {
 
 impl SqliteStateStore {
     pub(super) async fn begin_read(&self) -> Result<SqliteReadTransaction, StateStoreError> {
-        let owner = begin_transaction(self.path.clone(), self.limits.clone()).await?;
+        let owner = begin_transaction(
+            self.path.clone(),
+            self.limits.clone(),
+            #[cfg(test)]
+            Arc::clone(&self.test_hooks),
+        )
+        .await?;
         Ok(SqliteReadTransaction { owner: Some(owner) })
     }
 
@@ -238,7 +265,13 @@ impl SqliteStateStore {
         &self,
         transaction_id: TransactionId,
     ) -> Result<SqliteWriteTransaction, StateStoreError> {
-        let owner = begin_transaction(self.path.clone(), self.limits.clone()).await?;
+        let owner = begin_transaction(
+            self.path.clone(),
+            self.limits.clone(),
+            #[cfg(test)]
+            Arc::clone(&self.test_hooks),
+        )
+        .await?;
         Ok(SqliteWriteTransaction {
             owner: Some(owner),
             transaction_id,
@@ -479,6 +512,7 @@ impl Drop for SqliteWriteTransaction {
 async fn begin_transaction(
     path: PathBuf,
     limits: StateStoreLimits,
+    #[cfg(test)] test_hooks: TestHooks,
 ) -> Result<TxnOwner, StateStoreError> {
     let deadline = Instant::now() + limits.transaction_deadline;
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -521,6 +555,8 @@ async fn begin_transaction(
             range_frozen: false,
             interrupt_handle,
             snapshot_established: false,
+            #[cfg(test)]
+            test_hooks,
             active: true,
         })
     });
@@ -551,6 +587,20 @@ async fn begin_transaction(
         cancelled,
         interrupt_handle,
     })
+}
+
+pub(super) fn range_refill_started(state: &SqliteTxnState) {
+    #[cfg(test)]
+    state.test_hooks.range_refill_started();
+    #[cfg(not(test))]
+    let _ = state;
+}
+
+pub(super) fn range_refill_completed(state: &SqliteTxnState) {
+    #[cfg(test)]
+    state.test_hooks.pause_range_after_refill();
+    #[cfg(not(test))]
+    let _ = state;
 }
 
 struct BeginCancelOnDrop {
@@ -1440,9 +1490,9 @@ mod tests {
     use super::*;
     use crate::state_store::sqlite::SqliteStateStore;
     use crate::state_store::{
-        CommitOutcome, CommitReceipt, CommitResolution, FeDeploymentView, Key, Precondition,
-        StateRecord, StateStoreConfig, StateStoreErrorKind, StateStoreLimitOverrides,
-        StateStoreProviderConfig, TransactionId, Value, VersionToken,
+        CommitOutcome, CommitReceipt, CommitResolution, Direction, FeDeploymentView, Key, KeyRange,
+        Precondition, RangeRequest, StateRecord, StateStoreConfig, StateStoreErrorKind,
+        StateStoreLimitOverrides, StateStoreProviderConfig, TransactionId, Value, VersionToken,
     };
 
     fn key(value: &'static [u8]) -> Key {
@@ -2345,6 +2395,107 @@ mod tests {
             assert!(!state.snapshot_established);
         }
         writer.abort().await.expect("abort write");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sqlite_transaction_cancelled_range_stops_before_another_refill() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = store(&temp).await;
+        let rows = (0_u8..32)
+            .map(|number| {
+                (
+                    Key::try_from(Bytes::from(vec![number])).expect("valid key"),
+                    value(b"base"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut seed = store
+            .begin_write(transaction_id())
+            .await
+            .expect("begin seed write");
+        for (key, value) in &rows {
+            seed.put(key.clone(), value.clone(), Precondition::Any)
+                .await
+                .expect("stage seed row");
+        }
+        committed(seed.commit().await);
+        let durable_before = durable_counts(&store).await;
+
+        let gate = TestGate::new();
+        *store
+            .test_hooks
+            .range_after_refill
+            .lock()
+            .expect("install range gate") = Some(gate.clone());
+        store
+            .test_hooks
+            .range_refill_count
+            .store(0, Ordering::Release);
+
+        let mut writer = store
+            .begin_write(transaction_id())
+            .await
+            .expect("begin overlay write");
+        for (key, _) in &rows {
+            writer
+                .delete(key.clone(), Precondition::Any)
+                .await
+                .expect("stage overlay delete");
+        }
+        let owner = writer.owner().expect("writer owner").clone();
+        let task = tokio::spawn(async move {
+            let result = writer
+                .range(&RangeRequest {
+                    range: KeyRange::new(
+                        Key::try_from(Bytes::from(vec![0_u8])).expect("range start"),
+                        Key::try_from(Bytes::from(vec![0xff])).expect("range end"),
+                    )
+                    .expect("bounded range"),
+                    direction: Direction::Forward,
+                    page_size: 1,
+                    continuation: None,
+                })
+                .await;
+            (writer, result)
+        });
+
+        gate.wait_reached().await;
+        assert_eq!(
+            store.test_hooks.range_refill_count.load(Ordering::Acquire),
+            1
+        );
+        owner.cancelled.store(true, Ordering::Release);
+        owner.interrupt_handle.interrupt();
+        gate.release().await;
+
+        let (writer, result) = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("cancelled range worker must terminate")
+            .expect("range task must join");
+        assert_eq!(
+            result.expect_err("cancelled range must fail").kind(),
+            StateStoreErrorKind::DeadlineExceeded
+        );
+        assert_eq!(
+            store.test_hooks.range_refill_count.load(Ordering::Acquire),
+            1,
+            "cancelled range must not issue another bounded refill"
+        );
+        assert!(
+            !owner.state.lock().expect("transaction state").active,
+            "cancelled range must roll back before returning"
+        );
+        drop(writer);
+        assert_eq!(durable_counts(&store).await, durable_before);
+        for (key, expected) in rows {
+            assert_eq!(
+                read_value(&store, &key)
+                    .await
+                    .expect("seed row must remain durable")
+                    .value,
+                expected
+            );
+        }
     }
 
     #[test]
