@@ -15,21 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![allow(dead_code)] // Adapter-private until Task 6 wires the public StateStore traits.
-
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use rusqlite::{Connection, InterruptHandle, OptionalExtension, ffi, params};
 
 use crate::state_store::{
-    CommitOutcome, CommitReceipt, CommitResolution, Key, Precondition, StateRecord,
-    StateStoreError, StateStoreErrorKind, StateStoreLimits, StoreRevision, TransactionId, Value,
-    VersionToken,
+    CommitOutcome, CommitReceipt, CommitResolution, Key, Precondition, RangePage, RangeRequest,
+    ReadTransaction, StateRecord, StateStoreError, StateStoreErrorKind, StateStoreLimits,
+    StoreRevision, TransactionId, Value, VersionToken, WriteTransaction,
 };
 
 use super::{SqliteStateStore, open_connection, schema};
@@ -193,7 +192,7 @@ pub(super) enum Mutation {
 }
 
 pub(super) struct SqliteTxnState {
-    connection: Connection,
+    pub(super) connection: Connection,
     pub(super) overlay: BTreeMap<Key, Mutation>,
     mutations: Vec<(Key, Mutation)>,
     operation_count: usize,
@@ -203,7 +202,7 @@ pub(super) struct SqliteTxnState {
     pub(super) cancelled: Arc<AtomicBool>,
     pub(super) range_frozen: bool,
     pub(super) interrupt_handle: Arc<InterruptHandle>,
-    snapshot_established: bool,
+    pub(super) snapshot_established: bool,
     active: bool,
 }
 
@@ -288,6 +287,19 @@ impl SqliteReadTransaction {
         get(self.owner()?, key.clone()).await
     }
 
+    pub(super) async fn range(
+        &mut self,
+        request: &RangeRequest,
+    ) -> Result<RangePage, StateStoreError> {
+        validate_range_request(request, &self.owner()?.limits)?;
+        let owner = self.owner()?.clone();
+        let request = request.clone();
+        run_operation(&owner, move |state| {
+            super::range::range_page(state, &request)
+        })
+        .await
+    }
+
     pub(super) async fn abort(mut self) -> Result<(), StateStoreError> {
         let owner = self.take_owner()?;
         run_operation(&owner, |state| rollback(state)).await
@@ -314,6 +326,23 @@ impl SqliteWriteTransaction {
     pub(super) async fn get(&mut self, key: &Key) -> Result<Option<StateRecord>, StateStoreError> {
         validate_key_value(key, None, &self.owner()?.limits)?;
         get(self.owner()?, key.clone()).await
+    }
+
+    pub(super) async fn range(
+        &mut self,
+        request: &RangeRequest,
+    ) -> Result<RangePage, StateStoreError> {
+        validate_range_request(request, &self.owner()?.limits)?;
+        let owner = self.owner()?.clone();
+        let request = request.clone();
+        run_operation(&owner, move |state| {
+            let page = super::range::range_page(state, &request)?;
+            if page.continuation.is_some() {
+                state.range_frozen = true;
+            }
+            Ok(page)
+        })
+        .await
     }
 
     pub(super) async fn put(
@@ -701,6 +730,20 @@ fn validate_key_value(
     Ok(())
 }
 
+fn validate_range_request(
+    request: &RangeRequest,
+    limits: &StateStoreLimits,
+) -> Result<(), StateStoreError> {
+    request.validate(limits)?;
+    validate_key_value(&request.range.start, None, limits)?;
+    validate_key_value(&request.range.end, None, limits)?;
+    if let Some(continuation) = &request.continuation {
+        let last_key = continuation.resume_after(request)?;
+        validate_key_value(&last_key, None, limits)?;
+    }
+    Ok(())
+}
+
 fn stage_mutation(
     state: &mut SqliteTxnState,
     key: Key,
@@ -1039,7 +1082,7 @@ fn load_version(connection: &Connection, key: &Key) -> Result<Option<u64>, State
         .transpose()
 }
 
-fn load_current_revision(connection: &Connection) -> Result<u64, StateStoreError> {
+pub(super) fn load_current_revision(connection: &Connection) -> Result<u64, StateStoreError> {
     let value = connection
         .query_row(
             "SELECT value FROM state_store_meta WHERE key = ?1",
@@ -1244,7 +1287,7 @@ fn is_base_busy(error: &rusqlite::Error) -> bool {
     )
 }
 
-fn operation_error(error: &rusqlite::Error, message: &'static str) -> StateStoreError {
+pub(super) fn operation_error(error: &rusqlite::Error, message: &'static str) -> StateStoreError {
     let kind = match error.sqlite_error_code() {
         Some(ffi::ErrorCode::OperationInterrupted) => StateStoreErrorKind::Cancelled,
         Some(ffi::ErrorCode::DatabaseBusy | ffi::ErrorCode::DatabaseLocked) => {
@@ -1265,12 +1308,12 @@ fn operation_error(error: &rusqlite::Error, message: &'static str) -> StateStore
     StateStoreError::new(kind, message)
 }
 
-fn revision_token(revision: u64) -> StoreRevision {
+pub(super) fn revision_token(revision: u64) -> StoreRevision {
     StoreRevision::try_from(Bytes::copy_from_slice(&revision.to_be_bytes()))
         .expect("u64 revision is non-empty")
 }
 
-fn revision_version(revision: u64) -> VersionToken {
+pub(super) fn revision_version(revision: u64) -> VersionToken {
     VersionToken::try_from(Bytes::copy_from_slice(&revision.to_be_bytes()))
         .expect("u64 version is non-empty")
 }
@@ -1324,6 +1367,64 @@ const fn corruption_error() -> StateStoreError {
 
 const fn limit_error(message: &'static str) -> StateStoreError {
     StateStoreError::new(StateStoreErrorKind::LimitExceeded, message)
+}
+
+#[async_trait]
+impl ReadTransaction for SqliteReadTransaction {
+    async fn get(&mut self, key: &Key) -> Result<Option<StateRecord>, StateStoreError> {
+        SqliteReadTransaction::get(self, key).await
+    }
+
+    async fn range(&mut self, request: &RangeRequest) -> Result<RangePage, StateStoreError> {
+        SqliteReadTransaction::range(self, request).await
+    }
+
+    async fn abort(self: Box<Self>) -> Result<(), StateStoreError> {
+        SqliteReadTransaction::abort(*self).await
+    }
+}
+
+#[async_trait]
+impl ReadTransaction for SqliteWriteTransaction {
+    async fn get(&mut self, key: &Key) -> Result<Option<StateRecord>, StateStoreError> {
+        SqliteWriteTransaction::get(self, key).await
+    }
+
+    async fn range(&mut self, request: &RangeRequest) -> Result<RangePage, StateStoreError> {
+        SqliteWriteTransaction::range(self, request).await
+    }
+
+    async fn abort(self: Box<Self>) -> Result<(), StateStoreError> {
+        SqliteWriteTransaction::abort(*self).await
+    }
+}
+
+#[async_trait]
+impl WriteTransaction for SqliteWriteTransaction {
+    fn transaction_id(&self) -> &TransactionId {
+        &self.transaction_id
+    }
+
+    async fn put(
+        &mut self,
+        key: Key,
+        value: Value,
+        precondition: Precondition,
+    ) -> Result<(), StateStoreError> {
+        SqliteWriteTransaction::put(self, key, value, precondition).await
+    }
+
+    async fn delete(
+        &mut self,
+        key: Key,
+        precondition: Precondition,
+    ) -> Result<(), StateStoreError> {
+        SqliteWriteTransaction::delete(self, key, precondition).await
+    }
+
+    async fn commit(self: Box<Self>) -> CommitOutcome {
+        SqliteWriteTransaction::commit(*self).await
+    }
 }
 
 #[cfg(test)]

@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
+
 pub mod config;
 pub mod contract;
 pub mod error;
@@ -39,3 +41,14 @@ pub use metrics::{
 };
 pub use range::{ChangeCursor, ContinuationToken, Direction, KeyRange, RangeRequest};
 pub use runner::{RunFailure, RunSuccess, derive_transaction_id, run_side_effect_free};
+
+pub async fn open_state_store(
+    config: StateStoreConfig,
+    deployment: FeDeploymentView,
+) -> Result<Arc<dyn StateStore>, StateStoreError> {
+    match config.provider {
+        StateStoreProviderConfig::Sqlite => Ok(Arc::new(
+            sqlite::SqliteStateStore::open(config, deployment).await?,
+        )),
+    }
+}

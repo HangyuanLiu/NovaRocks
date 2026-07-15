@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod range;
 mod schema;
 mod txn;
 
@@ -22,16 +23,17 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
+use async_trait::async_trait;
 use fs2::FileExt;
 use rusqlite::ffi::ErrorCode as SqliteErrorCode;
 use rusqlite::{Connection, OpenFlags};
 
 use crate::state_store::{
-    FeDeploymentView, StateStoreConfig, StateStoreError, StateStoreErrorKind, StateStoreLimits,
-    StoreIdentity,
+    ChangePage, ChangePollRequest, CommitResolution, FeDeploymentView, ReadTransaction, StateStore,
+    StateStoreConfig, StateStoreError, StateStoreErrorKind, StateStoreLimits, StoreIdentity,
+    TransactionId, WriteTransaction,
 };
 
-#[allow(dead_code)]
 pub(super) struct SqliteStateStore {
     pub(super) path: PathBuf,
     pub(super) limits: StateStoreLimits,
@@ -42,7 +44,51 @@ pub(super) struct SqliteStateStore {
     _owner_lock: File,
 }
 
-#[allow(dead_code)]
+#[async_trait]
+impl StateStore for SqliteStateStore {
+    fn provider_name(&self) -> &'static str {
+        "sqlite"
+    }
+
+    fn limits(&self) -> &StateStoreLimits {
+        &self.limits
+    }
+
+    async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
+        Ok(Box::new(SqliteStateStore::begin_read(self).await?))
+    }
+
+    async fn begin_write(
+        &self,
+        transaction_id: TransactionId,
+        purpose: &str,
+    ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
+        let _ = purpose;
+        Ok(Box::new(
+            SqliteStateStore::begin_write(self, transaction_id).await?,
+        ))
+    }
+
+    async fn poll_changes(
+        &self,
+        request: &ChangePollRequest,
+    ) -> Result<ChangePage, StateStoreError> {
+        request.validate(&self.limits)?;
+        range::poll_changes(self.path.clone(), self.identity.clone(), request.clone()).await
+    }
+
+    async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
+        Ok(self.identity.clone())
+    }
+
+    async fn resolve_commit(
+        &self,
+        transaction_id: &TransactionId,
+    ) -> Result<CommitResolution, StateStoreError> {
+        SqliteStateStore::resolve_commit(self, transaction_id).await
+    }
+}
+
 impl SqliteStateStore {
     pub(super) async fn open(
         config: StateStoreConfig,
@@ -84,6 +130,7 @@ impl SqliteStateStore {
             })?
     }
 
+    #[cfg(test)]
     pub(super) fn identity_snapshot(&self) -> &StoreIdentity {
         &self.identity
     }
