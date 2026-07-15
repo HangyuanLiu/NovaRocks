@@ -269,14 +269,64 @@ impl CfgPredicate {
         }
     }
 
-    fn evaluate(&self, assignments: &BTreeMap<String, bool>) -> bool {
+    fn evaluate_partial(&self, assignments: &BTreeMap<String, bool>) -> Option<bool> {
         match self {
-            Self::Test => false,
-            Self::Atom(atom) => assignments.get(atom).copied().unwrap_or(false),
-            Self::All(children) => children.iter().all(|child| child.evaluate(assignments)),
-            Self::Any(children) => children.iter().any(|child| child.evaluate(assignments)),
-            Self::Not(child) => !child.evaluate(assignments),
+            Self::Test => Some(false),
+            Self::Atom(atom) => assignments.get(atom).copied(),
+            Self::All(children) => {
+                if children
+                    .iter()
+                    .any(|child| child.evaluate_partial(assignments) == Some(false))
+                {
+                    Some(false)
+                } else if children
+                    .iter()
+                    .all(|child| child.evaluate_partial(assignments) == Some(true))
+                {
+                    Some(true)
+                } else {
+                    None
+                }
+            }
+            Self::Any(children) => {
+                if children
+                    .iter()
+                    .any(|child| child.evaluate_partial(assignments) == Some(true))
+                {
+                    Some(true)
+                } else if children
+                    .iter()
+                    .all(|child| child.evaluate_partial(assignments) == Some(false))
+                {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            Self::Not(child) => child.evaluate_partial(assignments).map(|value| !value),
         }
+    }
+
+    fn can_be_true(&self, atoms: &[String], assignments: &mut BTreeMap<String, bool>) -> bool {
+        if let Some(value) = self.evaluate_partial(assignments) {
+            return value;
+        }
+        let Some(atom) = atoms
+            .iter()
+            .find(|atom| !assignments.contains_key(atom.as_str()))
+        else {
+            return false;
+        };
+        let atom = atom.clone();
+        for value in [false, true] {
+            assignments.insert(atom.clone(), value);
+            if self.can_be_true(atoms, assignments) {
+                assignments.remove(&atom);
+                return true;
+            }
+        }
+        assignments.remove(&atom);
+        false
     }
 }
 
@@ -327,25 +377,12 @@ fn cfg_parse_predicate(tokens: &[String], start: usize) -> Option<(CfgPredicate,
 }
 
 fn cfg_predicate_requires_test(tokens: &[String], start: usize) -> Option<(bool, usize)> {
-    const MAX_UNKNOWN_ATOMS: usize = 12;
     let (predicate, end) = cfg_parse_predicate(tokens, start)?;
     let mut atoms = BTreeSet::new();
     predicate.collect_atoms(&mut atoms);
-    if atoms.len() > MAX_UNKNOWN_ATOMS {
-        return Some((false, end));
-    }
     let atoms = atoms.into_iter().collect::<Vec<_>>();
-    for mask in 0..(1usize << atoms.len()) {
-        let assignments = atoms
-            .iter()
-            .enumerate()
-            .map(|(index, atom)| (atom.clone(), mask & (1usize << index) != 0))
-            .collect::<BTreeMap<_, _>>();
-        if predicate.evaluate(&assignments) {
-            return Some((false, end));
-        }
-    }
-    Some((true, end))
+    let production_possible = predicate.can_be_true(&atoms, &mut BTreeMap::new());
+    Some((!production_possible, end))
 }
 
 fn cfg_attribute_requires_test(attribute: &str) -> bool {
@@ -10822,7 +10859,8 @@ fn runtime_filter_query_context_lock_discipline_violations(text: &str) -> Vec<St
 #[derive(Debug, Default)]
 struct RuntimeFilterReachableAudit {
     allow_nested_for_body: bool,
-    allowed_for_iterators: BTreeSet<String>,
+    allowed_owned_for_iterators: BTreeSet<String>,
+    allowed_shared_for_iterators: BTreeSet<String>,
     calls: BTreeSet<Vec<String>>,
     direct_calls: BTreeSet<Vec<String>>,
     methods: BTreeSet<String>,
@@ -10895,6 +10933,9 @@ fn runtime_filter_expr_definitely_terminates(expression: &syn::Expr) -> bool {
         syn::Expr::Paren(paren) => runtime_filter_expr_definitely_terminates(&paren.expr),
         syn::Expr::Try(expression) => runtime_filter_expr_definitely_terminates(&expression.expr),
         syn::Expr::If(expression) => {
+            if runtime_filter_expr_definitely_terminates(&expression.cond) {
+                return true;
+            }
             let then_terminates =
                 runtime_filter_block_definitely_terminates(&expression.then_branch);
             let else_terminates = expression
@@ -10907,12 +10948,68 @@ fn runtime_filter_expr_definitely_terminates(expression: &syn::Expr) -> bool {
                 None => then_terminates && else_terminates,
             }
         }
+        syn::Expr::Call(call) => {
+            runtime_filter_expr_definitely_terminates(&call.func)
+                || call
+                    .args
+                    .iter()
+                    .any(runtime_filter_expr_definitely_terminates)
+        }
+        syn::Expr::MethodCall(call) => {
+            runtime_filter_expr_definitely_terminates(&call.receiver)
+                || call
+                    .args
+                    .iter()
+                    .any(runtime_filter_expr_definitely_terminates)
+        }
+        syn::Expr::Binary(binary) => {
+            if runtime_filter_expr_definitely_terminates(&binary.left) {
+                return true;
+            }
+            match binary.op {
+                syn::BinOp::And(_) => {
+                    RuntimeFilterReachableAudit::literal_bool(&binary.left) == Some(true)
+                        && runtime_filter_expr_definitely_terminates(&binary.right)
+                }
+                syn::BinOp::Or(_) => {
+                    RuntimeFilterReachableAudit::literal_bool(&binary.left) == Some(false)
+                        && runtime_filter_expr_definitely_terminates(&binary.right)
+                }
+                _ => runtime_filter_expr_definitely_terminates(&binary.right),
+            }
+        }
+        syn::Expr::Array(array) => array
+            .elems
+            .iter()
+            .any(runtime_filter_expr_definitely_terminates),
+        syn::Expr::Tuple(tuple) => tuple
+            .elems
+            .iter()
+            .any(runtime_filter_expr_definitely_terminates),
+        syn::Expr::Index(index) => {
+            runtime_filter_expr_definitely_terminates(&index.expr)
+                || runtime_filter_expr_definitely_terminates(&index.index)
+        }
+        syn::Expr::Field(field) => runtime_filter_expr_definitely_terminates(&field.base),
+        syn::Expr::Reference(reference) => {
+            runtime_filter_expr_definitely_terminates(&reference.expr)
+        }
+        syn::Expr::Unary(unary) => runtime_filter_expr_definitely_terminates(&unary.expr),
+        syn::Expr::Cast(cast) => runtime_filter_expr_definitely_terminates(&cast.expr),
+        syn::Expr::Await(awaited) => runtime_filter_expr_definitely_terminates(&awaited.base),
+        syn::Expr::Match(expression) => runtime_filter_expr_definitely_terminates(&expression.expr),
         _ => false,
     }
 }
 
 fn runtime_filter_statement_definitely_terminates(statement: &syn::Stmt) -> bool {
-    matches!(statement, syn::Stmt::Expr(expression, _) if runtime_filter_expr_definitely_terminates(expression))
+    match statement {
+        syn::Stmt::Local(local) => local.init.as_ref().is_some_and(|initializer| {
+            runtime_filter_expr_definitely_terminates(&initializer.expr)
+        }),
+        syn::Stmt::Expr(expression, _) => runtime_filter_expr_definitely_terminates(expression),
+        syn::Stmt::Item(_) | syn::Stmt::Macro(_) => false,
+    }
 }
 
 fn runtime_filter_block_definitely_terminates(block: &syn::Block) -> bool {
@@ -10946,72 +11043,70 @@ fn runtime_filter_for_iterator_is_definitely_empty(expression: &syn::Expr) -> bo
     }
 }
 
-fn runtime_filter_for_iterator_binding(expression: &syn::Expr) -> Option<String> {
-    match expression {
-        syn::Expr::Path(path) if path.qself.is_none() && path.path.segments.len() == 1 => path
-            .path
-            .segments
-            .first()
-            .map(|segment| segment.ident.to_string()),
-        syn::Expr::Reference(reference) => runtime_filter_for_iterator_binding(&reference.expr),
-        syn::Expr::Group(group) => runtime_filter_for_iterator_binding(&group.expr),
-        syn::Expr::Paren(paren) => runtime_filter_for_iterator_binding(&paren.expr),
-        _ => None,
-    }
-}
-
 #[derive(Default)]
 struct RuntimeFilterDirectCallAudit {
     calls: BTreeSet<Vec<String>>,
 }
 
 impl RuntimeFilterDirectCallAudit {
-    fn audit_statement(&mut self, statement: &syn::Stmt) {
+    fn audit_statement(&mut self, statement: &syn::Stmt) -> bool {
         match statement {
             syn::Stmt::Local(local) => {
                 if let Some(initializer) = &local.init {
-                    self.audit_call_tree(&initializer.expr);
+                    return self.audit_call_tree(&initializer.expr);
                 }
             }
-            syn::Stmt::Expr(expression, _) => self.audit_call_tree(expression),
+            syn::Stmt::Expr(expression, _) => return self.audit_call_tree(expression),
             syn::Stmt::Item(_) | syn::Stmt::Macro(_) => {}
         }
+        false
     }
 
-    fn audit_call_tree(&mut self, expression: &syn::Expr) {
+    fn audit_call_tree(&mut self, expression: &syn::Expr) -> bool {
         match expression {
             syn::Expr::Call(call) => {
+                if self.audit_call_tree(&call.func) {
+                    return true;
+                }
+                for argument in &call.args {
+                    if self.audit_call_tree(argument) {
+                        return true;
+                    }
+                }
                 if let syn::Expr::Path(path) = call.func.as_ref()
                     && path.qself.is_none()
                     && path.path.leading_colon.is_none()
                 {
                     self.calls
                         .insert(RuntimeFilterReachableAudit::path_segments(&path.path));
-                } else {
-                    self.audit_call_tree(&call.func);
                 }
-                for argument in &call.args {
-                    self.audit_call_tree(argument);
-                }
+                false
             }
             syn::Expr::MethodCall(call) => {
-                self.audit_call_tree(&call.receiver);
-                for argument in &call.args {
-                    self.audit_call_tree(argument);
+                if self.audit_call_tree(&call.receiver) {
+                    return true;
                 }
+                for argument in &call.args {
+                    if self.audit_call_tree(argument) {
+                        return true;
+                    }
+                }
+                false
             }
             syn::Expr::Block(block) => {
                 for statement in &block.block.stmts {
-                    self.audit_statement(statement);
-                    if runtime_filter_statement_definitely_terminates(statement) {
-                        break;
+                    if self.audit_statement(statement)
+                        || runtime_filter_statement_definitely_terminates(statement)
+                    {
+                        return true;
                     }
                 }
+                false
             }
             syn::Expr::Group(group) => self.audit_call_tree(&group.expr),
             syn::Expr::Paren(paren) => self.audit_call_tree(&paren.expr),
             syn::Expr::Try(expression) => self.audit_call_tree(&expression.expr),
-            _ => {}
+            _ => runtime_filter_expr_definitely_terminates(expression),
         }
     }
 }
@@ -11077,8 +11172,13 @@ impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterReachableAudit {
 
     fn visit_expr_for_loop(&mut self, expression: &'ast syn::ExprForLoop) {
         syn::visit::Visit::visit_expr(self, &expression.expr);
-        let binding = runtime_filter_for_iterator_binding(&expression.expr);
-        let allowed = binding.is_some_and(|binding| self.allowed_for_iterators.contains(&binding))
+        let allowed = self
+            .allowed_owned_for_iterators
+            .iter()
+            .any(|binding| runtime_filter_expr_is_binding_path(&expression.expr, binding))
+            || self.allowed_shared_for_iterators.iter().any(|binding| {
+                runtime_filter_expr_is_shared_binding_reference(&expression.expr, binding)
+            })
             || self.reachable_for_depth > 0 && self.allow_nested_for_body;
         if allowed && !runtime_filter_for_iterator_is_definitely_empty(&expression.expr) {
             syn::visit::Visit::visit_pat(self, &expression.pat);
@@ -12215,19 +12315,397 @@ fn runtime_filter_direct_calls_in_block(block: &syn::Block) -> BTreeSet<Vec<Stri
     direct.calls
 }
 
-fn runtime_filter_manifest_direct_function_calls(
-    file: &syn::File,
-    name: &str,
-) -> BTreeSet<Vec<String>> {
-    file.items
-        .iter()
-        .find_map(|item| match item {
-            syn::Item::Fn(function) if function.sig.ident == name => {
-                Some(runtime_filter_direct_calls_in_block(&function.block))
+fn runtime_filter_expr_is_binding_path(expression: &syn::Expr, binding: &str) -> bool {
+    matches!(expression, syn::Expr::Path(path)
+        if path.qself.is_none()
+            && path.path.leading_colon.is_none()
+            && path.path.is_ident(binding))
+}
+
+fn runtime_filter_expr_is_shared_binding_reference(expression: &syn::Expr, binding: &str) -> bool {
+    matches!(expression, syn::Expr::Reference(reference)
+        if reference.mutability.is_none()
+            && runtime_filter_expr_is_binding_path(&reference.expr, binding))
+}
+
+fn runtime_filter_expr_is_exact_call(expression: &syn::Expr, callee: &str) -> bool {
+    matches!(expression, syn::Expr::Call(call)
+        if call.args.is_empty()
+            && matches!(call.func.as_ref(), syn::Expr::Path(path)
+                if path.qself.is_none()
+                    && path.path.leading_colon.is_none()
+                    && path.path.is_ident(callee)))
+}
+
+fn runtime_filter_local_is_immutable_exact_call(
+    statement: &syn::Stmt,
+    binding: &str,
+    callee: &str,
+) -> bool {
+    matches!(statement, syn::Stmt::Local(local)
+        if matches!(&local.pat, syn::Pat::Ident(pattern)
+            if pattern.ident == binding
+                && pattern.by_ref.is_none()
+                && pattern.mutability.is_none()
+                && pattern.subpat.is_none())
+            && local.init.as_ref().is_some_and(|initializer|
+                runtime_filter_expr_is_exact_call(&initializer.expr, callee)))
+}
+
+fn runtime_filter_statement_expression(statement: &syn::Stmt) -> Option<&syn::Expr> {
+    match statement {
+        syn::Stmt::Expr(expression, _) => Some(expression),
+        syn::Stmt::Local(_) | syn::Stmt::Item(_) | syn::Stmt::Macro(_) => None,
+    }
+}
+
+fn runtime_filter_top_level_for_loop(statement: &syn::Stmt) -> Option<&syn::ExprForLoop> {
+    match runtime_filter_statement_expression(statement) {
+        Some(syn::Expr::ForLoop(loop_expression)) => Some(loop_expression),
+        _ => None,
+    }
+}
+
+fn runtime_filter_call_has_exact_binding_reference(
+    statement: &syn::Stmt,
+    callee: &str,
+    binding: &str,
+) -> bool {
+    matches!(runtime_filter_statement_expression(statement), Some(syn::Expr::Call(call))
+        if matches!(call.func.as_ref(), syn::Expr::Path(path)
+            if path.qself.is_none()
+                && path.path.leading_colon.is_none()
+                && path.path.is_ident(callee))
+            && matches!(call.args.first(), Some(argument)
+                if runtime_filter_expr_is_shared_binding_reference(argument, binding)))
+}
+
+fn runtime_filter_asserts_binding_directly(
+    statement: &syn::Stmt,
+    assertion: &str,
+    binding: &str,
+) -> bool {
+    matches!(runtime_filter_statement_expression(statement), Some(syn::Expr::Call(call))
+        if call.args.len() == 1
+            && matches!(call.func.as_ref(), syn::Expr::Path(path)
+                if path.qself.is_none()
+                    && path.path.leading_colon.is_none()
+                    && path.path.is_ident(assertion))
+            && matches!(call.args.first(), Some(argument)
+                if runtime_filter_expr_is_shared_binding_reference(argument, binding)))
+}
+
+#[derive(Default)]
+struct RuntimeFilterBindingCount {
+    binding: String,
+    count: usize,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterBindingCount {
+    fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
+        if pattern.ident == self.binding {
+            self.count += 1;
+        }
+        syn::visit::visit_pat_ident(self, pattern);
+    }
+}
+
+fn runtime_filter_function_has_one_binding(function: &syn::ItemFn, binding: &str) -> bool {
+    let mut audit = RuntimeFilterBindingCount {
+        binding: binding.to_string(),
+        ..RuntimeFilterBindingCount::default()
+    };
+    syn::visit::Visit::visit_item_fn(&mut audit, function);
+    audit.count == 1
+}
+
+fn runtime_filter_function_has_one_binding_loop(function: &syn::ItemFn, binding: &str) -> bool {
+    struct BindingLoopCount<'a> {
+        binding: &'a str,
+        count: usize,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for BindingLoopCount<'_> {
+        fn visit_expr_for_loop(&mut self, loop_expression: &'ast syn::ExprForLoop) {
+            if runtime_filter_expr_mentions_binding(&loop_expression.expr, self.binding) {
+                self.count += 1;
             }
+            syn::visit::visit_expr_for_loop(self, loop_expression);
+        }
+    }
+    let mut audit = BindingLoopCount { binding, count: 0 };
+    syn::visit::Visit::visit_item_fn(&mut audit, function);
+    audit.count == 1
+}
+
+#[derive(Default)]
+struct RuntimeFilterLocalBindingInvalidationAudit {
+    binding: String,
+    invalid: bool,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterLocalBindingInvalidationAudit {
+    fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
+        if pattern.ident == self.binding {
+            self.invalid = true;
+        }
+        syn::visit::visit_pat_ident(self, pattern);
+    }
+
+    fn visit_expr_reference(&mut self, reference: &'ast syn::ExprReference) {
+        if runtime_filter_expr_is_binding_path(&reference.expr, &self.binding) {
+            if reference.mutability.is_some() {
+                self.invalid = true;
+            }
+            return;
+        }
+        syn::visit::visit_expr_reference(self, reference);
+    }
+
+    fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+        if path.qself.is_none() && path.path.is_ident(&self.binding) {
+            self.invalid = true;
+        }
+        syn::visit::visit_expr_path(self, path);
+    }
+}
+
+fn runtime_filter_local_binding_is_preserved(statements: &[syn::Stmt], binding: &str) -> bool {
+    let mut audit = RuntimeFilterLocalBindingInvalidationAudit {
+        binding: binding.to_string(),
+        ..RuntimeFilterLocalBindingInvalidationAudit::default()
+    };
+    for statement in statements {
+        syn::visit::Visit::visit_stmt(&mut audit, statement);
+    }
+    !audit.invalid
+}
+
+fn runtime_filter_expr_mentions_binding(expression: &syn::Expr, binding: &str) -> bool {
+    struct BindingUse<'a> {
+        binding: &'a str,
+        found: bool,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for BindingUse<'_> {
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            if path.qself.is_none() && path.path.is_ident(self.binding) {
+                self.found = true;
+            }
+            syn::visit::visit_expr_path(self, path);
+        }
+    }
+    let mut audit = BindingUse {
+        binding,
+        found: false,
+    };
+    syn::visit::Visit::visit_expr(&mut audit, expression);
+    audit.found
+}
+
+#[derive(Default)]
+struct RuntimeFilterSharedBindingInvalidationAudit {
+    binding: String,
+    invalid: bool,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterSharedBindingInvalidationAudit {
+    fn visit_expr_assign(&mut self, assignment: &'ast syn::ExprAssign) {
+        if runtime_filter_expr_mentions_binding(&assignment.left, &self.binding) {
+            self.invalid = true;
+        }
+        syn::visit::visit_expr_assign(self, assignment);
+    }
+
+    fn visit_expr_reference(&mut self, reference: &'ast syn::ExprReference) {
+        if reference.mutability.is_some()
+            && runtime_filter_expr_mentions_binding(&reference.expr, &self.binding)
+        {
+            self.invalid = true;
+        }
+        syn::visit::visit_expr_reference(self, reference);
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        if runtime_filter_expr_mentions_binding(&call.receiver, &self.binding)
+            && call.method != "len"
+        {
+            self.invalid = true;
+        }
+        syn::visit::visit_expr_method_call(self, call);
+    }
+}
+
+fn runtime_filter_shared_binding_is_preserved(statements: &[syn::Stmt], binding: &str) -> bool {
+    let mut audit = RuntimeFilterSharedBindingInvalidationAudit {
+        binding: binding.to_string(),
+        ..RuntimeFilterSharedBindingInvalidationAudit::default()
+    };
+    for statement in statements {
+        syn::visit::Visit::visit_stmt(&mut audit, statement);
+    }
+    !audit.invalid
+}
+
+fn runtime_filter_topn_loop_is_controlled(function: &syn::ItemFn) -> bool {
+    let statements = &function.block.stmts;
+    let Some(binding_index) = statements.iter().position(|statement| {
+        runtime_filter_local_is_immutable_exact_call(
+            statement,
+            "cases",
+            "topn_cases_with_fixed_seed",
+        )
+    }) else {
+        return false;
+    };
+    let Some(assertion) = statements.get(binding_index + 1) else {
+        return false;
+    };
+    let Some(loop_expression) = statements
+        .get(binding_index + 2)
+        .and_then(runtime_filter_top_level_for_loop)
+    else {
+        return false;
+    };
+    runtime_filter_function_has_one_binding(function, "cases")
+        && runtime_filter_function_has_one_binding_loop(function, "cases")
+        && runtime_filter_asserts_binding_directly(
+            assertion,
+            "assert_fixed_seed_case_diversity",
+            "cases",
+        )
+        && runtime_filter_expr_is_binding_path(&loop_expression.expr, "cases")
+}
+
+fn runtime_filter_join_loop_is_controlled(function: &syn::ItemFn) -> bool {
+    let statements = &function.block.stmts;
+    let Some(binding_index) = statements.iter().position(|statement| {
+        runtime_filter_local_is_immutable_exact_call(statement, "producers", "producer_fixtures")
+    }) else {
+        return false;
+    };
+    let loops = statements
+        .iter()
+        .enumerate()
+        .filter_map(|(index, statement)| {
+            runtime_filter_top_level_for_loop(statement)
+                .filter(|loop_expression| {
+                    runtime_filter_expr_is_shared_binding_reference(
+                        &loop_expression.expr,
+                        "producers",
+                    )
+                })
+                .map(|loop_expression| (index, loop_expression))
+        })
+        .collect::<Vec<_>>();
+    let [(loop_index, _)] = loops.as_slice() else {
+        return false;
+    };
+    binding_index < *loop_index
+        && runtime_filter_function_has_one_binding(function, "producers")
+        && runtime_filter_function_has_one_binding_loop(function, "producers")
+        && runtime_filter_local_binding_is_preserved(
+            &statements[binding_index + 1..*loop_index],
+            "producers",
+        )
+}
+
+fn runtime_filter_producer_fixtures_are_fixed_nonempty(function: &syn::ItemFn) -> bool {
+    let fixed_len = match &function.sig.output {
+        syn::ReturnType::Type(_, output) => match output.as_ref() {
+            syn::Type::Array(array) => match &array.len {
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Int(length),
+                    ..
+                }) => length.base10_parse::<usize>().ok(),
+                _ => None,
+            },
+            _ => None,
+        },
+        syn::ReturnType::Default => None,
+    };
+    let tail_len = function.block.stmts.last().and_then(|statement| {
+        runtime_filter_statement_expression(statement).and_then(|expression| match expression {
+            syn::Expr::Array(array) => Some(array.elems.len()),
             _ => None,
         })
-        .unwrap_or_default()
+    });
+    fixed_len
+        .zip(tail_len)
+        .is_some_and(|(fixed, tail)| fixed > 0 && fixed == tail)
+}
+
+fn runtime_filter_aggregate_caller_binds_live_producers(function: &syn::ItemFn) -> bool {
+    let statements = &function.block.stmts;
+    let Some(binding_index) = statements.iter().position(|statement| {
+        runtime_filter_local_is_immutable_exact_call(statement, "producers", "producer_fixtures")
+    }) else {
+        return false;
+    };
+    let calls = statements
+        .iter()
+        .enumerate()
+        .filter(|(_, statement)| {
+            runtime_filter_call_has_exact_binding_reference(
+                statement,
+                "aggregate_harness_with_memory",
+                "producers",
+            )
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let [call_index] = calls.as_slice() else {
+        return false;
+    };
+    binding_index < *call_index
+        && runtime_filter_function_has_one_binding(function, "producers")
+        && runtime_filter_local_binding_is_preserved(
+            &statements[binding_index + 1..*call_index],
+            "producers",
+        )
+}
+
+fn runtime_filter_aggregate_loop_is_controlled(file: &syn::File, function: &syn::ItemFn) -> bool {
+    let producers_parameter = function.sig.inputs.first().is_some_and(|argument| {
+        matches!(argument, syn::FnArg::Typed(argument)
+            if matches!(argument.pat.as_ref(), syn::Pat::Ident(pattern)
+                if pattern.ident == "producers"
+                    && pattern.by_ref.is_none()
+                    && pattern.mutability.is_none()
+                    && pattern.subpat.is_none())
+                && matches!(argument.ty.as_ref(), syn::Type::Reference(reference)
+                    if reference.mutability.is_none()
+                        && matches!(reference.elem.as_ref(), syn::Type::Slice(_))))
+    });
+    let statements = &function.block.stmts;
+    let loops = statements
+        .iter()
+        .enumerate()
+        .filter_map(|(index, statement)| {
+            runtime_filter_top_level_for_loop(statement)
+                .filter(|loop_expression| {
+                    runtime_filter_expr_is_binding_path(&loop_expression.expr, "producers")
+                })
+                .map(|loop_expression| (index, loop_expression))
+        })
+        .collect::<Vec<_>>();
+    let [(loop_index, _)] = loops.as_slice() else {
+        return false;
+    };
+    let producer_fixtures = file.items.iter().find_map(|item| match item {
+        syn::Item::Fn(function) if function.sig.ident == "producer_fixtures" => Some(function),
+        _ => None,
+    });
+    let aggregate_caller = file.items.iter().find_map(|item| match item {
+        syn::Item::Fn(function) if function.sig.ident == "aggregate_allof_harness" => {
+            Some(function)
+        }
+        _ => None,
+    });
+    producers_parameter
+        && runtime_filter_function_has_one_binding(function, "producers")
+        && runtime_filter_function_has_one_binding_loop(function, "producers")
+        && runtime_filter_shared_binding_is_preserved(&statements[..*loop_index], "producers")
+        && producer_fixtures.is_some_and(runtime_filter_producer_fixtures_are_fixed_nonempty)
+        && aggregate_caller.is_some_and(runtime_filter_aggregate_caller_binds_live_producers)
 }
 
 fn runtime_filter_manifest_function_audit(
@@ -12248,37 +12726,26 @@ fn runtime_filter_manifest_function_audit(
     let direct_calls = runtime_filter_direct_calls_in_block(&function.block);
     let controlled_topn_loop = name
         == "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds"
-        && RuntimeFilterReachableAudit::has_exact_path(
-            &direct_calls,
-            &["topn_cases_with_fixed_seed"],
-        )
-        && RuntimeFilterReachableAudit::has_exact_path(
-            &direct_calls,
-            &["assert_fixed_seed_case_diversity"],
-        );
-    let controlled_membership_loop = name == "join_harness"
-        && RuntimeFilterReachableAudit::has_exact_path(&direct_calls, &["producer_fixtures"]);
-    let aggregate_owner_calls =
-        runtime_filter_manifest_direct_function_calls(file, "aggregate_allof_harness");
+        && runtime_filter_topn_loop_is_controlled(function);
+    let controlled_membership_loop =
+        name == "join_harness" && runtime_filter_join_loop_is_controlled(function);
     let controlled_aggregate_loop = name == "aggregate_harness_with_memory"
-        && RuntimeFilterReachableAudit::has_exact_path(
-            &aggregate_owner_calls,
-            &["producer_fixtures"],
-        )
-        && RuntimeFilterReachableAudit::has_exact_path(
-            &aggregate_owner_calls,
-            &["aggregate_harness_with_memory"],
-        );
-    let mut allowed_for_iterators = BTreeSet::new();
+        && runtime_filter_aggregate_loop_is_controlled(file, function);
+    let mut allowed_owned_for_iterators = BTreeSet::new();
+    let mut allowed_shared_for_iterators = BTreeSet::new();
     if controlled_topn_loop {
-        allowed_for_iterators.insert("cases".to_string());
+        allowed_owned_for_iterators.insert("cases".to_string());
     }
-    if controlled_membership_loop || controlled_aggregate_loop {
-        allowed_for_iterators.insert("producers".to_string());
+    if controlled_membership_loop {
+        allowed_shared_for_iterators.insert("producers".to_string());
+    }
+    if controlled_aggregate_loop {
+        allowed_owned_for_iterators.insert("producers".to_string());
     }
     let mut audit = RuntimeFilterManifestBodyAudit {
         allow_nested_for_body: controlled_topn_loop,
-        allowed_for_iterators,
+        allowed_owned_for_iterators,
+        allowed_shared_for_iterators,
         ..RuntimeFilterManifestBodyAudit::default()
     };
     audit.audit_reachable_block(&function.block);
@@ -12363,6 +12830,37 @@ fn runtime_filter_rewrite_function_body(
     rewritten.push_str(suffix);
     rewritten.push_str(&source[tokens[close].start..]);
     rewritten
+}
+
+fn runtime_filter_replace_in_function_body(
+    source: &str,
+    function: &str,
+    from: &str,
+    to: &str,
+) -> String {
+    let tokens = rust_source_tokens(source);
+    let name = tokens
+        .windows(2)
+        .position(|window| window[0].text == "fn" && window[1].text == function)
+        .expect("fixture function must exist")
+        + 1;
+    let open = (name + 1..tokens.len())
+        .find(|index| tokens[*index].text == "{")
+        .expect("fixture function must have a body");
+    let close = rust_matching_token(&tokens, open, "{", "}")
+        .expect("fixture function body must be balanced");
+    let body = &source[tokens[open].end..tokens[close].start];
+    assert!(
+        body.contains(from),
+        "fixture function body must contain {from}"
+    );
+    let rewritten_body = body.replacen(from, to, 1);
+    format!(
+        "{}{}{}",
+        &source[..tokens[open].end],
+        rewritten_body,
+        &source[tokens[close].start..]
+    )
 }
 
 fn runtime_filter_conformance_manifest_violations(
@@ -12961,6 +13459,12 @@ fn m4_aggregate_conformance_requires_frozen_allof_and_separates_empty_unavailabl
             "\nif true { return; }\n",
             "",
         ),
+        ("local initializer return", "\nlet _: () = return;\n", ""),
+        (
+            "nested local initializer return",
+            "\nlet _: () = consume((if true { return; } else { () }));\n",
+            "",
+        ),
         ("empty array for-loop", "\nfor _ in [] {", "\n}\n"),
         ("empty range for-loop", "\nfor _ in 0..0 {", "\n}\n"),
         (
@@ -13049,6 +13553,109 @@ fn runtime_filter_manifest_direct_call_rejects_short_circuit_decoy() {
         !runtime_filter_conformance_manifest_violations(valid_root, &short_circuit_owner_edges)
             .is_empty(),
         "short-circuit RHS must not satisfy a direct helper call edge"
+    );
+    let terminating_argument_owner_edges = runtime_filter_rewrite_function_body(
+        &harness.replacen(
+            "install_service(compile_install_view(",
+            "removed_install(removed_compile(",
+            1,
+        ),
+        "join_harness",
+        "\nlet _ = install_service(compile_install_view(return fallback));\n",
+        "",
+    );
+    assert!(
+        !runtime_filter_conformance_manifest_violations(
+            valid_root,
+            &terminating_argument_owner_edges,
+        )
+        .is_empty(),
+        "a terminating call argument must prevent recording the inner and outer callees"
+    );
+}
+
+#[test]
+fn runtime_filter_manifest_controlled_loops_require_live_immutable_bindings() {
+    let valid_root = "#[cfg(test)] mod m4_conformance_tests;";
+    let harness = fs::read_to_string(
+        Path::new(manifest_dir()).join("src/runtime_filter/service/m4_conformance_tests.rs"),
+    )
+    .unwrap();
+    let topn_clear = runtime_filter_replace_in_function_body(
+        &harness,
+        "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+        "let cases = topn_cases_with_fixed_seed();\n    assert_fixed_seed_case_diversity(&cases);",
+        "let mut cases = topn_cases_with_fixed_seed();\n    assert_fixed_seed_case_diversity(&cases);\n    cases.clear();",
+    );
+    let topn_rebound = runtime_filter_replace_in_function_body(
+        &harness,
+        "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+        "assert_fixed_seed_case_diversity(&cases);\n    for case in cases {",
+        "assert_fixed_seed_case_diversity(&cases);\n    let cases = Vec::new();\n    for case in cases {",
+    );
+    let topn_filtered = runtime_filter_replace_in_function_body(
+        &harness,
+        "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+        "for case in cases {",
+        "for case in cases.into_iter().filter(|_| false) {",
+    );
+    let join_clear = runtime_filter_replace_in_function_body(
+        &harness,
+        "join_harness",
+        "let producers = producer_fixtures();",
+        "let mut producers = producer_fixtures();\n    producers.clear();",
+    );
+    let join_rebound = runtime_filter_replace_in_function_body(
+        &harness,
+        "join_harness",
+        "for producer in &producers {",
+        "let producers = Vec::new();\n    for producer in &producers {",
+    );
+    let join_filtered = runtime_filter_replace_in_function_body(
+        &harness,
+        "join_harness",
+        "for producer in &producers {",
+        "for producer in producers.iter().filter(|_| false) {",
+    );
+    let aggregate_clear = runtime_filter_replace_in_function_body(
+        &harness,
+        "aggregate_allof_harness",
+        "let producers = producer_fixtures();",
+        "let mut producers = producer_fixtures();\n    producers.clear();",
+    );
+    let aggregate_rebound = runtime_filter_replace_in_function_body(
+        &harness,
+        "aggregate_allof_harness",
+        "aggregate_harness_with_memory(\n        &producers,",
+        "let producers = Vec::new();\n    aggregate_harness_with_memory(\n        &producers,",
+    );
+    let aggregate_filtered = runtime_filter_replace_in_function_body(
+        &harness,
+        "aggregate_harness_with_memory",
+        "for producer in producers {",
+        "for producer in producers.iter().filter(|_| false) {",
+    );
+    let accepted = [
+        ("topn clear", topn_clear),
+        ("topn rebound", topn_rebound),
+        ("topn filter-to-empty", topn_filtered),
+        ("join clear", join_clear),
+        ("join rebound", join_rebound),
+        ("join filter-to-empty", join_filtered),
+        ("aggregate clear", aggregate_clear),
+        ("aggregate rebound", aggregate_rebound),
+        ("aggregate filter-to-empty", aggregate_filtered),
+    ]
+    .into_iter()
+    .filter_map(|(label, source)| {
+        runtime_filter_conformance_manifest_violations(valid_root, &source)
+            .is_empty()
+            .then_some(label)
+    })
+    .collect::<Vec<_>>();
+    assert!(
+        accepted.is_empty(),
+        "controlled loops must reject invalidated producer evidence: {accepted:?}"
     );
 }
 
@@ -13810,7 +14417,7 @@ fn runtime_filter_cfg_requires_test_handles_nested_boolean_predicates() {
             "predicate can be true when test=false: {attribute}"
         );
     }
-    let over_cap = format!(
+    let over_cap_unsatisfiable = format!(
         "#[cfg(all({}, feature = \"x0\", not(feature = \"x0\")))]",
         (0..13)
             .map(|index| format!("feature = \"x{index}\""))
@@ -13818,8 +14425,30 @@ fn runtime_filter_cfg_requires_test_handles_nested_boolean_predicates() {
             .join(", ")
     );
     assert!(
-        !cfg_attribute_requires_test(&over_cap),
-        "over-cap unknown predicates must remain production-visible"
+        cfg_attribute_requires_test(&over_cap_unsatisfiable),
+        "over-cap correlated contradiction still requires test"
+    );
+    let over_cap_with_test = format!(
+        "#[cfg(all(test, {}))]",
+        (0..13)
+            .map(|index| format!("feature = \"x{index}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    assert!(
+        cfg_attribute_requires_test(&over_cap_with_test),
+        "over-cap predicate with test conjunction still requires test"
+    );
+    let over_cap_production_possible = format!(
+        "#[cfg(all(any(feature = \"x0\", not(feature = \"x0\")), any({})))]",
+        (1..14)
+            .map(|index| format!("feature = \"x{index}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    assert!(
+        !cfg_attribute_requires_test(&over_cap_production_possible),
+        "over-cap satisfiable predicate remains production-visible"
     );
 }
 
@@ -14386,6 +15015,14 @@ fn fail(&self) { self.channel.fail_instance().map(|action| self.finish(action));
         good.replace(
             "self.dispatcher.dispatch(self.channel_id, action);",
             "if true { return; } self.dispatcher.dispatch(self.channel_id, action);",
+        ),
+        good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "let _: () = return; self.dispatcher.dispatch(self.channel_id, action);",
+        ),
+        good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "let _: () = consume((if true { return; } else { () })); self.dispatcher.dispatch(self.channel_id, action);",
         ),
         good.replace(
             "self.dispatcher.dispatch(self.channel_id, action);",
