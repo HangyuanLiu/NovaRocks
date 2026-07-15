@@ -253,6 +253,22 @@ enum CfgPredicate {
     Not(Box<CfgPredicate>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CfgSatisfiability {
+    Satisfiable,
+    Unsatisfiable,
+    Unproven,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CfgTestRequirement {
+    RequiresTest,
+    ProductionPossible,
+    Unproven,
+}
+
+const CFG_SAT_WORK_BUDGET: usize = 256;
+
 impl CfgPredicate {
     fn collect_atoms(&self, atoms: &mut BTreeSet<String>) {
         match self {
@@ -307,26 +323,64 @@ impl CfgPredicate {
         }
     }
 
-    fn can_be_true(&self, atoms: &[String], assignments: &mut BTreeMap<String, bool>) -> bool {
+    fn can_be_true_bounded(
+        &self,
+        atoms: &[String],
+        assignments: &mut BTreeMap<String, bool>,
+        memo: &mut BTreeMap<Vec<Option<bool>>, CfgSatisfiability>,
+        work_budget: &mut usize,
+    ) -> CfgSatisfiability {
+        let key = atoms
+            .iter()
+            .map(|atom| assignments.get(atom).copied())
+            .collect::<Vec<_>>();
+        if let Some(result) = memo.get(&key) {
+            return *result;
+        }
+        if *work_budget == 0 {
+            return CfgSatisfiability::Unproven;
+        }
+        *work_budget -= 1;
         if let Some(value) = self.evaluate_partial(assignments) {
-            return value;
+            let result = if value {
+                CfgSatisfiability::Satisfiable
+            } else {
+                CfgSatisfiability::Unsatisfiable
+            };
+            memo.insert(key, result);
+            return result;
         }
         let Some(atom) = atoms
             .iter()
             .find(|atom| !assignments.contains_key(atom.as_str()))
         else {
-            return false;
+            memo.insert(key, CfgSatisfiability::Unsatisfiable);
+            return CfgSatisfiability::Unsatisfiable;
         };
         let atom = atom.clone();
+        let mut unproven = false;
         for value in [false, true] {
             assignments.insert(atom.clone(), value);
-            if self.can_be_true(atoms, assignments) {
-                assignments.remove(&atom);
-                return true;
+            match self.can_be_true_bounded(atoms, assignments, memo, work_budget) {
+                CfgSatisfiability::Satisfiable => {
+                    assignments.remove(&atom);
+                    memo.insert(key, CfgSatisfiability::Satisfiable);
+                    return CfgSatisfiability::Satisfiable;
+                }
+                CfgSatisfiability::Unproven => unproven = true,
+                CfgSatisfiability::Unsatisfiable => {}
             }
         }
         assignments.remove(&atom);
-        false
+        let result = if unproven {
+            CfgSatisfiability::Unproven
+        } else {
+            CfgSatisfiability::Unsatisfiable
+        };
+        if result != CfgSatisfiability::Unproven {
+            memo.insert(key, result);
+        }
+        result
     }
 }
 
@@ -376,28 +430,55 @@ fn cfg_parse_predicate(tokens: &[String], start: usize) -> Option<(CfgPredicate,
     Some((predicate, end))
 }
 
-fn cfg_predicate_requires_test(tokens: &[String], start: usize) -> Option<(bool, usize)> {
+fn cfg_predicate_test_requirement_with_budget(
+    tokens: &[String],
+    start: usize,
+    mut work_budget: usize,
+) -> Option<(CfgTestRequirement, usize)> {
     let (predicate, end) = cfg_parse_predicate(tokens, start)?;
     let mut atoms = BTreeSet::new();
     predicate.collect_atoms(&mut atoms);
     let atoms = atoms.into_iter().collect::<Vec<_>>();
-    let production_possible = predicate.can_be_true(&atoms, &mut BTreeMap::new());
-    Some((!production_possible, end))
+    let satisfiability = predicate.can_be_true_bounded(
+        &atoms,
+        &mut BTreeMap::new(),
+        &mut BTreeMap::new(),
+        &mut work_budget,
+    );
+    let requirement = match satisfiability {
+        CfgSatisfiability::Satisfiable => CfgTestRequirement::ProductionPossible,
+        CfgSatisfiability::Unsatisfiable => CfgTestRequirement::RequiresTest,
+        CfgSatisfiability::Unproven => CfgTestRequirement::Unproven,
+    };
+    Some((requirement, end))
+}
+
+fn cfg_predicate_test_requirement(
+    tokens: &[String],
+    start: usize,
+) -> Option<(CfgTestRequirement, usize)> {
+    cfg_predicate_test_requirement_with_budget(tokens, start, CFG_SAT_WORK_BUDGET)
+}
+
+fn cfg_predicate_requires_test(tokens: &[String], start: usize) -> Option<(bool, usize)> {
+    cfg_predicate_test_requirement(tokens, start)
+        .map(|(requirement, end)| (requirement == CfgTestRequirement::RequiresTest, end))
+}
+
+fn cfg_attribute_test_requirement(attribute: &str) -> Option<CfgTestRequirement> {
+    let tokens = rust_use_tokens(attribute);
+    let open = tokens.iter().position(|token| token == "[")?;
+    let cfg = open + 1;
+    if tokens.get(cfg).is_none_or(|token| token != "cfg")
+        || tokens.get(cfg + 1).is_none_or(|token| token != "(")
+    {
+        return None;
+    }
+    cfg_predicate_test_requirement(&tokens, cfg + 2).map(|(requirement, _)| requirement)
 }
 
 fn cfg_attribute_requires_test(attribute: &str) -> bool {
-    let tokens = rust_use_tokens(attribute);
-    let Some(open) = tokens.iter().position(|token| token == "[") else {
-        return false;
-    };
-    let cfg = open + 1;
-    if tokens.get(cfg).is_none_or(|token| token != "cfg") {
-        return false;
-    }
-    if tokens.get(cfg + 1).is_none_or(|token| token != "(") {
-        return false;
-    }
-    cfg_predicate_requires_test(&tokens, cfg + 2).is_some_and(|(required, _)| required)
+    cfg_attribute_test_requirement(attribute) == Some(CfgTestRequirement::RequiresTest)
 }
 
 fn decode_rust_string_literal(literal: &str) -> Option<String> {
@@ -10858,7 +10939,8 @@ fn runtime_filter_query_context_lock_discipline_violations(text: &str) -> Vec<St
 
 #[derive(Debug, Default)]
 struct RuntimeFilterReachableAudit {
-    allow_nested_for_body: bool,
+    allow_nested_conditional_body: bool,
+    allow_topn_nested_rows_loop: bool,
     allowed_owned_for_iterators: BTreeSet<String>,
     allowed_shared_for_iterators: BTreeSet<String>,
     calls: BTreeSet<Vec<String>>,
@@ -10866,6 +10948,8 @@ struct RuntimeFilterReachableAudit {
     methods: BTreeSet<String>,
     paths: BTreeSet<Vec<String>>,
     reachable_for_depth: usize,
+    topn_case_loop_active: bool,
+    topn_rows_loop_active: bool,
 }
 
 impl RuntimeFilterReachableAudit {
@@ -10962,6 +11046,10 @@ fn runtime_filter_expr_definitely_terminates(expression: &syn::Expr) -> bool {
                     .iter()
                     .any(runtime_filter_expr_definitely_terminates)
         }
+        syn::Expr::Assign(assign) => {
+            runtime_filter_expr_definitely_terminates(&assign.left)
+                || runtime_filter_expr_definitely_terminates(&assign.right)
+        }
         syn::Expr::Binary(binary) => {
             if runtime_filter_expr_definitely_terminates(&binary.left) {
                 return true;
@@ -11043,6 +11131,63 @@ fn runtime_filter_for_iterator_is_definitely_empty(expression: &syn::Expr) -> bo
     }
 }
 
+fn runtime_filter_pat_is_immutable_ident(pattern: &syn::Pat, expected: &str) -> bool {
+    matches!(pattern, syn::Pat::Ident(binding)
+        if binding.ident == expected
+            && binding.by_ref.is_none()
+            && binding.mutability.is_none()
+            && binding.subpat.is_none())
+}
+
+fn runtime_filter_topn_rows_loop_is_exact(expression: &syn::ExprForLoop) -> bool {
+    let syn::Pat::Tuple(pattern) = expression.pat.as_ref() else {
+        return false;
+    };
+    if pattern.elems.len() != 2
+        || !runtime_filter_pat_is_immutable_ident(&pattern.elems[0], "index")
+        || !runtime_filter_pat_is_immutable_ident(&pattern.elems[1], "row")
+    {
+        return false;
+    }
+    let syn::Expr::MethodCall(skip) = expression.expr.as_ref() else {
+        return false;
+    };
+    if skip.method != "skip"
+        || skip.turbofish.is_some()
+        || skip.args.len() != 1
+        || !matches!(skip.args.first(), Some(syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Int(value),
+            ..
+        })) if value.base10_parse::<usize>().ok() == Some(2))
+    {
+        return false;
+    }
+    let syn::Expr::MethodCall(enumerate) = skip.receiver.as_ref() else {
+        return false;
+    };
+    if enumerate.method != "enumerate"
+        || enumerate.turbofish.is_some()
+        || !enumerate.args.is_empty()
+    {
+        return false;
+    }
+    let syn::Expr::MethodCall(into_iter) = enumerate.receiver.as_ref() else {
+        return false;
+    };
+    if into_iter.method != "into_iter"
+        || into_iter.turbofish.is_some()
+        || !into_iter.args.is_empty()
+    {
+        return false;
+    }
+    matches!(into_iter.receiver.as_ref(), syn::Expr::Field(field)
+        if matches!(&field.member, syn::Member::Named(member) if member == "rows")
+            && matches!(field.base.as_ref(), syn::Expr::Path(path)
+                if path.qself.is_none()
+                    && path.path.leading_colon.is_none()
+                    && path.path.is_ident("case")))
+}
+
 #[derive(Default)]
 struct RuntimeFilterDirectCallAudit {
     calls: BTreeSet<Vec<String>>,
@@ -11093,6 +11238,9 @@ impl RuntimeFilterDirectCallAudit {
                 }
                 false
             }
+            syn::Expr::Assign(assign) => {
+                self.audit_call_tree(&assign.left) || self.audit_call_tree(&assign.right)
+            }
             syn::Expr::Block(block) => {
                 for statement in &block.block.stmts {
                     if self.audit_statement(statement)
@@ -11138,7 +11286,7 @@ impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterReachableAudit {
                     syn::visit::Visit::visit_expr(self, fallback);
                 }
             }
-            None if self.reachable_for_depth > 0 && self.allow_nested_for_body => {
+            None if self.reachable_for_depth > 0 && self.allow_nested_conditional_body => {
                 syn::visit::Visit::visit_block(self, &expression.then_branch);
                 if let Some((_, fallback)) = &expression.else_branch {
                     syn::visit::Visit::visit_expr(self, fallback);
@@ -11172,18 +11320,38 @@ impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterReachableAudit {
 
     fn visit_expr_for_loop(&mut self, expression: &'ast syn::ExprForLoop) {
         syn::visit::Visit::visit_expr(self, &expression.expr);
-        let allowed = self
-            .allowed_owned_for_iterators
-            .iter()
-            .any(|binding| runtime_filter_expr_is_binding_path(&expression.expr, binding))
-            || self.allowed_shared_for_iterators.iter().any(|binding| {
+        let allowed_owned = self.reachable_for_depth == 0
+            && self
+                .allowed_owned_for_iterators
+                .iter()
+                .any(|binding| runtime_filter_expr_is_binding_path(&expression.expr, binding));
+        let allowed_shared = self.reachable_for_depth == 0
+            && self.allowed_shared_for_iterators.iter().any(|binding| {
                 runtime_filter_expr_is_shared_binding_reference(&expression.expr, binding)
-            })
-            || self.reachable_for_depth > 0 && self.allow_nested_for_body;
+            });
+        let topn_outer = allowed_owned
+            && self.allow_topn_nested_rows_loop
+            && runtime_filter_expr_is_binding_path(&expression.expr, "cases")
+            && runtime_filter_pat_is_immutable_ident(&expression.pat, "case");
+        let topn_nested = self.allow_topn_nested_rows_loop
+            && self.topn_case_loop_active
+            && !self.topn_rows_loop_active
+            && runtime_filter_topn_rows_loop_is_exact(expression);
+        let allowed = allowed_owned || allowed_shared || topn_nested;
         if allowed && !runtime_filter_for_iterator_is_definitely_empty(&expression.expr) {
             syn::visit::Visit::visit_pat(self, &expression.pat);
             self.reachable_for_depth += 1;
+            let previous_topn_case = self.topn_case_loop_active;
+            let previous_topn_rows = self.topn_rows_loop_active;
+            if topn_outer {
+                self.topn_case_loop_active = true;
+            }
+            if topn_nested {
+                self.topn_rows_loop_active = true;
+            }
             syn::visit::Visit::visit_block(self, &expression.body);
+            self.topn_case_loop_active = previous_topn_case;
+            self.topn_rows_loop_active = previous_topn_rows;
             self.reachable_for_depth -= 1;
         }
     }
@@ -11323,6 +11491,12 @@ fn runtime_filter_action_dispatch_boundary_violations(producer: &str) -> Vec<Str
             }
         },
     };
+    if runtime_filter_file_has_unproven_cfg(&parsed) {
+        return vec![
+            "Service producer bounded cfg analysis was unproven; action audit fails closed"
+                .to_string(),
+        ];
+    }
     let mut finish_audits = Vec::new();
     for item in &parsed.items {
         match item {
@@ -11652,6 +11826,29 @@ fn runtime_filter_syn_item_requires_test(item: &syn::Item) -> bool {
     })
 }
 
+#[derive(Default)]
+struct RuntimeFilterUnprovenCfgAudit {
+    found: bool,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterUnprovenCfgAudit {
+    fn visit_attribute(&mut self, attribute: &'ast syn::Attribute) {
+        if attribute.path().is_ident("cfg")
+            && matches!(&attribute.meta, syn::Meta::List(list)
+                if cfg_attribute_test_requirement(&format!("#[cfg({})]", list.tokens))
+                    == Some(CfgTestRequirement::Unproven))
+        {
+            self.found = true;
+        }
+    }
+}
+
+fn runtime_filter_file_has_unproven_cfg(file: &syn::File) -> bool {
+    let mut audit = RuntimeFilterUnprovenCfgAudit::default();
+    syn::visit::Visit::visit_file(&mut audit, file);
+    audit.found
+}
+
 fn runtime_filter_subscription_artifact_surface_violations(text: &str) -> Vec<String> {
     let production = rust_sanitized_production_text(text);
     let file = match syn::parse_file(&production) {
@@ -11669,6 +11866,12 @@ fn runtime_filter_subscription_artifact_surface_violations(text: &str) -> Vec<St
             }
         },
     };
+    if runtime_filter_file_has_unproven_cfg(&file) {
+        return vec![
+            "artifact subscription bounded cfg analysis was unproven; raw fallback fails closed"
+                .to_string(),
+        ];
+    }
     let mut violations = Vec::new();
     let local_roots = file
         .items
@@ -12573,6 +12776,7 @@ fn runtime_filter_topn_loop_is_controlled(function: &syn::ItemFn) -> bool {
             "cases",
         )
         && runtime_filter_expr_is_binding_path(&loop_expression.expr, "cases")
+        && runtime_filter_pat_is_immutable_ident(&loop_expression.pat, "case")
 }
 
 fn runtime_filter_join_loop_is_controlled(function: &syn::ItemFn) -> bool {
@@ -12743,7 +12947,8 @@ fn runtime_filter_manifest_function_audit(
         allowed_owned_for_iterators.insert("producers".to_string());
     }
     let mut audit = RuntimeFilterManifestBodyAudit {
-        allow_nested_for_body: controlled_topn_loop,
+        allow_nested_conditional_body: controlled_topn_loop,
+        allow_topn_nested_rows_loop: controlled_topn_loop,
         allowed_owned_for_iterators,
         allowed_shared_for_iterators,
         ..RuntimeFilterManifestBodyAudit::default()
@@ -13465,6 +13670,11 @@ fn m4_aggregate_conformance_requires_frozen_allof_and_separates_empty_unavailabl
             "\nlet _: () = consume((if true { return; } else { () }));\n",
             "",
         ),
+        (
+            "assignment return",
+            "\nlet mut sink = (); sink = return;\n",
+            "",
+        ),
         ("empty array for-loop", "\nfor _ in [] {", "\n}\n"),
         ("empty range for-loop", "\nfor _ in 0..0 {", "\n}\n"),
         (
@@ -13572,6 +13782,24 @@ fn runtime_filter_manifest_direct_call_rejects_short_circuit_decoy() {
         .is_empty(),
         "a terminating call argument must prevent recording the inner and outer callees"
     );
+    let assignment_terminating_owner_edges = runtime_filter_rewrite_function_body(
+        &harness.replacen(
+            "install_service(compile_install_view(",
+            "removed_install(removed_compile(",
+            1,
+        ),
+        "join_harness",
+        "\nlet mut sink = (); sink = return;\nlet _ = install_service(compile_install_view(fallback));\n",
+        "",
+    );
+    assert!(
+        !runtime_filter_conformance_manifest_violations(
+            valid_root,
+            &assignment_terminating_owner_edges,
+        )
+        .is_empty(),
+        "an assignment with a terminating RHS must prevent recording later direct callees"
+    );
 }
 
 #[test]
@@ -13598,6 +13826,18 @@ fn runtime_filter_manifest_controlled_loops_require_live_immutable_bindings() {
         "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
         "for case in cases {",
         "for case in cases.into_iter().filter(|_| false) {",
+    );
+    let topn_nested_empty = runtime_filter_replace_in_function_body(
+        &harness,
+        "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+        "for (index, row) in case.rows.into_iter().enumerate().skip(2) {",
+        "for _ in std::iter::empty::<()>() {",
+    );
+    let topn_nested_filtered = runtime_filter_replace_in_function_body(
+        &harness,
+        "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+        "for (index, row) in case.rows.into_iter().enumerate().skip(2) {",
+        "for (index, row) in case.rows.into_iter().enumerate().skip(2).filter(|_| false) {",
     );
     let join_clear = runtime_filter_replace_in_function_body(
         &harness,
@@ -13639,6 +13879,8 @@ fn runtime_filter_manifest_controlled_loops_require_live_immutable_bindings() {
         ("topn clear", topn_clear),
         ("topn rebound", topn_rebound),
         ("topn filter-to-empty", topn_filtered),
+        ("topn nested empty iterator", topn_nested_empty),
+        ("topn nested filter-to-empty", topn_nested_filtered),
         ("join clear", join_clear),
         ("join rebound", join_rebound),
         ("join filter-to-empty", join_filtered),
@@ -14453,6 +14695,90 @@ fn runtime_filter_cfg_requires_test_handles_nested_boolean_predicates() {
 }
 
 #[test]
+fn runtime_filter_cfg_solver_is_bounded_and_raw_fallback_fails_closed() {
+    let tautologies = (0..12)
+        .map(|index| format!("any(feature = \"x{index}\", not(feature = \"x{index}\"))"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let hard_unsatisfiable =
+        format!("#[cfg(all({tautologies}, feature = \"zz\", not(feature = \"zz\")))]");
+    let hard_tokens = rust_use_tokens(&hard_unsatisfiable);
+    let hard_start = hard_tokens
+        .iter()
+        .position(|token| token == "cfg")
+        .expect("hard CFG fixture must contain cfg")
+        + 2;
+    assert_eq!(
+        cfg_predicate_test_requirement(&hard_tokens, hard_start).map(|result| result.0),
+        Some(CfgTestRequirement::Unproven),
+        "the default work budget must bound the adversarial predicate"
+    );
+    assert_eq!(
+        cfg_predicate_test_requirement_with_budget(&hard_tokens, hard_start, 16_384)
+            .map(|result| result.0),
+        Some(CfgTestRequirement::RequiresTest),
+        "with enough explicit work, the bounded solver must preserve predicate semantics"
+    );
+    let production_possible = format!("#[cfg(all({tautologies}, feature = \"zz\"))]");
+    assert_eq!(
+        cfg_attribute_test_requirement(&production_possible),
+        Some(CfgTestRequirement::ProductionPossible),
+        "a satisfiable multi-atom predicate must remain production-visible"
+    );
+    let source = format!(
+        r#"
+use std::sync::Arc;
+use crate::runtime_filter::port::artifact::ArtifactBundle;
+{hard_unsatisfiable}
+enum ArtifactAcquireOutcome {{ Published(Arc<ArtifactBundle>) }}
+{hard_unsatisfiable}
+enum ArtifactDeliveryOutcome {{ Published(Arc<ArtifactBundle>) }}
+{hard_unsatisfiable}
+trait BlockingSnapshotSubscription {{
+    fn snapshot(&self) -> Option<Arc<ArtifactBundle>>;
+}}
+fn force_sanitizer_failure() {{
+    let _value = 1 + #[cfg(test)] 2;
+}}
+"#
+    );
+    assert!(
+        syn::parse_file(&source).is_ok()
+            && syn::parse_file(&rust_sanitized_production_text(&source)).is_err(),
+        "fixture must exercise the filtered raw fallback"
+    );
+    let violations = runtime_filter_subscription_artifact_surface_violations(&source);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("bounded cfg analysis")),
+        "an unproven CFG predicate must fail the raw fallback closed: {violations:#?}"
+    );
+
+    let action_source = format!(
+        r#"
+{hard_unsatisfiable}
+fn finish(&self, action: crate::runtime_filter::core::channel::ChannelAction) {{
+    self.dispatcher.dispatch(self.channel_id, action);
+}}
+fn submit(&self) {{ self.channel.submit().map(|action| self.finish(action)); }}
+fn close_partition(&self) {{ self.channel.close_partition().map(|action| self.finish(action)); }}
+fn fail(&self) {{ self.channel.fail_instance().map(|action| self.finish(action)); }}
+fn force_sanitizer_failure() {{
+    let _value = 1 + #[cfg(test)] 2;
+}}
+"#
+    );
+    let action_violations = runtime_filter_action_dispatch_boundary_violations(&action_source);
+    assert!(
+        action_violations
+            .iter()
+            .any(|violation| violation.contains("bounded cfg analysis")),
+        "an unproven CFG predicate must fail the action raw fallback closed: {action_violations:#?}"
+    );
+}
+
+#[test]
 fn runtime_filter_materializer_semantic_detector_rejects_range_magic_fallback_and_second_queue() {
     for (source_rel, source) in [
         (
@@ -15023,6 +15349,10 @@ fn fail(&self) { self.channel.fail_instance().map(|action| self.finish(action));
         good.replace(
             "self.dispatcher.dispatch(self.channel_id, action);",
             "let _: () = consume((if true { return; } else { () })); self.dispatcher.dispatch(self.channel_id, action);",
+        ),
+        good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "let mut sink = (); sink = return; self.dispatcher.dispatch(self.channel_id, action);",
         ),
         good.replace(
             "self.dispatcher.dispatch(self.channel_id, action);",
