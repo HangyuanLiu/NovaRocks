@@ -36,12 +36,12 @@ use crate::connector::iceberg::compact::{
     execute_whole_table_rewrite_with_metrics_for_target,
 };
 use crate::engine::catalog::normalize_identifier;
-use crate::engine::procedure::{CallProcedureStmt, ProcedureArgMode, ProcedureArgValue};
 use crate::engine::{
     QueryResult, QueryResultColumn, StandaloneState, StatementResult, record_batch_to_chunk,
 };
 use crate::fs::object_store::ObjectStoreConfig;
 use crate::meta::repository::job::CreateIcebergOptimizeJobRequest;
+use crate::sql::parser::procedure::{CallProcedureStmt, ProcedureArgMode, ProcedureArgValue};
 
 /// Return type shared by `resolve_maintenance_catalog` and `build_action_catalog`.
 pub(crate) type MaintenanceCatalogTriple =
@@ -1038,7 +1038,7 @@ fn column(name: &str, data_type: DataType, nullable: bool) -> QueryResultColumn 
 mod tests {
     use super::*;
     use crate::connector::iceberg::commit::LiveFileMetrics;
-    use crate::engine::procedure::parse_call_procedure_sql;
+    use crate::sql::parser::procedure::parse_call_procedure_sql;
 
     fn test_request(kind: MaintenanceActionKind) -> MaintenanceActionRequest {
         MaintenanceActionRequest {
@@ -1060,6 +1060,40 @@ mod tests {
     fn request_from_call(sql: &str) -> Result<MaintenanceActionRequest, String> {
         let stmt = parse_call_procedure_sql(sql).unwrap();
         MaintenanceActionRequest::from_call(&stmt, "db")
+    }
+
+    #[test]
+    fn named_rewrite_manifests_to_action_request() {
+        let req = request_from_call("CALL ice.system.rewrite_manifests(table => 'db.t')").unwrap();
+
+        assert_eq!(req.catalog, "ice");
+        assert_eq!(req.namespace, "db");
+        assert_eq!(req.table, "t");
+        assert_eq!(req.kind, MaintenanceActionKind::RewriteManifests);
+    }
+
+    #[test]
+    fn positional_rewrite_manifests_to_action_request() {
+        let req = request_from_call("CALL ice.system.rewrite_manifests('db.t', false)").unwrap();
+
+        assert_eq!(req.use_caching, Some(false));
+    }
+
+    #[test]
+    fn unknown_procedure_rejected() {
+        let err = request_from_call("CALL ice.system.unknown_proc(table => 'db.t')").unwrap_err();
+
+        assert!(err.contains("unsupported Iceberg system procedure"));
+    }
+
+    #[test]
+    fn remove_orphan_dry_run_rejected_until_supported() {
+        let err = request_from_call(
+            "CALL ice.system.remove_orphan_files(table => 'db.t', older_than => TIMESTAMP '2026-01-01 00:00:00', dry_run => true)",
+        )
+        .unwrap_err();
+
+        assert!(err.contains("not implemented"));
     }
 
     #[test]

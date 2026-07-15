@@ -17,7 +17,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::engine::catalog::normalize_identifier;
 use crate::sql::parser::dialect::StarRocksDialect;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use sqlparser::ast::ObjectName;
@@ -82,7 +81,7 @@ pub(crate) struct CallProcedureStmt {
 
 impl CallProcedureStmt {
     pub(crate) fn arg(&self, name: &str) -> Option<&ProcedureArgValue> {
-        let normalized = normalize_identifier(name).ok()?;
+        let normalized = normalize_procedure_identifier(name).ok()?;
         self.args.iter().find_map(|arg| {
             if arg.name.as_deref() == Some(normalized.as_str()) {
                 Some(&arg.value)
@@ -91,6 +90,28 @@ impl CallProcedureStmt {
             }
         })
     }
+}
+
+fn normalize_procedure_identifier(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    let trimmed = trimmed
+        .strip_prefix('`')
+        .and_then(|value| value.strip_suffix('`'))
+        .unwrap_or(trimmed);
+    if trimmed.is_empty() {
+        return Err("identifier is empty".to_string());
+    }
+    let mut chars = trimmed.chars();
+    let Some(first) = chars.next() else {
+        return Err("identifier is empty".to_string());
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return Err(format!("unsupported identifier `{trimmed}`"));
+    }
+    if !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+        return Err(format!("unsupported identifier `{trimmed}`"));
+    }
+    Ok(trimmed.to_ascii_lowercase())
 }
 
 pub(crate) fn looks_like_call_procedure(sql: &str) -> bool {
@@ -142,7 +163,9 @@ fn normalize_object_name(name: ObjectName) -> Result<Vec<String>, String> {
     name.0
         .into_iter()
         .map(|part| match part {
-            sqlparser::ast::ObjectNamePart::Identifier(ident) => normalize_identifier(&ident.value),
+            sqlparser::ast::ObjectNamePart::Identifier(ident) => {
+                normalize_procedure_identifier(&ident.value)
+            }
             other => Err(format!("unsupported CALL procedure name part: {other}")),
         })
         .collect()
@@ -202,7 +225,7 @@ fn parse_arg(parser: &mut Parser<'_>) -> Result<ProcedureArg, String> {
             .parse_identifier()
             .map_err(|e| format!("CALL procedure expected argument name: {e}"))?;
         consume_fat_arrow(parser)?;
-        Some(normalize_identifier(&ident.value)?)
+        Some(normalize_procedure_identifier(&ident.value)?)
     } else {
         None
     };
@@ -367,6 +390,38 @@ mod tests {
     }
 
     #[test]
+    fn quoted_identifiers_preserve_normalization_and_lookup_behavior() {
+        let stmt =
+            parse_call_procedure_sql("CALL `ICE`.`SYSTEM`.`REWRITE_MANIFESTS`(`TABLE` => 'db.t')")
+                .unwrap();
+
+        assert_eq!(stmt.catalog, "ice");
+        assert_eq!(stmt.namespace, "system");
+        assert_eq!(stmt.procedure, "rewrite_manifests");
+        assert_eq!(
+            stmt.arg("`TABLE`").and_then(ProcedureArgValue::as_string),
+            Some("db.t")
+        );
+    }
+
+    #[test]
+    fn invalid_quoted_identifier_first_character_preserves_error_text() {
+        let err = parse_call_procedure_sql("CALL `1ICE`.system.rewrite_manifests(table => 'db.t')")
+            .unwrap_err();
+
+        assert_eq!(err, "unsupported identifier `1ICE`");
+    }
+
+    #[test]
+    fn invalid_quoted_identifier_character_preserves_error_text() {
+        let err =
+            parse_call_procedure_sql("CALL ice.system.rewrite_manifests(`table-name` => 'db.t')")
+                .unwrap_err();
+
+        assert_eq!(err, "unsupported identifier `table-name`");
+    }
+
+    #[test]
     fn plain_string_epoch_millis_stays_string() {
         let stmt =
             parse_call_procedure_sql("CALL ice.system.rewrite_manifests(table => '1700000000000')")
@@ -399,54 +454,6 @@ mod tests {
         assert_eq!(stmt.args[0].name, None);
         assert_eq!(stmt.args[0].value.as_string().unwrap(), "db.t");
         assert_eq!(stmt.args[1].value.as_bool().unwrap(), false);
-    }
-
-    #[test]
-    fn named_rewrite_manifests_to_action_request() {
-        let stmt =
-            parse_call_procedure_sql("CALL ice.system.rewrite_manifests(table => 'db.t')").unwrap();
-        let req =
-            crate::engine::iceberg_maintenance::MaintenanceActionRequest::from_call(&stmt, "db")
-                .unwrap();
-        assert_eq!(req.catalog, "ice");
-        assert_eq!(req.namespace, "db");
-        assert_eq!(req.table, "t");
-        assert_eq!(
-            req.kind,
-            crate::engine::iceberg_maintenance::MaintenanceActionKind::RewriteManifests
-        );
-    }
-
-    #[test]
-    fn positional_rewrite_manifests_to_action_request() {
-        let stmt =
-            parse_call_procedure_sql("CALL ice.system.rewrite_manifests('db.t', false)").unwrap();
-        let req =
-            crate::engine::iceberg_maintenance::MaintenanceActionRequest::from_call(&stmt, "db")
-                .unwrap();
-        assert_eq!(req.use_caching, Some(false));
-    }
-
-    #[test]
-    fn unknown_procedure_rejected() {
-        let stmt =
-            parse_call_procedure_sql("CALL ice.system.unknown_proc(table => 'db.t')").unwrap();
-        let err =
-            crate::engine::iceberg_maintenance::MaintenanceActionRequest::from_call(&stmt, "db")
-                .unwrap_err();
-        assert!(err.contains("unsupported Iceberg system procedure"));
-    }
-
-    #[test]
-    fn remove_orphan_dry_run_rejected_until_supported() {
-        let stmt = parse_call_procedure_sql(
-            "CALL ice.system.remove_orphan_files(table => 'db.t', older_than => TIMESTAMP '2026-01-01 00:00:00', dry_run => true)",
-        )
-        .unwrap();
-        let err =
-            crate::engine::iceberg_maintenance::MaintenanceActionRequest::from_call(&stmt, "db")
-                .unwrap_err();
-        assert!(err.contains("not implemented"));
     }
 
     #[test]
