@@ -165,6 +165,30 @@ impl OrderedBoundUpdate {
     pub(crate) const fn replay_digest(&self) -> [u8; 32] {
         self.replay_digest
     }
+
+    pub(crate) fn canonical_contribution_bytes(&self) -> Option<usize> {
+        self.bound.values().iter().try_fold(
+            REPLAY_DIGEST_DOMAIN
+                .len()
+                .checked_add(size_of::<u16>())?
+                .checked_add(32)?
+                .checked_add(size_of::<u64>())?,
+            |bytes, value| {
+                let scalar_bytes = match value {
+                    None => 0,
+                    Some(OrderedScalar::Boolean(_) | OrderedScalar::Int8(_)) => 1,
+                    Some(OrderedScalar::Int16(_)) => 2,
+                    Some(OrderedScalar::Int32(_) | OrderedScalar::Date32(_)) => 4,
+                    Some(OrderedScalar::Int64(_) | OrderedScalar::Timestamp(_)) => 8,
+                    Some(OrderedScalar::LargeInt(_) | OrderedScalar::Decimal128(_)) => 16,
+                    Some(OrderedScalar::Utf8(value)) => {
+                        size_of::<u64>().checked_add(value.len())?
+                    }
+                };
+                bytes.checked_add(1)?.checked_add(scalar_bytes)
+            },
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

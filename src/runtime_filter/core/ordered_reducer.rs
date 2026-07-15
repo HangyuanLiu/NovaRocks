@@ -129,6 +129,49 @@ impl OrderedReducer {
         })
     }
 
+    pub(crate) fn retain_protocol_tombstones(&mut self) -> Option<usize> {
+        for stream in self.streams.values_mut() {
+            stream.latest_bound = None;
+        }
+        self.global = None;
+        self.estimated_retained_bytes()
+    }
+
+    pub(crate) fn validate_tombstone_update(
+        &self,
+        stream_id: ProducerStreamId,
+        sequence: ProducerSequence,
+        update: &OrderedBoundUpdate,
+    ) -> Result<(), RuntimeContractViolation> {
+        if update.order_contract_digest() != self.contract.digest() {
+            return Err(violation(
+                RuntimeContractViolationKind::OrderedContractMismatch,
+                "ordered bound update does not match the installed order contract",
+            ));
+        }
+        let Some(current) = self.streams.get(&stream_id) else {
+            return Ok(());
+        };
+        if current
+            .terminal_sequence
+            .is_some_and(|terminal| sequence >= terminal)
+        {
+            return Err(violation(
+                RuntimeContractViolationKind::SequenceOutsideTerminalRange,
+                "ordered update sequence is outside the exclusive terminal range",
+            ));
+        }
+        if current.highest_sequence == Some(sequence)
+            && current.replay_digest != Some(update.replay_digest())
+        {
+            return Err(violation(
+                RuntimeContractViolationKind::ConflictingReplay,
+                "same ordered producer sequence carried a different cumulative bound",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn apply(
         &mut self,
         stream_id: ProducerStreamId,

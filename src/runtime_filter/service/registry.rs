@@ -148,6 +148,7 @@ pub(super) struct InstalledDeployment {
     channels: BTreeMap<ChannelId, Arc<RuntimeFilterChannel>>,
     deadlines: BTreeMap<ChannelId, Instant>,
     producers: BTreeMap<BindingId, ProducerRoute>,
+    consumer_activations: BTreeMap<BindingId, ConsumerActivation>,
     subscriptions: BTreeMap<BindingId, Arc<SubscriptionGroup>>,
     router: Arc<LoopbackRouter>,
     channel_routes: BTreeMap<ChannelId, Vec<RouteEdgeId>>,
@@ -206,8 +207,12 @@ impl InstalledDeployment {
             .and_then(|group| group.slot(instance))
     }
 
+    pub(super) fn consumer_activation(&self, binding_id: BindingId) -> Option<ConsumerActivation> {
+        self.consumer_activations.get(&binding_id).copied()
+    }
+
     pub(super) fn has_consumer(&self, binding_id: BindingId) -> bool {
-        self.subscriptions.contains_key(&binding_id)
+        self.consumer_activations.contains_key(&binding_id)
     }
 
     #[cfg(test)]
@@ -536,6 +541,7 @@ impl DeploymentRegistry {
             channels,
             deadlines,
             producers: routing.producers,
+            consumer_activations: routing.consumer_activations,
             subscriptions: routing.subscriptions,
             router: Arc::new(LoopbackRouter::new(routing.routes)),
             channel_routes: routing.channel_routes,
@@ -781,6 +787,7 @@ pub(crate) fn validate_view_for_test(view: &RuntimeFilterInstallView) -> Result<
 
 struct RoutingBuild {
     producers: BTreeMap<BindingId, ProducerRoute>,
+    consumer_activations: BTreeMap<BindingId, ConsumerActivation>,
     subscriptions: BTreeMap<BindingId, Arc<SubscriptionGroup>>,
     routes:
         BTreeMap<RouteEdgeId, Arc<dyn crate::runtime_filter::port::subscription::ArtifactDelivery>>,
@@ -797,6 +804,7 @@ fn build_routing(
 ) -> Result<RoutingBuild, InstallContractError> {
     let mut build = RoutingBuild {
         producers: BTreeMap::new(),
+        consumer_activations: BTreeMap::new(),
         subscriptions: BTreeMap::new(),
         routes: BTreeMap::new(),
         channel_routes: BTreeMap::new(),
@@ -837,6 +845,15 @@ fn build_routing(
             );
         }
         for (binding_id, consumer) in deployment.consumers() {
+            build
+                .consumer_activations
+                .insert(*binding_id, consumer.activation());
+            if matches!(
+                consumer.activation(),
+                ConsumerActivation::NonBlockingLive { .. }
+            ) {
+                continue;
+            }
             let route_edge_id = consumer.loopback_route_edge_id();
             let group = Arc::new(SubscriptionGroup::new(
                 common,

@@ -169,6 +169,13 @@ impl OrderedBoundProducerAdapter for ServiceProducerAdapter {
     ) -> Result<SubmitOutcome, RuntimeContractViolation> {
         self.channel
             .authorize_submit(self.binding_id, self.fragment_instance_id, partition_id)?;
+        let Some(bytes) = update.canonical_contribution_bytes() else {
+            return self.finish(self.channel.resource_exhausted());
+        };
+        let Ok(lease) = TemporaryContributionLease::try_new(self.memory_account.clone(), bytes)
+        else {
+            return self.finish(self.channel.resource_exhausted());
+        };
         self.channel
             .submit_ordered(
                 self.binding_id,
@@ -176,6 +183,7 @@ impl OrderedBoundProducerAdapter for ServiceProducerAdapter {
                 partition_id,
                 sequence,
                 update,
+                lease,
             )
             .and_then(|action| self.finish(action))
     }

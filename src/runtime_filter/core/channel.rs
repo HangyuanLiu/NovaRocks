@@ -665,7 +665,20 @@ impl RuntimeFilterChannel {
         partition_id: PartitionId,
         sequence: ProducerSequence,
         update: OrderedBoundUpdate,
+        temporary_lease: TemporaryContributionLease,
     ) -> Result<ChannelAction, RuntimeContractViolation> {
+        let contribution_bytes = update.canonical_contribution_bytes().ok_or_else(|| {
+            violation(
+                RuntimeContractViolationKind::InvalidContributionLease,
+                "ordered contribution canonical size overflowed",
+            )
+        })?;
+        if temporary_lease.bytes() != contribution_bytes {
+            return Err(violation(
+                RuntimeContractViolationKind::InvalidContributionLease,
+                "temporary contribution lease does not match canonical ordered payload size",
+            ));
+        }
         let identity = ContributionIdentity::new(
             self.event_identity.query_id(),
             self.event_identity.participant_id(),
@@ -677,6 +690,7 @@ impl RuntimeFilterChannel {
         let stream_id = identity.stream();
         let mut metadata_reservation = None;
         let mut snapshot_reservation = None;
+        let mut reservation_failed_for = None;
         loop {
             let mut state = self.state.lock().unwrap();
             partition_state(&state, binding_id, fragment_instance_id, partition_id)?;
@@ -686,6 +700,27 @@ impl RuntimeFilterChannel {
                     "membership channel cannot accept ordered bounds",
                 )
             })?;
+            if matches!(
+                state.terminal,
+                ChannelTerminal::Unavailable { .. } | ChannelTerminal::Cancelled { .. }
+            ) {
+                ordered
+                    .reducer
+                    .validate_tombstone_update(stream_id, sequence, &update)?;
+                return Ok(terminal_action_from_state(&state));
+            }
+            if u64::try_from(contribution_bytes)
+                .map_or(true, |bytes| bytes > self.max_contribution_bytes)
+            {
+                let locked = self.make_ordered_unavailable_or_degraded(
+                    &mut state,
+                    UnavailableReason::ResourceLimit,
+                    SubmitOutcome::TerminalNoop,
+                    Vec::new(),
+                );
+                drop(state);
+                return Ok(locked.finish());
+            }
             let before_bytes = ordered.reducer.estimated_retained_bytes().ok_or_else(|| {
                 violation(
                     RuntimeContractViolationKind::OrderedContractMismatch,
@@ -777,6 +812,17 @@ impl RuntimeFilterChannel {
                     .map(RetainedMemoryReservation::bytes)
                     == Some(snapshot_bytes);
             if !reservations_match {
+                let required = (metadata_growth, snapshot_bytes);
+                if reservation_failed_for == Some(required) {
+                    let locked = self.make_ordered_unavailable_or_degraded(
+                        &mut state,
+                        UnavailableReason::ResourceLimit,
+                        SubmitOutcome::TerminalNoop,
+                        Vec::new(),
+                    );
+                    drop(state);
+                    return Ok(locked.finish());
+                }
                 drop(state);
                 drop(metadata_reservation.take());
                 drop(snapshot_reservation.take());
@@ -789,15 +835,7 @@ impl RuntimeFilterChannel {
                     RetainedMemoryReservation::try_new(self.memory_account.clone(), snapshot_bytes)
                         .ok();
                 if metadata_reservation.is_none() || snapshot_reservation.is_none() {
-                    let mut state = self.state.lock().unwrap();
-                    let locked = self.make_ordered_unavailable_or_degraded(
-                        &mut state,
-                        UnavailableReason::ResourceLimit,
-                        SubmitOutcome::TerminalNoop,
-                        Vec::new(),
-                    );
-                    drop(state);
-                    return Ok(locked.finish());
+                    reservation_failed_for = Some(required);
                 }
                 continue;
             }
@@ -894,6 +932,7 @@ impl RuntimeFilterChannel {
     ) -> Result<ChannelAction, RuntimeContractViolation> {
         let stream_id = ProducerStreamId::new(binding_id, fragment_instance_id, partition_id);
         let mut reservation = None;
+        let mut reservation_failed_for = None;
         loop {
             let mut state = self.state.lock().unwrap();
             partition_state(&state, binding_id, fragment_instance_id, partition_id)?;
@@ -938,12 +977,7 @@ impl RuntimeFilterChannel {
                 return Ok(locked.finish());
             }
             if reservation.as_ref().map(RetainedMemoryReservation::bytes) != Some(growth) {
-                drop(state);
-                drop(reservation.take());
-                reservation =
-                    RetainedMemoryReservation::try_new(self.memory_account.clone(), growth).ok();
-                if reservation.is_none() {
-                    let mut state = self.state.lock().unwrap();
+                if reservation_failed_for == Some(growth) {
                     let locked = self.make_ordered_unavailable_or_degraded(
                         &mut state,
                         UnavailableReason::ResourceLimit,
@@ -952,6 +986,13 @@ impl RuntimeFilterChannel {
                     );
                     drop(state);
                     return Ok(locked.finish());
+                }
+                drop(state);
+                drop(reservation.take());
+                reservation =
+                    RetainedMemoryReservation::try_new(self.memory_account.clone(), growth).ok();
+                if reservation.is_none() {
+                    reservation_failed_for = Some(growth);
                 }
                 continue;
             }
@@ -1647,7 +1688,7 @@ impl RuntimeFilterChannel {
     }
 
     fn detach_collecting_state(&self, state: &mut ChannelState) -> RetainedMemoryReservation {
-        let reservation =
+        let mut reservation =
             std::mem::replace(&mut state.reservation, RetainedMemoryReservation::empty());
         if self.data_type.is_some() {
             state.reducer = Some(
@@ -1661,8 +1702,13 @@ impl RuntimeFilterChannel {
                 .expect("validated membership type"),
             );
         } else if let Some(ordered) = state.ordered.as_mut() {
-            let contract = ordered.reducer.contract().clone();
-            ordered.reducer = OrderedReducer::new(contract);
+            let tombstone_bytes = ordered
+                .reducer
+                .retain_protocol_tombstones()
+                .expect("accounted ordered tombstone size remains representable");
+            let released = reservation.split_off_excess(tombstone_bytes);
+            state.reservation = reservation;
+            reservation = released;
         }
         for producer in state.producers.values_mut() {
             for instance in producer.instances.values_mut() {
@@ -3322,13 +3368,39 @@ mod tests {
     }
 
     struct OrderedChannelHarness {
-        channel: RuntimeFilterChannel,
+        channel: Arc<RuntimeFilterChannel>,
         contract: Arc<RuntimeOrderContract>,
         streams: Vec<(BindingId, UniqueId)>,
+        temporary_account: Arc<Account>,
     }
 
     impl OrderedChannelHarness {
         fn with_streams(count: usize) -> Self {
+            Self::with_streams_and_limits(count, 1024, 4096, Arc::new(Account::default()))
+        }
+
+        fn with_streams_and_limits(
+            count: usize,
+            max_contribution_bytes: u64,
+            max_reducer_bytes: u64,
+            memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
+        ) -> Self {
+            Self::with_streams_coverage_and_limits(
+                count,
+                true,
+                max_contribution_bytes,
+                max_reducer_bytes,
+                memory_account,
+            )
+        }
+
+        fn with_streams_coverage_and_limits(
+            count: usize,
+            any_of: bool,
+            max_contribution_bytes: u64,
+            max_reducer_bytes: u64,
+            memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
+        ) -> Self {
             let keys = vec![OrderKeyContract {
                 data_type: DataType::Int64,
                 direction: SortDirection::Ascending,
@@ -3351,7 +3423,12 @@ mod tests {
             let witnesses = (0..count)
                 .map(|index| CoverageWitnessId::new(1 + u32::try_from(index).unwrap()))
                 .collect::<Vec<_>>();
-            let coverage = Coverage::AnyOf(witnesses.iter().copied().map(Coverage::Leaf).collect());
+            let coverage_children = witnesses.iter().copied().map(Coverage::Leaf).collect();
+            let coverage = if any_of {
+                Coverage::AnyOf(coverage_children)
+            } else {
+                Coverage::AllOf(coverage_children)
+            };
             let deployment = RuntimeFilterChannelDeployment::new(
                 ChannelId::new(1),
                 RuntimeFilterLogicalDomain::OrderedBound(plan),
@@ -3365,12 +3442,12 @@ mod tests {
                 ]),
                 CompletionRequirement::ProducerClosed,
                 RuntimeFilterPolicyRequirement {
-                    max_contribution_bytes: 1024,
+                    max_contribution_bytes,
                     max_artifact_bytes: 1024,
                     deadline_ms: 100,
                     max_retries: 0,
                 },
-                RuntimeFilterCoreBudget::new(4096),
+                RuntimeFilterCoreBudget::new(max_reducer_bytes),
                 MaterializationPolicy::for_test(),
                 streams
                     .iter()
@@ -3384,15 +3461,17 @@ mod tests {
                     .collect(),
                 BTreeMap::new(),
             );
-            let channel = RuntimeFilterChannel::new(
-                uid(99),
-                RuntimeFilterParticipantId::new(1),
-                DeploymentEpoch::new(1),
-                &deployment,
-                Instant::now() + Duration::from_secs(10),
-                Arc::new(Account::default()),
-            )
-            .unwrap();
+            let channel = Arc::new(
+                RuntimeFilterChannel::new(
+                    uid(99),
+                    RuntimeFilterParticipantId::new(1),
+                    DeploymentEpoch::new(1),
+                    &deployment,
+                    Instant::now() + Duration::from_secs(10),
+                    memory_account,
+                )
+                .unwrap(),
+            );
             for (binding, instance) in &streams {
                 channel.open_producer(*binding, *instance, 1).unwrap();
             }
@@ -3400,6 +3479,7 @@ mod tests {
                 channel,
                 contract,
                 streams,
+                temporary_account: Arc::new(Account::default()),
             }
         }
 
@@ -3421,6 +3501,7 @@ mod tests {
             let tuple =
                 OrderedTuple::try_new(&self.contract, [Some(OrderedScalar::Int64(value))]).unwrap();
             let update = OrderedBoundUpdate::new(&self.contract, tuple).unwrap();
+            let contribution_bytes = update.canonical_contribution_bytes().unwrap();
             self.channel
                 .submit_ordered(
                     binding,
@@ -3428,6 +3509,10 @@ mod tests {
                     PartitionId::new(0),
                     ProducerSequence::new(sequence),
                     update,
+                    TemporaryContributionLease::new(
+                        self.temporary_account.clone(),
+                        contribution_bytes,
+                    ),
                 )
                 .map(test_action)
         }
@@ -3475,6 +3560,82 @@ mod tests {
                 state.next_dispatch_order
             )
         }
+    }
+
+    fn utf8_order_contract() -> (OrderContract, Arc<RuntimeOrderContract>) {
+        let keys = vec![OrderKeyContract {
+            data_type: DataType::Utf8,
+            direction: SortDirection::Ascending,
+            null_order: NullOrder::Last,
+        }];
+        let plan = OrderContract {
+            comparator_digest: comparator_digest_for_test(&keys, COMPARATOR_ALGORITHM_VERSION),
+            keys,
+            inclusive: true,
+        };
+        let contract = Arc::new(RuntimeOrderContract::try_from_plan(&plan).unwrap());
+        (plan, contract)
+    }
+
+    fn ordered_single_channel(
+        plan: OrderContract,
+        max_contribution_bytes: u64,
+        memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
+    ) -> Arc<RuntimeFilterChannel> {
+        let witness = CoverageWitnessId::new(1);
+        let deployment = RuntimeFilterChannelDeployment::new(
+            ChannelId::new(1),
+            RuntimeFilterLogicalDomain::OrderedBound(plan),
+            RuntimeFilterLifecycle::MonotonicUpdates,
+            Coverage::Leaf(witness),
+            Coverage::Leaf(witness),
+            ReductionRequirement::TightenOrderedBound,
+            BTreeSet::from([
+                ContributionKind::OrderedBoundUpdate,
+                ContributionKind::ProducerClosed,
+            ]),
+            CompletionRequirement::ProducerClosed,
+            RuntimeFilterPolicyRequirement {
+                max_contribution_bytes,
+                max_artifact_bytes: 4096,
+                deadline_ms: 100,
+                max_retries: 0,
+            },
+            RuntimeFilterCoreBudget::new(4096),
+            MaterializationPolicy::for_test(),
+            BTreeMap::from([(
+                BindingId::new(10),
+                ProducerDeployment::new(witness, BTreeSet::from([uid(10)])),
+            )]),
+            BTreeMap::new(),
+        );
+        let channel = Arc::new(
+            RuntimeFilterChannel::new(
+                uid(99),
+                RuntimeFilterParticipantId::new(1),
+                DeploymentEpoch::new(1),
+                &deployment,
+                Instant::now() + Duration::from_secs(10),
+                memory_account,
+            )
+            .unwrap(),
+        );
+        channel
+            .open_producer(BindingId::new(10), uid(10), 1)
+            .unwrap();
+        channel
+    }
+
+    fn utf8_update(contract: &RuntimeOrderContract, len: usize) -> OrderedBoundUpdate {
+        OrderedBoundUpdate::new(
+            contract,
+            OrderedTuple::try_new(
+                contract,
+                [Some(OrderedScalar::Utf8(Arc::from("x".repeat(len))))],
+            )
+            .unwrap(),
+        )
+        .unwrap()
     }
 
     mod ordered {
@@ -3639,6 +3800,318 @@ mod tests {
                 harness.channel.terminal_action().logical_terminal(),
                 Some(crate::runtime_filter::core::state::LogicalTerminal::CompletedWithoutArtifact)
             );
+        }
+
+        #[test]
+        fn submit_reservation_failure_revalidates_concurrent_cancel() {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let harness = OrderedChannelHarness::with_streams_and_limits(
+                1,
+                1024,
+                4096,
+                Arc::new(BlockingRejectingAccount {
+                    entered: entered_tx,
+                    release: Mutex::new(release_rx),
+                }),
+            );
+            let channel = harness.channel.clone();
+            let contract = harness.contract.clone();
+            let (binding, instance) = harness.streams[0];
+            let (done_tx, done_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let tuple =
+                    OrderedTuple::try_new(&contract, [Some(OrderedScalar::Int64(40))]).unwrap();
+                let update = OrderedBoundUpdate::new(&contract, tuple).unwrap();
+                let contribution_bytes = update.canonical_contribution_bytes().unwrap();
+                done_tx
+                    .send(channel.submit_ordered(
+                        binding,
+                        instance,
+                        PartitionId::new(0),
+                        ProducerSequence::new(0),
+                        update,
+                        TemporaryContributionLease::new(
+                            Arc::new(Account::default()),
+                            contribution_bytes,
+                        ),
+                    ))
+                    .unwrap();
+            });
+
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert!(matches!(
+                harness.channel.cancel(),
+                ChannelAction::Cancelled { .. }
+            ));
+            release_tx.send(()).unwrap();
+            release_tx.send(()).unwrap();
+            assert_eq!(
+                done_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap()
+                    .outcome(),
+                SubmitOutcome::TerminalNoop
+            );
+            assert!(matches!(
+                harness.channel.terminal_action(),
+                ChannelAction::Cancelled { .. }
+            ));
+        }
+
+        #[test]
+        fn close_reservation_failure_revalidates_concurrent_cancel() {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let harness = OrderedChannelHarness::with_streams_and_limits(
+                1,
+                1024,
+                4096,
+                Arc::new(BlockingRejectingAccount {
+                    entered: entered_tx,
+                    release: Mutex::new(release_rx),
+                }),
+            );
+            let channel = harness.channel.clone();
+            let (binding, instance) = harness.streams[0];
+            let (done_tx, done_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                done_tx
+                    .send(channel.close_ordered_partition(
+                        binding,
+                        instance,
+                        PartitionId::new(0),
+                        ProducerSequence::new(0),
+                    ))
+                    .unwrap();
+            });
+
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert!(matches!(
+                harness.channel.cancel(),
+                ChannelAction::Cancelled { .. }
+            ));
+            release_tx.send(()).unwrap();
+            assert_eq!(
+                done_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap()
+                    .outcome(),
+                SubmitOutcome::TerminalNoop
+            );
+            assert!(matches!(
+                harness.channel.terminal_action(),
+                ChannelAction::Cancelled { .. }
+            ));
+        }
+
+        #[test]
+        fn unavailable_retains_ordered_protocol_tombstone() {
+            let account = Arc::new(Account::default());
+            let harness = OrderedChannelHarness::with_streams_coverage_and_limits(
+                2,
+                false,
+                1024,
+                4096,
+                account.clone(),
+            );
+            assert_eq!(
+                harness.submit(0, 0, int_bound(40)).unwrap(),
+                TestAction::Other(SubmitOutcome::Published)
+            );
+            assert_eq!(
+                harness.close(0, 2).unwrap(),
+                TestAction::PendingFinalSnapshot
+            );
+            assert!(matches!(
+                harness
+                    .channel
+                    .expire_deadline(Instant::now() + Duration::from_secs(20)),
+                ChannelAction::Unavailable {
+                    reason: UnavailableReason::IncompleteCoverage,
+                    ..
+                }
+            ));
+            {
+                let state = harness.channel.state.lock().unwrap();
+                let reducer = &state.ordered.as_ref().unwrap().reducer;
+                assert!(reducer.global().is_none());
+                assert!(state.reservation.bytes() > 0);
+                assert_eq!(
+                    state.reservation.bytes(),
+                    reducer.estimated_retained_bytes().unwrap()
+                );
+                assert_eq!(
+                    account.current.load(Ordering::SeqCst),
+                    state.reservation.bytes()
+                );
+            }
+            assert_eq!(
+                harness.close(0, 3).unwrap_err().kind(),
+                RuntimeContractViolationKind::ConflictingTerminalSequence
+            );
+            assert_eq!(
+                harness.submit(0, 2, int_bound(40)).unwrap_err().kind(),
+                RuntimeContractViolationKind::SequenceOutsideTerminalRange
+            );
+        }
+
+        #[test]
+        fn cancelled_retains_ordered_protocol_tombstone() {
+            let account = Arc::new(Account::default());
+            let harness =
+                OrderedChannelHarness::with_streams_and_limits(1, 1024, 4096, account.clone());
+            assert_eq!(
+                harness.submit(0, 0, int_bound(40)).unwrap(),
+                TestAction::Published(1, 40)
+            );
+            assert_eq!(
+                harness.close(0, 2).unwrap(),
+                TestAction::PendingFinalSnapshot
+            );
+            assert!(matches!(
+                harness.channel.cancel(),
+                ChannelAction::Cancelled { .. }
+            ));
+            {
+                let state = harness.channel.state.lock().unwrap();
+                let ordered = state.ordered.as_ref().unwrap();
+                assert!(ordered.reducer.global().is_none());
+                assert!(state.reservation.bytes() > 0);
+                assert_eq!(
+                    state.reservation.bytes(),
+                    ordered.reducer.estimated_retained_bytes().unwrap()
+                );
+                assert_eq!(
+                    account.current.load(Ordering::SeqCst),
+                    state.reservation.bytes()
+                        + ordered.latest.as_ref().unwrap().retained_memory_bytes()
+                );
+            }
+            assert_eq!(
+                harness.close(0, 3).unwrap_err().kind(),
+                RuntimeContractViolationKind::ConflictingTerminalSequence
+            );
+            assert_eq!(
+                harness.submit(0, 2, int_bound(40)).unwrap_err().kind(),
+                RuntimeContractViolationKind::SequenceOutsideTerminalRange
+            );
+        }
+
+        #[test]
+        fn oversized_utf8_contribution_fails_open_without_reducer_mutation_or_leak() {
+            let (plan, contract) = utf8_order_contract();
+            let update = utf8_update(&contract, 256);
+            let contribution_bytes = update.canonical_contribution_bytes().unwrap();
+            let account = Arc::new(Account::default());
+            let channel = ordered_single_channel(
+                plan,
+                u64::try_from(contribution_bytes - 1).unwrap(),
+                account.clone(),
+            );
+            let before_reducer = {
+                let state = channel.state.lock().unwrap();
+                format!("{:?}", state.ordered.as_ref().unwrap().reducer)
+            };
+
+            let action = channel
+                .submit_ordered(
+                    BindingId::new(10),
+                    uid(10),
+                    PartitionId::new(0),
+                    ProducerSequence::new(0),
+                    update,
+                    TemporaryContributionLease::new(account.clone(), contribution_bytes),
+                )
+                .unwrap();
+            assert_eq!(
+                action.unavailable_reason(),
+                Some(UnavailableReason::ResourceLimit)
+            );
+            let state = channel.state.lock().unwrap();
+            assert_eq!(
+                format!("{:?}", state.ordered.as_ref().unwrap().reducer),
+                before_reducer
+            );
+            assert_eq!(state.reservation.bytes(), 0);
+            drop(state);
+            assert_eq!(account.current.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn exact_ordered_contribution_budget_is_accepted_and_fully_released() {
+            let (plan, contract) = utf8_order_contract();
+            let update = utf8_update(&contract, 64);
+            let contribution_bytes = update.canonical_contribution_bytes().unwrap();
+            let account = Arc::new(Account::default());
+            let channel = ordered_single_channel(
+                plan,
+                u64::try_from(contribution_bytes).unwrap(),
+                account.clone(),
+            );
+
+            let action = channel
+                .submit_ordered(
+                    BindingId::new(10),
+                    uid(10),
+                    PartitionId::new(0),
+                    ProducerSequence::new(0),
+                    update,
+                    TemporaryContributionLease::new(account.clone(), contribution_bytes),
+                )
+                .unwrap();
+            assert!(matches!(
+                action,
+                ChannelAction::VisibleSnapshot {
+                    version: LogicalVersion::FIRST,
+                    ..
+                }
+            ));
+            drop(action);
+            drop(channel);
+            assert_eq!(account.current.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn mismatched_ordered_contribution_lease_preserves_state_and_releases_memory() {
+            let (plan, contract) = utf8_order_contract();
+            let update = utf8_update(&contract, 32);
+            let contribution_bytes = update.canonical_contribution_bytes().unwrap();
+            let account = Arc::new(Account::default());
+            let channel = ordered_single_channel(
+                plan,
+                u64::try_from(contribution_bytes).unwrap(),
+                account.clone(),
+            );
+            let before = {
+                let state = channel.state.lock().unwrap();
+                format!("{:?}", state.ordered.as_ref().unwrap().reducer)
+            };
+
+            let error = channel
+                .submit_ordered(
+                    BindingId::new(10),
+                    uid(10),
+                    PartitionId::new(0),
+                    ProducerSequence::new(0),
+                    update,
+                    TemporaryContributionLease::new(account.clone(), contribution_bytes - 1),
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                RuntimeContractViolationKind::InvalidContributionLease
+            );
+            let state = channel.state.lock().unwrap();
+            assert_eq!(
+                format!("{:?}", state.ordered.as_ref().unwrap().reducer),
+                before
+            );
+            assert_eq!(state.reservation.bytes(), 0);
+            drop(state);
+            assert_eq!(account.current.load(Ordering::SeqCst), 0);
         }
     }
 }

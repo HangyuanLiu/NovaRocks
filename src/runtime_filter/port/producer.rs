@@ -103,6 +103,7 @@ pub(crate) enum RuntimeContractViolationKind {
     OrderedBoundLoosened,
     LogicalVersionOverflow,
     ProducerPortMismatch,
+    ConsumerPortMismatch,
     ServiceUnavailable,
 }
 
@@ -335,6 +336,7 @@ mod tests {
             RuntimeContractViolationKind::OrderedBoundLoosened => "ordered-bound-loosened",
             RuntimeContractViolationKind::LogicalVersionOverflow => "logical-version-overflow",
             RuntimeContractViolationKind::ProducerPortMismatch => "producer-port-mismatch",
+            RuntimeContractViolationKind::ConsumerPortMismatch => "consumer-port-mismatch",
             RuntimeContractViolationKind::ServiceUnavailable => "service-unavailable",
         }
     }

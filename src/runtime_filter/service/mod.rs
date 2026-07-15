@@ -32,7 +32,7 @@ use std::time::Instant;
 
 use crate::common::types::UniqueId;
 use crate::runtime_filter::core::channel::ChannelAction;
-use crate::runtime_filter::model::contract::{BindingId, ChannelId};
+use crate::runtime_filter::model::contract::{BindingId, ChannelId, ConsumerActivation};
 use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
 use crate::runtime_filter::port::install::RuntimeFilterInstallView;
 use crate::runtime_filter::port::producer::{
@@ -1004,10 +1004,16 @@ impl RuntimeFilterService {
             .registry
             .active_installation()
             .ok_or_else(service_cancelled)?;
-        if !installed.has_consumer(binding_id) {
+        let Some(activation) = installed.consumer_activation(binding_id) else {
             return Err(violation(
                 RuntimeContractViolationKind::UnauthorizedBinding,
                 "consumer binding is not installed on this participant",
+            ));
+        };
+        if !matches!(activation, ConsumerActivation::BlockingSnapshot) {
+            return Err(violation(
+                RuntimeContractViolationKind::ConsumerPortMismatch,
+                "non-blocking live consumer cannot open a blocking snapshot subscription",
             ));
         }
         installed
@@ -4496,5 +4502,33 @@ mod tests {
                 .unwrap(),
             ProducerHandle::OrderedBound(_)
         ));
+    }
+
+    #[test]
+    fn ordered_live_consumer_rejects_blocking_subscribe_without_cache_or_hang() {
+        let service = installed_ordered_service_fixture();
+        let subscribe_service = service.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let kind = match subscribe_service.subscribe(BindingId::new(2), uid(2)) {
+                Ok(_) => None,
+                Err(error) => Some(error.kind()),
+            };
+            done_tx.send(kind).unwrap();
+        });
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Some(RuntimeContractViolationKind::ConsumerPortMismatch)
+        );
+        let installed = service.registry.active_installation().unwrap();
+        assert!(installed.subscription(BindingId::new(2), uid(2)).is_none());
+        assert_eq!(
+            service
+                .subscribe(BindingId::new(2), uid(2))
+                .err()
+                .unwrap()
+                .kind(),
+            RuntimeContractViolationKind::ConsumerPortMismatch
+        );
     }
 }

@@ -443,6 +443,30 @@ impl RetainedMemoryReservation {
         Ok(())
     }
 
+    pub(crate) fn split_off_excess(&mut self, retained_bytes: usize) -> Self {
+        assert!(
+            retained_bytes <= self.bytes,
+            "retained reservation cannot grow while splitting excess"
+        );
+        let released_bytes = self.bytes - retained_bytes;
+        if released_bytes == 0 {
+            return Self::empty();
+        }
+        let account = self
+            .account
+            .as_ref()
+            .expect("non-empty reservation account")
+            .clone();
+        self.bytes = retained_bytes;
+        if retained_bytes == 0 {
+            self.account = None;
+        }
+        Self {
+            account: Some(account),
+            bytes: released_bytes,
+        }
+    }
+
     pub(crate) const fn bytes(&self) -> usize {
         self.bytes
     }
