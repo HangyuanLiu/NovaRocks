@@ -1399,6 +1399,25 @@ fn is_legacy_ebd_3a_owner_path(path: &[String]) -> bool {
         && matches!(path[2].as_str(), "parquet" | "stream_load")
 }
 
+fn is_legacy_ebd_3b_owner_path(path: &[String]) -> bool {
+    path.len() >= 3 && path[0] == "crate" && path[1] == "engine" && path[2] == "query_options"
+}
+
+fn legacy_ebd_3b_references(text: &str, source_rel: &str) -> BTreeSet<String> {
+    let mut references = rust_all_source_canonical_paths(text, source_rel)
+        .into_iter()
+        .filter(|path| is_legacy_ebd_3b_owner_path(path))
+        .map(|path| format!("path:{}", path.join("::")))
+        .collect::<BTreeSet<_>>();
+    references.extend(
+        rust_source_tokens(text)
+            .into_iter()
+            .filter(|token| token.text == "StandaloneQueryOptions")
+            .map(|_| "symbol:StandaloneQueryOptions".to_string()),
+    );
+    references
+}
+
 fn is_standalone_state_path(path: &[String]) -> bool {
     is_engine_path(path) && path.get(2).is_some_and(|item| item == "StandaloneState")
 }
@@ -2357,6 +2376,153 @@ mod tests {
             .collect::<Vec<_>>()
         ),
         "all-source scan must resolve the cfg(test) stream-load alias"
+    );
+}
+
+#[test]
+fn ebd_3b_query_options_have_one_runtime_owner() {
+    const RUNTIME_OWNER: &str = "src/runtime/query_options.rs";
+    const OLD_OWNER: &str = "src/engine/query_options.rs";
+    const FORBIDDEN_RUNTIME_IDENTIFIERS: &[&str] = &[
+        "NovaRocksMysqlShim",
+        "SessionDatabaseContext",
+        "StandaloneSession",
+        "StandaloneState",
+    ];
+
+    let repo = Path::new(manifest_dir());
+    let src = src_dir();
+    let mut violations = BTreeSet::new();
+
+    let runtime_owner_path = repo.join(RUNTIME_OWNER);
+    if !runtime_owner_path.is_file() {
+        violations.insert(format!("runtime-owner-missing: {RUNTIME_OWNER}"));
+    } else {
+        let text = fs::read_to_string(&runtime_owner_path)
+            .unwrap_or_else(|error| panic!("failed to read {RUNTIME_OWNER}: {error}"));
+        let tokens = rust_source_tokens(&text)
+            .into_iter()
+            .map(|token| token.text)
+            .collect::<Vec<_>>();
+        if !tokens
+            .windows(2)
+            .any(|tokens| tokens[0] == "struct" && tokens[1] == "QueryOptions")
+        {
+            violations.insert(format!(
+                "runtime-contract-missing: {RUNTIME_OWNER}|QueryOptions"
+            ));
+        }
+        for dependency in rust_all_source_canonical_paths(&text, RUNTIME_OWNER)
+            .into_iter()
+            .filter(|dependency| {
+                is_engine_path(dependency)
+                    || dependency.len() >= 2
+                        && dependency[0] == "crate"
+                        && matches!(dependency[1].as_str(), "frontend" | "server")
+            })
+        {
+            violations.insert(format!(
+                "runtime-owner-forbidden-dependency: {RUNTIME_OWNER}|{}",
+                dependency.join("::")
+            ));
+        }
+        for identifier in tokens
+            .iter()
+            .filter(|identifier| FORBIDDEN_RUNTIME_IDENTIFIERS.contains(&identifier.as_str()))
+        {
+            violations.insert(format!(
+                "runtime-owner-forbidden-identifier: {RUNTIME_OWNER}|{identifier}"
+            ));
+        }
+    }
+
+    if repo.join(OLD_OWNER).exists() {
+        violations.insert(format!("old-owner-still-present: {OLD_OWNER}"));
+    }
+
+    let engine_root = repo.join("src/engine/mod.rs");
+    let engine_root_text = fs::read_to_string(&engine_root)
+        .unwrap_or_else(|error| panic!("failed to read src/engine/mod.rs: {error}"));
+    if rust_module_items(&engine_root_text)
+        .into_iter()
+        .any(|item| item.name == "query_options")
+    {
+        violations.insert("old-module-still-declared: src/engine/mod.rs|query_options".to_string());
+    }
+
+    for root in [&src, &repo.join("tests")] {
+        for path in rs_files(root) {
+            let source = rel(&path);
+            let text = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("failed to read {source}: {error}"));
+            let tokens = rust_source_tokens(&text)
+                .into_iter()
+                .map(|token| token.text)
+                .collect::<Vec<_>>();
+            if source != RUNTIME_OWNER
+                && tokens
+                    .windows(2)
+                    .any(|tokens| tokens[0] == "struct" && tokens[1] == "QueryOptions")
+            {
+                violations.insert(format!("duplicate-query-options-owner: {source}"));
+            }
+            for reference in legacy_ebd_3b_references(&text, &source) {
+                violations.insert(format!(
+                    "legacy-query-options-reference: {source}|{reference}"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "EBD-3B query options owner boundary failed:\n{}",
+        violations.into_iter().collect::<Vec<_>>().join("\n")
+    );
+}
+
+#[test]
+fn ebd_3b_detector_covers_test_aliases_reexports_and_ignores_noise() {
+    let source = r###"
+// use crate::engine::query_options::StandaloneQueryOptions;
+const DOCUMENTATION: &str = "crate::engine::query_options::StandaloneQueryOptions";
+const RAW_DOCUMENTATION: &str = r#"StandaloneQueryOptions via crate::engine::query_options"#;
+use crate::runtime::query_options::QueryOptions;
+
+#[cfg(test)]
+mod tests {
+    use crate::engine::query_options as legacy;
+    pub(crate) use legacy::StandaloneQueryOptions as LegacyOptions;
+
+    fn legacy_options(_: LegacyOptions) {}
+}
+"###;
+
+    assert!(
+        legacy_ebd_3b_references(
+            &rust_sanitized_production_text(source),
+            "src/runtime/query_options.rs"
+        )
+        .is_empty(),
+        "production scan must ignore cfg(test), comments, strings, raw strings, and QueryOptions"
+    );
+
+    let references = legacy_ebd_3b_references(source, "src/runtime/query_options.rs");
+    assert!(
+        references.contains("path:crate::engine::query_options"),
+        "all-source scan must resolve the cfg(test) namespace alias: {references:?}"
+    );
+    assert!(
+        references.contains("path:crate::engine::query_options::StandaloneQueryOptions"),
+        "all-source scan must resolve the cfg(test) forwarding re-export: {references:?}"
+    );
+    assert_eq!(
+        references
+            .iter()
+            .filter(|reference| reference.starts_with("symbol:"))
+            .collect::<Vec<_>>(),
+        vec![&"symbol:StandaloneQueryOptions".to_string()],
+        "the legacy symbol detector must be exact and deduplicated"
     );
 }
 
