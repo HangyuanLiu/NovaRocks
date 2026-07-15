@@ -36,7 +36,6 @@ use crate::common::types::UniqueId;
 use crate::runtime_filter::core::channel::ChannelAction;
 use crate::runtime_filter::model::contract::{BindingId, ChannelId, ConsumerActivation};
 use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
-use crate::runtime_filter::port::identity::ContributionIdentity;
 use crate::runtime_filter::port::install::RuntimeFilterInstallView;
 use crate::runtime_filter::port::producer::{
     InstallContractError, InstallOutcome, OrderedBoundProducerAdapter, ProducerAdapter,
@@ -408,20 +407,6 @@ fn action_needs_materialization_launch_prefix(action: &ChannelAction) -> bool {
 }
 
 impl ActionDispatcher {
-    fn emit_ordered_rejection(
-        &self,
-        identity: ContributionIdentity,
-        violation: RuntimeContractViolationKind,
-    ) {
-        let batch = self
-            .events
-            .prequeue([RuntimeFilterEvent::OrderedUpdateRejected {
-                identity,
-                violation,
-            }]);
-        self.events.publish(batch);
-    }
-
     fn finish_publishing_action(
         flight: Arc<ChannelDispatchFlight>,
         order: u64,
@@ -1423,6 +1408,7 @@ mod tests {
     };
     use crate::runtime_filter::port::support::{
         MemoryAccountError, RuntimeFilterClock, RuntimeFilterMemoryAccount,
+        TemporaryContributionLease,
     };
     use crate::runtime_filter::port::value_domain::{
         LogicalSnapshot, MembershipValues, ReducedMembershipDomain, ValueDomainDelta,
@@ -2155,6 +2141,192 @@ mod tests {
                 if identity.sequence() == ProducerSequence::new(0)
                     && *violation == RuntimeContractViolationKind::ConflictingReplay
         )));
+    }
+
+    #[test]
+    fn ordered_authorize_rejection_emits_typed_event_before_return() {
+        let events = Arc::new(Events::default());
+        let account = Arc::new(ArmableRejectingMemoryAccount::default());
+        let (service, contract) =
+            installed_ordered_service_with_account_and_events(account.clone(), events.clone());
+        let ProducerHandle::OrderedBound(producer) = service
+            .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+            .unwrap()
+        else {
+            panic!("ordered fixture must return ordered producer")
+        };
+
+        events.0.lock().unwrap().clear();
+        let invalid_partition = producer
+            .submit_bound(
+                PartitionId::new(1),
+                ProducerSequence::new(0),
+                ordered_update(&contract, 100),
+            )
+            .unwrap_err();
+        assert_eq!(
+            invalid_partition.kind(),
+            RuntimeContractViolationKind::InvalidPartition
+        );
+        assert!(events.0.lock().unwrap().iter().any(|event| matches!(
+            event,
+            RuntimeFilterEvent::OrderedUpdateRejected { identity, violation }
+                if identity.stream().partition_id() == PartitionId::new(1)
+                    && identity.sequence() == ProducerSequence::new(0)
+                    && *violation == RuntimeContractViolationKind::InvalidPartition
+        )));
+    }
+
+    #[test]
+    fn ordered_resource_preflight_rejection_emits_typed_event_before_return() {
+        let events = Arc::new(Events::default());
+        let account = Arc::new(ArmableRejectingMemoryAccount::default());
+        let (service, contract) =
+            installed_ordered_service_with_account_and_events(account.clone(), events.clone());
+        let ProducerHandle::OrderedBound(producer) = service
+            .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+            .unwrap()
+        else {
+            panic!("ordered fixture must return ordered producer")
+        };
+
+        producer
+            .submit_bound(
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                ordered_update(&contract, 100),
+            )
+            .unwrap();
+        events.0.lock().unwrap().clear();
+        account.armed.store(true, Ordering::SeqCst);
+        let mismatched_keys = vec![OrderKeyContract {
+            data_type: DataType::Int64,
+            direction: SortDirection::Descending,
+            null_order: NullOrder::Last,
+        }];
+        let mismatched_contract = RuntimeOrderContract::try_from_plan(&OrderContract {
+            comparator_digest: comparator_digest_for_test(
+                &mismatched_keys,
+                COMPARATOR_ALGORITHM_VERSION,
+            ),
+            keys: mismatched_keys,
+            inclusive: true,
+        })
+        .unwrap();
+        let contract_error = producer
+            .submit_bound(
+                PartitionId::new(0),
+                ProducerSequence::new(1),
+                ordered_update(&mismatched_contract, 90),
+            )
+            .unwrap_err();
+        assert_eq!(
+            contract_error.kind(),
+            RuntimeContractViolationKind::OrderedContractMismatch
+        );
+        assert!(events.0.lock().unwrap().iter().any(|event| matches!(
+            event,
+            RuntimeFilterEvent::OrderedUpdateRejected { identity, violation }
+                if identity.stream().partition_id() == PartitionId::new(0)
+                    && identity.sequence() == ProducerSequence::new(1)
+                    && *violation == RuntimeContractViolationKind::OrderedContractMismatch
+        )));
+    }
+
+    #[test]
+    fn ordered_rejection_waits_for_earlier_accepted_action_without_test_reservation() {
+        let events = Arc::new(Events::default());
+        let (service, contract) = installed_ordered_allof_service_with_events(events.clone());
+        let ProducerHandle::OrderedBound(producer) = service
+            .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+            .unwrap()
+        else {
+            panic!("ordered fixture must return ordered producer")
+        };
+        let channel = service
+            .registry
+            .active_installation()
+            .unwrap()
+            .channels()
+            .next()
+            .unwrap()
+            .1;
+        events.0.lock().unwrap().clear();
+
+        let accepted_update = ordered_update(&contract, 100);
+        let accepted_bytes = accepted_update.canonical_contribution_bytes().unwrap();
+        let accepted = channel
+            .submit_ordered(
+                BindingId::new(1),
+                uid(1),
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                accepted_update,
+                TemporaryContributionLease::new(
+                    MemTrackerMemoryAccount::new_root_for_test("ordered-event-order-test"),
+                    accepted_bytes,
+                ),
+            )
+            .unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let rejected_producer = producer.clone();
+        let rejected_contract = contract.clone();
+        let rejected = std::thread::spawn(move || {
+            let error = rejected_producer
+                .submit_bound(
+                    PartitionId::new(0),
+                    ProducerSequence::new(1),
+                    ordered_update(&rejected_contract, 101),
+                )
+                .unwrap_err();
+            done_tx.send(error.kind()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while service.dispatcher.pending_action_count(ChannelId::new(1)) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "later rejection never reached dispatcher"
+            );
+            std::thread::yield_now();
+        }
+        assert!(events.0.lock().unwrap().is_empty());
+
+        service
+            .dispatcher
+            .dispatch(ChannelId::new(1), accepted)
+            .unwrap();
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeContractViolationKind::OrderedBoundLoosened
+        );
+        rejected.join().unwrap();
+        let ordered_events = events
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeFilterEvent::OrderedUpdateApplied { identity } => {
+                    Some((identity.sequence(), None))
+                }
+                RuntimeFilterEvent::OrderedUpdateRejected {
+                    identity,
+                    violation,
+                } => Some((identity.sequence(), Some(*violation))),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered_events,
+            vec![
+                (ProducerSequence::new(0), None),
+                (
+                    ProducerSequence::new(1),
+                    Some(RuntimeContractViolationKind::OrderedBoundLoosened),
+                ),
+            ]
+        );
     }
 
     #[test]

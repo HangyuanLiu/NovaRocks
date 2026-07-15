@@ -100,15 +100,18 @@ impl ServiceProducerAdapter {
         match result {
             Ok(action) => self.finish(action),
             Err(error) => {
-                self.dispatcher.emit_ordered_rejection(
-                    self.channel.contribution_identity(
-                        self.binding_id,
-                        self.fragment_instance_id,
-                        partition_id,
-                        sequence,
-                    ),
-                    error.kind(),
+                let identity = self.channel.contribution_identity(
+                    self.binding_id,
+                    self.fragment_instance_id,
+                    partition_id,
+                    sequence,
                 );
+                let action = self
+                    .channel
+                    .ordered_rejection_action(identity, error.kind());
+                self.dispatcher
+                    .dispatch(self.channel_id, action)
+                    .expect("ordered rejection-only dispatch cannot materialize or route");
                 Err(error)
             }
         }
@@ -193,41 +196,40 @@ impl OrderedBoundProducerAdapter for ServiceProducerAdapter {
         sequence: ProducerSequence,
         update: OrderedBoundUpdate,
     ) -> Result<SubmitOutcome, RuntimeContractViolation> {
-        self.channel
-            .authorize_submit(self.binding_id, self.fragment_instance_id, partition_id)?;
-        let Some(bytes) = update.canonical_contribution_bytes() else {
-            return self
-                .channel
-                .reject_ordered_submit_resource_exhausted(
+        let result = (|| {
+            self.channel.authorize_submit(
+                self.binding_id,
+                self.fragment_instance_id,
+                partition_id,
+            )?;
+            let Some(bytes) = update.canonical_contribution_bytes() else {
+                return self.channel.reject_ordered_submit_resource_exhausted(
                     self.binding_id,
                     self.fragment_instance_id,
                     partition_id,
                     sequence,
                     &update,
-                )
-                .and_then(|action| self.finish(action));
-        };
-        let Ok(lease) = TemporaryContributionLease::try_new(self.memory_account.clone(), bytes)
-        else {
-            return self
-                .channel
-                .reject_ordered_submit_resource_exhausted(
+                );
+            };
+            let Ok(lease) = TemporaryContributionLease::try_new(self.memory_account.clone(), bytes)
+            else {
+                return self.channel.reject_ordered_submit_resource_exhausted(
                     self.binding_id,
                     self.fragment_instance_id,
                     partition_id,
                     sequence,
                     &update,
-                )
-                .and_then(|action| self.finish(action));
-        };
-        let result = self.channel.submit_ordered(
-            self.binding_id,
-            self.fragment_instance_id,
-            partition_id,
-            sequence,
-            update,
-            lease,
-        );
+                );
+            };
+            self.channel.submit_ordered(
+                self.binding_id,
+                self.fragment_instance_id,
+                partition_id,
+                sequence,
+                update,
+                lease,
+            )
+        })();
         self.finish_ordered(partition_id, sequence, result)
     }
 

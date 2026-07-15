@@ -282,6 +282,22 @@ impl RuntimeFilterChannel {
         )
     }
 
+    pub(crate) fn ordered_rejection_action(
+        &self,
+        identity: ContributionIdentity,
+        violation: RuntimeContractViolationKind,
+    ) -> ChannelAction {
+        let mut state = self.state.lock().unwrap();
+        ChannelAction::Progress {
+            order: Some(next_dispatch_order(&mut state)),
+            outcome: SubmitOutcome::TerminalNoop,
+            events: vec![RuntimeFilterEvent::OrderedUpdateRejected {
+                identity,
+                violation,
+            }],
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         query_id: UniqueId,
