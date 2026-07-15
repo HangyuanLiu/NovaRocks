@@ -64,6 +64,8 @@ pub(crate) enum GraphValidationErrorKind {
     MembershipContributionMismatch,
     FinalDomainShardRequiresNullSafeEqual,
     TopKSummaryCoverageMismatch,
+    TopKSummaryMissingCoverageWitness(CoverageWitnessId),
+    TopKSummaryConsumerCapabilityMismatch,
     OrderedBoundReductionMismatch,
     OrderedBoundContributionMissing,
     OrderedBoundContributionMismatch(ContributionKind),
@@ -399,9 +401,24 @@ fn validate_channel_matrix(channel: &RuntimeFilterChannelSpec) -> Result<(), Gra
                 ));
             }
             let required_contribution = match channel.reduction_requirement {
-                ReductionRequirement::TightenOrderedBound => ContributionKind::OrderedBoundUpdate,
-                ReductionRequirement::MergeTopKSummary(requirement) => {
-                    let _k = requirement.k();
+                ReductionRequirement::TightenOrderedBound => {
+                    let expected = BTreeSet::from([
+                        ContributionKind::OrderedBoundUpdate,
+                        ContributionKind::ProducerClosed,
+                    ]);
+                    if let Some(forbidden) = channel
+                        .allowed_contribution_kinds
+                        .difference(&expected)
+                        .next()
+                    {
+                        return Err(channel_error(
+                            channel.channel_id,
+                            GraphValidationErrorKind::OrderedBoundContributionMismatch(*forbidden),
+                        ));
+                    }
+                    ContributionKind::OrderedBoundUpdate
+                }
+                ReductionRequirement::MergeTopKSummary(_) => {
                     if !channel.availability_coverage.is_all_of_only()
                         || !channel
                             .availability_coverage
@@ -410,6 +427,14 @@ fn validate_channel_matrix(channel: &RuntimeFilterChannelSpec) -> Result<(), Gra
                         return Err(channel_error(
                             channel.channel_id,
                             GraphValidationErrorKind::TopKSummaryCoverageMismatch,
+                        ));
+                    }
+                    if channel.required_consumer_capabilities
+                        != BTreeSet::from([ArtifactCapability::OrderedRange])
+                    {
+                        return Err(channel_error(
+                            channel.channel_id,
+                            GraphValidationErrorKind::TopKSummaryConsumerCapabilityMismatch,
                         ));
                     }
                     let expected = BTreeSet::from([
@@ -501,10 +526,7 @@ fn validate_producer(
         RuntimeFilterLogicalDomain::OrderedBound(_) => {
             let reduction_contribution = match channel.reduction_requirement {
                 ReductionRequirement::TightenOrderedBound => ContributionKind::OrderedBoundUpdate,
-                ReductionRequirement::MergeTopKSummary(requirement) => {
-                    let _k = requirement.k();
-                    ContributionKind::TopKSummary
-                }
+                ReductionRequirement::MergeTopKSummary(_) => ContributionKind::TopKSummary,
                 ReductionRequirement::SetUnion => unreachable!(
                     "ordered-bound reduction was validated before producer relationships"
                 ),
@@ -556,6 +578,16 @@ fn validate_coverage_ownership(
             GraphValidationErrorKind::UnknownCoverageWitness(*witness_id),
         ));
     }
+    if matches!(
+        channel.reduction_requirement,
+        ReductionRequirement::MergeTopKSummary(_)
+    ) && let Some(witness_id) = producer_witnesses.difference(&witness_ids).next()
+    {
+        return Err(channel_error(
+            channel.channel_id,
+            GraphValidationErrorKind::TopKSummaryMissingCoverageWitness(*witness_id),
+        ));
+    }
     Ok(())
 }
 
@@ -564,6 +596,16 @@ fn validate_consumer(
     binding: &RuntimeFilterBindingSpec,
     requirement: &ConsumerRequirement,
 ) -> Result<(), GraphValidationError> {
+    if matches!(
+        channel.reduction_requirement,
+        ReductionRequirement::MergeTopKSummary(_)
+    ) && requirement.capabilities != BTreeSet::from([ArtifactCapability::OrderedRange])
+    {
+        return Err(binding_error(
+            binding,
+            GraphValidationErrorKind::TopKSummaryConsumerCapabilityMismatch,
+        ));
+    }
     if let Some(missing) = channel
         .required_consumer_capabilities
         .difference(&requirement.capabilities)
@@ -813,6 +855,118 @@ mod tests {
                 ContributionKind::OrderedBoundUpdate,
             ),
         );
+    }
+
+    #[test]
+    fn validate_direct_ordered_bound_rejects_summary_contribution_mixing() {
+        let mut channel_mixing = topn_graph();
+        channel_mixing
+            .channel_mut_for_test(ChannelId::new(1))
+            .unwrap()
+            .allowed_contribution_kinds
+            .insert(ContributionKind::TopKSummary);
+        assert_kind(
+            &channel_mixing,
+            GraphValidationErrorKind::OrderedBoundContributionMismatch(
+                ContributionKind::TopKSummary,
+            ),
+        );
+
+        let mut producer_mixing = topn_graph();
+        if let RuntimeFilterBindingRole::Producer(requirement) = &mut producer_mixing
+            .binding_mut_for_test(BindingId::new(1))
+            .unwrap()
+            .role
+        {
+            requirement
+                .contribution_kinds
+                .insert(ContributionKind::TopKSummary);
+        }
+        assert_kind(
+            &producer_mixing,
+            GraphValidationErrorKind::UnsupportedProducerContribution(
+                ContributionKind::TopKSummary,
+            ),
+        );
+    }
+
+    #[test]
+    fn validate_top_k_summary_requires_every_producer_witness() {
+        let mut graph = topk_summary_graph();
+        graph
+            .insert_binding(producer_binding(
+                BindingId::new(3),
+                ChannelId::new(1),
+                CoverageWitnessId::new(2),
+                BTreeSet::from([
+                    ContributionKind::TopKSummary,
+                    ContributionKind::ProducerClosed,
+                ]),
+                CompletionRequirement::ProducerClosed,
+            ))
+            .unwrap();
+
+        assert_kind(
+            &graph,
+            GraphValidationErrorKind::TopKSummaryMissingCoverageWitness(CoverageWitnessId::new(2)),
+        );
+    }
+
+    #[test]
+    fn validate_top_k_summary_requires_exact_channel_consumer_capability() {
+        let mut graph = topk_summary_graph();
+        graph
+            .channel_mut_for_test(ChannelId::new(1))
+            .unwrap()
+            .required_consumer_capabilities
+            .insert(ArtifactCapability::Membership);
+
+        assert_kind(
+            &graph,
+            GraphValidationErrorKind::TopKSummaryConsumerCapabilityMismatch,
+        );
+    }
+
+    #[test]
+    fn validate_top_k_summary_requires_exact_consumer_binding_capability() {
+        for capabilities in [
+            BTreeSet::from([ArtifactCapability::Membership]),
+            BTreeSet::from([
+                ArtifactCapability::OrderedRange,
+                ArtifactCapability::Membership,
+            ]),
+        ] {
+            let mut graph = topk_summary_graph();
+            let RuntimeFilterBindingRole::Consumer(requirement) =
+                &mut graph.binding_mut_for_test(BindingId::new(2)).unwrap().role
+            else {
+                unreachable!("top-k summary fixture has a consumer")
+            };
+            requirement.capabilities = capabilities;
+
+            assert_kind(
+                &graph,
+                GraphValidationErrorKind::TopKSummaryConsumerCapabilityMismatch,
+            );
+        }
+    }
+
+    #[test]
+    fn validate_top_k_summary_requires_non_blocking_consumer() {
+        let mut graph = topk_summary_graph();
+        let RuntimeFilterBindingRole::Consumer(requirement) =
+            &mut graph.binding_mut_for_test(BindingId::new(2)).unwrap().role
+        else {
+            unreachable!("top-k summary fixture has a consumer")
+        };
+        requirement.activation = ConsumerActivation::BlockingSnapshot;
+
+        assert_kind(&graph, GraphValidationErrorKind::BlockingFeedbackConsumer);
+    }
+
+    #[test]
+    fn validate_accepts_exact_top_k_summary_consumer_matrix() {
+        topk_summary_graph().validate().unwrap();
     }
 
     #[test]

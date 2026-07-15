@@ -279,7 +279,6 @@ mod tests {
                 ReductionRequirement::TightenOrderedBound,
                 BTreeSet::from([
                     ContributionKind::OrderedBoundUpdate,
-                    ContributionKind::TopKSummary,
                     ContributionKind::ProducerClosed,
                 ]),
             ),
