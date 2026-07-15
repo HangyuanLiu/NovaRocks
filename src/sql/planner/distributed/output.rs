@@ -165,9 +165,8 @@ pub(crate) struct NodeExecutionOutput {
 /// visible-or-full execution output (the layout is *not* recoverable from that
 /// execution output when a visible projection subsets it).
 ///
-/// (`OutputColumn` carries an arrow `DataType` and implements neither `PartialEq`
-/// nor `Eq`, so this — and the [`NodeOutputCatalog`] that holds it — are `Clone,
-/// Debug` only.)
+/// (`OutputColumn` derives only `Clone, Debug` — not `PartialEq`/`Eq` — so this,
+/// and the [`NodeOutputCatalog`] that holds it, are `Clone, Debug` only.)
 #[derive(Clone, Debug)]
 pub(crate) struct FinalizedAggregateLayout {
     pub group_key_columns: Vec<OutputColumn>,
@@ -962,7 +961,8 @@ pub(crate) struct FragmentEdgeOutputCatalog {
 impl FragmentEdgeOutputCatalog {
     /// The finalized output columns of the fragment identified by `fragment_id`,
     /// or `None` for an Iceberg write fragment (whose output schema is owned by
-    /// CGO-9C Task 3 and computed by the encoder's write path).
+    /// the `WriteContractCatalog`, finalized at seal in CGO-9C Task 3; the
+    /// encoder only maps that contract 1:1).
     pub(crate) fn fragment_output_columns(
         &self,
         fragment_id: FragmentId,
