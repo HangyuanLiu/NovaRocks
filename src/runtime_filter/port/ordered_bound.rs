@@ -166,6 +166,19 @@ impl OrderedTuple {
             bytes.checked_add(value_bytes)
         })
     }
+
+    pub(crate) fn visit_canonical(&self, mut visitor: impl FnMut(&[u8])) {
+        visitor(&(self.values.len() as u64).to_be_bytes());
+        for value in self.values() {
+            match value {
+                None => visitor(&[0]),
+                Some(value) => {
+                    visitor(&[1]);
+                    visit_ordered_scalar(value, &mut visitor);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -202,27 +215,16 @@ impl OrderedBoundUpdate {
     }
 
     pub(crate) fn canonical_contribution_bytes(&self) -> Option<usize> {
-        self.bound.values().iter().try_fold(
+        let mut bytes = Some(
             REPLAY_DIGEST_DOMAIN
                 .len()
                 .checked_add(size_of::<u16>())?
-                .checked_add(32)?
-                .checked_add(size_of::<u64>())?,
-            |bytes, value| {
-                let scalar_bytes = match value {
-                    None => 0,
-                    Some(OrderedScalar::Boolean(_) | OrderedScalar::Int8(_)) => 1,
-                    Some(OrderedScalar::Int16(_)) => 2,
-                    Some(OrderedScalar::Int32(_) | OrderedScalar::Date32(_)) => 4,
-                    Some(OrderedScalar::Int64(_) | OrderedScalar::Timestamp(_)) => 8,
-                    Some(OrderedScalar::LargeInt(_) | OrderedScalar::Decimal128(_)) => 16,
-                    Some(OrderedScalar::Utf8(value)) => {
-                        size_of::<u64>().checked_add(value.len())?
-                    }
-                };
-                bytes.checked_add(1)?.checked_add(scalar_bytes)
-            },
-        )
+                .checked_add(32)?,
+        );
+        self.bound.visit_canonical(|part| {
+            bytes = bytes.and_then(|bytes| bytes.checked_add(part.len()));
+        });
+        bytes
     }
 }
 
@@ -486,40 +488,31 @@ fn decimal128_fits_precision(value: i128, precision: u8) -> bool {
 }
 
 fn canonical_replay_digest(contract: &RuntimeOrderContract, bound: &OrderedTuple) -> [u8; 32] {
-    let mut canonical = Vec::with_capacity(64 + bound.values().len() * 17);
-    canonical.extend_from_slice(REPLAY_DIGEST_DOMAIN);
-    canonical.extend_from_slice(&REPLAY_DIGEST_VERSION.to_be_bytes());
-    canonical.extend_from_slice(&contract.digest().bytes());
-    canonical.extend_from_slice(&(bound.values().len() as u64).to_be_bytes());
-    for value in bound.values() {
-        match value {
-            None => canonical.push(0),
-            Some(value) => {
-                canonical.push(1);
-                encode_ordered_scalar(value, &mut canonical);
-            }
-        }
-    }
-    Sha256::digest(canonical).into()
+    let mut canonical = Sha256::new();
+    canonical.update(REPLAY_DIGEST_DOMAIN);
+    canonical.update(REPLAY_DIGEST_VERSION.to_be_bytes());
+    canonical.update(contract.digest().bytes());
+    bound.visit_canonical(|part| canonical.update(part));
+    canonical.finalize().into()
 }
 
-fn encode_ordered_scalar(value: &OrderedScalar, canonical: &mut Vec<u8>) {
+fn visit_ordered_scalar(value: &OrderedScalar, visitor: &mut impl FnMut(&[u8])) {
     match value {
-        OrderedScalar::Boolean(value) => canonical.push(u8::from(*value)),
-        OrderedScalar::Int8(value) => canonical.extend_from_slice(&value.to_be_bytes()),
-        OrderedScalar::Int16(value) => canonical.extend_from_slice(&value.to_be_bytes()),
+        OrderedScalar::Boolean(value) => visitor(&[u8::from(*value)]),
+        OrderedScalar::Int8(value) => visitor(&value.to_be_bytes()),
+        OrderedScalar::Int16(value) => visitor(&value.to_be_bytes()),
         OrderedScalar::Int32(value) | OrderedScalar::Date32(value) => {
-            canonical.extend_from_slice(&value.to_be_bytes());
+            visitor(&value.to_be_bytes());
         }
         OrderedScalar::Int64(value) | OrderedScalar::Timestamp(value) => {
-            canonical.extend_from_slice(&value.to_be_bytes());
+            visitor(&value.to_be_bytes());
         }
         OrderedScalar::LargeInt(value) | OrderedScalar::Decimal128(value) => {
-            canonical.extend_from_slice(&value.to_be_bytes());
+            visitor(&value.to_be_bytes());
         }
         OrderedScalar::Utf8(value) => {
-            canonical.extend_from_slice(&(value.len() as u64).to_be_bytes());
-            canonical.extend_from_slice(value.as_bytes());
+            visitor(&(value.len() as u64).to_be_bytes());
+            visitor(value.as_bytes());
         }
     }
 }
