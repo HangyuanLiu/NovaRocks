@@ -29,7 +29,6 @@ use crate::connector::starrocks::lake::schema::create_lake_tablet_from_req_with_
 use crate::connector::starrocks::lake::transactions::delete_tablet;
 use crate::engine::catalog::normalize_identifier;
 use crate::engine::query_prep::drop_local_table_registration_if_exists;
-use crate::engine::record_batch_to_chunk;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
 use crate::meta::MetaReadTxn;
 #[cfg(test)]
@@ -76,7 +75,8 @@ use crate::engine::mv::agg_state::physical_column::{
 use crate::engine::mv::agg_state::sql_type::arrow_data_type_to_sql_type;
 use crate::engine::mv::lifecycle::{MvListRow, MvStorageEngine};
 use crate::engine::mv::table_ref::IcebergTableRef;
-use crate::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
+use crate::engine::{StandaloneState, StatementResult};
+use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 
 /// Resolved base-table reference as the MV analyzer stage returns it.
 /// Only the `Iceberg` variant is allowed; anything else fails validation.

@@ -36,11 +36,10 @@ use crate::connector::iceberg::compact::{
     execute_whole_table_rewrite_with_metrics_for_target,
 };
 use crate::engine::catalog::normalize_identifier;
-use crate::engine::{
-    QueryResult, QueryResultColumn, StandaloneState, StatementResult, record_batch_to_chunk,
-};
+use crate::engine::{StandaloneState, StatementResult};
 use crate::fs::object_store::ObjectStoreConfig;
 use crate::meta::repository::job::CreateIcebergOptimizeJobRequest;
+use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::sql::parser::procedure::{CallProcedureStmt, ProcedureArgMode, ProcedureArgValue};
 
 /// Return type shared by `resolve_maintenance_catalog` and `build_action_catalog`.

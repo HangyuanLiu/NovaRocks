@@ -19,10 +19,11 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::connector::iceberg::catalog::load_table;
+use crate::engine::StandaloneState;
 use crate::engine::mv::table_ref::IcebergTableRef;
 use crate::engine::mv_flow::execute_query_for_mv_refresh_with_catalog;
-use crate::engine::{QueryResult, StandaloneState, record_batch_to_chunk};
 use crate::exec::chunk::Chunk;
+use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
 
 pub(crate) fn run_mv_full_select_chunks_with_catalog(
     state: &Arc<StandaloneState>,

@@ -43,7 +43,6 @@ use crate::engine::mv::agg_state::state_codec::{
     KeyValue, decode_avg_decimal128, decode_avg_int64, decode_count_state, decode_sum_decimal128,
     decode_sum_int64,
 };
-use crate::engine::{QueryResult, record_batch_to_chunk};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::agg::{AggScalarValue, agg_scalar_from_array, build_agg_scalar_array};
 use crate::exec::expr::decimal::{div_round_i128, pow10_i128};
@@ -54,6 +53,7 @@ use crate::exec::expr::function::mv_state::{
     count_state_visible, max_state_union, max_state_visible_key_value, min_state_union,
     min_state_visible_key_value, sum_state_union,
 };
+use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
 use crate::sql::analysis::OutputColumn;
 use crate::sql::parser::ast::SqlType;
 

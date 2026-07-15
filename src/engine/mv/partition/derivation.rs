@@ -29,6 +29,8 @@ use crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout;
 use crate::engine::mv::partition::{MvPartitionKey, MvPartitionKeyField};
 use crate::exec::chunk::Chunk;
 use crate::meta::repository::mv_contract::{ExpressionKind, MvSchemaContract};
+#[cfg(test)]
+use crate::runtime::query_result::record_batch_to_chunk;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AffectedTargetPartitions {
@@ -944,7 +946,7 @@ mod tests {
             Field::new("__agg_state_c", DataType::Int64, false),
         ]));
         let batch = RecordBatch::try_new(schema, vec![row_id_arr, values, counts, states]).unwrap();
-        crate::engine::record_batch_to_chunk(batch).unwrap()
+        record_batch_to_chunk(batch).unwrap()
     }
 
     // --- Moved from aggregate_delta.rs: arrow_array_row_to_partition_value tests ---
@@ -1408,7 +1410,7 @@ mod tests {
             Field::new("__agg_state_c", DataType::Int64, false),
         ]));
         let batch = RecordBatch::try_new(schema, vec![row_ids, other, counts, states]).unwrap();
-        let chunk = crate::engine::record_batch_to_chunk(batch).unwrap();
+        let chunk = record_batch_to_chunk(batch).unwrap();
 
         let err = derive_for_test(&contract, &layout, &[chunk]).unwrap_err();
         assert!(matches!(

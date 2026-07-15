@@ -23,7 +23,8 @@ use arrow::record_batch::RecordBatch;
 use sqlparser::ast as sqlast;
 
 use crate::engine::virtual_table::{INFORMATION_SCHEMA_DB, VirtualTableProvider};
-use crate::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
+use crate::engine::{StandaloneState, StatementResult};
+use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::sql::catalog::ColumnDef;
 
 #[derive(Clone, Debug)]
@@ -378,7 +379,7 @@ fn build_query_result(
         .map_err(|e| format!("build information_schema.materialized_views result failed: {e}"))?;
     Ok(QueryResult {
         columns: query_columns,
-        chunks: vec![crate::engine::record_batch_to_chunk(batch)?],
+        chunks: vec![record_batch_to_chunk(batch)?],
     })
 }
 

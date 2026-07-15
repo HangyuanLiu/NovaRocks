@@ -26,9 +26,9 @@ use crate::engine::mv::agg_state::mv_agg_state::{
     AggregateMvLayout, build_old_state_map, merge_aggregate_state_batches_with_retractions,
 };
 use crate::engine::mv::refresh_context::MvRefreshPruningLimits;
-use crate::engine::record_batch_to_chunk;
 use crate::exec::change_op::{ChangeOp, change_op_array, change_op_field};
 use crate::exec::chunk::Chunk;
+use crate::runtime::query_result::record_batch_to_chunk;
 
 pub(crate) struct IcebergAggregateMergeResult {
     pub(crate) delete_row_ids: Vec<String>,
@@ -436,7 +436,7 @@ mod tests {
     use crate::sql::parser::ast::SqlType;
 
     fn chunk(batch: RecordBatch) -> crate::exec::chunk::Chunk {
-        crate::engine::record_batch_to_chunk(batch).expect("chunk")
+        record_batch_to_chunk(batch).expect("chunk")
     }
 
     fn encoded_utf8_group_row_id(value: &str) -> String {

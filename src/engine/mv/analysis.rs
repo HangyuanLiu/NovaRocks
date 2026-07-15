@@ -25,16 +25,16 @@ use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
+use crate::engine::StandaloneState;
 use crate::engine::catalog::normalize_identifier;
 use crate::engine::mv::agg_state::mv_shape::AggregateMvShape;
 use crate::engine::mv::agg_state::physical_column::StarRocksPhysicalColumn;
 use crate::engine::mv::agg_state::sql_type::arrow_data_type_to_sql_type;
 use crate::engine::mv::lifecycle::{MvListRow, MvStorageEngine};
 use crate::engine::query_prep::drop_local_table_registration_if_exists;
-use crate::engine::record_batch_to_chunk;
-use crate::engine::{QueryResult, QueryResultColumn, StandaloneState};
 use crate::meta::MetaReadTxn;
 use crate::meta::repository::mv::{MvRefreshState, StoredMvDefinition};
+use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::sql::analysis::{OutputColumn, QueryBody, ResolvedQuery};
 use crate::sql::column_id::ColumnId;
 use crate::sql::parser::ast::{

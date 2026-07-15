@@ -35,6 +35,8 @@ use crate::engine::dictionary::model::{
 };
 use crate::meta::repository::id_scopes;
 use crate::runtime::query_result::QueryResult;
+#[cfg(test)]
+use crate::runtime::query_result::record_batch_to_chunk;
 use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
 
 /// Rebuild active dictionary snapshots for `database.table`'s string-typed
@@ -396,7 +398,7 @@ mod tests {
         let array =
             Arc::new(StringArray::from(vec![Some("a"), Some("b")])) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![array]).expect("batch");
-        let chunk = crate::engine::record_batch_to_chunk(batch).expect("chunk");
+        let chunk = record_batch_to_chunk(batch).expect("chunk");
         let result = QueryResult {
             columns: vec![crate::runtime::query_result::QueryResultColumn {
                 name: "s".to_string(),
@@ -429,7 +431,7 @@ mod tests {
             Some("c"),
         ])) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![array]).expect("batch");
-        let chunk = crate::engine::record_batch_to_chunk(batch).expect("chunk");
+        let chunk = record_batch_to_chunk(batch).expect("chunk");
         let result = QueryResult {
             columns: vec![crate::runtime::query_result::QueryResultColumn {
                 name: "s".to_string(),

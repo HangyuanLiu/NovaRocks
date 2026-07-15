@@ -24,10 +24,11 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::common::app_config::ClusterRole;
-use crate::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
+use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::MetaStoreProvider;
 use crate::meta::repository::backend::StoredBackend;
 use crate::runtime::backend_registry::{BackendRegistry, BackendState, BeId, HeartbeatOutcome};
+use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::runtime::query_state::in_flight_table;
 use crate::sql::parser::ast::{AddBackendStmt, DropBackendStmt};
 
@@ -369,7 +370,7 @@ fn show_backends_result(
                 logical_type: None,
             })
             .collect(),
-        chunks: vec![crate::engine::record_batch_to_chunk(batch)?],
+        chunks: vec![record_batch_to_chunk(batch)?],
     })
 }
 

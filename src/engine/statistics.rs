@@ -24,7 +24,8 @@ use arrow::record_batch::RecordBatch;
 use regex::Regex;
 use sqlparser::ast as sqlast;
 
-use crate::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
+use crate::engine::{StandaloneState, StatementResult};
+use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::sql::literal::sqlparser_expr_to_custom_expr;
 use crate::sql::parser::ast::{
     ArithmeticOp, Expr, InsertSource, Literal, ObjectName, OverwriteMode,
@@ -2375,7 +2376,7 @@ fn string_result(columns: Vec<String>, rows: Vec<Vec<String>>) -> Result<QueryRe
                 logical_type: None,
             })
             .collect(),
-        chunks: vec![crate::engine::record_batch_to_chunk(batch)?],
+        chunks: vec![record_batch_to_chunk(batch)?],
     })
 }
 

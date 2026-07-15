@@ -102,6 +102,7 @@ use crate::meta::repository::mv_descriptor::{
     DescriptorDependency, MV_DESCRIPTOR_VERSION, MvDescriptorV1,
 };
 use crate::runtime::global_async_runtime::data_block_on;
+use crate::runtime::query_result::record_batch_to_chunk;
 use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::parser::ast::{
@@ -9032,7 +9033,7 @@ fn append_branch_id_to_first_refresh_chunk(
     .map_err(|e| {
         format!("append branch id to branch UNION ALL aggregate first refresh chunk failed: {e}")
     })?;
-    crate::engine::record_batch_to_chunk(batch)
+    record_batch_to_chunk(batch)
 }
 
 fn normalize_aggregate_state_result_column_names(
@@ -9211,7 +9212,7 @@ fn reorder_and_rename_chunk_columns(
     let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields));
     let batch = arrow::record_batch::RecordBatch::try_new(schema, columns)
         .map_err(|e| format!("reorder aggregate MV state result columns failed: {e}"))?;
-    crate::engine::record_batch_to_chunk(batch)
+    record_batch_to_chunk(batch)
 }
 
 fn alias_aggregate_refresh_group_key_projection(
@@ -17054,7 +17055,7 @@ mod tests {
                     logical_type: None,
                 },
             ],
-            chunks: vec![crate::engine::record_batch_to_chunk(batch).expect("chunk")],
+            chunks: vec![record_batch_to_chunk(batch).expect("chunk")],
         };
 
         let normalized = normalize_aggregate_state_result_column_names(result, &layout, &calls)
@@ -17125,7 +17126,7 @@ mod tests {
                     logical_type: None,
                 },
             ],
-            chunks: vec![crate::engine::record_batch_to_chunk(batch).expect("chunk")],
+            chunks: vec![record_batch_to_chunk(batch).expect("chunk")],
         };
 
         let normalized = normalize_aggregate_state_result_column_names(result, &layout, &calls)
@@ -19894,7 +19895,10 @@ mod tests {
 
     /// Read one string cell out of the W0 stateless-rebuild report chunk.
     /// Returns `None` for a NULL cell (the hash columns are nullable).
-    fn stateless_report_cell(result: &crate::engine::QueryResult, column: usize) -> Option<String> {
+    fn stateless_report_cell(
+        result: &crate::runtime::query_result::QueryResult,
+        column: usize,
+    ) -> Option<String> {
         let chunk = &result.chunks[0];
         let array = chunk
             .batch
