@@ -425,6 +425,303 @@ fn topk_service_emits_typed_input_events_and_keeps_global_event_names() {
 }
 
 #[test]
+fn topk_exact_replay_emits_equal_without_publishing_another_version() {
+    let fixture = fixture();
+    let live = live(&fixture.service);
+    let first = summary_producer(&fixture.service, PRODUCER_A, uid(1));
+    let second = summary_producer(&fixture.service, PRODUCER_B, uid(3));
+
+    first
+        .submit_summary(
+            PartitionId::new(0),
+            ProducerSequence::new(0),
+            summary(&fixture.contract, &[1, 4]),
+        )
+        .unwrap();
+    second
+        .submit_summary(
+            PartitionId::new(0),
+            ProducerSequence::new(0),
+            summary(&fixture.contract, &[2, 2]),
+        )
+        .unwrap();
+    assert_eq!(
+        range_value(live.poll_after(None)),
+        (LogicalVersion::FIRST, 4, None)
+    );
+    fixture.events.0.lock().unwrap().clear();
+
+    assert_eq!(
+        second
+            .submit_summary(
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                summary(&fixture.contract, &[2, 2]),
+            )
+            .unwrap(),
+        SubmitOutcome::Duplicate
+    );
+    assert!(matches!(
+        live.poll_after(Some(LogicalVersion::FIRST)),
+        LivePollOutcome::Idle {
+            latest_version: Some(version),
+            terminal: None
+        } if version == LogicalVersion::FIRST
+    ));
+    let events = fixture.events.0.lock().unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RuntimeFilterEvent::TopKSummaryEqual { identity }
+            if identity.stream().binding_id() == PRODUCER_B
+                && identity.stream().fragment_instance_id() == uid(3)
+                && identity.stream().partition_id() == PartitionId::new(0)
+                && identity.sequence() == ProducerSequence::new(0)
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        RuntimeFilterEvent::OrderedGlobalTightened { .. }
+            | RuntimeFilterEvent::LogicalVersionPublished { .. }
+    )));
+}
+
+#[test]
+fn topk_close_states_emit_typed_input_events_before_return() {
+    let satisfied = fixture();
+    let satisfied_producer = summary_producer(&satisfied.service, PRODUCER_A, uid(1));
+    satisfied_producer
+        .submit_summary(
+            PartitionId::new(0),
+            ProducerSequence::new(0),
+            summary(&satisfied.contract, &[1, 4]),
+        )
+        .unwrap();
+    satisfied.events.0.lock().unwrap().clear();
+
+    assert_eq!(
+        satisfied_producer
+            .close_partition(PartitionId::new(0), ProducerSequence::new(1))
+            .unwrap(),
+        SubmitOutcome::Applied
+    );
+    assert!(
+        satisfied
+            .events
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(
+                event,
+                RuntimeFilterEvent::TopKSummaryApplied { identity }
+                    if identity.stream().binding_id() == PRODUCER_A
+                        && identity.sequence() == ProducerSequence::new(1)
+            ))
+    );
+    satisfied.events.0.lock().unwrap().clear();
+
+    assert_eq!(
+        satisfied_producer
+            .close_partition(PartitionId::new(0), ProducerSequence::new(1))
+            .unwrap(),
+        SubmitOutcome::Duplicate
+    );
+    assert!(
+        satisfied
+            .events
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(
+                event,
+                RuntimeFilterEvent::TopKSummaryEqual { identity }
+                    if identity.stream().binding_id() == PRODUCER_A
+                        && identity.sequence() == ProducerSequence::new(1)
+            ))
+    );
+
+    let pending = fixture();
+    let pending_producer = summary_producer(&pending.service, PRODUCER_A, uid(1));
+    pending_producer
+        .submit_summary(
+            PartitionId::new(0),
+            ProducerSequence::new(0),
+            summary(&pending.contract, &[1, 4]),
+        )
+        .unwrap();
+    pending.events.0.lock().unwrap().clear();
+
+    assert_eq!(
+        pending_producer
+            .close_partition(PartitionId::new(0), ProducerSequence::new(2))
+            .unwrap(),
+        SubmitOutcome::PendingFinalSnapshot
+    );
+    assert!(
+        pending
+            .events
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(
+                event,
+                RuntimeFilterEvent::TopKStreamUpdated { identity }
+                    if identity.stream().binding_id() == PRODUCER_A
+                        && identity.sequence() == ProducerSequence::new(2)
+            ))
+    );
+}
+
+#[test]
+fn topk_close_preflight_rejections_are_typed_before_return() {
+    let fixture = fixture();
+    let producer = summary_producer(&fixture.service, PRODUCER_A, uid(1));
+    producer
+        .submit_summary(
+            PartitionId::new(0),
+            ProducerSequence::new(1),
+            summary(&fixture.contract, &[1, 4]),
+        )
+        .unwrap();
+    fixture.events.0.lock().unwrap().clear();
+
+    let outside_terminal = producer
+        .close_partition(PartitionId::new(0), ProducerSequence::new(1))
+        .unwrap_err();
+    assert_eq!(
+        outside_terminal.kind(),
+        RuntimeContractViolationKind::SequenceOutsideTerminalRange
+    );
+    assert!(
+        fixture
+            .events
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(
+                event,
+                RuntimeFilterEvent::TopKSummaryRejected { identity, violation }
+                    if identity.sequence() == ProducerSequence::new(1)
+                        && *violation
+                            == RuntimeContractViolationKind::SequenceOutsideTerminalRange
+            ))
+    );
+
+    producer
+        .close_partition(PartitionId::new(0), ProducerSequence::new(2))
+        .unwrap();
+    fixture.events.0.lock().unwrap().clear();
+    let conflicting = producer
+        .close_partition(PartitionId::new(0), ProducerSequence::new(3))
+        .unwrap_err();
+    assert_eq!(
+        conflicting.kind(),
+        RuntimeContractViolationKind::ConflictingTerminalSequence
+    );
+    assert!(
+        fixture
+            .events
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(
+                event,
+                RuntimeFilterEvent::TopKSummaryRejected { identity, violation }
+                    if identity.sequence() == ProducerSequence::new(3)
+                        && *violation
+                            == RuntimeContractViolationKind::ConflictingTerminalSequence
+            ))
+    );
+}
+
+#[test]
+fn topk_close_rejection_cannot_overtake_earlier_accepted_close() {
+    let fixture = fixture();
+    let producer = summary_producer(&fixture.service, PRODUCER_A, uid(1));
+    let channel = fixture
+        .service
+        .registry
+        .active_installation()
+        .unwrap()
+        .channels()
+        .next()
+        .unwrap()
+        .1;
+    fixture.events.0.lock().unwrap().clear();
+
+    let accepted = channel
+        .close_topk_partition(
+            PRODUCER_A,
+            uid(1),
+            PartitionId::new(0),
+            ProducerSequence::new(0),
+        )
+        .unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let rejected = std::thread::spawn(move || {
+        let error = producer
+            .close_partition(PartitionId::new(0), ProducerSequence::new(1))
+            .unwrap_err();
+        done_tx.send(error.kind()).unwrap();
+    });
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while fixture
+        .service
+        .dispatcher
+        .pending_action_count(ChannelId::new(1))
+        == 0
+    {
+        assert!(
+            Instant::now() < deadline,
+            "close rejection never reached dispatcher"
+        );
+        std::thread::yield_now();
+    }
+    assert!(fixture.events.0.lock().unwrap().is_empty());
+
+    fixture
+        .service
+        .dispatcher
+        .dispatch(ChannelId::new(1), accepted)
+        .unwrap();
+    assert_eq!(
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        RuntimeContractViolationKind::ConflictingTerminalSequence
+    );
+    rejected.join().unwrap();
+    let typed = fixture
+        .events
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeFilterEvent::TopKSummaryApplied { identity } => {
+                Some((identity.sequence(), None))
+            }
+            RuntimeFilterEvent::TopKSummaryRejected {
+                identity,
+                violation,
+            } => Some((identity.sequence(), Some(*violation))),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        typed,
+        vec![
+            (ProducerSequence::new(0), None),
+            (
+                ProducerSequence::new(1),
+                Some(RuntimeContractViolationKind::ConflictingTerminalSequence),
+            ),
+        ]
+    );
+}
+
+#[test]
 fn topk_authorize_preflight_and_core_rejections_are_typed_before_return() {
     let account = Arc::new(ArmableMemoryAccount::default());
     let fixture = fixture_with_account(account.clone());

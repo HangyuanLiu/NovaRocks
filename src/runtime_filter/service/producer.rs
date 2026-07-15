@@ -332,14 +332,13 @@ impl TopKSummaryProducerAdapter for ServiceProducerAdapter {
         partition_id: PartitionId,
         terminal: ProducerSequence,
     ) -> Result<SubmitOutcome, RuntimeContractViolation> {
-        self.channel
-            .close_topk_partition(
-                self.binding_id,
-                self.fragment_instance_id,
-                partition_id,
-                terminal,
-            )
-            .and_then(|action| self.finish(action))
+        let result = self.channel.close_topk_partition(
+            self.binding_id,
+            self.fragment_instance_id,
+            partition_id,
+            terminal,
+        );
+        self.finish_topk(partition_id, terminal, result)
     }
 
     fn fail(

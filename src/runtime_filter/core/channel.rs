@@ -1271,10 +1271,10 @@ impl RuntimeFilterChannel {
                 TopKApplyOutcome::Stale => {
                     vec![RuntimeFilterEvent::TopKSummaryStale { identity }]
                 }
-                TopKApplyOutcome::Duplicate | TopKApplyOutcome::GlobalTightened => Vec::new(),
-                TopKApplyOutcome::SequenceAdvancedEqual => {
+                TopKApplyOutcome::Duplicate | TopKApplyOutcome::SequenceAdvancedEqual => {
                     vec![RuntimeFilterEvent::TopKSummaryEqual { identity }]
                 }
+                TopKApplyOutcome::GlobalTightened => Vec::new(),
                 TopKApplyOutcome::StreamUpdated => {
                     vec![RuntimeFilterEvent::TopKStreamUpdated { identity }]
                 }
@@ -1489,7 +1489,17 @@ impl RuntimeFilterChannel {
                 .expect("top-k strategy remains installed")
                 .commit_close(projection);
             ordered.availability_witnesses = availability_witnesses;
-            let mut events = Vec::new();
+            let mut events = match close_outcome {
+                TopKCloseOutcome::Duplicate => {
+                    vec![RuntimeFilterEvent::TopKSummaryEqual { identity }]
+                }
+                TopKCloseOutcome::PendingFinalSnapshot => {
+                    vec![RuntimeFilterEvent::TopKStreamUpdated { identity }]
+                }
+                TopKCloseOutcome::Satisfied => {
+                    vec![RuntimeFilterEvent::TopKSummaryApplied { identity }]
+                }
+            };
             if !availability_was_satisfied && availability == CoverageProgress::Satisfied {
                 events.push(RuntimeFilterEvent::OrderedAvailabilityReached {
                     identity: self.event_identity,
