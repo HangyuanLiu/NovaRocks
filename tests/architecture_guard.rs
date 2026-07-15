@@ -8001,8 +8001,120 @@ fn runtime_filter_runtime_dependency_allowlist(
             &["crate", "runtime_filter", "port", "value_domain"],
             &["crate", "runtime_filter", "core", "coverage"],
             &["crate", "runtime_filter", "core", "error"],
+            &[
+                "crate",
+                "runtime_filter",
+                "core",
+                "ordered_reducer",
+                "OrderedApplyOutcome",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "core",
+                "ordered_reducer",
+                "OrderedBoundDomain",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "core",
+                "ordered_reducer",
+                "OrderedCloseOutcome",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "core",
+                "ordered_reducer",
+                "OrderedReducer",
+            ],
             &["crate", "runtime_filter", "core", "reducer"],
             &["crate", "runtime_filter", "core", "state"],
+            &[
+                "crate",
+                "runtime_filter",
+                "core",
+                "topk_reducer",
+                "TopKApplyOutcome",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "core",
+                "topk_reducer",
+                "TopKCloseOutcome",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "core",
+                "topk_reducer",
+                "TopKSummaryReducer",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "artifact",
+                "ArtifactMembershipSchema",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "events",
+                "FinalDomainRejectionKind",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "final_domain",
+                "FinalDomainShard",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "final_domain",
+                "RuntimeCompletionFenceContract",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "install",
+                "RuntimeFilterChannelDeployment",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "ordered_bound",
+                "OrderedBoundUpdate",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "ordered_bound",
+                "RuntimeOrderContract",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "topk_summary",
+                "RuntimeTopKSummaryContract",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "topk_summary",
+                "TopKSummary",
+            ],
         ],
         "src/runtime_filter/core/coverage.rs" => vec![
             &["std", "collections", "BTreeMap"],
@@ -8032,6 +8144,62 @@ fn runtime_filter_runtime_dependency_allowlist(
             ],
             &["crate", "runtime_filter", "port", "value_domain"],
         ],
+        "src/runtime_filter/core/ordered_reducer.rs" => vec![
+            &["std", "cmp", "Ordering"],
+            &["std", "collections", "BTreeMap"],
+            &["std", "sync", "Arc"],
+            &["crate", "common", "types", "UniqueId"],
+            &["crate", "runtime_filter", "model", "contract", "BindingId"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "identity",
+                "ProducerSequence",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "identity",
+                "ProducerStreamId",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "ordered_bound",
+                "OrderedBoundUpdate",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "ordered_bound",
+                "OrderedTuple",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "ordered_bound",
+                "RuntimeOrderContract",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "producer",
+                "RuntimeContractViolation",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "producer",
+                "RuntimeContractViolationKind",
+            ],
+        ],
         "src/runtime_filter/core/state.rs" => vec![
             &["std", "collections", "BTreeMap"],
             &["crate", "runtime_filter", "port", "identity"],
@@ -8041,6 +8209,83 @@ fn runtime_filter_runtime_dependency_allowlist(
                 "port",
                 "value_domain",
                 "ContributionFingerprint",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "subscription",
+                "UnavailableReason",
+            ],
+        ],
+        "src/runtime_filter/core/topk_reducer.rs" => vec![
+            &["std", "cmp", "Ordering"],
+            &["std", "collections", "BTreeMap"],
+            &["std", "sync", "Arc"],
+            &["crate", "common", "types", "UniqueId"],
+            &["crate", "runtime_filter", "model", "contract", "BindingId"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "identity",
+                "ProducerSequence",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "identity",
+                "ProducerStreamId",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "ordered_bound",
+                "OrderedTuple",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "ordered_bound",
+                "RuntimeOrderContract",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "producer",
+                "RuntimeContractViolation",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "producer",
+                "RuntimeContractViolationKind",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "topk_summary",
+                "RuntimeTopKSummaryContract",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "topk_summary",
+                "TopKSummary",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "core",
+                "ordered_reducer",
+                "OrderedBoundDomain",
             ],
         ],
         "src/runtime_filter/materializer/mod.rs" => vec![
@@ -8069,15 +8314,143 @@ fn runtime_filter_runtime_dependency_allowlist(
             &["std", "cmp", "Ordering"],
             &["std", "error", "Error"],
             &["std", "fmt"],
+            &["std", "mem", "size_of"],
             &["std", "str", "from_utf8"],
             &["std", "sync", "Arc"],
             &["arrow", "datatypes", "DECIMAL128_MAX_PRECISION"],
+            &["arrow", "datatypes", "DECIMAL128_MAX_SCALE"],
+            &["arrow", "datatypes", "DataType"],
+            &["arrow", "datatypes", "TimeUnit"],
             &["crate", "runtime_filter", "model", "contract"],
             &["crate", "runtime_filter", "port", "artifact"],
             &["crate", "runtime_filter", "port", "identity"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "ordered_bound",
+                "OrderContractDigest",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "ordered_bound",
+                "OrderedScalar",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "ordered_bound",
+                "OrderedTuple",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "ordered_bound",
+                "RuntimeOrderContract",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "ordered_bound",
+                "RuntimeOrderKey",
+            ],
             &["crate", "runtime_filter", "port", "support"],
             &["crate", "runtime_filter", "port", "value_domain"],
             &["crate", "runtime_filter", "materializer", "bloom"],
+        ],
+        "src/runtime_filter/materializer/range.rs" => vec![
+            &["std", "collections", "BTreeSet"],
+            &["std", "sync", "Arc"],
+            &[
+                "crate",
+                "runtime_filter",
+                "materializer",
+                "codec",
+                "encode_range_leaf",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "materializer",
+                "codec",
+                "encoded_range_leaf_len",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "materializer",
+                "codec",
+                "ArtifactCodecError",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "artifact",
+                "ArtifactBundle",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "artifact",
+                "ArtifactKind",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "artifact",
+                "ConsumerArtifactProfile",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "artifact",
+                "PhysicalArtifact",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "artifact",
+                "RangeArtifactData",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "artifact",
+                "RangeArtifactResidentLayout",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "producer",
+                "RuntimeContractViolation",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "producer",
+                "RuntimeContractViolationKind",
+            ],
+            &["crate", "runtime_filter", "port", "support"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "value_domain",
+                "LogicalSnapshot",
+            ],
         ],
         "src/runtime_filter/port/mod.rs" => vec![],
         "src/runtime_filter/port/artifact.rs" => vec![
@@ -8091,6 +8464,7 @@ fn runtime_filter_runtime_dependency_allowlist(
             &["sha2"],
             &["crate", "common", "largeint", "LARGEINT_BYTE_WIDTH"],
             &["crate", "runtime_filter", "model", "contract"],
+            &["crate", "runtime_filter", "port", "ordered_bound"],
             &["crate", "runtime_filter", "port", "identity"],
             &["crate", "runtime_filter", "port", "support"],
         ],
@@ -8120,6 +8494,44 @@ fn runtime_filter_runtime_dependency_allowlist(
                 "subscription",
                 "ArtifactUnsupportedReason",
             ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "producer",
+                "RuntimeContractViolationKind",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "subscription",
+                "LiveTerminal",
+            ],
+        ],
+        "src/runtime_filter/port/final_domain.rs" => vec![
+            &["std", "error", "Error"],
+            &["std", "fmt"],
+            &["std", "sync", "Arc"],
+            &["sha2"],
+            &["crate", "common", "types", "UniqueId"],
+            &["crate", "runtime_filter", "model", "contract"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "artifact",
+                "ArtifactMembershipSchema",
+            ],
+            &["crate", "runtime_filter", "port", "identity"],
+            &["crate", "runtime_filter", "port", "producer"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "value_domain",
+                "ValueDomainDelta",
+            ],
         ],
         "src/runtime_filter/port/identity.rs" => vec![
             &["crate", "common", "types", "UniqueId"],
@@ -8133,12 +8545,50 @@ fn runtime_filter_runtime_dependency_allowlist(
             &["crate", "runtime_filter", "port", "artifact"],
             &["crate", "runtime_filter", "port", "identity"],
         ],
+        "src/runtime_filter/port/ordered_bound.rs" => vec![
+            &["std", "cmp", "Ordering"],
+            &["std", "sync", "Arc"],
+            &["arrow", "datatypes", "DataType"],
+            &["sha2"],
+            &["crate", "common", "largeint", "LARGEINT_BYTE_WIDTH"],
+            &["crate", "runtime_filter", "model", "contract"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "artifact",
+                "encode_schema",
+            ],
+        ],
         "src/runtime_filter/port/producer.rs" => vec![
             &["std", "error", "Error"],
             &["std", "fmt"],
+            &["std", "sync", "Arc"],
+            &["std", "sync", "Weak"],
             &["crate", "common", "types", "UniqueId"],
             &["crate", "runtime_filter", "model", "contract", "BindingId"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "final_domain",
+                "FinalDomainShard",
+            ],
             &["crate", "runtime_filter", "port", "identity"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "ordered_bound",
+                "OrderedBoundUpdate",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "topk_summary",
+                "TopKSummary",
+            ],
             &[
                 "crate",
                 "runtime_filter",
@@ -8148,6 +8598,7 @@ fn runtime_filter_runtime_dependency_allowlist(
             ],
         ],
         "src/runtime_filter/port/subscription.rs" => vec![
+            &["std", "fmt"],
             &["std", "sync", "Arc"],
             &["std", "time", "Duration"],
             &["crate", "common", "types", "UniqueId"],
@@ -8160,6 +8611,27 @@ fn runtime_filter_runtime_dependency_allowlist(
                 "ArtifactBundle",
             ],
             &["crate", "runtime_filter", "port", "identity", "RouteEdgeId"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "identity",
+                "LogicalVersion",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "producer",
+                "RuntimeContractViolation",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "producer",
+                "RuntimeContractViolationKind",
+            ],
         ],
         "src/runtime_filter/port/support.rs" => vec![
             &["std", "error", "Error"],
@@ -8167,6 +8639,14 @@ fn runtime_filter_runtime_dependency_allowlist(
             &["std", "sync", "Arc"],
             &["std", "sync", "atomic"],
             &["std", "time", "Instant"],
+        ],
+        "src/runtime_filter/port/topk_summary.rs" => vec![
+            &["std", "cmp", "Ordering"],
+            &["std", "num", "NonZeroU32"],
+            &["std", "sync", "Arc"],
+            &["sha2"],
+            &["crate", "runtime_filter", "model", "contract"],
+            &["crate", "runtime_filter", "port", "ordered_bound"],
         ],
         "src/runtime_filter/port/value_domain.rs" => vec![
             &["std", "cmp", "Ordering"],
@@ -8178,6 +8658,13 @@ fn runtime_filter_runtime_dependency_allowlist(
             &["sha2"],
             &["crate", "common", "largeint", "LARGEINT_BYTE_WIDTH"],
             &["crate", "runtime_filter", "model", "contract"],
+            &[
+                "crate",
+                "runtime_filter",
+                "core",
+                "ordered_reducer",
+                "OrderedBoundDomain",
+            ],
             &[
                 "crate",
                 "runtime_filter",
@@ -8301,12 +8788,231 @@ fn runtime_filter_runtime_dependency_allowlist(
             &["crate", "runtime_filter", "port", "value_domain"],
             &["crate", "runtime_filter", "service", "registry"],
         ],
+        "src/runtime_filter/service/m3a_tests.rs" => vec![
+            &["std", "sync", "atomic"],
+            &["std", "sync", "Arc"],
+            &["std", "sync", "Mutex"],
+            &["std", "sync", "mpsc"],
+            &["std", "thread", "spawn"],
+            &["std", "time", "Duration"],
+            &["crate", "common", "types", "UniqueId"],
+            &["crate", "runtime_filter", "model", "contract"],
+            &["crate", "runtime_filter", "port", "identity"],
+            &["crate", "runtime_filter", "port", "producer"],
+            &["crate", "runtime_filter", "port", "subscription"],
+            &["crate", "runtime_filter", "port", "support"],
+            &["crate", "runtime_filter", "service", "RuntimeFilterService"],
+            &[
+                "crate",
+                "runtime_filter",
+                "service",
+                "memory",
+                "MemTrackerMemoryAccount",
+            ],
+            &["crate", "runtime_filter", "service", "tests"],
+        ],
+        "src/runtime_filter/service/m3b_tests.rs" => vec![
+            &["ArtifactCapability"],
+            &["BindingId"],
+            &["ChannelId"],
+            &["CompletionRequirement"],
+            &["ConsumerActivation"],
+            &["ConsumerDeployment"],
+            &["ContributionKind"],
+            &["CoverageWitnessId"],
+            &["DeploymentEpoch"],
+            &["LateApplyGranularity"],
+            &["LogicalVersion"],
+            &["MaterializationPolicy"],
+            &["NullOrder"],
+            &["PartitionId"],
+            &["ProducerDeployment"],
+            &["ProducerSequence"],
+            &["ReductionRequirement"],
+            &["RouteEdgeId"],
+            &["RuntimeFilterChannelDeployment"],
+            &["RuntimeFilterCoreBudget"],
+            &["RuntimeFilterInstallView"],
+            &["RuntimeFilterLifecycle"],
+            &["RuntimeFilterLogicalDomain"],
+            &["RuntimeFilterParticipantId"],
+            &["SortDirection"],
+            &["TopKSummaryRequirement"],
+            &["std", "collections", "BTreeMap"],
+            &["std", "collections", "BTreeSet"],
+            &["std", "sync", "atomic"],
+            &["std", "sync", "Arc"],
+            &["std", "sync", "Barrier"],
+            &["std", "sync", "Mutex"],
+            &["std", "sync", "Weak"],
+            &["std", "sync", "mpsc"],
+            &["std", "thread", "spawn"],
+            &["std", "thread", "yield_now"],
+            &["std", "time", "Duration"],
+            &["std", "time", "Instant"],
+            &["arrow", "datatypes", "DataType"],
+            &["crate", "common", "types", "UniqueId"],
+            &["crate", "runtime_filter", "model", "contract"],
+            &["crate", "runtime_filter", "model", "coverage", "Coverage"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "artifact",
+                "ConsumerArtifactProfile",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "artifact",
+                "ArtifactKind",
+            ],
+            &["crate", "runtime_filter", "port", "events"],
+            &["crate", "runtime_filter", "port", "identity"],
+            &["crate", "runtime_filter", "port", "install"],
+            &["crate", "runtime_filter", "port", "ordered_bound"],
+            &["crate", "runtime_filter", "port", "producer"],
+            &["crate", "runtime_filter", "port", "subscription"],
+            &["crate", "runtime_filter", "port", "support"],
+            &["crate", "runtime_filter", "port", "topk_summary"],
+            &["crate", "runtime_filter", "service", "RuntimeFilterService"],
+            &[
+                "crate",
+                "runtime_filter",
+                "service",
+                "memory",
+                "MemTrackerMemoryAccount",
+            ],
+        ],
+        "src/runtime_filter/service/m3c_tests.rs" => vec![
+            &["ArtifactCapability"],
+            &["BindingId"],
+            &["ChannelId"],
+            &["CompletionFenceKind"],
+            &["CompletionRequirement"],
+            &["ConsumerActivation"],
+            &["ConsumerDeployment"],
+            &["ContributionKind"],
+            &["CoverageWitnessId"],
+            &["DeploymentEpoch"],
+            &["LateApplyGranularity"],
+            &["LogicalVersion"],
+            &["MaterializationPolicy"],
+            &["NullSemantics"],
+            &["PartitionId"],
+            &["ProducerDeployment"],
+            &["ProducerSequence"],
+            &["ProducerStreamId"],
+            &["ReductionRequirement"],
+            &["RouteEdgeId"],
+            &["RuntimeFilterChannelDeployment"],
+            &["RuntimeFilterCoreBudget"],
+            &["RuntimeFilterInstallView"],
+            &["RuntimeFilterLifecycle"],
+            &["RuntimeFilterLogicalDomain"],
+            &["RuntimeFilterParticipantId"],
+            &["std", "collections", "BTreeMap"],
+            &["std", "collections", "BTreeSet"],
+            &["std", "sync", "atomic"],
+            &["std", "sync", "Arc"],
+            &["std", "sync", "Barrier"],
+            &["std", "sync", "Mutex"],
+            &["std", "sync", "Weak"],
+            &["std", "sync", "mpsc"],
+            &["std", "thread", "sleep"],
+            &["std", "thread", "spawn"],
+            &["std", "thread", "yield_now"],
+            &["std", "time", "Duration"],
+            &["std", "time", "Instant"],
+            &["arrow", "datatypes", "DataType"],
+            &["crate", "common", "types", "UniqueId"],
+            &[
+                "crate",
+                "runtime_filter",
+                "core",
+                "channel",
+                "ChannelAction",
+            ],
+            &["crate", "runtime_filter", "model", "contract"],
+            &["crate", "runtime_filter", "model", "coverage", "Coverage"],
+            &["crate", "runtime_filter", "port", "artifact"],
+            &["crate", "runtime_filter", "port", "events"],
+            &["crate", "runtime_filter", "port", "final_domain"],
+            &["crate", "runtime_filter", "port", "identity"],
+            &["crate", "runtime_filter", "port", "install"],
+            &["crate", "runtime_filter", "port", "producer"],
+            &["crate", "runtime_filter", "port", "subscription"],
+            &["crate", "runtime_filter", "port", "support"],
+            &["crate", "runtime_filter", "port", "value_domain"],
+            &["crate", "runtime_filter", "service", "RuntimeFilterService"],
+            &[
+                "crate",
+                "runtime_filter",
+                "service",
+                "memory",
+                "MemTrackerMemoryAccount",
+            ],
+        ],
+        "src/runtime_filter/service/m4_conformance_tests.rs" => vec![
+            &["std", "cmp", "Ordering"],
+            &["std", "collections", "BTreeMap"],
+            &["std", "collections", "BTreeSet"],
+            &["std", "net", "SocketAddr"],
+            &["std", "slice", "from_ref"],
+            &["std", "sync", "Arc"],
+            &["std", "sync", "Mutex"],
+            &["std", "time", "Instant"],
+            &["arrow", "datatypes", "DataType"],
+            &["crate", "common", "types", "UniqueId"],
+            &["crate", "coordinator", "scheduler"],
+            &["crate", "runtime", "endpoint", "RuntimeEndpoint"],
+            &[
+                "crate",
+                "runtime_filter",
+                "deployment",
+                "RuntimeFilterDeploymentPolicy",
+            ],
+            &["crate", "runtime_filter", "deployment", "compiler"],
+            &["crate", "runtime_filter", "materializer", "codec"],
+            &["crate", "runtime_filter", "model", "contract"],
+            &["crate", "runtime_filter", "model", "coverage", "Coverage"],
+            &["crate", "runtime_filter", "model", "graph"],
+            &["crate", "runtime_filter", "port", "artifact"],
+            &["crate", "runtime_filter", "port", "events"],
+            &["crate", "runtime_filter", "port", "final_domain"],
+            &["crate", "runtime_filter", "port", "identity"],
+            &["crate", "runtime_filter", "port", "install"],
+            &["crate", "runtime_filter", "port", "ordered_bound"],
+            &["crate", "runtime_filter", "port", "producer"],
+            &["crate", "runtime_filter", "port", "subscription"],
+            &["crate", "runtime_filter", "port", "support"],
+            &["crate", "runtime_filter", "port", "topk_summary"],
+            &["crate", "runtime_filter", "port", "value_domain"],
+            &["crate", "sql", "analysis"],
+            &["crate", "sql", "planner", "distributed"],
+            &["crate", "runtime_filter", "service", "RuntimeFilterService"],
+            &[
+                "crate",
+                "runtime_filter",
+                "service",
+                "memory",
+                "MemTrackerMemoryAccount",
+            ],
+        ],
         "src/runtime_filter/service/subscription.rs" => vec![
             &["std", "collections", "BTreeMap"],
             &["std", "sync"],
             &["std", "time", "Duration"],
             &["crate", "common", "types", "UniqueId"],
             &["crate", "runtime_filter", "model", "contract", "BindingId"],
+            &[
+                "crate",
+                "runtime_filter",
+                "model",
+                "contract",
+                "ConsumerActivation",
+            ],
             &["crate", "runtime_filter", "port"],
             &["crate", "runtime_filter", "service", "EventBatchCompletion"],
         ],
@@ -9004,11 +9710,43 @@ fn runtime_filter_action_dispatch_boundary_violations(producer: &str) -> Vec<Str
         .windows(4)
         .filter(|window| window == &["dispatcher", ".", "dispatch", "("])
         .count();
-    if !finish_tokens
-        .windows(4)
-        .any(|window| window == ["dispatcher", ".", "dispatch", "("])
-        || dispatch_count != 1
-    {
+    let exact_dispatch = [
+        "dispatcher",
+        ".",
+        "dispatch",
+        "(",
+        "self",
+        ".",
+        "channel_id",
+        ",",
+        "action",
+        ")",
+    ];
+    let finish_dispatch_count = finish_tokens
+        .windows(exact_dispatch.len())
+        .filter(|window| {
+            window
+                .iter()
+                .zip(exact_dispatch)
+                .all(|(actual, expected)| actual == expected)
+        })
+        .count();
+    let owned_dispatch_count = ["finish", "finish_ordered", "finish_topk", "finish_final"]
+        .into_iter()
+        .filter_map(|function| runtime_filter_function_tokens(&production, function))
+        .map(|tokens| {
+            tokens
+                .windows(exact_dispatch.len())
+                .filter(|window| {
+                    window
+                        .iter()
+                        .zip(exact_dispatch)
+                        .all(|(actual, expected)| actual == expected)
+                })
+                .count()
+        })
+        .sum::<usize>();
+    if finish_dispatch_count != 1 || dispatch_count != owned_dispatch_count {
         violations.push("Service producer must dispatch the returned ChannelAction".to_string());
     }
 
@@ -9221,11 +9959,28 @@ fn runtime_filter_type_is_option_arc_artifact_bundle(ty: &syn::Type) -> bool {
 
 fn runtime_filter_subscription_artifact_surface_violations(text: &str) -> Vec<String> {
     let production = rust_sanitized_production_text(text);
-    let Ok(file) = syn::parse_file(&production) else {
-        return vec!["artifact subscription production source must parse".to_string()];
+    let file = match syn::parse_file(&production).or_else(|_| syn::parse_file(text)) {
+        Ok(file) => file,
+        Err(error) => {
+            return vec![format!(
+                "artifact subscription production source must parse: {error}"
+            )];
+        }
     };
     let mut violations = Vec::new();
-    let local_roots = runtime_filter_model_local_roots(text);
+    let local_roots = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Enum(item) => Some(item.ident.to_string()),
+            syn::Item::Mod(item) => Some(item.ident.to_string()),
+            syn::Item::Struct(item) => Some(item.ident.to_string()),
+            syn::Item::Trait(item) => Some(item.ident.to_string()),
+            syn::Item::Type(item) => Some(item.ident.to_string()),
+            syn::Item::Union(item) => Some(item.ident.to_string()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
     for shadowed in ["Arc", "ArtifactBundle", "LogicalSnapshot"] {
         if local_roots.contains(shadowed) {
             violations.push(format!(
@@ -9578,6 +10333,105 @@ fn runtime_filter_materializer_has_exact_range_rejection(source_rel: &str, text:
     }
 }
 
+fn runtime_filter_materializer_allowed_range_count(source_rel: &str, text: &str) -> usize {
+    let production = rust_sanitized_production_text(text);
+    let tokens = rust_use_tokens(&production);
+    match source_rel {
+        "src/runtime_filter/materializer/mod.rs"
+            if runtime_filter_materializer_has_exact_range_rejection(source_rel, text) =>
+        {
+            1
+        }
+        "src/runtime_filter/materializer/codec.rs"
+            if runtime_filter_materializer_has_exact_range_rejection(source_rel, text)
+                && runtime_filter_token_sequence(
+                    &tokens,
+                    &[
+                        "encoded",
+                        ".",
+                        "push",
+                        "(",
+                        "ArtifactKind",
+                        "::",
+                        "Range",
+                        ".",
+                        "tag",
+                        "(",
+                        ")",
+                        ")",
+                    ],
+                )
+                .is_some()
+                && runtime_filter_token_sequence(
+                    &tokens,
+                    &[
+                        "header",
+                        ".",
+                        "kind",
+                        "!",
+                        "=",
+                        "ArtifactKind",
+                        "::",
+                        "Range",
+                    ],
+                )
+                .is_some() =>
+        {
+            3
+        }
+        "src/runtime_filter/materializer/range.rs"
+            if runtime_filter_token_sequence(
+                &tokens,
+                &[
+                    "profile",
+                    ".",
+                    "accepted_kinds",
+                    "(",
+                    ")",
+                    "!",
+                    "=",
+                    "&",
+                    "std",
+                    "::",
+                    "collections",
+                    "::",
+                    "BTreeSet",
+                    "::",
+                    "from",
+                    "(",
+                    "[",
+                    "ArtifactKind",
+                    "::",
+                    "Range",
+                    "]",
+                    ")",
+                ],
+            )
+            .is_some()
+                && runtime_filter_token_sequence(
+                    &tokens,
+                    &[
+                        "vec",
+                        "!",
+                        "[",
+                        "(",
+                        "ArtifactKind",
+                        "::",
+                        "Range",
+                        ",",
+                        "artifact",
+                        ")",
+                        "]",
+                    ],
+                )
+                .is_some() =>
+        {
+            2
+        }
+        _ => 0,
+    }
+}
+
 fn runtime_filter_eval_const_u128(expr: &syn::Expr) -> Option<u128> {
     match expr {
         syn::Expr::Lit(syn::ExprLit {
@@ -9735,9 +10589,7 @@ fn runtime_filter_materializer_semantic_violations(source_rel: &str, text: &str)
         .filter(|window| window == &["ArtifactKind", "::", "Range"])
         .count();
     let range_count = canonical_range_count.max(direct_range_count);
-    let allowed_range_count = usize::from(runtime_filter_materializer_has_exact_range_rejection(
-        source_rel, text,
-    ));
+    let allowed_range_count = runtime_filter_materializer_allowed_range_count(source_rel, text);
     if range_count != allowed_range_count {
         violations.push(format!(
             "{source_rel}: Membership must not materialize ArtifactKind::Range"
@@ -9746,6 +10598,225 @@ fn runtime_filter_materializer_semantic_violations(source_rel: &str, text: &str)
     violations.extend(runtime_filter_global_registry_violations(source_rel, text));
     violations.extend(runtime_filter_any_dead_code_violations(source_rel, text));
     violations
+}
+
+fn runtime_filter_conformance_manifest_violations(
+    service_root: &str,
+    harness: &str,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    let registrations = rust_module_items(service_root)
+        .into_iter()
+        .filter(|item| item.name == "m4_conformance_tests")
+        .collect::<Vec<_>>();
+    let exact_cfg_test = matches!(
+        registrations.as_slice(),
+        [registration]
+            if registration.attributes == ["#[cfg(test)]"]
+                && registration.inline_modules.is_empty()
+                && registration.is_external
+    );
+    if !exact_cfg_test {
+        violations.push(
+            "Service must register exactly one external #[cfg(test)] mod m4_conformance_tests"
+                .to_string(),
+        );
+    }
+
+    let wrapped = format!("#[cfg(test)]\nmod m4_conformance_tests {{\n{harness}\n}}\n");
+    if !rust_use_tokens(&rust_sanitized_production_text(&wrapped)).is_empty() {
+        violations.push("M4 conformance harness must sanitize to no production source".to_string());
+    }
+
+    let tokens = rust_use_tokens(&rust_lexically_sanitized(harness));
+    for test_name in [
+        "m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts",
+        "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+        "m4_topk_summary_conformance_merges_incomplete_shards_only_after_allof",
+        "m4_aggregate_conformance_requires_frozen_allof_and_separates_empty_unavailable",
+    ] {
+        let expected = ["#", "[", "test", "]", "fn", test_name, "("];
+        let count = tokens
+            .windows(expected.len())
+            .filter(|window| {
+                window
+                    .iter()
+                    .zip(expected)
+                    .all(|(actual, expected)| actual == expected)
+            })
+            .count();
+        if count != 1 {
+            violations.push(format!(
+                "M4 conformance harness must define exactly one #[test] fn {test_name}"
+            ));
+        }
+    }
+
+    for (label, expected) in [
+        (
+            "deployment compiler",
+            &["compiler", "::", "compile", "("][..],
+        ),
+        ("Service install", &[".", "install", "("][..]),
+        ("Service producer open", &[".", "open_producer", "("][..]),
+        ("Service subscription", &[".", "subscribe", "("][..]),
+        ("membership submit", &[".", "submit", "("][..]),
+        ("ordered submit", &[".", "submit_bound", "("][..]),
+        ("TopK submit", &[".", "submit_summary", "("][..]),
+        ("fenced-final complete", &[".", "complete", "("][..]),
+        ("producer completion", &[".", "close_partition", "("][..]),
+    ] {
+        if runtime_filter_token_sequence(&tokens, expected).is_none() {
+            violations.push(format!(
+                "M4 conformance harness is missing {label} call surface"
+            ));
+        }
+    }
+
+    for (label, expected) in [
+        (
+            "Membership producer handle",
+            &["ProducerHandle", "::", "Membership"][..],
+        ),
+        (
+            "OrderedBound producer handle",
+            &["ProducerHandle", "::", "OrderedBound"][..],
+        ),
+        (
+            "TopKSummary producer handle",
+            &["ProducerHandle", "::", "TopKSummary"][..],
+        ),
+        (
+            "FinalDomain producer handle",
+            &["ProducerHandle", "::", "FinalDomain"][..],
+        ),
+        (
+            "Membership producer kind",
+            &["ProducerPortKind", "::", "Membership"][..],
+        ),
+        (
+            "OrderedBound producer kind",
+            &["ProducerPortKind", "::", "OrderedBound"][..],
+        ),
+        (
+            "TopKSummary producer kind",
+            &["ProducerPortKind", "::", "TopKSummary"][..],
+        ),
+        (
+            "FinalDomain producer kind",
+            &["ProducerPortKind", "::", "FinalDomain"][..],
+        ),
+    ] {
+        if runtime_filter_token_sequence(&tokens, expected).is_none() {
+            violations.push(format!("M4 conformance harness is missing typed {label}"));
+        }
+    }
+    for surface in ["ProducerSequence", "LogicalVersion", "ArtifactBundle"] {
+        if !tokens.iter().any(|token| token == surface) {
+            violations.push(format!(
+                "M4 conformance harness is missing {surface} surface"
+            ));
+        }
+    }
+
+    for declaration in tokens.windows(2).filter(|pair| {
+        matches!(
+            pair[0].as_str(),
+            "enum" | "struct" | "trait" | "type" | "union"
+        )
+    }) {
+        let name = &declaration[1];
+        if name.ends_with("Channel")
+            || name.ends_with("Reducer")
+            || name.contains("Transport")
+            || name.contains("Envelope")
+            || matches!(name.as_str(), "Ack" | "Retry")
+        {
+            violations.push(format!(
+                "M4 conformance harness must not define Channel/reducer/transport surface {name}"
+            ));
+        }
+    }
+    if tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "RuntimeFilterHub" | "shared_version"))
+    {
+        violations.push("M4 conformance harness must not use Hub shared version state".to_string());
+    }
+    if tokens.iter().any(|token| {
+        token.eq_ignore_ascii_case("thrift")
+            || token.contains("Thrift")
+            || (token.starts_with('T') && token.contains("Filter"))
+    }) {
+        violations.push("M4 conformance harness must not use compat Thrift surfaces".to_string());
+    }
+
+    violations
+}
+
+#[test]
+fn runtime_filter_producer_conformance_gate_is_complete() {
+    let repo = Path::new(manifest_dir());
+    let service_root = fs::read_to_string(repo.join("src/runtime_filter/service/mod.rs")).unwrap();
+    let harness =
+        fs::read_to_string(repo.join("src/runtime_filter/service/m4_conformance_tests.rs"))
+            .unwrap();
+    let violations = runtime_filter_conformance_manifest_violations(&service_root, &harness);
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+#[test]
+fn runtime_filter_conformance_manifest_rejects_missing_or_fake_surfaces() {
+    let valid_root = "#[cfg(test)] mod m4_conformance_tests;";
+    for invalid in [
+        "fn m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts() {}",
+        "struct RuntimeFilterChannel; struct OrderedReducer;",
+        "fn route() { RuntimeFilterHub::shared_version(); }",
+        "fn compat() { let _: TPublishFilterParams; }",
+    ] {
+        assert!(!runtime_filter_conformance_manifest_violations(valid_root, invalid).is_empty());
+    }
+
+    let repo = Path::new(manifest_dir());
+    let harness =
+        fs::read_to_string(repo.join("src/runtime_filter/service/m4_conformance_tests.rs"))
+            .unwrap();
+    for forbidden in [
+        "struct FixtureChannel;",
+        "struct FixtureReducer;",
+        "struct FixtureTransport;",
+        "fn route() { RuntimeFilterHub::shared_version(); }",
+        "fn compat() { let _: TPublishFilterParams; }",
+    ] {
+        let invalid = format!("{harness}\n{forbidden}\n");
+        assert!(
+            !runtime_filter_conformance_manifest_violations(valid_root, &invalid).is_empty(),
+            "manifest detector must reject {forbidden}"
+        );
+    }
+    for missing in [
+        "compiler::compile(",
+        ".install(",
+        ".open_producer(",
+        ".subscribe(",
+        ".submit_bound(",
+        ".submit_summary(",
+        ".complete(",
+        "ProducerSequence",
+        "LogicalVersion",
+        "ArtifactBundle",
+    ] {
+        let invalid = harness.replace(missing, "removed_surface");
+        assert!(
+            !runtime_filter_conformance_manifest_violations(valid_root, &invalid).is_empty(),
+            "manifest detector must reject missing {missing}"
+        );
+    }
+    assert!(
+        !runtime_filter_conformance_manifest_violations("mod m4_conformance_tests;", &harness)
+            .is_empty(),
+        "M4 conformance registration must remain test-only"
+    );
 }
 
 #[test]
@@ -9866,10 +10937,19 @@ fn runtime_filter_channel_service_boundaries_are_default_deny_and_harness_only()
         "src/runtime_filter/materializer/bloom.rs".to_string(),
         "src/runtime_filter/materializer/codec.rs".to_string(),
         "src/runtime_filter/materializer/mod.rs".to_string(),
+        "src/runtime_filter/materializer/range.rs".to_string(),
     ]);
     assert_eq!(
         actual_materializer_sources, expected_materializer_sources,
         "materializer source inventory is explicit and unknown files default-deny"
+    );
+    assert!(
+        !runtime_filter_runtime_boundary_violations(
+            "src/runtime_filter/service/unknown.rs",
+            "use std::sync::Arc;",
+        )
+        .is_empty(),
+        "unknown runtime-filter source must remain default-deny"
     );
 
     let src = repo.join("src");
