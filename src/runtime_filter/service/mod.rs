@@ -348,6 +348,8 @@ struct ActionDispatcher {
     #[cfg(test)]
     before_materialization_admission: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
+    after_materialization_gate_claim: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
     before_encode: Mutex<
         Option<Arc<dyn Fn(crate::runtime_filter::port::artifact::ConsumerProfileId) + Send + Sync>>,
     >,
@@ -365,6 +367,9 @@ struct ActionDispatcher {
 struct ChannelDispatchState {
     next_order: u64,
     draining: bool,
+    // Blocks a later cancel core from entering the event FIFO until this action's
+    // owner launch prefix has either been reserved or proven unnecessary.
+    launch_prefix_pending: bool,
     active_completion: Option<Arc<EventBatchCompletion>>,
     pending: BTreeMap<u64, PendingDispatch>,
     completed_errors: BTreeMap<u64, RuntimeContractViolation>,
@@ -390,6 +395,13 @@ struct ClaimedActionMaterialization {
     snapshot: Arc<crate::runtime_filter::port::value_domain::LogicalSnapshot>,
     jobs: Vec<ClaimedMaterializationJob>,
     launch_batch: Option<EventBatchHandle>,
+}
+
+fn action_needs_materialization_launch_prefix(action: &ChannelAction) -> bool {
+    matches!(
+        action,
+        ChannelAction::VisibleSnapshot { .. } | ChannelAction::Completed { .. }
+    )
 }
 
 impl ActionDispatcher {
@@ -427,6 +439,7 @@ impl ActionDispatcher {
         if order == state.next_order && !state.reserved_core.contains_key(&order) {
             if let Some(batch) = self.events.reserve_unready(action.events().iter().cloned()) {
                 state.reserved_core.insert(order, batch);
+                state.launch_prefix_pending = action_needs_materialization_launch_prefix(action);
             }
         }
     }
@@ -529,6 +542,7 @@ impl ActionDispatcher {
                 let predecessor_reserved =
                     state.draining || state.reserved_core.contains_key(&state.next_order);
                 let reserve_contiguous_cancel = predecessor_reserved
+                    && !state.launch_prefix_pending
                     && order == state.next_order.saturating_add(1)
                     && matches!(&action, ChannelAction::Cancelled { .. });
                 let previously_reserved = state.reserved_core.remove(&order);
@@ -585,6 +599,7 @@ impl ActionDispatcher {
             let core_batch = reserved_core_batch
                 .or_else(|| self.events.reserve_unready(action.events().iter().cloned()));
             state.draining = true;
+            state.launch_prefix_pending = action_needs_materialization_launch_prefix(&action);
             state.active_completion = Some(action_completion.clone());
             drop(state);
             let caller_completion = caller_completion.unwrap_or_else(|| action_completion.clone());
@@ -629,6 +644,7 @@ impl ActionDispatcher {
             let core_batch =
                 core_batch.or_else(|| self.events.reserve_unready(action.events().iter().cloned()));
             state.draining = true;
+            state.launch_prefix_pending = action_needs_materialization_launch_prefix(&action);
             state.active_completion = Some(completion.clone());
             drop(state);
             let _ = self.process_claimed_action(
@@ -668,6 +684,7 @@ impl ActionDispatcher {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        state.launch_prefix_pending = false;
         state.next_order = state
             .next_order
             .checked_add(1)
@@ -736,6 +753,20 @@ impl ActionDispatcher {
         let plan = installed.artifact_plan(channel_id)?;
         let mut jobs =
             claim_materialization_jobs(plan, installed.publish_gate(), snapshot.version());
+        #[cfg(test)]
+        let after_materialization_gate_claim = jobs
+            .iter()
+            .any(|job| matches!(job, ClaimedMaterializationJob::Owner { .. }))
+            .then(|| {
+                self.after_materialization_gate_claim
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take()
+            });
+        #[cfg(test)]
+        if let Some(Some(hook)) = after_materialization_gate_claim {
+            hook();
+        }
         let launch_batch = self
             .events
             .reserve_unready(take_materialization_launch_events(&mut jobs));
@@ -954,6 +985,8 @@ impl RuntimeFilterService {
             after_claim: Mutex::new(None),
             #[cfg(test)]
             before_materialization_admission: Mutex::new(None),
+            #[cfg(test)]
+            after_materialization_gate_claim: Mutex::new(None),
             #[cfg(test)]
             before_encode: Mutex::new(None),
             #[cfg(test)]
@@ -1177,6 +1210,15 @@ impl RuntimeFilterService {
         *self
             .dispatcher
             .before_materialization_admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn set_after_materialization_gate_claim_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .dispatcher
+            .after_materialization_gate_claim
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(hook);
     }
@@ -2012,6 +2054,133 @@ mod tests {
             })
             .expect("older version must become stale");
         assert!(newer_published < older_stale);
+    }
+
+    #[test]
+    fn claimed_owner_launch_prefix_precedes_contiguous_cancel_without_deadlock() {
+        let fixture = fixture();
+        let value_set = ConsumerArtifactProfile::new(
+            BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
+            None,
+        )
+        .unwrap();
+        let bitset = ConsumerArtifactProfile::new(
+            BTreeSet::from([ArtifactKind::Bitset, ArtifactKind::EmptyDomain]),
+            None,
+        )
+        .unwrap();
+        fixture
+            .service
+            .install(view([deployment_with_profiles([
+                (30, 40, 30, value_set),
+                (31, 41, 31, bitset),
+            ])]))
+            .unwrap();
+        let producer = fixture
+            .service
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
+            .unwrap();
+
+        let (owner_claimed_tx, owner_claimed_rx) = mpsc::channel();
+        let (claim_release_tx, claim_release_rx) = mpsc::channel();
+        let claim_release_rx = Mutex::new(claim_release_rx);
+        fixture
+            .service
+            .set_after_materialization_gate_claim_hook(Arc::new(move || {
+                owner_claimed_tx.send(()).unwrap();
+                claim_release_rx.lock().unwrap().recv().unwrap();
+            }));
+
+        let (complete_tx, complete_rx) = mpsc::channel();
+        let completing_producer = producer.clone();
+        let completing = std::thread::spawn(move || {
+            complete(&completing_producer, 23);
+            complete_tx.send(()).unwrap();
+        });
+        owner_claimed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("completion must claim at least one materialization owner");
+
+        let (cancel_started_tx, cancel_started_rx) = mpsc::channel();
+        let (cancel_done_tx, cancel_done_rx) = mpsc::channel();
+        let cancelling_dispatcher = fixture.service.dispatcher.clone();
+        let cancelling = std::thread::spawn(move || {
+            cancel_started_tx.send(()).unwrap();
+            cancelling_dispatcher.dispatch_nonblocking(
+                ChannelId::new(1),
+                ChannelAction::Cancelled {
+                    order: 2,
+                    events: vec![RuntimeFilterEvent::ChannelCancelled {
+                        identity: RuntimeFilterEventIdentity::new(
+                            uid(0),
+                            RuntimeFilterParticipantId::new(3),
+                            ChannelId::new(1),
+                            DeploymentEpoch::new(9),
+                        ),
+                    }],
+                },
+            );
+            cancel_done_tx.send(()).unwrap();
+        });
+        cancel_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let cancel_completed_before_release = cancel_done_rx
+            .recv_timeout(Duration::from_millis(200))
+            .is_ok();
+        claim_release_tx.send(()).unwrap();
+
+        let completed_without_rescue = complete_rx.recv_timeout(Duration::from_millis(300)).is_ok();
+        if !completed_without_rescue {
+            let flight = fixture
+                .service
+                .dispatcher
+                .channels
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(&ChannelId::new(1))
+                .cloned()
+                .expect("channel dispatch flight must exist");
+            fixture
+                .service
+                .dispatcher
+                .drain_ready_nonblocking(ChannelId::new(1), flight);
+            complete_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("rescue drain must release the old deadlock window");
+        }
+        if !cancel_completed_before_release {
+            cancel_done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("cancel must finish after the launch prefix is reserved");
+        }
+        completing.join().unwrap();
+        cancelling.join().unwrap();
+
+        let events = fixture.events.0.lock().unwrap();
+        let started = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| {
+                matches!(event, RuntimeFilterEvent::MaterializationStarted { .. }).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let cancelled = events
+            .iter()
+            .position(|event| matches!(event, RuntimeFilterEvent::ChannelCancelled { .. }))
+            .expect("contiguous cancel must emit its causal event");
+        assert_eq!(
+            started.len(),
+            2,
+            "both canonical profile owners must launch"
+        );
+        assert!(
+            completed_without_rescue,
+            "launch publication must not wait behind its contiguous cancel core"
+        );
+        assert!(started.into_iter().all(|index| index < cancelled));
     }
 
     fn install_one(fixture: &Fixture) {
