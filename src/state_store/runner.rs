@@ -79,6 +79,19 @@ pub fn derive_transaction_id(operation_id: OperationId, attempt: usize) -> Trans
 /// The operation may be replayed from the beginning after a conflict or a
 /// failure known to have happened before commit. Stable request identifiers
 /// must therefore be allocated before calling this function.
+///
+/// # Cancellation safety
+///
+/// If the future returned by this function is cancelled or dropped, the caller
+/// must treat the operation as possibly committed. The caller must not restart
+/// it with a new [`OperationId`]. Recovery must instead derive or resolve the
+/// known attempt [`TransactionId`] values from the same `OperationId`, for every
+/// attempt up to the store's configured `runner_max_attempts` limit, or perform
+/// an authoritative re-read that establishes the operation's effect.
+///
+/// While the future remains polled, an ordinary commit timeout returns
+/// [`RunFailure::CommitUnknown`] with the active `TransactionId`; the same
+/// recovery rule applies.
 pub async fn run_side_effect_free<T, F>(
     store: &dyn StateStore,
     metrics: &StateStoreMetrics,
@@ -185,4 +198,35 @@ where
 fn deadline_exceeded(metrics: &StateStoreMetrics) -> RunFailure {
     metrics.record_deadline();
     RunFailure::DeadlineExceeded
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn cancellation_contract_is_documented() {
+        let source = include_str!("runner.rs");
+        let rustdoc = source
+            .split_once("pub async fn run_side_effect_free")
+            .expect("run_side_effect_free must remain public")
+            .0;
+        let rustdoc = rustdoc
+            .lines()
+            .filter_map(|line| line.strip_prefix("///"))
+            .flat_map(str::split_whitespace)
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        for required in [
+            "must treat the operation as possibly committed",
+            "must not restart it with a new [`OperationId`]",
+            "known attempt [`TransactionId`] values from the same `OperationId`",
+            "authoritative re-read",
+            "ordinary commit timeout returns [`RunFailure::CommitUnknown`]",
+        ] {
+            assert!(
+                rustdoc.contains(required),
+                "run_side_effect_free rustdoc is missing `{required}`"
+            );
+        }
+    }
 }
