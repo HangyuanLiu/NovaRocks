@@ -81,7 +81,6 @@ pub(crate) mod query_prep;
 mod query_stats;
 pub(crate) mod statement;
 pub(crate) mod statistics;
-pub(crate) mod stream_load;
 pub(crate) mod view_rewrite;
 pub(crate) mod virtual_table;
 pub(crate) mod write_operation_lifecycle;

@@ -478,11 +478,6 @@ const ENGINE_FILE_OWNERS: &[EngineFileOwner] = &[
         migration_task: "EBD-7",
     },
     EngineFileOwner {
-        path: "src/engine/stream_load.rs",
-        target_owner: "formats",
-        migration_task: "EBD-3A",
-    },
-    EngineFileOwner {
         path: "src/engine/view_rewrite.rs",
         target_owner: "split:catalog,sql",
         migration_task: "EBD-6B",
@@ -550,7 +545,6 @@ const ENGINE_MODULE_DECLARATIONS: &[&str] = &[
     "src/engine/mod.rs||external|path=default|query_stats",
     "src/engine/mod.rs||external|path=default|statement",
     "src/engine/mod.rs||external|path=default|statistics",
-    "src/engine/mod.rs||external|path=default|stream_load",
     "src/engine/mod.rs||external|path=default|view_rewrite",
     "src/engine/mod.rs||external|path=default|virtual_table",
     "src/engine/mod.rs||external|path=default|write_operation_lifecycle",
