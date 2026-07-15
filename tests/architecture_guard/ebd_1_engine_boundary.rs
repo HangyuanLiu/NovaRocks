@@ -4,11 +4,11 @@ use std::path::{Component, Path, PathBuf};
 
 use super::{
     RustScopedAliases, RustScopedUsePath, cfg_attr_generated_path_values,
-    cfg_attribute_requires_test, manifest_dir, path_attribute_value,
+    cfg_attribute_requires_test, decode_rust_string_literal, manifest_dir, path_attribute_value,
     production_rs_files_from_entries, rel, rs_files, rust_canonical_path_segments_in_scope,
     rust_module_items, rust_production_canonical_paths, rust_production_scoped_aliases,
     rust_raw_production_use_statements, rust_resolve_scoped_paths, rust_sanitized_production_text,
-    rust_source_module_segments, src_dir,
+    rust_source_module_segments, rust_source_tokens, src_dir,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1473,21 +1473,33 @@ fn forwarding_export_name(path: &[String], alias: Option<&str>) -> Option<String
     }
 }
 
-fn forwarding_qualified_alias_key(
+fn forwarding_qualified_alias_candidates(
     path: &[String],
     source_path: &str,
     inline_modules: &[String],
-) -> Option<(Vec<String>, String)> {
-    let local_name = path.last()?;
-    if matches!(local_name.as_str(), "*" | "crate" | "self" | "super") {
-        return None;
-    }
+    aliases: &RustScopedAliases,
+) -> Vec<((Vec<String>, String), Vec<String>)> {
+    let Some(canonical) = rust_canonical_path_segments_in_scope(path, source_path, inline_modules)
+    else {
+        return Vec::new();
+    };
+    let Some(source_scope) = rust_source_module_segments(source_path) else {
+        return Vec::new();
+    };
+    let Some(relative) = canonical.strip_prefix(source_scope.as_slice()) else {
+        return Vec::new();
+    };
 
-    let canonical = rust_canonical_path_segments_in_scope(path, source_path, inline_modules)?;
-    let source_scope = rust_source_module_segments(source_path)?;
-    let relative = canonical.strip_prefix(source_scope.as_slice())?;
-    let (local_name, alias_scope) = relative.split_last()?;
-    Some((alias_scope.to_vec(), local_name.clone()))
+    (0..relative.len())
+        .rev()
+        .filter_map(|index| {
+            let alias_key = (relative[..index].to_vec(), relative[index].clone());
+            aliases.contains_key(&alias_key).then(|| {
+                let suffix = relative[index + 1..].to_vec();
+                (alias_key, suffix)
+            })
+        })
+        .collect()
 }
 
 fn resolve_forwarding_paths(
@@ -1505,34 +1517,42 @@ fn resolve_forwarding_paths(
     let resolved = rust_resolve_scoped_paths(path, inline_modules, aliases, resolving, depth)?;
     let mut targets = BTreeSet::new();
     for resolved_path in resolved {
-        let Some(alias_key) = forwarding_qualified_alias_key(
+        let alias_candidates = forwarding_qualified_alias_candidates(
             &resolved_path.segments,
             source_path,
             &resolved_path.inline_modules,
-        ) else {
+            aliases,
+        );
+        if alias_candidates.is_empty() {
             targets.insert(resolved_path);
-            continue;
-        };
-        let Some(alias_targets) = aliases.get(&alias_key) else {
-            targets.insert(resolved_path);
-            continue;
-        };
-        if !resolving.insert(alias_key.clone()) {
             continue;
         }
-        for alias_target in alias_targets {
-            if let Some(nested_targets) = resolve_forwarding_paths(
-                &alias_target.segments,
-                source_path,
-                &alias_target.inline_modules,
-                aliases,
-                resolving,
-                depth + 1,
-            ) {
-                targets.extend(nested_targets);
+
+        for (alias_key, suffix) in alias_candidates {
+            if !resolving.insert(alias_key.clone()) {
+                continue;
+            }
+            let mut candidate_targets = BTreeSet::new();
+            for alias_target in &aliases[&alias_key] {
+                let mut target_path = alias_target.segments.clone();
+                target_path.extend(suffix.iter().cloned());
+                if let Some(nested_targets) = resolve_forwarding_paths(
+                    &target_path,
+                    source_path,
+                    &alias_target.inline_modules,
+                    aliases,
+                    resolving,
+                    depth + 1,
+                ) {
+                    candidate_targets.extend(nested_targets);
+                }
+            }
+            resolving.remove(&alias_key);
+            if !candidate_targets.is_empty() {
+                targets.extend(candidate_targets);
+                break;
             }
         }
-        resolving.remove(&alias_key);
     }
     (!targets.is_empty()).then(|| targets.into_iter().collect())
 }
@@ -1646,6 +1666,23 @@ fn normalized_module_target(source_path: &str, target: &str) -> String {
     normalized.display().to_string()
 }
 
+fn normalized_attribute_token_identity(attribute: &str) -> String {
+    let tokens = rust_source_tokens(attribute);
+    let mut identity = String::new();
+    let mut cursor = 0usize;
+    for token in tokens {
+        if let Some(value) = decode_rust_string_literal(attribute[cursor..token.start].trim()) {
+            identity.push_str(&format!("{value:?}"));
+        }
+        identity.push_str(&token.text);
+        cursor = token.end;
+    }
+    if let Some(value) = decode_rust_string_literal(attribute[cursor..].trim()) {
+        identity.push_str(&format!("{value:?}"));
+    }
+    identity
+}
+
 fn module_path_metadata(source_path: &str, attributes: &[String]) -> String {
     let direct = attributes
         .iter()
@@ -1654,8 +1691,17 @@ fn module_path_metadata(source_path: &str, attributes: &[String]) -> String {
         .collect::<BTreeSet<_>>();
     let conditional = attributes
         .iter()
-        .flat_map(|attribute| cfg_attr_generated_path_values(attribute))
-        .map(|target| normalized_module_target(source_path, &target))
+        .flat_map(|attribute| {
+            let identity = normalized_attribute_token_identity(attribute);
+            cfg_attr_generated_path_values(attribute)
+                .into_iter()
+                .map(move |target| {
+                    format!(
+                        "{identity}=>{}",
+                        normalized_module_target(source_path, &target)
+                    )
+                })
+        })
         .collect::<BTreeSet<_>>();
 
     let mut metadata = if direct.is_empty() {
@@ -2057,25 +2103,41 @@ fn inspect(_: &State) { let _ = legacy_mv::table_ref::IcebergTableRef::default; 
     ];
     let actual =
         collect_engine_boundary_snapshot(Path::new("fixture-root-that-does-not-exist"), &sources);
-    let violations = engine_boundary_violations(&actual, &EMPTY_BASELINE);
-    assert!(
-        violations
-            .iter()
-            .any(|item| item.contains("crate::engine::catalog")),
-        "grouped engine import must be rejected: {violations:?}"
+    assert_eq!(
+        actual.external_engine_dependencies,
+        BTreeMap::from([
+            (
+                "src/catalog/legacy.rs".to_string(),
+                BTreeSet::from(["crate::engine::catalog::*".to_string()]),
+            ),
+            (
+                "src/sql/example.rs".to_string(),
+                BTreeSet::from([
+                    "crate::engine::StandaloneState".to_string(),
+                    "crate::engine::catalog::TableDef".to_string(),
+                    "crate::engine::mv".to_string(),
+                ]),
+            ),
+        ])
     );
-    assert!(
-        violations
-            .iter()
-            .any(|item| item.contains("StandaloneState")),
-        "StandaloneState alias must be rejected: {violations:?}"
+    assert_eq!(
+        actual.standalone_state_dependencies,
+        BTreeMap::from([(
+            "src/sql/example.rs".to_string(),
+            BTreeSet::from(["crate::engine::StandaloneState".to_string()]),
+        )])
     );
-    assert!(
-        violations
-            .iter()
-            .any(|item| item.contains("forwarding-reexport")),
-        "public forwarding must be rejected: {violations:?}"
+    assert_eq!(
+        actual.forwarding_reexports,
+        BTreeSet::from([
+            "src/catalog/legacy.rs|crate::catalog::legacy|pub(crate)|*|crate::engine::catalog::*"
+                .to_string(),
+        ])
     );
+    assert!(actual.engine_files.is_empty());
+    assert!(actual.engine_module_declarations.is_empty());
+    assert!(actual.lower_layer_frontend_dependencies.is_empty());
+    assert!(!engine_boundary_violations(&actual, &EMPTY_BASELINE).is_empty());
 }
 
 #[test]
@@ -2192,8 +2254,7 @@ fn ebd_1_detector_distinguishes_path_affecting_module_attributes() {
     assert_eq!(
         conditional,
         BTreeSet::from([
-            "src/engine/mod.rs||external|path=default;cfg:src/engine/alternate.rs|aggregate"
-                .to_string()
+            "src/engine/mod.rs||external|path=default;cfg:#[cfg_attr(feature=\"alternate\",path=\"alternate.rs\")]=>src/engine/alternate.rs|aggregate".to_string()
         ])
     );
 }
@@ -2308,5 +2369,73 @@ mod exports {
             "src/catalog/legacy.rs|crate::catalog::legacy::aliases|pub(crate)|Legacy|crate::engine::catalog::TableDef".to_string(),
             "src/catalog/legacy.rs|crate::catalog::legacy::exports|pub(crate)|Legacy|crate::engine::catalog::TableDef".to_string(),
         ])
+    );
+}
+
+#[test]
+fn ebd_1_detector_resolves_intermediate_module_qualified_forwarding_alias() {
+    let source = GuardSource::new(
+        "src/catalog/legacy.rs",
+        r#"
+mod aliases {
+    pub(crate) use crate::engine as legacy;
+}
+mod exports {
+    pub(crate) use super::aliases::legacy::catalog::TableDef;
+}
+"#,
+    );
+    let actual =
+        collect_engine_boundary_snapshot(Path::new("fixture-root-that-does-not-exist"), &[source]);
+
+    assert_eq!(
+        actual.forwarding_reexports,
+        BTreeSet::from([
+            "src/catalog/legacy.rs|crate::catalog::legacy::aliases|pub(crate)|legacy|crate::engine"
+                .to_string(),
+            "src/catalog/legacy.rs|crate::catalog::legacy::exports|pub(crate)|TableDef|crate::engine::catalog::TableDef"
+                .to_string(),
+        ])
+    );
+}
+
+#[test]
+fn ebd_1_detector_distinguishes_path_cfg_attr_predicates() {
+    let collect = |feature: &str| {
+        let source = GuardSource::new(
+            "src/engine/mod.rs",
+            &format!(r#"#[cfg_attr(feature = "{feature}", path = "shared.rs")] mod aggregate;"#),
+        );
+        collect_engine_boundary_snapshot(Path::new("fixture-root-that-does-not-exist"), &[source])
+            .engine_module_declarations
+    };
+
+    let feature_a = collect("a");
+    let feature_b = collect("b");
+    assert_eq!(
+        feature_a,
+        BTreeSet::from([
+            "src/engine/mod.rs||external|path=default;cfg:#[cfg_attr(feature=\"a\",path=\"shared.rs\")]=>src/engine/shared.rs|aggregate".to_string(),
+        ])
+    );
+    assert_eq!(
+        feature_b,
+        BTreeSet::from([
+            "src/engine/mod.rs||external|path=default;cfg:#[cfg_attr(feature=\"b\",path=\"shared.rs\")]=>src/engine/shared.rs|aggregate".to_string(),
+        ])
+    );
+    assert_ne!(feature_a, feature_b);
+
+    let test_only = GuardSource::new(
+        "src/engine/mod.rs",
+        r#"#[cfg_attr(test, path = "test_only.rs")] mod aggregate;"#,
+    );
+    assert_eq!(
+        collect_engine_boundary_snapshot(
+            Path::new("fixture-root-that-does-not-exist"),
+            &[test_only],
+        )
+        .engine_module_declarations,
+        BTreeSet::from(["src/engine/mod.rs||external|path=default|aggregate".to_string()])
     );
 }
