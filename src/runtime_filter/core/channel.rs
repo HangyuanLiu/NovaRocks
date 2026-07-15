@@ -1105,9 +1105,10 @@ impl RuntimeFilterChannel {
                 state.terminal,
                 ChannelTerminal::Unavailable { .. } | ChannelTerminal::Cancelled { .. }
             ) {
-                topk.preflight_apply(stream_id, sequence, &summary)?;
+                topk.validate_tombstone_summary(stream_id, sequence, &summary)?;
                 return Ok(terminal_action_from_state(&state));
             }
+            let projection = topk.preflight_apply(stream_id, sequence, &summary)?;
             if u64::try_from(contribution_bytes)
                 .map_or(true, |bytes| bytes > self.max_contribution_bytes)
             {
@@ -1127,7 +1128,6 @@ impl RuntimeFilterChannel {
                 )
             })?;
             let stream_was_covered = topk.stream_covered(stream_id);
-            let projection = topk.preflight_apply(stream_id, sequence, &summary)?;
             if !matches!(state.terminal, ChannelTerminal::Collecting) {
                 return Ok(terminal_action_from_state(&state));
             }
@@ -2070,7 +2070,14 @@ impl RuntimeFilterChannel {
                 "direct ordered channel cannot accept top-k summaries",
             )
         })?;
-        topk.preflight_apply(stream_id, sequence, summary)?;
+        if matches!(
+            state.terminal,
+            ChannelTerminal::Unavailable { .. } | ChannelTerminal::Cancelled { .. }
+        ) {
+            topk.validate_tombstone_summary(stream_id, sequence, summary)?;
+        } else {
+            topk.preflight_apply(stream_id, sequence, summary)?;
+        }
         if !matches!(state.terminal, ChannelTerminal::Collecting) {
             return Ok(terminal_action_from_state(&state));
         }
@@ -2696,7 +2703,7 @@ mod tests {
         LogicalSnapshot, MembershipValues, ValueDomainDelta,
     };
 
-    use super::{ChannelAction, RuntimeFilterChannel};
+    use super::{ChannelAction, ChannelTerminal, RuntimeFilterChannel};
 
     #[derive(Default)]
     struct Account {
@@ -4541,6 +4548,273 @@ mod tests {
 
     mod topk {
         use super::*;
+
+        fn wrong_contract_summary(harness: &TopKChannelHarness, values: &[i64]) -> TopKSummary {
+            let requirement =
+                TopKSummaryRequirement::try_new(harness.contract.k().get().checked_add(1).unwrap())
+                    .unwrap();
+            let keys = vec![OrderKeyContract {
+                data_type: DataType::Int64,
+                direction: SortDirection::Ascending,
+                null_order: NullOrder::Last,
+            }];
+            let plan = OrderContract {
+                comparator_digest: comparator_digest_for_test(&keys, COMPARATOR_ALGORITHM_VERSION),
+                keys,
+                inclusive: true,
+            };
+            let wrong_contract =
+                RuntimeTopKSummaryContract::try_from_plan(&plan, requirement).unwrap();
+            TopKSummary::try_new(
+                &wrong_contract,
+                values
+                    .iter()
+                    .map(|value| {
+                        OrderedTuple::try_new(
+                            wrong_contract.order(),
+                            [Some(OrderedScalar::Int64(*value))],
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+            )
+            .unwrap()
+        }
+
+        fn utf8_topk_plan() -> OrderContract {
+            let keys = vec![OrderKeyContract {
+                data_type: DataType::Utf8,
+                direction: SortDirection::Ascending,
+                null_order: NullOrder::Last,
+            }];
+            OrderContract {
+                comparator_digest: comparator_digest_for_test(&keys, COMPARATOR_ALGORITHM_VERSION),
+                keys,
+                inclusive: true,
+            }
+        }
+
+        fn utf8_topk_summary(
+            contract: &RuntimeTopKSummaryContract,
+            values: &[String],
+        ) -> TopKSummary {
+            TopKSummary::try_new(
+                contract,
+                values
+                    .iter()
+                    .map(|value| {
+                        OrderedTuple::try_new(
+                            contract.order(),
+                            [Some(OrderedScalar::Utf8(Arc::from(value.as_str())))],
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+            )
+            .unwrap()
+        }
+
+        fn topk_channel_state(harness: &TopKChannelHarness) -> String {
+            let state = harness.channel.state.lock().unwrap();
+            format!(
+                "{:?}:{}:{}",
+                state.ordered.as_ref().unwrap().reducer,
+                state.reservation.bytes(),
+                state.next_dispatch_order
+            )
+        }
+
+        fn assert_topk_collecting(harness: &TopKChannelHarness) {
+            let state = harness.channel.state.lock().unwrap();
+            assert!(matches!(state.terminal, ChannelTerminal::Collecting));
+        }
+
+        #[test]
+        fn oversized_topk_wrong_contract_digest_is_rejected_without_terminal_mutation() {
+            let plan = utf8_topk_plan();
+            let retained_account = Arc::new(Account::default());
+            let harness = TopKChannelHarness::with_plan_and_limits(
+                1,
+                2,
+                plan.clone(),
+                256,
+                16 * 1024,
+                retained_account.clone(),
+            );
+            let wrong_contract = RuntimeTopKSummaryContract::try_from_plan(
+                &plan,
+                TopKSummaryRequirement::try_new(3).unwrap(),
+            )
+            .unwrap();
+            let summary = utf8_topk_summary(&wrong_contract, &["x".repeat(512)]);
+            assert!(summary.canonical_contribution_bytes().unwrap() > 256);
+            let before = topk_channel_state(&harness);
+
+            let error = harness.submit_raw_summary(0, 0, summary).unwrap_err();
+
+            assert_eq!(
+                error.kind(),
+                RuntimeContractViolationKind::OrderedContractMismatch
+            );
+            assert_eq!(topk_channel_state(&harness), before);
+            assert_topk_collecting(&harness);
+            assert_eq!(retained_account.current.load(Ordering::SeqCst), 0);
+            assert_eq!(harness.temporary_account.current.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn oversized_topk_invalid_cumulative_transition_is_rejected_without_terminal_mutation() {
+            let retained_account = Arc::new(Account::default());
+            let harness = TopKChannelHarness::with_plan_and_limits(
+                1,
+                4,
+                utf8_topk_plan(),
+                256,
+                16 * 1024,
+                retained_account.clone(),
+            );
+            let first = utf8_topk_summary(&harness.contract, &["a".to_owned(), "c".to_owned()]);
+            assert!(first.canonical_contribution_bytes().unwrap() <= 256);
+            assert_eq!(
+                harness.submit_summary(0, 0, first).unwrap(),
+                TestAction::StreamAcceptedNoGlobalChange
+            );
+            let retained_before = retained_account.current.load(Ordering::SeqCst);
+            let before = topk_channel_state(&harness);
+            let invalid = utf8_topk_summary(
+                &harness.contract,
+                &["a".to_owned(), format!("b{}", "x".repeat(512))],
+            );
+            assert!(invalid.canonical_contribution_bytes().unwrap() > 256);
+
+            let error = harness.submit_raw_summary(0, 1, invalid).unwrap_err();
+
+            assert_eq!(
+                error.kind(),
+                RuntimeContractViolationKind::OrderedBoundLoosened
+            );
+            assert_eq!(topk_channel_state(&harness), before);
+            assert_topk_collecting(&harness);
+            assert_eq!(
+                retained_account.current.load(Ordering::SeqCst),
+                retained_before
+            );
+            assert_eq!(harness.temporary_account.current.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn topk_cancelled_tombstone_accepts_legal_higher_sequence_as_terminal_noop() {
+            let harness = TopKChannelHarness::with_streams(1, 1);
+            assert_eq!(
+                harness.submit(0, 0, &[7]).unwrap(),
+                TestAction::Published(1, 7)
+            );
+            assert!(matches!(
+                harness.channel.cancel(),
+                ChannelAction::Cancelled { .. }
+            ));
+
+            let action = harness
+                .submit_raw_summary(0, 1, harness.summary(&[6]))
+                .unwrap();
+
+            assert_eq!(action.outcome(), SubmitOutcome::TerminalNoop);
+            assert!(matches!(action, ChannelAction::Cancelled { .. }));
+        }
+
+        #[test]
+        fn topk_unavailable_tombstone_accepts_legal_higher_sequence_as_terminal_noop() {
+            let harness = TopKChannelHarness::with_streams(1, 2);
+            assert_eq!(
+                harness.submit(0, 0, &[7]).unwrap(),
+                TestAction::StreamAcceptedNoGlobalChange
+            );
+            assert_eq!(
+                harness.channel.resource_exhausted().unavailable_reason(),
+                Some(UnavailableReason::ResourceLimit)
+            );
+
+            let action = harness
+                .submit_raw_summary(0, 1, harness.summary(&[6, 7]))
+                .unwrap();
+
+            assert_eq!(action.outcome(), SubmitOutcome::TerminalNoop);
+            assert_eq!(
+                action.unavailable_reason(),
+                Some(UnavailableReason::ResourceLimit)
+            );
+        }
+
+        #[test]
+        fn topk_resource_rejection_uses_tombstone_validation_after_cancel() {
+            let harness = TopKChannelHarness::with_streams(1, 1);
+            harness.submit(0, 0, &[7]).unwrap();
+            drop(harness.channel.cancel());
+            let (binding, instance) = harness.streams[0];
+            let summary = harness.summary(&[6]);
+
+            let action = harness
+                .channel
+                .reject_topk_submit_resource_exhausted(
+                    binding,
+                    instance,
+                    PartitionId::new(0),
+                    ProducerSequence::new(1),
+                    &summary,
+                )
+                .unwrap();
+
+            assert_eq!(action.outcome(), SubmitOutcome::TerminalNoop);
+            assert!(matches!(action, ChannelAction::Cancelled { .. }));
+        }
+
+        #[test]
+        fn topk_tombstone_preserves_invalid_contract_digest_rejection() {
+            let harness = TopKChannelHarness::with_streams(1, 1);
+            harness.submit(0, 0, &[7]).unwrap();
+            drop(harness.channel.cancel());
+
+            let error = harness
+                .submit_raw_summary(0, 1, wrong_contract_summary(&harness, &[6]))
+                .unwrap_err();
+
+            assert_eq!(
+                error.kind(),
+                RuntimeContractViolationKind::OrderedContractMismatch
+            );
+        }
+
+        #[test]
+        fn topk_tombstone_preserves_terminal_range_rejection() {
+            let harness = TopKChannelHarness::with_streams(1, 1);
+            harness.submit(0, 0, &[7]).unwrap();
+            assert_eq!(
+                harness.close(0, 2).unwrap(),
+                TestAction::PendingFinalSnapshot
+            );
+            drop(harness.channel.cancel());
+
+            let error = harness.submit(0, 2, &[6]).unwrap_err();
+
+            assert_eq!(
+                error.kind(),
+                RuntimeContractViolationKind::SequenceOutsideTerminalRange
+            );
+        }
+
+        #[test]
+        fn topk_tombstone_preserves_conflicting_replay_rejection() {
+            let harness = TopKChannelHarness::with_streams(1, 1);
+            harness.submit(0, 0, &[7]).unwrap();
+            drop(harness.channel.cancel());
+
+            let error = harness.submit(0, 0, &[6]).unwrap_err();
+
+            assert_eq!(
+                error.kind(),
+                RuntimeContractViolationKind::ConflictingReplay
+            );
+        }
 
         #[test]
         fn complete_stream_coverage_gates_first_summary_publication() {

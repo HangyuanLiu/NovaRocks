@@ -325,6 +325,41 @@ impl TopKSummaryReducer {
         self.estimated_retained_bytes()
     }
 
+    pub(crate) fn validate_tombstone_summary(
+        &self,
+        stream: ProducerStreamId,
+        sequence: ProducerSequence,
+        summary: &TopKSummary,
+    ) -> Result<(), RuntimeContractViolation> {
+        if summary.contract_digest() != self.contract.digest() {
+            return Err(violation(
+                RuntimeContractViolationKind::OrderedContractMismatch,
+                "top-k summary does not match the installed summary contract",
+            ));
+        }
+        let Some(current) = self.streams.get(&stream) else {
+            return Ok(());
+        };
+        if current
+            .terminal_sequence
+            .is_some_and(|terminal| sequence >= terminal)
+        {
+            return Err(violation(
+                RuntimeContractViolationKind::SequenceOutsideTerminalRange,
+                "top-k summary sequence is outside the exclusive terminal range",
+            ));
+        }
+        if current.highest_sequence == Some(sequence)
+            && current.replay_digest != Some(summary.replay_digest())
+        {
+            return Err(violation(
+                RuntimeContractViolationKind::ConflictingReplay,
+                "same top-k producer sequence carried a different cumulative summary",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn submitted_partition_count(
         &self,
         binding_id: BindingId,
