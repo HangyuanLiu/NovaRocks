@@ -1403,6 +1403,49 @@ fn is_legacy_ebd_3b_owner_path(path: &[String]) -> bool {
     path.len() >= 3 && path[0] == "crate" && path[1] == "engine" && path[2] == "query_options"
 }
 
+fn rust_all_source_text(text: &str) -> String {
+    let tokens = rust_source_tokens(text);
+    let mut all_source = rust_lexically_sanitized(text).into_bytes();
+    let mut cursor = 0usize;
+    while cursor + 1 < tokens.len() {
+        if tokens[cursor].text != "#" || tokens[cursor + 1].text != "[" {
+            cursor += 1;
+            continue;
+        }
+
+        let mut depth = 0usize;
+        let mut close = cursor + 1;
+        while close < tokens.len() {
+            match tokens[close].text.as_str() {
+                "[" => depth += 1,
+                "]" => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            close += 1;
+        }
+        if close == tokens.len() {
+            break;
+        }
+
+        let attribute = &text[tokens[cursor].start..tokens[close].end];
+        if cfg_attribute_requires_test(attribute) {
+            for byte in &mut all_source[tokens[cursor].start..tokens[close].end] {
+                if !matches!(*byte, b'\n' | b'\r') {
+                    *byte = b' ';
+                }
+            }
+        }
+        cursor = close + 1;
+    }
+
+    String::from_utf8(all_source).expect("all-source sanitizer must preserve UTF-8")
+}
+
 fn legacy_ebd_3b_references(text: &str, source_rel: &str) -> BTreeSet<String> {
     let mut references = rust_all_source_canonical_paths(text, source_rel)
         .into_iter()
@@ -1416,6 +1459,40 @@ fn legacy_ebd_3b_references(text: &str, source_rel: &str) -> BTreeSet<String> {
             .map(|_| "symbol:StandaloneQueryOptions".to_string()),
     );
     references
+}
+
+fn engine_root_query_options_forwarding_surfaces(text: &str) -> BTreeSet<String> {
+    let source = GuardSource::new("src/engine/mod.rs", &rust_all_source_text(text));
+    let mut snapshot = EngineBoundarySnapshot::default();
+    collect_source_dependencies(&mut snapshot, &source);
+    snapshot
+        .forwarding_reexports
+        .into_iter()
+        .filter(|export| {
+            let fields = export.split('|').collect::<Vec<_>>();
+            fields.get(1) == Some(&"crate::engine") && fields.get(3) == Some(&"query_options")
+        })
+        .collect()
+}
+
+fn has_top_level_production_struct(text: &str, name: &str) -> bool {
+    let production = rust_sanitized_production_text(text);
+    let tokens = rust_source_tokens(&production);
+    let mut brace_depth = 0usize;
+    for (index, token) in tokens.iter().enumerate() {
+        match token.text.as_str() {
+            "{" => brace_depth += 1,
+            "}" => brace_depth = brace_depth.saturating_sub(1),
+            "struct"
+                if brace_depth == 0
+                    && tokens.get(index + 1).is_some_and(|next| next.text == name) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn is_standalone_state_path(path: &[String]) -> bool {
@@ -2404,10 +2481,7 @@ fn ebd_3b_query_options_have_one_runtime_owner() {
             .into_iter()
             .map(|token| token.text)
             .collect::<Vec<_>>();
-        if !tokens
-            .windows(2)
-            .any(|tokens| tokens[0] == "struct" && tokens[1] == "QueryOptions")
-        {
+        if !has_top_level_production_struct(&text, "QueryOptions") {
             violations.insert(format!(
                 "runtime-contract-missing: {RUNTIME_OWNER}|QueryOptions"
             ));
@@ -2449,23 +2523,15 @@ fn ebd_3b_query_options_have_one_runtime_owner() {
     {
         violations.insert("old-module-still-declared: src/engine/mod.rs|query_options".to_string());
     }
+    for export in engine_root_query_options_forwarding_surfaces(&engine_root_text) {
+        violations.insert(format!("engine-query-options-surface-reexport: {export}"));
+    }
 
     for root in [&src, &repo.join("tests")] {
         for path in rs_files(root) {
             let source = rel(&path);
             let text = fs::read_to_string(&path)
                 .unwrap_or_else(|error| panic!("failed to read {source}: {error}"));
-            let tokens = rust_source_tokens(&text)
-                .into_iter()
-                .map(|token| token.text)
-                .collect::<Vec<_>>();
-            if source != RUNTIME_OWNER
-                && tokens
-                    .windows(2)
-                    .any(|tokens| tokens[0] == "struct" && tokens[1] == "QueryOptions")
-            {
-                violations.insert(format!("duplicate-query-options-owner: {source}"));
-            }
             for reference in legacy_ebd_3b_references(&text, &source) {
                 violations.insert(format!(
                     "legacy-query-options-reference: {source}|{reference}"
@@ -2523,6 +2589,104 @@ mod tests {
             .collect::<Vec<_>>(),
         vec![&"symbol:StandaloneQueryOptions".to_string()],
         "the legacy symbol detector must be exact and deduplicated"
+    );
+}
+
+#[test]
+fn ebd_3b_detector_rejects_direct_and_grouped_legacy_targets_and_reverse_surfaces() {
+    let direct_legacy = r#"
+pub(crate) use crate::engine::query_options::StandaloneQueryOptions as LegacyOptions;
+"#;
+    let grouped_legacy = r#"
+pub(crate) use crate::engine::{query_options::StandaloneQueryOptions as LegacyOptions};
+"#;
+    let test_direct_legacy = r#"
+#[cfg(test)]
+pub(crate) use crate::engine::query_options::StandaloneQueryOptions as LegacyOptions;
+"#;
+    let test_grouped_legacy = r#"
+#[cfg(test)]
+pub(crate) use crate::engine::{query_options::StandaloneQueryOptions as LegacyOptions};
+"#;
+    for source in [
+        direct_legacy,
+        grouped_legacy,
+        test_direct_legacy,
+        test_grouped_legacy,
+    ] {
+        let references = legacy_ebd_3b_references(source, "src/runtime/query_options.rs");
+        assert!(
+            references.contains("path:crate::engine::query_options::StandaloneQueryOptions"),
+            "legacy target direction must be exact for direct and grouped imports: {references:?}"
+        );
+    }
+
+    let direct_reverse = r#"
+pub(crate) use crate::runtime::query_options as query_options;
+"#;
+    let grouped_reverse = r#"
+pub(crate) use crate::runtime::{query_options};
+"#;
+    let test_only_reverse = r#"
+#[cfg(test)]
+pub(crate) use crate::runtime::{query_options};
+"#;
+    let test_only_direct_reverse = r#"
+#[cfg(test)]
+pub(crate) use crate::runtime::query_options as query_options;
+"#;
+    for source in [
+        direct_reverse,
+        grouped_reverse,
+        test_only_direct_reverse,
+        test_only_reverse,
+    ] {
+        let surfaces = engine_root_query_options_forwarding_surfaces(source);
+        assert_eq!(
+            surfaces.len(),
+            1,
+            "engine root reverse surface must be caught for direct, grouped, and test source: {surfaces:?}"
+        );
+    }
+
+    let unrelated = r#"
+pub(crate) use crate::runtime::query_options::QueryOptions;
+mod nested {
+    pub(crate) use crate::runtime::query_options as query_options;
+}
+"#;
+    assert!(
+        engine_root_query_options_forwarding_surfaces(unrelated).is_empty(),
+        "a type export or nested namespace must not reconstruct crate::engine::query_options"
+    );
+}
+
+#[test]
+fn ebd_3b_runtime_owner_requires_top_level_production_struct() {
+    assert!(has_top_level_production_struct(
+        "pub(crate) struct QueryOptions {}",
+        "QueryOptions"
+    ));
+
+    for fake_owner in [
+        r#"mod nested { pub(crate) struct QueryOptions {} }"#,
+        r#"#[cfg(test)] struct QueryOptions;"#,
+        r#"#[cfg(test)] mod tests { struct QueryOptions; }"#,
+        r#"const DOC: &str = "struct QueryOptions"; // struct QueryOptions"#,
+    ] {
+        assert!(
+            !has_top_level_production_struct(fake_owner, "QueryOptions"),
+            "nested, cfg(test), comment, and string definitions are not runtime owners: {fake_owner}"
+        );
+    }
+
+    assert!(
+        legacy_ebd_3b_references(
+            "#[cfg(test)] struct QueryOptions;",
+            "tests/query_options_fixture.rs"
+        )
+        .is_empty(),
+        "unrelated same-name test structs are not legacy EBD-3B references"
     );
 }
 
