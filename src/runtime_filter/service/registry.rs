@@ -36,10 +36,11 @@ use crate::runtime_filter::port::events::{
 };
 use crate::runtime_filter::port::identity::{DeploymentEpoch, RouteEdgeId};
 use crate::runtime_filter::port::install::{
-    CompleteOnceChannelDeployment, RuntimeFilterInstallView,
+    RuntimeFilterChannelDeployment, RuntimeFilterInstallView,
 };
+use crate::runtime_filter::port::ordered_bound::RuntimeOrderContract;
 use crate::runtime_filter::port::producer::{
-    InstallContractError, InstallContractErrorKind, InstallOutcome,
+    InstallContractError, InstallContractErrorKind, InstallOutcome, ProducerPortKind,
 };
 use crate::runtime_filter::port::support::{
     ArtifactRetainedBudget, ArtifactScratchBudget, RuntimeFilterClock, RuntimeFilterMemoryAccount,
@@ -76,6 +77,7 @@ pub(super) struct ProducerRoute {
     pub(super) channel_id: ChannelId,
     pub(super) channel: Arc<RuntimeFilterChannel>,
     pub(super) expected_instances: BTreeSet<UniqueId>,
+    pub(super) kind: ProducerPortKind,
 }
 
 #[derive(Clone)]
@@ -823,6 +825,14 @@ fn build_routing(
                     channel_id: *channel_id,
                     channel: channel.clone(),
                     expected_instances: producer.expected_fragment_instances().clone(),
+                    kind: match deployment.logical_domain() {
+                        RuntimeFilterLogicalDomain::Membership { .. } => {
+                            ProducerPortKind::Membership
+                        }
+                        RuntimeFilterLogicalDomain::OrderedBound(_) => {
+                            ProducerPortKind::OrderedBound
+                        }
+                    },
                 },
             );
         }
@@ -940,9 +950,15 @@ fn build_routing(
 }
 
 fn validate_channel<'a>(
-    channel: &'a CompleteOnceChannelDeployment,
+    channel: &'a RuntimeFilterChannelDeployment,
     profile_encodings: &mut BTreeMap<ConsumerProfileId, &'a [u8]>,
 ) -> Result<(), InstallContractError> {
+    if matches!(
+        channel.logical_domain(),
+        RuntimeFilterLogicalDomain::OrderedBound(_)
+    ) {
+        return validate_ordered_channel(channel, profile_encodings);
+    }
     let RuntimeFilterLogicalDomain::Membership {
         value_type,
         null_semantics,
@@ -1156,6 +1172,152 @@ fn validate_channel<'a>(
     Ok(())
 }
 
+fn validate_ordered_channel<'a>(
+    channel: &'a RuntimeFilterChannelDeployment,
+    profile_encodings: &mut BTreeMap<ConsumerProfileId, &'a [u8]>,
+) -> Result<(), InstallContractError> {
+    let RuntimeFilterLogicalDomain::OrderedBound(plan) = channel.logical_domain() else {
+        unreachable!("ordered validator is called only for ordered channels")
+    };
+    let contract = RuntimeOrderContract::try_from_plan(plan).map_err(|error| {
+        install_error(
+            InstallContractErrorKind::UnsupportedChannelContract,
+            format!("ordered channel has an invalid order contract: {error:?}"),
+        )
+    })?;
+    if channel.lifecycle() != RuntimeFilterLifecycle::MonotonicUpdates
+        || channel.reduction_requirement() != ReductionRequirement::TightenOrderedBound
+        || channel.allowed_contribution_kinds()
+            != &BTreeSet::from([
+                ContributionKind::OrderedBoundUpdate,
+                ContributionKind::ProducerClosed,
+            ])
+        || channel.completion_requirement() != CompletionRequirement::ProducerClosed
+    {
+        return Err(install_error(
+            InstallContractErrorKind::UnsupportedChannelContract,
+            "channel does not match the MonotonicUpdates OrderedBound M3A matrix",
+        ));
+    }
+    if channel.producers().is_empty() || channel.consumers().is_empty() {
+        return Err(install_error(
+            InstallContractErrorKind::UnsupportedChannelContract,
+            "ordered channel requires at least one producer and one consumer binding",
+        ));
+    }
+    if channel.policy().max_contribution_bytes == 0
+        || channel.policy().max_artifact_bytes == 0
+        || channel.policy().deadline_ms == 0
+    {
+        return Err(install_error(
+            InstallContractErrorKind::InvalidPolicy,
+            "max contribution bytes, max artifact bytes, and completion deadline must be non-zero",
+        ));
+    }
+    if channel.core_budget().max_reducer_bytes() == 0 {
+        return Err(install_error(
+            InstallContractErrorKind::InvalidBudget,
+            "max reducer bytes must be non-zero",
+        ));
+    }
+    let materialization_policy = channel.materialization_policy();
+    usize::try_from(materialization_policy.max_total_retained_bytes()).map_err(|_| {
+        install_error(
+            InstallContractErrorKind::InvalidBudget,
+            "materialization retained budget does not fit this platform",
+        )
+    })?;
+    usize::try_from(materialization_policy.max_scratch_bytes_per_job()).map_err(|_| {
+        install_error(
+            InstallContractErrorKind::InvalidBudget,
+            "materialization scratch budget does not fit this platform",
+        )
+    })?;
+    materialization_policy
+        .aggregate_scratch_bytes()
+        .map_err(|_| {
+            install_error(
+                InstallContractErrorKind::InvalidBudget,
+                "materialization aggregate scratch budget overflows",
+            )
+        })?;
+
+    let mut producer_witnesses = BTreeSet::new();
+    for producer in channel.producers().values() {
+        if !producer_witnesses.insert(producer.coverage_witness_id()) {
+            return Err(install_error(
+                InstallContractErrorKind::DuplicateCoverageWitness,
+                "producer witness identities must be unique within a channel",
+            ));
+        }
+        if producer.expected_fragment_instances().is_empty() {
+            return Err(install_error(
+                InstallContractErrorKind::EmptyExpectedInstances,
+                "producer expected fragment instance set must be non-empty",
+            ));
+        }
+    }
+    validate_coverage(channel.availability_coverage(), channel)?;
+    validate_coverage(channel.terminal_coverage(), channel)?;
+
+    let mut unique_profiles = BTreeSet::new();
+    for consumer in channel.consumers().values() {
+        if consumer.expected_fragment_instances().is_empty() {
+            return Err(install_error(
+                InstallContractErrorKind::EmptyExpectedInstances,
+                "consumer expected fragment instance set must be non-empty",
+            ));
+        }
+        if !matches!(
+            consumer.activation(),
+            ConsumerActivation::NonBlockingLive { .. }
+        ) {
+            return Err(install_error(
+                InstallContractErrorKind::InvalidConsumerActivation,
+                "ordered consumers must use NonBlockingLive activation",
+            ));
+        }
+        if consumer.capabilities() != &BTreeSet::from([ArtifactCapability::OrderedRange]) {
+            return Err(install_error(
+                InstallContractErrorKind::UnsupportedChannelContract,
+                "ordered consumers must declare exactly OrderedRange capability",
+            ));
+        }
+        let profile = consumer.artifact_profile();
+        if profile.accepted_kinds() != &BTreeSet::from([ArtifactKind::Range])
+            || profile.order_contract_digest() != Some(contract.digest())
+        {
+            return Err(install_error(
+                InstallContractErrorKind::UnsupportedChannelContract,
+                "ordered consumer profile must accept only Range with the channel order digest",
+            ));
+        }
+        unique_profiles.insert((profile.id(), profile.canonical_bytes()));
+        if let Some(existing) = profile_encodings.insert(profile.id(), profile.canonical_bytes())
+            && existing != profile.canonical_bytes()
+        {
+            return Err(install_error(
+                InstallContractErrorKind::ConflictingDeployment,
+                "consumer profile digest collision carried different canonical bytes",
+            ));
+        }
+    }
+    if materialization_policy.max_concurrent_jobs() > unique_profiles.len() {
+        return Err(install_error(
+            InstallContractErrorKind::InvalidPolicy,
+            "max concurrent materialization jobs exceeds normalized unique profile count",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn validate_channel_contract(
+    channel: &RuntimeFilterChannelDeployment,
+) -> Result<(), InstallContractError> {
+    validate_channel(channel, &mut BTreeMap::new())
+}
+
 fn bitset_schema_is_feasible(data_type: &arrow::datatypes::DataType) -> bool {
     use arrow::datatypes::DataType;
     matches!(
@@ -1172,7 +1334,7 @@ fn bitset_schema_is_feasible(data_type: &arrow::datatypes::DataType) -> bool {
 
 fn validate_coverage(
     coverage: &Coverage,
-    channel: &CompleteOnceChannelDeployment,
+    channel: &RuntimeFilterChannelDeployment,
 ) -> Result<(), InstallContractError> {
     coverage.validate_shape().map_err(|error| {
         install_error(
@@ -1281,8 +1443,8 @@ fn install_views_equivalent(
 }
 
 fn channels_equivalent(
-    left: &CompleteOnceChannelDeployment,
-    right: &CompleteOnceChannelDeployment,
+    left: &RuntimeFilterChannelDeployment,
+    right: &RuntimeFilterChannelDeployment,
 ) -> bool {
     left.channel_id() == right.channel_id()
         && left.logical_domain() == right.logical_domain()
@@ -1341,7 +1503,9 @@ mod tests {
         MemoryAccountError, RuntimeFilterClock, RuntimeFilterMemoryAccount,
     };
 
-    use super::{DeploymentRegistry, EventEmitter};
+    use super::{
+        DeploymentRegistry, EventEmitter, RuntimeOrderContract, validate_channel_contract,
+    };
 
     #[derive(Default)]
     struct Account;
@@ -1408,8 +1572,8 @@ mod tests {
         witness: u32,
         consumer: u32,
         route: u32,
-    ) -> CompleteOnceChannelDeployment {
-        CompleteOnceChannelDeployment::new(
+    ) -> RuntimeFilterChannelDeployment {
+        RuntimeFilterChannelDeployment::new(
             ChannelId::new(channel),
             RuntimeFilterLogicalDomain::Membership {
                 value_type: DataType::Int64,
@@ -1451,6 +1615,133 @@ mod tests {
         )
     }
 
+    struct OrderedDeploymentFixture(RuntimeFilterChannelDeployment);
+
+    impl std::ops::Deref for OrderedDeploymentFixture {
+        type Target = RuntimeFilterChannelDeployment;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl OrderedDeploymentFixture {
+        fn with_consumer(
+            &self,
+            activation: ConsumerActivation,
+            capabilities: BTreeSet<ArtifactCapability>,
+            profile: ConsumerArtifactProfile,
+        ) -> RuntimeFilterChannelDeployment {
+            let (binding, consumer) = self.0.consumers().iter().next().unwrap();
+            RuntimeFilterChannelDeployment::new(
+                self.0.channel_id(),
+                self.0.logical_domain().clone(),
+                self.0.lifecycle(),
+                self.0.availability_coverage().clone(),
+                self.0.terminal_coverage().clone(),
+                self.0.reduction_requirement(),
+                self.0.allowed_contribution_kinds().clone(),
+                self.0.completion_requirement(),
+                self.0.policy(),
+                self.0.core_budget(),
+                self.0.materialization_policy(),
+                self.0.producers().clone(),
+                BTreeMap::from([(
+                    *binding,
+                    ConsumerDeployment::with_profile(
+                        activation,
+                        capabilities,
+                        profile,
+                        consumer.loopback_route_edge_id(),
+                        consumer.expected_fragment_instances().clone(),
+                    ),
+                )]),
+            )
+        }
+
+        fn with_blocking_consumer(&self) -> RuntimeFilterChannelDeployment {
+            let consumer = self.0.consumers().values().next().unwrap();
+            self.with_consumer(
+                ConsumerActivation::BlockingSnapshot,
+                consumer.capabilities().clone(),
+                consumer.artifact_profile().clone(),
+            )
+        }
+
+        fn without_range_profile(&self) -> RuntimeFilterChannelDeployment {
+            let consumer = self.0.consumers().values().next().unwrap();
+            self.with_consumer(
+                consumer.activation(),
+                consumer.capabilities().clone(),
+                ConsumerArtifactProfile::m1_test_default(),
+            )
+        }
+    }
+
+    fn ordered_deployment_fixture() -> OrderedDeploymentFixture {
+        let keys = vec![OrderKeyContract {
+            data_type: DataType::Int64,
+            direction: SortDirection::Ascending,
+            null_order: NullOrder::Last,
+        }];
+        let plan = OrderContract {
+            comparator_digest:
+                crate::runtime_filter::port::ordered_bound::comparator_digest_for_test(
+                    &keys,
+                    crate::runtime_filter::port::ordered_bound::COMPARATOR_ALGORITHM_VERSION,
+                ),
+            keys,
+            inclusive: true,
+        };
+        let order_digest = RuntimeOrderContract::try_from_plan(&plan).unwrap().digest();
+        let witness = CoverageWitnessId::new(20);
+        OrderedDeploymentFixture(RuntimeFilterChannelDeployment::new(
+            ChannelId::new(1),
+            RuntimeFilterLogicalDomain::OrderedBound(plan),
+            RuntimeFilterLifecycle::MonotonicUpdates,
+            Coverage::Leaf(witness),
+            Coverage::Leaf(witness),
+            ReductionRequirement::TightenOrderedBound,
+            BTreeSet::from([
+                ContributionKind::OrderedBoundUpdate,
+                ContributionKind::ProducerClosed,
+            ]),
+            CompletionRequirement::ProducerClosed,
+            RuntimeFilterPolicyRequirement {
+                max_contribution_bytes: 1024,
+                max_artifact_bytes: 1024,
+                deadline_ms: 100,
+                max_retries: 3,
+            },
+            RuntimeFilterCoreBudget::new(4096),
+            MaterializationPolicy::for_test(),
+            BTreeMap::from([(
+                BindingId::new(10),
+                ProducerDeployment::new(witness, BTreeSet::from([uid(10)])),
+            )]),
+            BTreeMap::from([(
+                BindingId::new(30),
+                ConsumerDeployment::with_profile(
+                    ConsumerActivation::NonBlockingLive {
+                        late_apply: LateApplyGranularity::Batch,
+                    },
+                    BTreeSet::from([ArtifactCapability::OrderedRange]),
+                    ConsumerArtifactProfile::new_ordered_range(order_digest).unwrap(),
+                    RouteEdgeId::new(40),
+                    BTreeSet::from([uid(30)]),
+                ),
+            )]),
+        ))
+    }
+
+    #[test]
+    fn ordered_install_requires_live_range_profile_and_exact_matrix() {
+        let valid = ordered_deployment_fixture();
+        assert!(validate_channel_contract(&valid).is_ok());
+        assert!(validate_channel_contract(&valid.with_blocking_consumer()).is_err());
+        assert!(validate_channel_contract(&valid.without_range_profile()).is_err());
+    }
+
     #[derive(Clone, Copy)]
     enum InvalidDeployment {
         Lifecycle,
@@ -1475,7 +1766,7 @@ mod tests {
         DuplicateProducerWitness,
     }
 
-    fn invalid_deployment(case: InvalidDeployment) -> CompleteOnceChannelDeployment {
+    fn invalid_deployment(case: InvalidDeployment) -> RuntimeFilterChannelDeployment {
         let base = channel(1, 10, 20, 30, 40);
         let mut logical_domain = base.logical_domain().clone();
         let mut lifecycle = base.lifecycle();
@@ -1581,7 +1872,7 @@ mod tests {
                 );
             }
         }
-        CompleteOnceChannelDeployment::new(
+        RuntimeFilterChannelDeployment::new(
             base.channel_id(),
             logical_domain,
             lifecycle,
@@ -1599,7 +1890,7 @@ mod tests {
     }
 
     fn view(
-        channels: impl IntoIterator<Item = (u32, CompleteOnceChannelDeployment)>,
+        channels: impl IntoIterator<Item = (u32, RuntimeFilterChannelDeployment)>,
     ) -> RuntimeFilterInstallView {
         RuntimeFilterInstallView::new(
             DeploymentEpoch::new(9),
@@ -1612,13 +1903,13 @@ mod tests {
     }
 
     fn with_consumer_contract(
-        base: CompleteOnceChannelDeployment,
+        base: RuntimeFilterChannelDeployment,
         logical_domain: RuntimeFilterLogicalDomain,
         capabilities: BTreeSet<ArtifactCapability>,
         profile: ConsumerArtifactProfile,
-    ) -> CompleteOnceChannelDeployment {
+    ) -> RuntimeFilterChannelDeployment {
         let consumer = base.consumers().values().next().unwrap();
-        CompleteOnceChannelDeployment::new(
+        RuntimeFilterChannelDeployment::new(
             base.channel_id(),
             logical_domain,
             base.lifecycle(),
@@ -1767,7 +2058,7 @@ mod tests {
     #[test]
     fn install_recomputes_bloom_contract_and_bounds_jobs_by_unique_profiles() {
         let base = channel(1, 10, 20, 30, 40);
-        let too_many_jobs = CompleteOnceChannelDeployment::new(
+        let too_many_jobs = RuntimeFilterChannelDeployment::new(
             base.channel_id(),
             base.logical_domain().clone(),
             base.lifecycle(),
@@ -2020,7 +2311,7 @@ mod tests {
         let registry = registry();
         let first = channel(1, 10, 20, 30, 40);
         let mut second = channel(2, 11, 21, 31, 41);
-        second = CompleteOnceChannelDeployment::new(
+        second = RuntimeFilterChannelDeployment::new(
             second.channel_id(),
             second.logical_domain().clone(),
             second.lifecycle(),
@@ -2077,7 +2368,7 @@ mod tests {
         let registry = registry();
         let base = channel(1, 10, 20, 30, 40);
         registry.install(view([(1, base.clone())])).unwrap();
-        let changed = CompleteOnceChannelDeployment::new(
+        let changed = RuntimeFilterChannelDeployment::new(
             base.channel_id(),
             base.logical_domain().clone(),
             base.lifecycle(),
@@ -2114,7 +2405,7 @@ mod tests {
             ),
         ]);
         let make_channel = |coverage: Coverage| {
-            CompleteOnceChannelDeployment::new(
+            RuntimeFilterChannelDeployment::new(
                 base.channel_id(),
                 base.logical_domain().clone(),
                 base.lifecycle(),
@@ -2159,7 +2450,7 @@ mod tests {
         let base = channel(1, 10, 20, 30, 40);
         let mut policy = base.policy();
         policy.deadline_ms = u64::MAX;
-        let invalid = CompleteOnceChannelDeployment::new(
+        let invalid = RuntimeFilterChannelDeployment::new(
             base.channel_id(),
             base.logical_domain().clone(),
             base.lifecycle(),
@@ -2258,7 +2549,7 @@ mod tests {
     fn invalid_channel_causes_zero_partial_install() {
         let registry = registry();
         let mut invalid = channel(2, 11, 21, 31, 41);
-        invalid = CompleteOnceChannelDeployment::new(
+        invalid = RuntimeFilterChannelDeployment::new(
             invalid.channel_id(),
             invalid.logical_domain().clone(),
             invalid.lifecycle(),
@@ -2313,7 +2604,7 @@ mod tests {
             (
                 view([(
                     1,
-                    CompleteOnceChannelDeployment::new(
+                    RuntimeFilterChannelDeployment::new(
                         base.channel_id(),
                         RuntimeFilterLogicalDomain::OrderedBound(OrderContract {
                             keys: vec![],
@@ -2338,7 +2629,7 @@ mod tests {
             (
                 view([(
                     1,
-                    CompleteOnceChannelDeployment::new(
+                    RuntimeFilterChannelDeployment::new(
                         base.channel_id(),
                         RuntimeFilterLogicalDomain::Membership {
                             value_type: DataType::List(Arc::new(arrow::datatypes::Field::new(
@@ -2491,7 +2782,7 @@ mod tests {
         let base = invalid_deployment(InvalidDeployment::CoverageShape);
         let mut policy = base.policy();
         policy.max_contribution_bytes = 0;
-        let invalid_policy = CompleteOnceChannelDeployment::new(
+        let invalid_policy = RuntimeFilterChannelDeployment::new(
             base.channel_id(),
             base.logical_domain().clone(),
             base.lifecycle(),
@@ -2514,7 +2805,7 @@ mod tests {
             InstallContractErrorKind::InvalidPolicy
         );
 
-        let invalid_budget = CompleteOnceChannelDeployment::new(
+        let invalid_budget = RuntimeFilterChannelDeployment::new(
             base.channel_id(),
             base.logical_domain().clone(),
             base.lifecycle(),
@@ -2540,7 +2831,7 @@ mod tests {
         let duplicate = invalid_deployment(InvalidDeployment::DuplicateProducerWitness);
         let mut duplicate_policy = duplicate.policy();
         duplicate_policy.max_contribution_bytes = 0;
-        let invalid_policy_and_duplicate = CompleteOnceChannelDeployment::new(
+        let invalid_policy_and_duplicate = RuntimeFilterChannelDeployment::new(
             duplicate.channel_id(),
             duplicate.logical_domain().clone(),
             duplicate.lifecycle(),

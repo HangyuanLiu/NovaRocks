@@ -36,8 +36,8 @@ use crate::runtime_filter::model::contract::{BindingId, ChannelId};
 use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
 use crate::runtime_filter::port::install::RuntimeFilterInstallView;
 use crate::runtime_filter::port::producer::{
-    InstallContractError, InstallOutcome, ProducerAdapter, RuntimeContractViolation,
-    RuntimeContractViolationKind,
+    InstallContractError, InstallOutcome, ProducerAdapter, ProducerHandle, ProducerHandleWeak,
+    ProducerPortKind, RuntimeContractViolation, RuntimeContractViolationKind,
 };
 use crate::runtime_filter::port::subscription::{
     ArtifactDeliveryOutcome, BlockingSnapshotSubscription,
@@ -849,7 +849,9 @@ pub(crate) struct RuntimeFilterService {
     memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
     registry: Arc<DeploymentRegistry>,
     dispatcher: Arc<ActionDispatcher>,
-    producer_handles: Mutex<BTreeMap<(BindingId, UniqueId), Weak<ServiceProducerAdapter>>>,
+    producer_handles: Mutex<BTreeMap<(BindingId, UniqueId), ProducerHandleWeak>>,
+    #[cfg(test)]
+    producer_test_handles: Mutex<BTreeMap<(BindingId, UniqueId), Weak<ServiceProducerAdapter>>>,
     operation: Mutex<()>,
 }
 
@@ -890,6 +892,8 @@ impl RuntimeFilterService {
             registry,
             dispatcher,
             producer_handles: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            producer_test_handles: Mutex::new(BTreeMap::new()),
             operation: Mutex::new(()),
         }
     }
@@ -908,7 +912,8 @@ impl RuntimeFilterService {
         binding_id: BindingId,
         fragment_instance_id: UniqueId,
         local_partition_count: u32,
-    ) -> Result<Arc<dyn ProducerAdapter>, RuntimeContractViolation> {
+        requested: ProducerPortKind,
+    ) -> Result<ProducerHandle, RuntimeContractViolation> {
         let _operation = self
             .operation
             .lock()
@@ -929,6 +934,12 @@ impl RuntimeFilterService {
                 "producer fragment instance is not installed for this binding",
             ));
         }
+        if route.kind != requested {
+            return Err(violation(
+                RuntimeContractViolationKind::ProducerPortMismatch,
+                "requested producer port does not match the installed channel contract",
+            ));
+        }
         route
             .channel
             .open_producer(binding_id, fragment_instance_id, local_partition_count)?;
@@ -937,10 +948,18 @@ impl RuntimeFilterService {
             .producer_handles
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if let Some(handle) = handles.get(&key).and_then(Weak::upgrade) {
-            return Ok(handle);
+        if let Some(cached) = handles.get(&key) {
+            if cached.kind() != requested {
+                return Err(violation(
+                    RuntimeContractViolationKind::ProducerPortMismatch,
+                    "cached producer port does not match the requested channel contract",
+                ));
+            }
+            if let Some(handle) = cached.upgrade() {
+                return Ok(handle);
+            }
         }
-        let handle = Arc::new(ServiceProducerAdapter::new(
+        let concrete = Arc::new(ServiceProducerAdapter::new(
             route.channel_id,
             route.channel.clone(),
             binding_id,
@@ -948,7 +967,14 @@ impl RuntimeFilterService {
             self.memory_account.clone(),
             self.dispatcher.clone(),
         ));
-        handles.insert(key, Arc::downgrade(&handle));
+        #[cfg(test)]
+        self.producer_test_handles
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(key, Arc::downgrade(&concrete));
+        let membership: Arc<dyn ProducerAdapter> = concrete;
+        let handle = ProducerHandle::Membership(membership);
+        handles.insert(key, handle.downgrade());
         Ok(handle)
     }
 
@@ -1035,7 +1061,7 @@ impl RuntimeFilterService {
         hook: Arc<dyn Fn() + Send + Sync>,
     ) {
         if let Some(handle) = self
-            .producer_handles
+            .producer_test_handles
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .get(&(binding_id, fragment_instance_id))
@@ -1155,7 +1181,8 @@ mod tests {
     use crate::runtime_filter::port::identity::*;
     use crate::runtime_filter::port::install::*;
     use crate::runtime_filter::port::producer::{
-        InstallOutcome, ProducerAdapter, RuntimeContractViolationKind, SubmitOutcome,
+        InstallOutcome, ProducerAdapter, ProducerHandle, ProducerPortKind,
+        RuntimeContractViolationKind, SubmitOutcome,
     };
     use crate::runtime_filter::port::subscription::{
         ArtifactAcquireOutcome, ArtifactDelivery, ArtifactDeliveryOutcome,
@@ -1469,9 +1496,9 @@ mod tests {
         producer_instances: impl IntoIterator<Item = i64>,
         consumer_instances: impl IntoIterator<Item = i64>,
         deadline_ms: u64,
-    ) -> CompleteOnceChannelDeployment {
+    ) -> RuntimeFilterChannelDeployment {
         let witness = CoverageWitnessId::new(channel_id + 100);
-        CompleteOnceChannelDeployment::new(
+        RuntimeFilterChannelDeployment::new(
             ChannelId::new(channel_id),
             RuntimeFilterLogicalDomain::Membership {
                 value_type: DataType::Int64,
@@ -1511,7 +1538,7 @@ mod tests {
     }
 
     fn view(
-        channels: impl IntoIterator<Item = CompleteOnceChannelDeployment>,
+        channels: impl IntoIterator<Item = RuntimeFilterChannelDeployment>,
     ) -> RuntimeFilterInstallView {
         RuntimeFilterInstallView::new(
             DeploymentEpoch::new(9),
@@ -1525,7 +1552,7 @@ mod tests {
 
     fn deployment_with_profiles(
         consumers: impl IntoIterator<Item = (u32, u32, i64, ConsumerArtifactProfile)>,
-    ) -> CompleteOnceChannelDeployment {
+    ) -> RuntimeFilterChannelDeployment {
         let consumers = consumers.into_iter().collect::<Vec<_>>();
         let max_concurrent_jobs = consumers
             .iter()
@@ -1538,7 +1565,7 @@ mod tests {
     fn deployment_with_profiles_and_concurrency(
         consumers: impl IntoIterator<Item = (u32, u32, i64, ConsumerArtifactProfile)>,
         max_concurrent_jobs: usize,
-    ) -> CompleteOnceChannelDeployment {
+    ) -> RuntimeFilterChannelDeployment {
         let base = deployment(1, 10, 30, 40, [10], [30], 100);
         let consumers = consumers
             .into_iter()
@@ -1558,7 +1585,7 @@ mod tests {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        CompleteOnceChannelDeployment::new(
+        RuntimeFilterChannelDeployment::new(
             base.channel_id(),
             base.logical_domain().clone(),
             base.lifecycle(),
@@ -1619,6 +1646,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn membership_open_rejects_ordered_port_before_caching_handle() {
+        let fixture = fixture();
+        install_one(&fixture);
+        let error = fixture
+            .service
+            .open_producer(
+                BindingId::new(10),
+                uid(10),
+                1,
+                ProducerPortKind::OrderedBound,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            RuntimeContractViolationKind::ProducerPortMismatch
+        );
+        assert!(matches!(
+            fixture
+                .service
+                .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership,)
+                .unwrap(),
+            ProducerHandle::Membership(_)
+        ));
+    }
+
     fn open_and_subscribe(
         fixture: &Fixture,
     ) -> (
@@ -1631,7 +1684,9 @@ mod tests {
             .unwrap();
         let producer = fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         (producer, subscription)
     }
@@ -1913,7 +1968,9 @@ mod tests {
         ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let producer = fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         let (submit_tx, submit_rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -2249,7 +2306,9 @@ mod tests {
         assert_eq!(plan.groups()[0].route_edges().len(), 2);
         let producer = fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         complete(&producer, 11);
         let (ArtifactAcquireOutcome::Published(first), ArtifactAcquireOutcome::Published(second)) = (
@@ -2453,7 +2512,9 @@ mod tests {
             .unwrap();
         let producer = fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         complete(&producer, 11);
 
@@ -2535,7 +2596,9 @@ mod tests {
         }));
         let producer = fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         complete(&producer, 19);
         assert_eq!(peak.load(Ordering::SeqCst), 2);
@@ -2646,7 +2709,9 @@ mod tests {
 
         let producer = fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         complete(&producer, 19);
         assert_eq!(peak.load(Ordering::SeqCst), 2);
@@ -2842,7 +2907,9 @@ mod tests {
             service.subscribe(BindingId::new(31), uid(31)).unwrap(),
         ];
         let producer = service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         producer
             .submit(
@@ -2944,7 +3011,9 @@ mod tests {
         install_one(&fixture);
         let producer = fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         producer
             .submit(
@@ -3092,7 +3161,9 @@ mod tests {
             .unwrap();
         let subscription = service.subscribe(BindingId::new(30), uid(30)).unwrap();
         let producer = service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         producer
             .submit(
@@ -3155,7 +3226,9 @@ mod tests {
             service.subscribe(BindingId::new(31), uid(31)).unwrap(),
         ];
         let producer = service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         producer
             .submit(
@@ -3284,7 +3357,9 @@ mod tests {
             .unwrap();
         let producer = fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         complete(&producer, 1);
         fixture
@@ -3307,7 +3382,7 @@ mod tests {
         assert_eq!(
             fixture
                 .service
-                .open_producer(BindingId::new(99), uid(10), 1)
+                .open_producer(BindingId::new(99), uid(10), 1, ProducerPortKind::Membership)
                 .err()
                 .unwrap()
                 .kind(),
@@ -3316,7 +3391,7 @@ mod tests {
         assert_eq!(
             fixture
                 .service
-                .open_producer(BindingId::new(10), uid(99), 1)
+                .open_producer(BindingId::new(10), uid(99), 1, ProducerPortKind::Membership)
                 .err()
                 .unwrap()
                 .kind(),
@@ -3342,7 +3417,9 @@ mod tests {
         );
         let producer = fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         assert!(
             producer
@@ -3370,7 +3447,9 @@ mod tests {
             .install(view([deployment(1, 10, 30, 40, [10], [30], 100)]))
             .unwrap();
         let producer = service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         assert_eq!(
             producer
@@ -3412,7 +3491,9 @@ mod tests {
             .install(view([deployment(1, 10, 30, 40, [10], [30], 100)]))
             .unwrap();
         let producer = service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         let first = producer.clone();
         let (first_tx, first_rx) = mpsc::channel();
@@ -3533,11 +3614,15 @@ mod tests {
         install_one(&fixture);
         let first = fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 2)
+            .open_producer(BindingId::new(10), uid(10), 2, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         let second = fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 2)
+            .open_producer(BindingId::new(10), uid(10), 2, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         assert!(Arc::ptr_eq(&first, &second));
     }
@@ -3548,12 +3633,14 @@ mod tests {
         install_one(&fixture);
         fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         assert!(
             fixture
                 .service
-                .open_producer(BindingId::new(10), uid(10), 2)
+                .open_producer(BindingId::new(10), uid(10), 2, ProducerPortKind::Membership)
                 .is_err()
         );
     }
@@ -3579,7 +3666,7 @@ mod tests {
         assert!(
             fixture
                 .service
-                .open_producer(BindingId::new(10), uid(10), 1)
+                .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
                 .is_err()
         );
         assert!(
@@ -3743,7 +3830,9 @@ mod tests {
         install_one(&fixture);
         let producer = fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         let (ready_tx, ready_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -3801,7 +3890,9 @@ mod tests {
         fixture.events.0.lock().unwrap().clear();
         let producer = fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         let subscription = fixture
             .service
@@ -4022,7 +4113,9 @@ mod tests {
         let subscription = service.subscribe(BindingId::new(30), uid(30)).unwrap();
         *sink.subscription.lock().unwrap() = Some(Arc::downgrade(&subscription));
         let producer = service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         complete(&producer, 41);
         assert!(sink.panicked.load(Ordering::SeqCst));
@@ -4207,7 +4300,9 @@ mod tests {
         );
         let subscription = service.subscribe(BindingId::new(30), uid(30)).unwrap();
         let producer = service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         complete(&producer, 7);
         assert!(matches!(

@@ -31,9 +31,10 @@ use crate::runtime_filter::port::identity::{
     DeploymentEpoch, RouteEdgeId, RuntimeFilterParticipantId,
 };
 use crate::runtime_filter::port::install::{
-    CompleteOnceChannelDeployment, ConsumerDeployment, MaterializationPolicy, ProducerDeployment,
+    ConsumerDeployment, MaterializationPolicy, ProducerDeployment, RuntimeFilterChannelDeployment,
     RuntimeFilterCoreBudget, RuntimeFilterInstallView,
 };
+use crate::runtime_filter::port::ordered_bound::RuntimeOrderContract;
 
 /// Channel-level facts the projection stamps into each shard (mirrors the model
 /// channel spec, plus the per-channel completion requirement and producer→witness
@@ -64,15 +65,25 @@ type InstanceIndex =
 
 /// Lower a consumer's semantic `ArtifactCapability` set into the physical
 /// `ConsumerArtifactProfile` the M2 install contract requires (RFD-3/M2 §159-162):
-/// `Membership` → `ValueSet` (statically feasible for every M2 Membership Arrow
-/// schema), `EmptyDomain` → `EmptyDomain` (install requires the profile accept
-/// it). `OrderedRange` → `Range` is deferred to M3 (materializer returns typed
-/// unsupported today), so RFD-2's Membership scope never emits it; Bloom/Bitset
-/// are not selected, so no `bloom_hash_contract` is needed. The BE-side
-/// `validate_channel` re-checks capability↔profile consistency at install time.
+/// `Membership` → `ValueSet`, `EmptyDomain` → `EmptyDomain`, and an M3A
+/// `OrderedBound` contract with `OrderedRange` capability → an exact Range
+/// profile carrying the validated order digest. Membership channels never map
+/// `OrderedRange` to Range. Bloom/Bitset are not selected here.
 fn consumer_artifact_profile(
+    logical_domain: &RuntimeFilterLogicalDomain,
     capabilities: &BTreeSet<ArtifactCapability>,
 ) -> Result<ConsumerArtifactProfile, DeploymentError> {
+    if let RuntimeFilterLogicalDomain::OrderedBound(plan) = logical_domain {
+        let contract = RuntimeOrderContract::try_from_plan(plan).map_err(|_| {
+            DeploymentError::InvalidArtifactProfile(
+                crate::runtime_filter::port::artifact::ArtifactContractError::UnsupportedSchema,
+            )
+        })?;
+        if capabilities.contains(&ArtifactCapability::OrderedRange) {
+            return ConsumerArtifactProfile::new_ordered_range(contract.digest())
+                .map_err(DeploymentError::InvalidArtifactProfile);
+        }
+    }
     let mut accepted = BTreeSet::new();
     if capabilities.contains(&ArtifactCapability::Membership) {
         accepted.insert(ArtifactKind::ValueSet);
@@ -175,7 +186,7 @@ pub(crate) fn project_install_views(
                     );
                     continue;
                 };
-                let profile = consumer_artifact_profile(&facts.capabilities)?;
+                let profile = consumer_artifact_profile(&spec.logical_domain, &facts.capabilities)?;
                 let expected = instances
                     .get(&(*channel_id, *binding, *participant))
                     .cloned()
@@ -214,7 +225,7 @@ pub(crate) fn project_install_views(
             let spec = &channel_specs[&channel_id];
             channel_deployments.insert(
                 channel_id,
-                CompleteOnceChannelDeployment::new(
+                RuntimeFilterChannelDeployment::new(
                     channel_id,
                     spec.logical_domain.clone(),
                     spec.lifecycle,
@@ -292,6 +303,39 @@ mod tests {
                 ]),
             },
         )
+    }
+
+    #[test]
+    fn ordered_range_projector_emits_exact_profile_contract() {
+        let keys = vec![OrderKeyContract {
+            data_type: DataType::Int64,
+            direction: SortDirection::Ascending,
+            null_order: NullOrder::Last,
+        }];
+        let plan = OrderContract {
+            comparator_digest:
+                crate::runtime_filter::port::ordered_bound::comparator_digest_for_test(
+                    &keys,
+                    crate::runtime_filter::port::ordered_bound::COMPARATOR_ALGORITHM_VERSION,
+                ),
+            keys,
+            inclusive: true,
+        };
+        let expected =
+            crate::runtime_filter::port::ordered_bound::RuntimeOrderContract::try_from_plan(&plan)
+                .unwrap()
+                .digest();
+        let profile = consumer_artifact_profile(
+            &RuntimeFilterLogicalDomain::OrderedBound(plan),
+            &BTreeSet::from([ArtifactCapability::OrderedRange]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            profile.accepted_kinds(),
+            &BTreeSet::from([ArtifactKind::Range])
+        );
+        assert_eq!(profile.order_contract_digest(), Some(expected));
     }
 
     #[test]

@@ -16,11 +16,13 @@
 // under the License.
 use std::error::Error;
 use std::fmt;
+use std::sync::{Arc, Weak};
 
 use crate::common::types::UniqueId;
 use crate::runtime_filter::model::contract::BindingId;
 
 use super::identity::{PartitionId, ProducerSequence};
+use super::ordered_bound::OrderedBoundUpdate;
 use super::value_domain::ValueDomainDelta;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,6 +99,7 @@ pub(crate) enum RuntimeContractViolationKind {
     ConflictingTerminalSequence,
     ConflictingArtifactPublish,
     SequenceOutsideTerminalRange,
+    ProducerPortMismatch,
     ServiceUnavailable,
 }
 
@@ -204,6 +207,95 @@ pub(crate) trait ProducerAdapter: Send + Sync {
     ) -> Result<SubmitOutcome, RuntimeContractViolation>;
 }
 
+pub(crate) trait OrderedBoundProducerAdapter: Send + Sync {
+    fn submit_bound(
+        &self,
+        partition_id: PartitionId,
+        sequence: ProducerSequence,
+        update: OrderedBoundUpdate,
+    ) -> Result<SubmitOutcome, RuntimeContractViolation>;
+
+    fn close_partition(
+        &self,
+        partition_id: PartitionId,
+        terminal_sequence: ProducerSequence,
+    ) -> Result<SubmitOutcome, RuntimeContractViolation>;
+
+    fn fail(
+        &self,
+        reason: ProducerFailureReason,
+    ) -> Result<SubmitOutcome, RuntimeContractViolation>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProducerPortKind {
+    Membership,
+    OrderedBound,
+}
+
+pub(crate) enum ProducerHandle {
+    Membership(Arc<dyn ProducerAdapter>),
+    OrderedBound(Arc<dyn OrderedBoundProducerAdapter>),
+}
+
+impl fmt::Debug for ProducerHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("ProducerHandle")
+            .field(&self.kind())
+            .finish()
+    }
+}
+
+impl ProducerHandle {
+    pub(crate) const fn kind(&self) -> ProducerPortKind {
+        match self {
+            Self::Membership(_) => ProducerPortKind::Membership,
+            Self::OrderedBound(_) => ProducerPortKind::OrderedBound,
+        }
+    }
+
+    pub(crate) fn downgrade(&self) -> ProducerHandleWeak {
+        match self {
+            Self::Membership(handle) => ProducerHandleWeak::Membership(Arc::downgrade(handle)),
+            Self::OrderedBound(handle) => ProducerHandleWeak::OrderedBound(Arc::downgrade(handle)),
+        }
+    }
+
+    pub(crate) fn into_membership(
+        self,
+    ) -> Result<Arc<dyn ProducerAdapter>, RuntimeContractViolation> {
+        match self {
+            Self::Membership(handle) => Ok(handle),
+            Self::OrderedBound(_) => Err(RuntimeContractViolation::new(
+                RuntimeContractViolationKind::ProducerPortMismatch,
+                "ordered producer handle cannot be used as a membership producer",
+            )),
+        }
+    }
+}
+
+pub(crate) enum ProducerHandleWeak {
+    Membership(Weak<dyn ProducerAdapter>),
+    OrderedBound(Weak<dyn OrderedBoundProducerAdapter>),
+}
+
+impl ProducerHandleWeak {
+    pub(crate) const fn kind(&self) -> ProducerPortKind {
+        match self {
+            Self::Membership(_) => ProducerPortKind::Membership,
+            Self::OrderedBound(_) => ProducerPortKind::OrderedBound,
+        }
+    }
+
+    pub(crate) fn upgrade(&self) -> Option<ProducerHandle> {
+        match self {
+            Self::Membership(handle) => handle.upgrade().map(ProducerHandle::Membership),
+            Self::OrderedBound(handle) => handle.upgrade().map(ProducerHandle::OrderedBound),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::RuntimeContractViolationKind;
@@ -229,6 +321,7 @@ mod tests {
             RuntimeContractViolationKind::SequenceOutsideTerminalRange => {
                 "sequence-outside-terminal-range"
             }
+            RuntimeContractViolationKind::ProducerPortMismatch => "producer-port-mismatch",
             RuntimeContractViolationKind::ServiceUnavailable => "service-unavailable",
         }
     }

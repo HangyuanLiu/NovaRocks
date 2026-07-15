@@ -33,7 +33,7 @@ use crate::runtime_filter::port::identity::{
     ContributionIdentity, DeploymentEpoch, PartitionId, ProducerSequence, ProducerStreamId,
     RuntimeFilterParticipantId,
 };
-use crate::runtime_filter::port::install::CompleteOnceChannelDeployment;
+use crate::runtime_filter::port::install::RuntimeFilterChannelDeployment;
 use crate::runtime_filter::port::producer::{
     ProducerFailureReason, RuntimeContractViolation, RuntimeContractViolationKind, SubmitOutcome,
 };
@@ -193,7 +193,7 @@ impl RuntimeFilterChannel {
         query_id: UniqueId,
         participant_id: RuntimeFilterParticipantId,
         epoch: DeploymentEpoch,
-        deployment: &CompleteOnceChannelDeployment,
+        deployment: &RuntimeFilterChannelDeployment,
         deadline: Instant,
         memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
     ) -> Result<Self, ChannelBuildError> {
@@ -210,7 +210,7 @@ impl RuntimeFilterChannel {
         query_id: UniqueId,
         participant_id: RuntimeFilterParticipantId,
         epoch: DeploymentEpoch,
-        deployment: &CompleteOnceChannelDeployment,
+        deployment: &RuntimeFilterChannelDeployment,
         memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
     ) -> Result<Self, ChannelBuildError> {
         let (data_type, null_semantics) = match deployment.logical_domain() {
@@ -1289,7 +1289,7 @@ mod tests {
         producers: &[(u32, u32, i64)],
         budget: u64,
         max: u64,
-    ) -> CompleteOnceChannelDeployment {
+    ) -> RuntimeFilterChannelDeployment {
         let producers = producers
             .iter()
             .map(|(binding, witness, instance)| {
@@ -1302,7 +1302,7 @@ mod tests {
                 )
             })
             .collect();
-        CompleteOnceChannelDeployment::new(
+        RuntimeFilterChannelDeployment::new(
             ChannelId::new(1),
             RuntimeFilterLogicalDomain::Membership {
                 value_type: DataType::Int64,
@@ -1335,7 +1335,7 @@ mod tests {
         producers: &[(u32, u32, i64)],
         budget: u64,
         max: u64,
-    ) -> CompleteOnceChannelDeployment {
+    ) -> RuntimeFilterChannelDeployment {
         deployment_with_coverages(coverage.clone(), coverage, producers, budget, max)
     }
 
@@ -1360,7 +1360,7 @@ mod tests {
     }
 
     fn channel_from(
-        deployment: CompleteOnceChannelDeployment,
+        deployment: RuntimeFilterChannelDeployment,
     ) -> (RuntimeFilterChannel, Arc<Account>, Instant) {
         let account = Arc::new(Account::default());
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1385,9 +1385,9 @@ mod tests {
         )
     }
 
-    fn multi_instance_deployment() -> CompleteOnceChannelDeployment {
+    fn multi_instance_deployment() -> RuntimeFilterChannelDeployment {
         let witness = CoverageWitnessId::new(1);
-        CompleteOnceChannelDeployment::new(
+        RuntimeFilterChannelDeployment::new(
             ChannelId::new(1),
             RuntimeFilterLogicalDomain::Membership {
                 value_type: DataType::Int64,

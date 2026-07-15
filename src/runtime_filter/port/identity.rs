@@ -44,6 +44,13 @@ runtime_id!(LogicalVersion, u64);
 
 impl LogicalVersion {
     pub(crate) const FIRST: Self = Self(1);
+
+    pub(crate) const fn checked_next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(next) => Some(Self(next)),
+            None => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -163,5 +170,10 @@ mod tests {
         assert_eq!(identity.stream(), stream);
         assert_eq!(identity.sequence().get(), 10);
         assert_eq!(LogicalVersion::FIRST.get(), 1);
+        assert_eq!(
+            LogicalVersion::FIRST.checked_next(),
+            Some(LogicalVersion::new(2))
+        );
+        assert_eq!(LogicalVersion::new(u64::MAX).checked_next(), None);
     }
 }

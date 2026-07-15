@@ -28,9 +28,11 @@ use crate::common::largeint::LARGEINT_BYTE_WIDTH;
 use crate::runtime_filter::model::contract::{ChannelId, NullSemantics};
 
 use super::identity::LogicalVersion;
+use super::ordered_bound::OrderContractDigest;
 use super::support::ArtifactRetention;
 
 const PROFILE_VERSION: u8 = 1;
+const ORDERED_PROFILE_VERSION: u8 = 2;
 const SCHEMA_VERSION: u8 = 1;
 pub(crate) const LEAF_CODEC_VERSION: u16 = 1;
 
@@ -296,7 +298,10 @@ impl<'a> SchemaCursor<'a> {
     }
 }
 
-fn encode_schema(data_type: &DataType, output: &mut Vec<u8>) -> Result<(), ArtifactContractError> {
+pub(super) fn encode_schema(
+    data_type: &DataType,
+    output: &mut Vec<u8>,
+) -> Result<(), ArtifactContractError> {
     match data_type {
         DataType::Boolean => output.push(1),
         DataType::Int8 => output.push(2),
@@ -346,6 +351,7 @@ fn encode_schema(data_type: &DataType, output: &mut Vec<u8>) -> Result<(), Artif
 pub(crate) struct ConsumerArtifactProfile {
     accepted_kinds: BTreeSet<ArtifactKind>,
     bloom_hash_contract: Option<HashContractDigest>,
+    order_contract_digest: Option<OrderContractDigest>,
     canonical_bytes: Arc<[u8]>,
     id: ConsumerProfileId,
 }
@@ -354,6 +360,24 @@ impl ConsumerArtifactProfile {
     pub(crate) fn new(
         accepted_kinds: BTreeSet<ArtifactKind>,
         bloom_hash_contract: Option<HashContractDigest>,
+    ) -> Result<Self, ArtifactContractError> {
+        Self::new_with_order_contract(accepted_kinds, bloom_hash_contract, None)
+    }
+
+    pub(crate) fn new_ordered_range(
+        order_contract_digest: OrderContractDigest,
+    ) -> Result<Self, ArtifactContractError> {
+        Self::new_with_order_contract(
+            BTreeSet::from([ArtifactKind::Range]),
+            None,
+            Some(order_contract_digest),
+        )
+    }
+
+    fn new_with_order_contract(
+        accepted_kinds: BTreeSet<ArtifactKind>,
+        bloom_hash_contract: Option<HashContractDigest>,
+        order_contract_digest: Option<OrderContractDigest>,
     ) -> Result<Self, ArtifactContractError> {
         if accepted_kinds.is_empty() {
             return Err(ArtifactContractError::EmptyProfile);
@@ -364,7 +388,11 @@ impl ConsumerArtifactProfile {
         let count = u16::try_from(accepted_kinds.len())
             .map_err(|_| ArtifactContractError::LengthOverflow)?;
         let mut canonical = Vec::with_capacity(4 + accepted_kinds.len() + 32);
-        canonical.extend_from_slice(&[PROFILE_VERSION]);
+        canonical.extend_from_slice(&[if order_contract_digest.is_some() {
+            ORDERED_PROFILE_VERSION
+        } else {
+            PROFILE_VERSION
+        }]);
         canonical.extend_from_slice(&count.to_be_bytes());
         canonical.extend(accepted_kinds.iter().map(|kind| kind.tag()));
         match bloom_hash_contract {
@@ -374,10 +402,21 @@ impl ConsumerArtifactProfile {
             }
             None => canonical.push(0),
         }
+        match order_contract_digest {
+            Some(digest) => {
+                if !accepted_kinds.contains(&ArtifactKind::Range) {
+                    return Err(ArtifactContractError::RangeOrderContractMismatch);
+                }
+                canonical.push(1);
+                canonical.extend_from_slice(&digest.bytes());
+            }
+            None => {}
+        }
         let id = ConsumerProfileId(Sha256::digest(&canonical).into());
         Ok(Self {
             accepted_kinds,
             bloom_hash_contract,
+            order_contract_digest,
             canonical_bytes: canonical.into(),
             id,
         })
@@ -404,6 +443,10 @@ impl ConsumerArtifactProfile {
         self.bloom_hash_contract
     }
 
+    pub(crate) const fn order_contract_digest(&self) -> Option<OrderContractDigest> {
+        self.order_contract_digest
+    }
+
     pub(crate) fn canonical_bytes(&self) -> &[u8] {
         &self.canonical_bytes
     }
@@ -423,6 +466,7 @@ impl ConsumerArtifactProfile {
 pub(crate) enum ArtifactContractError {
     EmptyProfile,
     BloomHashContractMismatch,
+    RangeOrderContractMismatch,
     UnsupportedSchema,
     NonCanonicalSchema,
     LengthOverflow,
@@ -874,6 +918,23 @@ mod tests {
 
         assert_eq!(left.canonical_bytes(), right.canonical_bytes());
         assert_eq!(left.id(), right.id());
+    }
+
+    #[test]
+    fn membership_profile_preserves_v1_canonical_identity() {
+        let profile =
+            ConsumerArtifactProfile::new(BTreeSet::from([ArtifactKind::ValueSet]), None).unwrap();
+
+        assert_eq!(
+            profile.canonical_bytes(),
+            &[
+                super::PROFILE_VERSION,
+                0,
+                1,
+                ArtifactKind::ValueSet.tag(),
+                0,
+            ]
+        );
     }
 
     #[test]
