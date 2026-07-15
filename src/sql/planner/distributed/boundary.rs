@@ -425,6 +425,7 @@ mod tests {
     use crate::runtime_filter::model::graph::RuntimeFilterGraph;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::analysis::cte::CteId;
+    use crate::sql::catalog::ColumnDef;
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed::test_support::DistributedPlanDraftBuilder;
     use crate::sql::planner::distributed::write::change_stream::{
@@ -701,6 +702,24 @@ mod tests {
         input: IcebergWriteInputBinding,
         columns: Vec<OutputColumn>,
     ) -> Result<DistributedPlan, String> {
+        // Give the sink a target schema whose arity matches the bound input so
+        // the plan is a valid write plan for the seal-time write-contract
+        // finalization (the target arity is incidental to what these boundary
+        // tests assert).
+        let target_arity = match &input {
+            IcebergWriteInputBinding::RootOutputByOrdinal => columns.len(),
+            IcebergWriteInputBinding::OutputOrdinals(ordinals) => ordinals.len(),
+        };
+        let mut spec = simple_sink_spec();
+        spec.target_columns = (0..target_arity)
+            .map(|idx| ColumnDef {
+                name: format!("t{idx}"),
+                data_type: DataType::Int64,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            })
+            .collect();
         DistributedPlanDraftBuilder::new(
             vec![PlanFragment {
                 fragment_id: 0,
@@ -709,7 +728,7 @@ mod tests {
                 output_partition: DataPartition::unpartitioned(),
                 sink: DataSink::IcebergWrite(IcebergWriteFragmentSink {
                     descriptor_database: "test_db".to_string(),
-                    spec: simple_sink_spec(),
+                    spec,
                     input,
                 }),
                 output_exprs: None,

@@ -29,7 +29,11 @@ use crate::coordinator::prepare::scan::{
     ResolvedScanBinding, ResolvedScanColumnKind, ResolvedScanExecution, ScanExecutionBindings,
 };
 use crate::proto::{common, plan};
-use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, TypedExpr};
+use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
+// Consumed only by `#[cfg(test)]` encoder fixtures (the production write/router
+// encoding reads finalized planner types, not these analysis constructors).
+#[cfg(test)]
+use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::catalog;
 use crate::sql::codegen::scan::connector::{
     StarRocksColumnSchemaDescriptor, StarRocksKeysTypeDescriptor, StarRocksScanSourceDescriptor,
@@ -46,19 +50,39 @@ use crate::sql::planner::distributed::write::sink::{
 };
 use crate::sql::planner::distributed::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor,
-    ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentStreamKind, PartitionKind,
-    PlanFragment,
+    ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentEdgeOutputCatalog,
+    FragmentStreamKind, NodeExecutionColumn, NodeOutputCatalog, PartitionKind, PlanFragment,
+    WriteContractCatalog,
 };
-use crate::sql::planner::payload::{AggregateCall, PlanRowCountAssertion};
+use crate::sql::planner::payload::PlanRowCountAssertion;
 use crate::sql::planner::physical::{
-    AggMode, HashSource, JoinDistribution, JoinExecutionMode, PhysicalHashAggregateNode,
-    PhysicalPlanKind, PlanSetOpKind, RedistributeMode, TopNPhase,
+    AggMode, HashSource, JoinDistribution, JoinExecutionMode, PhysicalPlanKind, PlanSetOpKind,
+    RedistributeMode, TopNPhase,
 };
-use crate::types::aggregate::infer_agg_function_types;
 use crate::types::native_proto::encode_type;
 
 pub(crate) struct NativePlanEncodeContext<'a> {
     pub(crate) scan_bindings: Option<&'a ScanExecutionBindings>,
+    /// The sealed node-output contract. The encoder reads each covered node's
+    /// (join / scan / set-op / sort) execution output from here rather than
+    /// re-deriving or repairing it. `None` only in bare-node encoder unit tests
+    /// that have no sealed plan; those rely on the payload columns encoded by
+    /// `encode_physical_node`, which is the same data the catalog is built from.
+    pub(crate) node_outputs: Option<&'a NodeOutputCatalog>,
+    /// The sealed fragment-output / stream-edge-projection contract (CGO-9C
+    /// Task 2). The encoder maps each fragment's finalized output columns and each
+    /// stream edge's finalized sender/receiver projection from here instead of
+    /// re-deriving a stream schema or patching the exchange receiver. `None` only
+    /// in bare-node/bare-fragment encoder unit tests that have no sealed plan.
+    pub(crate) fragment_edge_outputs: Option<&'a FragmentEdgeOutputCatalog>,
+    /// The sealed Iceberg write output / change-stream router partition contract
+    /// (CGO-9C Task 3). The encoder maps each Iceberg write fragment's finalized
+    /// output expressions and target output schema, and each change-stream router
+    /// branch's finalized partition, from here instead of synthesizing the write
+    /// output or reconstructing a partition from `output_partition_ordinals`.
+    /// `None` only in bare-node/bare-fragment encoder unit tests, which never
+    /// encode a write or router fragment.
+    pub(crate) write_contracts: Option<&'a WriteContractCatalog>,
 }
 
 #[cfg(test)]
@@ -69,6 +93,10 @@ pub(crate) fn encode_distributed_plan(
         src,
         NativePlanEncodeContext {
             scan_bindings: None,
+            // Both bound from the sealed plan inside encode_distributed_plan_with_context.
+            node_outputs: None,
+            fragment_edge_outputs: None,
+            write_contracts: None,
         },
     )
 }
@@ -77,12 +105,22 @@ pub(crate) fn encode_distributed_plan_with_context(
     src: &DistributedPlan,
     ctx: NativePlanEncodeContext<'_>,
 ) -> Result<plan::DistributedPlan, String> {
+    // The sealed node-output contract of `src` is authoritative for every covered
+    // node, so bind it here: all fragment/node encoding then reads each covered
+    // node's execution output from it instead of re-deriving or repairing it,
+    // regardless of how the incoming context was constructed.
+    let ctx = NativePlanEncodeContext {
+        scan_bindings: ctx.scan_bindings,
+        node_outputs: Some(src.node_outputs()),
+        fragment_edge_outputs: Some(src.fragment_edge_outputs()),
+        write_contracts: Some(src.write_contracts()),
+    };
     let mut fragments = src
         .fragments()
         .iter()
         .map(|fragment| encode_plan_fragment_with_context(fragment, &ctx))
         .collect::<Result<Vec<_>, _>>()?;
-    attach_stream_sinks(src, &mut fragments)?;
+    attach_stream_sinks(src, &mut fragments, &ctx)?;
     Ok(plan::DistributedPlan {
         fragments,
         root_fragment_id: src.root_fragment_id(),
@@ -97,16 +135,12 @@ pub(crate) fn encode_distributed_plan_with_context(
 fn attach_stream_sinks(
     src: &DistributedPlan,
     fragments: &mut [plan::PlanFragment],
+    ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<(), String> {
     let fragment_index_by_id = fragments
         .iter()
         .enumerate()
         .map(|(idx, fragment)| (fragment.fragment_id, idx))
-        .collect::<HashMap<_, _>>();
-    let source_fragment_by_id = src
-        .fragments()
-        .iter()
-        .map(|fragment| (fragment.fragment_id, fragment))
         .collect::<HashMap<_, _>>();
 
     for edge in src.edges() {
@@ -121,29 +155,12 @@ fn attach_stream_sinks(
                     edge.source_fragment_id
                 )
             })?;
-        let target_idx = *fragment_index_by_id
-            .get(&edge.target_fragment_id)
-            .ok_or_else(|| {
-                format!(
-                    "native stream edge target fragment {} missing encoded fragment",
-                    edge.target_fragment_id
-                )
-            })?;
-        let source = source_fragment_by_id
-            .get(&edge.source_fragment_id)
-            .ok_or_else(|| {
-                format!(
-                    "native stream edge source fragment {} missing source fragment",
-                    edge.source_fragment_id
-                )
-            })?;
-        let target_exchange_columns = encoded_exchange_receiver_output_columns(
-            &fragments[target_idx],
-            edge.target_exchange_node_id,
-        )?;
-        let stream_output_columns =
-            stream_edge_output_columns(source, &fragments[idx], edge, &target_exchange_columns)?;
-        let stream_output_slot_ids = stream_output_slot_ids(&stream_output_columns)?;
+        // The planner finalized this edge's projection at seal. The encoder maps
+        // the sender's `DataStreamSink.output_columns` (source slot ids) from it
+        // 1:1; the destination receiver's `output_columns` are set to the same
+        // projection during node encoding (`encode_exchange_receiver`), so the two
+        // sides stay equal without an after-the-fact receiver patch.
+        let stream_output_slot_ids = finalized_stream_edge_slot_ids(ctx, edge)?;
         let fragment = &mut fragments[idx];
         if !matches!(
             fragment.sink.as_ref().and_then(|sink| sink.kind.as_ref()),
@@ -162,539 +179,48 @@ fn attach_stream_sinks(
                 limit: None,
             })),
         });
-        patch_exchange_receiver_output_columns(
-            &mut fragments[target_idx],
-            edge.target_exchange_node_id,
-            stream_output_columns,
-        )?;
     }
     Ok(())
 }
 
-fn stream_edge_output_columns(
-    source: &PlanFragment,
-    encoded_source: &plan::PlanFragment,
+/// The finalized stream-edge projection for `edge`, as planner output columns
+/// read from the sealed fragment/edge contract.
+fn finalized_stream_edge_projection<'a>(
+    ctx: &'a NativePlanEncodeContext<'_>,
     edge: &FragmentEdge,
-    target_exchange_columns: &[common::OutputColumn],
-) -> Result<Vec<common::OutputColumn>, String> {
-    if source.output_columns.is_empty()
-        && edge.output_slot_ids.is_empty()
-        && target_exchange_columns.is_empty()
-    {
-        return Ok(Vec::new());
-    }
-    let columns = match encoded_fragment_root_output_columns(encoded_source) {
-        Ok(columns) if !columns.is_empty() => columns,
-        Ok(_) if !source.output_columns.is_empty() => encode_output_columns(&source.output_columns)?,
-        Ok(_) => Vec::new(),
-        Err(root_err) if !source.output_columns.is_empty() => {
-            encode_output_columns(&source.output_columns).map_err(|source_err| {
-                format!(
-                    "native stream source root output unavailable ({root_err}); fragment output encoding failed: {source_err}"
-                )
-            })?
-        }
-        Err(root_err) => return Err(root_err),
-    };
-    if !target_exchange_columns.is_empty()
-        && let Some(projected) = project_output_columns_for_requested_exchange(
-            columns.clone(),
-            &source.output_columns,
-            target_exchange_columns,
-        )?
-    {
-        return Ok(projected);
-    }
-    project_output_columns_for_edge(columns, &source.output_columns, &edge.output_slot_ids)
+) -> Result<&'a [AnalysisOutputColumn], String> {
+    let catalog = ctx.fragment_edge_outputs.ok_or_else(|| {
+        format!(
+            "native stream edge from fragment {} to exchange node {} has no sealed projection contract",
+            edge.source_fragment_id, edge.target_exchange_node_id
+        )
+    })?;
+    catalog
+        .stream_edge_projection(edge.target_fragment_id, edge.target_exchange_node_id)
+        .ok_or_else(|| {
+            format!(
+                "native stream edge from fragment {} to exchange node {} is missing from the sealed projection contract",
+                edge.source_fragment_id, edge.target_exchange_node_id
+            )
+        })
 }
 
-fn stream_output_slot_ids(
-    stream_output_columns: &[common::OutputColumn],
+/// The sender-side slot ids (= projection column ids) for a stream edge.
+fn finalized_stream_edge_slot_ids(
+    ctx: &NativePlanEncodeContext<'_>,
+    edge: &FragmentEdge,
 ) -> Result<Vec<i32>, String> {
-    stream_output_columns
+    finalized_stream_edge_projection(ctx, edge)?
         .iter()
         .map(|column| {
-            i32::try_from(column.column_id).map_err(|_| {
+            i32::try_from(column.column_id.0).map_err(|_| {
                 format!(
                     "native stream edge output column {} cannot convert to slot id",
-                    column.column_id
+                    column.column_id.0
                 )
             })
         })
         .collect()
-}
-
-pub(crate) fn encoded_fragment_root_output_columns(
-    fragment: &plan::PlanFragment,
-) -> Result<Vec<common::OutputColumn>, String> {
-    let root = fragment
-        .root
-        .as_ref()
-        .ok_or_else(|| format!("native fragment {} missing root", fragment.fragment_id))?;
-    encoded_node_output_columns(root)
-}
-
-fn encoded_node_output_columns(
-    node: &plan::DistributedNode,
-) -> Result<Vec<common::OutputColumn>, String> {
-    match node.payload.as_ref() {
-        Some(plan::distributed_node::Payload::Physical(physical)) => match physical.kind.as_ref() {
-            Some(plan::plan_node::Kind::Project(project)) => {
-                encoded_project_output_columns(node, project)
-            }
-            Some(plan::plan_node::Kind::Filter(_))
-            | Some(plan::plan_node::Kind::Limit(_))
-            | Some(plan::plan_node::Kind::AssertOneRow(_))
-            | Some(plan::plan_node::Kind::Sort(_))
-            | Some(plan::plan_node::Kind::Topn(_)) => {
-                encoded_unary_passthrough_output_columns(node, "native stream source")
-            }
-            Some(plan::plan_node::Kind::HashAggregate(aggregate)) => {
-                if !aggregate.output_columns.is_empty() {
-                    return Ok(aggregate.output_columns.clone());
-                }
-                let output_layout = aggregate.output_layout.as_ref().ok_or_else(|| {
-                    format!(
-                        "native stream source aggregate node {} missing output_layout",
-                        node.node_id
-                    )
-                })?;
-                let mut columns = Vec::with_capacity(
-                    output_layout.group_key_columns.len() + output_layout.aggregate_columns.len(),
-                );
-                columns.extend(output_layout.group_key_columns.clone());
-                columns.extend(output_layout.aggregate_columns.clone());
-                Ok(columns)
-            }
-            Some(plan::plan_node::Kind::GenerateSeries(generate_series)) => {
-                Ok(vec![common::OutputColumn {
-                    column_id: generate_series.output_column_id,
-                    name: if generate_series.column_name.is_empty() {
-                        "generate_series".to_string()
-                    } else {
-                        generate_series.column_name.clone()
-                    },
-                    r#type: Some(encode_type(&DataType::Int64)?),
-                    nullable: false,
-                    is_internal: false,
-                }])
-            }
-            Some(plan::plan_node::Kind::Scan(scan)) => encoded_scan_output_columns(scan),
-            Some(plan::plan_node::Kind::TableFunction(table_function)) => {
-                let mut columns =
-                    encoded_unary_passthrough_output_columns(node, "native table function output")?;
-                columns.extend(table_function.output_columns.clone());
-                Ok(columns)
-            }
-            Some(plan::plan_node::Kind::Values(values)) if values.columns.is_empty() => {
-                Ok(Vec::new())
-            }
-            Some(_) if !physical.output_columns.is_empty() => Ok(physical.output_columns.clone()),
-            Some(kind) => Err(format!(
-                "native stream source node {} has no output columns for {:?}",
-                node.node_id, kind
-            )),
-            None => Err(format!(
-                "native stream source physical node {} missing kind",
-                node.node_id
-            )),
-        },
-        Some(plan::distributed_node::Payload::Exchange(exchange)) => {
-            Ok(exchange.output_columns.clone())
-        }
-        None => Err(format!(
-            "native stream source node {} missing payload",
-            node.node_id
-        )),
-    }
-}
-
-fn encoded_unary_passthrough_output_columns(
-    node: &plan::DistributedNode,
-    context: &str,
-) -> Result<Vec<common::OutputColumn>, String> {
-    let [child] = node.children.as_slice() else {
-        return Err(format!(
-            "{context} node {} expected one child for output columns, got {}",
-            node.node_id,
-            node.children.len()
-        ));
-    };
-    encoded_node_output_columns(child)
-}
-
-struct EncodedProjectItemOutput {
-    preferred_compute_column_id: u32,
-    output_column_id: u32,
-    can_reuse_input_slot: bool,
-    output_name: String,
-    r#type: common::TypeDesc,
-    nullable: bool,
-}
-
-fn encoded_project_output_columns(
-    node: &plan::DistributedNode,
-    project: &plan::ProjectNode,
-) -> Result<Vec<common::OutputColumn>, String> {
-    let item_outputs = project
-        .items
-        .iter()
-        .enumerate()
-        .map(encoded_project_item_output)
-        .collect::<Result<Vec<_>, _>>()?;
-    let input_column_ids = match node.children.as_slice() {
-        [] => HashSet::new(),
-        [child] => encoded_node_output_columns(child)?
-            .into_iter()
-            .map(|column| column.column_id)
-            .collect::<HashSet<_>>(),
-        _ => {
-            return Err(format!(
-                "native stream source project node {} expected at most one child, got {}",
-                node.node_id,
-                node.children.len()
-            ));
-        }
-    };
-    let output_column_id_candidates = item_outputs
-        .iter()
-        .map(|item| item.output_column_id)
-        .collect::<HashSet<_>>();
-    let mut used_output_column_ids = HashSet::new();
-    let mut used_compute_column_ids = input_column_ids.clone();
-    let mut next_synthetic_column_id = output_column_id_candidates
-        .iter()
-        .chain(used_compute_column_ids.iter())
-        .copied()
-        .max()
-        .unwrap_or(0)
-        .saturating_add(1);
-    let mut first_expr_index_by_column_id = HashMap::new();
-    let mut computed_columns = Vec::new();
-    let mut output_columns = Vec::with_capacity(project.items.len());
-
-    for item in item_outputs {
-        let preferred_compute_column_id = item.preferred_compute_column_id;
-        let mut compute_column_id = if item.can_reuse_input_slot
-            || !input_column_ids.contains(&preferred_compute_column_id)
-        {
-            preferred_compute_column_id
-        } else {
-            allocate_project_boundary_synthetic_column_id(
-                &mut next_synthetic_column_id,
-                &mut used_output_column_ids,
-                &mut used_compute_column_ids,
-            )?
-        };
-        if !item.can_reuse_input_slot && used_compute_column_ids.contains(&compute_column_id) {
-            compute_column_id = allocate_project_boundary_synthetic_column_id(
-                &mut next_synthetic_column_id,
-                &mut used_output_column_ids,
-                &mut used_compute_column_ids,
-            )?;
-        }
-
-        if item.can_reuse_input_slot
-            && first_expr_index_by_column_id.contains_key(&compute_column_id)
-        {
-            // Repeated slot-ref projections share the same computed value but
-            // still need distinct visible output slots below.
-        } else {
-            let computed_idx = computed_columns.len();
-            first_expr_index_by_column_id.insert(compute_column_id, computed_idx);
-            used_compute_column_ids.insert(compute_column_id);
-            computed_columns.push(compute_column_id);
-        }
-
-        let output_column_id = if used_output_column_ids.insert(item.output_column_id) {
-            item.output_column_id
-        } else {
-            allocate_project_boundary_synthetic_column_id(
-                &mut next_synthetic_column_id,
-                &mut used_output_column_ids,
-                &mut used_compute_column_ids,
-            )?
-        };
-        output_columns.push(common::OutputColumn {
-            column_id: output_column_id,
-            name: item.output_name,
-            r#type: Some(item.r#type),
-            nullable: item.nullable,
-            is_internal: false,
-        });
-    }
-
-    Ok(output_columns)
-}
-
-fn encoded_project_item_output(
-    (idx, item): (usize, &plan::ProjectItem),
-) -> Result<EncodedProjectItemOutput, String> {
-    let expr = item
-        .expr
-        .as_ref()
-        .ok_or_else(|| format!("native stream source project item {} missing expr", idx))?;
-    let r#type = expr.r#type.clone().ok_or_else(|| {
-        format!(
-            "native stream source project item {} missing expr type",
-            idx
-        )
-    })?;
-    let (preferred_compute_column_id, can_reuse_input_slot) = match expr.kind.as_ref() {
-        Some(crate::proto::expr::expr::Kind::ColumnRef(column)) => (column.column_id, true),
-        _ => (item.output_column_id, false),
-    };
-    Ok(EncodedProjectItemOutput {
-        preferred_compute_column_id,
-        output_column_id: item.output_column_id,
-        can_reuse_input_slot,
-        output_name: item.output_name.clone(),
-        r#type,
-        nullable: expr.nullable,
-    })
-}
-
-fn allocate_project_boundary_synthetic_column_id(
-    next_synthetic_column_id: &mut u32,
-    used_output_column_ids: &mut HashSet<u32>,
-    used_compute_column_ids: &mut HashSet<u32>,
-) -> Result<u32, String> {
-    while used_output_column_ids.contains(next_synthetic_column_id)
-        || used_compute_column_ids.contains(next_synthetic_column_id)
-    {
-        *next_synthetic_column_id = next_synthetic_column_id
-            .checked_add(1)
-            .ok_or_else(|| "ProjectNode cannot allocate synthetic output column id".to_string())?;
-    }
-    let synthetic = *next_synthetic_column_id;
-    used_output_column_ids.insert(synthetic);
-    used_compute_column_ids.insert(synthetic);
-    *next_synthetic_column_id = next_synthetic_column_id
-        .checked_add(1)
-        .ok_or_else(|| "ProjectNode cannot allocate synthetic output column id".to_string())?;
-    Ok(synthetic)
-}
-
-fn project_output_columns_for_edge(
-    columns: Vec<common::OutputColumn>,
-    source_output_columns: &[AnalysisOutputColumn],
-    output_slot_ids: &[i32],
-) -> Result<Vec<common::OutputColumn>, String> {
-    if output_slot_ids.is_empty() {
-        return Ok(columns);
-    }
-    if !source_output_columns.is_empty() {
-        let source_encoded_columns = encode_output_columns(source_output_columns)?;
-        let mut ordinals_by_column_id: HashMap<u32, Vec<usize>> = HashMap::new();
-        for (idx, column) in source_output_columns.iter().enumerate() {
-            ordinals_by_column_id
-                .entry(column.column_id.0)
-                .or_default()
-                .push(idx);
-        }
-        let columns_by_id = columns
-            .iter()
-            .cloned()
-            .map(|column| (column.column_id, column))
-            .collect::<HashMap<_, _>>();
-        let mut next_ordinal_by_column_id = HashMap::new();
-        let mut resolved = Vec::with_capacity(output_slot_ids.len());
-        let mut resolved_all_by_ordinal = true;
-        for slot_id in output_slot_ids {
-            let column_id = u32::try_from(*slot_id).map_err(|_| {
-                format!("native stream edge output slot id {slot_id} cannot convert to u32")
-            })?;
-            let next = next_ordinal_by_column_id.entry(column_id).or_insert(0);
-            let Some(ordinals) = ordinals_by_column_id.get(&column_id) else {
-                resolved_all_by_ordinal = false;
-                break;
-            };
-            let Some(ordinal) = ordinals.get(*next).copied() else {
-                resolved_all_by_ordinal = false;
-                break;
-            };
-            if ordinal >= source_encoded_columns.len() {
-                resolved_all_by_ordinal = false;
-                break;
-            }
-            *next += 1;
-            let source_column = source_encoded_columns.get(ordinal).ok_or_else(|| {
-                format!("native stream edge source output ordinal {ordinal} is missing")
-            })?;
-            let encoded = if ordinals.len() > 1 {
-                columns
-                    .get(ordinal)
-                    .cloned()
-                    .or_else(|| columns_by_id.get(&source_column.column_id).cloned())
-            } else {
-                columns_by_id
-                    .get(&source_column.column_id)
-                    .cloned()
-                    .or_else(|| {
-                        if source_encoded_columns.len() == columns.len() {
-                            columns.get(ordinal).cloned()
-                        } else {
-                            None
-                        }
-                    })
-            };
-            let Some(encoded) = encoded else {
-                resolved_all_by_ordinal = false;
-                break;
-            };
-            resolved.push(encoded);
-        }
-        if resolved_all_by_ordinal {
-            return Ok(resolved);
-        }
-    }
-    let columns_by_id = columns
-        .iter()
-        .cloned()
-        .map(|column| (column.column_id, column))
-        .collect::<HashMap<_, _>>();
-    let mut resolved = Vec::with_capacity(output_slot_ids.len());
-    let mut missing_slot_id = None;
-    for slot_id in output_slot_ids.iter().copied() {
-        let column_id = u32::try_from(slot_id).map_err(|_| {
-            format!("native stream edge output slot id {slot_id} cannot convert to u32")
-        })?;
-        if let Some(column) = columns_by_id.get(&column_id) {
-            resolved.push(column.clone());
-        } else {
-            missing_slot_id = Some(slot_id);
-            break;
-        }
-    }
-    if missing_slot_id.is_none() {
-        return Ok(resolved);
-    }
-    if output_slot_ids.len() >= columns.len() {
-        return Ok(columns);
-    }
-    let missing_slot_id = missing_slot_id.expect("checked above");
-    Err(format!(
-        "native stream edge output slot id {missing_slot_id} missing from source output columns"
-    ))
-}
-
-fn project_output_columns_for_requested_exchange(
-    columns: Vec<common::OutputColumn>,
-    source_output_columns: &[AnalysisOutputColumn],
-    requested_columns: &[common::OutputColumn],
-) -> Result<Option<Vec<common::OutputColumn>>, String> {
-    if requested_columns.is_empty() {
-        return Ok(None);
-    }
-    let requested_slot_ids = requested_columns
-        .iter()
-        .map(|column| {
-            i32::try_from(column.column_id).map_err(|_| {
-                format!(
-                    "native stream target exchange output column {} cannot convert to slot id",
-                    column.column_id
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    match project_output_columns_for_edge(columns, source_output_columns, &requested_slot_ids) {
-        Ok(projected) if projected.len() == requested_columns.len() => Ok(Some(projected)),
-        Ok(_) => Ok(None),
-        Err(err) if err.contains("missing from source output columns") => Ok(None),
-        Err(err) => Err(err),
-    }
-}
-
-fn encoded_exchange_receiver_output_columns(
-    fragment: &plan::PlanFragment,
-    target_exchange_node_id: i32,
-) -> Result<Vec<common::OutputColumn>, String> {
-    let root = fragment
-        .root
-        .as_ref()
-        .ok_or_else(|| format!("native fragment {} missing root", fragment.fragment_id))?;
-    find_exchange_receiver_output_columns(root, target_exchange_node_id).ok_or_else(|| {
-        format!(
-            "native stream edge target fragment {} missing exchange node {}",
-            fragment.fragment_id, target_exchange_node_id
-        )
-    })
-}
-
-fn find_exchange_receiver_output_columns(
-    node: &plan::DistributedNode,
-    target_exchange_node_id: i32,
-) -> Option<Vec<common::OutputColumn>> {
-    if node.node_id == target_exchange_node_id
-        && let Some(plan::distributed_node::Payload::Exchange(exchange)) = node.payload.as_ref()
-    {
-        return Some(exchange.output_columns.clone());
-    }
-    node.children
-        .iter()
-        .find_map(|child| find_exchange_receiver_output_columns(child, target_exchange_node_id))
-}
-
-fn patch_exchange_receiver_output_columns(
-    fragment: &mut plan::PlanFragment,
-    target_exchange_node_id: i32,
-    output_columns: Vec<common::OutputColumn>,
-) -> Result<(), String> {
-    let root = fragment
-        .root
-        .as_mut()
-        .ok_or_else(|| format!("native fragment {} missing root", fragment.fragment_id))?;
-    if patch_exchange_receiver_output_columns_in_node(
-        root,
-        target_exchange_node_id,
-        &output_columns,
-    ) {
-        normalize_encoded_subtree_output_columns(root)?;
-        return Ok(());
-    }
-    Err(format!(
-        "native stream edge target fragment {} missing exchange node {}",
-        fragment.fragment_id, target_exchange_node_id
-    ))
-}
-
-fn patch_exchange_receiver_output_columns_in_node(
-    node: &mut plan::DistributedNode,
-    target_exchange_node_id: i32,
-    output_columns: &[common::OutputColumn],
-) -> bool {
-    if node.node_id == target_exchange_node_id
-        && let Some(plan::distributed_node::Payload::Exchange(exchange)) = node.payload.as_mut()
-    {
-        exchange.output_columns = output_columns.to_vec();
-        return true;
-    }
-    node.children.iter_mut().any(|child| {
-        patch_exchange_receiver_output_columns_in_node(
-            child,
-            target_exchange_node_id,
-            output_columns,
-        )
-    })
-}
-
-fn normalize_encoded_subtree_output_columns(
-    node: &mut plan::DistributedNode,
-) -> Result<(), String> {
-    for child in &mut node.children {
-        normalize_encoded_subtree_output_columns(child)?;
-    }
-    normalize_encoded_node_output_columns(node)
-}
-
-#[cfg(test)]
-pub(crate) fn encode_plan_fragment(src: &PlanFragment) -> Result<plan::PlanFragment, String> {
-    encode_plan_fragment_with_context(
-        src,
-        &NativePlanEncodeContext {
-            scan_bindings: None,
-        },
-    )
 }
 
 fn encode_plan_fragment_with_context(
@@ -702,13 +228,13 @@ fn encode_plan_fragment_with_context(
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::PlanFragment, String> {
     let root = encode_node_with_context(&src.root, ctx)?;
-    let (output_exprs, output_columns) = encode_fragment_output_contract(src, &root)?;
+    let (output_exprs, output_columns) = encode_fragment_output_contract(src, ctx)?;
     Ok(plan::PlanFragment {
         fragment_id: src.fragment_id,
         root: Some(root),
         data_partition: Some(encode_data_partition(&src.data_partition)?),
         output_partition: Some(encode_data_partition(&src.output_partition)?),
-        sink: Some(encode_data_sink(&src.sink, &src.output_columns)?),
+        sink: Some(encode_data_sink(&src.sink, src.fragment_id, ctx)?),
         output_exprs,
         output_columns,
         cte_id: src.cte_id,
@@ -726,35 +252,42 @@ fn encode_plan_fragment_with_context(
 
 fn encode_fragment_output_contract(
     src: &PlanFragment,
-    encoded_root: &plan::DistributedNode,
+    ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<(Vec<crate::proto::expr::Expr>, Vec<common::OutputColumn>), String> {
-    if let DataSink::IcebergWrite(sink) = &src.sink {
-        let output_exprs = if let Some(exprs) = src.output_exprs.as_ref() {
-            if exprs.len() != sink.spec.target_columns.len() {
-                return Err(format!(
-                    "native Iceberg write fragment output_exprs count {} does not match target column count {}",
-                    exprs.len(),
-                    sink.spec.target_columns.len()
-                ));
-            }
-            encode_exprs(exprs)?
-        } else {
-            let sink_columns =
-                iceberg_write_sink_columns_for_input(&src.output_columns, &sink.input)?;
-            if sink_columns.len() != sink.spec.target_columns.len() {
-                return Err(format!(
-                    "native Iceberg write sink input column count {} does not match target column count {}",
-                    sink_columns.len(),
-                    sink.spec.target_columns.len()
-                ));
-            }
-            let exprs = sink_columns
-                .iter()
-                .map(column_ref_expr_for_output_column)
-                .collect::<Vec<_>>();
-            encode_exprs(&exprs)?
-        };
-        let output_columns = encode_iceberg_write_sink_output_columns(&sink.spec.target_columns)?;
+    if matches!(src.sink, DataSink::IcebergWrite(_)) {
+        // The planner finalized the write output expressions and target output
+        // schema at seal (CGO-9C Task 3). The encoder maps them 1:1 instead of
+        // synthesizing the target schema or falling back to the fragment's output
+        // columns / input binding.
+        let contract = ctx
+            .write_contracts
+            .ok_or_else(|| {
+                format!(
+                    "native Iceberg write fragment {} has no sealed write contract",
+                    src.fragment_id
+                )
+            })?
+            .iceberg_write_output(src.fragment_id)
+            .ok_or_else(|| {
+                format!(
+                    "native Iceberg write fragment {} is missing from the sealed write contract",
+                    src.fragment_id
+                )
+            })?;
+        let output_exprs = encode_exprs(&contract.output_exprs)?;
+        let output_columns = contract
+            .target_schema
+            .iter()
+            .map(|column| {
+                Ok(common::OutputColumn {
+                    column_id: column.column_id,
+                    name: column.name.clone(),
+                    r#type: Some(encode_type(&column.data_type)?),
+                    nullable: column.nullable,
+                    is_internal: column.is_internal,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         return Ok((output_exprs, output_columns));
     }
 
@@ -764,94 +297,34 @@ fn encode_fragment_output_contract(
         .map(|exprs| encode_exprs(exprs))
         .transpose()?
         .unwrap_or_default();
-    let output_columns = encode_fragment_execution_output_columns(src, encoded_root)?;
+    let output_columns = encode_finalized_fragment_output_columns(src, ctx)?;
     Ok((output_exprs, output_columns))
 }
 
-fn encode_fragment_execution_output_columns(
+/// Map a fragment's finalized output columns from the sealed fragment/edge
+/// contract. The planner already reconciled the fragment's declared output with
+/// its root's execution output (unique wire ids for re-materialized projections,
+/// producer fragments forwarding their root wholesale); the encoder maps the
+/// result 1:1 instead of re-walking the encoded tree or falling back.
+fn encode_finalized_fragment_output_columns(
     src: &PlanFragment,
-    encoded_root: &plan::DistributedNode,
+    ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<Vec<common::OutputColumn>, String> {
-    match encoded_node_output_columns(encoded_root) {
-        Ok(root_output_columns)
-            if src.output_columns.is_empty() && matches!(src.sink, DataSink::Noop) =>
-        {
-            Ok(root_output_columns)
-        }
-        Ok(_) if src.output_columns.is_empty() => Ok(Vec::new()),
-        Ok(root_output_columns) if root_output_columns.is_empty() => {
-            encode_output_columns(&src.output_columns)
-        }
-        Ok(root_output_columns) if root_output_columns.len() == src.output_columns.len() => {
-            Ok(root_output_columns)
-        }
-        Ok(root_output_columns) if matches!(src.sink, DataSink::Noop) => Ok(root_output_columns),
-        Ok(root_output_columns) => Err(format!(
-            "native fragment {} root output column count {} does not match fragment output column count {}",
-            src.fragment_id,
-            root_output_columns.len(),
-            src.output_columns.len()
-        )),
-        Err(root_err) => encode_output_columns(&src.output_columns).map_err(|source_err| {
+    let catalog = ctx.fragment_edge_outputs.ok_or_else(|| {
+        format!(
+            "native fragment {} has no sealed output contract",
+            src.fragment_id
+        )
+    })?;
+    let columns = catalog
+        .fragment_output_columns(src.fragment_id)
+        .ok_or_else(|| {
             format!(
-                "native fragment {} root output unavailable ({root_err}); fragment output encoding failed: {source_err}",
+                "native fragment {} is missing from the sealed output contract",
                 src.fragment_id
             )
-        }),
-    }
-}
-
-fn iceberg_write_sink_columns_for_input(
-    output_columns: &[AnalysisOutputColumn],
-    input: &IcebergWriteInputBinding,
-) -> Result<Vec<AnalysisOutputColumn>, String> {
-    match input {
-        IcebergWriteInputBinding::RootOutputByOrdinal => Ok(output_columns.to_vec()),
-        IcebergWriteInputBinding::OutputOrdinals(ordinals) => ordinals
-            .iter()
-            .copied()
-            .map(|ordinal| {
-                output_columns.get(ordinal).cloned().ok_or_else(|| {
-                    format!("native Iceberg write sink output ordinal {ordinal} is out of range")
-                })
-            })
-            .collect(),
-    }
-}
-
-fn column_ref_expr_for_output_column(column: &AnalysisOutputColumn) -> TypedExpr {
-    TypedExpr {
-        kind: ExprKind::ColumnRef {
-            column_id: column.column_id,
-            qualifier: None,
-            column: column.name.clone(),
-        },
-        data_type: column.data_type.clone(),
-        nullable: column.nullable,
-    }
-}
-
-fn encode_iceberg_write_sink_output_columns(
-    target_columns: &[catalog::ColumnDef],
-) -> Result<Vec<common::OutputColumn>, String> {
-    target_columns
-        .iter()
-        .enumerate()
-        .map(|(idx, column)| {
-            let ordinal = idx
-                .checked_add(1)
-                .ok_or_else(|| "native Iceberg write sink output ordinal overflow".to_string())?;
-            let column_id = u32::try_from(ordinal)
-                .map_err(|_| "native Iceberg write sink output column id overflow".to_string())?;
-            Ok(common::OutputColumn {
-                column_id,
-                name: column.name.clone(),
-                r#type: Some(encode_type(&column.data_type)?),
-                nullable: column.nullable,
-                is_internal: false,
-            })
-        })
-        .collect()
+        })?;
+    encode_output_columns(columns)
 }
 
 #[cfg(test)]
@@ -860,6 +333,9 @@ pub(crate) fn encode_node(src: &DistributedNode) -> Result<plan::DistributedNode
         src,
         &NativePlanEncodeContext {
             scan_bindings: None,
+            node_outputs: None,
+            fragment_edge_outputs: None,
+            write_contracts: None,
         },
     )
 }
@@ -875,7 +351,20 @@ pub(crate) fn encode_node_with_context(
         .collect::<Result<Vec<_>, _>>()?;
     let payload = match &src.payload {
         DistributedNodeKind::Exchange(exchange) => {
-            plan::distributed_node::Payload::Exchange(encode_exchange_receiver(exchange)?)
+            // A stream-edge receiver carries exactly the edge's finalized
+            // projection (the planner's authoritative reconciliation of this
+            // receiver against what its source fragment sends); the encoder maps
+            // it 1:1 here instead of a later exchange-receiver patch. A receiver
+            // that is not a finalized stream-edge target (a CTE-multicast or
+            // change-stream-router receiver) keeps its declared columns.
+            let output_columns = ctx
+                .fragment_edge_outputs
+                .and_then(|catalog| catalog.stream_edge_projection(src.fragment_id, src.node_id))
+                .unwrap_or(&exchange.output_columns);
+            plan::distributed_node::Payload::Exchange(encode_exchange_receiver(
+                exchange,
+                output_columns,
+            )?)
         }
         other => {
             let physical = crate::sql::planner::distributed::distributed_kind_to_physical(other);
@@ -905,274 +394,85 @@ pub(crate) fn encode_node_with_context(
         children,
         payload: Some(payload),
     };
-    normalize_encoded_node_output_columns(&mut node)?;
+    apply_sealed_node_output_columns(&mut node, src, ctx)?;
     Ok(node)
 }
 
-fn normalize_encoded_node_output_columns(node: &mut plan::DistributedNode) -> Result<(), String> {
-    let normalized_join_output_columns = match node.payload.as_ref() {
-        Some(plan::distributed_node::Payload::Physical(physical)) => match physical.kind.as_ref() {
-            Some(plan::plan_node::Kind::HashJoin(join)) => Some(normalize_join_output_columns(
-                join.join_type,
-                &physical.output_columns,
-                &node.children,
-                "HashJoinNode",
-            )?),
-            Some(plan::plan_node::Kind::NestLoopJoin(join)) => Some(normalize_join_output_columns(
-                join.join_type,
-                &physical.output_columns,
-                &node.children,
-                "NestLoopJoinNode",
-            )?),
-            _ => None,
-        },
-        _ => None,
-    };
-    if let Some(output_columns) = normalized_join_output_columns {
-        if let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_mut() {
-            physical.output_columns = output_columns;
-        }
+/// Bind the encoded node's execution output columns from the sealed node-output
+/// contract for the covered kinds (join / scan / set-op / sort / hash-aggregate).
+/// The planner has already finalized and validated those outputs at seal time, so
+/// the encoder maps them 1:1 here rather than re-deriving or repairing them.
+///
+/// A `HashAggregate` additionally carries a finalized group-key + aggregate-state
+/// wire layout (with per-mode intermediate types applied); this maps that layout —
+/// and the visible-or-full output columns — into the `HashAggregateNode` payload,
+/// replacing the raw baseline `encode_physical_node` produced. The intermediate
+/// aggregate-state type determination lives entirely in the planner.
+///
+/// `ctx.node_outputs` is `None` only in the bare-node encoder unit tests, which
+/// have no sealed plan; there the payload columns encoded by `encode_physical_node`
+/// already stand (the same data the catalog is built from).
+fn apply_sealed_node_output_columns(
+    node: &mut plan::DistributedNode,
+    src: &DistributedNode,
+    ctx: &NativePlanEncodeContext<'_>,
+) -> Result<(), String> {
+    let Some(catalog) = ctx.node_outputs else {
         return Ok(());
-    }
-
-    let normalized_scan_columns = match node.payload.as_ref() {
-        Some(plan::distributed_node::Payload::Physical(physical)) => match physical.kind.as_ref() {
-            Some(plan::plan_node::Kind::Scan(scan))
-                if output_columns_have_duplicate_ids(&scan.columns)
-                    || !scan.required_columns.is_empty() =>
-            {
-                let scan_columns = if output_columns_have_duplicate_ids(&scan.columns) {
-                    deduplicate_output_columns_by_id(&scan.columns)
-                } else {
-                    scan.columns.clone()
-                };
-                let output_columns = encoded_scan_output_columns_from_columns(
-                    &scan_columns,
-                    &scan.required_columns,
-                )?;
-                Some((output_columns, scan_columns))
-            }
-            _ => None,
-        },
-        _ => None,
     };
-    if let Some((output_columns, scan_columns)) = normalized_scan_columns {
-        if let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_mut() {
-            physical.output_columns = output_columns.clone();
-            if let Some(plan::plan_node::Kind::Scan(scan)) = physical.kind.as_mut() {
-                scan.columns = scan_columns;
-            }
-        }
+    let Some(output) = catalog.output_for(src.fragment_id, src.node_id) else {
+        // Not a covered kind; its output columns come straight from encoding.
         return Ok(());
-    }
-
-    let normalized_set_op_child_columns = match node.payload.as_ref() {
-        Some(plan::distributed_node::Payload::Physical(physical)) => match physical.kind.as_ref() {
-            Some(plan::plan_node::Kind::SetOp(set_op))
-                if !set_op.child_output_columns.is_empty()
-                    && set_op.child_output_columns.len() == node.children.len() =>
-            {
-                let mut changed = false;
-                let mut child_output_columns =
-                    Vec::with_capacity(set_op.child_output_columns.len());
-                for (child_columns, child) in set_op.child_output_columns.iter().zip(&node.children)
-                {
-                    if output_columns_have_duplicate_ids(&child_columns.columns) {
-                        let normalized = encoded_node_output_columns(child)?;
-                        if normalized.len() != child_columns.columns.len() {
-                            return Err(format!(
-                                "SetOpNode child output column count {} does not match child output column count {}",
-                                child_columns.columns.len(),
-                                normalized.len()
-                            ));
-                        }
-                        child_output_columns.push(plan::OutputColumnList {
-                            columns: normalized,
-                        });
-                        changed = true;
-                    } else {
-                        child_output_columns.push(child_columns.clone());
-                    }
-                }
-                changed.then_some(child_output_columns)
-            }
-            _ => None,
-        },
-        _ => None,
     };
-    if let Some(child_output_columns) = normalized_set_op_child_columns
-        && let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_mut()
-        && let Some(plan::plan_node::Kind::SetOp(set_op)) = physical.kind.as_mut()
-    {
-        set_op.child_output_columns = child_output_columns;
-    }
-
-    let normalized_output_columns = match node.payload.as_ref() {
-        Some(plan::distributed_node::Payload::Physical(physical)) => match physical.kind.as_ref() {
-            Some(plan::plan_node::Kind::Sort(sort)) => {
-                let requested = if sort.output_columns.is_empty() {
-                    physical.output_columns.as_slice()
-                } else {
-                    sort.output_columns.as_slice()
-                };
-                if output_columns_have_duplicate_ids(requested) {
-                    Some(encoded_passthrough_boundary_output_columns(
-                        node, requested, "SortNode",
-                    )?)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        },
-        _ => None,
+    let output_columns = output
+        .columns
+        .iter()
+        .map(encode_node_execution_column)
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_mut() else {
+        return Err(format!(
+            "native node {} carries a sealed execution output but is not a physical payload",
+            src.node_id
+        ));
     };
+    physical.output_columns = output_columns;
 
-    if let Some(output_columns) = normalized_output_columns
-        && let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_mut()
-    {
-        physical.output_columns = output_columns.clone();
-        if let Some(plan::plan_node::Kind::Sort(sort)) = physical.kind.as_mut() {
-            sort.output_columns = output_columns;
-        }
+    // A HashAggregate maps its finalized wire layout (and visible output columns)
+    // 1:1 from the contract, overriding the raw baseline.
+    if matches!(physical.kind, Some(plan::plan_node::Kind::HashAggregate(_))) {
+        let layout = catalog
+            .aggregate_layout(src.fragment_id, src.node_id)
+            .ok_or_else(|| {
+                format!(
+                    "native HashAggregate node {} has a covered execution output but no sealed wire layout",
+                    src.node_id
+                )
+            })?;
+        let group_key_columns = encode_output_columns(&layout.group_key_columns)?;
+        let aggregate_columns = encode_output_columns(&layout.aggregate_columns)?;
+        let visible_output_columns = physical.output_columns.clone();
+        let Some(plan::plan_node::Kind::HashAggregate(aggregate)) = physical.kind.as_mut() else {
+            unreachable!("physical.kind was just matched as HashAggregate");
+        };
+        aggregate.output_layout = Some(plan::AggregateOutputLayout {
+            group_key_columns,
+            aggregate_columns,
+        });
+        aggregate.output_columns = visible_output_columns;
     }
     Ok(())
 }
 
-fn normalize_join_output_columns(
-    join_type: i32,
-    requested: &[common::OutputColumn],
-    children: &[plan::DistributedNode],
-    node_kind: &str,
-) -> Result<Vec<common::OutputColumn>, String> {
-    let [left, right] = children else {
-        return Ok(requested.to_vec());
-    };
-    let left = encoded_node_output_columns(left)?;
-    let right = encoded_node_output_columns(right)?;
-    let derived = derive_join_output_columns(join_type, left, right, node_kind)?;
-    if requested.is_empty() || !same_output_column_ids(requested, &derived) {
-        return Ok(derived);
-    }
-    Ok(requested.to_vec())
-}
-
-fn derive_join_output_columns(
-    join_type: i32,
-    left: Vec<common::OutputColumn>,
-    right: Vec<common::OutputColumn>,
-    node_kind: &str,
-) -> Result<Vec<common::OutputColumn>, String> {
-    let join_type = plan::JoinKind::try_from(join_type)
-        .map_err(|_| format!("{node_kind} unknown join_type {join_type}"))?;
-    Ok(match join_type {
-        plan::JoinKind::Inner | plan::JoinKind::Cross => {
-            let mut out = left;
-            out.extend(right);
-            out
-        }
-        plan::JoinKind::LeftOuter => {
-            let mut out = left;
-            out.extend(nullable_output_columns(right));
-            out
-        }
-        plan::JoinKind::RightOuter => {
-            let mut out = nullable_output_columns(left);
-            out.extend(right);
-            out
-        }
-        plan::JoinKind::FullOuter => {
-            let mut out = nullable_output_columns(left);
-            out.extend(nullable_output_columns(right));
-            out
-        }
-        plan::JoinKind::LeftSemi | plan::JoinKind::LeftAnti | plan::JoinKind::NullAwareLeftAnti => {
-            left
-        }
-        plan::JoinKind::RightSemi | plan::JoinKind::RightAnti => right,
-        plan::JoinKind::Unspecified => {
-            return Err(format!("{node_kind} join_type is unspecified"));
-        }
+fn encode_node_execution_column(
+    column: &NodeExecutionColumn,
+) -> Result<common::OutputColumn, String> {
+    Ok(common::OutputColumn {
+        column_id: column.column_id.0,
+        name: column.name.clone(),
+        r#type: Some(encode_type(&column.data_type)?),
+        nullable: column.nullable,
+        is_internal: column.is_internal,
     })
-}
-
-fn nullable_output_columns(mut columns: Vec<common::OutputColumn>) -> Vec<common::OutputColumn> {
-    for column in &mut columns {
-        column.nullable = true;
-    }
-    columns
-}
-
-fn same_output_column_ids(left: &[common::OutputColumn], right: &[common::OutputColumn]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right.iter())
-            .all(|(left, right)| left.column_id == right.column_id)
-}
-
-fn encoded_scan_output_columns(scan: &plan::ScanNode) -> Result<Vec<common::OutputColumn>, String> {
-    encoded_scan_output_columns_from_columns(&scan.columns, &scan.required_columns)
-}
-
-fn encoded_scan_output_columns_from_columns(
-    columns: &[common::OutputColumn],
-    required_columns: &[String],
-) -> Result<Vec<common::OutputColumn>, String> {
-    if columns.is_empty() {
-        return Err("ScanNode columns are empty".to_string());
-    }
-    if required_columns.is_empty() {
-        return Ok(columns.to_vec());
-    }
-
-    let required = required_columns
-        .iter()
-        .map(|name| name.to_ascii_lowercase())
-        .collect::<HashSet<_>>();
-    let output_columns = columns
-        .iter()
-        .filter(|column| required.contains(&column.name.to_ascii_lowercase()))
-        .cloned()
-        .collect::<Vec<_>>();
-    if output_columns.is_empty() {
-        return Err(format!(
-            "ScanNode required_columns {:?} do not match any scan columns",
-            required_columns
-        ));
-    }
-    Ok(output_columns)
-}
-
-fn encoded_passthrough_boundary_output_columns(
-    node: &plan::DistributedNode,
-    requested: &[common::OutputColumn],
-    context: &str,
-) -> Result<Vec<common::OutputColumn>, String> {
-    let child_output_columns = encoded_unary_passthrough_output_columns(node, context)?;
-    if child_output_columns.len() != requested.len() {
-        return Err(format!(
-            "{context} node {} duplicate output column count {} does not match child output column count {}",
-            node.node_id,
-            requested.len(),
-            child_output_columns.len()
-        ));
-    }
-    Ok(child_output_columns)
-}
-
-fn output_columns_have_duplicate_ids(columns: &[common::OutputColumn]) -> bool {
-    let mut seen = HashSet::with_capacity(columns.len());
-    columns.iter().any(|column| !seen.insert(column.column_id))
-}
-
-fn deduplicate_output_columns_by_id(columns: &[common::OutputColumn]) -> Vec<common::OutputColumn> {
-    let mut seen = HashSet::with_capacity(columns.len());
-    columns
-        .iter()
-        .filter(|column| seen.insert(column.column_id))
-        .cloned()
-        .collect()
 }
 
 #[cfg(test)]
@@ -1399,9 +699,20 @@ fn encode_physical_node(
             }),
         ),
         PhysicalPlanKind::HashAggregate(node) => {
-            let wire = hash_aggregate_wire_output_columns(node)?;
+            // Baseline raw layout/output columns straight from the physical payload.
+            // In a sealed plan `apply_sealed_node_output_columns` overwrites both the
+            // node output columns and this `output_layout`/`output_columns` from the
+            // finalized aggregate contract (which applies the per-mode intermediate
+            // aggregate-state types). This raw form only stands in the bare-node
+            // encoder unit tests that have no sealed plan; the intermediate-type
+            // determination is owned by the planner (`finalize_hash_aggregate_wire`).
+            let raw_output_columns = if node.output_columns.is_empty() {
+                node.output_layout.full_output_columns()
+            } else {
+                node.output_columns.clone()
+            };
             (
-                encode_output_columns(&wire.output_columns)?,
+                encode_output_columns(&raw_output_columns)?,
                 Kind::HashAggregate(plan::HashAggregateNode {
                     mode: encode_agg_mode(node.mode),
                     group_by: encode_exprs(&node.group_by)?,
@@ -1421,10 +732,14 @@ fn encode_physical_node(
                         .collect::<Result<Vec<_>, String>>()?,
                     is_merge: node.is_merge.clone(),
                     output_layout: Some(plan::AggregateOutputLayout {
-                        group_key_columns: encode_output_columns(&wire.group_key_columns)?,
-                        aggregate_columns: encode_output_columns(&wire.aggregate_columns)?,
+                        group_key_columns: encode_output_columns(
+                            &node.output_layout.group_key_columns,
+                        )?,
+                        aggregate_columns: encode_output_columns(
+                            &node.output_layout.aggregate_columns,
+                        )?,
                     }),
-                    output_columns: encode_output_columns(&wire.output_columns)?,
+                    output_columns: encode_output_columns(&raw_output_columns)?,
                 }),
             )
         }
@@ -1552,98 +867,6 @@ fn encode_physical_node(
         output_columns,
         kind: Some(kind),
     })
-}
-
-struct HashAggregateWireOutputColumns {
-    group_key_columns: Vec<AnalysisOutputColumn>,
-    aggregate_columns: Vec<AnalysisOutputColumn>,
-    output_columns: Vec<AnalysisOutputColumn>,
-}
-
-fn hash_aggregate_wire_output_columns(
-    node: &PhysicalHashAggregateNode,
-) -> Result<HashAggregateWireOutputColumns, String> {
-    if node.output_layout.aggregate_columns.len() != node.aggregates.len() {
-        return Err(format!(
-            "native HashAggregate output_layout aggregate column count {} does not match aggregate count {}",
-            node.output_layout.aggregate_columns.len(),
-            node.aggregates.len()
-        ));
-    }
-
-    let group_key_columns = node.output_layout.group_key_columns.clone();
-    let mut aggregate_columns = node.output_layout.aggregate_columns.clone();
-    if hash_aggregate_outputs_intermediate(node.mode) {
-        for (idx, (column, call)) in aggregate_columns
-            .iter_mut()
-            .zip(node.aggregates.iter())
-            .enumerate()
-        {
-            column.data_type = aggregate_intermediate_type(call).map_err(|err| {
-                format!("native HashAggregate aggregate {idx} intermediate type: {err}")
-            })?;
-        }
-    }
-
-    let mut full_output_columns =
-        Vec::with_capacity(group_key_columns.len() + aggregate_columns.len());
-    full_output_columns.extend(group_key_columns.iter().cloned());
-    full_output_columns.extend(aggregate_columns.iter().cloned());
-
-    let output_columns = if node.output_columns.is_empty() {
-        full_output_columns
-    } else {
-        let data_type_by_id = full_output_columns
-            .iter()
-            .map(|column| (column.column_id, column.data_type.clone()))
-            .collect::<HashMap<_, _>>();
-        let mut output_columns = node.output_columns.clone();
-        for column in &mut output_columns {
-            let data_type = data_type_by_id.get(&column.column_id).ok_or_else(|| {
-                format!(
-                    "native HashAggregate output column {} missing from output_layout",
-                    column.column_id.0
-                )
-            })?;
-            column.data_type = data_type.clone();
-        }
-        output_columns
-    };
-
-    Ok(HashAggregateWireOutputColumns {
-        group_key_columns,
-        aggregate_columns,
-        output_columns,
-    })
-}
-
-fn hash_aggregate_outputs_intermediate(mode: AggMode) -> bool {
-    !matches!(mode, AggMode::Single | AggMode::Global)
-}
-
-fn aggregate_intermediate_type(call: &AggregateCall) -> Result<DataType, String> {
-    let function_name = aggregate_function_name(call);
-    let arg_types = call
-        .args
-        .iter()
-        .map(|arg| arg.data_type.clone())
-        .collect::<Vec<_>>();
-    infer_agg_function_types(&function_name, &arg_types, call.distinct)?
-        .1
-        .ok_or_else(|| format!("{} does not expose an intermediate type", function_name))
-}
-
-fn aggregate_function_name(call: &AggregateCall) -> String {
-    let name = call.name.to_ascii_lowercase();
-    if !call.distinct {
-        return name;
-    }
-    match name.as_str() {
-        "count" => "multi_distinct_count".to_string(),
-        "sum" => "multi_distinct_sum".to_string(),
-        "array_agg" => "array_agg_distinct".to_string(),
-        _ => name,
-    }
 }
 
 fn encode_row_count_assertion(assertion: PlanRowCountAssertion) -> i32 {
@@ -1774,12 +997,19 @@ fn encode_bound_scan_output_column(
     })
 }
 
-fn encode_exchange_receiver(src: &ExchangeReceiver) -> Result<plan::ExchangeReceiver, String> {
+/// Encode an exchange receiver. `output_columns` is the receiver's finalized
+/// wire schema: for a stream-edge target it is the planner's reconciled edge
+/// projection (kept equal to what the sender sends); otherwise it is the
+/// receiver's own declared columns.
+fn encode_exchange_receiver(
+    src: &ExchangeReceiver,
+    output_columns: &[AnalysisOutputColumn],
+) -> Result<plan::ExchangeReceiver, String> {
     Ok(plan::ExchangeReceiver {
         partition_type: encode_edge_partition_type(&src.partition),
         partition_exprs: encode_exprs(&src.partition.exprs)?,
         source_fragment_id: src.source_fragment_id,
-        output_columns: encode_output_columns(&src.output_columns)?,
+        output_columns: encode_output_columns(output_columns)?,
         output_qualifier: src.output_qualifier.clone(),
         flavor: Some(encode_exchange_flavor(&src.flavor)?),
     })
@@ -1833,7 +1063,8 @@ pub(crate) fn encode_data_partition(src: &DataPartition) -> Result<plan::DataPar
 
 fn encode_data_sink(
     src: &DataSink,
-    fragment_output_columns: &[AnalysisOutputColumn],
+    fragment_id: crate::sql::planner::distributed::FragmentId,
+    ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::DataSink, String> {
     use plan::data_sink::Kind;
 
@@ -1865,14 +1096,19 @@ fn encode_data_sink(
                                     .iter()
                                     .map(|value| usize_to_u64(*value))
                                     .collect(),
+                                // The ordinals still travel on the wire 1:1, but
+                                // the runtime consumes `output_partition` below;
+                                // the encoder no longer reconstructs the partition
+                                // expression from them (CGO-9C Task 3).
                                 output_partition_ordinals: branch
                                     .output_partition_ordinals
                                     .iter()
                                     .map(|value| usize_to_u64(*value))
                                     .collect(),
-                                output_partition: Some(encode_change_stream_branch_partition(
-                                    branch,
-                                    fragment_output_columns,
+                                output_partition: Some(encode_finalized_router_branch_partition(
+                                    ctx,
+                                    fragment_id,
+                                    branch.branch_id,
                                 )?),
                                 destinations: None,
                             })
@@ -1884,35 +1120,27 @@ fn encode_data_sink(
     })
 }
 
-fn encode_change_stream_branch_partition(
-    branch: &crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamBranchRoute,
-    fragment_output_columns: &[AnalysisOutputColumn],
+/// Map a change-stream router branch's finalized partition from the sealed write
+/// contract (CGO-9C Task 3). The planner already reconstructed the partition
+/// expression from the branch's ordinals against the router fragment's output
+/// columns at seal; the encoder maps the typed result 1:1.
+fn encode_finalized_router_branch_partition(
+    ctx: &NativePlanEncodeContext<'_>,
+    fragment_id: crate::sql::planner::distributed::FragmentId,
+    branch_id: i32,
 ) -> Result<plan::DataPartition, String> {
-    if branch.output_partition_ordinals.is_empty() {
-        return Ok(plan::DataPartition {
-            kind: plan::PartitionKind::Unpartitioned as i32,
-            exprs: Vec::new(),
-        });
-    }
-    let exprs = branch
-        .output_partition_ordinals
-        .iter()
-        .map(|ordinal| {
-            fragment_output_columns
-                .get(*ordinal)
-                .ok_or_else(|| {
-                    format!(
-                        "native Iceberg change-stream router branch {} partition ordinal {} is out of range",
-                        branch.branch_id, ordinal
-                    )
-                })
-                .map(column_ref_expr_for_output_column)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(plan::DataPartition {
-        kind: plan::PartitionKind::Hash as i32,
-        exprs: encode_exprs(&exprs)?,
-    })
+    let partition = ctx
+        .write_contracts
+        .ok_or_else(|| {
+            format!("native change-stream router fragment {fragment_id} has no sealed write contract")
+        })?
+        .router_branch_partition(fragment_id, branch_id)
+        .ok_or_else(|| {
+            format!(
+                "native change-stream router fragment {fragment_id} branch {branch_id} is missing from the sealed write contract"
+            )
+        })?;
+    encode_data_partition(partition)
 }
 
 fn encode_fragment_edge(src: &FragmentEdge) -> Result<plan::FragmentEdge, String> {
@@ -1993,6 +1221,9 @@ fn encode_table_def(src: &catalog::TableDef) -> Result<plan::TableDef, String> {
         None,
         &NativePlanEncodeContext {
             scan_bindings: None,
+            node_outputs: None,
+            fragment_edge_outputs: None,
+            write_contracts: None,
         },
     )
 }
@@ -3694,187 +2925,6 @@ mod tests {
     }
 
     #[test]
-    fn stream_edge_output_slots_use_root_slots_when_fragment_outputs_are_retagged() {
-        let root_columns = encode_output_columns(&[
-            output_column(3, "a", DataType::Int64),
-            output_column(4, "b", DataType::Int64),
-        ])
-        .expect("encode root columns");
-        let source_outputs = vec![
-            output_column(5, "a", DataType::Int64),
-            output_column(6, "b", DataType::Int64),
-        ];
-
-        let resolved = project_output_columns_for_edge(root_columns, &source_outputs, &[5, 6])
-            .expect("resolve stream edge output columns");
-
-        assert_eq!(
-            resolved
-                .iter()
-                .map(|column| column.column_id)
-                .collect::<Vec<_>>(),
-            vec![3, 4]
-        );
-    }
-
-    #[test]
-    fn stream_edge_output_slots_fall_back_to_root_when_requested_slots_are_stale_superset() {
-        let root_columns = encode_output_columns(&[
-            output_column(2, "l_partkey", DataType::Int64),
-            output_column(4, "l_shipdate", DataType::Date32),
-            output_column(1, "l_orderkey", DataType::Int64),
-            output_column(3, "l_suppkey", DataType::Int64),
-        ])
-        .expect("encode root columns");
-        let source_outputs = vec![
-            output_column(1, "l_orderkey", DataType::Int64),
-            output_column(2, "l_partkey", DataType::Int64),
-            output_column(3, "l_suppkey", DataType::Int64),
-            output_column(4, "l_shipdate", DataType::Date32),
-            output_column(5, "col1", DataType::Utf8),
-        ];
-
-        let resolved =
-            project_output_columns_for_edge(root_columns, &source_outputs, &[1, 2, 3, 4, 5])
-                .expect("resolve stream edge output columns");
-
-        assert_eq!(
-            resolved
-                .iter()
-                .map(|column| column.column_id)
-                .collect::<Vec<_>>(),
-            vec![2, 4, 1, 3]
-        );
-    }
-
-    #[test]
-    fn stream_sink_projection_uses_unique_project_output_ids_for_duplicate_slots() {
-        let mut source = duplicate_projection_fragment_for_test(DataSink::Noop);
-        source.fragment_id = 1;
-        source.root.fragment_id = 1;
-        source.root.children[0].fragment_id = 1;
-
-        let target_output_columns = source.output_columns.clone();
-        let exchange = DistributedNode {
-            node_id: 20,
-            fragment_id: 0,
-            tuple_ids: vec![20],
-            nullable_tuple_ids: Vec::new(),
-            limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
-            children: Vec::new(),
-            stats: stats(),
-            payload: DistributedNodeKind::Exchange(ExchangeReceiver {
-                partition: DataPartition::unpartitioned(),
-                source_fragment_id: 1,
-                output_columns: target_output_columns.clone(),
-                output_qualifier: None,
-                flavor: ExchangeFlavor::Distribution,
-            }),
-        };
-        let target = PlanFragment {
-            fragment_id: 0,
-            root: DistributedNode {
-                node_id: 21,
-                fragment_id: 0,
-                tuple_ids: vec![21],
-                nullable_tuple_ids: Vec::new(),
-                limit: -1,
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
-                children: vec![exchange],
-                stats: stats(),
-                payload: DistributedNodeKind::Sort(crate::sql::planner::payload::PlanSortNode {
-                    items: Vec::new(),
-                    analytic_partition_by: Vec::new(),
-                    output_columns: target_output_columns,
-                    offset: None,
-                    partition_limit: None,
-                    topn_type: None,
-                }),
-            },
-            data_partition: DataPartition::unpartitioned(),
-            output_partition: DataPartition::unpartitioned(),
-            sink: DataSink::Result,
-            output_exprs: None,
-            output_columns: Vec::new(),
-            cte_id: None,
-            cte_exchange_nodes: Vec::new(),
-        };
-        let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
-            fragments: vec![source, target],
-            root_fragment_id: 0,
-            runtime_filter_graph: RuntimeFilterGraph::default(),
-            edges: vec![FragmentEdge {
-                source_fragment_id: 1,
-                target_fragment_id: 0,
-                target_exchange_node_id: 20,
-                output_partition: DataPartition::unpartitioned(),
-                stream_kind: FragmentStreamKind::Gather,
-                edge_kind: FragmentEdgeKind::Stream,
-                output_slot_ids: vec![1, 1],
-            }],
-        };
-
-        let encoded = encode_distributed_plan(&plan).expect("encode native plan");
-
-        let source = encoded
-            .fragments
-            .iter()
-            .find(|fragment| fragment.fragment_id == 1)
-            .expect("source fragment");
-        let Some(plan::data_sink::Kind::DataStream(sink)) =
-            source.sink.as_ref().and_then(|sink| sink.kind.as_ref())
-        else {
-            panic!("expected DataStream sink");
-        };
-        assert_eq!(sink.output_columns, vec![1, 3]);
-
-        let target = encoded
-            .fragments
-            .iter()
-            .find(|fragment| fragment.fragment_id == 0)
-            .expect("target fragment");
-        let receiver = target.root.as_ref().expect("target root");
-        let Some(plan::distributed_node::Payload::Physical(physical)) = receiver.payload.as_ref()
-        else {
-            panic!("expected Sort root");
-        };
-        assert_eq!(
-            physical
-                .output_columns
-                .iter()
-                .map(|column| (column.column_id, column.name.as_str()))
-                .collect::<Vec<_>>(),
-            vec![(1, "c1"), (3, "c1")]
-        );
-        let Some(plan::plan_node::Kind::Sort(sort)) = physical.kind.as_ref() else {
-            panic!("expected Sort root");
-        };
-        assert_eq!(
-            sort.output_columns
-                .iter()
-                .map(|column| (column.column_id, column.name.as_str()))
-                .collect::<Vec<_>>(),
-            vec![(1, "c1"), (3, "c1")]
-        );
-        let receiver = receiver.children.first().expect("exchange child");
-        let Some(plan::distributed_node::Payload::Exchange(exchange)) = receiver.payload.as_ref()
-        else {
-            panic!("expected Exchange receiver");
-        };
-        assert_eq!(
-            exchange
-                .output_columns
-                .iter()
-                .map(|column| (column.column_id, column.name.as_str()))
-                .collect::<Vec<_>>(),
-            vec![(1, "c1"), (3, "c1")]
-        );
-    }
-
-    #[test]
     fn stream_sink_allows_zero_column_values_source() {
         let plan = two_fragment_zero_column_stream_plan_for_test();
 
@@ -3903,6 +2953,111 @@ mod tests {
             panic!("expected Exchange receiver");
         };
         assert!(exchange.output_columns.is_empty());
+    }
+
+    #[test]
+    fn encoded_join_output_maps_reconciled_children_not_stale_payload() {
+        // The join payload lists a stale id (999) that neither child produces --
+        // the divergence a marker/anti join or a pruned probe scan creates. The
+        // sealed node-output contract reconciles the join against its children,
+        // and the encoder maps that contract 1:1, so the encoded join emits
+        // [1, 2], not the stale [1, 2, 999]. Were the reconciliation missing, the
+        // encoder (now a pure map of the contract) would emit 999 and the BE sink
+        // would fail with "output_columns slot id 999 not found in chunk schema".
+        let left = output_column(1, "l_k", DataType::Int64);
+        let right = output_column(2, "r_k", DataType::Int64);
+        let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
+            fragments: vec![PlanFragment {
+                fragment_id: 0,
+                root: DistributedNode {
+                    node_id: 1,
+                    fragment_id: 0,
+                    tuple_ids: vec![1],
+                    nullable_tuple_ids: Vec::new(),
+                    limit: -1,
+                    build_runtime_filters: Vec::new(),
+                    probe_runtime_filters: Vec::new(),
+                    children: vec![
+                        DistributedNode {
+                            node_id: 2,
+                            fragment_id: 0,
+                            tuple_ids: vec![2],
+                            nullable_tuple_ids: Vec::new(),
+                            limit: -1,
+                            build_runtime_filters: Vec::new(),
+                            probe_runtime_filters: Vec::new(),
+                            children: Vec::new(),
+                            stats: stats(),
+                            payload: DistributedNodeKind::Values(
+                                crate::sql::planner::payload::PlanValuesNode {
+                                    rows: Vec::new(),
+                                    columns: vec![left.clone()],
+                                },
+                            ),
+                        },
+                        DistributedNode {
+                            node_id: 3,
+                            fragment_id: 0,
+                            tuple_ids: vec![3],
+                            nullable_tuple_ids: Vec::new(),
+                            limit: -1,
+                            build_runtime_filters: Vec::new(),
+                            probe_runtime_filters: Vec::new(),
+                            children: Vec::new(),
+                            stats: stats(),
+                            payload: DistributedNodeKind::Values(
+                                crate::sql::planner::payload::PlanValuesNode {
+                                    rows: Vec::new(),
+                                    columns: vec![right.clone()],
+                                },
+                            ),
+                        },
+                    ],
+                    stats: stats(),
+                    payload: DistributedNodeKind::HashJoin(Box::new(
+                        crate::sql::planner::physical::PhysicalHashJoinNode {
+                            join_type: JoinKind::Inner,
+                            eq_conditions: Vec::new(),
+                            other_condition: None,
+                            distribution: JoinDistribution::Unknown,
+                            execution_mode: None,
+                            build_runtime_filters: Vec::new(),
+                            output_columns: vec![
+                                left.clone(),
+                                right.clone(),
+                                output_column(999, "stale", DataType::Int64),
+                            ],
+                        },
+                    )),
+                },
+                data_partition: DataPartition::unpartitioned(),
+                output_partition: DataPartition::unpartitioned(),
+                sink: DataSink::Result,
+                output_exprs: None,
+                output_columns: vec![left.clone(), right.clone()],
+                cte_id: None,
+                cte_exchange_nodes: Vec::new(),
+            }],
+            root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
+            edges: Vec::new(),
+        };
+
+        let encoded = encode_distributed_plan(&plan).expect("encode native plan");
+        let root = encoded.fragments[0].root.as_ref().expect("root");
+        let Some(plan::distributed_node::Payload::Physical(physical)) = root.payload.as_ref()
+        else {
+            panic!("expected physical join root");
+        };
+        assert_eq!(
+            physical
+                .output_columns
+                .iter()
+                .map(|column| (column.column_id, column.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "l_k"), (2, "r_k")],
+            "the encoder maps the reconciled contract, dropping the stale id 999"
+        );
     }
 
     #[test]
@@ -3969,6 +3124,9 @@ mod tests {
             &plan,
             plan::NativePlanEncodeContext {
                 scan_bindings: Some(&bindings),
+                node_outputs: None,
+                fragment_edge_outputs: None,
+                write_contracts: None,
             },
         )
         .expect("encode prepared delta binding");
@@ -4053,6 +3211,9 @@ mod tests {
             &plan,
             NativePlanEncodeContext {
                 scan_bindings: Some(&bindings),
+                node_outputs: None,
+                fragment_edge_outputs: None,
+                write_contracts: None,
             },
         )
         .expect("encode ordinary Iceberg binding");
@@ -4166,6 +3327,9 @@ mod tests {
                 &plan,
                 NativePlanEncodeContext {
                     scan_bindings: Some(&bindings),
+                    node_outputs: None,
+                    fragment_edge_outputs: None,
+                    write_contracts: None,
                 },
             )
             .expect("encode refresh binding");
@@ -4235,6 +3399,9 @@ mod tests {
             &plan,
             NativePlanEncodeContext {
                 scan_bindings: Some(&ScanExecutionBindings::default()),
+                node_outputs: None,
+                fragment_edge_outputs: None,
+                write_contracts: None,
             },
         )
         .expect_err("delta source without prepared binding must fail");
@@ -4251,6 +3418,9 @@ mod tests {
             &plan,
             NativePlanEncodeContext {
                 scan_bindings: Some(&wrong_node),
+                node_outputs: None,
+                fragment_edge_outputs: None,
+                write_contracts: None,
             },
         )
         .expect_err("binding at another node id must not be reused");
@@ -4275,6 +3445,9 @@ mod tests {
             &plan,
             NativePlanEncodeContext {
                 scan_bindings: Some(&wrong_execution),
+                node_outputs: None,
+                fragment_edge_outputs: None,
+                write_contracts: None,
             },
         )
         .expect_err("delta source with file binding must fail");
@@ -4337,6 +3510,9 @@ mod tests {
             &plan,
             NativePlanEncodeContext {
                 scan_bindings: Some(&bindings),
+                node_outputs: None,
+                fragment_edge_outputs: None,
+                write_contracts: None,
             },
         )
         .expect("encode bound VARIANT scan");
@@ -4590,97 +3766,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn project_root_output_columns_allocate_unique_ids_for_duplicate_projection_items() {
-        let child_columns = vec![
-            output_column(1, "c1", DataType::Int64),
-            output_column(2, "c2", DataType::Int64),
-        ];
-        let duplicate_project = DistributedNode {
-            node_id: 30,
-            fragment_id: 0,
-            tuple_ids: vec![30],
-            nullable_tuple_ids: Vec::new(),
-            limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
-            children: vec![DistributedNode {
-                node_id: 29,
-                fragment_id: 0,
-                tuple_ids: vec![29],
-                nullable_tuple_ids: Vec::new(),
-                limit: -1,
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
-                children: Vec::new(),
-                stats: stats(),
-                payload: DistributedNodeKind::Values(
-                    crate::sql::planner::payload::PlanValuesNode {
-                        rows: Vec::new(),
-                        columns: child_columns,
-                    },
-                ),
-            }],
-            stats: stats(),
-            payload: DistributedNodeKind::Project(crate::sql::planner::payload::PlanProjectNode {
-                items: vec![
-                    crate::sql::analysis::ProjectItem {
-                        expr: crate::sql::analysis::TypedExpr {
-                            kind: crate::sql::analysis::ExprKind::ColumnRef {
-                                column_id: ColumnId::new_for_test(1),
-                                qualifier: None,
-                                column: "c1".to_string(),
-                            },
-                            data_type: DataType::Int64,
-                            nullable: false,
-                        },
-                        output_name: "c1".to_string(),
-                        output_column_id: ColumnId::new_for_test(1),
-                    },
-                    crate::sql::analysis::ProjectItem {
-                        expr: crate::sql::analysis::TypedExpr {
-                            kind: crate::sql::analysis::ExprKind::ColumnRef {
-                                column_id: ColumnId::new_for_test(1),
-                                qualifier: None,
-                                column: "c1".to_string(),
-                            },
-                            data_type: DataType::Int64,
-                            nullable: false,
-                        },
-                        output_name: "c1".to_string(),
-                        output_column_id: ColumnId::new_for_test(1),
-                    },
-                ],
-                output_qualifier: None,
-            }),
-        };
-        let encoded = encode_node(&duplicate_project).expect("encode node");
-
-        let columns = encoded_fragment_root_output_columns(&plan::PlanFragment {
-            fragment_id: 0,
-            root: Some(encoded),
-            data_partition: None,
-            output_partition: None,
-            sink: None,
-            output_exprs: Vec::new(),
-            output_columns: Vec::new(),
-            cte_id: None,
-            cte_exchange_nodes: Vec::new(),
-        })
-        .expect("root output columns");
-
-        assert_eq!(columns.len(), 2);
-        assert_eq!(columns[0].column_id, 1);
-        assert_eq!(columns[1].column_id, 3);
-        assert_eq!(
-            columns
-                .iter()
-                .map(|column| column.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["c1", "c1"]
-        );
-    }
-
     fn duplicate_projection_fragment_for_test(sink: DataSink) -> PlanFragment {
         let child_columns = vec![
             output_column(1, "c1", DataType::Int64),
@@ -4750,114 +3835,37 @@ mod tests {
     }
 
     #[test]
-    fn result_fragment_output_columns_follow_project_root_unique_ids() {
+    fn result_fragment_output_columns_map_finalized_project_root_unique_ids() {
+        // The encoder maps the fragment's finalized output columns from the
+        // sealed contract: a `SELECT c1, c1` project root's repeated id is made
+        // unique (1, then a synthetic 3) by planner finalization, and the encoder
+        // emits that 1:1.
         let fragment = duplicate_projection_fragment_for_test(DataSink::Result);
+        let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
+            fragments: vec![fragment],
+            root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
+            edges: Vec::new(),
+        };
 
-        let encoded = encode_plan_fragment(&fragment).expect("encode result fragment");
-
+        let encoded = encode_distributed_plan(&plan).expect("encode native plan");
+        let fragment = encoded
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == 0)
+            .expect("fragment 0");
         assert_eq!(
-            encoded
+            fragment
                 .output_columns
                 .iter()
-                .map(|column| column.column_id)
+                .map(|column| (column.column_id, column.name.as_str()))
                 .collect::<Vec<_>>(),
-            vec![1, 3]
-        );
-        assert_eq!(
-            encoded
-                .output_columns
-                .iter()
-                .map(|column| column.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["c1", "c1"]
+            vec![(1, "c1"), (3, "c1")]
         );
     }
 
     #[test]
-    fn noop_fragment_output_columns_follow_project_root_unique_ids() {
-        let fragment = duplicate_projection_fragment_for_test(DataSink::Noop);
-
-        let encoded = encode_plan_fragment(&fragment).expect("encode noop fragment");
-
-        assert_eq!(
-            encoded
-                .output_columns
-                .iter()
-                .map(|column| column.column_id)
-                .collect::<Vec<_>>(),
-            vec![1, 3]
-        );
-        assert_eq!(
-            encoded
-                .output_columns
-                .iter()
-                .map(|column| column.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["c1", "c1"]
-        );
-    }
-
-    #[test]
-    fn sort_output_columns_follow_child_unique_ids_for_duplicate_projection_items() {
-        let mut fragment = duplicate_projection_fragment_for_test(DataSink::Result);
-        let sort_output_columns = fragment.output_columns.clone();
-        let child = fragment.root;
-        fragment.root = DistributedNode {
-            node_id: 31,
-            fragment_id: 0,
-            tuple_ids: vec![31],
-            nullable_tuple_ids: Vec::new(),
-            limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
-            children: vec![child],
-            stats: stats(),
-            payload: DistributedNodeKind::Sort(crate::sql::planner::payload::PlanSortNode {
-                items: Vec::new(),
-                analytic_partition_by: Vec::new(),
-                output_columns: sort_output_columns,
-                offset: None,
-                partition_limit: None,
-                topn_type: None,
-            }),
-        };
-
-        let encoded = encode_plan_fragment(&fragment).expect("encode sort fragment");
-        let root = encoded.root.as_ref().expect("encoded root");
-        let Some(plan::distributed_node::Payload::Physical(physical)) = root.payload.as_ref()
-        else {
-            panic!("expected physical sort root");
-        };
-        assert_eq!(
-            physical
-                .output_columns
-                .iter()
-                .map(|column| column.column_id)
-                .collect::<Vec<_>>(),
-            vec![1, 3]
-        );
-        let Some(plan::plan_node::Kind::Sort(sort)) = physical.kind.as_ref() else {
-            panic!("expected sort root");
-        };
-        assert_eq!(
-            sort.output_columns
-                .iter()
-                .map(|column| column.column_id)
-                .collect::<Vec<_>>(),
-            vec![1, 3]
-        );
-        assert_eq!(
-            encoded
-                .output_columns
-                .iter()
-                .map(|column| column.column_id)
-                .collect::<Vec<_>>(),
-            vec![1, 3]
-        );
-    }
-
-    #[test]
-    fn topn_root_output_columns_follow_child_unique_ids_for_duplicate_projection_items() {
+    fn topn_root_fragment_output_columns_map_finalized_child_unique_ids() {
         let mut fragment = duplicate_projection_fragment_for_test(DataSink::Result);
         let child = fragment.root;
         fragment.root = DistributedNode {
@@ -4878,33 +3886,51 @@ mod tests {
                 is_split: false,
             }),
         };
+        let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
+            fragments: vec![fragment],
+            root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
+            edges: Vec::new(),
+        };
 
-        let encoded = encode_plan_fragment(&fragment).expect("encode topn fragment");
-
+        let encoded = encode_distributed_plan(&plan).expect("encode native plan");
+        let fragment = encoded
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == 0)
+            .expect("fragment 0");
         assert_eq!(
-            encoded
+            fragment
                 .output_columns
                 .iter()
                 .map(|column| column.column_id)
                 .collect::<Vec<_>>(),
-            vec![1, 3]
-        );
-        assert_eq!(
-            encoded_fragment_root_output_columns(&encoded)
-                .expect("root output columns")
-                .iter()
-                .map(|column| column.column_id)
-                .collect::<Vec<_>>(),
-            vec![1, 3]
+            vec![1, 3],
+            "a TopN root forwards its child's finalized unique-id output"
         );
     }
 
     #[test]
-    fn hash_join_root_output_columns_follow_join_schema() {
+    fn encoder_maps_sealed_join_output_columns_from_the_node_output_contract() {
         let output_columns = vec![
             output_column(1, "l_k", DataType::Int64),
             output_column(2, "r_k", DataType::Int64),
         ];
+        let child = |node_id: i32, column: OutputColumn| DistributedNode {
+            node_id,
+            fragment_id: 0,
+            tuple_ids: vec![node_id],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            stats: stats(),
+            payload: DistributedNodeKind::Values(crate::sql::planner::payload::PlanValuesNode {
+                rows: Vec::new(),
+                columns: vec![column],
+            }),
+        };
         let join = DistributedNode {
             node_id: 40,
             fragment_id: 0,
@@ -4913,7 +3939,10 @@ mod tests {
             limit: -1,
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
-            children: Vec::new(),
+            children: vec![
+                child(41, output_column(1, "l_k", DataType::Int64)),
+                child(42, output_column(2, "r_k", DataType::Int64)),
+            ],
             stats: stats(),
             payload: DistributedNodeKind::HashJoin(Box::new(
                 crate::sql::planner::physical::PhysicalHashJoinNode {
@@ -4927,25 +3956,75 @@ mod tests {
                 },
             )),
         };
+        let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
+            fragments: vec![PlanFragment {
+                fragment_id: 0,
+                root: join,
+                data_partition: DataPartition::unpartitioned(),
+                output_partition: DataPartition::unpartitioned(),
+                sink: DataSink::Result,
+                output_exprs: None,
+                output_columns: output_columns.clone(),
+                cte_id: None,
+                cte_exchange_nodes: Vec::new(),
+            }],
+            root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
+            edges: Vec::new(),
+        };
 
-        let encoded = encode_node(&join).expect("encode hash join");
+        // The sealed node-output contract is the authoritative source of the
+        // join's execution output.
+        let sealed = plan
+            .node_outputs()
+            .output_for(0, 40)
+            .expect("sealed join output");
+        let sealed_columns: Vec<(u32, &str)> = sealed
+            .columns
+            .iter()
+            .map(|column| (column.column_id.0, column.name.as_str()))
+            .collect();
+        assert_eq!(sealed_columns, vec![(1, "l_k"), (2, "r_k")]);
 
+        // The encoder maps that sealed contract 1:1 onto the wire, never
+        // re-deriving from the children or join type.
+        let encoded = encode_distributed_plan(&plan).expect("encode native plan");
+        let root = encoded.fragments[0].root.as_ref().expect("encoded root");
+        let Some(plan::distributed_node::Payload::Physical(physical)) = root.payload.as_ref()
+        else {
+            panic!("expected physical join root");
+        };
         assert_eq!(
-            encoded_node_output_columns(&encoded)
-                .expect("hash join output columns")
+            physical
+                .output_columns
                 .iter()
                 .map(|column| (column.column_id, column.name.as_str()))
                 .collect::<Vec<_>>(),
-            vec![(1, "l_k"), (2, "r_k")]
+            sealed_columns
         );
     }
 
     #[test]
-    fn nest_loop_join_root_output_columns_follow_join_schema() {
+    fn encoder_maps_sealed_nest_loop_join_output_columns_from_the_node_output_contract() {
         let output_columns = vec![
             output_column(1, "l_k", DataType::Int64),
             output_column(2, "r_k", DataType::Int64),
         ];
+        let child = |node_id: i32, column: OutputColumn| DistributedNode {
+            node_id,
+            fragment_id: 0,
+            tuple_ids: vec![node_id],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            stats: stats(),
+            payload: DistributedNodeKind::Values(crate::sql::planner::payload::PlanValuesNode {
+                rows: Vec::new(),
+                columns: vec![column],
+            }),
+        };
         let join = DistributedNode {
             node_id: 41,
             fragment_id: 0,
@@ -4954,7 +4033,10 @@ mod tests {
             limit: -1,
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
-            children: Vec::new(),
+            children: vec![
+                child(42, output_column(1, "l_k", DataType::Int64)),
+                child(43, output_column(2, "r_k", DataType::Int64)),
+            ],
             stats: stats(),
             payload: DistributedNodeKind::NestLoopJoin(
                 crate::sql::planner::physical::PhysicalNestLoopJoinNode {
@@ -4964,21 +4046,59 @@ mod tests {
                 },
             ),
         };
+        let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
+            fragments: vec![PlanFragment {
+                fragment_id: 0,
+                root: join,
+                data_partition: DataPartition::unpartitioned(),
+                output_partition: DataPartition::unpartitioned(),
+                sink: DataSink::Result,
+                output_exprs: None,
+                output_columns: output_columns.clone(),
+                cte_id: None,
+                cte_exchange_nodes: Vec::new(),
+            }],
+            root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
+            edges: Vec::new(),
+        };
 
-        let encoded = encode_node(&join).expect("encode nest loop join");
+        // The sealed node-output contract is the authoritative source of the
+        // nest-loop join's execution output.
+        let sealed = plan
+            .node_outputs()
+            .output_for(0, 41)
+            .expect("sealed nest loop join output");
+        let sealed_columns: Vec<(u32, &str)> = sealed
+            .columns
+            .iter()
+            .map(|column| (column.column_id.0, column.name.as_str()))
+            .collect();
+        assert_eq!(sealed_columns, vec![(1, "l_k"), (2, "r_k")]);
 
+        // The encoder maps that sealed contract 1:1 onto the wire, never
+        // re-deriving from the children or join type.
+        let encoded = encode_distributed_plan(&plan).expect("encode native plan");
+        let root = encoded.fragments[0].root.as_ref().expect("encoded root");
+        let Some(plan::distributed_node::Payload::Physical(physical)) = root.payload.as_ref()
+        else {
+            panic!("expected physical nest loop join root");
+        };
         assert_eq!(
-            encoded_node_output_columns(&encoded)
-                .expect("nest loop join output columns")
+            physical
+                .output_columns
                 .iter()
                 .map(|column| (column.column_id, column.name.as_str()))
                 .collect::<Vec<_>>(),
-            vec![(1, "l_k"), (2, "r_k")]
+            sealed_columns
         );
     }
 
     #[test]
-    fn assert_one_row_root_output_columns_follow_child_schema() {
+    fn assert_one_row_root_fragment_output_columns_follow_finalized_child_schema() {
+        // An AssertOneRow passthrough root has no independent output: the planner
+        // seal finalizes the fragment output from its child, and the encoder maps
+        // that sealed contract 1:1 (no re-derivation from the encoded tree).
         let child_column = output_column(1, "only_row", DataType::Int64);
         let node = DistributedNode {
             node_id: 42,
@@ -5010,12 +4130,32 @@ mod tests {
                 crate::sql::planner::payload::PlanAssertOneRowNode::global_at_most_one("select 1"),
             ),
         };
+        let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
+            fragments: vec![PlanFragment {
+                fragment_id: 0,
+                root: node,
+                data_partition: DataPartition::unpartitioned(),
+                output_partition: DataPartition::unpartitioned(),
+                sink: DataSink::Result,
+                output_exprs: None,
+                output_columns: vec![child_column],
+                cte_id: None,
+                cte_exchange_nodes: Vec::new(),
+            }],
+            root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
+            edges: Vec::new(),
+        };
 
-        let encoded = encode_node(&node).expect("encode assert one row");
-
+        let encoded = encode_distributed_plan(&plan).expect("encode native plan");
+        let fragment = encoded
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == 0)
+            .expect("fragment 0");
         assert_eq!(
-            encoded_node_output_columns(&encoded)
-                .expect("assert one row output columns")
+            fragment
+                .output_columns
                 .iter()
                 .map(|column| (column.column_id, column.name.as_str()))
                 .collect::<Vec<_>>(),
@@ -5024,19 +4164,16 @@ mod tests {
     }
 
     #[test]
-    fn sort_root_output_columns_follow_child_schema_when_physical_output_is_stale() {
-        let actual_columns = encode_output_columns(&[
+    fn sort_root_fragment_output_columns_follow_finalized_child_schema() {
+        // A Sort passthrough root forwards its child's finalized execution
+        // output. The planner seal owns that finalization (there is no stale
+        // physical output to "repair" anymore), and the encoder maps the sealed
+        // fragment output 1:1 rather than re-walking the encoded tree.
+        let child_columns = vec![
             output_column(4, "l_shipdate", DataType::Date32),
             output_column(1, "l_orderkey", DataType::Int64),
-        ])
-        .expect("encode actual columns");
-        let stale_columns = encode_output_columns(&[
-            output_column(1, "l_orderkey", DataType::Int64),
-            output_column(2, "l_partkey", DataType::Int64),
-            output_column(3, "l_suppkey", DataType::Int64),
-        ])
-        .expect("encode stale columns");
-        let node = plan::DistributedNode {
+        ];
+        let sort = DistributedNode {
             node_id: 42,
             fragment_id: 0,
             tuple_ids: vec![1],
@@ -5044,7 +4181,7 @@ mod tests {
             limit: -1,
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
-            children: vec![plan::DistributedNode {
+            children: vec![DistributedNode {
                 node_id: 41,
                 fragment_id: 0,
                 tuple_ids: vec![1],
@@ -5053,379 +4190,54 @@ mod tests {
                 build_runtime_filters: Vec::new(),
                 probe_runtime_filters: Vec::new(),
                 children: Vec::new(),
-                payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
-                    output_columns: actual_columns.clone(),
-                    kind: Some(plan::plan_node::Kind::Values(plan::ValuesNode {
+                stats: stats(),
+                payload: DistributedNodeKind::Values(
+                    crate::sql::planner::payload::PlanValuesNode {
                         rows: Vec::new(),
-                        columns: actual_columns.clone(),
-                    })),
-                })),
+                        columns: child_columns.clone(),
+                    },
+                ),
             }],
-            payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
-                output_columns: stale_columns,
-                kind: Some(plan::plan_node::Kind::Sort(plan::SortNode {
-                    items: Vec::new(),
-                    analytic_partition_by: Vec::new(),
-                    output_columns: Vec::new(),
-                    offset: None,
-                    partition_limit: None,
-                    topn_type: None,
-                })),
-            })),
+            stats: stats(),
+            payload: DistributedNodeKind::Sort(crate::sql::planner::payload::PlanSortNode {
+                items: Vec::new(),
+                analytic_partition_by: Vec::new(),
+                output_columns: child_columns.clone(),
+                offset: None,
+                partition_limit: None,
+                topn_type: None,
+            }),
+        };
+        let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
+            fragments: vec![PlanFragment {
+                fragment_id: 0,
+                root: sort,
+                data_partition: DataPartition::unpartitioned(),
+                output_partition: DataPartition::unpartitioned(),
+                sink: DataSink::Result,
+                output_exprs: None,
+                output_columns: child_columns,
+                cte_id: None,
+                cte_exchange_nodes: Vec::new(),
+            }],
+            root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
+            edges: Vec::new(),
         };
 
-        let resolved = encoded_node_output_columns(&node).expect("sort output columns");
-
+        let encoded = encode_distributed_plan(&plan).expect("encode native plan");
+        let fragment = encoded
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == 0)
+            .expect("fragment 0");
         assert_eq!(
-            resolved
+            fragment
+                .output_columns
                 .iter()
                 .map(|column| column.column_id)
                 .collect::<Vec<_>>(),
             vec![4, 1]
-        );
-    }
-
-    #[test]
-    fn stream_sink_projection_uses_join_child_schema_when_join_output_ids_are_stale() {
-        let actual_left = output_column(1, "l_k", DataType::Int64);
-        let actual_right = output_column(2, "r_k", DataType::Int64);
-        let stale_source_columns = vec![
-            output_column(10, "l_k", DataType::Int64),
-            output_column(11, "r_k", DataType::Int64),
-            output_column(999, "pruned", DataType::Int64),
-        ];
-        let receiver_columns = vec![
-            output_column(84, "l_k", DataType::Int64),
-            output_column(85, "r_k", DataType::Int64),
-        ];
-        let source = PlanFragment {
-            fragment_id: 1,
-            root: DistributedNode {
-                node_id: 10,
-                fragment_id: 1,
-                tuple_ids: vec![10, 11],
-                nullable_tuple_ids: Vec::new(),
-                limit: -1,
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
-                children: vec![
-                    DistributedNode {
-                        node_id: 11,
-                        fragment_id: 1,
-                        tuple_ids: vec![10],
-                        nullable_tuple_ids: Vec::new(),
-                        limit: -1,
-                        build_runtime_filters: Vec::new(),
-                        probe_runtime_filters: Vec::new(),
-                        children: Vec::new(),
-                        stats: stats(),
-                        payload: DistributedNodeKind::Values(
-                            crate::sql::planner::payload::PlanValuesNode {
-                                rows: Vec::new(),
-                                columns: vec![actual_left.clone()],
-                            },
-                        ),
-                    },
-                    DistributedNode {
-                        node_id: 12,
-                        fragment_id: 1,
-                        tuple_ids: vec![11],
-                        nullable_tuple_ids: Vec::new(),
-                        limit: -1,
-                        build_runtime_filters: Vec::new(),
-                        probe_runtime_filters: Vec::new(),
-                        children: Vec::new(),
-                        stats: stats(),
-                        payload: DistributedNodeKind::Values(
-                            crate::sql::planner::payload::PlanValuesNode {
-                                rows: Vec::new(),
-                                columns: vec![actual_right.clone()],
-                            },
-                        ),
-                    },
-                ],
-                stats: stats(),
-                payload: DistributedNodeKind::HashJoin(Box::new(
-                    crate::sql::planner::physical::PhysicalHashJoinNode {
-                        join_type: JoinKind::Inner,
-                        eq_conditions: Vec::new(),
-                        other_condition: None,
-                        distribution: JoinDistribution::Unknown,
-                        execution_mode: None,
-                        build_runtime_filters: Vec::new(),
-                        output_columns: stale_source_columns.clone(),
-                    },
-                )),
-            },
-            data_partition: DataPartition::unpartitioned(),
-            output_partition: DataPartition::unpartitioned(),
-            sink: DataSink::Noop,
-            output_exprs: None,
-            output_columns: stale_source_columns.clone(),
-            cte_id: None,
-            cte_exchange_nodes: Vec::new(),
-        };
-        let target = PlanFragment {
-            fragment_id: 0,
-            root: DistributedNode {
-                node_id: 20,
-                fragment_id: 0,
-                tuple_ids: vec![20],
-                nullable_tuple_ids: Vec::new(),
-                limit: -1,
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
-                children: Vec::new(),
-                stats: stats(),
-                payload: DistributedNodeKind::Exchange(ExchangeReceiver {
-                    partition: DataPartition::unpartitioned(),
-                    source_fragment_id: 1,
-                    output_columns: receiver_columns,
-                    output_qualifier: None,
-                    flavor: ExchangeFlavor::Distribution,
-                }),
-            },
-            data_partition: DataPartition::unpartitioned(),
-            output_partition: DataPartition::unpartitioned(),
-            sink: DataSink::Result,
-            output_exprs: None,
-            output_columns: Vec::new(),
-            cte_id: None,
-            cte_exchange_nodes: Vec::new(),
-        };
-        let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
-            fragments: vec![source, target],
-            root_fragment_id: 0,
-            runtime_filter_graph: RuntimeFilterGraph::default(),
-            edges: vec![FragmentEdge {
-                source_fragment_id: 1,
-                target_fragment_id: 0,
-                target_exchange_node_id: 20,
-                output_partition: DataPartition::unpartitioned(),
-                stream_kind: FragmentStreamKind::Gather,
-                edge_kind: FragmentEdgeKind::Stream,
-                output_slot_ids: vec![84, 85, 999],
-            }],
-        };
-
-        let encoded = encode_distributed_plan(&plan).expect("encode native plan");
-        let source = encoded
-            .fragments
-            .iter()
-            .find(|fragment| fragment.fragment_id == 1)
-            .expect("source fragment");
-        let Some(plan::data_sink::Kind::DataStream(sink)) =
-            source.sink.as_ref().and_then(|sink| sink.kind.as_ref())
-        else {
-            panic!("expected DataStream sink");
-        };
-        assert_eq!(sink.output_columns, vec![1, 2]);
-
-        let target = encoded
-            .fragments
-            .iter()
-            .find(|fragment| fragment.fragment_id == 0)
-            .expect("target fragment");
-        let receiver = target.root.as_ref().expect("target root");
-        let Some(plan::distributed_node::Payload::Exchange(exchange)) = receiver.payload.as_ref()
-        else {
-            panic!("expected Exchange receiver");
-        };
-        assert_eq!(
-            exchange
-                .output_columns
-                .iter()
-                .map(|column| (column.column_id, column.name.as_str()))
-                .collect::<Vec<_>>(),
-            vec![(1, "l_k"), (2, "r_k")]
-        );
-    }
-
-    #[test]
-    fn scan_output_columns_drop_duplicate_column_ids() {
-        let duplicate_scan_columns = vec![
-            output_column(1, "c1", DataType::Int64),
-            output_column(2, "c2", DataType::Int64),
-            output_column(1, "c1", DataType::Int64),
-        ];
-        let duplicate_scan_columns =
-            encode_output_columns(&duplicate_scan_columns).expect("encode output columns");
-        let mut node = plan::DistributedNode {
-            node_id: 10,
-            fragment_id: 0,
-            tuple_ids: vec![10],
-            nullable_tuple_ids: Vec::new(),
-            limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
-            children: Vec::new(),
-            payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
-                output_columns: duplicate_scan_columns.clone(),
-                kind: Some(plan::plan_node::Kind::Scan(plan::ScanNode {
-                    database: "db".to_string(),
-                    table: None,
-                    alias: None,
-                    columns: duplicate_scan_columns,
-                    predicates: Vec::new(),
-                    required_columns: Vec::new(),
-                    dict_columns: Vec::new(),
-                    variant_columns: Vec::new(),
-                    mv_rewritten_from: None,
-                })),
-            })),
-        };
-
-        normalize_encoded_node_output_columns(&mut node).expect("normalize scan");
-
-        let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_ref()
-        else {
-            panic!("expected physical scan");
-        };
-        assert_eq!(
-            physical
-                .output_columns
-                .iter()
-                .map(|column| column.column_id)
-                .collect::<Vec<_>>(),
-            vec![1, 2]
-        );
-        let Some(plan::plan_node::Kind::Scan(scan)) = physical.kind.as_ref() else {
-            panic!("expected scan");
-        };
-        assert_eq!(
-            scan.columns
-                .iter()
-                .map(|column| column.column_id)
-                .collect::<Vec<_>>(),
-            vec![1, 2]
-        );
-    }
-
-    #[test]
-    fn scan_boundary_output_columns_follow_required_columns_without_dropping_scan_columns() {
-        let scan_columns = encode_output_columns(&[
-            output_column(1, "l_orderkey", DataType::Int64),
-            output_column(2, "l_partkey", DataType::Int64),
-            output_column(3, "l_suppkey", DataType::Int64),
-            output_column(4, "l_shipdate", DataType::Date32),
-            output_column(5, "_row_id", DataType::Int64),
-            output_column(6, "_last_updated_sequence_number", DataType::Int64),
-        ])
-        .expect("encode scan columns");
-        let mut node = plan::DistributedNode {
-            node_id: 10,
-            fragment_id: 0,
-            tuple_ids: vec![10],
-            nullable_tuple_ids: Vec::new(),
-            limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
-            children: Vec::new(),
-            payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
-                output_columns: scan_columns.clone(),
-                kind: Some(plan::plan_node::Kind::Scan(plan::ScanNode {
-                    database: "db".to_string(),
-                    table: None,
-                    alias: None,
-                    columns: scan_columns.clone(),
-                    predicates: Vec::new(),
-                    required_columns: vec![
-                        "l_orderkey".to_string(),
-                        "l_partkey".to_string(),
-                        "l_suppkey".to_string(),
-                        "l_shipdate".to_string(),
-                    ],
-                    dict_columns: Vec::new(),
-                    variant_columns: Vec::new(),
-                    mv_rewritten_from: None,
-                })),
-            })),
-        };
-
-        normalize_encoded_node_output_columns(&mut node).expect("normalize scan");
-
-        let resolved = encoded_node_output_columns(&node).expect("scan output columns");
-        assert_eq!(
-            resolved
-                .iter()
-                .map(|column| column.column_id)
-                .collect::<Vec<_>>(),
-            vec![1, 2, 3, 4]
-        );
-        let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_ref()
-        else {
-            panic!("expected physical scan");
-        };
-        assert_eq!(
-            physical
-                .output_columns
-                .iter()
-                .map(|column| column.column_id)
-                .collect::<Vec<_>>(),
-            vec![1, 2, 3, 4]
-        );
-        let Some(plan::plan_node::Kind::Scan(scan)) = physical.kind.as_ref() else {
-            panic!("expected scan");
-        };
-        assert_eq!(
-            scan.columns
-                .iter()
-                .map(|column| column.column_id)
-                .collect::<Vec<_>>(),
-            vec![1, 2, 3, 4, 5, 6]
-        );
-    }
-
-    #[test]
-    fn set_op_child_output_columns_follow_child_unique_ids() {
-        let child = duplicate_projection_fragment_for_test(DataSink::Noop).root;
-        let duplicate_child_output_columns = vec![
-            output_column(1, "c1", DataType::Int64),
-            output_column(1, "c1", DataType::Int64),
-        ];
-        let set_op = DistributedNode {
-            node_id: 50,
-            fragment_id: 0,
-            tuple_ids: vec![50],
-            nullable_tuple_ids: Vec::new(),
-            limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
-            children: vec![child.clone(), child],
-            stats: stats(),
-            payload: DistributedNodeKind::SetOp(crate::sql::planner::physical::PhysicalSetOpNode {
-                kind: PlanSetOpKind::UnionAll,
-                output_columns: vec![
-                    output_column(10, "c1", DataType::Int64),
-                    output_column(11, "c1", DataType::Int64),
-                ],
-                child_output_columns: vec![
-                    duplicate_child_output_columns.clone(),
-                    duplicate_child_output_columns,
-                ],
-            }),
-        };
-
-        let encoded = encode_node(&set_op).expect("encode set op");
-
-        let Some(plan::distributed_node::Payload::Physical(physical)) = encoded.payload.as_ref()
-        else {
-            panic!("expected physical set op");
-        };
-        let Some(plan::plan_node::Kind::SetOp(set_op)) = physical.kind.as_ref() else {
-            panic!("expected set op");
-        };
-        assert_eq!(
-            set_op
-                .child_output_columns
-                .iter()
-                .map(|columns| columns
-                    .columns
-                    .iter()
-                    .map(|column| column.column_id)
-                    .collect::<Vec<_>>())
-                .collect::<Vec<_>>(),
-            vec![vec![1, 3], vec![1, 3]]
         );
     }
 

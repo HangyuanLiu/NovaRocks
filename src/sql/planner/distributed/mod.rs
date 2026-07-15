@@ -19,6 +19,7 @@ pub(crate) mod boundary;
 pub(crate) mod build;
 mod fragment;
 mod node;
+pub(crate) mod output;
 pub(crate) mod runtime_filter;
 mod seal;
 pub(crate) mod topology;
@@ -36,6 +37,9 @@ pub(crate) use fragment::{
 pub(crate) use node::{
     DistributedNode, DistributedNodeKind, ExchangeFlavor, ExchangeReceiver,
     distributed_kind_from_physical, distributed_kind_to_physical,
+};
+pub(crate) use output::{
+    FragmentEdgeOutputCatalog, NodeExecutionColumn, NodeOutputCatalog, WriteContractCatalog,
 };
 pub(crate) use seal::DistributedPlan;
 

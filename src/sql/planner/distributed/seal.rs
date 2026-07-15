@@ -24,6 +24,11 @@ use super::boundary::{
     BoundaryCatalog, BoundaryError, ExecutionColumnIdAllocator, build_boundary_catalog,
 };
 use super::fragment::{DistributedPlanDraft, FragmentEdge, FragmentId, PlanFragment};
+use super::output::{
+    FragmentEdgeOutputCatalog, NodeOutputCatalog, NodeOutputError, WriteContractCatalog,
+    WriteContractError, build_fragment_edge_output_catalog, build_node_output_catalog,
+    build_write_contract_catalog,
+};
 use super::topology::{TopologyContract, TopologyError, build_topology_contract};
 use super::validation::{self, DistributedPlanValidationError};
 
@@ -38,10 +43,20 @@ struct DistributedPlanData {
     // Authoritative boundary membership catalog derived at seal time.
     boundaries: BoundaryCatalog,
     // Final state of the single query-scoped occurrence allocator. Preserved so
-    // CGO-9C can resume allocating internal occurrences without rebuilding it.
+    // later stages can resume allocating internal occurrences without rebuilding it.
     execution_column_id_allocator: ExecutionColumnIdAllocator,
     // Authoritative fragment-graph execution shape derived at seal time.
     topology: TopologyContract,
+    // Authoritative covered node execution outputs derived at seal time.
+    node_outputs: NodeOutputCatalog,
+    // Authoritative fragment output columns and stream-edge projections derived
+    // at seal time. The native encoder maps these 1:1.
+    fragment_edge_outputs: FragmentEdgeOutputCatalog,
+    // Authoritative Iceberg write output/target-schema and change-stream router
+    // branch partitions derived at seal time. The native encoder maps these 1:1
+    // instead of synthesizing the write output or reconstructing a router
+    // partition from ordinals.
+    write_contracts: WriteContractCatalog,
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +98,28 @@ impl DistributedPlan {
     pub(crate) fn topology(&self) -> &TopologyContract {
         &self.data.topology
     }
+
+    // Consumed by the native encoder (CGO-9C Task 1), which reads each covered
+    // node's execution output from this catalog instead of re-deriving it, and
+    // by later CGO-9C tasks that thread the occurrence mapping.
+    pub(crate) fn node_outputs(&self) -> &NodeOutputCatalog {
+        &self.data.node_outputs
+    }
+
+    // Consumed by the native encoder (CGO-9C Task 2), which maps each fragment's
+    // finalized output columns and each stream edge's finalized projection 1:1
+    // instead of re-deriving a stream schema or patching the exchange receiver.
+    pub(crate) fn fragment_edge_outputs(&self) -> &FragmentEdgeOutputCatalog {
+        &self.data.fragment_edge_outputs
+    }
+
+    // Consumed by the native encoder (CGO-9C Task 3), which maps each Iceberg
+    // write fragment's finalized output expressions/target schema and each
+    // change-stream router branch's finalized partition 1:1 instead of
+    // synthesizing the write output or reconstructing a partition from ordinals.
+    pub(crate) fn write_contracts(&self) -> &WriteContractCatalog {
+        &self.data.write_contracts
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -94,6 +131,8 @@ pub(in crate::sql::planner::distributed) enum DistributedPlanSealError {
     RuntimeFilterGraph(GraphValidationError),
     Boundary(BoundaryError),
     Topology(TopologyError),
+    NodeOutput(NodeOutputError),
+    WriteContract(WriteContractError),
 }
 
 impl fmt::Display for DistributedPlanSealError {
@@ -111,6 +150,8 @@ impl fmt::Display for DistributedPlanSealError {
             Self::RuntimeFilterGraph(error) => error.fmt(formatter),
             Self::Boundary(error) => error.fmt(formatter),
             Self::Topology(error) => error.fmt(formatter),
+            Self::NodeOutput(error) => error.fmt(formatter),
+            Self::WriteContract(error) => error.fmt(formatter),
         }
     }
 }
@@ -164,6 +205,31 @@ pub(in crate::sql::planner::distributed) fn seal_draft(
         &mut execution_column_id_allocator,
     )
     .map_err(DistributedPlanSealError::Boundary)?;
+    // Finalize the covered node execution outputs. This reads each covered
+    // node's planner-computed output columns (for a hash-aggregate, with per-mode
+    // intermediate aggregate-state types applied), fails fast on any missing or
+    // inconsistent output, and numbers each occurrence from the SAME allocator
+    // (reusing boundary occurrences for boundary-participating root outputs).
+    // Runs after boundary derivation so the allocator continues from there.
+    let node_outputs =
+        build_node_output_catalog(&fragments, &boundaries, &mut execution_column_id_allocator)
+            .map_err(DistributedPlanSealError::NodeOutput)?;
+    // Finalize each fragment's output columns and each stream edge's projection
+    // from the sealed fragments, edges, and the node-output catalog. This is the
+    // planner-side successor of the native encoder's fragment-output derivation,
+    // stream-schema reselection, and exchange-receiver patch: it fails fast on an
+    // inconsistency rather than falling back, and the encoder maps it 1:1.
+    let fragment_edge_outputs =
+        build_fragment_edge_output_catalog(&fragments, &edges, &node_outputs)
+            .map_err(DistributedPlanSealError::NodeOutput)?;
+    // Finalize the write-path semantics the native encoder used to synthesize or
+    // reconstruct at encode time: each Iceberg write fragment's output
+    // expressions and target output schema, and each change-stream router
+    // branch's typed partition. Derives purely from the sealed fragments' sinks
+    // and output columns/exprs and fails fast rather than falling back; the
+    // encoder maps the result 1:1.
+    let write_contracts = build_write_contract_catalog(&fragments)
+        .map_err(DistributedPlanSealError::WriteContract)?;
     Ok(DistributedPlan {
         data: DistributedPlanData {
             fragments,
@@ -173,6 +239,9 @@ pub(in crate::sql::planner::distributed) fn seal_draft(
             boundaries,
             execution_column_id_allocator,
             topology,
+            node_outputs,
+            fragment_edge_outputs,
+            write_contracts,
         },
     })
 }

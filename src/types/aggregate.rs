@@ -293,13 +293,58 @@ fn list_output_type(item_type: DataType) -> DataType {
     )))
 }
 
+/// Apply the canonical DISTINCT aggregate name mangling to `name`: a distinct
+/// `count` / `sum` / `array_agg` maps to its multi-distinct/`_distinct` variant
+/// (`count` -> `multi_distinct_count`, `sum` -> `multi_distinct_sum`, `array_agg`
+/// -> `array_agg_distinct`); every other name is returned lowercased unchanged.
+///
+/// This is the single source of truth for the DISTINCT-mangling table, feeding
+/// both the planner-typed aggregate adapters (`sql::planner::physical`) and the
+/// proto-typed decode path (`lower::novarocks::node::aggregate`). It is pure
+/// (`&str` in, `String` out) so this module stays a protobuf-free, planner-free
+/// leaf next to [`infer_agg_function_types`].
+pub(crate) fn mangle_distinct_aggregate_name(name: &str, distinct: bool) -> String {
+    let name = name.to_ascii_lowercase();
+    if !distinct {
+        return name;
+    }
+    match name.as_str() {
+        "count" => "multi_distinct_count".to_string(),
+        "sum" => "multi_distinct_sum".to_string(),
+        "array_agg" => "array_agg_distinct".to_string(),
+        _ => name,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use arrow::datatypes::{DataType, Field, Fields};
 
-    use super::infer_agg_function_types;
+    use super::{infer_agg_function_types, mangle_distinct_aggregate_name};
+
+    #[test]
+    fn distinct_name_mangling_is_the_single_source_of_truth() {
+        // Non-distinct names are lowercased unchanged.
+        assert_eq!(mangle_distinct_aggregate_name("count", false), "count");
+        assert_eq!(mangle_distinct_aggregate_name("COUNT", false), "count");
+        // The distinct-mangling table.
+        assert_eq!(
+            mangle_distinct_aggregate_name("COUNT", true),
+            "multi_distinct_count"
+        );
+        assert_eq!(
+            mangle_distinct_aggregate_name("sum", true),
+            "multi_distinct_sum"
+        );
+        assert_eq!(
+            mangle_distinct_aggregate_name("array_agg", true),
+            "array_agg_distinct"
+        );
+        // A distinct function with no mangling rule keeps its lowercased name.
+        assert_eq!(mangle_distinct_aggregate_name("MAX", true), "max");
+    }
 
     #[test]
     fn infers_core_numeric_aggregate_types() {

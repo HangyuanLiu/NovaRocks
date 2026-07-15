@@ -340,17 +340,28 @@ fn build_distributed_plan_sort_reuses_child_tuple() {
 #[test]
 fn build_distributed_plan_hash_aggregate_allocates_new_tuple() {
     let scan = scan_node(1, "k");
+    // A minimal `COUNT(*)` aggregate: a real aggregate always produces at least one
+    // output column, which the sealed node-output catalog now requires (this test
+    // only asserts tuple allocation).
+    let count_col = output_col(20, "count", DataType::Int64, false);
     let aggregate = PhysicalPlanNode {
         kind: PhysicalPlanKind::HashAggregate(Box::new(PhysicalHashAggregateNode {
             mode: AggMode::Single,
             group_by: vec![],
-            aggregates: vec![],
-            is_merge: vec![],
-            output_layout: AggregateOutputLayout::new(vec![], vec![]),
-            output_columns: vec![],
+            aggregates: vec![AggregateCall {
+                name: "count".to_string(),
+                args: vec![],
+                distinct: false,
+                result_type: DataType::Int64,
+                order_by: vec![],
+                output_column_id: ColumnId::new_for_test(20),
+            }],
+            is_merge: vec![false],
+            output_layout: AggregateOutputLayout::new(vec![], vec![count_col.clone()]),
+            output_columns: vec![count_col.clone()],
         })),
         children: vec![scan],
-        output_columns: vec![],
+        output_columns: vec![count_col],
         stats: stats(),
         probe_runtime_filters: vec![],
     };

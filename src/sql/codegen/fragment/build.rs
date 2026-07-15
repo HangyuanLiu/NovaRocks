@@ -80,6 +80,13 @@ pub(crate) fn build(request: FragmentBuildRequest<'_>) -> Result<MultiFragmentBu
         dp,
         crate::sql::codegen::proto_encode::plan::NativePlanEncodeContext {
             scan_bindings: Some(&scan_bindings),
+            // The encoder reads each covered node's execution output, each
+            // fragment/stream-edge output, and each write/router contract from the
+            // sealed catalogs; all are bound from `dp` inside
+            // encode_distributed_plan_with_context.
+            node_outputs: None,
+            fragment_edge_outputs: None,
+            write_contracts: None,
         },
     )?;
     let mut native_fragments = BTreeMap::new();
