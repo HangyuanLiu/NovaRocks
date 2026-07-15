@@ -18,13 +18,15 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::runtime_filter::model::contract::BindingId;
+use crate::runtime_filter::model::contract::{BindingId, ChannelId};
 use crate::runtime_filter::port::identity::{LogicalVersion, PartitionId, ProducerSequence};
 use crate::runtime_filter::port::producer::{
-    ProducerHandle, ProducerPortKind, RuntimeContractViolationKind, SubmitOutcome,
+    ProducerFailureReason, ProducerHandle, ProducerPortKind, RuntimeContractViolationKind,
+    SubmitOutcome,
 };
 use crate::runtime_filter::port::subscription::{
-    LivePollOutcome, LiveTerminal, SubscriptionHandle, SubscriptionKind, UnavailableReason,
+    ArtifactDeliveryOutcome, LivePollOutcome, LiveTerminal, SubscriptionHandle, SubscriptionKind,
+    UnavailableReason,
 };
 use crate::runtime_filter::port::support::{MemoryAccountError, RuntimeFilterMemoryAccount};
 
@@ -224,7 +226,7 @@ impl RuntimeFilterMemoryAccount for ArmableLargeAllocationRejector {
 }
 
 #[test]
-fn ordered_artifact_failure_retains_latest_without_changing_logical_terminal() {
+fn ordered_final_artifact_failure_retains_latest_and_degraded_terminal() {
     let account = Arc::new(ArmableLargeAllocationRejector::default());
     let (service, contract) = installed_ordered_service_with_account(account.clone());
     let live = live_handle(&service);
@@ -278,11 +280,77 @@ fn ordered_artifact_failure_retains_latest_without_changing_logical_terminal() {
             outcome,
             LivePollOutcome::Idle {
                 latest_version: Some(LogicalVersion::FIRST),
-                terminal: Some(LiveTerminal::Completed)
+                terminal: Some(LiveTerminal::DegradedArtifact(
+                    UnavailableReason::ResourceLimit
+                ))
             }
         ),
         "unexpected live completion after artifact degradation: {outcome:?}"
     );
+}
+
+#[test]
+fn ordered_service_first_materialization_failure_is_unavailable() {
+    let account = Arc::new(ArmableLargeAllocationRejector::default());
+    let (service, contract) = installed_ordered_service_with_account(account.clone());
+    let live = live_handle(&service);
+    let ProducerHandle::OrderedBound(producer) = service
+        .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+        .unwrap()
+    else {
+        panic!("ordered fixture returned membership producer")
+    };
+    account.armed.store(true, Ordering::SeqCst);
+
+    assert_eq!(
+        producer
+            .submit_bound(
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                ordered_update(&contract, 100),
+            )
+            .unwrap(),
+        SubmitOutcome::Published
+    );
+    assert!(live.snapshot().is_none());
+    assert!(matches!(
+        live.poll_after(None),
+        LivePollOutcome::Idle {
+            latest_version: None,
+            terminal: Some(LiveTerminal::Unavailable(UnavailableReason::ResourceLimit))
+        }
+    ));
+}
+
+#[test]
+fn ordered_service_first_route_failure_is_unavailable() {
+    let service = installed_ordered_service_fixture();
+    let live = live_handle(&service);
+    let installed = service.registry.active_installation().unwrap();
+    let routes = installed.artifact_plan(ChannelId::new(1)).unwrap().groups()[0]
+        .route_edges()
+        .to_vec();
+
+    assert_eq!(
+        installed.router().route_live(
+            &routes,
+            Some(&ArtifactDeliveryOutcome::Unavailable(
+                UnavailableReason::RouteUnavailable,
+            )),
+            None,
+        ),
+        routes
+    );
+    assert!(live.snapshot().is_none());
+    assert!(matches!(
+        live.poll_after(None),
+        LivePollOutcome::Idle {
+            latest_version: None,
+            terminal: Some(LiveTerminal::Unavailable(
+                UnavailableReason::RouteUnavailable
+            ))
+        }
+    ));
 }
 
 #[test]
@@ -313,6 +381,86 @@ fn ordered_service_cancellation_retains_latest_live_snapshot() {
         live.poll_after(Some(LogicalVersion::FIRST)),
         LivePollOutcome::Idle {
             latest_version: Some(LogicalVersion::FIRST),
+            terminal: Some(LiveTerminal::Cancelled)
+        }
+    ));
+}
+
+#[test]
+fn ordered_service_cancel_overrides_completed_and_retains_latest() {
+    let (service, contract) = installed_ordered_service_with_account(
+        super::memory::MemTrackerMemoryAccount::new_root_for_test(
+            "ordered-live-completed-then-cancelled",
+        ),
+    );
+    let live = live_handle(&service);
+    let ProducerHandle::OrderedBound(producer) = service
+        .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+        .unwrap()
+    else {
+        panic!("ordered fixture returned membership producer")
+    };
+    producer
+        .submit_bound(
+            PartitionId::new(0),
+            ProducerSequence::new(0),
+            ordered_update(&contract, 100),
+        )
+        .unwrap();
+    producer
+        .close_partition(PartitionId::new(0), ProducerSequence::new(1))
+        .unwrap();
+    assert!(matches!(
+        live.poll_after(Some(LogicalVersion::FIRST)),
+        LivePollOutcome::Idle {
+            terminal: Some(LiveTerminal::Completed),
+            ..
+        }
+    ));
+
+    service.cancel();
+
+    assert_eq!(live.snapshot().unwrap().version(), LogicalVersion::FIRST);
+    assert!(matches!(
+        live.poll_after(Some(LogicalVersion::FIRST)),
+        LivePollOutcome::Idle {
+            terminal: Some(LiveTerminal::Cancelled),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn ordered_service_cancel_overrides_unavailable_without_artifact() {
+    let service = installed_ordered_service_fixture();
+    let live = live_handle(&service);
+    let ProducerHandle::OrderedBound(producer) = service
+        .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+        .unwrap()
+    else {
+        panic!("ordered fixture returned membership producer")
+    };
+    assert_eq!(
+        producer
+            .fail(ProducerFailureReason::ExecutionFailed)
+            .unwrap(),
+        SubmitOutcome::CoverageStillPossible
+    );
+    assert!(matches!(
+        live.poll_after(None),
+        LivePollOutcome::Idle {
+            latest_version: None,
+            terminal: Some(LiveTerminal::Unavailable(UnavailableReason::ProducerFailed))
+        }
+    ));
+
+    service.cancel();
+
+    assert!(live.snapshot().is_none());
+    assert!(matches!(
+        live.poll_after(None),
+        LivePollOutcome::Idle {
+            latest_version: None,
             terminal: Some(LiveTerminal::Cancelled)
         }
     ));

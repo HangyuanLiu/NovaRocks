@@ -184,26 +184,34 @@ impl LiveSubscriptionSlot {
             .unwrap_or_else(|error| error.into_inner()) = Some(barrier);
     }
 
+    fn terminal_precedence(terminal: LiveTerminal) -> u8 {
+        match terminal {
+            LiveTerminal::Completed | LiveTerminal::CompletedWithoutArtifact => 0,
+            LiveTerminal::DegradedArtifact(_) => 1,
+            LiveTerminal::DegradedDelivery(_) => 2,
+            LiveTerminal::DegradedLogical(_) => 3,
+            LiveTerminal::Unavailable(_) => 4,
+            LiveTerminal::Cancelled => 5,
+        }
+    }
+
+    fn normalize_terminal(has_latest: bool, terminal: LiveTerminal) -> LiveTerminal {
+        if has_latest {
+            return terminal;
+        }
+        match terminal {
+            LiveTerminal::DegradedArtifact(reason) | LiveTerminal::DegradedDelivery(reason) => {
+                LiveTerminal::Unavailable(reason)
+            }
+            terminal => terminal,
+        }
+    }
+
     fn merge_terminal(current: &mut Option<LiveTerminal>, incoming: LiveTerminal) {
-        let incoming_is_logical = matches!(
-            incoming,
-            LiveTerminal::Completed
-                | LiveTerminal::CompletedWithoutArtifact
-                | LiveTerminal::DegradedLogical(_)
-                | LiveTerminal::Unavailable(_)
-                | LiveTerminal::Cancelled
-        );
-        let current_is_logical = current.is_some_and(|terminal| {
-            matches!(
-                terminal,
-                LiveTerminal::Completed
-                    | LiveTerminal::CompletedWithoutArtifact
-                    | LiveTerminal::DegradedLogical(_)
-                    | LiveTerminal::Unavailable(_)
-                    | LiveTerminal::Cancelled
-            )
-        });
-        if current.is_none() || incoming_is_logical && !current_is_logical {
+        if current.is_none()
+            || Self::terminal_precedence(incoming)
+                > Self::terminal_precedence(current.expect("live terminal is present"))
+        {
             *current = Some(incoming);
         }
     }
@@ -238,26 +246,34 @@ impl LiveSubscriptionSlot {
                         state.latest = Some(bundle);
                     }
                 }
-                ArtifactDeliveryOutcome::Unsupported(_) => Self::merge_terminal(
-                    &mut state.terminal,
-                    LiveTerminal::DegradedArtifact(UnavailableReason::MaterializationFailed),
-                ),
+                ArtifactDeliveryOutcome::Unsupported(_) => {
+                    let terminal = Self::normalize_terminal(
+                        state.latest.is_some(),
+                        LiveTerminal::DegradedArtifact(UnavailableReason::MaterializationFailed),
+                    );
+                    Self::merge_terminal(&mut state.terminal, terminal);
+                }
                 ArtifactDeliveryOutcome::Unavailable(UnavailableReason::RouteUnavailable) => {
-                    Self::merge_terminal(
-                        &mut state.terminal,
+                    let terminal = Self::normalize_terminal(
+                        state.latest.is_some(),
                         LiveTerminal::DegradedDelivery(UnavailableReason::RouteUnavailable),
                     );
+                    Self::merge_terminal(&mut state.terminal, terminal);
                 }
-                ArtifactDeliveryOutcome::Unavailable(reason) => Self::merge_terminal(
-                    &mut state.terminal,
-                    LiveTerminal::DegradedArtifact(reason),
-                ),
+                ArtifactDeliveryOutcome::Unavailable(reason) => {
+                    let terminal = Self::normalize_terminal(
+                        state.latest.is_some(),
+                        LiveTerminal::DegradedArtifact(reason),
+                    );
+                    Self::merge_terminal(&mut state.terminal, terminal);
+                }
                 ArtifactDeliveryOutcome::Cancelled => {
                     Self::merge_terminal(&mut state.terminal, LiveTerminal::Cancelled);
                 }
             }
         }
         if let Some(terminal) = terminal {
+            let terminal = Self::normalize_terminal(state.latest.is_some(), terminal);
             Self::merge_terminal(&mut state.terminal, terminal);
         }
         let terminal_event = if state.terminal != previous_terminal {
@@ -684,6 +700,27 @@ mod tests {
     }
 
     #[test]
+    fn artifact_failure_without_latest_is_unavailable() {
+        let live = slot();
+        live.apply_delivery(
+            Some(ArtifactDeliveryOutcome::Unavailable(
+                UnavailableReason::MaterializationFailed,
+            )),
+            None,
+        );
+
+        assert!(matches!(
+            live.poll_after(None),
+            LivePollOutcome::Idle {
+                latest_version: None,
+                terminal: Some(LiveTerminal::Unavailable(
+                    UnavailableReason::MaterializationFailed
+                ))
+            }
+        ));
+    }
+
+    #[test]
     fn delivery_failure_retains_latest_bundle() {
         let live = slot();
         live.deliver(bundle(LogicalVersion::FIRST, 100), None);
@@ -704,6 +741,90 @@ mod tests {
                 ))
             }
         ));
+    }
+
+    #[test]
+    fn delivery_failure_without_latest_is_unavailable() {
+        let live = slot();
+        live.apply_delivery(
+            Some(ArtifactDeliveryOutcome::Unavailable(
+                UnavailableReason::RouteUnavailable,
+            )),
+            None,
+        );
+
+        assert!(matches!(
+            live.poll_after(None),
+            LivePollOutcome::Idle {
+                latest_version: None,
+                terminal: Some(LiveTerminal::Unavailable(
+                    UnavailableReason::RouteUnavailable
+                ))
+            }
+        ));
+    }
+
+    #[test]
+    fn terminal_precedence_preserves_degradation_and_escalates_by_severity() {
+        let live = slot();
+        live.deliver(bundle(LogicalVersion::FIRST, 100), None);
+        live.terminal(LiveTerminal::DegradedArtifact(
+            UnavailableReason::MaterializationFailed,
+        ));
+        live.terminal(LiveTerminal::Completed);
+        assert!(matches!(
+            live.poll_after(Some(LogicalVersion::FIRST)),
+            LivePollOutcome::Idle {
+                terminal: Some(LiveTerminal::DegradedArtifact(
+                    UnavailableReason::MaterializationFailed
+                )),
+                ..
+            }
+        ));
+
+        live.terminal(LiveTerminal::DegradedDelivery(
+            UnavailableReason::RouteUnavailable,
+        ));
+        live.terminal(LiveTerminal::DegradedLogical(
+            UnavailableReason::ProducerFailed,
+        ));
+        live.terminal(LiveTerminal::Unavailable(
+            UnavailableReason::IncompleteCoverage,
+        ));
+        assert!(matches!(
+            live.poll_after(Some(LogicalVersion::FIRST)),
+            LivePollOutcome::Idle {
+                terminal: Some(LiveTerminal::Unavailable(
+                    UnavailableReason::IncompleteCoverage
+                )),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn cancelled_overrides_every_prior_terminal_and_retains_latest() {
+        let prior_terminals = [
+            LiveTerminal::Completed,
+            LiveTerminal::CompletedWithoutArtifact,
+            LiveTerminal::DegradedArtifact(UnavailableReason::MaterializationFailed),
+            LiveTerminal::DegradedDelivery(UnavailableReason::RouteUnavailable),
+            LiveTerminal::DegradedLogical(UnavailableReason::ProducerFailed),
+            LiveTerminal::Unavailable(UnavailableReason::IncompleteCoverage),
+        ];
+        for prior in prior_terminals {
+            let live = slot();
+            live.deliver(bundle(LogicalVersion::FIRST, 100), Some(prior));
+            live.terminal(LiveTerminal::Cancelled);
+            assert_eq!(live.snapshot().unwrap().version(), LogicalVersion::FIRST);
+            assert!(matches!(
+                live.poll_after(Some(LogicalVersion::FIRST)),
+                LivePollOutcome::Idle {
+                    terminal: Some(LiveTerminal::Cancelled),
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]
