@@ -24,7 +24,10 @@ use super::boundary::{
     BoundaryCatalog, BoundaryError, ExecutionColumnIdAllocator, build_boundary_catalog,
 };
 use super::fragment::{DistributedPlanDraft, FragmentEdge, FragmentId, PlanFragment};
-use super::output::{NodeOutputCatalog, NodeOutputError, build_node_output_catalog};
+use super::output::{
+    FragmentEdgeOutputCatalog, NodeOutputCatalog, NodeOutputError,
+    build_fragment_edge_output_catalog, build_node_output_catalog,
+};
 use super::topology::{TopologyContract, TopologyError, build_topology_contract};
 use super::validation::{self, DistributedPlanValidationError};
 
@@ -45,6 +48,9 @@ struct DistributedPlanData {
     topology: TopologyContract,
     // Authoritative non-aggregate node execution outputs derived at seal time.
     node_outputs: NodeOutputCatalog,
+    // Authoritative fragment output columns and stream-edge projections derived
+    // at seal time. The native encoder maps these 1:1.
+    fragment_edge_outputs: FragmentEdgeOutputCatalog,
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +98,13 @@ impl DistributedPlan {
     // by later CGO-9C tasks that thread the occurrence mapping.
     pub(crate) fn node_outputs(&self) -> &NodeOutputCatalog {
         &self.data.node_outputs
+    }
+
+    // Consumed by the native encoder (CGO-9C Task 2), which maps each fragment's
+    // finalized output columns and each stream edge's finalized projection 1:1
+    // instead of re-deriving a stream schema or patching the exchange receiver.
+    pub(crate) fn fragment_edge_outputs(&self) -> &FragmentEdgeOutputCatalog {
+        &self.data.fragment_edge_outputs
     }
 }
 
@@ -184,6 +197,14 @@ pub(in crate::sql::planner::distributed) fn seal_draft(
     let node_outputs =
         build_node_output_catalog(&fragments, &boundaries, &mut execution_column_id_allocator)
             .map_err(DistributedPlanSealError::NodeOutput)?;
+    // Finalize each fragment's output columns and each stream edge's projection
+    // from the sealed fragments, edges, and the node-output catalog. This is the
+    // planner-side successor of the native encoder's fragment-output derivation,
+    // stream-schema reselection, and exchange-receiver patch: it fails fast on an
+    // inconsistency rather than falling back, and the encoder maps it 1:1.
+    let fragment_edge_outputs =
+        build_fragment_edge_output_catalog(&fragments, &edges, &node_outputs)
+            .map_err(DistributedPlanSealError::NodeOutput)?;
     Ok(DistributedPlan {
         data: DistributedPlanData {
             fragments,
@@ -194,6 +215,7 @@ pub(in crate::sql::planner::distributed) fn seal_draft(
             execution_column_id_allocator,
             topology,
             node_outputs,
+            fragment_edge_outputs,
         },
     })
 }

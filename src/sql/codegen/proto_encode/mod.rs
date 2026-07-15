@@ -1461,6 +1461,7 @@ mod tests {
             &plan::NativePlanEncodeContext {
                 scan_bindings: Some(&bindings),
                 node_outputs: None,
+                fragment_edge_outputs: None,
             },
         )
         .expect("encode StarRocks native scan source");
@@ -1570,6 +1571,7 @@ mod tests {
             &plan::NativePlanEncodeContext {
                 scan_bindings: Some(&bindings),
                 node_outputs: None,
+                fragment_edge_outputs: None,
             },
         )
         .expect_err("mismatched builder descriptor must fail");
@@ -1675,6 +1677,7 @@ mod tests {
                 &plan::NativePlanEncodeContext {
                     scan_bindings: Some(&bindings),
                     node_outputs: None,
+                    fragment_edge_outputs: None,
                 },
             )
             .expect_err("invalid StarRocks source must fail");

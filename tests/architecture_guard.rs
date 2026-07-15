@@ -6633,6 +6633,7 @@ fn planner_distributed_core_has_stage_namespace() {
             "pub(crate)|node::ExchangeReceiver".to_string(),
             "pub(crate)|node::distributed_kind_from_physical".to_string(),
             "pub(crate)|node::distributed_kind_to_physical".to_string(),
+            "pub(crate)|output::FragmentEdgeOutputCatalog".to_string(),
             "pub(crate)|output::NodeExecutionColumn".to_string(),
             "pub(crate)|output::NodeOutputCatalog".to_string(),
             "pub(crate)|seal::DistributedPlan".to_string(),
