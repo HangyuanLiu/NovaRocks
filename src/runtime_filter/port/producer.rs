@@ -21,6 +21,7 @@ use std::sync::{Arc, Weak};
 use crate::common::types::UniqueId;
 use crate::runtime_filter::model::contract::BindingId;
 
+use super::final_domain::FinalDomainShard;
 use super::identity::{PartitionId, ProducerSequence};
 use super::ordered_bound::OrderedBoundUpdate;
 use super::topk_summary::TopKSummary;
@@ -100,6 +101,7 @@ pub(crate) enum RuntimeContractViolationKind {
     ConflictingTerminalSequence,
     ConflictingArtifactPublish,
     SequenceOutsideTerminalRange,
+    FinalDomainMissing,
     OrderedContractMismatch,
     OrderedBoundLoosened,
     LogicalVersionOverflow,
@@ -260,17 +262,39 @@ pub(crate) trait TopKSummaryProducerAdapter: Send + Sync {
     ) -> Result<SubmitOutcome, RuntimeContractViolation>;
 }
 
+pub(crate) trait FinalDomainProducerAdapter: Send + Sync {
+    fn complete(
+        &self,
+        partition_id: PartitionId,
+        sequence: ProducerSequence,
+        shard: FinalDomainShard,
+    ) -> Result<SubmitOutcome, RuntimeContractViolation>;
+
+    fn close_partition(
+        &self,
+        partition_id: PartitionId,
+        terminal_sequence: ProducerSequence,
+    ) -> Result<SubmitOutcome, RuntimeContractViolation>;
+
+    fn fail(
+        &self,
+        reason: ProducerFailureReason,
+    ) -> Result<SubmitOutcome, RuntimeContractViolation>;
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProducerPortKind {
     Membership,
     OrderedBound,
     TopKSummary,
+    FinalDomain,
 }
 
 pub(crate) enum ProducerHandle {
     Membership(Arc<dyn ProducerAdapter>),
     OrderedBound(Arc<dyn OrderedBoundProducerAdapter>),
     TopKSummary(Arc<dyn TopKSummaryProducerAdapter>),
+    FinalDomain(Arc<dyn FinalDomainProducerAdapter>),
 }
 
 impl fmt::Debug for ProducerHandle {
@@ -288,6 +312,7 @@ impl ProducerHandle {
             Self::Membership(_) => ProducerPortKind::Membership,
             Self::OrderedBound(_) => ProducerPortKind::OrderedBound,
             Self::TopKSummary(_) => ProducerPortKind::TopKSummary,
+            Self::FinalDomain(_) => ProducerPortKind::FinalDomain,
         }
     }
 
@@ -296,6 +321,7 @@ impl ProducerHandle {
             Self::Membership(handle) => ProducerHandleWeak::Membership(Arc::downgrade(handle)),
             Self::OrderedBound(handle) => ProducerHandleWeak::OrderedBound(Arc::downgrade(handle)),
             Self::TopKSummary(handle) => ProducerHandleWeak::TopKSummary(Arc::downgrade(handle)),
+            Self::FinalDomain(handle) => ProducerHandleWeak::FinalDomain(Arc::downgrade(handle)),
         }
     }
 
@@ -312,6 +338,24 @@ impl ProducerHandle {
                 RuntimeContractViolationKind::ProducerPortMismatch,
                 "top-k summary producer handle cannot be used as a membership producer",
             )),
+            Self::FinalDomain(_) => Err(RuntimeContractViolation::new(
+                RuntimeContractViolationKind::ProducerPortMismatch,
+                "final-domain producer handle cannot be used as a membership producer",
+            )),
+        }
+    }
+
+    pub(crate) fn into_final_domain(
+        self,
+    ) -> Result<Arc<dyn FinalDomainProducerAdapter>, RuntimeContractViolation> {
+        match self {
+            Self::FinalDomain(handle) => Ok(handle),
+            Self::Membership(_) | Self::OrderedBound(_) | Self::TopKSummary(_) => {
+                Err(RuntimeContractViolation::new(
+                    RuntimeContractViolationKind::ProducerPortMismatch,
+                    "non-final producer handle cannot be used as a final-domain producer",
+                ))
+            }
         }
     }
 }
@@ -320,6 +364,7 @@ pub(crate) enum ProducerHandleWeak {
     Membership(Weak<dyn ProducerAdapter>),
     OrderedBound(Weak<dyn OrderedBoundProducerAdapter>),
     TopKSummary(Weak<dyn TopKSummaryProducerAdapter>),
+    FinalDomain(Weak<dyn FinalDomainProducerAdapter>),
 }
 
 impl ProducerHandleWeak {
@@ -328,6 +373,7 @@ impl ProducerHandleWeak {
             Self::Membership(_) => ProducerPortKind::Membership,
             Self::OrderedBound(_) => ProducerPortKind::OrderedBound,
             Self::TopKSummary(_) => ProducerPortKind::TopKSummary,
+            Self::FinalDomain(_) => ProducerPortKind::FinalDomain,
         }
     }
 
@@ -336,6 +382,7 @@ impl ProducerHandleWeak {
             Self::Membership(handle) => handle.upgrade().map(ProducerHandle::Membership),
             Self::OrderedBound(handle) => handle.upgrade().map(ProducerHandle::OrderedBound),
             Self::TopKSummary(handle) => handle.upgrade().map(ProducerHandle::TopKSummary),
+            Self::FinalDomain(handle) => handle.upgrade().map(ProducerHandle::FinalDomain),
         }
     }
 }
@@ -344,15 +391,45 @@ impl ProducerHandleWeak {
 mod tests {
     use std::sync::Arc;
 
+    use crate::runtime_filter::port::final_domain::FinalDomainShard;
     use crate::runtime_filter::port::identity::{PartitionId, ProducerSequence};
     use crate::runtime_filter::port::topk_summary::TopKSummary;
 
     use super::{
-        ProducerFailureReason, ProducerHandle, ProducerPortKind, RuntimeContractViolation,
-        RuntimeContractViolationKind, SubmitOutcome, TopKSummaryProducerAdapter,
+        FinalDomainProducerAdapter, ProducerFailureReason, ProducerHandle, ProducerPortKind,
+        RuntimeContractViolation, RuntimeContractViolationKind, SubmitOutcome,
+        TopKSummaryProducerAdapter,
     };
 
     struct TopKAdapter;
+
+    struct FinalDomainAdapter;
+
+    impl FinalDomainProducerAdapter for FinalDomainAdapter {
+        fn complete(
+            &self,
+            _partition_id: PartitionId,
+            _sequence: ProducerSequence,
+            _shard: FinalDomainShard,
+        ) -> Result<SubmitOutcome, RuntimeContractViolation> {
+            unreachable!("typed handle tests do not complete")
+        }
+
+        fn close_partition(
+            &self,
+            _partition_id: PartitionId,
+            _terminal: ProducerSequence,
+        ) -> Result<SubmitOutcome, RuntimeContractViolation> {
+            unreachable!("typed handle tests do not close")
+        }
+
+        fn fail(
+            &self,
+            _reason: ProducerFailureReason,
+        ) -> Result<SubmitOutcome, RuntimeContractViolation> {
+            unreachable!("typed handle tests do not fail")
+        }
+    }
 
     impl TopKSummaryProducerAdapter for TopKAdapter {
         fn submit_summary(
@@ -401,6 +478,7 @@ mod tests {
             RuntimeContractViolationKind::SequenceOutsideTerminalRange => {
                 "sequence-outside-terminal-range"
             }
+            RuntimeContractViolationKind::FinalDomainMissing => "final-domain-missing",
             RuntimeContractViolationKind::OrderedContractMismatch => "ordered-contract-mismatch",
             RuntimeContractViolationKind::OrderedBoundLoosened => "ordered-bound-loosened",
             RuntimeContractViolationKind::LogicalVersionOverflow => "logical-version-overflow",
@@ -433,5 +511,30 @@ mod tests {
             weak.upgrade().expect("strong typed handle is alive").kind(),
             ProducerPortKind::TopKSummary
         );
+    }
+
+    #[test]
+    fn final_domain_handle_is_typed_and_wrong_handle_conversions_fail_closed() {
+        let adapter: Arc<dyn FinalDomainProducerAdapter> = Arc::new(FinalDomainAdapter);
+        let handle = ProducerHandle::FinalDomain(adapter);
+        let weak = handle.downgrade();
+
+        assert_eq!(handle.kind(), ProducerPortKind::FinalDomain);
+        assert_eq!(weak.kind(), ProducerPortKind::FinalDomain);
+        assert_eq!(
+            weak.upgrade().expect("strong typed handle is alive").kind(),
+            ProducerPortKind::FinalDomain
+        );
+        assert!(handle.into_final_domain().is_ok());
+
+        for wrong in [ProducerHandle::TopKSummary(Arc::new(TopKAdapter))] {
+            let Err(error) = wrong.into_final_domain() else {
+                panic!("wrong typed producer handle must fail closed")
+            };
+            assert_eq!(
+                error.kind(),
+                RuntimeContractViolationKind::ProducerPortMismatch
+            );
+        }
     }
 }

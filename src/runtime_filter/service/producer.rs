@@ -20,11 +20,13 @@ use std::sync::Arc;
 use crate::common::types::UniqueId;
 use crate::runtime_filter::core::channel::RuntimeFilterChannel;
 use crate::runtime_filter::model::contract::{BindingId, ChannelId};
+use crate::runtime_filter::port::final_domain::{CompletionFenceAuthority, FinalDomainShard};
 use crate::runtime_filter::port::identity::{PartitionId, ProducerSequence};
 use crate::runtime_filter::port::ordered_bound::OrderedBoundUpdate;
 use crate::runtime_filter::port::producer::{
-    OrderedBoundProducerAdapter, ProducerAdapter, ProducerFailureReason, RuntimeContractViolation,
-    RuntimeContractViolationKind, SubmitOutcome, TopKSummaryProducerAdapter,
+    FinalDomainProducerAdapter, OrderedBoundProducerAdapter, ProducerAdapter,
+    ProducerFailureReason, RuntimeContractViolation, RuntimeContractViolationKind, SubmitOutcome,
+    TopKSummaryProducerAdapter,
 };
 use crate::runtime_filter::port::support::{
     RuntimeFilterMemoryAccount, TemporaryContributionLease,
@@ -41,6 +43,7 @@ pub(super) struct ServiceProducerAdapter {
     fragment_instance_id: UniqueId,
     memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
     dispatcher: Arc<ActionDispatcher>,
+    final_domain_authority: Option<CompletionFenceAuthority>,
     #[cfg(test)]
     before_dispatch: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
@@ -53,6 +56,7 @@ impl ServiceProducerAdapter {
         fragment_instance_id: UniqueId,
         memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
         dispatcher: Arc<ActionDispatcher>,
+        final_domain_authority: Option<CompletionFenceAuthority>,
     ) -> Self {
         Self {
             channel_id,
@@ -61,6 +65,7 @@ impl ServiceProducerAdapter {
             fragment_instance_id,
             memory_account,
             dispatcher,
+            final_domain_authority,
             #[cfg(test)]
             before_dispatch: std::sync::Mutex::new(None),
         }
@@ -69,6 +74,19 @@ impl ServiceProducerAdapter {
     #[cfg(test)]
     pub(super) fn set_before_dispatch(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         *self.before_dispatch.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(super) fn final_domain_test_issuer(
+        &self,
+        open_drivers: u32,
+    ) -> Option<crate::runtime_filter::port::final_domain::CollectingFinalDomainTestIssuer> {
+        self.final_domain_authority.clone().map(|authority| {
+            crate::runtime_filter::port::final_domain::CollectingFinalDomainTestIssuer::new(
+                authority,
+                open_drivers,
+            )
+        })
     }
 
     fn finish(
@@ -199,6 +217,88 @@ impl ProducerAdapter for ServiceProducerAdapter {
     ) -> Result<SubmitOutcome, RuntimeContractViolation> {
         self.channel
             .close_partition(
+                self.binding_id,
+                self.fragment_instance_id,
+                partition_id,
+                terminal_sequence,
+            )
+            .and_then(|action| self.finish(action))
+    }
+
+    fn fail(
+        &self,
+        reason: ProducerFailureReason,
+    ) -> Result<SubmitOutcome, RuntimeContractViolation> {
+        self.channel
+            .fail_instance(self.binding_id, self.fragment_instance_id, reason)
+            .and_then(|action| self.finish(action))
+    }
+}
+
+impl FinalDomainProducerAdapter for ServiceProducerAdapter {
+    fn complete(
+        &self,
+        partition_id: PartitionId,
+        sequence: ProducerSequence,
+        shard: FinalDomainShard,
+    ) -> Result<SubmitOutcome, RuntimeContractViolation> {
+        if self.final_domain_authority.is_none() {
+            return Err(RuntimeContractViolation::new(
+                RuntimeContractViolationKind::ProducerPortMismatch,
+                "producer adapter has no installed completion-fence authority",
+            ));
+        }
+        self.channel.authorize_final(
+            self.binding_id,
+            self.fragment_instance_id,
+            partition_id,
+            sequence,
+            &shard,
+        )?;
+        let Some(bytes) = shard.canonical_contribution_bytes() else {
+            return self
+                .channel
+                .reject_final_resource_exhausted(
+                    self.binding_id,
+                    self.fragment_instance_id,
+                    partition_id,
+                    sequence,
+                    &shard,
+                )
+                .and_then(|action| self.finish(action));
+        };
+        let Ok(lease) = TemporaryContributionLease::try_new(self.memory_account.clone(), bytes)
+        else {
+            return self
+                .channel
+                .reject_final_resource_exhausted(
+                    self.binding_id,
+                    self.fragment_instance_id,
+                    partition_id,
+                    sequence,
+                    &shard,
+                )
+                .and_then(|action| self.finish(action));
+        };
+        self.channel
+            .complete_final(
+                self.binding_id,
+                self.fragment_instance_id,
+                partition_id,
+                sequence,
+                shard,
+                lease,
+            )
+            .and_then(|action| self.finish(action))
+    }
+
+    fn close_partition(
+        &self,
+        partition_id: PartitionId,
+        terminal_sequence: ProducerSequence,
+    ) -> Result<SubmitOutcome, RuntimeContractViolation> {
+        self.channel
+            .close_final_partition(
                 self.binding_id,
                 self.fragment_instance_id,
                 partition_id,

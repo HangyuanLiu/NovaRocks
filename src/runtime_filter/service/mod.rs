@@ -40,9 +40,9 @@ use crate::runtime_filter::model::contract::{BindingId, ChannelId, ConsumerActiv
 use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
 use crate::runtime_filter::port::install::RuntimeFilterInstallView;
 use crate::runtime_filter::port::producer::{
-    InstallContractError, InstallOutcome, OrderedBoundProducerAdapter, ProducerAdapter,
-    ProducerHandle, ProducerHandleWeak, ProducerPortKind, RuntimeContractViolation,
-    RuntimeContractViolationKind, TopKSummaryProducerAdapter,
+    FinalDomainProducerAdapter, InstallContractError, InstallOutcome, OrderedBoundProducerAdapter,
+    ProducerAdapter, ProducerHandle, ProducerHandleWeak, ProducerPortKind,
+    RuntimeContractViolation, RuntimeContractViolationKind, TopKSummaryProducerAdapter,
 };
 use crate::runtime_filter::port::subscription::{
     ArtifactDeliveryOutcome, LiveTerminal, SubscriptionHandle, SubscriptionKind,
@@ -1122,6 +1122,22 @@ impl RuntimeFilterService {
                 return Ok(handle);
             }
         }
+        let final_domain_authority = if requested == ProducerPortKind::FinalDomain {
+            Some(
+                route
+                    .final_domain_seed
+                    .as_ref()
+                    .ok_or_else(|| {
+                        violation(
+                            RuntimeContractViolationKind::ProducerPortMismatch,
+                            "installed final-domain producer route is missing its private seed",
+                        )
+                    })?
+                    .derive(binding_id, fragment_instance_id)?,
+            )
+        } else {
+            None
+        };
         let concrete = Arc::new(ServiceProducerAdapter::new(
             route.channel_id,
             route.channel.clone(),
@@ -1129,6 +1145,7 @@ impl RuntimeFilterService {
             fragment_instance_id,
             self.memory_account.clone(),
             self.dispatcher.clone(),
+            final_domain_authority,
         ));
         #[cfg(test)]
         self.producer_test_handles
@@ -1147,6 +1164,10 @@ impl RuntimeFilterService {
             ProducerPortKind::TopKSummary => {
                 let summary: Arc<dyn TopKSummaryProducerAdapter> = concrete;
                 ProducerHandle::TopKSummary(summary)
+            }
+            ProducerPortKind::FinalDomain => {
+                let final_domain: Arc<dyn FinalDomainProducerAdapter> = concrete;
+                ProducerHandle::FinalDomain(final_domain)
             }
         };
         handles.insert(key, handle.downgrade());
@@ -1274,6 +1295,21 @@ impl RuntimeFilterService {
     }
 
     #[cfg(test)]
+    fn final_domain_test_issuer(
+        &self,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        open_drivers: u32,
+    ) -> Option<crate::runtime_filter::port::final_domain::CollectingFinalDomainTestIssuer> {
+        self.producer_test_handles
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&(binding_id, fragment_instance_id))
+            .and_then(Weak::upgrade)
+            .and_then(|adapter| adapter.final_domain_test_issuer(open_drivers))
+    }
+
+    #[cfg(test)]
     fn set_dispatcher_after_claim_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         *self
             .dispatcher
@@ -1388,9 +1424,20 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use crate::common::types::UniqueId;
+    use crate::coordinator::scheduler::{
+        FragmentInstancePlacement, LiveBackendSnapshot, SchedulingPlan,
+    };
+    use crate::runtime::endpoint::RuntimeEndpoint;
+    use crate::runtime_filter::deployment::RuntimeFilterDeploymentPolicy;
+    use crate::runtime_filter::deployment::compiler::compile;
     use crate::runtime_filter::materializer::codec::{ArtifactDecodeExpectations, decode_leaf};
     use crate::runtime_filter::model::contract::*;
     use crate::runtime_filter::model::coverage::Coverage;
+    use crate::runtime_filter::model::graph::{
+        ApplyPoint, ConsumerRequirement, PlanLocation, ProducerRequirement,
+        RuntimeFilterBindingRole, RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
+        RuntimeFilterGraph,
+    };
     use crate::runtime_filter::port::artifact::{
         ArtifactBundle, ArtifactKind, ConsumerArtifactProfile, ConsumerProfileId, PhysicalArtifact,
     };
@@ -1398,6 +1445,7 @@ mod tests {
         ConsumerEventIdentity, RuntimeFilterEvent, RuntimeFilterEventIdentity,
         RuntimeFilterEventSink,
     };
+    use crate::runtime_filter::port::final_domain::FinalDomainTestIssuerTransition;
     use crate::runtime_filter::port::identity::*;
     use crate::runtime_filter::port::install::*;
     use crate::runtime_filter::port::ordered_bound::{
@@ -1420,6 +1468,7 @@ mod tests {
         LogicalSnapshot, MembershipValues, ReducedMembershipDomain, ValueDomainDelta,
     };
     use crate::runtime_filter::router::loopback::LoopbackRouter;
+    use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
 
     use super::materialization::MaterializationWorkClaim;
     use super::memory::MemTrackerMemoryAccount;
@@ -1783,6 +1832,163 @@ mod tests {
         )
     }
 
+    fn fenced_final_deployment() -> RuntimeFilterChannelDeployment {
+        let witness = CoverageWitnessId::new(101);
+        let coverage = Coverage::AllOf(vec![Coverage::Leaf(witness)]);
+        RuntimeFilterChannelDeployment::new(
+            ChannelId::new(1),
+            RuntimeFilterLogicalDomain::Membership {
+                value_type: DataType::Int64,
+                null_semantics: NullSemantics::NullSafeEqual,
+            },
+            RuntimeFilterLifecycle::CompleteOnce,
+            coverage.clone(),
+            coverage,
+            ReductionRequirement::SetUnion,
+            BTreeSet::from([
+                ContributionKind::FinalDomainShard,
+                ContributionKind::ProducerClosed,
+            ]),
+            CompletionRequirement::FencedFinalDomain(CompletionFenceKind::CommittedDomainFrozen),
+            RuntimeFilterPolicyRequirement {
+                max_contribution_bytes: 1024,
+                max_artifact_bytes: 1024,
+                deadline_ms: 100,
+                max_retries: 2,
+            },
+            RuntimeFilterCoreBudget::new(8192),
+            MaterializationPolicy::for_test(),
+            BTreeMap::from([(
+                BindingId::new(10),
+                ProducerDeployment::new(witness, BTreeSet::from([uid(10)])),
+            )]),
+            BTreeMap::from([(
+                BindingId::new(30),
+                ConsumerDeployment::with_profile(
+                    ConsumerActivation::NonBlockingLive {
+                        late_apply: LateApplyGranularity::Batch,
+                    },
+                    BTreeSet::from([
+                        ArtifactCapability::Membership,
+                        ArtifactCapability::EmptyDomain,
+                    ]),
+                    ConsumerArtifactProfile::new(
+                        BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
+                        None,
+                    )
+                    .unwrap(),
+                    RouteEdgeId::new(40),
+                    BTreeSet::from([uid(30)]),
+                ),
+            )]),
+        )
+    }
+
+    fn compiled_fenced_final_view() -> RuntimeFilterInstallView {
+        let deployment = fenced_final_deployment();
+        let expression = TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Int(1)),
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+        let mut graph = RuntimeFilterGraph::default();
+        graph
+            .insert_channel(RuntimeFilterChannelSpec {
+                channel_id: deployment.channel_id(),
+                logical_domain: deployment.logical_domain().clone(),
+                lifecycle: deployment.lifecycle(),
+                availability_coverage: deployment.availability_coverage().clone(),
+                terminal_coverage: deployment.terminal_coverage().clone(),
+                reduction_requirement: deployment.reduction_requirement(),
+                allowed_contribution_kinds: deployment.allowed_contribution_kinds().clone(),
+                required_consumer_capabilities: BTreeSet::from([
+                    ArtifactCapability::Membership,
+                    ArtifactCapability::EmptyDomain,
+                ]),
+                policy: deployment.policy(),
+            })
+            .unwrap();
+        graph
+            .insert_binding(RuntimeFilterBindingSpec {
+                binding_id: BindingId::new(10),
+                channel_id: ChannelId::new(1),
+                coverage_witness_id: Some(CoverageWitnessId::new(101)),
+                location: PlanLocation {
+                    fragment_id: PlanFragmentId::new(0),
+                    node_id: PlanNodeId::new(1),
+                },
+                expression: expression.clone(),
+                apply_point: ApplyPoint::NodeOutput,
+                role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
+                    contribution_kinds: BTreeSet::from([
+                        ContributionKind::FinalDomainShard,
+                        ContributionKind::ProducerClosed,
+                    ]),
+                    completion_requirement: CompletionRequirement::FencedFinalDomain(
+                        CompletionFenceKind::CommittedDomainFrozen,
+                    ),
+                }),
+            })
+            .unwrap();
+        graph
+            .insert_binding(RuntimeFilterBindingSpec {
+                binding_id: BindingId::new(30),
+                channel_id: ChannelId::new(1),
+                coverage_witness_id: None,
+                location: PlanLocation {
+                    fragment_id: PlanFragmentId::new(0),
+                    node_id: PlanNodeId::new(2),
+                },
+                expression,
+                apply_point: ApplyPoint::NodeInput,
+                role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
+                    capabilities: BTreeSet::from([
+                        ArtifactCapability::Membership,
+                        ArtifactCapability::EmptyDomain,
+                    ]),
+                    activation: ConsumerActivation::NonBlockingLive {
+                        late_apply: LateApplyGranularity::Batch,
+                    },
+                }),
+            })
+            .unwrap();
+        let placement = FragmentInstancePlacement {
+            fragment_id: 0,
+            instance_index: 0,
+            finst_id: uid(10),
+            backend_idx: 0,
+            endpoint: RuntimeEndpoint::from_socket_addr("127.0.0.1:9060".parse().unwrap()),
+            scan_ranges: BTreeMap::new(),
+            destinations: Vec::new(),
+            runtime_filter_prober_params: BTreeMap::new(),
+            per_exch_num_senders: BTreeMap::new(),
+        };
+        let scheduling = SchedulingPlan {
+            root_fragment_id: 0,
+            by_fragment: BTreeMap::from([(0, vec![placement])]),
+            root_finst_id: uid(10),
+            root_backend_idx: 0,
+        };
+        let backends = LiveBackendSnapshot::from_endpoints(vec!["127.0.0.1:9060".parse().unwrap()]);
+        let policy = RuntimeFilterDeploymentPolicy {
+            core_budget: deployment.core_budget(),
+            replica_redundancy: 1,
+            materialization: deployment.materialization_policy(),
+        };
+        compile(
+            &graph,
+            &scheduling,
+            &[],
+            &backends,
+            &policy,
+            DeploymentEpoch::new(9),
+        )
+        .unwrap()
+        .install_views
+        .remove(&RuntimeFilterParticipantId::new(0))
+        .expect("compiler projects the colocated aggregate install shard")
+    }
+
     fn view(
         channels: impl IntoIterator<Item = RuntimeFilterChannelDeployment>,
     ) -> RuntimeFilterInstallView {
@@ -1880,6 +2086,70 @@ mod tests {
             started,
             tracker,
         }
+    }
+
+    #[test]
+    fn fenced_final_install_opens_only_typed_handle_and_completes_through_private_authority() {
+        let fixture = fixture();
+        assert_eq!(
+            fixture
+                .service
+                .install(compiled_fenced_final_view())
+                .unwrap(),
+            InstallOutcome::Installed
+        );
+        for wrong in [
+            ProducerPortKind::Membership,
+            ProducerPortKind::OrderedBound,
+            ProducerPortKind::TopKSummary,
+        ] {
+            assert_eq!(
+                fixture
+                    .service
+                    .open_producer(BindingId::new(10), uid(10), 1, wrong)
+                    .unwrap_err()
+                    .kind(),
+                RuntimeContractViolationKind::ProducerPortMismatch
+            );
+        }
+        let ProducerHandle::FinalDomain(producer) = fixture
+            .service
+            .open_producer(
+                BindingId::new(10),
+                uid(10),
+                1,
+                ProducerPortKind::FinalDomain,
+            )
+            .unwrap()
+        else {
+            panic!("fenced-final install must return the typed final-domain handle")
+        };
+        let collecting = fixture
+            .service
+            .final_domain_test_issuer(BindingId::new(10), uid(10), 1)
+            .expect("service adapter privately owns the installed authority");
+        let FinalDomainTestIssuerTransition::Frozen(issuer) = collecting.close_driver() else {
+            panic!("last driver close freezes the committed domain")
+        };
+        let shard = issuer
+            .issue_shard(
+                ProducerStreamId::new(BindingId::new(10), uid(10), PartitionId::new(0)),
+                ProducerSequence::new(0),
+                ValueDomainDelta::new(MembershipValues::int64([7]), false),
+            )
+            .unwrap();
+        assert_eq!(
+            producer
+                .complete(PartitionId::new(0), ProducerSequence::new(0), shard)
+                .unwrap(),
+            SubmitOutcome::Applied
+        );
+        assert_eq!(
+            producer
+                .close_partition(PartitionId::new(0), ProducerSequence::new(1))
+                .unwrap(),
+            SubmitOutcome::Completed
+        );
     }
 
     pub(super) fn installed_ordered_service_fixture() -> Arc<RuntimeFilterService> {

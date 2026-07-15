@@ -23,13 +23,15 @@ use arrow::datatypes::DataType;
 
 use crate::common::types::UniqueId;
 use crate::runtime_filter::model::contract::{
-    BindingId, ChannelId, CoverageWitnessId, NullSemantics, ReductionRequirement,
-    RuntimeFilterLogicalDomain,
+    BindingId, ChannelId, CompletionRequirement, CoverageWitnessId, NullSemantics,
+    ReductionRequirement, RuntimeFilterLogicalDomain,
 };
 use crate::runtime_filter::model::coverage::Coverage;
+use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
 use crate::runtime_filter::port::events::{
     ProducerEventIdentity, RuntimeFilterEvent, RuntimeFilterEventIdentity,
 };
+use crate::runtime_filter::port::final_domain::{FinalDomainShard, RuntimeCompletionFenceContract};
 use crate::runtime_filter::port::identity::{
     ContributionIdentity, DeploymentEpoch, LogicalVersion, PartitionId, ProducerSequence,
     ProducerStreamId, RuntimeFilterParticipantId,
@@ -278,6 +280,11 @@ struct ChannelState {
     next_dispatch_order: u64,
 }
 
+enum MembershipContributionMode {
+    Incremental,
+    FencedFinal(Arc<RuntimeCompletionFenceContract>),
+}
+
 struct LockedAction {
     action: ChannelAction,
     release_after_unlock: Option<RetainedMemoryReservation>,
@@ -317,6 +324,7 @@ pub(crate) struct RuntimeFilterChannel {
     terminal_coverage: Coverage,
     data_type: Option<DataType>,
     null_semantics: Option<NullSemantics>,
+    membership_mode: Option<MembershipContributionMode>,
     max_contribution_bytes: u64,
     max_reducer_bytes: u64,
     deadline: OnceLock<Instant>,
@@ -325,6 +333,13 @@ pub(crate) struct RuntimeFilterChannel {
 }
 
 impl RuntimeFilterChannel {
+    fn final_domain_contract(&self) -> Option<&Arc<RuntimeCompletionFenceContract>> {
+        match self.membership_mode.as_ref() {
+            Some(MembershipContributionMode::FencedFinal(contract)) => Some(contract),
+            Some(MembershipContributionMode::Incremental) | None => None,
+        }
+    }
+
     pub(crate) fn contribution_identity(
         &self,
         binding_id: BindingId,
@@ -399,6 +414,24 @@ impl RuntimeFilterChannel {
         deployment: &RuntimeFilterChannelDeployment,
         memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
     ) -> Result<Self, ChannelBuildError> {
+        Self::new_unanchored_with_final_domain_contract(
+            query_id,
+            participant_id,
+            epoch,
+            deployment,
+            memory_account,
+            None,
+        )
+    }
+
+    pub(crate) fn new_unanchored_with_final_domain_contract(
+        query_id: UniqueId,
+        participant_id: RuntimeFilterParticipantId,
+        epoch: DeploymentEpoch,
+        deployment: &RuntimeFilterChannelDeployment,
+        memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
+        final_domain_contract: Option<Arc<RuntimeCompletionFenceContract>>,
+    ) -> Result<Self, ChannelBuildError> {
         let (data_type, null_semantics, reducer, ordered_reducer) =
             match deployment.logical_domain() {
                 RuntimeFilterLogicalDomain::Membership {
@@ -437,6 +470,47 @@ impl RuntimeFilterChannel {
                     (None, None, None, Some(reducer))
                 }
             };
+        let membership_mode = match (
+            deployment.logical_domain(),
+            deployment.completion_requirement(),
+        ) {
+            (
+                RuntimeFilterLogicalDomain::Membership {
+                    value_type,
+                    null_semantics,
+                },
+                CompletionRequirement::FencedFinalDomain(fence_kind),
+            ) => {
+                let schema = ArtifactMembershipSchema::new(value_type, *null_semantics)
+                    .map_err(|_| ChannelBuildError::UnsupportedMembershipType)?;
+                let expected = RuntimeCompletionFenceContract::try_from_install(
+                    query_id,
+                    epoch,
+                    deployment.channel_id(),
+                    fence_kind,
+                    &schema,
+                )
+                .map_err(|_| ChannelBuildError::UnsupportedContract)?;
+                let contract = match final_domain_contract {
+                    Some(contract) if *contract == expected => contract,
+                    Some(_) => return Err(ChannelBuildError::UnsupportedContract),
+                    None => Arc::new(expected),
+                };
+                Some(MembershipContributionMode::FencedFinal(contract))
+            }
+            (RuntimeFilterLogicalDomain::Membership { .. }, _) => {
+                if final_domain_contract.is_some() {
+                    return Err(ChannelBuildError::UnsupportedContract);
+                }
+                Some(MembershipContributionMode::Incremental)
+            }
+            (RuntimeFilterLogicalDomain::OrderedBound(_), _) => {
+                if final_domain_contract.is_some() {
+                    return Err(ChannelBuildError::UnsupportedContract);
+                }
+                None
+            }
+        };
         let mut witnesses = BTreeMap::new();
         let producers = deployment
             .producers()
@@ -479,6 +553,7 @@ impl RuntimeFilterChannel {
             terminal_coverage: deployment.terminal_coverage().clone(),
             data_type,
             null_semantics,
+            membership_mode,
             max_contribution_bytes: deployment.policy().max_contribution_bytes,
             max_reducer_bytes: deployment.core_budget().max_reducer_bytes(),
             deadline: OnceLock::new(),
@@ -557,6 +632,12 @@ impl RuntimeFilterChannel {
         delta: ValueDomainDelta,
         temporary_lease: TemporaryContributionLease,
     ) -> Result<ChannelAction, RuntimeContractViolation> {
+        if self.final_domain_contract().is_some() {
+            return Err(violation(
+                RuntimeContractViolationKind::ProducerPortMismatch,
+                "fenced-final channel cannot accept incremental membership deltas",
+            ));
+        }
         let Some(data_type) = self.data_type.as_ref() else {
             return Err(violation(
                 RuntimeContractViolationKind::ProducerPortMismatch,
@@ -601,7 +682,7 @@ impl RuntimeFilterChannel {
             ) {
                 return Ok(progress(SubmitOutcome::TerminalNoop));
             }
-            let fingerprint = delta.fingerprint();
+            let fingerprint = delta.fingerprint().bytes();
             {
                 let partition =
                     partition_state(&state, binding_id, fragment_instance_id, partition_id)?;
@@ -781,6 +862,253 @@ impl RuntimeFilterChannel {
                 fragment_instance_id,
                 SubmitOutcome::Applied,
                 events,
+            );
+            drop(state);
+            return Ok(locked.finish());
+        }
+    }
+
+    pub(crate) fn authorize_final(
+        &self,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        partition_id: PartitionId,
+        sequence: ProducerSequence,
+        shard: &FinalDomainShard,
+    ) -> Result<(), RuntimeContractViolation> {
+        let contract = self.final_domain_contract().ok_or_else(|| {
+            violation(
+                RuntimeContractViolationKind::ProducerPortMismatch,
+                "non-final channel cannot accept final-domain shards",
+            )
+        })?;
+        let state = self.state.lock().unwrap();
+        partition_state(&state, binding_id, fragment_instance_id, partition_id)?;
+        shard.verify_scope(
+            contract,
+            ProducerStreamId::new(binding_id, fragment_instance_id, partition_id),
+            sequence,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn complete_final(
+        &self,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        partition_id: PartitionId,
+        sequence: ProducerSequence,
+        shard: FinalDomainShard,
+        temporary_lease: TemporaryContributionLease,
+    ) -> Result<ChannelAction, RuntimeContractViolation> {
+        let contract = self.final_domain_contract().ok_or_else(|| {
+            violation(
+                RuntimeContractViolationKind::ProducerPortMismatch,
+                "non-final channel cannot accept final-domain shards",
+            )
+        })?;
+        let stream = ProducerStreamId::new(binding_id, fragment_instance_id, partition_id);
+        let mut incoming_reservation: Option<RetainedMemoryReservation> = None;
+        let mut reservation_failed_for = None;
+        loop {
+            let mut state = self.state.lock().unwrap();
+            partition_state(&state, binding_id, fragment_instance_id, partition_id)?;
+            shard.verify_scope(contract, stream, sequence)?;
+            if matches!(
+                state.terminal,
+                ChannelTerminal::Unavailable { .. } | ChannelTerminal::Cancelled { .. }
+            ) {
+                return Ok(terminal_action_from_state(&state));
+            }
+            let replay_digest = shard.replay_digest();
+            if let Some(previous) =
+                partition_state(&state, binding_id, fragment_instance_id, partition_id)?
+                    .and_then(|partition| partition.seen.get(&sequence))
+            {
+                return if *previous == replay_digest {
+                    Ok(progress(SubmitOutcome::Duplicate))
+                } else {
+                    Err(violation(
+                        RuntimeContractViolationKind::ConflictingReplay,
+                        "same final-domain contribution identity carried a different payload",
+                    ))
+                };
+            }
+            if !matches!(state.terminal, ChannelTerminal::Collecting) {
+                return Ok(terminal_action_from_state(&state));
+            }
+            let instance_progress =
+                instance_mut(&mut state, binding_id, fragment_instance_id)?.progress;
+            let (partition_progress, terminal_sequence) =
+                partition_state(&state, binding_id, fragment_instance_id, partition_id)?
+                    .map_or((TerminalProgress::Pending, None), |partition| {
+                        (partition.progress, partition.terminal_sequence)
+                    });
+            if instance_progress == TerminalProgress::Impossible
+                || partition_progress == TerminalProgress::Impossible
+            {
+                return Ok(progress(SubmitOutcome::TerminalNoop));
+            }
+            if partition_progress == TerminalProgress::Satisfied {
+                return Err(violation(
+                    RuntimeContractViolationKind::SequenceOutsideTerminalRange,
+                    "new final domain arrived after partition close",
+                ));
+            }
+            if terminal_sequence.is_some_and(|terminal| sequence >= terminal) {
+                return Err(violation(
+                    RuntimeContractViolationKind::SequenceOutsideTerminalRange,
+                    "final-domain sequence is outside the exclusive terminal range",
+                ));
+            }
+            let contribution_bytes = match shard.canonical_contribution_bytes() {
+                Some(bytes) => bytes,
+                None => {
+                    let locked = self.make_unavailable(
+                        &mut state,
+                        UnavailableReason::ResourceLimit,
+                        SubmitOutcome::TerminalNoop,
+                    );
+                    drop(state);
+                    drop(incoming_reservation);
+                    return Ok(locked.finish());
+                }
+            };
+            if temporary_lease.bytes() != contribution_bytes {
+                return Err(violation(
+                    RuntimeContractViolationKind::InvalidContributionLease,
+                    "temporary contribution lease does not match canonical final-domain size",
+                ));
+            }
+            if u64::try_from(contribution_bytes)
+                .map_or(true, |bytes| bytes > self.max_contribution_bytes)
+            {
+                let locked = self.make_unavailable(
+                    &mut state,
+                    UnavailableReason::ResourceLimit,
+                    SubmitOutcome::TerminalNoop,
+                );
+                drop(state);
+                drop(incoming_reservation);
+                return Ok(locked.finish());
+            }
+            let projection = match state
+                .reducer
+                .as_ref()
+                .expect("membership channel owns a membership reducer")
+                .preflight(shard.domain())
+            {
+                Ok(projection) => projection,
+                Err(ReducerError::TypeMismatch | ReducerError::UnsupportedType) => {
+                    return Err(violation(
+                        RuntimeContractViolationKind::TypeMismatch,
+                        "final domain type does not match channel membership type",
+                    ));
+                }
+                Err(ReducerError::SizeOverflow) => {
+                    let locked = self.make_unavailable(
+                        &mut state,
+                        UnavailableReason::ResourceLimit,
+                        SubmitOutcome::TerminalNoop,
+                    );
+                    drop(state);
+                    drop(incoming_reservation);
+                    return Ok(locked.finish());
+                }
+            };
+            let retained_growth = match projection
+                .retained_growth()
+                .checked_add(REPLAY_METADATA_BYTES)
+            {
+                Some(bytes) => bytes,
+                None => {
+                    let locked = self.make_unavailable(
+                        &mut state,
+                        UnavailableReason::ResourceLimit,
+                        SubmitOutcome::TerminalNoop,
+                    );
+                    drop(state);
+                    drop(incoming_reservation);
+                    return Ok(locked.finish());
+                }
+            };
+            if state
+                .reservation
+                .bytes()
+                .checked_add(retained_growth)
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .is_none_or(|bytes| bytes > self.max_reducer_bytes)
+            {
+                let locked = self.make_unavailable(
+                    &mut state,
+                    UnavailableReason::ResourceLimit,
+                    SubmitOutcome::TerminalNoop,
+                );
+                drop(state);
+                drop(incoming_reservation);
+                return Ok(locked.finish());
+            }
+            if incoming_reservation
+                .as_ref()
+                .map(RetainedMemoryReservation::bytes)
+                != Some(retained_growth)
+            {
+                if reservation_failed_for == Some(retained_growth) {
+                    let locked = self.make_unavailable(
+                        &mut state,
+                        UnavailableReason::ResourceLimit,
+                        SubmitOutcome::TerminalNoop,
+                    );
+                    drop(state);
+                    return Ok(locked.finish());
+                }
+                drop(state);
+                drop(incoming_reservation.take());
+                match RetainedMemoryReservation::try_new(
+                    self.memory_account.clone(),
+                    retained_growth,
+                ) {
+                    Ok(reservation) => incoming_reservation = Some(reservation),
+                    Err(_) => reservation_failed_for = Some(retained_growth),
+                }
+                continue;
+            }
+            let incoming = incoming_reservation
+                .take()
+                .expect("matching final-domain reservation must exist");
+            if let Err(failure) = state.reservation.absorb(incoming) {
+                let (_, incoming) = failure.into_parts();
+                let locked = self.make_unavailable(
+                    &mut state,
+                    UnavailableReason::ResourceLimit,
+                    SubmitOutcome::TerminalNoop,
+                );
+                drop(state);
+                drop(incoming);
+                return Ok(locked.finish());
+            }
+            state
+                .reducer
+                .as_mut()
+                .expect("membership channel owns a membership reducer")
+                .commit_preflighted(shard.domain())
+                .expect("preflighted final-domain commit preserves type invariants");
+            let partition = partition_mut_for_commit(
+                &mut state,
+                binding_id,
+                fragment_instance_id,
+                partition_id,
+            );
+            partition.seen.insert(sequence, replay_digest);
+            if partition.is_gapless() {
+                partition.progress = TerminalProgress::Satisfied;
+            }
+            let locked = self.refresh_after_progress(
+                &mut state,
+                binding_id,
+                fragment_instance_id,
+                SubmitOutcome::Applied,
+                Vec::new(),
             );
             drop(state);
             return Ok(locked.finish());
@@ -1655,6 +1983,55 @@ impl RuntimeFilterChannel {
         partition_id: PartitionId,
         terminal_sequence: ProducerSequence,
     ) -> Result<ChannelAction, RuntimeContractViolation> {
+        if self.final_domain_contract().is_some() {
+            return Err(violation(
+                RuntimeContractViolationKind::ProducerPortMismatch,
+                "fenced-final channel requires the final-domain close port",
+            ));
+        }
+        self.close_membership_partition(
+            binding_id,
+            fragment_instance_id,
+            partition_id,
+            terminal_sequence,
+        )
+    }
+
+    pub(crate) fn close_final_partition(
+        &self,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        partition_id: PartitionId,
+        terminal_sequence: ProducerSequence,
+    ) -> Result<ChannelAction, RuntimeContractViolation> {
+        if self.final_domain_contract().is_none() {
+            return Err(violation(
+                RuntimeContractViolationKind::ProducerPortMismatch,
+                "non-final channel cannot use the final-domain close port",
+            ));
+        }
+        self.authorize_submit(binding_id, fragment_instance_id, partition_id)?;
+        if terminal_sequence.get() == 0 {
+            return Err(violation(
+                RuntimeContractViolationKind::FinalDomainMissing,
+                "fenced-final partition cannot close before final-domain sequence zero",
+            ));
+        }
+        self.close_membership_partition(
+            binding_id,
+            fragment_instance_id,
+            partition_id,
+            terminal_sequence,
+        )
+    }
+
+    fn close_membership_partition(
+        &self,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        partition_id: PartitionId,
+        terminal_sequence: ProducerSequence,
+    ) -> Result<ChannelAction, RuntimeContractViolation> {
         let mut incoming_reservation: Option<RetainedMemoryReservation> = None;
         let mut reservation_failed = false;
         loop {
@@ -1920,6 +2297,12 @@ impl RuntimeFilterChannel {
         sequence: ProducerSequence,
         delta: &ValueDomainDelta,
     ) -> Result<ChannelAction, RuntimeContractViolation> {
+        if self.final_domain_contract().is_some() {
+            return Err(violation(
+                RuntimeContractViolationKind::ProducerPortMismatch,
+                "fenced-final channel cannot accept incremental membership deltas",
+            ));
+        }
         let Some(data_type) = self.data_type.as_ref() else {
             return Err(violation(
                 RuntimeContractViolationKind::ProducerPortMismatch,
@@ -1948,7 +2331,7 @@ impl RuntimeFilterChannel {
         ) {
             return Ok(terminal_action_from_state(&state));
         }
-        let fingerprint = delta.fingerprint();
+        let fingerprint = delta.fingerprint().bytes();
         if let Some(previous) =
             partition_state(&state, binding_id, fragment_instance_id, partition_id)?
                 .and_then(|partition| partition.seen.get(&sequence))
@@ -1991,6 +2374,76 @@ impl RuntimeFilterChannel {
             return Err(violation(
                 RuntimeContractViolationKind::SequenceOutsideTerminalRange,
                 "delta sequence is outside the exclusive terminal range",
+            ));
+        }
+        let locked = self.make_unavailable(
+            &mut state,
+            UnavailableReason::ResourceLimit,
+            SubmitOutcome::TerminalNoop,
+        );
+        drop(state);
+        Ok(locked.finish())
+    }
+
+    pub(crate) fn reject_final_resource_exhausted(
+        &self,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        partition_id: PartitionId,
+        sequence: ProducerSequence,
+        shard: &FinalDomainShard,
+    ) -> Result<ChannelAction, RuntimeContractViolation> {
+        let contract = self.final_domain_contract().ok_or_else(|| {
+            violation(
+                RuntimeContractViolationKind::ProducerPortMismatch,
+                "non-final channel cannot accept final-domain shards",
+            )
+        })?;
+        let stream = ProducerStreamId::new(binding_id, fragment_instance_id, partition_id);
+        let mut state = self.state.lock().unwrap();
+        partition_state(&state, binding_id, fragment_instance_id, partition_id)?;
+        shard.verify_scope(contract, stream, sequence)?;
+        if matches!(
+            state.terminal,
+            ChannelTerminal::Unavailable { .. } | ChannelTerminal::Cancelled { .. }
+        ) {
+            return Ok(terminal_action_from_state(&state));
+        }
+        let replay_digest = shard.replay_digest();
+        if let Some(previous) =
+            partition_state(&state, binding_id, fragment_instance_id, partition_id)?
+                .and_then(|partition| partition.seen.get(&sequence))
+        {
+            return if *previous == replay_digest {
+                Ok(progress(SubmitOutcome::Duplicate))
+            } else {
+                Err(violation(
+                    RuntimeContractViolationKind::ConflictingReplay,
+                    "same final-domain contribution identity carried a different payload",
+                ))
+            };
+        }
+        if !matches!(state.terminal, ChannelTerminal::Collecting) {
+            return Ok(terminal_action_from_state(&state));
+        }
+        let instance_progress =
+            instance_mut(&mut state, binding_id, fragment_instance_id)?.progress;
+        let (partition_progress, terminal_sequence) =
+            partition_state(&state, binding_id, fragment_instance_id, partition_id)?
+                .map_or((TerminalProgress::Pending, None), |partition| {
+                    (partition.progress, partition.terminal_sequence)
+                });
+        if instance_progress == TerminalProgress::Impossible
+            || partition_progress == TerminalProgress::Impossible
+        {
+            return Ok(progress(SubmitOutcome::TerminalNoop));
+        }
+        if partition_progress == TerminalProgress::Satisfied
+            || terminal_sequence.is_some_and(|terminal| sequence >= terminal)
+        {
+            return Err(violation(
+                RuntimeContractViolationKind::SequenceOutsideTerminalRange,
+                "final-domain sequence is outside the exclusive terminal range",
             ));
         }
         let locked = self.make_unavailable(
@@ -6069,6 +6522,862 @@ mod tests {
             assert_eq!(state.reservation.bytes(), 0);
             drop(state);
             assert_eq!(account.current.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    mod fenced_final {
+        use super::*;
+        use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
+        use crate::runtime_filter::port::final_domain::{
+            CollectingFinalDomainTestIssuer, CompletionFenceAuthority,
+            FinalDomainTestIssuerTransition, FrozenFinalDomainTestIssuer,
+            RuntimeCompletionFenceContract,
+        };
+
+        struct BlockingOnceAccount {
+            block_next: AtomicBool,
+            current: AtomicUsize,
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+
+        impl RuntimeFilterMemoryAccount for BlockingOnceAccount {
+            fn try_consume(&self, bytes: usize) -> Result<(), MemoryAccountError> {
+                if self.block_next.swap(false, Ordering::SeqCst) {
+                    self.entered.send(()).unwrap();
+                    self.release.lock().unwrap().recv().unwrap();
+                }
+                self.current.fetch_add(bytes, Ordering::SeqCst);
+                Ok(())
+            }
+
+            fn release(&self, bytes: usize) {
+                let previous = self.current.fetch_sub(bytes, Ordering::SeqCst);
+                assert!(previous >= bytes);
+            }
+        }
+
+        fn blocking_once_account() -> (
+            Arc<BlockingOnceAccount>,
+            mpsc::Receiver<()>,
+            mpsc::Sender<()>,
+        ) {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            (
+                Arc::new(BlockingOnceAccount {
+                    block_next: AtomicBool::new(true),
+                    current: AtomicUsize::new(0),
+                    entered: entered_tx,
+                    release: Mutex::new(release_rx),
+                }),
+                entered_rx,
+                release_tx,
+            )
+        }
+
+        fn final_deployment(
+            producers: &[(u32, u32, i64)],
+            local_partition_budget: u64,
+        ) -> RuntimeFilterChannelDeployment {
+            let coverage = Coverage::AllOf(
+                producers
+                    .iter()
+                    .map(|(_, witness, _)| Coverage::Leaf(CoverageWitnessId::new(*witness)))
+                    .collect(),
+            );
+            RuntimeFilterChannelDeployment::new(
+                ChannelId::new(1),
+                RuntimeFilterLogicalDomain::Membership {
+                    value_type: DataType::Int64,
+                    null_semantics: NullSemantics::NullSafeEqual,
+                },
+                RuntimeFilterLifecycle::CompleteOnce,
+                coverage.clone(),
+                coverage,
+                ReductionRequirement::SetUnion,
+                BTreeSet::from([
+                    ContributionKind::FinalDomainShard,
+                    ContributionKind::ProducerClosed,
+                ]),
+                CompletionRequirement::FencedFinalDomain(
+                    CompletionFenceKind::CommittedDomainFrozen,
+                ),
+                RuntimeFilterPolicyRequirement {
+                    max_contribution_bytes: 4096,
+                    max_artifact_bytes: 1,
+                    deadline_ms: 10,
+                    max_retries: 0,
+                },
+                RuntimeFilterCoreBudget::new(local_partition_budget),
+                MaterializationPolicy::for_test(),
+                producers
+                    .iter()
+                    .map(|(binding, witness, instance)| {
+                        (
+                            BindingId::new(*binding),
+                            ProducerDeployment::new(
+                                CoverageWitnessId::new(*witness),
+                                BTreeSet::from([uid(*instance)]),
+                            ),
+                        )
+                    })
+                    .collect(),
+                BTreeMap::new(),
+            )
+        }
+
+        fn frozen_issuer(binding: u32, instance: i64) -> FrozenFinalDomainTestIssuer {
+            let schema =
+                ArtifactMembershipSchema::new(&DataType::Int64, NullSemantics::NullSafeEqual)
+                    .unwrap();
+            let contract = Arc::new(
+                RuntimeCompletionFenceContract::try_from_install(
+                    uid(99),
+                    DeploymentEpoch::new(1),
+                    ChannelId::new(1),
+                    CompletionFenceKind::CommittedDomainFrozen,
+                    &schema,
+                )
+                .unwrap(),
+            );
+            let authority =
+                CompletionFenceAuthority::try_new(contract, BindingId::new(binding), uid(instance))
+                    .unwrap();
+            match CollectingFinalDomainTestIssuer::new(authority, 1).close_driver() {
+                FinalDomainTestIssuerTransition::Frozen(issuer) => issuer,
+                FinalDomainTestIssuerTransition::Collecting(_) => unreachable!(),
+            }
+        }
+
+        fn final_channel(
+            producers: &[(u32, u32, i64)],
+            budget: u64,
+        ) -> (RuntimeFilterChannel, Arc<Account>) {
+            let account = Arc::new(Account::default());
+            let channel = RuntimeFilterChannel::new(
+                uid(99),
+                RuntimeFilterParticipantId::new(1),
+                DeploymentEpoch::new(1),
+                &final_deployment(producers, budget),
+                Instant::now() + Duration::from_secs(10),
+                account.clone(),
+            )
+            .unwrap();
+            (channel, account)
+        }
+
+        fn final_channel_with_memory_account(
+            producers: &[(u32, u32, i64)],
+            budget: u64,
+            account: Arc<dyn RuntimeFilterMemoryAccount>,
+        ) -> Arc<RuntimeFilterChannel> {
+            Arc::new(
+                RuntimeFilterChannel::new(
+                    uid(99),
+                    RuntimeFilterParticipantId::new(1),
+                    DeploymentEpoch::new(1),
+                    &final_deployment(producers, budget),
+                    Instant::now() + Duration::from_secs(10),
+                    account,
+                )
+                .unwrap(),
+            )
+        }
+
+        fn shard(
+            issuer: &FrozenFinalDomainTestIssuer,
+            binding: u32,
+            instance: i64,
+            partition: u32,
+            sequence: u64,
+            values: &[i64],
+        ) -> crate::runtime_filter::port::final_domain::FinalDomainShard {
+            issuer
+                .issue_shard(
+                    ProducerStreamId::new(
+                        BindingId::new(binding),
+                        uid(instance),
+                        PartitionId::new(partition),
+                    ),
+                    ProducerSequence::new(sequence),
+                    ValueDomainDelta::new(MembershipValues::int64(values.iter().copied()), false),
+                )
+                .unwrap()
+        }
+
+        fn complete(
+            channel: &RuntimeFilterChannel,
+            account: Arc<Account>,
+            binding: u32,
+            instance: i64,
+            partition: u32,
+            sequence: u64,
+            shard: crate::runtime_filter::port::final_domain::FinalDomainShard,
+        ) -> Result<ChannelAction, RuntimeContractViolation> {
+            let bytes = shard.canonical_contribution_bytes().unwrap();
+            channel.complete_final(
+                BindingId::new(binding),
+                uid(instance),
+                PartitionId::new(partition),
+                ProducerSequence::new(sequence),
+                shard,
+                TemporaryContributionLease::new(account, bytes),
+            )
+        }
+
+        #[test]
+        fn final_and_incremental_membership_modes_are_mutually_exclusive_and_scope_is_checked() {
+            let (final_channel, account) = final_channel(&[(10, 1, 10)], 4096);
+            final_channel
+                .open_producer(BindingId::new(10), uid(10), 1)
+                .unwrap();
+            assert_eq!(
+                submit(&final_channel, account.clone(), 10, 10, 0, &[1])
+                    .unwrap_err()
+                    .kind(),
+                RuntimeContractViolationKind::ProducerPortMismatch
+            );
+
+            let wrong_scope = shard(&frozen_issuer(20, 10), 20, 10, 0, 0, &[1]);
+            assert_eq!(
+                complete(&final_channel, account, 10, 10, 0, 0, wrong_scope)
+                    .unwrap_err()
+                    .kind(),
+                RuntimeContractViolationKind::UnauthorizedBinding
+            );
+
+            let (ordinary, ordinary_account, _) = one_channel();
+            ordinary
+                .open_producer(BindingId::new(10), uid(10), 1)
+                .unwrap();
+            let wrong_mode = shard(&frozen_issuer(10, 10), 10, 10, 0, 0, &[1]);
+            assert_eq!(
+                complete(&ordinary, ordinary_account, 10, 10, 0, 0, wrong_mode)
+                    .unwrap_err()
+                    .kind(),
+                RuntimeContractViolationKind::ProducerPortMismatch
+            );
+        }
+
+        #[test]
+        fn out_of_order_replay_gap_and_close_zero_follow_exclusive_terminal_range() {
+            let issuer = frozen_issuer(10, 10);
+            let (channel, account) = final_channel(&[(10, 1, 10)], 4096);
+            channel
+                .open_producer(BindingId::new(10), uid(10), 1)
+                .unwrap();
+            let seq1 = shard(&issuer, 10, 10, 0, 1, &[2]);
+            let seq0 = shard(&issuer, 10, 10, 0, 0, &[1]);
+            assert_eq!(
+                channel
+                    .close_final_partition(
+                        BindingId::new(10),
+                        uid(10),
+                        PartitionId::new(0),
+                        ProducerSequence::new(2),
+                    )
+                    .unwrap()
+                    .outcome(),
+                SubmitOutcome::PendingGap
+            );
+            assert_eq!(
+                channel
+                    .close_final_partition(
+                        BindingId::new(10),
+                        uid(10),
+                        PartitionId::new(0),
+                        ProducerSequence::new(3),
+                    )
+                    .unwrap_err()
+                    .kind(),
+                RuntimeContractViolationKind::ConflictingTerminalSequence
+            );
+            assert_eq!(
+                complete(&channel, account.clone(), 10, 10, 0, 1, seq1.clone())
+                    .unwrap()
+                    .outcome(),
+                SubmitOutcome::Applied
+            );
+            assert!(channel.snapshot().is_none());
+            assert_eq!(
+                complete(&channel, account.clone(), 10, 10, 0, 1, seq1)
+                    .unwrap()
+                    .outcome(),
+                SubmitOutcome::Duplicate
+            );
+            assert_eq!(
+                complete(&channel, account, 10, 10, 0, 0, seq0)
+                    .unwrap()
+                    .outcome(),
+                SubmitOutcome::Completed
+            );
+            assert_eq!(channel.snapshot().unwrap().domain().values().len(), 2);
+
+            let (empty, empty_account) = final_channel(&[(10, 1, 10)], 4096);
+            empty.open_producer(BindingId::new(10), uid(10), 1).unwrap();
+            assert_eq!(
+                empty
+                    .close_final_partition(
+                        BindingId::new(10),
+                        uid(10),
+                        PartitionId::new(0),
+                        ProducerSequence::new(0),
+                    )
+                    .unwrap_err()
+                    .kind(),
+                RuntimeContractViolationKind::FinalDomainMissing
+            );
+            assert_eq!(empty_account.current.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                empty
+                    .state
+                    .lock()
+                    .unwrap()
+                    .producers
+                    .get(&BindingId::new(10))
+                    .unwrap()
+                    .instances
+                    .get(&uid(10))
+                    .unwrap()
+                    .materialized_partition_count(),
+                0
+            );
+            let explicit_empty = shard(&issuer, 10, 10, 0, 0, &[]);
+            complete(&empty, empty_account, 10, 10, 0, 0, explicit_empty).unwrap();
+            assert_eq!(
+                empty
+                    .close_final_partition(
+                        BindingId::new(10),
+                        uid(10),
+                        PartitionId::new(0),
+                        ProducerSequence::new(1),
+                    )
+                    .unwrap()
+                    .outcome(),
+                SubmitOutcome::Completed
+            );
+            assert!(empty.snapshot().unwrap().domain().values().is_empty());
+        }
+
+        #[test]
+        fn multipartition_allof_and_explicit_empty_domains_complete_once() {
+            let (channel, account) = final_channel(&[(10, 1, 10), (20, 2, 20)], 8192);
+            channel
+                .open_producer(BindingId::new(10), uid(10), 2)
+                .unwrap();
+            channel
+                .open_producer(BindingId::new(20), uid(20), 1)
+                .unwrap();
+            for (index, (binding, instance, partition, values)) in [
+                (10, 10, 0, vec![1]),
+                (10, 10, 1, Vec::new()),
+                (20, 20, 0, vec![2]),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let issuer = frozen_issuer(binding, instance);
+                let final_shard = shard(&issuer, binding, instance, partition, 0, &values);
+                complete(
+                    &channel,
+                    account.clone(),
+                    binding,
+                    instance,
+                    partition,
+                    0,
+                    final_shard,
+                )
+                .unwrap();
+                channel
+                    .close_final_partition(
+                        BindingId::new(binding),
+                        uid(instance),
+                        PartitionId::new(partition),
+                        ProducerSequence::new(1),
+                    )
+                    .unwrap();
+                if index < 2 {
+                    assert!(channel.snapshot().is_none());
+                }
+            }
+            let snapshot = channel.snapshot().unwrap();
+            assert_eq!(snapshot.version(), LogicalVersion::FIRST);
+            assert_eq!(snapshot.domain().values().len(), 2);
+        }
+
+        #[test]
+        fn semantic_validation_precedes_resource_and_terminal_precedence_keeps_completed_replay() {
+            let issuer = frozen_issuer(10, 10);
+            let (channel, account) = final_channel(&[(10, 1, 10)], 4096);
+            channel
+                .open_producer(BindingId::new(10), uid(10), 1)
+                .unwrap();
+            let wrong = shard(&frozen_issuer(20, 10), 20, 10, 0, 0, &[9]);
+            assert_eq!(
+                channel
+                    .reject_final_resource_exhausted(
+                        BindingId::new(10),
+                        uid(10),
+                        PartitionId::new(0),
+                        ProducerSequence::new(0),
+                        &wrong,
+                    )
+                    .unwrap_err()
+                    .kind(),
+                RuntimeContractViolationKind::UnauthorizedBinding
+            );
+            assert!(!channel.is_terminal());
+
+            let first = shard(&issuer, 10, 10, 0, 0, &[1]);
+            complete(&channel, account.clone(), 10, 10, 0, 0, first.clone()).unwrap();
+            channel
+                .close_final_partition(
+                    BindingId::new(10),
+                    uid(10),
+                    PartitionId::new(0),
+                    ProducerSequence::new(1),
+                )
+                .unwrap();
+            assert_eq!(
+                complete(&channel, account.clone(), 10, 10, 0, 0, first.clone())
+                    .unwrap()
+                    .outcome(),
+                SubmitOutcome::Duplicate
+            );
+            assert_eq!(
+                channel
+                    .reject_final_resource_exhausted(
+                        BindingId::new(10),
+                        uid(10),
+                        PartitionId::new(0),
+                        ProducerSequence::new(0),
+                        &first,
+                    )
+                    .unwrap()
+                    .outcome(),
+                SubmitOutcome::Duplicate
+            );
+            let conflict = shard(&issuer, 10, 10, 0, 0, &[2]);
+            assert_eq!(
+                complete(&channel, account.clone(), 10, 10, 0, 0, conflict.clone())
+                    .unwrap_err()
+                    .kind(),
+                RuntimeContractViolationKind::ConflictingReplay
+            );
+            assert_eq!(
+                channel
+                    .reject_final_resource_exhausted(
+                        BindingId::new(10),
+                        uid(10),
+                        PartitionId::new(0),
+                        ProducerSequence::new(0),
+                        &conflict,
+                    )
+                    .unwrap_err()
+                    .kind(),
+                RuntimeContractViolationKind::ConflictingReplay
+            );
+            let completed_late = shard(&issuer, 10, 10, 0, 1, &[3]);
+            assert_eq!(
+                channel
+                    .complete_final(
+                        BindingId::new(10),
+                        uid(10),
+                        PartitionId::new(0),
+                        ProducerSequence::new(1),
+                        completed_late.clone(),
+                        TemporaryContributionLease::new(account.clone(), 0),
+                    )
+                    .unwrap()
+                    .outcome(),
+                SubmitOutcome::TerminalNoop
+            );
+            assert_eq!(
+                channel
+                    .reject_final_resource_exhausted(
+                        BindingId::new(10),
+                        uid(10),
+                        PartitionId::new(0),
+                        ProducerSequence::new(1),
+                        &completed_late,
+                    )
+                    .unwrap()
+                    .outcome(),
+                SubmitOutcome::TerminalNoop
+            );
+
+            for terminal in ["unavailable", "cancelled"] {
+                let (channel, account) = final_channel(&[(10, 1, 10)], 4096);
+                channel
+                    .open_producer(BindingId::new(10), uid(10), 1)
+                    .unwrap();
+                let valid = shard(&issuer, 10, 10, 0, 0, &[1]);
+                complete(&channel, account.clone(), 10, 10, 0, 0, valid.clone()).unwrap();
+                assert!(account.current.load(Ordering::SeqCst) > 0);
+                if terminal == "unavailable" {
+                    let next = shard(&issuer, 10, 10, 0, 1, &[2]);
+                    channel
+                        .reject_final_resource_exhausted(
+                            BindingId::new(10),
+                            uid(10),
+                            PartitionId::new(0),
+                            ProducerSequence::new(1),
+                            &next,
+                        )
+                        .unwrap();
+                } else {
+                    drop(channel.cancel());
+                }
+                assert_eq!(account.current.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    channel
+                        .state
+                        .lock()
+                        .unwrap()
+                        .producers
+                        .get(&BindingId::new(10))
+                        .unwrap()
+                        .instances
+                        .get(&uid(10))
+                        .unwrap()
+                        .materialized_partition_count(),
+                    0
+                );
+                let wrong = shard(&frozen_issuer(20, 10), 20, 10, 0, 0, &[9]);
+                assert_eq!(
+                    complete(&channel, account.clone(), 10, 10, 0, 0, wrong)
+                        .unwrap_err()
+                        .kind(),
+                    RuntimeContractViolationKind::UnauthorizedBinding
+                );
+                assert_eq!(
+                    channel
+                        .complete_final(
+                            BindingId::new(10),
+                            uid(10),
+                            PartitionId::new(0),
+                            ProducerSequence::new(0),
+                            valid,
+                            TemporaryContributionLease::new(account, 0),
+                        )
+                        .unwrap()
+                        .outcome(),
+                    SubmitOutcome::TerminalNoop
+                );
+            }
+        }
+
+        #[test]
+        fn retained_rejection_after_temporary_success_is_atomic_and_scope_stays_first() {
+            let channel =
+                final_channel_with_memory_account(&[(10, 1, 10)], 4096, Arc::new(RejectingAccount));
+            channel
+                .open_producer(BindingId::new(10), uid(10), 1)
+                .unwrap();
+            let temporary = Arc::new(Account::default());
+            let wrong = shard(&frozen_issuer(20, 10), 20, 10, 0, 0, &[9]);
+            let wrong_bytes = wrong.canonical_contribution_bytes().unwrap();
+            assert_eq!(
+                channel
+                    .complete_final(
+                        BindingId::new(10),
+                        uid(10),
+                        PartitionId::new(0),
+                        ProducerSequence::new(0),
+                        wrong,
+                        TemporaryContributionLease::new(temporary.clone(), wrong_bytes),
+                    )
+                    .unwrap_err()
+                    .kind(),
+                RuntimeContractViolationKind::UnauthorizedBinding
+            );
+            assert!(!channel.is_terminal());
+            assert_eq!(temporary.current.load(Ordering::SeqCst), 0);
+
+            let valid = shard(&frozen_issuer(10, 10), 10, 10, 0, 0, &[1]);
+            let valid_bytes = valid.canonical_contribution_bytes().unwrap();
+            assert!(matches!(
+                channel
+                    .complete_final(
+                        BindingId::new(10),
+                        uid(10),
+                        PartitionId::new(0),
+                        ProducerSequence::new(0),
+                        valid,
+                        TemporaryContributionLease::new(temporary.clone(), valid_bytes),
+                    )
+                    .unwrap(),
+                ChannelAction::Unavailable {
+                    reason: UnavailableReason::ResourceLimit,
+                    ..
+                }
+            ));
+            assert_eq!(temporary.current.load(Ordering::SeqCst), 0);
+            let state = channel.state.lock().unwrap();
+            assert_eq!(state.reservation.bytes(), 0);
+            assert!(state.reducer.as_ref().unwrap().domain().values().is_empty());
+            assert_eq!(
+                state
+                    .producers
+                    .get(&BindingId::new(10))
+                    .unwrap()
+                    .instances
+                    .get(&uid(10))
+                    .unwrap()
+                    .materialized_partition_count(),
+                0
+            );
+        }
+
+        #[test]
+        fn retained_reservation_repreflights_duplicate_and_rolls_back_after_cancel() {
+            let issuer = frozen_issuer(10, 10);
+            let (account, entered, release) = blocking_once_account();
+            let channel = final_channel_with_memory_account(&[(10, 1, 10)], 4096, account.clone());
+            channel
+                .open_producer(BindingId::new(10), uid(10), 1)
+                .unwrap();
+            let final_shard = shard(&issuer, 10, 10, 0, 0, &[1]);
+            let outer_channel = channel.clone();
+            let outer_shard = final_shard.clone();
+            let (done_tx, done_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                done_tx
+                    .send(complete(
+                        &outer_channel,
+                        Arc::new(Account::default()),
+                        10,
+                        10,
+                        0,
+                        0,
+                        outer_shard,
+                    ))
+                    .unwrap();
+            });
+            entered.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(
+                complete(
+                    &channel,
+                    Arc::new(Account::default()),
+                    10,
+                    10,
+                    0,
+                    0,
+                    final_shard,
+                )
+                .unwrap()
+                .outcome(),
+                SubmitOutcome::Applied
+            );
+            let retained_after_inner = account.current.load(Ordering::SeqCst);
+            assert!(retained_after_inner > 0);
+            release.send(()).unwrap();
+            assert_eq!(
+                done_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap()
+                    .outcome(),
+                SubmitOutcome::Duplicate
+            );
+            assert_eq!(account.current.load(Ordering::SeqCst), retained_after_inner);
+            drop(channel.cancel());
+            assert_eq!(account.current.load(Ordering::SeqCst), 0);
+
+            let (account, entered, release) = blocking_once_account();
+            let channel = final_channel_with_memory_account(&[(10, 1, 10)], 4096, account.clone());
+            channel
+                .open_producer(BindingId::new(10), uid(10), 1)
+                .unwrap();
+            let final_shard = shard(&issuer, 10, 10, 0, 0, &[1]);
+            let submit_channel = channel.clone();
+            let (done_tx, done_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                done_tx
+                    .send(complete(
+                        &submit_channel,
+                        Arc::new(Account::default()),
+                        10,
+                        10,
+                        0,
+                        0,
+                        final_shard,
+                    ))
+                    .unwrap();
+            });
+            entered.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert!(matches!(channel.cancel(), ChannelAction::Cancelled { .. }));
+            release.send(()).unwrap();
+            assert_eq!(
+                done_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap()
+                    .outcome(),
+                SubmitOutcome::TerminalNoop
+            );
+            assert_eq!(account.current.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn retained_account_callbacks_reenter_final_channel_without_locking_it() {
+            let account = Arc::new(ReentrantAccount::default());
+            let channel = final_channel_with_memory_account(&[(10, 1, 10)], 4096, account.clone());
+            *account.channel.lock().unwrap() = Some(Arc::downgrade(&channel));
+            channel
+                .open_producer(BindingId::new(10), uid(10), 1)
+                .unwrap();
+            let final_shard = shard(&frozen_issuer(10, 10), 10, 10, 0, 0, &[1]);
+            let (done_tx, done_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let outcome = complete(
+                    &channel,
+                    Arc::new(Account::default()),
+                    10,
+                    10,
+                    0,
+                    0,
+                    final_shard,
+                )
+                .map(|action| action.outcome());
+                drop(channel.cancel());
+                done_tx
+                    .send((outcome, account.current.load(Ordering::SeqCst)))
+                    .unwrap();
+            });
+            let (outcome, current) = done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(outcome.unwrap(), SubmitOutcome::Applied);
+            assert_eq!(current, 0);
+        }
+
+        #[test]
+        fn oversized_and_deadline_terminals_release_collecting_state_while_completed_keeps_replay_accounted()
+         {
+            let base = final_deployment(&[(10, 1, 10)], 4096);
+            let mut tiny_policy = base.policy();
+            tiny_policy.max_contribution_bytes = 1;
+            let tiny = RuntimeFilterChannelDeployment::new(
+                base.channel_id(),
+                base.logical_domain().clone(),
+                base.lifecycle(),
+                base.availability_coverage().clone(),
+                base.terminal_coverage().clone(),
+                base.reduction_requirement(),
+                base.allowed_contribution_kinds().clone(),
+                base.completion_requirement(),
+                tiny_policy,
+                base.core_budget(),
+                base.materialization_policy(),
+                base.producers().clone(),
+                base.consumers().clone(),
+            );
+            let tiny_account = Arc::new(Account::default());
+            let tiny_channel = RuntimeFilterChannel::new(
+                uid(99),
+                RuntimeFilterParticipantId::new(1),
+                DeploymentEpoch::new(1),
+                &tiny,
+                Instant::now() + Duration::from_secs(10),
+                tiny_account.clone(),
+            )
+            .unwrap();
+            tiny_channel
+                .open_producer(BindingId::new(10), uid(10), 1)
+                .unwrap();
+            let wrong = shard(&frozen_issuer(20, 10), 20, 10, 0, 0, &[9]);
+            assert_eq!(
+                complete(&tiny_channel, tiny_account.clone(), 10, 10, 0, 0, wrong,)
+                    .unwrap_err()
+                    .kind(),
+                RuntimeContractViolationKind::UnauthorizedBinding
+            );
+            assert!(!tiny_channel.is_terminal());
+            let issuer = frozen_issuer(10, 10);
+            let valid = shard(&issuer, 10, 10, 0, 0, &[1]);
+            assert!(matches!(
+                complete(&tiny_channel, tiny_account.clone(), 10, 10, 0, 0, valid,).unwrap(),
+                ChannelAction::Unavailable {
+                    reason: UnavailableReason::ResourceLimit,
+                    ..
+                }
+            ));
+            assert_eq!(tiny_account.current.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                tiny_channel
+                    .state
+                    .lock()
+                    .unwrap()
+                    .producers
+                    .get(&BindingId::new(10))
+                    .unwrap()
+                    .instances
+                    .get(&uid(10))
+                    .unwrap()
+                    .materialized_partition_count(),
+                0
+            );
+
+            let (deadline_channel, deadline_account) = final_channel(&[(10, 1, 10)], 4096);
+            deadline_channel
+                .open_producer(BindingId::new(10), uid(10), 1)
+                .unwrap();
+            assert!(matches!(
+                deadline_channel.expire_deadline(Instant::now() + Duration::from_secs(20)),
+                ChannelAction::Unavailable {
+                    reason: UnavailableReason::IncompleteCoverage,
+                    ..
+                }
+            ));
+            let late = shard(&issuer, 10, 10, 0, 0, &[1]);
+            assert_eq!(
+                complete(
+                    &deadline_channel,
+                    deadline_account.clone(),
+                    10,
+                    10,
+                    0,
+                    0,
+                    late,
+                )
+                .unwrap()
+                .outcome(),
+                SubmitOutcome::TerminalNoop
+            );
+            assert_eq!(deadline_account.current.load(Ordering::SeqCst), 0);
+
+            let (completed, completed_account) = final_channel(&[(10, 1, 10)], 4096);
+            completed
+                .open_producer(BindingId::new(10), uid(10), 1)
+                .unwrap();
+            complete(
+                &completed,
+                completed_account.clone(),
+                10,
+                10,
+                0,
+                0,
+                shard(&issuer, 10, 10, 0, 0, &[1]),
+            )
+            .unwrap();
+            completed
+                .close_final_partition(
+                    BindingId::new(10),
+                    uid(10),
+                    PartitionId::new(0),
+                    ProducerSequence::new(1),
+                )
+                .unwrap();
+            let snapshot = completed.snapshot().unwrap();
+            assert!(snapshot.retained_memory_bytes() >= super::super::REPLAY_METADATA_BYTES);
+            assert_eq!(
+                completed_account.current.load(Ordering::SeqCst),
+                snapshot.retained_memory_bytes()
+            );
+            drop(completed);
+            assert!(completed_account.current.load(Ordering::SeqCst) > 0);
+            drop(snapshot);
+            assert_eq!(completed_account.current.load(Ordering::SeqCst), 0);
         }
     }
 }
