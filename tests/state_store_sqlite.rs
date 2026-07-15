@@ -25,7 +25,8 @@ use bytes::Bytes;
 use novarocks::state_store::{
     ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution, Direction, FeDeploymentView,
     Key, KeyRange, Precondition, RangeRequest, StateStore, StateStoreConfig, StateStoreErrorKind,
-    StateStoreLimitOverrides, StateStoreProviderConfig, TransactionId, Value, open_state_store,
+    StateStoreLimitOverrides, StateStoreOperation, StateStoreOutcome, StateStoreProviderConfig,
+    TransactionId, Value, open_state_store,
 };
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -193,6 +194,7 @@ mod conformance {
     conformance_test!(preconditions);
     conformance_test!(forward_reverse_pages);
     conformance_test!(same_revision_change_pages);
+    conformance_test!(notification_delivery_faults);
     conformance_test!(atomic_commit);
     conformance_test!(limits_before_io);
     conformance_test!(arbitrary_binary_payloads);
@@ -1247,4 +1249,263 @@ async fn sqlite_pagination_change_cursor_reports_a_retention_gap_before_resuming
     assert!(!empty_tail.resync_required);
     assert!(empty_tail.hints.is_empty());
     assert_eq!(empty_tail.next_cursor, tail_gap.next_cursor);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sqlite_metrics_are_driven_by_real_store_operations() {
+    let temp = TempDir::new().expect("metrics temp dir");
+    let store = open_store(&temp, "metrics-fe").await;
+    let before = store.metrics_snapshot();
+
+    let first = key(b"metrics/a".to_vec());
+    let second = key(b"metrics/b".to_vec());
+    let mut seed = store
+        .begin_write(transaction_id(), "metrics seed")
+        .await
+        .expect("begin metrics seed");
+    seed.put(first.clone(), value(b"one"), Precondition::Any)
+        .await
+        .expect("put first metrics row");
+    seed.put(second.clone(), value(b"two"), Precondition::Any)
+        .await
+        .expect("put second metrics row");
+    assert!(matches!(seed.commit().await, CommitOutcome::Committed(_)));
+
+    let mut reader = store.begin_read().await.expect("begin metrics reader");
+    assert!(reader.get(&first).await.expect("metrics get").is_some());
+    let page = reader
+        .range(&RangeRequest {
+            range: KeyRange::new(key(b"metrics/".to_vec()), key(b"metrics0".to_vec()))
+                .expect("metrics range"),
+            direction: Direction::Forward,
+            page_size: 10,
+            continuation: None,
+        })
+        .await
+        .expect("metrics range page");
+    assert_eq!(page.records.len(), 2);
+    reader.abort().await.expect("abort metrics reader");
+
+    let mut update = store
+        .begin_write(transaction_id(), "metrics update")
+        .await
+        .expect("begin metrics update");
+    update
+        .put(first.clone(), value(b"new"), Precondition::Any)
+        .await
+        .expect("update metrics row");
+    update
+        .delete(second, Precondition::Any)
+        .await
+        .expect("delete metrics row");
+    assert!(matches!(update.commit().await, CommitOutcome::Committed(_)));
+
+    let mut conflict_winner = store
+        .begin_write(transaction_id(), "metrics conflict winner")
+        .await
+        .expect("begin metrics conflict winner");
+    let mut conflict_loser = store
+        .begin_write(transaction_id(), "metrics conflict loser")
+        .await
+        .expect("begin metrics conflict loser");
+    conflict_winner
+        .get(&first)
+        .await
+        .expect("establish winner snapshot");
+    conflict_loser
+        .get(&first)
+        .await
+        .expect("establish loser snapshot");
+    conflict_winner
+        .put(first.clone(), value(b"winner"), Precondition::Any)
+        .await
+        .expect("stage metrics conflict winner");
+    conflict_loser
+        .put(first.clone(), value(b"loser"), Precondition::Any)
+        .await
+        .expect("stage metrics conflict loser");
+    assert!(matches!(
+        conflict_winner.commit().await,
+        CommitOutcome::Committed(_)
+    ));
+    assert!(matches!(
+        conflict_loser.commit().await,
+        CommitOutcome::Conflict(_)
+    ));
+
+    let changes = store
+        .poll_changes(&ChangePollRequest {
+            after: None,
+            page_size: 10,
+        })
+        .await
+        .expect("poll metrics changes");
+    assert_eq!(changes.hints.len(), 5);
+
+    let snapshot = store.metrics_snapshot();
+    assert!(snapshot.begin_count >= before.begin_count + 5);
+    assert_eq!(snapshot.get_count, before.get_count + 3);
+    assert_eq!(snapshot.range_count, before.range_count + 1);
+    assert_eq!(snapshot.put_count, before.put_count + 5);
+    assert_eq!(snapshot.delete_count, before.delete_count + 1);
+    assert_eq!(snapshot.commit_count, before.commit_count + 4);
+    for operation in [
+        StateStoreOperation::Begin,
+        StateStoreOperation::Get,
+        StateStoreOperation::Range,
+        StateStoreOperation::Put,
+        StateStoreOperation::Delete,
+        StateStoreOperation::Commit,
+    ] {
+        assert!(
+            snapshot.operation_duration_observations(operation) > 0,
+            "real {operation:?} operation must record duration"
+        );
+        assert!(
+            snapshot.operation_outcome_count(operation, StateStoreOutcome::Success) > 0,
+            "real {operation:?} operation must record its outcome"
+        );
+    }
+    assert!(snapshot.bytes_read > before.bytes_read);
+    assert!(snapshot.bytes_written > before.bytes_written);
+    assert!(snapshot.page_records >= before.page_records + 7);
+    assert!(snapshot.notification_lag_observations > before.notification_lag_observations);
+    assert!(
+        snapshot.operation_outcome_count(StateStoreOperation::Commit, StateStoreOutcome::Conflict,)
+            > 0,
+        "real provider conflicts must drive outcome metrics"
+    );
+
+    let debug = format!("{snapshot:?}");
+    assert!(!debug.contains("metrics/a"));
+    assert!(!debug.contains("metrics/b"));
+    assert!(!debug.contains("INSERT INTO"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sqlite_accounting_counts_repeated_change_keys_before_io() {
+    let temp = TempDir::new().expect("accounting temp dir");
+    let store = open_store(&temp, "accounting-fe").await;
+    let mut transaction = store
+        .begin_write(transaction_id(), "exact accounting")
+        .await
+        .expect("begin exact accounting transaction");
+    let mut rejected_at = None;
+    for index in 0_u64..300 {
+        let mut bytes = vec![b'k'; 8 * 1024];
+        bytes[(8 * 1024 - 8)..].copy_from_slice(&index.to_be_bytes());
+        let result = transaction
+            .put(key(bytes), value(b""), Precondition::Any)
+            .await;
+        if let Err(error) = result {
+            assert_eq!(error.kind(), StateStoreErrorKind::LimitExceeded);
+            rejected_at = Some(index);
+            break;
+        }
+    }
+    assert!(
+        rejected_at.is_some(),
+        "full accounting must reject a transaction whose repeated 8 KiB keys fit the old mutation-only estimate but exceed 4 MiB once exact change rows are included"
+    );
+
+    let connection =
+        Connection::open(temp.path().join("state-store.sqlite")).expect("open accounting observer");
+    for table in [
+        "state_store_kv",
+        "state_store_changes",
+        "state_store_commits",
+    ] {
+        let count: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("count durable rows before abort");
+        assert_eq!(count, 0, "limit rejection must happen before durable I/O");
+    }
+    drop(connection);
+    transaction
+        .abort()
+        .await
+        .expect("abort rejected accounting transaction");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sqlite_concurrent_first_open_has_exactly_one_schema_owner() {
+    let temp = TempDir::new().expect("first-open temp dir");
+    let path = temp.path().join("state-store.sqlite");
+    let gate = Arc::new(Barrier::new(3));
+    let mut opens = Vec::new();
+    for _ in 0..2 {
+        let path = path.clone();
+        let gate = Arc::clone(&gate);
+        opens.push(tokio::spawn(async move {
+            gate.wait().await;
+            open_state_store(
+                StateStoreConfig {
+                    provider: StateStoreProviderConfig::Sqlite,
+                    path,
+                    cluster_id: "race-cluster".to_owned(),
+                    deployment_owner: "race-fe".to_owned(),
+                    limits: StateStoreLimitOverrides::default(),
+                },
+                FeDeploymentView {
+                    active_fe_count: NonZeroUsize::new(1).expect("one FE"),
+                    topology_revision: Bytes::from_static(b"race-topology"),
+                },
+            )
+            .await
+        }));
+    }
+    gate.wait().await;
+    let first = opens.remove(0).await.expect("first open task");
+    let second = opens.remove(0).await.expect("second open task");
+    let (winner, loser) = match (first, second) {
+        (Ok(store), Err(error)) | (Err(error), Ok(store)) => (store, error),
+        (Ok(_), Ok(_)) => panic!("exactly one concurrent first open may own the path"),
+        (Err(first), Err(second)) => panic!("one first open must succeed: {first}; {second}"),
+    };
+    assert_eq!(loser.kind(), StateStoreErrorKind::ProviderUnavailable);
+    let identity = winner.identity().await.expect("winner identity");
+
+    let connection = Connection::open(&path).expect("inspect raced database");
+    let tables: HashSet<String> = connection
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'state_store_%'",
+        )
+        .expect("prepare table inventory")
+        .query_map([], |row| row.get(0))
+        .expect("query table inventory")
+        .collect::<rusqlite::Result<HashSet<_>>>()
+        .expect("collect table inventory");
+    assert_eq!(
+        tables,
+        HashSet::from([
+            "state_store_meta".to_owned(),
+            "state_store_kv".to_owned(),
+            "state_store_changes".to_owned(),
+            "state_store_commits".to_owned(),
+        ])
+    );
+    drop(connection);
+    drop(winner);
+
+    let reopened = open_state_store(
+        StateStoreConfig {
+            provider: StateStoreProviderConfig::Sqlite,
+            path,
+            cluster_id: "race-cluster".to_owned(),
+            deployment_owner: "race-fe".to_owned(),
+            limits: StateStoreLimitOverrides::default(),
+        },
+        FeDeploymentView {
+            active_fe_count: NonZeroUsize::new(1).expect("one FE"),
+            topology_revision: Bytes::from_static(b"race-topology-reopen"),
+        },
+    )
+    .await
+    .expect("winner schema must reopen cleanly");
+    assert_eq!(
+        reopened.identity().await.expect("reopened identity"),
+        identity
+    );
 }

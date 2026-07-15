@@ -47,6 +47,8 @@ pub enum StateStoreOutcome {
 pub struct StateStoreMetrics {
     provider: &'static str,
     operation_outcomes: [[AtomicU64; STATE_STORE_OUTCOME_COUNT]; STATE_STORE_OPERATION_COUNT],
+    operation_duration_micros: [AtomicU64; STATE_STORE_OPERATION_COUNT],
+    operation_duration_observations: [AtomicU64; STATE_STORE_OPERATION_COUNT],
     retry_count: AtomicU64,
     deadline_count: AtomicU64,
     blocking_failure_count: AtomicU64,
@@ -62,6 +64,8 @@ impl StateStoreMetrics {
         Self {
             provider,
             operation_outcomes: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+            operation_duration_micros: std::array::from_fn(|_| AtomicU64::new(0)),
+            operation_duration_observations: std::array::from_fn(|_| AtomicU64::new(0)),
             retry_count: AtomicU64::new(0),
             deadline_count: AtomicU64::new(0),
             blocking_failure_count: AtomicU64::new(0),
@@ -77,9 +81,17 @@ impl StateStoreMetrics {
         self.provider
     }
 
-    pub fn record_operation(&self, operation: StateStoreOperation, outcome: StateStoreOutcome) {
+    pub fn record_operation(
+        &self,
+        operation: StateStoreOperation,
+        outcome: StateStoreOutcome,
+        duration: Duration,
+    ) {
         self.operation_outcomes[operation as usize][outcome as usize]
             .fetch_add(1, Ordering::Relaxed);
+        let micros = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
+        self.operation_duration_micros[operation as usize].fetch_add(micros, Ordering::Relaxed);
+        self.operation_duration_observations[operation as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_retry(&self) {
@@ -129,6 +141,12 @@ impl StateStoreMetrics {
             delete_count: operation_total(&operation_outcomes, StateStoreOperation::Delete),
             commit_count: operation_total(&operation_outcomes, StateStoreOperation::Commit),
             operation_outcomes,
+            operation_duration_micros: std::array::from_fn(|operation| {
+                self.operation_duration_micros[operation].load(Ordering::Relaxed)
+            }),
+            operation_duration_observations: std::array::from_fn(|operation| {
+                self.operation_duration_observations[operation].load(Ordering::Relaxed)
+            }),
             retry_count: self.retry_count.load(Ordering::Relaxed),
             deadline_count: self.deadline_count.load(Ordering::Relaxed),
             blocking_failure_count: self.blocking_failure_count.load(Ordering::Relaxed),
@@ -153,6 +171,8 @@ pub struct StateStoreMetricsSnapshot {
     pub delete_count: u64,
     pub commit_count: u64,
     pub operation_outcomes: [[u64; STATE_STORE_OUTCOME_COUNT]; STATE_STORE_OPERATION_COUNT],
+    pub operation_duration_micros: [u64; STATE_STORE_OPERATION_COUNT],
+    pub operation_duration_observations: [u64; STATE_STORE_OPERATION_COUNT],
     pub retry_count: u64,
     pub deadline_count: u64,
     pub blocking_failure_count: u64,
@@ -170,6 +190,14 @@ impl StateStoreMetricsSnapshot {
         outcome: StateStoreOutcome,
     ) -> u64 {
         self.operation_outcomes[operation as usize][outcome as usize]
+    }
+
+    pub fn operation_duration_micros(&self, operation: StateStoreOperation) -> u64 {
+        self.operation_duration_micros[operation as usize]
+    }
+
+    pub fn operation_duration_observations(&self, operation: StateStoreOperation) -> u64 {
+        self.operation_duration_observations[operation as usize]
     }
 }
 

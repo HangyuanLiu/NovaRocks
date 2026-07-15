@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -26,8 +27,8 @@ use novarocks::state_store::limits::MAX_KEY_BYTES;
 use novarocks::state_store::{
     ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution, Direction, Key,
     KeyRange, Precondition, RangePage, RangeRequest, ReadTransaction, StateRecord, StateStore,
-    StateStoreError, StateStoreErrorKind, StateStoreLimits, StoreIdentity, TransactionId, Value,
-    WriteTransaction,
+    StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
+    StoreIdentity, TransactionId, Value, WriteTransaction,
 };
 use tokio::sync::{oneshot, watch};
 use uuid::Uuid;
@@ -44,6 +45,7 @@ pub async fn run_state_store_conformance(factory: StateStoreFactory) {
     preconditions(&factory).await;
     forward_reverse_pages(&factory).await;
     same_revision_change_pages(&factory).await;
+    notification_delivery_faults(&factory).await;
     atomic_commit(&factory).await;
     limits_before_io(&factory).await;
     arbitrary_binary_payloads(&factory).await;
@@ -559,6 +561,191 @@ pub async fn same_revision_change_pages(factory: &StateStoreFactory) {
     );
 }
 
+#[derive(Default)]
+struct AuthoritativeNotificationConsumer {
+    records: BTreeMap<Vec<u8>, Vec<u8>>,
+    authoritative_reads: usize,
+    reload_pages: usize,
+}
+
+impl AuthoritativeNotificationConsumer {
+    async fn consume(
+        &mut self,
+        store: &Arc<dyn StateStore>,
+        page: ChangePage,
+        mut reload_request: RangeRequest,
+    ) {
+        if page.resync_required {
+            let mut reader = store.begin_read().await.expect("begin notification resync");
+            let mut reloaded = BTreeMap::new();
+            loop {
+                let page = reader
+                    .range(&reload_request)
+                    .await
+                    .expect("read bounded notification resync page");
+                self.reload_pages += 1;
+                for record in page.records {
+                    reloaded.insert(
+                        record.key.as_bytes().to_vec(),
+                        record.value.as_bytes().to_vec(),
+                    );
+                }
+                let Some(continuation) = page.continuation else {
+                    break;
+                };
+                reload_request.continuation = Some(continuation);
+            }
+            reader.abort().await.expect("abort notification resync");
+            self.records = reloaded;
+            return;
+        }
+
+        let mut seen = HashSet::new();
+        for hint in page.hints {
+            let identity = (
+                hint.revision.as_bytes().to_vec(),
+                hint.key.as_bytes().to_vec(),
+            );
+            if !seen.insert(identity) {
+                continue;
+            }
+            self.authoritative_reads += 1;
+            match read_record(store, &hint.key).await {
+                Some(record) => {
+                    self.records.insert(
+                        record.key.as_bytes().to_vec(),
+                        record.value.as_bytes().to_vec(),
+                    );
+                }
+                None => {
+                    self.records.remove(hint.key.as_bytes());
+                }
+            }
+        }
+    }
+}
+
+pub async fn notification_delivery_faults(factory: &StateStoreFactory) {
+    let store = open(factory).await;
+    let mut baseline = None;
+    loop {
+        let page = store
+            .poll_changes(&ChangePollRequest {
+                after: baseline,
+                page_size: store.limits().max_page_size,
+            })
+            .await
+            .expect("drain notification baseline");
+        baseline = Some(page.next_cursor);
+        if page.hints.len() < store.limits().max_page_size {
+            break;
+        }
+    }
+
+    let rows = (1_u8..=3)
+        .map(|suffix| (key(vec![17, suffix]), value(vec![suffix])))
+        .collect::<Vec<_>>();
+    commit_puts(&store, &rows).await;
+    let original = store
+        .poll_changes(&ChangePollRequest {
+            after: baseline.clone(),
+            page_size: store.limits().max_page_size,
+        })
+        .await
+        .expect("poll original notification page");
+    let original_hint = original.hints[0].clone();
+
+    let updated_value = value(b"latest-after-delay".to_vec());
+    let delayed_receipt = commit_puts(
+        &store,
+        &[(original_hint.key.clone(), updated_value.clone())],
+    )
+    .await;
+    assert_ne!(original_hint.revision, delayed_receipt.revision);
+
+    let loss_key = key(vec![17, 4]);
+    commit_puts(&store, &[(loss_key.clone(), value(vec![4]))]).await;
+    let loss_page = store
+        .poll_changes(&ChangePollRequest {
+            after: Some(original.next_cursor.clone()),
+            page_size: store.limits().max_page_size,
+        })
+        .await
+        .expect("poll page to be replaced by loss signal");
+
+    let duplicate_page = ChangePage {
+        hints: vec![original_hint.clone(), original_hint.clone()],
+        next_cursor: original.next_cursor.clone(),
+        high_watermark: original.high_watermark.clone(),
+        resync_required: false,
+    };
+    let delayed_page = ChangePage {
+        hints: vec![original_hint],
+        next_cursor: original.next_cursor,
+        high_watermark: delayed_receipt.revision,
+        resync_required: false,
+    };
+    let resync_page = ChangePage {
+        hints: Vec::new(),
+        next_cursor: loss_page.next_cursor,
+        high_watermark: loss_page.high_watermark,
+        resync_required: true,
+    };
+
+    let fault = FaultInjectingStateStore::new(Arc::clone(&store));
+    fault.script_change_pages(vec![duplicate_page, delayed_page, resync_page]);
+    let consumer_store: Arc<dyn StateStore> = fault.clone();
+    let reload_request = conformance_range(17, Direction::Forward, 2);
+    let mut consumer = AuthoritativeNotificationConsumer::default();
+
+    let duplicate = fault
+        .poll_changes(&ChangePollRequest {
+            after: baseline,
+            page_size: 2,
+        })
+        .await
+        .expect("inject duplicate notifications");
+    assert_eq!(duplicate.hints.len(), 2);
+    consumer
+        .consume(&consumer_store, duplicate, reload_request.clone())
+        .await;
+    assert_eq!(
+        consumer.authoritative_reads, 1,
+        "duplicate hints deduplicate"
+    );
+
+    let delayed = fault
+        .poll_changes(&ChangePollRequest {
+            after: None,
+            page_size: 2,
+        })
+        .await
+        .expect("inject delayed notification");
+    consumer
+        .consume(&consumer_store, delayed, reload_request.clone())
+        .await;
+    assert_eq!(
+        consumer.records.get(original.hints[0].key.as_bytes()),
+        Some(&updated_value.as_bytes().to_vec()),
+        "delayed hints trigger an authoritative read instead of replaying stale payload"
+    );
+
+    let loss = fault
+        .poll_changes(&ChangePollRequest {
+            after: None,
+            page_size: 2,
+        })
+        .await
+        .expect("inject notification loss signal");
+    assert!(loss.resync_required);
+    consumer
+        .consume(&consumer_store, loss, reload_request)
+        .await;
+    assert_eq!(consumer.reload_pages, 2, "resync reload stays paginated");
+    assert_eq!(consumer.records.len(), 4);
+    assert_eq!(consumer.records.get(loss_key.as_bytes()), Some(&vec![4]));
+}
+
 pub async fn atomic_commit(factory: &StateStoreFactory) {
     let store = open(factory).await;
     let guard = key(b"c08/guard".to_vec());
@@ -827,7 +1014,7 @@ struct FaultScript {
     pre_commit: Option<ScriptedCommitResult>,
     post_dispatch: Option<FaultGate>,
     change_poll: Option<StateStoreError>,
-    change_page: Option<ChangePage>,
+    change_pages: VecDeque<ChangePage>,
 }
 
 pub struct FaultInjectingStateStore {
@@ -864,7 +1051,19 @@ impl FaultInjectingStateStore {
     }
 
     pub fn script_next_change_page(&self, page: ChangePage) {
-        self.script.lock().expect("fault script").change_page = Some(page);
+        self.script
+            .lock()
+            .expect("fault script")
+            .change_pages
+            .push_back(page);
+    }
+
+    pub fn script_change_pages(&self, pages: impl IntoIterator<Item = ChangePage>) {
+        self.script
+            .lock()
+            .expect("fault script")
+            .change_pages
+            .extend(pages);
     }
 
     fn take_begin_error(&self) -> Option<StateStoreError> {
@@ -1059,6 +1258,10 @@ impl StateStore for FaultInjectingStateStore {
         self.inner.limits()
     }
 
+    fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot {
+        self.inner.metrics_snapshot()
+    }
+
     async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
         if let Some(error) = self.take_begin_error() {
             return Err(error);
@@ -1089,7 +1292,7 @@ impl StateStore for FaultInjectingStateStore {
     ) -> Result<ChangePage, StateStoreError> {
         let (error, page) = {
             let mut script = self.script.lock().expect("fault script");
-            (script.change_poll.take(), script.change_page.take())
+            (script.change_poll.take(), script.change_pages.pop_front())
         };
         if let Some(error) = error {
             return Err(error);

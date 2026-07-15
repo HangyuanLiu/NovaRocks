@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use super::error::{StateStoreError, StateStoreErrorKind};
 use super::limits::{MAX_KEY_BYTES, MAX_VALUE_BYTES, StateStoreLimits};
+use super::metrics::StateStoreMetricsSnapshot;
 use super::range::{ChangeCursor, RangeRequest};
 
 macro_rules! opaque_bytes {
@@ -247,6 +248,7 @@ pub trait WriteTransaction: ReadTransaction {
 pub trait StateStore: Send + Sync {
     fn provider_name(&self) -> &'static str;
     fn limits(&self) -> &StateStoreLimits;
+    fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot;
     async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError>;
     async fn begin_write(
         &self,

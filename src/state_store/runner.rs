@@ -27,7 +27,7 @@ use super::contract::{
 };
 use super::error::{StateStoreError, StateStoreErrorKind};
 use super::limits::MAX_RUNNER_ATTEMPTS;
-use super::metrics::{StateStoreMetrics, StateStoreOperation, StateStoreOutcome};
+use super::metrics::StateStoreMetrics;
 
 const RETRY_BACKOFFS: [Duration; MAX_RUNNER_ATTEMPTS - 1] = [
     Duration::from_millis(10),
@@ -107,19 +107,12 @@ where
 
     for attempt in 1..=max_attempts {
         let transaction_id = derive_transaction_id(operation_id, attempt);
-        let mut transaction = match timeout_at(deadline, store.begin_write(transaction_id, purpose))
-            .await
-        {
-            Ok(Ok(transaction)) => {
-                metrics.record_operation(StateStoreOperation::Begin, StateStoreOutcome::Success);
-                transaction
-            }
-            Ok(Err(error)) => {
-                metrics.record_operation(StateStoreOperation::Begin, StateStoreOutcome::Error);
-                return Err(RunFailure::Begin(error));
-            }
-            Err(_) => return Err(deadline_exceeded(metrics)),
-        };
+        let mut transaction =
+            match timeout_at(deadline, store.begin_write(transaction_id, purpose)).await {
+                Ok(Ok(transaction)) => transaction,
+                Ok(Err(error)) => return Err(RunFailure::Begin(error)),
+                Err(_) => return Err(deadline_exceeded(metrics)),
+            };
 
         let value = match timeout_at(deadline, operation(transaction.as_mut())).await {
             Ok(Ok(value)) => value,
@@ -131,10 +124,6 @@ where
             Ok(outcome) => outcome,
             Err(_) => {
                 metrics.record_deadline();
-                metrics.record_operation(
-                    StateStoreOperation::Commit,
-                    StateStoreOutcome::CommitUnknown,
-                );
                 return Err(RunFailure::CommitUnknown {
                     transaction_id,
                     error: StateStoreError::new(
@@ -146,33 +135,12 @@ where
         };
 
         let retry_error = match outcome {
-            CommitOutcome::Committed(receipt) => {
-                metrics.record_operation(StateStoreOperation::Commit, StateStoreOutcome::Success);
-                return Ok(RunSuccess { value, receipt });
-            }
-            CommitOutcome::Conflict(error) => {
-                metrics.record_operation(StateStoreOperation::Commit, StateStoreOutcome::Conflict);
-                error
-            }
-            CommitOutcome::TransientBeforeCommit(error) => {
-                metrics.record_operation(
-                    StateStoreOperation::Commit,
-                    StateStoreOutcome::TransientBeforeCommit,
-                );
-                error
-            }
+            CommitOutcome::Committed(receipt) => return Ok(RunSuccess { value, receipt }),
+            CommitOutcome::Conflict(error) | CommitOutcome::TransientBeforeCommit(error) => error,
             CommitOutcome::DefiniteFailure(error) => {
-                metrics.record_operation(
-                    StateStoreOperation::Commit,
-                    StateStoreOutcome::DefiniteFailure,
-                );
                 return Err(RunFailure::DefiniteFailure(error));
             }
             CommitOutcome::CommitUnknown(error) => {
-                metrics.record_operation(
-                    StateStoreOperation::Commit,
-                    StateStoreOutcome::CommitUnknown,
-                );
                 return Err(RunFailure::CommitUnknown {
                     transaction_id,
                     error,

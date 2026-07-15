@@ -22,6 +22,7 @@ mod txn;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use fs2::FileExt;
@@ -30,13 +31,14 @@ use rusqlite::{Connection, OpenFlags};
 
 use crate::state_store::{
     ChangePage, ChangePollRequest, CommitResolution, FeDeploymentView, ReadTransaction, StateStore,
-    StateStoreConfig, StateStoreError, StateStoreErrorKind, StateStoreLimits, StoreIdentity,
-    TransactionId, WriteTransaction,
+    StateStoreConfig, StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetrics,
+    StateStoreMetricsSnapshot, StoreIdentity, TransactionId, WriteTransaction,
 };
 
 pub(super) struct SqliteStateStore {
     pub(super) path: PathBuf,
     pub(super) limits: StateStoreLimits,
+    metrics: Arc<StateStoreMetrics>,
     commit_registry: txn::CommitRegistry,
     #[cfg(test)]
     test_hooks: txn::TestHooks,
@@ -52,6 +54,10 @@ impl StateStore for SqliteStateStore {
 
     fn limits(&self) -> &StateStoreLimits {
         &self.limits
+    }
+
+    fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
@@ -74,7 +80,23 @@ impl StateStore for SqliteStateStore {
         request: &ChangePollRequest,
     ) -> Result<ChangePage, StateStoreError> {
         request.validate(&self.limits)?;
-        range::poll_changes(self.path.clone(), self.identity.clone(), request.clone()).await
+        let result = range::poll_changes(
+            self.path.clone(),
+            self.identity.clone(),
+            request.clone(),
+            Arc::clone(&self.metrics),
+        )
+        .await;
+        if let Ok(page) = &result {
+            self.metrics.record_page_records(page.hints.len() as u64);
+            let bytes = page.hints.iter().fold(0_u64, |total, hint| {
+                total.saturating_add(
+                    (hint.key.as_bytes().len() + hint.revision.as_bytes().len()) as u64,
+                )
+            });
+            self.metrics.record_bytes_read(bytes);
+        }
+        result
     }
 
     async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
@@ -154,6 +176,7 @@ fn open_blocking(
     Ok(SqliteStateStore {
         path,
         limits,
+        metrics: Arc::new(StateStoreMetrics::new("sqlite")),
         commit_registry: txn::new_commit_registry(),
         #[cfg(test)]
         test_hooks: txn::new_test_hooks(),

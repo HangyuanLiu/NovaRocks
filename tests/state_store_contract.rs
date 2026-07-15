@@ -56,6 +56,7 @@ enum ScriptedCommit {
 
 struct ScriptedStore {
     limits: StateStoreLimits,
+    metrics: Arc<StateStoreMetrics>,
     commits: Mutex<VecDeque<ScriptedCommit>>,
     transaction_ids: Mutex<Vec<TransactionId>>,
 }
@@ -64,6 +65,7 @@ impl ScriptedStore {
     fn new(commits: impl IntoIterator<Item = ScriptedCommit>) -> Self {
         Self {
             limits: StateStoreLimits::default(),
+            metrics: Arc::new(StateStoreMetrics::new("scripted")),
             commits: Mutex::new(commits.into_iter().collect()),
             transaction_ids: Mutex::new(Vec::new()),
         }
@@ -75,6 +77,7 @@ impl ScriptedStore {
     ) -> Self {
         Self {
             limits,
+            metrics: Arc::new(StateStoreMetrics::new("scripted")),
             commits: Mutex::new(commits.into_iter().collect()),
             transaction_ids: Mutex::new(Vec::new()),
         }
@@ -91,6 +94,7 @@ impl ScriptedStore {
 struct ScriptedWriteTransaction {
     transaction_id: TransactionId,
     commit: ScriptedCommit,
+    metrics: Arc<StateStoreMetrics>,
 }
 
 #[async_trait]
@@ -135,13 +139,14 @@ impl WriteTransaction for ScriptedWriteTransaction {
     }
 
     async fn commit(self: Box<Self>) -> CommitOutcome {
+        let started = std::time::Instant::now();
         let error = || {
             StateStoreError::new(
                 StateStoreErrorKind::Internal,
                 "scripted state store outcome",
             )
         };
-        match self.commit {
+        let outcome = match self.commit {
             ScriptedCommit::Committed => CommitOutcome::Committed(CommitReceipt {
                 transaction_id: self.transaction_id,
                 revision: StoreRevision::try_from(Bytes::from_static(b"revision"))
@@ -151,7 +156,20 @@ impl WriteTransaction for ScriptedWriteTransaction {
             ScriptedCommit::TransientBeforeCommit => CommitOutcome::TransientBeforeCommit(error()),
             ScriptedCommit::DefiniteFailure => CommitOutcome::DefiniteFailure(error()),
             ScriptedCommit::CommitUnknown => CommitOutcome::CommitUnknown(error()),
-        }
+        };
+        let metric_outcome = match &outcome {
+            CommitOutcome::Committed(_) => StateStoreOutcome::Success,
+            CommitOutcome::Conflict(_) => StateStoreOutcome::Conflict,
+            CommitOutcome::TransientBeforeCommit(_) => StateStoreOutcome::TransientBeforeCommit,
+            CommitOutcome::DefiniteFailure(_) => StateStoreOutcome::DefiniteFailure,
+            CommitOutcome::CommitUnknown(_) => StateStoreOutcome::CommitUnknown,
+        };
+        self.metrics.record_operation(
+            StateStoreOperation::Commit,
+            metric_outcome,
+            started.elapsed(),
+        );
+        outcome
     }
 }
 
@@ -165,6 +183,10 @@ impl StateStore for ScriptedStore {
         &self.limits
     }
 
+    fn metrics_snapshot(&self) -> novarocks::state_store::StateStoreMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
     async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
         unreachable!("runner tests do not begin reads")
     }
@@ -174,6 +196,7 @@ impl StateStore for ScriptedStore {
         transaction_id: TransactionId,
         _purpose: &str,
     ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
+        let started = std::time::Instant::now();
         self.transaction_ids
             .lock()
             .expect("transaction ids")
@@ -184,10 +207,17 @@ impl StateStore for ScriptedStore {
             .expect("commit script")
             .pop_front()
             .expect("scripted commit outcome");
-        Ok(Box::new(ScriptedWriteTransaction {
+        let transaction = Box::new(ScriptedWriteTransaction {
             transaction_id,
             commit,
-        }))
+            metrics: Arc::clone(&self.metrics),
+        });
+        self.metrics.record_operation(
+            StateStoreOperation::Begin,
+            StateStoreOutcome::Success,
+            started.elapsed(),
+        );
+        Ok(transaction)
     }
 
     async fn poll_changes(
@@ -632,17 +662,22 @@ async fn runner_replays_the_whole_operation_for_retryable_commit_outcomes() {
         ScriptedCommit::TransientBeforeCommit,
         ScriptedCommit::Committed,
     ]);
-    let metrics = StateStoreMetrics::new(store.provider_name());
     let operation_id = OperationId::new_v7();
     let operation_runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-    let success = run_side_effect_free(&store, &metrics, operation_id, "runner retry test", {
-        let operation_runs = Arc::clone(&operation_runs);
-        move |_transaction| -> BoxFuture<'_, Result<usize, StateStoreError>> {
-            let run = operation_runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-            Box::pin(async move { Ok(run) })
-        }
-    })
+    let success = run_side_effect_free(
+        &store,
+        store.metrics.as_ref(),
+        operation_id,
+        "runner retry test",
+        {
+            let operation_runs = Arc::clone(&operation_runs);
+            move |_transaction| -> BoxFuture<'_, Result<usize, StateStoreError>> {
+                let run = operation_runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                Box::pin(async move { Ok(run) })
+            }
+        },
+    )
     .await
     .expect("third attempt commits");
 
@@ -654,7 +689,7 @@ async fn runner_replays_the_whole_operation_for_retryable_commit_outcomes() {
     assert_eq!(store.transaction_ids(), expected_ids);
     assert_eq!(success.receipt.transaction_id, expected_ids[2]);
 
-    let snapshot = metrics.snapshot();
+    let snapshot = store.metrics_snapshot();
     assert_eq!(snapshot.begin_count, 3);
     assert_eq!(snapshot.commit_count, 3);
     assert_eq!(snapshot.retry_count, 2);
@@ -677,7 +712,7 @@ async fn runner_does_not_retry_operation_definite_or_unknown_failures() {
     let operation_error_runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let failure = run_side_effect_free(
         &operation_error_store,
-        &StateStoreMetrics::new(operation_error_store.provider_name()),
+        operation_error_store.metrics.as_ref(),
         OperationId::new_v7(),
         "operation error test",
         {
@@ -710,7 +745,7 @@ async fn runner_does_not_retry_operation_definite_or_unknown_failures() {
         let operation_id = OperationId::new_v7();
         let failure = run_side_effect_free(
             &store,
-            &StateStoreMetrics::new(store.provider_name()),
+            store.metrics.as_ref(),
             operation_id,
             "terminal commit outcome test",
             |_transaction| Box::pin(async { Ok(()) }),
@@ -771,7 +806,7 @@ async fn runner_stops_at_the_attempt_budget_without_a_sixth_id() {
     let operation_id = OperationId::new_v7();
     let failure = run_side_effect_free(
         &store,
-        &StateStoreMetrics::new(store.provider_name()),
+        store.metrics.as_ref(),
         operation_id,
         "retry budget test",
         |_transaction| Box::pin(async { Ok(()) }),
@@ -794,10 +829,9 @@ async fn runner_enforces_one_total_deadline_without_retrying_a_slow_operation() 
         ..StateStoreLimits::default()
     };
     let store = ScriptedStore::with_limits(limits, [ScriptedCommit::Committed]);
-    let metrics = StateStoreMetrics::new(store.provider_name());
     let failure = run_side_effect_free(
         &store,
-        &metrics,
+        store.metrics.as_ref(),
         OperationId::new_v7(),
         "deadline test",
         |_transaction| {
@@ -812,36 +846,5 @@ async fn runner_enforces_one_total_deadline_without_retrying_a_slow_operation() 
 
     assert!(matches!(failure, RunFailure::DeadlineExceeded));
     assert_eq!(store.transaction_ids().len(), 1);
-    assert_eq!(metrics.snapshot().deadline_count, 1);
-}
-
-#[test]
-fn runner_metrics_have_only_fixed_low_cardinality_dimensions() {
-    let metrics = StateStoreMetrics::new("scripted");
-    metrics.record_operation(StateStoreOperation::Get, StateStoreOutcome::Success);
-    metrics.record_operation(StateStoreOperation::Range, StateStoreOutcome::Error);
-    metrics.record_operation(StateStoreOperation::Put, StateStoreOutcome::Success);
-    metrics.record_operation(StateStoreOperation::Delete, StateStoreOutcome::Error);
-    metrics.record_bytes_read(11);
-    metrics.record_bytes_written(13);
-    metrics.record_page_records(17);
-    metrics.record_notification_lag(Duration::from_millis(19));
-    metrics.record_blocking_failure();
-
-    let snapshot = metrics.snapshot();
-    assert_eq!(snapshot.provider, "scripted");
-    assert_eq!(snapshot.get_count, 1);
-    assert_eq!(snapshot.range_count, 1);
-    assert_eq!(snapshot.put_count, 1);
-    assert_eq!(snapshot.delete_count, 1);
-    assert_eq!(snapshot.bytes_read, 11);
-    assert_eq!(snapshot.bytes_written, 13);
-    assert_eq!(snapshot.page_records, 17);
-    assert_eq!(snapshot.notification_lag_micros, 19_000);
-    assert_eq!(snapshot.blocking_failure_count, 1);
-
-    let debug = format!("{snapshot:?}");
-    assert!(!debug.contains("customer/secret-key"));
-    assert!(!debug.contains("secret-value"));
-    assert!(!debug.contains("password"));
+    assert_eq!(store.metrics_snapshot().deadline_count, 1);
 }

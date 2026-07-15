@@ -18,16 +18,17 @@
 use std::collections::VecDeque;
 use std::ops::Bound::{Excluded, Included};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use rusqlite::{Connection, params};
 
 use crate::state_store::{
     ChangeCursor, ChangeHint, ChangePage, ChangePollRequest, Direction, Key, RangePage,
-    RangeRequest, StateRecord, StateStoreError, StateStoreErrorKind, StoreIdentity, StoreRevision,
-    Value,
+    RangeRequest, StateRecord, StateStoreError, StateStoreErrorKind, StateStoreMetrics,
+    StoreIdentity, StoreRevision, Value,
 };
 
 use super::open_connection;
@@ -275,6 +276,7 @@ pub(super) async fn poll_changes(
     path: PathBuf,
     identity: StoreIdentity,
     request: ChangePollRequest,
+    metrics: Arc<StateStoreMetrics>,
 ) -> Result<ChangePage, StateStoreError> {
     let decoded_after = request
         .after
@@ -284,11 +286,13 @@ pub(super) async fn poll_changes(
             Ok((decode_revision(&revision)?, sequence))
         })
         .transpose()?;
+    let worker_metrics = Arc::clone(&metrics);
     tokio::task::spawn_blocking(move || {
-        poll_changes_blocking(&path, &identity, &request, decoded_after)
+        poll_changes_blocking(&path, &identity, &request, decoded_after, &worker_metrics)
     })
     .await
     .map_err(|_| {
+        metrics.record_blocking_failure();
         StateStoreError::new(
             StateStoreErrorKind::Internal,
             "SQLite change polling worker failed",
@@ -301,6 +305,7 @@ fn poll_changes_blocking(
     identity: &StoreIdentity,
     request: &ChangePollRequest,
     decoded_after: Option<(u64, u32)>,
+    metrics: &StateStoreMetrics,
 ) -> Result<ChangePage, StateStoreError> {
     let connection = open_connection(path)?;
     connection
@@ -340,10 +345,13 @@ fn poll_changes_blocking(
     let high_watermark_i64 = i64::try_from(high_watermark).map_err(|_| malformed_revision())?;
     let mut statement = connection
         .prepare(
-            "SELECT revision, sequence, key FROM state_store_changes \
-             WHERE revision <= ?1 \
-               AND ((revision > ?2) OR (revision = ?2 AND sequence > ?3)) \
-             ORDER BY revision ASC, sequence ASC LIMIT ?4",
+            "SELECT changes.revision, changes.sequence, changes.key, commits.committed_at_ms \
+             FROM state_store_changes AS changes \
+             JOIN state_store_commits AS commits ON commits.revision = changes.revision \
+             WHERE changes.revision <= ?1 \
+               AND ((changes.revision > ?2) OR \
+                    (changes.revision = ?2 AND changes.sequence > ?3)) \
+             ORDER BY changes.revision ASC, changes.sequence ASC LIMIT ?4",
         )
         .map_err(|error| {
             operation_error(&error, "failed to prepare bounded SQLite change query")
@@ -356,6 +364,7 @@ fn poll_changes_blocking(
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             },
         )
@@ -364,12 +373,12 @@ fn poll_changes_blocking(
         })?;
     let mut decoded = Vec::with_capacity(request.page_size + 1);
     for row in rows {
-        let (revision, sequence, key) = row.map_err(|error| {
+        let (revision, sequence, key, committed_at_ms) = row.map_err(|error| {
             operation_error(&error, "failed to decode bounded SQLite change row")
         })?;
         let revision = u64::try_from(revision).map_err(|_| malformed_revision())?;
         let sequence = u32::try_from(sequence).map_err(|_| malformed_sequence())?;
-        decoded.push((revision, sequence, key));
+        decoded.push((revision, sequence, key, committed_at_ms));
     }
     drop(statement);
     connection.execute_batch("ROLLBACK").map_err(|error| {
@@ -379,7 +388,15 @@ fn poll_changes_blocking(
 
     let mut hints = Vec::with_capacity(decoded.len());
     let mut last_position = None;
-    for (revision, sequence, key) in decoded {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    for (revision, sequence, key, committed_at_ms) in decoded {
+        metrics.record_notification_lag(Duration::from_millis(
+            now_ms.saturating_sub(committed_at_ms).max(0) as u64,
+        ));
         hints.push(ChangeHint {
             revision: revision_token(revision),
             key: Key::try_from(Bytes::from(key))?,
