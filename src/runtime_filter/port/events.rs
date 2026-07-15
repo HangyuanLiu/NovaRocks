@@ -219,6 +219,22 @@ pub(crate) enum RuntimeFilterEvent {
     OrderedStreamTightened {
         identity: ContributionIdentity,
     },
+    TopKSummaryStale {
+        identity: ContributionIdentity,
+    },
+    TopKSummaryApplied {
+        identity: ContributionIdentity,
+    },
+    TopKSummaryRejected {
+        identity: ContributionIdentity,
+        violation: RuntimeContractViolationKind,
+    },
+    TopKSummaryEqual {
+        identity: ContributionIdentity,
+    },
+    TopKStreamUpdated {
+        identity: ContributionIdentity,
+    },
     OrderedGlobalTightened {
         identity: ContributionIdentity,
         version: LogicalVersion,

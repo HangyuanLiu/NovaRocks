@@ -852,13 +852,10 @@ fn build_routing(
                     channel_id: *channel_id,
                     channel: channel.clone(),
                     expected_instances: producer.expected_fragment_instances().clone(),
-                    kind: match deployment.logical_domain() {
-                        RuntimeFilterLogicalDomain::Membership { .. } => {
-                            ProducerPortKind::Membership
-                        }
-                        RuntimeFilterLogicalDomain::OrderedBound(_) => {
-                            ProducerPortKind::OrderedBound
-                        }
+                    kind: match deployment.reduction_requirement() {
+                        ReductionRequirement::SetUnion => ProducerPortKind::Membership,
+                        ReductionRequirement::TightenOrderedBound => ProducerPortKind::OrderedBound,
+                        ReductionRequirement::MergeTopKSummary(_) => ProducerPortKind::TopKSummary,
                     },
                 },
             );
@@ -1871,6 +1868,20 @@ mod tests {
     fn topk_install_accepts_exact_k4_summary_matrix_and_preserves_direct_matrix() {
         assert!(validate_channel_contract(&topk_deployment_fixture()).is_ok());
         assert!(validate_channel_contract(&ordered_deployment_fixture()).is_ok());
+    }
+
+    #[test]
+    fn topk_producer_route_kind_follows_summary_reduction_not_ordered_domain() {
+        let registry = registry();
+        registry
+            .install(view([(1, topk_deployment_fixture().0)]))
+            .unwrap();
+        let installed = registry.active_installation().unwrap();
+
+        assert_eq!(
+            installed.producer(BindingId::new(10)).unwrap().kind,
+            crate::runtime_filter::port::producer::ProducerPortKind::TopKSummary
+        );
     }
 
     #[test]

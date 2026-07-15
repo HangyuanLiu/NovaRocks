@@ -247,6 +247,11 @@ impl From<&RuntimeFilterEvent> for RuntimeFilterChannelEventCoordinate {
             | RuntimeFilterEvent::OrderedUpdateRejected { identity, .. }
             | RuntimeFilterEvent::OrderedUpdateEqual { identity }
             | RuntimeFilterEvent::OrderedStreamTightened { identity }
+            | RuntimeFilterEvent::TopKSummaryStale { identity }
+            | RuntimeFilterEvent::TopKSummaryApplied { identity }
+            | RuntimeFilterEvent::TopKSummaryRejected { identity, .. }
+            | RuntimeFilterEvent::TopKSummaryEqual { identity }
+            | RuntimeFilterEvent::TopKStreamUpdated { identity }
             | RuntimeFilterEvent::OrderedGlobalTightened { identity, .. }
             | RuntimeFilterEvent::SequenceGapObserved { identity } => Self::Contribution(*identity),
             RuntimeFilterEvent::ProducerInstanceClosed { identity }
@@ -639,6 +644,47 @@ mod tests {
                 identity,
                 violation: RuntimeContractViolationKind::OrderedBoundLoosened,
             },
+        ];
+        for event in &events {
+            sink.record(event.clone());
+        }
+
+        let snapshot = registry.snapshot(query).expect("query snapshot");
+        assert_eq!(
+            snapshot
+                .channel_events
+                .get(&RuntimeFilterChannelEventCoordinate::Contribution(identity)),
+            Some(&events)
+        );
+    }
+
+    #[test]
+    fn topk_summary_input_events_share_one_contribution_coordinate() {
+        let registry = RuntimeFilterLifecycleRegistry::new();
+        let query = QueryKey::from_hi_lo(33, 34);
+        let sink = RegistryRuntimeFilterEventSink::new(&registry, query);
+        let common = channel_identity(query);
+        let identity = ContributionIdentity::new(
+            common.query_id(),
+            common.participant_id(),
+            common.channel_id(),
+            common.epoch(),
+            ProducerStreamId::new(
+                BindingId::new(6),
+                UniqueId { hi: 7, lo: 8 },
+                PartitionId::new(9),
+            ),
+            ProducerSequence::new(10),
+        );
+        let events = vec![
+            RuntimeFilterEvent::TopKSummaryStale { identity },
+            RuntimeFilterEvent::TopKSummaryApplied { identity },
+            RuntimeFilterEvent::TopKSummaryRejected {
+                identity,
+                violation: RuntimeContractViolationKind::OrderedBoundLoosened,
+            },
+            RuntimeFilterEvent::TopKSummaryEqual { identity },
+            RuntimeFilterEvent::TopKStreamUpdated { identity },
         ];
         for event in &events {
             sink.record(event.clone());

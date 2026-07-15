@@ -24,11 +24,12 @@ use crate::runtime_filter::port::identity::{PartitionId, ProducerSequence};
 use crate::runtime_filter::port::ordered_bound::OrderedBoundUpdate;
 use crate::runtime_filter::port::producer::{
     OrderedBoundProducerAdapter, ProducerAdapter, ProducerFailureReason, RuntimeContractViolation,
-    SubmitOutcome,
+    RuntimeContractViolationKind, SubmitOutcome, TopKSummaryProducerAdapter,
 };
 use crate::runtime_filter::port::support::{
     RuntimeFilterMemoryAccount, TemporaryContributionLease,
 };
+use crate::runtime_filter::port::topk_summary::TopKSummary;
 use crate::runtime_filter::port::value_domain::ValueDomainDelta;
 
 use super::ActionDispatcher;
@@ -112,6 +113,33 @@ impl ServiceProducerAdapter {
                 self.dispatcher
                     .dispatch(self.channel_id, action)
                     .expect("ordered rejection-only dispatch cannot materialize or route");
+                Err(error)
+            }
+        }
+    }
+
+    fn finish_topk(
+        &self,
+        partition_id: PartitionId,
+        sequence: ProducerSequence,
+        result: Result<
+            crate::runtime_filter::core::channel::ChannelAction,
+            RuntimeContractViolation,
+        >,
+    ) -> Result<SubmitOutcome, RuntimeContractViolation> {
+        match result {
+            Ok(action) => self.finish(action),
+            Err(error) => {
+                let identity = self.channel.contribution_identity(
+                    self.binding_id,
+                    self.fragment_instance_id,
+                    partition_id,
+                    sequence,
+                );
+                let action = self.channel.topk_rejection_action(identity, error.kind());
+                self.dispatcher
+                    .dispatch(self.channel_id, action)
+                    .expect("top-k rejection-only dispatch cannot materialize or route");
                 Err(error)
             }
         }
@@ -244,6 +272,72 @@ impl OrderedBoundProducerAdapter for ServiceProducerAdapter {
                 self.fragment_instance_id,
                 partition_id,
                 terminal_sequence,
+            )
+            .and_then(|action| self.finish(action))
+    }
+
+    fn fail(
+        &self,
+        reason: ProducerFailureReason,
+    ) -> Result<SubmitOutcome, RuntimeContractViolation> {
+        self.channel
+            .fail_instance(self.binding_id, self.fragment_instance_id, reason)
+            .and_then(|action| self.finish(action))
+    }
+}
+
+impl TopKSummaryProducerAdapter for ServiceProducerAdapter {
+    fn submit_summary(
+        &self,
+        partition_id: PartitionId,
+        sequence: ProducerSequence,
+        summary: TopKSummary,
+    ) -> Result<SubmitOutcome, RuntimeContractViolation> {
+        let result = (|| {
+            self.channel.authorize_submit(
+                self.binding_id,
+                self.fragment_instance_id,
+                partition_id,
+            )?;
+            let bytes = summary.canonical_contribution_bytes().ok_or_else(|| {
+                RuntimeContractViolation::new(
+                    RuntimeContractViolationKind::InvalidContributionLease,
+                    "top-k summary canonical size overflowed",
+                )
+            })?;
+            let Ok(lease) = TemporaryContributionLease::try_new(self.memory_account.clone(), bytes)
+            else {
+                return self.channel.reject_topk_submit_resource_exhausted(
+                    self.binding_id,
+                    self.fragment_instance_id,
+                    partition_id,
+                    sequence,
+                    &summary,
+                );
+            };
+            self.channel.submit_topk_summary(
+                self.binding_id,
+                self.fragment_instance_id,
+                partition_id,
+                sequence,
+                summary,
+                lease,
+            )
+        })();
+        self.finish_topk(partition_id, sequence, result)
+    }
+
+    fn close_partition(
+        &self,
+        partition_id: PartitionId,
+        terminal: ProducerSequence,
+    ) -> Result<SubmitOutcome, RuntimeContractViolation> {
+        self.channel
+            .close_topk_partition(
+                self.binding_id,
+                self.fragment_instance_id,
+                partition_id,
+                terminal,
             )
             .and_then(|action| self.finish(action))
     }

@@ -358,6 +358,22 @@ impl RuntimeFilterChannel {
         }
     }
 
+    pub(crate) fn topk_rejection_action(
+        &self,
+        identity: ContributionIdentity,
+        violation: RuntimeContractViolationKind,
+    ) -> ChannelAction {
+        let mut state = self.state.lock().unwrap();
+        ChannelAction::Progress {
+            order: Some(next_dispatch_order(&mut state)),
+            outcome: SubmitOutcome::TerminalNoop,
+            events: vec![RuntimeFilterEvent::TopKSummaryRejected {
+                identity,
+                violation,
+            }],
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         query_id: UniqueId,
@@ -1251,7 +1267,24 @@ impl RuntimeFilterChannel {
                 .expect("top-k strategy remains installed")
                 .commit_apply(projection);
             ordered.availability_witnesses = availability_witnesses;
-            let mut events = Vec::new();
+            let mut events = match apply_outcome {
+                TopKApplyOutcome::Stale => {
+                    vec![RuntimeFilterEvent::TopKSummaryStale { identity }]
+                }
+                TopKApplyOutcome::Duplicate | TopKApplyOutcome::GlobalTightened => Vec::new(),
+                TopKApplyOutcome::SequenceAdvancedEqual => {
+                    vec![RuntimeFilterEvent::TopKSummaryEqual { identity }]
+                }
+                TopKApplyOutcome::StreamUpdated => {
+                    vec![RuntimeFilterEvent::TopKStreamUpdated { identity }]
+                }
+            };
+            if !matches!(
+                apply_outcome,
+                TopKApplyOutcome::Stale | TopKApplyOutcome::Duplicate
+            ) {
+                events.insert(0, RuntimeFilterEvent::TopKSummaryApplied { identity });
+            }
             if !availability_was_satisfied && availability == CoverageProgress::Satisfied {
                 events.push(RuntimeFilterEvent::OrderedAvailabilityReached {
                     identity: self.event_identity,
@@ -1991,6 +2024,43 @@ impl RuntimeFilterChannel {
             let mut preflight = direct.clone();
             preflight.apply(stream_id, sequence, update.clone())?;
         }
+        if !matches!(state.terminal, ChannelTerminal::Collecting) {
+            return Ok(terminal_action_from_state(&state));
+        }
+        let locked = self.make_ordered_unavailable_or_degraded(
+            &mut state,
+            UnavailableReason::ResourceLimit,
+            SubmitOutcome::TerminalNoop,
+            Vec::new(),
+        );
+        drop(state);
+        Ok(locked.finish())
+    }
+
+    pub(crate) fn reject_topk_submit_resource_exhausted(
+        &self,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        partition_id: PartitionId,
+        sequence: ProducerSequence,
+        summary: &TopKSummary,
+    ) -> Result<ChannelAction, RuntimeContractViolation> {
+        let stream_id = ProducerStreamId::new(binding_id, fragment_instance_id, partition_id);
+        let mut state = self.state.lock().unwrap();
+        partition_state(&state, binding_id, fragment_instance_id, partition_id)?;
+        let ordered = state.ordered.as_ref().ok_or_else(|| {
+            violation(
+                RuntimeContractViolationKind::ProducerPortMismatch,
+                "membership channel cannot accept top-k summaries",
+            )
+        })?;
+        let topk = ordered.reducer.topk().ok_or_else(|| {
+            violation(
+                RuntimeContractViolationKind::ProducerPortMismatch,
+                "direct ordered channel cannot accept top-k summaries",
+            )
+        })?;
+        topk.preflight_apply(stream_id, sequence, summary)?;
         if !matches!(state.terminal, ChannelTerminal::Collecting) {
             return Ok(terminal_action_from_state(&state));
         }
