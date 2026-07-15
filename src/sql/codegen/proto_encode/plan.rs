@@ -54,12 +54,11 @@ use crate::sql::planner::distributed::{
     FragmentStreamKind, NodeExecutionColumn, NodeOutputCatalog, PartitionKind, PlanFragment,
     WriteContractCatalog,
 };
-use crate::sql::planner::payload::{AggregateCall, PlanRowCountAssertion};
+use crate::sql::planner::payload::PlanRowCountAssertion;
 use crate::sql::planner::physical::{
-    AggMode, HashSource, JoinDistribution, JoinExecutionMode, PhysicalHashAggregateNode,
-    PhysicalPlanKind, PlanSetOpKind, RedistributeMode, TopNPhase,
+    AggMode, HashSource, JoinDistribution, JoinExecutionMode, PhysicalPlanKind, PlanSetOpKind,
+    RedistributeMode, TopNPhase,
 };
-use crate::types::aggregate::infer_agg_function_types;
 use crate::types::native_proto::encode_type;
 
 pub(crate) struct NativePlanEncodeContext<'a> {
@@ -665,9 +664,15 @@ pub(crate) fn encode_node_with_context(
 }
 
 /// Bind the encoded node's execution output columns from the sealed node-output
-/// contract for the covered kinds (join / scan / set-op / sort). The planner has
-/// already finalized and validated those outputs at seal time, so the encoder
-/// maps them 1:1 here rather than re-deriving or repairing them.
+/// contract for the covered kinds (join / scan / set-op / sort / hash-aggregate).
+/// The planner has already finalized and validated those outputs at seal time, so
+/// the encoder maps them 1:1 here rather than re-deriving or repairing them.
+///
+/// A `HashAggregate` additionally carries a finalized group-key + aggregate-state
+/// wire layout (with per-mode intermediate types applied); this maps that layout —
+/// and the visible-or-full output columns — into the `HashAggregateNode` payload,
+/// replacing the raw baseline `encode_physical_node` produced. The intermediate
+/// aggregate-state type determination lives entirely in the planner.
 ///
 /// `ctx.node_outputs` is `None` only in the bare-node encoder unit tests, which
 /// have no sealed plan; there the payload columns encoded by `encode_physical_node`
@@ -696,6 +701,30 @@ fn apply_sealed_node_output_columns(
         ));
     };
     physical.output_columns = output_columns;
+
+    // A HashAggregate maps its finalized wire layout (and visible output columns)
+    // 1:1 from the contract, overriding the raw baseline.
+    if matches!(physical.kind, Some(plan::plan_node::Kind::HashAggregate(_))) {
+        let layout = catalog
+            .aggregate_layout(src.fragment_id, src.node_id)
+            .ok_or_else(|| {
+                format!(
+                    "native HashAggregate node {} has a covered execution output but no sealed wire layout",
+                    src.node_id
+                )
+            })?;
+        let group_key_columns = encode_output_columns(&layout.group_key_columns)?;
+        let aggregate_columns = encode_output_columns(&layout.aggregate_columns)?;
+        let visible_output_columns = physical.output_columns.clone();
+        let Some(plan::plan_node::Kind::HashAggregate(aggregate)) = physical.kind.as_mut() else {
+            unreachable!("physical.kind was just matched as HashAggregate");
+        };
+        aggregate.output_layout = Some(plan::AggregateOutputLayout {
+            group_key_columns,
+            aggregate_columns,
+        });
+        aggregate.output_columns = visible_output_columns;
+    }
     Ok(())
 }
 
@@ -968,9 +997,20 @@ fn encode_physical_node(
             }),
         ),
         PhysicalPlanKind::HashAggregate(node) => {
-            let wire = hash_aggregate_wire_output_columns(node)?;
+            // Baseline raw layout/output columns straight from the physical payload.
+            // In a sealed plan `apply_sealed_node_output_columns` overwrites both the
+            // node output columns and this `output_layout`/`output_columns` from the
+            // finalized aggregate contract (which applies the per-mode intermediate
+            // aggregate-state types). This raw form only stands in the bare-node
+            // encoder unit tests that have no sealed plan; the intermediate-type
+            // determination is owned by the planner (`finalize_hash_aggregate_wire`).
+            let raw_output_columns = if node.output_columns.is_empty() {
+                node.output_layout.full_output_columns()
+            } else {
+                node.output_columns.clone()
+            };
             (
-                encode_output_columns(&wire.output_columns)?,
+                encode_output_columns(&raw_output_columns)?,
                 Kind::HashAggregate(plan::HashAggregateNode {
                     mode: encode_agg_mode(node.mode),
                     group_by: encode_exprs(&node.group_by)?,
@@ -990,10 +1030,14 @@ fn encode_physical_node(
                         .collect::<Result<Vec<_>, String>>()?,
                     is_merge: node.is_merge.clone(),
                     output_layout: Some(plan::AggregateOutputLayout {
-                        group_key_columns: encode_output_columns(&wire.group_key_columns)?,
-                        aggregate_columns: encode_output_columns(&wire.aggregate_columns)?,
+                        group_key_columns: encode_output_columns(
+                            &node.output_layout.group_key_columns,
+                        )?,
+                        aggregate_columns: encode_output_columns(
+                            &node.output_layout.aggregate_columns,
+                        )?,
                     }),
-                    output_columns: encode_output_columns(&wire.output_columns)?,
+                    output_columns: encode_output_columns(&raw_output_columns)?,
                 }),
             )
         }
@@ -1121,98 +1165,6 @@ fn encode_physical_node(
         output_columns,
         kind: Some(kind),
     })
-}
-
-struct HashAggregateWireOutputColumns {
-    group_key_columns: Vec<AnalysisOutputColumn>,
-    aggregate_columns: Vec<AnalysisOutputColumn>,
-    output_columns: Vec<AnalysisOutputColumn>,
-}
-
-fn hash_aggregate_wire_output_columns(
-    node: &PhysicalHashAggregateNode,
-) -> Result<HashAggregateWireOutputColumns, String> {
-    if node.output_layout.aggregate_columns.len() != node.aggregates.len() {
-        return Err(format!(
-            "native HashAggregate output_layout aggregate column count {} does not match aggregate count {}",
-            node.output_layout.aggregate_columns.len(),
-            node.aggregates.len()
-        ));
-    }
-
-    let group_key_columns = node.output_layout.group_key_columns.clone();
-    let mut aggregate_columns = node.output_layout.aggregate_columns.clone();
-    if hash_aggregate_outputs_intermediate(node.mode) {
-        for (idx, (column, call)) in aggregate_columns
-            .iter_mut()
-            .zip(node.aggregates.iter())
-            .enumerate()
-        {
-            column.data_type = aggregate_intermediate_type(call).map_err(|err| {
-                format!("native HashAggregate aggregate {idx} intermediate type: {err}")
-            })?;
-        }
-    }
-
-    let mut full_output_columns =
-        Vec::with_capacity(group_key_columns.len() + aggregate_columns.len());
-    full_output_columns.extend(group_key_columns.iter().cloned());
-    full_output_columns.extend(aggregate_columns.iter().cloned());
-
-    let output_columns = if node.output_columns.is_empty() {
-        full_output_columns
-    } else {
-        let data_type_by_id = full_output_columns
-            .iter()
-            .map(|column| (column.column_id, column.data_type.clone()))
-            .collect::<HashMap<_, _>>();
-        let mut output_columns = node.output_columns.clone();
-        for column in &mut output_columns {
-            let data_type = data_type_by_id.get(&column.column_id).ok_or_else(|| {
-                format!(
-                    "native HashAggregate output column {} missing from output_layout",
-                    column.column_id.0
-                )
-            })?;
-            column.data_type = data_type.clone();
-        }
-        output_columns
-    };
-
-    Ok(HashAggregateWireOutputColumns {
-        group_key_columns,
-        aggregate_columns,
-        output_columns,
-    })
-}
-
-fn hash_aggregate_outputs_intermediate(mode: AggMode) -> bool {
-    !matches!(mode, AggMode::Single | AggMode::Global)
-}
-
-fn aggregate_intermediate_type(call: &AggregateCall) -> Result<DataType, String> {
-    let function_name = aggregate_function_name(call);
-    let arg_types = call
-        .args
-        .iter()
-        .map(|arg| arg.data_type.clone())
-        .collect::<Vec<_>>();
-    infer_agg_function_types(&function_name, &arg_types, call.distinct)?
-        .1
-        .ok_or_else(|| format!("{} does not expose an intermediate type", function_name))
-}
-
-fn aggregate_function_name(call: &AggregateCall) -> String {
-    let name = call.name.to_ascii_lowercase();
-    if !call.distinct {
-        return name;
-    }
-    match name.as_str() {
-        "count" => "multi_distinct_count".to_string(),
-        "sum" => "multi_distinct_sum".to_string(),
-        "array_agg" => "array_agg_distinct".to_string(),
-        _ => name,
-    }
 }
 
 fn encode_row_count_assertion(assertion: PlanRowCountAssertion) -> i32 {

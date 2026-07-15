@@ -47,7 +47,7 @@ struct DistributedPlanData {
     execution_column_id_allocator: ExecutionColumnIdAllocator,
     // Authoritative fragment-graph execution shape derived at seal time.
     topology: TopologyContract,
-    // Authoritative non-aggregate node execution outputs derived at seal time.
+    // Authoritative covered node execution outputs derived at seal time.
     node_outputs: NodeOutputCatalog,
     // Authoritative fragment output columns and stream-edge projections derived
     // at seal time. The native encoder maps these 1:1.
@@ -205,8 +205,9 @@ pub(in crate::sql::planner::distributed) fn seal_draft(
         &mut execution_column_id_allocator,
     )
     .map_err(DistributedPlanSealError::Boundary)?;
-    // Finalize the non-aggregate node execution outputs. This reads each covered
-    // node's planner-computed output columns, fails fast on any missing or
+    // Finalize the covered node execution outputs. This reads each covered
+    // node's planner-computed output columns (for a hash-aggregate, with per-mode
+    // intermediate aggregate-state types applied), fails fast on any missing or
     // inconsistent output, and numbers each occurrence from the SAME allocator
     // (reusing boundary occurrences for boundary-participating root outputs).
     // Runs after boundary derivation so the allocator continues from there.

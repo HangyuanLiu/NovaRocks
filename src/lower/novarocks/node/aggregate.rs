@@ -26,7 +26,7 @@ use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::aggregate::{AggFunction, AggOrderSpec, AggTypeSignature, AggregateNode};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{common as proto_common, plan};
-use crate::types::aggregate::infer_agg_function_types;
+use crate::types::aggregate::{infer_agg_function_types, mangle_distinct_aggregate_name};
 
 pub(super) fn lower_hash_aggregate_node(
     node: &plan::DistributedNode,
@@ -198,16 +198,9 @@ fn aggregate_output_columns_from_layout(
 }
 
 fn aggregate_function_name(call: &plan::PlanAggregateCall) -> Result<String, String> {
-    let name = call.name.to_ascii_lowercase();
-    if call.distinct {
-        return match name.as_str() {
-            "count" => Ok("multi_distinct_count".to_string()),
-            "sum" => Ok("multi_distinct_sum".to_string()),
-            "array_agg" => Ok("array_agg_distinct".to_string()),
-            _ => Ok(name),
-        };
-    }
-    Ok(name)
+    // Delegate the DISTINCT-mangling table to the single source of truth; this
+    // proto-typed wrapper differs from the planner-typed one only in its input.
+    Ok(mangle_distinct_aggregate_name(&call.name, call.distinct))
 }
 
 fn aggregate_signature_arg_types(call: &plan::PlanAggregateCall) -> Result<Vec<DataType>, String> {

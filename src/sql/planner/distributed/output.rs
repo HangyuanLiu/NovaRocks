@@ -15,21 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// The node-output catalog is the planner-native record of every non-aggregate
-// physical node's execution output. CGO-9C Task 1 populates it and converts the
-// native encoder onto exact reads of it; Tasks 2-5 (fragment/stream projection,
-// write/router, guards) consume the occurrence mapping. Until every field and
-// accessor is read, allow the not-yet-consumed surface, mirroring `boundary.rs`.
+// The node-output catalog is the planner-native record of every covered physical
+// node's execution output (joins, scan, set-op, sort, and — as of CGO-9C Task 4 —
+// hash-aggregate). CGO-9C Task 1 populates it and converts the native encoder onto
+// exact reads of it; Tasks 2-5 (fragment/stream projection, write/router, guards)
+// consume the occurrence mapping. Until every field and accessor is read, allow
+// the not-yet-consumed surface, mirroring `boundary.rs`.
 #![allow(dead_code)]
 
 //! Planner-native node execution-output contract for a sealed distributed plan.
 //!
 //! Where [`super::boundary`] records *which columns cross each plan seam*, this
 //! module records *what each execution node outputs*. It finalizes the output
-//! columns of the non-aggregate physical nodes whose output the native encoder
-//! historically re-derived or repaired: joins (`HashJoin` / `NestLoopJoin`),
-//! `Scan`, set operations (`SetOp`), and `Sort`. Aggregate output shape/type is
-//! deliberately excluded here (CGO-9C Task 4 owns it).
+//! columns of the physical nodes whose output the native encoder historically
+//! re-derived or repaired: joins (`HashJoin` / `NestLoopJoin`), `Scan`, set
+//! operations (`SetOp`), `Sort`, and `HashAggregate`. For a `HashAggregate` the
+//! finalized execution output is the visible-or-full aggregate output columns
+//! with per-mode intermediate aggregate-state types applied, and the full
+//! group-key + aggregate-state wire layout is finalized alongside it (the encoder
+//! maps that layout 1:1 into the `HashAggregateNode` payload).
 //!
 //! Non-join covered outputs (`Scan`, `SetOp`, `Sort`) are *read* from the
 //! planner's already-computed physical payloads. Join outputs (`HashJoin` /
@@ -78,11 +82,10 @@ use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::catalog::ColumnDef;
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::expr::JoinKind;
-use crate::sql::planner::payload::{
-    AggregateCall, PlanGenerateSeriesNode, PlanProjectNode, PlanScanNode,
+use crate::sql::planner::payload::{PlanGenerateSeriesNode, PlanProjectNode, PlanScanNode};
+use crate::sql::planner::physical::{
+    PhysicalHashAggregateNode, aggregate_intermediate_type, hash_aggregate_outputs_intermediate,
 };
-use crate::sql::planner::physical::{AggMode, PhysicalHashAggregateNode};
-use crate::types::aggregate::infer_agg_function_types;
 
 use super::boundary::{
     BoundaryCatalog, BoundaryContract, ExecutionColumnId, ExecutionColumnIdAllocator,
@@ -100,8 +103,10 @@ type FragmentRoots<'a> = BTreeMap<FragmentId, &'a DistributedNode>;
 
 /// The physical node kinds whose execution output this contract finalizes.
 ///
-/// Aggregate nodes are intentionally absent: their output shape and
-/// intermediate types stay in CGO-9C Task 4.
+/// `HashAggregate` is covered (CGO-9C Task 4): its execution output is the
+/// visible-or-full aggregate output columns with per-mode intermediate aggregate
+/// state types applied, and its group-key + aggregate-state wire layout is
+/// finalized alongside (see [`FinalizedAggregateLayout`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum NodeExecutionKind {
     Scan,
@@ -109,6 +114,7 @@ pub(crate) enum NodeExecutionKind {
     NestLoopJoin,
     SetOp,
     Sort,
+    HashAggregate,
 }
 
 impl fmt::Display for NodeExecutionKind {
@@ -119,6 +125,7 @@ impl fmt::Display for NodeExecutionKind {
             Self::NestLoopJoin => "nest-loop-join",
             Self::SetOp => "set-op",
             Self::Sort => "sort",
+            Self::HashAggregate => "hash-aggregate",
         })
     }
 }
@@ -150,13 +157,33 @@ pub(crate) struct NodeExecutionOutput {
     pub columns: Vec<NodeExecutionColumn>,
 }
 
+/// The finalized wire layout of a `HashAggregate` node: the group-key columns and
+/// the aggregate-state columns, with per-mode intermediate aggregate-state types
+/// already applied to the aggregate columns (for partial modes). The native
+/// encoder maps this 1:1 into the `HashAggregateNode.output_layout` payload; the
+/// aggregate's covered [`NodeExecutionOutput`] separately carries its
+/// visible-or-full execution output (the layout is *not* recoverable from that
+/// execution output when a visible projection subsets it).
+///
+/// (`OutputColumn` carries an arrow `DataType` and implements neither `PartialEq`
+/// nor `Eq`, so this — and the [`NodeOutputCatalog`] that holds it — are `Clone,
+/// Debug` only.)
+#[derive(Clone, Debug)]
+pub(crate) struct FinalizedAggregateLayout {
+    pub group_key_columns: Vec<OutputColumn>,
+    pub aggregate_columns: Vec<OutputColumn>,
+}
+
 /// The full set of finalized node execution outputs for a sealed distributed
 /// plan, in deterministic derivation order (fragment declaration order, then a
 /// pre-order walk of each fragment's node tree).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) struct NodeOutputCatalog {
     outputs: Vec<NodeExecutionOutput>,
     index: BTreeMap<(FragmentId, i32), usize>,
+    /// Finalized `HashAggregate` wire layouts, keyed by `(fragment_id, node_id)`.
+    /// Present for every covered `HashAggregate` node.
+    aggregate_layouts: BTreeMap<(FragmentId, i32), FinalizedAggregateLayout>,
 }
 
 impl NodeOutputCatalog {
@@ -175,6 +202,16 @@ impl NodeOutputCatalog {
         self.index
             .get(&(fragment_id, node_id))
             .map(|&index| &self.outputs[index])
+    }
+
+    /// The finalized `HashAggregate` wire layout of the node identified by
+    /// `(fragment_id, node_id)`, or `None` if that node is not a `HashAggregate`.
+    pub(crate) fn aggregate_layout(
+        &self,
+        fragment_id: FragmentId,
+        node_id: i32,
+    ) -> Option<&FinalizedAggregateLayout> {
+        self.aggregate_layouts.get(&(fragment_id, node_id))
     }
 }
 
@@ -235,12 +272,12 @@ pub(in crate::sql::planner::distributed) enum NodeOutputError {
         target_exchange_node_id: i32,
         slot_id: i32,
     },
-    /// A partial (`Local`/`Distinct*`) `HashAggregate` on a fragment root or an
-    /// edge source exposes no intermediate type for one of its aggregate calls, so
-    /// the wire schema its downstream fragment must receive cannot be finalized.
-    /// Mirrors the encoder's `hash_aggregate_wire_output_columns` failure. (The
-    /// aggregate node's own output finalization is CGO-9C Task 4; this reproduces
-    /// only the wire type the fragment/edge output must carry.)
+    /// A `HashAggregate` node's wire output cannot be finalized: its
+    /// `output_layout` aggregate-column count disagrees with its aggregate count, a
+    /// partial-mode (`Local`/`Distinct*`) aggregate call exposes no intermediate
+    /// type, or a visible output column is absent from the layout. Mirrors the
+    /// native encoder's `hash_aggregate_wire_output_columns` fail-fasts, which
+    /// CGO-9C Task 4 consolidated into [`finalize_hash_aggregate_wire`].
     AggregateIntermediateType {
         fragment_id: FragmentId,
         node_id: i32,
@@ -319,6 +356,17 @@ impl fmt::Display for NodeOutputError {
     }
 }
 
+/// The finalized covered output of a node: its covered kind, its deduplicated
+/// execution-output columns, and — for a `HashAggregate` — the full group-key +
+/// aggregate-state wire layout the flat execution output does not capture.
+struct CoveredNodeOutput {
+    kind: NodeExecutionKind,
+    columns: Vec<OutputColumn>,
+    /// `Some` only for a `HashAggregate`. The finalized wire layout stored in the
+    /// catalog alongside the execution output.
+    aggregate_layout: Option<FinalizedAggregateLayout>,
+}
+
 /// Return the covered kind and finalized execution-output columns of a node, or
 /// `None` for a node whose output this contract does not finalize.
 ///
@@ -326,16 +374,21 @@ impl fmt::Display for NodeOutputError {
 /// planner-computed payload. Join outputs are *reconciled against the node's
 /// children* (see [`derive_join_execution_output`]) rather than read verbatim,
 /// because a join's payload `output_columns` can list ids no child produces at
-/// execution. Every covered output is deduplicated by column id so the wire
-/// schema the encoder emits has unique `OutputColumn.column_id`s.
+/// execution. A `HashAggregate` output is finalized from its group-key +
+/// aggregate-state layout with per-mode intermediate types applied, preferring
+/// its visible `output_columns` when non-empty (see
+/// [`finalize_hash_aggregate_wire`]). Every covered output is deduplicated by
+/// column id so the wire schema the encoder emits has unique
+/// `OutputColumn.column_id`s.
 fn covered_node_output(
     node: &DistributedNode,
     fragment_roots: &FragmentRoots<'_>,
-) -> Result<Option<(NodeExecutionKind, Vec<OutputColumn>)>, NodeOutputError> {
-    let (kind, columns) = match &node.payload {
+) -> Result<Option<CoveredNodeOutput>, NodeOutputError> {
+    let (kind, columns, aggregate_layout) = match &node.payload {
         DistributedNodeKind::Scan(scan) => (
             NodeExecutionKind::Scan,
             scan_execution_output_columns(scan)?,
+            None,
         ),
         DistributedNodeKind::HashJoin(join) => (
             NodeExecutionKind::HashJoin,
@@ -345,6 +398,7 @@ fn covered_node_output(
                 node,
                 fragment_roots,
             )?,
+            None,
         ),
         DistributedNodeKind::NestLoopJoin(join) => (
             NodeExecutionKind::NestLoopJoin,
@@ -354,14 +408,34 @@ fn covered_node_output(
                 node,
                 fragment_roots,
             )?,
+            None,
         ),
-        DistributedNodeKind::SetOp(set_op) => {
-            (NodeExecutionKind::SetOp, set_op.output_columns.clone())
+        DistributedNodeKind::SetOp(set_op) => (
+            NodeExecutionKind::SetOp,
+            set_op.output_columns.clone(),
+            None,
+        ),
+        DistributedNodeKind::Sort(sort) => {
+            (NodeExecutionKind::Sort, sort.output_columns.clone(), None)
         }
-        DistributedNodeKind::Sort(sort) => (NodeExecutionKind::Sort, sort.output_columns.clone()),
+        DistributedNodeKind::HashAggregate(aggregate) => {
+            let wire = finalize_hash_aggregate_wire(node, aggregate)?;
+            (
+                NodeExecutionKind::HashAggregate,
+                wire.output_columns,
+                Some(FinalizedAggregateLayout {
+                    group_key_columns: wire.group_key_columns,
+                    aggregate_columns: wire.aggregate_columns,
+                }),
+            )
+        }
         _ => return Ok(None),
     };
-    Ok(Some((kind, deduplicate_output_columns_by_id(columns))))
+    Ok(Some(CoveredNodeOutput {
+        kind,
+        columns: deduplicate_output_columns_by_id(columns),
+        aggregate_layout,
+    }))
 }
 
 /// Reconcile a join's execution output against its children.
@@ -419,18 +493,16 @@ fn node_execution_output_columns(
         }
         DistributedNodeKind::Project(project) => Ok(project_execution_output_columns(project)),
         DistributedNodeKind::HashAggregate(aggregate) => {
-            // Prefer the aggregate's visible `output_columns` (a subset-by-id,
-            // possibly reordered, of the full layout — the projection introduced
-            // by #551 "Project visible aggregate output columns"), falling back to
-            // the full group-key + aggregate layout only when it is empty. The BE
-            // aggregate emits exactly this set, so a parent join derived from the
-            // full layout would declare columns the child never produces. This
-            // mirrors the encoder's `encoded_node_output_columns` aggregate arm.
-            if aggregate.output_columns.is_empty() {
-                Ok(aggregate.output_layout.full_output_columns())
-            } else {
-                Ok(aggregate.output_columns.clone())
-            }
+            // The aggregate's execution output is its visible-or-full output
+            // columns with per-mode intermediate aggregate-state types applied
+            // (the same finalization the covered node output uses), so a parent
+            // join reconciled against it sees exactly what the BE aggregate emits.
+            // `finalize_hash_aggregate_wire` prefers the visible `output_columns`
+            // (a subset-by-id, possibly reordered, of the full layout — the
+            // projection introduced by #551 "Project visible aggregate output
+            // columns"), falling back to the full group-key + aggregate layout only
+            // when it is empty.
+            Ok(finalize_hash_aggregate_wire(node, aggregate)?.output_columns)
         }
         DistributedNodeKind::Window(window) => Ok(window.output_columns.clone()),
         DistributedNodeKind::GenerateSeries(generate_series) => {
@@ -669,6 +741,7 @@ pub(in crate::sql::planner::distributed) fn build_node_output_catalog(
 
     let mut outputs = Vec::new();
     let mut index = BTreeMap::new();
+    let mut aggregate_layouts = BTreeMap::new();
     for fragment in fragments {
         let root_sink_boundary = sink_boundary_by_fragment
             .get(&fragment.fragment_id)
@@ -682,10 +755,15 @@ pub(in crate::sql::planner::distributed) fn build_node_output_catalog(
             allocator,
             &mut outputs,
             &mut index,
+            &mut aggregate_layouts,
         )?;
     }
 
-    Ok(NodeOutputCatalog { outputs, index })
+    Ok(NodeOutputCatalog {
+        outputs,
+        index,
+        aggregate_layouts,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -698,9 +776,10 @@ fn visit_node(
     allocator: &mut ExecutionColumnIdAllocator,
     outputs: &mut Vec<NodeExecutionOutput>,
     index: &mut BTreeMap<(FragmentId, i32), usize>,
+    aggregate_layouts: &mut BTreeMap<(FragmentId, i32), FinalizedAggregateLayout>,
 ) -> Result<(), NodeOutputError> {
-    if let Some((kind, columns)) = covered_node_output(node, fragment_roots)? {
-        validate_node_output(fragment_id, node, kind, &columns)?;
+    if let Some(covered) = covered_node_output(node, fragment_roots)? {
+        validate_node_output(fragment_id, node, covered.kind, &covered.columns)?;
 
         // Reuse the boundary occurrences only when this node is the fragment
         // root and the fragment's sink boundary carries exactly this node's
@@ -709,12 +788,13 @@ fn visit_node(
         // input; a reordered write projection or an exchange producer does not
         // match and is numbered as internal.
         let reuse = if is_fragment_root {
-            root_sink_boundary.filter(|boundary| boundary_matches_node_output(boundary, &columns))
+            root_sink_boundary
+                .filter(|boundary| boundary_matches_node_output(boundary, &covered.columns))
         } else {
             None
         };
 
-        let execution_columns = assign_occurrences(&columns, reuse, allocator);
+        let execution_columns = assign_occurrences(&covered.columns, reuse, allocator);
         let node_key = (fragment_id, node.node_id);
         if index.contains_key(&node_key) {
             return Err(NodeOutputError::DuplicateNodeKey {
@@ -722,11 +802,17 @@ fn visit_node(
                 node_id: node.node_id,
             });
         }
+        // A HashAggregate additionally stores its finalized group-key +
+        // aggregate-state wire layout, which the flat execution output above does
+        // not capture when a visible projection subsets it.
+        if let Some(layout) = covered.aggregate_layout {
+            aggregate_layouts.insert(node_key, layout);
+        }
         index.insert(node_key, outputs.len());
         outputs.push(NodeExecutionOutput {
             fragment_id,
             node_id: node.node_id,
-            kind,
+            kind: covered.kind,
             columns: execution_columns,
         });
     }
@@ -741,6 +827,7 @@ fn visit_node(
             allocator,
             outputs,
             index,
+            aggregate_layouts,
         )?;
     }
     Ok(())
@@ -1224,11 +1311,13 @@ fn project_edge_output_columns(
 /// is used only to finalize fragment and stream-edge outputs (both start at a
 /// fragment root).
 ///
-/// Covered kinds (join / set-op / scan) read their finalized output from the
-/// Task-1 [`NodeOutputCatalog`], exactly the sealed schema the encoder emits for
-/// them. `Sort` (and the other unary passthroughs) forward their child, matching
-/// the encoder's read walk. `Project` re-materialization is made unique here (the
-/// boundary/projection concern the node-output catalog defers to Task 2).
+/// Covered kinds (join / set-op / scan / hash-aggregate) read their finalized
+/// output from the [`NodeOutputCatalog`], exactly the sealed schema the encoder
+/// emits for them (a partial hash-aggregate's cataloged output already carries its
+/// intermediate aggregate-state types). `Sort` (and the other unary passthroughs)
+/// forward their child, matching the encoder's read walk. `Project`
+/// re-materialization is made unique here (the boundary/projection concern the
+/// node-output catalog defers to Task 2).
 ///
 /// MIRROR PAIR: this is the planner-typed twin of the native encoder's surviving
 /// `encoded_node_output_columns` (`sql::codegen::proto_encode::plan`). The two
@@ -1254,7 +1343,19 @@ fn wire_node_output_columns(
             wire_unary_passthrough_output_columns(node, fragment_id, node_outputs)
         }
         DistributedNodeKind::HashAggregate(aggregate) => {
-            wire_hash_aggregate_output_columns(node, aggregate)
+            // HashAggregate is a covered kind (CGO-9C Task 4): read its finalized
+            // visible-or-full execution output (with per-mode intermediate types
+            // applied) from the node-output catalog, exactly the schema the encoder
+            // emits for it. Fall back to recomputing the wire only if the aggregate
+            // is somehow not cataloged (never in a sealed plan).
+            match node_outputs.output_for(fragment_id, node.node_id) {
+                Some(output) => Ok(output
+                    .columns
+                    .iter()
+                    .map(node_execution_column_to_output)
+                    .collect()),
+                None => Ok(finalize_hash_aggregate_wire(node, aggregate)?.output_columns),
+            }
         }
         DistributedNodeKind::GenerateSeries(generate_series) => {
             Ok(vec![generate_series_output_column(generate_series)])
@@ -1330,21 +1431,34 @@ fn node_execution_column_to_output(column: &NodeExecutionColumn) -> OutputColumn
     }
 }
 
-/// Finalize a `HashAggregate` node's wire output columns, applying the
-/// intermediate aggregate-state type when the node runs in a partial mode
-/// (`Local` / `Distinct*`). Faithful planner-typed port of the encoder's
-/// `hash_aggregate_wire_output_columns` (the `output_columns` view its read walk
-/// consumes): a partial aggregate sends its aggregate columns as their
-/// intermediate state type, so a fragment/edge output carrying them must too.
+/// The finalized wire encoding of a `HashAggregate` node: its group-key columns,
+/// its aggregate-state columns (with per-mode intermediate types applied), and its
+/// visible-or-full output columns (with data types remapped from the full layout).
+struct FinalizedAggregateWire {
+    group_key_columns: Vec<OutputColumn>,
+    aggregate_columns: Vec<OutputColumn>,
+    output_columns: Vec<OutputColumn>,
+}
+
+/// Finalize a `HashAggregate` node's full wire encoding. This is the single
+/// planner-side owner of the aggregate intermediate-output determination the
+/// native encoder used to perform in `hash_aggregate_wire_output_columns`: a
+/// partial-mode aggregate (`Local` / `Distinct*`) emits its aggregate columns as
+/// their intermediate aggregate-state type, and the terminal modes
+/// (`Single` / `Global`) emit the final result type. The planner-typed aggregate
+/// adapters ([`hash_aggregate_outputs_intermediate`] / [`aggregate_intermediate_type`]
+/// in `crate::sql::planner::physical`), which delegate to the canonical type
+/// contract in `crate::types::aggregate`, are reused; no inference is duplicated here.
 ///
-/// The aggregate NODE's own output finalization is CGO-9C Task 4; this reproduces
-/// only the wire type the fragment/stream-edge output must carry so the encoder
-/// keeps mapping a semantically-complete projection 1:1. Task 4 can later have
-/// this read the aggregate contract it finalizes instead of recomputing.
-fn wire_hash_aggregate_output_columns(
+/// The `output_columns` view prefers the aggregate's visible `output_columns`
+/// (a subset-by-id, possibly reordered, of the full layout) when non-empty,
+/// falling back to the full group-key + aggregate layout, matching the encoder
+/// twin exactly. Fails fast (rather than falling back) on an aggregate-column
+/// arity mismatch or a visible output column absent from the layout.
+fn finalize_hash_aggregate_wire(
     node: &DistributedNode,
     aggregate: &PhysicalHashAggregateNode,
-) -> Result<Vec<OutputColumn>, NodeOutputError> {
+) -> Result<FinalizedAggregateWire, NodeOutputError> {
     // Validate arity unconditionally, matching the encoder twin (which fails fast
     // before any mode branch), so a malformed layout is rejected at seal even in a
     // final/single mode where no per-aggregate zip runs below.
@@ -1359,6 +1473,7 @@ fn wire_hash_aggregate_output_columns(
             ),
         });
     }
+    let group_key_columns = aggregate.output_layout.group_key_columns.clone();
     let mut aggregate_columns = aggregate.output_layout.aggregate_columns.clone();
     if hash_aggregate_outputs_intermediate(aggregate.mode) {
         for (column, call) in aggregate_columns
@@ -1375,60 +1490,38 @@ fn wire_hash_aggregate_output_columns(
         }
     }
 
-    let mut full_output_columns = aggregate.output_layout.group_key_columns.clone();
-    full_output_columns.extend(aggregate_columns);
+    let mut full_output_columns = group_key_columns.clone();
+    full_output_columns.extend(aggregate_columns.iter().cloned());
 
-    if aggregate.output_columns.is_empty() {
-        return Ok(full_output_columns);
-    }
-    let data_type_by_id = full_output_columns
-        .iter()
-        .map(|column| (column.column_id, column.data_type.clone()))
-        .collect::<HashMap<_, _>>();
-    let mut output_columns = aggregate.output_columns.clone();
-    for column in &mut output_columns {
-        let data_type = data_type_by_id.get(&column.column_id).ok_or_else(|| {
-            NodeOutputError::AggregateIntermediateType {
-                fragment_id: node.fragment_id,
-                node_id: node.node_id,
-                detail: format!(
-                    "output column {} is missing from output_layout",
-                    column.column_id.0
-                ),
-            }
-        })?;
-        column.data_type = data_type.clone();
-    }
-    Ok(output_columns)
-}
+    let output_columns = if aggregate.output_columns.is_empty() {
+        full_output_columns
+    } else {
+        let data_type_by_id = full_output_columns
+            .iter()
+            .map(|column| (column.column_id, column.data_type.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut output_columns = aggregate.output_columns.clone();
+        for column in &mut output_columns {
+            let data_type = data_type_by_id.get(&column.column_id).ok_or_else(|| {
+                NodeOutputError::AggregateIntermediateType {
+                    fragment_id: node.fragment_id,
+                    node_id: node.node_id,
+                    detail: format!(
+                        "output column {} is missing from output_layout",
+                        column.column_id.0
+                    ),
+                }
+            })?;
+            column.data_type = data_type.clone();
+        }
+        output_columns
+    };
 
-fn hash_aggregate_outputs_intermediate(mode: AggMode) -> bool {
-    !matches!(mode, AggMode::Single | AggMode::Global)
-}
-
-fn aggregate_intermediate_type(call: &AggregateCall) -> Result<DataType, String> {
-    let function_name = aggregate_function_name(call);
-    let arg_types = call
-        .args
-        .iter()
-        .map(|arg| arg.data_type.clone())
-        .collect::<Vec<_>>();
-    infer_agg_function_types(&function_name, &arg_types, call.distinct)?
-        .1
-        .ok_or_else(|| format!("{function_name} does not expose an intermediate type"))
-}
-
-fn aggregate_function_name(call: &AggregateCall) -> String {
-    let name = call.name.to_ascii_lowercase();
-    if !call.distinct {
-        return name;
-    }
-    match name.as_str() {
-        "count" => "multi_distinct_count".to_string(),
-        "sum" => "multi_distinct_sum".to_string(),
-        "array_agg" => "array_agg_distinct".to_string(),
-        _ => name,
-    }
+    Ok(FinalizedAggregateWire {
+        group_key_columns,
+        aggregate_columns,
+        output_columns,
+    })
 }
 
 fn wire_unary_passthrough_output_columns(
@@ -1980,7 +2073,9 @@ mod tests {
 
     use super::NodeExecutionKind;
     use crate::runtime_filter::model::graph::RuntimeFilterGraph;
-    use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
+    use crate::sql::analysis::{
+        ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
+    };
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::ChangeStreamBranchKind;
@@ -1998,7 +2093,7 @@ mod tests {
         PartitionKind, PlanFragment,
     };
     use crate::sql::planner::payload::{
-        PlanProjectNode, PlanScanNode, PlanSortNode, PlanValuesNode,
+        AggregateCall, PlanProjectNode, PlanScanNode, PlanSortNode, PlanValuesNode,
     };
     use crate::sql::planner::physical::{
         AggMode, AggregateOutputLayout, JoinDistribution, PhysicalHashAggregateNode,
@@ -2084,19 +2179,62 @@ mod tests {
         values_node_in(0, node_id, columns)
     }
 
-    /// A `HashAggregate` payload whose full group-key + aggregate layout is
-    /// `full_layout` but whose visible `output_columns` (what the BE emits) is
-    /// `visible`.
+    /// An `AggregateCall` over `arg_types` whose output column id is `output_id`.
+    fn agg_call(
+        name: &str,
+        distinct: bool,
+        arg_types: Vec<DataType>,
+        output_id: u32,
+    ) -> AggregateCall {
+        AggregateCall {
+            name: name.to_string(),
+            args: arg_types
+                .into_iter()
+                .map(|data_type| TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Int(1)),
+                    data_type,
+                    nullable: true,
+                })
+                .collect(),
+            distinct,
+            result_type: DataType::Int64,
+            order_by: Vec::new(),
+            output_column_id: ColumnId::new_for_test(output_id),
+        }
+    }
+
+    /// A `Single`-mode `HashAggregate` payload whose full group-key + aggregate
+    /// layout is `group_key` + `aggregate` but whose visible `output_columns` (what
+    /// the BE emits) is `visible`. One placeholder `count` call per aggregate column
+    /// keeps the layout/aggregate arity consistent (now that the aggregate is a
+    /// covered node whose finalization checks it).
     fn hash_aggregate_payload(
         group_key: Vec<OutputColumn>,
         aggregate: Vec<OutputColumn>,
         visible: Vec<OutputColumn>,
     ) -> DistributedNodeKind {
+        let aggregates = aggregate
+            .iter()
+            .map(|column| agg_call("count", false, Vec::new(), column.column_id.0))
+            .collect::<Vec<_>>();
+        hash_aggregate_payload_full(AggMode::Single, group_key, aggregate, aggregates, visible)
+    }
+
+    /// A `HashAggregate` payload with explicit `mode` and `aggregates`, so tests
+    /// can exercise partial-mode intermediate typing and arity/consistency failures.
+    fn hash_aggregate_payload_full(
+        mode: AggMode,
+        group_key: Vec<OutputColumn>,
+        aggregate: Vec<OutputColumn>,
+        aggregates: Vec<AggregateCall>,
+        visible: Vec<OutputColumn>,
+    ) -> DistributedNodeKind {
+        let is_merge = vec![false; aggregates.len()];
         DistributedNodeKind::HashAggregate(Box::new(PhysicalHashAggregateNode {
-            mode: AggMode::Single,
+            mode,
             group_by: Vec::new(),
-            aggregates: Vec::new(),
-            is_merge: Vec::new(),
+            aggregates,
+            is_merge,
             output_layout: AggregateOutputLayout::new(group_key, aggregate),
             output_columns: visible,
         }))
@@ -2735,11 +2873,150 @@ mod tests {
         );
     }
 
+    // ----- RED: HashAggregate is a covered node with finalized intermediate types
+
+    #[test]
+    fn seal_covers_hash_aggregate_with_intermediate_state_types() {
+        // A partial (`Local`) aggregate emits its aggregate column as its
+        // intermediate aggregate-state type: avg's intermediate is Utf8 even though
+        // its final output is Float64. The covered execution output and the stored
+        // wire layout must both carry the intermediate type, and the covered output
+        // must be numbered with query-scoped occurrence ids.
+        let avg = agg_call("avg", false, vec![DataType::Int64], 2);
+        let visible = vec![output_col(2, "avg_v")];
+        let aggregate = node(
+            1,
+            vec![values_node(2, vec![output_col(1, "v")])],
+            hash_aggregate_payload_full(
+                AggMode::Local,
+                Vec::new(),
+                vec![output_col(2, "avg_v")],
+                vec![avg],
+                visible.clone(),
+            ),
+        );
+        let plan = seal_single_fragment(aggregate, visible).expect("partial aggregate plan seals");
+        let output = plan
+            .node_outputs()
+            .output_for(0, 1)
+            .expect("aggregate is a covered node");
+        assert_eq!(output.kind, NodeExecutionKind::HashAggregate);
+        assert_eq!(
+            output
+                .columns
+                .iter()
+                .map(|column| (column.column_id.0, column.data_type.clone()))
+                .collect::<Vec<_>>(),
+            vec![(2, DataType::Utf8)],
+            "the visible avg output carries the Utf8 intermediate state type, not Float64"
+        );
+        // Every covered output column is numbered with an occurrence id.
+        assert_eq!(output.columns.len(), 1);
+        let _occurrence = output.columns[0].execution_column_id;
+        // The stored wire layout carries the same intermediate type for the encoder.
+        let layout = plan
+            .node_outputs()
+            .aggregate_layout(0, 1)
+            .expect("covered aggregate stores its wire layout");
+        assert!(layout.group_key_columns.is_empty());
+        assert_eq!(
+            layout
+                .aggregate_columns
+                .iter()
+                .map(|column| (column.column_id.0, column.data_type.clone()))
+                .collect::<Vec<_>>(),
+            vec![(2, DataType::Utf8)]
+        );
+    }
+
+    #[test]
+    fn seal_keeps_final_type_for_terminal_mode_aggregate() {
+        // A terminal (`Global`) aggregate emits final result types, so no
+        // intermediate repair is applied: avg stays Float64.
+        let avg = agg_call("avg", false, vec![DataType::Int64], 2);
+        let visible = vec![OutputColumn {
+            column_id: ColumnId::new_for_test(2),
+            name: "avg_v".to_string(),
+            data_type: DataType::Float64,
+            nullable: true,
+            is_internal: false,
+        }];
+        let aggregate = node(
+            1,
+            vec![values_node(2, vec![output_col(1, "v")])],
+            hash_aggregate_payload_full(
+                AggMode::Global,
+                Vec::new(),
+                visible.clone(),
+                vec![avg],
+                visible.clone(),
+            ),
+        );
+        let plan = seal_single_fragment(aggregate, visible).expect("terminal aggregate seals");
+        let output = plan
+            .node_outputs()
+            .output_for(0, 1)
+            .expect("aggregate covered");
+        assert_eq!(
+            output.columns[0].data_type,
+            DataType::Float64,
+            "a Global aggregate keeps the final result type"
+        );
+    }
+
+    #[test]
+    fn seal_rejects_hash_aggregate_with_aggregate_column_arity_mismatch() {
+        // The output_layout declares two aggregate columns but the node has only one
+        // aggregate call. The seal must fail fast rather than emit a wire whose
+        // aggregate-state columns do not line up with the calls.
+        let one_call = agg_call("count", false, Vec::new(), 2);
+        let aggregate = node(
+            1,
+            vec![values_node(2, vec![output_col(1, "v")])],
+            hash_aggregate_payload_full(
+                AggMode::Local,
+                Vec::new(),
+                vec![output_col(2, "c0"), output_col(3, "c1")],
+                vec![one_call],
+                vec![output_col(2, "c0"), output_col(3, "c1")],
+            ),
+        );
+        let error = seal_single_fragment(aggregate, vec![output_col(2, "c0"), output_col(3, "c1")])
+            .expect_err("an aggregate whose layout/call arity disagree must not seal");
+        assert!(error.contains("hash-aggregate"), "{error}");
+        assert!(error.contains("does not match aggregate count"), "{error}");
+    }
+
+    #[test]
+    fn seal_rejects_hash_aggregate_visible_output_absent_from_layout() {
+        // The visible output_columns reference id 99, which is neither a group key
+        // nor an aggregate column. The seal cannot type it from the layout and must
+        // fail fast.
+        let count = agg_call("count", false, Vec::new(), 2);
+        let aggregate = node(
+            1,
+            vec![values_node(2, vec![output_col(1, "v")])],
+            hash_aggregate_payload_full(
+                AggMode::Local,
+                Vec::new(),
+                vec![output_col(2, "c0")],
+                vec![count],
+                vec![output_col(99, "stale")],
+            ),
+        );
+        let error = seal_single_fragment(aggregate, vec![output_col(99, "stale")])
+            .expect_err("a visible output column absent from the layout must not seal");
+        assert!(error.contains("hash-aggregate"), "{error}");
+        assert!(error.contains("is missing from output_layout"), "{error}");
+    }
+
     #[test]
     fn node_output_catalog_derivation_is_deterministic() {
+        // `NodeOutputCatalog` holds finalized `OutputColumn`s (arrow `DataType`,
+        // no `Eq`), so compare structurally via its `Debug` form.
         assert_eq!(
-            sort_over_scan_plan().node_outputs(),
-            sort_over_scan_plan().node_outputs()
+            format!("{:?}", sort_over_scan_plan().node_outputs()),
+            format!("{:?}", sort_over_scan_plan().node_outputs())
         );
     }
 

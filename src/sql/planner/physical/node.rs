@@ -17,6 +17,8 @@
 
 //! Planner-owned physical plan nodes.
 
+use arrow::datatypes::DataType;
+
 use crate::sql::analysis::{JoinKind, OutputColumn, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::ChangeStreamBranchKind;
@@ -32,6 +34,7 @@ use crate::sql::planner::physical::{
     AggMode, AggregateOutputLayout, HashSource, JoinDistribution, JoinExecutionMode,
     PhysicalPlanStats, TopNPhase,
 };
+use crate::types::aggregate::{infer_agg_function_types, mangle_distinct_aggregate_name};
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -212,6 +215,117 @@ pub(crate) enum RedistributeMode {
         source: HashSource,
     },
     Broadcast,
+}
+
+// ---------------------------------------------------------------------------
+// Aggregate wire-type adapters
+// ---------------------------------------------------------------------------
+//
+// Planner-typed adapters bridging a `PhysicalHashAggregateNode`'s calls/mode to
+// the canonical aggregate type contract in `crate::types::aggregate` (which stays
+// a pure, planner-free leaf). Consumed by the distributed planner's aggregate
+// output finalization (`sql::planner::distributed::output::finalize_hash_aggregate_wire`).
+
+/// Whether a `HashAggregate` running in `mode` emits intermediate aggregate-state
+/// types on the wire. Partial modes (`Local` / `DistinctGlobal` / `DistinctLocal`)
+/// emit intermediate state; the terminal modes (`Single` / `Global`) emit the
+/// final result type.
+pub(crate) fn hash_aggregate_outputs_intermediate(mode: AggMode) -> bool {
+    !matches!(mode, AggMode::Single | AggMode::Global)
+}
+
+/// The intermediate aggregate-state Arrow type an aggregate `call` exposes,
+/// derived from its canonical function name and argument types via
+/// [`infer_agg_function_types`]. Errors when the function exposes no intermediate
+/// type.
+///
+/// Only the call's positional `args` participate (matching the wire the encoder
+/// historically emitted); `order_by` inputs are intentionally excluded.
+pub(crate) fn aggregate_intermediate_type(call: &AggregateCall) -> Result<DataType, String> {
+    let function_name = aggregate_function_name(call);
+    let arg_types = call
+        .args
+        .iter()
+        .map(|arg| arg.data_type.clone())
+        .collect::<Vec<_>>();
+    infer_agg_function_types(&function_name, &arg_types, call.distinct)?
+        .1
+        .ok_or_else(|| format!("{function_name} does not expose an intermediate type"))
+}
+
+/// The canonical aggregate function name for a `call`, delegating the DISTINCT
+/// name-mangling table to the single source of truth
+/// [`mangle_distinct_aggregate_name`].
+pub(crate) fn aggregate_function_name(call: &AggregateCall) -> String {
+    mangle_distinct_aggregate_name(&call.name, call.distinct)
+}
+
+#[cfg(test)]
+mod aggregate_wire_tests {
+    use arrow::datatypes::DataType;
+
+    use super::{AggMode, hash_aggregate_outputs_intermediate};
+    use super::{aggregate_function_name, aggregate_intermediate_type};
+    use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
+    use crate::sql::column_id::ColumnId;
+    use crate::sql::planner::payload::AggregateCall;
+
+    fn agg_call(name: &str, distinct: bool, args: Vec<DataType>) -> AggregateCall {
+        AggregateCall {
+            name: name.to_string(),
+            args: args
+                .into_iter()
+                .map(|data_type| TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Int(1)),
+                    data_type,
+                    nullable: true,
+                })
+                .collect(),
+            distinct,
+            result_type: DataType::Int64,
+            order_by: Vec::new(),
+            output_column_id: ColumnId::new_for_test(1),
+        }
+    }
+
+    #[test]
+    fn intermediate_mode_covers_partial_and_distinct_modes_only() {
+        assert!(!hash_aggregate_outputs_intermediate(AggMode::Single));
+        assert!(!hash_aggregate_outputs_intermediate(AggMode::Global));
+        assert!(hash_aggregate_outputs_intermediate(AggMode::Local));
+        assert!(hash_aggregate_outputs_intermediate(AggMode::DistinctGlobal));
+        assert!(hash_aggregate_outputs_intermediate(AggMode::DistinctLocal));
+    }
+
+    #[test]
+    fn function_name_applies_distinct_mangling() {
+        assert_eq!(
+            aggregate_function_name(&agg_call("count", false, vec![])),
+            "count"
+        );
+        assert_eq!(
+            aggregate_function_name(&agg_call("COUNT", true, vec![DataType::Int64])),
+            "multi_distinct_count"
+        );
+    }
+
+    #[test]
+    fn intermediate_type_follows_canonical_contract_using_args_only() {
+        // avg's intermediate state is Utf8 regardless of its Float64 output.
+        assert_eq!(
+            aggregate_intermediate_type(&agg_call("avg", false, vec![DataType::Int64])).unwrap(),
+            DataType::Utf8
+        );
+        // DISTINCT count mangles to multi_distinct_count -> Binary intermediate.
+        assert_eq!(
+            aggregate_intermediate_type(&agg_call("count", true, vec![DataType::Int64])).unwrap(),
+            DataType::Binary
+        );
+        assert_eq!(
+            aggregate_intermediate_type(&agg_call("sum", false, vec![DataType::Int32])).unwrap(),
+            DataType::Int64
+        );
+    }
 }
 
 #[cfg(test)]
