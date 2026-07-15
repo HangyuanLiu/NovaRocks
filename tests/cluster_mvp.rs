@@ -1039,6 +1039,23 @@ fn cross_process_two_be_multi_fragment() {
 }
 
 #[test]
+fn cross_process_three_be_state_store_baseline() {
+    let _guard = lock_cluster_mvp();
+    let cluster = MultiBeClusterHarness::start_n_be(3, "", "");
+    eprintln!("NOVAROCKS_CLUSTER_BASELINE_READY fe=1 be=3");
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    let rows: Vec<i64> = conn
+        .query(multi_submit_query_sql())
+        .expect("multi-fragment CTE+JOIN query must succeed on 3-BE cluster");
+    assert_eq!(
+        rows,
+        vec![1i64, 2i64],
+        "3-BE multi-fragment query must return sorted results [1, 2]"
+    );
+    eprintln!("NOVAROCKS_CLUSTER_BASELINE_RESULT fragments=multi rows=[1,2]");
+}
+
+#[test]
 fn reserved_port_blocks_rebinding_until_release() {
     let port = ReservedPort::new();
     let addr = ("127.0.0.1", port.port());

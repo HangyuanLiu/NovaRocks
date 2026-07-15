@@ -80,6 +80,18 @@ fn path_starts_with(path: &[String], prefix: &[&str]) -> bool {
             .all(|(actual, expected)| actual == expected)
 }
 
+fn has_unqualified_path(tokens: &[String], owner: &str) -> bool {
+    tokens
+        .windows(2)
+        .any(|tokens| tokens[0] == owner && tokens[1] == "::")
+}
+
+fn declares_module(tokens: &[String], owner: &str) -> bool {
+    tokens.windows(3).any(|tokens| {
+        tokens[0] == "mod" && tokens[1] == owner && matches!(tokens[2].as_str(), ";" | "{")
+    })
+}
+
 fn state_store_boundary_violations(sources: &[GuardSource]) -> Vec<String> {
     let mut violations = Vec::new();
     for source in sources {
@@ -133,6 +145,18 @@ fn state_store_boundary_violations(sources: &[GuardSource]) -> Vec<String> {
                     path.join("::")
                 ));
             }
+        }
+
+        let production_tokens = rust_use_tokens(&production);
+        if is_connector_source(&source.path)
+            && paths.iter().any(|path| path.as_slice() == ["crate", "*"])
+            && has_unqualified_path(&production_tokens, "state_store")
+            && !declares_module(&production_tokens, "state_store")
+        {
+            violations.push(format!(
+                "connector-state-store-dependency: {} -> crate::* + state_store::",
+                source.path
+            ));
         }
     }
     violations.sort();
@@ -221,6 +245,41 @@ fn state_store_boundary_detector_rejects_forbidden_imports() {
 }
 
 #[test]
+fn state_store_boundary_detector_rejects_canonical_alias_group_and_glob_bypasses() {
+    let sources = [
+        GuardSource::new(
+            "src/state_store/contract.rs",
+            "use crate::{meta as metadata}; fn leak() { metadata::MetaStoreProvider::open(); }",
+        ),
+        GuardSource::new(
+            "src/state_store/contract.rs",
+            "use crate::*; fn leak() { meta::MetaStoreProvider::open(); }",
+        ),
+        GuardSource::new(
+            "src/catalog/reexport.rs",
+            "use crate::state_store as durable; pub use durable::sqlite::*;",
+        ),
+        GuardSource::new(
+            "src/connector/state_store.rs",
+            "use crate::*; fn leak(_: state_store::StateStoreConfig) {}",
+        ),
+    ];
+
+    let violations = state_store_boundary_violations(&sources);
+
+    for expected in [
+        "state-store-forbidden-owner: src/state_store/contract.rs -> crate::meta",
+        "state-store-sqlite-import-outside-owner: src/catalog/reexport.rs -> crate::state_store::sqlite::*",
+        "connector-state-store-dependency: src/connector/state_store.rs -> crate::* + state_store::",
+    ] {
+        assert!(
+            violations.iter().any(|violation| violation == expected),
+            "canonical alias/group/glob dependency escaped detection: expected={expected}, violations={violations:?}"
+        );
+    }
+}
+
+#[test]
 fn state_store_boundary_detector_rejects_each_forbidden_token() {
     let fixtures = [
         ("MetaStoreProvider", "use crate::safe::MetaStoreProvider;"),
@@ -245,6 +304,37 @@ fn state_store_boundary_detector_rejects_each_forbidden_token() {
             "forbidden token {token} must be rejected: {violations:?}"
         );
     }
+}
+
+#[test]
+fn state_store_boundary_denylist_matches_the_ss1_contract() {
+    assert_eq!(
+        FORBIDDEN_STATE_STORE_OWNERS,
+        [
+            "catalog",
+            "connector",
+            "coordinator",
+            "dictionary",
+            "dml",
+            "engine",
+            "frontend",
+            "meta",
+            "mv",
+            "sql",
+            "table_maintenance",
+        ]
+    );
+    assert_eq!(
+        FORBIDDEN_STATE_STORE_TOKENS,
+        [
+            "DictionaryDefinition",
+            "IcebergTable",
+            "MaterializedView",
+            "MetaStoreProvider",
+            "TPlanNode",
+            "apache_avro",
+        ]
+    );
 }
 
 #[test]
@@ -300,6 +390,16 @@ mod tests {
 const EXAMPLE: &str = "crate::state_store::StateStoreConfig";
 #[cfg(test)]
 use crate::state_store::StateStoreConfig;
+"#,
+        ),
+        GuardSource::new(
+            "src/connector/local.rs",
+            r#"
+use crate::*;
+mod state_store {
+    pub fn local_helper() {}
+}
+fn use_local_module() { state_store::local_helper(); }
 "#,
         ),
     ];
