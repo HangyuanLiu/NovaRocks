@@ -1399,9 +1399,17 @@ impl RuntimeFilterChannel {
                 "membership channel cannot accept ordered bounds",
             )
         })?;
-        ordered
-            .reducer
-            .validate_tombstone_update(stream_id, sequence, update)?;
+        if matches!(
+            state.terminal,
+            ChannelTerminal::Unavailable { .. } | ChannelTerminal::Cancelled { .. }
+        ) {
+            ordered
+                .reducer
+                .validate_tombstone_update(stream_id, sequence, update)?;
+        } else {
+            let mut preflight = ordered.reducer.clone();
+            preflight.apply(stream_id, sequence, update.clone())?;
+        }
         if !matches!(state.terminal, ChannelTerminal::Collecting) {
             return Ok(terminal_action_from_state(&state));
         }

@@ -1204,7 +1204,7 @@ mod tests {
         RuntimeOrderContract, comparator_digest_for_test,
     };
     use crate::runtime_filter::port::producer::{
-        InstallOutcome, ProducerAdapter, ProducerHandle, ProducerPortKind,
+        InstallOutcome, ProducerAdapter, ProducerFailureReason, ProducerHandle, ProducerPortKind,
         RuntimeContractViolationKind, SubmitOutcome,
     };
     use crate::runtime_filter::port::subscription::{
@@ -4695,5 +4695,105 @@ mod tests {
                 .unwrap(),
             SubmitOutcome::SequenceAdvancedEqual
         );
+    }
+
+    #[test]
+    fn ordered_rejected_lease_preserves_collecting_loosen_violation_and_state() {
+        let account = Arc::new(ArmableRejectingMemoryAccount::default());
+        let (service, contract) = installed_ordered_service_with_account(account.clone());
+        let ProducerHandle::OrderedBound(producer) = service
+            .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+            .unwrap()
+        else {
+            panic!("ordered fixture must return ordered producer")
+        };
+        assert_eq!(
+            producer
+                .submit_bound(
+                    PartitionId::new(0),
+                    ProducerSequence::new(0),
+                    ordered_update(&contract, 40),
+                )
+                .unwrap(),
+            SubmitOutcome::Published
+        );
+        let retained_before = account.current.load(Ordering::SeqCst);
+        account.armed.store(true, Ordering::SeqCst);
+
+        let error = producer
+            .submit_bound(
+                PartitionId::new(0),
+                ProducerSequence::new(1),
+                ordered_update(&contract, 50),
+            )
+            .err()
+            .expect("higher-sequence loosen violation must precede rejected temporary lease");
+        assert_eq!(
+            error.kind(),
+            RuntimeContractViolationKind::OrderedBoundLoosened
+        );
+        assert_eq!(account.current.load(Ordering::SeqCst), retained_before);
+
+        account.armed.store(false, Ordering::SeqCst);
+        assert_eq!(
+            producer
+                .submit_bound(
+                    PartitionId::new(0),
+                    ProducerSequence::new(1),
+                    ordered_update(&contract, 30),
+                )
+                .unwrap(),
+            SubmitOutcome::Published
+        );
+        let installed = service.registry.active_installation().unwrap();
+        let snapshot = installed.channels().next().unwrap().1.snapshot().unwrap();
+        assert_eq!(
+            snapshot.version(),
+            LogicalVersion::FIRST.checked_next().unwrap()
+        );
+    }
+
+    #[test]
+    fn ordered_rejected_lease_preserves_degraded_loosen_violation_and_version() {
+        let account = Arc::new(ArmableRejectingMemoryAccount::default());
+        let (service, contract) = installed_ordered_service_with_account(account.clone());
+        let ProducerHandle::OrderedBound(producer) = service
+            .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+            .unwrap()
+        else {
+            panic!("ordered fixture must return ordered producer")
+        };
+        assert_eq!(
+            producer
+                .submit_bound(
+                    PartitionId::new(0),
+                    ProducerSequence::new(0),
+                    ordered_update(&contract, 40),
+                )
+                .unwrap(),
+            SubmitOutcome::Published
+        );
+        producer
+            .fail(ProducerFailureReason::ExecutionFailed)
+            .unwrap();
+        let retained_before = account.current.load(Ordering::SeqCst);
+        account.armed.store(true, Ordering::SeqCst);
+
+        let error = producer
+            .submit_bound(
+                PartitionId::new(0),
+                ProducerSequence::new(1),
+                ordered_update(&contract, 50),
+            )
+            .err()
+            .expect("degraded full reducer must preserve ordered loosen violation");
+        assert_eq!(
+            error.kind(),
+            RuntimeContractViolationKind::OrderedBoundLoosened
+        );
+        assert_eq!(account.current.load(Ordering::SeqCst), retained_before);
+        let installed = service.registry.active_installation().unwrap();
+        let snapshot = installed.channels().next().unwrap().1.snapshot().unwrap();
+        assert_eq!(snapshot.version(), LogicalVersion::FIRST);
     }
 }
