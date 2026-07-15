@@ -19,6 +19,8 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
+use crate::state_store::config::StateStoreConfig;
+
 static CONFIG: OnceLock<RwLock<&'static NovaRocksConfig>> = OnceLock::new();
 pub use crate::common::memory_limit::DEFAULT_MEM_LIMIT_SPEC;
 
@@ -281,6 +283,9 @@ pub struct NovaRocksConfig {
     pub metadata: Option<MetadataConfig>,
 
     #[serde(default)]
+    pub state_store: Option<StateStoreConfig>,
+
+    #[serde(default)]
     pub standalone_server: Option<StandaloneServerConfig>,
 
     #[serde(default)]
@@ -303,6 +308,9 @@ impl NovaRocksConfig {
         let cfg: NovaRocksConfig = value
             .try_into()
             .with_context(|| format!("parse toml: {}", path.display()))?;
+        if let Some(state_store) = &cfg.state_store {
+            state_store.validate()?;
+        }
         Ok(cfg)
     }
 
@@ -337,6 +345,7 @@ impl Default for NovaRocksConfig {
             debug: DebugConfig::default(),
             jdbc: None,
             metadata: None,
+            state_store: None,
             standalone_server: None,
             spill: SpillStorageConfig::default(),
             starrocks: StarRocksConfig::default(),
@@ -1552,10 +1561,117 @@ impl std::fmt::Debug for JdbcConfig {
 mod tests {
     use std::path::PathBuf;
 
+    use crate::state_store::config::StateStoreProviderConfig;
+
     use super::{
         DEFAULT_MEM_LIMIT_SPEC, MetadataProviderConfig, NovaRocksConfig, RuntimeConfig,
         StandaloneObjectStoreConfig, StandaloneServerConfig, StandaloneStarRocksTableConfig,
     };
+
+    #[test]
+    fn state_store_config_loads_explicit_sqlite_provider() -> anyhow::Result<()> {
+        let temp = tempfile::NamedTempFile::new()?;
+        std::fs::write(
+            temp.path(),
+            r#"
+[state_store]
+provider = "sqlite"
+path = "meta/state-store.sqlite"
+cluster_id = "cluster-a"
+deployment_owner = "fe-a"
+"#,
+        )?;
+
+        let cfg = NovaRocksConfig::load_from_file(temp.path())?;
+
+        assert_eq!(
+            cfg.state_store.expect("state store config").provider,
+            StateStoreProviderConfig::Sqlite
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn state_store_config_requires_provider() -> anyhow::Result<()> {
+        let temp = tempfile::NamedTempFile::new()?;
+        std::fs::write(
+            temp.path(),
+            r#"
+[state_store]
+path = "meta/state-store.sqlite"
+cluster_id = "cluster-a"
+deployment_owner = "fe-a"
+"#,
+        )?;
+
+        let error = match NovaRocksConfig::load_from_file(temp.path()) {
+            Ok(_) => panic!("state_store.provider must be explicit"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("parse toml"));
+        Ok(())
+    }
+
+    #[test]
+    fn state_store_config_rejects_unimplemented_provider() -> anyhow::Result<()> {
+        let temp = tempfile::NamedTempFile::new()?;
+        std::fs::write(
+            temp.path(),
+            r#"
+[state_store]
+provider = "foundationdb"
+path = "meta/state-store.sqlite"
+cluster_id = "cluster-a"
+deployment_owner = "fe-a"
+"#,
+        )?;
+
+        let error = match NovaRocksConfig::load_from_file(temp.path()) {
+            Ok(_) => panic!("unimplemented providers must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("parse toml"));
+        Ok(())
+    }
+
+    #[test]
+    fn state_store_config_rejects_relaxed_key_limit() -> anyhow::Result<()> {
+        let temp = tempfile::NamedTempFile::new()?;
+        std::fs::write(
+            temp.path(),
+            r#"
+[state_store]
+provider = "sqlite"
+path = "meta/state-store.sqlite"
+cluster_id = "cluster-a"
+deployment_owner = "fe-a"
+
+[state_store.limits]
+max_key_bytes = 8193
+"#,
+        )?;
+
+        let error = match NovaRocksConfig::load_from_file(temp.path()) {
+            Ok(_) => panic!("provider limits may only tighten the common contract"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("InvalidStateStoreConfig"));
+        Ok(())
+    }
+
+    #[test]
+    fn state_store_config_is_disabled_when_section_is_absent() -> anyhow::Result<()> {
+        let temp = tempfile::NamedTempFile::new()?;
+        std::fs::write(temp.path(), "log_level = \"info\"\n")?;
+
+        let cfg = NovaRocksConfig::load_from_file(temp.path())?;
+
+        assert!(cfg.state_store.is_none());
+        Ok(())
+    }
 
     #[test]
     fn test_server_priority_networks_default_is_empty() {

@@ -60,7 +60,8 @@ libm = "0.2"
 num-traits = "0.2"
 ordered-float = "4"
 async-trait = "0.1"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v7"] }
+fs2 = "0.4"
 as-any = "0.3"
 opensrv-mysql = { version = "0.7", default-features = false }
 
@@ -72,7 +73,7 @@ bytes = "1"
 csv = "1"
 hashbrown = { version = "0.14", features = ["raw"] }
 prost = "0.13"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tonic = { version = "0.12", features = ["transport"] }
 axum = "0.7"
 tokio-stream = "0.1"
