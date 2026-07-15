@@ -704,6 +704,48 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_open_rejects_stealth_objects_attached_to_state_store_tables() {
+        for (case, schema_sql) in [
+            (
+                "unique-index",
+                "CREATE UNIQUE INDEX stealth_unique_value ON state_store_kv(value)",
+            ),
+            (
+                "trigger",
+                "CREATE TRIGGER stealth_delete_after_insert \
+                 AFTER INSERT ON state_store_kv \
+                 BEGIN DELETE FROM state_store_kv WHERE key = NEW.key; END",
+            ),
+            (
+                "view",
+                "CREATE VIEW stealth_kv_view AS SELECT key, value FROM state_store_kv",
+            ),
+        ] {
+            let temp = TempDir::new().expect("stealth-object temp dir");
+            let path = temp.path().join(format!("state-store-{case}.sqlite"));
+            let runtime = runtime();
+            let initialized = runtime
+                .block_on(SqliteStateStore::open(
+                    config(&path, "cluster-a", "fe-a"),
+                    deployment(1),
+                ))
+                .expect("initialize complete store");
+            drop(initialized);
+
+            Connection::open(&path)
+                .expect("open initialized store")
+                .execute_batch(schema_sql)
+                .expect("attach stealth schema object");
+
+            assert_eq!(
+                open_error(&runtime, config(&path, "cluster-a", "fe-a"), deployment(1),).kind(),
+                StateStoreErrorKind::Corruption,
+                "{case} attached to an owned table must be rejected",
+            );
+        }
+    }
+
+    #[test]
     fn sqlite_open_rejects_malformed_state_store_columns_and_primary_keys() {
         let temp = TempDir::new().expect("malformed-schema temp dir");
         let path = temp.path().join("state-store.sqlite");
@@ -976,6 +1018,38 @@ mod tests {
             .optional()
             .expect("read schema version");
         assert_eq!(persisted, Some(2_u32.to_be_bytes().to_vec()));
+        drop(connection);
+
+        let error = open_error(&runtime, config(&path, "cluster-a", "fe-a"), deployment(1));
+        assert_eq!(error.kind(), StateStoreErrorKind::Corruption);
+    }
+
+    #[test]
+    fn sqlite_open_rejects_current_revision_beyond_sqlite_integer_range() {
+        let temp = TempDir::new().expect("temp dir");
+        let path = temp.path().join("state-store.sqlite");
+        let runtime = runtime();
+        let first = runtime
+            .block_on(SqliteStateStore::open(
+                config(&path, "cluster-a", "fe-a"),
+                deployment(1),
+            ))
+            .expect("initialize SQLite store");
+        drop(first);
+
+        let connection = Connection::open(&path).expect("open seeded store");
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE state_store_meta SET value = ?1 WHERE key = ?2",
+                    params![
+                        u64::MAX.to_be_bytes().as_slice(),
+                        b"current_revision".as_slice()
+                    ],
+                )
+                .expect("write out-of-range current revision"),
+            1,
+        );
         drop(connection);
 
         let error = open_error(&runtime, config(&path, "cluster-a", "fe-a"), deployment(1));

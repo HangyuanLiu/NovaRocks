@@ -73,6 +73,13 @@ struct SchemaColumn {
     primary_key_position: i64,
 }
 
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SchemaObject {
+    name: String,
+    object_type: String,
+    table_name: String,
+}
+
 const EXPECTED_TABLES: [(&str, &str); 4] = [
     ("state_store_changes", CHANGES_SCHEMA_SQL),
     ("state_store_commits", COMMITS_SCHEMA_SQL),
@@ -125,11 +132,17 @@ pub(super) fn initialize(
 
 fn state_store_objects(
     transaction: &Transaction<'_>,
-) -> Result<Vec<(String, String)>, StateStoreError> {
+) -> Result<Vec<SchemaObject>, StateStoreError> {
     let mut statement = transaction
         .prepare(
-            "SELECT name, type FROM sqlite_schema \
-             WHERE lower(name) GLOB 'state_store_*' ORDER BY name, type",
+            "SELECT name, type, tbl_name FROM sqlite_schema \
+             WHERE lower(name) GLOB 'state_store_*' \
+                OR lower(tbl_name) IN (\
+                    'state_store_changes', 'state_store_commits', \
+                    'state_store_kv', 'state_store_meta'\
+                ) \
+                OR (lower(type) = 'view' AND lower(COALESCE(sql, '')) GLOB '*state_store_*') \
+             ORDER BY name, type, tbl_name",
         )
         .map_err(|error| {
             sqlite_error(
@@ -139,7 +152,13 @@ fn state_store_objects(
             )
         })?;
     statement
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .query_map([], |row| {
+            Ok(SchemaObject {
+                name: row.get(0)?,
+                object_type: row.get(1)?,
+                table_name: row.get(2)?,
+            })
+        })
         .map_err(|error| {
             sqlite_error(
                 &error,
@@ -159,12 +178,26 @@ fn state_store_objects(
 
 fn validate_schema(
     transaction: &Transaction<'_>,
-    objects: &[(String, String)],
+    objects: &[SchemaObject],
 ) -> Result<(), StateStoreError> {
-    let expected_objects = EXPECTED_TABLES
+    let mut expected_objects = EXPECTED_TABLES
         .iter()
-        .map(|(name, _)| ((*name).to_owned(), "table".to_owned()))
+        .flat_map(|(name, _)| {
+            [
+                SchemaObject {
+                    name: (*name).to_owned(),
+                    object_type: "table".to_owned(),
+                    table_name: (*name).to_owned(),
+                },
+                SchemaObject {
+                    name: format!("sqlite_autoindex_{name}_1"),
+                    object_type: "index".to_owned(),
+                    table_name: (*name).to_owned(),
+                },
+            ]
+        })
         .collect::<Vec<_>>();
+    expected_objects.sort();
     if objects != expected_objects {
         return Err(schema_error(
             "SQLite state store schema inventory is incomplete or unexpected",
@@ -402,6 +435,11 @@ fn load_identity(
         &load_required(transaction, CURRENT_REVISION_KEY)?,
         "SQLite current revision is malformed",
     )?;
+    if current_revision > i64::MAX as u64 {
+        return Err(schema_error(
+            "SQLite current revision exceeds the supported integer range",
+        ));
+    }
     let retention_floor =
         decode_change_retention_floor(&load_required(transaction, CHANGE_RETENTION_FLOOR_KEY)?)?;
     validate_change_retention_floor(retention_floor, current_revision)?;

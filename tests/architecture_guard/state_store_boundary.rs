@@ -95,6 +95,15 @@ fn declares_module(tokens: &[String], owner: &str) -> bool {
     })
 }
 
+fn references_absolute_or_extern_owner(tokens: &[String], owner: &str) -> bool {
+    tokens
+        .windows(2)
+        .any(|tokens| tokens[0] == "::" && tokens[1] == owner)
+        || tokens
+            .windows(3)
+            .any(|tokens| tokens[0] == "extern" && tokens[1] == "crate" && tokens[2] == owner)
+}
+
 fn state_store_boundary_violations(sources: &[GuardSource]) -> Vec<String> {
     let mut violations = Vec::new();
     for source in sources {
@@ -153,7 +162,8 @@ fn state_store_boundary_violations(sources: &[GuardSource]) -> Vec<String> {
             if is_state_store_source(&source.path) && !is_state_store_sqlite_source(&source.path) {
                 for owner in SQLITE_ONLY_EXTERNAL_OWNERS {
                     if let Some(owner_index) = path.iter().position(|segment| segment == owner)
-                        && !declares_module(&production_tokens, owner)
+                        && (!declares_module(&production_tokens, owner)
+                            || references_absolute_or_extern_owner(&production_tokens, owner))
                     {
                         violations.push(format!(
                             "state-store-sqlite-external-outside-owner: {} -> {}",
@@ -168,7 +178,8 @@ fn state_store_boundary_violations(sources: &[GuardSource]) -> Vec<String> {
         if is_state_store_source(&source.path) && !is_state_store_sqlite_source(&source.path) {
             for owner in SQLITE_ONLY_EXTERNAL_OWNERS {
                 if production_tokens.iter().any(|token| token == owner)
-                    && !declares_module(&production_tokens, owner)
+                    && (!declares_module(&production_tokens, owner)
+                        || references_absolute_or_extern_owner(&production_tokens, owner))
                 {
                     violations.push(format!(
                         "state-store-sqlite-external-outside-owner: {} -> {owner}",
@@ -415,6 +426,14 @@ fn state_store_boundary_detector_rejects_sqlite_external_crates_and_ffi_tokens_o
             "src/state_store/runner.rs",
             "extern crate fs2 as locks; fn leak<T: locks::FileExt>() {}",
         ),
+        GuardSource::new(
+            "src/state_store/shadowed_rusqlite.rs",
+            "mod rusqlite {} use ::rusqlite::{Connection as Db}; fn leak(_: Db) {}",
+        ),
+        GuardSource::new(
+            "src/state_store/shadowed_fs2.rs",
+            "mod fs2 {} extern crate fs2 as locks; fn leak<T: locks::FileExt>() {}",
+        ),
     ];
 
     let violations = state_store_boundary_violations(&sources);
@@ -426,6 +445,8 @@ fn state_store_boundary_detector_rejects_sqlite_external_crates_and_ffi_tokens_o
         ("src/state_store/remote/mod.rs", "SQLITE_BUSY_SNAPSHOT"),
         ("src/state_store/future_provider.rs", "rusqlite"),
         ("src/state_store/runner.rs", "fs2"),
+        ("src/state_store/shadowed_rusqlite.rs", "rusqlite"),
+        ("src/state_store/shadowed_fs2.rs", "fs2"),
     ] {
         assert!(
             violations
@@ -434,6 +455,24 @@ fn state_store_boundary_detector_rejects_sqlite_external_crates_and_ffi_tokens_o
             "SQLite-only dependency escaped at {path}: {dependency}; violations={violations:?}"
         );
     }
+}
+
+#[test]
+fn state_store_boundary_detector_allows_truly_local_shadow_modules() {
+    let sources = [
+        GuardSource::new(
+            "src/state_store/local_rusqlite.rs",
+            "mod rusqlite { pub struct Connection; } \
+             use rusqlite::Connection; fn local(_: Connection) {}",
+        ),
+        GuardSource::new(
+            "src/state_store/local_fs2.rs",
+            "mod fs2 { pub trait FileExt {} } \
+             use fs2::FileExt; fn local<T: FileExt>() {}",
+        ),
+    ];
+
+    assert!(state_store_boundary_violations(&sources).is_empty());
 }
 
 #[test]

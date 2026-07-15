@@ -999,24 +999,24 @@ async fn run_post_dispatch_scenario(factory: &StateStoreFactory, scenario: PostD
     let waiter = tokio::spawn(async move { transaction.commit().await });
     control.wait_dispatched().await;
 
-    let held_resolution = store
-        .resolve_commit(&transaction_id)
-        .await
-        .expect("resolve held post-dispatch commit");
-    assert!(
-        matches!(
-            (scenario.expected_terminal(), &held_resolution),
-            (_, CommitResolution::Unresolved)
-                | (ExpectedTerminal::Either, CommitResolution::Committed(_))
-                | (ExpectedTerminal::Either, CommitResolution::NotCommitted)
-                | (ExpectedTerminal::Committed, CommitResolution::Committed(_))
-                | (
-                    ExpectedTerminal::NotCommitted,
-                    CommitResolution::NotCommitted
-                )
-        ),
-        "post-dispatch hold exposed the wrong terminal: scenario={scenario:?}, resolution={held_resolution:?}"
-    );
+    match scenario {
+        PostDispatchScenario::CancelWaiterBeforeApply => {
+            assert_repeated_unresolved(&store, transaction_id, "before waiter cancellation").await;
+        }
+        PostDispatchScenario::LoseCommittedResponse => {
+            let held_resolution = store
+                .resolve_commit(&transaction_id)
+                .await
+                .expect("resolve held post-dispatch commit");
+            assert!(
+                matches!(
+                    held_resolution,
+                    CommitResolution::Unresolved | CommitResolution::Committed(_)
+                ),
+                "response-loss hold exposed the wrong terminal: resolution={held_resolution:?}"
+            );
+        }
+    }
 
     let terminal = match scenario {
         PostDispatchScenario::CancelWaiterBeforeApply => {
@@ -1028,6 +1028,7 @@ async fn run_post_dispatch_scenario(factory: &StateStoreFactory, scenario: PostD
                     .is_cancelled()
             );
             control.wait_waiter_cancelled().await;
+            assert_repeated_unresolved(&store, transaction_id, "after waiter cancellation").await;
             control.release_response().await;
             control.wait_inner_dropped().await;
             control.allow_provider_progress().await;
@@ -1058,6 +1059,23 @@ async fn run_post_dispatch_scenario(factory: &StateStoreFactory, scenario: PostD
         &terminal,
     )
     .await;
+}
+
+async fn assert_repeated_unresolved(
+    store: &Arc<dyn StateStore>,
+    transaction_id: TransactionId,
+    phase: &str,
+) {
+    for attempt in 1..=3 {
+        assert_eq!(
+            store
+                .resolve_commit(&transaction_id)
+                .await
+                .expect("resolve held post-dispatch commit"),
+            CommitResolution::Unresolved,
+            "pre-apply hold must stay unresolved {phase}, attempt={attempt}",
+        );
+    }
 }
 
 async fn await_expected_terminal(
