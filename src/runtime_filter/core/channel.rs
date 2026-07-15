@@ -23,7 +23,8 @@ use arrow::datatypes::DataType;
 
 use crate::common::types::UniqueId;
 use crate::runtime_filter::model::contract::{
-    BindingId, ChannelId, CoverageWitnessId, NullSemantics, RuntimeFilterLogicalDomain,
+    BindingId, ChannelId, CoverageWitnessId, NullSemantics, ReductionRequirement,
+    RuntimeFilterLogicalDomain,
 };
 use crate::runtime_filter::model::coverage::Coverage;
 use crate::runtime_filter::port::events::{
@@ -42,6 +43,7 @@ use crate::runtime_filter::port::subscription::UnavailableReason;
 use crate::runtime_filter::port::support::{
     RetainedMemoryReservation, RuntimeFilterMemoryAccount, TemporaryContributionLease,
 };
+use crate::runtime_filter::port::topk_summary::{RuntimeTopKSummaryContract, TopKSummary};
 use crate::runtime_filter::port::value_domain::{LogicalSnapshot, ValueDomainDelta};
 
 use super::coverage::{CoverageProgress, WitnessProgress, evaluate};
@@ -49,6 +51,7 @@ use super::error::ChannelBuildError;
 use super::ordered_reducer::{OrderedApplyOutcome, OrderedCloseOutcome, OrderedReducer};
 use super::reducer::{MembershipReducer, ReducerError};
 use super::state::{InstanceState, LogicalTerminal, TerminalProgress};
+use super::topk_reducer::{TopKApplyOutcome, TopKCloseOutcome, TopKSummaryReducer};
 
 const REPLAY_METADATA_BYTES: usize = size_of::<u64>() + 32;
 const TERMINAL_METADATA_BYTES: usize = size_of::<u64>();
@@ -202,8 +205,65 @@ enum ChannelTerminal {
     },
 }
 
+#[derive(Debug)]
+enum OrderedCoreReducer {
+    Direct(OrderedReducer),
+    TopK(TopKSummaryReducer),
+}
+
+impl OrderedCoreReducer {
+    fn global(&self) -> Option<&Arc<super::ordered_reducer::OrderedBoundDomain>> {
+        match self {
+            Self::Direct(reducer) => reducer.global(),
+            Self::TopK(reducer) => reducer.global(),
+        }
+    }
+
+    fn estimated_retained_bytes(&self) -> Option<usize> {
+        match self {
+            Self::Direct(reducer) => reducer.estimated_retained_bytes(),
+            Self::TopK(reducer) => reducer.estimated_retained_bytes(),
+        }
+    }
+
+    fn retain_protocol_tombstones(&mut self) -> Option<usize> {
+        match self {
+            Self::Direct(reducer) => reducer.retain_protocol_tombstones(),
+            Self::TopK(reducer) => reducer.retain_protocol_tombstones(),
+        }
+    }
+
+    fn terminal_partition_count(&self, binding_id: BindingId, instance: UniqueId) -> usize {
+        match self {
+            Self::Direct(reducer) => reducer.terminal_partition_count(binding_id, instance),
+            Self::TopK(reducer) => reducer.terminal_partition_count(binding_id, instance),
+        }
+    }
+
+    fn direct(&self) -> Option<&OrderedReducer> {
+        match self {
+            Self::Direct(reducer) => Some(reducer),
+            Self::TopK(_) => None,
+        }
+    }
+
+    fn topk(&self) -> Option<&TopKSummaryReducer> {
+        match self {
+            Self::Direct(_) => None,
+            Self::TopK(reducer) => Some(reducer),
+        }
+    }
+
+    fn topk_mut(&mut self) -> Option<&mut TopKSummaryReducer> {
+        match self {
+            Self::Direct(_) => None,
+            Self::TopK(reducer) => Some(reducer),
+        }
+    }
+}
+
 struct OrderedCoreState {
-    reducer: OrderedReducer,
+    reducer: OrderedCoreReducer,
     availability_witnesses: BTreeMap<CoverageWitnessId, WitnessProgress>,
     latest: Option<Arc<LogicalSnapshot>>,
 }
@@ -323,7 +383,7 @@ impl RuntimeFilterChannel {
         deployment: &RuntimeFilterChannelDeployment,
         memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
     ) -> Result<Self, ChannelBuildError> {
-        let (data_type, null_semantics, reducer, ordered_contract) =
+        let (data_type, null_semantics, reducer, ordered_reducer) =
             match deployment.logical_domain() {
                 RuntimeFilterLogicalDomain::Membership {
                     value_type,
@@ -338,15 +398,28 @@ impl RuntimeFilterChannel {
                         None,
                     )
                 }
-                RuntimeFilterLogicalDomain::OrderedBound(plan) => (
-                    None,
-                    None,
-                    None,
-                    Some(Arc::new(
-                        RuntimeOrderContract::try_from_plan(plan)
-                            .map_err(|_| ChannelBuildError::UnsupportedContract)?,
-                    )),
-                ),
+                RuntimeFilterLogicalDomain::OrderedBound(plan) => {
+                    let reducer = match deployment.reduction_requirement() {
+                        ReductionRequirement::TightenOrderedBound => {
+                            let contract = Arc::new(
+                                RuntimeOrderContract::try_from_plan(plan)
+                                    .map_err(|_| ChannelBuildError::UnsupportedContract)?,
+                            );
+                            OrderedCoreReducer::Direct(OrderedReducer::new(contract))
+                        }
+                        ReductionRequirement::MergeTopKSummary(requirement) => {
+                            let contract = Arc::new(
+                                RuntimeTopKSummaryContract::try_from_plan(plan, requirement)
+                                    .map_err(|_| ChannelBuildError::UnsupportedContract)?,
+                            );
+                            OrderedCoreReducer::TopK(TopKSummaryReducer::new(contract))
+                        }
+                        ReductionRequirement::SetUnion => {
+                            return Err(ChannelBuildError::UnsupportedContract);
+                        }
+                    };
+                    (None, None, None, Some(reducer))
+                }
             };
         let mut witnesses = BTreeMap::new();
         let producers = deployment
@@ -399,8 +472,8 @@ impl RuntimeFilterChannel {
                 producers,
                 witnesses: witnesses.clone(),
                 reducer,
-                ordered: ordered_contract.map(|contract| OrderedCoreState {
-                    reducer: OrderedReducer::new(contract),
+                ordered: ordered_reducer.map(|reducer| OrderedCoreState {
+                    reducer,
                     availability_witnesses: witnesses,
                     latest: None,
                 }),
@@ -734,13 +807,17 @@ impl RuntimeFilterChannel {
                     "membership channel cannot accept ordered bounds",
                 )
             })?;
+            let direct = ordered.reducer.direct().ok_or_else(|| {
+                violation(
+                    RuntimeContractViolationKind::ProducerPortMismatch,
+                    "top-k summary channel cannot accept direct ordered bounds",
+                )
+            })?;
             if matches!(
                 state.terminal,
                 ChannelTerminal::Unavailable { .. } | ChannelTerminal::Cancelled { .. }
             ) {
-                ordered
-                    .reducer
-                    .validate_tombstone_update(stream_id, sequence, &update)?;
+                direct.validate_tombstone_update(stream_id, sequence, &update)?;
                 return Ok(terminal_action_from_state(&state));
             }
             if u64::try_from(contribution_bytes)
@@ -755,13 +832,13 @@ impl RuntimeFilterChannel {
                 drop(state);
                 return Ok(locked.finish());
             }
-            let before_bytes = ordered.reducer.estimated_retained_bytes().ok_or_else(|| {
+            let before_bytes = direct.estimated_retained_bytes().ok_or_else(|| {
                 violation(
                     RuntimeContractViolationKind::OrderedContractMismatch,
                     "ordered reducer retained size overflowed",
                 )
             })?;
-            let mut next_reducer = ordered.reducer.clone();
+            let mut next_reducer = direct.clone();
             let apply_outcome = next_reducer.apply(stream_id, sequence, update.clone())?;
             if !matches!(state.terminal, ChannelTerminal::Collecting) {
                 return Ok(terminal_action_from_state(&state));
@@ -927,7 +1004,7 @@ impl RuntimeFilterChannel {
                 .ordered
                 .as_mut()
                 .expect("ordered channel owns ordered state");
-            ordered.reducer = next_reducer;
+            ordered.reducer = OrderedCoreReducer::Direct(next_reducer);
             ordered.availability_witnesses = availability_witnesses;
             if !availability_was_satisfied && availability == CoverageProgress::Satisfied {
                 events.push(RuntimeFilterEvent::OrderedAvailabilityReached {
@@ -943,6 +1020,452 @@ impl RuntimeFilterChannel {
                 let reservation = snapshot_reservation
                     .take()
                     .expect("published ordered version owns exact reservation");
+                let snapshot = Arc::new(LogicalSnapshot::ordered(
+                    self.channel_id,
+                    version,
+                    domain,
+                    reservation,
+                ));
+                ordered.latest = Some(snapshot.clone());
+                events.push(RuntimeFilterEvent::OrderedGlobalTightened { identity, version });
+                events.push(RuntimeFilterEvent::LogicalVersionPublished {
+                    identity: self.event_identity,
+                    version,
+                });
+                snapshot
+            });
+            refresh_ordered_instance_progress(&mut state, binding_id, fragment_instance_id);
+            let mut locked =
+                self.refresh_after_ordered_progress(&mut state, outcome, published, events);
+            locked.add_release_after_unlock(release_after_unlock);
+            drop(state);
+            return Ok(locked.finish());
+        }
+    }
+
+    pub(crate) fn submit_topk_summary(
+        &self,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        partition_id: PartitionId,
+        sequence: ProducerSequence,
+        summary: TopKSummary,
+        temporary_lease: TemporaryContributionLease,
+    ) -> Result<ChannelAction, RuntimeContractViolation> {
+        let contribution_bytes = summary.canonical_contribution_bytes().ok_or_else(|| {
+            violation(
+                RuntimeContractViolationKind::InvalidContributionLease,
+                "top-k summary canonical size overflowed",
+            )
+        })?;
+        if temporary_lease.bytes() != contribution_bytes {
+            return Err(violation(
+                RuntimeContractViolationKind::InvalidContributionLease,
+                "temporary contribution lease does not match canonical top-k summary size",
+            ));
+        }
+        let identity =
+            self.contribution_identity(binding_id, fragment_instance_id, partition_id, sequence);
+        let stream_id = identity.stream();
+        let mut metadata_reservation = None;
+        let mut snapshot_reservation = None;
+        let mut reservation_failed_for = None;
+        loop {
+            let mut state = self.state.lock().unwrap();
+            partition_state(&state, binding_id, fragment_instance_id, partition_id)?;
+            let ordered = state.ordered.as_ref().ok_or_else(|| {
+                violation(
+                    RuntimeContractViolationKind::ProducerPortMismatch,
+                    "membership channel cannot accept top-k summaries",
+                )
+            })?;
+            let topk = ordered.reducer.topk().ok_or_else(|| {
+                violation(
+                    RuntimeContractViolationKind::ProducerPortMismatch,
+                    "direct ordered channel cannot accept top-k summaries",
+                )
+            })?;
+            if matches!(
+                state.terminal,
+                ChannelTerminal::Unavailable { .. } | ChannelTerminal::Cancelled { .. }
+            ) {
+                topk.preflight_apply(stream_id, sequence, &summary)?;
+                return Ok(terminal_action_from_state(&state));
+            }
+            if u64::try_from(contribution_bytes)
+                .map_or(true, |bytes| bytes > self.max_contribution_bytes)
+            {
+                let locked = self.make_ordered_unavailable_or_degraded(
+                    &mut state,
+                    UnavailableReason::ResourceLimit,
+                    SubmitOutcome::TerminalNoop,
+                    Vec::new(),
+                );
+                drop(state);
+                return Ok(locked.finish());
+            }
+            let before_bytes = topk.estimated_retained_bytes().ok_or_else(|| {
+                violation(
+                    RuntimeContractViolationKind::OrderedContractMismatch,
+                    "top-k reducer retained size overflowed",
+                )
+            })?;
+            let stream_was_covered = topk.stream_covered(stream_id);
+            let projection = topk.preflight_apply(stream_id, sequence, &summary)?;
+            if !matches!(state.terminal, ChannelTerminal::Collecting) {
+                return Ok(terminal_action_from_state(&state));
+            }
+            debug_assert_eq!(
+                state.reservation.bytes(),
+                before_bytes,
+                "top-k reducer reservation tracks current retained bytes"
+            );
+            let after_bytes = projection.retained_bytes();
+            let metadata_growth = after_bytes.saturating_sub(state.reservation.bytes());
+            let availability_witnesses = projected_topk_availability(
+                &state,
+                binding_id,
+                fragment_instance_id,
+                stream_was_covered,
+                projection.stream_covered(),
+            );
+            let availability = evaluate(&self.availability_coverage, &availability_witnesses);
+            let publish = availability == CoverageProgress::Satisfied
+                && projection.global().is_some()
+                && (ordered.latest.is_none()
+                    || matches!(projection.outcome(), TopKApplyOutcome::GlobalTightened));
+            let (version, snapshot_bytes) = if publish {
+                let version =
+                    ordered
+                        .latest
+                        .as_ref()
+                        .map_or(Ok(LogicalVersion::FIRST), |latest| {
+                            latest.version().checked_next().ok_or_else(|| {
+                                violation(
+                                    RuntimeContractViolationKind::LogicalVersionOverflow,
+                                    "top-k logical version overflowed",
+                                )
+                            })
+                        })?;
+                let bytes = projection
+                    .global()
+                    .expect("published top-k projection owns a global bound")
+                    .estimated_retained_bytes()
+                    .ok_or_else(|| {
+                        violation(
+                            RuntimeContractViolationKind::OrderedContractMismatch,
+                            "top-k snapshot retained size overflowed",
+                        )
+                    })?;
+                (Some(version), bytes)
+            } else {
+                (None, 0)
+            };
+            if after_bytes
+                .checked_add(snapshot_bytes)
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .is_none_or(|bytes| bytes > self.max_reducer_bytes)
+            {
+                let locked = self.make_ordered_unavailable_or_degraded(
+                    &mut state,
+                    UnavailableReason::ResourceLimit,
+                    SubmitOutcome::TerminalNoop,
+                    Vec::new(),
+                );
+                drop(state);
+                return Ok(locked.finish());
+            }
+            let reservations_match = metadata_reservation
+                .as_ref()
+                .map(RetainedMemoryReservation::bytes)
+                == Some(metadata_growth)
+                && snapshot_reservation
+                    .as_ref()
+                    .map(RetainedMemoryReservation::bytes)
+                    == Some(snapshot_bytes);
+            if !reservations_match {
+                let required = (metadata_growth, snapshot_bytes);
+                if reservation_failed_for == Some(required) {
+                    let locked = self.make_ordered_unavailable_or_degraded(
+                        &mut state,
+                        UnavailableReason::ResourceLimit,
+                        SubmitOutcome::TerminalNoop,
+                        Vec::new(),
+                    );
+                    drop(state);
+                    return Ok(locked.finish());
+                }
+                drop(state);
+                drop(metadata_reservation.take());
+                drop(snapshot_reservation.take());
+                metadata_reservation = RetainedMemoryReservation::try_new(
+                    self.memory_account.clone(),
+                    metadata_growth,
+                )
+                .ok();
+                snapshot_reservation =
+                    RetainedMemoryReservation::try_new(self.memory_account.clone(), snapshot_bytes)
+                        .ok();
+                if metadata_reservation.is_none() || snapshot_reservation.is_none() {
+                    reservation_failed_for = Some(required);
+                }
+                continue;
+            }
+
+            let availability_was_satisfied =
+                evaluate(&self.availability_coverage, &ordered.availability_witnesses)
+                    == CoverageProgress::Satisfied;
+
+            let incoming_metadata = metadata_reservation
+                .take()
+                .expect("matching top-k metadata reservation exists");
+            if let Err(failure) = state.reservation.absorb(incoming_metadata) {
+                let (_, incoming) = failure.into_parts();
+                let locked = self.make_ordered_unavailable_or_degraded(
+                    &mut state,
+                    UnavailableReason::ResourceLimit,
+                    SubmitOutcome::TerminalNoop,
+                    Vec::new(),
+                );
+                drop(state);
+                drop(incoming);
+                return Ok(locked.finish());
+            }
+            let apply_outcome = projection.outcome();
+            let outcome = match apply_outcome {
+                TopKApplyOutcome::Stale => SubmitOutcome::Stale,
+                TopKApplyOutcome::Duplicate => SubmitOutcome::Duplicate,
+                TopKApplyOutcome::SequenceAdvancedEqual => SubmitOutcome::SequenceAdvancedEqual,
+                TopKApplyOutcome::StreamUpdated => SubmitOutcome::StreamAcceptedNoGlobalChange,
+                TopKApplyOutcome::GlobalTightened => SubmitOutcome::Published,
+            };
+            let release_after_unlock = state.reservation.split_off_excess(after_bytes);
+            let ordered = state
+                .ordered
+                .as_mut()
+                .expect("top-k channel owns ordered state");
+            ordered
+                .reducer
+                .topk_mut()
+                .expect("top-k strategy remains installed")
+                .commit_apply(projection);
+            ordered.availability_witnesses = availability_witnesses;
+            let mut events = Vec::new();
+            if !availability_was_satisfied && availability == CoverageProgress::Satisfied {
+                events.push(RuntimeFilterEvent::OrderedAvailabilityReached {
+                    identity: self.event_identity,
+                });
+            }
+            let published = version.map(|version| {
+                let domain = ordered
+                    .reducer
+                    .global()
+                    .expect("published top-k version owns a global bound")
+                    .clone();
+                let reservation = snapshot_reservation
+                    .take()
+                    .expect("published top-k version owns exact reservation");
+                let snapshot = Arc::new(LogicalSnapshot::ordered(
+                    self.channel_id,
+                    version,
+                    domain,
+                    reservation,
+                ));
+                ordered.latest = Some(snapshot.clone());
+                events.push(RuntimeFilterEvent::OrderedGlobalTightened { identity, version });
+                events.push(RuntimeFilterEvent::LogicalVersionPublished {
+                    identity: self.event_identity,
+                    version,
+                });
+                snapshot
+            });
+            refresh_ordered_instance_progress(&mut state, binding_id, fragment_instance_id);
+            let mut locked =
+                self.refresh_after_ordered_progress(&mut state, outcome, published, events);
+            locked.add_release_after_unlock(release_after_unlock);
+            drop(state);
+            return Ok(locked.finish());
+        }
+    }
+
+    pub(crate) fn close_topk_partition(
+        &self,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        partition_id: PartitionId,
+        terminal_sequence: ProducerSequence,
+    ) -> Result<ChannelAction, RuntimeContractViolation> {
+        let identity = self.contribution_identity(
+            binding_id,
+            fragment_instance_id,
+            partition_id,
+            terminal_sequence,
+        );
+        let stream_id = identity.stream();
+        let mut metadata_reservation = None;
+        let mut snapshot_reservation = None;
+        let mut reservation_failed_for = None;
+        loop {
+            let mut state = self.state.lock().unwrap();
+            partition_state(&state, binding_id, fragment_instance_id, partition_id)?;
+            let ordered = state.ordered.as_ref().ok_or_else(|| {
+                violation(
+                    RuntimeContractViolationKind::ProducerPortMismatch,
+                    "membership channel cannot accept top-k close",
+                )
+            })?;
+            let topk = ordered.reducer.topk().ok_or_else(|| {
+                violation(
+                    RuntimeContractViolationKind::ProducerPortMismatch,
+                    "direct ordered channel cannot accept top-k close",
+                )
+            })?;
+            let before_bytes = topk.estimated_retained_bytes().ok_or_else(|| {
+                violation(
+                    RuntimeContractViolationKind::OrderedContractMismatch,
+                    "top-k reducer retained size overflowed",
+                )
+            })?;
+            let stream_was_covered = topk.stream_covered(stream_id);
+            let projection = topk.preflight_close(stream_id, terminal_sequence)?;
+            if !matches!(state.terminal, ChannelTerminal::Collecting) {
+                return Ok(terminal_action_from_state(&state));
+            }
+            debug_assert_eq!(
+                state.reservation.bytes(),
+                before_bytes,
+                "top-k reducer reservation tracks current retained bytes"
+            );
+            let after_bytes = projection.retained_bytes();
+            let metadata_growth = after_bytes.saturating_sub(state.reservation.bytes());
+            let availability_witnesses = projected_topk_availability(
+                &state,
+                binding_id,
+                fragment_instance_id,
+                stream_was_covered,
+                projection.stream_covered(),
+            );
+            let availability = evaluate(&self.availability_coverage, &availability_witnesses);
+            let publish = availability == CoverageProgress::Satisfied
+                && ordered.latest.is_none()
+                && topk.global().is_some();
+            let (version, snapshot_bytes) = if publish {
+                let bytes = topk
+                    .global()
+                    .expect("published top-k close owns a global bound")
+                    .estimated_retained_bytes()
+                    .ok_or_else(|| {
+                        violation(
+                            RuntimeContractViolationKind::OrderedContractMismatch,
+                            "top-k snapshot retained size overflowed",
+                        )
+                    })?;
+                (Some(LogicalVersion::FIRST), bytes)
+            } else {
+                (None, 0)
+            };
+            if after_bytes
+                .checked_add(snapshot_bytes)
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .is_none_or(|bytes| bytes > self.max_reducer_bytes)
+            {
+                let locked = self.make_ordered_unavailable_or_degraded(
+                    &mut state,
+                    UnavailableReason::ResourceLimit,
+                    SubmitOutcome::TerminalNoop,
+                    Vec::new(),
+                );
+                drop(state);
+                return Ok(locked.finish());
+            }
+            let reservations_match = metadata_reservation
+                .as_ref()
+                .map(RetainedMemoryReservation::bytes)
+                == Some(metadata_growth)
+                && snapshot_reservation
+                    .as_ref()
+                    .map(RetainedMemoryReservation::bytes)
+                    == Some(snapshot_bytes);
+            if !reservations_match {
+                let required = (metadata_growth, snapshot_bytes);
+                if reservation_failed_for == Some(required) {
+                    let locked = self.make_ordered_unavailable_or_degraded(
+                        &mut state,
+                        UnavailableReason::ResourceLimit,
+                        SubmitOutcome::TerminalNoop,
+                        Vec::new(),
+                    );
+                    drop(state);
+                    return Ok(locked.finish());
+                }
+                drop(state);
+                drop(metadata_reservation.take());
+                drop(snapshot_reservation.take());
+                metadata_reservation = RetainedMemoryReservation::try_new(
+                    self.memory_account.clone(),
+                    metadata_growth,
+                )
+                .ok();
+                snapshot_reservation =
+                    RetainedMemoryReservation::try_new(self.memory_account.clone(), snapshot_bytes)
+                        .ok();
+                if metadata_reservation.is_none() || snapshot_reservation.is_none() {
+                    reservation_failed_for = Some(required);
+                }
+                continue;
+            }
+
+            let availability_was_satisfied =
+                evaluate(&self.availability_coverage, &ordered.availability_witnesses)
+                    == CoverageProgress::Satisfied;
+
+            let incoming_metadata = metadata_reservation
+                .take()
+                .expect("matching top-k close reservation exists");
+            if let Err(failure) = state.reservation.absorb(incoming_metadata) {
+                let (_, incoming) = failure.into_parts();
+                let locked = self.make_ordered_unavailable_or_degraded(
+                    &mut state,
+                    UnavailableReason::ResourceLimit,
+                    SubmitOutcome::TerminalNoop,
+                    Vec::new(),
+                );
+                drop(state);
+                drop(incoming);
+                return Ok(locked.finish());
+            }
+            let close_outcome = projection.outcome();
+            let outcome = match close_outcome {
+                TopKCloseOutcome::Duplicate => SubmitOutcome::Duplicate,
+                TopKCloseOutcome::PendingFinalSnapshot => SubmitOutcome::PendingFinalSnapshot,
+                TopKCloseOutcome::Satisfied => SubmitOutcome::Applied,
+            };
+            let release_after_unlock = state.reservation.split_off_excess(after_bytes);
+            let ordered = state
+                .ordered
+                .as_mut()
+                .expect("top-k channel owns ordered state");
+            ordered
+                .reducer
+                .topk_mut()
+                .expect("top-k strategy remains installed")
+                .commit_close(projection);
+            ordered.availability_witnesses = availability_witnesses;
+            let mut events = Vec::new();
+            if !availability_was_satisfied && availability == CoverageProgress::Satisfied {
+                events.push(RuntimeFilterEvent::OrderedAvailabilityReached {
+                    identity: self.event_identity,
+                });
+            }
+            let published = version.map(|version| {
+                let domain = ordered
+                    .reducer
+                    .global()
+                    .expect("published top-k close owns a global bound")
+                    .clone();
+                let reservation = snapshot_reservation
+                    .take()
+                    .expect("published top-k close owns exact reservation");
                 let snapshot = Arc::new(LogicalSnapshot::ordered(
                     self.channel_id,
                     version,
@@ -985,13 +1508,19 @@ impl RuntimeFilterChannel {
                     "membership channel cannot accept ordered close",
                 )
             })?;
-            let before_bytes = ordered.reducer.estimated_retained_bytes().ok_or_else(|| {
+            let direct = ordered.reducer.direct().ok_or_else(|| {
+                violation(
+                    RuntimeContractViolationKind::ProducerPortMismatch,
+                    "top-k summary channel cannot accept direct ordered close",
+                )
+            })?;
+            let before_bytes = direct.estimated_retained_bytes().ok_or_else(|| {
                 violation(
                     RuntimeContractViolationKind::OrderedContractMismatch,
                     "ordered reducer retained size overflowed",
                 )
             })?;
-            let mut next_reducer = ordered.reducer.clone();
+            let mut next_reducer = direct.clone();
             let close_outcome = next_reducer.close(stream_id, terminal_sequence)?;
             if !matches!(state.terminal, ChannelTerminal::Collecting) {
                 return Ok(terminal_action_from_state(&state));
@@ -1058,7 +1587,7 @@ impl RuntimeFilterChannel {
                 .ordered
                 .as_mut()
                 .expect("ordered channel owns ordered state")
-                .reducer = next_reducer;
+                .reducer = OrderedCoreReducer::Direct(next_reducer);
             refresh_ordered_instance_progress(&mut state, binding_id, fragment_instance_id);
             let outcome = match close_outcome {
                 OrderedCloseOutcome::Duplicate => SubmitOutcome::Duplicate,
@@ -1442,15 +1971,19 @@ impl RuntimeFilterChannel {
                 "membership channel cannot accept ordered bounds",
             )
         })?;
+        let direct = ordered.reducer.direct().ok_or_else(|| {
+            violation(
+                RuntimeContractViolationKind::ProducerPortMismatch,
+                "top-k summary channel cannot accept direct ordered bounds",
+            )
+        })?;
         if matches!(
             state.terminal,
             ChannelTerminal::Unavailable { .. } | ChannelTerminal::Cancelled { .. }
         ) {
-            ordered
-                .reducer
-                .validate_tombstone_update(stream_id, sequence, update)?;
+            direct.validate_tombstone_update(stream_id, sequence, update)?;
         } else {
-            let mut preflight = ordered.reducer.clone();
+            let mut preflight = direct.clone();
             preflight.apply(stream_id, sequence, update.clone())?;
         }
         if !matches!(state.terminal, ChannelTerminal::Collecting) {
@@ -1811,6 +2344,49 @@ fn progress(outcome: SubmitOutcome) -> ChannelAction {
     }
 }
 
+fn projected_topk_availability(
+    state: &ChannelState,
+    binding_id: BindingId,
+    fragment_instance_id: UniqueId,
+    stream_was_covered: bool,
+    stream_will_be_covered: bool,
+) -> BTreeMap<CoverageWitnessId, WitnessProgress> {
+    let ordered = state
+        .ordered
+        .as_ref()
+        .expect("top-k channel owns ordered state");
+    let topk = ordered
+        .reducer
+        .topk()
+        .expect("top-k availability uses top-k strategy");
+    let producer = state
+        .producers
+        .get(&binding_id)
+        .expect("authorized top-k producer");
+    let newly_covered = usize::from(!stream_was_covered && stream_will_be_covered);
+    let binding_satisfied = producer.instances.iter().all(|(instance_id, instance)| {
+        let Some(partition_count) = instance.local_partition_count() else {
+            return false;
+        };
+        let projected_count = topk
+            .covered_partition_count(binding_id, *instance_id)
+            .saturating_add(if *instance_id == fragment_instance_id {
+                newly_covered
+            } else {
+                0
+            });
+        usize::try_from(partition_count) == Ok(projected_count)
+    });
+    let mut witnesses = ordered.availability_witnesses.clone();
+    if binding_satisfied {
+        witnesses
+            .get_mut(&producer.witness_id)
+            .expect("top-k availability witness is installed")
+            .advance(WitnessProgress::Satisfied);
+    }
+    witnesses
+}
+
 fn refresh_ordered_instance_progress(
     state: &mut ChannelState,
     binding_id: BindingId,
@@ -2030,6 +2606,7 @@ mod tests {
     use crate::runtime_filter::port::support::{
         MemoryAccountError, RuntimeFilterMemoryAccount, TemporaryContributionLease,
     };
+    use crate::runtime_filter::port::topk_summary::{RuntimeTopKSummaryContract, TopKSummary};
     use crate::runtime_filter::port::value_domain::{
         LogicalSnapshot, MembershipValues, ValueDomainDelta,
     };
@@ -3643,6 +4220,354 @@ mod tests {
                 latest,
                 state.next_dispatch_order
             )
+        }
+    }
+
+    struct TopKChannelHarness {
+        channel: Arc<RuntimeFilterChannel>,
+        contract: Arc<RuntimeTopKSummaryContract>,
+        streams: Vec<(BindingId, UniqueId)>,
+        temporary_account: Arc<Account>,
+    }
+
+    impl TopKChannelHarness {
+        fn with_streams(count: usize, k: u32) -> Self {
+            Self::with_streams_and_account(count, k, Arc::new(Account::default()))
+        }
+
+        fn with_streams_and_account(
+            count: usize,
+            k: u32,
+            memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
+        ) -> Self {
+            let keys = vec![OrderKeyContract {
+                data_type: DataType::Int64,
+                direction: SortDirection::Ascending,
+                null_order: NullOrder::Last,
+            }];
+            let plan = OrderContract {
+                comparator_digest: comparator_digest_for_test(&keys, COMPARATOR_ALGORITHM_VERSION),
+                keys,
+                inclusive: true,
+            };
+            let requirement = TopKSummaryRequirement::try_new(k).unwrap();
+            let contract =
+                Arc::new(RuntimeTopKSummaryContract::try_from_plan(&plan, requirement).unwrap());
+            let streams = (0..count)
+                .map(|index| {
+                    (
+                        BindingId::new(10 + u32::try_from(index).unwrap()),
+                        uid(10 + i64::try_from(index).unwrap()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let witnesses = (0..count)
+                .map(|index| CoverageWitnessId::new(1 + u32::try_from(index).unwrap()))
+                .collect::<Vec<_>>();
+            let coverage = if witnesses.len() == 1 {
+                Coverage::Leaf(witnesses[0])
+            } else {
+                Coverage::AllOf(witnesses.iter().copied().map(Coverage::Leaf).collect())
+            };
+            let deployment = RuntimeFilterChannelDeployment::new(
+                ChannelId::new(1),
+                RuntimeFilterLogicalDomain::OrderedBound(plan),
+                RuntimeFilterLifecycle::MonotonicUpdates,
+                coverage.clone(),
+                coverage,
+                ReductionRequirement::MergeTopKSummary(requirement),
+                BTreeSet::from([
+                    ContributionKind::TopKSummary,
+                    ContributionKind::ProducerClosed,
+                ]),
+                CompletionRequirement::ProducerClosed,
+                RuntimeFilterPolicyRequirement {
+                    max_contribution_bytes: 4096,
+                    max_artifact_bytes: 4096,
+                    deadline_ms: 100,
+                    max_retries: 0,
+                },
+                RuntimeFilterCoreBudget::new(16 * 1024),
+                MaterializationPolicy::for_test(),
+                streams
+                    .iter()
+                    .zip(&witnesses)
+                    .map(|((binding, instance), witness)| {
+                        (
+                            *binding,
+                            ProducerDeployment::new(*witness, BTreeSet::from([*instance])),
+                        )
+                    })
+                    .collect(),
+                BTreeMap::new(),
+            );
+            let channel = Arc::new(
+                RuntimeFilterChannel::new(
+                    uid(99),
+                    RuntimeFilterParticipantId::new(1),
+                    DeploymentEpoch::new(1),
+                    &deployment,
+                    Instant::now() + Duration::from_secs(10),
+                    memory_account,
+                )
+                .unwrap(),
+            );
+            for (binding, instance) in &streams {
+                channel.open_producer(*binding, *instance, 1).unwrap();
+            }
+            Self {
+                channel,
+                contract,
+                streams,
+                temporary_account: Arc::new(Account::default()),
+            }
+        }
+
+        fn summary(&self, values: &[i64]) -> TopKSummary {
+            TopKSummary::try_new(
+                &self.contract,
+                values
+                    .iter()
+                    .map(|value| {
+                        OrderedTuple::try_new(
+                            self.contract.order(),
+                            [Some(OrderedScalar::Int64(*value))],
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+            )
+            .unwrap()
+        }
+
+        fn submit(
+            &self,
+            stream: usize,
+            sequence: u64,
+            values: &[i64],
+        ) -> Result<TestAction, RuntimeContractViolation> {
+            let (binding, instance) = self.streams[stream];
+            let summary = self.summary(values);
+            let bytes = summary.canonical_contribution_bytes().unwrap();
+            self.channel
+                .submit_topk_summary(
+                    binding,
+                    instance,
+                    PartitionId::new(0),
+                    ProducerSequence::new(sequence),
+                    summary,
+                    TemporaryContributionLease::new(self.temporary_account.clone(), bytes),
+                )
+                .map(test_action)
+        }
+
+        fn close(
+            &self,
+            stream: usize,
+            terminal: u64,
+        ) -> Result<TestAction, RuntimeContractViolation> {
+            let (binding, instance) = self.streams[stream];
+            self.channel
+                .close_topk_partition(
+                    binding,
+                    instance,
+                    PartitionId::new(0),
+                    ProducerSequence::new(terminal),
+                )
+                .map(test_action)
+        }
+
+        fn latest(&self) -> Option<(u64, i64)> {
+            self.channel
+                .snapshot()
+                .map(|snapshot| (snapshot.version().get(), ordered_value(&snapshot)))
+        }
+    }
+
+    #[derive(Default)]
+    struct InterleavingAccount {
+        current: AtomicUsize,
+        hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl RuntimeFilterMemoryAccount for InterleavingAccount {
+        fn try_consume(&self, bytes: usize) -> Result<(), MemoryAccountError> {
+            self.current.fetch_add(bytes, Ordering::SeqCst);
+            let hook = self.hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            Ok(())
+        }
+
+        fn release(&self, bytes: usize) {
+            self.current.fetch_sub(bytes, Ordering::SeqCst);
+        }
+    }
+
+    mod topk {
+        use super::*;
+
+        #[test]
+        fn complete_stream_coverage_gates_first_summary_publication() {
+            let harness = TopKChannelHarness::with_streams(2, 4);
+            assert_eq!(
+                harness.submit(0, 0, &[1, 4]).unwrap(),
+                TestAction::StreamAcceptedNoGlobalChange
+            );
+            assert_eq!(harness.latest(), None);
+            assert_eq!(
+                harness.submit(1, 0, &[2, 2]).unwrap(),
+                TestAction::Published(1, 4)
+            );
+        }
+
+        #[test]
+        fn last_close_zero_can_publish_the_first_complete_bound() {
+            let harness = TopKChannelHarness::with_streams(2, 4);
+            assert_eq!(
+                harness.submit(0, 0, &[1, 2, 3, 4]).unwrap(),
+                TestAction::Other(SubmitOutcome::Published)
+            );
+            assert_eq!(harness.latest(), None);
+            assert_eq!(harness.close(1, 0).unwrap(), TestAction::Published(1, 4));
+        }
+
+        #[test]
+        fn versions_advance_only_when_the_global_kth_tightens() {
+            let harness = TopKChannelHarness::with_streams(2, 4);
+            harness.submit(0, 0, &[1, 4]).unwrap();
+            assert_eq!(
+                harness.submit(1, 0, &[2, 2]).unwrap(),
+                TestAction::Published(1, 4)
+            );
+            assert_eq!(
+                harness.submit(0, 1, &[1, 4, 5]).unwrap(),
+                TestAction::StreamAcceptedNoGlobalChange
+            );
+            assert_eq!(harness.latest(), Some((1, 4)));
+            assert_eq!(
+                harness.submit(0, 2, &[0, 1, 4, 5]).unwrap(),
+                TestAction::Published(2, 2)
+            );
+        }
+
+        #[test]
+        fn terminal_insufficient_k_completes_without_artifact() {
+            let harness = TopKChannelHarness::with_streams(2, 4);
+            harness.submit(0, 0, &[1]).unwrap();
+            harness.submit(1, 0, &[2]).unwrap();
+            assert_eq!(
+                harness.close(0, 1).unwrap(),
+                TestAction::Other(SubmitOutcome::Applied)
+            );
+            assert_eq!(
+                harness.close(1, 1).unwrap(),
+                TestAction::CompletedWithoutArtifact
+            );
+        }
+
+        #[test]
+        fn resource_failure_before_and_after_latest_uses_ordered_fail_open() {
+            let before = TopKChannelHarness::with_streams(1, 1);
+            assert!(matches!(
+                before.channel.resource_exhausted(),
+                ChannelAction::Unavailable {
+                    reason: UnavailableReason::ResourceLimit,
+                    ..
+                }
+            ));
+
+            let after = TopKChannelHarness::with_streams(1, 1);
+            assert_eq!(
+                after.submit(0, 0, &[7]).unwrap(),
+                TestAction::Published(1, 7)
+            );
+            assert!(matches!(
+                after.channel.resource_exhausted(),
+                ChannelAction::DegradedLogical {
+                    reason: UnavailableReason::ResourceLimit,
+                    snapshot,
+                    ..
+                } if snapshot.version() == LogicalVersion::FIRST
+                    && ordered_value(&snapshot) == 7
+            ));
+        }
+
+        #[test]
+        fn direct_submit_is_rejected_by_the_topk_strategy() {
+            let harness = TopKChannelHarness::with_streams(1, 1);
+            let tuple =
+                OrderedTuple::try_new(harness.contract.order(), [Some(OrderedScalar::Int64(7))])
+                    .unwrap();
+            let update = OrderedBoundUpdate::new(harness.contract.order(), tuple).unwrap();
+            let bytes = update.canonical_contribution_bytes().unwrap();
+            let (binding, instance) = harness.streams[0];
+            assert_eq!(
+                harness
+                    .channel
+                    .submit_ordered(
+                        binding,
+                        instance,
+                        PartitionId::new(0),
+                        ProducerSequence::new(0),
+                        update,
+                        TemporaryContributionLease::new(harness.temporary_account.clone(), bytes,),
+                    )
+                    .unwrap_err()
+                    .kind(),
+                RuntimeContractViolationKind::ProducerPortMismatch
+            );
+        }
+
+        #[test]
+        fn reservation_interleaving_repreflights_before_commit() {
+            let account = Arc::new(InterleavingAccount::default());
+            let harness = TopKChannelHarness::with_streams_and_account(1, 2, account.clone());
+            let channel = harness.channel.clone();
+            let contract = harness.contract.clone();
+            let temporary = harness.temporary_account.clone();
+            let (binding, instance) = harness.streams[0];
+            *account.hook.lock().unwrap() = Some(Box::new(move || {
+                let summary = TopKSummary::try_new(
+                    &contract,
+                    [5, 10]
+                        .into_iter()
+                        .map(|value| {
+                            OrderedTuple::try_new(
+                                contract.order(),
+                                [Some(OrderedScalar::Int64(value))],
+                            )
+                            .unwrap()
+                        })
+                        .collect(),
+                )
+                .unwrap();
+                let bytes = summary.canonical_contribution_bytes().unwrap();
+                let action = channel
+                    .submit_topk_summary(
+                        binding,
+                        instance,
+                        PartitionId::new(0),
+                        ProducerSequence::new(1),
+                        summary,
+                        TemporaryContributionLease::new(temporary, bytes),
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    action,
+                    ChannelAction::VisibleSnapshot {
+                        version: LogicalVersion::FIRST,
+                        ..
+                    }
+                ));
+            }));
+
+            assert_eq!(
+                harness.submit(0, 0, &[10, 20]).unwrap(),
+                TestAction::Other(SubmitOutcome::Stale)
+            );
+            assert_eq!(harness.latest(), Some((1, 10)));
         }
     }
 

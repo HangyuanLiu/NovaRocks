@@ -87,14 +87,14 @@ impl TopKStreamState {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct TopKSummaryReducer {
     contract: Arc<RuntimeTopKSummaryContract>,
     streams: BTreeMap<ProducerStreamId, TopKStreamState>,
     global: Option<Arc<OrderedBoundDomain>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct TopKApplyProjection {
     stream: ProducerStreamId,
     next_stream: TopKStreamState,
@@ -111,9 +111,17 @@ impl TopKApplyProjection {
     pub(crate) const fn retained_bytes(&self) -> usize {
         self.retained_bytes
     }
+
+    pub(crate) fn global(&self) -> Option<&Arc<OrderedBoundDomain>> {
+        self.next_global.as_ref()
+    }
+
+    pub(crate) fn stream_covered(&self) -> bool {
+        self.next_stream.highest_sequence.is_some() || self.next_stream.terminal_satisfied()
+    }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct TopKCloseProjection {
     stream: ProducerStreamId,
     next_stream: TopKStreamState,
@@ -128,6 +136,10 @@ impl TopKCloseProjection {
 
     pub(crate) const fn retained_bytes(&self) -> usize {
         self.retained_bytes
+    }
+
+    pub(crate) fn stream_covered(&self) -> bool {
+        self.next_stream.highest_sequence.is_some() || self.next_stream.terminal_satisfied()
     }
 }
 
@@ -341,6 +353,27 @@ impl TopKSummaryReducer {
                     && state.terminal_satisfied()
             })
             .count()
+    }
+
+    pub(crate) fn covered_partition_count(
+        &self,
+        binding_id: BindingId,
+        instance: UniqueId,
+    ) -> usize {
+        self.streams
+            .iter()
+            .filter(|(stream, state)| {
+                stream.binding_id() == binding_id
+                    && stream.fragment_instance_id() == instance
+                    && (state.highest_sequence.is_some() || state.terminal_satisfied())
+            })
+            .count()
+    }
+
+    pub(crate) fn stream_covered(&self, stream: ProducerStreamId) -> bool {
+        self.streams
+            .get(&stream)
+            .is_some_and(|state| state.highest_sequence.is_some() || state.terminal_satisfied())
     }
 
     fn unchanged_apply_projection(
