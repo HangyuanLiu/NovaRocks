@@ -458,11 +458,6 @@ const ENGINE_FILE_OWNERS: &[EngineFileOwner] = &[
         migration_task: "EBD-3A",
     },
     EngineFileOwner {
-        path: "src/engine/procedure.rs",
-        target_owner: "sql",
-        migration_task: "EBD-2",
-    },
-    EngineFileOwner {
         path: "src/engine/query_options.rs",
         target_owner: "split:frontend,runtime",
         migration_task: "EBD-3B",
@@ -476,11 +471,6 @@ const ENGINE_FILE_OWNERS: &[EngineFileOwner] = &[
         path: "src/engine/query_stats.rs",
         target_owner: "statistics",
         migration_task: "EBD-7",
-    },
-    EngineFileOwner {
-        path: "src/engine/sql_expr.rs",
-        target_owner: "sql",
-        migration_task: "EBD-2",
     },
     EngineFileOwner {
         path: "src/engine/statement.rs",
@@ -561,11 +551,9 @@ const ENGINE_MODULE_DECLARATIONS: &[&str] = &[
     "src/engine/mod.rs||external|path=default|mv_scheduler",
     "src/engine/mod.rs||external|path=default|name_resolve",
     "src/engine/mod.rs||external|path=default|parquet",
-    "src/engine/mod.rs||external|path=default|procedure",
     "src/engine/mod.rs||external|path=default|query_options",
     "src/engine/mod.rs||external|path=default|query_prep",
     "src/engine/mod.rs||external|path=default|query_stats",
-    "src/engine/mod.rs||external|path=default|sql_expr",
     "src/engine/mod.rs||external|path=default|statement",
     "src/engine/mod.rs||external|path=default|statistics",
     "src/engine/mod.rs||external|path=default|stream_load",
@@ -652,8 +640,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "crate::engine::catalog::ColumnDef",
             "crate::engine::catalog::normalize_identifier",
             "crate::engine::parquet::parse_datetime_string_to_nanos",
-            "crate::engine::sql_expr::latin1_string_to_bytes",
-            "crate::engine::sql_expr::literal_to_i128_for_integer",
         ],
     ),
     (
@@ -1036,7 +1022,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "crate::engine::mv_scheduler::RefreshCoordinatorConfig",
             "crate::engine::mv_scheduler::start_refresh_coordinator_for_server",
             "crate::engine::query_options::StandaloneQueryOptions",
-            "crate::engine::sql_expr::literal_from_batch",
             "crate::engine::statement::looks_like_show_alter_table_optimize",
             "crate::engine::statement::looks_like_show_create_table",
             "crate::engine::statement::looks_like_show_create_view",
