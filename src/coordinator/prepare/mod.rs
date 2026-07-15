@@ -15,5 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod connector;
-pub(crate) mod iceberg_delta;
+pub(crate) mod scan;
+mod scan_preparation;
+
+#[cfg(test)]
+pub(crate) use scan_preparation::build_iceberg_metadata_scan_range_params;
+pub(crate) use scan_preparation::prepare_scan_bindings;

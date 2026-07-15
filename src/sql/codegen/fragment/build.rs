@@ -38,11 +38,8 @@ pub(crate) fn build(request: FragmentBuildRequest<'_>) -> Result<MultiFragmentBu
     } = request;
     let _ = catalog;
 
-    let scan_bindings = crate::sql::codegen::scan::preparation::prepare_scan_bindings(
-        dp,
-        connectors,
-        scan_binding_resolver,
-    )?;
+    let scan_bindings =
+        crate::coordinator::prepare::prepare_scan_bindings(dp, connectors, scan_binding_resolver)?;
 
     // Boundary reports are a read-only projection of the planner's sealed
     // boundary catalog. Codegen never discovers boundary membership or re-selects
@@ -284,11 +281,11 @@ mod tests {
     };
     use super::*;
     use crate::connector::ConnectorRegistry;
+    use crate::coordinator::prepare::build_iceberg_metadata_scan_range_params;
     use crate::runtime_filter::model::graph::RuntimeFilterGraph;
     use crate::sql::analysis::cte::CteId;
     use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, TypedExpr};
     use crate::sql::catalog::{CatalogProvider, IcebergDataFileBinding, ScanSource, TableDef};
-    use crate::sql::codegen::scan::preparation::build_iceberg_metadata_scan_range_params;
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed::{
         BoundaryContract, BoundaryKind as PlannerBoundaryKind, DataPartition, ExchangeFlavor,
@@ -717,12 +714,12 @@ mod tests {
         calls: AtomicUsize,
     }
 
-    impl crate::sql::codegen::scan::binding::ScanBindingResolver for SentinelDeltaResolver {
+    impl crate::coordinator::prepare::scan::ScanBindingResolver for SentinelDeltaResolver {
         fn resolve_scan(
             &self,
             node_id: i32,
             scan: &PlanScanNode,
-        ) -> Result<Option<crate::sql::codegen::scan::binding::ResolvedScanExecution>, String>
+        ) -> Result<Option<crate::coordinator::prepare::scan::ResolvedScanExecution>, String>
         {
             self.calls.fetch_add(1, Ordering::Relaxed);
             assert_eq!(node_id, 10);
@@ -735,8 +732,8 @@ mod tests {
                 }
             ));
             Ok(Some(
-                crate::sql::codegen::scan::binding::ResolvedScanExecution::IcebergDelta(
-                    crate::sql::codegen::scan::binding::ResolvedIcebergDeltaScan {
+                crate::coordinator::prepare::scan::ResolvedScanExecution::IcebergDelta(
+                    crate::coordinator::prepare::scan::ResolvedIcebergDeltaScan {
                         runtime_plan:
                             crate::sql::codegen::scan::iceberg_delta::IcebergDeltaScanRuntimePlan {
                                 table_location: "s3://bucket/test_table".to_string(),

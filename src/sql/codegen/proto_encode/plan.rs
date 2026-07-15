@@ -25,12 +25,12 @@ use iceberg::spec::{ListType, MapType, NestedField, PrimitiveType, StructType, T
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use super::expr::{encode_expr, encode_sort_items, encode_window_frame};
+use crate::coordinator::prepare::scan::{
+    ResolvedScanBinding, ResolvedScanColumnKind, ResolvedScanExecution, ScanExecutionBindings,
+};
 use crate::proto::{common, plan};
 use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, TypedExpr};
 use crate::sql::catalog;
-use crate::sql::codegen::scan::binding::{
-    ResolvedScanBinding, ResolvedScanColumnKind, ResolvedScanExecution, ScanExecutionBindings,
-};
 use crate::sql::codegen::scan::connector::{
     StarRocksColumnSchemaDescriptor, StarRocksKeysTypeDescriptor, StarRocksScanSourceDescriptor,
     StarRocksTabletSchemaDescriptor,
@@ -1763,7 +1763,7 @@ fn encode_bound_required_columns(
 }
 
 fn encode_bound_scan_output_column(
-    column: &crate::sql::codegen::scan::binding::ResolvedScanColumn,
+    column: &crate::coordinator::prepare::scan::ResolvedScanColumn,
 ) -> Result<common::OutputColumn, String> {
     Ok(common::OutputColumn {
         column_id: column.planner.column_id.0,
@@ -3349,6 +3349,11 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
+    use crate::coordinator::prepare::scan::{
+        ResolvedIcebergDeltaScan, ResolvedIcebergFileScan, ResolvedReadColumn, ResolvedReadReason,
+        ResolvedScanBinding, ResolvedScanColumn, ResolvedScanColumnKind, ResolvedScanExecution,
+        ScanExecutionBindings,
+    };
     use crate::proto::expr::expr;
     use crate::runtime_filter::model::contract::{
         ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
@@ -3363,11 +3368,6 @@ mod tests {
         RuntimeFilterGraph,
     };
     use crate::sql::analysis::OutputColumn;
-    use crate::sql::codegen::scan::binding::{
-        ResolvedIcebergDeltaScan, ResolvedIcebergFileScan, ResolvedReadColumn, ResolvedReadReason,
-        ResolvedScanBinding, ResolvedScanColumn, ResolvedScanColumnKind, ResolvedScanExecution,
-        ScanExecutionBindings,
-    };
     use crate::sql::codegen::scan::iceberg_delta::IcebergDeltaScanRuntimePlan;
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed::DataPartition;
