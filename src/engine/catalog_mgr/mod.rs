@@ -90,8 +90,9 @@ impl CatalogMgr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::identifier::TableIdentity;
     use crate::engine::catalog_mgr::catalog::Catalog;
-    use crate::engine::catalog_mgr::metadata::{TableBinding, TableIdentity, TableMetadata};
+    use crate::engine::catalog_mgr::metadata::{TableBinding, TableMetadata};
     use std::sync::Arc;
 
     struct OneTableCatalog {

@@ -18,13 +18,13 @@
 //! In-memory database/table catalog and shared catalog utilities.
 //!
 //! Holds the logical `InMemoryCatalog` (databases -> tables + physical
-//! layouts) and the `normalize_identifier` helper used across the SQL
-//! and engine layers. Everything here is backend-agnostic — the
+//! layouts). Everything here is backend-agnostic — the
 //! StarRocks table and iceberg subsystems both query this catalog for
 //! table metadata.
 
 use std::collections::HashMap;
 
+use crate::catalog::identifier::normalize_identifier;
 // Re-export from sql::catalog so callers can use either
 // `crate::engine::catalog::*` or `crate::sql::catalog::*`
 // interchangeably without double-defining the types.
@@ -330,29 +330,6 @@ impl CatalogProvider for InMemoryCatalog {
     ) -> Result<Option<PhysicalTableLayout>, String> {
         self.get_physical_layout(database, table)
     }
-}
-
-pub(crate) fn normalize_identifier(raw: &str) -> Result<String, String> {
-    let trimmed = raw.trim();
-    // Strip backtick quotes if present
-    let trimmed = trimmed
-        .strip_prefix('`')
-        .and_then(|s| s.strip_suffix('`'))
-        .unwrap_or(trimmed);
-    if trimmed.is_empty() {
-        return Err("identifier is empty".to_string());
-    }
-    let mut chars = trimmed.chars();
-    let Some(first) = chars.next() else {
-        return Err("identifier is empty".to_string());
-    };
-    if !(first == '_' || first.is_ascii_alphabetic()) {
-        return Err(format!("unsupported identifier `{trimmed}`"));
-    }
-    if !chars.all(|c| c == '_' || c.is_ascii_alphanumeric()) {
-        return Err(format!("unsupported identifier `{trimmed}`"));
-    }
-    Ok(trimmed.to_ascii_lowercase())
 }
 
 #[cfg(test)]

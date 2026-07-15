@@ -24,6 +24,7 @@ use arrow::record_batch::RecordBatch;
 use iceberg::Catalog;
 use iceberg::{NamespaceIdent, TableIdent};
 
+use crate::catalog::identifier::normalize_identifier;
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::expire_snapshots::{ExpireParams, run_expire_snapshots};
 use crate::connector::iceberg::commit::remove_orphan_files::run_remove_orphan_files;
@@ -35,7 +36,6 @@ use crate::connector::iceberg::compact::{
     WholeTableRewriteResult, WholeTableRewriteTarget,
     execute_whole_table_rewrite_with_metrics_for_target,
 };
-use crate::engine::catalog::normalize_identifier;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::fs::object_store::ObjectStoreConfig;
 use crate::meta::repository::job::CreateIcebergOptimizeJobRequest;

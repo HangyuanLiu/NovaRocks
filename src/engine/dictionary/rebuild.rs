@@ -27,8 +27,8 @@ use std::sync::Arc;
 use arrow::array::{Array, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
 use arrow::datatypes::DataType;
 
+use crate::catalog::identifier::normalize_identifier;
 use crate::engine::StandaloneState;
-use crate::engine::catalog::normalize_identifier;
 use crate::engine::dictionary::model::{
     DictionaryOwner, DictionarySnapshot, DictionaryState, DictionaryValue, DictionaryWatermark,
     StarRocksTabletWatermark,

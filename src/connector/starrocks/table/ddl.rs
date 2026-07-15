@@ -34,11 +34,11 @@ use super::catalog::{
     StarRocksTableCatalog, StarRocksTableRuntime, register_starrocks_table_in_catalog,
 };
 use super::model::{StarRocksPartitionState, StoredStarRocksColumn};
+use crate::catalog::identifier::normalize_identifier;
 use crate::connector::starrocks::table::config::StarRocksTableConfig;
 use crate::connector::starrocks::table::schema_adapter::{
     build_create_tablet_request, build_tablet_schema, request_schema_from_runtime,
 };
-use crate::engine::catalog::normalize_identifier;
 use crate::engine::mv::agg_state::physical_column::StarRocksPhysicalColumn;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::starrocks_table::{

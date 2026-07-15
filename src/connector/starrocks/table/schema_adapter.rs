@@ -17,12 +17,12 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::catalog::identifier::normalize_identifier;
 use crate::connector::starrocks::table::catalog::StarRocksTableRuntime;
 use crate::connector::starrocks::table::ddl::{
     aggregation_string_to_column_aggregation, parse_keys_type, parse_starrocks_logical_type,
     to_keys_type,
 };
-use crate::engine::catalog::normalize_identifier;
 use crate::sql::parser::ast::{
     ColumnAggregation, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind,
 };

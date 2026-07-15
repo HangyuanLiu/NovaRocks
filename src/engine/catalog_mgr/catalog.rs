@@ -34,7 +34,8 @@ pub(crate) trait Catalog: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::catalog_mgr::metadata::{TableBinding, TableIdentity, TableMetadata};
+    use crate::catalog::identifier::TableIdentity;
+    use crate::engine::catalog_mgr::metadata::{TableBinding, TableMetadata};
 
     struct FixedCatalog;
 

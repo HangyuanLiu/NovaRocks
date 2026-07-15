@@ -696,7 +696,7 @@ fn wrap_insert_query_with_write_projection(
     let source_alias = "__nr_insert_src";
     let mut projection = Vec::with_capacity(write_columns.len());
     for (write_idx, column) in write_columns.iter().enumerate() {
-        let target_name = crate::engine::catalog::normalize_identifier(&column.name)?;
+        let target_name = crate::catalog::identifier::normalize_identifier(&column.name)?;
         let expr = if let Some(source_idx) = insert_idx_by_target.get(&target_name) {
             let source_expr = format!(
                 "{}.{}",
@@ -796,7 +796,7 @@ fn values_append_source_to_query_for_write(
                         }
                     } else {
                         let target_name =
-                            crate::engine::catalog::normalize_identifier(&column.name)?;
+                            crate::catalog::identifier::normalize_identifier(&column.name)?;
                         if let Some(literal) = insert_idx_by_target
                             .get(&target_name)
                             .and_then(|source_idx| row.get(*source_idx))
@@ -877,12 +877,14 @@ fn insert_column_index_by_target_name(
 ) -> Result<std::collections::HashMap<String, usize>, String> {
     let mut target_names = std::collections::HashSet::with_capacity(target_columns.len());
     for column in target_columns {
-        target_names.insert(crate::engine::catalog::normalize_identifier(&column.name)?);
+        target_names.insert(crate::catalog::identifier::normalize_identifier(
+            &column.name,
+        )?);
     }
 
     let mut mapping = std::collections::HashMap::with_capacity(insert_columns.len());
     for (idx, column) in insert_columns.iter().enumerate() {
-        let normalized = crate::engine::catalog::normalize_identifier(column)?;
+        let normalized = crate::catalog::identifier::normalize_identifier(column)?;
         if !target_names.contains(&normalized) {
             return Err(format!("unknown INSERT column `{column}`"));
         }

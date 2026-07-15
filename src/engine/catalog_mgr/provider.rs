@@ -150,13 +150,14 @@ impl CatalogProvider for CatalogMgrProvider<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::identifier::TableIdentity;
     use crate::connector::backend::{
         CatalogBackend, CreateTableRequest, ResolvedTable, TableSource,
     };
     use crate::connector::iceberg::IcebergMetadataTableType;
     use crate::engine::catalog::InMemoryCatalog;
     use crate::engine::catalog_mgr::catalog::Catalog;
-    use crate::engine::catalog_mgr::metadata::{TableBinding, TableIdentity, TableMetadata};
+    use crate::engine::catalog_mgr::metadata::{TableBinding, TableMetadata};
     use crate::sql::catalog::{
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableLookupMode,
     };

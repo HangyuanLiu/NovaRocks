@@ -23,8 +23,8 @@
 
 use std::sync::Arc;
 
+use crate::catalog::identifier::{resolve_catalog_namespace_name, resolve_catalog_table_name};
 use crate::engine::StandaloneState;
-use crate::engine::name_resolve::{resolve_iceberg_namespace_name, resolve_iceberg_table_name};
 use crate::sql::parser::ast::ObjectName;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,7 +77,8 @@ pub(crate) fn resolve_table_target(
         return Err(missing_current_catalog_error("CREATE TABLE"));
     }
 
-    let resolved = resolve_iceberg_table_name(name.clone(), current_catalog, current_database)?;
+    let resolved =
+        resolve_catalog_table_name(name.parts.as_slice(), current_catalog, current_database)?;
     Ok(TargetBackend {
         backend_name: "iceberg",
         catalog: resolved.catalog,
@@ -97,7 +98,8 @@ pub(crate) fn resolve_existing_table_target(
         return Err(missing_current_catalog_error("Table operation"));
     }
 
-    let resolved = resolve_iceberg_table_name(name.clone(), current_catalog, current_database)?;
+    let resolved =
+        resolve_catalog_table_name(name.parts.as_slice(), current_catalog, current_database)?;
     Ok(TargetBackend {
         backend_name: "iceberg",
         catalog: resolved.catalog,
@@ -116,7 +118,7 @@ pub(crate) fn resolve_namespace_target(
         return Err(missing_current_catalog_error("CREATE DATABASE"));
     }
 
-    let resolved = resolve_iceberg_namespace_name(name.clone(), current_catalog)?;
+    let resolved = resolve_catalog_namespace_name(name.parts.as_slice(), current_catalog)?;
     Ok(TargetBackend {
         backend_name: "iceberg",
         catalog: resolved.catalog,

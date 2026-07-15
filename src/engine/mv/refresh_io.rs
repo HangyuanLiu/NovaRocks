@@ -97,9 +97,9 @@ pub(crate) fn parse_iceberg_table_refs(refs: &[String]) -> Result<Vec<IcebergTab
                 ));
             };
             Ok(IcebergTableRef {
-                catalog: crate::engine::catalog::normalize_identifier(catalog)?,
-                namespace: crate::engine::catalog::normalize_identifier(namespace)?,
-                table: crate::engine::catalog::normalize_identifier(table)?,
+                catalog: crate::catalog::identifier::normalize_identifier(catalog)?,
+                namespace: crate::catalog::identifier::normalize_identifier(namespace)?,
+                table: crate::catalog::identifier::normalize_identifier(table)?,
             })
         })
         .collect()

@@ -23,9 +23,10 @@
 
 use std::sync::Arc;
 
+use crate::catalog::identifier::TableIdentity;
 use crate::connector::backend::{CatalogBackend, TableSource};
 use crate::engine::catalog_mgr::catalog::Catalog;
-use crate::engine::catalog_mgr::metadata::{TableIdentity, TableMetadata};
+use crate::engine::catalog_mgr::metadata::TableMetadata;
 use crate::engine::catalog_mgr::schema_cache::SchemaCache;
 
 pub(crate) struct IcebergCatalog {

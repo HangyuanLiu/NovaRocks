@@ -845,7 +845,7 @@ impl IcebergMvRefreshContext {
         &self,
         catalog: &str,
     ) -> Result<&IcebergCatalogEntry, String> {
-        let key = crate::engine::catalog::normalize_identifier(catalog)?;
+        let key = crate::catalog::identifier::normalize_identifier(catalog)?;
         self.base_catalog_entries.get(&key).ok_or_else(|| {
             format!("Iceberg version scan requires base catalog {catalog} in MV refresh context")
         })
@@ -1350,7 +1350,7 @@ fn collect_base_catalog_entries(
 ) -> Result<BTreeMap<String, IcebergCatalogEntry>, String> {
     let mut entries = BTreeMap::new();
     for base_ref in base_refs {
-        let key = crate::engine::catalog::normalize_identifier(&base_ref.catalog)?;
+        let key = crate::catalog::identifier::normalize_identifier(&base_ref.catalog)?;
         if entries.contains_key(&key) {
             continue;
         }

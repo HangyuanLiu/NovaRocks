@@ -40,6 +40,7 @@ use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 
 use crate::runtime::global_async_runtime::data_block_on;
 
+use crate::catalog::identifier::normalize_identifier;
 use crate::common::types::UniqueId;
 use crate::connector::iceberg::commit::{
     CommitCtx, CommitOpKind, FastAppendCommit, IcebergCommitAction, IcebergCommitCollector,
@@ -48,7 +49,7 @@ use crate::connector::iceberg::commit::{
 use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
 use crate::connector::iceberg::fs_io;
 use crate::connector::iceberg::variant_write::parse_variant_shredding_properties;
-use crate::engine::catalog::{ColumnDef, normalize_identifier};
+use crate::engine::catalog::ColumnDef;
 use crate::sql::literal::{literal_to_i128_for_integer, parse_datetime_string_to_nanos};
 use crate::sql::{ColumnAggregation, Literal, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
 

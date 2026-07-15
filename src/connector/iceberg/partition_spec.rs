@@ -20,7 +20,7 @@ use iceberg::spec::{
     UnboundPartitionSpec, UnboundPartitionSpecBuilder,
 };
 
-use crate::engine::catalog::normalize_identifier;
+use crate::catalog::identifier::normalize_identifier;
 use crate::sql::parser::ast::IcebergPartitionFieldExpr;
 
 /// First partition field id by Iceberg spec convention.

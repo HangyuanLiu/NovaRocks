@@ -449,11 +449,6 @@ const ENGINE_FILE_OWNERS: &[EngineFileOwner] = &[
         migration_task: "EBD-19",
     },
     EngineFileOwner {
-        path: "src/engine/name_resolve.rs",
-        target_owner: "catalog",
-        migration_task: "EBD-4",
-    },
-    EngineFileOwner {
         path: "src/engine/query_prep.rs",
         target_owner: "split:catalog,connector,frontend,mv,sql",
         migration_task: "EBD-5A/EBD-15/EBD-20",
@@ -535,7 +530,6 @@ const ENGINE_MODULE_DECLARATIONS: &[&str] = &[
     "src/engine/mod.rs||external|path=default|mv_maintenance",
     "src/engine/mod.rs||external|path=default|mv_rewrite_prep",
     "src/engine/mod.rs||external|path=default|mv_scheduler",
-    "src/engine/mod.rs||external|path=default|name_resolve",
     "src/engine/mod.rs||external|path=default|query_prep",
     "src/engine/mod.rs||external|path=default|query_stats",
     "src/engine/mod.rs||external|path=default|statement",
@@ -610,19 +604,8 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "src/connector/iceberg/catalog/add_files.rs",
-        &["crate::engine::catalog::normalize_identifier"],
-    ),
-    (
-        "src/connector/iceberg/catalog/backend.rs",
-        &["crate::engine::catalog::normalize_identifier"],
-    ),
-    (
         "src/connector/iceberg/catalog/registry.rs",
-        &[
-            "crate::engine::catalog::ColumnDef",
-            "crate::engine::catalog::normalize_identifier",
-        ],
+        &["crate::engine::catalog::ColumnDef"],
     ),
     (
         "src/connector/iceberg/catalog/schema_update.rs",
@@ -630,7 +613,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "crate::engine::StandaloneState",
             "crate::engine::backend_resolver::TargetBackend",
             "crate::engine::backend_resolver::resolve_existing_table_target",
-            "crate::engine::catalog::normalize_identifier",
             "crate::engine::iceberg_writer::invalidate_iceberg_caches",
             "crate::engine::statement::AddPosition",
             "crate::engine::statement::AlterIcebergPropertiesStmt",
@@ -639,10 +621,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "crate::engine::statement::IcebergSchemaChange",
             "crate::engine::statement::PropertiesOp",
         ],
-    ),
-    (
-        "src/connector/iceberg/catalog/views.rs",
-        &["crate::engine::catalog::normalize_identifier"],
     ),
     (
         "src/connector/iceberg/changes.rs",
@@ -662,14 +640,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "crate::engine::iceberg_writer::run_select_to_chunks",
             "crate::engine::mv::iceberg_refresh::write_chunks_as_iceberg_data_files",
         ],
-    ),
-    (
-        "src/connector/iceberg/partition_spec.rs",
-        &["crate::engine::catalog::normalize_identifier"],
-    ),
-    (
-        "src/connector/iceberg/variant_write.rs",
-        &["crate::engine::catalog::normalize_identifier"],
     ),
     (
         "src/connector/mod.rs",
@@ -727,7 +697,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "crate::engine::catalog::ScanSource",
             "crate::engine::catalog::StarRocksTabletRef",
             "crate::engine::catalog::TableDef",
-            "crate::engine::catalog::normalize_identifier",
         ],
     ),
     (
@@ -735,7 +704,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
         &[
             "crate::engine::StandaloneState",
             "crate::engine::StatementResult",
-            "crate::engine::catalog::normalize_identifier",
             "crate::engine::mv::agg_state::physical_column::StarRocksPhysicalColumn",
         ],
     ),
@@ -787,7 +755,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
         &[
             "crate::engine::StandaloneState",
             "crate::engine::StatementResult",
-            "crate::engine::catalog::normalize_identifier",
             "crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls::from",
             "crate::engine::mv::agg_state::mv_agg_state::ROW_ID_COLUMN",
             "crate::engine::mv::agg_state::mv_agg_state::aggregate_input_types_from_resolved_query",
@@ -815,10 +782,8 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
     (
         "src/connector/starrocks/table/mv_refresh.rs",
         &[
-            "crate::engine::ResolvedLocalTableName",
             "crate::engine::StandaloneState",
             "crate::engine::StatementResult",
-            "crate::engine::catalog::normalize_identifier",
             "crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls::from",
             "crate::engine::mv::agg_state::mv_agg_state::aggregate_input_types_from_resolved_query",
             "crate::engine::mv::agg_state::mv_agg_state::build_aggregate_mv_layout_with_input_types",
@@ -846,18 +811,12 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
         &["crate::engine::StandaloneState"],
     ),
     (
-        "src/connector/starrocks/table/schema_adapter.rs",
-        &["crate::engine::catalog::normalize_identifier"],
-    ),
-    (
         "src/connector/starrocks/table/txn.rs",
         &[
-            "crate::engine::ResolvedLocalTableName",
             "crate::engine::StandaloneState",
             "crate::engine::StatementResult",
             "crate::engine::build_local_insert_batch",
             "crate::engine::catalog::ColumnDef",
-            "crate::engine::catalog::normalize_identifier",
             "crate::engine::dictionary::maintenance::mark_starrocks_table_stale",
             "crate::engine::execute_query",
             "crate::engine::mv::agg_state::mv_agg_state",
@@ -981,7 +940,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "crate::engine::StandaloneOptions",
             "crate::engine::StatementResult",
             "crate::engine::catalog::DEFAULT_DATABASE",
-            "crate::engine::catalog::normalize_identifier",
             "crate::engine::mv_maintenance::MaintenanceCoordinatorConfig",
             "crate::engine::mv_maintenance::start_maintenance_coordinator_for_server",
             "crate::engine::mv_scheduler::RefreshCoordinatorConfig",
@@ -995,10 +953,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
     (
         "src/sql/optimizer/rewrite/required_columns.rs",
         &["crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN"],
-    ),
-    (
-        "src/sql/parser/dialect/create_table.rs",
-        &["crate::engine::catalog::normalize_identifier"],
     ),
     (
         "src/sql/planner/imv_rewrite/action_column.rs",
@@ -1957,6 +1911,18 @@ fn ebd_3c_all_source_alias_surfaces(source: &GuardSource) -> BTreeSet<String> {
         .collect()
 }
 
+fn is_legacy_ebd_4a_owner_path(path: &[String]) -> bool {
+    let segments = path.iter().map(String::as_str).collect::<Vec<_>>();
+    segments.starts_with(&["crate", "engine", "catalog", "normalize_identifier"])
+        || segments.starts_with(&["crate", "engine", "ResolvedLocalTableName"])
+        || segments.starts_with(&["crate", "engine", "name_resolve"])
+}
+
+fn is_catalog_identifier_path(path: &[String]) -> bool {
+    let segments = path.iter().map(String::as_str).collect::<Vec<_>>();
+    segments.starts_with(&["crate", "catalog", "identifier"])
+}
+
 fn is_standalone_state_path(path: &[String]) -> bool {
     is_engine_path(path) && path.get(2).is_some_and(|item| item == "StandaloneState")
 }
@@ -2529,7 +2495,7 @@ fn baseline_arrays_are_canonical() -> bool {
 fn ebd_1_engine_migration_firewall_matches_source_tree() {
     let actual = current_source_tree_snapshot();
     assert!(
-        actual.engine_files.len() >= 89,
+        actual.engine_files.len() >= 88,
         "EBD-1 must scan the full engine tree, found only {} files",
         actual.engine_files.len()
     );
@@ -3491,6 +3457,681 @@ trait PrivateFactoryDefaults {
     assert!(
         ebd_3c_all_source_alias_surfaces(&clean).is_empty(),
         "generic parameters shadow module aliases and private consumers stay allowed"
+    );
+}
+
+const EBD_4A_OWNER: &str = "src/catalog/identifier.rs";
+const EBD_4A_CANONICAL_STRUCTS: &[&str] = &[
+    "CatalogNamespaceIdentity",
+    "LocalTableIdentity",
+    "TableIdentity",
+];
+const EBD_4A_CANONICAL_FUNCTIONS: &[&str] = &[
+    "normalize_identifier",
+    "normalize_optional_identifier",
+    "resolve_catalog_namespace_name",
+    "resolve_catalog_table_name",
+    "resolve_local_table_name",
+];
+
+fn ebd_4a_dependency_crate_roots_from_manifest(manifest: &toml::Value) -> BTreeSet<String> {
+    let mut roots = BTreeSet::new();
+    let mut collect = |table: &toml::map::Map<String, toml::Value>| {
+        for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+            let Some(dependencies) = table.get(section).and_then(toml::Value::as_table) else {
+                continue;
+            };
+            roots.extend(dependencies.keys().map(|name| name.replace('-', "_")));
+        }
+    };
+    if let Some(root) = manifest.as_table() {
+        collect(root);
+        if let Some(targets) = root.get("target").and_then(toml::Value::as_table) {
+            for target in targets.values().filter_map(toml::Value::as_table) {
+                collect(target);
+            }
+        }
+    }
+    roots
+}
+
+fn ebd_4a_dependency_crate_roots() -> BTreeSet<String> {
+    let manifest = fs::read_to_string(Path::new(manifest_dir()).join("Cargo.toml"))
+        .expect("read Cargo.toml for EBD-4A dependency audit");
+    let manifest = manifest
+        .parse::<toml::Value>()
+        .expect("parse Cargo.toml for EBD-4A dependency audit");
+    ebd_4a_dependency_crate_roots_from_manifest(&manifest)
+}
+
+fn ebd_4a_allowed_catalog_path(path: &[String]) -> bool {
+    path == ["crate"] || (path.len() >= 2 && path[0] == "crate" && path[1] == "catalog")
+}
+
+fn ebd_4a_audit_catalog_dependencies(source: &GuardSource) -> BTreeSet<String> {
+    struct ExternalPathAudit<'a> {
+        dependency_roots: &'a BTreeSet<String>,
+        source: &'a str,
+        violations: BTreeSet<String>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for ExternalPathAudit<'_> {
+        fn visit_item_extern_crate(&mut self, item: &'ast syn::ItemExternCrate) {
+            let root = item.ident.to_string();
+            if !matches!(root.as_str(), "std" | "core" | "alloc") {
+                self.violations.insert(format!(
+                    "catalog-forbidden-external-crate: {}|{root}",
+                    self.source
+                ));
+            }
+            syn::visit::visit_item_extern_crate(self, item);
+        }
+
+        fn visit_path(&mut self, path: &'ast syn::Path) {
+            let segments = path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>();
+            if let Some(root) = segments.first()
+                && self.dependency_roots.contains(root)
+                && !matches!(root.as_str(), "std" | "core" | "alloc")
+            {
+                self.violations.insert(format!(
+                    "catalog-forbidden-external-path: {}|{}",
+                    self.source,
+                    segments.join("::")
+                ));
+            }
+            if segments.first().is_some_and(|segment| segment == "crate")
+                && !ebd_4a_allowed_catalog_path(&segments)
+            {
+                self.violations.insert(format!(
+                    "catalog-forbidden-crate-path: {}|{}",
+                    self.source,
+                    segments.join("::")
+                ));
+            }
+            syn::visit::visit_path(self, path);
+        }
+    }
+
+    let sanitized = rust_lexically_sanitized(&source.text);
+    let dependency_roots = ebd_4a_dependency_crate_roots();
+    let aliases = super::rust_scoped_aliases(&sanitized);
+    let mut violations = BTreeSet::new();
+
+    if rust_source_tokens(&sanitized)
+        .iter()
+        .any(|token| token.text == "StandaloneState")
+    {
+        violations.insert(format!(
+            "catalog-forbidden-StandaloneState-token: {}",
+            source.path
+        ));
+    }
+
+    for import in super::rust_raw_use_statements(&sanitized) {
+        let resolved = rust_resolve_scoped_paths(
+            &import.path.segments,
+            &import.inline_modules,
+            &aliases,
+            &mut BTreeSet::new(),
+            0,
+        )
+        .unwrap_or_else(|| {
+            vec![RustScopedUsePath {
+                segments: import.path.segments,
+                inline_modules: import.inline_modules,
+            }]
+        });
+        for path in resolved {
+            let root = path.segments.first().map(String::as_str);
+            if matches!(root, Some("std" | "core" | "alloc")) {
+                continue;
+            }
+            if matches!(root, Some("crate" | "self" | "super")) {
+                let canonical = rust_canonical_path_segments_in_scope(
+                    &path.segments,
+                    &source.path,
+                    &path.inline_modules,
+                );
+                if canonical
+                    .as_deref()
+                    .is_none_or(|canonical| !ebd_4a_allowed_catalog_path(canonical))
+                {
+                    violations.insert(format!(
+                        "catalog-forbidden-use: {}|{}",
+                        source.path,
+                        path.segments.join("::")
+                    ));
+                }
+                continue;
+            }
+            violations.insert(format!(
+                "catalog-forbidden-use: {}|{}",
+                source.path,
+                path.segments.join("::")
+            ));
+        }
+    }
+
+    for path in rust_all_source_canonical_paths(&source.text, &source.path)
+        .into_iter()
+        .filter(|path| path.first().is_some_and(|segment| segment == "crate"))
+        .filter(|path| !ebd_4a_allowed_catalog_path(path))
+    {
+        violations.insert(format!(
+            "catalog-forbidden-crate-path: {}|{}",
+            source.path,
+            path.join("::")
+        ));
+    }
+
+    if let Ok(file) = syn::parse_file(&source.text) {
+        let mut audit = ExternalPathAudit {
+            dependency_roots: &dependency_roots,
+            source: &source.path,
+            violations: BTreeSet::new(),
+        };
+        syn::visit::Visit::visit_file(&mut audit, &file);
+        violations.extend(audit.violations);
+    } else {
+        violations.insert(format!("catalog-source-parse-failed: {}", source.path));
+    }
+    violations
+}
+
+fn ebd_4a_audit_owner_items(source: &GuardSource) -> BTreeSet<String> {
+    let Ok(file) = syn::parse_file(&source.text) else {
+        return BTreeSet::from([format!("catalog-owner-parse-failed: {}", source.path)]);
+    };
+    let structs = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Struct(item) => Some(item.ident.to_string()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let functions = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Fn(item) => Some(item.sig.ident.to_string()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let mut violations = BTreeSet::new();
+    for item in EBD_4A_CANONICAL_STRUCTS {
+        if !structs.contains(*item) {
+            violations.insert(format!("catalog-owner-struct-missing: {item}"));
+        }
+    }
+    for item in EBD_4A_CANONICAL_FUNCTIONS {
+        if !functions.contains(*item) {
+            violations.insert(format!("catalog-owner-function-missing: {item}"));
+        }
+    }
+    if functions.contains("resolve_iceberg_table_name_explicit") {
+        violations.insert(
+            "catalog-owner-zero-caller-helper-present: resolve_iceberg_table_name_explicit"
+                .to_string(),
+        );
+    }
+    violations
+}
+
+fn ebd_4a_audit_exact_legacy_owner_definitions(sources: &[GuardSource]) -> BTreeSet<String> {
+    struct LegacyDefinitionAudit<'a> {
+        source_path: &'a str,
+        item_name: &'a str,
+        allowed_kinds: &'a [&'a str],
+        violations: BTreeSet<String>,
+    }
+
+    impl LegacyDefinitionAudit<'_> {
+        fn reject(&mut self, kind: &str, name: &syn::Ident) {
+            if name == self.item_name && self.allowed_kinds.contains(&kind) {
+                self.violations.insert(format!(
+                    "catalog-legacy-owner-definition: {}|{kind} {}",
+                    self.source_path, self.item_name
+                ));
+            }
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for LegacyDefinitionAudit<'_> {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            self.reject("function", &item.sig.ident);
+            syn::visit::visit_item_fn(self, item);
+        }
+
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            self.reject("struct", &item.ident);
+            syn::visit::visit_item_struct(self, item);
+        }
+
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            self.reject("type", &item.ident);
+            syn::visit::visit_item_type(self, item);
+        }
+    }
+
+    let mut violations = BTreeSet::new();
+    for (source_path, item_name, allowed_kinds) in [
+        (
+            "src/engine/catalog.rs",
+            "normalize_identifier",
+            &["function", "type"] as &[&str],
+        ),
+        (
+            "src/engine/catalog_mgr/metadata.rs",
+            "TableIdentity",
+            &["struct", "type"] as &[&str],
+        ),
+        (
+            "src/engine/mod.rs",
+            "ResolvedLocalTableName",
+            &["struct", "type"] as &[&str],
+        ),
+    ] {
+        let Some(source) = sources.iter().find(|source| source.path == source_path) else {
+            continue;
+        };
+        let Ok(file) = syn::parse_file(&source.text) else {
+            violations.insert(format!("catalog-legacy-owner-parse-failed: {source_path}"));
+            continue;
+        };
+        let mut audit = LegacyDefinitionAudit {
+            source_path,
+            item_name,
+            allowed_kinds,
+            violations: BTreeSet::new(),
+        };
+        syn::visit::Visit::visit_file(&mut audit, &file);
+        violations.extend(audit.violations);
+    }
+    violations
+}
+
+fn ebd_4a_audit_legacy_paths_and_forwarding(sources: &[GuardSource]) -> BTreeSet<String> {
+    let mut violations = BTreeSet::new();
+    for source in sources {
+        for path in rust_all_source_canonical_paths(&source.text, &source.path)
+            .into_iter()
+            .filter(|path| is_legacy_ebd_4a_owner_path(path))
+        {
+            violations.insert(format!(
+                "catalog-legacy-path: {}|{}",
+                source.path,
+                path.join("::")
+            ));
+        }
+
+        if source.path == EBD_4A_OWNER {
+            continue;
+        }
+        let sanitized = rust_lexically_sanitized(&source.text);
+        let aliases = super::rust_scoped_aliases(&sanitized);
+        for import in super::rust_raw_use_statements(&sanitized)
+            .into_iter()
+            .filter(|import| import.visibility != "private")
+        {
+            let Some(resolved) = resolve_forwarding_paths(
+                &import.path.segments,
+                &source.path,
+                &import.inline_modules,
+                &aliases,
+                &mut BTreeSet::new(),
+                0,
+            ) else {
+                continue;
+            };
+            for target in resolved {
+                let Some(canonical) = rust_canonical_path_segments_in_scope(
+                    &target.segments,
+                    &source.path,
+                    &target.inline_modules,
+                ) else {
+                    continue;
+                };
+                if is_catalog_identifier_path(&canonical) {
+                    violations.insert(format!(
+                        "catalog-identifier-forwarding-reexport: {}|{}|{}",
+                        source.path,
+                        import.visibility,
+                        canonical.join("::")
+                    ));
+                }
+            }
+        }
+    }
+    violations
+}
+
+#[test]
+fn ebd_4a_catalog_identifier_boundary_is_ast_free() {
+    let repo = Path::new(manifest_dir());
+    let src = src_dir();
+    let mut sources = Vec::new();
+    for root in [&src, &repo.join("tests")] {
+        for path in rs_files(root) {
+            let source = rel(&path);
+            let text = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("failed to read {source}: {error}"));
+            sources.push(GuardSource::new(&source, &text));
+        }
+    }
+
+    let mut violations = BTreeSet::new();
+    let owner = sources.iter().find(|source| source.path == EBD_4A_OWNER);
+    if let Some(owner) = owner {
+        violations.extend(ebd_4a_audit_owner_items(owner));
+    } else {
+        violations.insert(format!("catalog-owner-missing: {EBD_4A_OWNER}"));
+    }
+    for source in sources
+        .iter()
+        .filter(|source| source.path.starts_with("src/catalog/"))
+    {
+        violations.extend(ebd_4a_audit_catalog_dependencies(source));
+    }
+
+    let old_owner = repo.join("src/engine/name_resolve.rs");
+    if old_owner.exists() {
+        violations
+            .insert("catalog-old-owner-still-present: src/engine/name_resolve.rs".to_string());
+    }
+    if let Some(engine_mod) = sources
+        .iter()
+        .find(|source| source.path == "src/engine/mod.rs")
+        && rust_module_items(&engine_mod.text)
+            .iter()
+            .any(|item| item.name == "name_resolve")
+    {
+        violations.insert(
+            "catalog-old-module-still-declared: src/engine/mod.rs|name_resolve".to_string(),
+        );
+    }
+    violations.extend(ebd_4a_audit_exact_legacy_owner_definitions(&sources));
+    violations.extend(ebd_4a_audit_legacy_paths_and_forwarding(&sources));
+
+    assert!(
+        violations.is_empty(),
+        "EBD-4A catalog identifier boundary failed:\n{}",
+        violations.into_iter().collect::<Vec<_>>().join("\n")
+    );
+}
+
+#[test]
+fn ebd_4a_detector_rejects_dependencies_and_allows_only_catalog_core() {
+    let target_manifest = r#"
+[dependencies]
+top-level = "1"
+[target.'cfg(unix)'.dependencies]
+target-only = "1"
+[target.'cfg(windows)'.dev-dependencies]
+target-dev = "1"
+"#
+    .parse::<toml::Value>()
+    .expect("parse target dependency fixture");
+    assert_eq!(
+        ebd_4a_dependency_crate_roots_from_manifest(&target_manifest),
+        BTreeSet::from([
+            "target_dev".to_string(),
+            "target_only".to_string(),
+            "top_level".to_string(),
+        ])
+    );
+
+    let valid = GuardSource::new(
+        EBD_4A_OWNER,
+        r###"
+use std::collections::BTreeSet;
+use core::fmt;
+use alloc::string::String;
+use crate::catalog::identifier::TableIdentity;
+use super::identifier::LocalTableIdentity;
+
+pub(crate) struct CrateVisible;
+
+// use crate::engine::StandaloneState;
+const TEXT: &str = "iceberg::spec::Literal crate::sql::SqlType";
+const RAW: &str = r#"arrow::array::ArrayRef"#;
+fn local(_: TableIdentity, _: LocalTableIdentity) { let _ = BTreeSet::<String>::new(); }
+"###,
+    );
+    let valid_violations = ebd_4a_audit_catalog_dependencies(&valid);
+    assert!(
+        valid_violations.is_empty(),
+        "valid catalog-core fixture was rejected: {valid_violations:?}"
+    );
+
+    let invalid = [
+        (
+            "use crate::engine::StandaloneState;",
+            "catalog-forbidden-StandaloneState-token",
+        ),
+        ("use iceberg::spec::Literal;", "catalog-forbidden-use"),
+        (
+            "use iceberg::{spec::Literal as Lit};",
+            "catalog-forbidden-use",
+        ),
+        (
+            "fn bad() { let _: Option<arrow::array::ArrayRef> = None; }",
+            "catalog-forbidden-external-path",
+        ),
+        (
+            "fn bad() { let _: Option<sqlparser::ast::ObjectName> = None; }",
+            "catalog-forbidden-external-path",
+        ),
+        (
+            "#[cfg(test)] mod tests { use crate::connector::ConnectorRegistry; }",
+            "catalog-forbidden",
+        ),
+        (
+            "mod nested { use super::super::super::engine::StandaloneState; }",
+            "catalog-forbidden-StandaloneState-token",
+        ),
+        (
+            "struct StandaloneState; fn bad(_: StandaloneState) {}",
+            "catalog-forbidden-StandaloneState-token",
+        ),
+    ];
+    for (text, expected) in invalid {
+        let source = GuardSource::new(EBD_4A_OWNER, text);
+        let violations = ebd_4a_audit_catalog_dependencies(&source);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "dependency fixture did not produce {expected}: {text}; got {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn ebd_4a_detector_requires_the_exact_canonical_owner_items() {
+    let valid = GuardSource::new(
+        EBD_4A_OWNER,
+        r#"
+pub(crate) struct LocalTableIdentity;
+pub(crate) struct CatalogNamespaceIdentity;
+pub(crate) struct TableIdentity;
+pub(crate) fn normalize_identifier() {}
+pub(crate) fn normalize_optional_identifier() {}
+pub(crate) fn resolve_local_table_name() {}
+pub(crate) fn resolve_catalog_namespace_name() {}
+pub(crate) fn resolve_catalog_table_name() {}
+"#,
+    );
+    assert!(ebd_4a_audit_owner_items(&valid).is_empty());
+
+    let missing = GuardSource::new(
+        EBD_4A_OWNER,
+        &valid.text.replace("pub(crate) struct TableIdentity;", ""),
+    );
+    assert_eq!(
+        ebd_4a_audit_owner_items(&missing),
+        BTreeSet::from(["catalog-owner-struct-missing: TableIdentity".to_string()])
+    );
+
+    let forbidden = GuardSource::new(
+        EBD_4A_OWNER,
+        &format!(
+            "{}\npub(crate) fn resolve_iceberg_table_name_explicit() {{}}",
+            valid.text
+        ),
+    );
+    assert_eq!(
+        ebd_4a_audit_owner_items(&forbidden),
+        BTreeSet::from([
+            "catalog-owner-zero-caller-helper-present: resolve_iceberg_table_name_explicit"
+                .to_string(),
+        ])
+    );
+}
+
+#[test]
+fn ebd_4a_detector_rejects_only_the_exact_legacy_owner_definitions() {
+    let legacy = [
+        GuardSource::new(
+            "src/engine/catalog.rs",
+            "mod nested { pub(crate) fn normalize_identifier(_: &str) {} }",
+        ),
+        GuardSource::new(
+            "src/engine/catalog_mgr/metadata.rs",
+            "pub(crate) type TableIdentity = crate::catalog::identifier::TableIdentity;",
+        ),
+        GuardSource::new(
+            "src/engine/mod.rs",
+            "mod nested { pub(crate) type ResolvedLocalTableName = crate::catalog::identifier::LocalTableIdentity; }",
+        ),
+    ];
+    assert_eq!(
+        ebd_4a_audit_exact_legacy_owner_definitions(&legacy),
+        BTreeSet::from([
+            "catalog-legacy-owner-definition: src/engine/catalog.rs|function normalize_identifier"
+                .to_string(),
+            "catalog-legacy-owner-definition: src/engine/catalog_mgr/metadata.rs|type TableIdentity"
+                .to_string(),
+            "catalog-legacy-owner-definition: src/engine/mod.rs|type ResolvedLocalTableName"
+                .to_string(),
+        ])
+    );
+
+    let unrelated = [
+        GuardSource::new(
+            "src/sql/optimizer/example.rs",
+            "fn normalize_identifier(_: &str) {}",
+        ),
+        GuardSource::new(
+            "src/connector/starrocks/txn_log.rs",
+            "struct TableIdentity;",
+        ),
+    ];
+    assert!(ebd_4a_audit_exact_legacy_owner_definitions(&unrelated).is_empty());
+}
+
+#[test]
+fn ebd_4a_detector_rejects_legacy_paths_and_non_private_forwarding() {
+    let sources = vec![
+        GuardSource::new(
+            "src/catalog/mod.rs",
+            r###"
+use crate::catalog::identifier::TableIdentity;
+// pub use crate::catalog::identifier::TableIdentity;
+const TEXT: &str = "pub(crate) use crate::catalog::identifier::TableIdentity";
+const RAW: &str = r#"crate::engine::catalog::normalize_identifier"#;
+"###,
+        ),
+        GuardSource::new(
+            "src/catalog/legacy.rs",
+            r#"
+pub use crate::catalog::identifier::TableIdentity;
+pub(crate) use crate::catalog::identifier::{LocalTableIdentity, resolve_local_table_name};
+pub(super) use crate::catalog::identifier::CatalogNamespaceIdentity as Namespace;
+mod nested {
+    pub(crate) use crate::catalog::identifier::normalize_identifier;
+}
+#[cfg(test)]
+mod tests {
+    pub(super) use crate::catalog::identifier::TableIdentity as TestIdentity;
+}
+"#,
+        ),
+        GuardSource::new(
+            "src/server/example.rs",
+            r#"
+use crate::engine::catalog::normalize_identifier;
+use crate::engine::{ResolvedLocalTableName as Local, name_resolve::*};
+#[cfg(test)]
+mod tests {
+    use crate::engine::name_resolve as legacy;
+    fn inspect() { let _ = legacy::resolve_local_table_name; }
+}
+"#,
+        ),
+        GuardSource::new(
+            "src/catalog/nested_forward.rs",
+            "mod nested { pub(crate) use crate::catalog::identifier::normalize_identifier; }",
+        ),
+        GuardSource::new(
+            "src/catalog/test_forward.rs",
+            "#[cfg(test)] mod tests { pub(super) use crate::catalog::identifier::TableIdentity as TestIdentity; }",
+        ),
+        GuardSource::new(
+            "src/server/test_legacy.rs",
+            "#[cfg(test)] mod tests { use crate::engine::name_resolve as legacy; fn inspect() { let _ = legacy::resolve_local_table_name; } }",
+        ),
+    ];
+    let violations = ebd_4a_audit_legacy_paths_and_forwarding(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|item| item.contains("|pub|crate::catalog::identifier::TableIdentity"))
+    );
+    assert!(
+        violations.iter().any(|item| item
+            .contains("|pub(crate)|crate::catalog::identifier::LocalTableIdentity"))
+    );
+    assert!(violations.iter().any(|item| {
+        item.contains("|pub(super)|crate::catalog::identifier::CatalogNamespaceIdentity")
+    }));
+    assert!(violations.iter().any(
+        |item| item.contains("src/catalog/legacy.rs") && item.contains("normalize_identifier")
+    ));
+    assert!(violations.iter().any(|item| {
+        item.contains("src/catalog/nested_forward.rs") && item.contains("normalize_identifier")
+    }));
+    assert!(violations.iter().any(|item| {
+        item.contains("src/catalog/test_forward.rs") && item.contains("TableIdentity")
+    }));
+    assert!(
+        violations
+            .iter()
+            .any(|item| item.contains("src/server/example.rs|crate::engine::name_resolve"))
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|item| { item.contains("src/server/test_legacy.rs|crate::engine::name_resolve") })
+    );
+
+    let allowed_local_helpers = [
+        GuardSource::new(
+            "src/sql/optimizer/rbo/rules/example.rs",
+            "fn normalize_identifier(raw: &str) -> String { raw.to_string() }",
+        ),
+        GuardSource::new(
+            "src/connector/starrocks/txn_log.rs",
+            "struct TableIdentity { table: String }",
+        ),
+    ];
+    assert!(
+        ebd_4a_audit_legacy_paths_and_forwarding(&allowed_local_helpers).is_empty(),
+        "unrelated local helpers must not be treated as legacy EBD-4A owners"
     );
 }
 

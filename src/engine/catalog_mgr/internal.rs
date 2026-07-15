@@ -21,9 +21,10 @@
 
 use std::sync::{Arc, RwLock};
 
+use crate::catalog::identifier::TableIdentity;
 use crate::engine::catalog::InMemoryCatalog;
 use crate::engine::catalog_mgr::catalog::Catalog;
-use crate::engine::catalog_mgr::metadata::{TableIdentity, TableMetadata};
+use crate::engine::catalog_mgr::metadata::TableMetadata;
 
 pub(crate) struct InternalCatalog {
     name: String,
