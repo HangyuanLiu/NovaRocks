@@ -986,7 +986,7 @@ pub(crate) fn literal_to_sql_for_arrow_type(
             Literal::String(value) | Literal::Date(value),
             DataType::Binary | DataType::LargeBinary,
         ) => {
-            let bytes = crate::engine::sql_expr::latin1_string_to_bytes(value)?;
+            let bytes = crate::sql::literal::latin1_string_to_bytes(value)?;
             Ok(format!("X'{}'", hex::encode_upper(bytes)))
         }
         (Literal::Array(items), DataType::List(item_field)) => {
@@ -1882,7 +1882,7 @@ mod tests {
     #[test]
     fn append_source_to_query_values_renders_binary_literals_as_hex() {
         let target_columns = vec![test_column("payload", DataType::Binary, None)];
-        let packed = crate::engine::sql_expr::bytes_to_latin1_string(&[0xab, 0x01]);
+        let packed = crate::sql::literal::bytes_to_latin1_string(&[0xab, 0x01]);
         let source =
             InsertSource::Values(vec![vec![crate::sql::parser::ast::Literal::String(packed)]]);
 

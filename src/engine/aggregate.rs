@@ -26,8 +26,8 @@ use std::collections::HashMap;
 use arrow::record_batch::RecordBatch;
 
 use crate::engine::catalog::normalize_identifier;
-use crate::engine::sql_expr::{LiteralKey, compare_literals, literal_from_batch, literal_to_key};
 use crate::sql::catalog::ColumnDef;
+use crate::sql::literal::{LiteralKey, compare_literals, literal_from_batch, literal_to_key};
 use crate::sql::parser::ast::{ColumnAggregation, Literal, TableKeyDesc, TableKeyKind};
 
 pub(crate) fn merge_aggregate_table_rows_if_needed(

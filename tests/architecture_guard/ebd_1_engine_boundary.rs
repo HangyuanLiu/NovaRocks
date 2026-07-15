@@ -5,8 +5,9 @@ use std::path::{Component, Path, PathBuf};
 use super::{
     RustScopedAliases, RustScopedUsePath, cfg_attr_generated_path_values,
     cfg_attribute_requires_test, decode_rust_string_literal, manifest_dir, path_attribute_value,
-    production_rs_files_from_entries, rel, rs_files, rust_canonical_path_segments_in_scope,
-    rust_module_items, rust_production_canonical_paths, rust_production_scoped_aliases,
+    production_rs_files_from_entries, rel, rs_files, rust_all_source_canonical_paths,
+    rust_canonical_path_segments_in_scope, rust_lexically_sanitized, rust_module_items,
+    rust_production_canonical_paths, rust_production_scoped_aliases,
     rust_raw_production_use_statements, rust_resolve_scoped_paths, rust_sanitized_production_text,
     rust_source_module_segments, rust_source_tokens, src_dir,
 };
@@ -457,11 +458,6 @@ const ENGINE_FILE_OWNERS: &[EngineFileOwner] = &[
         migration_task: "EBD-3A",
     },
     EngineFileOwner {
-        path: "src/engine/procedure.rs",
-        target_owner: "sql",
-        migration_task: "EBD-2",
-    },
-    EngineFileOwner {
         path: "src/engine/query_options.rs",
         target_owner: "split:frontend,runtime",
         migration_task: "EBD-3B",
@@ -475,11 +471,6 @@ const ENGINE_FILE_OWNERS: &[EngineFileOwner] = &[
         path: "src/engine/query_stats.rs",
         target_owner: "statistics",
         migration_task: "EBD-7",
-    },
-    EngineFileOwner {
-        path: "src/engine/sql_expr.rs",
-        target_owner: "sql",
-        migration_task: "EBD-2",
     },
     EngineFileOwner {
         path: "src/engine/statement.rs",
@@ -560,11 +551,9 @@ const ENGINE_MODULE_DECLARATIONS: &[&str] = &[
     "src/engine/mod.rs||external|path=default|mv_scheduler",
     "src/engine/mod.rs||external|path=default|name_resolve",
     "src/engine/mod.rs||external|path=default|parquet",
-    "src/engine/mod.rs||external|path=default|procedure",
     "src/engine/mod.rs||external|path=default|query_options",
     "src/engine/mod.rs||external|path=default|query_prep",
     "src/engine/mod.rs||external|path=default|query_stats",
-    "src/engine/mod.rs||external|path=default|sql_expr",
     "src/engine/mod.rs||external|path=default|statement",
     "src/engine/mod.rs||external|path=default|statistics",
     "src/engine/mod.rs||external|path=default|stream_load",
@@ -651,8 +640,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "crate::engine::catalog::ColumnDef",
             "crate::engine::catalog::normalize_identifier",
             "crate::engine::parquet::parse_datetime_string_to_nanos",
-            "crate::engine::sql_expr::latin1_string_to_bytes",
-            "crate::engine::sql_expr::literal_to_i128_for_integer",
         ],
     ),
     (
@@ -1035,7 +1022,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "crate::engine::mv_scheduler::RefreshCoordinatorConfig",
             "crate::engine::mv_scheduler::start_refresh_coordinator_for_server",
             "crate::engine::query_options::StandaloneQueryOptions",
-            "crate::engine::sql_expr::literal_from_batch",
             "crate::engine::statement::looks_like_show_alter_table_optimize",
             "crate::engine::statement::looks_like_show_create_table",
             "crate::engine::statement::looks_like_show_create_view",
@@ -1416,6 +1402,13 @@ impl GuardSource {
 
 fn is_engine_path(path: &[String]) -> bool {
     path.len() >= 2 && path[0] == "crate" && path[1] == "engine"
+}
+
+fn is_legacy_ebd_2_owner_path(path: &[String]) -> bool {
+    path.len() >= 3
+        && path[0] == "crate"
+        && path[1] == "engine"
+        && matches!(path[2].as_str(), "sql_expr" | "procedure")
 }
 
 fn is_standalone_state_path(path: &[String]) -> bool {
@@ -2039,6 +2032,150 @@ fn ebd_1_engine_migration_firewall_matches_source_tree() {
         violations.is_empty(),
         "EBD-1 engine migration firewall failed:\n{}",
         violations.join("\n")
+    );
+}
+
+#[test]
+fn ebd_2_sql_literal_tools_have_canonical_owners() {
+    const NEW_OWNERS: &[&str] = &["src/sql/literal.rs", "src/sql/parser/procedure.rs"];
+    const OLD_OWNERS: &[&str] = &["src/engine/sql_expr.rs", "src/engine/procedure.rs"];
+    const FORBIDDEN_IDENTIFIERS: &[&str] = &[
+        "Chunk",
+        "QueryResult",
+        "QueryResultColumn",
+        "StandaloneSession",
+        "StandaloneState",
+        "record_batch_to_chunk",
+    ];
+
+    let repo = Path::new(manifest_dir());
+    let src = src_dir();
+    let mut violations = BTreeSet::new();
+
+    for owner in NEW_OWNERS {
+        let path = repo.join(owner);
+        if !path.is_file() {
+            violations.insert(format!("new-owner-missing: {owner}"));
+            continue;
+        }
+
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {owner}: {error}"));
+        let all_source = rust_lexically_sanitized(&text);
+        for dependency in rust_all_source_canonical_paths(&text, owner)
+            .into_iter()
+            .filter(|dependency| is_engine_path(dependency))
+        {
+            violations.insert(format!(
+                "new-owner-engine-dependency: {owner}|{}",
+                dependency.join("::")
+            ));
+        }
+        for identifier in rust_source_tokens(&all_source)
+            .into_iter()
+            .map(|token| token.text)
+            .filter(|identifier| FORBIDDEN_IDENTIFIERS.contains(&identifier.as_str()))
+        {
+            violations.insert(format!(
+                "new-owner-forbidden-identifier: {owner}|{identifier}"
+            ));
+        }
+    }
+
+    for owner in OLD_OWNERS {
+        if repo.join(owner).exists() {
+            violations.insert(format!("old-owner-still-present: {owner}"));
+        }
+    }
+
+    for path in production_rs_files_from_entries(&src, &[src.join("lib.rs"), src.join("main.rs")]) {
+        let source = rel(&path);
+        if OLD_OWNERS.contains(&source.as_str()) {
+            continue;
+        }
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {source}: {error}"));
+        let production = rust_sanitized_production_text(&text);
+        for dependency in rust_production_canonical_paths(&production, &source)
+            .into_iter()
+            .filter(|dependency| is_legacy_ebd_2_owner_path(dependency))
+        {
+            violations.insert(format!(
+                "old-canonical-path: {source}|{}",
+                dependency.join("::")
+            ));
+        }
+    }
+
+    for path in rs_files(&src) {
+        let source = rel(&path);
+        if OLD_OWNERS.contains(&source.as_str()) {
+            continue;
+        }
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {source}: {error}"));
+        for dependency in rust_all_source_canonical_paths(&text, &source)
+            .into_iter()
+            .filter(|dependency| is_legacy_ebd_2_owner_path(dependency))
+        {
+            violations.insert(format!(
+                "old-canonical-path: {source}|{}",
+                dependency.join("::")
+            ));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "EBD-2 SQL/literal owner boundary failed:\n{}",
+        violations.into_iter().collect::<Vec<_>>().join("\n")
+    );
+}
+
+#[test]
+fn ebd_2_all_source_detector_covers_test_aliases_and_ignores_noise() {
+    let source = r#"
+// use crate::engine::sql_expr as legacy_literal;
+const DOCUMENTATION: &str = "crate::engine::sql_expr::literal_from_batch";
+
+#[cfg(test)]
+mod tests {
+    use crate::engine::procedure as legacy;
+
+    fn parser_model() {
+        let _ = legacy::CallProcedureStmt::default;
+    }
+}
+"#;
+
+    let production = rust_sanitized_production_text(source);
+    assert!(
+        rust_production_canonical_paths(&production, "src/sql/literal.rs")
+            .into_iter()
+            .all(|path| !is_legacy_ebd_2_owner_path(&path)),
+        "production scan must continue to ignore cfg(test) source"
+    );
+    assert_eq!(
+        rust_all_source_canonical_paths(source, "src/sql/literal.rs")
+            .into_iter()
+            .filter(|path| is_legacy_ebd_2_owner_path(path))
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            vec!["crate", "engine", "procedure"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            vec![
+                "crate",
+                "engine",
+                "procedure",
+                "CallProcedureStmt",
+                "default"
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        ])
     );
 }
 

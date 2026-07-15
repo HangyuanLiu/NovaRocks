@@ -1660,7 +1660,7 @@ fn build_cow_rewrite_query(
                     )
                 })?;
             let literal =
-                crate::engine::sql_expr::literal_from_batch(matched.new_rows.column(col_idx), idx)?;
+                crate::sql::literal::literal_from_batch(matched.new_rows.column(col_idx), idx)?;
             values.push(literal_to_sql_for_values_target_column(
                 &literal,
                 target_column,

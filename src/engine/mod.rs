@@ -77,11 +77,9 @@ pub(crate) mod mv_rewrite_prep;
 pub(crate) mod mv_scheduler;
 pub(crate) mod name_resolve;
 pub(crate) mod parquet;
-pub(crate) mod procedure;
 pub(crate) mod query_options;
 pub(crate) mod query_prep;
 mod query_stats;
-pub(crate) mod sql_expr;
 pub(crate) mod statement;
 pub(crate) mod statistics;
 pub(crate) mod stream_load;
@@ -93,10 +91,6 @@ mod write_transaction;
 pub(crate) use self::name_resolve::ResolvedLocalTableName;
 
 pub(crate) use self::insert::{build_local_insert_batch, reorder_insert_rows};
-#[cfg(test)]
-use self::sql_expr::sql_type_to_arrow_type;
-#[cfg(test)]
-use self::sql_expr::sqlparser_expr_to_literal;
 use self::statement::{
     convert_sqlparser_insert_to_custom, execute_create_database_statement,
     execute_create_table_statement, execute_drop_catalog_statement,
@@ -113,8 +107,9 @@ use self::statement::{
     parse_alter_table_remove_orphan_files_sql, parse_alter_table_rewrite_manifests_sql,
     parse_show_alter_table_optimize_sql, parse_show_create_table,
 };
-use crate::engine::procedure::{looks_like_call_procedure, parse_call_procedure_sql};
 use crate::engine::query_prep::{has_time_travel_refs, rewrite_time_travel_refs};
+#[cfg(test)]
+use crate::sql::literal::{sql_type_to_arrow_type, sqlparser_expr_to_literal};
 
 #[derive(Clone, Debug, Default)]
 pub struct StandaloneOptions {
@@ -124,6 +119,7 @@ pub struct StandaloneOptions {
 pub use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use crate::sql::catalog::LegacyRangePartition;
 pub use crate::sql::catalog::{CatalogProvider, ColumnDef, ScanSource, TableDef};
+use crate::sql::parser::procedure::{looks_like_call_procedure, parse_call_procedure_sql};
 
 #[cfg(feature = "compat")]
 pub(crate) fn recover_starrocks_tablet_paths_from_current_engine(

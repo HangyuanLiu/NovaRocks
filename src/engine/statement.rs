@@ -40,7 +40,7 @@ use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
 
-use super::sql_expr::sqlparser_expr_to_literal;
+use crate::sql::literal::sqlparser_expr_to_literal;
 
 fn convert_set_expr_to_insert_source(
     body: &sqlparser::ast::SetExpr,

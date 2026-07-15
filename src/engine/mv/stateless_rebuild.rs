@@ -55,10 +55,10 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::engine::mv::iceberg_discovery::discover_iceberg_mvs;
-use crate::engine::procedure::CallProcedureStmt;
 use crate::engine::{
     QueryResult, QueryResultColumn, StandaloneState, StatementResult, record_batch_to_chunk,
 };
+use crate::sql::parser::procedure::CallProcedureStmt;
 
 pub(crate) const PROCEDURE_NAME: &str = "novarocks_imv_stateless_rebuild";
 const TEST_ENABLE_ENV: &str = "NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD";
@@ -411,7 +411,7 @@ fn column(name: &str, nullable: bool) -> QueryResultColumn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::procedure::parse_call_procedure_sql;
+    use crate::sql::parser::procedure::parse_call_procedure_sql;
 
     #[test]
     fn guard_rejects_when_flag_absent() {

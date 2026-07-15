@@ -1400,7 +1400,7 @@ fn query_result_cell_to_user_variable_sql(
     if let Some(text) = arrow_text_cell(column, row_idx) {
         return user_variable_text_to_sql(&text?, declared_type);
     }
-    let literal = crate::engine::sql_expr::literal_from_batch(column, row_idx)?;
+    let literal = crate::sql::literal::literal_from_batch(column, row_idx)?;
     user_variable_literal_to_sql(&literal)
 }
 
