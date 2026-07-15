@@ -17,6 +17,7 @@
 
 pub(crate) mod artifact;
 pub(crate) mod events;
+pub(crate) mod final_domain;
 pub(crate) mod identity;
 pub(crate) mod install;
 pub(crate) mod ordered_bound;
