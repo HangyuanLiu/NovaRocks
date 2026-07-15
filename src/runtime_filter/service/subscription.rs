@@ -518,6 +518,7 @@ impl ArtifactDelivery for SubscriptionGroup {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, Weak};
 
     use arrow::datatypes::DataType;
@@ -537,6 +538,9 @@ mod tests {
     use crate::runtime_filter::port::subscription::{
         ArtifactDeliveryOutcome, LivePollOutcome, LiveTerminal, NonBlockingLiveSubscription,
         UnavailableReason,
+    };
+    use crate::runtime_filter::port::support::{
+        ArtifactRetainedBudget, ArtifactRetention, MemoryAccountError, RuntimeFilterMemoryAccount,
     };
 
     use super::LiveSubscriptionSlot;
@@ -594,6 +598,77 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    #[derive(Default)]
+    struct CountingMemory(AtomicUsize);
+
+    impl RuntimeFilterMemoryAccount for CountingMemory {
+        fn try_consume(&self, bytes: usize) -> Result<(), MemoryAccountError> {
+            self.0.fetch_add(bytes, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn release(&self, bytes: usize) {
+            let previous = self.0.fetch_sub(bytes, Ordering::SeqCst);
+            assert!(previous >= bytes);
+        }
+    }
+
+    fn retained_bundle(
+        version: LogicalVersion,
+        byte: u8,
+    ) -> (
+        Arc<ArtifactBundle>,
+        Arc<ArtifactRetainedBudget>,
+        Arc<CountingMemory>,
+        usize,
+    ) {
+        let profile = ConsumerArtifactProfile::new(
+            BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
+            None,
+        )
+        .unwrap();
+        let schema =
+            ArtifactSchemaDigest::for_membership(&DataType::Int64, NullSemantics::NeverMatches)
+                .unwrap();
+        let encoded: Arc<[u8]> = Arc::from([byte]);
+        let component_bytes =
+            PhysicalArtifact::accounted_resident_component_bytes(encoded.len()).unwrap();
+        let retained_bytes = ArtifactBundle::accounted_resident_overhead(&profile, 1)
+            .unwrap()
+            .checked_add(component_bytes)
+            .unwrap();
+        let budget = Arc::new(ArtifactRetainedBudget::new(retained_bytes));
+        let memory = Arc::new(CountingMemory::default());
+        let retention = Arc::new(
+            ArtifactRetention::try_new(retained_bytes, budget.clone(), memory.clone()).unwrap(),
+        );
+        let artifact = Arc::new(
+            PhysicalArtifact::from_shared_retained_bytes(
+                ArtifactKind::ValueSet,
+                schema,
+                version,
+                false,
+                encoded,
+                component_bytes,
+                retained_bytes,
+                retention.clone(),
+            )
+            .unwrap(),
+        );
+        let bundle = Arc::new(
+            ArtifactBundle::new_retained(
+                ChannelId::new(1),
+                version,
+                &profile,
+                vec![(ArtifactKind::ValueSet, artifact)],
+                usize::MAX,
+                retention,
+            )
+            .unwrap(),
+        );
+        (bundle, budget, memory, retained_bytes)
     }
 
     fn slot() -> LiveSubscriptionSlot {
@@ -696,6 +771,59 @@ mod tests {
                     UnavailableReason::MaterializationFailed
                 ))
             }
+        ));
+    }
+
+    #[test]
+    fn live_snapshot_clones_share_one_retention_account() {
+        let live = slot();
+        let (bundle, budget, memory, retained_bytes) = retained_bundle(LogicalVersion::FIRST, 100);
+        live.deliver(bundle.clone(), None);
+        drop(bundle);
+        assert_eq!(budget.retained_bytes(), retained_bytes);
+        assert_eq!(memory.0.load(Ordering::SeqCst), retained_bytes);
+
+        let first = live.snapshot().unwrap();
+        let clones = (0..32).map(|_| first.clone()).collect::<Vec<_>>();
+        assert_eq!(budget.retained_bytes(), retained_bytes);
+        assert_eq!(memory.0.load(Ordering::SeqCst), retained_bytes);
+        drop(clones);
+        drop(first);
+        assert_eq!(budget.retained_bytes(), retained_bytes);
+        assert_eq!(memory.0.load(Ordering::SeqCst), retained_bytes);
+
+        drop(live);
+        assert_eq!(budget.retained_bytes(), 0);
+        assert_eq!(memory.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn profile_local_failure_retains_v1_while_sibling_route_publishes_v2() {
+        let failed_profile = slot();
+        let healthy_profile = slot();
+        failed_profile.deliver(bundle(LogicalVersion::FIRST, 100), None);
+        healthy_profile.deliver(bundle(LogicalVersion::FIRST, 100), None);
+
+        failed_profile.terminal(LiveTerminal::DegradedArtifact(
+            UnavailableReason::MaterializationFailed,
+        ));
+        healthy_profile.deliver(bundle(LogicalVersion::new(2), 70), None);
+
+        assert!(matches!(
+            failed_profile.poll_after(Some(LogicalVersion::FIRST)),
+            LivePollOutcome::Idle {
+                latest_version: Some(LogicalVersion::FIRST),
+                terminal: Some(LiveTerminal::DegradedArtifact(
+                    UnavailableReason::MaterializationFailed
+                ))
+            }
+        ));
+        assert!(matches!(
+            healthy_profile.poll_after(Some(LogicalVersion::FIRST)),
+            LivePollOutcome::Updated {
+                bundle,
+                terminal: None
+            } if bundle.version() == LogicalVersion::new(2)
         ));
     }
 

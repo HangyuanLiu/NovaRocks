@@ -420,6 +420,49 @@ mod tests {
         assert_eq!(fixture.memory.0.load(Ordering::SeqCst), 0);
     }
 
+    #[test]
+    fn order_mismatch_allocates_zero_and_failed_scratch_admission_rolls_back() {
+        let fixture = fixture();
+        let wrong_profile = ConsumerArtifactProfile::new_ordered_range(
+            crate::runtime_filter::port::ordered_bound::OrderContractDigest::from_bytes_for_codec(
+                [0x5a; 32],
+            ),
+        )
+        .unwrap();
+        let RangeMaterializationOutcome::ContractViolation(error) = RangeMaterializer::materialize(
+            fixture.snapshot.clone(),
+            &wrong_profile,
+            usize::MAX,
+            fixture.retained.clone(),
+            fixture.scratch.clone(),
+            fixture.memory.clone(),
+        ) else {
+            panic!("order digest mismatch must remain a trusted contract violation");
+        };
+        assert_eq!(
+            error.kind(),
+            RuntimeContractViolationKind::OrderedContractMismatch
+        );
+        assert_eq!(fixture.retained.retained_bytes(), 0);
+        assert_eq!(fixture.scratch.retained_bytes(), 0);
+        assert_eq!(fixture.memory.0.load(Ordering::SeqCst), 0);
+
+        let plan = RangeMaterializer::plan(fixture.snapshot, &fixture.profile, usize::MAX).unwrap();
+        let scratch = Arc::new(ArtifactScratchBudget::new(1, 1).unwrap());
+        assert!(matches!(
+            RangeMaterializer::admit(
+                plan,
+                fixture.retained.clone(),
+                scratch.clone(),
+                fixture.memory.clone(),
+            ),
+            Err(RangeMaterializationOutcome::ResourceUnavailable)
+        ));
+        assert_eq!(fixture.retained.retained_bytes(), 0);
+        assert_eq!(scratch.retained_bytes(), 0);
+        assert_eq!(fixture.memory.0.load(Ordering::SeqCst), 0);
+    }
+
     fn fixture_for_types(
         data: Vec<(DataType, Option<OrderedScalar>)>,
         version: LogicalVersion,

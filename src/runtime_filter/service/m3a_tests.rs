@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 use crate::runtime_filter::model::contract::{BindingId, ChannelId};
 use crate::runtime_filter::port::identity::{LogicalVersion, PartitionId, ProducerSequence};
@@ -464,4 +465,124 @@ fn ordered_service_cancel_overrides_unavailable_without_artifact() {
             terminal: Some(LiveTerminal::Cancelled)
         }
     ));
+}
+
+#[test]
+fn ordered_cancel_between_reducer_commit_and_dispatch_releases_every_owner() {
+    let account = Arc::new(ArmableLargeAllocationRejector::default());
+    let (service, contract) = installed_ordered_service_with_account(account.clone());
+    let live = live_handle(&service);
+    let ProducerHandle::OrderedBound(producer) = service
+        .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+        .unwrap()
+    else {
+        panic!("ordered fixture returned membership producer")
+    };
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    service.set_producer_before_dispatch_hook(
+        BindingId::new(1),
+        uid(1),
+        Arc::new(move || {
+            ready_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        }),
+    );
+
+    let (result_tx, result_rx) = mpsc::channel();
+    let submit = std::thread::spawn(move || {
+        result_tx
+            .send(producer.submit_bound(
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                ordered_update(&contract, 100),
+            ))
+            .unwrap();
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("ordered action must pause after reducer commit");
+    assert!(account.current.load(Ordering::SeqCst) > 0);
+
+    service.cancel();
+    assert!(matches!(
+        live.poll_after(None),
+        LivePollOutcome::Idle {
+            latest_version: None,
+            terminal: Some(LiveTerminal::Cancelled)
+        }
+    ));
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap(),
+        SubmitOutcome::Published
+    );
+    submit.join().unwrap();
+    assert!(live.snapshot().is_none());
+
+    drop(live);
+    drop(service);
+    assert_eq!(account.current.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn service_drop_cancels_caller_owned_encode_without_retaining_service() {
+    let account = Arc::new(ArmableLargeAllocationRejector::default());
+    let (service, contract) = installed_ordered_service_with_account(account.clone());
+    let live = live_handle(&service);
+    let ProducerHandle::OrderedBound(producer) = service
+        .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+        .unwrap()
+    else {
+        panic!("ordered fixture returned membership producer")
+    };
+    let (encode_tx, encode_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    service.set_before_encode_hook(Arc::new(move |_| {
+        encode_tx.send(()).unwrap();
+        release_rx.lock().unwrap().recv().unwrap();
+    }));
+
+    let (result_tx, result_rx) = mpsc::channel();
+    let submit = std::thread::spawn(move || {
+        result_tx
+            .send(producer.submit_bound(
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                ordered_update(&contract, 100),
+            ))
+            .unwrap();
+    });
+    encode_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("ordered v1 encode must enter its caller-owned scoped work");
+
+    let weak_service = Arc::downgrade(&service);
+    drop(service);
+    assert!(weak_service.upgrade().is_none());
+    assert!(matches!(
+        live.poll_after(None),
+        LivePollOutcome::Idle {
+            latest_version: None,
+            terminal: Some(LiveTerminal::Cancelled)
+        }
+    ));
+
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap(),
+        SubmitOutcome::Published
+    );
+    submit.join().unwrap();
+    assert!(live.snapshot().is_none());
+    drop(live);
+    assert_eq!(account.current.load(Ordering::SeqCst), 0);
 }

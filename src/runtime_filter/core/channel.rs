@@ -3765,6 +3765,88 @@ mod tests {
         }
 
         #[test]
+        fn concurrent_close_and_final_snapshot_complete_exactly_once() {
+            for _ in 0..32 {
+                let harness = Arc::new(OrderedChannelHarness::single_stream_anyof());
+                let start = Arc::new(Barrier::new(3));
+                let close = {
+                    let harness = harness.clone();
+                    let start = start.clone();
+                    std::thread::spawn(move || {
+                        start.wait();
+                        harness.close(0, 8)
+                    })
+                };
+                let final_snapshot = {
+                    let harness = harness.clone();
+                    let start = start.clone();
+                    std::thread::spawn(move || {
+                        start.wait();
+                        harness.submit(0, 7, int_bound(40))
+                    })
+                };
+                start.wait();
+
+                let outcomes = [
+                    close.join().unwrap().unwrap(),
+                    final_snapshot.join().unwrap().unwrap(),
+                ];
+                assert_eq!(
+                    outcomes
+                        .iter()
+                        .filter(|outcome| matches!(outcome, TestAction::Completed(Some((1, 40)))))
+                        .count(),
+                    1
+                );
+                assert!(outcomes.iter().any(|outcome| matches!(
+                    outcome,
+                    TestAction::PendingFinalSnapshot | TestAction::Published(1, 40)
+                )));
+                assert_eq!(harness.latest(), Some((1, 40)));
+                assert!(harness.channel.is_terminal());
+            }
+        }
+
+        #[test]
+        fn concurrent_tighter_and_higher_looser_update_preserves_tighter_state() {
+            for _ in 0..32 {
+                let harness = Arc::new(OrderedChannelHarness::single_stream_anyof());
+                assert_eq!(
+                    harness.submit(0, 0, int_bound(100)).unwrap(),
+                    TestAction::Published(1, 100)
+                );
+                let start = Arc::new(Barrier::new(3));
+                let tighter = {
+                    let harness = harness.clone();
+                    let start = start.clone();
+                    std::thread::spawn(move || {
+                        start.wait();
+                        harness.submit(0, 1, int_bound(70))
+                    })
+                };
+                let looser = {
+                    let harness = harness.clone();
+                    let start = start.clone();
+                    std::thread::spawn(move || {
+                        start.wait();
+                        harness.submit(0, 2, int_bound(110))
+                    })
+                };
+                start.wait();
+
+                assert_eq!(
+                    tighter.join().unwrap().unwrap(),
+                    TestAction::Published(2, 70)
+                );
+                assert_eq!(
+                    looser.join().unwrap().unwrap_err().kind(),
+                    RuntimeContractViolationKind::OrderedBoundLoosened
+                );
+                assert_eq!(harness.latest(), Some((2, 70)));
+            }
+        }
+
+        #[test]
         fn availability_and_terminal_coverage_are_independent() {
             let harness = OrderedChannelHarness::single_stream_anyof();
             assert_eq!(

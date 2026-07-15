@@ -1329,6 +1329,68 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_generation_invalidates_v1_and_v2_without_orphaned_flights() {
+        let gate = ArtifactPublishGate::default();
+        let key = key(16);
+        let ArtifactJobClaim::Owner(v1_owner) = gate.claim(key, LogicalVersion::FIRST) else {
+            panic!("v1 must own its generation-scoped flight");
+        };
+        let ArtifactJobClaim::Follower(v1_follower) = gate.claim(key, LogicalVersion::FIRST) else {
+            panic!("duplicate v1 must follow");
+        };
+        let ArtifactJobClaim::Owner(v2_owner) = gate.claim(key, LogicalVersion::new(2)) else {
+            panic!("v2 must own an independent generation-scoped flight");
+        };
+        let ArtifactJobClaim::Follower(v2_follower) = gate.claim(key, LogicalVersion::new(2))
+        else {
+            panic!("duplicate v2 must follow");
+        };
+
+        assert_eq!(gate.generation(key), 0);
+        gate.cancel_channel(ChannelId::new(1), DeploymentEpoch::new(2));
+        assert_eq!(gate.generation(key), 1);
+        assert!(matches!(
+            v1_follower.wait(),
+            ArtifactDeliveryOutcome::Cancelled
+        ));
+        assert!(matches!(
+            v2_follower.wait(),
+            ArtifactDeliveryOutcome::Cancelled
+        ));
+        assert_eq!(
+            v2_owner
+                .finish(ArtifactDeliveryOutcome::Published(bundle(
+                    LogicalVersion::new(2),
+                    2,
+                )))
+                .unwrap(),
+            PublishCommitOutcome::Cancelled
+        );
+        assert_eq!(
+            v1_owner
+                .finish(ArtifactDeliveryOutcome::Published(bundle(
+                    LogicalVersion::FIRST,
+                    1,
+                )))
+                .unwrap(),
+            PublishCommitOutcome::Cancelled
+        );
+        assert_eq!(gate.in_flight_follower_count(key, LogicalVersion::FIRST), 0);
+        assert_eq!(
+            gate.in_flight_follower_count(key, LogicalVersion::new(2)),
+            0
+        );
+        let ArtifactJobClaim::Follower(after_shutdown) = gate.claim(key, LogicalVersion::new(3))
+        else {
+            panic!("a cancelled generation cannot recreate an owner");
+        };
+        assert!(matches!(
+            after_shutdown.wait(),
+            ArtifactDeliveryOutcome::Cancelled
+        ));
+    }
+
+    #[test]
     fn conflicting_owner_finish_always_wakes_same_version_follower() {
         let gate = ArtifactPublishGate::default();
         let key = key(7);
