@@ -5,9 +5,9 @@ use std::path::{Component, Path, PathBuf};
 use super::{
     cfg_attr_generated_path_values, cfg_attribute_requires_test, manifest_dir,
     path_attribute_value, production_rs_files_from_entries, rel, rs_files,
-    rust_canonical_use_segments_in_scope, rust_module_items, rust_production_canonical_paths,
-    rust_production_scoped_use_statements, rust_sanitized_production_text,
-    rust_source_module_segments, rust_use_visibility, src_dir,
+    rust_canonical_path_segments_in_scope, rust_module_items, rust_production_canonical_paths,
+    rust_production_scoped_aliases, rust_raw_production_use_statements, rust_resolve_scoped_paths,
+    rust_sanitized_production_text, rust_source_module_segments, src_dir,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1464,12 +1464,12 @@ fn forwarding_export_scope(source_path: &str, inline_modules: &[String]) -> Opti
     Some(scope.join("::"))
 }
 
-fn forwarding_export_name(import: &str, target: &[String]) -> Option<String> {
-    let imported = import.split_once('|').map_or(import, |(_, path)| path);
-    if let Some((_, alias)) = imported.rsplit_once(" as ") {
-        return Some(alias.to_string());
+fn forwarding_export_name(path: &[String], alias: Option<&str>) -> Option<String> {
+    match alias {
+        Some("_") => None,
+        Some(alias) => Some(alias.to_string()),
+        None => path.last().cloned(),
     }
-    target.last().cloned()
 }
 
 fn collect_source_dependencies(snapshot: &mut EngineBoundarySnapshot, source: &GuardSource) {
@@ -1514,36 +1514,50 @@ fn collect_source_dependencies(snapshot: &mut EngineBoundarySnapshot, source: &G
         );
     }
 
-    for import in rust_production_scoped_use_statements(&production)
+    let scoped_aliases = rust_production_scoped_aliases(&production);
+    for import in rust_raw_production_use_statements(&production)
         .into_iter()
-        .filter(|import| rust_use_visibility(&import.import) != "private")
+        .filter(|import| import.visibility != "private")
     {
-        let visibility = rust_use_visibility(&import.import);
-        let Some(target) = rust_canonical_use_segments_in_scope(
-            &import.import,
-            &source.path,
+        let Some(export_scope) = forwarding_export_scope(&source.path, &import.inline_modules)
+        else {
+            continue;
+        };
+        let Some(export_name) =
+            forwarding_export_name(&import.path.segments, import.path.alias.as_deref())
+        else {
+            continue;
+        };
+        let Some(resolved_targets) = rust_resolve_scoped_paths(
+            &import.path.segments,
             &import.inline_modules,
+            &scoped_aliases,
+            &mut BTreeSet::new(),
+            0,
         ) else {
             continue;
         };
-        let source_engine = source_is_engine(&source.path);
-        let target_engine = is_engine_path(&target);
-        if source_engine != target_engine {
-            let Some(export_scope) = forwarding_export_scope(&source.path, &import.inline_modules)
-            else {
+
+        for resolved_target in resolved_targets {
+            let Some(target) = rust_canonical_path_segments_in_scope(
+                &resolved_target.segments,
+                &source.path,
+                &resolved_target.inline_modules,
+            ) else {
                 continue;
             };
-            let Some(export_name) = forwarding_export_name(&import.import, &target) else {
-                continue;
-            };
-            snapshot.forwarding_reexports.insert(format!(
-                "{}|{}|{}|{}|{}",
-                source.path,
-                export_scope,
-                visibility,
-                export_name,
-                target.join("::")
-            ));
+            let source_engine = source_is_engine(&source.path);
+            let target_engine = is_engine_path(&target);
+            if source_engine != target_engine {
+                snapshot.forwarding_reexports.insert(format!(
+                    "{}|{}|{}|{}|{}",
+                    source.path,
+                    export_scope,
+                    import.visibility,
+                    export_name,
+                    target.join("::")
+                ));
+            }
         }
     }
 }
@@ -2160,6 +2174,64 @@ mod second {
         BTreeSet::from([
             "src/catalog/legacy.rs|crate::catalog::legacy::first|pub(crate)|TableDef|crate::engine::catalog::TableDef".to_string(),
             "src/catalog/legacy.rs|crate::catalog::legacy::second|pub(crate)|TableDef|crate::engine::catalog::TableDef".to_string(),
+        ])
+    );
+}
+
+#[test]
+fn ebd_1_detector_preserves_forwarding_name_through_private_alias() {
+    let collect = |alias: &str| {
+        let source = GuardSource::new(
+            "src/catalog/legacy.rs",
+            &format!("use crate::engine::catalog::TableDef as {alias};\npub use {alias};"),
+        );
+        collect_engine_boundary_snapshot(Path::new("fixture-root-that-does-not-exist"), &[source])
+            .forwarding_reexports
+    };
+
+    let legacy = collect("Legacy");
+    let renamed = collect("RenamedLegacy");
+    assert_eq!(
+        legacy,
+        BTreeSet::from([
+            "src/catalog/legacy.rs|crate::catalog::legacy|pub|Legacy|crate::engine::catalog::TableDef"
+                .to_string()
+        ])
+    );
+    assert_eq!(
+        renamed,
+        BTreeSet::from([
+            "src/catalog/legacy.rs|crate::catalog::legacy|pub|RenamedLegacy|crate::engine::catalog::TableDef"
+                .to_string()
+        ])
+    );
+    assert_ne!(
+        legacy, renamed,
+        "renaming the public alias must change the key"
+    );
+}
+
+#[test]
+fn ebd_1_detector_preserves_public_scope_across_private_alias_indirection() {
+    let source = GuardSource::new(
+        "src/catalog/legacy.rs",
+        r#"
+mod aliases {
+    use crate::engine::catalog::TableDef as Legacy;
+    mod exports {
+        pub(crate) use super::Legacy;
+    }
+}
+"#,
+    );
+    let actual =
+        collect_engine_boundary_snapshot(Path::new("fixture-root-that-does-not-exist"), &[source]);
+
+    assert_eq!(
+        actual.forwarding_reexports,
+        BTreeSet::from([
+            "src/catalog/legacy.rs|crate::catalog::legacy::aliases::exports|pub(crate)|Legacy|crate::engine::catalog::TableDef"
+                .to_string()
         ])
     );
 }
