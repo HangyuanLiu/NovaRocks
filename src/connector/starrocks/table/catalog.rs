@@ -821,7 +821,7 @@ pub(crate) fn arrow_type_from_tablet_column(column: &ColumnPb) -> Result<DataTyp
 /// `data_type` does not uniquely identify the logical type (`JSON` collapses
 /// onto `DataType::Utf8`; `BITMAP` and `HLL` collapse onto `DataType::Binary`).
 /// Returns `None` for columns whose Arrow type is authoritative.
-fn logical_type_from_tablet_column(column: &ColumnPb) -> Option<crate::sql::SqlType> {
+fn logical_type_from_tablet_column(column: &ColumnPb) -> Option<crate::catalog::schema::SqlType> {
     let raw_type = column.r#type.trim().to_ascii_uppercase();
     let base_type = raw_type
         .split('(')
@@ -829,10 +829,10 @@ fn logical_type_from_tablet_column(column: &ColumnPb) -> Option<crate::sql::SqlT
         .unwrap_or(raw_type.as_str())
         .trim();
     match base_type {
-        "JSON" => Some(crate::sql::SqlType::Json),
+        "JSON" => Some(crate::catalog::schema::SqlType::Json),
         // BE schema persists BITMAP as `OBJECT` (the historical wire name).
-        "OBJECT" | "BITMAP" => Some(crate::sql::SqlType::Bitmap),
-        "HLL" => Some(crate::sql::SqlType::Hll),
+        "OBJECT" | "BITMAP" => Some(crate::catalog::schema::SqlType::Bitmap),
+        "HLL" => Some(crate::catalog::schema::SqlType::Hll),
         _ => None,
     }
 }

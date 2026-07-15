@@ -33,13 +33,17 @@ use crate::coordinator::prepare::scan::{
 };
 use crate::proto::{common, plan};
 use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
+// Consumed only by `#[cfg(test)]` encoder fixtures (the production write/router
+// encoding reads finalized planner types, not these analysis constructors).
+use crate::catalog::schema::SqlType;
+#[cfg(test)]
+use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::catalog;
 use crate::sql::codegen::scan::connector::{
     StarRocksColumnSchemaDescriptor, StarRocksKeysTypeDescriptor, StarRocksScanSourceDescriptor,
     StarRocksTabletSchemaDescriptor,
 };
 use crate::sql::common::{ChangeStreamBranchKind, JoinKind};
-use crate::sql::parser::ast::SqlType;
 use crate::sql::planner::distributed::runtime_filter::{
     GraphRuntimeFilterBuild, GraphRuntimeFilterProbe, RuntimeFilterGraphProjection,
     project_runtime_filters,

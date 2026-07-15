@@ -935,8 +935,9 @@ mod tests {
     use iceberg::table::Table;
     use iceberg::{NamespaceIdent, TableIdent};
 
+    use crate::catalog::schema::SqlType;
     use crate::connector::iceberg::catalog::registry::DataFileWithStats;
-    use crate::sql::parser::ast::{SqlType, TableColumnDef};
+    use crate::sql::parser::ast::TableColumnDef;
 
     use super::*;
 

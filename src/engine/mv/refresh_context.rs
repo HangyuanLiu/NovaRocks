@@ -1723,14 +1723,14 @@ pub(crate) mod tests_support {
             &[
                 crate::sql::TableColumnDef {
                     name: "k".to_string(),
-                    data_type: crate::sql::SqlType::BigInt,
+                    data_type: crate::catalog::schema::SqlType::BigInt,
                     nullable: false,
                     aggregation: None,
                     default: None,
                 },
                 crate::sql::TableColumnDef {
                     name: "v".to_string(),
-                    data_type: crate::sql::SqlType::BigInt,
+                    data_type: crate::catalog::schema::SqlType::BigInt,
                     nullable: true,
                     aggregation: None,
                     default: None,

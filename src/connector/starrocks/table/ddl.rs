@@ -19,6 +19,7 @@ use prost::Message;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::catalog::schema::SqlType;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::{get_tablet_runtime, remove_tablet_runtime};
 use crate::connector::starrocks::lake::create_lake_tablet_from_req;
@@ -27,7 +28,7 @@ use crate::connector::starrocks::lake::transactions::delete_tablet;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
 use crate::service::grpc_client::proto::starrocks::DeleteTabletRequest;
 use crate::sql::parser::ast::{
-    ColumnAggregation, ObjectName, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind,
+    ColumnAggregation, ObjectName, TableColumnDef, TableKeyDesc, TableKeyKind,
 };
 
 use super::catalog::{
@@ -1059,6 +1060,7 @@ mod tests {
 
     use prost::Message;
 
+    use crate::catalog::schema::SqlType;
     use crate::connector::starrocks::table::catalog::register_starrocks_table_in_catalog;
     use crate::connector::starrocks::table::model::{
         StarRocksGlobalMeta, StarRocksIndexState, StarRocksPartitionState, StarRocksTableKind,
@@ -1076,7 +1078,7 @@ mod tests {
         SqliteMetaStoreProvider,
     };
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
-    use crate::sql::parser::ast::{SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
+    use crate::sql::parser::ast::{TableColumnDef, TableKeyDesc, TableKeyKind};
 
     use crate::engine::mv::agg_state::physical_column::starrocks_physical_column;
 

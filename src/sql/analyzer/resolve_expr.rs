@@ -3280,17 +3280,17 @@ fn json_semantic_group_by_type_name(expr: &TypedExpr) -> Option<String> {
 fn is_json_in_subquery_operand(expr: &TypedExpr, scope: &AnalyzerScope) -> bool {
     matches!(
         scope.logical_type_of_expr(expr),
-        Some(crate::sql::SqlType::Json)
+        Some(crate::catalog::schema::SqlType::Json)
     ) || matches!(
         json_semantic_group_by_type_name(expr).as_deref(),
         Some("json")
     )
 }
 
-fn is_bitmap_or_hll_type(sql_type: &crate::sql::SqlType) -> bool {
+fn is_bitmap_or_hll_type(sql_type: &crate::catalog::schema::SqlType) -> bool {
     matches!(
         sql_type,
-        crate::sql::SqlType::Bitmap | crate::sql::SqlType::Hll
+        crate::catalog::schema::SqlType::Bitmap | crate::catalog::schema::SqlType::Hll
     )
 }
 

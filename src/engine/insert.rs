@@ -129,8 +129,8 @@ fn reorder_insert_row(
 
 fn arrow_data_type_to_sql_type(
     dt: &arrow::datatypes::DataType,
-) -> Result<crate::sql::parser::ast::SqlType, String> {
-    use crate::sql::parser::ast::SqlType;
+) -> Result<crate::catalog::schema::SqlType, String> {
+    use crate::catalog::schema::SqlType;
     use arrow::datatypes::{DataType, TimeUnit};
     Ok(match dt {
         DataType::Boolean => SqlType::Boolean,

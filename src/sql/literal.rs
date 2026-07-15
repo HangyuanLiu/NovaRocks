@@ -28,7 +28,8 @@ use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 
-use crate::sql::parser::ast::{ArithmeticOp, Expr, Literal, SqlType};
+use crate::catalog::schema::SqlType;
+use crate::sql::parser::ast::{ArithmeticOp, Expr, Literal};
 
 pub(crate) fn sqlparser_expr_to_custom_expr(expr: &sqlparser::ast::Expr) -> Result<Expr, String> {
     use sqlparser::ast as sqlast;
@@ -960,9 +961,9 @@ pub(crate) fn eval_literal_arithmetic(
 /// Cast a `Literal` to the given SQL type without `ManualValue`.
 pub(crate) fn cast_literal(
     value: Literal,
-    data_type: &crate::sql::SqlType,
+    data_type: &crate::catalog::schema::SqlType,
 ) -> Result<Literal, String> {
-    use crate::sql::SqlType;
+    use crate::catalog::schema::SqlType;
     match data_type {
         SqlType::String | SqlType::Json => match &value {
             Literal::Null => Ok(Literal::Null),

@@ -18,14 +18,13 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::catalog::identifier::normalize_identifier;
+use crate::catalog::schema::SqlType;
 use crate::connector::starrocks::table::catalog::StarRocksTableRuntime;
 use crate::connector::starrocks::table::ddl::{
     aggregation_string_to_column_aggregation, parse_keys_type, parse_starrocks_logical_type,
     to_keys_type,
 };
-use crate::sql::parser::ast::{
-    ColumnAggregation, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind,
-};
+use crate::sql::parser::ast::{ColumnAggregation, TableColumnDef, TableKeyDesc, TableKeyKind};
 
 pub(crate) fn request_schema_from_runtime(
     runtime: &StarRocksTableRuntime,
@@ -500,6 +499,7 @@ fn index_length_for_sql_type(data_type: &SqlType) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
+    use crate::catalog::schema::SqlType;
     use crate::connector::starrocks::table::catalog::StarRocksTableRuntime;
     use crate::connector::starrocks::table::ddl::{
         logical_type_name, parse_starrocks_logical_type,
@@ -508,9 +508,7 @@ mod tests {
         StarRocksTableKind, StarRocksTableState, StoredStarRocksColumn, StoredStarRocksTable,
     };
     use crate::engine::catalog::DEFAULT_DATABASE;
-    use crate::sql::parser::ast::{
-        ColumnAggregation, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind,
-    };
+    use crate::sql::parser::ast::{ColumnAggregation, TableColumnDef, TableKeyDesc, TableKeyKind};
 
     use super::{
         build_tablet_schema, request_schema_from_runtime, sql_type_to_tcolumn_type,

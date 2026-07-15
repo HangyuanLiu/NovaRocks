@@ -31,6 +31,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
+use crate::catalog::schema::SqlType;
 use crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls;
 use crate::engine::mv::agg_state::mv_shape::{
     AggregateFunctionKind, AggregateInput, AggregateMvShape, VisibleAggregateOutput,
@@ -55,7 +56,6 @@ use crate::exec::expr::function::mv_state::{
 };
 use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
 use crate::sql::analysis::OutputColumn;
-use crate::sql::parser::ast::SqlType;
 
 pub(crate) const ROW_ID_COLUMN: &str = "__row_id__";
 pub(crate) const AGG_STATE_PREFIX: &str = "__agg_state_";

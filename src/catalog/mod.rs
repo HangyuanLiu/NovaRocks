@@ -16,3 +16,4 @@
 // under the License.
 
 pub(crate) mod identifier;
+pub(crate) mod schema;

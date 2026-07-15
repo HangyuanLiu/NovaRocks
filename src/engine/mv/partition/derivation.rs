@@ -863,13 +863,13 @@ mod tests {
 
     // --- Test fixtures for bind/evaluate tests (copied verbatim from aggregate_delta.rs) ---
 
+    use crate::catalog::schema::SqlType;
     use crate::engine::mv::agg_state::mv_agg_state::{
         AggregateMvLayout, AggregateStateColumn, AggregateStateRole, AggregateVisibleColumn,
     };
     use crate::engine::mv::agg_state::mv_shape::AggregateFunctionKind;
     use crate::engine::mv::agg_state::physical_column::starrocks_physical_column;
     use crate::exec::chunk::Chunk;
-    use crate::sql::parser::ast::SqlType;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc as StdArcFixture;
@@ -1093,7 +1093,7 @@ mod tests {
 
     #[test]
     fn bind_and_evaluate_identity_partition_over_chunks() {
-        use crate::sql::parser::ast::SqlType;
+        use crate::catalog::schema::SqlType;
         use arrow::array::StringArray;
         use arrow::datatypes::DataType;
 
@@ -1124,7 +1124,7 @@ mod tests {
 
     #[test]
     fn bind_rejects_non_group_key_output_index() {
-        use crate::sql::parser::ast::SqlType;
+        use crate::catalog::schema::SqlType;
         use arrow::datatypes::DataType;
 
         let mut layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);

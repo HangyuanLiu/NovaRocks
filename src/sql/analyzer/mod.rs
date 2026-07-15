@@ -3928,10 +3928,10 @@ fn replace_grouping_markers_in_relation(
     }
 }
 
-fn is_bitmap_or_hll_type(sql_type: &crate::sql::SqlType) -> bool {
+fn is_bitmap_or_hll_type(sql_type: &crate::catalog::schema::SqlType) -> bool {
     matches!(
         sql_type,
-        crate::sql::SqlType::Bitmap | crate::sql::SqlType::Hll
+        crate::catalog::schema::SqlType::Bitmap | crate::catalog::schema::SqlType::Hll
     )
 }
 

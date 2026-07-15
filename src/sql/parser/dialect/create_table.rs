@@ -21,11 +21,12 @@ use sqlparser::tokenizer::Token;
 
 use super::{StarRocksDialect, convert_object_name, convert_sql_type, peek_word_eq};
 use crate::catalog::identifier::normalize_identifier;
+use crate::catalog::schema::SqlType;
 use crate::sql::analyzer::iceberg_ref::split_ref_suffix;
 use crate::sql::catalog::LegacyRangePartition;
 use crate::sql::parser::ast::{
     ColumnAggregation, CreateTableKind, CreateTableStmt, DefaultLiteral, IcebergPartitionFieldExpr,
-    SqlType, TableColumnDef, TableKeyDesc, TableKeyKind,
+    TableColumnDef, TableKeyDesc, TableKeyKind,
 };
 
 /// Parse StarRocks CREATE TABLE statement:
@@ -981,9 +982,10 @@ fn skip_default_value(parser: &mut Parser<'_>) {
 
 pub(crate) fn parse_default_literal(
     parser: &mut sqlparser::parser::Parser<'_>,
-    data_type: &crate::sql::parser::ast::SqlType,
+    data_type: &crate::catalog::schema::SqlType,
 ) -> Result<crate::sql::parser::ast::DefaultLiteral, String> {
-    use crate::sql::parser::ast::{DefaultLiteral, SqlType};
+    use crate::catalog::schema::SqlType;
+    use crate::sql::parser::ast::DefaultLiteral;
 
     // Consumes one token unconditionally. Callers must propagate Err
     // immediately — parser state is not rewound on failure.
@@ -1038,9 +1040,10 @@ pub(crate) fn parse_default_literal(
 
 fn parse_numeric_default(
     text: &str,
-    data_type: &crate::sql::parser::ast::SqlType,
+    data_type: &crate::catalog::schema::SqlType,
 ) -> Result<crate::sql::parser::ast::DefaultLiteral, String> {
-    use crate::sql::parser::ast::{DefaultLiteral, SqlType};
+    use crate::catalog::schema::SqlType;
+    use crate::sql::parser::ast::DefaultLiteral;
     match data_type {
         SqlType::TinyInt | SqlType::SmallInt | SqlType::Int | SqlType::BigInt => {
             let v: i64 = text
@@ -1074,9 +1077,10 @@ fn parse_numeric_default(
 
 fn parse_string_default(
     s: &str,
-    data_type: &crate::sql::parser::ast::SqlType,
+    data_type: &crate::catalog::schema::SqlType,
 ) -> Result<crate::sql::parser::ast::DefaultLiteral, String> {
-    use crate::sql::parser::ast::{DefaultLiteral, SqlType};
+    use crate::catalog::schema::SqlType;
+    use crate::sql::parser::ast::DefaultLiteral;
     match data_type {
         SqlType::String => Ok(DefaultLiteral::String(s.to_string())),
         // StarRocks-compatible: quoted numeric defaults — `DEFAULT "0"` on
@@ -1175,8 +1179,9 @@ mod tests {
     use sqlparser::parser::Parser;
 
     use super::parse_create_table_statement;
+    use crate::catalog::schema::SqlType;
     use crate::sql::parser::ast::{
-        ColumnAggregation, CreateTableKind, CreateTableStmt, IcebergPartitionFieldExpr, SqlType,
+        ColumnAggregation, CreateTableKind, CreateTableStmt, IcebergPartitionFieldExpr,
     };
     use crate::sql::parser::dialect::StarRocksDialect;
 

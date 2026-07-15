@@ -15,7 +15,8 @@ use iceberg::spec::{
     FormatVersion, Literal as IcebergLiteral, Map as IcebergMap, PrimitiveLiteral,
 };
 
-use crate::sql::parser::ast::{DefaultLiteral, Literal as AstLiteral, SqlType};
+use crate::catalog::schema::SqlType;
+use crate::sql::parser::ast::{DefaultLiteral, Literal as AstLiteral};
 
 /// Convert an AST `DefaultLiteral` to an `iceberg::spec::Literal` validated
 /// against the column's SqlType.  Returns `Ok(None)` for `DefaultLiteral::Null`
