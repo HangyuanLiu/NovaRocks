@@ -3091,9 +3091,8 @@ struct RustRawUseStatement {
     inline_modules: Vec<String>,
 }
 
-fn rust_raw_production_use_statements(text: &str) -> Vec<RustRawUseStatement> {
-    let production = rust_sanitized_production_text(text);
-    let tokens = rust_use_tokens(&production);
+fn rust_raw_use_statements(sanitized: &str) -> Vec<RustRawUseStatement> {
+    let tokens = rust_use_tokens(sanitized);
     let inline_module_openings = (0..tokens.len().saturating_sub(2))
         .filter_map(|index| {
             (tokens[index] == "mod"
@@ -3184,6 +3183,10 @@ fn rust_raw_production_use_statements(text: &str) -> Vec<RustRawUseStatement> {
     raw_imports
 }
 
+fn rust_raw_production_use_statements(text: &str) -> Vec<RustRawUseStatement> {
+    rust_raw_use_statements(&rust_sanitized_production_text(text))
+}
+
 fn rust_production_use_statements(text: &str) -> Vec<String> {
     let raw_imports = rust_raw_production_use_statements(text);
 
@@ -3269,9 +3272,9 @@ fn rust_production_scoped_use_statements(text: &str) -> Vec<RustScopedUseStateme
 
 type RustScopedAliases = BTreeMap<(Vec<String>, String), Vec<RustScopedUsePath>>;
 
-fn rust_production_scoped_aliases(text: &str) -> RustScopedAliases {
+fn rust_scoped_aliases(sanitized: &str) -> RustScopedAliases {
     let mut aliases = RustScopedAliases::new();
-    for raw in rust_raw_production_use_statements(text) {
+    for raw in rust_raw_use_statements(sanitized) {
         let local_name = match raw.path.alias.as_deref() {
             Some("_") => None,
             Some(alias) => Some(alias.to_string()),
@@ -3295,6 +3298,10 @@ fn rust_production_scoped_aliases(text: &str) -> RustScopedAliases {
         }
     }
     aliases
+}
+
+fn rust_production_scoped_aliases(text: &str) -> RustScopedAliases {
+    rust_scoped_aliases(&rust_sanitized_production_text(text))
 }
 
 fn rust_scoped_alias_key(
@@ -3373,9 +3380,8 @@ fn rust_resolve_scoped_paths(
     (!resolved.is_empty()).then(|| resolved.into_iter().collect())
 }
 
-fn rust_raw_production_non_use_paths(text: &str) -> Vec<RustScopedUsePath> {
-    let production = rust_sanitized_production_text(text);
-    let tokens = rust_use_tokens(&production);
+fn rust_raw_non_use_paths(sanitized: &str) -> Vec<RustScopedUsePath> {
+    let tokens = rust_use_tokens(sanitized);
     let inline_module_openings = (0..tokens.len().saturating_sub(2))
         .filter_map(|index| {
             (tokens[index] == "mod"
@@ -3568,15 +3574,28 @@ fn rust_canonical_use_segments(import: &str, source_rel: &str) -> Option<Vec<Str
     rust_canonical_use_segments_in_scope(import, source_rel, &[])
 }
 
-fn rust_production_canonical_paths(text: &str, source_rel: &str) -> Vec<Vec<String>> {
-    let mut canonical = rust_production_scoped_use_statements(text)
-        .into_iter()
-        .filter_map(|import| {
-            rust_canonical_use_segments_in_scope(&import.import, source_rel, &import.inline_modules)
-        })
-        .collect::<BTreeSet<_>>();
-    let aliases = rust_production_scoped_aliases(text);
-    for path in rust_raw_production_non_use_paths(text) {
+fn rust_canonical_paths(sanitized: &str, source_rel: &str) -> Vec<Vec<String>> {
+    let aliases = rust_scoped_aliases(sanitized);
+    let mut canonical = BTreeSet::new();
+    for raw in rust_raw_use_statements(sanitized) {
+        let resolved = rust_resolve_scoped_paths(
+            &raw.path.segments,
+            &raw.inline_modules,
+            &aliases,
+            &mut BTreeSet::new(),
+            0,
+        )
+        .unwrap_or_else(|| {
+            vec![RustScopedUsePath {
+                segments: raw.path.segments,
+                inline_modules: raw.inline_modules,
+            }]
+        });
+        canonical.extend(resolved.into_iter().filter_map(|path| {
+            rust_canonical_path_segments_in_scope(&path.segments, source_rel, &path.inline_modules)
+        }));
+    }
+    for path in rust_raw_non_use_paths(sanitized) {
         let resolved = rust_resolve_scoped_paths(
             &path.segments,
             &path.inline_modules,
@@ -3590,6 +3609,14 @@ fn rust_production_canonical_paths(text: &str, source_rel: &str) -> Vec<Vec<Stri
         }));
     }
     canonical.into_iter().collect()
+}
+
+fn rust_production_canonical_paths(text: &str, source_rel: &str) -> Vec<Vec<String>> {
+    rust_canonical_paths(&rust_sanitized_production_text(text), source_rel)
+}
+
+fn rust_all_source_canonical_paths(text: &str, source_rel: &str) -> Vec<Vec<String>> {
+    rust_canonical_paths(&rust_lexically_sanitized(text), source_rel)
 }
 
 #[test]
