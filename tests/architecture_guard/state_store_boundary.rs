@@ -68,6 +68,10 @@ fn is_connector_source(path: &str) -> bool {
     path.starts_with("src/connector/")
 }
 
+fn is_state_store_sqlite_source(path: &str) -> bool {
+    path == "src/state_store/sqlite.rs" || path.starts_with("src/state_store/sqlite/")
+}
+
 fn path_starts_with(path: &[String], prefix: &[&str]) -> bool {
     path.len() >= prefix.len()
         && path
@@ -120,6 +124,7 @@ fn state_store_boundary_violations(sources: &[GuardSource]) -> Vec<String> {
             }
 
             if source.path != "src/state_store/mod.rs"
+                && !is_state_store_sqlite_source(&source.path)
                 && path_starts_with(path, &["crate", "state_store", "sqlite"])
             {
                 violations.push(format!(
@@ -178,6 +183,10 @@ fn state_store_boundary_detector_rejects_forbidden_imports() {
         GuardSource::new("src/state_store/contract.rs", "use crate::meta::*;"),
         GuardSource::new("src/state_store/contract.rs", "use crate::connector::*;"),
         GuardSource::new(
+            "src/connector/state_store.rs",
+            "use crate::state_store::StateStoreConfig;",
+        ),
+        GuardSource::new(
             "src/catalog/reexport.rs",
             "pub use crate::state_store::sqlite::*;",
         ),
@@ -203,22 +212,97 @@ fn state_store_boundary_detector_rejects_forbidden_imports() {
             .any(|item| item.contains("crate::state_store::sqlite::*")),
         "sqlite adapter re-export must be rejected: {violations:?}"
     );
+    assert!(
+        violations
+            .iter()
+            .any(|item| item.contains("connector-state-store-dependency")),
+        "connector dependency on state store must be rejected: {violations:?}"
+    );
+}
+
+#[test]
+fn state_store_boundary_detector_rejects_each_forbidden_token() {
+    let fixtures = [
+        ("MetaStoreProvider", "use crate::safe::MetaStoreProvider;"),
+        ("apache_avro", "use apache_avro::Schema;"),
+        ("TPlanNode", "use crate::safe::TPlanNode;"),
+        ("IcebergTable", "use crate::safe::IcebergTable;"),
+        ("MaterializedView", "use crate::safe::MaterializedView;"),
+        (
+            "DictionaryDefinition",
+            "use crate::safe::DictionaryDefinition;",
+        ),
+    ];
+
+    for (token, text) in fixtures {
+        let violations = state_store_boundary_violations(&[GuardSource::new(
+            "src/state_store/contract.rs",
+            text,
+        )]);
+        assert!(
+            violations.iter().any(|item| item
+                == &format!("state-store-forbidden-token: src/state_store/contract.rs -> {token}")),
+            "forbidden token {token} must be rejected: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn state_store_boundary_detector_allows_sqlite_adapter_internal_imports() {
+    let sources = [
+        GuardSource::new(
+            "src/state_store/sqlite/mod.rs",
+            "use self::schema::SqliteSchema;",
+        ),
+        GuardSource::new(
+            "src/state_store/sqlite/transaction.rs",
+            "use super::schema::SqliteSchema;",
+        ),
+        GuardSource::new(
+            "src/state_store/mod.rs",
+            "pub use crate::state_store::sqlite::SqliteStateStore;",
+        ),
+    ];
+
+    assert!(state_store_boundary_violations(&sources).is_empty());
 }
 
 #[test]
 fn state_store_boundary_detector_ignores_non_production_noise() {
-    let source = GuardSource::new(
-        "src/state_store/contract.rs",
-        r#"
+    let sources = [
+        GuardSource::new(
+            "src/state_store/contract.rs",
+            r#"
 // use crate::meta::*;
-const EXAMPLE: &str = "crate::connector::IcebergTable";
+// use crate::safe::{MetaStoreProvider, TPlanNode, MaterializedView};
+// use apache_avro::Schema;
+const EXAMPLE: &str = "crate::connector::{IcebergTable, DictionaryDefinition}";
+const CONNECTOR_EXAMPLE: &str = "crate::state_store::StateStoreConfig";
+"#,
+        ),
+        GuardSource::new(
+            "src/state_store/contract.rs",
+            r#"
 #[cfg(test)]
 mod tests {
-    use crate::meta::MetaStoreProvider;
+    use apache_avro::Schema;
+    use crate::safe::{
+        DictionaryDefinition, IcebergTable, MaterializedView, MetaStoreProvider, TPlanNode,
+    };
     use crate::state_store::sqlite::*;
 }
 "#,
-    );
+        ),
+        GuardSource::new(
+            "src/connector/state_store.rs",
+            r#"
+// use crate::state_store::StateStoreConfig;
+const EXAMPLE: &str = "crate::state_store::StateStoreConfig";
+#[cfg(test)]
+use crate::state_store::StateStoreConfig;
+"#,
+        ),
+    ];
 
-    assert!(state_store_boundary_violations(&[source]).is_empty());
+    assert!(state_store_boundary_violations(&sources).is_empty());
 }
