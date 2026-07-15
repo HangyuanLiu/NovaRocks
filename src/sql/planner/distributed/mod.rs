@@ -15,17 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) mod boundary;
 pub(crate) mod build;
 mod fragment;
 mod node;
 pub(crate) mod runtime_filter;
 mod seal;
+pub(crate) mod topology;
 mod validation;
 pub(crate) mod write;
 
 #[cfg(test)]
 pub(crate) mod test_support;
 
+pub(crate) use boundary::{BoundaryColumn, BoundaryContract, BoundaryKind, ExecutionColumnId};
 pub(crate) use fragment::{
     DataPartition, DataSink, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind,
     PartitionKind, PlanFragment,

@@ -17,19 +17,16 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use super::boundary_schema::{
-    BoundaryKind, BoundarySchemaReport, output_columns_to_boundary_columns,
-};
+use super::boundary_schema::project_boundary_reports;
 use super::request::FragmentBuildRequest;
 use super::result::{
-    FragmentOutputKind, FragmentSchedulingMetadata, MultiFragmentBuildResult, OutputColumn,
-    RuntimeFilterPlanResult,
+    FragmentOutputKind, FragmentSchedulingMetadata, FragmentTopology, MultiFragmentBuildResult,
+    OutputColumn, RuntimeFilterPlanResult,
 };
 use super::runtime_filter::PlannedRuntimeFilter;
 use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
 use crate::sql::planner::distributed::{
-    DataPartition, DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor,
-    FragmentEdgeKind, FragmentId, PartitionKind, PlanFragment,
+    DistributedNode, DistributedNodeKind, DistributedPlan, FragmentId,
 };
 
 pub(crate) fn build(request: FragmentBuildRequest<'_>) -> Result<MultiFragmentBuildResult, String> {
@@ -47,6 +44,12 @@ pub(crate) fn build(request: FragmentBuildRequest<'_>) -> Result<MultiFragmentBu
         scan_binding_resolver,
     )?;
 
+    // Boundary reports are a read-only projection of the planner's sealed
+    // boundary catalog. Codegen never discovers boundary membership or re-selects
+    // any boundary's logical schema; the planner (`build_boundary_catalog`) owns
+    // that, and this projection copies its column order and provenance verbatim.
+    let boundary_reports = project_boundary_reports(dp);
+
     let mut fragment_schedules = Vec::with_capacity(dp.fragments().len());
     for fragment in dp.fragments() {
         let output_columns = fragment
@@ -54,11 +57,6 @@ pub(crate) fn build(request: FragmentBuildRequest<'_>) -> Result<MultiFragmentBu
             .iter()
             .map(output_column_for_boundary)
             .collect::<Vec<_>>();
-        let boundary_schemas = vec![result_root_boundary_schema_report(
-            fragment.fragment_id,
-            fragment.root.node_id,
-            &output_columns,
-        )];
         let has_scan_nodes = distributed_node_has_scan(&fragment.root);
         let output_kind = fragment_output_kind(&fragment.sink);
         let native_scan_ranges = scan_bindings
@@ -72,17 +70,14 @@ pub(crate) fn build(request: FragmentBuildRequest<'_>) -> Result<MultiFragmentBu
             output_kind,
             native_scan_ranges,
             output_columns,
-            boundary_schemas,
             cte_id: fragment.cte_id,
             cte_exchange_nodes: fragment.cte_exchange_nodes.clone(),
         });
     }
 
-    let mut boundary_schemas = fragment_schedules
-        .iter()
-        .flat_map(|fragment| fragment.boundary_schemas.clone())
-        .collect::<Vec<_>>();
-    boundary_schemas.extend(edge_boundary_schemas(dp)?);
+    // The query-level boundary reports are the full catalog projection, in the
+    // planner's canonical derivation order.
+    let boundary_schemas = boundary_reports;
 
     let encoded = crate::sql::codegen::proto_encode::plan::encode_distributed_plan_with_context(
         dp,
@@ -105,10 +100,19 @@ pub(crate) fn build(request: FragmentBuildRequest<'_>) -> Result<MultiFragmentBu
         dp.root_fragment_id(),
     )?;
 
+    // Project the planner's sealed topology (Task 2) read-only. The scheduler
+    // and coordinator consume this order/anchor instead of rederiving the DAG
+    // shape from edges.
+    let topology = FragmentTopology::new(
+        dp.topology().topological_fragment_order().to_vec(),
+        dp.topology().execution_anchor_fragment_id(),
+    );
+
     Ok(MultiFragmentBuildResult {
         fragment_schedules,
         native_fragments,
         root_fragment_id: dp.root_fragment_id(),
+        topology,
         edges: dp.edges().to_vec(),
         boundary_schemas,
         rf_plan: runtime_filter_plan(dp),
@@ -147,73 +151,6 @@ fn output_column_for_boundary(column: &AnalysisOutputColumn) -> OutputColumn {
         data_type: column.data_type.clone(),
         nullable: column.nullable,
     }
-}
-
-fn result_root_boundary_schema_report(
-    fragment_id: FragmentId,
-    root_node_id: i32,
-    output_columns: &[OutputColumn],
-) -> BoundarySchemaReport {
-    BoundarySchemaReport {
-        fragment_id: Some(fragment_id as i32),
-        node_id: root_node_id,
-        boundary_kind: BoundaryKind::ResultRoot,
-        columns: output_columns_to_boundary_columns(output_columns),
-    }
-}
-
-fn edge_boundary_schemas(dp: &DistributedPlan) -> Result<Vec<BoundarySchemaReport>, String> {
-    let fragments_by_id: BTreeMap<FragmentId, &PlanFragment> = dp
-        .fragments()
-        .iter()
-        .map(|fragment| (fragment.fragment_id, fragment))
-        .collect();
-    let mut reports = Vec::with_capacity(dp.edges().len() * 2);
-    for edge in dp.edges() {
-        let source = fragments_by_id
-            .get(&edge.source_fragment_id)
-            .ok_or_else(|| {
-                format!(
-                    "lower_distributed_plan edge references missing source fragment id={}",
-                    edge.source_fragment_id
-                )
-            })?;
-        if !fragments_by_id.contains_key(&edge.target_fragment_id) {
-            return Err(format!(
-                "lower_distributed_plan edge references missing target fragment id={}",
-                edge.target_fragment_id
-            ));
-        }
-        let exchange = target_exchange_for_edge(&fragments_by_id, edge)?;
-        let edge_output_columns = match edge.edge_kind {
-            FragmentEdgeKind::CteMulticast { .. } | FragmentEdgeKind::Stream => {
-                if exchange.output_columns.is_empty() {
-                    &source.output_columns
-                } else {
-                    &exchange.output_columns
-                }
-            }
-            FragmentEdgeKind::IcebergChangeStreamRouter { .. } => &exchange.output_columns,
-        };
-        let output_columns = edge_output_columns
-            .iter()
-            .map(output_column_for_boundary)
-            .collect::<Vec<_>>();
-        let columns = output_columns_to_boundary_columns(&output_columns);
-        reports.push(BoundarySchemaReport {
-            fragment_id: Some(edge.source_fragment_id as i32),
-            node_id: edge.target_exchange_node_id,
-            boundary_kind: BoundaryKind::ExchangeSender,
-            columns: columns.clone(),
-        });
-        reports.push(BoundarySchemaReport {
-            fragment_id: Some(edge.target_fragment_id as i32),
-            node_id: edge.target_exchange_node_id,
-            boundary_kind: BoundaryKind::ExchangeReceiver,
-            columns,
-        });
-    }
-    Ok(reports)
 }
 
 fn runtime_filter_plan(dp: &DistributedPlan) -> Option<RuntimeFilterPlanResult> {
@@ -317,122 +254,6 @@ fn collect_runtime_filter_builds(
     }
 }
 
-// CGO-9B seam: distributed-plan structural validation now lives in the planner
-// (`crate::sql::planner::distributed::validation`) and runs at seal time, so
-// `build()` no longer validates. `edge_boundary_schemas` still needs to resolve
-// the target Exchange for boundary-schema reporting, and it runs on an
-// already-sealed, already-validated plan, so this resolver (and the small
-// exchange-flavor/partition checks it reuses) remains here transiently. Its
-// structural checks are redundant with the planner validator; CGO-9B unifies
-// them when boundary ownership moves into the planner. Do not extend it.
-fn target_exchange_for_edge<'a>(
-    fragments_by_id: &BTreeMap<FragmentId, &'a PlanFragment>,
-    edge: &crate::sql::planner::distributed::FragmentEdge,
-) -> Result<&'a crate::sql::planner::distributed::ExchangeReceiver, String> {
-    let target = fragments_by_id
-        .get(&edge.target_fragment_id)
-        .ok_or_else(|| {
-            format!(
-                "lower_distributed_plan edge references missing target fragment id={}",
-                edge.target_fragment_id
-            )
-        })?;
-    let exchange = find_exchange_node(&target.root, edge.target_exchange_node_id).ok_or_else(|| {
-        format!(
-            "lower_distributed_plan edge target_exchange_node_id={} not found in target fragment id={}",
-            edge.target_exchange_node_id, edge.target_fragment_id
-        )
-    })?;
-    let DistributedNodeKind::Exchange(exchange) = &exchange.payload else {
-        return Err(format!(
-            "lower_distributed_plan edge target_exchange_node_id={} in target fragment id={} must target Exchange",
-            edge.target_exchange_node_id, edge.target_fragment_id
-        ));
-    };
-    if edge.source_fragment_id != exchange.source_fragment_id {
-        return Err(format!(
-            "lower_distributed_plan {} edge source_fragment_id={} does not match Exchange source_fragment_id={} for target_exchange_node_id={} in target fragment id={}",
-            fragment_edge_kind_label(&edge.edge_kind),
-            edge.source_fragment_id,
-            exchange.source_fragment_id,
-            edge.target_exchange_node_id,
-            edge.target_fragment_id
-        ));
-    }
-    validate_exchange_partition(&exchange.partition)?;
-    match (&edge.edge_kind, &exchange.flavor) {
-        (FragmentEdgeKind::Stream, ExchangeFlavor::Distribution)
-        | (FragmentEdgeKind::Stream, ExchangeFlavor::LimitOffset { .. })
-        | (FragmentEdgeKind::Stream, ExchangeFlavor::TopNSplit { .. }) => {}
-        (
-            FragmentEdgeKind::CteMulticast {
-                cte_id,
-                receive_producer_column_ids,
-            },
-            ExchangeFlavor::CteMulticast {
-                cte_id: exchange_cte_id,
-                receive_producer_column_ids: exchange_ids,
-            },
-        ) => {
-            if cte_id != exchange_cte_id || receive_producer_column_ids != exchange_ids {
-                return Err(format!(
-                    "lower_distributed_plan CTE multicast edge metadata does not match Exchange metadata for target_exchange_node_id={} in target fragment id={}",
-                    edge.target_exchange_node_id, edge.target_fragment_id
-                ));
-            }
-        }
-        (FragmentEdgeKind::IcebergChangeStreamRouter { .. }, ExchangeFlavor::Distribution) => {}
-        (FragmentEdgeKind::Stream, _) => {
-            return Err(format!(
-                "lower_distributed_plan stream edge target_exchange_node_id={} in target fragment id={} must target stream Exchange",
-                edge.target_exchange_node_id, edge.target_fragment_id
-            ));
-        }
-        (FragmentEdgeKind::CteMulticast { .. }, _) => {
-            return Err(format!(
-                "lower_distributed_plan CTE multicast edge target_exchange_node_id={} in target fragment id={} must target Exchange(CteMulticast)",
-                edge.target_exchange_node_id, edge.target_fragment_id
-            ));
-        }
-        (FragmentEdgeKind::IcebergChangeStreamRouter { .. }, _) => {
-            return Err(format!(
-                "lower_distributed_plan Iceberg change-stream router edge target_exchange_node_id={} in target fragment id={} must target Exchange(Distribution)",
-                edge.target_exchange_node_id, edge.target_fragment_id
-            ));
-        }
-    }
-    Ok(exchange)
-}
-
-fn fragment_edge_kind_label(edge_kind: &FragmentEdgeKind) -> &'static str {
-    match edge_kind {
-        FragmentEdgeKind::Stream => "stream",
-        FragmentEdgeKind::CteMulticast { .. } => "CTE multicast",
-        FragmentEdgeKind::IcebergChangeStreamRouter { .. } => "Iceberg change-stream router",
-    }
-}
-
-fn validate_exchange_partition(partition: &DataPartition) -> Result<(), String> {
-    if matches!(partition.kind, PartitionKind::Hash) && partition.exprs.is_empty() {
-        return Err(
-            "DistributedPlan HASH Exchange has no native partition expressions".to_string(),
-        );
-    }
-    Ok(())
-}
-
-fn find_exchange_node(node: &DistributedNode, node_id: i32) -> Option<&DistributedNode> {
-    if node.node_id == node_id {
-        return Some(node);
-    }
-    for child in &node.children {
-        if let Some(found) = find_exchange_node(child, node_id) {
-            return Some(found);
-        }
-    }
-    None
-}
-
 fn distributed_node_has_scan(node: &DistributedNode) -> bool {
     matches!(node.payload, DistributedNodeKind::Scan(_))
         || node.children.iter().any(distributed_node_has_scan)
@@ -458,6 +279,9 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
+    use super::super::boundary_schema::{
+        BoundaryKind, BoundarySchemaColumn, BoundarySchemaReport, project_boundary_reports,
+    };
     use super::*;
     use crate::connector::ConnectorRegistry;
     use crate::runtime_filter::model::graph::RuntimeFilterGraph;
@@ -467,7 +291,9 @@ mod tests {
     use crate::sql::codegen::scan::preparation::build_iceberg_metadata_scan_range_params;
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed::{
-        ExchangeFlavor, ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
+        BoundaryContract, BoundaryKind as PlannerBoundaryKind, DataPartition, ExchangeFlavor,
+        ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentStreamKind, PartitionKind,
+        PlanFragment,
     };
     use crate::sql::planner::payload::{PlanScanNode, PlanValuesNode};
     use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
@@ -1401,6 +1227,7 @@ mod tests {
             .assign(
                 &result.fragment_schedules,
                 &result.edges,
+                &result.topology,
                 crate::common::types::UniqueId { hi: 1, lo: 7 },
             )
             .expect("schedule broadcast plan");
@@ -1941,5 +1768,262 @@ mod tests {
             .get(&consumer_fragment_id)
             .expect("encoded native consumer");
         assert_eq!(native_consumer.cte_exchange_nodes[0].column_ids, vec![1, 3]);
+    }
+
+    // ------------------------------------------------------------------
+    // CGO-9B Task 3: codegen boundary reports are a read-only projection of
+    // the planner's sealed boundary catalog. These tests pin that the
+    // projection preserves ExecutionColumnId occurrence order and ColumnId
+    // provenance, and that codegen cannot select a different logical schema
+    // than the planner catalog.
+    // ------------------------------------------------------------------
+
+    fn cte_multicast_plan() -> DistributedPlan {
+        let cte_id: CteId = 7;
+        let producer_columns = vec![
+            output_col(1, "k"),
+            output_col(2, "v"),
+            output_col(3, "payload"),
+        ];
+        let receive_columns = vec![producer_columns[0].clone(), producer_columns[2].clone()];
+        let receive_producer_column_ids =
+            vec![producer_columns[0].column_id, producer_columns[2].column_id];
+        let producer_fragment_id = 1;
+        let consumer_fragment_id = 0;
+        let exchange_node_id = 20;
+        let producer_fragment = PlanFragment {
+            fragment_id: producer_fragment_id,
+            root: physical_values_node(producer_fragment_id, 10, producer_columns.clone()),
+            data_partition: DataPartition::unpartitioned(),
+            output_partition: DataPartition::unpartitioned(),
+            sink: crate::sql::planner::distributed::DataSink::Noop,
+            output_exprs: None,
+            output_columns: producer_columns,
+            cte_id: Some(cte_id),
+            cte_exchange_nodes: Vec::new(),
+        };
+        let consumer_fragment = PlanFragment {
+            fragment_id: consumer_fragment_id,
+            root: DistributedNode {
+                node_id: exchange_node_id,
+                fragment_id: consumer_fragment_id,
+                tuple_ids: vec![exchange_node_id],
+                nullable_tuple_ids: Vec::new(),
+                limit: -1,
+                build_runtime_filters: Vec::new(),
+                probe_runtime_filters: Vec::new(),
+                children: Vec::new(),
+                stats: stats(),
+                payload: DistributedNodeKind::Exchange(ExchangeReceiver {
+                    partition: DataPartition::unpartitioned(),
+                    source_fragment_id: producer_fragment_id,
+                    output_columns: receive_columns.clone(),
+                    output_qualifier: Some("c".to_string()),
+                    flavor: ExchangeFlavor::CteMulticast {
+                        cte_id,
+                        receive_producer_column_ids: receive_producer_column_ids.clone(),
+                    },
+                }),
+            },
+            data_partition: DataPartition::unpartitioned(),
+            output_partition: DataPartition::unpartitioned(),
+            sink: crate::sql::planner::distributed::DataSink::Result,
+            output_exprs: None,
+            output_columns: receive_columns,
+            cte_id: None,
+            cte_exchange_nodes: vec![(
+                cte_id,
+                exchange_node_id,
+                receive_producer_column_ids.clone(),
+            )],
+        };
+        crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
+            fragments: vec![producer_fragment, consumer_fragment],
+            root_fragment_id: consumer_fragment_id,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
+            edges: vec![FragmentEdge {
+                source_fragment_id: producer_fragment_id,
+                target_fragment_id: consumer_fragment_id,
+                target_exchange_node_id: exchange_node_id,
+                output_partition: DataPartition::unpartitioned(),
+                stream_kind: FragmentStreamKind::Gather,
+                edge_kind: FragmentEdgeKind::CteMulticast {
+                    cte_id,
+                    receive_producer_column_ids,
+                },
+                output_slot_ids: vec![1, 3],
+            }],
+        }
+    }
+
+    /// Assert the projected reports are a faithful, order-preserving projection
+    /// of the sealed boundary catalog: one report per contract, kind mapped, and
+    /// every column copied verbatim (occurrence identity, logical provenance, and
+    /// descriptive schema). This is the structural proof that codegen cannot
+    /// select a different logical schema: it cannot fabricate the planner's
+    /// per-occurrence `ExecutionColumnId`s, so matching them means they were
+    /// copied, not re-derived.
+    fn assert_reports_mirror_catalog(plan: &DistributedPlan) {
+        let contracts = plan.boundaries().contracts();
+        let reports = project_boundary_reports(plan);
+        assert_eq!(
+            reports.len(),
+            contracts.len(),
+            "exactly one report per sealed boundary contract"
+        );
+        for (report, contract) in reports.iter().zip(contracts) {
+            assert_eq!(report.fragment_id, Some(contract.fragment_id as i32));
+            assert_eq!(report.node_id, contract.node_id);
+            assert_eq!(
+                report.boundary_kind,
+                BoundaryKind::from_planner(contract.kind)
+            );
+            assert_eq!(
+                report.columns.len(),
+                contract.columns.len(),
+                "column count preserved for {:?}",
+                contract.kind
+            );
+            for (ordinal, (column, source)) in
+                report.columns.iter().zip(&contract.columns).enumerate()
+            {
+                // Occurrence identity and logical provenance copied verbatim.
+                assert_eq!(column.execution_column_id, source.execution_column_id);
+                assert_eq!(column.column_id, source.column_id);
+                // Descriptive schema copied verbatim, never re-selected.
+                assert_eq!(column.name, source.name);
+                assert_eq!(column.arrow_type, source.data_type);
+                assert_eq!(column.nullable, source.nullable);
+                // slot_id is the 1-based boundary-local occurrence position.
+                assert_eq!(column.slot_id, ordinal as i32 + 1);
+                assert_eq!(column.slot_id, source.output_ordinal as i32 + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn codegen_projects_stream_boundaries_from_planner_catalog() {
+        assert_reports_mirror_catalog(&stream_exchange_plan(ExchangeFlavor::Distribution));
+    }
+
+    #[test]
+    fn codegen_projects_cte_multicast_boundaries_from_planner_catalog() {
+        // The receiver projects producer columns [k, payload] out of [k, v,
+        // payload]; the send/receive boundaries must carry exactly that
+        // planner-owned two-column schema, never the producer's full output.
+        assert_reports_mirror_catalog(&cte_multicast_plan());
+    }
+
+    #[test]
+    fn codegen_projects_router_and_write_boundaries_from_planner_catalog() {
+        assert_reports_mirror_catalog(&finalized_router_plan());
+    }
+
+    #[test]
+    fn codegen_projects_single_fragment_result_boundary_from_planner_catalog() {
+        assert_reports_mirror_catalog(&iceberg_scan_plan(None));
+    }
+
+    #[test]
+    fn codegen_preserves_execution_column_id_occurrence_order_across_send_and_receive() {
+        let plan = stream_exchange_plan(ExchangeFlavor::Distribution);
+        let reports = project_boundary_reports(&plan);
+        let send = reports
+            .iter()
+            .find(|report| report.boundary_kind == BoundaryKind::ExchangeSender)
+            .expect("stream plan has an exchange sender boundary");
+        let receive = reports
+            .iter()
+            .find(|report| report.boundary_kind == BoundaryKind::ExchangeReceiver)
+            .expect("stream plan has an exchange receiver boundary");
+
+        // Same logical column at both seams ...
+        assert_eq!(send.columns[0].column_id, receive.columns[0].column_id);
+        // ... but distinct query-scoped occurrence identity, and the planner
+        // numbers the send occurrence before the receive occurrence per edge.
+        assert_ne!(
+            send.columns[0].execution_column_id,
+            receive.columns[0].execution_column_id
+        );
+        assert!(
+            send.columns[0].execution_column_id.value()
+                < receive.columns[0].execution_column_id.value()
+        );
+    }
+
+    #[test]
+    fn codegen_projection_drops_per_fragment_root_and_gains_sink_boundaries() {
+        // A change-stream router/write plan has no result sink. The projection
+        // emits exactly the planner's four seams -- no ResultRoot, and the sink
+        // inputs the planner owns (router input + Iceberg write input) that the
+        // pre-Task-3 codegen enum had no variant for.
+        let reports = project_boundary_reports(&finalized_router_plan());
+        let has = |kind: BoundaryKind| reports.iter().any(|report| report.boundary_kind == kind);
+        assert!(
+            !has(BoundaryKind::ResultRoot),
+            "a router/write plan projects no ResultRoot boundary"
+        );
+        assert!(has(BoundaryKind::ChangeStreamRouterInput));
+        assert!(has(BoundaryKind::IcebergWriteInput));
+        assert!(has(BoundaryKind::ExchangeSender));
+        assert!(has(BoundaryKind::ExchangeReceiver));
+    }
+
+    #[test]
+    fn native_fragment_build_boundary_schemas_are_the_planner_catalog_projection() {
+        let plan = stream_exchange_plan(ExchangeFlavor::Distribution);
+        let result = build(FragmentBuildRequest::result(
+            &plan,
+            &EmptyCatalog,
+            &ConnectorRegistry::new(),
+            None,
+        ))
+        .expect("native fragment build");
+
+        // build() wires the query-level reports straight from the projection,
+        // in canonical order, without reordering or dropping any boundary.
+        assert_eq!(result.boundary_schemas, project_boundary_reports(&plan));
+    }
+
+    #[test]
+    fn boundary_schema_columns_carry_planner_provenance() {
+        // Regression pin for the provenance the pre-Task-3 generator dropped: the
+        // projected column carries both the query-scoped occurrence id and the
+        // logical ColumnId, not just a re-numbered slot.
+        let plan = cte_multicast_plan();
+        let reports = project_boundary_reports(&plan);
+        let result_root = reports
+            .iter()
+            .find(|report| report.boundary_kind == BoundaryKind::ResultRoot)
+            .expect("cte plan has a result-root boundary");
+        let column_ids: Vec<ColumnId> = result_root
+            .columns
+            .iter()
+            .map(|column: &BoundarySchemaColumn| column.column_id)
+            .collect();
+        assert_eq!(
+            column_ids,
+            vec![ColumnId::new_for_test(1), ColumnId::new_for_test(3)],
+            "result-root boundary preserves the planner ColumnId provenance"
+        );
+        // Occurrence ids are dense and ordered within the boundary.
+        assert!(
+            result_root.columns[0].execution_column_id.value()
+                < result_root.columns[1].execution_column_id.value()
+        );
+
+        // Anchor the provenance to the concrete planner contract it projects, so
+        // the pin fails if codegen ever re-derives instead of copying.
+        let contract: &BoundaryContract = plan
+            .boundaries()
+            .contracts()
+            .iter()
+            .find(|contract| contract.kind == PlannerBoundaryKind::ResultOutput)
+            .expect("cte plan has a result-output contract");
+        assert_eq!(contract.columns.len(), result_root.columns.len());
+        for (projected, source) in result_root.columns.iter().zip(&contract.columns) {
+            assert_eq!(projected.column_id, source.column_id);
+            assert_eq!(projected.execution_column_id, source.execution_column_id);
+        }
     }
 }

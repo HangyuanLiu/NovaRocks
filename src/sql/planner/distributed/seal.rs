@@ -20,7 +20,11 @@ use std::fmt;
 use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 use crate::runtime_filter::model::validation::GraphValidationError;
 
+use super::boundary::{
+    BoundaryCatalog, BoundaryError, ExecutionColumnIdAllocator, build_boundary_catalog,
+};
 use super::fragment::{DistributedPlanDraft, FragmentEdge, FragmentId, PlanFragment};
+use super::topology::{TopologyContract, TopologyError, build_topology_contract};
 use super::validation::{self, DistributedPlanValidationError};
 
 #[derive(Clone, Debug)]
@@ -31,6 +35,13 @@ struct DistributedPlanData {
     // RFD-5A will populate and consume this slot; remove the allowance at that cutover.
     #[allow(dead_code)]
     runtime_filter_graph: RuntimeFilterGraph,
+    // Authoritative boundary membership catalog derived at seal time.
+    boundaries: BoundaryCatalog,
+    // Final state of the single query-scoped occurrence allocator. Preserved so
+    // CGO-9C can resume allocating internal occurrences without rebuilding it.
+    execution_column_id_allocator: ExecutionColumnIdAllocator,
+    // Authoritative fragment-graph execution shape derived at seal time.
+    topology: TopologyContract,
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +65,24 @@ impl DistributedPlan {
     pub(crate) fn runtime_filter_graph(&self) -> &RuntimeFilterGraph {
         &self.data.runtime_filter_graph
     }
+
+    // Consumed on the production codegen path (`project_boundary_reports` in
+    // `sql::codegen::fragment`) and, later, by CGO-9C occurrence allocation.
+    pub(crate) fn boundaries(&self) -> &BoundaryCatalog {
+        &self.data.boundaries
+    }
+
+    // CGO-9C resumes occurrence allocation from this preserved state.
+    #[allow(dead_code)]
+    pub(crate) fn execution_column_id_allocator(&self) -> &ExecutionColumnIdAllocator {
+        &self.data.execution_column_id_allocator
+    }
+
+    // Consumed on the production path by codegen `build()` (CGO-9B/Task 4),
+    // which projects the sealed order/anchor into the scheduler's topology.
+    pub(crate) fn topology(&self) -> &TopologyContract {
+        &self.data.topology
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -63,6 +92,8 @@ pub(in crate::sql::planner::distributed) enum DistributedPlanSealError {
     RootFragmentNotFound { root_fragment_id: FragmentId },
     Structural(DistributedPlanValidationError),
     RuntimeFilterGraph(GraphValidationError),
+    Boundary(BoundaryError),
+    Topology(TopologyError),
 }
 
 impl fmt::Display for DistributedPlanSealError {
@@ -78,6 +109,8 @@ impl fmt::Display for DistributedPlanSealError {
             ),
             Self::Structural(error) => error.fmt(formatter),
             Self::RuntimeFilterGraph(error) => error.fmt(formatter),
+            Self::Boundary(error) => error.fmt(formatter),
+            Self::Topology(error) => error.fmt(formatter),
         }
     }
 }
@@ -104,6 +137,14 @@ pub(in crate::sql::planner::distributed) fn seal_draft(
     }
     validation::validate_distributed_structure(&fragments, root_fragment_id, &edges)
         .map_err(DistributedPlanSealError::Structural)?;
+    // Finalize the fragment-graph execution shape as an extension of structural
+    // validation: this derives the topological order, execution anchor, and the
+    // producer/terminal-write/result sets, and fails fast on the graph-level
+    // invariants (acyclicity, order consistency, anchor determinacy) that
+    // structural validation does not cover. Runs before construction and before
+    // the runtime-filter graph check.
+    let topology = build_topology_contract(&fragments, root_fragment_id, &edges)
+        .map_err(DistributedPlanSealError::Topology)?;
     // RFD-1 read-only structural validation of the runtime filter graph, run after
     // non-RF structural validation and before immutable construction. The graph is
     // validated here, never populated; CGO-9A stays agnostic to whether nodes still
@@ -111,12 +152,27 @@ pub(in crate::sql::planner::distributed) fn seal_draft(
     runtime_filter_graph
         .validate()
         .map_err(DistributedPlanSealError::RuntimeFilterGraph)?;
+    // Finalize logical boundary membership and occurrence identity. This only
+    // derives from the now known-valid fragments/edges/sinks; it fails fast on
+    // any unresolved column reference and never repairs or guesses. The final
+    // allocator state is preserved in the sealed plan for CGO-9C.
+    let mut execution_column_id_allocator = ExecutionColumnIdAllocator::new();
+    let boundaries = build_boundary_catalog(
+        &fragments,
+        root_fragment_id,
+        &edges,
+        &mut execution_column_id_allocator,
+    )
+    .map_err(DistributedPlanSealError::Boundary)?;
     Ok(DistributedPlan {
         data: DistributedPlanData {
             fragments,
             root_fragment_id,
             edges,
             runtime_filter_graph,
+            boundaries,
+            execution_column_id_allocator,
+            topology,
         },
     })
 }

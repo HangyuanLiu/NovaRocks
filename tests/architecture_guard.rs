@@ -6326,22 +6326,26 @@ fn planner_distributed_core_has_stage_namespace() {
     assert_eq!(
         planner_namespace_module_declarations(&distributed_mod),
         BTreeSet::from([
+            "boundary".to_string(),
             "build".to_string(),
             "fragment".to_string(),
             "node".to_string(),
             "runtime_filter".to_string(),
             "seal".to_string(),
+            "topology".to_string(),
             "validation".to_string(),
             "write".to_string(),
         ]),
-        "distributed/mod.rs must declare exactly build, fragment, node, runtime_filter, seal, validation, and write"
+        "distributed/mod.rs must declare exactly boundary, build, fragment, node, runtime_filter, seal, topology, validation, and write"
     );
     for declaration in [
+        "pub(crate) mod boundary;",
         "pub(crate) mod build;",
         "mod fragment;",
         "mod node;",
         "pub(crate) mod runtime_filter;",
         "mod seal;",
+        "pub(crate) mod topology;",
         "mod validation;",
         "pub(crate) mod write;",
     ] {
@@ -6355,6 +6359,10 @@ fn planner_distributed_core_has_stage_namespace() {
             .into_iter()
             .collect::<BTreeSet<_>>(),
         BTreeSet::from([
+            "pub(crate)|boundary::BoundaryColumn".to_string(),
+            "pub(crate)|boundary::BoundaryContract".to_string(),
+            "pub(crate)|boundary::BoundaryKind".to_string(),
+            "pub(crate)|boundary::ExecutionColumnId".to_string(),
             "pub(crate)|fragment::DataPartition".to_string(),
             "pub(crate)|fragment::DataSink".to_string(),
             "pub(crate)|fragment::FragmentEdge".to_string(),
@@ -26383,7 +26391,7 @@ fn distributed_plan_seal_task2_enforces_private_draft_and_single_typed_seal() {
 //
 // The detector keys on function *definitions* (`fn validate_distributed_plan`
 // / `fn validate_distributed_structure`), so codegen helpers that legitimately
-// stay (e.g. `validate_native_fragment_ownership`, `target_exchange_for_edge`)
+// stay (e.g. `validate_native_fragment_ownership`, `output_column_for_boundary`)
 // and prose comments referencing the planner module are not matched.
 // ---------------------------------------------------------------------------
 
@@ -26439,7 +26447,7 @@ fn distributed_plan_seal_task3_detector_accepts_planner_owned_validator() {
     let sources = [
         Cgo8GuardSource::new(
             "src/sql/codegen/fragment/build.rs",
-            "fn build() {} fn target_exchange_for_edge() {} fn validate_native_fragment_ownership() {}",
+            "fn build() {} fn output_column_for_boundary() {} fn validate_native_fragment_ownership() {}",
         ),
         Cgo8GuardSource::new(
             "src/sql/planner/distributed/validation.rs",
@@ -26696,6 +26704,463 @@ fn distributed_plan_seal_task4_source_tree_validates_runtime_filter_graph_withou
         node_carrier_violations.is_empty(),
         "CGO-9A Task 4 seal must stay agnostic to node-carried runtime filters:\n{}",
         node_carrier_violations.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CGO-9B Task 3: the boundary contract is planner-owned; `codegen::fragment`
+// is a read-only projection of the sealed catalog.
+//
+// Tasks 1-2 moved boundary derivation into the planner seal
+// (`crate::sql::planner::distributed::boundary`): `build_boundary_catalog`
+// derives every boundary's membership and numbers each column occurrence
+// (`struct BoundaryColumn` carrying an `ExecutionColumnId`). Task 3 makes
+// codegen consume that catalog verbatim -- it deleted the codegen-side
+// boundary-column generator (`output_columns_to_boundary_columns`) and the
+// edge/target-exchange discovery that re-selected boundary columns. These
+// guards keep derivation, the occurrence type, and provenance on the planner
+// side, and keep `codegen::fragment` projection-only by requiring it to read
+// the sealed catalog through the `DistributedPlan::boundaries()` accessor.
+//
+// The detector keys on function/type *definitions* under each root and on
+// codegen's use of the planner accessor (`.boundaries()`), so prose comments,
+// `use` lines, and function parameters that merely *name* the planner types are
+// not matched (`struct BoundaryColumn` is not a substring of the codegen report
+// type `struct BoundarySchemaColumn`). Text is sanitized (comments/strings
+// stripped, `#[cfg(test)]` items blanked) so test fixtures never trip the
+// production guard.
+// ---------------------------------------------------------------------------
+
+const PLANNER_BOUNDARY_CONTRACT_CODEGEN_ROOT: &str = "src/sql/codegen/fragment/";
+const PLANNER_BOUNDARY_CONTRACT_PLANNER_ROOT: &str = "src/sql/planner/distributed/";
+const PLANNER_BOUNDARY_CONTRACT_DERIVATION_DEF: &str = "fn build_boundary_catalog(";
+const PLANNER_BOUNDARY_CONTRACT_COLUMN_TYPE_DEF: &str = "struct BoundaryColumn";
+const PLANNER_BOUNDARY_CONTRACT_CODEGEN_GENERATOR_DEF: &str =
+    "fn output_columns_to_boundary_columns(";
+const PLANNER_BOUNDARY_CONTRACT_CATALOG_ACCESSOR: &str = ".boundaries()";
+
+fn planner_boundary_contract_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut planner_defines_derivation = false;
+    let mut planner_defines_column_type = false;
+    let mut codegen_projects_catalog = false;
+
+    for source in sources {
+        let production = rust_sanitized_production_text(&source.text);
+        if source
+            .path
+            .starts_with(PLANNER_BOUNDARY_CONTRACT_CODEGEN_ROOT)
+        {
+            if production.contains(PLANNER_BOUNDARY_CONTRACT_CODEGEN_GENERATOR_DEF) {
+                violations.push(format!(
+                    "codegen-owns-boundary-generator: {} defines `output_columns_to_boundary_columns`; boundary columns must be projected from the planner catalog, never generated in codegen",
+                    source.path
+                ));
+            }
+            if production.contains(PLANNER_BOUNDARY_CONTRACT_DERIVATION_DEF) {
+                violations.push(format!(
+                    "codegen-defines-boundary-derivation: {} defines `build_boundary_catalog`; boundary membership derivation is planner-owned",
+                    source.path
+                ));
+            }
+            if production.contains(PLANNER_BOUNDARY_CONTRACT_COLUMN_TYPE_DEF) {
+                violations.push(format!(
+                    "codegen-defines-boundary-column-type: {} defines `struct BoundaryColumn`; the boundary column occurrence type is planner-owned",
+                    source.path
+                ));
+            }
+            if production.contains(PLANNER_BOUNDARY_CONTRACT_CATALOG_ACCESSOR) {
+                codegen_projects_catalog = true;
+            }
+        }
+        if source
+            .path
+            .starts_with(PLANNER_BOUNDARY_CONTRACT_PLANNER_ROOT)
+        {
+            if production.contains(PLANNER_BOUNDARY_CONTRACT_DERIVATION_DEF) {
+                planner_defines_derivation = true;
+            }
+            if production.contains(PLANNER_BOUNDARY_CONTRACT_COLUMN_TYPE_DEF) {
+                planner_defines_column_type = true;
+            }
+        }
+    }
+
+    if !planner_defines_derivation {
+        violations.push(format!(
+            "missing-planner-boundary-derivation: no {PLANNER_BOUNDARY_CONTRACT_PLANNER_ROOT} source defines `{PLANNER_BOUNDARY_CONTRACT_DERIVATION_DEF}`"
+        ));
+    }
+    if !planner_defines_column_type {
+        violations.push(format!(
+            "missing-planner-boundary-column-type: no {PLANNER_BOUNDARY_CONTRACT_PLANNER_ROOT} source defines `{PLANNER_BOUNDARY_CONTRACT_COLUMN_TYPE_DEF}`"
+        ));
+    }
+    if !codegen_projects_catalog {
+        violations.push(format!(
+            "codegen-not-projecting-planner-catalog: no {PLANNER_BOUNDARY_CONTRACT_CODEGEN_ROOT} source consumes the sealed boundary catalog via `{PLANNER_BOUNDARY_CONTRACT_CATALOG_ACCESSOR}`; codegen must project the planner catalog, not re-derive boundaries"
+        ));
+    }
+
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+#[test]
+fn planner_boundary_contract_detector_accepts_planner_owned_projection() {
+    let sources = [
+        Cgo8GuardSource::new(
+            "src/sql/codegen/fragment/boundary_schema.rs",
+            "use crate::sql::planner::distributed::{BoundaryColumn, BoundaryContract};\n\
+             fn project_boundary_reports(plan: &DistributedPlan) -> Vec<BoundarySchemaReport> {\n\
+                 plan.boundaries().contracts().iter().map(project).collect()\n\
+             }\n\
+             fn project(_: &BoundaryContract) {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/boundary.rs",
+            "pub(crate) struct BoundaryColumn { pub column_id: ColumnId }\n\
+             pub(in crate::sql::planner::distributed) fn build_boundary_catalog() {}",
+        ),
+    ];
+    let violations = planner_boundary_contract_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "planner-owned boundary contract with projection-only codegen must pass: {violations:?}"
+    );
+}
+
+#[test]
+fn planner_boundary_contract_detector_rejects_codegen_ownership() {
+    let planner_owner = Cgo8GuardSource::new(
+        "src/sql/planner/distributed/boundary.rs",
+        "pub(crate) struct BoundaryColumn {}\n\
+         pub(in crate::sql::planner::distributed) fn build_boundary_catalog() {}",
+    );
+
+    for (forbidden, marker) in [
+        (
+            "fn output_columns_to_boundary_columns(o: &[OutputColumn]) -> Vec<BoundarySchemaColumn> { Vec::new() }",
+            "codegen-owns-boundary-generator",
+        ),
+        (
+            "fn build_boundary_catalog(fragments: &[PlanFragment]) {}",
+            "codegen-defines-boundary-derivation",
+        ),
+        (
+            "struct BoundaryColumn { column_id: u32 }",
+            "codegen-defines-boundary-column-type",
+        ),
+    ] {
+        // The codegen fixture still projects the sealed catalog, so only the
+        // ownership re-acquisition trips -- never the projection requirement.
+        let codegen_text =
+            format!("{forbidden}\nfn other(p: &DistributedPlan) {{ let _ = p.boundaries(); }}");
+        let sources = [
+            Cgo8GuardSource::new("src/sql/codegen/fragment/boundary_schema.rs", codegen_text),
+            planner_owner.clone(),
+        ];
+        let violations = planner_boundary_contract_violations(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(marker)),
+            "codegen re-owning the boundary contract must fail closed for `{forbidden}`: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn planner_boundary_contract_detector_requires_planner_owner() {
+    // Codegen projects the sealed catalog, but no planner source owns the
+    // derivation or the occurrence type: both must fail closed.
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/codegen/fragment/boundary_schema.rs",
+        "fn project(plan: &DistributedPlan) { let _ = plan.boundaries(); }",
+    )];
+    let violations = planner_boundary_contract_violations(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("missing-planner-boundary-derivation")),
+        "a tree with no planner-owned boundary derivation must fail closed: {violations:?}"
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("missing-planner-boundary-column-type")),
+        "a tree with no planner-owned boundary column type must fail closed: {violations:?}"
+    );
+}
+
+#[test]
+fn planner_boundary_contract_detector_requires_codegen_projection() {
+    // The planner owns derivation and the occurrence type, but codegen never
+    // consumes the sealed catalog: it must fail closed rather than silently
+    // permitting codegen to re-derive boundaries.
+    let sources = [
+        Cgo8GuardSource::new(
+            "src/sql/codegen/fragment/build.rs",
+            "fn build() { let _ = 1; }",
+        ),
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/boundary.rs",
+            "pub(crate) struct BoundaryColumn {}\n\
+             pub(in crate::sql::planner::distributed) fn build_boundary_catalog() {}",
+        ),
+    ];
+    let violations = planner_boundary_contract_violations(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("codegen-not-projecting-planner-catalog")),
+        "codegen that never consumes the sealed catalog must fail closed: {violations:?}"
+    );
+}
+
+#[test]
+fn planner_boundary_contract() {
+    let src = src_dir();
+    let sources =
+        production_rs_files_from_entries(&src, &[src.join("lib.rs"), src.join("main.rs")])
+            .into_iter()
+            .map(|path| Cgo8GuardSource::new(rel(&path), fs::read_to_string(path).unwrap()))
+            .collect::<Vec<_>>();
+    let violations = planner_boundary_contract_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "CGO-9B Task 3 planner-owned boundary-contract guard failed:\n{}",
+        violations.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CGO-9B Task 5: static topology / edge-shape decisions are planner-owned; the
+// execution coordinator consumes the sealed shape and never re-decides it.
+//
+// The planner seal owns every static fragment-graph shape decision:
+//   * `validate_source_edge_shape` (distributed/validation.rs) rejects plain-
+//     stream fan-out, plain/router mix, more-than-one router group per source,
+//     and per-(source, group) router branch_id / branch_kind / target-exchange
+//     duplication;
+//   * `build_topology_contract` (distributed/topology.rs) derives the leaves-
+//     first topological order, detects cycles, and selects the single execution
+//     anchor.
+// Task 5 deleted the redundant re-checks the coordinator used to run, so its
+// edge indices `build_stream_edge_by_source` / `group_router_edges_by_source`
+// are now infallible map-builders: they return a `BTreeMap`, not a `Result`,
+// and carry no shape-validation error return.
+//
+// This guard fails closed if (a) the planner stops owning either decider,
+// (b) the coordinator re-implements either named decider, or (c) either
+// coordinator edge index re-acquires a `Result` return -- the signal that it has
+// re-taken a shape decision the seal now owns. The signature scan keys on the
+// `fn <name>` token up to the body's opening brace; parameters and the
+// `BTreeMap<...>` return type never contain `{`, so the first `{` reliably ends
+// the signature, and whitespace is collapsed so a re-introduced `-> Result` is
+// caught regardless of line wrapping. Text is sanitized (comments/strings
+// stripped, `#[cfg(test)]` items blanked) so fixtures never trip the production
+// guard and prose that merely names the deciders is not matched.
+// ---------------------------------------------------------------------------
+
+const PLANNER_TOPOLOGY_CONTRACT_PLANNER_ROOT: &str = "src/sql/planner/distributed/";
+const PLANNER_TOPOLOGY_CONTRACT_COORDINATOR_ROOT: &str = "src/coordinator/";
+const PLANNER_TOPOLOGY_EDGE_SHAPE_DEF: &str = "fn validate_source_edge_shape(";
+const PLANNER_TOPOLOGY_CONTRACT_DEF: &str = "fn build_topology_contract(";
+const COORDINATOR_STREAM_EDGE_BUILDER_DEF: &str = "fn build_stream_edge_by_source";
+const COORDINATOR_ROUTER_GROUP_BUILDER_DEF: &str = "fn group_router_edges_by_source";
+
+/// If a coordinator edge-index builder is defined and its signature returns
+/// `Result`, return the collapsed signature slice so the guard can report it.
+/// The signature runs from the `fn <name>` token to the body's opening brace;
+/// whitespace is stripped so a re-introduced `-> Result` is detected regardless
+/// of line wrapping.
+///
+/// The match keys on bare `-> Result`, matching this codebase's convention of
+/// returning `Result<_, String>` unqualified. It would intentionally not catch a
+/// qualified `-> anyhow::Result<_>` / `-> std::result::Result<_, _>`; that is
+/// acceptable given the convention and documented here so the limitation is
+/// explicit rather than a silent gap.
+fn coordinator_builder_result_signature(production: &str, builder_def: &str) -> Option<String> {
+    let start = production.find(builder_def)?;
+    let rest = &production[start..];
+    let brace = rest.find('{')?;
+    let signature = compact_line(&rest[..brace]);
+    signature.contains("->Result").then_some(signature)
+}
+
+fn planner_topology_contract_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut planner_owns_edge_shape = false;
+    let mut planner_owns_topology = false;
+
+    for source in sources {
+        let production = rust_sanitized_production_text(&source.text);
+        if source
+            .path
+            .starts_with(PLANNER_TOPOLOGY_CONTRACT_PLANNER_ROOT)
+        {
+            if production.contains(PLANNER_TOPOLOGY_EDGE_SHAPE_DEF) {
+                planner_owns_edge_shape = true;
+            }
+            if production.contains(PLANNER_TOPOLOGY_CONTRACT_DEF) {
+                planner_owns_topology = true;
+            }
+        }
+        if source
+            .path
+            .starts_with(PLANNER_TOPOLOGY_CONTRACT_COORDINATOR_ROOT)
+        {
+            if production.contains(PLANNER_TOPOLOGY_EDGE_SHAPE_DEF) {
+                violations.push(format!(
+                    "coordinator-owns-edge-shape: {} defines `validate_source_edge_shape`; per-source edge-shape validation (fan-out, plain/router mix, router branch/kind/target uniqueness) is planner-owned",
+                    source.path
+                ));
+            }
+            if production.contains(PLANNER_TOPOLOGY_CONTRACT_DEF) {
+                violations.push(format!(
+                    "coordinator-owns-topology: {} defines `build_topology_contract`; topological order, cycle detection, and execution-anchor selection are planner-owned",
+                    source.path
+                ));
+            }
+            for builder in [
+                COORDINATOR_STREAM_EDGE_BUILDER_DEF,
+                COORDINATOR_ROUTER_GROUP_BUILDER_DEF,
+            ] {
+                if let Some(signature) = coordinator_builder_result_signature(&production, builder)
+                {
+                    violations.push(format!(
+                        "coordinator-edge-index-fallible: {} `{}` returns Result (`{}`); it must stay an infallible map-builder because edge-shape validation is sealed by the planner",
+                        source.path, builder, signature
+                    ));
+                }
+            }
+        }
+    }
+
+    if !planner_owns_edge_shape {
+        violations.push(format!(
+            "missing-planner-edge-shape: no {PLANNER_TOPOLOGY_CONTRACT_PLANNER_ROOT} source defines `{PLANNER_TOPOLOGY_EDGE_SHAPE_DEF}`"
+        ));
+    }
+    if !planner_owns_topology {
+        violations.push(format!(
+            "missing-planner-topology: no {PLANNER_TOPOLOGY_CONTRACT_PLANNER_ROOT} source defines `{PLANNER_TOPOLOGY_CONTRACT_DEF}`"
+        ));
+    }
+
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+#[test]
+fn planner_topology_contract_detector_accepts_sealed_ownership() {
+    let sources = [
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/validation.rs",
+            "fn validate_source_edge_shape(edges: &[FragmentEdge]) -> Result<(), String> { Ok(()) }",
+        ),
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/topology.rs",
+            "pub(in crate::sql::planner::distributed) fn build_topology_contract() {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/coordinator/execution.rs",
+            "fn build_stream_edge_by_source<'a>(edges: &'a [FragmentEdge]) -> BTreeMap<FragmentId, &'a FragmentEdge> { BTreeMap::new() }\n\
+             fn group_router_edges_by_source<'a>(edges: &'a [FragmentEdge]) -> BTreeMap<(FragmentId, i32), Vec<&'a FragmentEdge>> { BTreeMap::new() }",
+        ),
+    ];
+    let violations = planner_topology_contract_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "planner-owned topology contract with infallible coordinator indices must pass: {violations:?}"
+    );
+}
+
+#[test]
+fn planner_topology_contract_detector_rejects_coordinator_reacquisition() {
+    let planner = [
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/validation.rs",
+            "fn validate_source_edge_shape(edges: &[FragmentEdge]) -> Result<(), String> { Ok(()) }",
+        ),
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/topology.rs",
+            "pub(in crate::sql::planner::distributed) fn build_topology_contract() {}",
+        ),
+    ];
+
+    for (coordinator_text, marker) in [
+        (
+            "fn build_stream_edge_by_source<'a>(edges: &'a [FragmentEdge]) -> Result<BTreeMap<FragmentId, &'a FragmentEdge>, String> { Ok(BTreeMap::new()) }",
+            "coordinator-edge-index-fallible",
+        ),
+        (
+            "fn group_router_edges_by_source<'a>(edges: &'a [FragmentEdge])\n    -> Result<BTreeMap<(FragmentId, i32), Vec<&'a FragmentEdge>>, String> { Ok(BTreeMap::new()) }",
+            "coordinator-edge-index-fallible",
+        ),
+        (
+            "fn validate_source_edge_shape(edges: &[FragmentEdge]) -> Result<(), String> { Ok(()) }",
+            "coordinator-owns-edge-shape",
+        ),
+        (
+            "pub(crate) fn build_topology_contract(frags: &[PlanFragment]) {}",
+            "coordinator-owns-topology",
+        ),
+    ] {
+        let mut sources = planner.to_vec();
+        sources.push(Cgo8GuardSource::new(
+            "src/coordinator/execution.rs",
+            coordinator_text,
+        ));
+        let violations = planner_topology_contract_violations(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(marker)),
+            "coordinator re-acquiring a static topology decision must fail closed for `{coordinator_text}`: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn planner_topology_contract_detector_requires_planner_owner() {
+    // Coordinator indices are infallible, but no planner source owns either
+    // decider: both must fail closed.
+    let sources = [Cgo8GuardSource::new(
+        "src/coordinator/execution.rs",
+        "fn build_stream_edge_by_source<'a>(edges: &'a [FragmentEdge]) -> BTreeMap<FragmentId, &'a FragmentEdge> { BTreeMap::new() }",
+    )];
+    let violations = planner_topology_contract_violations(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("missing-planner-edge-shape")),
+        "a tree with no planner-owned edge-shape validator must fail closed: {violations:?}"
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("missing-planner-topology")),
+        "a tree with no planner-owned topology contract must fail closed: {violations:?}"
+    );
+}
+
+#[test]
+fn planner_topology_contract() {
+    let src = src_dir();
+    let sources =
+        production_rs_files_from_entries(&src, &[src.join("lib.rs"), src.join("main.rs")])
+            .into_iter()
+            .map(|path| Cgo8GuardSource::new(rel(&path), fs::read_to_string(path).unwrap()))
+            .collect::<Vec<_>>();
+    let violations = planner_topology_contract_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "CGO-9B Task 5 planner-owned topology-contract guard failed:\n{}",
+        violations.join("\n")
     );
 }
 
