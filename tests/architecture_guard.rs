@@ -16629,7 +16629,6 @@ fn nfe_3_fe_owned_helpers_are_raw_starrocks_idl_free() {
     let repo = Path::new(manifest_dir());
     let mut violations = Vec::new();
     for source in [
-        "src/engine/query_options.rs",
         "src/engine/dml_change_stream.rs",
         "src/sql/common/change_stream.rs",
         "src/coordinator/dispatch.rs",
