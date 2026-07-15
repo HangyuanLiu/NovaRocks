@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::num::NonZeroU32;
+
 use arrow::datatypes::DataType;
 
 macro_rules! model_id {
@@ -110,10 +112,23 @@ pub(crate) enum RuntimeFilterLifecycle {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct TopKSummaryRequirement(NonZeroU32);
+
+impl TopKSummaryRequirement {
+    pub(crate) fn try_new(k: u32) -> Option<Self> {
+        NonZeroU32::new(k).map(Self)
+    }
+
+    pub(crate) const fn k(self) -> NonZeroU32 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum ReductionRequirement {
     SetUnion,
     TightenOrderedBound,
-    MergeTopKSummary,
+    MergeTopKSummary(TopKSummaryRequirement),
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -196,6 +211,12 @@ mod tests {
     }
 
     #[test]
+    fn top_k_summary_requirement_rejects_zero_and_keeps_k() {
+        assert!(TopKSummaryRequirement::try_new(0).is_none());
+        assert_eq!(TopKSummaryRequirement::try_new(7).unwrap().k().get(), 7);
+    }
+
+    #[test]
     fn ordered_bound_contract_keeps_full_comparator_semantics() {
         let contract = OrderContract {
             keys: vec![OrderKeyContract {
@@ -253,9 +274,22 @@ mod tests {
 
     #[test]
     fn topn_producer_matrix_preserves_contract_requirements() {
-        for reduction in [
-            ReductionRequirement::TightenOrderedBound,
-            ReductionRequirement::MergeTopKSummary,
+        for (reduction, contributions) in [
+            (
+                ReductionRequirement::TightenOrderedBound,
+                BTreeSet::from([
+                    ContributionKind::OrderedBoundUpdate,
+                    ContributionKind::TopKSummary,
+                    ContributionKind::ProducerClosed,
+                ]),
+            ),
+            (
+                ReductionRequirement::MergeTopKSummary(TopKSummaryRequirement::try_new(3).unwrap()),
+                BTreeSet::from([
+                    ContributionKind::TopKSummary,
+                    ContributionKind::ProducerClosed,
+                ]),
+            ),
         ] {
             let matrix = ProducerMatrix {
                 domain: RuntimeFilterLogicalDomain::OrderedBound(OrderContract {
@@ -268,11 +302,7 @@ mod tests {
                     comparator_digest: ComparatorDigest::new([9; 32]),
                 }),
                 lifecycle: RuntimeFilterLifecycle::MonotonicUpdates,
-                contributions: BTreeSet::from([
-                    ContributionKind::OrderedBoundUpdate,
-                    ContributionKind::TopKSummary,
-                    ContributionKind::ProducerClosed,
-                ]),
+                contributions: contributions.clone(),
                 reduction,
                 completion: CompletionRequirement::ProducerClosed,
             };
@@ -287,14 +317,7 @@ mod tests {
             assert!(!order.inclusive);
             assert_eq!(order.comparator_digest.get(), [9; 32]);
             assert_eq!(matrix.lifecycle, RuntimeFilterLifecycle::MonotonicUpdates);
-            assert_eq!(
-                matrix.contributions,
-                BTreeSet::from([
-                    ContributionKind::OrderedBoundUpdate,
-                    ContributionKind::TopKSummary,
-                    ContributionKind::ProducerClosed,
-                ])
-            );
+            assert_eq!(matrix.contributions, contributions);
             assert_eq!(matrix.reduction, reduction);
             assert_eq!(matrix.completion, CompletionRequirement::ProducerClosed);
         }

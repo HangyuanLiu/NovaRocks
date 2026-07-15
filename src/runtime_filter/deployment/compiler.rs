@@ -262,9 +262,10 @@ mod tests {
     use crate::coordinator::scheduler::FragmentInstancePlacement;
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime_filter::model::contract::{
-        ArtifactCapability, ConsumerActivation, ContributionKind, NullSemantics, PlanFragmentId,
-        PlanNodeId, ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
-        RuntimeFilterPolicyRequirement,
+        ArtifactCapability, ConsumerActivation, ContributionKind, LateApplyGranularity, NullOrder,
+        NullSemantics, OrderContract, OrderKeyContract, PlanFragmentId, PlanNodeId,
+        ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
+        RuntimeFilterPolicyRequirement, SortDirection, TopKSummaryRequirement,
     };
     use crate::runtime_filter::model::coverage::Coverage;
     use crate::runtime_filter::model::graph::{
@@ -350,6 +351,43 @@ mod tests {
         }
     }
 
+    fn top_k_summary_channel_spec(id: u32) -> RuntimeFilterChannelSpec {
+        let keys = vec![OrderKeyContract {
+            data_type: DataType::Int64,
+            direction: SortDirection::Descending,
+            null_order: NullOrder::Last,
+        }];
+        RuntimeFilterChannelSpec {
+            channel_id: ChannelId::new(id),
+            logical_domain: RuntimeFilterLogicalDomain::OrderedBound(OrderContract {
+                comparator_digest:
+                    crate::runtime_filter::port::ordered_bound::comparator_digest_for_test(
+                        &keys,
+                        crate::runtime_filter::port::ordered_bound::COMPARATOR_ALGORITHM_VERSION,
+                    ),
+                keys,
+                inclusive: true,
+            }),
+            lifecycle: RuntimeFilterLifecycle::MonotonicUpdates,
+            availability_coverage: Coverage::Leaf(CoverageWitnessId::new(1)),
+            terminal_coverage: Coverage::Leaf(CoverageWitnessId::new(1)),
+            reduction_requirement: ReductionRequirement::MergeTopKSummary(
+                TopKSummaryRequirement::try_new(3).unwrap(),
+            ),
+            allowed_contribution_kinds: BTreeSet::from([
+                ContributionKind::TopKSummary,
+                ContributionKind::ProducerClosed,
+            ]),
+            required_consumer_capabilities: BTreeSet::from([ArtifactCapability::OrderedRange]),
+            policy: RuntimeFilterPolicyRequirement {
+                max_contribution_bytes: 64,
+                max_artifact_bytes: 128,
+                deadline_ms: 1000,
+                max_retries: 3,
+            },
+        }
+    }
+
     fn producer_binding(binding: u32, channel: u32, fragment: u32) -> RuntimeFilterBindingSpec {
         RuntimeFilterBindingSpec {
             binding_id: BindingId::new(binding),
@@ -375,6 +413,22 @@ mod tests {
                 completion_requirement: CompletionRequirement::ProducerClosed,
             }),
         }
+    }
+
+    fn top_k_summary_producer_binding(
+        binding: u32,
+        channel: u32,
+        fragment: u32,
+    ) -> RuntimeFilterBindingSpec {
+        let mut binding = producer_binding(binding, channel, fragment);
+        let RuntimeFilterBindingRole::Producer(requirement) = &mut binding.role else {
+            unreachable!("producer_binding always returns a producer")
+        };
+        requirement.contribution_kinds = BTreeSet::from([
+            ContributionKind::TopKSummary,
+            ContributionKind::ProducerClosed,
+        ]);
+        binding
     }
 
     fn consumer_binding(
@@ -404,6 +458,26 @@ mod tests {
                 activation,
             }),
         }
+    }
+
+    fn top_k_summary_consumer_binding(
+        binding: u32,
+        channel: u32,
+        fragment: u32,
+    ) -> RuntimeFilterBindingSpec {
+        let mut binding = consumer_binding(
+            binding,
+            channel,
+            fragment,
+            ConsumerActivation::NonBlockingLive {
+                late_apply: LateApplyGranularity::Batch,
+            },
+        );
+        let RuntimeFilterBindingRole::Consumer(requirement) = &mut binding.role else {
+            unreachable!("consumer_binding always returns a consumer")
+        };
+        requirement.capabilities = BTreeSet::from([ArtifactCapability::OrderedRange]);
+        binding
     }
 
     #[test]
@@ -454,6 +528,52 @@ mod tests {
         assert_eq!(plan.participants.len(), 1);
         assert_eq!(plan.install_views.len(), 1);
         assert_eq!(plan.epoch.get(), 7);
+    }
+
+    #[test]
+    fn compile_preserves_top_k_summary_requirement_in_install_view() {
+        let mut graph = RuntimeFilterGraph::default();
+        graph.insert_channel(top_k_summary_channel_spec(5)).unwrap();
+        graph
+            .insert_binding(top_k_summary_producer_binding(10, 5, 2))
+            .unwrap();
+        graph
+            .insert_binding(top_k_summary_consumer_binding(11, 5, 1))
+            .unwrap();
+
+        let mut by_fragment = BTreeMap::new();
+        by_fragment.insert(1u32, vec![placement(1, 0, 0, UniqueId { hi: 1, lo: 1 })]);
+        by_fragment.insert(2u32, vec![placement(2, 0, 0, UniqueId { hi: 1, lo: 2 })]);
+        let scheduling = SchedulingPlan {
+            root_fragment_id: 1,
+            by_fragment,
+            root_finst_id: UniqueId { hi: 1, lo: 1 },
+            root_backend_idx: 0,
+        };
+        let backends = LiveBackendSnapshot::from_endpoints(vec![
+            "127.0.0.1:9060".parse::<SocketAddr>().unwrap(),
+        ]);
+        let policy = RuntimeFilterDeploymentPolicy {
+            core_budget: RuntimeFilterCoreBudget::new(1024),
+            replica_redundancy: 1,
+            materialization: MaterializationPolicy::for_test(),
+        };
+
+        let plan = compile(
+            &graph,
+            &scheduling,
+            &[edge(2, 1)],
+            &backends,
+            &policy,
+            DeploymentEpoch::new(7),
+        )
+        .unwrap();
+        let deployment =
+            &plan.install_views[&RuntimeFilterParticipantId::new(0)].channels()[&ChannelId::new(5)];
+        assert_eq!(
+            deployment.reduction_requirement(),
+            ReductionRequirement::MergeTopKSummary(TopKSummaryRequirement::try_new(3).unwrap())
+        );
     }
 
     #[test]
