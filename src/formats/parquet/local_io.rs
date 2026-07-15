@@ -15,26 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Parquet I/O helpers: read a column-set from a parquet file,
+//! Local Parquet I/O helpers: read a schema-shaped batch from a parquet file,
 //! cast/normalize batches to match the table schema, and write batches back
 //! to disk.
-//!
-//! This module also owns the small string-to-date/datetime parsing helpers
-//! used while coercing literal rows into typed arrow arrays for parquet
-//! writes.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-
-use crate::sql::catalog::ColumnDef;
 
 pub(crate) fn read_local_parquet_data(
     path: &Path,
-    columns: &[ColumnDef],
+    target_schema: &SchemaRef,
 ) -> Result<RecordBatch, String> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -50,35 +44,24 @@ pub(crate) fn read_local_parquet_data(
         let batch = batch_result.map_err(|e| format!("read local parquet batch failed: {e}"))?;
         batches.push(batch);
     }
-    let batch = concat_or_empty_batches(columns, batches)?;
-    let target_schema = Arc::new(Schema::new(
-        columns
-            .iter()
-            .map(|c| Field::new(&c.name, c.data_type.clone(), c.nullable))
-            .collect::<Vec<_>>(),
-    ));
-    cast_batch_to_schema(&batch, &target_schema)
+    let batch = concat_or_empty_batches(target_schema, batches)?;
+    cast_batch_to_schema(&batch, target_schema)
 }
 
 fn concat_or_empty_batches(
-    columns: &[ColumnDef],
+    target_schema: &SchemaRef,
     batches: Vec<RecordBatch>,
 ) -> Result<RecordBatch, String> {
     if let Some(first) = batches.first() {
         arrow::compute::concat_batches(&first.schema(), batches.iter())
             .map_err(|e| format!("concat standalone batches failed: {e}"))
     } else {
-        let schema = Arc::new(Schema::new(
-            columns
-                .iter()
-                .map(|column| Field::new(&column.name, column.data_type.clone(), column.nullable))
-                .collect::<Vec<_>>(),
-        ));
-        let arrays = columns
+        let arrays = target_schema
+            .fields()
             .iter()
-            .map(|column| arrow::array::new_empty_array(&column.data_type))
+            .map(|field| arrow::array::new_empty_array(field.data_type()))
             .collect::<Vec<_>>();
-        RecordBatch::try_new(schema, arrays)
+        RecordBatch::try_new(target_schema.clone(), arrays)
             .map_err(|e| format!("build empty standalone batch failed: {e}"))
     }
 }
@@ -122,58 +105,6 @@ pub(crate) fn normalize_map_entries_nullability(data_type: &DataType) -> DataTyp
         }
         other => other.clone(),
     }
-}
-
-pub(crate) fn parse_date_string_to_days(s: &str) -> Result<i32, String> {
-    use chrono::NaiveDate;
-    let date = NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
-        .map_err(|e| format!("invalid date literal `{s}`: {e}"))?;
-    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch");
-    Ok((date - epoch).num_days() as i32)
-}
-
-pub(crate) fn parse_datetime_string_to_micros(s: &str) -> Result<i64, String> {
-    use chrono::NaiveDateTime;
-    let s = s.trim();
-    // Try datetime first, then date-only
-    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
-        return Ok(dt.and_utc().timestamp_micros());
-    }
-    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
-        return Ok(dt.and_utc().timestamp_micros());
-    }
-    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        let dt = d.and_hms_opt(0, 0, 0).expect("midnight");
-        return Ok(dt.and_utc().timestamp_micros());
-    }
-    Err(format!("invalid datetime literal `{s}`"))
-}
-
-/// Parse a `YYYY-MM-DD HH:MM:SS[.fffffffff]` literal into nanoseconds since the
-/// Unix epoch. Mirrors `parse_datetime_string_to_micros` but keeps nanosecond
-/// precision for Iceberg v3 `timestamp_ns` columns. Errors if the value is
-/// outside the nanosecond-representable range (~1677-09-21 .. 2262-04-11).
-pub(crate) fn parse_datetime_string_to_nanos(s: &str) -> Result<i64, String> {
-    use chrono::NaiveDateTime;
-    let s = s.trim();
-    // Try datetime first, then date-only
-    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
-        return dt.and_utc().timestamp_nanos_opt().ok_or_else(|| {
-            format!("DATETIME literal '{s}' out of nanosecond representable range")
-        });
-    }
-    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
-        return dt.and_utc().timestamp_nanos_opt().ok_or_else(|| {
-            format!("DATETIME literal '{s}' out of nanosecond representable range")
-        });
-    }
-    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        let dt = d.and_hms_opt(0, 0, 0).expect("midnight");
-        return dt.and_utc().timestamp_nanos_opt().ok_or_else(|| {
-            format!("DATETIME literal '{s}' out of nanosecond representable range")
-        });
-    }
-    Err(format!("invalid datetime literal `{s}`"))
 }
 
 /// Cast a RecordBatch to match a target schema (column-by-column cast).
@@ -402,25 +333,6 @@ fn normalize_local_parquet_batch(batch: &RecordBatch) -> Result<RecordBatch, Str
         .map_err(|e| format!("build local parquet storage batch failed: {e}"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_datetime_string_to_nanos_keeps_nanoseconds() {
-        let nanos = parse_datetime_string_to_nanos("2024-01-02 03:04:05.123456789").unwrap();
-        assert_eq!(nanos % 1_000, 789); // last 3 nanosecond digits survive
-    }
-
-    #[test]
-    fn parse_datetime_string_to_nanos_handles_no_fraction() {
-        let a = parse_datetime_string_to_nanos("2024-01-02 03:04:05").unwrap();
-        let b = parse_datetime_string_to_nanos("2024-01-02").unwrap();
-        assert_eq!(a % 1_000_000_000, 0);
-        assert_eq!(b % 1_000_000_000, 0);
-    }
-}
-
 /// Write a RecordBatch to a parquet file at the given path.
 pub(crate) fn write_parquet_to_path(path: &Path, batch: &RecordBatch) -> Result<(), String> {
     use parquet::arrow::ArrowWriter;
@@ -437,4 +349,167 @@ pub(crate) fn write_parquet_to_path(path: &Path, batch: &RecordBatch) -> Result<
         .close()
         .map_err(|e| format!("close local parquet writer failed: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{BinaryArray, Int32Array, MapArray, StringArray, StructArray};
+    use arrow_buffer::OffsetBuffer;
+
+    fn single_entry_map_batch() -> RecordBatch {
+        let entry_fields = vec![
+            Arc::new(Field::new("key", DataType::Int32, false)),
+            Arc::new(Field::new("value", DataType::Utf8, true)),
+        ];
+        let entries = StructArray::new(
+            entry_fields.clone().into(),
+            vec![
+                Arc::new(Int32Array::from(vec![7])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("value")])) as ArrayRef,
+            ],
+            None,
+        );
+        let entries_field = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(entry_fields.into()),
+            false,
+        ));
+        let map = Arc::new(MapArray::new(
+            entries_field.clone(),
+            OffsetBuffer::new(vec![0, 1].into()),
+            entries,
+            None,
+            false,
+        )) as ArrayRef;
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "m",
+                DataType::Map(entries_field, false),
+                true,
+            )])),
+            vec![map],
+        )
+        .expect("build map batch")
+    }
+
+    #[test]
+    fn normalize_map_entries_nullability_recurses_through_nested_collections() {
+        let entries = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new("key", DataType::Int32, false)),
+                    Arc::new(Field::new("value", DataType::Utf8, true)),
+                ]
+                .into(),
+            ),
+            true,
+        ));
+        let nested = DataType::List(Arc::new(Field::new(
+            "items",
+            DataType::Map(entries, false),
+            true,
+        )));
+
+        let DataType::List(items) = normalize_map_entries_nullability(&nested) else {
+            panic!("expected LIST");
+        };
+        let DataType::Map(entries, ordered) = items.data_type() else {
+            panic!("expected nested MAP");
+        };
+        assert!(!ordered);
+        assert!(!entries.is_nullable());
+        assert!(items.is_nullable());
+    }
+
+    #[test]
+    fn cast_batch_to_schema_preserves_latin1_binary_payload() {
+        let payload = [0x00, 0x7f, 0x80, 0xff];
+        let source = RecordBatch::try_from_iter(vec![(
+            "payload",
+            Arc::new(BinaryArray::from_vec(vec![payload.as_slice()])) as ArrayRef,
+        )])
+        .expect("build source batch");
+        let target = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Utf8,
+            false,
+        )]));
+
+        let casted = cast_batch_to_schema(&source, &target).expect("cast binary payload");
+        let values = casted
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("StringArray");
+        assert_eq!(
+            values
+                .value(0)
+                .chars()
+                .map(|ch| ch as u32)
+                .collect::<Vec<_>>(),
+            vec![0x00, 0x7f, 0x80, 0xff]
+        );
+    }
+
+    #[test]
+    fn cast_batch_to_schema_relaxes_map_key_nullability() {
+        let source = single_entry_map_batch();
+        let target_entries = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new("key", DataType::Int32, true)),
+                    Arc::new(Field::new("value", DataType::Utf8, true)),
+                ]
+                .into(),
+            ),
+            false,
+        ));
+        let target = Arc::new(Schema::new(vec![Field::new(
+            "m",
+            DataType::Map(target_entries, false),
+            true,
+        )]));
+
+        let casted = cast_batch_to_schema(&source, &target).expect("cast map batch");
+        let casted_schema = casted.schema();
+        let DataType::Map(entries, _) = casted_schema.field(0).data_type() else {
+            panic!("expected MAP");
+        };
+        let DataType::Struct(fields) = entries.data_type() else {
+            panic!("expected MAP entries STRUCT");
+        };
+        assert!(fields[0].is_nullable());
+    }
+
+    #[test]
+    fn local_parquet_round_trip_preserves_non_null_map_keys() {
+        let source = single_entry_map_batch();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("map_round_trip.parquet");
+
+        write_parquet_to_path(&path, &source).expect("write local parquet");
+        let round_tripped =
+            read_local_parquet_data(&path, &source.schema()).expect("read local parquet");
+        let map = round_tripped
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("MapArray");
+        let keys = map
+            .entries()
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Int32Array");
+        assert_eq!(keys.null_count(), 0);
+        assert_eq!(keys.value(0), 7);
+        let round_tripped_schema = round_tripped.schema();
+        let DataType::Map(entries, _) = round_tripped_schema.field(0).data_type() else {
+            panic!("expected MAP");
+        };
+        assert!(!entries.is_nullable());
+    }
 }

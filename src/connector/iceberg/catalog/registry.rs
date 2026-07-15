@@ -49,8 +49,7 @@ use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
 use crate::connector::iceberg::fs_io;
 use crate::connector::iceberg::variant_write::parse_variant_shredding_properties;
 use crate::engine::catalog::{ColumnDef, normalize_identifier};
-use crate::engine::parquet::parse_datetime_string_to_nanos;
-use crate::sql::literal::literal_to_i128_for_integer;
+use crate::sql::literal::{literal_to_i128_for_integer, parse_datetime_string_to_nanos};
 use crate::sql::{ColumnAggregation, Literal, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
 
 #[derive(Default)]
