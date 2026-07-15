@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use super::{
-    manifest_dir, production_rs_files_from_entries, rel, rs_files,
+    cfg_attr_generated_path_values, cfg_attribute_requires_test, manifest_dir,
+    path_attribute_value, production_rs_files_from_entries, rel, rs_files,
     rust_canonical_use_segments_in_scope, rust_module_items, rust_production_canonical_paths,
-    rust_production_scoped_use_statements, rust_sanitized_production_text, rust_use_visibility,
-    src_dir,
+    rust_production_scoped_use_statements, rust_sanitized_production_text,
+    rust_source_module_segments, rust_use_visibility, src_dir,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -517,98 +518,98 @@ const ENGINE_FILE_OWNERS: &[EngineFileOwner] = &[
 ];
 
 const ENGINE_MODULE_DECLARATIONS: &[&str] = &[
-    "src/engine/catalog_mgr/mod.rs||external|catalog",
-    "src/engine/catalog_mgr/mod.rs||external|iceberg",
-    "src/engine/catalog_mgr/mod.rs||external|internal",
-    "src/engine/catalog_mgr/mod.rs||external|metadata",
-    "src/engine/catalog_mgr/mod.rs||external|provider",
-    "src/engine/catalog_mgr/mod.rs||external|schema_cache",
-    "src/engine/dictionary/mod.rs||external|maintenance",
-    "src/engine/dictionary/mod.rs||external|model",
-    "src/engine/dictionary/mod.rs||external|rebuild",
-    "src/engine/mod.rs||external|aggregate",
-    "src/engine/mod.rs||external|backend_ops",
-    "src/engine/mod.rs||external|backend_resolver",
-    "src/engine/mod.rs||external|catalog",
-    "src/engine/mod.rs||external|catalog_mgr",
-    "src/engine/mod.rs||external|delete_flow",
-    "src/engine/mod.rs||external|delete_predicate_translate",
-    "src/engine/mod.rs||external|dictionary",
-    "src/engine/mod.rs||external|dml_change_stream",
-    "src/engine/mod.rs||external|equality_delete_flow",
-    "src/engine/mod.rs||external|iceberg_change_stream_write",
-    "src/engine/mod.rs||external|iceberg_ctas",
-    "src/engine/mod.rs||external|iceberg_expire_snapshots",
-    "src/engine/mod.rs||external|iceberg_maintenance",
-    "src/engine/mod.rs||external|iceberg_ref_flow",
-    "src/engine/mod.rs||external|iceberg_remove_orphan_files",
-    "src/engine/mod.rs||external|iceberg_rewrite_manifests",
-    "src/engine/mod.rs||external|iceberg_truncate",
-    "src/engine/mod.rs||external|iceberg_view",
-    "src/engine/mod.rs||external|iceberg_view_rewrite",
-    "src/engine/mod.rs||external|iceberg_writer",
-    "src/engine/mod.rs||external|information_schema",
-    "src/engine/mod.rs||external|insert",
-    "src/engine/mod.rs||external|insert_flow",
-    "src/engine/mod.rs||external|mutation_flow",
-    "src/engine/mod.rs||external|mv",
-    "src/engine/mod.rs||external|mv_flow",
-    "src/engine/mod.rs||external|mv_maintenance",
-    "src/engine/mod.rs||external|mv_rewrite_prep",
-    "src/engine/mod.rs||external|mv_scheduler",
-    "src/engine/mod.rs||external|name_resolve",
-    "src/engine/mod.rs||external|parquet",
-    "src/engine/mod.rs||external|procedure",
-    "src/engine/mod.rs||external|query_options",
-    "src/engine/mod.rs||external|query_prep",
-    "src/engine/mod.rs||external|query_stats",
-    "src/engine/mod.rs||external|sql_expr",
-    "src/engine/mod.rs||external|statement",
-    "src/engine/mod.rs||external|statistics",
-    "src/engine/mod.rs||external|stream_load",
-    "src/engine/mod.rs||external|view_rewrite",
-    "src/engine/mod.rs||external|virtual_table",
-    "src/engine/mod.rs||external|write_operation_lifecycle",
-    "src/engine/mod.rs||external|write_transaction",
-    "src/engine/mv/agg_state/mod.rs||external|aggregate_sql_calls",
-    "src/engine/mv/agg_state/mod.rs||external|mv_agg_state",
-    "src/engine/mv/agg_state/mod.rs||external|mv_shape",
-    "src/engine/mv/agg_state/mod.rs||external|physical_column",
-    "src/engine/mv/agg_state/mod.rs||external|sql_type",
-    "src/engine/mv/agg_state/mod.rs||external|state_codec",
-    "src/engine/mv/mod.rs||external|agg_state",
-    "src/engine/mv/mod.rs||external|analysis",
-    "src/engine/mv/mod.rs||external|apply_key",
-    "src/engine/mv/mod.rs||external|dependency",
-    "src/engine/mv/mod.rs||external|iceberg_aggregate_state",
-    "src/engine/mv/mod.rs||external|iceberg_backend",
-    "src/engine/mv/mod.rs||external|iceberg_discovery",
-    "src/engine/mv/mod.rs||external|iceberg_guard",
-    "src/engine/mv/mod.rs||external|iceberg_join_branch",
-    "src/engine/mv/mod.rs||external|iceberg_join_coalesce",
-    "src/engine/mv/mod.rs||external|iceberg_refresh",
-    "src/engine/mv/mod.rs||external|iceberg_target_apply",
-    "src/engine/mv/mod.rs||external|lake_rebuild",
-    "src/engine/mv/mod.rs||external|lifecycle",
-    "src/engine/mv/mod.rs||external|partition",
-    "src/engine/mv/mod.rs||external|rebind",
-    "src/engine/mv/mod.rs||external|recovery",
-    "src/engine/mv/mod.rs||external|refresh_context",
-    "src/engine/mv/mod.rs||external|refresh_contract",
-    "src/engine/mv/mod.rs||external|refresh_driver",
-    "src/engine/mv/mod.rs||external|refresh_io",
-    "src/engine/mv/mod.rs||external|refresh_pin",
-    "src/engine/mv/mod.rs||external|refresh_property",
-    "src/engine/mv/mod.rs||external|scan_binding",
-    "src/engine/mv/mod.rs||external|schema_contract",
-    "src/engine/mv/mod.rs||external|stateless_rebuild",
-    "src/engine/mv/mod.rs||external|table_ref",
-    "src/engine/mv/partition/mod.rs||external|derivation",
-    "src/engine/mv/partition/mod.rs||external|key",
-    "src/engine/mv/partition/mod.rs||external|mapping",
-    "src/engine/mv/partition/mod.rs||external|planner",
-    "src/engine/mv_maintenance/mod.rs||external|policy",
-    "src/engine/mv_maintenance/mod.rs||external|stats",
+    "src/engine/catalog_mgr/mod.rs||external|path=default|catalog",
+    "src/engine/catalog_mgr/mod.rs||external|path=default|iceberg",
+    "src/engine/catalog_mgr/mod.rs||external|path=default|internal",
+    "src/engine/catalog_mgr/mod.rs||external|path=default|metadata",
+    "src/engine/catalog_mgr/mod.rs||external|path=default|provider",
+    "src/engine/catalog_mgr/mod.rs||external|path=default|schema_cache",
+    "src/engine/dictionary/mod.rs||external|path=default|maintenance",
+    "src/engine/dictionary/mod.rs||external|path=default|model",
+    "src/engine/dictionary/mod.rs||external|path=default|rebuild",
+    "src/engine/mod.rs||external|path=default|aggregate",
+    "src/engine/mod.rs||external|path=default|backend_ops",
+    "src/engine/mod.rs||external|path=default|backend_resolver",
+    "src/engine/mod.rs||external|path=default|catalog",
+    "src/engine/mod.rs||external|path=default|catalog_mgr",
+    "src/engine/mod.rs||external|path=default|delete_flow",
+    "src/engine/mod.rs||external|path=default|delete_predicate_translate",
+    "src/engine/mod.rs||external|path=default|dictionary",
+    "src/engine/mod.rs||external|path=default|dml_change_stream",
+    "src/engine/mod.rs||external|path=default|equality_delete_flow",
+    "src/engine/mod.rs||external|path=default|iceberg_change_stream_write",
+    "src/engine/mod.rs||external|path=default|iceberg_ctas",
+    "src/engine/mod.rs||external|path=default|iceberg_expire_snapshots",
+    "src/engine/mod.rs||external|path=default|iceberg_maintenance",
+    "src/engine/mod.rs||external|path=default|iceberg_ref_flow",
+    "src/engine/mod.rs||external|path=default|iceberg_remove_orphan_files",
+    "src/engine/mod.rs||external|path=default|iceberg_rewrite_manifests",
+    "src/engine/mod.rs||external|path=default|iceberg_truncate",
+    "src/engine/mod.rs||external|path=default|iceberg_view",
+    "src/engine/mod.rs||external|path=default|iceberg_view_rewrite",
+    "src/engine/mod.rs||external|path=default|iceberg_writer",
+    "src/engine/mod.rs||external|path=default|information_schema",
+    "src/engine/mod.rs||external|path=default|insert",
+    "src/engine/mod.rs||external|path=default|insert_flow",
+    "src/engine/mod.rs||external|path=default|mutation_flow",
+    "src/engine/mod.rs||external|path=default|mv",
+    "src/engine/mod.rs||external|path=default|mv_flow",
+    "src/engine/mod.rs||external|path=default|mv_maintenance",
+    "src/engine/mod.rs||external|path=default|mv_rewrite_prep",
+    "src/engine/mod.rs||external|path=default|mv_scheduler",
+    "src/engine/mod.rs||external|path=default|name_resolve",
+    "src/engine/mod.rs||external|path=default|parquet",
+    "src/engine/mod.rs||external|path=default|procedure",
+    "src/engine/mod.rs||external|path=default|query_options",
+    "src/engine/mod.rs||external|path=default|query_prep",
+    "src/engine/mod.rs||external|path=default|query_stats",
+    "src/engine/mod.rs||external|path=default|sql_expr",
+    "src/engine/mod.rs||external|path=default|statement",
+    "src/engine/mod.rs||external|path=default|statistics",
+    "src/engine/mod.rs||external|path=default|stream_load",
+    "src/engine/mod.rs||external|path=default|view_rewrite",
+    "src/engine/mod.rs||external|path=default|virtual_table",
+    "src/engine/mod.rs||external|path=default|write_operation_lifecycle",
+    "src/engine/mod.rs||external|path=default|write_transaction",
+    "src/engine/mv/agg_state/mod.rs||external|path=default|aggregate_sql_calls",
+    "src/engine/mv/agg_state/mod.rs||external|path=default|mv_agg_state",
+    "src/engine/mv/agg_state/mod.rs||external|path=default|mv_shape",
+    "src/engine/mv/agg_state/mod.rs||external|path=default|physical_column",
+    "src/engine/mv/agg_state/mod.rs||external|path=default|sql_type",
+    "src/engine/mv/agg_state/mod.rs||external|path=default|state_codec",
+    "src/engine/mv/mod.rs||external|path=default|agg_state",
+    "src/engine/mv/mod.rs||external|path=default|analysis",
+    "src/engine/mv/mod.rs||external|path=default|apply_key",
+    "src/engine/mv/mod.rs||external|path=default|dependency",
+    "src/engine/mv/mod.rs||external|path=default|iceberg_aggregate_state",
+    "src/engine/mv/mod.rs||external|path=default|iceberg_backend",
+    "src/engine/mv/mod.rs||external|path=default|iceberg_discovery",
+    "src/engine/mv/mod.rs||external|path=default|iceberg_guard",
+    "src/engine/mv/mod.rs||external|path=default|iceberg_join_branch",
+    "src/engine/mv/mod.rs||external|path=default|iceberg_join_coalesce",
+    "src/engine/mv/mod.rs||external|path=default|iceberg_refresh",
+    "src/engine/mv/mod.rs||external|path=default|iceberg_target_apply",
+    "src/engine/mv/mod.rs||external|path=default|lake_rebuild",
+    "src/engine/mv/mod.rs||external|path=default|lifecycle",
+    "src/engine/mv/mod.rs||external|path=default|partition",
+    "src/engine/mv/mod.rs||external|path=default|rebind",
+    "src/engine/mv/mod.rs||external|path=default|recovery",
+    "src/engine/mv/mod.rs||external|path=default|refresh_context",
+    "src/engine/mv/mod.rs||external|path=default|refresh_contract",
+    "src/engine/mv/mod.rs||external|path=default|refresh_driver",
+    "src/engine/mv/mod.rs||external|path=default|refresh_io",
+    "src/engine/mv/mod.rs||external|path=default|refresh_pin",
+    "src/engine/mv/mod.rs||external|path=default|refresh_property",
+    "src/engine/mv/mod.rs||external|path=default|scan_binding",
+    "src/engine/mv/mod.rs||external|path=default|schema_contract",
+    "src/engine/mv/mod.rs||external|path=default|stateless_rebuild",
+    "src/engine/mv/mod.rs||external|path=default|table_ref",
+    "src/engine/mv/partition/mod.rs||external|path=default|derivation",
+    "src/engine/mv/partition/mod.rs||external|path=default|key",
+    "src/engine/mv/partition/mod.rs||external|path=default|mapping",
+    "src/engine/mv/partition/mod.rs||external|path=default|planner",
+    "src/engine/mv_maintenance/mod.rs||external|path=default|policy",
+    "src/engine/mv_maintenance/mod.rs||external|path=default|stats",
 ];
 
 const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
@@ -1368,25 +1369,25 @@ const STANDALONE_STATE_DEPENDENCIES: &[(&str, &[&str])] = &[
 ];
 
 const FORWARDING_REEXPORTS: &[&str] = &[
-    "src/engine/catalog.rs|pub|crate::sql::catalog::CatalogProvider",
-    "src/engine/catalog.rs|pub|crate::sql::catalog::ColumnDef",
-    "src/engine/catalog.rs|pub|crate::sql::catalog::PhysicalTableLayout",
-    "src/engine/catalog.rs|pub|crate::sql::catalog::ScanSource",
-    "src/engine/catalog.rs|pub|crate::sql::catalog::StarRocksTabletRef",
-    "src/engine/catalog.rs|pub|crate::sql::catalog::TableDef",
-    "src/engine/dictionary/model.rs|pub(crate)|crate::sql::common::dictionary::DictionaryOwner",
-    "src/engine/dictionary/model.rs|pub(crate)|crate::sql::common::dictionary::DictionarySnapshot",
-    "src/engine/dictionary/model.rs|pub(crate)|crate::sql::common::dictionary::DictionaryState",
-    "src/engine/dictionary/model.rs|pub(crate)|crate::sql::common::dictionary::DictionaryValue",
-    "src/engine/dictionary/model.rs|pub(crate)|crate::sql::common::dictionary::DictionaryWatermark",
-    "src/engine/dictionary/model.rs|pub(crate)|crate::sql::common::dictionary::QueryDictionarySelection",
-    "src/engine/dictionary/model.rs|pub(crate)|crate::sql::common::dictionary::StarRocksTabletWatermark",
-    "src/engine/mod.rs|pub|crate::runtime::query_result::QueryResult",
-    "src/engine/mod.rs|pub|crate::runtime::query_result::QueryResultColumn",
-    "src/engine/mod.rs|pub|crate::sql::catalog::CatalogProvider",
-    "src/engine/mod.rs|pub|crate::sql::catalog::ColumnDef",
-    "src/engine/mod.rs|pub|crate::sql::catalog::ScanSource",
-    "src/engine/mod.rs|pub|crate::sql::catalog::TableDef",
+    "src/engine/catalog.rs|crate::engine::catalog|pub|CatalogProvider|crate::sql::catalog::CatalogProvider",
+    "src/engine/catalog.rs|crate::engine::catalog|pub|ColumnDef|crate::sql::catalog::ColumnDef",
+    "src/engine/catalog.rs|crate::engine::catalog|pub|PhysicalTableLayout|crate::sql::catalog::PhysicalTableLayout",
+    "src/engine/catalog.rs|crate::engine::catalog|pub|ScanSource|crate::sql::catalog::ScanSource",
+    "src/engine/catalog.rs|crate::engine::catalog|pub|StarRocksTabletRef|crate::sql::catalog::StarRocksTabletRef",
+    "src/engine/catalog.rs|crate::engine::catalog|pub|TableDef|crate::sql::catalog::TableDef",
+    "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|DictionaryOwner|crate::sql::common::dictionary::DictionaryOwner",
+    "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|DictionarySnapshot|crate::sql::common::dictionary::DictionarySnapshot",
+    "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|DictionaryState|crate::sql::common::dictionary::DictionaryState",
+    "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|DictionaryValue|crate::sql::common::dictionary::DictionaryValue",
+    "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|DictionaryWatermark|crate::sql::common::dictionary::DictionaryWatermark",
+    "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|QueryDictionarySelection|crate::sql::common::dictionary::QueryDictionarySelection",
+    "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|StarRocksTabletWatermark|crate::sql::common::dictionary::StarRocksTabletWatermark",
+    "src/engine/mod.rs|crate::engine|pub|CatalogProvider|crate::sql::catalog::CatalogProvider",
+    "src/engine/mod.rs|crate::engine|pub|ColumnDef|crate::sql::catalog::ColumnDef",
+    "src/engine/mod.rs|crate::engine|pub|QueryResultColumn|crate::runtime::query_result::QueryResultColumn",
+    "src/engine/mod.rs|crate::engine|pub|QueryResult|crate::runtime::query_result::QueryResult",
+    "src/engine/mod.rs|crate::engine|pub|ScanSource|crate::sql::catalog::ScanSource",
+    "src/engine/mod.rs|crate::engine|pub|TableDef|crate::sql::catalog::TableDef",
 ];
 
 const CURRENT_ENGINE_BOUNDARY_BASELINE: EngineBoundaryBaseline = EngineBoundaryBaseline {
@@ -1457,6 +1458,20 @@ fn remove_redundant_descendant_paths(paths: BTreeSet<Vec<String>>) -> BTreeSet<V
         .collect()
 }
 
+fn forwarding_export_scope(source_path: &str, inline_modules: &[String]) -> Option<String> {
+    let mut scope = rust_source_module_segments(source_path)?;
+    scope.extend(inline_modules.iter().cloned());
+    Some(scope.join("::"))
+}
+
+fn forwarding_export_name(import: &str, target: &[String]) -> Option<String> {
+    let imported = import.split_once('|').map_or(import, |(_, path)| path);
+    if let Some((_, alias)) = imported.rsplit_once(" as ") {
+        return Some(alias.to_string());
+    }
+    target.last().cloned()
+}
+
 fn collect_source_dependencies(snapshot: &mut EngineBoundarySnapshot, source: &GuardSource) {
     let production = rust_sanitized_production_text(&source.text);
     let canonical_paths = rust_production_canonical_paths(&production, &source.path)
@@ -1514,14 +1529,68 @@ fn collect_source_dependencies(snapshot: &mut EngineBoundarySnapshot, source: &G
         let source_engine = source_is_engine(&source.path);
         let target_engine = is_engine_path(&target);
         if source_engine != target_engine {
+            let Some(export_scope) = forwarding_export_scope(&source.path, &import.inline_modules)
+            else {
+                continue;
+            };
+            let Some(export_name) = forwarding_export_name(&import.import, &target) else {
+                continue;
+            };
             snapshot.forwarding_reexports.insert(format!(
-                "{}|{}|{}",
+                "{}|{}|{}|{}|{}",
                 source.path,
+                export_scope,
                 visibility,
+                export_name,
                 target.join("::")
             ));
         }
     }
+}
+
+fn normalized_module_target(source_path: &str, target: &str) -> String {
+    let joined = Path::new(source_path)
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(target);
+    let mut normalized = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir if normalized.pop() => {}
+            Component::ParentDir => normalized.push(".."),
+            Component::Normal(part) => normalized.push(part),
+            Component::RootDir | Component::Prefix(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized.display().to_string()
+}
+
+fn module_path_metadata(source_path: &str, attributes: &[String]) -> String {
+    let direct = attributes
+        .iter()
+        .filter_map(|attribute| path_attribute_value(attribute))
+        .map(|target| normalized_module_target(source_path, &target))
+        .collect::<BTreeSet<_>>();
+    let conditional = attributes
+        .iter()
+        .flat_map(|attribute| cfg_attr_generated_path_values(attribute))
+        .map(|target| normalized_module_target(source_path, &target))
+        .collect::<BTreeSet<_>>();
+
+    let mut metadata = if direct.is_empty() {
+        "default".to_string()
+    } else {
+        format!(
+            "direct:{}",
+            direct.into_iter().collect::<Vec<_>>().join(",")
+        )
+    };
+    if !conditional.is_empty() {
+        metadata.push_str(";cfg:");
+        metadata.push_str(&conditional.into_iter().collect::<Vec<_>>().join(","));
+    }
+    metadata
 }
 
 fn collect_engine_module_declarations(
@@ -1529,8 +1598,12 @@ fn collect_engine_module_declarations(
     source_path: &str,
     text: &str,
 ) {
-    let production = rust_sanitized_production_text(text);
-    for item in rust_module_items(&production) {
+    for item in rust_module_items(text).into_iter().filter(|item| {
+        !item
+            .attributes
+            .iter()
+            .any(|attribute| cfg_attribute_requires_test(attribute))
+    }) {
         let inline_scope = item
             .inline_modules
             .iter()
@@ -1542,9 +1615,11 @@ fn collect_engine_module_declarations(
         } else {
             "inline"
         };
-        snapshot
-            .engine_module_declarations
-            .insert(format!("{source_path}|{inline_scope}|{kind}|{}", item.name));
+        snapshot.engine_module_declarations.insert(format!(
+            "{source_path}|{inline_scope}|{kind}|path={}|{}",
+            module_path_metadata(source_path, &item.attributes),
+            item.name
+        ));
     }
 }
 
@@ -1871,9 +1946,10 @@ fn ebd_1_exact_baseline_rejects_each_growth_axis() {
     assert_growth_axis_rejected(dependency_growth, "engine-dependency-unexpected:");
 
     let mut forwarding_growth = clean.clone();
-    forwarding_growth
-        .forwarding_reexports
-        .insert("src/catalog/legacy.rs|pub(crate)|crate::engine::catalog".to_string());
+    forwarding_growth.forwarding_reexports.insert(
+        "src/catalog/legacy.rs|crate::catalog::legacy|pub(crate)|catalog|crate::engine::catalog"
+            .to_string(),
+    );
     assert_growth_axis_rejected(forwarding_growth, "forwarding-reexport-unexpected:");
 
     let mut frontend_growth = clean;
@@ -1972,8 +2048,8 @@ mod nested {
     assert_eq!(
         actual.forwarding_reexports,
         BTreeSet::from([
-            "src/catalog/legacy.rs|pub|crate::engine::catalog::TableDef".to_string(),
-            "src/engine/catalog.rs|pub(crate)|crate::sql::catalog::TableDef".to_string(),
+            "src/catalog/legacy.rs|crate::catalog::legacy|pub|TableDef|crate::engine::catalog::TableDef".to_string(),
+            "src/engine/catalog.rs|crate::engine::catalog::nested|pub(crate)|TableDef|crate::sql::catalog::TableDef".to_string(),
         ])
     );
 }
@@ -2000,5 +2076,90 @@ fn production() {
             "crate::engine::StandaloneState::default".to_string(),
             "crate::engine::StandaloneState::new".to_string(),
         ]))
+    );
+}
+
+#[test]
+fn ebd_1_detector_distinguishes_path_affecting_module_attributes() {
+    let plain = GuardSource::new("src/engine/mod.rs", "mod aggregate;");
+    let direct = GuardSource::new(
+        "src/engine/mod.rs",
+        "#[path = \"aggregate.rs\"] mod aggregate;",
+    );
+    let conditional = GuardSource::new(
+        "src/engine/mod.rs",
+        "#[cfg_attr(feature = \"alternate\", path = \"alternate.rs\")] mod aggregate;",
+    );
+
+    let collect = |source| {
+        collect_engine_boundary_snapshot(Path::new("fixture-root-that-does-not-exist"), &[source])
+            .engine_module_declarations
+    };
+    let plain = collect(plain);
+    let direct = collect(direct);
+    let conditional = collect(conditional);
+
+    assert_eq!(
+        plain,
+        BTreeSet::from(["src/engine/mod.rs||external|path=default|aggregate".to_string()])
+    );
+    assert_eq!(
+        direct,
+        BTreeSet::from([
+            "src/engine/mod.rs||external|path=direct:src/engine/aggregate.rs|aggregate".to_string()
+        ])
+    );
+    assert_eq!(
+        conditional,
+        BTreeSet::from([
+            "src/engine/mod.rs||external|path=default;cfg:src/engine/alternate.rs|aggregate"
+                .to_string()
+        ])
+    );
+}
+
+#[test]
+fn ebd_1_detector_distinguishes_forwarding_export_aliases() {
+    let source = GuardSource::new(
+        "src/catalog/legacy.rs",
+        r#"
+pub use crate::engine::catalog::TableDef as FirstTableDef;
+pub use crate::engine::catalog::TableDef as SecondTableDef;
+"#,
+    );
+    let actual =
+        collect_engine_boundary_snapshot(Path::new("fixture-root-that-does-not-exist"), &[source]);
+
+    assert_eq!(
+        actual.forwarding_reexports,
+        BTreeSet::from([
+            "src/catalog/legacy.rs|crate::catalog::legacy|pub|FirstTableDef|crate::engine::catalog::TableDef".to_string(),
+            "src/catalog/legacy.rs|crate::catalog::legacy|pub|SecondTableDef|crate::engine::catalog::TableDef".to_string(),
+        ])
+    );
+}
+
+#[test]
+fn ebd_1_detector_distinguishes_forwarding_export_scopes() {
+    let source = GuardSource::new(
+        "src/catalog/legacy.rs",
+        r#"
+mod first {
+    pub(crate) use crate::engine::catalog::TableDef;
+}
+mod second {
+    pub(crate) use crate::engine::catalog::TableDef;
+}
+"#,
+    );
+    let actual =
+        collect_engine_boundary_snapshot(Path::new("fixture-root-that-does-not-exist"), &[source]);
+
+    assert_eq!(
+        actual.forwarding_reexports,
+        BTreeSet::from([
+            "src/catalog/legacy.rs|crate::catalog::legacy::first|pub(crate)|TableDef|crate::engine::catalog::TableDef".to_string(),
+            "src/catalog/legacy.rs|crate::catalog::legacy::second|pub(crate)|TableDef|crate::engine::catalog::TableDef".to_string(),
+        ])
     );
 }
