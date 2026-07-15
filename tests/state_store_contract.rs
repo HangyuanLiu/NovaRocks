@@ -15,13 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use async_trait::async_trait;
 use bytes::Bytes;
+use futures::future::BoxFuture;
 use novarocks::state_store::{
-    ChangeCursor, ContinuationToken, Direction, Key, KeyRange, RangeRequest, ReadTransaction,
-    StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits, StoreRevision, Value,
-    VersionToken, WriteTransaction,
+    ChangeCursor, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution,
+    ContinuationToken, Direction, Key, KeyRange, OperationId, Precondition, RangePage,
+    RangeRequest, ReadTransaction, RunFailure, StateStore, StateStoreError, StateStoreErrorKind,
+    StateStoreLimits, StateStoreMetrics, StateStoreOperation, StateStoreOutcome, StoreIdentity,
+    StoreRevision, TransactionId, Value, VersionToken, WriteTransaction, derive_transaction_id,
+    run_side_effect_free,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -33,6 +40,170 @@ fn key(bytes: &'static [u8]) -> Key {
 fn assert_object_safe(_: Arc<dyn StateStore>) {}
 fn assert_read_object_safe(_: Box<dyn ReadTransaction>) {}
 fn assert_write_object_safe(_: Box<dyn WriteTransaction>) {}
+
+#[derive(Clone, Copy)]
+enum ScriptedCommit {
+    Committed,
+    Conflict,
+    TransientBeforeCommit,
+    DefiniteFailure,
+    CommitUnknown,
+}
+
+struct ScriptedStore {
+    limits: StateStoreLimits,
+    commits: Mutex<VecDeque<ScriptedCommit>>,
+    transaction_ids: Mutex<Vec<TransactionId>>,
+}
+
+impl ScriptedStore {
+    fn new(commits: impl IntoIterator<Item = ScriptedCommit>) -> Self {
+        Self {
+            limits: StateStoreLimits::default(),
+            commits: Mutex::new(commits.into_iter().collect()),
+            transaction_ids: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn with_limits(
+        limits: StateStoreLimits,
+        commits: impl IntoIterator<Item = ScriptedCommit>,
+    ) -> Self {
+        Self {
+            limits,
+            commits: Mutex::new(commits.into_iter().collect()),
+            transaction_ids: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn transaction_ids(&self) -> Vec<TransactionId> {
+        self.transaction_ids
+            .lock()
+            .expect("transaction ids")
+            .clone()
+    }
+}
+
+struct ScriptedWriteTransaction {
+    transaction_id: TransactionId,
+    commit: ScriptedCommit,
+}
+
+#[async_trait]
+impl ReadTransaction for ScriptedWriteTransaction {
+    async fn get(
+        &mut self,
+        _key: &Key,
+    ) -> Result<Option<novarocks::state_store::StateRecord>, StateStoreError> {
+        unreachable!("runner tests do not read")
+    }
+
+    async fn range(&mut self, _request: &RangeRequest) -> Result<RangePage, StateStoreError> {
+        unreachable!("runner tests do not scan")
+    }
+
+    async fn abort(self: Box<Self>) -> Result<(), StateStoreError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl WriteTransaction for ScriptedWriteTransaction {
+    fn transaction_id(&self) -> &TransactionId {
+        &self.transaction_id
+    }
+
+    async fn put(
+        &mut self,
+        _key: Key,
+        _value: Value,
+        _precondition: Precondition,
+    ) -> Result<(), StateStoreError> {
+        unreachable!("runner tests do not write")
+    }
+
+    async fn delete(
+        &mut self,
+        _key: Key,
+        _precondition: Precondition,
+    ) -> Result<(), StateStoreError> {
+        unreachable!("runner tests do not delete")
+    }
+
+    async fn commit(self: Box<Self>) -> CommitOutcome {
+        let error = || {
+            StateStoreError::new(
+                StateStoreErrorKind::Internal,
+                "scripted state store outcome",
+            )
+        };
+        match self.commit {
+            ScriptedCommit::Committed => CommitOutcome::Committed(CommitReceipt {
+                transaction_id: self.transaction_id,
+                revision: StoreRevision::try_from(Bytes::from_static(b"revision"))
+                    .expect("revision"),
+            }),
+            ScriptedCommit::Conflict => CommitOutcome::Conflict(error()),
+            ScriptedCommit::TransientBeforeCommit => CommitOutcome::TransientBeforeCommit(error()),
+            ScriptedCommit::DefiniteFailure => CommitOutcome::DefiniteFailure(error()),
+            ScriptedCommit::CommitUnknown => CommitOutcome::CommitUnknown(error()),
+        }
+    }
+}
+
+#[async_trait]
+impl StateStore for ScriptedStore {
+    fn provider_name(&self) -> &'static str {
+        "scripted"
+    }
+
+    fn limits(&self) -> &StateStoreLimits {
+        &self.limits
+    }
+
+    async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
+        unreachable!("runner tests do not begin reads")
+    }
+
+    async fn begin_write(
+        &self,
+        transaction_id: TransactionId,
+        _purpose: &str,
+    ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
+        self.transaction_ids
+            .lock()
+            .expect("transaction ids")
+            .push(transaction_id);
+        let commit = self
+            .commits
+            .lock()
+            .expect("commit script")
+            .pop_front()
+            .expect("scripted commit outcome");
+        Ok(Box::new(ScriptedWriteTransaction {
+            transaction_id,
+            commit,
+        }))
+    }
+
+    async fn poll_changes(
+        &self,
+        _request: &ChangePollRequest,
+    ) -> Result<ChangePage, StateStoreError> {
+        unreachable!("runner tests do not poll changes")
+    }
+
+    async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
+        unreachable!("runner tests do not load identity")
+    }
+
+    async fn resolve_commit(
+        &self,
+        _transaction_id: &TransactionId,
+    ) -> Result<CommitResolution, StateStoreError> {
+        unreachable!("runner tests do not resolve commits")
+    }
+}
 
 #[test]
 fn contract_accepts_binary_payloads_and_rejects_invalid_ranges() {
@@ -332,4 +503,225 @@ fn contract_traits_are_object_safe() {
     let _ = assert_object_safe as fn(Arc<dyn StateStore>);
     let _ = assert_read_object_safe as fn(Box<dyn ReadTransaction>);
     let _ = assert_write_object_safe as fn(Box<dyn WriteTransaction>);
+}
+
+#[tokio::test]
+async fn runner_replays_the_whole_operation_for_retryable_commit_outcomes() {
+    let store = ScriptedStore::new([
+        ScriptedCommit::Conflict,
+        ScriptedCommit::TransientBeforeCommit,
+        ScriptedCommit::Committed,
+    ]);
+    let metrics = StateStoreMetrics::new(store.provider_name());
+    let operation_id = OperationId::new_v7();
+    let operation_runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let success = run_side_effect_free(&store, &metrics, operation_id, "runner retry test", {
+        let operation_runs = Arc::clone(&operation_runs);
+        move |_transaction| -> BoxFuture<'_, Result<usize, StateStoreError>> {
+            let run = operation_runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            Box::pin(async move { Ok(run) })
+        }
+    })
+    .await
+    .expect("third attempt commits");
+
+    assert_eq!(success.value, 3);
+    assert_eq!(operation_runs.load(std::sync::atomic::Ordering::SeqCst), 3);
+    let expected_ids = (1..=3)
+        .map(|attempt| derive_transaction_id(operation_id, attempt))
+        .collect::<Vec<_>>();
+    assert_eq!(store.transaction_ids(), expected_ids);
+    assert_eq!(success.receipt.transaction_id, expected_ids[2]);
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.begin_count, 3);
+    assert_eq!(snapshot.commit_count, 3);
+    assert_eq!(snapshot.retry_count, 2);
+    assert_eq!(
+        snapshot.operation_outcome_count(StateStoreOperation::Commit, StateStoreOutcome::Conflict),
+        1
+    );
+    assert_eq!(
+        snapshot.operation_outcome_count(
+            StateStoreOperation::Commit,
+            StateStoreOutcome::TransientBeforeCommit
+        ),
+        1
+    );
+}
+
+#[tokio::test]
+async fn runner_does_not_retry_operation_definite_or_unknown_failures() {
+    let operation_error_store = ScriptedStore::new([ScriptedCommit::Committed]);
+    let operation_error_runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let failure = run_side_effect_free(
+        &operation_error_store,
+        &StateStoreMetrics::new(operation_error_store.provider_name()),
+        OperationId::new_v7(),
+        "operation error test",
+        {
+            let operation_error_runs = Arc::clone(&operation_error_runs);
+            move |_transaction| -> BoxFuture<'_, Result<(), StateStoreError>> {
+                operation_error_runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async {
+                    Err(StateStoreError::new(
+                        StateStoreErrorKind::InvalidRequest,
+                        "scripted operation failure",
+                    ))
+                })
+            }
+        },
+    )
+    .await
+    .expect_err("operation failure is terminal");
+    assert!(matches!(failure, RunFailure::Operation(_)));
+    assert_eq!(
+        operation_error_runs.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(operation_error_store.transaction_ids().len(), 1);
+
+    for (outcome, expect_unknown) in [
+        (ScriptedCommit::DefiniteFailure, false),
+        (ScriptedCommit::CommitUnknown, true),
+    ] {
+        let store = ScriptedStore::new([outcome]);
+        let operation_id = OperationId::new_v7();
+        let failure = run_side_effect_free(
+            &store,
+            &StateStoreMetrics::new(store.provider_name()),
+            operation_id,
+            "terminal commit outcome test",
+            |_transaction| Box::pin(async { Ok(()) }),
+        )
+        .await
+        .expect_err("commit outcome is terminal");
+        if expect_unknown {
+            match failure {
+                RunFailure::CommitUnknown { transaction_id, .. } => {
+                    assert_eq!(transaction_id, derive_transaction_id(operation_id, 1));
+                }
+                other => panic!("expected CommitUnknown, got {other:?}"),
+            }
+        } else {
+            assert!(matches!(failure, RunFailure::DefiniteFailure(_)));
+        }
+        assert_eq!(store.transaction_ids().len(), 1);
+    }
+}
+
+#[test]
+fn runner_derives_stable_distinct_uuid_v7_attempt_ids() {
+    let operation_id = OperationId::new_v7();
+    let first = derive_transaction_id(operation_id, 1);
+    let first_again = derive_transaction_id(operation_id, 1);
+    let second = derive_transaction_id(operation_id, 2);
+
+    assert_eq!(first, first_again);
+    assert_ne!(first, second);
+    assert_eq!(
+        &first.as_uuid().as_bytes()[..6],
+        &operation_id.as_uuid().as_bytes()[..6]
+    );
+    assert_eq!(first.as_uuid().get_version(), Some(uuid::Version::SortRand));
+    assert_eq!(first.as_uuid().get_variant(), uuid::Variant::RFC4122);
+
+    let digest = Sha256::digest(
+        [
+            operation_id.as_uuid().as_bytes().as_slice(),
+            &1_u32.to_be_bytes(),
+        ]
+        .concat(),
+    );
+    let mut expected = [0_u8; 16];
+    expected[..6].copy_from_slice(&operation_id.as_uuid().as_bytes()[..6]);
+    expected[6..].copy_from_slice(&digest[..10]);
+    expected[6] = (expected[6] & 0x0f) | 0x70;
+    expected[8] = (expected[8] & 0x3f) | 0x80;
+    assert_eq!(first.as_uuid().as_bytes(), &expected);
+
+    assert!(std::panic::catch_unwind(|| derive_transaction_id(operation_id, 0)).is_err());
+    assert!(std::panic::catch_unwind(|| derive_transaction_id(operation_id, 6)).is_err());
+}
+
+#[tokio::test]
+async fn runner_stops_at_the_attempt_budget_without_a_sixth_id() {
+    let store = ScriptedStore::new([ScriptedCommit::Conflict; 5]);
+    let operation_id = OperationId::new_v7();
+    let failure = run_side_effect_free(
+        &store,
+        &StateStoreMetrics::new(store.provider_name()),
+        operation_id,
+        "retry budget test",
+        |_transaction| Box::pin(async { Ok(()) }),
+    )
+    .await
+    .expect_err("five conflicts exhaust retry budget");
+
+    assert!(matches!(failure, RunFailure::RetryExhausted(_)));
+    assert_eq!(store.transaction_ids().len(), 5);
+    assert_eq!(
+        store.transaction_ids().last().copied(),
+        Some(derive_transaction_id(operation_id, 5))
+    );
+}
+
+#[tokio::test]
+async fn runner_enforces_one_total_deadline_without_retrying_a_slow_operation() {
+    let limits = StateStoreLimits {
+        transaction_deadline: Duration::from_millis(20),
+        ..StateStoreLimits::default()
+    };
+    let store = ScriptedStore::with_limits(limits, [ScriptedCommit::Committed]);
+    let metrics = StateStoreMetrics::new(store.provider_name());
+    let failure = run_side_effect_free(
+        &store,
+        &metrics,
+        OperationId::new_v7(),
+        "deadline test",
+        |_transaction| {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                Ok(())
+            })
+        },
+    )
+    .await
+    .expect_err("operation exceeds total deadline");
+
+    assert!(matches!(failure, RunFailure::DeadlineExceeded));
+    assert_eq!(store.transaction_ids().len(), 1);
+    assert_eq!(metrics.snapshot().deadline_count, 1);
+}
+
+#[test]
+fn runner_metrics_have_only_fixed_low_cardinality_dimensions() {
+    let metrics = StateStoreMetrics::new("scripted");
+    metrics.record_operation(StateStoreOperation::Get, StateStoreOutcome::Success);
+    metrics.record_operation(StateStoreOperation::Range, StateStoreOutcome::Error);
+    metrics.record_operation(StateStoreOperation::Put, StateStoreOutcome::Success);
+    metrics.record_operation(StateStoreOperation::Delete, StateStoreOutcome::Error);
+    metrics.record_bytes_read(11);
+    metrics.record_bytes_written(13);
+    metrics.record_page_records(17);
+    metrics.record_notification_lag(Duration::from_millis(19));
+    metrics.record_blocking_failure();
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.provider, "scripted");
+    assert_eq!(snapshot.get_count, 1);
+    assert_eq!(snapshot.range_count, 1);
+    assert_eq!(snapshot.put_count, 1);
+    assert_eq!(snapshot.delete_count, 1);
+    assert_eq!(snapshot.bytes_read, 11);
+    assert_eq!(snapshot.bytes_written, 13);
+    assert_eq!(snapshot.page_records, 17);
+    assert_eq!(snapshot.notification_lag_micros, 19_000);
+    assert_eq!(snapshot.blocking_failure_count, 1);
+
+    let debug = format!("{snapshot:?}");
+    assert!(!debug.contains("customer/secret-key"));
+    assert!(!debug.contains("secret-value"));
+    assert!(!debug.contains("password"));
 }

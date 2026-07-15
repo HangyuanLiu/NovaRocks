@@ -19,7 +19,9 @@ pub mod config;
 pub mod contract;
 pub mod error;
 pub mod limits;
+pub mod metrics;
 pub mod range;
+pub mod runner;
 
 pub use config::{StateStoreConfig, StateStoreProviderConfig};
 pub use contract::{
@@ -29,4 +31,9 @@ pub use contract::{
 };
 pub use error::{StateStoreError, StateStoreErrorKind};
 pub use limits::{StateStoreLimitOverrides, StateStoreLimits};
+pub use metrics::{
+    STATE_STORE_OPERATION_COUNT, STATE_STORE_OUTCOME_COUNT, StateStoreMetrics,
+    StateStoreMetricsSnapshot, StateStoreOperation, StateStoreOutcome,
+};
 pub use range::{ChangeCursor, ContinuationToken, Direction, KeyRange, RangeRequest};
+pub use runner::{RunFailure, RunSuccess, derive_transaction_id, run_side_effect_free};

@@ -115,6 +115,10 @@ impl From<Uuid> for TransactionId {
 pub struct OperationId(Uuid);
 
 impl OperationId {
+    pub fn new_v7() -> Self {
+        Self(Uuid::now_v7())
+    }
+
     pub const fn as_uuid(&self) -> &Uuid {
         &self.0
     }
