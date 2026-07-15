@@ -3,8 +3,9 @@ use std::fs;
 use std::path::Path;
 
 use super::{
-    rel, rs_files, rust_canonical_use_segments, rust_module_items, rust_production_canonical_paths,
-    rust_raw_production_use_statements, rust_sanitized_production_text,
+    rel, rs_files, rust_canonical_use_segments_in_scope, rust_module_items,
+    rust_production_canonical_paths, rust_production_scoped_use_statements,
+    rust_sanitized_production_text, rust_use_visibility,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -61,7 +62,7 @@ fn is_engine_path(path: &[String]) -> bool {
 }
 
 fn is_standalone_state_path(path: &[String]) -> bool {
-    is_engine_path(path) && path.last().is_some_and(|item| item == "StandaloneState")
+    is_engine_path(path) && path.get(2).is_some_and(|item| item == "StandaloneState")
 }
 
 fn is_top_level_frontend_path(path: &[String]) -> bool {
@@ -143,12 +144,16 @@ fn collect_source_dependencies(snapshot: &mut EngineBoundarySnapshot, source: &G
         );
     }
 
-    for raw in rust_raw_production_use_statements(&production)
+    for import in rust_production_scoped_use_statements(&production)
         .into_iter()
-        .filter(|raw| raw.visibility != "private")
+        .filter(|import| rust_use_visibility(&import.import) != "private")
     {
-        let import = raw.path.segments.join("::");
-        let Some(target) = rust_canonical_use_segments(&import, &source.path) else {
+        let visibility = rust_use_visibility(&import.import);
+        let Some(target) = rust_canonical_use_segments_in_scope(
+            &import.import,
+            &source.path,
+            &import.inline_modules,
+        ) else {
             continue;
         };
         let source_engine = source_is_engine(&source.path);
@@ -157,7 +162,7 @@ fn collect_source_dependencies(snapshot: &mut EngineBoundarySnapshot, source: &G
             snapshot.forwarding_reexports.insert(format!(
                 "{}|{}|{}",
                 source.path,
-                raw.visibility,
+                visibility,
                 target.join("::")
             ));
         }
@@ -426,4 +431,59 @@ fn production() { let _ = legacy_catalog::normalize_identifier("x"); }
         &BTreeSet::from(["crate::engine::catalog".to_string()])
     );
     assert!(actual.standalone_state_dependencies.is_empty());
+}
+
+#[test]
+fn ebd_1_detector_resolves_forwarding_aliases_and_inline_relative_paths() {
+    let sources = vec![
+        GuardSource::new(
+            "src/catalog/legacy.rs",
+            r#"
+use crate::engine as legacy;
+pub use legacy::catalog::TableDef;
+"#,
+        ),
+        GuardSource::new(
+            "src/engine/catalog.rs",
+            r#"
+mod nested {
+    pub(crate) use super::super::super::sql::catalog::TableDef;
+}
+"#,
+        ),
+    ];
+    let actual =
+        collect_engine_boundary_snapshot(Path::new("fixture-root-that-does-not-exist"), &sources);
+    assert_eq!(
+        actual.forwarding_reexports,
+        BTreeSet::from([
+            "src/catalog/legacy.rs|pub|crate::engine::catalog::TableDef".to_string(),
+            "src/engine/catalog.rs|pub(crate)|crate::sql::catalog::TableDef".to_string(),
+        ])
+    );
+}
+
+#[test]
+fn ebd_1_detector_rejects_standalone_state_associated_items_only() {
+    let source = GuardSource::new(
+        "src/sql/example.rs",
+        r#"
+fn production() {
+    let _ = crate::engine::StandaloneState::new();
+    let _ = crate::engine::StandaloneState::default();
+    let _ = crate::engine::StandaloneStateFactory::new();
+}
+"#,
+    );
+    let actual =
+        collect_engine_boundary_snapshot(Path::new("fixture-root-that-does-not-exist"), &[source]);
+    assert_eq!(
+        actual
+            .standalone_state_dependencies
+            .get("src/sql/example.rs"),
+        Some(&BTreeSet::from([
+            "crate::engine::StandaloneState::default".to_string(),
+            "crate::engine::StandaloneState::new".to_string(),
+        ]))
+    );
 }
