@@ -1237,7 +1237,8 @@ impl RuntimeFilterChannel {
                 TopKApplyOutcome::Duplicate => SubmitOutcome::Duplicate,
                 TopKApplyOutcome::SequenceAdvancedEqual => SubmitOutcome::SequenceAdvancedEqual,
                 TopKApplyOutcome::StreamUpdated => SubmitOutcome::StreamAcceptedNoGlobalChange,
-                TopKApplyOutcome::GlobalTightened => SubmitOutcome::Published,
+                TopKApplyOutcome::GlobalTightened if version.is_some() => SubmitOutcome::Published,
+                TopKApplyOutcome::GlobalTightened => SubmitOutcome::StreamAcceptedNoGlobalChange,
             };
             let release_after_unlock = state.reservation.split_off_excess(after_bytes);
             let ordered = state
@@ -1435,10 +1436,14 @@ impl RuntimeFilterChannel {
                 return Ok(locked.finish());
             }
             let close_outcome = projection.outcome();
-            let outcome = match close_outcome {
-                TopKCloseOutcome::Duplicate => SubmitOutcome::Duplicate,
-                TopKCloseOutcome::PendingFinalSnapshot => SubmitOutcome::PendingFinalSnapshot,
-                TopKCloseOutcome::Satisfied => SubmitOutcome::Applied,
+            let outcome = if version.is_some() {
+                SubmitOutcome::Published
+            } else {
+                match close_outcome {
+                    TopKCloseOutcome::Duplicate => SubmitOutcome::Duplicate,
+                    TopKCloseOutcome::PendingFinalSnapshot => SubmitOutcome::PendingFinalSnapshot,
+                    TopKCloseOutcome::Satisfied => SubmitOutcome::Applied,
+                }
             };
             let release_after_unlock = state.reservation.split_off_excess(after_bytes);
             let ordered = state
@@ -4427,10 +4432,173 @@ mod tests {
             let harness = TopKChannelHarness::with_streams(2, 4);
             assert_eq!(
                 harness.submit(0, 0, &[1, 2, 3, 4]).unwrap(),
-                TestAction::Other(SubmitOutcome::Published)
+                TestAction::StreamAcceptedNoGlobalChange
             );
             assert_eq!(harness.latest(), None);
-            assert_eq!(harness.close(1, 0).unwrap(), TestAction::Published(1, 4));
+            let (binding, instance) = harness.streams[1];
+            let action = harness
+                .channel
+                .close_topk_partition(
+                    binding,
+                    instance,
+                    PartitionId::new(0),
+                    ProducerSequence::new(0),
+                )
+                .unwrap();
+            assert_eq!(action.outcome(), SubmitOutcome::Published);
+            assert_eq!(test_action(action), TestAction::Published(1, 4));
+        }
+
+        #[test]
+        fn availability_requires_every_expected_instance_and_local_partition() {
+            let keys = vec![OrderKeyContract {
+                data_type: DataType::Int64,
+                direction: SortDirection::Ascending,
+                null_order: NullOrder::Last,
+            }];
+            let plan = OrderContract {
+                comparator_digest: comparator_digest_for_test(&keys, COMPARATOR_ALGORITHM_VERSION),
+                keys,
+                inclusive: true,
+            };
+            let requirement = TopKSummaryRequirement::try_new(2).unwrap();
+            let contract =
+                Arc::new(RuntimeTopKSummaryContract::try_from_plan(&plan, requirement).unwrap());
+            let witness = CoverageWitnessId::new(1);
+            let binding = BindingId::new(10);
+            let deployment = RuntimeFilterChannelDeployment::new(
+                ChannelId::new(1),
+                RuntimeFilterLogicalDomain::OrderedBound(plan),
+                RuntimeFilterLifecycle::MonotonicUpdates,
+                Coverage::Leaf(witness),
+                Coverage::Leaf(witness),
+                ReductionRequirement::MergeTopKSummary(requirement),
+                BTreeSet::from([
+                    ContributionKind::TopKSummary,
+                    ContributionKind::ProducerClosed,
+                ]),
+                CompletionRequirement::ProducerClosed,
+                RuntimeFilterPolicyRequirement {
+                    max_contribution_bytes: 4096,
+                    max_artifact_bytes: 4096,
+                    deadline_ms: 100,
+                    max_retries: 0,
+                },
+                RuntimeFilterCoreBudget::new(16 * 1024),
+                MaterializationPolicy::for_test(),
+                BTreeMap::from([(
+                    binding,
+                    ProducerDeployment::new(witness, BTreeSet::from([uid(10), uid(11)])),
+                )]),
+                BTreeMap::new(),
+            );
+            let account = Arc::new(Account::default());
+            let channel = RuntimeFilterChannel::new(
+                uid(99),
+                RuntimeFilterParticipantId::new(1),
+                DeploymentEpoch::new(1),
+                &deployment,
+                Instant::now() + Duration::from_secs(10),
+                account.clone(),
+            )
+            .unwrap();
+            let summary = |values: &[i64]| {
+                TopKSummary::try_new(
+                    &contract,
+                    values
+                        .iter()
+                        .map(|value| {
+                            OrderedTuple::try_new(
+                                contract.order(),
+                                [Some(OrderedScalar::Int64(*value))],
+                            )
+                            .unwrap()
+                        })
+                        .collect(),
+                )
+                .unwrap()
+            };
+            let submit = |instance: UniqueId, partition: u32, sequence: u64, values: &[i64]| {
+                let summary = summary(values);
+                let bytes = summary.canonical_contribution_bytes().unwrap();
+                channel
+                    .submit_topk_summary(
+                        binding,
+                        instance,
+                        PartitionId::new(partition),
+                        ProducerSequence::new(sequence),
+                        summary,
+                        TemporaryContributionLease::new(account.clone(), bytes),
+                    )
+                    .map(test_action)
+            };
+
+            channel.open_producer(binding, uid(10), 2).unwrap();
+            assert_eq!(
+                submit(uid(10), 0, 0, &[1, 4]).unwrap(),
+                TestAction::StreamAcceptedNoGlobalChange
+            );
+            assert_eq!(
+                channel
+                    .close_topk_partition(
+                        binding,
+                        uid(10),
+                        PartitionId::new(1),
+                        ProducerSequence::new(0),
+                    )
+                    .map(test_action)
+                    .unwrap(),
+                TestAction::Other(SubmitOutcome::Applied)
+            );
+            assert!(channel.snapshot().is_none());
+
+            channel.open_producer(binding, uid(11), 2).unwrap();
+            assert_eq!(
+                channel
+                    .close_topk_partition(
+                        binding,
+                        uid(11),
+                        PartitionId::new(0),
+                        ProducerSequence::new(0),
+                    )
+                    .map(test_action)
+                    .unwrap(),
+                TestAction::Other(SubmitOutcome::Applied)
+            );
+            assert!(channel.snapshot().is_none());
+            assert_eq!(
+                channel
+                    .close_topk_partition(
+                        binding,
+                        uid(11),
+                        PartitionId::new(1),
+                        ProducerSequence::new(2),
+                    )
+                    .map(test_action)
+                    .unwrap(),
+                TestAction::PendingFinalSnapshot
+            );
+            assert!(channel.snapshot().is_none());
+            assert!(!channel.is_terminal());
+
+            assert_eq!(
+                submit(uid(11), 1, 1, &[2, 3]).unwrap(),
+                TestAction::Published(1, 2)
+            );
+            assert!(!channel.is_terminal());
+            assert_eq!(
+                channel
+                    .close_topk_partition(
+                        binding,
+                        uid(10),
+                        PartitionId::new(0),
+                        ProducerSequence::new(1),
+                    )
+                    .map(test_action)
+                    .unwrap(),
+                TestAction::Completed(Some((1, 2)))
+            );
+            assert!(channel.is_terminal());
         }
 
         #[test]
