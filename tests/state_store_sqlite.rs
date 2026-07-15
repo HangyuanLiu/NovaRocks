@@ -47,6 +47,32 @@ fn transaction_id() -> TransactionId {
     Uuid::now_v7().into()
 }
 
+fn operation_total(
+    snapshot: &novarocks::state_store::StateStoreMetricsSnapshot,
+    operation: StateStoreOperation,
+) -> u64 {
+    snapshot.operation_outcomes[operation as usize].iter().sum()
+}
+
+fn assert_failed_operation_observed(
+    before: &novarocks::state_store::StateStoreMetricsSnapshot,
+    after: &novarocks::state_store::StateStoreMetricsSnapshot,
+    operation: StateStoreOperation,
+) {
+    assert_eq!(
+        operation_total(after, operation),
+        operation_total(before, operation) + 1
+    );
+    assert_eq!(
+        after.operation_outcome_count(operation, StateStoreOutcome::Error),
+        before.operation_outcome_count(operation, StateStoreOutcome::Error) + 1
+    );
+    assert_eq!(
+        after.operation_duration_observations(operation),
+        before.operation_duration_observations(operation) + 1
+    );
+}
+
 async fn open_store(temp: &TempDir, owner: &str) -> Arc<dyn StateStore> {
     open_store_with_limits(temp, owner, StateStoreLimitOverrides::default()).await
 }
@@ -1380,6 +1406,101 @@ async fn sqlite_metrics_are_driven_by_real_store_operations() {
     assert!(!debug.contains("metrics/a"));
     assert!(!debug.contains("metrics/b"));
     assert!(!debug.contains("INSERT INTO"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sqlite_fail_fast_operations_are_observed_once_without_payload_metrics() {
+    let temp = TempDir::new().expect("fail-fast metrics temp dir");
+    let store = open_store_with_limits(
+        &temp,
+        "fail-fast-metrics-fe",
+        StateStoreLimitOverrides {
+            max_key_bytes: Some(4),
+            max_transaction_bytes: Some(60),
+            ..StateStoreLimitOverrides::default()
+        },
+    )
+    .await;
+
+    let mut reader = store.begin_read().await.expect("begin fail-fast reader");
+    let before_get = store.metrics_snapshot();
+    assert_eq!(
+        reader
+            .get(&key(b"oversized".to_vec()))
+            .await
+            .expect_err("oversized key must fail before provider I/O")
+            .kind(),
+        StateStoreErrorKind::LimitExceeded
+    );
+    let after_get = store.metrics_snapshot();
+    assert_failed_operation_observed(&before_get, &after_get, StateStoreOperation::Get);
+    assert_eq!(after_get.bytes_read, before_get.bytes_read);
+
+    let forward = RangeRequest {
+        range: KeyRange::new(key(b"a".to_vec()), key(b"z".to_vec())).expect("fail-fast range"),
+        direction: Direction::Forward,
+        page_size: 1,
+        continuation: None,
+    };
+    let mismatched = RangeRequest {
+        direction: Direction::Reverse,
+        continuation: Some(
+            forward
+                .continuation_after(&key(b"m".to_vec()))
+                .expect("forward continuation"),
+        ),
+        ..forward
+    };
+    let before_range = store.metrics_snapshot();
+    assert_eq!(
+        reader
+            .range(&mismatched)
+            .await
+            .expect_err("mismatched continuation must fail before provider I/O")
+            .kind(),
+        StateStoreErrorKind::InvalidRequest
+    );
+    let after_range = store.metrics_snapshot();
+    assert_failed_operation_observed(&before_range, &after_range, StateStoreOperation::Range);
+    assert_eq!(after_range.bytes_read, before_range.bytes_read);
+    assert_eq!(after_range.page_records, before_range.page_records);
+    reader.abort().await.expect("abort fail-fast reader");
+
+    let mut putter = store
+        .begin_write(transaction_id(), "fail-fast put")
+        .await
+        .expect("begin fail-fast put");
+    let before_put = store.metrics_snapshot();
+    assert_eq!(
+        putter
+            .put(key(b"put1".to_vec()), value(b"x"), Precondition::Any)
+            .await
+            .expect_err("accounted put must exceed the transaction budget")
+            .kind(),
+        StateStoreErrorKind::LimitExceeded
+    );
+    let after_put = store.metrics_snapshot();
+    assert_failed_operation_observed(&before_put, &after_put, StateStoreOperation::Put);
+    assert_eq!(after_put.bytes_written, before_put.bytes_written);
+    putter.abort().await.expect("abort fail-fast put");
+
+    let mut deleter = store
+        .begin_write(transaction_id(), "fail-fast delete")
+        .await
+        .expect("begin fail-fast delete");
+    let before_delete = store.metrics_snapshot();
+    assert_eq!(
+        deleter
+            .delete(key(b"del1".to_vec()), Precondition::Any)
+            .await
+            .expect_err("accounted delete must exceed the transaction budget")
+            .kind(),
+        StateStoreErrorKind::LimitExceeded
+    );
+    let after_delete = store.metrics_snapshot();
+    assert_failed_operation_observed(&before_delete, &after_delete, StateStoreOperation::Delete);
+    assert_eq!(after_delete.bytes_written, before_delete.bytes_written);
+    deleter.abort().await.expect("abort fail-fast delete");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

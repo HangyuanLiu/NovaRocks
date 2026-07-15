@@ -253,10 +253,12 @@ struct TxnOwner {
 
 pub(super) struct SqliteReadTransaction {
     owner: Option<TxnOwner>,
+    metrics: Arc<StateStoreMetrics>,
 }
 
 pub(super) struct SqliteWriteTransaction {
     owner: Option<TxnOwner>,
+    metrics: Arc<StateStoreMetrics>,
     transaction_id: TransactionId,
     path: PathBuf,
     commit_registry: CommitRegistry,
@@ -278,6 +280,7 @@ impl SqliteStateStore {
         record_result(&self.metrics, StateStoreOperation::Begin, started, &result);
         Ok(SqliteReadTransaction {
             owner: Some(result?),
+            metrics: Arc::clone(&self.metrics),
         })
     }
 
@@ -286,18 +289,24 @@ impl SqliteStateStore {
         transaction_id: TransactionId,
     ) -> Result<SqliteWriteTransaction, StateStoreError> {
         let started = Instant::now();
-        let result = begin_transaction(
-            self.path.clone(),
-            self.limits.clone(),
-            Arc::clone(&self.metrics),
-            #[cfg(test)]
-            Arc::clone(&self.test_hooks),
-        )
-        .await;
+        let result = match validate_transaction_envelope(&self.limits) {
+            Ok(()) => {
+                begin_transaction(
+                    self.path.clone(),
+                    self.limits.clone(),
+                    Arc::clone(&self.metrics),
+                    #[cfg(test)]
+                    Arc::clone(&self.test_hooks),
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
         record_result(&self.metrics, StateStoreOperation::Begin, started, &result);
         let owner = result?;
         Ok(SqliteWriteTransaction {
             owner: Some(owner),
+            metrics: Arc::clone(&self.metrics),
             transaction_id,
             path: self.path.clone(),
             commit_registry: Arc::clone(&self.commit_registry),
@@ -341,10 +350,14 @@ impl SqliteStateStore {
 impl SqliteReadTransaction {
     pub(super) async fn get(&mut self, key: &Key) -> Result<Option<StateRecord>, StateStoreError> {
         let started = Instant::now();
-        let metrics = Arc::clone(&self.owner()?.metrics);
-        validate_key_value(key, None, &self.owner()?.limits)?;
-        let result = get(self.owner()?, key.clone()).await;
-        record_read_result(&metrics, StateStoreOperation::Get, started, &result);
+        let result = match self.owner().and_then(|owner| {
+            validate_key_value(key, None, &owner.limits)?;
+            Ok(owner.clone())
+        }) {
+            Ok(owner) => get(&owner, key.clone()).await,
+            Err(error) => Err(error),
+        };
+        record_read_result(&self.metrics, StateStoreOperation::Get, started, &result);
         result
     }
 
@@ -352,16 +365,21 @@ impl SqliteReadTransaction {
         &mut self,
         request: &RangeRequest,
     ) -> Result<RangePage, StateStoreError> {
-        validate_range_request(request, &self.owner()?.limits)?;
-        let owner = self.owner()?.clone();
-        let request = request.clone();
         let started = Instant::now();
-        let metrics = Arc::clone(&owner.metrics);
-        let result = run_operation(&owner, move |state| {
-            super::range::range_page(state, &request)
-        })
-        .await;
-        record_range_result(&metrics, started, &result);
+        let result = match self.owner().and_then(|owner| {
+            validate_range_request(request, &owner.limits)?;
+            Ok(owner.clone())
+        }) {
+            Ok(owner) => {
+                let request = request.clone();
+                run_operation(&owner, move |state| {
+                    super::range::range_page(state, &request)
+                })
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        record_range_result(&self.metrics, started, &result);
         result
     }
 
@@ -390,10 +408,14 @@ impl Drop for SqliteReadTransaction {
 impl SqliteWriteTransaction {
     pub(super) async fn get(&mut self, key: &Key) -> Result<Option<StateRecord>, StateStoreError> {
         let started = Instant::now();
-        let metrics = Arc::clone(&self.owner()?.metrics);
-        validate_key_value(key, None, &self.owner()?.limits)?;
-        let result = get(self.owner()?, key.clone()).await;
-        record_read_result(&metrics, StateStoreOperation::Get, started, &result);
+        let result = match self.owner().and_then(|owner| {
+            validate_key_value(key, None, &owner.limits)?;
+            Ok(owner.clone())
+        }) {
+            Ok(owner) => get(&owner, key.clone()).await,
+            Err(error) => Err(error),
+        };
+        record_read_result(&self.metrics, StateStoreOperation::Get, started, &result);
         result
     }
 
@@ -401,20 +423,25 @@ impl SqliteWriteTransaction {
         &mut self,
         request: &RangeRequest,
     ) -> Result<RangePage, StateStoreError> {
-        validate_range_request(request, &self.owner()?.limits)?;
-        let owner = self.owner()?.clone();
-        let request = request.clone();
         let started = Instant::now();
-        let metrics = Arc::clone(&owner.metrics);
-        let result = run_operation(&owner, move |state| {
-            let page = super::range::range_page(state, &request)?;
-            if page.continuation.is_some() {
-                state.range_frozen = true;
+        let result = match self.owner().and_then(|owner| {
+            validate_range_request(request, &owner.limits)?;
+            Ok(owner.clone())
+        }) {
+            Ok(owner) => {
+                let request = request.clone();
+                run_operation(&owner, move |state| {
+                    let page = super::range::range_page(state, &request)?;
+                    if page.continuation.is_some() {
+                        state.range_frozen = true;
+                    }
+                    Ok(page)
+                })
+                .await
             }
-            Ok(page)
-        })
-        .await;
-        record_range_result(&metrics, started, &result);
+            Err(error) => Err(error),
+        };
+        record_range_result(&self.metrics, started, &result);
         result
     }
 
@@ -424,42 +451,43 @@ impl SqliteWriteTransaction {
         value: Value,
         precondition: Precondition,
     ) -> Result<(), StateStoreError> {
-        validate_key_value(&key, Some(&value), &self.owner()?.limits)?;
-        let owner = self.owner()?.clone();
-        let metrics = Arc::clone(&owner.metrics);
-        let measured_bytes = accounted_mutation_bytes(
-            &key,
-            &Mutation::Put {
-                value: value.clone(),
-                precondition: precondition.clone(),
-                provisional_version: provisional_version(self.transaction_id, 1),
-            },
-        )?;
         let started = Instant::now();
         let transaction_id = self.transaction_id;
-        let result = run_operation(&owner, move |state| {
-            let next_operation = next_operation_count(state)?;
-            let provisional_version = provisional_version(transaction_id, next_operation);
-            stage_mutation(
-                state,
-                key,
-                Mutation::Put {
-                    value,
-                    precondition,
-                    provisional_version,
+        let setup = self.owner().and_then(|owner| {
+            validate_key_value(&key, Some(&value), &owner.limits)?;
+            let measured_bytes = accounted_mutation_bytes(
+                &key,
+                &Mutation::Put {
+                    value: value.clone(),
+                    precondition: precondition.clone(),
+                    provisional_version: provisional_version(transaction_id, 1),
                 },
-                next_operation,
-            )
-        })
-        .await;
-        record_write_result(
-            &metrics,
-            StateStoreOperation::Put,
-            started,
-            measured_bytes,
-            &result,
-        );
-        result
+            )?;
+            Ok((owner.clone(), measured_bytes))
+        });
+        let result = match setup {
+            Ok((owner, measured_bytes)) => {
+                run_operation(&owner, move |state| {
+                    let next_operation = next_operation_count(state)?;
+                    let provisional_version = provisional_version(transaction_id, next_operation);
+                    stage_mutation(
+                        state,
+                        key,
+                        Mutation::Put {
+                            value,
+                            precondition,
+                            provisional_version,
+                        },
+                        next_operation,
+                    )?;
+                    Ok(measured_bytes)
+                })
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        record_write_result(&self.metrics, StateStoreOperation::Put, started, &result);
+        result.map(|_| ())
     }
 
     pub(super) async fn delete(
@@ -467,34 +495,35 @@ impl SqliteWriteTransaction {
         key: Key,
         precondition: Precondition,
     ) -> Result<(), StateStoreError> {
-        validate_key_value(&key, None, &self.owner()?.limits)?;
-        let owner = self.owner()?.clone();
-        let metrics = Arc::clone(&owner.metrics);
-        let measured_bytes = accounted_mutation_bytes(
-            &key,
-            &Mutation::Delete {
-                precondition: precondition.clone(),
-            },
-        )?;
         let started = Instant::now();
-        let result = run_operation(&owner, move |state| {
-            let next_operation = next_operation_count(state)?;
-            stage_mutation(
-                state,
-                key,
-                Mutation::Delete { precondition },
-                next_operation,
-            )
-        })
-        .await;
-        record_write_result(
-            &metrics,
-            StateStoreOperation::Delete,
-            started,
-            measured_bytes,
-            &result,
-        );
-        result
+        let setup = self.owner().and_then(|owner| {
+            validate_key_value(&key, None, &owner.limits)?;
+            let measured_bytes = accounted_mutation_bytes(
+                &key,
+                &Mutation::Delete {
+                    precondition: precondition.clone(),
+                },
+            )?;
+            Ok((owner.clone(), measured_bytes))
+        });
+        let result = match setup {
+            Ok((owner, measured_bytes)) => {
+                run_operation(&owner, move |state| {
+                    let next_operation = next_operation_count(state)?;
+                    stage_mutation(
+                        state,
+                        key,
+                        Mutation::Delete { precondition },
+                        next_operation,
+                    )?;
+                    Ok(measured_bytes)
+                })
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        record_write_result(&self.metrics, StateStoreOperation::Delete, started, &result);
+        result.map(|_| ())
     }
 
     pub(super) async fn abort(mut self) -> Result<(), StateStoreError> {
@@ -503,17 +532,15 @@ impl SqliteWriteTransaction {
     }
 
     pub(super) async fn commit(self) -> CommitOutcome {
-        let metrics = self.owner.as_ref().map(|owner| Arc::clone(&owner.metrics));
+        let metrics = Arc::clone(&self.metrics);
         let started = Instant::now();
         let outcome = self.commit_inner().await;
-        if let Some(metrics) = metrics {
-            let metric_outcome = commit_metric_outcome(&outcome);
-            metrics.record_operation(
-                StateStoreOperation::Commit,
-                metric_outcome,
-                started.elapsed(),
-            );
-        }
+        let metric_outcome = commit_metric_outcome(&outcome);
+        metrics.record_operation(
+            StateStoreOperation::Commit,
+            metric_outcome,
+            started.elapsed(),
+        );
         outcome
     }
 
@@ -888,6 +915,14 @@ fn validate_key_value(
     Ok(())
 }
 
+fn validate_transaction_envelope(limits: &StateStoreLimits) -> Result<(), StateStoreError> {
+    let accounted_bytes = checked_accounting_add(0, TRANSACTION_ENVELOPE_BYTES)?;
+    if accounted_bytes > limits.max_transaction_bytes {
+        return Err(limit_error("transaction byte limit exceeded"));
+    }
+    Ok(())
+}
+
 fn validate_range_request(
     request: &RangeRequest,
     limits: &StateStoreLimits,
@@ -1034,12 +1069,11 @@ fn record_write_result(
     metrics: &StateStoreMetrics,
     operation: StateStoreOperation,
     started: Instant,
-    bytes: usize,
-    result: &Result<(), StateStoreError>,
+    result: &Result<usize, StateStoreError>,
 ) {
     record_result(metrics, operation, started, result);
-    if result.is_ok() {
-        metrics.record_bytes_written(u64::try_from(bytes).unwrap_or(u64::MAX));
+    if let Ok(bytes) = result {
+        metrics.record_bytes_written(u64::try_from(*bytes).unwrap_or(u64::MAX));
     }
 }
 
@@ -1748,6 +1782,32 @@ mod tests {
         .expect("inspection worker")
     }
 
+    async fn durable_state_counts(store: &SqliteStateStore) -> (u64, i64, i64, i64) {
+        let path = store.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let connection = open_connection(&path).expect("inspection connection");
+            let revision = load_current_revision(&connection).expect("current revision");
+            let kv = connection
+                .query_row("SELECT COUNT(*) FROM state_store_kv", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("KV count");
+            let changes = connection
+                .query_row("SELECT COUNT(*) FROM state_store_changes", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("change count");
+            let commits = connection
+                .query_row("SELECT COUNT(*) FROM state_store_commits", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("commit count");
+            (revision, kv, changes, commits)
+        })
+        .await
+        .expect("inspection worker")
+    }
+
     fn committed(outcome: CommitOutcome) -> CommitReceipt {
         match outcome {
             CommitOutcome::Committed(receipt) => receipt,
@@ -1851,6 +1911,100 @@ mod tests {
             }
             transaction.abort().await.expect("abort budget transaction");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sqlite_transaction_envelope_is_checked_before_provider_io() {
+        let under_budget = TempDir::new().expect("under-budget temp dir");
+        let under_budget_store = store_with_limits(
+            &under_budget,
+            StateStoreLimitOverrides {
+                max_transaction_bytes: Some(TRANSACTION_ENVELOPE_BYTES - 1),
+                ..StateStoreLimitOverrides::default()
+            },
+        )
+        .await;
+        let durable_before = durable_state_counts(&under_budget_store).await;
+        let metrics_before = under_budget_store.metrics.snapshot();
+        let error = match under_budget_store.begin_write(transaction_id()).await {
+            Ok(_) => panic!("transaction envelope must fit before provider I/O"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), StateStoreErrorKind::LimitExceeded);
+        let metrics_after = under_budget_store.metrics.snapshot();
+        assert_eq!(
+            metrics_after.begin_count,
+            metrics_before.begin_count + 1,
+            "rejected envelope must count one begin attempt"
+        );
+        assert_eq!(
+            metrics_after
+                .operation_outcome_count(StateStoreOperation::Begin, StateStoreOutcome::Error),
+            metrics_before
+                .operation_outcome_count(StateStoreOperation::Begin, StateStoreOutcome::Error)
+                + 1
+        );
+        assert_eq!(
+            metrics_after.operation_duration_observations(StateStoreOperation::Begin),
+            metrics_before.operation_duration_observations(StateStoreOperation::Begin) + 1
+        );
+        assert_eq!(
+            durable_state_counts(&under_budget_store).await,
+            durable_before
+        );
+
+        let exact = TempDir::new().expect("exact-envelope temp dir");
+        let exact_store = store_with_limits(
+            &exact,
+            StateStoreLimitOverrides {
+                max_transaction_bytes: Some(TRANSACTION_ENVELOPE_BYTES),
+                ..StateStoreLimitOverrides::default()
+            },
+        )
+        .await;
+        let exact_before = durable_state_counts(&exact_store).await;
+        let exact_receipt = committed(
+            exact_store
+                .begin_write(transaction_id())
+                .await
+                .expect("exact envelope begins")
+                .commit()
+                .await,
+        );
+        let exact_after = durable_state_counts(&exact_store).await;
+        assert_eq!(exact_after.0, exact_before.0 + 1);
+        assert_eq!(exact_after.1, exact_before.1);
+        assert_eq!(exact_after.2, exact_before.2);
+        assert_eq!(exact_after.3, exact_before.3 + 1);
+        assert_eq!(exact_receipt.revision, revision_token(exact_after.0));
+
+        let one_byte = TempDir::new().expect("one-byte mutation budget temp dir");
+        let one_byte_store = store_with_limits(
+            &one_byte,
+            StateStoreLimitOverrides {
+                max_transaction_bytes: Some(TRANSACTION_ENVELOPE_BYTES + 1),
+                ..StateStoreLimitOverrides::default()
+            },
+        )
+        .await;
+        let one_byte_before = durable_state_counts(&one_byte_store).await;
+        let mut transaction = one_byte_store
+            .begin_write(transaction_id())
+            .await
+            .expect("envelope plus one begins");
+        assert_eq!(
+            transaction
+                .delete(key(b"x"), Precondition::Any)
+                .await
+                .expect_err("one byte cannot fund a delete mutation")
+                .kind(),
+            StateStoreErrorKind::LimitExceeded
+        );
+        transaction
+            .abort()
+            .await
+            .expect("abort one-byte transaction");
+        assert_eq!(durable_state_counts(&one_byte_store).await, one_byte_before);
     }
 
     async fn read_value(store: &SqliteStateStore, key: &Key) -> Option<StateRecord> {
