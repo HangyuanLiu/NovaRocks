@@ -99,6 +99,9 @@ pub(crate) enum RuntimeContractViolationKind {
     ConflictingTerminalSequence,
     ConflictingArtifactPublish,
     SequenceOutsideTerminalRange,
+    OrderedContractMismatch,
+    OrderedBoundLoosened,
+    LogicalVersionOverflow,
     ProducerPortMismatch,
     ServiceUnavailable,
 }
@@ -149,9 +152,16 @@ pub(crate) enum ProducerFailureReason {
 pub(crate) enum SubmitOutcome {
     Applied,
     Duplicate,
+    Stale,
+    SequenceAdvancedEqual,
+    StreamAcceptedNoGlobalChange,
+    Published,
     PendingGap,
+    PendingFinalSnapshot,
+    CoverageStillPossible,
     TerminalNoop,
     Completed,
+    CompletedWithoutArtifact,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -321,6 +331,9 @@ mod tests {
             RuntimeContractViolationKind::SequenceOutsideTerminalRange => {
                 "sequence-outside-terminal-range"
             }
+            RuntimeContractViolationKind::OrderedContractMismatch => "ordered-contract-mismatch",
+            RuntimeContractViolationKind::OrderedBoundLoosened => "ordered-bound-loosened",
+            RuntimeContractViolationKind::LogicalVersionOverflow => "logical-version-overflow",
             RuntimeContractViolationKind::ProducerPortMismatch => "producer-port-mismatch",
             RuntimeContractViolationKind::ServiceUnavailable => "service-unavailable",
         }

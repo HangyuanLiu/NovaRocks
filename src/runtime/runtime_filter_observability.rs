@@ -234,10 +234,18 @@ impl From<&RuntimeFilterEvent> for RuntimeFilterChannelEventCoordinate {
             },
             RuntimeFilterEvent::ChannelPlanned { identity }
             | RuntimeFilterEvent::ChannelCompleted { identity, .. }
+            | RuntimeFilterEvent::OrderedAvailabilityReached { identity }
+            | RuntimeFilterEvent::LogicalVersionPublished { identity, .. }
+            | RuntimeFilterEvent::ChannelCompletedWithoutArtifact { identity }
+            | RuntimeFilterEvent::ChannelLogicalDegraded { identity, .. }
             | RuntimeFilterEvent::ChannelUnavailable { identity, .. }
             | RuntimeFilterEvent::ChannelCancelled { identity } => Self::Channel(*identity),
             RuntimeFilterEvent::DeltaAccepted { identity }
             | RuntimeFilterEvent::DeltaDuplicateIgnored { identity }
+            | RuntimeFilterEvent::OrderedUpdateStale { identity }
+            | RuntimeFilterEvent::OrderedUpdateEqual { identity }
+            | RuntimeFilterEvent::OrderedStreamTightened { identity }
+            | RuntimeFilterEvent::OrderedGlobalTightened { identity, .. }
             | RuntimeFilterEvent::SequenceGapObserved { identity } => Self::Contribution(*identity),
             RuntimeFilterEvent::ProducerInstanceClosed { identity }
             | RuntimeFilterEvent::ProducerInstanceFailed { identity, .. } => {

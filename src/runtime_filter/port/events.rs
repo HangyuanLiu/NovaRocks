@@ -203,6 +203,26 @@ pub(crate) enum RuntimeFilterEvent {
     DeltaDuplicateIgnored {
         identity: ContributionIdentity,
     },
+    OrderedUpdateStale {
+        identity: ContributionIdentity,
+    },
+    OrderedUpdateEqual {
+        identity: ContributionIdentity,
+    },
+    OrderedStreamTightened {
+        identity: ContributionIdentity,
+    },
+    OrderedGlobalTightened {
+        identity: ContributionIdentity,
+        version: LogicalVersion,
+    },
+    OrderedAvailabilityReached {
+        identity: RuntimeFilterEventIdentity,
+    },
+    LogicalVersionPublished {
+        identity: RuntimeFilterEventIdentity,
+        version: LogicalVersion,
+    },
     SequenceGapObserved {
         identity: ContributionIdentity,
     },
@@ -216,6 +236,14 @@ pub(crate) enum RuntimeFilterEvent {
     ChannelCompleted {
         identity: RuntimeFilterEventIdentity,
         version: LogicalVersion,
+    },
+    ChannelCompletedWithoutArtifact {
+        identity: RuntimeFilterEventIdentity,
+    },
+    ChannelLogicalDegraded {
+        identity: RuntimeFilterEventIdentity,
+        reason: UnavailableReason,
+        retained_version: LogicalVersion,
     },
     ChannelUnavailable {
         identity: RuntimeFilterEventIdentity,

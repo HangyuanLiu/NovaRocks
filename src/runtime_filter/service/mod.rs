@@ -36,8 +36,9 @@ use crate::runtime_filter::model::contract::{BindingId, ChannelId};
 use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
 use crate::runtime_filter::port::install::RuntimeFilterInstallView;
 use crate::runtime_filter::port::producer::{
-    InstallContractError, InstallOutcome, ProducerAdapter, ProducerHandle, ProducerHandleWeak,
-    ProducerPortKind, RuntimeContractViolation, RuntimeContractViolationKind,
+    InstallContractError, InstallOutcome, OrderedBoundProducerAdapter, ProducerAdapter,
+    ProducerHandle, ProducerHandleWeak, ProducerPortKind, RuntimeContractViolation,
+    RuntimeContractViolationKind,
 };
 use crate::runtime_filter::port::subscription::{
     ArtifactDeliveryOutcome, BlockingSnapshotSubscription,
@@ -700,7 +701,11 @@ impl ActionDispatcher {
         let mut deliveries = Vec::new();
         let mut error = None;
         match action {
-            ChannelAction::None | ChannelAction::Progress { .. } => {}
+            ChannelAction::None
+            | ChannelAction::Progress { .. }
+            | ChannelAction::VisibleSnapshot { .. }
+            | ChannelAction::CompletedWithoutArtifact { .. }
+            | ChannelAction::DegradedLogical { .. } => {}
             ChannelAction::Completed { snapshot, .. } => {
                 let Some(plan) = installed.artifact_plan(channel_id) else {
                     return (None, None);
@@ -972,8 +977,16 @@ impl RuntimeFilterService {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .insert(key, Arc::downgrade(&concrete));
-        let membership: Arc<dyn ProducerAdapter> = concrete;
-        let handle = ProducerHandle::Membership(membership);
+        let handle = match requested {
+            ProducerPortKind::Membership => {
+                let membership: Arc<dyn ProducerAdapter> = concrete;
+                ProducerHandle::Membership(membership)
+            }
+            ProducerPortKind::OrderedBound => {
+                let ordered: Arc<dyn OrderedBoundProducerAdapter> = concrete;
+                ProducerHandle::OrderedBound(ordered)
+            }
+        };
         handles.insert(key, handle.downgrade());
         Ok(handle)
     }
@@ -1180,6 +1193,9 @@ mod tests {
     };
     use crate::runtime_filter::port::identity::*;
     use crate::runtime_filter::port::install::*;
+    use crate::runtime_filter::port::ordered_bound::{
+        COMPARATOR_ALGORITHM_VERSION, RuntimeOrderContract, comparator_digest_for_test,
+    };
     use crate::runtime_filter::port::producer::{
         InstallOutcome, ProducerAdapter, ProducerHandle, ProducerPortKind,
         RuntimeContractViolationKind, SubmitOutcome,
@@ -1634,6 +1650,61 @@ mod tests {
             started,
             tracker,
         }
+    }
+
+    fn installed_ordered_service_fixture() -> Arc<RuntimeFilterService> {
+        let fixture = fixture();
+        let keys = vec![OrderKeyContract {
+            data_type: DataType::Int64,
+            direction: SortDirection::Ascending,
+            null_order: NullOrder::Last,
+        }];
+        let plan = OrderContract {
+            comparator_digest: comparator_digest_for_test(&keys, COMPARATOR_ALGORITHM_VERSION),
+            keys,
+            inclusive: true,
+        };
+        let order_digest = RuntimeOrderContract::try_from_plan(&plan).unwrap().digest();
+        let witness = CoverageWitnessId::new(1);
+        let channel = RuntimeFilterChannelDeployment::new(
+            ChannelId::new(1),
+            RuntimeFilterLogicalDomain::OrderedBound(plan),
+            RuntimeFilterLifecycle::MonotonicUpdates,
+            Coverage::Leaf(witness),
+            Coverage::Leaf(witness),
+            ReductionRequirement::TightenOrderedBound,
+            BTreeSet::from([
+                ContributionKind::OrderedBoundUpdate,
+                ContributionKind::ProducerClosed,
+            ]),
+            CompletionRequirement::ProducerClosed,
+            RuntimeFilterPolicyRequirement {
+                max_contribution_bytes: 1024,
+                max_artifact_bytes: 1024,
+                deadline_ms: 100,
+                max_retries: 0,
+            },
+            RuntimeFilterCoreBudget::new(4096),
+            MaterializationPolicy::for_test(),
+            BTreeMap::from([(
+                BindingId::new(1),
+                ProducerDeployment::new(witness, BTreeSet::from([uid(1)])),
+            )]),
+            BTreeMap::from([(
+                BindingId::new(2),
+                ConsumerDeployment::with_profile(
+                    ConsumerActivation::NonBlockingLive {
+                        late_apply: LateApplyGranularity::Batch,
+                    },
+                    BTreeSet::from([ArtifactCapability::OrderedRange]),
+                    ConsumerArtifactProfile::new_ordered_range(order_digest).unwrap(),
+                    RouteEdgeId::new(1),
+                    BTreeSet::from([uid(2)]),
+                ),
+            )]),
+        );
+        fixture.service.install(view([channel])).unwrap();
+        fixture.service
     }
 
     fn install_one(fixture: &Fixture) {
@@ -4407,5 +4478,23 @@ mod tests {
             matches!(early_return, Err(mpsc::RecvTimeoutError::Timeout)),
             "concurrent duplicate returned before the nested event batch published"
         );
+    }
+
+    #[test]
+    fn ordered_open_returns_ordered_handle_and_rejects_membership_request() {
+        let service = installed_ordered_service_fixture();
+        let error = service
+            .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::Membership)
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            RuntimeContractViolationKind::ProducerPortMismatch
+        );
+        assert!(matches!(
+            service
+                .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+                .unwrap(),
+            ProducerHandle::OrderedBound(_)
+        ));
     }
 }

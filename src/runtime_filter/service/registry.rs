@@ -874,12 +874,20 @@ fn build_routing(
             }
             entry.1.push(route_edge_id);
         }
+        if matches!(
+            deployment.logical_domain(),
+            RuntimeFilterLogicalDomain::OrderedBound(_)
+        ) {
+            // Task 2 installs the typed ordered Core and producer handle. Range
+            // materialization planning is added by Task 3.
+            continue;
+        }
         let RuntimeFilterLogicalDomain::Membership {
             value_type,
             null_semantics,
         } = deployment.logical_domain()
         else {
-            unreachable!("validated deployment is membership-only")
+            unreachable!("ordered deployments returned before membership artifact planning")
         };
         let schema = ArtifactMembershipSchema::new(value_type, *null_semantics).map_err(|_| {
             install_error(

@@ -30,10 +30,11 @@ use crate::runtime_filter::port::events::{
     ProducerEventIdentity, RuntimeFilterEvent, RuntimeFilterEventIdentity,
 };
 use crate::runtime_filter::port::identity::{
-    ContributionIdentity, DeploymentEpoch, PartitionId, ProducerSequence, ProducerStreamId,
-    RuntimeFilterParticipantId,
+    ContributionIdentity, DeploymentEpoch, LogicalVersion, PartitionId, ProducerSequence,
+    ProducerStreamId, RuntimeFilterParticipantId,
 };
 use crate::runtime_filter::port::install::RuntimeFilterChannelDeployment;
+use crate::runtime_filter::port::ordered_bound::{OrderedBoundUpdate, RuntimeOrderContract};
 use crate::runtime_filter::port::producer::{
     ProducerFailureReason, RuntimeContractViolation, RuntimeContractViolationKind, SubmitOutcome,
 };
@@ -45,8 +46,9 @@ use crate::runtime_filter::port::value_domain::{LogicalSnapshot, ValueDomainDelt
 
 use super::coverage::{CoverageProgress, WitnessProgress, evaluate};
 use super::error::ChannelBuildError;
+use super::ordered_reducer::{OrderedApplyOutcome, OrderedCloseOutcome, OrderedReducer};
 use super::reducer::{MembershipReducer, ReducerError};
-use super::state::{InstanceState, TerminalProgress};
+use super::state::{InstanceState, LogicalTerminal, TerminalProgress};
 
 const REPLAY_METADATA_BYTES: usize = size_of::<u64>() + 32;
 const TERMINAL_METADATA_BYTES: usize = size_of::<u64>();
@@ -57,6 +59,13 @@ pub(crate) enum ChannelAction {
     Progress {
         order: Option<u64>,
         outcome: SubmitOutcome,
+        events: Vec<RuntimeFilterEvent>,
+    },
+    VisibleSnapshot {
+        order: u64,
+        outcome: SubmitOutcome,
+        version: LogicalVersion,
+        snapshot: Arc<LogicalSnapshot>,
         events: Vec<RuntimeFilterEvent>,
     },
     Completed {
@@ -71,6 +80,18 @@ pub(crate) enum ChannelAction {
         reason: UnavailableReason,
         events: Vec<RuntimeFilterEvent>,
     },
+    CompletedWithoutArtifact {
+        order: u64,
+        outcome: SubmitOutcome,
+        events: Vec<RuntimeFilterEvent>,
+    },
+    DegradedLogical {
+        order: u64,
+        outcome: SubmitOutcome,
+        reason: UnavailableReason,
+        snapshot: Arc<LogicalSnapshot>,
+        events: Vec<RuntimeFilterEvent>,
+    },
     Cancelled {
         order: u64,
         events: Vec<RuntimeFilterEvent>,
@@ -78,25 +99,45 @@ pub(crate) enum ChannelAction {
 }
 
 impl ChannelAction {
+    pub(crate) fn logical_terminal(&self) -> Option<LogicalTerminal> {
+        match self {
+            Self::Completed { .. } => Some(LogicalTerminal::Completed),
+            Self::CompletedWithoutArtifact { .. } => {
+                Some(LogicalTerminal::CompletedWithoutArtifact)
+            }
+            Self::DegradedLogical { reason, .. } => Some(LogicalTerminal::DegradedLogical(*reason)),
+            Self::Unavailable { reason, .. } => Some(LogicalTerminal::Unavailable(*reason)),
+            Self::Cancelled { .. } => Some(LogicalTerminal::Cancelled),
+            Self::None | Self::Progress { .. } | Self::VisibleSnapshot { .. } => None,
+        }
+    }
+
     pub(crate) fn outcome(&self) -> SubmitOutcome {
         match self {
             Self::None | Self::Cancelled { .. } => SubmitOutcome::TerminalNoop,
             Self::Progress { outcome, .. }
+            | Self::VisibleSnapshot { outcome, .. }
             | Self::Completed { outcome, .. }
-            | Self::Unavailable { outcome, .. } => *outcome,
+            | Self::Unavailable { outcome, .. }
+            | Self::CompletedWithoutArtifact { outcome, .. }
+            | Self::DegradedLogical { outcome, .. } => *outcome,
         }
     }
 
     pub(crate) fn snapshot(&self) -> Option<Arc<LogicalSnapshot>> {
         match self {
-            Self::Completed { snapshot, .. } => Some(snapshot.clone()),
+            Self::VisibleSnapshot { snapshot, .. }
+            | Self::Completed { snapshot, .. }
+            | Self::DegradedLogical { snapshot, .. } => Some(snapshot.clone()),
             _ => None,
         }
     }
 
     pub(crate) const fn unavailable_reason(&self) -> Option<UnavailableReason> {
         match self {
-            Self::Unavailable { reason, .. } => Some(*reason),
+            Self::Unavailable { reason, .. } | Self::DegradedLogical { reason, .. } => {
+                Some(*reason)
+            }
             _ => None,
         }
     }
@@ -105,8 +146,11 @@ impl ChannelAction {
         match self {
             Self::None => &[],
             Self::Progress { events, .. }
+            | Self::VisibleSnapshot { events, .. }
             | Self::Completed { events, .. }
             | Self::Unavailable { events, .. }
+            | Self::CompletedWithoutArtifact { events, .. }
+            | Self::DegradedLogical { events, .. }
             | Self::Cancelled { events, .. } => events,
         }
     }
@@ -115,8 +159,11 @@ impl ChannelAction {
         match self {
             Self::None => None,
             Self::Progress { order, .. } => *order,
-            Self::Completed { order, .. }
+            Self::VisibleSnapshot { order, .. }
+            | Self::Completed { order, .. }
             | Self::Unavailable { order, .. }
+            | Self::CompletedWithoutArtifact { order, .. }
+            | Self::DegradedLogical { order, .. }
             | Self::Cancelled { order, .. } => Some(*order),
         }
     }
@@ -139,17 +186,34 @@ enum ChannelTerminal {
         reason: UnavailableReason,
         events: Vec<RuntimeFilterEvent>,
     },
+    CompletedWithoutArtifact {
+        order: u64,
+        events: Vec<RuntimeFilterEvent>,
+    },
+    DegradedLogical {
+        order: u64,
+        reason: UnavailableReason,
+        snapshot: Arc<LogicalSnapshot>,
+        events: Vec<RuntimeFilterEvent>,
+    },
     Cancelled {
         order: u64,
         events: Vec<RuntimeFilterEvent>,
     },
 }
 
+struct OrderedCoreState {
+    reducer: OrderedReducer,
+    availability_witnesses: BTreeMap<CoverageWitnessId, WitnessProgress>,
+    latest: Option<Arc<LogicalSnapshot>>,
+}
+
 struct ChannelState {
     terminal: ChannelTerminal,
     producers: BTreeMap<BindingId, ProducerRuntime>,
     witnesses: BTreeMap<CoverageWitnessId, WitnessProgress>,
-    reducer: MembershipReducer,
+    reducer: Option<MembershipReducer>,
+    ordered: Option<OrderedCoreState>,
     reservation: RetainedMemoryReservation,
     next_dispatch_order: u64,
 }
@@ -178,8 +242,8 @@ pub(crate) struct RuntimeFilterChannel {
     channel_id: ChannelId,
     availability_coverage: Coverage,
     terminal_coverage: Coverage,
-    data_type: DataType,
-    null_semantics: NullSemantics,
+    data_type: Option<DataType>,
+    null_semantics: Option<NullSemantics>,
     max_contribution_bytes: u64,
     max_reducer_bytes: u64,
     deadline: OnceLock<Instant>,
@@ -213,17 +277,31 @@ impl RuntimeFilterChannel {
         deployment: &RuntimeFilterChannelDeployment,
         memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
     ) -> Result<Self, ChannelBuildError> {
-        let (data_type, null_semantics) = match deployment.logical_domain() {
-            RuntimeFilterLogicalDomain::Membership {
-                value_type,
-                null_semantics,
-            } => (value_type.clone(), *null_semantics),
-            RuntimeFilterLogicalDomain::OrderedBound(_) => {
-                return Err(ChannelBuildError::UnsupportedContract);
-            }
-        };
-        let reducer = MembershipReducer::try_new(data_type.clone(), null_semantics)
-            .map_err(|_| ChannelBuildError::UnsupportedMembershipType)?;
+        let (data_type, null_semantics, reducer, ordered_contract) =
+            match deployment.logical_domain() {
+                RuntimeFilterLogicalDomain::Membership {
+                    value_type,
+                    null_semantics,
+                } => {
+                    let reducer = MembershipReducer::try_new(value_type.clone(), *null_semantics)
+                        .map_err(|_| ChannelBuildError::UnsupportedMembershipType)?;
+                    (
+                        Some(value_type.clone()),
+                        Some(*null_semantics),
+                        Some(reducer),
+                        None,
+                    )
+                }
+                RuntimeFilterLogicalDomain::OrderedBound(plan) => (
+                    None,
+                    None,
+                    None,
+                    Some(Arc::new(
+                        RuntimeOrderContract::try_from_plan(plan)
+                            .map_err(|_| ChannelBuildError::UnsupportedContract)?,
+                    )),
+                ),
+            };
         let mut witnesses = BTreeMap::new();
         let producers = deployment
             .producers()
@@ -273,8 +351,13 @@ impl RuntimeFilterChannel {
             state: Mutex::new(ChannelState {
                 terminal: ChannelTerminal::Collecting,
                 producers,
-                witnesses,
+                witnesses: witnesses.clone(),
                 reducer,
+                ordered: ordered_contract.map(|contract| OrderedCoreState {
+                    reducer: OrderedReducer::new(contract),
+                    availability_witnesses: witnesses,
+                    latest: None,
+                }),
                 reservation: RetainedMemoryReservation::empty(),
                 next_dispatch_order: 0,
             }),
@@ -339,6 +422,12 @@ impl RuntimeFilterChannel {
         delta: ValueDomainDelta,
         temporary_lease: TemporaryContributionLease,
     ) -> Result<ChannelAction, RuntimeContractViolation> {
+        let Some(data_type) = self.data_type.as_ref() else {
+            return Err(violation(
+                RuntimeContractViolationKind::ProducerPortMismatch,
+                "ordered channel cannot accept membership deltas",
+            ));
+        };
         let identity = ContributionIdentity::new(
             self.event_identity.query_id(),
             self.event_identity.participant_id(),
@@ -352,7 +441,7 @@ impl RuntimeFilterChannel {
         loop {
             let mut state = self.state.lock().unwrap();
             partition_state(&state, binding_id, fragment_instance_id, partition_id)?;
-            if !delta.matches_data_type(&self.data_type) {
+            if !delta.matches_data_type(data_type) {
                 return Err(violation(
                     RuntimeContractViolationKind::TypeMismatch,
                     "delta type does not match channel membership type",
@@ -447,7 +536,12 @@ impl RuntimeFilterChannel {
                 drop(incoming_reservation);
                 return Ok(locked.finish());
             }
-            let projection = match state.reducer.preflight(&delta) {
+            let projection = match state
+                .reducer
+                .as_ref()
+                .expect("membership channel owns a membership reducer")
+                .preflight(&delta)
+            {
                 Ok(projection) => projection,
                 Err(ReducerError::TypeMismatch | ReducerError::UnsupportedType) => {
                     return Err(violation(
@@ -537,6 +631,8 @@ impl RuntimeFilterChannel {
             }
             state
                 .reducer
+                .as_mut()
+                .expect("membership channel owns a membership reducer")
                 .commit_preflighted(&delta)
                 .expect("preflighted reducer commit must preserve type invariants");
             let partition = partition_mut_for_commit(
@@ -557,6 +653,335 @@ impl RuntimeFilterChannel {
                 SubmitOutcome::Applied,
                 events,
             );
+            drop(state);
+            return Ok(locked.finish());
+        }
+    }
+
+    pub(crate) fn submit_ordered(
+        &self,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        partition_id: PartitionId,
+        sequence: ProducerSequence,
+        update: OrderedBoundUpdate,
+    ) -> Result<ChannelAction, RuntimeContractViolation> {
+        let identity = ContributionIdentity::new(
+            self.event_identity.query_id(),
+            self.event_identity.participant_id(),
+            self.channel_id,
+            self.event_identity.epoch(),
+            ProducerStreamId::new(binding_id, fragment_instance_id, partition_id),
+            sequence,
+        );
+        let stream_id = identity.stream();
+        let mut metadata_reservation = None;
+        let mut snapshot_reservation = None;
+        loop {
+            let mut state = self.state.lock().unwrap();
+            partition_state(&state, binding_id, fragment_instance_id, partition_id)?;
+            let ordered = state.ordered.as_ref().ok_or_else(|| {
+                violation(
+                    RuntimeContractViolationKind::ProducerPortMismatch,
+                    "membership channel cannot accept ordered bounds",
+                )
+            })?;
+            let before_bytes = ordered.reducer.estimated_retained_bytes().ok_or_else(|| {
+                violation(
+                    RuntimeContractViolationKind::OrderedContractMismatch,
+                    "ordered reducer retained size overflowed",
+                )
+            })?;
+            let mut next_reducer = ordered.reducer.clone();
+            let apply_outcome = next_reducer.apply(stream_id, sequence, update.clone())?;
+            if !matches!(state.terminal, ChannelTerminal::Collecting) {
+                return Ok(terminal_action_from_state(&state));
+            }
+            let after_bytes = next_reducer.estimated_retained_bytes().ok_or_else(|| {
+                violation(
+                    RuntimeContractViolationKind::OrderedContractMismatch,
+                    "ordered reducer retained size overflowed",
+                )
+            })?;
+            let metadata_growth = after_bytes.saturating_sub(before_bytes);
+            let mut availability_witnesses = ordered.availability_witnesses.clone();
+            if !matches!(
+                apply_outcome,
+                OrderedApplyOutcome::Stale | OrderedApplyOutcome::Duplicate
+            ) {
+                let witness_id = state
+                    .producers
+                    .get(&binding_id)
+                    .expect("authorized ordered producer")
+                    .witness_id;
+                availability_witnesses
+                    .get_mut(&witness_id)
+                    .expect("ordered availability witness is installed")
+                    .advance(WitnessProgress::Satisfied);
+            }
+            let availability = evaluate(&self.availability_coverage, &availability_witnesses);
+            let publish = availability == CoverageProgress::Satisfied
+                && (ordered.latest.is_none()
+                    || matches!(apply_outcome, OrderedApplyOutcome::GlobalTightened(_)));
+            let (version, snapshot_bytes) = if publish {
+                let version =
+                    ordered
+                        .latest
+                        .as_ref()
+                        .map_or(Ok(LogicalVersion::FIRST), |latest| {
+                            latest.version().checked_next().ok_or_else(|| {
+                                violation(
+                                    RuntimeContractViolationKind::LogicalVersionOverflow,
+                                    "ordered logical version overflowed",
+                                )
+                            })
+                        })?;
+                let bytes = next_reducer
+                    .global()
+                    .expect("satisfied ordered availability owns a global bound")
+                    .estimated_retained_bytes()
+                    .ok_or_else(|| {
+                        violation(
+                            RuntimeContractViolationKind::OrderedContractMismatch,
+                            "ordered snapshot retained size overflowed",
+                        )
+                    })?;
+                (Some(version), bytes)
+            } else {
+                (None, 0)
+            };
+            let projected_bytes = state
+                .reservation
+                .bytes()
+                .checked_add(metadata_growth)
+                .and_then(|bytes| bytes.checked_add(snapshot_bytes));
+            if projected_bytes
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .is_none_or(|bytes| bytes > self.max_reducer_bytes)
+            {
+                let locked = self.make_ordered_unavailable_or_degraded(
+                    &mut state,
+                    UnavailableReason::ResourceLimit,
+                    SubmitOutcome::TerminalNoop,
+                    Vec::new(),
+                );
+                drop(state);
+                return Ok(locked.finish());
+            }
+            let reservations_match = metadata_reservation
+                .as_ref()
+                .map(RetainedMemoryReservation::bytes)
+                == Some(metadata_growth)
+                && snapshot_reservation
+                    .as_ref()
+                    .map(RetainedMemoryReservation::bytes)
+                    == Some(snapshot_bytes);
+            if !reservations_match {
+                drop(state);
+                drop(metadata_reservation.take());
+                drop(snapshot_reservation.take());
+                metadata_reservation = RetainedMemoryReservation::try_new(
+                    self.memory_account.clone(),
+                    metadata_growth,
+                )
+                .ok();
+                snapshot_reservation =
+                    RetainedMemoryReservation::try_new(self.memory_account.clone(), snapshot_bytes)
+                        .ok();
+                if metadata_reservation.is_none() || snapshot_reservation.is_none() {
+                    let mut state = self.state.lock().unwrap();
+                    let locked = self.make_ordered_unavailable_or_degraded(
+                        &mut state,
+                        UnavailableReason::ResourceLimit,
+                        SubmitOutcome::TerminalNoop,
+                        Vec::new(),
+                    );
+                    drop(state);
+                    return Ok(locked.finish());
+                }
+                continue;
+            }
+
+            let incoming_metadata = metadata_reservation
+                .take()
+                .expect("matching ordered metadata reservation exists");
+            if let Err(failure) = state.reservation.absorb(incoming_metadata) {
+                let (_, incoming) = failure.into_parts();
+                let locked = self.make_ordered_unavailable_or_degraded(
+                    &mut state,
+                    UnavailableReason::ResourceLimit,
+                    SubmitOutcome::TerminalNoop,
+                    Vec::new(),
+                );
+                drop(state);
+                drop(incoming);
+                return Ok(locked.finish());
+            }
+            let mut events = match apply_outcome {
+                OrderedApplyOutcome::Stale => {
+                    vec![RuntimeFilterEvent::OrderedUpdateStale { identity }]
+                }
+                OrderedApplyOutcome::Duplicate => {
+                    vec![RuntimeFilterEvent::DeltaDuplicateIgnored { identity }]
+                }
+                OrderedApplyOutcome::SequenceAdvancedEqual => {
+                    vec![RuntimeFilterEvent::OrderedUpdateEqual { identity }]
+                }
+                OrderedApplyOutcome::StreamTightened => {
+                    vec![RuntimeFilterEvent::OrderedStreamTightened { identity }]
+                }
+                OrderedApplyOutcome::GlobalTightened(_) => Vec::new(),
+            };
+            let outcome = match apply_outcome {
+                OrderedApplyOutcome::Stale => SubmitOutcome::Stale,
+                OrderedApplyOutcome::Duplicate => SubmitOutcome::Duplicate,
+                OrderedApplyOutcome::SequenceAdvancedEqual => SubmitOutcome::SequenceAdvancedEqual,
+                OrderedApplyOutcome::StreamTightened => SubmitOutcome::StreamAcceptedNoGlobalChange,
+                OrderedApplyOutcome::GlobalTightened(_) => SubmitOutcome::Published,
+            };
+            let availability_was_satisfied = state.ordered.as_ref().is_some_and(|ordered| {
+                evaluate(&self.availability_coverage, &ordered.availability_witnesses)
+                    == CoverageProgress::Satisfied
+            });
+            let ordered = state
+                .ordered
+                .as_mut()
+                .expect("ordered channel owns ordered state");
+            ordered.reducer = next_reducer;
+            ordered.availability_witnesses = availability_witnesses;
+            if !availability_was_satisfied && availability == CoverageProgress::Satisfied {
+                events.push(RuntimeFilterEvent::OrderedAvailabilityReached {
+                    identity: self.event_identity,
+                });
+            }
+            let published = version.map(|version| {
+                let domain = ordered
+                    .reducer
+                    .global()
+                    .expect("published ordered version owns a global bound")
+                    .clone();
+                let reservation = snapshot_reservation
+                    .take()
+                    .expect("published ordered version owns exact reservation");
+                let snapshot = Arc::new(LogicalSnapshot::ordered(
+                    self.channel_id,
+                    version,
+                    domain,
+                    reservation,
+                ));
+                ordered.latest = Some(snapshot.clone());
+                events.push(RuntimeFilterEvent::OrderedGlobalTightened { identity, version });
+                events.push(RuntimeFilterEvent::LogicalVersionPublished {
+                    identity: self.event_identity,
+                    version,
+                });
+                snapshot
+            });
+            refresh_ordered_instance_progress(&mut state, binding_id, fragment_instance_id);
+            let locked =
+                self.refresh_after_ordered_progress(&mut state, outcome, published, events);
+            drop(state);
+            return Ok(locked.finish());
+        }
+    }
+
+    pub(crate) fn close_ordered_partition(
+        &self,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        partition_id: PartitionId,
+        terminal_sequence: ProducerSequence,
+    ) -> Result<ChannelAction, RuntimeContractViolation> {
+        let stream_id = ProducerStreamId::new(binding_id, fragment_instance_id, partition_id);
+        let mut reservation = None;
+        loop {
+            let mut state = self.state.lock().unwrap();
+            partition_state(&state, binding_id, fragment_instance_id, partition_id)?;
+            let ordered = state.ordered.as_ref().ok_or_else(|| {
+                violation(
+                    RuntimeContractViolationKind::ProducerPortMismatch,
+                    "membership channel cannot accept ordered close",
+                )
+            })?;
+            let before_bytes = ordered.reducer.estimated_retained_bytes().ok_or_else(|| {
+                violation(
+                    RuntimeContractViolationKind::OrderedContractMismatch,
+                    "ordered reducer retained size overflowed",
+                )
+            })?;
+            let mut next_reducer = ordered.reducer.clone();
+            let close_outcome = next_reducer.close(stream_id, terminal_sequence)?;
+            if !matches!(state.terminal, ChannelTerminal::Collecting) {
+                return Ok(terminal_action_from_state(&state));
+            }
+            let after_bytes = next_reducer.estimated_retained_bytes().ok_or_else(|| {
+                violation(
+                    RuntimeContractViolationKind::OrderedContractMismatch,
+                    "ordered reducer retained size overflowed",
+                )
+            })?;
+            let growth = after_bytes.saturating_sub(before_bytes);
+            if state
+                .reservation
+                .bytes()
+                .checked_add(growth)
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .is_none_or(|bytes| bytes > self.max_reducer_bytes)
+            {
+                let locked = self.make_ordered_unavailable_or_degraded(
+                    &mut state,
+                    UnavailableReason::ResourceLimit,
+                    SubmitOutcome::TerminalNoop,
+                    Vec::new(),
+                );
+                drop(state);
+                return Ok(locked.finish());
+            }
+            if reservation.as_ref().map(RetainedMemoryReservation::bytes) != Some(growth) {
+                drop(state);
+                drop(reservation.take());
+                reservation =
+                    RetainedMemoryReservation::try_new(self.memory_account.clone(), growth).ok();
+                if reservation.is_none() {
+                    let mut state = self.state.lock().unwrap();
+                    let locked = self.make_ordered_unavailable_or_degraded(
+                        &mut state,
+                        UnavailableReason::ResourceLimit,
+                        SubmitOutcome::TerminalNoop,
+                        Vec::new(),
+                    );
+                    drop(state);
+                    return Ok(locked.finish());
+                }
+                continue;
+            }
+            let incoming = reservation
+                .take()
+                .expect("matching ordered close reservation exists");
+            if let Err(failure) = state.reservation.absorb(incoming) {
+                let (_, incoming) = failure.into_parts();
+                let locked = self.make_ordered_unavailable_or_degraded(
+                    &mut state,
+                    UnavailableReason::ResourceLimit,
+                    SubmitOutcome::TerminalNoop,
+                    Vec::new(),
+                );
+                drop(state);
+                drop(incoming);
+                return Ok(locked.finish());
+            }
+            state
+                .ordered
+                .as_mut()
+                .expect("ordered channel owns ordered state")
+                .reducer = next_reducer;
+            refresh_ordered_instance_progress(&mut state, binding_id, fragment_instance_id);
+            let outcome = match close_outcome {
+                OrderedCloseOutcome::Duplicate => SubmitOutcome::Duplicate,
+                OrderedCloseOutcome::PendingFinalSnapshot => SubmitOutcome::PendingFinalSnapshot,
+                OrderedCloseOutcome::Satisfied => SubmitOutcome::Applied,
+            };
+            let locked = self.refresh_after_ordered_progress(&mut state, outcome, None, Vec::new());
             drop(state);
             return Ok(locked.finish());
         }
@@ -720,6 +1145,40 @@ impl RuntimeFilterChannel {
         if !matches!(state.terminal, ChannelTerminal::Collecting) {
             return Ok(progress(SubmitOutcome::TerminalNoop));
         }
+        if state.ordered.is_some() {
+            let instance = instance_mut(&mut state, binding_id, fragment_instance_id)?;
+            if instance.progress != TerminalProgress::Pending {
+                return Ok(progress(SubmitOutcome::TerminalNoop));
+            }
+            instance.progress = TerminalProgress::Impossible;
+            let witness_id = state
+                .producers
+                .get(&binding_id)
+                .expect("authorized ordered producer")
+                .witness_id;
+            state
+                .ordered
+                .as_mut()
+                .expect("ordered channel owns ordered state")
+                .availability_witnesses
+                .get_mut(&witness_id)
+                .expect("ordered availability witness is installed")
+                .advance(WitnessProgress::Impossible);
+            refresh_ordered_witness(&mut state, binding_id);
+            let producer_identity =
+                ProducerEventIdentity::new(self.event_identity, binding_id, fragment_instance_id);
+            let locked = self.refresh_after_ordered_progress(
+                &mut state,
+                SubmitOutcome::CoverageStillPossible,
+                None,
+                vec![RuntimeFilterEvent::ProducerInstanceFailed {
+                    identity: producer_identity,
+                    reason,
+                }],
+            );
+            drop(state);
+            return Ok(locked.finish());
+        }
         let instance = instance_mut(&mut state, binding_id, fragment_instance_id)?;
         if instance.progress != TerminalProgress::Pending {
             return Ok(progress(SubmitOutcome::TerminalNoop));
@@ -748,11 +1207,20 @@ impl RuntimeFilterChannel {
         {
             return ChannelAction::None;
         }
-        let locked = self.make_unavailable(
-            &mut state,
-            UnavailableReason::IncompleteCoverage,
-            SubmitOutcome::TerminalNoop,
-        );
+        let locked = if state.ordered.is_some() {
+            self.make_ordered_unavailable_or_degraded(
+                &mut state,
+                UnavailableReason::IncompleteCoverage,
+                SubmitOutcome::TerminalNoop,
+                Vec::new(),
+            )
+        } else {
+            self.make_unavailable(
+                &mut state,
+                UnavailableReason::IncompleteCoverage,
+                SubmitOutcome::TerminalNoop,
+            )
+        };
         drop(state);
         locked.finish()
     }
@@ -791,6 +1259,12 @@ impl RuntimeFilterChannel {
         sequence: ProducerSequence,
         delta: &ValueDomainDelta,
     ) -> Result<ChannelAction, RuntimeContractViolation> {
+        let Some(data_type) = self.data_type.as_ref() else {
+            return Err(violation(
+                RuntimeContractViolationKind::ProducerPortMismatch,
+                "ordered channel cannot accept membership deltas",
+            ));
+        };
         let identity = ContributionIdentity::new(
             self.event_identity.query_id(),
             self.event_identity.participant_id(),
@@ -801,7 +1275,7 @@ impl RuntimeFilterChannel {
         );
         let mut state = self.state.lock().unwrap();
         partition_state(&state, binding_id, fragment_instance_id, partition_id)?;
-        if !delta.matches_data_type(&self.data_type) {
+        if !delta.matches_data_type(data_type) {
             return Err(violation(
                 RuntimeContractViolationKind::TypeMismatch,
                 "delta type does not match channel membership type",
@@ -872,11 +1346,20 @@ impl RuntimeFilterChannel {
         if !matches!(state.terminal, ChannelTerminal::Collecting) {
             return terminal_action_from_state(&state);
         }
-        let locked = self.make_unavailable(
-            &mut state,
-            UnavailableReason::ResourceLimit,
-            SubmitOutcome::TerminalNoop,
-        );
+        let locked = if state.ordered.is_some() {
+            self.make_ordered_unavailable_or_degraded(
+                &mut state,
+                UnavailableReason::ResourceLimit,
+                SubmitOutcome::TerminalNoop,
+                Vec::new(),
+            )
+        } else {
+            self.make_unavailable(
+                &mut state,
+                UnavailableReason::ResourceLimit,
+                SubmitOutcome::TerminalNoop,
+            )
+        };
         drop(state);
         locked.finish()
     }
@@ -885,13 +1368,23 @@ impl RuntimeFilterChannel {
         let state = self.state.lock().unwrap();
         match &state.terminal {
             ChannelTerminal::Completed { snapshot, .. } => Some(snapshot.clone()),
-            _ => None,
+            ChannelTerminal::DegradedLogical { snapshot, .. } => Some(snapshot.clone()),
+            _ => state
+                .ordered
+                .as_ref()
+                .and_then(|ordered| ordered.latest.clone()),
         }
     }
 
     pub(crate) fn availability_progress(&self) -> CoverageProgress {
         let state = self.state.lock().unwrap();
-        evaluate(&self.availability_coverage, &state.witnesses)
+        evaluate(
+            &self.availability_coverage,
+            state
+                .ordered
+                .as_ref()
+                .map_or(&state.witnesses, |ordered| &ordered.availability_witnesses),
+        )
     }
 
     pub(crate) fn is_terminal(&self) -> bool {
@@ -951,10 +1444,22 @@ impl RuntimeFilterChannel {
 
         match evaluate(&self.terminal_coverage, &state.witnesses) {
             CoverageProgress::Satisfied => {
-                let replacement =
-                    MembershipReducer::try_new(self.data_type.clone(), self.null_semantics)
-                        .expect("validated membership type");
-                let domain = std::mem::replace(&mut state.reducer, replacement).into_domain();
+                let replacement = MembershipReducer::try_new(
+                    self.data_type
+                        .clone()
+                        .expect("membership channel owns its data type"),
+                    self.null_semantics
+                        .expect("membership channel owns null semantics"),
+                )
+                .expect("validated membership type");
+                let domain = std::mem::replace(
+                    state
+                        .reducer
+                        .as_mut()
+                        .expect("membership channel owns a membership reducer"),
+                    replacement,
+                )
+                .into_domain();
                 let reservation =
                     std::mem::replace(&mut state.reservation, RetainedMemoryReservation::empty());
                 let snapshot =
@@ -990,6 +1495,116 @@ impl RuntimeFilterChannel {
                     events,
                 })
             }
+        }
+    }
+
+    fn refresh_after_ordered_progress(
+        &self,
+        state: &mut ChannelState,
+        outcome: SubmitOutcome,
+        published: Option<Arc<LogicalSnapshot>>,
+        mut events: Vec<RuntimeFilterEvent>,
+    ) -> LockedAction {
+        match evaluate(&self.terminal_coverage, &state.witnesses) {
+            CoverageProgress::Satisfied => {
+                if let Some(snapshot) = state
+                    .ordered
+                    .as_ref()
+                    .and_then(|ordered| ordered.latest.clone())
+                {
+                    events.push(RuntimeFilterEvent::ChannelCompleted {
+                        identity: self.event_identity,
+                        version: snapshot.version(),
+                    });
+                    let order = next_dispatch_order(state);
+                    state.terminal = ChannelTerminal::Completed {
+                        order,
+                        snapshot: snapshot.clone(),
+                        events: events.clone(),
+                    };
+                    LockedAction::without_release(ChannelAction::Completed {
+                        order,
+                        outcome: SubmitOutcome::Completed,
+                        snapshot,
+                        events,
+                    })
+                } else {
+                    events.push(RuntimeFilterEvent::ChannelCompletedWithoutArtifact {
+                        identity: self.event_identity,
+                    });
+                    let order = next_dispatch_order(state);
+                    state.terminal = ChannelTerminal::CompletedWithoutArtifact {
+                        order,
+                        events: events.clone(),
+                    };
+                    LockedAction::without_release(ChannelAction::CompletedWithoutArtifact {
+                        order,
+                        outcome: SubmitOutcome::CompletedWithoutArtifact,
+                        events,
+                    })
+                }
+            }
+            CoverageProgress::Impossible => self.make_ordered_unavailable_or_degraded(
+                state,
+                UnavailableReason::ProducerFailed,
+                outcome,
+                events,
+            ),
+            CoverageProgress::Pending => {
+                if let Some(snapshot) = published {
+                    let order = next_dispatch_order(state);
+                    LockedAction::without_release(ChannelAction::VisibleSnapshot {
+                        order,
+                        outcome,
+                        version: snapshot.version(),
+                        snapshot,
+                        events,
+                    })
+                } else {
+                    let order = (!events.is_empty()).then(|| next_dispatch_order(state));
+                    LockedAction::without_release(ChannelAction::Progress {
+                        order,
+                        outcome,
+                        events,
+                    })
+                }
+            }
+        }
+    }
+
+    fn make_ordered_unavailable_or_degraded(
+        &self,
+        state: &mut ChannelState,
+        reason: UnavailableReason,
+        outcome: SubmitOutcome,
+        mut events: Vec<RuntimeFilterEvent>,
+    ) -> LockedAction {
+        if let Some(snapshot) = state
+            .ordered
+            .as_ref()
+            .and_then(|ordered| ordered.latest.clone())
+        {
+            events.push(RuntimeFilterEvent::ChannelLogicalDegraded {
+                identity: self.event_identity,
+                reason,
+                retained_version: snapshot.version(),
+            });
+            let order = next_dispatch_order(state);
+            state.terminal = ChannelTerminal::DegradedLogical {
+                order,
+                reason,
+                snapshot: snapshot.clone(),
+                events: events.clone(),
+            };
+            LockedAction::without_release(ChannelAction::DegradedLogical {
+                order,
+                outcome,
+                reason,
+                snapshot,
+                events,
+            })
+        } else {
+            self.make_unavailable_with_events(state, reason, outcome, events)
         }
     }
 
@@ -1034,8 +1649,21 @@ impl RuntimeFilterChannel {
     fn detach_collecting_state(&self, state: &mut ChannelState) -> RetainedMemoryReservation {
         let reservation =
             std::mem::replace(&mut state.reservation, RetainedMemoryReservation::empty());
-        state.reducer = MembershipReducer::try_new(self.data_type.clone(), self.null_semantics)
-            .expect("validated membership type");
+        if self.data_type.is_some() {
+            state.reducer = Some(
+                MembershipReducer::try_new(
+                    self.data_type
+                        .clone()
+                        .expect("membership channel owns its data type"),
+                    self.null_semantics
+                        .expect("membership channel owns null semantics"),
+                )
+                .expect("validated membership type"),
+            );
+        } else if let Some(ordered) = state.ordered.as_mut() {
+            let contract = ordered.reducer.contract().clone();
+            ordered.reducer = OrderedReducer::new(contract);
+        }
         for producer in state.producers.values_mut() {
             for instance in producer.instances.values_mut() {
                 instance.clear_partitions();
@@ -1051,6 +1679,56 @@ fn progress(outcome: SubmitOutcome) -> ChannelAction {
         outcome,
         events: Vec::new(),
     }
+}
+
+fn refresh_ordered_instance_progress(
+    state: &mut ChannelState,
+    binding_id: BindingId,
+    fragment_instance_id: UniqueId,
+) {
+    let terminal_count = state
+        .ordered
+        .as_ref()
+        .expect("ordered channel owns ordered state")
+        .reducer
+        .terminal_partition_count(binding_id, fragment_instance_id);
+    let instance = instance_mut(state, binding_id, fragment_instance_id)
+        .expect("authorized ordered producer instance");
+    if instance.progress == TerminalProgress::Pending
+        && instance
+            .local_partition_count()
+            .is_some_and(|count| usize::try_from(count) == Ok(terminal_count))
+    {
+        instance.progress = TerminalProgress::Satisfied;
+    }
+    refresh_ordered_witness(state, binding_id);
+}
+
+fn refresh_ordered_witness(state: &mut ChannelState, binding_id: BindingId) {
+    let producer = state
+        .producers
+        .get(&binding_id)
+        .expect("authorized ordered producer");
+    let progress = if producer
+        .instances
+        .values()
+        .any(|instance| instance.progress == TerminalProgress::Impossible)
+    {
+        WitnessProgress::Impossible
+    } else if producer
+        .instances
+        .values()
+        .all(|instance| instance.progress == TerminalProgress::Satisfied)
+    {
+        WitnessProgress::Satisfied
+    } else {
+        WitnessProgress::Pending
+    };
+    state
+        .witnesses
+        .get_mut(&producer.witness_id)
+        .expect("installed ordered terminal witness")
+        .advance(progress);
 }
 
 fn terminal_action_from_state(state: &ChannelState) -> ChannelAction {
@@ -1074,6 +1752,25 @@ fn terminal_action_from_state(state: &ChannelState) -> ChannelAction {
             order: *order,
             outcome: SubmitOutcome::TerminalNoop,
             reason: *reason,
+            events: events.clone(),
+        },
+        ChannelTerminal::CompletedWithoutArtifact { order, events } => {
+            ChannelAction::CompletedWithoutArtifact {
+                order: *order,
+                outcome: SubmitOutcome::TerminalNoop,
+                events: events.clone(),
+            }
+        }
+        ChannelTerminal::DegradedLogical {
+            order,
+            reason,
+            snapshot,
+            events,
+        } => ChannelAction::DegradedLogical {
+            order: *order,
+            outcome: SubmitOutcome::TerminalNoop,
+            reason: *reason,
+            snapshot: snapshot.clone(),
             events: events.clone(),
         },
         ChannelTerminal::Cancelled { order, events } => ChannelAction::Cancelled {
@@ -1191,14 +1888,21 @@ mod tests {
     use crate::runtime_filter::port::events::RuntimeFilterEvent;
     use crate::runtime_filter::port::identity::*;
     use crate::runtime_filter::port::install::*;
+    use crate::runtime_filter::port::ordered_bound::{
+        COMPARATOR_ALGORITHM_VERSION, OrderedBoundUpdate, OrderedScalar, OrderedTuple,
+        RuntimeOrderContract, comparator_digest_for_test,
+    };
     use crate::runtime_filter::port::producer::{
-        ProducerFailureReason, RuntimeContractViolationKind, SubmitOutcome,
+        ProducerFailureReason, RuntimeContractViolation, RuntimeContractViolationKind,
+        SubmitOutcome,
     };
     use crate::runtime_filter::port::subscription::UnavailableReason;
     use crate::runtime_filter::port::support::{
         MemoryAccountError, RuntimeFilterMemoryAccount, TemporaryContributionLease,
     };
-    use crate::runtime_filter::port::value_domain::{MembershipValues, ValueDomainDelta};
+    use crate::runtime_filter::port::value_domain::{
+        LogicalSnapshot, MembershipValues, ValueDomainDelta,
+    };
 
     use super::{ChannelAction, RuntimeFilterChannel};
 
@@ -2564,5 +3268,377 @@ mod tests {
             RuntimeContractViolationKind::TypeMismatch
         );
         assert_eq!(account.current.load(Ordering::SeqCst), retained);
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum TestAction {
+        Published(u64, i64),
+        SequenceAdvancedEqual,
+        StreamAcceptedNoGlobalChange,
+        PendingFinalSnapshot,
+        CoverageStillPossible,
+        Completed(Option<(u64, i64)>),
+        CompletedWithoutArtifact,
+        Other(SubmitOutcome),
+    }
+
+    fn ordered_value(snapshot: &LogicalSnapshot) -> i64 {
+        let Some(OrderedScalar::Int64(value)) = snapshot
+            .ordered_bound()
+            .expect("ordered snapshot")
+            .bound()
+            .values()
+            .first()
+            .and_then(Option::as_ref)
+        else {
+            panic!("test ordered snapshot contains one int64")
+        };
+        *value
+    }
+
+    fn test_action(action: ChannelAction) -> TestAction {
+        match action {
+            ChannelAction::VisibleSnapshot {
+                version, snapshot, ..
+            } => TestAction::Published(version.get(), ordered_value(&snapshot)),
+            ChannelAction::Completed { snapshot, .. } => {
+                TestAction::Completed(Some((snapshot.version().get(), ordered_value(&snapshot))))
+            }
+            ChannelAction::CompletedWithoutArtifact { .. } => TestAction::CompletedWithoutArtifact,
+            action => match action.outcome() {
+                SubmitOutcome::SequenceAdvancedEqual => TestAction::SequenceAdvancedEqual,
+                SubmitOutcome::StreamAcceptedNoGlobalChange => {
+                    TestAction::StreamAcceptedNoGlobalChange
+                }
+                SubmitOutcome::PendingFinalSnapshot => TestAction::PendingFinalSnapshot,
+                SubmitOutcome::CoverageStillPossible => TestAction::CoverageStillPossible,
+                outcome => TestAction::Other(outcome),
+            },
+        }
+    }
+
+    fn int_bound(value: i64) -> i64 {
+        value
+    }
+
+    struct OrderedChannelHarness {
+        channel: RuntimeFilterChannel,
+        contract: Arc<RuntimeOrderContract>,
+        streams: Vec<(BindingId, UniqueId)>,
+    }
+
+    impl OrderedChannelHarness {
+        fn with_streams(count: usize) -> Self {
+            let keys = vec![OrderKeyContract {
+                data_type: DataType::Int64,
+                direction: SortDirection::Ascending,
+                null_order: NullOrder::Last,
+            }];
+            let plan = OrderContract {
+                comparator_digest: comparator_digest_for_test(&keys, COMPARATOR_ALGORITHM_VERSION),
+                keys,
+                inclusive: true,
+            };
+            let contract = Arc::new(RuntimeOrderContract::try_from_plan(&plan).unwrap());
+            let streams = (0..count)
+                .map(|index| {
+                    (
+                        BindingId::new(10 + u32::try_from(index).unwrap()),
+                        uid(10 + i64::try_from(index).unwrap()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let witnesses = (0..count)
+                .map(|index| CoverageWitnessId::new(1 + u32::try_from(index).unwrap()))
+                .collect::<Vec<_>>();
+            let coverage = Coverage::AnyOf(witnesses.iter().copied().map(Coverage::Leaf).collect());
+            let deployment = RuntimeFilterChannelDeployment::new(
+                ChannelId::new(1),
+                RuntimeFilterLogicalDomain::OrderedBound(plan),
+                RuntimeFilterLifecycle::MonotonicUpdates,
+                coverage.clone(),
+                coverage,
+                ReductionRequirement::TightenOrderedBound,
+                BTreeSet::from([
+                    ContributionKind::OrderedBoundUpdate,
+                    ContributionKind::ProducerClosed,
+                ]),
+                CompletionRequirement::ProducerClosed,
+                RuntimeFilterPolicyRequirement {
+                    max_contribution_bytes: 1024,
+                    max_artifact_bytes: 1024,
+                    deadline_ms: 100,
+                    max_retries: 0,
+                },
+                RuntimeFilterCoreBudget::new(4096),
+                MaterializationPolicy::for_test(),
+                streams
+                    .iter()
+                    .zip(&witnesses)
+                    .map(|((binding, instance), witness)| {
+                        (
+                            *binding,
+                            ProducerDeployment::new(*witness, BTreeSet::from([*instance])),
+                        )
+                    })
+                    .collect(),
+                BTreeMap::new(),
+            );
+            let channel = RuntimeFilterChannel::new(
+                uid(99),
+                RuntimeFilterParticipantId::new(1),
+                DeploymentEpoch::new(1),
+                &deployment,
+                Instant::now() + Duration::from_secs(10),
+                Arc::new(Account::default()),
+            )
+            .unwrap();
+            for (binding, instance) in &streams {
+                channel.open_producer(*binding, *instance, 1).unwrap();
+            }
+            Self {
+                channel,
+                contract,
+                streams,
+            }
+        }
+
+        fn single_stream_anyof() -> Self {
+            Self::with_streams(1)
+        }
+
+        fn two_stream_anyof() -> Self {
+            Self::with_streams(2)
+        }
+
+        fn submit(
+            &self,
+            stream: usize,
+            sequence: u64,
+            value: i64,
+        ) -> Result<TestAction, RuntimeContractViolation> {
+            let (binding, instance) = self.streams[stream];
+            let tuple =
+                OrderedTuple::try_new(&self.contract, [Some(OrderedScalar::Int64(value))]).unwrap();
+            let update = OrderedBoundUpdate::new(&self.contract, tuple).unwrap();
+            self.channel
+                .submit_ordered(
+                    binding,
+                    instance,
+                    PartitionId::new(0),
+                    ProducerSequence::new(sequence),
+                    update,
+                )
+                .map(test_action)
+        }
+
+        fn close(
+            &self,
+            stream: usize,
+            terminal: u64,
+        ) -> Result<TestAction, RuntimeContractViolation> {
+            let (binding, instance) = self.streams[stream];
+            self.channel
+                .close_ordered_partition(
+                    binding,
+                    instance,
+                    PartitionId::new(0),
+                    ProducerSequence::new(terminal),
+                )
+                .map(test_action)
+        }
+
+        fn fail_stream(&self, stream: usize) -> Result<TestAction, RuntimeContractViolation> {
+            let (binding, instance) = self.streams[stream];
+            self.channel
+                .fail_instance(binding, instance, ProducerFailureReason::ExecutionFailed)
+                .map(test_action)
+        }
+
+        fn latest(&self) -> Option<(u64, i64)> {
+            self.channel
+                .snapshot()
+                .map(|snapshot| (snapshot.version().get(), ordered_value(&snapshot)))
+        }
+
+        fn state_digest(&self) -> String {
+            let state = self.channel.state.lock().unwrap();
+            let latest = state
+                .ordered
+                .as_ref()
+                .and_then(|ordered| ordered.latest.as_ref())
+                .map(|snapshot| (snapshot.version().get(), ordered_value(snapshot)));
+            format!(
+                "{:?}:{:?}:{}",
+                state.ordered.as_ref().expect("ordered state").reducer,
+                latest,
+                state.next_dispatch_order
+            )
+        }
+    }
+
+    mod ordered {
+        use super::*;
+
+        #[test]
+        fn higher_equal_advances_sequence_without_new_version() {
+            let harness = OrderedChannelHarness::single_stream_anyof();
+            assert_eq!(
+                harness.submit(0, 3, int_bound(100)).unwrap(),
+                TestAction::Published(1, 100)
+            );
+            assert_eq!(
+                harness.submit(0, 7, int_bound(100)).unwrap(),
+                TestAction::SequenceAdvancedEqual
+            );
+            assert_eq!(harness.latest(), Some((1, 100)));
+        }
+
+        #[test]
+        fn higher_looser_is_contract_violation_and_state_is_unchanged() {
+            let harness = OrderedChannelHarness::single_stream_anyof();
+            harness.submit(0, 3, int_bound(100)).unwrap();
+            let before = harness.state_digest();
+            let error = harness.submit(0, 4, int_bound(101)).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                RuntimeContractViolationKind::OrderedBoundLoosened
+            );
+            assert_eq!(harness.state_digest(), before);
+        }
+
+        #[test]
+        fn another_stream_may_be_looser_than_global_without_violation() {
+            let harness = OrderedChannelHarness::two_stream_anyof();
+            assert_eq!(
+                harness.submit(0, 0, int_bound(50)).unwrap(),
+                TestAction::Published(1, 50)
+            );
+            assert_eq!(
+                harness.submit(1, 0, int_bound(90)).unwrap(),
+                TestAction::StreamAcceptedNoGlobalChange
+            );
+            assert_eq!(harness.latest(), Some((1, 50)));
+        }
+
+        #[test]
+        fn cumulative_close_zero_completes_without_artifact() {
+            let harness = OrderedChannelHarness::single_stream_anyof();
+            assert_eq!(
+                harness.close(0, 0).unwrap(),
+                super::TestAction::CompletedWithoutArtifact
+            );
+        }
+
+        #[test]
+        fn cumulative_close_waits_only_for_terminal_minus_one_and_allows_gaps() {
+            let harness = OrderedChannelHarness::single_stream_anyof();
+            assert_eq!(
+                harness.submit(0, 7, super::int_bound(40)).unwrap(),
+                super::TestAction::Published(1, 40)
+            );
+            assert_eq!(
+                harness.close(0, 8).unwrap(),
+                super::TestAction::Completed(Some((1, 40)))
+            );
+        }
+
+        #[test]
+        fn close_before_final_snapshot_and_snapshot_before_close_both_complete() {
+            let close_first = OrderedChannelHarness::single_stream_anyof();
+            assert_eq!(
+                close_first.close(0, 8).unwrap(),
+                TestAction::PendingFinalSnapshot
+            );
+            assert_eq!(
+                close_first.submit(0, 7, int_bound(40)).unwrap(),
+                TestAction::Completed(Some((1, 40)))
+            );
+            let update_first = OrderedChannelHarness::single_stream_anyof();
+            update_first.submit(0, 7, int_bound(40)).unwrap();
+            assert_eq!(
+                update_first.close(0, 8).unwrap(),
+                TestAction::Completed(Some((1, 40)))
+            );
+        }
+
+        #[test]
+        fn availability_and_terminal_coverage_are_independent() {
+            let harness = OrderedChannelHarness::single_stream_anyof();
+            assert_eq!(
+                harness.submit(0, 0, int_bound(80)).unwrap(),
+                TestAction::Published(1, 80)
+            );
+            assert!(!harness.channel.is_terminal());
+        }
+
+        #[test]
+        fn logical_versions_advance_only_when_global_bound_tightens() {
+            let harness = OrderedChannelHarness::two_stream_anyof();
+            assert_eq!(
+                harness.submit(0, 0, int_bound(80)).unwrap(),
+                TestAction::Published(1, 80)
+            );
+            assert_eq!(
+                harness.submit(1, 0, int_bound(90)).unwrap(),
+                TestAction::StreamAcceptedNoGlobalChange
+            );
+            assert_eq!(
+                harness.submit(1, 1, int_bound(70)).unwrap(),
+                TestAction::Published(2, 70)
+            );
+        }
+
+        #[test]
+        fn anyof_one_producer_failure_keeps_channel_available_until_other_completes() {
+            let harness = OrderedChannelHarness::two_stream_anyof();
+            harness.submit(0, 0, int_bound(80)).unwrap();
+            assert_eq!(
+                harness.fail_stream(0).unwrap(),
+                TestAction::CoverageStillPossible
+            );
+            assert_eq!(
+                harness.submit(1, 0, int_bound(70)).unwrap(),
+                TestAction::Published(2, 70)
+            );
+            assert_eq!(
+                harness.close(1, 1).unwrap(),
+                TestAction::Completed(Some((2, 70)))
+            );
+        }
+
+        #[test]
+        fn conflicting_close_replay_is_rejected_after_channel_completion() {
+            let harness = OrderedChannelHarness::single_stream_anyof();
+            assert_eq!(
+                harness.close(0, 0).unwrap(),
+                TestAction::CompletedWithoutArtifact
+            );
+            assert_eq!(
+                harness.close(0, 1).unwrap_err().kind(),
+                RuntimeContractViolationKind::ConflictingTerminalSequence
+            );
+        }
+
+        #[test]
+        fn update_at_terminal_is_rejected_after_channel_completion() {
+            let harness = OrderedChannelHarness::single_stream_anyof();
+            harness.submit(0, 0, int_bound(40)).unwrap();
+            harness.close(0, 1).unwrap();
+            assert_eq!(
+                harness.submit(0, 1, int_bound(30)).unwrap_err().kind(),
+                RuntimeContractViolationKind::SequenceOutsideTerminalRange
+            );
+        }
+
+        #[test]
+        fn channel_action_exposes_exact_logical_terminal_mapping() {
+            let harness = OrderedChannelHarness::single_stream_anyof();
+            harness.close(0, 0).unwrap();
+            assert_eq!(
+                harness.channel.terminal_action().logical_terminal(),
+                Some(crate::runtime_filter::core::state::LogicalTerminal::CompletedWithoutArtifact)
+            );
+        }
     }
 }

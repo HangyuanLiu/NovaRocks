@@ -18,7 +18,17 @@
 use std::collections::BTreeMap;
 
 use crate::runtime_filter::port::identity::{PartitionId, ProducerSequence};
+use crate::runtime_filter::port::subscription::UnavailableReason;
 use crate::runtime_filter::port::value_domain::ContributionFingerprint;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LogicalTerminal {
+    Completed,
+    CompletedWithoutArtifact,
+    DegradedLogical(UnavailableReason),
+    Unavailable(UnavailableReason),
+    Cancelled,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TerminalProgress {

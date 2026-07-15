@@ -116,6 +116,21 @@ impl OrderedTuple {
     pub(crate) fn values(&self) -> &[Option<OrderedScalar>] {
         &self.values
     }
+
+    pub(crate) fn estimated_retained_bytes(&self) -> Option<usize> {
+        self.values.iter().try_fold(0usize, |bytes, value| {
+            let value_bytes = match value {
+                None => 1,
+                Some(OrderedScalar::Boolean(_)) | Some(OrderedScalar::Int8(_)) => 2,
+                Some(OrderedScalar::Int16(_)) => 3,
+                Some(OrderedScalar::Int32(_)) | Some(OrderedScalar::Date32(_)) => 5,
+                Some(OrderedScalar::Int64(_)) | Some(OrderedScalar::Timestamp(_)) => 9,
+                Some(OrderedScalar::LargeInt(_)) | Some(OrderedScalar::Decimal128(_)) => 17,
+                Some(OrderedScalar::Utf8(value)) => 1usize.checked_add(value.len())?,
+            };
+            bytes.checked_add(value_bytes)
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
