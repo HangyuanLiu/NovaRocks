@@ -1105,15 +1105,15 @@ fn parse_string_default(
             Ok(DefaultLiteral::String(s.to_string()))
         }
         SqlType::Date => {
-            let days = crate::engine::parquet::parse_date_string_to_days(s)?;
+            let days = crate::sql::literal::parse_date_string_to_days(s)?;
             Ok(DefaultLiteral::Date(days))
         }
         SqlType::DateTime => {
-            let micros = crate::engine::parquet::parse_datetime_string_to_micros(s)?;
+            let micros = crate::sql::literal::parse_datetime_string_to_micros(s)?;
             Ok(DefaultLiteral::DateTime(micros))
         }
         SqlType::DateTimeNs => {
-            let nanos = crate::engine::parquet::parse_datetime_string_to_nanos(s)?;
+            let nanos = crate::sql::literal::parse_datetime_string_to_nanos(s)?;
             Ok(DefaultLiteral::DateTime(nanos))
         }
         // Binary: interpret the SQL string literal as raw UTF-8 bytes.

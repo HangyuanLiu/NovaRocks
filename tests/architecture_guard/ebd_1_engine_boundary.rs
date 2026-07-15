@@ -639,7 +639,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
         &[
             "crate::engine::catalog::ColumnDef",
             "crate::engine::catalog::normalize_identifier",
-            "crate::engine::parquet::parse_datetime_string_to_nanos",
         ],
     ),
     (
@@ -1034,12 +1033,7 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
     ),
     (
         "src/sql/parser/dialect/create_table.rs",
-        &[
-            "crate::engine::catalog::normalize_identifier",
-            "crate::engine::parquet::parse_date_string_to_days",
-            "crate::engine::parquet::parse_datetime_string_to_micros",
-            "crate::engine::parquet::parse_datetime_string_to_nanos",
-        ],
+        &["crate::engine::catalog::normalize_identifier"],
     ),
     (
         "src/sql/planner/imv_rewrite/action_column.rs",

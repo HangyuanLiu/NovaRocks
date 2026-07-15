@@ -152,6 +152,58 @@ pub(crate) fn latin1_string_to_bytes(value: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+pub(crate) fn parse_date_string_to_days(s: &str) -> Result<i32, String> {
+    use chrono::NaiveDate;
+    let date = NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+        .map_err(|e| format!("invalid date literal `{s}`: {e}"))?;
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch");
+    Ok((date - epoch).num_days() as i32)
+}
+
+pub(crate) fn parse_datetime_string_to_micros(s: &str) -> Result<i64, String> {
+    use chrono::NaiveDateTime;
+    let s = s.trim();
+    // Try datetime first, then date-only
+    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Ok(dt.and_utc().timestamp_micros());
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+        return Ok(dt.and_utc().timestamp_micros());
+    }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        let dt = d.and_hms_opt(0, 0, 0).expect("midnight");
+        return Ok(dt.and_utc().timestamp_micros());
+    }
+    Err(format!("invalid datetime literal `{s}`"))
+}
+
+/// Parse a `YYYY-MM-DD HH:MM:SS[.fffffffff]` literal into nanoseconds since the
+/// Unix epoch. Mirrors `parse_datetime_string_to_micros` but keeps nanosecond
+/// precision for Iceberg v3 `timestamp_ns` columns. Errors if the value is
+/// outside the nanosecond-representable range (~1677-09-21 .. 2262-04-11).
+pub(crate) fn parse_datetime_string_to_nanos(s: &str) -> Result<i64, String> {
+    use chrono::NaiveDateTime;
+    let s = s.trim();
+    // Try datetime first, then date-only
+    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return dt.and_utc().timestamp_nanos_opt().ok_or_else(|| {
+            format!("DATETIME literal '{s}' out of nanosecond representable range")
+        });
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+        return dt.and_utc().timestamp_nanos_opt().ok_or_else(|| {
+            format!("DATETIME literal '{s}' out of nanosecond representable range")
+        });
+    }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        let dt = d.and_hms_opt(0, 0, 0).expect("midnight");
+        return dt.and_utc().timestamp_nanos_opt().ok_or_else(|| {
+            format!("DATETIME literal '{s}' out of nanosecond representable range")
+        });
+    }
+    Err(format!("invalid datetime literal `{s}`"))
+}
+
 /// Convert a sqlparser expression to a Literal (for INSERT VALUES)
 pub(crate) fn sqlparser_expr_to_literal(expr: &sqlparser::ast::Expr) -> Result<Literal, String> {
     use sqlparser::ast as sqlast;
@@ -1410,6 +1462,64 @@ mod tests {
             .try_with_sql(sql)
             .expect("build parser");
         parser.parse_expr().expect("parse expression")
+    }
+
+    #[test]
+    fn parse_date_string_to_days_uses_unix_epoch() {
+        assert_eq!(parse_date_string_to_days("1970-01-01").unwrap(), 0);
+        assert_eq!(parse_date_string_to_days("1970-01-02").unwrap(), 1);
+    }
+
+    #[test]
+    fn parse_datetime_string_to_micros_accepts_seconds_fraction_and_date_only() {
+        assert_eq!(
+            parse_datetime_string_to_micros("1970-01-01 00:00:01").unwrap(),
+            1_000_000
+        );
+        assert_eq!(
+            parse_datetime_string_to_micros("1970-01-01 00:00:01.123456").unwrap(),
+            1_123_456
+        );
+        assert_eq!(
+            parse_datetime_string_to_micros("1970-01-02").unwrap(),
+            86_400_000_000
+        );
+    }
+
+    #[test]
+    fn parse_datetime_string_to_nanos_keeps_nanoseconds() {
+        let nanos = parse_datetime_string_to_nanos("2024-01-02 03:04:05.123456789").unwrap();
+        assert_eq!(nanos % 1_000, 789);
+    }
+
+    #[test]
+    fn parse_datetime_string_to_nanos_handles_no_fraction() {
+        let a = parse_datetime_string_to_nanos("2024-01-02 03:04:05").unwrap();
+        let b = parse_datetime_string_to_nanos("2024-01-02").unwrap();
+        assert_eq!(a % 1_000_000_000, 0);
+        assert_eq!(b % 1_000_000_000, 0);
+    }
+
+    #[test]
+    fn parse_datetime_string_to_nanos_rejects_out_of_range() {
+        assert_eq!(
+            parse_datetime_string_to_nanos("2262-04-12 00:00:00").unwrap_err(),
+            "DATETIME literal '2262-04-12 00:00:00' out of nanosecond representable range"
+        );
+    }
+
+    #[test]
+    fn temporal_literal_parsers_preserve_invalid_error_text() {
+        let date_error = parse_date_string_to_days("not-a-date").unwrap_err();
+        assert!(date_error.starts_with("invalid date literal `not-a-date`:"));
+        assert_eq!(
+            parse_datetime_string_to_micros("not-a-datetime").unwrap_err(),
+            "invalid datetime literal `not-a-datetime`"
+        );
+        assert_eq!(
+            parse_datetime_string_to_nanos("not-a-datetime").unwrap_err(),
+            "invalid datetime literal `not-a-datetime`"
+        );
     }
 
     #[test]
