@@ -19,21 +19,27 @@ mod common;
 
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use bytes::Bytes;
+use novarocks::state_store::limits::{MAX_KEY_BYTES, MAX_VALUE_BYTES};
 use novarocks::state_store::{
-    ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution, Direction, FeDeploymentView,
-    Key, KeyRange, Precondition, RangeRequest, StateStore, StateStoreConfig, StateStoreErrorKind,
-    StateStoreLimitOverrides, StateStoreOperation, StateStoreOutcome, StateStoreProviderConfig,
-    TransactionId, Value, open_state_store,
+    ChangeCursor, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution, Direction,
+    FeDeploymentView, Key, KeyRange, Precondition, RangeRequest, StateStore, StateStoreConfig,
+    StateStoreErrorKind, StateStoreLimitOverrides, StateStoreOperation, StateStoreOutcome,
+    StateStoreProviderConfig, StoreRevision, TransactionId, Value, open_state_store,
 };
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
-use common::state_store_conformance::{FaultGate, FaultInjectingStateStore, StateStoreFactory};
+use common::state_store_conformance::{
+    FaultGate, FaultInjectingStateStore, PostDispatchControl, PostDispatchController,
+    PostDispatchScenario, StateStoreConformanceFixture, StateStoreFactory,
+};
 
 fn key(bytes: impl Into<Vec<u8>>) -> Key {
     Key::try_from(Bytes::from(bytes.into())).expect("valid key")
@@ -114,10 +120,11 @@ fn conformance_factory() -> StateStoreFactory {
     Arc::new(move || {
         let temp = Arc::clone(&temp);
         Box::pin(async move {
-            open_state_store(
+            let path = temp.path().join("state-store.sqlite");
+            let store = open_state_store(
                 StateStoreConfig {
                     provider: StateStoreProviderConfig::Sqlite,
-                    path: temp.path().join("state-store.sqlite"),
+                    path: path.clone(),
                     cluster_id: "conformance-cluster".to_owned(),
                     deployment_owner: "conformance-fe".to_owned(),
                     limits: StateStoreLimitOverrides {
@@ -135,9 +142,89 @@ fn conformance_factory() -> StateStoreFactory {
                     topology_revision: Bytes::from_static(b"conformance-topology"),
                 },
             )
-            .await
+            .await?;
+            let fault = FaultInjectingStateStore::new(store);
+            let controller: Arc<dyn PostDispatchController> =
+                Arc::new(SqlitePostDispatchController {
+                    fault: Arc::clone(&fault),
+                    path,
+                });
+            let store: Arc<dyn StateStore> = fault;
+            Ok(StateStoreConformanceFixture::new(store, controller))
         })
     })
+}
+
+struct SqlitePostDispatchController {
+    fault: Arc<FaultInjectingStateStore>,
+    path: PathBuf,
+}
+
+#[async_trait]
+impl PostDispatchController for SqlitePostDispatchController {
+    async fn arm(&self, scenario: PostDispatchScenario) -> Box<dyn PostDispatchControl> {
+        let path = self.path.clone();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let connection = Connection::open(path).expect("open post-dispatch blocker");
+            connection
+                .execute_batch("BEGIN IMMEDIATE")
+                .expect("hold post-dispatch provider progress");
+            connection
+        })
+        .await
+        .expect("create post-dispatch blocker");
+        let gate = FaultGate::new();
+        match scenario {
+            PostDispatchScenario::CancelWaiterBeforeApply => {
+                self.fault.pause_next_post_dispatch(gate.clone());
+            }
+            PostDispatchScenario::LoseCommittedResponse => {
+                self.fault.lose_next_post_dispatch_response(gate.clone());
+            }
+        }
+        Box::new(SqlitePostDispatchControl {
+            gate,
+            blocker: Mutex::new(Some(blocker)),
+        })
+    }
+}
+
+struct SqlitePostDispatchControl {
+    gate: FaultGate,
+    blocker: Mutex<Option<Connection>>,
+}
+
+#[async_trait]
+impl PostDispatchControl for SqlitePostDispatchControl {
+    async fn wait_dispatched(&self) {
+        self.gate.wait_reached().await;
+        self.gate.wait_armed().await;
+    }
+
+    async fn wait_waiter_cancelled(&self) {
+        self.gate.wait_cancelled().await;
+    }
+
+    async fn allow_provider_progress(&self) {
+        let blocker = self.blocker.lock().expect("post-dispatch blocker").take();
+        if let Some(blocker) = blocker {
+            tokio::task::spawn_blocking(move || {
+                blocker
+                    .execute_batch("ROLLBACK")
+                    .expect("release post-dispatch provider progress");
+            })
+            .await
+            .expect("release post-dispatch blocker");
+        }
+    }
+
+    async fn release_response(&self) {
+        self.gate.release().await;
+    }
+
+    async fn wait_inner_dropped(&self) {
+        self.gate.wait_inner_dropped().await;
+    }
 }
 
 mod conformance {
@@ -222,6 +309,8 @@ mod conformance {
     conformance_test!(same_revision_change_pages);
     conformance_test!(notification_delivery_faults);
     conformance_test!(atomic_commit);
+    conformance_test!(post_dispatch_cancel_waiter_reconciles);
+    conformance_test!(post_dispatch_response_loss_reconciles);
     conformance_test!(limits_before_io);
     conformance_test!(arbitrary_binary_payloads);
 
@@ -1112,6 +1201,188 @@ async fn sqlite_pagination_change_cursor_spans_one_revision_without_gaps() {
             .expect_err("change cursor from another store")
             .kind(),
         StateStoreErrorKind::InvalidRequest
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sqlite_change_poll_rejects_a_cursor_beyond_the_snapshot_high_watermark() {
+    let temp = TempDir::new().expect("temp dir");
+    let store = open_store(&temp, "fe-a").await;
+    let identity = store.identity().await.expect("store identity");
+    let baseline = store
+        .poll_changes(&ChangePollRequest {
+            after: None,
+            page_size: 10,
+        })
+        .await
+        .expect("baseline poll");
+    let future_revision = StoreRevision::try_from(Bytes::copy_from_slice(&100_u64.to_be_bytes()))
+        .expect("future revision token");
+    let future_cursor = ChangeCursor::new(identity.store_id, future_revision, u32::MAX)
+        .expect("future change cursor");
+
+    assert_eq!(
+        store
+            .poll_changes(&ChangePollRequest {
+                after: Some(future_cursor),
+                page_size: 10,
+            })
+            .await
+            .expect_err("future cursor must not swallow subsequent commits")
+            .kind(),
+        StateStoreErrorKind::InvalidRequest
+    );
+
+    let item = key(b"future-cursor-visible".to_vec());
+    let receipt = commit_puts(&store, &[(item.clone(), value(b"visible"))]).await;
+    let changes = store
+        .poll_changes(&ChangePollRequest {
+            after: Some(baseline.next_cursor),
+            page_size: 10,
+        })
+        .await
+        .expect("poll from valid baseline");
+    assert!(
+        changes
+            .hints
+            .iter()
+            .any(|hint| hint.key == item && hint.revision == receipt.revision)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sqlite_get_classifies_an_oversized_persisted_value_as_corruption() {
+    let temp = TempDir::new().expect("temp dir");
+    let store = open_store(&temp, "fe-a").await;
+    let item = key(b"oversized-value".to_vec());
+    let connection =
+        Connection::open(temp.path().join("state-store.sqlite")).expect("open fixture database");
+    connection
+        .execute(
+            "INSERT INTO state_store_kv(key, value, version) VALUES (?1, ?2, 1)",
+            params![item.as_bytes(), vec![7_u8; MAX_VALUE_BYTES + 1]],
+        )
+        .expect("inject oversized persisted value");
+    drop(connection);
+
+    let mut reader = store.begin_read().await.expect("begin corrupt value read");
+    assert_eq!(
+        reader
+            .get(&item)
+            .await
+            .expect_err("oversized persisted value")
+            .kind(),
+        StateStoreErrorKind::Corruption
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sqlite_get_classifies_a_malformed_persisted_version_as_corruption() {
+    let temp = TempDir::new().expect("temp dir");
+    let store = open_store(&temp, "fe-a").await;
+    let item = key(b"malformed-version".to_vec());
+    let connection =
+        Connection::open(temp.path().join("state-store.sqlite")).expect("open fixture database");
+    connection
+        .execute(
+            "INSERT INTO state_store_kv(key, value, version) VALUES (?1, ?2, ?3)",
+            params![
+                item.as_bytes(),
+                b"value".as_slice(),
+                b"not-an-integer".as_slice()
+            ],
+        )
+        .expect("inject malformed persisted version");
+    drop(connection);
+
+    let mut reader = store
+        .begin_read()
+        .await
+        .expect("begin corrupt version read");
+    assert_eq!(
+        reader
+            .get(&item)
+            .await
+            .expect_err("malformed persisted version")
+            .kind(),
+        StateStoreErrorKind::Corruption
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sqlite_range_classifies_an_oversized_persisted_key_as_corruption() {
+    let temp = TempDir::new().expect("temp dir");
+    let store = open_store(&temp, "fe-a").await;
+    let oversized_key = vec![b'm'; MAX_KEY_BYTES + 1];
+    let connection =
+        Connection::open(temp.path().join("state-store.sqlite")).expect("open fixture database");
+    connection
+        .execute(
+            "INSERT INTO state_store_kv(key, value, version) VALUES (?1, ?2, 1)",
+            params![oversized_key, b"value".as_slice()],
+        )
+        .expect("inject oversized persisted key");
+    drop(connection);
+
+    let mut reader = store.begin_read().await.expect("begin corrupt range read");
+    let request = RangeRequest {
+        range: KeyRange::new(key(b"m".to_vec()), key(b"n".to_vec())).expect("fixture range"),
+        direction: Direction::Forward,
+        page_size: 10,
+        continuation: None,
+    };
+    assert_eq!(
+        reader
+            .range(&request)
+            .await
+            .expect_err("oversized persisted range key")
+            .kind(),
+        StateStoreErrorKind::Corruption
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sqlite_change_poll_classifies_an_oversized_persisted_key_as_corruption() {
+    let temp = TempDir::new().expect("temp dir");
+    let store = open_store(&temp, "fe-a").await;
+    let oversized_key = vec![b'c'; MAX_KEY_BYTES + 1];
+    let connection =
+        Connection::open(temp.path().join("state-store.sqlite")).expect("open fixture database");
+    let transaction_id = Uuid::now_v7();
+    connection
+        .execute(
+            "INSERT INTO state_store_commits(transaction_id, revision, committed_at_ms) \
+             VALUES (?1, 1, 0)",
+            params![transaction_id.as_bytes()],
+        )
+        .expect("inject commit ledger row");
+    connection
+        .execute(
+            "INSERT INTO state_store_changes(revision, sequence, key) VALUES (1, 0, ?1)",
+            params![oversized_key],
+        )
+        .expect("inject oversized change key");
+    connection
+        .execute(
+            "UPDATE state_store_meta SET value = ?1 WHERE key = ?2",
+            params![
+                1_u64.to_be_bytes().as_slice(),
+                b"current_revision".as_slice()
+            ],
+        )
+        .expect("advance fixture high watermark");
+    drop(connection);
+
+    assert_eq!(
+        store
+            .poll_changes(&ChangePollRequest {
+                after: None,
+                page_size: 10,
+            })
+            .await
+            .expect_err("oversized persisted change key")
+            .kind(),
+        StateStoreErrorKind::Corruption
     );
 }
 

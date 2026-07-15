@@ -290,7 +290,6 @@ async fn fault_injecting_state_store_scripts_all_contract_boundaries() {
         ScriptedCommitResult::Conflict,
         ScriptedCommitResult::TransientBeforeCommit,
         ScriptedCommitResult::DefiniteFailure,
-        ScriptedCommitResult::CommitUnknown,
     ] {
         let transaction_id = Uuid::now_v7().into();
         let transaction = fault
@@ -311,10 +310,6 @@ async fn fault_injecting_state_store_scripts_all_contract_boundaries() {
                     | (
                         ScriptedCommitResult::DefiniteFailure,
                         CommitOutcome::DefiniteFailure(_)
-                    )
-                    | (
-                        ScriptedCommitResult::CommitUnknown,
-                        CommitOutcome::CommitUnknown(_)
                     )
             ),
             "unexpected injected outcome"

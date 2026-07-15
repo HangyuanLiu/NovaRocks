@@ -45,6 +45,9 @@ const FORBIDDEN_STATE_STORE_TOKENS: &[&str] = &[
     "apache_avro",
 ];
 
+const SQLITE_ONLY_EXTERNAL_OWNERS: &[&str] = &["fs2", "rusqlite"];
+const SQLITE_ONLY_FFI_TOKENS: &[&str] = &["SQLITE_BUSY", "SQLITE_BUSY_SNAPSHOT"];
+
 #[derive(Clone)]
 struct GuardSource {
     path: String,
@@ -97,6 +100,7 @@ fn state_store_boundary_violations(sources: &[GuardSource]) -> Vec<String> {
     for source in sources {
         let production = rust_sanitized_production_text(&source.text);
         let paths = rust_production_canonical_paths(&production, &source.path);
+        let production_tokens = rust_use_tokens(&production);
 
         if is_state_store_source(&source.path) {
             for path in &paths {
@@ -145,9 +149,42 @@ fn state_store_boundary_violations(sources: &[GuardSource]) -> Vec<String> {
                     path.join("::")
                 ));
             }
+
+            if is_state_store_source(&source.path) && !is_state_store_sqlite_source(&source.path) {
+                for owner in SQLITE_ONLY_EXTERNAL_OWNERS {
+                    if let Some(owner_index) = path.iter().position(|segment| segment == owner)
+                        && !declares_module(&production_tokens, owner)
+                    {
+                        violations.push(format!(
+                            "state-store-sqlite-external-outside-owner: {} -> {}",
+                            source.path,
+                            path[owner_index..].join("::")
+                        ));
+                    }
+                }
+            }
         }
 
-        let production_tokens = rust_use_tokens(&production);
+        if is_state_store_source(&source.path) && !is_state_store_sqlite_source(&source.path) {
+            for owner in SQLITE_ONLY_EXTERNAL_OWNERS {
+                if production_tokens.iter().any(|token| token == owner)
+                    && !declares_module(&production_tokens, owner)
+                {
+                    violations.push(format!(
+                        "state-store-sqlite-external-outside-owner: {} -> {owner}",
+                        source.path
+                    ));
+                }
+            }
+            for token in SQLITE_ONLY_FFI_TOKENS {
+                if production_tokens.iter().any(|actual| actual == token) {
+                    violations.push(format!(
+                        "state-store-sqlite-ffi-outside-owner: {} -> {token}",
+                        source.path
+                    ));
+                }
+            }
+        }
         if is_connector_source(&source.path)
             && paths.iter().any(|path| path.as_slice() == ["crate", "*"])
             && has_unqualified_path(&production_tokens, "state_store")
@@ -353,6 +390,59 @@ fn state_store_boundary_detector_allows_sqlite_adapter_internal_imports() {
             "pub use crate::state_store::sqlite::SqliteStateStore;",
         ),
     ];
+
+    assert!(state_store_boundary_violations(&sources).is_empty());
+}
+
+#[test]
+fn state_store_boundary_detector_rejects_sqlite_external_crates_and_ffi_tokens_outside_owner() {
+    let sources = [
+        GuardSource::new("src/state_store/contract.rs", "use rusqlite::Connection;"),
+        GuardSource::new(
+            "src/state_store/config.rs",
+            "use rusqlite::{Connection as Db, ffi::*};",
+        ),
+        GuardSource::new("src/state_store/runner.rs", "use fs2::FileExt as LockExt;"),
+        GuardSource::new(
+            "src/state_store/remote/mod.rs",
+            "use fs2::*; const CODE: i32 = SQLITE_BUSY_SNAPSHOT;",
+        ),
+        GuardSource::new(
+            "src/state_store/future_provider.rs",
+            "extern crate rusqlite as db; fn leak(_: db::Connection) {}",
+        ),
+        GuardSource::new(
+            "src/state_store/runner.rs",
+            "extern crate fs2 as locks; fn leak<T: locks::FileExt>() {}",
+        ),
+    ];
+
+    let violations = state_store_boundary_violations(&sources);
+    for (path, dependency) in [
+        ("src/state_store/contract.rs", "rusqlite::Connection"),
+        ("src/state_store/config.rs", "rusqlite::ffi::*"),
+        ("src/state_store/runner.rs", "fs2::FileExt"),
+        ("src/state_store/remote/mod.rs", "fs2::*"),
+        ("src/state_store/remote/mod.rs", "SQLITE_BUSY_SNAPSHOT"),
+        ("src/state_store/future_provider.rs", "rusqlite"),
+        ("src/state_store/runner.rs", "fs2"),
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(path) && violation.contains(dependency)),
+            "SQLite-only dependency escaped at {path}: {dependency}; violations={violations:?}"
+        );
+    }
+}
+
+#[test]
+fn state_store_boundary_detector_allows_sqlite_external_crates_and_ffi_tokens_in_owner() {
+    let sources = [GuardSource::new(
+        "src/state_store/sqlite/txn.rs",
+        "use rusqlite::{Connection, ffi::*}; use fs2::FileExt; \
+         const BUSY: i32 = SQLITE_BUSY; const SNAPSHOT: i32 = SQLITE_BUSY_SNAPSHOT;",
+    )];
 
     assert!(state_store_boundary_violations(&sources).is_empty());
 }

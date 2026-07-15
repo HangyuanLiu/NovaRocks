@@ -25,17 +25,70 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use novarocks::state_store::limits::MAX_KEY_BYTES;
 use novarocks::state_store::{
-    ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution, Direction, Key,
-    KeyRange, Precondition, RangePage, RangeRequest, ReadTransaction, StateRecord, StateStore,
-    StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
+    ChangeCursor, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution,
+    Direction, Key, KeyRange, Precondition, RangePage, RangeRequest, ReadTransaction, StateRecord,
+    StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
     StoreIdentity, TransactionId, Value, WriteTransaction,
 };
 use tokio::sync::{oneshot, watch};
 use uuid::Uuid;
 
-pub type StoreFuture =
-    Pin<Box<dyn Future<Output = Result<Arc<dyn StateStore>, StateStoreError>> + Send + 'static>>;
+pub type StoreFuture = Pin<
+    Box<
+        dyn Future<Output = Result<StateStoreConformanceFixture, StateStoreError>> + Send + 'static,
+    >,
+>;
 pub type StateStoreFactory = Arc<dyn Fn() -> StoreFuture + Send + Sync>;
+
+pub struct StateStoreConformanceFixture {
+    pub store: Arc<dyn StateStore>,
+    pub post_dispatch: Arc<dyn PostDispatchController>,
+}
+
+impl StateStoreConformanceFixture {
+    pub fn new(store: Arc<dyn StateStore>, post_dispatch: Arc<dyn PostDispatchController>) -> Self {
+        Self {
+            store,
+            post_dispatch,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PostDispatchScenario {
+    CancelWaiterBeforeApply,
+    LoseCommittedResponse,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExpectedTerminal {
+    Committed,
+    NotCommitted,
+    Either,
+}
+
+impl PostDispatchScenario {
+    pub const fn expected_terminal(self) -> ExpectedTerminal {
+        match self {
+            Self::CancelWaiterBeforeApply => ExpectedTerminal::Either,
+            Self::LoseCommittedResponse => ExpectedTerminal::Committed,
+        }
+    }
+}
+
+#[async_trait]
+pub trait PostDispatchController: Send + Sync {
+    async fn arm(&self, scenario: PostDispatchScenario) -> Box<dyn PostDispatchControl>;
+}
+
+#[async_trait]
+pub trait PostDispatchControl: Send + Sync {
+    async fn wait_dispatched(&self);
+    async fn wait_waiter_cancelled(&self);
+    async fn allow_provider_progress(&self);
+    async fn release_response(&self);
+    async fn wait_inner_dropped(&self);
+}
 
 pub async fn run_state_store_conformance(factory: StateStoreFactory) {
     snapshot_repeatable_read(&factory).await;
@@ -47,6 +100,8 @@ pub async fn run_state_store_conformance(factory: StateStoreFactory) {
     same_revision_change_pages(&factory).await;
     notification_delivery_faults(&factory).await;
     atomic_commit(&factory).await;
+    post_dispatch_cancel_waiter_reconciles(&factory).await;
+    post_dispatch_response_loss_reconciles(&factory).await;
     limits_before_io(&factory).await;
     arbitrary_binary_payloads(&factory).await;
 }
@@ -64,6 +119,10 @@ fn transaction_id() -> TransactionId {
 }
 
 async fn open(factory: &StateStoreFactory) -> Arc<dyn StateStore> {
+    open_fixture(factory).await.store
+}
+
+async fn open_fixture(factory: &StateStoreFactory) -> StateStoreConformanceFixture {
     factory().await.expect("open conformance state store")
 }
 
@@ -845,7 +904,6 @@ pub async fn atomic_commit(factory: &StateStoreFactory) {
             ScriptedCommitResult::TransientBeforeCommit,
         ),
         ("definite-failure", ScriptedCommitResult::DefiniteFailure),
-        ("commit-unknown", ScriptedCommitResult::CommitUnknown),
     ] {
         let transaction_id = transaction_id();
         let item = key(format!("c08/scripted-{suffix}").into_bytes());
@@ -874,10 +932,6 @@ pub async fn atomic_commit(factory: &StateStoreFactory) {
                     | (
                         ScriptedCommitResult::DefiniteFailure,
                         CommitOutcome::DefiniteFailure(_)
-                    )
-                    | (
-                        ScriptedCommitResult::CommitUnknown,
-                        CommitOutcome::CommitUnknown(_)
                     )
             ),
             "unexpected scripted failure outcome"
@@ -908,13 +962,186 @@ pub async fn atomic_commit(factory: &StateStoreFactory) {
     );
 }
 
+pub async fn post_dispatch_cancel_waiter_reconciles(factory: &StateStoreFactory) {
+    run_post_dispatch_scenario(factory, PostDispatchScenario::CancelWaiterBeforeApply).await;
+}
+
+pub async fn post_dispatch_response_loss_reconciles(factory: &StateStoreFactory) {
+    run_post_dispatch_scenario(factory, PostDispatchScenario::LoseCommittedResponse).await;
+}
+
+async fn run_post_dispatch_scenario(factory: &StateStoreFactory, scenario: PostDispatchScenario) {
+    let fixture = open_fixture(factory).await;
+    let store = fixture.store;
+    let control = fixture.post_dispatch.arm(scenario).await;
+    let baseline = store
+        .poll_changes(&ChangePollRequest {
+            after: None,
+            page_size: store.limits().max_page_size,
+        })
+        .await
+        .expect("poll post-dispatch baseline")
+        .next_cursor;
+    let transaction_id = transaction_id();
+    let item = key(match scenario {
+        PostDispatchScenario::CancelWaiterBeforeApply => b"c08/post-dispatch-cancel".to_vec(),
+        PostDispatchScenario::LoseCommittedResponse => b"c08/post-dispatch-response-loss".to_vec(),
+    });
+    let expected_value = value(b"authoritative".to_vec());
+    let mut transaction = store
+        .begin_write(transaction_id, "post-dispatch conformance")
+        .await
+        .expect("begin post-dispatch transaction");
+    transaction
+        .put(item.clone(), expected_value.clone(), Precondition::Any)
+        .await
+        .expect("stage post-dispatch transaction");
+    let waiter = tokio::spawn(async move { transaction.commit().await });
+    control.wait_dispatched().await;
+
+    let held_resolution = store
+        .resolve_commit(&transaction_id)
+        .await
+        .expect("resolve held post-dispatch commit");
+    assert!(
+        matches!(
+            (scenario.expected_terminal(), &held_resolution),
+            (_, CommitResolution::Unresolved)
+                | (ExpectedTerminal::Either, CommitResolution::Committed(_))
+                | (ExpectedTerminal::Either, CommitResolution::NotCommitted)
+                | (ExpectedTerminal::Committed, CommitResolution::Committed(_))
+                | (
+                    ExpectedTerminal::NotCommitted,
+                    CommitResolution::NotCommitted
+                )
+        ),
+        "post-dispatch hold exposed the wrong terminal: scenario={scenario:?}, resolution={held_resolution:?}"
+    );
+
+    let terminal = match scenario {
+        PostDispatchScenario::CancelWaiterBeforeApply => {
+            waiter.abort();
+            assert!(
+                waiter
+                    .await
+                    .expect_err("cancel post-dispatch waiter")
+                    .is_cancelled()
+            );
+            control.wait_waiter_cancelled().await;
+            control.release_response().await;
+            control.wait_inner_dropped().await;
+            control.allow_provider_progress().await;
+            let terminal =
+                await_expected_terminal(&store, transaction_id, scenario.expected_terminal()).await;
+            terminal
+        }
+        PostDispatchScenario::LoseCommittedResponse => {
+            control.allow_provider_progress().await;
+            let terminal =
+                await_expected_terminal(&store, transaction_id, scenario.expected_terminal()).await;
+            control.release_response().await;
+            assert!(matches!(
+                waiter.await.expect("join response-loss waiter"),
+                CommitOutcome::CommitUnknown(_)
+            ));
+            control.wait_inner_dropped().await;
+            terminal
+        }
+    };
+
+    assert_authoritative_terminal(
+        &store,
+        transaction_id,
+        &item,
+        &expected_value,
+        baseline,
+        &terminal,
+    )
+    .await;
+}
+
+async fn await_expected_terminal(
+    store: &Arc<dyn StateStore>,
+    transaction_id: TransactionId,
+    expected: ExpectedTerminal,
+) -> CommitResolution {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let resolution = store
+                .resolve_commit(&transaction_id)
+                .await
+                .expect("resolve post-dispatch commit");
+            match (&expected, &resolution) {
+                (ExpectedTerminal::Committed, CommitResolution::Committed(_))
+                | (ExpectedTerminal::NotCommitted, CommitResolution::NotCommitted) => {
+                    return resolution;
+                }
+                (ExpectedTerminal::Either, CommitResolution::Committed(_))
+                | (ExpectedTerminal::Either, CommitResolution::NotCommitted) => return resolution,
+                (_, CommitResolution::Unresolved) => tokio::task::yield_now().await,
+                _ => panic!(
+                    "post-dispatch commit reached wrong terminal: expected={expected:?}, actual={resolution:?}"
+                ),
+            }
+        }
+    })
+    .await
+    .expect("post-dispatch commit must reach a terminal state")
+}
+
+async fn assert_authoritative_terminal(
+    store: &Arc<dyn StateStore>,
+    transaction_id: TransactionId,
+    item: &Key,
+    expected_value: &Value,
+    baseline: ChangeCursor,
+    terminal: &CommitResolution,
+) {
+    let record = read_record(store, item).await;
+    let changes = store
+        .poll_changes(&ChangePollRequest {
+            after: Some(baseline),
+            page_size: store.limits().max_page_size,
+        })
+        .await
+        .expect("poll post-dispatch authoritative changes");
+    match terminal {
+        CommitResolution::Committed(receipt) => {
+            assert_eq!(
+                record.expect("committed post-dispatch record").value,
+                expected_value.clone()
+            );
+            assert!(
+                changes
+                    .hints
+                    .iter()
+                    .any(|hint| { hint.key == *item && hint.revision == receipt.revision })
+            );
+        }
+        CommitResolution::NotCommitted => {
+            assert_eq!(record, None);
+            assert!(changes.hints.iter().all(|hint| hint.key != *item));
+        }
+        CommitResolution::Unresolved => panic!("post-dispatch terminal stayed unresolved"),
+    }
+    for _ in 0..3 {
+        assert_eq!(
+            store
+                .resolve_commit(&transaction_id)
+                .await
+                .expect("repeat post-dispatch terminal"),
+            terminal.clone(),
+            "post-dispatch terminal must not regress"
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum ScriptedCommitResult {
     Committed,
     Conflict,
     TransientBeforeCommit,
     DefiniteFailure,
-    CommitUnknown,
 }
 
 #[derive(Clone)]
@@ -1012,9 +1239,14 @@ struct FaultScript {
     begin: Option<StateStoreError>,
     operation: Option<StateStoreError>,
     pre_commit: Option<ScriptedCommitResult>,
-    post_dispatch: Option<FaultGate>,
+    post_dispatch: Option<PostDispatchFault>,
     change_poll: Option<StateStoreError>,
     change_pages: VecDeque<ChangePage>,
+}
+
+struct PostDispatchFault {
+    gate: FaultGate,
+    lose_response: bool,
 }
 
 pub struct FaultInjectingStateStore {
@@ -1043,7 +1275,17 @@ impl FaultInjectingStateStore {
     }
 
     pub fn pause_next_post_dispatch(&self, gate: FaultGate) {
-        self.script.lock().expect("fault script").post_dispatch = Some(gate);
+        self.script.lock().expect("fault script").post_dispatch = Some(PostDispatchFault {
+            gate,
+            lose_response: false,
+        });
+    }
+
+    pub fn lose_next_post_dispatch_response(&self, gate: FaultGate) {
+        self.script.lock().expect("fault script").post_dispatch = Some(PostDispatchFault {
+            gate,
+            lose_response: true,
+        });
     }
 
     pub fn fail_next_change_poll(&self, error: StateStoreError) {
@@ -1143,7 +1385,6 @@ fn scripted_failure(result: ScriptedCommitResult) -> CommitOutcome {
             CommitOutcome::TransientBeforeCommit(error())
         }
         ScriptedCommitResult::DefiniteFailure => CommitOutcome::DefiniteFailure(error()),
-        ScriptedCommitResult::CommitUnknown => CommitOutcome::CommitUnknown(error()),
     }
 }
 
@@ -1213,9 +1454,11 @@ impl WriteTransaction for FaultWriteTransaction {
                 Err(error) => CommitOutcome::DefiniteFailure(error),
             };
         }
-        let Some(gate) = post_dispatch else {
+        let Some(post_dispatch) = post_dispatch else {
             return self.inner.commit().await;
         };
+        let gate = post_dispatch.gate;
+        let lose_response = post_dispatch.lose_response;
         let (outcome_tx, outcome_rx) = oneshot::channel();
         let supervisor_gate = gate.clone();
         tokio::spawn(async move {
@@ -1239,7 +1482,16 @@ impl WriteTransaction for FaultWriteTransaction {
                 Some(outcome) => outcome,
                 None => commit.await,
             };
-            let _ = outcome_tx.send(outcome);
+            supervisor_gate.publish_inner_dropped();
+            let delivered = if lose_response {
+                CommitOutcome::CommitUnknown(StateStoreError::new(
+                    StateStoreErrorKind::Internal,
+                    "state store commit response was lost after dispatch",
+                ))
+            } else {
+                outcome
+            };
+            let _ = outcome_tx.send(delivered);
         });
         let mut cancellation = FaultWaiterCancellation::new(gate);
         let outcome = outcome_rx.await.expect("fault commit supervisor");

@@ -36,6 +36,50 @@ const INITIAL_INCARNATION: u64 = 1;
 const INITIAL_REVISION: u64 = 0;
 const INITIAL_CHANGE_RETENTION_FLOOR: [u8; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff];
 
+const META_SCHEMA_SQL: &str = r#"
+    CREATE TABLE state_store_meta (
+        key BLOB PRIMARY KEY,
+        value BLOB NOT NULL
+    )
+"#;
+const KV_SCHEMA_SQL: &str = r#"
+    CREATE TABLE state_store_kv (
+        key BLOB PRIMARY KEY,
+        value BLOB NOT NULL,
+        version INTEGER NOT NULL
+    )
+"#;
+const CHANGES_SCHEMA_SQL: &str = r#"
+    CREATE TABLE state_store_changes (
+        revision INTEGER NOT NULL,
+        sequence INTEGER NOT NULL,
+        key BLOB NOT NULL,
+        PRIMARY KEY(revision, sequence)
+    )
+"#;
+const COMMITS_SCHEMA_SQL: &str = r#"
+    CREATE TABLE state_store_commits (
+        transaction_id BLOB PRIMARY KEY,
+        revision INTEGER NOT NULL,
+        committed_at_ms INTEGER NOT NULL
+    )
+"#;
+
+#[derive(Debug, Eq, PartialEq)]
+struct SchemaColumn {
+    name: String,
+    declared_type: String,
+    not_null: bool,
+    primary_key_position: i64,
+}
+
+const EXPECTED_TABLES: [(&str, &str); 4] = [
+    ("state_store_changes", CHANGES_SCHEMA_SQL),
+    ("state_store_commits", COMMITS_SCHEMA_SQL),
+    ("state_store_kv", KV_SCHEMA_SQL),
+    ("state_store_meta", META_SCHEMA_SQL),
+];
+
 pub(super) fn initialize(
     connection: &mut Connection,
     cluster_id: &[u8],
@@ -51,48 +95,23 @@ pub(super) fn initialize(
                 "failed to start SQLite initialization transaction",
             )
         })?;
-    transaction
-        .execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS state_store_meta (
-                key BLOB PRIMARY KEY,
-                value BLOB NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS state_store_kv (
-                key BLOB PRIMARY KEY,
-                value BLOB NOT NULL,
-                version INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS state_store_changes (
-                revision INTEGER NOT NULL,
-                sequence INTEGER NOT NULL,
-                key BLOB NOT NULL,
-                PRIMARY KEY(revision, sequence)
-            );
-
-            CREATE TABLE IF NOT EXISTS state_store_commits (
-                transaction_id BLOB PRIMARY KEY,
-                revision INTEGER NOT NULL,
-                committed_at_ms INTEGER NOT NULL
-            );
-            "#,
-        )
-        .map_err(|error| {
-            sqlite_error(
-                &error,
-                StateStoreErrorKind::Internal,
-                "failed to create SQLite state store schema",
-            )
-        })?;
-
-    let identity = match load_optional(&transaction, SCHEMA_VERSION_KEY)? {
-        None => initialize_identity(&transaction, cluster_id, deployment_owner, database_path)?,
-        Some(version) => {
-            validate_schema_version(&version)?;
-            load_identity(&transaction, cluster_id, deployment_owner, database_path)?
+    let existing_objects = state_store_objects(&transaction)?;
+    let identity = if existing_objects.is_empty() {
+        for (_, sql) in EXPECTED_TABLES {
+            transaction.execute_batch(sql).map_err(|error| {
+                sqlite_error(
+                    &error,
+                    StateStoreErrorKind::Internal,
+                    "failed to create SQLite state store schema",
+                )
+            })?;
         }
+        initialize_identity(&transaction, cluster_id, deployment_owner, database_path)?
+    } else {
+        validate_schema(&transaction, &existing_objects)?;
+        let version = load_required(&transaction, SCHEMA_VERSION_KEY)?;
+        validate_schema_version(&version)?;
+        load_identity(&transaction, cluster_id, deployment_owner, database_path)?
     };
     transaction.commit().map_err(|error| {
         sqlite_error(
@@ -102,6 +121,179 @@ pub(super) fn initialize(
         )
     })?;
     Ok(identity)
+}
+
+fn state_store_objects(
+    transaction: &Transaction<'_>,
+) -> Result<Vec<(String, String)>, StateStoreError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT name, type FROM sqlite_schema \
+             WHERE lower(name) GLOB 'state_store_*' ORDER BY name, type",
+        )
+        .map_err(|error| {
+            sqlite_error(
+                &error,
+                StateStoreErrorKind::Corruption,
+                "failed to inspect SQLite state store schema inventory",
+            )
+        })?;
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|error| {
+            sqlite_error(
+                &error,
+                StateStoreErrorKind::Corruption,
+                "failed to inspect SQLite state store schema inventory",
+            )
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| {
+            sqlite_error(
+                &error,
+                StateStoreErrorKind::Corruption,
+                "failed to inspect SQLite state store schema inventory",
+            )
+        })
+}
+
+fn validate_schema(
+    transaction: &Transaction<'_>,
+    objects: &[(String, String)],
+) -> Result<(), StateStoreError> {
+    let expected_objects = EXPECTED_TABLES
+        .iter()
+        .map(|(name, _)| ((*name).to_owned(), "table".to_owned()))
+        .collect::<Vec<_>>();
+    if objects != expected_objects {
+        return Err(schema_error(
+            "SQLite state store schema inventory is incomplete or unexpected",
+        ));
+    }
+
+    validate_table(
+        transaction,
+        "state_store_meta",
+        &[("key", "BLOB", false, 1), ("value", "BLOB", true, 0)],
+    )?;
+    validate_table_sql(transaction, "state_store_meta", META_SCHEMA_SQL)?;
+    validate_table(
+        transaction,
+        "state_store_kv",
+        &[
+            ("key", "BLOB", false, 1),
+            ("value", "BLOB", true, 0),
+            ("version", "INTEGER", true, 0),
+        ],
+    )?;
+    validate_table_sql(transaction, "state_store_kv", KV_SCHEMA_SQL)?;
+    validate_table(
+        transaction,
+        "state_store_changes",
+        &[
+            ("revision", "INTEGER", true, 1),
+            ("sequence", "INTEGER", true, 2),
+            ("key", "BLOB", true, 0),
+        ],
+    )?;
+    validate_table_sql(transaction, "state_store_changes", CHANGES_SCHEMA_SQL)?;
+    validate_table(
+        transaction,
+        "state_store_commits",
+        &[
+            ("transaction_id", "BLOB", false, 1),
+            ("revision", "INTEGER", true, 0),
+            ("committed_at_ms", "INTEGER", true, 0),
+        ],
+    )?;
+    validate_table_sql(transaction, "state_store_commits", COMMITS_SCHEMA_SQL)
+}
+
+fn validate_table_sql(
+    transaction: &Transaction<'_>,
+    table: &'static str,
+    expected: &str,
+) -> Result<(), StateStoreError> {
+    let actual = transaction
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+            params![table],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| {
+            sqlite_error(
+                &error,
+                StateStoreErrorKind::Corruption,
+                "failed to inspect SQLite state store table definition",
+            )
+        })?;
+    if normalize_schema_sql(&actual) != normalize_schema_sql(expected) {
+        return Err(schema_error(
+            "SQLite state store table constraints are malformed",
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_schema_sql(sql: &str) -> String {
+    sql.chars()
+        .filter(|character| !character.is_ascii_whitespace() && *character != ';')
+        .flat_map(char::to_uppercase)
+        .collect()
+}
+
+fn validate_table(
+    transaction: &Transaction<'_>,
+    table: &'static str,
+    expected: &[(&str, &str, bool, i64)],
+) -> Result<(), StateStoreError> {
+    let sql = format!("PRAGMA table_info({table})");
+    let mut statement = transaction.prepare(&sql).map_err(|error| {
+        sqlite_error(
+            &error,
+            StateStoreErrorKind::Corruption,
+            "failed to inspect SQLite state store table schema",
+        )
+    })?;
+    let actual = statement
+        .query_map([], |row| {
+            Ok(SchemaColumn {
+                name: row.get(1)?,
+                declared_type: row.get::<_, String>(2)?.to_ascii_uppercase(),
+                not_null: row.get::<_, i64>(3)? != 0,
+                primary_key_position: row.get(5)?,
+            })
+        })
+        .map_err(|error| {
+            sqlite_error(
+                &error,
+                StateStoreErrorKind::Corruption,
+                "failed to inspect SQLite state store table schema",
+            )
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| {
+            sqlite_error(
+                &error,
+                StateStoreErrorKind::Corruption,
+                "failed to inspect SQLite state store table schema",
+            )
+        })?;
+    let expected = expected
+        .iter()
+        .map(
+            |(name, declared_type, not_null, primary_key_position)| SchemaColumn {
+                name: (*name).to_owned(),
+                declared_type: (*declared_type).to_owned(),
+                not_null: *not_null,
+                primary_key_position: *primary_key_position,
+            },
+        )
+        .collect::<Vec<_>>();
+    if actual != expected {
+        return Err(schema_error("SQLite state store table schema is malformed"));
+    }
+    Ok(())
 }
 
 fn initialize_identity(

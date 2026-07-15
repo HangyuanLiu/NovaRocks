@@ -634,6 +634,138 @@ mod tests {
         assert_eq!(restarted.identity_snapshot(), &first_identity);
     }
 
+    #[test]
+    fn sqlite_open_rejects_missing_or_orphaned_state_store_tables() {
+        let runtime = runtime();
+
+        let missing_temp = TempDir::new().expect("missing-table temp dir");
+        let missing_path = missing_temp.path().join("state-store.sqlite");
+        let initialized = runtime
+            .block_on(SqliteStateStore::open(
+                config(&missing_path, "cluster-a", "fe-a"),
+                deployment(1),
+            ))
+            .expect("initialize complete store");
+        drop(initialized);
+        Connection::open(&missing_path)
+            .expect("open missing-table store")
+            .execute_batch("DROP TABLE state_store_kv")
+            .expect("drop durable KV table");
+        assert_eq!(
+            open_error(
+                &runtime,
+                config(&missing_path, "cluster-a", "fe-a"),
+                deployment(1)
+            )
+            .kind(),
+            StateStoreErrorKind::Corruption
+        );
+
+        let orphan_temp = TempDir::new().expect("orphan-table temp dir");
+        let orphan_path = orphan_temp.path().join("state-store.sqlite");
+        Connection::open(&orphan_path)
+            .expect("open orphan store")
+            .execute_batch(
+                "CREATE TABLE state_store_kv (key BLOB PRIMARY KEY, value BLOB NOT NULL, version INTEGER NOT NULL);",
+            )
+            .expect("create orphan KV table");
+        assert_eq!(
+            open_error(
+                &runtime,
+                config(&orphan_path, "cluster-a", "fe-a"),
+                deployment(1)
+            )
+            .kind(),
+            StateStoreErrorKind::Corruption
+        );
+
+        let extra_temp = TempDir::new().expect("extra-table temp dir");
+        let extra_path = extra_temp.path().join("state-store.sqlite");
+        let initialized = runtime
+            .block_on(SqliteStateStore::open(
+                config(&extra_path, "cluster-a", "fe-a"),
+                deployment(1),
+            ))
+            .expect("initialize store for extra table");
+        drop(initialized);
+        Connection::open(&extra_path)
+            .expect("open extra-table store")
+            .execute_batch("CREATE TABLE state_store_unexpected (key BLOB PRIMARY KEY)")
+            .expect("create unexpected state store table");
+        assert_eq!(
+            open_error(
+                &runtime,
+                config(&extra_path, "cluster-a", "fe-a"),
+                deployment(1)
+            )
+            .kind(),
+            StateStoreErrorKind::Corruption
+        );
+    }
+
+    #[test]
+    fn sqlite_open_rejects_malformed_state_store_columns_and_primary_keys() {
+        let temp = TempDir::new().expect("malformed-schema temp dir");
+        let path = temp.path().join("state-store.sqlite");
+        let runtime = runtime();
+        let initialized = runtime
+            .block_on(SqliteStateStore::open(
+                config(&path, "cluster-a", "fe-a"),
+                deployment(1),
+            ))
+            .expect("initialize complete store");
+        drop(initialized);
+
+        Connection::open(&path)
+            .expect("open malformed store")
+            .execute_batch(
+                "DROP TABLE state_store_changes;\
+                 CREATE TABLE state_store_changes (\
+                   revision INTEGER NOT NULL,\
+                   sequence INTEGER NOT NULL,\
+                   key TEXT,\
+                   PRIMARY KEY(sequence, revision)\
+                 );",
+            )
+            .expect("replace change table with malformed schema");
+
+        assert_eq!(
+            open_error(&runtime, config(&path, "cluster-a", "fe-a"), deployment(1)).kind(),
+            StateStoreErrorKind::Corruption
+        );
+    }
+
+    #[test]
+    fn sqlite_open_rejects_unexpected_state_store_table_constraints() {
+        let temp = TempDir::new().expect("constraint-schema temp dir");
+        let path = temp.path().join("state-store.sqlite");
+        let runtime = runtime();
+        let initialized = runtime
+            .block_on(SqliteStateStore::open(
+                config(&path, "cluster-a", "fe-a"),
+                deployment(1),
+            ))
+            .expect("initialize complete store");
+        drop(initialized);
+
+        Connection::open(&path)
+            .expect("open constrained store")
+            .execute_batch(
+                "DROP TABLE state_store_kv;\
+                 CREATE TABLE state_store_kv (\
+                   key BLOB PRIMARY KEY,\
+                   value BLOB NOT NULL UNIQUE CHECK(length(value) = 0),\
+                   version INTEGER NOT NULL\
+                 );",
+            )
+            .expect("replace KV table with unexpected constraints");
+
+        assert_eq!(
+            open_error(&runtime, config(&path, "cluster-a", "fe-a"), deployment(1)).kind(),
+            StateStoreErrorKind::Corruption
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn sqlite_open_preserves_tagged_non_utf8_native_path_identity() {

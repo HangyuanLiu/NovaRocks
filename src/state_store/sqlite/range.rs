@@ -22,20 +22,20 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use bytes::Bytes;
 use rusqlite::{Connection, params};
 
 use crate::state_store::{
     ChangeCursor, ChangeHint, ChangePage, ChangePollRequest, Direction, Key, RangePage,
     RangeRequest, StateRecord, StateStoreError, StateStoreErrorKind, StateStoreMetrics,
-    StoreIdentity, StoreRevision, Value,
+    StoreIdentity, StoreRevision,
 };
 
 use super::open_connection;
 use super::schema::load_change_retention_floor;
 use super::txn::{
-    Mutation, SqliteTxnState, load_current_revision, operation_error, range_refill_completed,
-    range_refill_started, revision_token, revision_version,
+    Mutation, SqliteTxnState, load_current_revision, operation_error, persisted_key,
+    persisted_row_error, persisted_value, range_refill_completed, range_refill_started,
+    revision_token, revision_version,
 };
 
 struct BaseWindow {
@@ -235,12 +235,12 @@ fn query_base(
     };
     rows.map(|row| {
         let (key, value, version) = row.map_err(|error| {
-            operation_error(&error, "failed to decode bounded SQLite range row")
+            persisted_row_error(&error, "failed to decode bounded SQLite range row")
         })?;
         let version = u64::try_from(version).map_err(|_| malformed_revision())?;
         Ok(StateRecord {
-            key: Key::try_from(Bytes::from(key))?,
-            value: Value::try_from(Bytes::from(value))?,
+            key: persisted_key(key)?,
+            value: persisted_value(value)?,
             version: revision_version(version),
         })
     })
@@ -317,6 +317,13 @@ fn poll_changes_blocking(
     let retention_floor = load_change_retention_floor(&connection, high_watermark)?;
     let start = decoded_after.unwrap_or((0, u32::MAX));
 
+    if start.0 > high_watermark {
+        connection.execute_batch("ROLLBACK").map_err(|error| {
+            operation_error(&error, "failed to finish SQLite change polling snapshot")
+        })?;
+        return Err(invalid_change_request());
+    }
+
     if start < retention_floor {
         connection.execute_batch("ROLLBACK").map_err(|error| {
             operation_error(&error, "failed to finish SQLite change polling snapshot")
@@ -374,7 +381,7 @@ fn poll_changes_blocking(
     let mut decoded = Vec::with_capacity(request.page_size + 1);
     for row in rows {
         let (revision, sequence, key, committed_at_ms) = row.map_err(|error| {
-            operation_error(&error, "failed to decode bounded SQLite change row")
+            persisted_row_error(&error, "failed to decode bounded SQLite change row")
         })?;
         let revision = u64::try_from(revision).map_err(|_| malformed_revision())?;
         let sequence = u32::try_from(sequence).map_err(|_| malformed_sequence())?;
@@ -399,7 +406,7 @@ fn poll_changes_blocking(
         ));
         hints.push(ChangeHint {
             revision: revision_token(revision),
-            key: Key::try_from(Bytes::from(key))?,
+            key: persisted_key(key)?,
         });
         last_position = Some((revision, sequence));
     }

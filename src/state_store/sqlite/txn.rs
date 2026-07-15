@@ -129,6 +129,8 @@ pub(super) struct TestHookState {
     range_after_refill: Mutex<Option<TestGate>>,
     range_refill_count: AtomicUsize,
     fail_next_operation_worker: AtomicBool,
+    panic_next_commit_before_apply: AtomicBool,
+    panic_next_commit_after_apply: AtomicBool,
 }
 
 #[cfg(test)]
@@ -188,6 +190,24 @@ impl TestHookState {
             .take()
         {
             gate.pause();
+        }
+    }
+
+    fn panic_commit_before_apply(&self) {
+        if self
+            .panic_next_commit_before_apply
+            .swap(false, Ordering::AcqRel)
+        {
+            panic!("injected SQLite commit worker failure before apply");
+        }
+    }
+
+    fn panic_commit_after_apply(&self) {
+        if self
+            .panic_next_commit_after_apply
+            .swap(false, Ordering::AcqRel)
+        {
+            panic!("injected SQLite commit worker failure after apply");
         }
     }
 
@@ -580,31 +600,59 @@ impl SqliteWriteTransaction {
         let registry = Arc::clone(&self.commit_registry);
         let transaction_id = self.transaction_id;
         let path = self.path.clone();
+        let recovery_registry = Arc::clone(&registry);
+        let recovery_path = path.clone();
         #[cfg(test)]
         let test_hooks = Arc::clone(&self.test_hooks);
         let mut cancel_guard = CancelOnDrop::new(&owner);
         let mut worker = tokio::task::spawn_blocking(move || {
             #[cfg(test)]
-            test_hooks.pause_commit_after_inflight();
+            {
+                test_hooks.pause_commit_after_inflight();
+                test_hooks.panic_commit_before_apply();
+            }
             let outcome = match state.lock() {
                 Ok(mut state) => commit_blocking(&mut state, transaction_id, &path),
                 Err(_) => CommitOutcome::CommitUnknown(internal_error()),
             };
+            #[cfg(test)]
+            test_hooks.panic_commit_after_apply();
             finalize_registry(&registry, transaction_id, &outcome);
             outcome
         });
 
         let deadline = tokio::time::Instant::from_std(owner.deadline);
         let outcome = match tokio::time::timeout_at(deadline, &mut worker).await {
-            Ok(joined) => joined.unwrap_or_else(|_| {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => {
                 owner.metrics.record_blocking_failure();
+                cancel_guard.disarm();
+                drop(owner);
+                recover_commit_after_worker_failure(
+                    recovery_path,
+                    recovery_registry,
+                    transaction_id,
+                )
+                .await;
                 CommitOutcome::CommitUnknown(worker_error())
-            }),
+            }
             Err(_) => {
                 cancel_guard.cancel();
-                worker
-                    .await
-                    .unwrap_or_else(|_| CommitOutcome::CommitUnknown(worker_error()))
+                match worker.await {
+                    Ok(outcome) => outcome,
+                    Err(_) => {
+                        owner.metrics.record_blocking_failure();
+                        cancel_guard.disarm();
+                        drop(owner);
+                        recover_commit_after_worker_failure(
+                            recovery_path,
+                            recovery_registry,
+                            transaction_id,
+                        )
+                        .await;
+                        return CommitOutcome::CommitUnknown(worker_error());
+                    }
+                }
             }
         };
         cancel_guard.disarm();
@@ -617,6 +665,46 @@ impl SqliteWriteTransaction {
 
     fn take_owner(&mut self) -> Result<TxnOwner, StateStoreError> {
         self.owner.take().ok_or_else(transaction_finished)
+    }
+}
+
+async fn recover_commit_after_worker_failure(
+    path: PathBuf,
+    registry: CommitRegistry,
+    transaction_id: TransactionId,
+) {
+    let recovery_registry = Arc::clone(&registry);
+    let recovery = tokio::task::spawn_blocking(move || {
+        let terminal = match lookup_commit(&path, transaction_id) {
+            Ok(Some(receipt)) => Some(CommitRegistryState::Committed(receipt)),
+            Ok(None) => Some(CommitRegistryState::NotCommitted),
+            Err(_) => None,
+        };
+        if let Ok(mut registry) = recovery_registry.lock()
+            && matches!(
+                registry.get(&transaction_id),
+                Some(CommitRegistryState::InFlight)
+            )
+        {
+            match terminal {
+                Some(terminal) => {
+                    registry.insert(transaction_id, terminal);
+                }
+                None => {
+                    registry.remove(&transaction_id);
+                }
+            }
+        }
+    })
+    .await;
+    if recovery.is_err()
+        && let Ok(mut registry) = registry.lock()
+        && matches!(
+            registry.get(&transaction_id),
+            Some(CommitRegistryState::InFlight)
+        )
+    {
+        registry.remove(&transaction_id);
     }
 }
 
@@ -1334,12 +1422,12 @@ fn load_record(connection: &Connection, key: &Key) -> Result<Option<StateRecord>
             |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
         )
         .optional()
-        .map_err(|error| operation_error(&error, "failed to read SQLite state record"))?;
+        .map_err(|error| persisted_row_error(&error, "failed to read SQLite state record"))?;
     row.map(|(value, version)| {
         let version = u64::try_from(version).map_err(|_| corruption_error())?;
         Ok(StateRecord {
             key: key.clone(),
-            value: Value::try_from(Bytes::from(value))?,
+            value: persisted_value(value)?,
             version: revision_version(version),
         })
     })
@@ -1585,6 +1673,29 @@ pub(super) fn operation_error(error: &rusqlite::Error, message: &'static str) ->
     StateStoreError::new(kind, message)
 }
 
+pub(super) fn persisted_row_error(
+    error: &rusqlite::Error,
+    message: &'static str,
+) -> StateStoreError {
+    if matches!(
+        error,
+        rusqlite::Error::InvalidColumnType(..)
+            | rusqlite::Error::FromSqlConversionFailure(..)
+            | rusqlite::Error::IntegralValueOutOfRange(..)
+    ) {
+        return persisted_corruption();
+    }
+    operation_error(error, message)
+}
+
+pub(super) fn persisted_key(bytes: Vec<u8>) -> Result<Key, StateStoreError> {
+    Key::try_from(Bytes::from(bytes)).map_err(|_| persisted_corruption())
+}
+
+pub(super) fn persisted_value(bytes: Vec<u8>) -> Result<Value, StateStoreError> {
+    Value::try_from(Bytes::from(bytes)).map_err(|_| persisted_corruption())
+}
+
 pub(super) fn revision_token(revision: u64) -> StoreRevision {
     StoreRevision::try_from(Bytes::copy_from_slice(&revision.to_be_bytes()))
         .expect("u64 revision is non-empty")
@@ -1639,6 +1750,13 @@ const fn corruption_error() -> StateStoreError {
     StateStoreError::new(
         StateStoreErrorKind::Corruption,
         "SQLite state store revision is malformed",
+    )
+}
+
+const fn persisted_corruption() -> StateStoreError {
+    StateStoreError::new(
+        StateStoreErrorKind::Corruption,
+        "SQLite persisted state record is malformed",
     )
 }
 
@@ -2643,6 +2761,93 @@ mod tests {
                 .expect("resolve committed transaction"),
             CommitResolution::Committed(receipt)
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sqlite_commit_worker_panic_before_apply_recovers_not_committed() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = store(&temp).await;
+        let transaction_id = transaction_id();
+        let item = key(b"panic-before-apply");
+        let durable_before = durable_state_counts(&store).await;
+        let mut transaction = store
+            .begin_write(transaction_id)
+            .await
+            .expect("begin transaction");
+        transaction
+            .put(item.clone(), value(b"must-not-apply"), Precondition::Any)
+            .await
+            .expect("stage transaction");
+        store
+            .test_hooks
+            .panic_next_commit_before_apply
+            .store(true, Ordering::Release);
+
+        assert!(matches!(
+            transaction.commit().await,
+            CommitOutcome::CommitUnknown(_)
+        ));
+        for _ in 0..3 {
+            assert_eq!(
+                store
+                    .resolve_commit(&transaction_id)
+                    .await
+                    .expect("resolve failed commit worker"),
+                CommitResolution::NotCommitted
+            );
+        }
+        assert_eq!(read_value(&store, &item).await, None);
+        assert_eq!(durable_state_counts(&store).await, durable_before);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sqlite_commit_worker_panic_after_apply_recovers_committed() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = store(&temp).await;
+        let transaction_id = transaction_id();
+        let item = key(b"panic-after-apply");
+        let mut transaction = store
+            .begin_write(transaction_id)
+            .await
+            .expect("begin transaction");
+        transaction
+            .put(item.clone(), value(b"must-apply-once"), Precondition::Any)
+            .await
+            .expect("stage transaction");
+        store
+            .test_hooks
+            .panic_next_commit_after_apply
+            .store(true, Ordering::Release);
+
+        assert!(matches!(
+            transaction.commit().await,
+            CommitOutcome::CommitUnknown(_)
+        ));
+        let receipt = match store
+            .resolve_commit(&transaction_id)
+            .await
+            .expect("resolve committed worker failure")
+        {
+            CommitResolution::Committed(receipt) => receipt,
+            other => panic!("committed worker failure must recover immediately: {other:?}"),
+        };
+        for _ in 0..3 {
+            assert_eq!(
+                store
+                    .resolve_commit(&transaction_id)
+                    .await
+                    .expect("repeat committed resolution"),
+                CommitResolution::Committed(receipt.clone())
+            );
+        }
+        assert_eq!(
+            read_value(&store, &item)
+                .await
+                .expect("committed row")
+                .value,
+            value(b"must-apply-once")
+        );
+        assert_eq!(durable_state_counts(&store).await, (1, 1, 1, 1));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
