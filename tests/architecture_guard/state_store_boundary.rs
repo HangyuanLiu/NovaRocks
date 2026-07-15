@@ -667,8 +667,11 @@ fn state_store_boundary_detector_rejects_foundationdb_runtime_forbidden_apis() {
         "directory",
         "fallback",
     ] {
+        let expected_suffix = format!(" -> {token}");
         assert!(
-            violations.iter().any(|violation| violation.contains(token)),
+            violations
+                .iter()
+                .any(|violation| violation.ends_with(&expected_suffix)),
             "forbidden FoundationDB runtime token escaped: {token}; violations={violations:?}"
         );
     }

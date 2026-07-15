@@ -287,15 +287,22 @@ fn foundationdb_config_client_debug_redacts_paths_and_password_environment_name(
 
 #[test]
 fn foundationdb_config_loads_complete_tls_client_configuration() -> anyhow::Result<()> {
-    let cluster_file = tempfile::NamedTempFile::new()?;
-    let tls_cert = tempfile::NamedTempFile::new()?;
-    let tls_key = tempfile::NamedTempFile::new()?;
-    let tls_ca = tempfile::NamedTempFile::new()?;
-    let config_path = tempfile::NamedTempFile::new()?;
-    let password_env = format!(
-        "NOVAROCKS_TEST_FDB_TLS_PASSWORD_{}",
-        Uuid::new_v4().simple()
-    );
+    const FIXTURE_ENV: &str = "NOVAROCKS_TEST_FDB_TLS_CONFIG_FIXTURE";
+    const PASSWORD_ENV: &str = "NOVAROCKS_TEST_FDB_TLS_PASSWORD";
+
+    if let Some(config_path) = std::env::var_os(FIXTURE_ENV) {
+        return assert_complete_tls_client_configuration(PathBuf::from(config_path), PASSWORD_ENV);
+    }
+
+    let fixture_dir = tempfile::tempdir()?;
+    let cluster_file = fixture_dir.path().join("fdb.cluster");
+    let tls_cert = fixture_dir.path().join("client.crt");
+    let tls_key = fixture_dir.path().join("client.key");
+    let tls_ca = fixture_dir.path().join("ca.crt");
+    let config_path = fixture_dir.path().join("novarocks.toml");
+    for path in [&cluster_file, &tls_cert, &tls_key, &tls_ca] {
+        std::fs::write(path, b"")?;
+    }
     let config_text = format!(
         r#"
 [state_store]
@@ -312,49 +319,65 @@ tls_ca_path = "{}"
 tls_verify_peers = "Check.Valid=1"
 tls_password_env = "{}"
 "#,
-        cluster_file.path().display(),
-        tls_cert.path().display(),
-        tls_key.path().display(),
-        tls_ca.path().display(),
-        password_env,
+        cluster_file.display(),
+        tls_cert.display(),
+        tls_key.display(),
+        tls_ca.display(),
+        PASSWORD_ENV,
     );
-    std::fs::write(config_path.path(), config_text)?;
+    std::fs::write(&config_path, config_text)?;
 
-    // SAFETY: the unique variable name prevents interference with concurrently running tests.
-    unsafe { std::env::set_var(&password_env, "test-password") };
-    let load_result =
-        novarocks::common::app_config::NovaRocksConfig::load_from_file(config_path.path());
-    // SAFETY: restore the process environment immediately after the load that consumes it.
-    unsafe { std::env::remove_var(&password_env) };
-    let loaded = load_result?;
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .arg("--exact")
+        .arg("foundationdb_config_loads_complete_tls_client_configuration")
+        .arg("--nocapture")
+        .env(FIXTURE_ENV, &config_path)
+        .env(PASSWORD_ENV, "test-password")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "isolated TLS config test failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+fn assert_complete_tls_client_configuration(
+    config_path: PathBuf,
+    password_env: &str,
+) -> anyhow::Result<()> {
+    let fixture_dir = config_path.parent().expect("fixture directory");
+    let cluster_file = fixture_dir.join("fdb.cluster");
+    let tls_cert = fixture_dir.join("client.crt");
+    let tls_key = fixture_dir.join("client.key");
+    let tls_ca = fixture_dir.join("ca.crt");
+    let loaded = novarocks::common::app_config::NovaRocksConfig::load_from_file(&config_path)?;
 
     let state_store = loaded.state_store.expect("state store config");
     assert!(matches!(
         state_store.provider,
         StateStoreProviderConfig::Foundationdb { cluster_file: loaded, keyspace_id }
-            if loaded == cluster_file.path()
+            if loaded == cluster_file
                 && keyspace_id == Uuid::parse_str("22db595e-3031-48eb-8212-f56d3626ee41")?
     ));
 
     let client = loaded
         .foundationdb_client
         .expect("FoundationDB client config");
-    assert_eq!(client.tls_cert_path.as_deref(), Some(tls_cert.path()));
-    assert_eq!(client.tls_key_path.as_deref(), Some(tls_key.path()));
-    assert_eq!(client.tls_ca_path.as_deref(), Some(tls_ca.path()));
+    assert_eq!(client.tls_cert_path.as_deref(), Some(tls_cert.as_path()));
+    assert_eq!(client.tls_key_path.as_deref(), Some(tls_key.as_path()));
+    assert_eq!(client.tls_ca_path.as_deref(), Some(tls_ca.as_path()));
     assert_eq!(client.tls_verify_peers.as_deref(), Some("Check.Valid=1"));
-    assert_eq!(
-        client.tls_password_env.as_deref(),
-        Some(password_env.as_str())
-    );
+    assert_eq!(client.tls_password_env.as_deref(), Some(password_env));
 
     let debug = format!("{client:?}");
     for secret in [
-        tls_cert.path().to_string_lossy().as_ref(),
-        tls_key.path().to_string_lossy().as_ref(),
-        tls_ca.path().to_string_lossy().as_ref(),
+        tls_cert.to_string_lossy().as_ref(),
+        tls_key.to_string_lossy().as_ref(),
+        tls_ca.to_string_lossy().as_ref(),
         "Check.Valid=1",
-        password_env.as_str(),
+        password_env,
     ] {
         assert!(!debug.contains(secret), "Debug leaked {secret}: {debug}");
     }
