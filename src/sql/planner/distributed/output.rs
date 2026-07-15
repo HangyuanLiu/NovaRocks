@@ -74,7 +74,8 @@ use std::fmt;
 
 use arrow::datatypes::DataType;
 
-use crate::sql::analysis::{ExprKind, OutputColumn};
+use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
+use crate::sql::catalog::ColumnDef;
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::expr::JoinKind;
 use crate::sql::planner::payload::{
@@ -86,8 +87,10 @@ use crate::types::aggregate::infer_agg_function_types;
 use super::boundary::{
     BoundaryCatalog, BoundaryContract, ExecutionColumnId, ExecutionColumnIdAllocator,
 };
+use super::write::change_stream::IcebergChangeStreamBranchRoute;
+use super::write::sink::{IcebergWriteFragmentSink, IcebergWriteInputBinding};
 use super::{
-    DataSink, DistributedNode, DistributedNodeKind, ExchangeReceiver, FragmentEdge,
+    DataPartition, DataSink, DistributedNode, DistributedNodeKind, ExchangeReceiver, FragmentEdge,
     FragmentEdgeKind, FragmentId, PlanFragment,
 };
 
@@ -848,8 +851,9 @@ fn assign_occurrences(
 // back) on an inconsistency.
 //
 // Iceberg write fragment outputs (their target-schema output columns/exprs) are
-// deliberately excluded: CGO-9C Task 3 owns them, and the encoder keeps its own
-// write-output path.
+// finalized separately by CGO-9C Task 3's `WriteContractCatalog` (see the write
+// contract section below), which the encoder likewise maps 1:1; the encoder's own
+// write-output synthesis path has been removed.
 
 /// Finalized fragment output columns and per-stream-edge projections for a
 /// sealed distributed plan. The native encoder reads both verbatim.
@@ -1596,6 +1600,380 @@ fn find_exchange_receiver(node: &DistributedNode, node_id: i32) -> Option<&Excha
         .find_map(|child| find_exchange_receiver(child, node_id))
 }
 
+// ===========================================================================
+// CGO-9C Task 3: Iceberg write output/target-schema + change-stream router
+// branch partition finalization
+// ===========================================================================
+//
+// Where [`NodeOutputCatalog`] and [`FragmentEdgeOutputCatalog`] finalize the
+// query-path node and fragment/edge wire schemas, this catalog finalizes the
+// two write-path semantic facts the native encoder used to *synthesize* or
+// *reconstruct* at encode time:
+//
+//   * every Iceberg write fragment's output expressions and target output
+//     schema (the encoder's `encode_iceberg_write_sink_output_columns` and its
+//     `output_exprs`/input-binding fallback), and
+//   * every change-stream router branch's typed partition expression (the
+//     encoder rebuilt this from `output_partition_ordinals` against the router
+//     fragment's output columns at encode time).
+//
+// Both are computed here from the sealed fragments and their sinks, so the
+// encoder maps the finalized contract 1:1 rather than synthesizing a schema or
+// reconstructing a partition from ordinals. This is a faithful, planner-typed
+// successor of the encoder's removed write-output synthesis and router
+// ordinal->expression reconstruction: it fails fast (rather than falling back)
+// on an inconsistency. The `output_partition_ordinals` still travel on the wire
+// unchanged (mapped 1:1 by the encoder); only the semantic reconstruction moves
+// here.
+//
+// This finalization depends only on the sealed fragments/sinks. Unlike the
+// query-path catalogs it allocates no new [`ExecutionColumnId`] occurrences: the
+// write output expressions and router partition expressions reference existing
+// logical [`ColumnId`]s, and the target schema carries positional target-field
+// ids, not occurrences. The Iceberg write *input* occurrences it would need are
+// already numbered by the boundary catalog's `IcebergWriteInput` /
+// `ChangeStreamRouterInput` contracts.
+
+/// One column of a finalized Iceberg write sink's target output schema.
+///
+/// Unlike a [`NodeExecutionColumn`] or [`OutputColumn`], `column_id` here is the
+/// write's positional target-field id (the 1-based ordinal of the column within
+/// the target columns), not a logical [`ColumnId`] occurrence: it is the wire id
+/// the write sink's output schema carries, matching the target table's field
+/// positions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FinalizedWriteTargetColumn {
+    pub column_id: u32,
+    pub name: String,
+    pub data_type: DataType,
+    pub nullable: bool,
+    pub is_internal: bool,
+}
+
+/// The finalized output contract of an Iceberg write fragment: the expressions
+/// the fragment feeds into its write sink, and the sink's target output schema.
+/// The native encoder maps both 1:1.
+#[derive(Clone, Debug)]
+pub(crate) struct IcebergWriteOutputContract {
+    /// The write output expressions, evaluated against the fragment's execution
+    /// output. Always populated: either the fragment's declared `output_exprs`
+    /// (validated against the target arity) or, when the fragment declares none,
+    /// column references into the sink's bound input columns (the encoder's
+    /// removed input-binding fallback).
+    pub output_exprs: Vec<TypedExpr>,
+    /// The write sink's target output schema, carrying positional target-field
+    /// ids. Reproduces the encoder's removed `encode_iceberg_write_sink_output_columns`.
+    pub target_schema: Vec<FinalizedWriteTargetColumn>,
+}
+
+/// Finalized write-path contracts for a sealed distributed plan: Iceberg write
+/// fragment outputs and change-stream router branch partitions. The native
+/// encoder reads both instead of synthesizing/reconstructing them.
+///
+/// (`TypedExpr` / `DataPartition` carry an arrow `DataType` and do not implement
+/// `Eq`, so this catalog is `Clone, Debug` only, like [`FragmentEdgeOutputCatalog`].)
+#[derive(Clone, Debug)]
+pub(crate) struct WriteContractCatalog {
+    /// Finalized Iceberg write output/target-schema, keyed by fragment id. Only
+    /// `DataSink::IcebergWrite` fragments are present.
+    iceberg_write_outputs: BTreeMap<FragmentId, IcebergWriteOutputContract>,
+    /// Finalized change-stream router branch partition, keyed by the router
+    /// fragment id and the branch id. Only `DataSink::IcebergChangeStreamRouter`
+    /// fragments contribute entries.
+    router_branch_partitions: BTreeMap<(FragmentId, i32), DataPartition>,
+}
+
+impl WriteContractCatalog {
+    /// The finalized write output/target-schema of the Iceberg write fragment
+    /// identified by `fragment_id`, or `None` for a non-write fragment.
+    pub(crate) fn iceberg_write_output(
+        &self,
+        fragment_id: FragmentId,
+    ) -> Option<&IcebergWriteOutputContract> {
+        self.iceberg_write_outputs.get(&fragment_id)
+    }
+
+    /// The finalized partition of the change-stream router branch identified by
+    /// `(fragment_id, branch_id)`, or `None` if that fragment is not a router or
+    /// the branch id is unknown.
+    pub(crate) fn router_branch_partition(
+        &self,
+        fragment_id: FragmentId,
+        branch_id: i32,
+    ) -> Option<&DataPartition> {
+        self.router_branch_partitions.get(&(fragment_id, branch_id))
+    }
+}
+
+/// A reason write-contract finalization refused to seal the plan. Each arm
+/// reproduces a fail-fast the native encoder performed while synthesizing the
+/// write output or reconstructing a router partition.
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::sql::planner::distributed) enum WriteContractError {
+    /// An Iceberg write fragment declares `output_exprs` whose count does not
+    /// match the sink's target column count. Mirrors the encoder's arity check.
+    WriteOutputExprArity {
+        fragment_id: FragmentId,
+        output_exprs: usize,
+        target_columns: usize,
+    },
+    /// An Iceberg write fragment declares no `output_exprs`, and its sink-bound
+    /// input column count does not match the sink's target column count. Mirrors
+    /// the encoder's input-binding arity check.
+    WriteInputArity {
+        fragment_id: FragmentId,
+        input_columns: usize,
+        target_columns: usize,
+    },
+    /// An Iceberg write sink `OutputOrdinals` binding references a fragment
+    /// output ordinal that does not exist. Mirrors the encoder's fallback
+    /// out-of-range check (the boundary catalog also rejects this earlier at
+    /// seal; this is the defensive twin for the write finalization).
+    WriteInputOrdinalOutOfRange {
+        fragment_id: FragmentId,
+        ordinal: usize,
+        available: usize,
+    },
+    /// A write sink target column count overflows the positional wire id space.
+    WriteTargetColumnIdOverflow {
+        fragment_id: FragmentId,
+        ordinal: usize,
+    },
+    /// A change-stream router branch partition ordinal references a router
+    /// fragment output column that does not exist. Mirrors the encoder's
+    /// ordinal->expression reconstruction out-of-range check.
+    RouterPartitionOrdinalOutOfRange {
+        fragment_id: FragmentId,
+        branch_id: i32,
+        ordinal: usize,
+        available: usize,
+    },
+}
+
+impl fmt::Display for WriteContractError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WriteOutputExprArity {
+                fragment_id,
+                output_exprs,
+                target_columns,
+            } => write!(
+                formatter,
+                "distributed plan Iceberg write fragment id={fragment_id} output_exprs count {output_exprs} does not match target column count {target_columns}"
+            ),
+            Self::WriteInputArity {
+                fragment_id,
+                input_columns,
+                target_columns,
+            } => write!(
+                formatter,
+                "distributed plan Iceberg write fragment id={fragment_id} sink input column count {input_columns} does not match target column count {target_columns}"
+            ),
+            Self::WriteInputOrdinalOutOfRange {
+                fragment_id,
+                ordinal,
+                available,
+            } => write!(
+                formatter,
+                "distributed plan Iceberg write fragment id={fragment_id} sink input references output ordinal {ordinal} but only {available} output columns exist"
+            ),
+            Self::WriteTargetColumnIdOverflow {
+                fragment_id,
+                ordinal,
+            } => write!(
+                formatter,
+                "distributed plan Iceberg write fragment id={fragment_id} target column ordinal {ordinal} overflows the wire column id space"
+            ),
+            Self::RouterPartitionOrdinalOutOfRange {
+                fragment_id,
+                branch_id,
+                ordinal,
+                available,
+            } => write!(
+                formatter,
+                "distributed plan change-stream router fragment id={fragment_id} branch {branch_id} partition references output ordinal {ordinal} but only {available} output columns exist"
+            ),
+        }
+    }
+}
+
+/// Derive the write-path finalization catalog from the sealed fragments.
+///
+/// Runs inside `seal_draft` after the boundary/node/fragment-edge catalogs. It
+/// only *derives* from the fragments' sinks and output columns/exprs, and fails
+/// fast on any inconsistency; it never synthesizes a schema, reconstructs a
+/// partition from ordinals against a guessed source, or falls back.
+pub(in crate::sql::planner::distributed) fn build_write_contract_catalog(
+    fragments: &[PlanFragment],
+) -> Result<WriteContractCatalog, WriteContractError> {
+    let mut iceberg_write_outputs = BTreeMap::new();
+    let mut router_branch_partitions = BTreeMap::new();
+
+    for fragment in fragments {
+        match &fragment.sink {
+            DataSink::IcebergWrite(sink) => {
+                let contract = finalize_iceberg_write_output(fragment, sink)?;
+                iceberg_write_outputs.insert(fragment.fragment_id, contract);
+            }
+            DataSink::IcebergChangeStreamRouter(router) => {
+                for branch in &router.branches {
+                    let partition = finalize_router_branch_partition(fragment, branch)?;
+                    router_branch_partitions
+                        .insert((fragment.fragment_id, branch.branch_id), partition);
+                }
+            }
+            DataSink::Result | DataSink::Noop => {}
+        }
+    }
+
+    Ok(WriteContractCatalog {
+        iceberg_write_outputs,
+        router_branch_partitions,
+    })
+}
+
+/// Finalize an Iceberg write fragment's output expressions and target schema,
+/// reproducing the encoder's removed write-output synthesis.
+fn finalize_iceberg_write_output(
+    fragment: &PlanFragment,
+    sink: &IcebergWriteFragmentSink,
+) -> Result<IcebergWriteOutputContract, WriteContractError> {
+    let target_columns = &sink.spec.target_columns;
+    // The write output expressions: the fragment's declared `output_exprs` when
+    // present (validated against the target arity), otherwise column references
+    // into the sink's bound input columns. This is the planner-side twin of the
+    // encoder's `output_exprs`/input-binding branch.
+    let output_exprs = match fragment.output_exprs.as_ref() {
+        Some(exprs) => {
+            if exprs.len() != target_columns.len() {
+                return Err(WriteContractError::WriteOutputExprArity {
+                    fragment_id: fragment.fragment_id,
+                    output_exprs: exprs.len(),
+                    target_columns: target_columns.len(),
+                });
+            }
+            exprs.clone()
+        }
+        None => {
+            let input_columns = iceberg_write_input_columns(
+                fragment.fragment_id,
+                &fragment.output_columns,
+                &sink.input,
+            )?;
+            if input_columns.len() != target_columns.len() {
+                return Err(WriteContractError::WriteInputArity {
+                    fragment_id: fragment.fragment_id,
+                    input_columns: input_columns.len(),
+                    target_columns: target_columns.len(),
+                });
+            }
+            input_columns.into_iter().map(column_ref_expr).collect()
+        }
+    };
+
+    let target_schema = finalize_write_target_schema(fragment.fragment_id, target_columns)?;
+    Ok(IcebergWriteOutputContract {
+        output_exprs,
+        target_schema,
+    })
+}
+
+/// Select the fragment output columns that feed the write sink, per its input
+/// binding. Planner-side twin of the encoder's removed
+/// `iceberg_write_sink_columns_for_input`.
+fn iceberg_write_input_columns<'a>(
+    fragment_id: FragmentId,
+    output_columns: &'a [OutputColumn],
+    input: &IcebergWriteInputBinding,
+) -> Result<Vec<&'a OutputColumn>, WriteContractError> {
+    match input {
+        IcebergWriteInputBinding::RootOutputByOrdinal => Ok(output_columns.iter().collect()),
+        IcebergWriteInputBinding::OutputOrdinals(ordinals) => ordinals
+            .iter()
+            .copied()
+            .map(|ordinal| {
+                output_columns
+                    .get(ordinal)
+                    .ok_or(WriteContractError::WriteInputOrdinalOutOfRange {
+                        fragment_id,
+                        ordinal,
+                        available: output_columns.len(),
+                    })
+            })
+            .collect(),
+    }
+}
+
+/// Finalize the write sink's target output schema. Positional target-field ids
+/// are assigned as `ordinal + 1`, reproducing the encoder's removed
+/// `encode_iceberg_write_sink_output_columns`.
+fn finalize_write_target_schema(
+    fragment_id: FragmentId,
+    target_columns: &[ColumnDef],
+) -> Result<Vec<FinalizedWriteTargetColumn>, WriteContractError> {
+    target_columns
+        .iter()
+        .enumerate()
+        .map(|(idx, column)| {
+            let column_id = idx
+                .checked_add(1)
+                .and_then(|ordinal| u32::try_from(ordinal).ok())
+                .ok_or(WriteContractError::WriteTargetColumnIdOverflow {
+                    fragment_id,
+                    ordinal: idx,
+                })?;
+            Ok(FinalizedWriteTargetColumn {
+                column_id,
+                name: column.name.clone(),
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+                is_internal: false,
+            })
+        })
+        .collect()
+}
+
+/// Finalize a change-stream router branch's partition from the router fragment's
+/// output columns and the branch's partition ordinals. Planner-side successor of
+/// the encoder's removed ordinal->expression reconstruction: an empty ordinal
+/// list is unpartitioned, otherwise a hash partition over column references into
+/// the router fragment's output columns.
+fn finalize_router_branch_partition(
+    fragment: &PlanFragment,
+    branch: &IcebergChangeStreamBranchRoute,
+) -> Result<DataPartition, WriteContractError> {
+    if branch.output_partition_ordinals.is_empty() {
+        return Ok(DataPartition::unpartitioned());
+    }
+    let mut exprs = Vec::with_capacity(branch.output_partition_ordinals.len());
+    for ordinal in &branch.output_partition_ordinals {
+        let column = fragment.output_columns.get(*ordinal).ok_or(
+            WriteContractError::RouterPartitionOrdinalOutOfRange {
+                fragment_id: fragment.fragment_id,
+                branch_id: branch.branch_id,
+                ordinal: *ordinal,
+                available: fragment.output_columns.len(),
+            },
+        )?;
+        exprs.push(column_ref_expr(column));
+    }
+    Ok(DataPartition::hash(exprs))
+}
+
+/// A typed column-reference expression for an output column. Planner-side twin
+/// of the encoder's removed `column_ref_expr_for_output_column`.
+fn column_ref_expr(column: &OutputColumn) -> TypedExpr {
+    TypedExpr {
+        kind: ExprKind::ColumnRef {
+            column_id: column.column_id,
+            qualifier: None,
+            column: column.name.clone(),
+        },
+        data_type: column.data_type.clone(),
+        nullable: column.nullable,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::DataType;
@@ -1603,13 +1981,21 @@ mod tests {
     use super::NodeExecutionKind;
     use crate::runtime_filter::model::graph::RuntimeFilterGraph;
     use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
-    use crate::sql::catalog::{ScanSource, TableDef};
+    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::common::ChangeStreamBranchKind;
     use crate::sql::planner::distributed::test_support::DistributedPlanDraftBuilder;
+    use crate::sql::planner::distributed::write::change_stream::{
+        IcebergChangeStreamBranchRoute, IcebergChangeStreamRouterSink,
+    };
+    use crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec;
+    use crate::sql::planner::distributed::write::sink::{
+        IcebergWriteFragmentSink, IcebergWriteInputBinding,
+    };
     use crate::sql::planner::distributed::{
         DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan,
         ExchangeFlavor, ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
-        PlanFragment,
+        PartitionKind, PlanFragment,
     };
     use crate::sql::planner::payload::{
         PlanProjectNode, PlanScanNode, PlanSortNode, PlanValuesNode,
@@ -2674,5 +3060,333 @@ mod tests {
         )
         .expect("resolve stream edge output columns");
         assert_eq!(column_ids(&resolved), vec![2, 4, 1, 3]);
+    }
+
+    // ---- CGO-9C Task 3: Iceberg write output/target-schema + router partition ----
+
+    fn target_column(name: &str, data_type: DataType, nullable: bool) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type,
+            nullable,
+            write_default: None,
+            logical_type: None,
+        }
+    }
+
+    /// A single write fragment (root sink `IcebergWrite`) with the given output
+    /// columns, sink input binding, and target columns.
+    fn write_fragment(
+        output_columns: Vec<OutputColumn>,
+        output_exprs: Option<Vec<TypedExpr>>,
+        input: IcebergWriteInputBinding,
+        target_columns: Vec<ColumnDef>,
+    ) -> PlanFragment {
+        let mut spec = simple_sink_spec();
+        spec.target_columns = target_columns;
+        PlanFragment {
+            fragment_id: 0,
+            root: values_node(10, output_columns.clone()),
+            data_partition: DataPartition::unpartitioned(),
+            output_partition: DataPartition::unpartitioned(),
+            sink: DataSink::IcebergWrite(IcebergWriteFragmentSink {
+                descriptor_database: "test_db".to_string(),
+                spec,
+                input,
+            }),
+            output_exprs,
+            output_columns,
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        }
+    }
+
+    /// A single router fragment (root sink `IcebergChangeStreamRouter`) with the
+    /// given output columns and branch routes, and no writer edges (mirrors the
+    /// encoder's single-fragment router fixture, which seals with vacuous edges).
+    fn router_fragment(
+        output_columns: Vec<OutputColumn>,
+        branches: Vec<IcebergChangeStreamBranchRoute>,
+    ) -> PlanFragment {
+        PlanFragment {
+            fragment_id: 0,
+            root: values_node(10, output_columns.clone()),
+            data_partition: DataPartition::unpartitioned(),
+            output_partition: DataPartition::unpartitioned(),
+            sink: DataSink::IcebergChangeStreamRouter(IcebergChangeStreamRouterSink {
+                group_id: 0,
+                change_op_output_ordinal: 0,
+                data_route_output_ordinal: Some(1),
+                branches,
+            }),
+            output_exprs: None,
+            output_columns,
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        }
+    }
+
+    fn branch_route(
+        branch_id: i32,
+        output_ordinals: Vec<usize>,
+        output_partition_ordinals: Vec<usize>,
+    ) -> IcebergChangeStreamBranchRoute {
+        IcebergChangeStreamBranchRoute {
+            branch_id,
+            branch_kind: ChangeStreamBranchKind::DeleteDv,
+            target_fragment_id: 1,
+            target_exchange_node_id: 20,
+            output_ordinals,
+            output_partition_ordinals,
+        }
+    }
+
+    fn column_ref_id(expr: &TypedExpr) -> u32 {
+        match &expr.kind {
+            ExprKind::ColumnRef { column_id, .. } => column_id.0,
+            other => panic!("expected column ref expr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_contract_rejects_output_expr_arity_mismatch() {
+        // Declared `output_exprs` whose count differs from the target columns must
+        // fail fast, reproducing the encoder's arity check.
+        let fragment = write_fragment(
+            vec![output_col(1, "a"), output_col(2, "b")],
+            Some(vec![super::column_ref_expr(&output_col(1, "a"))]),
+            IcebergWriteInputBinding::RootOutputByOrdinal,
+            vec![
+                target_column("a", DataType::Int64, false),
+                target_column("b", DataType::Int64, false),
+            ],
+        );
+        let error = super::build_write_contract_catalog(std::slice::from_ref(&fragment))
+            .expect_err("output_exprs arity mismatch must not finalize");
+        assert_eq!(
+            error,
+            super::WriteContractError::WriteOutputExprArity {
+                fragment_id: 0,
+                output_exprs: 1,
+                target_columns: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn write_contract_rejects_input_arity_mismatch() {
+        // With no declared `output_exprs`, a bound input column count that differs
+        // from the target columns must fail fast (encoder's input-binding check).
+        let fragment = write_fragment(
+            vec![output_col(1, "a"), output_col(2, "b")],
+            None,
+            IcebergWriteInputBinding::RootOutputByOrdinal,
+            vec![target_column("a", DataType::Int64, false)],
+        );
+        let error = super::build_write_contract_catalog(std::slice::from_ref(&fragment))
+            .expect_err("input arity mismatch must not finalize");
+        assert_eq!(
+            error,
+            super::WriteContractError::WriteInputArity {
+                fragment_id: 0,
+                input_columns: 2,
+                target_columns: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn write_contract_rejects_out_of_range_input_ordinal() {
+        // An `OutputOrdinals` binding referencing a nonexistent fragment output
+        // column must fail fast (the defensive twin of the encoder's check; the
+        // boundary catalog also rejects this earlier through a full seal).
+        let fragment = write_fragment(
+            vec![output_col(1, "a")],
+            None,
+            IcebergWriteInputBinding::OutputOrdinals(vec![5]),
+            vec![target_column("a", DataType::Int64, false)],
+        );
+        let error = super::build_write_contract_catalog(std::slice::from_ref(&fragment))
+            .expect_err("out-of-range input ordinal must not finalize");
+        assert_eq!(
+            error,
+            super::WriteContractError::WriteInputOrdinalOutOfRange {
+                fragment_id: 0,
+                ordinal: 5,
+                available: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn write_contract_rejects_out_of_range_router_partition_ordinal() {
+        // A router branch partition ordinal outside the router fragment output
+        // must fail fast, reproducing the encoder's reconstruction check.
+        let fragment = router_fragment(
+            vec![
+                output_col(1, "op"),
+                output_col(2, "route"),
+                output_col(3, "bucket"),
+            ],
+            vec![branch_route(0, vec![2], vec![5])],
+        );
+        let error = super::build_write_contract_catalog(std::slice::from_ref(&fragment))
+            .expect_err("out-of-range router partition ordinal must not finalize");
+        assert_eq!(
+            error,
+            super::WriteContractError::RouterPartitionOrdinalOutOfRange {
+                fragment_id: 0,
+                branch_id: 0,
+                ordinal: 5,
+                available: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn seal_finalizes_write_output_exprs_and_positional_target_schema() {
+        // RootOutputByOrdinal: the write output expressions are column refs into
+        // the fragment output columns (real logical ids), and the target schema
+        // carries positional 1-based ids with the target column metadata.
+        let plan = DistributedPlanDraftBuilder::new(
+            vec![write_fragment(
+                vec![output_col(7, "a"), output_col(9, "b")],
+                None,
+                IcebergWriteInputBinding::RootOutputByOrdinal,
+                vec![
+                    target_column("ta", DataType::Int32, false),
+                    target_column("tb", DataType::Int64, true),
+                ],
+            )],
+            Some(0),
+            Vec::new(),
+            RuntimeFilterGraph::default(),
+        )
+        .seal()
+        .expect("write plan seals");
+
+        let contract = plan
+            .write_contracts()
+            .iceberg_write_output(0)
+            .expect("write fragment has a finalized contract");
+        assert_eq!(
+            contract
+                .output_exprs
+                .iter()
+                .map(column_ref_id)
+                .collect::<Vec<_>>(),
+            vec![7, 9]
+        );
+        assert_eq!(
+            contract.target_schema,
+            vec![
+                super::FinalizedWriteTargetColumn {
+                    column_id: 1,
+                    name: "ta".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    is_internal: false,
+                },
+                super::FinalizedWriteTargetColumn {
+                    column_id: 2,
+                    name: "tb".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn seal_finalizes_write_output_exprs_by_output_ordinals() {
+        // OutputOrdinals reorders the fragment output columns feeding the sink;
+        // the finalized output expressions follow that order.
+        let plan = DistributedPlanDraftBuilder::new(
+            vec![write_fragment(
+                vec![output_col(7, "a"), output_col(9, "b")],
+                None,
+                IcebergWriteInputBinding::OutputOrdinals(vec![1, 0]),
+                vec![
+                    target_column("ta", DataType::Int64, false),
+                    target_column("tb", DataType::Int64, false),
+                ],
+            )],
+            Some(0),
+            Vec::new(),
+            RuntimeFilterGraph::default(),
+        )
+        .seal()
+        .expect("write plan seals");
+
+        let contract = plan
+            .write_contracts()
+            .iceberg_write_output(0)
+            .expect("write fragment has a finalized contract");
+        assert_eq!(
+            contract
+                .output_exprs
+                .iter()
+                .map(column_ref_id)
+                .collect::<Vec<_>>(),
+            vec![9, 7]
+        );
+    }
+
+    #[test]
+    fn seal_finalizes_router_branch_partition_from_fragment_output_columns() {
+        // A non-empty partition ordinal list becomes a hash partition over column
+        // refs into the router fragment output columns; an empty list is
+        // unpartitioned.
+        let plan = DistributedPlanDraftBuilder::new(
+            vec![router_fragment(
+                vec![
+                    output_col(1, "op"),
+                    output_col(2, "route"),
+                    output_col(3, "bucket"),
+                ],
+                vec![
+                    branch_route(0, vec![2], vec![2]),
+                    branch_route(1, vec![2], Vec::new()),
+                ],
+            )],
+            Some(0),
+            Vec::new(),
+            RuntimeFilterGraph::default(),
+        )
+        .seal()
+        .expect("router plan seals");
+
+        let hashed = plan
+            .write_contracts()
+            .router_branch_partition(0, 0)
+            .expect("branch 0 has a finalized partition");
+        assert!(matches!(hashed.kind, PartitionKind::Hash));
+        assert_eq!(
+            hashed.exprs.iter().map(column_ref_id).collect::<Vec<_>>(),
+            vec![3]
+        );
+
+        let unpartitioned = plan
+            .write_contracts()
+            .router_branch_partition(0, 1)
+            .expect("branch 1 has a finalized partition");
+        assert!(matches!(unpartitioned.kind, PartitionKind::Unpartitioned));
+        assert!(unpartitioned.exprs.is_empty());
+    }
+
+    #[test]
+    fn write_contract_catalog_is_empty_for_a_result_plan() {
+        let plan = seal_single_fragment(
+            values_node(10, vec![output_col(1, "a")]),
+            vec![output_col(1, "a")],
+        )
+        .expect("result plan seals");
+        assert!(plan.write_contracts().iceberg_write_output(0).is_none());
+        assert!(
+            plan.write_contracts()
+                .router_branch_partition(0, 0)
+                .is_none()
+        );
     }
 }

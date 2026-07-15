@@ -6636,6 +6636,7 @@ fn planner_distributed_core_has_stage_namespace() {
             "pub(crate)|output::FragmentEdgeOutputCatalog".to_string(),
             "pub(crate)|output::NodeExecutionColumn".to_string(),
             "pub(crate)|output::NodeOutputCatalog".to_string(),
+            "pub(crate)|output::WriteContractCatalog".to_string(),
             "pub(crate)|seal::DistributedPlan".to_string(),
         ]),
         "distributed/mod.rs must expose exactly the distributed core surface"

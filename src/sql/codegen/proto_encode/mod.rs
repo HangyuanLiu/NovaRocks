@@ -1182,7 +1182,21 @@ mod tests {
             cte_exchange_nodes: Vec::new(),
         };
 
-        let encoded = plan::encode_plan_fragment(&fragment).expect("encode fragment");
+        // The write output/target-schema is finalized in the sealed plan
+        // (CGO-9C Task 3), so encode through a sealed distributed plan rather than
+        // the bare fragment helper: the encoder maps the finalized contract 1:1.
+        let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
+            fragments: vec![fragment],
+            root_fragment_id: 0,
+            runtime_filter_graph: RuntimeFilterGraph::default(),
+            edges: Vec::new(),
+        };
+        let encoded_plan = plan::encode_distributed_plan(&plan).expect("encode distributed plan");
+        let encoded = encoded_plan
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == 0)
+            .expect("write fragment");
 
         assert_eq!(encoded.output_exprs.len(), 2);
         let encoded_ids = encoded
@@ -1462,6 +1476,7 @@ mod tests {
                 scan_bindings: Some(&bindings),
                 node_outputs: None,
                 fragment_edge_outputs: None,
+                write_contracts: None,
             },
         )
         .expect("encode StarRocks native scan source");
@@ -1572,6 +1587,7 @@ mod tests {
                 scan_bindings: Some(&bindings),
                 node_outputs: None,
                 fragment_edge_outputs: None,
+                write_contracts: None,
             },
         )
         .expect_err("mismatched builder descriptor must fail");
@@ -1678,6 +1694,7 @@ mod tests {
                     scan_bindings: Some(&bindings),
                     node_outputs: None,
                     fragment_edge_outputs: None,
+                    write_contracts: None,
                 },
             )
             .expect_err("invalid StarRocks source must fail");

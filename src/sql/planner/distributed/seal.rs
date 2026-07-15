@@ -25,8 +25,9 @@ use super::boundary::{
 };
 use super::fragment::{DistributedPlanDraft, FragmentEdge, FragmentId, PlanFragment};
 use super::output::{
-    FragmentEdgeOutputCatalog, NodeOutputCatalog, NodeOutputError,
-    build_fragment_edge_output_catalog, build_node_output_catalog,
+    FragmentEdgeOutputCatalog, NodeOutputCatalog, NodeOutputError, WriteContractCatalog,
+    WriteContractError, build_fragment_edge_output_catalog, build_node_output_catalog,
+    build_write_contract_catalog,
 };
 use super::topology::{TopologyContract, TopologyError, build_topology_contract};
 use super::validation::{self, DistributedPlanValidationError};
@@ -51,6 +52,11 @@ struct DistributedPlanData {
     // Authoritative fragment output columns and stream-edge projections derived
     // at seal time. The native encoder maps these 1:1.
     fragment_edge_outputs: FragmentEdgeOutputCatalog,
+    // Authoritative Iceberg write output/target-schema and change-stream router
+    // branch partitions derived at seal time. The native encoder maps these 1:1
+    // instead of synthesizing the write output or reconstructing a router
+    // partition from ordinals.
+    write_contracts: WriteContractCatalog,
 }
 
 #[derive(Clone, Debug)]
@@ -106,6 +112,14 @@ impl DistributedPlan {
     pub(crate) fn fragment_edge_outputs(&self) -> &FragmentEdgeOutputCatalog {
         &self.data.fragment_edge_outputs
     }
+
+    // Consumed by the native encoder (CGO-9C Task 3), which maps each Iceberg
+    // write fragment's finalized output expressions/target schema and each
+    // change-stream router branch's finalized partition 1:1 instead of
+    // synthesizing the write output or reconstructing a partition from ordinals.
+    pub(crate) fn write_contracts(&self) -> &WriteContractCatalog {
+        &self.data.write_contracts
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -118,6 +132,7 @@ pub(in crate::sql::planner::distributed) enum DistributedPlanSealError {
     Boundary(BoundaryError),
     Topology(TopologyError),
     NodeOutput(NodeOutputError),
+    WriteContract(WriteContractError),
 }
 
 impl fmt::Display for DistributedPlanSealError {
@@ -136,6 +151,7 @@ impl fmt::Display for DistributedPlanSealError {
             Self::Boundary(error) => error.fmt(formatter),
             Self::Topology(error) => error.fmt(formatter),
             Self::NodeOutput(error) => error.fmt(formatter),
+            Self::WriteContract(error) => error.fmt(formatter),
         }
     }
 }
@@ -205,6 +221,14 @@ pub(in crate::sql::planner::distributed) fn seal_draft(
     let fragment_edge_outputs =
         build_fragment_edge_output_catalog(&fragments, &edges, &node_outputs)
             .map_err(DistributedPlanSealError::NodeOutput)?;
+    // Finalize the write-path semantics the native encoder used to synthesize or
+    // reconstruct at encode time: each Iceberg write fragment's output
+    // expressions and target output schema, and each change-stream router
+    // branch's typed partition. Derives purely from the sealed fragments' sinks
+    // and output columns/exprs and fails fast rather than falling back; the
+    // encoder maps the result 1:1.
+    let write_contracts = build_write_contract_catalog(&fragments)
+        .map_err(DistributedPlanSealError::WriteContract)?;
     Ok(DistributedPlan {
         data: DistributedPlanData {
             fragments,
@@ -216,6 +240,7 @@ pub(in crate::sql::planner::distributed) fn seal_draft(
             topology,
             node_outputs,
             fragment_edge_outputs,
+            write_contracts,
         },
     })
 }

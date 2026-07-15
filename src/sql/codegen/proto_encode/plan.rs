@@ -29,7 +29,11 @@ use crate::coordinator::prepare::scan::{
     ResolvedScanBinding, ResolvedScanColumnKind, ResolvedScanExecution, ScanExecutionBindings,
 };
 use crate::proto::{common, plan};
-use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, TypedExpr};
+use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
+// Consumed only by `#[cfg(test)]` encoder fixtures (the production write/router
+// encoding reads finalized planner types, not these analysis constructors).
+#[cfg(test)]
+use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::catalog;
 use crate::sql::codegen::scan::connector::{
     StarRocksColumnSchemaDescriptor, StarRocksKeysTypeDescriptor, StarRocksScanSourceDescriptor,
@@ -48,6 +52,7 @@ use crate::sql::planner::distributed::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor,
     ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentEdgeOutputCatalog,
     FragmentStreamKind, NodeExecutionColumn, NodeOutputCatalog, PartitionKind, PlanFragment,
+    WriteContractCatalog,
 };
 use crate::sql::planner::payload::{AggregateCall, PlanRowCountAssertion};
 use crate::sql::planner::physical::{
@@ -71,6 +76,14 @@ pub(crate) struct NativePlanEncodeContext<'a> {
     /// re-deriving a stream schema or patching the exchange receiver. `None` only
     /// in bare-node/bare-fragment encoder unit tests that have no sealed plan.
     pub(crate) fragment_edge_outputs: Option<&'a FragmentEdgeOutputCatalog>,
+    /// The sealed Iceberg write output / change-stream router partition contract
+    /// (CGO-9C Task 3). The encoder maps each Iceberg write fragment's finalized
+    /// output expressions and target output schema, and each change-stream router
+    /// branch's finalized partition, from here instead of synthesizing the write
+    /// output or reconstructing a partition from `output_partition_ordinals`.
+    /// `None` only in bare-node/bare-fragment encoder unit tests, which never
+    /// encode a write or router fragment.
+    pub(crate) write_contracts: Option<&'a WriteContractCatalog>,
 }
 
 #[cfg(test)]
@@ -84,6 +97,7 @@ pub(crate) fn encode_distributed_plan(
             // Both bound from the sealed plan inside encode_distributed_plan_with_context.
             node_outputs: None,
             fragment_edge_outputs: None,
+            write_contracts: None,
         },
     )
 }
@@ -100,6 +114,7 @@ pub(crate) fn encode_distributed_plan_with_context(
         scan_bindings: ctx.scan_bindings,
         node_outputs: Some(src.node_outputs()),
         fragment_edge_outputs: Some(src.fragment_edge_outputs()),
+        write_contracts: Some(src.write_contracts()),
     };
     let mut fragments = src
         .fragments()
@@ -474,22 +489,6 @@ fn allocate_project_boundary_synthetic_column_id(
     Ok(synthetic)
 }
 
-/// Encode a single fragment with no sealed fragment/edge contract. Only valid
-/// for fragments whose output contract is catalog-independent (Iceberg write
-/// fragments, whose output schema comes from the sink spec); a non-write fragment
-/// requires the sealed contract and is exercised through the full-plan path.
-#[cfg(test)]
-pub(crate) fn encode_plan_fragment(src: &PlanFragment) -> Result<plan::PlanFragment, String> {
-    encode_plan_fragment_with_context(
-        src,
-        &NativePlanEncodeContext {
-            scan_bindings: None,
-            node_outputs: None,
-            fragment_edge_outputs: None,
-        },
-    )
-}
-
 fn encode_plan_fragment_with_context(
     src: &PlanFragment,
     ctx: &NativePlanEncodeContext<'_>,
@@ -501,7 +500,7 @@ fn encode_plan_fragment_with_context(
         root: Some(root),
         data_partition: Some(encode_data_partition(&src.data_partition)?),
         output_partition: Some(encode_data_partition(&src.output_partition)?),
-        sink: Some(encode_data_sink(&src.sink, &src.output_columns)?),
+        sink: Some(encode_data_sink(&src.sink, src.fragment_id, ctx)?),
         output_exprs,
         output_columns,
         cte_id: src.cte_id,
@@ -521,33 +520,40 @@ fn encode_fragment_output_contract(
     src: &PlanFragment,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<(Vec<crate::proto::expr::Expr>, Vec<common::OutputColumn>), String> {
-    if let DataSink::IcebergWrite(sink) = &src.sink {
-        let output_exprs = if let Some(exprs) = src.output_exprs.as_ref() {
-            if exprs.len() != sink.spec.target_columns.len() {
-                return Err(format!(
-                    "native Iceberg write fragment output_exprs count {} does not match target column count {}",
-                    exprs.len(),
-                    sink.spec.target_columns.len()
-                ));
-            }
-            encode_exprs(exprs)?
-        } else {
-            let sink_columns =
-                iceberg_write_sink_columns_for_input(&src.output_columns, &sink.input)?;
-            if sink_columns.len() != sink.spec.target_columns.len() {
-                return Err(format!(
-                    "native Iceberg write sink input column count {} does not match target column count {}",
-                    sink_columns.len(),
-                    sink.spec.target_columns.len()
-                ));
-            }
-            let exprs = sink_columns
-                .iter()
-                .map(column_ref_expr_for_output_column)
-                .collect::<Vec<_>>();
-            encode_exprs(&exprs)?
-        };
-        let output_columns = encode_iceberg_write_sink_output_columns(&sink.spec.target_columns)?;
+    if matches!(src.sink, DataSink::IcebergWrite(_)) {
+        // The planner finalized the write output expressions and target output
+        // schema at seal (CGO-9C Task 3). The encoder maps them 1:1 instead of
+        // synthesizing the target schema or falling back to the fragment's output
+        // columns / input binding.
+        let contract = ctx
+            .write_contracts
+            .ok_or_else(|| {
+                format!(
+                    "native Iceberg write fragment {} has no sealed write contract",
+                    src.fragment_id
+                )
+            })?
+            .iceberg_write_output(src.fragment_id)
+            .ok_or_else(|| {
+                format!(
+                    "native Iceberg write fragment {} is missing from the sealed write contract",
+                    src.fragment_id
+                )
+            })?;
+        let output_exprs = encode_exprs(&contract.output_exprs)?;
+        let output_columns = contract
+            .target_schema
+            .iter()
+            .map(|column| {
+                Ok(common::OutputColumn {
+                    column_id: column.column_id,
+                    name: column.name.clone(),
+                    r#type: Some(encode_type(&column.data_type)?),
+                    nullable: column.nullable,
+                    is_internal: column.is_internal,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         return Ok((output_exprs, output_columns));
     }
 
@@ -587,59 +593,6 @@ fn encode_finalized_fragment_output_columns(
     encode_output_columns(columns)
 }
 
-fn iceberg_write_sink_columns_for_input(
-    output_columns: &[AnalysisOutputColumn],
-    input: &IcebergWriteInputBinding,
-) -> Result<Vec<AnalysisOutputColumn>, String> {
-    match input {
-        IcebergWriteInputBinding::RootOutputByOrdinal => Ok(output_columns.to_vec()),
-        IcebergWriteInputBinding::OutputOrdinals(ordinals) => ordinals
-            .iter()
-            .copied()
-            .map(|ordinal| {
-                output_columns.get(ordinal).cloned().ok_or_else(|| {
-                    format!("native Iceberg write sink output ordinal {ordinal} is out of range")
-                })
-            })
-            .collect(),
-    }
-}
-
-fn column_ref_expr_for_output_column(column: &AnalysisOutputColumn) -> TypedExpr {
-    TypedExpr {
-        kind: ExprKind::ColumnRef {
-            column_id: column.column_id,
-            qualifier: None,
-            column: column.name.clone(),
-        },
-        data_type: column.data_type.clone(),
-        nullable: column.nullable,
-    }
-}
-
-fn encode_iceberg_write_sink_output_columns(
-    target_columns: &[catalog::ColumnDef],
-) -> Result<Vec<common::OutputColumn>, String> {
-    target_columns
-        .iter()
-        .enumerate()
-        .map(|(idx, column)| {
-            let ordinal = idx
-                .checked_add(1)
-                .ok_or_else(|| "native Iceberg write sink output ordinal overflow".to_string())?;
-            let column_id = u32::try_from(ordinal)
-                .map_err(|_| "native Iceberg write sink output column id overflow".to_string())?;
-            Ok(common::OutputColumn {
-                column_id,
-                name: column.name.clone(),
-                r#type: Some(encode_type(&column.data_type)?),
-                nullable: column.nullable,
-                is_internal: false,
-            })
-        })
-        .collect()
-}
-
 #[cfg(test)]
 pub(crate) fn encode_node(src: &DistributedNode) -> Result<plan::DistributedNode, String> {
     encode_node_with_context(
@@ -648,6 +601,7 @@ pub(crate) fn encode_node(src: &DistributedNode) -> Result<plan::DistributedNode
             scan_bindings: None,
             node_outputs: None,
             fragment_edge_outputs: None,
+            write_contracts: None,
         },
     )
 }
@@ -1455,7 +1409,8 @@ pub(crate) fn encode_data_partition(src: &DataPartition) -> Result<plan::DataPar
 
 fn encode_data_sink(
     src: &DataSink,
-    fragment_output_columns: &[AnalysisOutputColumn],
+    fragment_id: crate::sql::planner::distributed::FragmentId,
+    ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::DataSink, String> {
     use plan::data_sink::Kind;
 
@@ -1487,14 +1442,19 @@ fn encode_data_sink(
                                     .iter()
                                     .map(|value| usize_to_u64(*value))
                                     .collect(),
+                                // The ordinals still travel on the wire 1:1, but
+                                // the runtime consumes `output_partition` below;
+                                // the encoder no longer reconstructs the partition
+                                // expression from them (CGO-9C Task 3).
                                 output_partition_ordinals: branch
                                     .output_partition_ordinals
                                     .iter()
                                     .map(|value| usize_to_u64(*value))
                                     .collect(),
-                                output_partition: Some(encode_change_stream_branch_partition(
-                                    branch,
-                                    fragment_output_columns,
+                                output_partition: Some(encode_finalized_router_branch_partition(
+                                    ctx,
+                                    fragment_id,
+                                    branch.branch_id,
                                 )?),
                                 destinations: None,
                             })
@@ -1506,35 +1466,27 @@ fn encode_data_sink(
     })
 }
 
-fn encode_change_stream_branch_partition(
-    branch: &crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamBranchRoute,
-    fragment_output_columns: &[AnalysisOutputColumn],
+/// Map a change-stream router branch's finalized partition from the sealed write
+/// contract (CGO-9C Task 3). The planner already reconstructed the partition
+/// expression from the branch's ordinals against the router fragment's output
+/// columns at seal; the encoder maps the typed result 1:1.
+fn encode_finalized_router_branch_partition(
+    ctx: &NativePlanEncodeContext<'_>,
+    fragment_id: crate::sql::planner::distributed::FragmentId,
+    branch_id: i32,
 ) -> Result<plan::DataPartition, String> {
-    if branch.output_partition_ordinals.is_empty() {
-        return Ok(plan::DataPartition {
-            kind: plan::PartitionKind::Unpartitioned as i32,
-            exprs: Vec::new(),
-        });
-    }
-    let exprs = branch
-        .output_partition_ordinals
-        .iter()
-        .map(|ordinal| {
-            fragment_output_columns
-                .get(*ordinal)
-                .ok_or_else(|| {
-                    format!(
-                        "native Iceberg change-stream router branch {} partition ordinal {} is out of range",
-                        branch.branch_id, ordinal
-                    )
-                })
-                .map(column_ref_expr_for_output_column)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(plan::DataPartition {
-        kind: plan::PartitionKind::Hash as i32,
-        exprs: encode_exprs(&exprs)?,
-    })
+    let partition = ctx
+        .write_contracts
+        .ok_or_else(|| {
+            format!("native change-stream router fragment {fragment_id} has no sealed write contract")
+        })?
+        .router_branch_partition(fragment_id, branch_id)
+        .ok_or_else(|| {
+            format!(
+                "native change-stream router fragment {fragment_id} branch {branch_id} is missing from the sealed write contract"
+            )
+        })?;
+    encode_data_partition(partition)
 }
 
 fn encode_fragment_edge(src: &FragmentEdge) -> Result<plan::FragmentEdge, String> {
@@ -1617,6 +1569,7 @@ fn encode_table_def(src: &catalog::TableDef) -> Result<plan::TableDef, String> {
             scan_bindings: None,
             node_outputs: None,
             fragment_edge_outputs: None,
+            write_contracts: None,
         },
     )
 }
@@ -3519,6 +3472,7 @@ mod tests {
                 scan_bindings: Some(&bindings),
                 node_outputs: None,
                 fragment_edge_outputs: None,
+                write_contracts: None,
             },
         )
         .expect("encode prepared delta binding");
@@ -3605,6 +3559,7 @@ mod tests {
                 scan_bindings: Some(&bindings),
                 node_outputs: None,
                 fragment_edge_outputs: None,
+                write_contracts: None,
             },
         )
         .expect("encode ordinary Iceberg binding");
@@ -3720,6 +3675,7 @@ mod tests {
                     scan_bindings: Some(&bindings),
                     node_outputs: None,
                     fragment_edge_outputs: None,
+                    write_contracts: None,
                 },
             )
             .expect("encode refresh binding");
@@ -3791,6 +3747,7 @@ mod tests {
                 scan_bindings: Some(&ScanExecutionBindings::default()),
                 node_outputs: None,
                 fragment_edge_outputs: None,
+                write_contracts: None,
             },
         )
         .expect_err("delta source without prepared binding must fail");
@@ -3809,6 +3766,7 @@ mod tests {
                 scan_bindings: Some(&wrong_node),
                 node_outputs: None,
                 fragment_edge_outputs: None,
+                write_contracts: None,
             },
         )
         .expect_err("binding at another node id must not be reused");
@@ -3835,6 +3793,7 @@ mod tests {
                 scan_bindings: Some(&wrong_execution),
                 node_outputs: None,
                 fragment_edge_outputs: None,
+                write_contracts: None,
             },
         )
         .expect_err("delta source with file binding must fail");
@@ -3899,6 +3858,7 @@ mod tests {
                 scan_bindings: Some(&bindings),
                 node_outputs: None,
                 fragment_edge_outputs: None,
+                write_contracts: None,
             },
         )
         .expect("encode bound VARIANT scan");

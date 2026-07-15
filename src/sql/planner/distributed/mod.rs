@@ -38,7 +38,9 @@ pub(crate) use node::{
     DistributedNode, DistributedNodeKind, ExchangeFlavor, ExchangeReceiver,
     distributed_kind_from_physical, distributed_kind_to_physical,
 };
-pub(crate) use output::{FragmentEdgeOutputCatalog, NodeExecutionColumn, NodeOutputCatalog};
+pub(crate) use output::{
+    FragmentEdgeOutputCatalog, NodeExecutionColumn, NodeOutputCatalog, WriteContractCatalog,
+};
 pub(crate) use seal::DistributedPlan;
 
 #[cfg(test)]
