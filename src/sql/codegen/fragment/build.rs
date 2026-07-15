@@ -15,243 +15,70 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-
-use super::boundary_schema::project_boundary_reports;
-use super::request::FragmentBuildRequest;
-use super::result::{
-    FragmentOutputKind, FragmentSchedulingMetadata, FragmentTopology, MultiFragmentBuildResult,
-    OutputColumn, RuntimeFilterPlanResult,
-};
-use super::runtime_filter::PlannedRuntimeFilter;
-use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
-#[cfg(test)]
+use super::NativeFragmentBundle;
+use super::boundary_schema::{BoundarySchemaReport, project_boundary_reports};
+use crate::connector::ConnectorRegistry;
+use crate::coordinator::prepare::scan::ScanBindingResolver;
+use crate::coordinator::prepare::{PreparedFragmentSet, prepare_fragments};
+use crate::sql::catalog::CatalogProvider;
 use crate::sql::planner::distributed::DistributedPlan;
-use crate::sql::planner::distributed::runtime_filter::{
-    RuntimeFilterGraphProjection, project_runtime_filters,
-};
-use crate::sql::planner::distributed::{DistributedNode, DistributedNodeKind, FragmentId};
 
-pub(crate) fn build(request: FragmentBuildRequest<'_>) -> Result<MultiFragmentBuildResult, String> {
-    let FragmentBuildRequest {
-        distributed_plan: dp,
-        catalog,
-        connectors,
-        scan_binding_resolver,
-    } = request;
-    let _ = catalog;
+struct TestBuildRequest<'a> {
+    distributed_plan: &'a DistributedPlan,
+    catalog: &'a dyn CatalogProvider,
+    connectors: &'a ConnectorRegistry,
+    scan_binding_resolver: Option<&'a dyn ScanBindingResolver>,
+}
 
-    let scan_bindings =
-        crate::coordinator::prepare::prepare_scan_bindings(dp, connectors, scan_binding_resolver)?;
-
-    // Boundary reports are a read-only projection of the planner's sealed
-    // boundary catalog. Codegen never discovers boundary membership or re-selects
-    // any boundary's logical schema; the planner (`build_boundary_catalog`) owns
-    // that, and this projection copies its column order and provenance verbatim.
-    let boundary_reports = project_boundary_reports(dp);
-
-    let mut fragment_schedules = Vec::with_capacity(dp.fragments().len());
-    for fragment in dp.fragments() {
-        let output_columns = fragment
-            .output_columns
-            .iter()
-            .map(output_column_for_boundary)
-            .collect::<Vec<_>>();
-        let has_scan_nodes = distributed_node_has_scan(&fragment.root);
-        let output_kind = fragment_output_kind(&fragment.sink);
-        let native_scan_ranges = scan_bindings
-            .scan_ranges_for_fragment(fragment.fragment_id)
-            .cloned()
-            .unwrap_or_default();
-
-        fragment_schedules.push(FragmentSchedulingMetadata {
-            fragment_id: fragment.fragment_id,
-            has_scan_nodes,
-            output_kind,
-            native_scan_ranges,
-            output_columns,
-            cte_id: fragment.cte_id,
-            cte_exchange_nodes: fragment.cte_exchange_nodes.clone(),
-        });
+impl<'a> TestBuildRequest<'a> {
+    fn result(
+        distributed_plan: &'a DistributedPlan,
+        catalog: &'a dyn CatalogProvider,
+        connectors: &'a ConnectorRegistry,
+        scan_binding_resolver: Option<&'a dyn ScanBindingResolver>,
+    ) -> Self {
+        Self {
+            distributed_plan,
+            catalog,
+            connectors,
+            scan_binding_resolver,
+        }
     }
+}
 
-    // The query-level boundary reports are the full catalog projection, in the
-    // planner's canonical derivation order.
-    let boundary_schemas = boundary_reports;
-
-    let runtime_filter_projection = project_runtime_filters(dp)?;
-    let encoded = crate::sql::codegen::proto_encode::plan::encode_distributed_plan_with_context(
-        dp,
-        crate::sql::codegen::proto_encode::plan::NativePlanEncodeContext {
-            scan_bindings: Some(&scan_bindings),
-            // The encoder reads each covered node's execution output, each
-            // fragment/stream-edge output, and each write/router contract from the
-            // sealed catalogs; all are bound from `dp` inside
-            // encode_distributed_plan_with_context.
-            node_outputs: None,
-            fragment_edge_outputs: None,
-            write_contracts: None,
-            runtime_filter_projection: Some(&runtime_filter_projection),
-        },
+fn build_for_test(
+    request: TestBuildRequest<'_>,
+) -> Result<
+    (
+        PreparedFragmentSet,
+        NativeFragmentBundle,
+        Vec<BoundarySchemaReport>,
+    ),
+    String,
+> {
+    let _ = request.catalog;
+    let prepared = prepare_fragments(
+        request.distributed_plan,
+        request.connectors,
+        request.scan_binding_resolver,
     )?;
-    let mut native_fragments = BTreeMap::new();
-    for fragment in encoded.fragments {
-        let fragment_id = fragment.fragment_id;
-        if native_fragments.insert(fragment_id, fragment).is_some() {
-            return Err(format!(
-                "native fragment build encoded duplicate fragment id={fragment_id}"
-            ));
-        }
-    }
-    validate_native_fragment_ownership(
-        &native_fragments,
-        &fragment_schedules,
-        dp.root_fragment_id(),
-    )?;
-
-    // Project the planner's sealed topology (Task 2) read-only. The scheduler
-    // and coordinator consume this order/anchor instead of rederiving the DAG
-    // shape from edges.
-    let topology = FragmentTopology::new(
-        dp.topology().topological_fragment_order().to_vec(),
-        dp.topology().execution_anchor_fragment_id(),
-    );
-
-    Ok(MultiFragmentBuildResult {
-        fragment_schedules,
-        native_fragments,
-        root_fragment_id: dp.root_fragment_id(),
-        topology,
-        edges: dp.edges().to_vec(),
-        boundary_schemas,
-        rf_plan: runtime_filter_plan(&runtime_filter_projection)?,
-    })
-}
-
-fn validate_native_fragment_ownership(
-    native_fragments: &BTreeMap<FragmentId, crate::proto::plan::PlanFragment>,
-    fragment_schedules: &[FragmentSchedulingMetadata],
-    root_fragment_id: FragmentId,
-) -> Result<(), String> {
-    let native_ids = native_fragments.keys().copied().collect::<BTreeSet<_>>();
-    let schedule_ids = fragment_schedules
-        .iter()
-        .map(|schedule| schedule.fragment_id)
-        .collect::<BTreeSet<_>>();
-    if schedule_ids.len() != fragment_schedules.len() {
-        return Err("native fragment build produced duplicate schedule fragment ids".to_string());
-    }
-    if !native_ids.contains(&root_fragment_id) {
-        return Err(format!(
-            "native fragment build is missing root fragment id={root_fragment_id}"
-        ));
-    }
-    if native_ids != schedule_ids {
-        return Err(format!(
-            "native fragment ids {native_ids:?} do not match schedule ids {schedule_ids:?}"
-        ));
-    }
-    Ok(())
-}
-
-fn output_column_for_boundary(column: &AnalysisOutputColumn) -> OutputColumn {
-    OutputColumn {
-        name: column.name.clone(),
-        data_type: column.data_type.clone(),
-        nullable: column.nullable,
-    }
-}
-
-fn runtime_filter_plan(
-    projection: &RuntimeFilterGraphProjection,
-) -> Result<Option<RuntimeFilterPlanResult>, String> {
-    let mut all_filters = HashMap::new();
-    let mut build_side_filters: HashMap<FragmentId, Vec<i32>> = HashMap::new();
-    let mut probe_side_filters: HashMap<FragmentId, Vec<(i32, i32)>> = HashMap::new();
-    for ((fragment_id, node_id), builds) in projection.builds() {
-        for build in builds {
-            let expr_order = i32::try_from(build.expr_order).map_err(|_| {
-                format!(
-                    "runtime filter channel {} expression order {} does not fit i32",
-                    build.channel_id.get(),
-                    build.expr_order
-                )
-            })?;
-            let mut targets = projection
-                .probes()
-                .flat_map(|((target_fragment_id, target_node_id), probes)| {
-                    probes
-                        .iter()
-                        .filter(|probe| probe.channel_id == build.channel_id)
-                        .map(move |_| (*target_fragment_id, *target_node_id))
-                })
-                .collect::<Vec<_>>();
-            targets.sort_unstable();
-            targets.dedup();
-            all_filters.insert(
-                build.filter_id,
-                PlannedRuntimeFilter {
-                    filter_id: build.filter_id,
-                    build_plan_node_id: *node_id,
-                    probe_target_node_ids: targets.iter().map(|(_, node_id)| *node_id).collect(),
-                    has_remote_targets: targets
-                        .iter()
-                        .any(|(target_fragment_id, _)| *target_fragment_id != *fragment_id),
-                    execution_mode: build.execution_mode,
-                    expr_order,
-                },
-            );
-            build_side_filters
-                .entry(*fragment_id)
-                .or_default()
-                .push(build.filter_id);
-            for (target_fragment_id, target_node_id) in targets {
-                probe_side_filters
-                    .entry(target_fragment_id)
-                    .or_default()
-                    .push((build.filter_id, target_node_id));
-            }
-        }
-    }
-
-    if all_filters.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(RuntimeFilterPlanResult {
-            all_filters,
-            build_side_filters,
-            probe_side_filters,
-        }))
-    }
-}
-
-fn distributed_node_has_scan(node: &DistributedNode) -> bool {
-    matches!(node.payload, DistributedNodeKind::Scan(_))
-        || node.children.iter().any(distributed_node_has_scan)
-}
-
-fn fragment_output_kind(sink: &crate::sql::planner::distributed::DataSink) -> FragmentOutputKind {
-    match sink {
-        crate::sql::planner::distributed::DataSink::Result => FragmentOutputKind::Result,
-        crate::sql::planner::distributed::DataSink::IcebergWrite(_) => {
-            FragmentOutputKind::TerminalWrite
-        }
-        crate::sql::planner::distributed::DataSink::Noop
-        | crate::sql::planner::distributed::DataSink::IcebergChangeStreamRouter(_) => {
-            FragmentOutputKind::NonTerminal
-        }
-    }
+    let native_bundle = super::encode_native_fragment_bundle(request.distributed_plan, &prepared)?;
+    Ok((
+        prepared,
+        native_bundle,
+        project_boundary_reports(request.distributed_plan),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use arrow::datatypes::DataType;
 
     use super::super::boundary_schema::{
-        BoundaryKind, BoundarySchemaColumn, BoundarySchemaReport, project_boundary_reports,
+        BoundaryKind, BoundarySchemaColumn, project_boundary_reports,
     };
     use super::*;
     use crate::connector::ConnectorRegistry;
@@ -262,9 +89,9 @@ mod tests {
     use crate::sql::catalog::{CatalogProvider, IcebergDataFileBinding, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed::{
-        BoundaryContract, BoundaryKind as PlannerBoundaryKind, DataPartition, ExchangeFlavor,
-        ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentStreamKind, PartitionKind,
-        PlanFragment,
+        BoundaryContract, BoundaryKind as PlannerBoundaryKind, DataPartition, DistributedNode,
+        DistributedNodeKind, ExchangeFlavor, ExchangeReceiver, FragmentEdge, FragmentEdgeKind,
+        FragmentId, FragmentStreamKind, PartitionKind, PlanFragment,
     };
     use crate::sql::planner::payload::{PlanScanNode, PlanValuesNode};
     use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
@@ -643,8 +470,18 @@ mod tests {
         registry
     }
 
-    fn native_root_scan(result: &MultiFragmentBuildResult) -> &crate::proto::plan::ScanNode {
-        let root = result.native_fragments[&result.root_fragment_id]
+    fn native_root_scan(
+        result: &(
+            PreparedFragmentSet,
+            NativeFragmentBundle,
+            Vec<BoundarySchemaReport>,
+        ),
+    ) -> &crate::proto::plan::ScanNode {
+        let root_fragment_id = result.0.scheduling_view().execution_anchor();
+        let root = result
+            .1
+            .get(root_fragment_id)
+            .expect("native root fragment")
             .root
             .as_ref()
             .expect("root node");
@@ -662,12 +499,16 @@ mod tests {
     }
 
     fn native_file_ranges(
-        result: &MultiFragmentBuildResult,
+        result: &(
+            PreparedFragmentSet,
+            NativeFragmentBundle,
+            Vec<BoundarySchemaReport>,
+        ),
     ) -> &[crate::runtime::scan_range::ScanRangeParams] {
-        result.fragment_schedules[0]
-            .native_scan_ranges
-            .get(&10)
-            .map(Vec::as_slice)
+        result
+            .0
+            .scheduling_view()
+            .scan_ranges(0, 10)
             .expect("scan node ranges")
     }
 
@@ -741,7 +582,7 @@ mod tests {
             calls: AtomicUsize::new(0),
         };
 
-        let result = build(FragmentBuildRequest {
+        let result = build_for_test(TestBuildRequest {
             distributed_plan: &plan,
             catalog: &EmptyCatalog,
             connectors: &ConnectorRegistry::new(),
@@ -755,9 +596,10 @@ mod tests {
             "delta binding must resolve once"
         );
         assert_eq!(format!("{plan:#?}"), before);
-        let ranges = result.fragment_schedules[0]
-            .native_scan_ranges
-            .get(&10)
+        let ranges = result
+            .0
+            .scheduling_view()
+            .scan_ranges(0, 10)
             .expect("delta sentinel range by original node id");
         assert_eq!(ranges.len(), 1);
         let file = native_file_range(&ranges[0]);
@@ -782,7 +624,7 @@ mod tests {
             },
         );
 
-        let err = match build(FragmentBuildRequest::result(
+        let err = match build_for_test(TestBuildRequest::result(
             &plan,
             &EmptyCatalog,
             &ConnectorRegistry::new(),
@@ -807,7 +649,7 @@ mod tests {
             vec![3],
         )])]);
 
-        let result = build(FragmentBuildRequest::result(
+        let result = build_for_test(TestBuildRequest::result(
             &plan,
             &EmptyCatalog,
             &registry,
@@ -829,7 +671,7 @@ mod tests {
             Vec::new(),
         )])]);
 
-        let result = build(FragmentBuildRequest::result(
+        let result = build_for_test(TestBuildRequest::result(
             &plan,
             &EmptyCatalog,
             &registry,
@@ -851,7 +693,7 @@ mod tests {
             vec![3],
         )])]);
 
-        let result = build(FragmentBuildRequest::result(
+        let result = build_for_test(TestBuildRequest::result(
             &plan,
             &EmptyCatalog,
             &registry,
@@ -878,7 +720,7 @@ mod tests {
             vec![3],
         )])]);
 
-        let result = build(FragmentBuildRequest::result(
+        let result = build_for_test(TestBuildRequest::result(
             &plan,
             &EmptyCatalog,
             &registry,
@@ -910,7 +752,7 @@ mod tests {
             vec![3],
         )])]);
 
-        let result = build(FragmentBuildRequest::result(
+        let result = build_for_test(TestBuildRequest::result(
             &plan,
             &EmptyCatalog,
             &registry,
@@ -937,7 +779,7 @@ mod tests {
             vec![99],
         )])]);
 
-        let err = match build(FragmentBuildRequest::result(
+        let err = match build_for_test(TestBuildRequest::result(
             &plan,
             &EmptyCatalog,
             &registry,
@@ -959,7 +801,7 @@ mod tests {
             let plan = iceberg_scan_plan(Some(vec!["id"]));
             let registry = iceberg_registry(vec![iceberg_data_file(vec![delete_file])]);
 
-            let err = match build(FragmentBuildRequest::result(
+            let err = match build_for_test(TestBuildRequest::result(
                 &plan,
                 &EmptyCatalog,
                 &registry,
@@ -980,7 +822,7 @@ mod tests {
             vec![3],
         )])]);
 
-        let err = match build(FragmentBuildRequest::result(
+        let err = match build_for_test(TestBuildRequest::result(
             &plan,
             &EmptyCatalog,
             &registry,
@@ -1001,7 +843,7 @@ mod tests {
             iceberg_i32_stats_file("s3://bucket/id-10-20.parquet", 10, 20),
         ]);
 
-        let result = build(FragmentBuildRequest::result(
+        let result = build_for_test(TestBuildRequest::result(
             &plan,
             &EmptyCatalog,
             &registry,
@@ -1025,7 +867,7 @@ mod tests {
             iceberg_identity_partition_file("s3://bucket/id-12.parquet", 12),
         ]);
 
-        let result = build(FragmentBuildRequest::result(
+        let result = build_for_test(TestBuildRequest::result(
             &plan,
             &EmptyCatalog,
             &registry,
@@ -1049,7 +891,7 @@ mod tests {
         file.size = 300 * 1024 * 1024;
         let registry = iceberg_registry(vec![file]);
 
-        let result = build(FragmentBuildRequest::result(
+        let result = build_for_test(TestBuildRequest::result(
             &plan,
             &EmptyCatalog,
             &registry,
@@ -1073,7 +915,7 @@ mod tests {
             .collect();
         let registry = iceberg_registry(vec![iceberg_data_file(delete_files)]);
 
-        let err = match build(FragmentBuildRequest::result(
+        let err = match build_for_test(TestBuildRequest::result(
             &plan,
             &EmptyCatalog,
             &registry,
@@ -1105,7 +947,7 @@ mod tests {
             iceberg_i32_stats_file("s3://bucket/id-10-20.parquet", 10, 20),
         ]);
 
-        let result = build(FragmentBuildRequest::result(
+        let result = build_for_test(TestBuildRequest::result(
             &plan,
             &EmptyCatalog,
             &registry,
@@ -1155,49 +997,65 @@ mod tests {
             PartitionKind::Unpartitioned
         ));
 
-        let mut result = build(FragmentBuildRequest::result(
+        let result = build_for_test(TestBuildRequest::result(
             &planned,
             &EmptyCatalog,
             &ConnectorRegistry::new(),
             None,
         ))
         .expect("native fragment build");
-        assert_eq!(result.edges[0].stream_kind, FragmentStreamKind::Broadcast);
+        assert_eq!(
+            result.0.scheduling_view().edges()[0].stream_kind,
+            FragmentStreamKind::Broadcast
+        );
         assert!(matches!(
-            result.edges[0].output_partition.kind,
+            result.0.scheduling_view().edges()[0].output_partition.kind,
             PartitionKind::Unpartitioned
         ));
 
-        let target_fragment_id = result.edges[0].target_fragment_id;
-        for schedule in &mut result.fragment_schedules {
-            schedule.output_kind = if schedule.fragment_id == target_fragment_id {
-                FragmentOutputKind::TerminalWrite
-            } else {
-                FragmentOutputKind::NonTerminal
-            };
-            if schedule.fragment_id == target_fragment_id {
-                schedule.has_scan_nodes = true;
-                schedule.native_scan_ranges.insert(
-                    99,
-                    vec![
-                        build_iceberg_metadata_scan_range_params(),
-                        build_iceberg_metadata_scan_range_params(),
-                        build_iceberg_metadata_scan_range_params(),
-                    ],
-                );
-            }
-        }
+        let target_fragment_id = result.0.scheduling_view().edges()[0].target_fragment_id;
+        let prepared = crate::coordinator::prepare::prepared_fragment_set_for_test(
+            planned
+                .fragments()
+                .iter()
+                .map(|fragment| {
+                    let is_target = fragment.fragment_id == target_fragment_id;
+                    (
+                        fragment.fragment_id,
+                        if is_target {
+                            crate::coordinator::prepare::PreparedFragmentRole::TerminalWrite
+                        } else {
+                            crate::coordinator::prepare::PreparedFragmentRole::NonTerminal
+                        },
+                        if is_target {
+                            vec![(
+                                99,
+                                vec![
+                                    build_iceberg_metadata_scan_range_params(),
+                                    build_iceberg_metadata_scan_range_params(),
+                                    build_iceberg_metadata_scan_range_params(),
+                                ],
+                            )]
+                        } else {
+                            Vec::new()
+                        },
+                    )
+                })
+                .collect(),
+            planned.topology().topological_fragment_order().to_vec(),
+            planned.topology().execution_anchor_fragment_id(),
+            planned.edges().to_vec(),
+        );
         let scheduler = crate::coordinator::scheduler::FragmentScheduler::new(vec![
             "127.0.0.1:19001".parse().unwrap(),
             "127.0.0.1:19002".parse().unwrap(),
             "127.0.0.1:19003".parse().unwrap(),
         ]);
         let scheduling = scheduler
-            .assign(
-                &result.fragment_schedules,
-                &result.edges,
-                &result.topology,
+            .schedule(
+                prepared.scheduling_view(),
                 crate::common::types::UniqueId { hi: 1, lo: 7 },
+                None,
             )
             .expect("schedule broadcast plan");
         assert_eq!(
@@ -1228,7 +1086,7 @@ mod tests {
             },
         );
 
-        let result = build(FragmentBuildRequest::result(
+        let result = build_for_test(TestBuildRequest::result(
             &plan,
             &EmptyCatalog,
             &ConnectorRegistry::new(),
@@ -1236,9 +1094,12 @@ mod tests {
         ))
         .expect("build random stream");
 
-        assert_eq!(result.edges[0].stream_kind, FragmentStreamKind::Other);
+        assert_eq!(
+            result.0.scheduling_view().edges()[0].stream_kind,
+            FragmentStreamKind::Other
+        );
         assert!(matches!(
-            result.edges[0].output_partition.kind,
+            result.0.scheduling_view().edges()[0].output_partition.kind,
             PartitionKind::Random
         ));
     }
@@ -1283,7 +1144,7 @@ mod tests {
                 },
             );
 
-            let result = build(FragmentBuildRequest::result(
+            let result = build_for_test(TestBuildRequest::result(
                 &plan,
                 &EmptyCatalog,
                 &ConnectorRegistry::new(),
@@ -1296,9 +1157,14 @@ mod tests {
                 )
             });
 
-            assert_eq!(result.edges[0].stream_kind, stream_kind);
             assert_eq!(
-                std::mem::discriminant(&result.edges[0].output_partition.kind),
+                result.0.scheduling_view().edges()[0].stream_kind,
+                stream_kind
+            );
+            assert_eq!(
+                std::mem::discriminant(
+                    &result.0.scheduling_view().edges()[0].output_partition.kind
+                ),
                 std::mem::discriminant(&partition.kind)
             );
         }
@@ -1385,7 +1251,7 @@ mod tests {
 
         for (label, flavor) in cases {
             let dp = stream_exchange_plan(flavor);
-            build(FragmentBuildRequest::result(
+            build_for_test(TestBuildRequest::result(
                 &dp,
                 &EmptyCatalog,
                 &ConnectorRegistry::new(),
@@ -1401,7 +1267,7 @@ mod tests {
         let before = format!("{dp:#?}");
         let planned_edges = format!("{:#?}", dp.edges());
 
-        let result = build(FragmentBuildRequest::result(
+        let result = build_for_test(TestBuildRequest::result(
             &dp,
             &EmptyCatalog,
             &ConnectorRegistry::new(),
@@ -1410,7 +1276,10 @@ mod tests {
         .expect("native fragment build");
 
         assert_eq!(format!("{dp:#?}"), before);
-        assert_eq!(format!("{:#?}", result.edges), planned_edges);
+        assert_eq!(
+            format!("{:#?}", result.0.scheduling_view().edges()),
+            planned_edges
+        );
     }
 
     fn finalized_router_plan() -> DistributedPlan {
@@ -1455,7 +1324,7 @@ mod tests {
         let before = format!("{planned:#?}");
         let planned_edges = format!("{:#?}", planned.edges());
 
-        let result = build(FragmentBuildRequest::result(
+        let result = build_for_test(TestBuildRequest::result(
             &planned,
             &EmptyCatalog,
             &ConnectorRegistry::new(),
@@ -1464,9 +1333,12 @@ mod tests {
         .expect("native fragment build");
 
         assert_eq!(format!("{planned:#?}"), before);
-        assert_eq!(format!("{:#?}", result.edges), planned_edges);
+        assert_eq!(
+            format!("{:#?}", result.0.scheduling_view().edges()),
+            planned_edges
+        );
 
-        let edge = &result.edges[0];
+        let edge = &result.0.scheduling_view().edges()[0];
         assert!(matches!(edge.output_partition.kind, PartitionKind::Hash));
         assert_eq!(edge.output_partition.exprs.len(), 1);
         let ExprKind::ColumnRef {
@@ -1479,8 +1351,8 @@ mod tests {
         assert_eq!(column, "delete_id");
         assert_eq!(edge.stream_kind, FragmentStreamKind::Partitioned);
         let source = result
-            .native_fragments
-            .get(&edge.source_fragment_id)
+            .1
+            .get(edge.source_fragment_id)
             .expect("router source fragment");
         let route_partition = match source
             .sink
@@ -1502,8 +1374,8 @@ mod tests {
         assert_eq!(route_partition.exprs.len(), 1);
 
         let target = result
-            .native_fragments
-            .get(&edge.target_fragment_id)
+            .1
+            .get(edge.target_fragment_id)
             .expect("router target fragment");
         let receiver = match target
             .root
@@ -1525,28 +1397,18 @@ mod tests {
             offset: Some(0),
         });
 
-        let result = crate::sql::codegen::fragment::build(
-            crate::sql::codegen::fragment::FragmentBuildRequest::result(
-                &dp,
-                &EmptyCatalog,
-                &ConnectorRegistry::new(),
-                None,
-            ),
-        )
+        let result = build_for_test(TestBuildRequest::result(
+            &dp,
+            &EmptyCatalog,
+            &ConnectorRegistry::new(),
+            None,
+        ))
         .expect("native fragment build");
-        let fragment_ids = result
-            .native_fragments
-            .keys()
-            .copied()
-            .collect::<BTreeSet<_>>();
-        let schedule_ids = result
-            .fragment_schedules
-            .iter()
-            .map(|schedule| schedule.fragment_id)
-            .collect::<BTreeSet<_>>();
+        let fragment_ids = result.1.fragment_ids().collect::<BTreeSet<_>>();
+        let prepared_ids = result.0.fragment_ids();
 
-        assert_eq!(fragment_ids, schedule_ids);
-        assert!(fragment_ids.contains(&result.root_fragment_id));
+        assert_eq!(fragment_ids, prepared_ids);
+        assert!(fragment_ids.contains(&dp.root_fragment_id()));
     }
 
     #[test]
@@ -1580,7 +1442,7 @@ mod tests {
             edges: Vec::new(),
         };
 
-        let result = build(FragmentBuildRequest::result(
+        let result = build_for_test(TestBuildRequest::result(
             &plan,
             &EmptyCatalog,
             &ConnectorRegistry::new(),
@@ -1588,10 +1450,27 @@ mod tests {
         ))
         .expect("native write fragment build");
         assert_eq!(
-            result.fragment_schedules[0].output_kind,
-            FragmentOutputKind::TerminalWrite
+            result
+                .0
+                .fragment(0)
+                .expect("prepared write fragment")
+                .execution_role(),
+            crate::coordinator::prepare::PreparedFragmentRole::TerminalWrite
         );
-        let sink = result.native_fragments[&0]
+        assert!(
+            result
+                .0
+                .fragment(0)
+                .expect("prepared write fragment")
+                .boundary_projection()
+                .output_columns()
+                .is_empty(),
+            "Iceberg target schema belongs to WriteContractCatalog, not prepared query output"
+        );
+        let sink = result
+            .1
+            .get(0)
+            .expect("native fragment")
             .sink
             .as_ref()
             .expect("native sink");
@@ -1599,46 +1478,6 @@ mod tests {
             sink.kind,
             Some(crate::proto::plan::data_sink::Kind::IcebergWrite(_))
         ));
-    }
-
-    #[test]
-    fn native_fragment_ownership_rejects_missing_fragment_and_root() {
-        let dp = stream_exchange_plan(ExchangeFlavor::LimitOffset {
-            limit: Some(1),
-            offset: Some(0),
-        });
-        let mut result = build(FragmentBuildRequest::result(
-            &dp,
-            &EmptyCatalog,
-            &ConnectorRegistry::new(),
-            None,
-        ))
-        .expect("native fragment build");
-
-        result.native_fragments.remove(&1);
-        let err = validate_native_fragment_ownership(
-            &result.native_fragments,
-            &result.fragment_schedules,
-            result.root_fragment_id,
-        )
-        .expect_err("missing scheduled fragment must be rejected");
-        assert!(err.contains("native fragment ids"), "{err}");
-
-        result.native_fragments.insert(
-            1,
-            crate::proto::plan::PlanFragment {
-                fragment_id: 1,
-                ..Default::default()
-            },
-        );
-        result.native_fragments.remove(&result.root_fragment_id);
-        let err = validate_native_fragment_ownership(
-            &result.native_fragments,
-            &result.fragment_schedules,
-            result.root_fragment_id,
-        )
-        .expect_err("missing root fragment must be rejected");
-        assert!(err.contains("root fragment"), "{err}");
     }
 
     #[test]
@@ -1720,7 +1559,7 @@ mod tests {
         };
         let before = format!("{dp:#?}");
 
-        let result = build(FragmentBuildRequest::result(
+        let result = build_for_test(TestBuildRequest::result(
             &dp,
             &EmptyCatalog,
             &ConnectorRegistry::new(),
@@ -1729,10 +1568,13 @@ mod tests {
         .expect("native lower plan");
 
         assert_eq!(format!("{dp:#?}"), before);
-        assert_eq!(result.edges[0].output_slot_ids, vec![1, 3]);
+        assert_eq!(
+            result.0.scheduling_view().edges()[0].output_slot_ids,
+            vec![1, 3]
+        );
         let native_consumer = result
-            .native_fragments
-            .get(&consumer_fragment_id)
+            .1
+            .get(consumer_fragment_id)
             .expect("encoded native consumer");
         assert_eq!(native_consumer.cte_exchange_nodes[0].column_ids, vec![1, 3]);
     }
@@ -1938,7 +1780,7 @@ mod tests {
     #[test]
     fn native_fragment_build_boundary_schemas_are_the_planner_catalog_projection() {
         let plan = stream_exchange_plan(ExchangeFlavor::Distribution);
-        let result = build(FragmentBuildRequest::result(
+        let result = build_for_test(TestBuildRequest::result(
             &plan,
             &EmptyCatalog,
             &ConnectorRegistry::new(),
@@ -1946,9 +1788,9 @@ mod tests {
         ))
         .expect("native fragment build");
 
-        // build() wires the query-level reports straight from the projection,
+        // build_for_test() wires the query-level reports straight from the projection,
         // in canonical order, without reordering or dropping any boundary.
-        assert_eq!(result.boundary_schemas, project_boundary_reports(&plan));
+        assert_eq!(result.2, project_boundary_reports(&plan));
     }
 
     #[test]

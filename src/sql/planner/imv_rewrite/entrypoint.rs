@@ -2977,7 +2977,6 @@ mod tests {
                 }
                 .expect("join projection coalesce plan");
                 let optimized_tree = optimize_logical_for_test(coalesce);
-                let catalog = crate::engine::catalog::InMemoryCatalog::default();
                 let mut connectors = crate::connector::ConnectorRegistry::default();
                 connectors.register_scan_planner(Arc::new(
                     crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
@@ -2989,13 +2988,15 @@ mod tests {
                 let distributed_plan =
                     crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
                     .expect("build DistributedPlan");
-                crate::sql::codegen::fragment::build(
-                    crate::sql::codegen::fragment::FragmentBuildRequest::result(
-                        &distributed_plan,
-                        &catalog,
-                        &connectors,
-                        Some(&refresh_ctx),
-                    ),
+                let prepared = crate::coordinator::prepare::prepare_fragments(
+                    &distributed_plan,
+                    &connectors,
+                    Some(&refresh_ctx),
+                )
+                .expect("join projection coalesce plan must prepare");
+                crate::sql::codegen::fragment::encode_native_fragment_bundle(
+                    &distributed_plan,
+                    &prepared,
                 )
                 .expect("join projection coalesce plan must lower");
             })

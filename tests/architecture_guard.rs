@@ -14038,16 +14038,26 @@ fn nfe_1_task_2_native_fragment_build_owns_submission_payload() {
     let repo = Path::new(manifest_dir());
     let mut violations = Vec::new();
 
-    let result = fs::read_to_string(repo.join("src/sql/codegen/fragment/result.rs")).unwrap();
-    let result_production = rust_sanitized_production_text(&result);
-    let result_compact = compact_line(&result_production);
-    if rust_named_type_declaration_count(&result_production, "MultiFragmentBuildResult") != 1
-        || !result_compact.contains(
-            "pubnative_fragments:std::collections::BTreeMap<FragmentId,crate::proto::plan::PlanFragment>",
-        )
+    let bundle = fs::read_to_string(repo.join("src/sql/codegen/fragment/bundle.rs")).unwrap();
+    let bundle_production = rust_sanitized_production_text(&bundle);
+    let bundle_compact = compact_line(&bundle_production);
+    if rust_named_type_declaration_count(&bundle_production, "NativeFragmentBundle") != 1
+        || !bundle_compact.contains("by_fragment:BTreeMap<FragmentId,NativePlanFragment>")
+        || bundle_compact.contains("pubby_fragment:")
+        || bundle_compact.contains("pub(crate)by_fragment:")
     {
         violations.push(
-            "src/sql/codegen/fragment/result.rs: MultiFragmentBuildResult must uniquely own required native fragments".to_string(),
+            "src/sql/codegen/fragment/bundle.rs: private NativeFragmentBundle must uniquely own required native fragments".to_string(),
+        );
+    }
+
+    let coordinator = fs::read_to_string(repo.join("src/coordinator/execution.rs")).unwrap();
+    if !compact_line(&rust_sanitized_production_text(&coordinator))
+        .contains("native_bundle:NativeFragmentBundle")
+    {
+        violations.push(
+            "src/coordinator/execution.rs: coordinator must own the native bundle artifact"
+                .to_string(),
         );
     }
 
@@ -14977,7 +14987,7 @@ fn nfe_4_fe_owned_raw_sources_are_starrocks_idl_free() {
     let owner_rel = owners.iter().map(|path| rel(path)).collect::<BTreeSet<_>>();
     for required in [
         "src/sql/mod.rs",
-        "src/sql/codegen/fragment/build.rs",
+        "src/sql/codegen/fragment/bundle.rs",
         "src/engine/mod.rs",
         "src/engine/statement.rs",
         "src/coordinator/dispatch.rs",
@@ -15159,8 +15169,8 @@ fn nfe_4_ledger_audit_native_structure_and_external_ingress_are_fixed() {
     }
 
     for source in [
-        "src/sql/codegen/fragment/build.rs",
-        "src/sql/codegen/fragment/result.rs",
+        "src/sql/codegen/fragment/bundle.rs",
+        "src/sql/codegen/fragment/runtime_filter.rs",
         "src/sql/codegen/scan/connector.rs",
         "src/sql/codegen/scan/iceberg_delta.rs",
         "src/sql/codegen/proto_encode/iceberg_delta_scan.rs",
@@ -15173,23 +15183,20 @@ fn nfe_4_ledger_audit_native_structure_and_external_ingress_are_fixed() {
         }
     }
 
-    let fragment_build =
-        fs::read_to_string(repo.join("src/sql/codegen/fragment/build.rs")).unwrap();
-    let fragment_production = rust_sanitized_production_text(&fragment_build);
+    let fragment_bundle =
+        fs::read_to_string(repo.join("src/sql/codegen/fragment/bundle.rs")).unwrap();
+    let fragment_production = rust_sanitized_production_text(&fragment_bundle);
     if fragment_production.contains("cfg") && fragment_production.contains("compat") {
         violations.push(
-            "src/sql/codegen/fragment/build.rs: unique native builder must be compat-neutral"
+            "src/sql/codegen/fragment/bundle.rs: unique native bundle must be compat-neutral"
                 .to_string(),
         );
     }
 
-    let result = fs::read_to_string(repo.join("src/sql/codegen/fragment/result.rs")).unwrap();
-    let result_compact = compact_line(&rust_sanitized_production_text(&result));
-    if !result_compact.contains(
-        "pubnative_fragments:std::collections::BTreeMap<FragmentId,crate::proto::plan::PlanFragment>",
-    ) {
+    let bundle_compact = compact_line(&fragment_production);
+    if !bundle_compact.contains("by_fragment:BTreeMap<FragmentId,NativePlanFragment>") {
         violations.push(
-            "src/sql/codegen/fragment/result.rs: MultiFragmentBuildResult must own required native PlanFragment map"
+            "src/sql/codegen/fragment/bundle.rs: NativeFragmentBundle must own required native PlanFragment map"
                 .to_string(),
         );
     }
@@ -17473,30 +17480,13 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
 
     let fragment_mod_path = codegen_root.join("fragment/mod.rs");
     let fragment_mod = fs::read_to_string(&fragment_mod_path).unwrap();
-    let build_exports = rust_production_scoped_use_statements(&fragment_mod)
-        .into_iter()
-        .filter(|import| rust_use_is_public(&import.import))
-        .filter_map(|import| {
-            rust_canonical_use_segments_in_scope(
-                &import.import,
-                "src/sql/codegen/fragment/mod.rs",
-                &import.inline_modules,
-            )
-        })
-        .filter(|path| {
-            path == &[
-                "crate".to_string(),
-                "sql".to_string(),
-                "codegen".to_string(),
-                "fragment".to_string(),
-                "build".to_string(),
-                "build".to_string(),
-            ]
-        })
-        .count();
-    if build_exports != 1 {
+    let fragment_production = rust_sanitized_production_text(&fragment_mod);
+    let actual_fragment_modules = rust_module_item_declarations(&fragment_production);
+    let expected_fragment_modules =
+        BTreeSet::from(["bundle".to_string(), "runtime_filter".to_string()]);
+    if actual_fragment_modules != expected_fragment_modules {
         violations.push(format!(
-            "src/sql/codegen/fragment/mod.rs: expected exactly one outward build entry, got {build_exports}"
+            "src/sql/codegen/fragment/mod.rs: production modules must be exactly {expected_fragment_modules:?}, got {actual_fragment_modules:?}"
         ));
     }
 
@@ -17504,38 +17494,14 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
         .into_iter()
         .map(|path| (rel(&path), fs::read_to_string(path).unwrap()))
         .collect::<Vec<_>>();
-    let build_owners = rust_named_declaration_owners(
-        &codegen_sources,
-        "build",
-        rust_named_function_declaration_count,
-    );
-    if build_owners != ["src/sql/codegen/fragment/build.rs (1)"] {
-        violations.push(format!(
-            "fragment build function must have one final owner, got {build_owners:?}"
-        ));
-    }
-
     for (name, expected_owner) in [
         (
-            "FragmentBuildRequest",
-            "src/sql/codegen/fragment/request.rs (1)",
-        ),
-        ("OutputColumn", "src/sql/codegen/fragment/result.rs (1)"),
-        (
-            "FragmentOutputKind",
-            "src/sql/codegen/fragment/result.rs (1)",
-        ),
-        (
-            "FragmentSchedulingMetadata",
-            "src/sql/codegen/fragment/result.rs (1)",
-        ),
-        (
-            "MultiFragmentBuildResult",
-            "src/sql/codegen/fragment/result.rs (1)",
+            "NativeFragmentBundle",
+            "src/sql/codegen/fragment/bundle.rs (1)",
         ),
         (
             "RuntimeFilterPlanResult",
-            "src/sql/codegen/fragment/result.rs (1)",
+            "src/sql/codegen/fragment/runtime_filter.rs (1)",
         ),
         (
             "StarRocksScanSourceDescriptor",
@@ -17557,10 +17523,10 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
         &cgo_8_production_source_texts(repo),
     ));
 
-    let fragment_build = fs::read_to_string(codegen_root.join("fragment/build.rs")).unwrap();
+    let fragment_build = fs::read_to_string(codegen_root.join("fragment/bundle.rs")).unwrap();
     let production = rust_sanitized_production_text(&fragment_build);
     violations.extend(nfe_3_raw_starrocks_idl_violations(
-        "src/sql/codegen/fragment/build.rs",
+        "src/sql/codegen/fragment/bundle.rs",
         &fragment_build,
     ));
     let production_tokens = rust_use_tokens(&production);
@@ -17570,7 +17536,7 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
         || production_tokens.iter().any(|token| token == "compat")
     {
         violations.push(
-            "src/sql/codegen/fragment/build.rs: unique native builder must be feature-neutral"
+            "src/sql/codegen/fragment/bundle.rs: unique native bundle must be feature-neutral"
                 .to_string(),
         );
     }
@@ -19670,11 +19636,11 @@ fn nidl_e3_planner_ir_uses_native_partition_and_runtime_filter_types() {
         );
     }
 
-    let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/fragment/result.rs")).unwrap();
+    let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/fragment/bundle.rs")).unwrap();
     let codegen_mod = rust_production_text_without_cfg_test(&codegen_mod);
     push_forbidden_terms(
         &mut violations,
-        "src/sql/codegen/fragment/result.rs",
+        "src/sql/codegen/fragment/bundle.rs",
         &codegen_mod,
         &[
             "pub compat_output_partition:",
@@ -19890,10 +19856,6 @@ fn nidl_e4_code_line_entries(text: &str) -> Vec<(usize, String)> {
     lines
 }
 
-fn nidl_e4_has_exact_code_line(text: &str, expected: &str) -> bool {
-    nidl_e4_has_code_line(text, |line| line == expected)
-}
-
 fn nidl_e4_struct_code_span(text: &str, header: &str) -> Option<Vec<(usize, String)>> {
     let lines = nidl_e4_code_line_entries(text);
     let start = lines.iter().position(|(_, line)| line == header)?;
@@ -19967,28 +19929,6 @@ fn nidl_e4_scheduler_and_coordinator_use_native_scheduling_metadata() {
     let repo = Path::new(manifest_dir());
     let mut violations = Vec::new();
 
-    let result = fs::read_to_string(repo.join("src/sql/codegen/fragment/result.rs")).unwrap();
-    let result_prod = rust_production_text_without_cfg_test(&result);
-    if !nidl_e4_has_exact_code_line(
-        &result_prod,
-        "pub(crate) struct FragmentSchedulingMetadata {",
-    ) {
-        violations.push(
-            "src/sql/codegen/fragment/result.rs: E4 must expose a native FragmentSchedulingMetadata result".to_string(),
-        );
-    }
-    if !nidl_e4_struct_has_code_line(
-        &result_prod,
-        "pub(crate) struct MultiFragmentBuildResult {",
-        |line| {
-            line.trim_end_matches(',') == "pub fragment_schedules: Vec<FragmentSchedulingMetadata>"
-        },
-    ) {
-        violations.push(
-            "src/sql/codegen/fragment/result.rs: MultiFragmentBuildResult must carry native fragment_schedules".to_string(),
-        );
-    }
-
     let scheduler = fs::read_to_string(repo.join("src/coordinator/scheduler/mod.rs")).unwrap();
     let scheduler_prod = rust_production_text_without_cfg_test(&scheduler);
     nidl_e4_push_forbidden_code_terms(
@@ -19997,24 +19937,24 @@ fn nidl_e4_scheduler_and_coordinator_use_native_scheduling_metadata() {
         &scheduler_prod,
         &[
             "FragmentBuildResult",
+            "FragmentSchedulingMetadata",
             "plan_nodes::TPlan",
             "TPlanNodeType",
             ".plan.nodes",
             ".exec_params",
             ".output_sink",
         ],
-        "scheduler must consume native FragmentSchedulingMetadata, not thrift fragment build payloads",
+        "scheduler must consume FragmentSchedulingView, not old build or thrift payloads",
     );
-    for fn_name in ["assign", "assign_with_live"] {
-        if !nidl_e4_function_signature_contains(
-            &scheduler_prod,
-            fn_name,
-            "fragments: &[FragmentSchedulingMetadata]",
-        ) {
-            violations.push(format!(
-                "src/coordinator/scheduler/mod.rs: {fn_name} signature must accept FragmentSchedulingMetadata"
-            ));
-        }
+    if !nidl_e4_function_signature_contains(
+        &scheduler_prod,
+        "schedule",
+        "view: FragmentSchedulingView<'_>",
+    ) {
+        violations.push(
+            "src/coordinator/scheduler/mod.rs: schedule signature must accept FragmentSchedulingView"
+                .to_string(),
+        );
     }
 
     for retired in [
@@ -20037,6 +19977,8 @@ fn nidl_e4_scheduler_and_coordinator_use_native_scheduling_metadata() {
         &[
             "scheduler.assign_with_live(&fragment_results",
             "topological_sort_bottom_up(&fragment_results",
+            "FragmentSchedulingMetadata",
+            "MultiFragmentBuildResult",
             "TPlanFragment::new",
             "crate::thrift::planner::TPlanFragment",
             "planner::TPlanFragment",
@@ -20044,13 +19986,14 @@ fn nidl_e4_scheduler_and_coordinator_use_native_scheduling_metadata() {
             "use crate::thrift::planner::TPlanFragment",
             "use crate::thrift::planner::{TPlanFragment",
         ],
-        "coordinator must schedule from native metadata and must not directly construct thrift TPlanFragment",
+        "coordinator must schedule from prepared projection and must not directly construct thrift TPlanFragment",
     );
     if !nidl_e4_has_code_line(&coordinator_prod, |line| {
-        line.contains("fragment_schedules")
-    }) {
+        line.contains("prepared.scheduling_view()")
+    }) || !coordinator_prod.contains("native_bundle: NativeFragmentBundle")
+    {
         violations.push(
-            "src/coordinator/execution.rs: coordinator must destructure and use fragment_schedules"
+            "src/coordinator/execution.rs: coordinator must consume prepared and native artifacts"
                 .to_string(),
         );
     }
@@ -27201,7 +27144,7 @@ fn distributed_plan_seal_task4_source_tree_validates_runtime_filter_graph_withou
 // production guard.
 // ---------------------------------------------------------------------------
 
-const PLANNER_BOUNDARY_CONTRACT_CODEGEN_ROOT: &str = "src/sql/codegen/fragment/";
+const PLANNER_BOUNDARY_CONTRACT_CODEGEN_ROOT: &str = "src/coordinator/prepare/";
 const PLANNER_BOUNDARY_CONTRACT_PLANNER_ROOT: &str = "src/sql/planner/distributed/";
 const PLANNER_BOUNDARY_CONTRACT_DERIVATION_DEF: &str = "fn build_boundary_catalog(";
 const PLANNER_BOUNDARY_CONTRACT_COLUMN_TYPE_DEF: &str = "struct BoundaryColumn";
@@ -27281,7 +27224,7 @@ fn planner_boundary_contract_violations(sources: &[Cgo8GuardSource]) -> Vec<Stri
 fn planner_boundary_contract_detector_accepts_planner_owned_projection() {
     let sources = [
         Cgo8GuardSource::new(
-            "src/sql/codegen/fragment/boundary_schema.rs",
+            "src/coordinator/prepare/mod.rs",
             "use crate::sql::planner::distributed::{BoundaryColumn, BoundaryContract};\n\
              fn project_boundary_reports(plan: &DistributedPlan) -> Vec<BoundarySchemaReport> {\n\
                  plan.boundaries().contracts().iter().map(project).collect()\n\
@@ -27328,7 +27271,7 @@ fn planner_boundary_contract_detector_rejects_codegen_ownership() {
         let codegen_text =
             format!("{forbidden}\nfn other(p: &DistributedPlan) {{ let _ = p.boundaries(); }}");
         let sources = [
-            Cgo8GuardSource::new("src/sql/codegen/fragment/boundary_schema.rs", codegen_text),
+            Cgo8GuardSource::new("src/coordinator/prepare/mod.rs", codegen_text),
             planner_owner.clone(),
         ];
         let violations = planner_boundary_contract_violations(&sources);
@@ -27346,7 +27289,7 @@ fn planner_boundary_contract_detector_requires_planner_owner() {
     // Codegen projects the sealed catalog, but no planner source owns the
     // derivation or the occurrence type: both must fail closed.
     let sources = [Cgo8GuardSource::new(
-        "src/sql/codegen/fragment/boundary_schema.rs",
+        "src/coordinator/prepare/mod.rs",
         "fn project(plan: &DistributedPlan) { let _ = plan.boundaries(); }",
     )];
     let violations = planner_boundary_contract_violations(&sources);
@@ -27371,7 +27314,7 @@ fn planner_boundary_contract_detector_requires_codegen_projection() {
     // permitting codegen to re-derive boundaries.
     let sources = [
         Cgo8GuardSource::new(
-            "src/sql/codegen/fragment/build.rs",
+            "src/coordinator/prepare/mod.rs",
             "fn build() { let _ = 1; }",
         ),
         Cgo8GuardSource::new(
@@ -28137,6 +28080,321 @@ fn rfd2_deployment_module_stays_a_leaf() {
                 rel(&file)
             );
         }
+    }
+}
+
+#[derive(Default)]
+struct NativeBundleConstructionAudit {
+    current_function: Option<String>,
+    current_impl_is_native_bundle: bool,
+    construction_owners: Vec<String>,
+    collector_is_private: bool,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for NativeBundleConstructionAudit {
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+            return;
+        }
+        syn::visit::visit_item(self, item);
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_impl_item_attrs(item)) {
+            return;
+        }
+        syn::visit::visit_impl_item(self, item);
+    }
+
+    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+        let previous = self.current_impl_is_native_bundle;
+        self.current_impl_is_native_bundle = matches!(
+            item.self_ty.as_ref(),
+            syn::Type::Path(path)
+                if path
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|segment| segment.ident == "NativeFragmentBundle")
+        );
+        syn::visit::visit_item_impl(self, item);
+        self.current_impl_is_native_bundle = previous;
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        let name = item.sig.ident.to_string();
+        if name == "collect_native_fragment_bundle" {
+            self.collector_is_private = matches!(item.vis, syn::Visibility::Inherited);
+        }
+        let previous = self.current_function.replace(name);
+        syn::visit::visit_item_fn(self, item);
+        self.current_function = previous;
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        let previous = self.current_function.replace(item.sig.ident.to_string());
+        syn::visit::visit_impl_item_fn(self, item);
+        self.current_function = previous;
+    }
+
+    fn visit_expr_struct(&mut self, expression: &'ast syn::ExprStruct) {
+        let constructed_type = expression
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string());
+        if constructed_type.as_deref() == Some("NativeFragmentBundle")
+            || (self.current_impl_is_native_bundle && constructed_type.as_deref() == Some("Self"))
+        {
+            self.construction_owners.push(
+                self.current_function
+                    .clone()
+                    .unwrap_or_else(|| "<module>".to_string()),
+            );
+        }
+        syn::visit::visit_expr_struct(self, expression);
+    }
+}
+
+fn validate_native_bundle_construction_contract(source: &str) -> Result<(), String> {
+    let file =
+        syn::parse_file(source).map_err(|error| format!("parse native bundle owner: {error}"))?;
+    let mut audit = NativeBundleConstructionAudit::default();
+    syn::visit::Visit::visit_file(&mut audit, &file);
+    if !audit.collector_is_private {
+        return Err("native bundle collector must remain file-private".to_string());
+    }
+    if audit.construction_owners != ["collect_native_fragment_bundle"] {
+        return Err(format!(
+            "native bundle construction must be unique to private collector, owners={:?}",
+            audit.construction_owners
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn coordinator_bundle_guard_rejects_differently_named_general_constructor() {
+    let fixture = r#"
+struct NativeFragmentBundle { by_fragment: BTreeMap<u32, NativePlanFragment> }
+
+fn collect_native_fragment_bundle(by_fragment: BTreeMap<u32, NativePlanFragment>) -> NativeFragmentBundle {
+    NativeFragmentBundle { by_fragment }
+}
+
+fn assemble_payloads(by_fragment: BTreeMap<u32, NativePlanFragment>) -> NativeFragmentBundle {
+    NativeFragmentBundle { by_fragment }
+}
+
+impl NativeFragmentBundle {
+    fn assemble_associated_payloads(by_fragment: BTreeMap<u32, NativePlanFragment>) -> Self {
+        Self { by_fragment }
+    }
+}
+"#;
+    let error = validate_native_bundle_construction_contract(fixture)
+        .expect_err("differently named general constructor must be rejected");
+    assert!(error.contains("assemble_payloads"), "{error}");
+    assert!(error.contains("assemble_associated_payloads"), "{error}");
+}
+
+#[test]
+fn coordinator_prepared_fragment_set() {
+    let projection_path = src_dir().join("coordinator/prepare/projection.rs");
+    assert!(
+        projection_path.is_file(),
+        "COOR-3B requires coordinator/prepare/projection.rs"
+    );
+    let source = fs::read_to_string(&projection_path).expect("read preparation projection");
+    for required in [
+        "struct PreparedFragmentSet",
+        "struct PreparedFragment",
+        "struct FragmentSchedulingView",
+        "fn scheduling_view(&self)",
+        "fn scan_ranges(",
+        "Option<&'a [ScanRangeParams]>",
+    ] {
+        assert!(
+            source.contains(required),
+            "missing prepared artifact API `{required}`"
+        );
+    }
+    assert!(
+        !source.contains("BTreeMap<i32, Vec<ScanRangeParams>>"),
+        "prepared projection must not own a second full scan-range map"
+    );
+
+    let prepare = fs::read_to_string(src_dir().join("coordinator/prepare/mod.rs"))
+        .expect("read preparation derivation");
+    for required in [
+        "plan.topology().result_fragment_id()",
+        ".terminal_write_fragment_ids()",
+        ".producer_fragment_ids()",
+        ".fragment_output_columns(fragment.fragment_id)",
+        "validate_and_group_boundary_contracts",
+    ] {
+        assert!(
+            prepare.contains(required),
+            "preparation must derive from sealed accessor `{required}`"
+        );
+    }
+    for forbidden in ["match fragment.sink", "fragment.output_columns.iter()"] {
+        assert!(
+            !prepare.contains(forbidden),
+            "preparation must not rederive sealed role/output from `{forbidden}`"
+        );
+    }
+    assert!(
+        !prepare.contains(
+            ".fragment_output_columns(fragment.fragment_id)\n            .unwrap_or_default()"
+        ),
+        "preparation must not repair a missing sealed output contract"
+    );
+    for required in [
+        "Iceberg write fragment unexpectedly has FragmentEdgeOutputCatalog output",
+        "non-write fragment is missing FragmentEdgeOutputCatalog output",
+    ] {
+        assert!(
+            prepare.contains(required),
+            "preparation must fail fast on sealed output mismatch `{required}`"
+        );
+    }
+
+    let scheduler =
+        fs::read_to_string(src_dir().join("coordinator/scheduler/mod.rs")).expect("read scheduler");
+    let payload_free = format!(
+        "{}\n{}",
+        rust_sanitized_production_text(&source),
+        rust_sanitized_production_text(&scheduler)
+    );
+    for forbidden in [
+        "NativePlanFragment",
+        "proto::plan::PlanFragment",
+        "struct PlanFragment",
+        "BTreeMap<FragmentId, NativePlanFragment>",
+    ] {
+        assert!(
+            !payload_free.contains(forbidden),
+            "prepared/scheduler projection must not own submission payload `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn coordinator_artifact_separation() {
+    let bundle_path = src_dir().join("sql/codegen/fragment/bundle.rs");
+    assert!(bundle_path.is_file(), "COOR-3B requires fragment/bundle.rs");
+    let bundle = fs::read_to_string(bundle_path).expect("read native bundle");
+    for required in [
+        "struct NativeFragmentBundle",
+        "fn fragment_ids(",
+        "fn fragments_in_id_order(",
+        "fn get(",
+        "fn into_fragments(",
+        "fn encode_native_fragment_bundle(",
+    ] {
+        assert!(
+            bundle.contains(required),
+            "missing native bundle API `{required}`"
+        );
+    }
+    assert!(
+        !bundle.contains("pub(crate) by_fragment"),
+        "bundle map must stay private"
+    );
+    let bundle_production = rust_sanitized_production_text(&bundle);
+    let bundle_compact = compact_line(&bundle_production);
+    assert!(
+        bundle_compact.contains("by_fragment:BTreeMap<FragmentId,NativePlanFragment>")
+            && !bundle_compact.contains("pubby_fragment:")
+            && !bundle_compact.contains("pub(crate)by_fragment:")
+            && !bundle_compact.contains("pub(super)by_fragment:"),
+        "bundle map declaration must remain fully private"
+    );
+    for forbidden in [
+        "fn get_mut(",
+        "fn iter_mut(",
+        "fn values_mut(",
+        "impl Deref for NativeFragmentBundle",
+        "impl AsRef<BTreeMap",
+    ] {
+        assert!(
+            !bundle_production.contains(forbidden),
+            "bundle must not expose mutable/map-shaped API `{forbidden}`"
+        );
+    }
+    assert_eq!(
+        rust_named_function_declaration_count(&bundle_production, "encode_native_fragment_bundle"),
+        1,
+        "production must have exactly one native bundle constructor"
+    );
+    assert_eq!(
+        rust_named_function_declaration_count(&bundle_production, "collect_native_fragment_bundle"),
+        1,
+        "encoder and malformed-id tests must share one private collector"
+    );
+    validate_native_bundle_construction_contract(&bundle)
+        .expect("bundle construction must be unique to the file-private collector");
+
+    let fragment_dir = src_dir().join("sql/codegen/fragment");
+    assert!(
+        !fragment_dir.join("request.rs").exists(),
+        "FragmentBuildRequest must be deleted"
+    );
+    let production = production_rs_files(&fragment_dir)
+        .into_iter()
+        .map(|path| fs::read_to_string(path).expect("read fragment source"))
+        .collect::<String>();
+    for retired in ["MultiFragmentBuildResult", "FragmentSchedulingMetadata"] {
+        assert!(
+            !production.contains(retired),
+            "retired mixed artifact remains: {retired}"
+        );
+    }
+    let test_build =
+        fs::read_to_string(fragment_dir.join("build.rs")).expect("read test-only fragment fixture");
+    assert!(
+        !test_build.contains("struct TestBuildFixture"),
+        "test fixture must pass prepared/native/boundary artifacts explicitly"
+    );
+}
+
+#[test]
+fn coordinator_scheduler_sealed_topology() {
+    let scheduler =
+        fs::read_to_string(src_dir().join("coordinator/scheduler/mod.rs")).expect("read scheduler");
+    let production = rust_sanitized_production_text(&scheduler);
+    assert!(
+        production
+            .contains("fn schedule(\n        &self,\n        view: FragmentSchedulingView<'_>"),
+        "scheduler must expose only the borrowed preparation-view API"
+    );
+    for retired in ["fn assign(", "fn assign_with_live(", "FragmentTopology"] {
+        assert!(
+            !production.contains(retired),
+            "retired scheduler surface remains: {retired}"
+        );
+    }
+    assert!(
+        !production.contains("native_scan_ranges"),
+        "scheduler must borrow prepared range slices"
+    );
+
+    let execution = fs::read_to_string(src_dir().join("coordinator/execution.rs"))
+        .expect("read coordinator execution");
+    let execution_production = rust_sanitized_production_text(&execution);
+    assert!(
+        execution_production.contains("scheduler: Arc<FragmentScheduler>"),
+        "execution coordinator must retain the concrete scheduler field"
+    );
+    for forbidden in [
+        "trait CoordinatorScheduler",
+        "Arc<dyn CoordinatorScheduler>",
+    ] {
+        assert!(
+            !execution_production.contains(forbidden),
+            "test drift must not create production scheduler surface `{forbidden}`"
+        );
     }
 }
 

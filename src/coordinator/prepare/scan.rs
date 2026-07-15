@@ -184,6 +184,10 @@ impl ScanExecutionBindings {
         self.by_node_id.get(&node_id)
     }
 
+    pub(super) fn binding_node_ids(&self) -> impl Iterator<Item = i32> + '_ {
+        self.by_node_id.keys().copied()
+    }
+
     pub(crate) fn insert_scan_ranges(
         &mut self,
         fragment_id: FragmentId,
@@ -211,11 +215,12 @@ impl ScanExecutionBindings {
             .map(Vec::as_slice)
     }
 
-    pub(crate) fn scan_ranges_for_fragment(
-        &self,
-        fragment_id: FragmentId,
-    ) -> Option<&BTreeMap<i32, Vec<ScanRangeParams>>> {
-        self.scan_ranges.get(&fragment_id)
+    pub(super) fn scan_range_keys(&self) -> impl Iterator<Item = (FragmentId, i32)> + '_ {
+        self.scan_ranges
+            .iter()
+            .flat_map(|(&fragment_id, per_node)| {
+                per_node.keys().map(move |&node_id| (fragment_id, node_id))
+            })
     }
 
     pub(crate) fn insert_starrocks_source(
@@ -232,6 +237,10 @@ impl ScanExecutionBindings {
 
     pub(crate) fn starrocks_source(&self, node_id: i32) -> Option<&StarRocksScanSourceDescriptor> {
         self.starrocks_sources.get(&node_id)
+    }
+
+    pub(super) fn starrocks_source_node_ids(&self) -> impl Iterator<Item = i32> + '_ {
+        self.starrocks_sources.keys().copied()
     }
 }
 
