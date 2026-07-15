@@ -29,7 +29,7 @@ use crate::runtime_filter::model::contract::{ChannelId, NullSemantics};
 
 use super::identity::LogicalVersion;
 use super::ordered_bound::{
-    OrderContractDigest, OrderedScalar, OrderedTuple, RuntimeOrderContract,
+    OrderContractDigest, OrderedScalar, OrderedTuple, RuntimeOrderContract, RuntimeOrderKey,
 };
 use super::support::ArtifactRetention;
 
@@ -511,10 +511,79 @@ pub(crate) struct RangeArtifactData {
     semantic_digest: ArtifactSemanticDigest,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RangeArtifactResidentLayout {
+    pub(crate) key_count: usize,
+    pub(crate) timezone_count: usize,
+    pub(crate) timezone_bytes: usize,
+    pub(crate) tuple_arity: usize,
+    pub(crate) utf8_count: usize,
+    pub(crate) utf8_bytes: usize,
+}
+
+impl RangeArtifactResidentLayout {
+    pub(crate) fn from_data(
+        contract: &RuntimeOrderContract,
+        bound: &OrderedTuple,
+    ) -> Result<Self, ArtifactContractError> {
+        let (timezone_count, timezone_bytes) =
+            contract
+                .keys()
+                .iter()
+                .try_fold((0usize, 0usize), |(count, bytes), key| {
+                    match key.data_type() {
+                        DataType::Timestamp(_, Some(timezone)) => Ok((
+                            count
+                                .checked_add(1)
+                                .ok_or(ArtifactContractError::ResidentSizeOverflow)?,
+                            bytes
+                                .checked_add(timezone.len())
+                                .ok_or(ArtifactContractError::ResidentSizeOverflow)?,
+                        )),
+                        _ => Ok((count, bytes)),
+                    }
+                })?;
+        let (utf8_count, utf8_bytes) = bound.values().iter().try_fold(
+            (0usize, 0usize),
+            |(count, bytes), value| match value {
+                Some(OrderedScalar::Utf8(value)) => Ok((
+                    count
+                        .checked_add(1)
+                        .ok_or(ArtifactContractError::ResidentSizeOverflow)?,
+                    bytes
+                        .checked_add(value.len())
+                        .ok_or(ArtifactContractError::ResidentSizeOverflow)?,
+                )),
+                _ => Ok((count, bytes)),
+            },
+        )?;
+        Ok(Self {
+            key_count: contract.keys().len(),
+            timezone_count,
+            timezone_bytes,
+            tuple_arity: bound.values().len(),
+            utf8_count,
+            utf8_bytes,
+        })
+    }
+
+    pub(crate) fn decode_temporary_bytes(self) -> Result<usize, ArtifactContractError> {
+        self.key_count
+            .checked_mul(size_of::<RuntimeOrderKey>())
+            .and_then(|bytes| {
+                self.tuple_arity
+                    .checked_mul(size_of::<Option<OrderedScalar>>())
+                    .and_then(|tuple| bytes.checked_add(tuple))
+            })
+            .ok_or(ArtifactContractError::ResidentSizeOverflow)
+    }
+}
+
 impl RangeArtifactData {
     pub(crate) fn new(
         contract: Arc<RuntimeOrderContract>,
         bound: OrderedTuple,
+        logical_version: LogicalVersion,
     ) -> Result<Self, ArtifactContractError> {
         contract
             .compare(&bound, &bound)
@@ -522,6 +591,7 @@ impl RangeArtifactData {
         let mut semantic = Sha256::new();
         semantic.update(b"novarocks.runtime-filter.range-semantic");
         semantic.update([1]);
+        semantic.update(logical_version.get().to_be_bytes());
         semantic.update(contract.digest().bytes());
         semantic.update((bound.values().len() as u64).to_be_bytes());
         for value in bound.values() {
@@ -553,20 +623,50 @@ impl RangeArtifactData {
     }
 
     pub(crate) fn accounted_resident_bytes(&self) -> Result<usize, ArtifactContractError> {
-        Self::accounted_resident_bytes_for_tuple(
-            self.bound
-                .estimated_retained_bytes()
-                .ok_or(ArtifactContractError::ResidentSizeOverflow)?,
-        )
+        Self::accounted_resident_bytes_for_layout(RangeArtifactResidentLayout::from_data(
+            &self.contract,
+            &self.bound,
+        )?)
     }
 
-    pub(crate) fn accounted_resident_bytes_for_tuple(
-        tuple_bytes: usize,
+    pub(crate) fn accounted_resident_bytes_for_layout(
+        layout: RangeArtifactResidentLayout,
     ) -> Result<usize, ArtifactContractError> {
+        let arc_header = 2usize
+            .checked_mul(size_of::<usize>())
+            .ok_or(ArtifactContractError::ResidentSizeOverflow)?;
         size_of::<Self>()
-            .checked_add(size_of::<Arc<Self>>())
-            .and_then(|bytes| bytes.checked_add(2 * size_of::<usize>()))
-            .and_then(|bytes| bytes.checked_add(tuple_bytes))
+            .checked_add(arc_header)
+            .and_then(|bytes| bytes.checked_add(size_of::<RuntimeOrderContract>()))
+            .and_then(|bytes| bytes.checked_add(arc_header))
+            .and_then(|bytes| {
+                layout
+                    .key_count
+                    .checked_mul(size_of::<RuntimeOrderKey>())
+                    .and_then(|keys| bytes.checked_add(keys))
+            })
+            .and_then(|bytes| bytes.checked_add(arc_header))
+            .and_then(|bytes| {
+                layout
+                    .timezone_count
+                    .checked_mul(arc_header)
+                    .and_then(|headers| bytes.checked_add(headers))
+            })
+            .and_then(|bytes| bytes.checked_add(layout.timezone_bytes))
+            .and_then(|bytes| {
+                layout
+                    .tuple_arity
+                    .checked_mul(size_of::<Option<OrderedScalar>>())
+                    .and_then(|values| bytes.checked_add(values))
+            })
+            .and_then(|bytes| bytes.checked_add(arc_header))
+            .and_then(|bytes| {
+                layout
+                    .utf8_count
+                    .checked_mul(arc_header)
+                    .and_then(|headers| bytes.checked_add(headers))
+            })
+            .and_then(|bytes| bytes.checked_add(layout.utf8_bytes))
             .ok_or(ArtifactContractError::ResidentSizeOverflow)
     }
 }
@@ -734,8 +834,28 @@ impl PhysicalArtifact {
         encoded_bytes: usize,
         data: &RangeArtifactData,
     ) -> Result<usize, ArtifactContractError> {
-        Self::accounted_resident_component_bytes(encoded_bytes)?
-            .checked_add(data.accounted_resident_bytes()?)
+        Self::accounted_range_resident_component_bytes_for_layout(
+            encoded_bytes,
+            RangeArtifactResidentLayout::from_data(data.contract(), data.bound())?,
+        )
+    }
+
+    pub(crate) fn accounted_range_resident_component_bytes_for_layout(
+        encoded_bytes: usize,
+        layout: RangeArtifactResidentLayout,
+    ) -> Result<usize, ArtifactContractError> {
+        let arc_header = 2usize
+            .checked_mul(size_of::<usize>())
+            .ok_or(ArtifactContractError::ResidentSizeOverflow)?;
+        size_of::<Self>()
+            .checked_add(arc_header)
+            .and_then(|bytes| bytes.checked_add(encoded_bytes))
+            .and_then(|bytes| bytes.checked_add(arc_header))
+            .and_then(|bytes| {
+                RangeArtifactData::accounted_resident_bytes_for_layout(layout)
+                    .ok()
+                    .and_then(|data| bytes.checked_add(data))
+            })
             .ok_or(ArtifactContractError::ResidentSizeOverflow)
     }
 
@@ -748,6 +868,7 @@ impl PhysicalArtifact {
         let accounted =
             Self::accounted_range_resident_component_bytes(canonical_bytes.len(), &data)?
                 .checked_add(size_of::<ArtifactRetention>())
+                .and_then(|bytes| bytes.checked_add(2 * size_of::<usize>()))
                 .ok_or(ArtifactContractError::ResidentSizeOverflow)?;
         if retained_memory.bytes() != accounted || retained_memory.budget_bytes() != accounted {
             return Err(ArtifactContractError::RetentionSizeMismatch);
@@ -756,7 +877,7 @@ impl PhysicalArtifact {
             version,
             data,
             canonical_bytes,
-            accounted - size_of::<ArtifactRetention>(),
+            accounted - size_of::<ArtifactRetention>() - 2 * size_of::<usize>(),
             accounted,
             Arc::new(retained_memory),
         )
@@ -915,6 +1036,23 @@ impl ArtifactBundle {
             .ok_or(ArtifactContractError::ResidentSizeOverflow)
     }
 
+    pub(crate) fn accounted_range_resident_overhead(
+        artifact_count: usize,
+    ) -> Result<usize, ArtifactContractError> {
+        let arc_header = 2usize
+            .checked_mul(size_of::<usize>())
+            .ok_or(ArtifactContractError::ResidentSizeOverflow)?;
+        let refs = artifact_count
+            .checked_mul(size_of::<(ArtifactKind, Arc<PhysicalArtifact>)>())
+            .ok_or(ArtifactContractError::ResidentSizeOverflow)?;
+        size_of::<Self>()
+            .checked_add(arc_header)
+            .and_then(|bytes| bytes.checked_add(refs))
+            .and_then(|bytes| bytes.checked_add(size_of::<ArtifactRetention>()))
+            .and_then(|bytes| bytes.checked_add(arc_header))
+            .ok_or(ArtifactContractError::ResidentSizeOverflow)
+    }
+
     pub(crate) fn new(
         channel_id: ChannelId,
         version: LogicalVersion,
@@ -940,14 +1078,21 @@ impl ArtifactBundle {
         max_artifact_bytes: usize,
         retained_memory: Arc<ArtifactRetention>,
     ) -> Result<Self, ArtifactContractError> {
-        let expected = artifacts.iter().try_fold(
-            Self::accounted_resident_overhead(profile, artifacts.len())?,
-            |bytes, (_, artifact)| {
+        let overhead = if artifacts
+            .iter()
+            .all(|(_, artifact)| artifact.kind() == ArtifactKind::Range)
+        {
+            Self::accounted_range_resident_overhead(artifacts.len())?
+        } else {
+            Self::accounted_resident_overhead(profile, artifacts.len())?
+        };
+        let expected = artifacts
+            .iter()
+            .try_fold(overhead, |bytes, (_, artifact)| {
                 bytes
                     .checked_add(artifact.accounted_component_bytes()?)
                     .ok_or(ArtifactContractError::ResidentSizeOverflow)
-            },
-        )?;
+            })?;
         if retained_memory.bytes() != expected || retained_memory.budget_bytes() != expected {
             return Err(ArtifactContractError::RetentionSizeMismatch);
         }

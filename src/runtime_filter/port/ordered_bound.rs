@@ -56,6 +56,18 @@ pub(crate) struct RuntimeOrderKey {
 }
 
 impl RuntimeOrderKey {
+    pub(crate) const fn from_codec(
+        data_type: DataType,
+        direction: SortDirection,
+        null_order: NullOrder,
+    ) -> Self {
+        Self {
+            data_type,
+            direction,
+            null_order,
+        }
+    }
+
     pub(crate) const fn data_type(&self) -> &DataType {
         &self.data_type
     }
@@ -119,6 +131,25 @@ impl OrderedTuple {
 
     pub(crate) fn values(&self) -> &[Option<OrderedScalar>] {
         &self.values
+    }
+
+    pub(crate) fn try_from_codec(
+        contract: &RuntimeOrderContract,
+        values: Vec<Option<OrderedScalar>>,
+    ) -> Result<Self, OrderedTupleError> {
+        if values.len() != contract.keys.len() {
+            return Err(OrderedTupleError::ArityMismatch);
+        }
+        if contract.keys.iter().zip(&values).any(|(key, value)| {
+            value
+                .as_ref()
+                .is_some_and(|value| !scalar_matches_type(value, &key.data_type))
+        }) {
+            return Err(OrderedTupleError::TypeMismatch);
+        }
+        Ok(Self {
+            values: values.into(),
+        })
     }
 
     pub(crate) fn estimated_retained_bytes(&self) -> Option<usize> {
@@ -226,6 +257,24 @@ impl ComparatorDigestV1 {
 }
 
 impl RuntimeOrderContract {
+    pub(crate) fn from_codec(
+        keys: Vec<RuntimeOrderKey>,
+        plan_comparator_digest: ComparatorDigest,
+        order_contract_digest: OrderContractDigest,
+    ) -> Result<Self, OrderContractError> {
+        if keys.is_empty() {
+            return Err(OrderContractError::EmptyKeys);
+        }
+        for key in &keys {
+            validate_supported_type(&key.data_type)?;
+        }
+        Ok(Self {
+            keys: keys.into(),
+            plan_comparator_digest,
+            order_contract_digest,
+        })
+    }
+
     pub(crate) fn validate_codec_contract_digest(
         canonical_keys: &[u8],
         comparator_digest: [u8; 32],

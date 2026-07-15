@@ -45,11 +45,14 @@ use crate::runtime_filter::port::subscription::{
 };
 use crate::runtime_filter::port::support::{RuntimeFilterClock, RuntimeFilterMemoryAccount};
 
+#[cfg(test)]
+use self::materialization::run_materialization_jobs;
 use self::materialization::{
-    MaterializationWorkClaim, PublishCommitOutcome, run_materialization_jobs,
+    ClaimedMaterializationJob, MaterializationWorkClaim, PublishCommitOutcome,
+    claim_materialization_jobs, execute_materialization_jobs,
 };
 use self::producer::ServiceProducerAdapter;
-use self::registry::DeploymentRegistry;
+use self::registry::{DeploymentRegistry, InstalledDeployment};
 
 struct EventQueueState {
     draining: bool,
@@ -221,34 +224,6 @@ impl EventEmitter {
         Some(EventBatchHandle { id, completion })
     }
 
-    fn merge_into_reserved(
-        &self,
-        target: Option<&EventBatchHandle>,
-        source: Option<EventBatchHandle>,
-    ) -> Option<EventBatchHandle> {
-        let Some(target) = target else { return source };
-        let Some(source) = source else { return None };
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let source_index = state
-            .batches
-            .iter()
-            .position(|batch| batch.id == source.id)
-            .expect("artifact event batch remains reserved");
-        let mut source_batch = state
-            .batches
-            .remove(source_index)
-            .expect("artifact event batch index is valid");
-        let target_batch = state
-            .batches
-            .iter_mut()
-            .find(|batch| batch.id == target.id)
-            .expect("core event batch remains reserved");
-        target_batch.events.append(&mut source_batch.events);
-        drop(state);
-        source_batch.completion.complete();
-        None
-    }
-
     fn publish(&self, batch: Option<EventBatchHandle>) {
         let Some(batch) = batch else {
             return;
@@ -399,12 +374,19 @@ struct PendingDispatch {
     action: ChannelAction,
     core_batch: Option<EventBatchHandle>,
     completion: Arc<EventBatchCompletion>,
+    needs_drainer: bool,
 }
 
 #[derive(Default)]
 struct ChannelDispatchFlight {
     state: Mutex<ChannelDispatchState>,
     changed: Condvar,
+}
+
+struct ClaimedActionMaterialization {
+    installed: Arc<InstalledDeployment>,
+    snapshot: Arc<crate::runtime_filter::port::value_domain::LogicalSnapshot>,
+    jobs: Vec<ClaimedMaterializationJob>,
 }
 
 impl ActionDispatcher {
@@ -505,11 +487,6 @@ impl ActionDispatcher {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             if order < state.next_order {
-                let result = state
-                    .completed_errors
-                    .get(&order)
-                    .cloned()
-                    .map_or(Ok(()), Err);
                 let completion = state
                     .publishing_completions
                     .get(&order)
@@ -519,6 +496,14 @@ impl ActionDispatcher {
                 if wait && !self.events.is_draining_on_current_thread() {
                     completion.wait();
                 }
+                let result = flight
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .completed_errors
+                    .get(&order)
+                    .cloned()
+                    .map_or(Ok(()), Err);
                 return (result, completion);
             }
             if state.draining && order == state.next_order {
@@ -559,9 +544,13 @@ impl ActionDispatcher {
                             action,
                             core_batch,
                             completion,
+                            needs_drainer: !wait,
                         });
                     }
-                    std::collections::btree_map::Entry::Occupied(entry) => {
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        if wait {
+                            entry.get_mut().needs_drainer = false;
+                        }
                         caller_completion = Some(entry.get().completion.clone());
                     }
                 }
@@ -582,119 +571,170 @@ impl ActionDispatcher {
             }
             let next_order = state.next_order;
             let PendingDispatch {
-                mut action,
+                action,
                 core_batch: reserved_core_batch,
-                completion: mut action_completion,
+                completion: action_completion,
+                ..
             } = state
                 .pending
                 .remove(&next_order)
                 .expect("next ordered runtime filter action is pending");
-            let mut core_batch = reserved_core_batch
+            let core_batch = reserved_core_batch
                 .or_else(|| self.events.reserve_unready(action.events().iter().cloned()));
             state.draining = true;
             state.active_completion = Some(action_completion.clone());
             drop(state);
-            let mut caller_result = None;
             let caller_completion = caller_completion.unwrap_or_else(|| action_completion.clone());
-            loop {
-                #[cfg(test)]
-                if let Some(hook) = self
-                    .after_claim
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .take()
-                {
-                    hook();
-                }
-                let (artifact_batch, error) = self.route_and_prequeue(channel_id, &action);
-                let artifact_batch = self
-                    .events
-                    .merge_into_reserved(core_batch.as_ref(), artifact_batch);
-                let result = error.map_or(Ok(()), Err);
-                let mut state = flight
-                    .state
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                state.next_order = state
-                    .next_order
-                    .checked_add(1)
-                    .expect("runtime filter dispatch order exhausted");
-                let completed_order = state
-                    .next_order
-                    .checked_sub(1)
-                    .expect("completed runtime filter dispatch has an order");
-                state.active_completion = None;
-                state.draining = false;
-                state
-                    .publishing_completions
-                    .insert(completed_order, action_completion.clone());
-                if let Err(error) = &result {
-                    state
-                        .completed_errors
-                        .insert(completed_order, error.clone());
-                }
-                drop(state);
-
-                let final_event_completion = artifact_batch
-                    .as_ref()
-                    .or(core_batch.as_ref())
-                    .map(|batch| batch.completion.clone());
-                if let Some(event_completion) = final_event_completion {
-                    let flight = flight.clone();
-                    let action_completion = action_completion.clone();
-                    event_completion.on_complete(move || {
-                        Self::finish_publishing_action(flight, completed_order, action_completion);
-                    });
-                } else {
-                    Self::finish_publishing_action(
-                        flight.clone(),
-                        completed_order,
-                        action_completion.clone(),
-                    );
-                }
-
-                self.events.publish(core_batch);
-                self.events.publish(artifact_batch);
-
-                let mut state = flight
-                    .state
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                if completed_order == order {
-                    caller_result = Some(result);
-                }
-                if state.draining || !state.pending.contains_key(&state.next_order) {
-                    return (caller_result.unwrap_or(Ok(())), caller_completion);
-                }
-                let next_order = state.next_order;
-                let PendingDispatch {
-                    action: next_action,
-                    core_batch: reserved_core_batch,
-                    completion: next_completion,
-                } = state
-                    .pending
-                    .remove(&next_order)
-                    .expect("next ordered runtime filter action is pending");
-                let next_core_batch = reserved_core_batch.or_else(|| {
-                    self.events
-                        .reserve_unready(next_action.events().iter().cloned())
-                });
-                state.draining = true;
-                state.active_completion = Some(next_completion.clone());
-                drop(state);
-                action = next_action;
-                core_batch = next_core_batch;
-                action_completion = next_completion;
-            }
+            let result = self.process_claimed_action(
+                channel_id,
+                flight.clone(),
+                action,
+                core_batch,
+                action_completion,
+            );
+            self.drain_ready_nonblocking(channel_id, flight);
+            return (result, caller_completion);
         }
+    }
+
+    fn drain_ready_nonblocking(&self, channel_id: ChannelId, flight: Arc<ChannelDispatchFlight>) {
+        loop {
+            let mut state = flight
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if state.draining {
+                return;
+            }
+            let next_order = state.next_order;
+            if !state
+                .pending
+                .get(&next_order)
+                .is_some_and(|pending| pending.needs_drainer)
+            {
+                return;
+            }
+            let PendingDispatch {
+                action,
+                core_batch,
+                completion,
+                ..
+            } = state
+                .pending
+                .remove(&next_order)
+                .expect("ready nonblocking dispatch remains pending");
+            let core_batch =
+                core_batch.or_else(|| self.events.reserve_unready(action.events().iter().cloned()));
+            state.draining = true;
+            state.active_completion = Some(completion.clone());
+            drop(state);
+            let _ = self.process_claimed_action(
+                channel_id,
+                flight.clone(),
+                action,
+                core_batch,
+                completion,
+            );
+        }
+    }
+
+    fn process_claimed_action(
+        &self,
+        channel_id: ChannelId,
+        flight: Arc<ChannelDispatchFlight>,
+        action: ChannelAction,
+        core_batch: Option<EventBatchHandle>,
+        action_completion: Arc<EventBatchCompletion>,
+    ) -> Result<(), RuntimeContractViolation> {
+        #[cfg(test)]
+        if let Some(hook) = self
+            .after_claim
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            hook();
+        }
+        let claimed = self.claim_action_materialization(channel_id, &action);
+        let core_completion = core_batch.as_ref().map(|batch| batch.completion.clone());
+
+        let mut state = flight
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.next_order = state
+            .next_order
+            .checked_add(1)
+            .expect("runtime filter dispatch order exhausted");
+        let completed_order = state.next_order - 1;
+        state.active_completion = None;
+        state.draining = false;
+        state
+            .publishing_completions
+            .insert(completed_order, action_completion.clone());
+        drop(state);
+        flight.changed.notify_all();
+
+        self.events.publish(core_batch);
+        let (artifact_batch, error) = self.route_and_prequeue(channel_id, &action, claimed);
+        let result = error.map_or(Ok(()), Err);
+        if let Err(error) = &result {
+            flight
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .completed_errors
+                .insert(completed_order, error.clone());
+        }
+
+        let final_event_completion = artifact_batch
+            .as_ref()
+            .map(|batch| batch.completion.clone())
+            .or(core_completion);
+        if let Some(event_completion) = final_event_completion {
+            let flight = flight.clone();
+            let action_completion = action_completion.clone();
+            event_completion.on_complete(move || {
+                Self::finish_publishing_action(flight, completed_order, action_completion);
+            });
+        } else {
+            Self::finish_publishing_action(flight, completed_order, action_completion);
+        }
+        self.events.publish(artifact_batch);
+        result
+    }
+
+    fn claim_action_materialization(
+        &self,
+        channel_id: ChannelId,
+        action: &ChannelAction,
+    ) -> Option<ClaimedActionMaterialization> {
+        let snapshot = match action {
+            ChannelAction::VisibleSnapshot { snapshot, .. }
+            | ChannelAction::Completed { snapshot, .. } => snapshot.clone(),
+            _ => return None,
+        };
+        let installed = self.registry.installation_for_dispatch()?;
+        let plan = installed.artifact_plan(channel_id)?;
+        let jobs = claim_materialization_jobs(plan, installed.publish_gate(), snapshot.version());
+        Some(ClaimedActionMaterialization {
+            installed,
+            snapshot,
+            jobs,
+        })
     }
 
     fn route_and_prequeue(
         &self,
         channel_id: ChannelId,
         action: &ChannelAction,
+        claimed: Option<ClaimedActionMaterialization>,
     ) -> (Option<EventBatchHandle>, Option<RuntimeContractViolation>) {
-        let Some(installed) = self.registry.installation_for_dispatch() else {
+        let installed = claimed
+            .as_ref()
+            .map(|claimed| claimed.installed.clone())
+            .or_else(|| self.registry.installation_for_dispatch());
+        let Some(installed) = installed else {
             return (None, None);
         };
         let mut events = Vec::new();
@@ -707,12 +747,15 @@ impl ActionDispatcher {
             | ChannelAction::DegradedLogical { .. } => {}
             ChannelAction::VisibleSnapshot { snapshot, .. }
             | ChannelAction::Completed { snapshot, .. } => {
+                let Some(claimed) = claimed else {
+                    return (None, None);
+                };
+                debug_assert!(Arc::ptr_eq(snapshot, &claimed.snapshot));
                 let Some(plan) = installed.artifact_plan(channel_id) else {
                     return (None, None);
                 };
-                for work in run_materialization_jobs(
+                for work in execute_materialization_jobs(
                     plan,
-                    installed.publish_gate(),
                     snapshot,
                     self.memory_account.clone(),
                     {
@@ -741,6 +784,7 @@ impl ActionDispatcher {
                             None
                         }
                     },
+                    claimed.jobs,
                 ) {
                     let identity =
                         crate::runtime_filter::port::events::ArtifactMaterializationIdentity::new(
@@ -749,6 +793,10 @@ impl ActionDispatcher {
                             snapshot.version(),
                         );
                     events.extend(work.events);
+                    if let Some(violation) = work.contract_violation {
+                        error.get_or_insert(violation);
+                        continue;
+                    }
                     let Some(outcome) = work.outcome else {
                         events.push(RuntimeFilterEvent::ArtifactPublishStaleSkipped { identity });
                         continue;
@@ -1802,6 +1850,118 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn ordered_newer_version_can_publish_while_older_encode_is_blocked() {
+        struct ReleaseOnDrop(Arc<(Mutex<bool>, Condvar)>);
+
+        impl ReleaseOnDrop {
+            fn release(&self) {
+                let (lock, changed) = &*self.0;
+                *lock.lock().unwrap_or_else(|error| error.into_inner()) = true;
+                changed.notify_all();
+            }
+        }
+
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.release();
+            }
+        }
+
+        let events = Arc::new(Events::default());
+        let (service, contract) = installed_ordered_service_with_account_and_events(
+            MemTrackerMemoryAccount::new_root_for_test("ordered-out-of-order-publish-test"),
+            events.clone(),
+        );
+        let ProducerHandle::OrderedBound(producer) = service
+            .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+            .unwrap()
+        else {
+            panic!("ordered fixture must return ordered producer")
+        };
+
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_on_drop = ReleaseOnDrop(release.clone());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (older_entered_tx, older_entered_rx) = mpsc::channel();
+        service.set_before_encode_hook(Arc::new({
+            let release = release.clone();
+            let calls = calls.clone();
+            move |_| {
+                if calls.fetch_add(1, Ordering::SeqCst) != 0 {
+                    return;
+                }
+                older_entered_tx.send(()).unwrap();
+                let (lock, changed) = &*release;
+                let mut released = lock.lock().unwrap_or_else(|error| error.into_inner());
+                while !*released {
+                    released = changed
+                        .wait(released)
+                        .unwrap_or_else(|error| error.into_inner());
+                }
+            }
+        }));
+
+        let (older_tx, older_rx) = mpsc::channel();
+        let older_producer = producer.clone();
+        let older_contract = contract.clone();
+        let older = std::thread::spawn(move || {
+            older_tx
+                .send(older_producer.submit_bound(
+                    PartitionId::new(0),
+                    ProducerSequence::new(0),
+                    ordered_update(&older_contract, 40),
+                ))
+                .unwrap();
+        });
+        older_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("older version must reach the encode hook");
+
+        let (newer_tx, newer_rx) = mpsc::channel();
+        let newer_producer = producer.clone();
+        let newer_contract = contract.clone();
+        let newer = std::thread::spawn(move || {
+            newer_tx
+                .send(newer_producer.submit_bound(
+                    PartitionId::new(0),
+                    ProducerSequence::new(1),
+                    ordered_update(&newer_contract, 30),
+                ))
+                .unwrap();
+        });
+        assert_eq!(
+            newer_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("newer version must publish before the older encode is released")
+                .unwrap(),
+            SubmitOutcome::Published
+        );
+
+        release_on_drop.release();
+        assert_eq!(
+            older_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap(),
+            SubmitOutcome::Published
+        );
+        older.join().unwrap();
+        newer.join().unwrap();
+
+        let events = events.0.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeFilterEvent::ArtifactPublished { identity, .. }
+                if identity.version() == LogicalVersion::new(2)
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeFilterEvent::ArtifactPublishStaleSkipped { identity }
+                if identity.version() == LogicalVersion::FIRST
+        )));
+    }
+
     fn install_one(fixture: &Fixture) {
         assert_eq!(
             fixture
@@ -1906,7 +2066,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatcher_owner_does_not_return_after_claiming_an_earlier_pending_order() {
+    fn each_pending_dispatch_order_is_drained_by_its_caller() {
         fn action(order: u64) -> ChannelAction {
             ChannelAction::Progress {
                 order: Some(order),
@@ -1943,6 +2103,7 @@ mod tests {
                     action: action(1),
                     core_batch: None,
                     completion: Arc::new(EventBatchCompletion::default()),
+                    needs_drainer: false,
                 },
             );
             state.pending.insert(
@@ -1951,6 +2112,7 @@ mod tests {
                     action: action(2),
                     core_batch: None,
                     completion: Arc::new(EventBatchCompletion::default()),
+                    needs_drainer: false,
                 },
             );
         }
@@ -1970,8 +2132,6 @@ mod tests {
             dispatcher.dispatch(channel_id, action(2)).unwrap();
             second_tx.send(()).unwrap();
         });
-        second_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-
         let dispatcher = fixture.service.dispatcher.clone();
         let (first_tx, first_rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -1979,6 +2139,7 @@ mod tests {
             first_tx.send(()).unwrap();
         });
         first_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        second_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
         let state = flight.state.lock().unwrap();
         assert_eq!(state.next_order, 3);
@@ -3287,10 +3448,15 @@ mod tests {
         };
         let channel = fixture.service.registry.channel(ChannelId::new(1)).unwrap();
         let repeated = channel.terminal_action();
-        let (batch, error) = fixture
+        let claimed = fixture
             .service
             .dispatcher
-            .route_and_prequeue(ChannelId::new(1), &repeated);
+            .claim_action_materialization(ChannelId::new(1), &repeated);
+        let (batch, error) =
+            fixture
+                .service
+                .dispatcher
+                .route_and_prequeue(ChannelId::new(1), &repeated, claimed);
         assert!(error.is_none());
         fixture.service.dispatcher.events.publish(batch);
         let ArtifactAcquireOutcome::Published(second) = subscription.acquire(Duration::ZERO) else {

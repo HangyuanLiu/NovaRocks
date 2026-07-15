@@ -440,6 +440,44 @@ pub(super) struct MaterializationWorkResult {
     pub(super) claim: MaterializationWorkClaim,
     pub(super) outcome: Option<ArtifactDeliveryOutcome>,
     pub(super) events: Vec<RuntimeFilterEvent>,
+    pub(super) contract_violation: Option<RuntimeContractViolation>,
+}
+
+pub(super) enum ClaimedMaterializationJob {
+    Owner {
+        group: CapabilityGroup,
+        owner: ArtifactJobOwner,
+    },
+    Follower {
+        group: CapabilityGroup,
+        follower: ArtifactJobFollower,
+    },
+    Stale {
+        group: CapabilityGroup,
+    },
+}
+
+pub(super) fn claim_materialization_jobs(
+    plan: &ChannelArtifactPlan,
+    gate: &ArtifactPublishGate,
+    version: LogicalVersion,
+) -> Vec<ClaimedMaterializationJob> {
+    plan.groups()
+        .iter()
+        .map(|group| match gate.claim(group.key(), version) {
+            ArtifactJobClaim::Owner(owner) => ClaimedMaterializationJob::Owner {
+                group: group.clone(),
+                owner,
+            },
+            ArtifactJobClaim::Follower(follower) => ClaimedMaterializationJob::Follower {
+                group: group.clone(),
+                follower,
+            },
+            ArtifactJobClaim::Stale => ClaimedMaterializationJob::Stale {
+                group: group.clone(),
+            },
+        })
+        .collect()
 }
 
 pub(super) fn run_materialization_jobs(
@@ -450,18 +488,41 @@ pub(super) fn run_materialization_jobs(
     before_encode: Option<Arc<dyn Fn(ConsumerProfileId) + Send + Sync>>,
     after_encode: Option<Arc<dyn Fn(ConsumerProfileId) + Send + Sync>>,
 ) -> Vec<MaterializationWorkResult> {
-    let groups = plan.groups();
-    if groups.is_empty() {
+    let claimed = claim_materialization_jobs(plan, gate, snapshot.version());
+    execute_materialization_jobs(
+        plan,
+        snapshot,
+        memory_account,
+        before_encode,
+        after_encode,
+        claimed,
+    )
+}
+
+pub(super) fn execute_materialization_jobs(
+    plan: &ChannelArtifactPlan,
+    snapshot: &Arc<LogicalSnapshot>,
+    memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
+    before_encode: Option<Arc<dyn Fn(ConsumerProfileId) + Send + Sync>>,
+    after_encode: Option<Arc<dyn Fn(ConsumerProfileId) + Send + Sync>>,
+    claimed: Vec<ClaimedMaterializationJob>,
+) -> Vec<MaterializationWorkResult> {
+    if claimed.is_empty() {
         return Vec::new();
     }
-    let batch_size = plan.max_concurrent_jobs().min(groups.len()).max(1);
-    let mut results = Vec::with_capacity(groups.len());
-    for batch in groups.chunks(batch_size) {
-        // Claim, plan, and reserve in canonical profile order. This makes scarce-budget
-        // winners deterministic while keeping the expensive codec phase concurrent.
+    let batch_size = plan.max_concurrent_jobs().min(claimed.len()).max(1);
+    let mut results = Vec::with_capacity(claimed.len());
+    let mut claimed = claimed.into_iter();
+    loop {
+        let batch = claimed.by_ref().take(batch_size).collect::<Vec<_>>();
+        if batch.is_empty() {
+            break;
+        }
+        // Plan and reserve in canonical profile order. This makes scarce-budget winners
+        // deterministic while keeping the expensive codec phase concurrent.
         let admitted = batch
-            .iter()
-            .map(|group| admit_group(plan, gate, snapshot, group, memory_account.clone()))
+            .into_iter()
+            .map(|claim| admit_claimed_group(plan, snapshot, claim, memory_account.clone()))
             .collect::<Vec<_>>();
         let mut batch_results = std::thread::scope(|scope| {
             let mut jobs = Vec::with_capacity(admitted.len());
@@ -475,6 +536,7 @@ pub(super) fn run_materialization_jobs(
                                 claim: MaterializationWorkClaim::Follower,
                                 outcome: Some(follower.wait()),
                                 events: Vec::new(),
+                                contract_violation: None,
                             }
                         })));
                     }
@@ -488,32 +550,75 @@ pub(super) fn run_materialization_jobs(
                         let before_encode = before_encode.clone();
                         let after_encode = after_encode.clone();
                         jobs.push(ScopedJob::Running(scope.spawn(move || {
-                            let outcome =
-                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let outcome = std::panic::catch_unwind(
+                                std::panic::AssertUnwindSafe(|| {
                                     if let Some(hook) = before_encode {
                                         hook(group.profile().id());
                                     }
                                     match admitted {
                                         AdmittedArtifactMaterialization::Membership(admitted) => {
-                                            Materializer::encode(admitted)
+                                            Materializer::encode(admitted).map_or_else(
+                                                |_| EncodeDispatch::Complete(
+                                                    MaterializationOutcome::Unavailable(
+                                                        MaterializerUnavailableReason::MaterializationFailed,
+                                                    ),
+                                                ),
+                                                EncodeDispatch::Published,
+                                            )
                                         }
                                         AdmittedArtifactMaterialization::Range(admitted) => {
-                                            RangeMaterializer::encode(admitted).map_err(|_| ())
+                                            match RangeMaterializer::encode(admitted) {
+                                                Ok(bundle) => EncodeDispatch::Published(bundle),
+                                                Err(RangeMaterializationOutcome::ContractViolation(
+                                                    violation,
+                                                )) => EncodeDispatch::ContractViolation(violation),
+                                                Err(RangeMaterializationOutcome::ResourceUnavailable) => {
+                                                    EncodeDispatch::Complete(
+                                                        MaterializationOutcome::Unavailable(
+                                                            MaterializerUnavailableReason::ResourceLimit,
+                                                        ),
+                                                    )
+                                                }
+                                                Err(_) => EncodeDispatch::Complete(
+                                                    MaterializationOutcome::Unavailable(
+                                                        MaterializerUnavailableReason::MaterializationFailed,
+                                                    ),
+                                                ),
+                                            }
                                         }
                                     }
-                                }))
-                                .ok()
-                                .and_then(Result::ok)
-                                .map(MaterializationOutcome::Published)
-                                .unwrap_or(
-                                    MaterializationOutcome::Unavailable(
-                                        MaterializerUnavailableReason::MaterializationFailed,
-                                    ),
-                                );
+                                }),
+                            )
+                            .unwrap_or(EncodeDispatch::Complete(
+                                MaterializationOutcome::Unavailable(
+                                    MaterializerUnavailableReason::MaterializationFailed,
+                                ),
+                            ));
                             if let Some(hook) = after_encode {
                                 hook(group.profile().id());
                             }
-                            complete_group(group, owner, identity, events, outcome)
+                            match outcome {
+                                EncodeDispatch::Published(bundle) => complete_group(
+                                    group,
+                                    owner,
+                                    identity,
+                                    events,
+                                    MaterializationOutcome::Published(bundle),
+                                ),
+                                EncodeDispatch::Complete(outcome) => {
+                                    complete_group(group, owner, identity, events, outcome)
+                                }
+                                EncodeDispatch::ContractViolation(violation) => {
+                                    drop(owner);
+                                    MaterializationWorkResult {
+                                        group,
+                                        claim: MaterializationWorkClaim::Stale,
+                                        outcome: None,
+                                        events,
+                                        contract_violation: Some(violation),
+                                    }
+                                }
+                            }
                         })));
                     }
                 }
@@ -557,30 +662,42 @@ enum AdmissionDispatch<'a> {
     Complete(MaterializationOutcome),
 }
 
+enum EncodeDispatch {
+    Published(Arc<ArtifactBundle>),
+    Complete(MaterializationOutcome),
+    ContractViolation(RuntimeContractViolation),
+}
+
 enum ScopedJob<'scope> {
     Complete(MaterializationWorkResult),
     Running(std::thread::ScopedJoinHandle<'scope, MaterializationWorkResult>),
 }
 
-fn admit_group<'a>(
+fn admit_claimed_group<'a>(
     plan: &'a ChannelArtifactPlan,
-    gate: &ArtifactPublishGate,
     snapshot: &Arc<LogicalSnapshot>,
-    group: &'a CapabilityGroup,
+    claim: ClaimedMaterializationJob,
     memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
 ) -> AdmittedGroup<'a> {
-    match gate.claim(group.key(), snapshot.version()) {
-        ArtifactJobClaim::Stale => AdmittedGroup::Complete(MaterializationWorkResult {
-            group: group.clone(),
-            claim: MaterializationWorkClaim::Stale,
-            outcome: None,
-            events: Vec::new(),
-        }),
-        ArtifactJobClaim::Follower(follower) => AdmittedGroup::Follower {
-            group: group.clone(),
-            follower,
-        },
-        ArtifactJobClaim::Owner(owner) => {
+    match claim {
+        ClaimedMaterializationJob::Stale { group } => {
+            AdmittedGroup::Complete(MaterializationWorkResult {
+                group,
+                claim: MaterializationWorkClaim::Stale,
+                outcome: None,
+                events: Vec::new(),
+                contract_violation: None,
+            })
+        }
+        ClaimedMaterializationJob::Follower { group, follower } => {
+            AdmittedGroup::Follower { group, follower }
+        }
+        ClaimedMaterializationJob::Owner { group, owner } => {
+            let planned_group = plan
+                .groups()
+                .iter()
+                .find(|planned| planned.key() == group.key())
+                .expect("claimed materialization group remains in its channel plan");
             let identity = ArtifactMaterializationIdentity::new(
                 group.common(),
                 group.profile().id(),
@@ -591,7 +708,7 @@ fn admit_group<'a>(
                 if snapshot.ordered_bound().is_some() {
                     let range_plan = match RangeMaterializer::plan(
                         snapshot.clone(),
-                        group.profile(),
+                        planned_group.profile(),
                         plan.max_artifact_bytes(),
                     ) {
                         Ok(plan) => plan,
@@ -602,7 +719,10 @@ fn admit_group<'a>(
                                 ),
                             ));
                         }
-                        Err(_) => return Err(()),
+                        Err(RangeMaterializationOutcome::ContractViolation(violation)) => {
+                            return Err(Some(violation));
+                        }
+                        Err(_) => return Err(None),
                     };
                     return match RangeMaterializer::admit(
                         range_plan,
@@ -618,18 +738,21 @@ fn admit_group<'a>(
                                 MaterializerUnavailableReason::ResourceLimit,
                             )),
                         ),
-                        Err(_) => Err(()),
+                        Err(RangeMaterializationOutcome::ContractViolation(violation)) => {
+                            Err(Some(violation))
+                        }
+                        Err(_) => Err(None),
                     };
                 }
-                let schema = plan.schema().ok_or(())?;
+                let schema = plan.schema().ok_or(None)?;
                 let materialization_plan = Materializer::plan(
                     snapshot.clone(),
                     schema,
-                    group.profile(),
+                    planned_group.profile(),
                     plan.policy(),
                     plan.max_artifact_bytes(),
                 )
-                .map_err(|_| ())?;
+                .map_err(|_| None)?;
                 match Materializer::admit(
                     materialization_plan,
                     plan.retained_budget(),
@@ -646,7 +769,7 @@ fn admit_group<'a>(
             }));
             match admitted {
                 Ok(Ok(AdmissionDispatch::Ready(admitted))) => AdmittedGroup::Ready {
-                    group: group.clone(),
+                    group,
                     owner,
                     identity,
                     admitted,
@@ -655,7 +778,17 @@ fn admit_group<'a>(
                 Ok(Ok(AdmissionDispatch::Complete(outcome))) => AdmittedGroup::Complete(
                     complete_group(group.clone(), owner, identity, events, outcome),
                 ),
-                Ok(Err(_)) | Err(_) => AdmittedGroup::Complete(complete_group(
+                Ok(Err(Some(violation))) => {
+                    drop(owner);
+                    AdmittedGroup::Complete(MaterializationWorkResult {
+                        group,
+                        claim: MaterializationWorkClaim::Stale,
+                        outcome: None,
+                        events,
+                        contract_violation: Some(violation),
+                    })
+                }
+                Ok(Err(None)) | Err(_) => AdmittedGroup::Complete(complete_group(
                     group.clone(),
                     owner,
                     identity,
@@ -721,6 +854,7 @@ fn complete_group(
         claim: MaterializationWorkClaim::Owner(owner),
         outcome: Some(outcome),
         events,
+        contract_violation: None,
     }
 }
 
