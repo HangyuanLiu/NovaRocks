@@ -28091,6 +28091,11 @@ struct NativeBundleConstructionAudit {
     collector_is_private: bool,
 }
 
+fn coor_3b_ident_text(ident: &syn::Ident) -> String {
+    use syn::ext::IdentExt;
+    ident.unraw().to_string()
+}
+
 impl<'ast> syn::visit::Visit<'ast> for NativeBundleConstructionAudit {
     fn visit_item(&mut self, item: &'ast syn::Item) {
         if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
@@ -28115,14 +28120,16 @@ impl<'ast> syn::visit::Visit<'ast> for NativeBundleConstructionAudit {
                     .path
                     .segments
                     .last()
-                    .is_some_and(|segment| segment.ident == "NativeFragmentBundle")
+                    .is_some_and(|segment| {
+                        coor_3b_ident_text(&segment.ident) == "NativeFragmentBundle"
+                    })
         );
         syn::visit::visit_item_impl(self, item);
         self.current_impl_is_native_bundle = previous;
     }
 
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
-        let name = item.sig.ident.to_string();
+        let name = coor_3b_ident_text(&item.sig.ident);
         if name == "collect_native_fragment_bundle" {
             self.collector_is_private = matches!(item.vis, syn::Visibility::Inherited);
         }
@@ -28132,7 +28139,9 @@ impl<'ast> syn::visit::Visit<'ast> for NativeBundleConstructionAudit {
     }
 
     fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
-        let previous = self.current_function.replace(item.sig.ident.to_string());
+        let previous = self
+            .current_function
+            .replace(coor_3b_ident_text(&item.sig.ident));
         syn::visit::visit_impl_item_fn(self, item);
         self.current_function = previous;
     }
@@ -28142,7 +28151,7 @@ impl<'ast> syn::visit::Visit<'ast> for NativeBundleConstructionAudit {
             .path
             .segments
             .last()
-            .map(|segment| segment.ident.to_string());
+            .map(|segment| coor_3b_ident_text(&segment.ident));
         if constructed_type.as_deref() == Some("NativeFragmentBundle")
             || (self.current_impl_is_native_bundle && constructed_type.as_deref() == Some("Self"))
         {
@@ -28196,6 +28205,2426 @@ impl NativeFragmentBundle {
         .expect_err("differently named general constructor must be rejected");
     assert!(error.contains("assemble_payloads"), "{error}");
     assert!(error.contains("assemble_associated_payloads"), "{error}");
+}
+
+fn coor_3b_type_mentions_owned_scan_range_map(ty: &syn::Type) -> bool {
+    #[derive(Default)]
+    struct TypeNames {
+        btree_map: bool,
+        scan_range_params: bool,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for TypeNames {
+        fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
+            for segment in &path.path.segments {
+                match coor_3b_ident_text(&segment.ident).as_str() {
+                    "BTreeMap" => self.btree_map = true,
+                    "ScanRangeParams" => self.scan_range_params = true,
+                    _ => {}
+                }
+            }
+            syn::visit::visit_type_path(self, path);
+        }
+    }
+
+    let mut names = TypeNames::default();
+    syn::visit::Visit::visit_type(&mut names, ty);
+    names.btree_map && names.scan_range_params
+}
+
+fn coor_3b_second_owned_range_map_structs(source: &str) -> Result<Vec<String>, String> {
+    let file = syn::parse_file(source)
+        .map_err(|error| format!("parse COOR-3B range ownership source: {error}"))?;
+    let mut owners = Vec::new();
+    fn visit_items(items: &[syn::Item], owners: &mut Vec<String>) {
+        for item in items {
+            if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+                continue;
+            }
+            match item {
+                syn::Item::Struct(item) => {
+                    let name = coor_3b_ident_text(&item.ident);
+                    if item
+                        .fields
+                        .iter()
+                        .any(|field| coor_3b_type_mentions_owned_scan_range_map(&field.ty))
+                    {
+                        owners.push(name);
+                    }
+                }
+                syn::Item::Mod(module) => {
+                    if let Some((_, nested)) = &module.content {
+                        visit_items(nested, owners);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    visit_items(&file.items, &mut owners);
+    Ok(owners)
+}
+
+fn coor_3b_type_mentions(ty: &syn::Type, expected: &str) -> bool {
+    struct TypeMention<'a> {
+        expected: &'a str,
+        found: bool,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for TypeMention<'_> {
+        fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
+            if path
+                .path
+                .segments
+                .iter()
+                .any(|segment| coor_3b_ident_text(&segment.ident) == self.expected)
+            {
+                self.found = true;
+            }
+            syn::visit::visit_type_path(self, path);
+        }
+    }
+    let mut mention = TypeMention {
+        expected,
+        found: false,
+    };
+    syn::visit::Visit::visit_type(&mut mention, ty);
+    mention.found
+}
+
+fn coor_3b_pattern_identifiers(pattern: &syn::Pat, out: &mut BTreeSet<String>) {
+    match pattern {
+        syn::Pat::Ident(ident) => {
+            out.insert(coor_3b_ident_text(&ident.ident));
+            if let Some((_, nested)) = &ident.subpat {
+                coor_3b_pattern_identifiers(nested, out);
+            }
+        }
+        syn::Pat::Type(typed) => coor_3b_pattern_identifiers(&typed.pat, out),
+        syn::Pat::Tuple(tuple) => {
+            for element in &tuple.elems {
+                coor_3b_pattern_identifiers(element, out);
+            }
+        }
+        syn::Pat::TupleStruct(tuple) => {
+            for element in &tuple.elems {
+                coor_3b_pattern_identifiers(element, out);
+            }
+        }
+        syn::Pat::Struct(item) => {
+            for field in &item.fields {
+                coor_3b_pattern_identifiers(&field.pat, out);
+            }
+        }
+        syn::Pat::Reference(reference) => coor_3b_pattern_identifiers(&reference.pat, out),
+        syn::Pat::Slice(slice) => {
+            for element in &slice.elems {
+                coor_3b_pattern_identifiers(element, out);
+            }
+        }
+        syn::Pat::Or(item) => {
+            for case in &item.cases {
+                coor_3b_pattern_identifiers(case, out);
+            }
+        }
+        syn::Pat::Paren(paren) => coor_3b_pattern_identifiers(&paren.pat, out),
+        _ => {}
+    }
+}
+
+fn coor_3b_expr_ident(expression: &syn::Expr) -> Option<String> {
+    match expression {
+        syn::Expr::Path(path) if path.qself.is_none() && path.path.segments.len() == 1 => {
+            Some(coor_3b_ident_text(&path.path.segments[0].ident))
+        }
+        syn::Expr::Reference(reference) => coor_3b_expr_ident(&reference.expr),
+        syn::Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Deref(_)) => {
+            coor_3b_expr_ident(&unary.expr)
+        }
+        syn::Expr::Paren(paren) => coor_3b_expr_ident(&paren.expr),
+        syn::Expr::Group(group) => coor_3b_expr_ident(&group.expr),
+        _ => None,
+    }
+}
+
+fn coor_3b_native_bundle_field_accesses(source: &str) -> Result<Vec<String>, String> {
+    struct Audit {
+        typed_bindings: Vec<BTreeSet<String>>,
+        bundle_fields_by_type: BTreeMap<String, BTreeSet<String>>,
+        current_bundle_fields: Vec<BTreeSet<String>>,
+        violations: Vec<String>,
+    }
+    impl Audit {
+        fn binding_is_bundle(&self, name: &str) -> bool {
+            self.typed_bindings
+                .last()
+                .is_some_and(|bindings| bindings.contains(name))
+        }
+
+        fn expression_is_bundle(&self, expression: &syn::Expr) -> bool {
+            if let Some(name) = coor_3b_expr_ident(expression) {
+                return self.binding_is_bundle(&name);
+            }
+            match expression {
+                syn::Expr::Field(field) => {
+                    matches!(&field.member, syn::Member::Named(name)
+                        if self.current_bundle_fields
+                            .last()
+                            .is_some_and(|fields| fields.contains(&coor_3b_ident_text(name))))
+                        && coor_3b_expr_ident(&field.base).as_deref() == Some("self")
+                }
+                syn::Expr::Reference(reference) => self.expression_is_bundle(&reference.expr),
+                syn::Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Deref(_)) => {
+                    self.expression_is_bundle(&unary.expr)
+                }
+                syn::Expr::Paren(paren) => self.expression_is_bundle(&paren.expr),
+                syn::Expr::Group(group) => self.expression_is_bundle(&group.expr),
+                _ => false,
+            }
+        }
+
+        fn visit_function(&mut self, signature: &syn::Signature, block: &syn::Block) {
+            let mut bindings = BTreeSet::new();
+            for input in &signature.inputs {
+                if let syn::FnArg::Typed(typed) = input
+                    && coor_3b_type_mentions(&typed.ty, "NativeFragmentBundle")
+                {
+                    coor_3b_pattern_identifiers(&typed.pat, &mut bindings);
+                }
+            }
+            self.typed_bindings.push(bindings);
+            syn::visit::Visit::visit_block(self, block);
+            self.typed_bindings.pop();
+        }
+    }
+    impl<'ast> syn::visit::Visit<'ast> for Audit {
+        fn visit_item(&mut self, item: &'ast syn::Item) {
+            if !nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+                syn::visit::visit_item(self, item);
+            }
+        }
+
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !nfe_4_syn_attrs_require_test(&item.attrs) {
+                self.visit_function(&item.sig, &item.block);
+            }
+        }
+
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            if nfe_4_syn_attrs_require_test(&item.attrs) {
+                return;
+            }
+            let fields = match item.self_ty.as_ref() {
+                syn::Type::Path(path) => path
+                    .path
+                    .segments
+                    .last()
+                    .and_then(|segment| {
+                        self.bundle_fields_by_type
+                            .get(&coor_3b_ident_text(&segment.ident))
+                    })
+                    .cloned()
+                    .unwrap_or_default(),
+                _ => BTreeSet::new(),
+            };
+            self.current_bundle_fields.push(fields);
+            syn::visit::visit_item_impl(self, item);
+            self.current_bundle_fields.pop();
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if !nfe_4_syn_attrs_require_test(&item.attrs) {
+                self.visit_function(&item.sig, &item.block);
+            }
+        }
+
+        fn visit_local(&mut self, local: &'ast syn::Local) {
+            let mut inferred_bundle = false;
+            let pattern = match &local.pat {
+                syn::Pat::Type(typed) => {
+                    inferred_bundle = coor_3b_type_mentions(&typed.ty, "NativeFragmentBundle");
+                    typed.pat.as_ref()
+                }
+                pattern => pattern,
+            };
+            if !inferred_bundle && let Some(init) = &local.init {
+                inferred_bundle = self.expression_is_bundle(&init.expr);
+            }
+            if inferred_bundle {
+                let mut names = BTreeSet::new();
+                coor_3b_pattern_identifiers(pattern, &mut names);
+                if let Some(bindings) = self.typed_bindings.last_mut() {
+                    bindings.extend(names);
+                }
+            }
+            syn::visit::visit_local(self, local);
+        }
+
+        fn visit_expr_field(&mut self, field: &'ast syn::ExprField) {
+            if matches!(&field.member, syn::Member::Named(name)
+                if coor_3b_ident_text(name) == "by_fragment")
+                && self.expression_is_bundle(&field.base)
+            {
+                self.violations
+                    .push("typed NativeFragmentBundle `.by_fragment` access".to_string());
+            }
+            syn::visit::visit_expr_field(self, field);
+        }
+    }
+
+    let file = syn::parse_file(source)
+        .map_err(|error| format!("parse COOR-3B bundle consumer source: {error}"))?;
+    let mut bundle_fields_by_type = BTreeMap::<String, BTreeSet<String>>::new();
+    fn collect_bundle_fields(
+        items: &[syn::Item],
+        fields_by_type: &mut BTreeMap<String, BTreeSet<String>>,
+    ) {
+        for item in items {
+            if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+                continue;
+            }
+            match item {
+                syn::Item::Struct(item) => {
+                    let fields = item
+                        .fields
+                        .iter()
+                        .filter(|field| coor_3b_type_mentions(&field.ty, "NativeFragmentBundle"))
+                        .filter_map(|field| field.ident.as_ref().map(coor_3b_ident_text))
+                        .collect::<BTreeSet<_>>();
+                    if !fields.is_empty() {
+                        fields_by_type.insert(coor_3b_ident_text(&item.ident), fields);
+                    }
+                }
+                syn::Item::Mod(module) => {
+                    if let Some((_, nested)) = &module.content {
+                        collect_bundle_fields(nested, fields_by_type);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    collect_bundle_fields(&file.items, &mut bundle_fields_by_type);
+    let mut audit = Audit {
+        typed_bindings: Vec::new(),
+        bundle_fields_by_type,
+        current_bundle_fields: Vec::new(),
+        violations: Vec::new(),
+    };
+    syn::visit::Visit::visit_file(&mut audit, &file);
+    Ok(audit.violations)
+}
+
+fn coor_3b_native_bundle_owner_top_level_violations(source: &str) -> Result<Vec<String>, String> {
+    let file = syn::parse_file(source)
+        .map_err(|error| format!("parse COOR-3B bundle interface source: {error}"))?;
+    let expected = BTreeSet::from([
+        "fragment_ids".to_string(),
+        "fragments_in_id_order".to_string(),
+        "get".to_string(),
+        "into_fragments".to_string(),
+    ]);
+    let mut methods = BTreeSet::new();
+    let mut violations = Vec::new();
+    let mut inherent_impls = 0usize;
+    for item in &file.items {
+        if let syn::Item::Struct(owner) = item
+            && coor_3b_ident_text(&owner.ident) == "NativeFragmentBundle"
+            && !nfe_4_syn_attrs_require_test(&owner.attrs)
+            && !owner.attrs.is_empty()
+        {
+            violations.push("bundle owner struct attributes are forbidden".to_string());
+        }
+        let syn::Item::Impl(item) = item else {
+            continue;
+        };
+        if nfe_4_syn_attrs_require_test(&item.attrs)
+            || !coor_3b_type_mentions(&item.self_ty, "NativeFragmentBundle")
+        {
+            continue;
+        }
+        if !item.attrs.is_empty() {
+            violations.push("bundle owner impl attributes are forbidden".to_string());
+        }
+        if let Some((_, trait_path, _)) = &item.trait_ {
+            let trait_name = trait_path
+                .segments
+                .last()
+                .map(|segment| coor_3b_ident_text(&segment.ident))
+                .unwrap_or_default();
+            violations.push(format!(
+                "forbidden NativeFragmentBundle trait impl `{trait_name}`"
+            ));
+            continue;
+        }
+        inherent_impls += 1;
+        for impl_item in &item.items {
+            let syn::ImplItem::Fn(method) = impl_item else {
+                violations.push(format!(
+                    "forbidden NativeFragmentBundle associated item `{}`",
+                    match impl_item {
+                        syn::ImplItem::Const(_) => "const",
+                        syn::ImplItem::Type(_) => "type",
+                        syn::ImplItem::Macro(_) => "macro",
+                        syn::ImplItem::Verbatim(_) => "verbatim",
+                        _ => "unknown",
+                    }
+                ));
+                continue;
+            };
+            if nfe_4_syn_attrs_require_test(&method.attrs) {
+                continue;
+            }
+            let name = coor_3b_ident_text(&method.sig.ident);
+            methods.insert(name.clone());
+            let mutable_receiver = method.sig.inputs.iter().any(|input| {
+                matches!(input, syn::FnArg::Receiver(receiver) if receiver.mutability.is_some() || receiver.reference.as_ref().is_some_and(|(_, mutability)| mutability.is_some()))
+            });
+            let mutable_return = matches!(
+                &method.sig.output,
+                syn::ReturnType::Type(_, ty)
+                    if matches!(ty.as_ref(), syn::Type::Reference(reference) if reference.mutability.is_some())
+            );
+            if mutable_receiver || mutable_return {
+                violations.push(format!("mutable NativeFragmentBundle method `{name}`"));
+            }
+            let crate_visible = matches!(
+                &method.vis,
+                syn::Visibility::Restricted(restricted)
+                    if restricted.path.segments.len() == 1
+                        && coor_3b_ident_text(&restricted.path.segments[0].ident) == "crate"
+            );
+            if !crate_visible {
+                violations.push(format!(
+                    "NativeFragmentBundle method `{name}` is not crate-visible"
+                ));
+            }
+            let receiver = method.sig.inputs.first();
+            let receiver_ok = match name.as_str() {
+                "fragment_ids" | "fragments_in_id_order" | "get" => matches!(
+                    receiver,
+                    Some(syn::FnArg::Receiver(receiver))
+                        if receiver.reference.is_some() && receiver.mutability.is_none()
+                ),
+                "into_fragments" => matches!(
+                    receiver,
+                    Some(syn::FnArg::Receiver(receiver))
+                        if receiver.reference.is_none() && receiver.mutability.is_none()
+                ),
+                _ => false,
+            };
+            if !receiver_ok {
+                violations.push(format!(
+                    "NativeFragmentBundle method `{name}` has forbidden receiver"
+                ));
+            }
+        }
+    }
+    if inherent_impls != 1 {
+        violations.push(format!(
+            "NativeFragmentBundle owner must have exactly one top-level inherent impl, actual={inherent_impls}"
+        ));
+    }
+    if methods != expected {
+        violations.push(format!(
+            "NativeFragmentBundle method set mismatch: expected={expected:?} actual={methods:?}"
+        ));
+    }
+    violations.sort();
+    violations.dedup();
+    Ok(violations)
+}
+
+enum Coor3bBundleAliasTarget {
+    Type(syn::Type),
+    Imported(String),
+}
+
+fn coor_3b_native_bundle_type_names(
+    sources: &[Cgo8GuardSource],
+) -> (BTreeSet<String>, Vec<String>) {
+    fn use_aliases(tree: &syn::UseTree, aliases: &mut Vec<(String, String)>) {
+        match tree {
+            syn::UseTree::Path(path) => use_aliases(&path.tree, aliases),
+            syn::UseTree::Name(name) => {
+                let name = coor_3b_ident_text(&name.ident);
+                aliases.push((name.clone(), name));
+            }
+            syn::UseTree::Rename(rename) => aliases.push((
+                coor_3b_ident_text(&rename.rename),
+                coor_3b_ident_text(&rename.ident),
+            )),
+            syn::UseTree::Group(group) => {
+                for item in &group.items {
+                    use_aliases(item, aliases);
+                }
+            }
+            syn::UseTree::Glob(_) => {}
+        }
+    }
+
+    fn collect_candidates(
+        items: &[syn::Item],
+        candidates: &mut Vec<(String, Coor3bBundleAliasTarget)>,
+    ) {
+        for item in items {
+            if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+                continue;
+            }
+            match item {
+                syn::Item::Type(item) => candidates.push((
+                    coor_3b_ident_text(&item.ident),
+                    Coor3bBundleAliasTarget::Type(item.ty.as_ref().clone()),
+                )),
+                syn::Item::Use(item) => {
+                    let mut aliases = Vec::new();
+                    use_aliases(&item.tree, &mut aliases);
+                    candidates.extend(aliases.into_iter().map(|(alias, imported)| {
+                        (alias, Coor3bBundleAliasTarget::Imported(imported))
+                    }));
+                }
+                syn::Item::Mod(module) => {
+                    if let Some((_, nested)) = &module.content {
+                        collect_candidates(nested, candidates);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut candidates = Vec::new();
+    let mut violations = Vec::new();
+    for source in sources {
+        match syn::parse_file(&source.text) {
+            Ok(file) => collect_candidates(&file.items, &mut candidates),
+            Err(error) => violations.push(format!(
+                "source-parse: {}: parse COOR-3B bundle aliases: {error}",
+                source.path
+            )),
+        }
+    }
+
+    let mut names = BTreeSet::from(["NativeFragmentBundle".to_string()]);
+    loop {
+        let discovered = candidates
+            .iter()
+            .filter(|(alias, _)| !names.contains(alias))
+            .filter(|(_, target)| match target {
+                Coor3bBundleAliasTarget::Type(ty) => {
+                    names.iter().any(|name| coor_3b_type_mentions(ty, name))
+                }
+                Coor3bBundleAliasTarget::Imported(imported) => names.contains(imported),
+            })
+            .map(|(alias, _)| alias.clone())
+            .collect::<Vec<_>>();
+        if discovered.is_empty() {
+            break;
+        }
+        names.extend(discovered);
+    }
+    (names, violations)
+}
+
+fn coor_3b_native_bundle_binding_violations(source: &str) -> Result<Vec<String>, String> {
+    fn use_renames_bundle(tree: &syn::UseTree) -> bool {
+        match tree {
+            syn::UseTree::Path(path) => use_renames_bundle(&path.tree),
+            syn::UseTree::Name(_) => false,
+            syn::UseTree::Rename(rename) => {
+                coor_3b_ident_text(&rename.ident) == "NativeFragmentBundle"
+            }
+            syn::UseTree::Group(group) => group.items.iter().any(use_renames_bundle),
+            syn::UseTree::Glob(_) => false,
+        }
+    }
+
+    #[derive(Default)]
+    struct Audit {
+        violations: Vec<String>,
+    }
+    struct NativeBundleMention {
+        found: bool,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for NativeBundleMention {
+        fn visit_path_segment(&mut self, segment: &'ast syn::PathSegment) {
+            if coor_3b_ident_text(&segment.ident) == "NativeFragmentBundle" {
+                self.found = true;
+            }
+            syn::visit::visit_path_segment(self, segment);
+        }
+    }
+    fn generics_mention_native_bundle(generics: &syn::Generics) -> bool {
+        let mut mention = NativeBundleMention { found: false };
+        syn::visit::Visit::visit_generics(&mut mention, generics);
+        mention.found
+    }
+    fn bound_mentions_native_bundle(bound: &syn::TypeParamBound) -> bool {
+        let mut mention = NativeBundleMention { found: false };
+        syn::visit::Visit::visit_type_param_bound(&mut mention, bound);
+        mention.found
+    }
+    impl<'ast> syn::visit::Visit<'ast> for Audit {
+        fn visit_item(&mut self, item: &'ast syn::Item) {
+            if !nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+                syn::visit::visit_item(self, item);
+            }
+        }
+
+        fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+            if !nfe_4_syn_attrs_require_test(nfe_4_syn_impl_item_attrs(item)) {
+                syn::visit::visit_impl_item(self, item);
+            }
+        }
+
+        fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+            if !nfe_4_syn_attrs_require_test(nfe_4_syn_trait_item_attrs(item)) {
+                syn::visit::visit_trait_item(self, item);
+            }
+        }
+
+        fn visit_generics(&mut self, generics: &'ast syn::Generics) {
+            if generics_mention_native_bundle(generics) {
+                self.violations
+                    .push("forbidden NativeFragmentBundle type binding in generics".to_string());
+            }
+            syn::visit::visit_generics(self, generics);
+        }
+
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            if coor_3b_type_mentions(&item.ty, "NativeFragmentBundle") {
+                self.violations.push(format!(
+                    "forbidden NativeFragmentBundle type alias `{}`",
+                    item.ident
+                ));
+            }
+            syn::visit::visit_item_type(self, item);
+        }
+
+        fn visit_impl_item_type(&mut self, item: &'ast syn::ImplItemType) {
+            if coor_3b_type_mentions(&item.ty, "NativeFragmentBundle") {
+                self.violations.push(format!(
+                    "forbidden NativeFragmentBundle associated type `{}`",
+                    item.ident
+                ));
+            }
+            syn::visit::visit_impl_item_type(self, item);
+        }
+
+        fn visit_trait_item_type(&mut self, item: &'ast syn::TraitItemType) {
+            let mentions_default = item
+                .default
+                .as_ref()
+                .is_some_and(|(_, ty)| coor_3b_type_mentions(ty, "NativeFragmentBundle"));
+            let mentions_bounds = item.bounds.iter().any(bound_mentions_native_bundle);
+            if mentions_default || mentions_bounds {
+                self.violations.push(format!(
+                    "forbidden NativeFragmentBundle trait associated type `{}`",
+                    item.ident
+                ));
+            }
+            syn::visit::visit_trait_item_type(self, item);
+        }
+
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            if use_renames_bundle(&item.tree) {
+                self.violations
+                    .push("forbidden NativeFragmentBundle import alias or re-export".to_string());
+            }
+            syn::visit::visit_item_use(self, item);
+        }
+
+        fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+            if rust_use_tokens(&item.mac.tokens.to_string())
+                .iter()
+                .any(|token| token == "NativeFragmentBundle")
+            {
+                self.violations
+                    .push("forbidden NativeFragmentBundle macro binding".to_string());
+            }
+            syn::visit::visit_item_macro(self, item);
+        }
+    }
+
+    let file = syn::parse_file(source)
+        .map_err(|error| format!("parse COOR-3B bundle binding source: {error}"))?;
+    let mut audit = Audit::default();
+    syn::visit::Visit::visit_file(&mut audit, &file);
+    audit.violations.sort();
+    audit.violations.dedup();
+    Ok(audit.violations)
+}
+
+fn coor_3b_native_bundle_interface_violations(
+    source: &str,
+    owner_file: bool,
+    bundle_type_names: &BTreeSet<String>,
+) -> Result<Vec<String>, String> {
+    let file = syn::parse_file(source)
+        .map_err(|error| format!("parse COOR-3B bundle interface source: {error}"))?;
+    let mut violations = if owner_file {
+        coor_3b_native_bundle_owner_top_level_violations(source)?
+    } else {
+        Vec::new()
+    };
+
+    fn walk(
+        items: &[syn::Item],
+        depth: usize,
+        owner_file: bool,
+        bundle_type_names: &BTreeSet<String>,
+        violations: &mut Vec<String>,
+    ) {
+        for item in items {
+            if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+                continue;
+            }
+            match item {
+                syn::Item::Mod(module) => {
+                    if let Some((_, nested)) = &module.content {
+                        walk(nested, depth + 1, owner_file, bundle_type_names, violations);
+                    }
+                }
+                syn::Item::Impl(item)
+                    if bundle_type_names
+                        .iter()
+                        .any(|name| coor_3b_type_mentions(&item.self_ty, name)) =>
+                {
+                    let trait_name = item.trait_.as_ref().and_then(|(_, path, _)| {
+                        path.segments
+                            .last()
+                            .map(|segment| coor_3b_ident_text(&segment.ident))
+                    });
+                    if !owner_file {
+                        violations.push(format!(
+                            "external NativeFragmentBundle impl{}",
+                            trait_name
+                                .as_deref()
+                                .map(|name| format!(" for trait `{name}`"))
+                                .unwrap_or_default()
+                        ));
+                    } else if depth != 0 {
+                        violations.push(format!(
+                            "nested NativeFragmentBundle impl{}",
+                            trait_name
+                                .as_deref()
+                                .map(|name| format!(" for trait `{name}`"))
+                                .unwrap_or_default()
+                        ));
+                    } else if !coor_3b_type_mentions(&item.self_ty, "NativeFragmentBundle") {
+                        violations.push(format!(
+                            "additional NativeFragmentBundle alias impl{}",
+                            trait_name
+                                .as_deref()
+                                .map(|name| format!(" for trait `{name}`"))
+                                .unwrap_or_default()
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    walk(
+        &file.items,
+        0,
+        owner_file,
+        bundle_type_names,
+        &mut violations,
+    );
+    violations.sort();
+    violations.dedup();
+    Ok(violations)
+}
+
+fn coor_3b_opaque_runtime_filter_graph_reads(source: &str) -> Result<Vec<String>, String> {
+    fn is_graph_ident(ident: &syn::Ident) -> bool {
+        matches!(
+            coor_3b_ident_text(ident).as_str(),
+            "graph" | "runtime_filter_graph"
+        )
+    }
+
+    fn macro_mentions_graph(mac: &syn::Macro) -> bool {
+        rust_use_tokens(&mac.tokens.to_string())
+            .iter()
+            .any(|token| matches!(token.as_str(), "graph" | "runtime_filter_graph"))
+    }
+
+    #[derive(Default)]
+    struct Audit {
+        violations: Vec<String>,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for Audit {
+        fn visit_item(&mut self, item: &'ast syn::Item) {
+            if !nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+                syn::visit::visit_item(self, item);
+            }
+        }
+
+        fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+            if !nfe_4_syn_attrs_require_test(nfe_4_syn_impl_item_attrs(item)) {
+                syn::visit::visit_impl_item(self, item);
+            }
+        }
+
+        fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+            if !nfe_4_syn_attrs_require_test(nfe_4_syn_trait_item_attrs(item)) {
+                syn::visit::visit_trait_item(self, item);
+            }
+        }
+
+        fn visit_stmt(&mut self, stmt: &'ast syn::Stmt) {
+            if !nfe_4_syn_attrs_require_test(nfe_4_syn_stmt_attrs(stmt)) {
+                syn::visit::visit_stmt(self, stmt);
+            }
+        }
+
+        fn visit_expr(&mut self, expression: &'ast syn::Expr) {
+            if !nfe_4_syn_attrs_require_test(nfe_4_syn_expr_attrs(expression)) {
+                syn::visit::visit_expr(self, expression);
+            }
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if is_graph_ident(&call.method) {
+                self.violations.push(format!(
+                    "opaque runtime-filter graph method read via `{}`",
+                    coor_3b_ident_text(&call.method)
+                ));
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            if path
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| is_graph_ident(&segment.ident))
+            {
+                let path = path
+                    .path
+                    .segments
+                    .iter()
+                    .map(|segment| coor_3b_ident_text(&segment.ident))
+                    .collect::<Vec<_>>()
+                    .join("::");
+                self.violations.push(format!(
+                    "opaque runtime-filter graph function or value path `{path}`"
+                ));
+            }
+            syn::visit::visit_expr_path(self, path);
+        }
+
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            let graph_ufcs = matches!(call.func.as_ref(), syn::Expr::Path(path)
+                if path.path.segments.last().is_some_and(|segment|
+                    is_graph_ident(&segment.ident)));
+            if graph_ufcs {
+                self.violations
+                    .push("opaque runtime-filter graph read via UFCS".to_string());
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+
+        fn visit_expr_field(&mut self, field: &'ast syn::ExprField) {
+            if matches!(&field.member, syn::Member::Named(name)
+                if is_graph_ident(name))
+            {
+                self.violations
+                    .push("opaque runtime-filter graph field read".to_string());
+            }
+            syn::visit::visit_expr_field(self, field);
+        }
+
+        fn visit_expr_struct(&mut self, expression: &'ast syn::ExprStruct) {
+            for field in &expression.fields {
+                if matches!(&field.member, syn::Member::Named(name) if is_graph_ident(name)) {
+                    self.violations.push(format!(
+                        "opaque runtime-filter graph struct expression field `{}`",
+                        match &field.member {
+                            syn::Member::Named(name) => coor_3b_ident_text(name),
+                            syn::Member::Unnamed(index) => index.index.to_string(),
+                        }
+                    ));
+                }
+            }
+            syn::visit::visit_expr_struct(self, expression);
+        }
+
+        fn visit_pat_struct(&mut self, pattern: &'ast syn::PatStruct) {
+            for field in &pattern.fields {
+                if matches!(&field.member, syn::Member::Named(name) if is_graph_ident(name)) {
+                    self.violations.push(format!(
+                        "opaque runtime-filter graph struct pattern field `{}`",
+                        match &field.member {
+                            syn::Member::Named(name) => coor_3b_ident_text(name),
+                            syn::Member::Unnamed(index) => index.index.to_string(),
+                        }
+                    ));
+                }
+            }
+            syn::visit::visit_pat_struct(self, pattern);
+        }
+
+        fn visit_expr_macro(&mut self, expression: &'ast syn::ExprMacro) {
+            if macro_mentions_graph(&expression.mac) {
+                self.violations
+                    .push("opaque runtime-filter graph expression macro tokens".to_string());
+            }
+            syn::visit::visit_expr_macro(self, expression);
+        }
+
+        fn visit_stmt_macro(&mut self, statement: &'ast syn::StmtMacro) {
+            if macro_mentions_graph(&statement.mac) {
+                self.violations
+                    .push("opaque runtime-filter graph statement macro tokens".to_string());
+            }
+            syn::visit::visit_stmt_macro(self, statement);
+        }
+    }
+
+    let file = syn::parse_file(source)
+        .map_err(|error| format!("parse COOR-3B runtime-filter source: {error}"))?;
+    let mut audit = Audit::default();
+    syn::visit::Visit::visit_file(&mut audit, &file);
+    Ok(audit.violations)
+}
+
+fn coor_3b_protected_item_macro_violations(source: &str) -> Result<Vec<String>, String> {
+    #[derive(Default)]
+    struct Audit {
+        violations: Vec<String>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for Audit {
+        fn visit_item(&mut self, item: &'ast syn::Item) {
+            if !nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+                syn::visit::visit_item(self, item);
+            }
+        }
+
+        fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+            let name = item
+                .mac
+                .path
+                .segments
+                .last()
+                .map(|segment| coor_3b_ident_text(&segment.ident))
+                .or_else(|| item.ident.as_ref().map(coor_3b_ident_text))
+                .unwrap_or_else(|| "<macro>".to_string());
+            if name == "include" {
+                self.violations
+                    .push("production-include-macro `include`".to_string());
+            } else {
+                self.violations
+                    .push(format!("production-item-macro `{name}`"));
+            }
+            syn::visit::visit_item_macro(self, item);
+        }
+    }
+
+    let file = syn::parse_file(source)
+        .map_err(|error| format!("parse COOR-3B protected macro source: {error}"))?;
+    let mut audit = Audit::default();
+    syn::visit::Visit::visit_file(&mut audit, &file);
+    audit.violations.sort();
+    audit.violations.dedup();
+    Ok(audit.violations)
+}
+
+fn coor_3b_old_codegen_scan_reexport_violations(
+    path: &str,
+    source: &str,
+) -> Result<Vec<String>, String> {
+    fn use_paths(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+        match tree {
+            syn::UseTree::Path(path) => {
+                prefix.push(coor_3b_ident_text(&path.ident));
+                use_paths(&path.tree, prefix, out);
+                prefix.pop();
+            }
+            syn::UseTree::Name(name) => {
+                let mut full = prefix.clone();
+                full.push(coor_3b_ident_text(&name.ident));
+                out.push(full);
+            }
+            syn::UseTree::Rename(rename) => {
+                let mut full = prefix.clone();
+                full.push(coor_3b_ident_text(&rename.ident));
+                out.push(full);
+            }
+            syn::UseTree::Glob(_) => {
+                let mut full = prefix.clone();
+                full.push("*".to_string());
+                out.push(full);
+            }
+            syn::UseTree::Group(group) => {
+                for item in &group.items {
+                    use_paths(item, prefix, out);
+                }
+            }
+        }
+    }
+
+    fn walk(items: &[syn::Item], in_scan_source: bool, violations: &mut Vec<String>) {
+        for item in items {
+            if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+                continue;
+            }
+            match item {
+                syn::Item::Mod(module) => {
+                    let name = coor_3b_ident_text(&module.ident);
+                    if in_scan_source && matches!(name.as_str(), "binding" | "preparation") {
+                        violations.push(format!("old scan module declaration `{name}`"));
+                    }
+                    if let Some((_, nested)) = &module.content {
+                        walk(nested, in_scan_source, violations);
+                    }
+                }
+                syn::Item::Use(item) => {
+                    let mut paths = Vec::new();
+                    use_paths(&item.tree, &mut Vec::new(), &mut paths);
+                    for path in paths {
+                        let relative_old = in_scan_source
+                            && path.iter().any(|segment| {
+                                matches!(segment.as_str(), "binding" | "preparation")
+                            });
+                        let qualified_old = path.windows(2).any(|window| {
+                            window[0] == "scan"
+                                && matches!(window[1].as_str(), "binding" | "preparation")
+                        });
+                        if relative_old || qualified_old {
+                            violations.push(format!("old scan use path `{}`", path.join("::")));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let file = syn::parse_file(source)
+        .map_err(|error| format!("parse COOR-3B codegen scan source: {error}"))?;
+    let mut violations = Vec::new();
+    walk(
+        &file.items,
+        path.starts_with("src/sql/codegen/scan/"),
+        &mut violations,
+    );
+    violations.sort();
+    violations.dedup();
+    Ok(violations)
+}
+
+fn coor_3b_forbidden_path_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
+    let (bundle_type_names, mut violations) = coor_3b_native_bundle_type_names(sources);
+    for source in sources {
+        let production = rust_sanitized_production_text(&source.text);
+        let compact = compact_line(&production);
+        let tokens = rust_use_tokens(&production);
+
+        if matches!(
+            source.path.as_str(),
+            "src/sql/codegen/scan/binding.rs" | "src/sql/codegen/scan/preparation.rs"
+        ) {
+            violations.push(format!("old-codegen-scan-owner: {}", source.path));
+        }
+        if tokens
+            .iter()
+            .any(|token| matches!(token.as_str(), "binding" | "preparation"))
+        {
+            match coor_3b_old_codegen_scan_reexport_violations(&source.path, &source.text) {
+                Ok(reexports) => violations.extend(reexports.into_iter().map(|reexport| {
+                    format!("old-codegen-scan-reexport: {}: {reexport}", source.path)
+                })),
+                Err(error) => violations.push(format!("source-parse: {}: {error}", source.path)),
+            }
+        }
+
+        let sealed_plan_consumer = source.path.starts_with("src/coordinator/")
+            || source.path.starts_with("src/sql/codegen/");
+        if sealed_plan_consumer {
+            match coor_3b_protected_item_macro_violations(&source.text) {
+                Ok(macros) => violations.extend(
+                    macros
+                        .into_iter()
+                        .map(|item| format!("protected-source-syntax: {}: {item}", source.path)),
+                ),
+                Err(error) => violations.push(format!("source-parse: {}: {error}", source.path)),
+            }
+        }
+        if sealed_plan_consumer && compact.contains("&mutDistributedPlan") {
+            violations.push(format!("mutable-sealed-plan: {}", source.path));
+        }
+        if sealed_plan_consumer
+            && compact.contains("plan.clone()")
+            && (compact.contains("letmut")
+                || compact.contains("fragments_mut(")
+                || compact.contains("edges_mut("))
+        {
+            violations.push(format!("clone-and-patch: {}", source.path));
+        }
+        if tokens
+            .iter()
+            .any(|token| token == "MultiFragmentBuildResult")
+        {
+            violations.push(format!("retired-mixed-artifact: {}", source.path));
+        }
+
+        if (source.path.starts_with("src/coordinator/prepare/")
+            && source.path != "src/coordinator/prepare/scan.rs")
+            || source.path.starts_with("src/coordinator/scheduler/")
+        {
+            match coor_3b_second_owned_range_map_structs(&source.text) {
+                Ok(owners) => violations.extend(
+                    owners
+                        .into_iter()
+                        .filter(|owner| {
+                            !source.path.starts_with("src/coordinator/scheduler/")
+                                || owner != "FragmentInstancePlacement"
+                        })
+                        .map(|owner| {
+                            format!("second-owned-range-map: {} struct {owner}", source.path)
+                        }),
+                ),
+                Err(error) => violations.push(format!("source-parse: {}: {error}", source.path)),
+            }
+        }
+
+        if source.path != "src/sql/codegen/fragment/bundle.rs"
+            && tokens.iter().any(|token| token == "by_fragment")
+        {
+            match coor_3b_native_bundle_field_accesses(&source.text) {
+                Ok(accesses) => violations.extend(accesses.into_iter().map(|access| {
+                    format!("bundle-map-cross-module-access: {}: {access}", source.path)
+                })),
+                Err(error) => violations.push(format!("source-parse: {}: {error}", source.path)),
+            }
+        }
+        let bundle_owner = source.path == "src/sql/codegen/fragment/bundle.rs";
+        if !bundle_owner {
+            match coor_3b_native_bundle_binding_violations(&source.text) {
+                Ok(binding_violations) => {
+                    violations.extend(binding_violations.into_iter().map(|violation| {
+                        format!("bundle-interface: {}: {violation}", source.path)
+                    }));
+                }
+                Err(error) => violations.push(format!("source-parse: {}: {error}", source.path)),
+            }
+        }
+        match coor_3b_native_bundle_interface_violations(
+            &source.text,
+            bundle_owner,
+            &bundle_type_names,
+        ) {
+            Ok(interface_violations) => {
+                violations.extend(
+                    interface_violations
+                        .into_iter()
+                        .map(|violation| format!("bundle-interface: {}: {violation}", source.path)),
+                );
+            }
+            Err(error) => violations.push(format!("source-parse: {}: {error}", source.path)),
+        }
+        if bundle_owner {
+            if let Err(error) = validate_native_bundle_construction_contract(&source.text) {
+                if error.contains("construction must be unique") {
+                    violations.push(format!(
+                        "second-bundle-constructor: {}: {error}",
+                        source.path
+                    ));
+                }
+            }
+        }
+
+        if source.path.starts_with("src/coordinator/prepare/")
+            && ["crate::service", "crate::proto", "crate::engine"]
+                .iter()
+                .any(|prefix| compact.contains(prefix))
+        {
+            violations.push(format!("prepare-concrete-import: {}", source.path));
+        }
+
+        if source.path.starts_with(CGO_9C_ENCODER_ROOT) {
+            for marker in CGO_9C_RETIRED_ENCODER_HELPERS
+                .iter()
+                .chain(CGO_9C_PLANNER_OUTPUT_FINALIZERS.iter())
+            {
+                if tokens.iter().any(|token| token == marker) {
+                    violations.push(format!(
+                        "encoder-semantic-repair: {} `{marker}`",
+                        source.path
+                    ));
+                }
+            }
+        }
+
+        if source.path.starts_with("src/coordinator/scheduler/") {
+            for window in tokens.windows(2).filter(|window| window[0] == "fn") {
+                let name = &window[1];
+                let reconstruction = matches!(
+                    name.as_str(),
+                    "topological_sort_bottom_up" | "select_execution_root_fragment"
+                ) || name.contains("cycle")
+                    || ((name.contains("root") || name.contains("terminal"))
+                        && ["infer", "reconstruct", "derive", "detect", "find", "select"]
+                            .iter()
+                            .any(|verb| name.contains(verb)));
+                if reconstruction {
+                    violations.push(format!(
+                        "scheduler-topology-reconstruction: {} `{name}`",
+                        source.path
+                    ));
+                }
+            }
+        }
+
+        let runtime_filter_scope = source.path.starts_with("src/coordinator/")
+            || source.path.starts_with("src/sql/codegen/");
+        if runtime_filter_scope
+            && tokens.iter().any(|token| {
+                matches!(
+                    token.as_str(),
+                    "graph" | "runtime_filter_graph" | "RuntimeFilterGraph"
+                )
+            })
+        {
+            if tokens.iter().any(|token| token == "RuntimeFilterGraph") {
+                violations.push(format!(
+                    "graph-derived-runtime-filter: {}: RuntimeFilterGraph production dependency",
+                    source.path
+                ));
+            }
+            match coor_3b_opaque_runtime_filter_graph_reads(&source.text) {
+                Ok(reads) => {
+                    violations.extend(reads.into_iter().map(|read| {
+                        format!("graph-derived-runtime-filter: {}: {read}", source.path)
+                    }))
+                }
+                Err(error) => violations.push(format!("source-parse: {}: {error}", source.path)),
+            }
+        }
+    }
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+fn assert_coor_3b_fixture_rejected(path: &str, source: &str, expected: &str) {
+    let violations = coor_3b_forbidden_path_violations(&[Cgo8GuardSource::new(path, source)]);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains(expected)),
+        "COOR-3B fixture `{path}` must be rejected as `{expected}`: {violations:?}"
+    );
+}
+
+#[test]
+fn coordinator_preparation_owner_guard_rejects_old_codegen_scan_owner() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/scan/preparation.rs",
+        "pub(crate) fn prepare_scan_bindings() {}",
+        "old-codegen-scan-owner",
+    );
+}
+
+#[test]
+fn coordinator_preparation_owner_guard_rejects_old_codegen_scan_reexport() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/scan/mod.rs",
+        "pub(crate) use preparation::prepare_scan_bindings;",
+        "old-codegen-scan-reexport",
+    );
+}
+
+#[test]
+fn coordinator_preparation_owner_guard_rejects_raw_old_codegen_scan_module() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/scan/mod.rs",
+        "mod r#preparation;",
+        "old-codegen-scan-reexport",
+    );
+}
+
+#[test]
+fn coordinator_preparation_owner_guard_rejects_qualified_old_codegen_scan_reexport() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/scan/mod.rs",
+        "pub(crate) use crate::sql::codegen::scan::preparation::prepare_scan_bindings;",
+        "old-codegen-scan-reexport",
+    );
+}
+
+#[test]
+fn coordinator_preparation_owner_guard_rejects_grouped_aliased_scan_reexport() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/execution.rs",
+        "use crate::sql::codegen::scan::{binding as old_binding, preparation::*};",
+        "old-codegen-scan-reexport",
+    );
+}
+
+#[test]
+fn coordinator_preparation_owner_guard_allows_scan_binding_parameter() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/codegen/scan/connector.rs",
+        "fn encode(binding: &ScanBinding) { let _ = binding; }",
+    )];
+    assert!(
+        coor_3b_forbidden_path_violations(&sources).is_empty(),
+        "ordinary scan binding vocabulary is not an owner module or re-export"
+    );
+}
+
+#[test]
+fn coordinator_preparation_owner_guard_ignores_test_only_old_scan_module() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/codegen/scan/mod.rs",
+        "#[cfg(test)] mod preparation; fn encode(binding: &ScanBinding) { let _ = binding; }",
+    )];
+    assert!(
+        coor_3b_forbidden_path_violations(&sources).is_empty(),
+        "test-only old module names and ordinary binding parameters are not production owners"
+    );
+}
+
+#[test]
+fn coordinator_preparation_owner_guard_rejects_mutable_sealed_plan() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/prepare/mod.rs",
+        "fn prepare(plan: &mut DistributedPlan) {}",
+        "mutable-sealed-plan",
+    );
+}
+
+#[test]
+fn coordinator_preparation_owner_guard_rejects_clone_and_patch() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/prepare/mod.rs",
+        "fn prepare(plan: &DistributedPlan) { let mut patched = plan.clone(); patched.fragments_mut(); }",
+        "clone-and-patch",
+    );
+}
+
+#[test]
+fn coordinator_preparation_owner_guard_rejects_retired_mixed_artifact() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/result.rs",
+        "struct MultiFragmentBuildResult;",
+        "retired-mixed-artifact",
+    );
+}
+
+#[test]
+fn coordinator_preparation_owner_guard_rejects_prepared_range_copy() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/prepare/projection.rs",
+        "struct PreparedFragment { native_scan_ranges: BTreeMap<i32, Vec<ScanRangeParams>> }",
+        "second-owned-range-map",
+    );
+}
+
+#[test]
+fn coordinator_preparation_owner_guard_rejects_scheduler_range_copy() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/scheduler/mod.rs",
+        "struct FragmentSchedulingMetadata { native_scan_ranges: BTreeMap<FragmentId, BTreeMap<i32, Vec<ScanRangeParams>>> }",
+        "second-owned-range-map",
+    );
+}
+
+#[test]
+fn coordinator_preparation_owner_guard_rejects_arbitrary_scheduler_range_copy() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/scheduler/mod.rs",
+        "struct SchedulerInput { copied_ranges: BTreeMap<FragmentId, BTreeMap<i32, Vec<ScanRangeParams>>> }",
+        "second-owned-range-map",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_cross_module_bundle_map_access() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/execution.rs",
+        "fn dispatch(native_bundle: &NativeFragmentBundle) { let _ = native_bundle.by_fragment; }",
+        "bundle-map-cross-module-access",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_aliased_cross_module_bundle_map_access() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/execution.rs",
+        "fn dispatch(bundle: &NativeFragmentBundle) { let _ = bundle.by_fragment; }",
+        "bundle-map-cross-module-access",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_renamed_typed_bundle_map_access() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/execution.rs",
+        "fn dispatch(artifacts: &NativeFragmentBundle) { let _ = artifacts.by_fragment; }",
+        "bundle-map-cross-module-access",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_two_level_bundle_alias_and_deref() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/execution.rs",
+        "fn dispatch(artifacts: &NativeFragmentBundle) { let first = &artifacts; let second = first; let _ = (*second).by_fragment; }",
+        "bundle-map-cross-module-access",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_bundle_held_in_self_field() {
+    assert_coor_3b_fixture_rejected(
+        "src/service/bundle_consumer.rs",
+        "struct Holder { artifacts: NativeFragmentBundle } impl Holder { fn leak(&self) { let _ = self.artifacts.by_fragment; } }",
+        "bundle-map-cross-module-access",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_allows_scheduling_plan_placement_map() {
+    let sources = [Cgo8GuardSource::new(
+        "src/coordinator/execution.rs",
+        "fn place(plan: &mut SchedulingPlan) { let _ = plan.by_fragment.get_mut(&7); }",
+    )];
+    assert!(
+        coor_3b_forbidden_path_violations(&sources).is_empty(),
+        "SchedulingPlan owns dynamic placement and is not a NativeFragmentBundle leak"
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_mutable_bundle_map_accessor() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/bundle.rs",
+        "impl NativeFragmentBundle { fn get_mut(&mut self, id: FragmentId) -> Option<&mut NativePlanFragment> { self.by_fragment.get_mut(&id) } }",
+        "get_mut",
+    );
+}
+
+fn coor_3b_bundle_interface_fixture(extra: &str) -> String {
+    format!(
+        r#"
+struct NativeFragmentBundle {{ by_fragment: BTreeMap<FragmentId, NativePlanFragment> }}
+impl NativeFragmentBundle {{
+    pub(crate) fn fragment_ids(&self) {{}}
+    pub(crate) fn fragments_in_id_order(&self) {{}}
+    pub(crate) fn get(&self) {{}}
+    pub(crate) fn into_fragments(self) {{}}
+    {extra}
+}}
+fn collect_native_fragment_bundle(by_fragment: BTreeMap<FragmentId, NativePlanFragment>) -> NativeFragmentBundle {{
+    NativeFragmentBundle {{ by_fragment }}
+}}
+"#
+    )
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_arbitrary_mutable_bundle_method() {
+    let fixture = coor_3b_bundle_interface_fixture("fn fragments_mut(&mut self) {}");
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/bundle.rs",
+        &fixture,
+        "fragments_mut",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_external_bundle_impl_without_field_access() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/execution.rs",
+        "impl NativeFragmentBundle { fn fragments_mut(&mut self) {} }",
+        "external NativeFragmentBundle impl",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_raw_bundle_impl() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/execution.rs",
+        "struct r#NativeFragmentBundle; impl r#NativeFragmentBundle { fn fragments_mut(&mut self) {} }",
+        "external NativeFragmentBundle impl",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_external_bundle_alias_impl() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/execution.rs",
+        "type BundleAlias = NativeFragmentBundle; impl BundleAlias { fn fragments_mut(&mut self) {} }",
+        "external NativeFragmentBundle impl",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_external_bundle_use_alias_impl() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/execution.rs",
+        "use crate::sql::codegen::fragment::NativeFragmentBundle as BundleAlias; impl BundleAlias { fn fragments_mut(&mut self) {} }",
+        "external NativeFragmentBundle impl",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_grouped_bundle_use_alias_impl() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/execution.rs",
+        "use crate::sql::codegen::fragment::{NativeFragmentBundle as BundleAlias, NativePlanFragment}; impl BundleAlias { fn fragments_mut(&mut self) {} }",
+        "external NativeFragmentBundle impl",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_cross_source_bundle_alias_impl() {
+    let sources = [
+        Cgo8GuardSource::new(
+            "src/coordinator/bundle_alias.rs",
+            "pub use crate::sql::codegen::fragment::NativeFragmentBundle as SharedBundle;",
+        ),
+        Cgo8GuardSource::new(
+            "src/coordinator/execution.rs",
+            "use crate::coordinator::bundle_alias::SharedBundle as LocalBundle; impl LocalBundle { fn fragments_mut(&mut self) {} }",
+        ),
+    ];
+    let violations = coor_3b_forbidden_path_violations(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("external NativeFragmentBundle impl")),
+        "cross-source bundle alias impl must be rejected: {violations:?}"
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_associated_type_projection_bundle_alias() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/execution.rs",
+        "trait Reveal { type Out; } struct Marker; impl Reveal for Marker { type Out = NativeFragmentBundle; } type BundleAlias = <Marker as Reveal>::Out; trait Leak {} impl Leak for BundleAlias {}",
+        "bundle-interface",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_bundle_type_alias_without_impl() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/execution.rs",
+        "type BundleAlias = NativeFragmentBundle;",
+        "forbidden NativeFragmentBundle type alias",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_bundle_type_alias_generic_default() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/execution.rs",
+        "type Identity<T = NativeFragmentBundle> = T; type BundleAlias = Identity; trait Leak {} impl Leak for BundleAlias {}",
+        "forbidden NativeFragmentBundle type binding",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_bundle_struct_generic_default() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/execution.rs",
+        "struct Holder<T = NativeFragmentBundle>(T);",
+        "forbidden NativeFragmentBundle type binding",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_bundle_enum_generic_default() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/execution.rs",
+        "enum Holder<T = NativeFragmentBundle> { Value(T) }",
+        "forbidden NativeFragmentBundle type binding",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_bundle_trait_generic_binding() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/execution.rs",
+        "trait Holder<T: Iterator<Item = NativeFragmentBundle>> {}",
+        "forbidden NativeFragmentBundle type binding",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_bundle_trait_associated_type_default() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/execution.rs",
+        "trait Holder { type Artifact = NativeFragmentBundle; }",
+        "forbidden NativeFragmentBundle trait associated type",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_bundle_trait_associated_type_bound() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/execution.rs",
+        "trait Holder { type Artifact: Iterator<Item = NativeFragmentBundle>; }",
+        "forbidden NativeFragmentBundle trait associated type",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_inline_bundle_generic_binding() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/execution.rs",
+        "mod nested { struct Holder<T = NativeFragmentBundle>(T); }",
+        "forbidden NativeFragmentBundle type binding",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_bundle_item_macro_binding() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/execution.rs",
+        "bind_bundle!(BundleAlias = NativeFragmentBundle);",
+        "forbidden NativeFragmentBundle macro binding",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_bundle_import_alias_without_impl() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/execution.rs",
+        "use crate::sql::codegen::fragment::NativeFragmentBundle as BundleAlias;",
+        "forbidden NativeFragmentBundle import alias or re-export",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_bundle_renamed_reexport() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/execution.rs",
+        "pub(crate) use crate::sql::codegen::fragment::NativeFragmentBundle as ExportedBundle;",
+        "forbidden NativeFragmentBundle import alias or re-export",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_nested_bundle_associated_type() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/execution.rs",
+        "mod nested { trait Reveal { type Out; } struct Marker; impl Reveal for Marker { type Out = NativeFragmentBundle; } }",
+        "forbidden NativeFragmentBundle associated type",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_ignores_test_only_bundle_alias_impl() {
+    let sources = [Cgo8GuardSource::new(
+        "src/coordinator/execution.rs",
+        "#[cfg(test)] type BundleAlias = NativeFragmentBundle; #[cfg(test)] impl BundleAlias { fn fragments_mut(&mut self) {} }",
+    )];
+    assert!(
+        coor_3b_forbidden_path_violations(&sources).is_empty(),
+        "test-only bundle aliases and impls are not part of the production interface"
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_ignores_test_only_bundle_use_alias_impl() {
+    let sources = [Cgo8GuardSource::new(
+        "src/coordinator/execution.rs",
+        "#[cfg(test)] use crate::sql::codegen::fragment::NativeFragmentBundle as BundleAlias; #[cfg(test)] impl BundleAlias { fn fragments_mut(&mut self) {} }",
+    )];
+    assert!(
+        coor_3b_forbidden_path_violations(&sources).is_empty(),
+        "test-only bundle use aliases and impls are not part of the production interface"
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_allows_private_direct_bundle_import() {
+    let sources = [Cgo8GuardSource::new(
+        "src/coordinator/execution.rs",
+        "use crate::sql::codegen::fragment::NativeFragmentBundle; fn consume(_: &NativeFragmentBundle) {}",
+    )];
+    assert!(
+        coor_3b_forbidden_path_violations(&sources).is_empty(),
+        "a private direct-name import used by an existing consumer remains legal"
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_allows_canonical_bundle_reexport() {
+    let sources = [Cgo8GuardSource::new(
+        "src/coordinator/execution.rs",
+        "pub(crate) use crate::sql::codegen::fragment::NativeFragmentBundle; fn consume(_: &NativeFragmentBundle) {}",
+    )];
+    assert!(
+        coor_3b_forbidden_path_violations(&sources).is_empty(),
+        "a same-name canonical re-export does not introduce an alternate bundle type binding"
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_ignores_test_only_bundle_generic_and_macro_bindings() {
+    let sources = [Cgo8GuardSource::new(
+        "src/coordinator/execution.rs",
+        "#[cfg(test)] struct Holder<T = NativeFragmentBundle>(T); #[cfg(test)] bind_bundle!(BundleAlias = NativeFragmentBundle);",
+    )];
+    assert!(
+        coor_3b_forbidden_path_violations(&sources).is_empty(),
+        "test-only generic and macro bundle bindings are outside the production interface"
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_ignores_test_only_bundle_associated_type() {
+    let sources = [Cgo8GuardSource::new(
+        "src/coordinator/execution.rs",
+        "#[cfg(test)] trait Reveal { type Out; } #[cfg(test)] struct Marker; #[cfg(test)] impl Reveal for Marker { type Out = NativeFragmentBundle; }",
+    )];
+    assert!(
+        coor_3b_forbidden_path_violations(&sources).is_empty(),
+        "test-only associated types are not part of the production interface"
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_nested_owner_bundle_impl() {
+    let fixture = format!(
+        "{}\nmod nested {{ impl NativeFragmentBundle {{ fn fragments_mut(&mut self) {{}} }} }}",
+        coor_3b_bundle_interface_fixture("")
+    );
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/bundle.rs",
+        &fixture,
+        "nested NativeFragmentBundle impl",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_nested_owner_bundle_trait_impl() {
+    let fixture = format!(
+        "{}\nmod nested {{ impl Borrow<NativeFragmentBundle> for NativeFragmentBundle {{ fn borrow(&self) -> &NativeFragmentBundle {{ self }} }} }}",
+        coor_3b_bundle_interface_fixture("")
+    );
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/bundle.rs",
+        &fixture,
+        "nested NativeFragmentBundle impl",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_mutable_bundle_return() {
+    let fixture = coor_3b_bundle_interface_fixture(
+        "fn payload_mut(&mut self) -> &mut BTreeMap<FragmentId, NativePlanFragment> { &mut self.by_fragment }",
+    );
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/bundle.rs",
+        &fixture,
+        "payload_mut",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_bundle_as_mut_trait() {
+    let fixture = format!(
+        "{}\nimpl AsMut<BTreeMap<FragmentId, NativePlanFragment>> for NativeFragmentBundle {{ fn as_mut(&mut self) -> &mut BTreeMap<FragmentId, NativePlanFragment> {{ &mut self.by_fragment }} }}",
+        coor_3b_bundle_interface_fixture("")
+    );
+    assert_coor_3b_fixture_rejected("src/sql/codegen/fragment/bundle.rs", &fixture, "AsMut");
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_bundle_deref_mut_trait() {
+    let fixture = format!(
+        "{}\nimpl DerefMut for NativeFragmentBundle {{ fn deref_mut(&mut self) -> &mut Self::Target {{ &mut self.by_fragment }} }}",
+        coor_3b_bundle_interface_fixture("")
+    );
+    assert_coor_3b_fixture_rejected("src/sql/codegen/fragment/bundle.rs", &fixture, "DerefMut");
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_bundle_map_as_ref_trait() {
+    let fixture = format!(
+        "{}\nimpl AsRef<BTreeMap<FragmentId, NativePlanFragment>> for NativeFragmentBundle {{ fn as_ref(&self) -> &BTreeMap<FragmentId, NativePlanFragment> {{ &self.by_fragment }} }}",
+        coor_3b_bundle_interface_fixture("")
+    );
+    assert_coor_3b_fixture_rejected("src/sql/codegen/fragment/bundle.rs", &fixture, "AsRef");
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_bundle_map_deref_trait() {
+    let fixture = format!(
+        "{}\nimpl Deref for NativeFragmentBundle {{ type Target = BTreeMap<FragmentId, NativePlanFragment>; fn deref(&self) -> &Self::Target {{ &self.by_fragment }} }}",
+        coor_3b_bundle_interface_fixture("")
+    );
+    assert_coor_3b_fixture_rejected("src/sql/codegen/fragment/bundle.rs", &fixture, "Deref");
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_arbitrary_bundle_trait_impl() {
+    let fixture = format!(
+        "{}\nimpl Borrow<NativeFragmentBundle> for NativeFragmentBundle {{ fn borrow(&self) -> &NativeFragmentBundle {{ self }} }}",
+        coor_3b_bundle_interface_fixture("")
+    );
+    assert_coor_3b_fixture_rejected("src/sql/codegen/fragment/bundle.rs", &fixture, "Borrow");
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_bundle_associated_item() {
+    let fixture = coor_3b_bundle_interface_fixture("const LEAK: usize = 1;");
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/bundle.rs",
+        &fixture,
+        "associated item `const`",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_bundle_owner_derive_macro() {
+    let fixture = coor_3b_bundle_interface_fixture("").replacen(
+        "struct NativeFragmentBundle",
+        "#[derive(Clone)] struct NativeFragmentBundle",
+        1,
+    );
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/bundle.rs",
+        &fixture,
+        "bundle owner struct attributes",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_bundle_owner_impl_attribute_macro() {
+    let fixture = coor_3b_bundle_interface_fixture("").replacen(
+        "impl NativeFragmentBundle",
+        "#[instrument] impl NativeFragmentBundle",
+        1,
+    );
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/bundle.rs",
+        &fixture,
+        "bundle owner impl attributes",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_second_bundle_constructor() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/bundle.rs",
+        "struct NativeFragmentBundle { by_fragment: BTreeMap<u32, NativePlanFragment> }\n\
+         fn collect_native_fragment_bundle(by_fragment: BTreeMap<u32, NativePlanFragment>) -> NativeFragmentBundle { NativeFragmentBundle { by_fragment } }\n\
+         fn assemble_payloads(by_fragment: BTreeMap<u32, NativePlanFragment>) -> NativeFragmentBundle { NativeFragmentBundle { by_fragment } }",
+        "second-bundle-constructor",
+    );
+}
+
+#[test]
+fn coordinator_preparation_owner_guard_rejects_service_import() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/prepare/mod.rs",
+        "use crate::service::backend_service::BackendService;",
+        "prepare-concrete-import",
+    );
+}
+
+#[test]
+fn coordinator_preparation_owner_guard_rejects_protobuf_import() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/prepare/scan.rs",
+        "use crate::proto::plan::PlanFragment;",
+        "prepare-concrete-import",
+    );
+}
+
+#[test]
+fn coordinator_preparation_owner_guard_rejects_engine_concrete_import() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/prepare/scan_preparation.rs",
+        "use crate::engine::mv_flow::IcebergMvRefreshContext;",
+        "prepare-concrete-import",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_rejects_encoder_semantic_repair() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/proto_encode/plan.rs",
+        "fn encode(node: &Node) { let _ = encoded_node_output_columns(node); }",
+        "encoder-semantic-repair",
+    );
+}
+
+#[test]
+fn coordinator_scheduler_guard_rejects_cycle_reconstruction() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/scheduler/mod.rs",
+        "fn detect_fragment_cycle(edges: &[FragmentEdge]) -> bool { false }",
+        "scheduler-topology-reconstruction",
+    );
+}
+
+#[test]
+fn coordinator_scheduler_guard_rejects_retired_topological_sort_helper() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/scheduler/mod.rs",
+        "fn topological_sort_bottom_up(edges: &[FragmentEdge]) -> Vec<FragmentId> { Vec::new() }",
+        "scheduler-topology-reconstruction",
+    );
+}
+
+#[test]
+fn coordinator_scheduler_guard_rejects_retired_helper_in_new_submodule() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/scheduler/drift.rs",
+        "fn topological_sort_bottom_up(edges: &[FragmentEdge]) -> Vec<FragmentId> { Vec::new() }",
+        "scheduler-topology-reconstruction",
+    );
+}
+
+#[test]
+fn coordinator_scheduler_guard_rejects_root_reconstruction() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/scheduler/mod.rs",
+        "fn infer_root_fragment(edges: &[FragmentEdge]) -> FragmentId { 0 }",
+        "scheduler-topology-reconstruction",
+    );
+}
+
+#[test]
+fn coordinator_scheduler_guard_rejects_retired_root_selector() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/scheduler/mod.rs",
+        "fn select_execution_root_fragment(edges: &[FragmentEdge]) -> FragmentId { 0 }",
+        "scheduler-topology-reconstruction",
+    );
+}
+
+#[test]
+fn coordinator_scheduler_guard_rejects_terminal_reconstruction() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/scheduler/mod.rs",
+        "fn reconstruct_terminal_fragments(edges: &[FragmentEdge]) -> Vec<FragmentId> { Vec::new() }",
+        "scheduler-topology-reconstruction",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_graph_requirement() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/runtime_filter.rs",
+        "fn plan_runtime_filters(plan: &DistributedPlan) { let graph = plan.runtime_filter_graph(); assert!(!graph.is_empty()); }",
+        "graph-derived-runtime-filter",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_raw_graph_method() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/runtime_filter.rs",
+        "fn plan_runtime_filters(plan: &DistributedPlan) { let _ = plan.r#runtime_filter_graph(); }",
+        "graph-derived-runtime-filter",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_aliased_graph_requirement() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/runtime_filter.rs",
+        "fn plan_runtime_filters(plan: &DistributedPlan) { let graph = plan.graph(); require_non_empty(graph); }",
+        "graph-derived-runtime-filter",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_graph_ufcs() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/runtime_filter.rs",
+        "fn plan_runtime_filters(plan: &DistributedPlan) { let _ = DistributedPlan::runtime_filter_graph(plan); }",
+        "graph-derived-runtime-filter",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_scoped_graph_function_item() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/runtime_filter.rs",
+        "fn plan_runtime_filters(plan: &DistributedPlan) { let read = DistributedPlan::runtime_filter_graph; let _ = read(plan); }",
+        "graph-derived-runtime-filter",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_parenthesized_graph_ufcs() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/runtime_filter.rs",
+        "fn plan_runtime_filters(plan: &DistributedPlan) { let _ = (DistributedPlan::runtime_filter_graph)(plan); }",
+        "graph-derived-runtime-filter",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_graph_field_access() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/runtime_filter.rs",
+        "fn plan_runtime_filters(plan: &DistributedPlan) { let _ = plan.runtime_filter_graph; }",
+        "graph-derived-runtime-filter",
+    );
+}
+
+#[test]
+fn coordinator_preparation_owner_guard_rejects_production_include_macro() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/scheduler/mod.rs",
+        "include!(\"drift.rs\");",
+        "production-include-macro",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_graph_expr_struct_field() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/runtime_filter.rs",
+        "struct Holder { runtime_filter_graph: usize } fn make() { let _ = Holder { runtime_filter_graph: 0 }; }",
+        "graph-derived-runtime-filter",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_graph_pattern_struct_field() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/runtime_filter.rs",
+        "struct Holder { graph: usize } fn read(holder: Holder) { let Holder { graph: _ } = holder; }",
+        "graph-derived-runtime-filter",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_graph_expression_macro_tokens() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/runtime_filter.rs",
+        "fn read() { inspect!(r#runtime_filter_graph); }",
+        "graph-derived-runtime-filter",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_graph_read_through_self_field() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/runtime_filter.rs",
+        "struct Holder { plan: DistributedPlan } impl Holder { fn leak(&self) { let _ = self.plan.graph(); } }",
+        "graph-derived-runtime-filter",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_graph_field_through_aliased_self_field() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/runtime_filter.rs",
+        "struct Holder { plan: DistributedPlan } impl Holder { fn leak(&self) { let first = &self.plan; let second = first; let _ = (*second).runtime_filter_graph; } }",
+        "graph-derived-runtime-filter",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_graph_read_through_parameter_type_alias() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/runtime_filter.rs",
+        "type P = DistributedPlan; fn leak(p: &P) { let _ = p.graph(); }",
+        "graph-derived-runtime-filter",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_graph_read_through_aliased_named_self_field() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/runtime_filter.rs",
+        "type P = DistributedPlan; struct Holder { plan: P } impl Holder { fn leak(&self) { let _ = self.plan.graph(); } }",
+        "graph-derived-runtime-filter",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_graph_read_through_tuple_self_field() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/runtime_filter.rs",
+        "struct Holder(DistributedPlan); impl Holder { fn leak(&self) { let _ = self.0.graph(); } }",
+        "graph-derived-runtime-filter",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_graph_type_dependency() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/runtime_filter.rs",
+        "use crate::runtime_filter::model::graph::RuntimeFilterGraph; fn require(graph: &RuntimeFilterGraph) {}",
+        "graph-derived-runtime-filter",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_unrelated_graph_method_in_opaque_scope() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/runtime_filter.rs",
+        "struct Other; impl Other { fn graph(&self) {} } fn inspect(other: &Other) { other.graph(); }",
+        "graph-derived-runtime-filter",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_allows_unrelated_graph_method() {
+    let sources = [Cgo8GuardSource::new(
+        "src/connector/graph_control.rs",
+        "struct Other; impl Other { fn graph(&self) {} } fn inspect(other: &Other) { other.graph(); }",
+    )];
+    assert!(
+        coor_3b_forbidden_path_violations(&sources).is_empty(),
+        "an unrelated graph method must not be treated as DistributedPlan Graph ownership"
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_allows_unrelated_self_field_graph_method() {
+    let sources = [Cgo8GuardSource::new(
+        "src/connector/graph_control.rs",
+        "struct Other; impl Other { fn graph(&self) {} } struct Holder { plan: Other } impl Holder { fn inspect(&self) { self.plan.graph(); } }",
+    )];
+    assert!(
+        coor_3b_forbidden_path_violations(&sources).is_empty(),
+        "an unrelated self field's graph method is not a DistributedPlan Graph read"
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_ignores_test_only_self_field_graph_read() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/codegen/fragment/runtime_filter.rs",
+        "#[cfg(test)] struct Holder { plan: DistributedPlan } #[cfg(test)] impl Holder { fn leak(&self) { let _ = self.plan.runtime_filter_graph; } }",
+    )];
+    assert!(
+        coor_3b_forbidden_path_violations(&sources).is_empty(),
+        "test-only holder fields are outside the production Graph ownership guard"
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_ignores_test_only_impl_method_graph_read() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/codegen/fragment/runtime_filter.rs",
+        "struct Other; impl Other { #[cfg(test)] fn inspect(&self) { self.graph(); } }",
+    )];
+    assert!(
+        coor_3b_forbidden_path_violations(&sources).is_empty(),
+        "test-only impl methods are outside the production Graph firewall"
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_allows_unrelated_expression_macro() {
+    let sources = [Cgo8GuardSource::new(
+        "src/coordinator/execution.rs",
+        "fn inspect() { inspect!(placement); }",
+    )];
+    assert!(
+        coor_3b_forbidden_path_violations(&sources).is_empty(),
+        "an expression macro without Graph ownership tokens remains legal"
+    );
+}
+
+#[test]
+fn coordinator_preparation_owner_guard_rejects_production_item_macro() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/scheduler/mod.rs",
+        "macro_rules! rebuild_topology { () => {} }",
+        "production-item-macro",
+    );
+}
+
+#[test]
+fn coordinator_preparation_guard_ignores_comments_and_test_only_items() {
+    let sources = [Cgo8GuardSource::new(
+        "src/coordinator/prepare/mod.rs",
+        "// struct MultiFragmentBuildResult; fn prepare(plan: &mut DistributedPlan) {}\n\
+         #[cfg(test)] mod tests { fn clone_and_patch(plan: &DistributedPlan) { let mut patched = plan.clone(); patched.fragments_mut(); } }",
+    )];
+    assert!(
+        coor_3b_forbidden_path_violations(&sources).is_empty(),
+        "comments and cfg(test) items are not production ownership violations"
+    );
+}
+
+fn coor_3b_direct_prepare_sources(repo: &Path) -> Vec<Cgo8GuardSource> {
+    let prepare_dir = repo.join("src/coordinator/prepare");
+    let mut files = fs::read_dir(&prepare_dir)
+        .unwrap_or_else(|error| panic!("read {}: {error}", prepare_dir.display()))
+        .map(|entry| entry.expect("read preparation directory entry").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+        .collect::<Vec<_>>();
+    files.sort();
+    files
+        .into_iter()
+        .map(|path| {
+            Cgo8GuardSource::new(
+                path.strip_prefix(repo)
+                    .expect("preparation source must be under repository root")
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("read {}: {error}", path.display())),
+            )
+        })
+        .collect()
+}
+
+fn coor_3b_preparation_owner_contract_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
+    let mut violations = Vec::new();
+    if sources.is_empty() {
+        violations.push("prepare-file-set-empty".to_string());
+        return violations;
+    }
+
+    let required = [
+        ("fn", "prepare_fragments"),
+        ("fn", "prepare_scan_bindings"),
+        ("struct", "PreparedFragmentSet"),
+        ("struct", "FragmentSchedulingView"),
+        ("struct", "ScanExecutionBindings"),
+        ("trait", "ScanBindingResolver"),
+    ];
+    let mut counts =
+        BTreeMap::from_iter(required.iter().map(|&(kind, name)| ((kind, name), 0usize)));
+    for source in sources {
+        if !source.path.starts_with("src/coordinator/prepare/") {
+            violations.push(format!("prepare-source-outside-owner: {}", source.path));
+            continue;
+        }
+        let production = rust_sanitized_production_text(&source.text);
+        if let Err(error) = syn::parse_file(&source.text) {
+            violations.push(format!("prepare-source-parse: {}: {error}", source.path));
+            continue;
+        }
+        for &(kind, name) in &required {
+            let count = match kind {
+                "fn" => rust_named_function_declaration_count(&production, name),
+                "struct" => rust_named_type_declaration_count(&production, name),
+                "trait" => rust_named_trait_declaration_count(&production, name),
+                _ => unreachable!(),
+            };
+            *counts.get_mut(&(kind, name)).expect("required owner count") += count;
+        }
+    }
+    for ((kind, name), count) in counts {
+        if count == 0 {
+            violations.push(format!("missing-positive-definition: {kind} {name}"));
+        } else if count != 1 {
+            violations.push(format!(
+                "ambiguous-positive-definition: {kind} {name} count={count}"
+            ));
+        }
+    }
+    violations.sort();
+    violations
+}
+
+fn coor_3b_production_guard_sources(repo: &Path) -> Vec<Cgo8GuardSource> {
+    let src = repo.join("src");
+    let mut files =
+        production_rs_files_from_entries(&src, &[src.join("lib.rs"), src.join("main.rs")]);
+    files.sort();
+    files.dedup();
+    files
+        .into_iter()
+        .map(|path| {
+            Cgo8GuardSource::new(
+                path.strip_prefix(repo)
+                    .expect("production source must be under repository root")
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("read {}: {error}", path.display())),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn coordinator_preparation_owner_guard_recurses_new_scheduler_and_codegen_scan_modules() {
+    let root = std::env::temp_dir().join(format!(
+        "coor_3b_recursive_guard_{}_{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    let files = [
+        ("src/lib.rs", "mod coordinator; mod sql;"),
+        ("src/coordinator/mod.rs", "mod scheduler;"),
+        ("src/coordinator/scheduler/mod.rs", "mod drift;"),
+        (
+            "src/coordinator/scheduler/drift.rs",
+            "fn topological_sort_bottom_up() {}",
+        ),
+        ("src/sql/mod.rs", "mod codegen;"),
+        (
+            "src/sql/codegen/mod.rs",
+            "mod scan; mod fragment; mod proto_encode;",
+        ),
+        (
+            "src/sql/codegen/scan/mod.rs",
+            "pub(crate) mod preparation; pub(crate) use preparation::prepare_scan_bindings;",
+        ),
+        (
+            "src/sql/codegen/scan/preparation.rs",
+            "pub(crate) fn prepare_scan_bindings() {}",
+        ),
+        ("src/sql/codegen/fragment/mod.rs", ""),
+        ("src/sql/codegen/proto_encode/mod.rs", ""),
+    ];
+    for (relative, source) in files {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, source).unwrap();
+    }
+
+    let sources = coor_3b_production_guard_sources(&root);
+    let paths = sources
+        .iter()
+        .map(|source| source.path.as_str())
+        .collect::<BTreeSet<_>>();
+    for expected in [
+        "src/coordinator/scheduler/drift.rs",
+        "src/sql/codegen/scan/mod.rs",
+        "src/sql/codegen/scan/preparation.rs",
+    ] {
+        assert!(
+            paths.contains(expected),
+            "recursive production scan must include `{expected}`: {paths:?}"
+        );
+    }
+    let violations = coor_3b_forbidden_path_violations(&sources);
+    for expected in [
+        "scheduler-topology-reconstruction",
+        "old-codegen-scan-owner",
+        "old-codegen-scan-reexport",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "recursive detector must reject `{expected}`: {violations:?}"
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn coordinator_preparation_owner_guard_rejects_include_reachable_scheduler_drift() {
+    let root = std::env::temp_dir().join(format!(
+        "coor_3b_include_guard_{}_{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    let files = [
+        ("src/lib.rs", "mod coordinator;"),
+        ("src/coordinator/mod.rs", "mod scheduler;"),
+        (
+            "src/coordinator/scheduler/mod.rs",
+            "include!(\"drift.rs\");",
+        ),
+        (
+            "src/coordinator/scheduler/drift.rs",
+            "fn topological_sort_bottom_up() {}",
+        ),
+    ];
+    for (relative, source) in files {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, source).unwrap();
+    }
+
+    let sources = coor_3b_production_guard_sources(&root);
+    let violations = coor_3b_forbidden_path_violations(&sources);
+    assert!(
+        violations.iter().any(|violation| {
+            violation.contains("production-include-macro")
+                && violation.contains("src/coordinator/scheduler/mod.rs")
+        }),
+        "a production include! must not bypass the protected source inventory: {violations:?}"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn coordinator_preparation_owner_detector_rejects_comment_only_positive_definitions() {
+    let sources = [Cgo8GuardSource::new(
+        "src/coordinator/prepare/mod.rs",
+        "// fn prepare_fragments() {}\n// struct PreparedFragmentSet;\n",
+    )];
+    let violations = coor_3b_preparation_owner_contract_violations(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("missing-positive-definition")),
+        "comments must not satisfy positive owner definitions: {violations:?}"
+    );
+}
+
+#[test]
+fn coordinator_preparation_owner() {
+    let repo = Path::new(manifest_dir());
+    let prepare_sources = coor_3b_direct_prepare_sources(repo);
+    assert!(
+        !prepare_sources.is_empty(),
+        "COOR-3B preparation owner file scan must be non-empty"
+    );
+    let owner_violations = coor_3b_preparation_owner_contract_violations(&prepare_sources);
+    assert!(
+        owner_violations.is_empty(),
+        "COOR-3B preparation owner definitions must be unique, parsed and non-vacuous:\n{}",
+        owner_violations.join("\n")
+    );
+
+    let sources = coor_3b_production_guard_sources(repo);
+    let source_paths = sources
+        .iter()
+        .map(|source| source.path.as_str())
+        .collect::<BTreeSet<_>>();
+    for prepare in &prepare_sources {
+        assert!(
+            source_paths.contains(prepare.path.as_str()),
+            "COOR-3B production inventory must include preparation owner `{}`",
+            prepare.path
+        );
+    }
+    for root in [
+        "src/coordinator/scheduler/",
+        "src/sql/codegen/scan/",
+        "src/sql/codegen/fragment/",
+        "src/sql/codegen/proto_encode/",
+    ] {
+        assert!(
+            source_paths.iter().any(|path| path.starts_with(root)),
+            "COOR-3B production inventory scope `{root}` must be non-empty"
+        );
+    }
+    assert_eq!(
+        source_paths
+            .iter()
+            .filter(|path| **path == "src/sql/codegen/fragment/bundle.rs")
+            .count(),
+        1,
+        "COOR-3B production inventory must contain exactly one native bundle owner"
+    );
+    let violations = coor_3b_forbidden_path_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "COOR-3B forbidden ownership paths reappeared:\n{}",
+        violations.join("\n")
+    );
 }
 
 #[test]
