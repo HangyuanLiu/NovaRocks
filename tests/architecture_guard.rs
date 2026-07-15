@@ -27639,3 +27639,6 @@ fn rfd2_deployment_module_stays_a_leaf() {
         }
     }
 }
+
+#[path = "architecture_guard/ebd_1_engine_boundary.rs"]
+mod ebd_1_engine_boundary;
