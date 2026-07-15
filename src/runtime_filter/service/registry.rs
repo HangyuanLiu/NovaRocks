@@ -1237,6 +1237,15 @@ fn validate_ordered_channel<'a>(
                     format!("ordered channel has an invalid top-k summary contract: {error:?}"),
                 )
             })?;
+            if !channel
+                .availability_coverage()
+                .is_canonically_equivalent_to(channel.terminal_coverage())
+            {
+                return Err(install_error(
+                    InstallContractErrorKind::InvalidCoverage,
+                    "top-k summary availability and terminal coverage must be canonically equivalent",
+                ));
+            }
             if channel.lifecycle() != RuntimeFilterLifecycle::MonotonicUpdates
                 || channel.allowed_contribution_kinds()
                     != &BTreeSet::from([
@@ -1868,6 +1877,22 @@ mod tests {
     fn topk_install_accepts_exact_k4_summary_matrix_and_preserves_direct_matrix() {
         assert!(validate_channel_contract(&topk_deployment_fixture()).is_ok());
         assert!(validate_channel_contract(&ordered_deployment_fixture()).is_ok());
+    }
+
+    #[test]
+    fn topk_install_rejects_non_equivalent_allof_coverages() {
+        let fixture = topk_deployment_fixture();
+        let mismatched = fixture.rebuild(
+            Coverage::AllOf(vec![fixture.availability_coverage().clone()]),
+            fixture.reduction_requirement(),
+            fixture.allowed_contribution_kinds().clone(),
+            fixture.consumer().clone(),
+        );
+
+        assert_eq!(
+            validate_channel_contract(&mismatched).unwrap_err().kind(),
+            InstallContractErrorKind::InvalidCoverage
+        );
     }
 
     #[test]

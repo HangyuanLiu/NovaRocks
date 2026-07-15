@@ -2667,7 +2667,7 @@ fn partition_mut_for_commit(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Mutex, Weak, mpsc};
     use std::time::{Duration, Instant};
 
@@ -2713,6 +2713,27 @@ mod tests {
 
         fn release(&self, bytes: usize) {
             self.current.fetch_sub(bytes, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Default)]
+    struct ArmableAccount {
+        rejecting: AtomicBool,
+        current: AtomicUsize,
+    }
+
+    impl RuntimeFilterMemoryAccount for ArmableAccount {
+        fn try_consume(&self, bytes: usize) -> Result<(), MemoryAccountError> {
+            if self.rejecting.load(Ordering::SeqCst) {
+                return Err(MemoryAccountError::CapacityExceeded);
+            }
+            self.current.fetch_add(bytes, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn release(&self, bytes: usize) {
+            let previous = self.current.fetch_sub(bytes, Ordering::SeqCst);
+            assert!(previous >= bytes);
         }
     }
 
@@ -4335,6 +4356,17 @@ mod tests {
                 keys,
                 inclusive: true,
             };
+            Self::with_plan_and_limits(count, k, plan, 4096, 16 * 1024, memory_account)
+        }
+
+        fn with_plan_and_limits(
+            count: usize,
+            k: u32,
+            plan: OrderContract,
+            max_contribution_bytes: u64,
+            max_reducer_bytes: u64,
+            memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
+        ) -> Self {
             let requirement = TopKSummaryRequirement::try_new(k).unwrap();
             let contract =
                 Arc::new(RuntimeTopKSummaryContract::try_from_plan(&plan, requirement).unwrap());
@@ -4367,12 +4399,12 @@ mod tests {
                 ]),
                 CompletionRequirement::ProducerClosed,
                 RuntimeFilterPolicyRequirement {
-                    max_contribution_bytes: 4096,
+                    max_contribution_bytes,
                     max_artifact_bytes: 4096,
                     deadline_ms: 100,
                     max_retries: 0,
                 },
-                RuntimeFilterCoreBudget::new(16 * 1024),
+                RuntimeFilterCoreBudget::new(max_reducer_bytes),
                 MaterializationPolicy::for_test(),
                 streams
                     .iter()
@@ -4425,25 +4457,42 @@ mod tests {
             .unwrap()
         }
 
+        fn submit_summary(
+            &self,
+            stream: usize,
+            sequence: u64,
+            summary: TopKSummary,
+        ) -> Result<TestAction, RuntimeContractViolation> {
+            self.submit_raw_summary(stream, sequence, summary)
+                .map(test_action)
+        }
+
+        fn submit_raw_summary(
+            &self,
+            stream: usize,
+            sequence: u64,
+            summary: TopKSummary,
+        ) -> Result<ChannelAction, RuntimeContractViolation> {
+            let (binding, instance) = self.streams[stream];
+            let bytes = summary.canonical_contribution_bytes().unwrap();
+            self.channel.submit_topk_summary(
+                binding,
+                instance,
+                PartitionId::new(0),
+                ProducerSequence::new(sequence),
+                summary,
+                TemporaryContributionLease::new(self.temporary_account.clone(), bytes),
+            )
+        }
+
         fn submit(
             &self,
             stream: usize,
             sequence: u64,
             values: &[i64],
         ) -> Result<TestAction, RuntimeContractViolation> {
-            let (binding, instance) = self.streams[stream];
             let summary = self.summary(values);
-            let bytes = summary.canonical_contribution_bytes().unwrap();
-            self.channel
-                .submit_topk_summary(
-                    binding,
-                    instance,
-                    PartitionId::new(0),
-                    ProducerSequence::new(sequence),
-                    summary,
-                    TemporaryContributionLease::new(self.temporary_account.clone(), bytes),
-                )
-                .map(test_action)
+            self.submit_summary(stream, sequence, summary)
         }
 
         fn close(
@@ -4743,6 +4792,113 @@ mod tests {
         }
 
         #[test]
+        fn topk_retained_reservation_failure_before_and_after_latest_is_fail_open() {
+            let before_account = Arc::new(ArmableAccount::default());
+            before_account.rejecting.store(true, Ordering::SeqCst);
+            let before = TopKChannelHarness::with_streams_and_account(1, 1, before_account.clone());
+            let before_action = before
+                .submit_raw_summary(0, 0, before.summary(&[7]))
+                .unwrap();
+            assert!(matches!(
+                before_action,
+                ChannelAction::Unavailable {
+                    reason: UnavailableReason::ResourceLimit,
+                    ..
+                }
+            ));
+            assert!(before.channel.snapshot().is_none());
+            assert_eq!(before_account.current.load(Ordering::SeqCst), 0);
+
+            let after_account = Arc::new(ArmableAccount::default());
+            let after = TopKChannelHarness::with_streams_and_account(1, 1, after_account.clone());
+            assert_eq!(
+                after.submit(0, 0, &[7]).unwrap(),
+                TestAction::Published(1, 7)
+            );
+            let retained_before_failure = after_account.current.load(Ordering::SeqCst);
+            after_account.rejecting.store(true, Ordering::SeqCst);
+            let after_action = after.submit_raw_summary(0, 1, after.summary(&[6])).unwrap();
+            assert!(matches!(
+                after_action,
+                ChannelAction::DegradedLogical {
+                    reason: UnavailableReason::ResourceLimit,
+                    ref snapshot,
+                    ..
+                } if snapshot.version() == LogicalVersion::FIRST
+                    && ordered_value(snapshot) == 7
+            ));
+            assert_eq!(after.latest(), Some((1, 7)));
+            assert!(after_account.current.load(Ordering::SeqCst) <= retained_before_failure);
+            after_account.rejecting.store(false, Ordering::SeqCst);
+            drop(after_action);
+            drop(after);
+            assert_eq!(after_account.current.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn topk_utf8_replacement_releases_retained_bytes() {
+            let keys = vec![OrderKeyContract {
+                data_type: DataType::Utf8,
+                direction: SortDirection::Ascending,
+                null_order: NullOrder::Last,
+            }];
+            let plan = OrderContract {
+                comparator_digest: comparator_digest_for_test(&keys, COMPARATOR_ALGORITHM_VERSION),
+                keys,
+                inclusive: true,
+            };
+            let account = Arc::new(Account::default());
+            let harness =
+                TopKChannelHarness::with_plan_and_limits(1, 2, plan, 4096, 8192, account.clone());
+            let make_summary = |values: &[String]| {
+                TopKSummary::try_new(
+                    &harness.contract,
+                    values
+                        .iter()
+                        .map(|value| {
+                            OrderedTuple::try_new(
+                                harness.contract.order(),
+                                [Some(OrderedScalar::Utf8(Arc::from(value.as_str())))],
+                            )
+                            .unwrap()
+                        })
+                        .collect(),
+                )
+                .unwrap()
+            };
+
+            let first = harness
+                .submit_raw_summary(0, 0, make_summary(&["y".repeat(512), "z".repeat(1024)]))
+                .unwrap();
+            assert_eq!(first.outcome(), SubmitOutcome::Published);
+            drop(first);
+            let first_retained = account.current.load(Ordering::SeqCst);
+            assert_eq!(first_retained, 3_628);
+
+            let replacement = harness
+                .submit_raw_summary(0, 1, make_summary(&["a".to_owned(), "b".to_owned()]))
+                .unwrap();
+            assert_eq!(replacement.outcome(), SubmitOutcome::Published);
+            drop(replacement);
+            let replacement_retained = account.current.load(Ordering::SeqCst);
+            assert_eq!(replacement_retained, 48);
+            assert_eq!(first_retained - replacement_retained, 3_580);
+
+            drop(harness.channel.cancel());
+            {
+                let state = harness.channel.state.lock().unwrap();
+                let topk = state.ordered.as_ref().unwrap().reducer.topk().unwrap();
+                assert!(topk.global().is_none());
+                assert_eq!(state.reservation.bytes(), 40);
+                assert_eq!(topk.estimated_retained_bytes(), Some(40));
+            }
+            assert_eq!(account.current.load(Ordering::SeqCst), 42);
+
+            drop(harness);
+            assert_eq!(account.current.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
         fn direct_submit_is_rejected_by_the_topk_strategy() {
             let harness = TopKChannelHarness::with_streams(1, 1);
             let tuple =
@@ -4816,6 +4972,107 @@ mod tests {
                 TestAction::Other(SubmitOutcome::Stale)
             );
             assert_eq!(harness.latest(), Some((1, 10)));
+        }
+
+        #[test]
+        fn topk_cancel_update_race_never_publishes_after_cancel() {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let harness = TopKChannelHarness::with_streams_and_account(
+                1,
+                1,
+                Arc::new(BlockingRejectingAccount {
+                    entered: entered_tx,
+                    release: Mutex::new(release_rx),
+                }),
+            );
+            let channel = harness.channel.clone();
+            let contract = harness.contract.clone();
+            let temporary = harness.temporary_account.clone();
+            let (binding, instance) = harness.streams[0];
+            let (done_tx, done_rx) = mpsc::channel();
+            let update = std::thread::spawn(move || {
+                let summary = TopKSummary::try_new(
+                    &contract,
+                    vec![
+                        OrderedTuple::try_new(contract.order(), [Some(OrderedScalar::Int64(7))])
+                            .unwrap(),
+                    ],
+                )
+                .unwrap();
+                let bytes = summary.canonical_contribution_bytes().unwrap();
+                let result = channel.submit_topk_summary(
+                    binding,
+                    instance,
+                    PartitionId::new(0),
+                    ProducerSequence::new(0),
+                    summary,
+                    TemporaryContributionLease::new(temporary, bytes),
+                );
+                done_tx.send(result).unwrap();
+            });
+
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert!(matches!(
+                harness.channel.cancel(),
+                ChannelAction::Cancelled { .. }
+            ));
+            release_tx.send(()).unwrap();
+            release_tx.send(()).unwrap();
+            let action = done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap();
+            assert_eq!(action.outcome(), SubmitOutcome::TerminalNoop);
+            assert!(action.snapshot().is_none());
+            assert!(matches!(
+                harness.channel.terminal_action(),
+                ChannelAction::Cancelled { .. }
+            ));
+            assert!(harness.channel.snapshot().is_none());
+            update.join().unwrap();
+        }
+
+        #[test]
+        fn topk_close_update_race_completes_once_with_final_bound() {
+            for _ in 0..32 {
+                let harness = Arc::new(TopKChannelHarness::with_streams(1, 1));
+                let start = Arc::new(Barrier::new(3));
+                let close = {
+                    let harness = harness.clone();
+                    let start = start.clone();
+                    std::thread::spawn(move || {
+                        start.wait();
+                        harness.close(0, 1)
+                    })
+                };
+                let update = {
+                    let harness = harness.clone();
+                    let start = start.clone();
+                    std::thread::spawn(move || {
+                        start.wait();
+                        harness.submit(0, 0, &[7])
+                    })
+                };
+                start.wait();
+
+                let outcomes = [
+                    close.join().unwrap().unwrap(),
+                    update.join().unwrap().unwrap(),
+                ];
+                assert_eq!(
+                    outcomes
+                        .iter()
+                        .filter(|outcome| matches!(outcome, TestAction::Completed(Some((1, 7)))))
+                        .count(),
+                    1
+                );
+                assert!(outcomes.iter().any(|outcome| matches!(
+                    outcome,
+                    TestAction::PendingFinalSnapshot | TestAction::Published(1, 7)
+                )));
+                assert_eq!(harness.latest(), Some((1, 7)));
+            }
         }
     }
 

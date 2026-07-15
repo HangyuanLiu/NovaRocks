@@ -679,11 +679,17 @@ mod tests {
     use super::{TopKApplyOutcome, TopKCloseOutcome, TopKSummaryReducer};
 
     fn contract(k: u32) -> Arc<RuntimeTopKSummaryContract> {
-        let keys = vec![OrderKeyContract {
-            data_type: DataType::Int64,
-            direction: SortDirection::Ascending,
-            null_order: NullOrder::Last,
-        }];
+        contract_with_keys(
+            k,
+            vec![OrderKeyContract {
+                data_type: DataType::Int64,
+                direction: SortDirection::Ascending,
+                null_order: NullOrder::Last,
+            }],
+        )
+    }
+
+    fn contract_with_keys(k: u32, keys: Vec<OrderKeyContract>) -> Arc<RuntimeTopKSummaryContract> {
         Arc::new(
             RuntimeTopKSummaryContract::try_from_plan(
                 &OrderContract {
@@ -744,6 +750,21 @@ mod tests {
         let outcome = projection.outcome();
         reducer.commit_apply(projection);
         Ok(outcome)
+    }
+
+    fn apply_summary(
+        reducer: &mut TopKSummaryReducer,
+        partition: u32,
+        sequence: u64,
+        candidates: Vec<OrderedTuple>,
+    ) -> TopKApplyOutcome {
+        let summary = TopKSummary::try_new(reducer.contract(), candidates).unwrap();
+        let projection = reducer
+            .preflight_apply(stream(partition), ProducerSequence::new(sequence), &summary)
+            .unwrap();
+        let outcome = projection.outcome();
+        reducer.commit_apply(projection);
+        outcome
     }
 
     fn close(
@@ -924,6 +945,104 @@ mod tests {
                 assert!(current <= previous);
             }
             previous_bound = expected.or(previous_bound);
+        }
+    }
+
+    #[test]
+    fn topk_randomized_reference_merge() {
+        const K: usize = 5;
+        let matrices = [
+            vec![OrderKeyContract {
+                data_type: DataType::Int64,
+                direction: SortDirection::Ascending,
+                null_order: NullOrder::Last,
+            }],
+            vec![OrderKeyContract {
+                data_type: DataType::Int64,
+                direction: SortDirection::Descending,
+                null_order: NullOrder::First,
+            }],
+            vec![
+                OrderKeyContract {
+                    data_type: DataType::Utf8,
+                    direction: SortDirection::Ascending,
+                    null_order: NullOrder::First,
+                },
+                OrderKeyContract {
+                    data_type: DataType::Int64,
+                    direction: SortDirection::Descending,
+                    null_order: NullOrder::Last,
+                },
+            ],
+        ];
+
+        for (matrix_index, keys) in matrices.into_iter().enumerate() {
+            let contract = contract_with_keys(K as u32, keys);
+            let mut reducer = TopKSummaryReducer::new(contract.clone());
+            let mut full_streams = BTreeMap::<u32, Vec<OrderedTuple>>::new();
+            let mut latest = BTreeMap::<u32, Vec<OrderedTuple>>::new();
+            let mut sequences = [0u64; 4];
+            let mut random = 0x5eed_u64.wrapping_add(matrix_index as u64);
+
+            for iteration in 0..200 {
+                random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let partition = ((random >> 32) % 4) as u32;
+                let values = full_streams.entry(partition).or_default();
+                for duplicate_index in 0..=usize::try_from((random >> 40) % 2).unwrap() {
+                    random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let bucket = ((random >> 32) % 9) as i64;
+                    let tuple = if contract.order().keys().len() == 1 {
+                        OrderedTuple::try_new(
+                            contract.order(),
+                            [(bucket % 4 != 0).then_some(OrderedScalar::Int64(bucket))],
+                        )
+                        .unwrap()
+                    } else {
+                        let word = match bucket % 4 {
+                            0 => None,
+                            1 => Some(OrderedScalar::Utf8(Arc::from("alpha"))),
+                            2 => Some(OrderedScalar::Utf8(Arc::from("beta"))),
+                            _ => Some(OrderedScalar::Utf8(Arc::from("gamma"))),
+                        };
+                        OrderedTuple::try_new(
+                            contract.order(),
+                            [
+                                word,
+                                (bucket % 3 != 0).then_some(OrderedScalar::Int64(
+                                    bucket + duplicate_index as i64,
+                                )),
+                            ],
+                        )
+                        .unwrap()
+                    };
+                    values.push(tuple);
+                    if duplicate_index == 1 {
+                        values.push(values.last().unwrap().clone());
+                    }
+                }
+                values.sort_by(|left, right| contract.order().compare(left, right).unwrap());
+                let candidates = values.iter().take(K).cloned().collect::<Vec<_>>();
+                latest.insert(partition, candidates.clone());
+                apply_summary(
+                    &mut reducer,
+                    partition,
+                    sequences[partition as usize],
+                    candidates,
+                );
+                sequences[partition as usize] += 1;
+
+                let mut reference = latest
+                    .values()
+                    .flat_map(|candidates| candidates.iter().cloned())
+                    .collect::<Vec<_>>();
+                reference.sort_by(|left, right| contract.order().compare(left, right).unwrap());
+                let expected = reference.get(K - 1);
+                assert_eq!(
+                    reducer.global().map(|domain| domain.bound()),
+                    expected,
+                    "matrix={matrix_index} iteration={iteration}"
+                );
+            }
         }
     }
 }
