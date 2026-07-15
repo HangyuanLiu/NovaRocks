@@ -447,6 +447,7 @@ pub(super) enum ClaimedMaterializationJob {
     Owner {
         group: CapabilityGroup,
         owner: ArtifactJobOwner,
+        launch_event: Option<RuntimeFilterEvent>,
     },
     Follower {
         group: CapabilityGroup,
@@ -468,6 +469,13 @@ pub(super) fn claim_materialization_jobs(
             ArtifactJobClaim::Owner(owner) => ClaimedMaterializationJob::Owner {
                 group: group.clone(),
                 owner,
+                launch_event: Some(RuntimeFilterEvent::MaterializationStarted {
+                    identity: ArtifactMaterializationIdentity::new(
+                        group.common(),
+                        group.profile().id(),
+                        version,
+                    ),
+                }),
             },
             ArtifactJobClaim::Follower(follower) => ClaimedMaterializationJob::Follower {
                 group: group.clone(),
@@ -476,6 +484,19 @@ pub(super) fn claim_materialization_jobs(
             ArtifactJobClaim::Stale => ClaimedMaterializationJob::Stale {
                 group: group.clone(),
             },
+        })
+        .collect()
+}
+
+pub(super) fn take_materialization_launch_events(
+    claimed: &mut [ClaimedMaterializationJob],
+) -> Vec<RuntimeFilterEvent> {
+    claimed
+        .iter_mut()
+        .filter_map(|claim| match claim {
+            ClaimedMaterializationJob::Owner { launch_event, .. } => launch_event.take(),
+            ClaimedMaterializationJob::Follower { .. }
+            | ClaimedMaterializationJob::Stale { .. } => None,
         })
         .collect()
 }
@@ -692,7 +713,11 @@ fn admit_claimed_group<'a>(
         ClaimedMaterializationJob::Follower { group, follower } => {
             AdmittedGroup::Follower { group, follower }
         }
-        ClaimedMaterializationJob::Owner { group, owner } => {
+        ClaimedMaterializationJob::Owner {
+            group,
+            owner,
+            launch_event,
+        } => {
             let planned_group = plan
                 .groups()
                 .iter()
@@ -703,7 +728,7 @@ fn admit_claimed_group<'a>(
                 group.profile().id(),
                 snapshot.version(),
             );
-            let events = vec![RuntimeFilterEvent::MaterializationStarted { identity }];
+            let events = launch_event.into_iter().collect();
             let admitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if snapshot.ordered_bound().is_some() {
                     let range_plan = match RangeMaterializer::plan(

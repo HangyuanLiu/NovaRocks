@@ -49,7 +49,7 @@ use crate::runtime_filter::port::support::{RuntimeFilterClock, RuntimeFilterMemo
 use self::materialization::run_materialization_jobs;
 use self::materialization::{
     ClaimedMaterializationJob, MaterializationWorkClaim, PublishCommitOutcome,
-    claim_materialization_jobs, execute_materialization_jobs,
+    claim_materialization_jobs, execute_materialization_jobs, take_materialization_launch_events,
 };
 use self::producer::ServiceProducerAdapter;
 use self::registry::{DeploymentRegistry, InstalledDeployment};
@@ -346,6 +346,8 @@ struct ActionDispatcher {
     #[cfg(test)]
     after_claim: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
+    before_materialization_admission: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
     before_encode: Mutex<
         Option<Arc<dyn Fn(crate::runtime_filter::port::artifact::ConsumerProfileId) + Send + Sync>>,
     >,
@@ -387,6 +389,7 @@ struct ClaimedActionMaterialization {
     installed: Arc<InstalledDeployment>,
     snapshot: Arc<crate::runtime_filter::port::value_domain::LogicalSnapshot>,
     jobs: Vec<ClaimedMaterializationJob>,
+    launch_batch: Option<EventBatchHandle>,
 }
 
 impl ActionDispatcher {
@@ -655,7 +658,10 @@ impl ActionDispatcher {
         {
             hook();
         }
-        let claimed = self.claim_action_materialization(channel_id, &action);
+        let mut claimed = self.claim_action_materialization(channel_id, &action);
+        let launch_batch = claimed
+            .as_mut()
+            .and_then(|claimed| claimed.launch_batch.take());
         let core_completion = core_batch.as_ref().map(|batch| batch.completion.clone());
 
         let mut state = flight
@@ -676,6 +682,18 @@ impl ActionDispatcher {
         flight.changed.notify_all();
 
         self.events.publish(core_batch);
+        self.events.publish(launch_batch);
+        #[cfg(test)]
+        let before_materialization_admission = claimed.is_some().then(|| {
+            self.before_materialization_admission
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+        });
+        #[cfg(test)]
+        if let Some(Some(hook)) = before_materialization_admission {
+            hook();
+        }
         let (artifact_batch, error) = self.route_and_prequeue(channel_id, &action, claimed);
         let result = error.map_or(Ok(()), Err);
         if let Err(error) = &result {
@@ -716,11 +734,16 @@ impl ActionDispatcher {
         };
         let installed = self.registry.installation_for_dispatch()?;
         let plan = installed.artifact_plan(channel_id)?;
-        let jobs = claim_materialization_jobs(plan, installed.publish_gate(), snapshot.version());
+        let mut jobs =
+            claim_materialization_jobs(plan, installed.publish_gate(), snapshot.version());
+        let launch_batch = self
+            .events
+            .reserve_unready(take_materialization_launch_events(&mut jobs));
         Some(ClaimedActionMaterialization {
             installed,
             snapshot,
             jobs,
+            launch_batch,
         })
     }
 
@@ -929,6 +952,8 @@ impl RuntimeFilterService {
             channels: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             after_claim: Mutex::new(None),
+            #[cfg(test)]
+            before_materialization_admission: Mutex::new(None),
             #[cfg(test)]
             before_encode: Mutex::new(None),
             #[cfg(test)]
@@ -1143,6 +1168,15 @@ impl RuntimeFilterService {
         *self
             .dispatcher
             .after_claim
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn set_before_materialization_admission_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .dispatcher
+            .before_materialization_admission
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(hook);
     }
@@ -1851,7 +1885,7 @@ mod tests {
     }
 
     #[test]
-    fn ordered_newer_version_can_publish_while_older_encode_is_blocked() {
+    fn ordered_launch_events_follow_claim_order_while_newer_version_commits_first() {
         struct ReleaseOnDrop(Arc<(Mutex<bool>, Condvar)>);
 
         impl ReleaseOnDrop {
@@ -1882,16 +1916,11 @@ mod tests {
 
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let release_on_drop = ReleaseOnDrop(release.clone());
-        let calls = Arc::new(AtomicUsize::new(0));
-        let (older_entered_tx, older_entered_rx) = mpsc::channel();
-        service.set_before_encode_hook(Arc::new({
+        let (older_claimed_tx, older_claimed_rx) = mpsc::channel();
+        service.set_before_materialization_admission_hook(Arc::new({
             let release = release.clone();
-            let calls = calls.clone();
-            move |_| {
-                if calls.fetch_add(1, Ordering::SeqCst) != 0 {
-                    return;
-                }
-                older_entered_tx.send(()).unwrap();
+            move || {
+                older_claimed_tx.send(()).unwrap();
                 let (lock, changed) = &*release;
                 let mut released = lock.lock().unwrap_or_else(|error| error.into_inner());
                 while !*released {
@@ -1914,9 +1943,9 @@ mod tests {
                 ))
                 .unwrap();
         });
-        older_entered_rx
+        older_claimed_rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("older version must reach the encode hook");
+            .expect("older version must advance before materialization admission");
 
         let (newer_tx, newer_rx) = mpsc::channel();
         let newer_producer = producer.clone();
@@ -1950,16 +1979,39 @@ mod tests {
         newer.join().unwrap();
 
         let events = events.0.lock().unwrap();
-        assert!(events.iter().any(|event| matches!(
-            event,
-            RuntimeFilterEvent::ArtifactPublished { identity, .. }
-                if identity.version() == LogicalVersion::new(2)
-        )));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            RuntimeFilterEvent::ArtifactPublishStaleSkipped { identity }
-                if identity.version() == LogicalVersion::FIRST
-        )));
+        let started_versions = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeFilterEvent::MaterializationStarted { identity } => Some(identity.version()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            started_versions,
+            [LogicalVersion::FIRST, LogicalVersion::new(2)],
+            "owner launch events must remain in ordered action-claim order"
+        );
+        let newer_published = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeFilterEvent::ArtifactPublished { identity, .. }
+                        if identity.version() == LogicalVersion::new(2)
+                )
+            })
+            .expect("newer version must publish");
+        let older_stale = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeFilterEvent::ArtifactPublishStaleSkipped { identity }
+                        if identity.version() == LogicalVersion::FIRST
+                )
+            })
+            .expect("older version must become stale");
+        assert!(newer_published < older_stale);
     }
 
     fn install_one(fixture: &Fixture) {
@@ -2861,15 +2913,20 @@ mod tests {
         assert_eq!(value_set_bundle.profile_id(), value_set.id());
         assert_eq!(bitset_bundle.profile_id(), bitset.id());
 
-        let materialization_profiles = fixture
-            .events
-            .0
-            .lock()
-            .unwrap()
+        let events = fixture.events.0.lock().unwrap();
+        let started_profiles = events
             .iter()
             .filter_map(|event| match event {
-                RuntimeFilterEvent::MaterializationStarted { identity }
-                | RuntimeFilterEvent::ArtifactMaterialized { identity, .. }
+                RuntimeFilterEvent::MaterializationStarted { identity } => {
+                    Some(identity.profile_id())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let completed_profiles = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeFilterEvent::ArtifactMaterialized { identity, .. }
                 | RuntimeFilterEvent::ArtifactPublished { identity, .. } => {
                     Some(identity.profile_id())
                 }
@@ -2878,11 +2935,12 @@ mod tests {
             .collect::<Vec<_>>();
         let mut expected_profiles = vec![value_set.id(), bitset.id()];
         expected_profiles.sort_unstable();
+        assert_eq!(started_profiles, expected_profiles);
         assert_eq!(
-            materialization_profiles,
+            completed_profiles,
             expected_profiles
                 .into_iter()
-                .flat_map(|profile| [profile; 3])
+                .flat_map(|profile| [profile; 2])
                 .collect::<Vec<_>>()
         );
     }
@@ -3053,26 +3111,32 @@ mod tests {
             *completed.lock().unwrap(),
             vec![canonical[1], canonical[0], canonical[2]]
         );
-        let materialization_profiles = fixture
-            .events
-            .0
-            .lock()
-            .unwrap()
+        let events = fixture.events.0.lock().unwrap();
+        let started_profiles = events
             .iter()
             .filter_map(|event| match event {
-                RuntimeFilterEvent::MaterializationStarted { identity }
-                | RuntimeFilterEvent::ArtifactMaterialized { identity, .. }
+                RuntimeFilterEvent::MaterializationStarted { identity } => {
+                    Some(identity.profile_id())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let completed_profiles = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeFilterEvent::ArtifactMaterialized { identity, .. }
                 | RuntimeFilterEvent::ArtifactPublished { identity, .. } => {
                     Some(identity.profile_id())
                 }
                 _ => None,
             })
             .collect::<Vec<_>>();
+        assert_eq!(started_profiles, canonical);
         assert_eq!(
-            materialization_profiles,
+            completed_profiles,
             canonical
                 .iter()
-                .flat_map(|profile_id| [*profile_id; 3])
+                .flat_map(|profile_id| [*profile_id; 2])
                 .collect::<Vec<_>>()
         );
     }
