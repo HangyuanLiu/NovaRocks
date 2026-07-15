@@ -82,6 +82,37 @@ grep -q "UNEXPECTED_PASS" "$run_dir/summary.md"
 targeted_suites="$(ci_tier_suites targeted "$REPO_ROOT/tools/ci/suites/stable-sql-suites.txt")"
 grep -qx "optimizer-dist" <<<"$targeted_suites"
 
+if [ "$SQL_CLUSTER_MODE" != "cross-process" ]; then
+  echo "default SQL cluster mode must be cross-process" >&2
+  exit 1
+fi
+if [ "$SQL_CLUSTER_SIZE" != "3" ]; then
+  echo "default SQL cluster size must be 3 BEs" >&2
+  exit 1
+fi
+if [ "$(ci_suite_cluster_mode optimizer)" != "cross-process" ]; then
+  echo "ordinary suites must default to cross-process mode" >&2
+  exit 1
+fi
+if [ "$(ci_suite_cluster_size optimizer)" != "3" ]; then
+  echo "ordinary suites must default to a 3-BE cluster" >&2
+  exit 1
+fi
+if ci_native_cross_process_enabled; then
+  echo "the duplicate native cross-process matrix must be disabled by default" >&2
+  exit 1
+fi
+
+if ! (
+  unset SQL_CLUSTER_MODE SQL_CLUSTER_SIZE
+  source "$REPO_ROOT/tools/ci/local-full-ci.sh" --source-only
+  parse_args --cluster-mode all-in-one
+  [ "$SQL_CLUSTER_MODE" = "all-in-one" ] && [ "$SQL_CLUSTER_SIZE" = "1" ]
+); then
+  echo "explicit all-in-one mode without a size must infer cluster size 1" >&2
+  exit 1
+fi
+
 SQL_CLUSTER_MODE="all-in-one"
 SQL_CLUSTER_SIZE="1"
 if [ "$(ci_suite_cluster_mode optimizer-dist)" != "cross-process" ]; then
@@ -109,13 +140,14 @@ if [ "$native_cross_process_core_suites" != "$expected_native_cross_process_core
   exit 1
 fi
 
+NOVA_CI_NATIVE_CROSS_PROCESS_CORE="1"
 if ! ci_native_cross_process_enabled; then
-  echo "native cross-process core matrix should be enabled by default" >&2
+  echo "explicit NOVA_CI_NATIVE_CROSS_PROCESS_CORE=1 should enable the native cross-process matrix" >&2
   exit 1
 fi
 
 if [ "$(ci_native_cross_process_suites | tr '\n' ' ')" != "$(printf "%s " join filter sort aggregate cte subquery iceberg-rest runtime-filter-distributed)" ]; then
-  echo "default native cross-process matrix should use the core suites" >&2
+  echo "explicit native cross-process core matrix should use the core suites" >&2
   exit 1
 fi
 
@@ -148,6 +180,11 @@ if [ "$(ci_native_cross_process_suite_cluster_size join)" != "3" ]; then
 fi
 
 local_full_ci_text="$(cat "$REPO_ROOT/tools/ci/local-full-ci.sh")"
+if ! grep -q 'echo "SQL_CLUSTER_MODE=$SQL_CLUSTER_MODE"' <<<"$local_full_ci_text" \
+  || ! grep -q 'echo "SQL_CLUSTER_SIZE=$SQL_CLUSTER_SIZE"' <<<"$local_full_ci_text"; then
+  echo "prepare runtime must record the effective SQL cluster topology" >&2
+  exit 1
+fi
 if ! grep -q 'stop_server_for_native_cross_process_stage' <<<"$local_full_ci_text"; then
   echo "local-full-ci must use the native cross-process stop-stage name" >&2
   exit 1
