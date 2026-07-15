@@ -27605,6 +27605,471 @@ fn planner_topology_contract() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// CGO-9C: the native encoder maps the sealed distributed plan 1:1; it owns no
+// semantic repair.
+//
+// CGO-9C retired every "repair a stale/incomplete plan" surface from the
+// encoder (`src/sql/codegen/proto_encode/`). The planner seal now finalizes all
+// node / fragment / stream-edge / write / aggregate outputs
+// (`sql::planner::distributed`), and the encoder maps that sealed contract onto
+// the wire without re-deriving it. Task 5 deleted the last surviving repair --
+// the node-output read walk (`encoded_node_output_columns` /
+// `encoded_fragment_root_output_columns`, the read twin of the planner's
+// `wire_node_output_columns`) -- after migrating its sole production consumer
+// (the coordinator CTE-multicast sink) to read the sealed
+// `PlanFragment.output_columns` directly.
+//
+// These guards fail closed if the encoder re-introduces any retired
+// semantic-repair helper (`patch_exchange_receiver`,
+// `normalize_encoded_node_output`, the aggregate intermediate-type inference
+// `hash_aggregate_outputs_intermediate` / `aggregate_intermediate_type`, or the
+// node-output read walk), re-invokes a planner output finalizer
+// (`wire_node_output_columns` / `finalize_hash_aggregate_wire`), reacquires the
+// draft (`DistributedPlanDraft`), or takes a mutable borrow of the sealed plan
+// (`&mut DistributedPlan`). Draft construction/finalization staying planner-only
+// and the no-clone-and-patch rule are enforced tree-wide by the
+// `distributed_plan_seal_task1`/`task2` guards; the production test below also
+// re-runs the seal-task1 detector over the codegen + coordinator consumers so
+// the "codegen only borrows the sealed plan" half is owned here too. A companion
+// guard keeps the planner distributed stage and the aggregate type contract
+// (`types::aggregate`) free of any protobuf import, so the seal cannot smuggle
+// wire concerns back upstream.
+//
+// LEGITIMATE MAPPING IS ALLOWED, SEMANTIC REPAIR IS BANNED. The detector keys on
+// the exact retired names, never on the 1:1 enum/presence/range mappers
+// (`encode_data_partition`, `encode_type`, `encode_scan_node`,
+// `encode_output_columns`) nor on the encoder's own sealed-contract readers
+// (`encode_finalized_fragment_output_columns`, `finalized_stream_edge_projection`),
+// so those never trip. Text is sanitized (comments/strings stripped,
+// `#[cfg(test)]` items blanked) so prose that merely names a retired helper, and
+// the encoder's `#[cfg(test)]` draft builders, never trip either.
+//
+// RF-AGNOSTIC BY CONSTRUCTION. The encoder legitimately encodes node-carried
+// runtime filters onto the wire (`build_runtime_filters` /
+// `probe_runtime_filters` are wire payload it must emit). Unlike the CGO-9A seal
+// guard -- which forbids the *seal* from reading those fields -- this encoder
+// guard must never key on them, or it would false-positive on legitimate RF wire
+// encoding. `cgo_9c_guard_markers_are_runtime_filter_agnostic` asserts no marker
+// mentions a node-carried RF field, and a positive fixture proves an encoder that
+// emits RF wire columns still passes.
+// ---------------------------------------------------------------------------
+
+const CGO_9C_ENCODER_ROOT: &str = "src/sql/codegen/proto_encode/";
+const CGO_9C_PLANNER_DISTRIBUTED_ROOT: &str = "src/sql/planner/distributed/";
+const CGO_9C_AGGREGATE_TYPE_CONTRACT: &str = "src/types/aggregate.rs";
+
+// Retired encoder semantic-repair helpers. Reintroducing any of these names in
+// the encoder is a regression: it re-derives output the planner already sealed.
+// These are exactly the names the retired-inventory `rg` in the CGO-9C plan
+// bans under `src/sql/codegen/proto_encode`.
+const CGO_9C_RETIRED_ENCODER_HELPERS: [&str; 6] = [
+    "patch_exchange_receiver",
+    "normalize_encoded_node_output",
+    "hash_aggregate_outputs_intermediate",
+    "aggregate_intermediate_type",
+    "encoded_node_output_columns",
+    "encoded_fragment_root_output_columns",
+];
+
+// Planner output finalizers the encoder must never re-invoke; it reads the
+// sealed contract instead. These are the planner's own distinctive names, with
+// no substring collision against the encoder's legitimate sealed-contract
+// readers (`encode_finalized_fragment_output_columns`, `finalized_stream_edge_*`).
+const CGO_9C_PLANNER_OUTPUT_FINALIZERS: [&str; 2] =
+    ["wire_node_output_columns", "finalize_hash_aggregate_wire"];
+
+// The sealed-plan draft type and the mutable-borrow shape the encoder must never
+// carry. `&mut DistributedPlan` is stored whitespace-collapsed so a
+// rustfmt-wrapped borrow still matches; `DistributedPlanDraft` is distinct from a
+// read-only `&DistributedPlan`, which stays allowed.
+const CGO_9C_ENCODER_PLAN_OWNERSHIP_MARKERS: [&str; 2] =
+    ["DistributedPlanDraft", "&mutDistributedPlan"];
+
+// Node-carried runtime-filter fields. The encoder legitimately emits these onto
+// the wire, so the guard stays agnostic to them: no marker set mentions them, and
+// an encoder that references them must still pass.
+const CGO_9C_NODE_CARRIED_RF_MARKERS: [&str; 2] =
+    ["build_runtime_filters", "probe_runtime_filters"];
+
+fn cgo_9c_encoder_semantic_repair_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut encoder_seen = false;
+
+    for source in sources {
+        if !source.path.starts_with(CGO_9C_ENCODER_ROOT) {
+            continue;
+        }
+        encoder_seen = true;
+        let production = rust_sanitized_production_text(&source.text);
+        // Collapse whitespace so a rustfmt-wrapped `&mut\n    DistributedPlan`
+        // still matches the mutable-borrow needle.
+        let collapsed: String = production.split_whitespace().collect();
+
+        for helper in CGO_9C_RETIRED_ENCODER_HELPERS {
+            if production.contains(helper) {
+                violations.push(format!(
+                    "encoder-retired-semantic-repair: {} references `{helper}`; the encoder maps the sealed plan 1:1 and must not re-run the retired semantic-repair walk/inference",
+                    source.path
+                ));
+            }
+        }
+        for finalizer in CGO_9C_PLANNER_OUTPUT_FINALIZERS {
+            if production.contains(finalizer) {
+                violations.push(format!(
+                    "encoder-calls-planner-finalizer: {} references `{finalizer}`; node/fragment/aggregate output is finalized by the planner seal, and the encoder must read the sealed contract, not re-invoke the finalizer",
+                    source.path
+                ));
+            }
+        }
+        if collapsed.contains(CGO_9C_ENCODER_PLAN_OWNERSHIP_MARKERS[0]) {
+            violations.push(format!(
+                "encoder-reacquires-draft: {} references `DistributedPlanDraft`; draft construction/finalization is planner-only and the encoder consumes the sealed `DistributedPlan`",
+                source.path
+            ));
+        }
+        if collapsed.contains(CGO_9C_ENCODER_PLAN_OWNERSHIP_MARKERS[1]) {
+            violations.push(format!(
+                "encoder-mutably-borrows-sealed-plan: {} takes `&mut DistributedPlan`; codegen only borrows the sealed plan immutably",
+                source.path
+            ));
+        }
+    }
+
+    if !encoder_seen {
+        violations.push(format!(
+            "missing-encoder-source: no source matched `{CGO_9C_ENCODER_ROOT}`"
+        ));
+    }
+
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+fn cgo_9c_planner_protobuf_free_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut planner_seen = false;
+    let mut aggregate_seen = false;
+
+    for source in sources {
+        let is_planner = source.path.starts_with(CGO_9C_PLANNER_DISTRIBUTED_ROOT);
+        let is_aggregate = source.path == CGO_9C_AGGREGATE_TYPE_CONTRACT;
+        if !is_planner && !is_aggregate {
+            continue;
+        }
+        planner_seen |= is_planner;
+        aggregate_seen |= is_aggregate;
+        // Collapse whitespace so `crate :: proto` (however wrapped) still matches.
+        let collapsed: String = rust_sanitized_production_text(&source.text)
+            .split_whitespace()
+            .collect();
+        if collapsed.contains("crate::proto") {
+            let stage = if is_aggregate {
+                "aggregate type contract"
+            } else {
+                "planner distributed stage"
+            };
+            violations.push(format!(
+                "planner-imports-protobuf: {} references `crate::proto`; the {stage} owns the sealed plan in native types and must never depend on the protobuf wire model",
+                source.path
+            ));
+        }
+    }
+
+    if !planner_seen {
+        violations.push(format!(
+            "missing-planner-source: no source matched `{CGO_9C_PLANNER_DISTRIBUTED_ROOT}`"
+        ));
+    }
+    if !aggregate_seen {
+        violations.push(format!(
+            "missing-aggregate-source: no source matched `{CGO_9C_AGGREGATE_TYPE_CONTRACT}`"
+        ));
+    }
+
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+/// The full set of substrings the CGO-9C encoder detector keys on. Used by the
+/// RF-agnostic proof to assert none of them mentions a node-carried runtime
+/// filter field.
+fn cgo_9c_encoder_detector_markers() -> Vec<&'static str> {
+    CGO_9C_RETIRED_ENCODER_HELPERS
+        .iter()
+        .chain(CGO_9C_PLANNER_OUTPUT_FINALIZERS.iter())
+        .chain(CGO_9C_ENCODER_PLAN_OWNERSHIP_MARKERS.iter())
+        .copied()
+        .collect()
+}
+
+#[test]
+fn cgo_9c_encoder_semantic_repair_detector_accepts_sealed_mapping_encoder() {
+    // A compliant encoder: it borrows the sealed plan immutably, maps sealed
+    // outputs through 1:1 enum/presence/range mappers, and reads the sealed
+    // fragment/stream contract through its own (distinctly named) readers.
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/codegen/proto_encode/plan.rs",
+        "fn encode_distributed_plan(plan: &DistributedPlan) -> Result<Encoded, String> {\n\
+             let _ = encode_data_partition(&plan.data_partition())?;\n\
+             let _ = encode_type(&column.data_type)?;\n\
+             let cols = encode_output_columns(&encode_finalized_fragment_output_columns(plan)?)?;\n\
+             let _ = finalized_stream_edge_projection(ctx, edge)?;\n\
+             Ok(cols)\n\
+         }",
+    )];
+    let violations = cgo_9c_encoder_semantic_repair_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "a sealed-plan-mapping encoder with only legitimate mappers must pass: {violations:?}"
+    );
+}
+
+#[test]
+fn cgo_9c_encoder_semantic_repair_detector_rejects_each_retired_helper() {
+    for helper in CGO_9C_RETIRED_ENCODER_HELPERS {
+        let sources = [Cgo8GuardSource::new(
+            "src/sql/codegen/proto_encode/plan.rs",
+            format!("fn repair(node: &Node) {{ let _ = {helper}(node); }}"),
+        )];
+        let violations = cgo_9c_encoder_semantic_repair_violations(&sources);
+        assert!(
+            violations.iter().any(|violation| violation
+                .contains("encoder-retired-semantic-repair")
+                && violation.contains(helper)),
+            "a reintroduced `{helper}` in the encoder must fail closed: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn cgo_9c_encoder_semantic_repair_detector_rejects_planner_finalizer_calls() {
+    for finalizer in CGO_9C_PLANNER_OUTPUT_FINALIZERS {
+        let sources = [Cgo8GuardSource::new(
+            "src/sql/codegen/proto_encode/plan.rs",
+            format!("fn encode(node: &Node) {{ let _ = {finalizer}(node); }}"),
+        )];
+        let violations = cgo_9c_encoder_semantic_repair_violations(&sources);
+        assert!(
+            violations.iter().any(|violation| violation
+                .contains("encoder-calls-planner-finalizer")
+                && violation.contains(finalizer)),
+            "the encoder re-invoking planner finalizer `{finalizer}` must fail closed: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn cgo_9c_encoder_semantic_repair_detector_rejects_draft_and_mutable_borrow() {
+    let draft = [Cgo8GuardSource::new(
+        "src/sql/codegen/proto_encode/plan.rs",
+        "fn encode(draft: DistributedPlanDraft) { let _ = draft; }",
+    )];
+    assert!(
+        cgo_9c_encoder_semantic_repair_violations(&draft)
+            .iter()
+            .any(|violation| violation.contains("encoder-reacquires-draft")),
+        "the encoder reacquiring the draft must fail closed"
+    );
+
+    let mutable = [Cgo8GuardSource::new(
+        "src/sql/codegen/proto_encode/plan.rs",
+        "fn encode(plan: &mut DistributedPlan) { let _ = plan; }",
+    )];
+    assert!(
+        cgo_9c_encoder_semantic_repair_violations(&mutable)
+            .iter()
+            .any(|violation| violation.contains("encoder-mutably-borrows-sealed-plan")),
+        "the encoder mutably borrowing the sealed plan must fail closed"
+    );
+}
+
+#[test]
+fn cgo_9c_encoder_semantic_repair_detector_requires_an_encoder_source() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/planner/distributed/output.rs",
+        "fn wire_node_output_columns() {}",
+    )];
+    let violations = cgo_9c_encoder_semantic_repair_violations(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("missing-encoder-source")),
+        "a tree without an encoder source must fail closed: {violations:?}"
+    );
+}
+
+#[test]
+fn cgo_9c_encoder_semantic_repair_detector_ignores_test_only_and_comment_surfaces() {
+    // A retired helper named only in a `//` comment and inside a `#[cfg(test)]`
+    // module is not production semantic repair; the sanitizer strips both, so the
+    // detector must not trip.
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/codegen/proto_encode/plan.rs",
+        "fn encode(plan: &DistributedPlan) { let _ = plan; } // encoded_node_output_columns is retired\n\
+         #[cfg(test)]\n\
+         mod tests {\n    fn probe() { let _ = encoded_fragment_root_output_columns(&fragment); }\n}",
+    )];
+    let violations = cgo_9c_encoder_semantic_repair_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "retired names in comments or `#[cfg(test)]` items must be ignored: {violations:?}"
+    );
+}
+
+#[test]
+fn cgo_9c_guard_markers_are_runtime_filter_agnostic() {
+    // The detector must never key on node-carried runtime-filter fields: the
+    // encoder emits them onto the wire legitimately. Prove no marker mentions one.
+    for marker in cgo_9c_encoder_detector_markers() {
+        for rf in CGO_9C_NODE_CARRIED_RF_MARKERS {
+            assert!(
+                !marker.contains(rf),
+                "CGO-9C encoder detector marker `{marker}` must not key on node-carried runtime filter `{rf}`"
+            );
+        }
+    }
+}
+
+#[test]
+fn cgo_9c_encoder_semantic_repair_detector_accepts_runtime_filter_wire_encoding() {
+    // The encoder mapping node-carried runtime filters onto the wire is
+    // legitimate 1:1 encoding, not semantic repair; it must pass.
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/codegen/proto_encode/plan.rs",
+        "fn encode_node(node: &DistributedNode) -> plan::DistributedNode {\n\
+             plan::DistributedNode {\n\
+                 build_runtime_filters: encode_runtime_filters(&node.build_runtime_filters),\n\
+                 probe_runtime_filters: encode_runtime_filters(&node.probe_runtime_filters),\n\
+                 ..Default::default()\n\
+             }\n\
+         }",
+    )];
+    let violations = cgo_9c_encoder_semantic_repair_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "an encoder that emits runtime-filter wire columns must pass: {violations:?}"
+    );
+}
+
+#[test]
+fn cgo_9c_planner_protobuf_free_detector_accepts_native_typed_planner() {
+    let sources = [
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/output.rs",
+            "use crate::sql::planner::payload::PlanSortNode;\nfn wire() {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/types/aggregate.rs",
+            "use crate::types::DataType;\npub(crate) fn aggregate_intermediate_type() {}",
+        ),
+    ];
+    let violations = cgo_9c_planner_protobuf_free_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "a native-typed planner + aggregate contract with no protobuf import must pass: {violations:?}"
+    );
+}
+
+#[test]
+fn cgo_9c_planner_protobuf_free_detector_rejects_protobuf_import() {
+    for (path, marker) in [
+        (
+            "src/sql/planner/distributed/output.rs",
+            "planner distributed stage",
+        ),
+        ("src/types/aggregate.rs", "aggregate type contract"),
+    ] {
+        // Keep both required roots present so only the protobuf import trips.
+        let mut sources = vec![
+            Cgo8GuardSource::new(
+                "src/sql/planner/distributed/mod.rs",
+                "pub(crate) mod output;",
+            ),
+            Cgo8GuardSource::new("src/types/aggregate.rs", "fn ok() {}"),
+        ];
+        sources.push(Cgo8GuardSource::new(
+            path,
+            "use crate::proto::plan::DataPartition;\nfn leak() {}",
+        ));
+        let violations = cgo_9c_planner_protobuf_free_violations(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("planner-imports-protobuf")
+                    && violation.contains(marker)),
+            "a protobuf import in `{path}` must fail closed: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn cgo_9c_planner_protobuf_free_detector_requires_both_roots() {
+    let planner_only = [Cgo8GuardSource::new(
+        "src/sql/planner/distributed/output.rs",
+        "fn wire() {}",
+    )];
+    assert!(
+        cgo_9c_planner_protobuf_free_violations(&planner_only)
+            .iter()
+            .any(|violation| violation.contains("missing-aggregate-source")),
+        "a tree without the aggregate type contract must fail closed"
+    );
+
+    let aggregate_only = [Cgo8GuardSource::new("src/types/aggregate.rs", "fn ok() {}")];
+    assert!(
+        cgo_9c_planner_protobuf_free_violations(&aggregate_only)
+            .iter()
+            .any(|violation| violation.contains("missing-planner-source")),
+        "a tree without the planner distributed stage must fail closed"
+    );
+}
+
+#[test]
+fn cgo_9c_encoder_maps_sealed_plan_without_semantic_repair() {
+    let src = src_dir();
+    let sources =
+        production_rs_files_from_entries(&src, &[src.join("lib.rs"), src.join("main.rs")])
+            .into_iter()
+            .map(|path| Cgo8GuardSource::new(rel(&path), fs::read_to_string(path).unwrap()))
+            .collect::<Vec<_>>();
+
+    let encoder_violations = cgo_9c_encoder_semantic_repair_violations(&sources);
+    assert!(
+        encoder_violations.is_empty(),
+        "CGO-9C encoder-semantic-repair guard failed:\n{}",
+        encoder_violations.join("\n")
+    );
+
+    let protobuf_violations = cgo_9c_planner_protobuf_free_violations(&sources);
+    assert!(
+        protobuf_violations.is_empty(),
+        "CGO-9C planner/aggregate protobuf-free guard failed:\n{}",
+        protobuf_violations.join("\n")
+    );
+
+    // "Codegen only borrows the sealed plan": re-run the existing seal-task1
+    // detector over the codegen + coordinator consumers so no `&mut
+    // DistributedPlan` / clone-and-patch / mutable-callback surface can reappear
+    // in the encoder's neighborhood.
+    let consumer_sources = sources
+        .iter()
+        .filter(|source| {
+            source.path.starts_with("src/sql/codegen/")
+                || source.path.starts_with("src/coordinator/")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let borrow_violations = distributed_plan_seal_task1_violations(&consumer_sources);
+    assert!(
+        borrow_violations.is_empty(),
+        "CGO-9C codegen/coordinator must borrow the sealed plan read-only:\n{}",
+        borrow_violations.join("\n")
+    );
+}
+
 #[test]
 fn rfd2_deployment_module_stays_a_leaf() {
     // RFD-2's DeploymentCompiler consumes a SchedulingPlan; it must NOT rebuild a

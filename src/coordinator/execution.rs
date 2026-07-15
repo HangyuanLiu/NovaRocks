@@ -1145,8 +1145,13 @@ fn native_cte_multicast_sink_output_columns(
         return Ok(Vec::new());
     }
 
-    let root_columns =
-        crate::sql::codegen::proto_encode::plan::encoded_fragment_root_output_columns(fragment)?;
+    // The CTE producer fragment is sealed with `DataSink::Noop`, so the planner
+    // seal (CGO-9C Task 2, `finalize_fragment_output_columns`) adopts the
+    // producer root's wire output wholesale into `fragment.output_columns`. That
+    // sealed contract is the authoritative producer-root output; read it directly
+    // rather than re-walking the encoded tree (the retired
+    // `encoded_fragment_root_output_columns` read-walk, deleted in CGO-9C Task 5).
+    let root_columns = fragment.output_columns.clone();
     let root_slot_ids = root_columns
         .iter()
         .map(|column| {
@@ -3028,7 +3033,7 @@ mod native_contract_tests {
                             native_plan::ProjectNode {
                                 items: vec![native_plan::ProjectItem {
                                     expr: Some(expr::Expr {
-                                        r#type: Some(bigint),
+                                        r#type: Some(bigint.clone()),
                                         nullable: true,
                                         kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
                                             column_id: 20,
@@ -3053,6 +3058,18 @@ mod native_contract_tests {
                 kind: native_plan::PartitionKind::Unpartitioned as i32,
                 exprs: Vec::new(),
             }),
+            // The CTE producer is a `DataSink::Noop` fragment, so the planner seal
+            // adopts its Project root's wire output into `output_columns` (CGO-9C
+            // Task 2). The coordinator reads that sealed contract directly, so the
+            // fixture carries it explicitly instead of relying on a re-walk of the
+            // encoded root.
+            output_columns: vec![common::OutputColumn {
+                column_id: 10,
+                name: "total".to_string(),
+                r#type: Some(bigint),
+                nullable: true,
+                is_internal: false,
+            }],
             cte_id: Some(3),
             ..Default::default()
         };

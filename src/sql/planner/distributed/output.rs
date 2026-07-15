@@ -474,9 +474,9 @@ fn derive_join_execution_output(
 
 /// Compute the logical execution-output columns a distributed node produces at
 /// the BE. Used to reconcile a join against its children, so it must match the
-/// BE's per-node output exactly (the native encoder's `encoded_node_output_columns`
-/// is the wire-side twin of this walk). Fails fast on a node kind whose execution
-/// output cannot be derived, mirroring that encoder.
+/// BE's per-node output exactly. Fails fast on a node kind whose execution output
+/// cannot be derived rather than guessing a default (CGO-9C deleted the encoder's
+/// wire-side read walk, so this planner walk is the sole owner of that contract).
 fn node_execution_output_columns(
     node: &DistributedNode,
     fragment_roots: &FragmentRoots<'_>,
@@ -1315,18 +1315,16 @@ fn project_edge_output_columns(
 /// output from the [`NodeOutputCatalog`], exactly the sealed schema the encoder
 /// emits for them (a partial hash-aggregate's cataloged output already carries its
 /// intermediate aggregate-state types). `Sort` (and the other unary passthroughs)
-/// forward their child, matching the encoder's read walk. `Project`
-/// re-materialization is made unique here (the boundary/projection concern the
-/// node-output catalog defers to Task 2).
+/// forward their child. `Project` re-materialization is made unique here (the
+/// boundary/projection concern the node-output catalog defers to Task 2).
 ///
-/// MIRROR PAIR: this is the planner-typed twin of the native encoder's surviving
-/// `encoded_node_output_columns` (`sql::codegen::proto_encode::plan`). The two
-/// must stay behaviorally identical. The encoder walk survives only because its
-/// sole remaining production consumer is the coordinator's CTE-multicast sink
-/// (`encoded_fragment_root_output_columns` -> `sql::codegen::proto_encode::plan`,
-/// reached from `src/coordinator/execution.rs`); CGO-9C Task 5 migrates that
-/// consumer and deletes the encoder walk, at which point this becomes the sole
-/// implementation. Keep any change to one in lockstep with the other until then.
+/// SOLE OWNER: CGO-9C Task 5 deleted the native encoder's read-walk twin
+/// (`encoded_node_output_columns` / `encoded_fragment_root_output_columns` in
+/// `sql::codegen::proto_encode::plan`) and migrated its last consumer -- the
+/// coordinator's CTE-multicast sink, which now reads the fragment's sealed
+/// `output_columns` directly. This planner walk is now the single implementation
+/// of the wire per-node output; the encoder maps the sealed contract 1:1 and no
+/// longer re-derives it.
 fn wire_node_output_columns(
     node: &DistributedNode,
     fragment_id: FragmentId,
@@ -1549,9 +1547,10 @@ struct WireProjectItemOutput {
 }
 
 /// Compute a `Project` node's wire output columns, making re-materialized columns
-/// unique. Faithful planner-typed port of the encoder's
-/// `encoded_project_output_columns` (`SELECT a, a` allocates a distinct wire id
-/// for the repeated output so the BE never sees a duplicate `OutputColumn` id).
+/// unique. This is now the sole owner of the logic (formerly the encoder's
+/// now-removed `encoded_project_output_columns`): `SELECT a, a` allocates a
+/// distinct wire id for the repeated output so the BE never sees a duplicate
+/// `OutputColumn` id.
 fn wire_project_output_columns(
     node: &DistributedNode,
     project: &PlanProjectNode,
