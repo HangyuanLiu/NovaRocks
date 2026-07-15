@@ -7800,236 +7800,1028 @@ fn runtime_filter_query_context_export_surface_violations(text: &str) -> Vec<Str
     violations
 }
 
-fn runtime_filter_task4_exact_symbol_ledger(
-    source_rel: &str,
-    canonical: &[String],
-) -> Option<bool> {
-    let entries: &[(&[&str], &[&str], bool)] = match source_rel {
-        "src/runtime_filter/materializer/range.rs" => &[(
-            &["crate", "runtime_filter", "port", "support"],
-            &[
-                "ArtifactRetainedBudget",
-                "ArtifactRetention",
-                "ArtifactScratchBudget",
-                "ArtifactScratchReservation",
-                "RuntimeFilterMemoryAccount",
-            ],
-            false,
-        )],
-        "src/runtime_filter/port/artifact.rs" => &[(
-            &["crate", "runtime_filter", "port", "ordered_bound"],
-            &[
-                "OrderContractDigest",
-                "OrderedScalar",
-                "OrderedTuple",
-                "RuntimeOrderContract",
-                "RuntimeOrderKey",
-            ],
-            false,
-        )],
-        "src/runtime_filter/service/m4_conformance_tests.rs" => &[
-            (
-                &["crate", "coordinator", "scheduler"],
-                &[
-                    "FragmentInstancePlacement",
-                    "LiveBackendSnapshot",
-                    "SchedulingPlan",
-                ],
-                false,
-            ),
-            (
-                &["crate", "runtime_filter", "deployment"],
-                &["RuntimeFilterDeploymentPolicy", "compiler"],
-                false,
-            ),
-            (
-                &["crate", "runtime_filter", "materializer", "codec"],
-                &[
-                    "ArtifactDecodeExpectations",
-                    "decode_leaf",
-                    "encode_physical_leaf",
-                ],
-                false,
-            ),
-            (
-                &["crate", "runtime_filter", "model", "contract"],
-                &[
-                    "ArtifactCapability",
-                    "BindingId",
-                    "ChannelId",
-                    "CompletionFenceKind",
-                    "CompletionRequirement",
-                    "ConsumerActivation",
-                    "ContributionKind",
-                    "CoverageWitnessId",
-                    "LateApplyGranularity",
-                    "NullOrder",
-                    "NullSemantics",
-                    "OrderContract",
-                    "OrderKeyContract",
-                    "PlanFragmentId",
-                    "PlanNodeId",
-                    "ReductionRequirement",
-                    "RuntimeFilterLifecycle",
-                    "RuntimeFilterLogicalDomain",
-                    "RuntimeFilterPolicyRequirement",
-                    "SortDirection",
-                    "TopKSummaryRequirement",
-                ],
-                false,
-            ),
-            (
-                &["crate", "runtime_filter", "model", "graph"],
-                &[
-                    "ApplyPoint",
-                    "ConsumerRequirement",
-                    "PlanLocation",
-                    "ProducerRequirement",
-                    "RuntimeFilterBindingRole",
-                    "RuntimeFilterBindingSpec",
-                    "RuntimeFilterChannelSpec",
-                    "RuntimeFilterGraph",
-                ],
-                false,
-            ),
-            (
-                &["crate", "runtime_filter", "port", "artifact"],
-                &[
-                    "ArtifactBundle",
-                    "ArtifactKind",
-                    "ArtifactMembershipSchema",
-                    "ConsumerArtifactProfile",
-                    "PhysicalArtifact",
-                ],
-                false,
-            ),
-            (
-                &["crate", "runtime_filter", "port", "events"],
-                &["RuntimeFilterEvent", "RuntimeFilterEventSink"],
-                false,
-            ),
-            (
-                &["crate", "runtime_filter", "port", "final_domain"],
-                &[
-                    "CollectingFinalDomainTestIssuer",
-                    "FinalDomainTestIssuerTransition",
-                    "FrozenFinalDomainTestIssuer",
-                ],
-                false,
-            ),
-            (
-                &["crate", "runtime_filter", "port", "identity"],
-                &[
-                    "DeploymentEpoch",
-                    "LogicalVersion",
-                    "PartitionId",
-                    "ProducerSequence",
-                    "ProducerStreamId",
-                    "RuntimeFilterParticipantId",
-                ],
-                false,
-            ),
-            (
-                &["crate", "runtime_filter", "port", "install"],
-                &[
-                    "MaterializationPolicy",
-                    "RuntimeFilterCoreBudget",
-                    "RuntimeFilterInstallView",
-                ],
-                false,
-            ),
-            (
-                &["crate", "runtime_filter", "port", "ordered_bound"],
-                &[
-                    "COMPARATOR_ALGORITHM_VERSION",
-                    "OrderedBoundUpdate",
-                    "OrderedScalar",
-                    "OrderedTuple",
-                    "RuntimeOrderContract",
-                    "comparator_digest_for_test",
-                ],
-                false,
-            ),
-            (
-                &["crate", "runtime_filter", "port", "producer"],
-                &[
-                    "FinalDomainProducerAdapter",
-                    "InstallOutcome",
-                    "OrderedBoundProducerAdapter",
-                    "ProducerAdapter",
-                    "ProducerHandle",
-                    "ProducerPortKind",
-                    "RuntimeContractViolation",
-                    "RuntimeContractViolationKind",
-                    "SubmitOutcome",
-                    "TopKSummaryProducerAdapter",
-                ],
-                false,
-            ),
-            (
-                &["crate", "runtime_filter", "port", "subscription"],
-                &[
-                    "BlockingSnapshotSubscription",
-                    "LivePollOutcome",
-                    "LiveTerminal",
-                    "NonBlockingLiveSubscription",
-                    "SubscriptionHandle",
-                    "SubscriptionKind",
-                    "UnavailableReason",
-                ],
-                false,
-            ),
-            (
-                &["crate", "runtime_filter", "port", "support"],
-                &[
-                    "ArtifactRetainedBudget",
-                    "MemoryAccountError",
-                    "RuntimeFilterClock",
-                    "RuntimeFilterMemoryAccount",
-                ],
-                false,
-            ),
-            (
-                &["crate", "runtime_filter", "port", "topk_summary"],
-                &["RuntimeTopKSummaryContract", "TopKSummary"],
-                false,
-            ),
-            (
-                &["crate", "runtime_filter", "port", "value_domain"],
-                &["MembershipValues", "ValueDomainDelta"],
-                false,
-            ),
-            (
-                &["crate", "sql", "analysis"],
-                &["ExprKind", "LiteralValue", "TypedExpr"],
-                false,
-            ),
-            (
-                &["crate", "sql", "planner", "distributed"],
-                &[
-                    "DataPartition",
-                    "FragmentEdge",
-                    "FragmentEdgeKind",
-                    "FragmentStreamKind",
-                ],
-                false,
-            ),
-        ],
-        _ => return None,
+fn runtime_filter_task4_exact_path_ledger(source_rel: &str, canonical: &[String]) -> Option<bool> {
+    let exact_inventory = match source_rel {
+        "src/runtime_filter/core/ordered_reducer.rs" => Some(
+            r#"
+crate::common::types::UniqueId
+crate::runtime_filter::model::contract::BindingId
+crate::runtime_filter::port::identity::ProducerSequence
+crate::runtime_filter::port::identity::ProducerSequence::new
+crate::runtime_filter::port::identity::ProducerStreamId
+crate::runtime_filter::port::ordered_bound::OrderedBoundUpdate
+crate::runtime_filter::port::ordered_bound::OrderedTuple
+crate::runtime_filter::port::ordered_bound::OrderedTuple::estimated_retained_bytes
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract
+crate::runtime_filter::port::producer::RuntimeContractViolation
+crate::runtime_filter::port::producer::RuntimeContractViolation::new
+crate::runtime_filter::port::producer::RuntimeContractViolationKind
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::ConflictingReplay
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::ConflictingTerminalSequence
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::OrderedBoundLoosened
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::OrderedContractMismatch
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::SequenceOutsideTerminalRange
+std::cmp::Ordering
+std::cmp::Ordering::Equal
+std::cmp::Ordering::Greater
+std::cmp::Ordering::Less
+std::collections::BTreeMap
+std::collections::BTreeMap::new
+std::sync::Arc
+std::sync::Arc::new
+"#,
+        ),
+        "src/runtime_filter/core/topk_reducer.rs" => Some(
+            r#"
+crate::common::types::UniqueId
+crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain
+crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain::new
+crate::runtime_filter::model::contract::BindingId
+crate::runtime_filter::port::identity::ProducerSequence
+crate::runtime_filter::port::identity::ProducerSequence::new
+crate::runtime_filter::port::identity::ProducerStreamId
+crate::runtime_filter::port::ordered_bound::OrderedTuple
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract
+crate::runtime_filter::port::producer::RuntimeContractViolation
+crate::runtime_filter::port::producer::RuntimeContractViolation::new
+crate::runtime_filter::port::producer::RuntimeContractViolationKind
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::ConflictingReplay
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::ConflictingTerminalSequence
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::OrderedBoundLoosened
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::OrderedContractMismatch
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::SequenceOutsideTerminalRange
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::TypeMismatch
+crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract
+crate::runtime_filter::port::topk_summary::TopKSummary
+std::cmp::Ordering
+std::cmp::Ordering::Equal
+std::cmp::Ordering::Greater
+std::cmp::Ordering::Less
+std::collections::BTreeMap
+std::collections::BTreeMap::new
+std::sync::Arc
+std::sync::Arc::new
+"#,
+        ),
+        "src/runtime_filter/materializer/range.rs" => Some(
+            r#"
+crate::runtime_filter::materializer::codec::ArtifactCodecError
+crate::runtime_filter::materializer::codec::ArtifactCodecError::ContractViolation
+crate::runtime_filter::materializer::codec::ArtifactCodecError::ResourceLimit
+crate::runtime_filter::materializer::codec::ArtifactCodecError::ResourceUnavailable
+crate::runtime_filter::materializer::codec::encode_range_leaf
+crate::runtime_filter::materializer::codec::encoded_range_leaf_len
+crate::runtime_filter::port::artifact::ArtifactBundle
+crate::runtime_filter::port::artifact::ArtifactBundle::accounted_range_resident_overhead
+crate::runtime_filter::port::artifact::ArtifactBundle::canonical_encoded_len_for_single_artifact
+crate::runtime_filter::port::artifact::ArtifactBundle::new_retained
+crate::runtime_filter::port::artifact::ArtifactKind
+crate::runtime_filter::port::artifact::ArtifactKind::Range
+crate::runtime_filter::port::artifact::ConsumerArtifactProfile
+crate::runtime_filter::port::artifact::PhysicalArtifact
+crate::runtime_filter::port::artifact::PhysicalArtifact::accounted_range_resident_component_bytes_for_layout
+crate::runtime_filter::port::artifact::PhysicalArtifact::from_range_shared_retained
+crate::runtime_filter::port::artifact::RangeArtifactData
+crate::runtime_filter::port::artifact::RangeArtifactData::new
+crate::runtime_filter::port::artifact::RangeArtifactResidentLayout
+crate::runtime_filter::port::artifact::RangeArtifactResidentLayout::from_data
+crate::runtime_filter::port::producer::RuntimeContractViolation
+crate::runtime_filter::port::producer::RuntimeContractViolation::new
+crate::runtime_filter::port::producer::RuntimeContractViolationKind
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::OrderedContractMismatch
+crate::runtime_filter::port::support::ArtifactRetainedBudget
+crate::runtime_filter::port::support::ArtifactRetention
+crate::runtime_filter::port::support::ArtifactRetention::try_new
+crate::runtime_filter::port::support::ArtifactScratchBudget
+crate::runtime_filter::port::support::ArtifactScratchReservation
+crate::runtime_filter::port::support::ArtifactScratchReservation::try_new
+crate::runtime_filter::port::support::RuntimeFilterMemoryAccount
+crate::runtime_filter::port::value_domain::LogicalSnapshot
+std::collections::BTreeSet::from
+std::sync::Arc
+std::sync::Arc::new
+"#,
+        ),
+        "src/runtime_filter/port/final_domain.rs" => Some(
+            r#"
+crate::common::types::UniqueId
+crate::runtime_filter::model::contract::BindingId
+crate::runtime_filter::model::contract::ChannelId
+crate::runtime_filter::model::contract::CompletionFenceKind
+crate::runtime_filter::model::contract::CompletionFenceKind::CommittedDomainFrozen
+crate::runtime_filter::model::contract::NullSemantics
+crate::runtime_filter::model::contract::NullSemantics::NullSafeEqual
+crate::runtime_filter::port::artifact::ArtifactMembershipSchema
+crate::runtime_filter::port::identity::DeploymentEpoch
+crate::runtime_filter::port::identity::ProducerSequence
+crate::runtime_filter::port::identity::ProducerStreamId
+crate::runtime_filter::port::producer::RuntimeContractViolation
+crate::runtime_filter::port::producer::RuntimeContractViolation::new
+crate::runtime_filter::port::producer::RuntimeContractViolationKind
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::ConflictingReplay
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::InvalidPartition
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::TypeMismatch
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::UnauthorizedBinding
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::UnauthorizedFragmentInstance
+crate::runtime_filter::port::value_domain::ValueDomainDelta
+sha2::Digest
+sha2::Sha256
+sha2::Sha256::new
+std::error::Error
+std::fmt
+std::fmt::Display
+std::fmt::Formatter
+std::fmt::Result
+std::sync::Arc
+"#,
+        ),
+        "src/runtime_filter/port/ordered_bound.rs" => Some(
+            r#"
+arrow::datatypes::DataType
+arrow::datatypes::DataType::Boolean
+arrow::datatypes::DataType::Date32
+arrow::datatypes::DataType::Decimal128
+arrow::datatypes::DataType::FixedSizeBinary
+arrow::datatypes::DataType::Int16
+arrow::datatypes::DataType::Int32
+arrow::datatypes::DataType::Int64
+arrow::datatypes::DataType::Int8
+arrow::datatypes::DataType::Timestamp
+arrow::datatypes::DataType::Utf8
+crate::common::largeint::LARGEINT_BYTE_WIDTH
+crate::runtime_filter::model::contract::ComparatorDigest
+crate::runtime_filter::model::contract::ComparatorDigest::new
+crate::runtime_filter::model::contract::NullOrder
+crate::runtime_filter::model::contract::NullOrder::First
+crate::runtime_filter::model::contract::NullOrder::Last
+crate::runtime_filter::model::contract::OrderContract
+crate::runtime_filter::model::contract::OrderKeyContract
+crate::runtime_filter::model::contract::SortDirection
+crate::runtime_filter::model::contract::SortDirection::Ascending
+crate::runtime_filter::model::contract::SortDirection::Descending
+crate::runtime_filter::port::artifact::encode_schema
+sha2::Digest
+sha2::Sha256
+sha2::Sha256::digest
+sha2::Sha256::new
+std::cmp::Ordering
+std::cmp::Ordering::Equal
+std::cmp::Ordering::Greater
+std::cmp::Ordering::Less
+std::sync::Arc
+"#,
+        ),
+        "src/runtime_filter/port/topk_summary.rs" => Some(
+            r#"
+crate::runtime_filter::model::contract::OrderContract
+crate::runtime_filter::model::contract::TopKSummaryRequirement
+crate::runtime_filter::port::ordered_bound::OrderContractError
+crate::runtime_filter::port::ordered_bound::OrderedTuple
+crate::runtime_filter::port::ordered_bound::OrderedTupleError
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract::try_from_plan
+sha2::Digest
+sha2::Sha256
+sha2::Sha256::new
+std::cmp::Ordering
+std::cmp::Ordering::Greater
+std::num::NonZeroU32
+std::sync::Arc
+std::sync::Arc::new
+"#,
+        ),
+        "src/runtime_filter/service/m3a_tests.rs" => Some(
+            r#"
+crate::common::types::UniqueId
+crate::runtime_filter::model::contract::BindingId
+crate::runtime_filter::model::contract::BindingId::new
+crate::runtime_filter::model::contract::ChannelId
+crate::runtime_filter::model::contract::ChannelId::new
+crate::runtime_filter::port::identity::LogicalVersion
+crate::runtime_filter::port::identity::LogicalVersion::FIRST
+crate::runtime_filter::port::identity::LogicalVersion::new
+crate::runtime_filter::port::identity::PartitionId
+crate::runtime_filter::port::identity::PartitionId::new
+crate::runtime_filter::port::identity::ProducerSequence
+crate::runtime_filter::port::identity::ProducerSequence::new
+crate::runtime_filter::port::producer::ProducerFailureReason
+crate::runtime_filter::port::producer::ProducerFailureReason::ExecutionFailed
+crate::runtime_filter::port::producer::ProducerHandle
+crate::runtime_filter::port::producer::ProducerHandle::OrderedBound
+crate::runtime_filter::port::producer::ProducerPortKind
+crate::runtime_filter::port::producer::ProducerPortKind::OrderedBound
+crate::runtime_filter::port::producer::RuntimeContractViolationKind
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::SubscriptionActivationMismatch
+crate::runtime_filter::port::producer::SubmitOutcome
+crate::runtime_filter::port::producer::SubmitOutcome::Completed
+crate::runtime_filter::port::producer::SubmitOutcome::CompletedWithoutArtifact
+crate::runtime_filter::port::producer::SubmitOutcome::CoverageStillPossible
+crate::runtime_filter::port::producer::SubmitOutcome::Published
+crate::runtime_filter::port::subscription::ArtifactDeliveryOutcome
+crate::runtime_filter::port::subscription::ArtifactDeliveryOutcome::Unavailable
+crate::runtime_filter::port::subscription::LivePollOutcome
+crate::runtime_filter::port::subscription::LivePollOutcome::Idle
+crate::runtime_filter::port::subscription::LivePollOutcome::Updated
+crate::runtime_filter::port::subscription::LiveTerminal
+crate::runtime_filter::port::subscription::LiveTerminal::Cancelled
+crate::runtime_filter::port::subscription::LiveTerminal::Completed
+crate::runtime_filter::port::subscription::LiveTerminal::CompletedWithoutArtifact
+crate::runtime_filter::port::subscription::LiveTerminal::DegradedArtifact
+crate::runtime_filter::port::subscription::LiveTerminal::Unavailable
+crate::runtime_filter::port::subscription::NonBlockingLiveSubscription
+crate::runtime_filter::port::subscription::SubscriptionHandle
+crate::runtime_filter::port::subscription::SubscriptionHandle::Blocking
+crate::runtime_filter::port::subscription::SubscriptionHandle::Live
+crate::runtime_filter::port::subscription::SubscriptionKind
+crate::runtime_filter::port::subscription::SubscriptionKind::BlockingSnapshot
+crate::runtime_filter::port::subscription::SubscriptionKind::NonBlockingLive
+crate::runtime_filter::port::subscription::UnavailableReason
+crate::runtime_filter::port::subscription::UnavailableReason::ProducerFailed
+crate::runtime_filter::port::subscription::UnavailableReason::ResourceLimit
+crate::runtime_filter::port::subscription::UnavailableReason::RouteUnavailable
+crate::runtime_filter::port::support::MemoryAccountError
+crate::runtime_filter::port::support::MemoryAccountError::CapacityExceeded
+crate::runtime_filter::port::support::RuntimeFilterMemoryAccount
+crate::runtime_filter::service::memory::MemTrackerMemoryAccount::new_root_for_test
+crate::runtime_filter::service::RuntimeFilterService
+crate::runtime_filter::service::tests::installed_ordered_service_fixture
+crate::runtime_filter::service::tests::installed_ordered_service_with_account
+crate::runtime_filter::service::tests::ordered_update
+std::sync::Arc
+std::sync::Arc::downgrade
+std::sync::Arc::new
+std::sync::atomic::AtomicBool
+std::sync::atomic::AtomicUsize
+std::sync::atomic::Ordering
+std::sync::atomic::Ordering::SeqCst
+std::sync::mpsc
+std::sync::mpsc::channel
+std::sync::Mutex
+std::sync::Mutex::new
+std::thread::spawn
+std::time::Duration
+std::time::Duration::from_millis
+std::time::Duration::from_secs
+"#,
+        ),
+        "src/runtime_filter/service/m3b_tests.rs" => Some(
+            r#"
+arrow::datatypes::DataType
+arrow::datatypes::DataType::Int64
+ArtifactCapability::OrderedRange
+BindingId::new
+ChannelId::new
+CompletionRequirement::ProducerClosed
+ConsumerActivation::NonBlockingLive
+ConsumerDeployment::with_profile
+ContributionKind::OrderedBoundUpdate
+ContributionKind::ProducerClosed
+ContributionKind::TopKSummary
+CoverageWitnessId::new
+crate::common::types::UniqueId
+crate::runtime_filter::model::contract::*
+crate::runtime_filter::model::coverage::Coverage
+crate::runtime_filter::model::coverage::Coverage::AllOf
+crate::runtime_filter::model::coverage::Coverage::Leaf
+crate::runtime_filter::port::artifact::ArtifactKind::Range
+crate::runtime_filter::port::artifact::ConsumerArtifactProfile
+crate::runtime_filter::port::artifact::ConsumerArtifactProfile::new_ordered_range
+crate::runtime_filter::port::events::RuntimeFilterEvent
+crate::runtime_filter::port::events::RuntimeFilterEvent::ArtifactPublished
+crate::runtime_filter::port::events::RuntimeFilterEvent::LogicalVersionPublished
+crate::runtime_filter::port::events::RuntimeFilterEvent::LoopbackDelivered
+crate::runtime_filter::port::events::RuntimeFilterEvent::OrderedGlobalTightened
+crate::runtime_filter::port::events::RuntimeFilterEvent::TopKStreamUpdated
+crate::runtime_filter::port::events::RuntimeFilterEvent::TopKSummaryApplied
+crate::runtime_filter::port::events::RuntimeFilterEvent::TopKSummaryEqual
+crate::runtime_filter::port::events::RuntimeFilterEvent::TopKSummaryRejected
+crate::runtime_filter::port::events::RuntimeFilterEvent::TopKSummaryStale
+crate::runtime_filter::port::events::RuntimeFilterEventSink
+crate::runtime_filter::port::identity::*
+crate::runtime_filter::port::install::*
+crate::runtime_filter::port::ordered_bound::COMPARATOR_ALGORITHM_VERSION
+crate::runtime_filter::port::ordered_bound::comparator_digest_for_test
+crate::runtime_filter::port::ordered_bound::OrderedBoundUpdate
+crate::runtime_filter::port::ordered_bound::OrderedBoundUpdate::new
+crate::runtime_filter::port::ordered_bound::OrderedScalar
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int64
+crate::runtime_filter::port::ordered_bound::OrderedTuple
+crate::runtime_filter::port::ordered_bound::OrderedTuple::try_new
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract::try_from_plan
+crate::runtime_filter::port::producer::ProducerHandle
+crate::runtime_filter::port::producer::ProducerHandle::OrderedBound
+crate::runtime_filter::port::producer::ProducerHandle::TopKSummary
+crate::runtime_filter::port::producer::ProducerPortKind
+crate::runtime_filter::port::producer::ProducerPortKind::Membership
+crate::runtime_filter::port::producer::ProducerPortKind::OrderedBound
+crate::runtime_filter::port::producer::ProducerPortKind::TopKSummary
+crate::runtime_filter::port::producer::RuntimeContractViolationKind
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::ConflictingReplay
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::ConflictingTerminalSequence
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::InvalidPartition
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::OrderedBoundLoosened
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::OrderedContractMismatch
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::ProducerPortMismatch
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::SequenceOutsideTerminalRange
+crate::runtime_filter::port::producer::SubmitOutcome
+crate::runtime_filter::port::producer::SubmitOutcome::Applied
+crate::runtime_filter::port::producer::SubmitOutcome::Completed
+crate::runtime_filter::port::producer::SubmitOutcome::Duplicate
+crate::runtime_filter::port::producer::SubmitOutcome::PendingFinalSnapshot
+crate::runtime_filter::port::producer::SubmitOutcome::Published
+crate::runtime_filter::port::producer::SubmitOutcome::StreamAcceptedNoGlobalChange
+crate::runtime_filter::port::producer::SubmitOutcome::TerminalNoop
+crate::runtime_filter::port::producer::TopKSummaryProducerAdapter
+crate::runtime_filter::port::subscription::LivePollOutcome
+crate::runtime_filter::port::subscription::LivePollOutcome::Idle
+crate::runtime_filter::port::subscription::LivePollOutcome::Updated
+crate::runtime_filter::port::subscription::LiveTerminal
+crate::runtime_filter::port::subscription::LiveTerminal::Cancelled
+crate::runtime_filter::port::subscription::LiveTerminal::Completed
+crate::runtime_filter::port::subscription::LiveTerminal::DegradedLogical
+crate::runtime_filter::port::subscription::LiveTerminal::Unavailable
+crate::runtime_filter::port::subscription::NonBlockingLiveSubscription
+crate::runtime_filter::port::subscription::SubscriptionHandle
+crate::runtime_filter::port::subscription::SubscriptionHandle::Live
+crate::runtime_filter::port::subscription::SubscriptionKind
+crate::runtime_filter::port::subscription::SubscriptionKind::NonBlockingLive
+crate::runtime_filter::port::subscription::UnavailableReason::ResourceLimit
+crate::runtime_filter::port::support::MemoryAccountError
+crate::runtime_filter::port::support::MemoryAccountError::CapacityExceeded
+crate::runtime_filter::port::support::RuntimeFilterClock
+crate::runtime_filter::port::support::RuntimeFilterMemoryAccount
+crate::runtime_filter::port::support::TemporaryContributionLease
+crate::runtime_filter::port::support::TemporaryContributionLease::new
+crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract
+crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract::try_from_plan
+crate::runtime_filter::port::topk_summary::TopKSummary
+crate::runtime_filter::port::topk_summary::TopKSummary::try_new
+crate::runtime_filter::service::memory::MemTrackerMemoryAccount
+crate::runtime_filter::service::memory::MemTrackerMemoryAccount::new_root_for_test
+crate::runtime_filter::service::RuntimeFilterService
+crate::runtime_filter::service::RuntimeFilterService::new_with_dependencies
+DeploymentEpoch::new
+LateApplyGranularity::Batch
+LogicalVersion::FIRST
+LogicalVersion::new
+MaterializationPolicy::for_test
+NullOrder::Last
+PartitionId::new
+ProducerDeployment::new
+ProducerSequence::new
+ReductionRequirement::MergeTopKSummary
+ReductionRequirement::TightenOrderedBound
+RouteEdgeId::new
+RuntimeFilterChannelDeployment::new
+RuntimeFilterCoreBudget::new
+RuntimeFilterInstallView::new
+RuntimeFilterLifecycle::MonotonicUpdates
+RuntimeFilterLogicalDomain::OrderedBound
+RuntimeFilterParticipantId::new
+SortDirection::Ascending
+SortDirection::Descending
+std::collections::BTreeMap
+std::collections::BTreeMap::from
+std::collections::BTreeSet
+std::collections::BTreeSet::from
+std::sync::Arc
+std::sync::Arc::downgrade
+std::sync::Arc::new
+std::sync::Arc::ptr_eq
+std::sync::atomic::AtomicBool
+std::sync::atomic::AtomicBool::new
+std::sync::atomic::AtomicUsize
+std::sync::atomic::AtomicUsize::new
+std::sync::atomic::Ordering
+std::sync::atomic::Ordering::SeqCst
+std::sync::Barrier::new
+std::sync::mpsc
+std::sync::mpsc::channel
+std::sync::Mutex
+std::sync::Mutex::new
+std::sync::Weak
+std::sync::Weak::upgrade
+std::thread::spawn
+std::thread::yield_now
+std::time::Duration
+std::time::Duration::from_secs
+std::time::Instant
+std::time::Instant::now
+TopKSummaryRequirement::try_new
+"#,
+        ),
+        "src/runtime_filter/service/m3c_tests.rs" => Some(
+            r#"
+arrow::datatypes::DataType
+arrow::datatypes::DataType::Int64
+ArtifactCapability::EmptyDomain
+ArtifactCapability::Membership
+BindingId::new
+ChannelId::new
+CompletionFenceKind::CommittedDomainFrozen
+CompletionRequirement::FencedFinalDomain
+ConsumerActivation::NonBlockingLive
+ConsumerDeployment::with_profile
+ContributionKind::FinalDomainShard
+ContributionKind::ProducerClosed
+CoverageWitnessId::new
+crate::common::types::UniqueId
+crate::runtime_filter::core::channel::ChannelAction
+crate::runtime_filter::core::channel::ChannelAction::Cancelled
+crate::runtime_filter::core::channel::ChannelAction::Completed
+crate::runtime_filter::core::channel::ChannelAction::Unavailable
+crate::runtime_filter::model::contract::*
+crate::runtime_filter::model::coverage::Coverage
+crate::runtime_filter::model::coverage::Coverage::AllOf
+crate::runtime_filter::model::coverage::Coverage::Leaf
+crate::runtime_filter::port::artifact::ArtifactKind
+crate::runtime_filter::port::artifact::ArtifactKind::EmptyDomain
+crate::runtime_filter::port::artifact::ArtifactKind::ValueSet
+crate::runtime_filter::port::artifact::ConsumerArtifactProfile
+crate::runtime_filter::port::artifact::ConsumerArtifactProfile::new
+crate::runtime_filter::port::events::FinalDomainRejectionKind
+crate::runtime_filter::port::events::FinalDomainRejectionKind::Contract
+crate::runtime_filter::port::events::FinalDomainRejectionKind::ResourceLimit
+crate::runtime_filter::port::events::RuntimeFilterEvent
+crate::runtime_filter::port::events::RuntimeFilterEvent::ArtifactPublished
+crate::runtime_filter::port::events::RuntimeFilterEvent::ChannelCancelled
+crate::runtime_filter::port::events::RuntimeFilterEvent::ChannelCompleted
+crate::runtime_filter::port::events::RuntimeFilterEvent::ChannelUnavailable
+crate::runtime_filter::port::events::RuntimeFilterEvent::FinalDomainShardAccepted
+crate::runtime_filter::port::events::RuntimeFilterEvent::FinalDomainShardDuplicate
+crate::runtime_filter::port::events::RuntimeFilterEvent::FinalDomainShardRejected
+crate::runtime_filter::port::events::RuntimeFilterEvent::LoopbackDelivered
+crate::runtime_filter::port::events::RuntimeFilterEventSink
+crate::runtime_filter::port::final_domain::FinalDomainShard
+crate::runtime_filter::port::final_domain::FinalDomainTestIssuerTransition
+crate::runtime_filter::port::final_domain::FinalDomainTestIssuerTransition::Collecting
+crate::runtime_filter::port::final_domain::FinalDomainTestIssuerTransition::Frozen
+crate::runtime_filter::port::final_domain::FrozenFinalDomainTestIssuer
+crate::runtime_filter::port::identity::*
+crate::runtime_filter::port::install::*
+crate::runtime_filter::port::producer::FinalDomainProducerAdapter
+crate::runtime_filter::port::producer::ProducerHandle
+crate::runtime_filter::port::producer::ProducerHandle::FinalDomain
+crate::runtime_filter::port::producer::ProducerPortKind
+crate::runtime_filter::port::producer::ProducerPortKind::FinalDomain
+crate::runtime_filter::port::producer::RuntimeContractViolationKind
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::ConflictingReplay
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::TypeMismatch
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::UnauthorizedBinding
+crate::runtime_filter::port::producer::SubmitOutcome
+crate::runtime_filter::port::producer::SubmitOutcome::Applied
+crate::runtime_filter::port::producer::SubmitOutcome::Completed
+crate::runtime_filter::port::producer::SubmitOutcome::Duplicate
+crate::runtime_filter::port::producer::SubmitOutcome::PendingGap
+crate::runtime_filter::port::producer::SubmitOutcome::TerminalNoop
+crate::runtime_filter::port::subscription::LivePollOutcome
+crate::runtime_filter::port::subscription::LivePollOutcome::Idle
+crate::runtime_filter::port::subscription::LivePollOutcome::Updated
+crate::runtime_filter::port::subscription::LiveTerminal
+crate::runtime_filter::port::subscription::LiveTerminal::Cancelled
+crate::runtime_filter::port::subscription::LiveTerminal::Completed
+crate::runtime_filter::port::subscription::LiveTerminal::Unavailable
+crate::runtime_filter::port::subscription::SubscriptionKind
+crate::runtime_filter::port::subscription::SubscriptionKind::NonBlockingLive
+crate::runtime_filter::port::subscription::UnavailableReason
+crate::runtime_filter::port::subscription::UnavailableReason::IncompleteCoverage
+crate::runtime_filter::port::subscription::UnavailableReason::ResourceLimit
+crate::runtime_filter::port::support::MemoryAccountError
+crate::runtime_filter::port::support::MemoryAccountError::CapacityExceeded
+crate::runtime_filter::port::support::RuntimeFilterClock
+crate::runtime_filter::port::support::RuntimeFilterMemoryAccount
+crate::runtime_filter::port::value_domain::MembershipValues
+crate::runtime_filter::port::value_domain::MembershipValues::int64
+crate::runtime_filter::port::value_domain::ValueDomainDelta
+crate::runtime_filter::port::value_domain::ValueDomainDelta::new
+crate::runtime_filter::service::memory::MemTrackerMemoryAccount
+crate::runtime_filter::service::memory::MemTrackerMemoryAccount::new_root_for_test
+crate::runtime_filter::service::RuntimeFilterService
+crate::runtime_filter::service::RuntimeFilterService::new_with_dependencies
+DeploymentEpoch::new
+LateApplyGranularity::Batch
+LogicalVersion::FIRST
+MaterializationPolicy::for_test
+NullSemantics::NullSafeEqual
+PartitionId::new
+ProducerDeployment::new
+ProducerSequence::new
+ProducerStreamId::new
+ReductionRequirement::SetUnion
+RouteEdgeId::new
+RuntimeFilterChannelDeployment::new
+RuntimeFilterCoreBudget::new
+RuntimeFilterInstallView::new
+RuntimeFilterLifecycle::CompleteOnce
+RuntimeFilterLogicalDomain::Membership
+RuntimeFilterParticipantId::new
+std::collections::BTreeMap
+std::collections::BTreeMap::from
+std::collections::BTreeMap::new
+std::collections::BTreeSet
+std::collections::BTreeSet::from
+std::collections::BTreeSet::new
+std::sync::Arc
+std::sync::Arc::downgrade
+std::sync::Arc::new
+std::sync::atomic::AtomicBool
+std::sync::atomic::AtomicUsize
+std::sync::atomic::AtomicUsize::new
+std::sync::atomic::Ordering
+std::sync::atomic::Ordering::SeqCst
+std::sync::Barrier
+std::sync::Barrier::new
+std::sync::mpsc
+std::sync::mpsc::channel
+std::sync::mpsc::Receiver
+std::sync::mpsc::Sender
+std::sync::Mutex
+std::sync::Mutex::new
+std::sync::Weak
+std::sync::Weak::upgrade
+std::thread::sleep
+std::thread::spawn
+std::thread::yield_now
+std::time::Duration
+std::time::Duration::from_millis
+std::time::Duration::from_secs
+std::time::Instant
+std::time::Instant::now
+"#,
+        ),
+        "src/runtime_filter/service/m4_conformance_tests.rs" => Some(
+            r#"
+arrow::datatypes::DataType
+arrow::datatypes::DataType::Int64
+crate::common::types::UniqueId
+crate::coordinator::scheduler::FragmentInstancePlacement
+crate::coordinator::scheduler::LiveBackendSnapshot
+crate::coordinator::scheduler::LiveBackendSnapshot::from_endpoints
+crate::coordinator::scheduler::SchedulingPlan
+crate::runtime_filter::deployment::compiler
+crate::runtime_filter::deployment::compiler::compile
+crate::runtime_filter::deployment::RuntimeFilterDeploymentPolicy
+crate::runtime_filter::materializer::codec::ArtifactDecodeExpectations
+crate::runtime_filter::materializer::codec::decode_leaf
+crate::runtime_filter::materializer::codec::encode_physical_leaf
+crate::runtime_filter::model::contract::ArtifactCapability
+crate::runtime_filter::model::contract::ArtifactCapability::EmptyDomain
+crate::runtime_filter::model::contract::ArtifactCapability::Membership
+crate::runtime_filter::model::contract::ArtifactCapability::OrderedRange
+crate::runtime_filter::model::contract::BindingId
+crate::runtime_filter::model::contract::BindingId::new
+crate::runtime_filter::model::contract::ChannelId
+crate::runtime_filter::model::contract::ChannelId::new
+crate::runtime_filter::model::contract::CompletionFenceKind
+crate::runtime_filter::model::contract::CompletionFenceKind::CommittedDomainFrozen
+crate::runtime_filter::model::contract::CompletionRequirement
+crate::runtime_filter::model::contract::CompletionRequirement::FencedFinalDomain
+crate::runtime_filter::model::contract::CompletionRequirement::ProducerClosed
+crate::runtime_filter::model::contract::ConsumerActivation
+crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot
+crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive
+crate::runtime_filter::model::contract::ContributionKind
+crate::runtime_filter::model::contract::ContributionKind::FinalDomainShard
+crate::runtime_filter::model::contract::ContributionKind::OrderedBoundUpdate
+crate::runtime_filter::model::contract::ContributionKind::ProducerClosed
+crate::runtime_filter::model::contract::ContributionKind::TopKSummary
+crate::runtime_filter::model::contract::ContributionKind::ValueDomainDelta
+crate::runtime_filter::model::contract::CoverageWitnessId
+crate::runtime_filter::model::contract::CoverageWitnessId::new
+crate::runtime_filter::model::contract::LateApplyGranularity
+crate::runtime_filter::model::contract::LateApplyGranularity::Batch
+crate::runtime_filter::model::contract::NullOrder
+crate::runtime_filter::model::contract::NullOrder::First
+crate::runtime_filter::model::contract::NullOrder::Last
+crate::runtime_filter::model::contract::NullSemantics
+crate::runtime_filter::model::contract::NullSemantics::NeverMatches
+crate::runtime_filter::model::contract::NullSemantics::NullSafeEqual
+crate::runtime_filter::model::contract::OrderContract
+crate::runtime_filter::model::contract::OrderKeyContract
+crate::runtime_filter::model::contract::PlanFragmentId
+crate::runtime_filter::model::contract::PlanFragmentId::new
+crate::runtime_filter::model::contract::PlanNodeId
+crate::runtime_filter::model::contract::PlanNodeId::new
+crate::runtime_filter::model::contract::ReductionRequirement
+crate::runtime_filter::model::contract::ReductionRequirement::MergeTopKSummary
+crate::runtime_filter::model::contract::ReductionRequirement::SetUnion
+crate::runtime_filter::model::contract::ReductionRequirement::TightenOrderedBound
+crate::runtime_filter::model::contract::RuntimeFilterLifecycle
+crate::runtime_filter::model::contract::RuntimeFilterLifecycle::CompleteOnce
+crate::runtime_filter::model::contract::RuntimeFilterLifecycle::MonotonicUpdates
+crate::runtime_filter::model::contract::RuntimeFilterLogicalDomain
+crate::runtime_filter::model::contract::RuntimeFilterLogicalDomain::Membership
+crate::runtime_filter::model::contract::RuntimeFilterLogicalDomain::OrderedBound
+crate::runtime_filter::model::contract::RuntimeFilterPolicyRequirement
+crate::runtime_filter::model::contract::SortDirection
+crate::runtime_filter::model::contract::SortDirection::Ascending
+crate::runtime_filter::model::contract::SortDirection::Descending
+crate::runtime_filter::model::contract::TopKSummaryRequirement
+crate::runtime_filter::model::contract::TopKSummaryRequirement::try_new
+crate::runtime_filter::model::coverage::Coverage
+crate::runtime_filter::model::coverage::Coverage::AllOf
+crate::runtime_filter::model::coverage::Coverage::AnyOf
+crate::runtime_filter::model::coverage::Coverage::Leaf
+crate::runtime_filter::model::graph::ApplyPoint
+crate::runtime_filter::model::graph::ApplyPoint::NodeInput
+crate::runtime_filter::model::graph::ApplyPoint::NodeOutput
+crate::runtime_filter::model::graph::ConsumerRequirement
+crate::runtime_filter::model::graph::PlanLocation
+crate::runtime_filter::model::graph::ProducerRequirement
+crate::runtime_filter::model::graph::RuntimeFilterBindingRole
+crate::runtime_filter::model::graph::RuntimeFilterBindingRole::Consumer
+crate::runtime_filter::model::graph::RuntimeFilterBindingRole::Producer
+crate::runtime_filter::model::graph::RuntimeFilterBindingSpec
+crate::runtime_filter::model::graph::RuntimeFilterChannelSpec
+crate::runtime_filter::model::graph::RuntimeFilterGraph
+crate::runtime_filter::model::graph::RuntimeFilterGraph::default
+crate::runtime_filter::port::artifact::ArtifactBundle
+crate::runtime_filter::port::artifact::ArtifactBundle::new
+crate::runtime_filter::port::artifact::ArtifactKind
+crate::runtime_filter::port::artifact::ArtifactKind::EmptyDomain
+crate::runtime_filter::port::artifact::ArtifactKind::Range
+crate::runtime_filter::port::artifact::ArtifactKind::ValueSet
+crate::runtime_filter::port::artifact::ArtifactMembershipSchema
+crate::runtime_filter::port::artifact::ArtifactMembershipSchema::new
+crate::runtime_filter::port::artifact::ConsumerArtifactProfile
+crate::runtime_filter::port::artifact::ConsumerArtifactProfile::new
+crate::runtime_filter::port::artifact::PhysicalArtifact
+crate::runtime_filter::port::artifact::PhysicalArtifact::accounted_resident_bytes
+crate::runtime_filter::port::events::RuntimeFilterEvent
+crate::runtime_filter::port::events::RuntimeFilterEventSink
+crate::runtime_filter::port::final_domain::CollectingFinalDomainTestIssuer
+crate::runtime_filter::port::final_domain::FinalDomainTestIssuerTransition
+crate::runtime_filter::port::final_domain::FinalDomainTestIssuerTransition::Collecting
+crate::runtime_filter::port::final_domain::FinalDomainTestIssuerTransition::Frozen
+crate::runtime_filter::port::final_domain::FrozenFinalDomainTestIssuer
+crate::runtime_filter::port::identity::DeploymentEpoch
+crate::runtime_filter::port::identity::DeploymentEpoch::new
+crate::runtime_filter::port::identity::LogicalVersion
+crate::runtime_filter::port::identity::LogicalVersion::checked_next
+crate::runtime_filter::port::identity::LogicalVersion::FIRST
+crate::runtime_filter::port::identity::LogicalVersion::new
+crate::runtime_filter::port::identity::PartitionId
+crate::runtime_filter::port::identity::PartitionId::new
+crate::runtime_filter::port::identity::ProducerSequence
+crate::runtime_filter::port::identity::ProducerSequence::new
+crate::runtime_filter::port::identity::ProducerStreamId
+crate::runtime_filter::port::identity::ProducerStreamId::new
+crate::runtime_filter::port::identity::RuntimeFilterParticipantId
+crate::runtime_filter::port::identity::RuntimeFilterParticipantId::new
+crate::runtime_filter::port::install::MaterializationPolicy
+crate::runtime_filter::port::install::MaterializationPolicy::for_test
+crate::runtime_filter::port::install::RuntimeFilterCoreBudget
+crate::runtime_filter::port::install::RuntimeFilterCoreBudget::new
+crate::runtime_filter::port::install::RuntimeFilterInstallView
+crate::runtime_filter::port::ordered_bound::COMPARATOR_ALGORITHM_VERSION
+crate::runtime_filter::port::ordered_bound::comparator_digest_for_test
+crate::runtime_filter::port::ordered_bound::OrderedBoundUpdate
+crate::runtime_filter::port::ordered_bound::OrderedBoundUpdate::new
+crate::runtime_filter::port::ordered_bound::OrderedScalar
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int64
+crate::runtime_filter::port::ordered_bound::OrderedTuple
+crate::runtime_filter::port::ordered_bound::OrderedTuple::try_new
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract::try_from_plan
+crate::runtime_filter::port::producer::FinalDomainProducerAdapter
+crate::runtime_filter::port::producer::InstallOutcome
+crate::runtime_filter::port::producer::InstallOutcome::Installed
+crate::runtime_filter::port::producer::OrderedBoundProducerAdapter
+crate::runtime_filter::port::producer::ProducerAdapter
+crate::runtime_filter::port::producer::ProducerHandle
+crate::runtime_filter::port::producer::ProducerHandle::FinalDomain
+crate::runtime_filter::port::producer::ProducerHandle::Membership
+crate::runtime_filter::port::producer::ProducerHandle::OrderedBound
+crate::runtime_filter::port::producer::ProducerHandle::TopKSummary
+crate::runtime_filter::port::producer::ProducerPortKind
+crate::runtime_filter::port::producer::ProducerPortKind::FinalDomain
+crate::runtime_filter::port::producer::ProducerPortKind::Membership
+crate::runtime_filter::port::producer::ProducerPortKind::OrderedBound
+crate::runtime_filter::port::producer::ProducerPortKind::TopKSummary
+crate::runtime_filter::port::producer::RuntimeContractViolation
+crate::runtime_filter::port::producer::RuntimeContractViolationKind
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::ProducerPortMismatch
+crate::runtime_filter::port::producer::SubmitOutcome
+crate::runtime_filter::port::producer::SubmitOutcome::Completed
+crate::runtime_filter::port::producer::SubmitOutcome::Published
+crate::runtime_filter::port::producer::SubmitOutcome::TerminalNoop
+crate::runtime_filter::port::producer::TopKSummaryProducerAdapter
+crate::runtime_filter::port::subscription::BlockingSnapshotSubscription
+crate::runtime_filter::port::subscription::LivePollOutcome
+crate::runtime_filter::port::subscription::LivePollOutcome::Idle
+crate::runtime_filter::port::subscription::LivePollOutcome::Updated
+crate::runtime_filter::port::subscription::LiveTerminal
+crate::runtime_filter::port::subscription::LiveTerminal::Completed
+crate::runtime_filter::port::subscription::LiveTerminal::Unavailable
+crate::runtime_filter::port::subscription::NonBlockingLiveSubscription
+crate::runtime_filter::port::subscription::SubscriptionHandle
+crate::runtime_filter::port::subscription::SubscriptionHandle::Blocking
+crate::runtime_filter::port::subscription::SubscriptionHandle::Live
+crate::runtime_filter::port::subscription::SubscriptionKind
+crate::runtime_filter::port::subscription::SubscriptionKind::BlockingSnapshot
+crate::runtime_filter::port::subscription::SubscriptionKind::NonBlockingLive
+crate::runtime_filter::port::subscription::UnavailableReason
+crate::runtime_filter::port::subscription::UnavailableReason::ResourceLimit
+crate::runtime_filter::port::support::ArtifactRetainedBudget
+crate::runtime_filter::port::support::ArtifactRetainedBudget::new
+crate::runtime_filter::port::support::MemoryAccountError
+crate::runtime_filter::port::support::MemoryAccountError::CapacityExceeded
+crate::runtime_filter::port::support::RuntimeFilterClock
+crate::runtime_filter::port::support::RuntimeFilterMemoryAccount
+crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract
+crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract::try_from_plan
+crate::runtime_filter::port::topk_summary::TopKSummary
+crate::runtime_filter::port::topk_summary::TopKSummary::try_new
+crate::runtime_filter::port::value_domain::MembershipValues
+crate::runtime_filter::port::value_domain::MembershipValues::int64
+crate::runtime_filter::port::value_domain::ValueDomainDelta
+crate::runtime_filter::port::value_domain::ValueDomainDelta::new
+crate::runtime_filter::service::memory::MemTrackerMemoryAccount
+crate::runtime_filter::service::memory::MemTrackerMemoryAccount::new_root_for_test
+crate::runtime_filter::service::RuntimeFilterService
+crate::runtime_filter::service::RuntimeFilterService::new_with_dependencies
+crate::runtime::endpoint::RuntimeEndpoint
+crate::runtime::endpoint::RuntimeEndpoint::from_socket_addr
+crate::sql::analysis::ExprKind
+crate::sql::analysis::ExprKind::Literal
+crate::sql::analysis::LiteralValue
+crate::sql::analysis::LiteralValue::Int
+crate::sql::analysis::TypedExpr
+crate::sql::planner::distributed::DataPartition
+crate::sql::planner::distributed::DataPartition::unpartitioned
+crate::sql::planner::distributed::FragmentEdge
+crate::sql::planner::distributed::FragmentEdgeKind
+crate::sql::planner::distributed::FragmentEdgeKind::Stream
+crate::sql::planner::distributed::FragmentStreamKind
+crate::sql::planner::distributed::FragmentStreamKind::Gather
+std::cmp::Ordering
+std::cmp::Ordering::Equal
+std::cmp::Ordering::Greater
+std::cmp::Ordering::Less
+std::collections::BTreeMap
+std::collections::BTreeMap::new
+std::collections::BTreeSet
+std::collections::BTreeSet::from
+std::collections::BTreeSet::new
+std::net::SocketAddr
+std::slice::from_ref
+std::sync::Arc
+std::sync::Arc::new
+std::sync::Arc::ptr_eq
+std::sync::Mutex
+std::time::Instant
+std::time::Instant::now
+"#,
+        ),
+        _ => None,
     };
-    entries.iter().find_map(|(prefix, symbols, allow_root)| {
-        let matches_prefix = canonical.len() >= prefix.len()
-            && canonical
-                .iter()
-                .zip(prefix.iter())
-                .all(|(actual, expected)| actual == expected);
-        matches_prefix.then(|| {
-            (canonical.len() == prefix.len() && *allow_root)
-                || canonical
-                    .get(prefix.len())
-                    .is_some_and(|symbol| symbols.contains(&symbol.as_str()))
-        })
-    })
+    if let Some(exact_inventory) = exact_inventory {
+        let dependency = canonical.join("::");
+        return Some(exact_inventory.lines().any(|allowed| allowed == dependency));
+    }
+    let dependency = canonical.join("::");
+    let added_prefixes: &[&str] = match source_rel {
+        "src/runtime_filter/core/channel.rs" => &[
+            "crate::runtime_filter::core::ordered_reducer",
+            "crate::runtime_filter::core::topk_reducer",
+            "crate::runtime_filter::port::artifact::ArtifactMembershipSchema",
+            "crate::runtime_filter::port::events::FinalDomainRejectionKind",
+            "crate::runtime_filter::port::final_domain",
+            "crate::runtime_filter::port::install::RuntimeFilterChannelDeployment",
+            "crate::runtime_filter::port::ordered_bound",
+            "crate::runtime_filter::port::topk_summary",
+        ],
+        "src/runtime_filter/core/state.rs" => {
+            &["crate::runtime_filter::port::subscription::UnavailableReason"]
+        }
+        "src/runtime_filter/materializer/codec.rs" => &[
+            "std::mem::size_of",
+            "arrow::datatypes::DECIMAL128_MAX_SCALE",
+            "arrow::datatypes::DataType",
+            "arrow::datatypes::TimeUnit",
+            "crate::runtime_filter::port::ordered_bound",
+        ],
+        "src/runtime_filter/port/artifact.rs" => &["crate::runtime_filter::port::ordered_bound"],
+        "src/runtime_filter/port/events.rs" => &[
+            "crate::runtime_filter::port::producer::RuntimeContractViolationKind",
+            "crate::runtime_filter::port::subscription::LiveTerminal",
+        ],
+        "src/runtime_filter/port/producer.rs" => &[
+            "std::sync::Arc",
+            "std::sync::Weak",
+            "crate::runtime_filter::port::final_domain::FinalDomainShard",
+            "crate::runtime_filter::port::ordered_bound::OrderedBoundUpdate",
+            "crate::runtime_filter::port::topk_summary::TopKSummary",
+        ],
+        "src/runtime_filter/port/subscription.rs" => &[
+            "std::fmt",
+            "crate::runtime_filter::port::identity::LogicalVersion",
+            "crate::runtime_filter::port::producer::RuntimeContractViolation",
+            "crate::runtime_filter::port::producer::RuntimeContractViolationKind",
+        ],
+        "src/runtime_filter/port/value_domain.rs" => {
+            &["crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain"]
+        }
+        "src/runtime_filter/service/subscription.rs" => {
+            &["crate::runtime_filter::model::contract::ConsumerActivation"]
+        }
+        _ => &[],
+    };
+    if added_prefixes.iter().any(|prefix| {
+        dependency == *prefix
+            || dependency
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| suffix.starts_with("::"))
+    }) {
+        let exact_added_inventory = match source_rel {
+            "src/runtime_filter/core/channel.rs" => {
+                r#"
+crate::runtime_filter::core::ordered_reducer::OrderedApplyOutcome
+crate::runtime_filter::core::ordered_reducer::OrderedApplyOutcome::Duplicate
+crate::runtime_filter::core::ordered_reducer::OrderedApplyOutcome::GlobalTightened
+crate::runtime_filter::core::ordered_reducer::OrderedApplyOutcome::SequenceAdvancedEqual
+crate::runtime_filter::core::ordered_reducer::OrderedApplyOutcome::Stale
+crate::runtime_filter::core::ordered_reducer::OrderedApplyOutcome::StreamTightened
+crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain
+crate::runtime_filter::core::ordered_reducer::OrderedCloseOutcome
+crate::runtime_filter::core::ordered_reducer::OrderedCloseOutcome::Duplicate
+crate::runtime_filter::core::ordered_reducer::OrderedCloseOutcome::PendingFinalSnapshot
+crate::runtime_filter::core::ordered_reducer::OrderedCloseOutcome::Satisfied
+crate::runtime_filter::core::ordered_reducer::OrderedReducer
+crate::runtime_filter::core::ordered_reducer::OrderedReducer::new
+crate::runtime_filter::core::topk_reducer::TopKApplyOutcome
+crate::runtime_filter::core::topk_reducer::TopKApplyOutcome::Duplicate
+crate::runtime_filter::core::topk_reducer::TopKApplyOutcome::GlobalTightened
+crate::runtime_filter::core::topk_reducer::TopKApplyOutcome::SequenceAdvancedEqual
+crate::runtime_filter::core::topk_reducer::TopKApplyOutcome::Stale
+crate::runtime_filter::core::topk_reducer::TopKApplyOutcome::StreamUpdated
+crate::runtime_filter::core::topk_reducer::TopKCloseOutcome
+crate::runtime_filter::core::topk_reducer::TopKCloseOutcome::Duplicate
+crate::runtime_filter::core::topk_reducer::TopKCloseOutcome::PendingFinalSnapshot
+crate::runtime_filter::core::topk_reducer::TopKCloseOutcome::Satisfied
+crate::runtime_filter::core::topk_reducer::TopKSummaryReducer
+crate::runtime_filter::core::topk_reducer::TopKSummaryReducer::new
+crate::runtime_filter::port::artifact::ArtifactMembershipSchema
+crate::runtime_filter::port::artifact::ArtifactMembershipSchema::new
+crate::runtime_filter::port::events::FinalDomainRejectionKind
+crate::runtime_filter::port::events::FinalDomainRejectionKind::Contract
+crate::runtime_filter::port::events::FinalDomainRejectionKind::ResourceLimit
+crate::runtime_filter::port::final_domain::FinalDomainShard
+crate::runtime_filter::port::final_domain::RuntimeCompletionFenceContract
+crate::runtime_filter::port::final_domain::RuntimeCompletionFenceContract::try_from_install
+crate::runtime_filter::port::install::RuntimeFilterChannelDeployment
+crate::runtime_filter::port::ordered_bound::OrderedBoundUpdate
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract::try_from_plan
+crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract
+crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract::try_from_plan
+crate::runtime_filter::port::topk_summary::TopKSummary
+"#
+            }
+            "src/runtime_filter/core/state.rs" => {
+                r#"
+crate::runtime_filter::port::subscription::UnavailableReason
+"#
+            }
+            "src/runtime_filter/materializer/codec.rs" => {
+                r#"
+arrow::datatypes::DataType
+arrow::datatypes::DataType::Boolean
+arrow::datatypes::DataType::Date32
+arrow::datatypes::DataType::Decimal128
+arrow::datatypes::DataType::FixedSizeBinary
+arrow::datatypes::DataType::Int16
+arrow::datatypes::DataType::Int32
+arrow::datatypes::DataType::Int64
+arrow::datatypes::DataType::Int8
+arrow::datatypes::DataType::Timestamp
+arrow::datatypes::DataType::Utf8
+arrow::datatypes::DECIMAL128_MAX_SCALE
+arrow::datatypes::TimeUnit
+arrow::datatypes::TimeUnit::Microsecond
+arrow::datatypes::TimeUnit::Millisecond
+arrow::datatypes::TimeUnit::Nanosecond
+arrow::datatypes::TimeUnit::Second
+crate::runtime_filter::port::ordered_bound::OrderContractDigest
+crate::runtime_filter::port::ordered_bound::OrderContractDigest::from_bytes_for_codec
+crate::runtime_filter::port::ordered_bound::OrderedScalar
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Boolean
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Date32
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Decimal128
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int16
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int32
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int64
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int8
+crate::runtime_filter::port::ordered_bound::OrderedScalar::LargeInt
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Timestamp
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Utf8
+crate::runtime_filter::port::ordered_bound::OrderedTuple
+crate::runtime_filter::port::ordered_bound::OrderedTuple::try_from_codec
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract::from_codec
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract::validate_codec_contract_digest
+crate::runtime_filter::port::ordered_bound::RuntimeOrderKey
+crate::runtime_filter::port::ordered_bound::RuntimeOrderKey::from_codec
+Membership must not materialize ArtifactKind::Range
+std::mem::size_of
+"#
+            }
+            "src/runtime_filter/port/artifact.rs" => {
+                r#"
+crate::runtime_filter::port::ordered_bound::OrderContractDigest
+crate::runtime_filter::port::ordered_bound::OrderedScalar
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Boolean
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Date32
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Decimal128
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int16
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int32
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int64
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int8
+crate::runtime_filter::port::ordered_bound::OrderedScalar::LargeInt
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Timestamp
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Utf8
+crate::runtime_filter::port::ordered_bound::OrderedTuple
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract
+crate::runtime_filter::port::ordered_bound::RuntimeOrderKey
+"#
+            }
+            "src/runtime_filter/port/events.rs" => {
+                r#"
+crate::runtime_filter::port::producer::RuntimeContractViolationKind
+crate::runtime_filter::port::subscription::LiveTerminal
+"#
+            }
+            "src/runtime_filter/port/producer.rs" => {
+                r#"
+crate::runtime_filter::port::final_domain::FinalDomainShard
+crate::runtime_filter::port::ordered_bound::OrderedBoundUpdate
+crate::runtime_filter::port::topk_summary::TopKSummary
+std::sync::Arc
+std::sync::Arc::downgrade
+std::sync::Weak
+"#
+            }
+            "src/runtime_filter/port/subscription.rs" => {
+                r#"
+crate::runtime_filter::port::identity::LogicalVersion
+crate::runtime_filter::port::producer::RuntimeContractViolation
+crate::runtime_filter::port::producer::RuntimeContractViolation::new
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::SubscriptionActivationMismatch
+std::fmt::Debug
+std::fmt::Formatter
+std::fmt::Result
+"#
+            }
+            "src/runtime_filter/port/value_domain.rs" => {
+                r#"
+crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain
+"#
+            }
+            "src/runtime_filter/service/subscription.rs" => {
+                r#"
+crate::runtime_filter::model::contract::ConsumerActivation
+crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot
+crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive
+"#
+            }
+            _ => "",
+        };
+        return Some(
+            exact_added_inventory
+                .lines()
+                .any(|allowed| allowed == dependency),
+        );
+    }
+    let ordered_bound_prefix = ["crate", "runtime_filter", "port", "ordered_bound"];
+    if source_rel == "src/runtime_filter/port/artifact.rs"
+        && canonical.len() >= ordered_bound_prefix.len()
+        && canonical
+            .iter()
+            .zip(ordered_bound_prefix)
+            .all(|(actual, expected)| actual == expected)
+    {
+        let exact_inventory = r#"
+crate::runtime_filter::port::ordered_bound::OrderContractDigest
+crate::runtime_filter::port::ordered_bound::OrderedScalar
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Boolean
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Date32
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Decimal128
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int16
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int32
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int64
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int8
+crate::runtime_filter::port::ordered_bound::OrderedScalar::LargeInt
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Timestamp
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Utf8
+crate::runtime_filter::port::ordered_bound::OrderedTuple
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract
+crate::runtime_filter::port::ordered_bound::RuntimeOrderKey
+"#;
+        let dependency = canonical.join("::");
+        return Some(exact_inventory.lines().any(|allowed| allowed == dependency));
+    }
+    None
 }
 
 fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> Vec<String> {
@@ -8127,7 +8919,7 @@ fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> V
                 .first()
                 .is_some_and(|root| local_roots.contains(root))
                 && !runtime_filter_path_is_rust_prelude(canonical)
-                && !runtime_filter_task4_exact_symbol_ledger(source_rel, canonical).unwrap_or_else(
+                && !runtime_filter_task4_exact_path_ledger(source_rel, canonical).unwrap_or_else(
                     || runtime_filter_path_is_allowlisted(canonical, &allowed_prefixes),
                 )
         })
@@ -8137,7 +8929,7 @@ fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> V
         runtime_filter_runtime_extern_crates(text)
             .into_iter()
             .filter(|path| {
-                !runtime_filter_task4_exact_symbol_ledger(source_rel, path)
+                !runtime_filter_task4_exact_path_ledger(source_rel, path)
                     .unwrap_or_else(|| runtime_filter_path_is_allowlisted(path, &allowed_prefixes))
             })
             .map(|path| format!("{source_rel}: external {}", path.join("::"))),
@@ -9937,14 +10729,35 @@ fn runtime_filter_action_dispatch_boundary_violations(producer: &str) -> Vec<Str
     let mut violations = Vec::new();
     #[derive(Default)]
     struct FinishBindingAudit {
+        parameter_dispatches: usize,
         shadows_action: bool,
     }
     impl<'ast> syn::visit::Visit<'ast> for FinishBindingAudit {
-        fn visit_local(&mut self, local: &'ast syn::Local) {
-            if runtime_filter_local_pattern_contains(local, "action") {
+        fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
+            if pattern.ident == "action" {
                 self.shadows_action = true;
             }
-            syn::visit::visit_local(self, local);
+            syn::visit::visit_pat_ident(self, pattern);
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            let self_field = |expression: &syn::Expr, field: &str| {
+                matches!(expression, syn::Expr::Field(access)
+                    if matches!(access.base.as_ref(), syn::Expr::Path(path) if path.path.is_ident("self"))
+                        && matches!(&access.member, syn::Member::Named(member) if member == field))
+            };
+            if call.method == "dispatch"
+                && self_field(&call.receiver, "dispatcher")
+                && call.args.len() == 2
+                && call
+                    .args
+                    .first()
+                    .is_some_and(|argument| self_field(argument, "channel_id"))
+                && matches!(call.args.last(), Some(syn::Expr::Path(path)) if path.path.is_ident("action"))
+            {
+                self.parameter_dispatches += 1;
+            }
+            syn::visit::visit_expr_method_call(self, call);
         }
     }
 
@@ -9985,7 +10798,8 @@ fn runtime_filter_action_dispatch_boundary_violations(producer: &str) -> Vec<Str
             _ => {}
         }
     }
-    if !matches!(finish_audits.as_slice(), [audit] if !audit.shadows_action) {
+    if !matches!(finish_audits.as_slice(), [audit] if !audit.shadows_action && audit.parameter_dispatches == 1)
+    {
         violations.push(
             "Service producer finish must dispatch its input action without shadowing or rebinding"
                 .to_string(),
@@ -10292,7 +11106,7 @@ fn runtime_filter_syn_item_requires_test(item: &syn::Item) -> bool {
     };
     attributes.iter().any(|attribute| {
         attribute.path().is_ident("cfg")
-            && matches!(&attribute.meta, syn::Meta::List(list) if list.tokens.to_string().split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_').any(|token| token == "test"))
+            && matches!(&attribute.meta, syn::Meta::List(list) if cfg_attribute_requires_test(&format!("#[cfg({})]", list.tokens)))
     })
 }
 
@@ -10966,9 +11780,38 @@ impl RuntimeFilterManifestBodyAudit {
                     .all(|(actual, expected)| actual == expected)
         })
     }
+
+    fn audit_reachable_block(&mut self, block: &syn::Block) {
+        for statement in &block.stmts {
+            if let syn::Stmt::Expr(syn::Expr::Return(ret), _) = statement {
+                if let Some(expr) = &ret.expr {
+                    syn::visit::Visit::visit_expr(self, expr);
+                }
+                break;
+            }
+            syn::visit::Visit::visit_stmt(self, statement);
+        }
+    }
 }
 
 impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterManifestBodyAudit {
+    fn visit_block(&mut self, block: &'ast syn::Block) {
+        self.audit_reachable_block(block);
+    }
+
+    fn visit_expr_closure(&mut self, _closure: &'ast syn::ExprClosure) {}
+
+    fn visit_expr_if(&mut self, expression: &'ast syn::ExprIf) {
+        let literal = matches!(expression.cond.as_ref(), syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Bool(value), .. }) if !value.value);
+        if literal {
+            if let Some((_, fallback)) = &expression.else_branch {
+                syn::visit::Visit::visit_expr(self, fallback);
+            }
+            return;
+        }
+        syn::visit::visit_expr_if(self, expression);
+    }
+
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         self.methods.insert(call.method.to_string());
         syn::visit::visit_expr_method_call(self, call);
@@ -11000,13 +11843,19 @@ impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterManifestBodyAudit {
     }
 
     fn visit_macro(&mut self, item: &'ast syn::Macro) {
-        let tokens = rust_use_tokens(&item.tokens.to_string());
-        for window in tokens.windows(3) {
-            if window[0] == "." && window[2] == "(" {
-                self.methods.insert(window[1].clone());
+        let supported = item.path.segments.last().is_some_and(|segment| {
+            matches!(
+                segment.ident.to_string().as_str(),
+                "assert" | "assert_eq" | "assert_ne"
+            )
+        });
+        if supported
+            && let Ok(tuple) = syn::parse_str::<syn::ExprTuple>(&format!("({})", item.tokens))
+        {
+            for expression in &tuple.elems {
+                syn::visit::Visit::visit_expr(self, expression);
             }
         }
-        syn::visit::visit_macro(self, item);
     }
 }
 
@@ -11072,6 +11921,32 @@ fn runtime_filter_manifest_body_has(
     })
 }
 
+fn runtime_filter_rewrite_function_body(
+    source: &str,
+    function: &str,
+    prefix: &str,
+    suffix: &str,
+) -> String {
+    let tokens = rust_source_tokens(source);
+    let name = tokens
+        .windows(2)
+        .position(|window| window[0].text == "fn" && window[1].text == function)
+        .expect("fixture function must exist")
+        + 1;
+    let open = (name + 1..tokens.len())
+        .find(|index| tokens[*index].text == "{")
+        .expect("fixture function must have a body");
+    let close = rust_matching_token(&tokens, open, "{", "}")
+        .expect("fixture function body must be balanced");
+    let mut rewritten = String::with_capacity(source.len() + prefix.len() + suffix.len());
+    rewritten.push_str(&source[..tokens[open].end]);
+    rewritten.push_str(prefix);
+    rewritten.push_str(&source[tokens[open].end..tokens[close].start]);
+    rewritten.push_str(suffix);
+    rewritten.push_str(&source[tokens[close].start..]);
+    rewritten
+}
+
 fn runtime_filter_conformance_manifest_violations(
     service_root: &str,
     harness: &str,
@@ -11123,7 +11998,7 @@ fn runtime_filter_conformance_manifest_violations(
         ),
         (
             "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
-            &["push", "poll_after", "published_versions"][..],
+            &["push", "published_versions"][..],
             &[
                 &["topn_cases_with_fixed_seed"][..],
                 &["assert_fixed_seed_case_diversity"][..],
@@ -11145,13 +12020,7 @@ fn runtime_filter_conformance_manifest_violations(
         ),
         (
             "m4_aggregate_conformance_requires_frozen_allof_and_separates_empty_unavailable",
-            &[
-                "collecting_issuer",
-                "freeze",
-                "complete",
-                "close",
-                "snapshot",
-            ][..],
+            &["collecting_issuer", "freeze", "complete", "close"][..],
             &[
                 &["aggregate_allof_harness"][..],
                 &["expect_collecting"][..],
@@ -11315,6 +12184,43 @@ fn runtime_filter_conformance_manifest_violations(
         }
     }
 
+    for (owner, required_callees) in [
+        ("join_allof_harness", &["join_harness"][..]),
+        ("join_anyof_harness", &["join_harness"][..]),
+        (
+            "join_harness",
+            &["compile_install_view", "install_service"][..],
+        ),
+        (
+            "direct_topn_harness",
+            &["compile_install_view", "install_service"][..],
+        ),
+        (
+            "topk_allof_harness",
+            &["compile_install_view", "install_service"][..],
+        ),
+        (
+            "aggregate_allof_harness",
+            &["aggregate_harness_with_memory"][..],
+        ),
+        (
+            "aggregate_harness_with_memory",
+            &["compile_install_view", "install_service_with_memory"][..],
+        ),
+        ("install_service", &["install_service_with_memory"][..]),
+    ] {
+        let audit = runtime_filter_manifest_function_audit(&file, owner);
+        if audit.as_ref().is_none_or(|audit| {
+            required_callees
+                .iter()
+                .any(|callee| !audit.has_path(&[callee]))
+        }) {
+            violations.push(format!(
+                "M4 conformance helper call graph is missing reachable edge from {owner}"
+            ));
+        }
+    }
+
     let canonical = rust_all_source_canonical_paths(
         harness,
         "src/runtime_filter/service/m4_conformance_tests.rs",
@@ -11368,27 +12274,57 @@ fn runtime_filter_conformance_manifest_violations(
         }
     }
 
-    let protected_names = [
+    const PROTECTED_NAMES: &[&str] = &[
         "ArtifactBundle",
         "LogicalVersion",
         "ProducerHandle",
         "ProducerPortKind",
         "ProducerSequence",
     ];
-    for item in &file.items {
-        let local = match item {
-            syn::Item::Enum(item) => Some(item.ident.to_string()),
-            syn::Item::Struct(item) => Some(item.ident.to_string()),
-            syn::Item::Trait(item) => Some(item.ident.to_string()),
-            syn::Item::Type(item) => Some(item.ident.to_string()),
-            syn::Item::Union(item) => Some(item.ident.to_string()),
-            _ => None,
-        };
-        if local.is_some_and(|name| protected_names.contains(&name.as_str())) {
-            violations.push(
-                "M4 conformance harness must not shadow canonical contract types".to_string(),
-            );
+    #[derive(Default)]
+    struct ProtectedShadowAudit {
+        names: BTreeSet<String>,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for ProtectedShadowAudit {
+        fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+            if PROTECTED_NAMES.contains(&item.ident.to_string().as_str()) {
+                self.names.insert(item.ident.to_string());
+            }
+            syn::visit::visit_item_enum(self, item);
         }
+
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            if PROTECTED_NAMES.contains(&item.ident.to_string().as_str()) {
+                self.names.insert(item.ident.to_string());
+            }
+            syn::visit::visit_item_struct(self, item);
+        }
+
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            if PROTECTED_NAMES.contains(&item.ident.to_string().as_str()) {
+                self.names.insert(item.ident.to_string());
+            }
+            syn::visit::visit_item_type(self, item);
+        }
+
+        fn visit_item_union(&mut self, item: &'ast syn::ItemUnion) {
+            if PROTECTED_NAMES.contains(&item.ident.to_string().as_str()) {
+                self.names.insert(item.ident.to_string());
+            }
+            syn::visit::visit_item_union(self, item);
+        }
+    }
+    let mut shadow_audit = ProtectedShadowAudit::default();
+    syn::visit::Visit::visit_file(&mut shadow_audit, &file);
+    if !shadow_audit.names.is_empty() {
+        violations.push(format!(
+            "M4 conformance harness must not shadow canonical contract types: {}",
+            shadow_audit
+                .names
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
 
     for declaration in tokens.windows(2).filter(|pair| {
@@ -11556,6 +12492,58 @@ fn m4_aggregate_conformance_requires_frozen_allof_and_separates_empty_unavailabl
     assert!(
         !runtime_filter_conformance_manifest_violations(valid_root, &shadowed).is_empty(),
         "local contract-type shadows must not satisfy the canonical manifest"
+    );
+
+    for test_name in [
+        "m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts",
+        "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+        "m4_topk_summary_conformance_merges_incomplete_shards_only_after_allof",
+        "m4_aggregate_conformance_requires_frozen_allof_and_separates_empty_unavailable",
+    ] {
+        let unreachable =
+            runtime_filter_rewrite_function_body(&harness, test_name, "\nif false {", "\n}\n");
+        assert!(
+            !runtime_filter_conformance_manifest_violations(valid_root, &unreachable).is_empty(),
+            "literal-false stable test body must not satisfy manifest: {test_name}"
+        );
+        let early_return =
+            runtime_filter_rewrite_function_body(&harness, test_name, "\nreturn;\n", "");
+        assert!(
+            !runtime_filter_conformance_manifest_violations(valid_root, &early_return).is_empty(),
+            "unconditional early return must make stable test calls unreachable: {test_name}"
+        );
+    }
+
+    let closure_hidden = runtime_filter_rewrite_function_body(
+        &harness,
+        "m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts",
+        "\nlet _hidden = || {",
+        "\n};\n",
+    );
+    assert!(
+        !runtime_filter_conformance_manifest_violations(valid_root, &closure_hidden).is_empty(),
+        "required stable-test calls must not be accepted only inside a closure"
+    );
+    let helper_closure_hidden = runtime_filter_rewrite_function_body(
+        &harness,
+        "compile_install_view",
+        "\n(|| {",
+        "\n})()\n",
+    );
+    assert!(
+        !runtime_filter_conformance_manifest_violations(valid_root, &helper_closure_hidden)
+            .is_empty(),
+        "required helper-owner calls must not be accepted only inside a closure"
+    );
+    let local_shadow = runtime_filter_rewrite_function_body(
+        &harness,
+        "m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts",
+        "\nstruct ProducerHandle;\nstruct ProducerPortKind;\nstruct ProducerSequence;\nstruct LogicalVersion;\nstruct ArtifactBundle;\n",
+        "",
+    );
+    assert!(
+        !runtime_filter_conformance_manifest_violations(valid_root, &local_shadow).is_empty(),
+        "owner-local protected type shadows must be rejected recursively"
     );
     assert!(
         !runtime_filter_conformance_manifest_violations("mod m4_conformance_tests;", &harness)
@@ -11864,6 +12852,34 @@ fn runtime_filter_task4_exact_dependency_ledger_rejects_unused_children() {
         (
             "src/runtime_filter/service/m4_conformance_tests.rs",
             "use crate::sql::analysis::FutureAnalysisSurface;",
+        ),
+        (
+            "src/runtime_filter/service/m3a_tests.rs",
+            "use crate::runtime_filter::port::identity::RouteEdgeId;",
+        ),
+        (
+            "src/runtime_filter/service/m3b_tests.rs",
+            "use crate::runtime_filter::port::producer::FinalDomainProducerAdapter;",
+        ),
+        (
+            "src/runtime_filter/service/m4_conformance_tests.rs",
+            "use crate::runtime_filter::deployment::compiler::FutureApi;",
+        ),
+        (
+            "src/runtime_filter/materializer/range.rs",
+            "use crate::runtime_filter::port::support::ArtifactRetention::FutureApi;",
+        ),
+        (
+            "src/runtime_filter/service/m4_conformance_tests.rs",
+            "use crate::runtime_filter::port::producer::ProducerHandle::FutureVariant;",
+        ),
+        (
+            "src/runtime_filter/core/channel.rs",
+            "use crate::runtime_filter::core::ordered_reducer::OrderedApplyOutcome::FutureVariant;",
+        ),
+        (
+            "src/runtime_filter/port/artifact.rs",
+            "use crate::runtime_filter::port::ordered_bound::OrderedScalar::FutureVariant;",
         ),
     ] {
         assert!(
@@ -12174,6 +13190,37 @@ fn force_sanitizer_failure() {
     assert!(
         !runtime_filter_subscription_artifact_surface_violations(cfg_test_only).is_empty(),
         "cfg(test)-only contract items must not satisfy the production subscription surface"
+    );
+
+    let cfg_not_test_shadow = r#"
+use std::sync::Arc;
+use crate::runtime_filter::port::artifact::ArtifactBundle as CanonicalArtifactBundle;
+#[cfg(not(test))]
+struct ArtifactBundle;
+enum ArtifactAcquireOutcome { Published(Arc<ArtifactBundle>) }
+enum ArtifactDeliveryOutcome { Published(Arc<ArtifactBundle>) }
+trait BlockingSnapshotSubscription {
+    fn snapshot(&self) -> Option<Arc<ArtifactBundle>>;
+}
+fn force_sanitizer_failure() {
+    let _ = core::mem::size_of::<CanonicalArtifactBundle>();
+    let _value = 1 + #[cfg(test)] 2;
+}
+"#;
+    let raw_parse = syn::parse_file(cfg_not_test_shadow);
+    assert!(
+        raw_parse.is_ok(),
+        "raw fallback fixture must parse: {:?}",
+        raw_parse.as_ref().err()
+    );
+    let sanitized_parse = syn::parse_file(&rust_sanitized_production_text(cfg_not_test_shadow));
+    assert!(
+        sanitized_parse.is_err(),
+        "fixture must exercise filtered raw fallback"
+    );
+    assert!(
+        !runtime_filter_subscription_artifact_surface_violations(cfg_not_test_shadow).is_empty(),
+        "cfg(not(test)) protected shadow must remain production-visible"
     );
 
     const GOOD_ROUTER: &str = r#"
@@ -12726,6 +13773,14 @@ fn fail(&self) { self.channel.fail_instance().map(|action| self.finish(action));
         good.replace(
             "self.dispatcher.dispatch(self.channel_id, action);",
             "let action = crate::runtime_filter::core::channel::ChannelAction::None; self.dispatcher.dispatch(self.channel_id, action);",
+        ),
+        good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "let _shadow = |action| action; self.dispatcher.dispatch(self.channel_id, action);",
+        ),
+        good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "match action { action => self.dispatcher.dispatch(self.channel_id, action) }",
         ),
         good.replace(
             "self.channel.submit().map(|action| self.finish(action))",
