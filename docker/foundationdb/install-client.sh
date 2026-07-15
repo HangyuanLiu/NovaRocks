@@ -76,7 +76,8 @@ write_manifest() {
     printf 'export NOVA_FDB_CLIENT_ASSET_PATH=%q\n' "$asset_path"
     printf 'export NOVA_FDB_CLIENT_ASSET_SHA256=%q\n' "$expected_sha256"
     printf 'export NOVA_FDB_CLIENT_LIBRARY_DIR=%q\n' "$library_dir"
-    printf 'export FDB_CLIENT_LIB_PATH=%q\n' "$library_path"
+    printf 'export NOVA_FDB_CLIENT_LIBRARY_FILE=%q\n' "$library_path"
+    printf 'export FDB_CLIENT_LIB_PATH=%q\n' "$library_dir"
     printf 'export NOVA_FDB_FDBCLI=%q\n' "$cli_path"
   } > "$path"
 }

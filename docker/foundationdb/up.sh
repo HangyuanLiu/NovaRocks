@@ -74,7 +74,9 @@ self_check() {
     test -n "$NOVA_FDB_COMPOSE_PROJECT"
     test -n "$NOVAROCKS_FDB_KEYSPACE_ID"
     test -f "$NOVAROCKS_FDB_CLUSTER_FILE"
-    test -f "$FDB_CLIENT_LIB_PATH"
+    test -d "$FDB_CLIENT_LIB_PATH"
+    test "$FDB_CLIENT_LIB_PATH" = "$NOVA_FDB_CLIENT_LIBRARY_DIR"
+    test -f "$NOVA_FDB_CLIENT_LIBRARY_FILE"
     test -x "$NOVA_FDB_FDBCLI"
     test "$NOVA_FDB_CLIENT_ASSET_SHA256" = "$expected_client_sha"
   )
@@ -173,6 +175,7 @@ chmod 600 "$cluster_file"
   printf 'export NOVA_FDB_CLIENT_ASSET_PATH=%q\n' "$NOVA_FDB_CLIENT_ASSET_PATH"
   printf 'export NOVA_FDB_CLIENT_ASSET_SHA256=%q\n' "$NOVA_FDB_CLIENT_ASSET_SHA256"
   printf 'export NOVA_FDB_CLIENT_LIBRARY_DIR=%q\n' "$NOVA_FDB_CLIENT_LIBRARY_DIR"
+  printf 'export NOVA_FDB_CLIENT_LIBRARY_FILE=%q\n' "$NOVA_FDB_CLIENT_LIBRARY_FILE"
   printf 'export FDB_CLIENT_LIB_PATH=%q\n' "$FDB_CLIENT_LIB_PATH"
   printf 'export NOVA_FDB_FDBCLI=%q\n' "$NOVA_FDB_FDBCLI"
   if [[ "$NOVA_FDB_CLIENT_PLATFORM" == "darwin-arm64" ]]; then

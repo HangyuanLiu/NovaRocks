@@ -28,9 +28,11 @@ source docker/foundationdb/runtime/current/env.sh
 
 The generated environment exports the cluster file, keyspace UUID, client
 library, `fdbcli`, runtime library path, Docker Compose project, and runtime
-paths. The environment and keyspace UUID are derived from the canonical
-worktree path, so separate worktrees do not share a Docker project or logical
-keyspace.
+paths. `FDB_CLIENT_LIB_PATH` and `NOVA_FDB_CLIENT_LIBRARY_DIR` both name the
+client library directory required by `foundationdb-sys`; the concrete library
+file is exported separately as `NOVA_FDB_CLIENT_LIBRARY_FILE`. The environment
+and keyspace UUID are derived from the canonical worktree path, so separate
+worktrees do not share a Docker project or logical keyspace.
 
 Start the pinned Linux amd64 server and wait for `fdbcli status` readiness:
 

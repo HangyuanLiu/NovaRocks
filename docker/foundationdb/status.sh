@@ -67,7 +67,9 @@ test -n "$NOVA_FDB_ENV_ID"
 test -n "$NOVA_FDB_COMPOSE_PROJECT"
 test -n "$NOVAROCKS_FDB_KEYSPACE_ID"
 test -f "$NOVAROCKS_FDB_CLUSTER_FILE"
-test -f "$FDB_CLIENT_LIB_PATH"
+test -d "$FDB_CLIENT_LIB_PATH"
+test "$FDB_CLIENT_LIB_PATH" = "$NOVA_FDB_CLIENT_LIBRARY_DIR"
+test -f "$NOVA_FDB_CLIENT_LIBRARY_FILE"
 test -x "$NOVA_FDB_FDBCLI"
 
 case "$NOVA_FDB_CLIENT_PLATFORM" in
@@ -88,7 +90,7 @@ if [[ "$client_version" != *"7.3.69"* ]]; then
   echo "unexpected fdbcli version: $client_version" >&2
   exit 1
 fi
-if ! LC_ALL=C grep -a -q '7.3.69' "$FDB_CLIENT_LIB_PATH"; then
+if ! LC_ALL=C grep -a -q '7.3.69' "$NOVA_FDB_CLIENT_LIBRARY_FILE"; then
   echo "FoundationDB client library does not identify itself as version 7.3.69" >&2
   exit 1
 fi
@@ -158,7 +160,8 @@ echo "FoundationDB fixture:"
 echo "  server version: $server_version"
 echo "  client binary version: $client_version"
 echo "  client library version: 7.3.69 (verified official package)"
-echo "  client library: $FDB_CLIENT_LIB_PATH"
+echo "  client link directory: $FDB_CLIENT_LIB_PATH"
+echo "  client library: $NOVA_FDB_CLIENT_LIBRARY_FILE"
 echo "  cluster file: $NOVAROCKS_FDB_CLUSTER_FILE"
 echo "  keyspace UUID: $NOVAROCKS_FDB_KEYSPACE_ID"
 echo "  environment: $exports_file"
