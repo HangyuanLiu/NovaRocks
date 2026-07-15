@@ -107,7 +107,7 @@ impl CapabilityGroup {
 }
 
 pub(super) struct ChannelArtifactPlan {
-    schema: ArtifactMembershipSchema,
+    schema: Option<ArtifactMembershipSchema>,
     policy: crate::runtime_filter::port::install::MaterializationPolicy,
     max_artifact_bytes: usize,
     max_concurrent_jobs: usize,
@@ -117,8 +117,8 @@ pub(super) struct ChannelArtifactPlan {
 }
 
 impl ChannelArtifactPlan {
-    pub(super) const fn schema(&self) -> &ArtifactMembershipSchema {
-        &self.schema
+    pub(super) const fn schema(&self) -> Option<&ArtifactMembershipSchema> {
+        self.schema.as_ref()
     }
     pub(super) const fn policy(
         &self,
@@ -848,6 +848,15 @@ fn build_routing(
             build
                 .consumer_activations
                 .insert(*binding_id, consumer.activation());
+            let entry = capability_routes
+                .entry(consumer.artifact_profile().id())
+                .or_insert_with(|| (consumer.artifact_profile().clone(), Vec::new()));
+            if entry.0.canonical_bytes() != consumer.artifact_profile().canonical_bytes() {
+                return Err(install_error(
+                    InstallContractErrorKind::ConflictingDeployment,
+                    "consumer profile digest collision carried different canonical bytes",
+                ));
+            }
             if matches!(
                 consumer.activation(),
                 ConsumerActivation::NonBlockingLive { .. }
@@ -880,38 +889,22 @@ fn build_routing(
                     })
                     .collect(),
             );
-            let entry = capability_routes
-                .entry(consumer.artifact_profile().id())
-                .or_insert_with(|| (consumer.artifact_profile().clone(), Vec::new()));
-            if entry.0.canonical_bytes() != consumer.artifact_profile().canonical_bytes() {
-                return Err(install_error(
-                    InstallContractErrorKind::ConflictingDeployment,
-                    "consumer profile digest collision carried different canonical bytes",
-                ));
-            }
             entry.1.push(route_edge_id);
         }
-        if matches!(
-            deployment.logical_domain(),
-            RuntimeFilterLogicalDomain::OrderedBound(_)
-        ) {
-            // Task 2 installs the typed ordered Core and producer handle. Range
-            // materialization planning is added by Task 3.
-            continue;
-        }
-        let RuntimeFilterLogicalDomain::Membership {
-            value_type,
-            null_semantics,
-        } = deployment.logical_domain()
-        else {
-            unreachable!("ordered deployments returned before membership artifact planning")
+        let schema = match deployment.logical_domain() {
+            RuntimeFilterLogicalDomain::Membership {
+                value_type,
+                null_semantics,
+            } => Some(
+                ArtifactMembershipSchema::new(value_type, *null_semantics).map_err(|_| {
+                    install_error(
+                        InstallContractErrorKind::UnsupportedMembershipType,
+                        "membership schema has no canonical artifact encoding",
+                    )
+                })?,
+            ),
+            RuntimeFilterLogicalDomain::OrderedBound(_) => None,
         };
-        let schema = ArtifactMembershipSchema::new(value_type, *null_semantics).map_err(|_| {
-            install_error(
-                InstallContractErrorKind::UnsupportedMembershipType,
-                "membership schema has no canonical artifact encoding",
-            )
-        })?;
         let policy = deployment.materialization_policy();
         let retained_bytes = usize::try_from(policy.max_total_retained_bytes()).map_err(|_| {
             install_error(

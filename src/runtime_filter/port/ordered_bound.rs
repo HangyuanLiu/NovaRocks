@@ -39,6 +39,10 @@ const REPLAY_DIGEST_VERSION: u16 = 1;
 pub(crate) struct OrderContractDigest([u8; 32]);
 
 impl OrderContractDigest {
+    pub(crate) const fn from_bytes_for_codec(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     pub(crate) const fn bytes(self) -> [u8; 32] {
         self.0
     }
@@ -222,6 +226,27 @@ impl ComparatorDigestV1 {
 }
 
 impl RuntimeOrderContract {
+    pub(crate) fn validate_codec_contract_digest(
+        canonical_keys: &[u8],
+        comparator_digest: [u8; 32],
+    ) -> Result<OrderContractDigest, OrderContractError> {
+        let mut comparator = Sha256::new();
+        comparator.update(COMPARATOR_DOMAIN);
+        comparator.update(COMPARATOR_ALGORITHM_VERSION.to_be_bytes());
+        comparator.update(canonical_keys);
+        if <[u8; 32]>::from(comparator.finalize()) != comparator_digest {
+            return Err(OrderContractError::ComparatorDigestMismatch);
+        }
+        let mut order = Sha256::new();
+        order.update(ORDER_CONTRACT_DOMAIN);
+        order.update(ORDER_CONTRACT_VERSION.to_be_bytes());
+        order.update(canonical_keys);
+        order.update([1]);
+        order.update(comparator_digest);
+        order.update(COMPARATOR_ALGORITHM_VERSION.to_be_bytes());
+        Ok(OrderContractDigest(order.finalize().into()))
+    }
+
     pub(crate) fn try_from_plan(plan: &OrderContract) -> Result<Self, OrderContractError> {
         if plan.keys.is_empty() {
             return Err(OrderContractError::EmptyKeys);

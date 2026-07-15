@@ -28,6 +28,9 @@ use crate::runtime_filter::port::producer::{
 };
 use crate::runtime_filter::port::subscription::ArtifactDeliveryOutcome;
 
+use crate::runtime_filter::materializer::range::{
+    AdmittedRangeMaterialization, RangeMaterializationOutcome, RangeMaterializer,
+};
 use crate::runtime_filter::materializer::{
     AdmittedMaterialization, MaterializationAdmission, MaterializationOutcome, Materializer,
     UnavailableReason as MaterializerUnavailableReason,
@@ -490,7 +493,14 @@ pub(super) fn run_materialization_jobs(
                                     if let Some(hook) = before_encode {
                                         hook(group.profile().id());
                                     }
-                                    Materializer::encode(admitted)
+                                    match admitted {
+                                        AdmittedArtifactMaterialization::Membership(admitted) => {
+                                            Materializer::encode(admitted)
+                                        }
+                                        AdmittedArtifactMaterialization::Range(admitted) => {
+                                            RangeMaterializer::encode(admitted).map_err(|_| ())
+                                        }
+                                    }
                                 }))
                                 .ok()
                                 .and_then(Result::ok)
@@ -527,7 +537,7 @@ enum AdmittedGroup<'a> {
         group: CapabilityGroup,
         owner: ArtifactJobOwner,
         identity: ArtifactMaterializationIdentity,
-        admitted: AdmittedMaterialization<'a>,
+        admitted: AdmittedArtifactMaterialization<'a>,
         events: Vec<RuntimeFilterEvent>,
     },
     Follower {
@@ -535,6 +545,16 @@ enum AdmittedGroup<'a> {
         follower: ArtifactJobFollower,
     },
     Complete(MaterializationWorkResult),
+}
+
+enum AdmittedArtifactMaterialization<'a> {
+    Membership(AdmittedMaterialization<'a>),
+    Range(AdmittedRangeMaterialization<'a>),
+}
+
+enum AdmissionDispatch<'a> {
+    Ready(AdmittedArtifactMaterialization<'a>),
+    Complete(MaterializationOutcome),
 }
 
 enum ScopedJob<'scope> {
@@ -568,31 +588,71 @@ fn admit_group<'a>(
             );
             let events = vec![RuntimeFilterEvent::MaterializationStarted { identity }];
             let admitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let materialization_plan = Materializer::plan(
-                    snapshot.clone(),
-                    plan.schema(),
-                    group.profile(),
-                    plan.policy(),
-                    plan.max_artifact_bytes(),
-                )?;
-                Ok::<_, crate::runtime_filter::materializer::MaterializationError>(
-                    Materializer::admit(
-                        materialization_plan,
+                if snapshot.ordered_bound().is_some() {
+                    let range_plan = match RangeMaterializer::plan(
+                        snapshot.clone(),
+                        group.profile(),
+                        plan.max_artifact_bytes(),
+                    ) {
+                        Ok(plan) => plan,
+                        Err(RangeMaterializationOutcome::ResourceUnavailable) => {
+                            return Ok(AdmissionDispatch::Complete(
+                                MaterializationOutcome::Unavailable(
+                                    MaterializerUnavailableReason::ResourceLimit,
+                                ),
+                            ));
+                        }
+                        Err(_) => return Err(()),
+                    };
+                    return match RangeMaterializer::admit(
+                        range_plan,
                         plan.retained_budget(),
                         plan.scratch_budget(),
                         memory_account,
-                    ),
+                    ) {
+                        Ok(admitted) => Ok(AdmissionDispatch::Ready(
+                            AdmittedArtifactMaterialization::Range(admitted),
+                        )),
+                        Err(RangeMaterializationOutcome::ResourceUnavailable) => Ok(
+                            AdmissionDispatch::Complete(MaterializationOutcome::Unavailable(
+                                MaterializerUnavailableReason::ResourceLimit,
+                            )),
+                        ),
+                        Err(_) => Err(()),
+                    };
+                }
+                let schema = plan.schema().ok_or(())?;
+                let materialization_plan = Materializer::plan(
+                    snapshot.clone(),
+                    schema,
+                    group.profile(),
+                    plan.policy(),
+                    plan.max_artifact_bytes(),
                 )
+                .map_err(|_| ())?;
+                match Materializer::admit(
+                    materialization_plan,
+                    plan.retained_budget(),
+                    plan.scratch_budget(),
+                    memory_account,
+                ) {
+                    MaterializationAdmission::Ready(admitted) => Ok(AdmissionDispatch::Ready(
+                        AdmittedArtifactMaterialization::Membership(admitted),
+                    )),
+                    MaterializationAdmission::Complete(outcome) => {
+                        Ok(AdmissionDispatch::Complete(outcome))
+                    }
+                }
             }));
             match admitted {
-                Ok(Ok(MaterializationAdmission::Ready(admitted))) => AdmittedGroup::Ready {
+                Ok(Ok(AdmissionDispatch::Ready(admitted))) => AdmittedGroup::Ready {
                     group: group.clone(),
                     owner,
                     identity,
                     admitted,
                     events,
                 },
-                Ok(Ok(MaterializationAdmission::Complete(outcome))) => AdmittedGroup::Complete(
+                Ok(Ok(AdmissionDispatch::Complete(outcome))) => AdmittedGroup::Complete(
                     complete_group(group.clone(), owner, identity, events, outcome),
                 ),
                 Ok(Err(_)) | Err(_) => AdmittedGroup::Complete(complete_group(
@@ -632,9 +692,6 @@ fn complete_group(
         }
         MaterializationOutcome::Unsupported(reason) => {
             let reason = match reason {
-                MaterializerUnsupportedReason::RangeDeferred => {
-                    ArtifactUnsupportedReason::RangeDeferred
-                }
                 MaterializerUnsupportedReason::NoAcceptedRepresentation => {
                     ArtifactUnsupportedReason::NoAcceptedRepresentation
                 }

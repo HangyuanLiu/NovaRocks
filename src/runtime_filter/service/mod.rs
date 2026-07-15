@@ -703,10 +703,10 @@ impl ActionDispatcher {
         match action {
             ChannelAction::None
             | ChannelAction::Progress { .. }
-            | ChannelAction::VisibleSnapshot { .. }
             | ChannelAction::CompletedWithoutArtifact { .. }
             | ChannelAction::DegradedLogical { .. } => {}
-            ChannelAction::Completed { snapshot, .. } => {
+            ChannelAction::VisibleSnapshot { snapshot, .. }
+            | ChannelAction::Completed { snapshot, .. } => {
                 let Some(plan) = installed.artifact_plan(channel_id) else {
                     return (None, None);
                 };
@@ -1690,11 +1690,21 @@ mod tests {
     fn installed_ordered_service_with_account(
         memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
     ) -> (Arc<RuntimeFilterService>, Arc<RuntimeOrderContract>) {
+        installed_ordered_service_with_account_and_events(
+            memory_account,
+            Arc::new(Events::default()),
+        )
+    }
+
+    fn installed_ordered_service_with_account_and_events(
+        memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
+        events: Arc<Events>,
+    ) -> (Arc<RuntimeFilterService>, Arc<RuntimeOrderContract>) {
         let started = Instant::now();
         let service = Arc::new(RuntimeFilterService::new_with_dependencies(
             uid(0),
             Arc::new(Clock(started)),
-            Arc::new(Events::default()),
+            events,
             memory_account,
         ));
         let keys = vec![OrderKeyContract {
@@ -1757,6 +1767,39 @@ mod tests {
             OrderedTuple::try_new(contract, [Some(OrderedScalar::Int64(value))]).unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn ordered_visible_snapshot_materializes_range_without_waiting_for_terminal() {
+        let events = Arc::new(Events::default());
+        let (service, contract) = installed_ordered_service_with_account_and_events(
+            MemTrackerMemoryAccount::new_root_for_test("ordered-range-materialization-test"),
+            events.clone(),
+        );
+        let ProducerHandle::OrderedBound(producer) = service
+            .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+            .unwrap()
+        else {
+            panic!("ordered fixture must return ordered producer")
+        };
+
+        assert_eq!(
+            producer
+                .submit_bound(
+                    PartitionId::new(0),
+                    ProducerSequence::new(0),
+                    ordered_update(&contract, 40),
+                )
+                .unwrap(),
+            SubmitOutcome::Published
+        );
+        assert!(events.0.lock().unwrap().iter().any(|event| matches!(
+            event,
+            RuntimeFilterEvent::ArtifactMaterialized {
+                kind: ArtifactKind::Range,
+                ..
+            }
+        )));
     }
 
     fn install_one(fixture: &Fixture) {
@@ -3150,7 +3193,9 @@ mod tests {
         let group = &plan.groups()[0];
         let artifact = Arc::new(PhysicalArtifact::new_test(
             ArtifactKind::ValueSet,
-            plan.schema().digest(),
+            plan.schema()
+                .expect("membership artifact plan has schema")
+                .digest(),
             LogicalVersion::FIRST,
             false,
             Arc::from([99]),

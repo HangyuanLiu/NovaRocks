@@ -18,6 +18,7 @@
 pub(crate) mod bitset;
 pub(crate) mod bloom;
 pub(crate) mod codec;
+pub(crate) mod range;
 
 use std::sync::Arc;
 
@@ -58,7 +59,6 @@ pub(crate) const fn validate_membership_kind(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UnsupportedReason {
-    RangeDeferred,
     NoAcceptedRepresentation,
 }
 
