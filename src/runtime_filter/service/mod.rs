@@ -28,6 +28,8 @@ mod m3a_tests;
 mod m3b_tests;
 #[cfg(test)]
 mod m3c_tests;
+#[cfg(test)]
+mod m4_conformance_tests;
 pub(crate) mod registry;
 mod subscription;
 
