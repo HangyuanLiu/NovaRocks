@@ -26,6 +26,8 @@ mod producer;
 mod m3a_tests;
 #[cfg(test)]
 mod m3b_tests;
+#[cfg(test)]
+mod m3c_tests;
 pub(crate) mod registry;
 mod subscription;
 

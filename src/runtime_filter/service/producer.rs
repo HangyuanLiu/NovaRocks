@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use crate::common::types::UniqueId;
-use crate::runtime_filter::core::channel::RuntimeFilterChannel;
+use crate::runtime_filter::core::channel::{FinalDomainRejection, RuntimeFilterChannel};
 use crate::runtime_filter::model::contract::{BindingId, ChannelId};
 use crate::runtime_filter::port::final_domain::{CompletionFenceAuthority, FinalDomainShard};
 use crate::runtime_filter::port::identity::{PartitionId, ProducerSequence};
@@ -162,6 +162,22 @@ impl ServiceProducerAdapter {
             }
         }
     }
+
+    fn finish_final(
+        &self,
+        result: Result<crate::runtime_filter::core::channel::ChannelAction, FinalDomainRejection>,
+    ) -> Result<SubmitOutcome, RuntimeContractViolation> {
+        match result {
+            Ok(action) => self.finish(action),
+            Err(rejection) => {
+                let (error, action) = rejection.into_parts();
+                self.dispatcher
+                    .dispatch(self.channel_id, action)
+                    .expect("final-domain rejection-only dispatch cannot materialize or route");
+                Err(error)
+            }
+        }
+    }
 }
 
 impl ProducerAdapter for ServiceProducerAdapter {
@@ -242,46 +258,35 @@ impl FinalDomainProducerAdapter for ServiceProducerAdapter {
         sequence: ProducerSequence,
         shard: FinalDomainShard,
     ) -> Result<SubmitOutcome, RuntimeContractViolation> {
-        if self.final_domain_authority.is_none() {
-            return Err(RuntimeContractViolation::new(
-                RuntimeContractViolationKind::ProducerPortMismatch,
-                "producer adapter has no installed completion-fence authority",
-            ));
-        }
-        self.channel.authorize_final(
-            self.binding_id,
-            self.fragment_instance_id,
-            partition_id,
-            sequence,
-            &shard,
-        )?;
-        let Some(bytes) = shard.canonical_contribution_bytes() else {
-            return self
-                .channel
-                .reject_final_resource_exhausted(
+        let result = (|| {
+            self.channel.authorize_final(
+                self.binding_id,
+                self.fragment_instance_id,
+                partition_id,
+                sequence,
+                self.final_domain_authority.is_some(),
+                &shard,
+            )?;
+            let Some(bytes) = shard.canonical_contribution_bytes() else {
+                return self.channel.reject_final_resource_exhausted(
                     self.binding_id,
                     self.fragment_instance_id,
                     partition_id,
                     sequence,
                     &shard,
-                )
-                .and_then(|action| self.finish(action));
-        };
-        let Ok(lease) = TemporaryContributionLease::try_new(self.memory_account.clone(), bytes)
-        else {
-            return self
-                .channel
-                .reject_final_resource_exhausted(
+                );
+            };
+            let Ok(lease) = TemporaryContributionLease::try_new(self.memory_account.clone(), bytes)
+            else {
+                return self.channel.reject_final_resource_exhausted(
                     self.binding_id,
                     self.fragment_instance_id,
                     partition_id,
                     sequence,
                     &shard,
-                )
-                .and_then(|action| self.finish(action));
-        };
-        self.channel
-            .complete_final(
+                );
+            };
+            self.channel.complete_final(
                 self.binding_id,
                 self.fragment_instance_id,
                 partition_id,
@@ -289,7 +294,8 @@ impl FinalDomainProducerAdapter for ServiceProducerAdapter {
                 shard,
                 lease,
             )
-            .and_then(|action| self.finish(action))
+        })();
+        self.finish_final(result)
     }
 
     fn close_partition(

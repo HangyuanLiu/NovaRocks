@@ -29,7 +29,7 @@ use crate::runtime_filter::model::contract::{
 use crate::runtime_filter::model::coverage::Coverage;
 use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
 use crate::runtime_filter::port::events::{
-    ProducerEventIdentity, RuntimeFilterEvent, RuntimeFilterEventIdentity,
+    FinalDomainRejectionKind, ProducerEventIdentity, RuntimeFilterEvent, RuntimeFilterEventIdentity,
 };
 use crate::runtime_filter::port::final_domain::{FinalDomainShard, RuntimeCompletionFenceContract};
 use crate::runtime_filter::port::identity::{
@@ -171,6 +171,23 @@ impl ChannelAction {
             | Self::DegradedLogical { order, .. }
             | Self::Cancelled { order, .. } => Some(*order),
         }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct FinalDomainRejection {
+    violation: RuntimeContractViolation,
+    action: ChannelAction,
+}
+
+impl FinalDomainRejection {
+    #[cfg(test)]
+    pub(crate) const fn kind(&self) -> RuntimeContractViolationKind {
+        self.violation.kind()
+    }
+
+    pub(crate) fn into_parts(self) -> (RuntimeContractViolation, ChannelAction) {
+        (self.violation, self.action)
     }
 }
 
@@ -330,6 +347,8 @@ pub(crate) struct RuntimeFilterChannel {
     deadline: OnceLock<Instant>,
     memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
     state: Mutex<ChannelState>,
+    #[cfg(test)]
+    before_final_semantic_rejection: Mutex<Option<Arc<dyn Fn(u64) + Send + Sync>>>,
 }
 
 impl RuntimeFilterChannel {
@@ -355,6 +374,22 @@ impl RuntimeFilterChannel {
             ProducerStreamId::new(binding_id, fragment_instance_id, partition_id),
             sequence,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_before_final_semantic_rejection_hook(
+        &self,
+        hook: Arc<dyn Fn(u64) + Send + Sync>,
+    ) {
+        *self.before_final_semantic_rejection.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn run_before_final_semantic_rejection_hook(&self, next_dispatch_order: u64) {
+        let hook = self.before_final_semantic_rejection.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook(next_dispatch_order);
+        }
     }
 
     pub(crate) fn ordered_rejection_action(
@@ -387,6 +422,25 @@ impl RuntimeFilterChannel {
                 violation,
             }],
         }
+    }
+
+    fn reject_final_locked(
+        &self,
+        state: &mut ChannelState,
+        identity: ContributionIdentity,
+        violation: RuntimeContractViolation,
+    ) -> FinalDomainRejection {
+        let action = ChannelAction::Progress {
+            order: Some(next_dispatch_order(state)),
+            outcome: SubmitOutcome::TerminalNoop,
+            events: vec![RuntimeFilterEvent::FinalDomainShardRejected {
+                identity,
+                rejection: FinalDomainRejectionKind::Contract(violation.kind()),
+            }],
+        };
+        #[cfg(test)]
+        self.run_before_final_semantic_rejection_hook(state.next_dispatch_order);
+        FinalDomainRejection { violation, action }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -571,6 +625,8 @@ impl RuntimeFilterChannel {
                 reservation: RetainedMemoryReservation::empty(),
                 next_dispatch_order: 0,
             }),
+            #[cfg(test)]
+            before_final_semantic_rejection: Mutex::new(None),
         })
     }
 
@@ -874,21 +930,44 @@ impl RuntimeFilterChannel {
         fragment_instance_id: UniqueId,
         partition_id: PartitionId,
         sequence: ProducerSequence,
+        authority_installed: bool,
         shard: &FinalDomainShard,
-    ) -> Result<(), RuntimeContractViolation> {
-        let contract = self.final_domain_contract().ok_or_else(|| {
-            violation(
-                RuntimeContractViolationKind::ProducerPortMismatch,
-                "non-final channel cannot accept final-domain shards",
-            )
-        })?;
-        let state = self.state.lock().unwrap();
-        partition_state(&state, binding_id, fragment_instance_id, partition_id)?;
-        shard.verify_scope(
+    ) -> Result<(), FinalDomainRejection> {
+        let identity =
+            self.contribution_identity(binding_id, fragment_instance_id, partition_id, sequence);
+        let mut state = self.state.lock().unwrap();
+        if !authority_installed {
+            return Err(self.reject_final_locked(
+                &mut state,
+                identity,
+                violation(
+                    RuntimeContractViolationKind::ProducerPortMismatch,
+                    "producer adapter has no installed completion-fence authority",
+                ),
+            ));
+        }
+        let Some(contract) = self.final_domain_contract() else {
+            return Err(self.reject_final_locked(
+                &mut state,
+                identity,
+                violation(
+                    RuntimeContractViolationKind::ProducerPortMismatch,
+                    "non-final channel cannot accept final-domain shards",
+                ),
+            ));
+        };
+        if let Err(error) = partition_state(&state, binding_id, fragment_instance_id, partition_id)
+        {
+            return Err(self.reject_final_locked(&mut state, identity, error));
+        }
+        if let Err(error) = shard.verify_scope(
             contract,
             ProducerStreamId::new(binding_id, fragment_instance_id, partition_id),
             sequence,
-        )
+        ) {
+            return Err(self.reject_final_locked(&mut state, identity, error));
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -900,20 +979,32 @@ impl RuntimeFilterChannel {
         sequence: ProducerSequence,
         shard: FinalDomainShard,
         temporary_lease: TemporaryContributionLease,
-    ) -> Result<ChannelAction, RuntimeContractViolation> {
-        let contract = self.final_domain_contract().ok_or_else(|| {
-            violation(
-                RuntimeContractViolationKind::ProducerPortMismatch,
-                "non-final channel cannot accept final-domain shards",
-            )
-        })?;
+    ) -> Result<ChannelAction, FinalDomainRejection> {
         let stream = ProducerStreamId::new(binding_id, fragment_instance_id, partition_id);
+        let identity =
+            self.contribution_identity(binding_id, fragment_instance_id, partition_id, sequence);
         let mut incoming_reservation: Option<RetainedMemoryReservation> = None;
         let mut reservation_failed_for = None;
         loop {
             let mut state = self.state.lock().unwrap();
-            partition_state(&state, binding_id, fragment_instance_id, partition_id)?;
-            shard.verify_scope(contract, stream, sequence)?;
+            let Some(contract) = self.final_domain_contract() else {
+                return Err(self.reject_final_locked(
+                    &mut state,
+                    identity,
+                    violation(
+                        RuntimeContractViolationKind::ProducerPortMismatch,
+                        "non-final channel cannot accept final-domain shards",
+                    ),
+                ));
+            };
+            if let Err(error) =
+                partition_state(&state, binding_id, fragment_instance_id, partition_id)
+            {
+                return Err(self.reject_final_locked(&mut state, identity, error));
+            }
+            if let Err(error) = shard.verify_scope(contract, stream, sequence) {
+                return Err(self.reject_final_locked(&mut state, identity, error));
+            }
             if matches!(
                 state.terminal,
                 ChannelTerminal::Unavailable { .. } | ChannelTerminal::Cancelled { .. }
@@ -921,52 +1012,84 @@ impl RuntimeFilterChannel {
                 return Ok(terminal_action_from_state(&state));
             }
             let replay_digest = shard.replay_digest();
-            if let Some(previous) =
-                partition_state(&state, binding_id, fragment_instance_id, partition_id)?
-                    .and_then(|partition| partition.seen.get(&sequence))
-            {
-                return if *previous == replay_digest {
-                    Ok(progress(SubmitOutcome::Duplicate))
+            let previous =
+                match partition_state(&state, binding_id, fragment_instance_id, partition_id) {
+                    Ok(partition) => partition
+                        .and_then(|partition| partition.seen.get(&sequence))
+                        .copied(),
+                    Err(error) => {
+                        return Err(self.reject_final_locked(&mut state, identity, error));
+                    }
+                };
+            if let Some(previous) = previous {
+                return if previous == replay_digest {
+                    Ok(ChannelAction::Progress {
+                        order: Some(next_dispatch_order(&mut state)),
+                        outcome: SubmitOutcome::Duplicate,
+                        events: vec![RuntimeFilterEvent::FinalDomainShardDuplicate { identity }],
+                    })
                 } else {
-                    Err(violation(
-                        RuntimeContractViolationKind::ConflictingReplay,
-                        "same final-domain contribution identity carried a different payload",
+                    Err(self.reject_final_locked(
+                        &mut state,
+                        identity,
+                        violation(
+                            RuntimeContractViolationKind::ConflictingReplay,
+                            "same final-domain contribution identity carried a different payload",
+                        ),
                     ))
                 };
             }
             if !matches!(state.terminal, ChannelTerminal::Collecting) {
                 return Ok(terminal_action_from_state(&state));
             }
-            let instance_progress =
-                instance_mut(&mut state, binding_id, fragment_instance_id)?.progress;
+            let instance_progress = match instance_mut(&mut state, binding_id, fragment_instance_id)
+            {
+                Ok(instance) => instance.progress,
+                Err(error) => {
+                    return Err(self.reject_final_locked(&mut state, identity, error));
+                }
+            };
             let (partition_progress, terminal_sequence) =
-                partition_state(&state, binding_id, fragment_instance_id, partition_id)?
-                    .map_or((TerminalProgress::Pending, None), |partition| {
-                        (partition.progress, partition.terminal_sequence)
-                    });
+                match partition_state(&state, binding_id, fragment_instance_id, partition_id) {
+                    Ok(partition) => partition
+                        .map_or((TerminalProgress::Pending, None), |partition| {
+                            (partition.progress, partition.terminal_sequence)
+                        }),
+                    Err(error) => {
+                        return Err(self.reject_final_locked(&mut state, identity, error));
+                    }
+                };
             if instance_progress == TerminalProgress::Impossible
                 || partition_progress == TerminalProgress::Impossible
             {
                 return Ok(progress(SubmitOutcome::TerminalNoop));
             }
             if partition_progress == TerminalProgress::Satisfied {
-                return Err(violation(
-                    RuntimeContractViolationKind::SequenceOutsideTerminalRange,
-                    "new final domain arrived after partition close",
+                return Err(self.reject_final_locked(
+                    &mut state,
+                    identity,
+                    violation(
+                        RuntimeContractViolationKind::SequenceOutsideTerminalRange,
+                        "new final domain arrived after partition close",
+                    ),
                 ));
             }
             if terminal_sequence.is_some_and(|terminal| sequence >= terminal) {
-                return Err(violation(
-                    RuntimeContractViolationKind::SequenceOutsideTerminalRange,
-                    "final-domain sequence is outside the exclusive terminal range",
+                return Err(self.reject_final_locked(
+                    &mut state,
+                    identity,
+                    violation(
+                        RuntimeContractViolationKind::SequenceOutsideTerminalRange,
+                        "final-domain sequence is outside the exclusive terminal range",
+                    ),
                 ));
             }
             let contribution_bytes = match shard.canonical_contribution_bytes() {
                 Some(bytes) => bytes,
                 None => {
-                    let locked = self.make_unavailable(
+                    let locked = self.make_final_resource_unavailable(
                         &mut state,
-                        UnavailableReason::ResourceLimit,
+                        identity,
                         SubmitOutcome::TerminalNoop,
                     );
                     drop(state);
@@ -975,17 +1098,21 @@ impl RuntimeFilterChannel {
                 }
             };
             if temporary_lease.bytes() != contribution_bytes {
-                return Err(violation(
-                    RuntimeContractViolationKind::InvalidContributionLease,
-                    "temporary contribution lease does not match canonical final-domain size",
+                return Err(self.reject_final_locked(
+                    &mut state,
+                    identity,
+                    violation(
+                        RuntimeContractViolationKind::InvalidContributionLease,
+                        "temporary contribution lease does not match canonical final-domain size",
+                    ),
                 ));
             }
             if u64::try_from(contribution_bytes)
                 .map_or(true, |bytes| bytes > self.max_contribution_bytes)
             {
-                let locked = self.make_unavailable(
+                let locked = self.make_final_resource_unavailable(
                     &mut state,
-                    UnavailableReason::ResourceLimit,
+                    identity,
                     SubmitOutcome::TerminalNoop,
                 );
                 drop(state);
@@ -1000,15 +1127,19 @@ impl RuntimeFilterChannel {
             {
                 Ok(projection) => projection,
                 Err(ReducerError::TypeMismatch | ReducerError::UnsupportedType) => {
-                    return Err(violation(
-                        RuntimeContractViolationKind::TypeMismatch,
-                        "final domain type does not match channel membership type",
+                    return Err(self.reject_final_locked(
+                        &mut state,
+                        identity,
+                        violation(
+                            RuntimeContractViolationKind::TypeMismatch,
+                            "final domain type does not match channel membership type",
+                        ),
                     ));
                 }
                 Err(ReducerError::SizeOverflow) => {
-                    let locked = self.make_unavailable(
+                    let locked = self.make_final_resource_unavailable(
                         &mut state,
-                        UnavailableReason::ResourceLimit,
+                        identity,
                         SubmitOutcome::TerminalNoop,
                     );
                     drop(state);
@@ -1022,9 +1153,9 @@ impl RuntimeFilterChannel {
             {
                 Some(bytes) => bytes,
                 None => {
-                    let locked = self.make_unavailable(
+                    let locked = self.make_final_resource_unavailable(
                         &mut state,
-                        UnavailableReason::ResourceLimit,
+                        identity,
                         SubmitOutcome::TerminalNoop,
                     );
                     drop(state);
@@ -1039,9 +1170,9 @@ impl RuntimeFilterChannel {
                 .and_then(|bytes| u64::try_from(bytes).ok())
                 .is_none_or(|bytes| bytes > self.max_reducer_bytes)
             {
-                let locked = self.make_unavailable(
+                let locked = self.make_final_resource_unavailable(
                     &mut state,
-                    UnavailableReason::ResourceLimit,
+                    identity,
                     SubmitOutcome::TerminalNoop,
                 );
                 drop(state);
@@ -1054,9 +1185,9 @@ impl RuntimeFilterChannel {
                 != Some(retained_growth)
             {
                 if reservation_failed_for == Some(retained_growth) {
-                    let locked = self.make_unavailable(
+                    let locked = self.make_final_resource_unavailable(
                         &mut state,
-                        UnavailableReason::ResourceLimit,
+                        identity,
                         SubmitOutcome::TerminalNoop,
                     );
                     drop(state);
@@ -1078,9 +1209,9 @@ impl RuntimeFilterChannel {
                 .expect("matching final-domain reservation must exist");
             if let Err(failure) = state.reservation.absorb(incoming) {
                 let (_, incoming) = failure.into_parts();
-                let locked = self.make_unavailable(
+                let locked = self.make_final_resource_unavailable(
                     &mut state,
-                    UnavailableReason::ResourceLimit,
+                    identity,
                     SubmitOutcome::TerminalNoop,
                 );
                 drop(state);
@@ -1108,7 +1239,7 @@ impl RuntimeFilterChannel {
                 binding_id,
                 fragment_instance_id,
                 SubmitOutcome::Applied,
-                Vec::new(),
+                vec![RuntimeFilterEvent::FinalDomainShardAccepted { identity }],
             );
             drop(state);
             return Ok(locked.finish());
@@ -2392,17 +2523,28 @@ impl RuntimeFilterChannel {
         partition_id: PartitionId,
         sequence: ProducerSequence,
         shard: &FinalDomainShard,
-    ) -> Result<ChannelAction, RuntimeContractViolation> {
-        let contract = self.final_domain_contract().ok_or_else(|| {
-            violation(
-                RuntimeContractViolationKind::ProducerPortMismatch,
-                "non-final channel cannot accept final-domain shards",
-            )
-        })?;
+    ) -> Result<ChannelAction, FinalDomainRejection> {
         let stream = ProducerStreamId::new(binding_id, fragment_instance_id, partition_id);
+        let identity =
+            self.contribution_identity(binding_id, fragment_instance_id, partition_id, sequence);
         let mut state = self.state.lock().unwrap();
-        partition_state(&state, binding_id, fragment_instance_id, partition_id)?;
-        shard.verify_scope(contract, stream, sequence)?;
+        let Some(contract) = self.final_domain_contract() else {
+            return Err(self.reject_final_locked(
+                &mut state,
+                identity,
+                violation(
+                    RuntimeContractViolationKind::ProducerPortMismatch,
+                    "non-final channel cannot accept final-domain shards",
+                ),
+            ));
+        };
+        if let Err(error) = partition_state(&state, binding_id, fragment_instance_id, partition_id)
+        {
+            return Err(self.reject_final_locked(&mut state, identity, error));
+        }
+        if let Err(error) = shard.verify_scope(contract, stream, sequence) {
+            return Err(self.reject_final_locked(&mut state, identity, error));
+        }
         if matches!(
             state.terminal,
             ChannelTerminal::Unavailable { .. } | ChannelTerminal::Cancelled { .. }
@@ -2410,29 +2552,51 @@ impl RuntimeFilterChannel {
             return Ok(terminal_action_from_state(&state));
         }
         let replay_digest = shard.replay_digest();
-        if let Some(previous) =
-            partition_state(&state, binding_id, fragment_instance_id, partition_id)?
-                .and_then(|partition| partition.seen.get(&sequence))
+        let previous = match partition_state(&state, binding_id, fragment_instance_id, partition_id)
         {
-            return if *previous == replay_digest {
-                Ok(progress(SubmitOutcome::Duplicate))
+            Ok(partition) => partition
+                .and_then(|partition| partition.seen.get(&sequence))
+                .copied(),
+            Err(error) => {
+                return Err(self.reject_final_locked(&mut state, identity, error));
+            }
+        };
+        if let Some(previous) = previous {
+            return if previous == replay_digest {
+                Ok(ChannelAction::Progress {
+                    order: Some(next_dispatch_order(&mut state)),
+                    outcome: SubmitOutcome::Duplicate,
+                    events: vec![RuntimeFilterEvent::FinalDomainShardDuplicate { identity }],
+                })
             } else {
-                Err(violation(
-                    RuntimeContractViolationKind::ConflictingReplay,
-                    "same final-domain contribution identity carried a different payload",
+                Err(self.reject_final_locked(
+                    &mut state,
+                    identity,
+                    violation(
+                        RuntimeContractViolationKind::ConflictingReplay,
+                        "same final-domain contribution identity carried a different payload",
+                    ),
                 ))
             };
         }
         if !matches!(state.terminal, ChannelTerminal::Collecting) {
             return Ok(terminal_action_from_state(&state));
         }
-        let instance_progress =
-            instance_mut(&mut state, binding_id, fragment_instance_id)?.progress;
+        let instance_progress = match instance_mut(&mut state, binding_id, fragment_instance_id) {
+            Ok(instance) => instance.progress,
+            Err(error) => {
+                return Err(self.reject_final_locked(&mut state, identity, error));
+            }
+        };
         let (partition_progress, terminal_sequence) =
-            partition_state(&state, binding_id, fragment_instance_id, partition_id)?
-                .map_or((TerminalProgress::Pending, None), |partition| {
+            match partition_state(&state, binding_id, fragment_instance_id, partition_id) {
+                Ok(partition) => partition.map_or((TerminalProgress::Pending, None), |partition| {
                     (partition.progress, partition.terminal_sequence)
-                });
+                }),
+                Err(error) => {
+                    return Err(self.reject_final_locked(&mut state, identity, error));
+                }
+            };
         if instance_progress == TerminalProgress::Impossible
             || partition_progress == TerminalProgress::Impossible
         {
@@ -2441,16 +2605,17 @@ impl RuntimeFilterChannel {
         if partition_progress == TerminalProgress::Satisfied
             || terminal_sequence.is_some_and(|terminal| sequence >= terminal)
         {
-            return Err(violation(
-                RuntimeContractViolationKind::SequenceOutsideTerminalRange,
-                "final-domain sequence is outside the exclusive terminal range",
+            return Err(self.reject_final_locked(
+                &mut state,
+                identity,
+                violation(
+                    RuntimeContractViolationKind::SequenceOutsideTerminalRange,
+                    "final-domain sequence is outside the exclusive terminal range",
+                ),
             ));
         }
-        let locked = self.make_unavailable(
-            &mut state,
-            UnavailableReason::ResourceLimit,
-            SubmitOutcome::TerminalNoop,
-        );
+        let locked =
+            self.make_final_resource_unavailable(&mut state, identity, SubmitOutcome::TerminalNoop);
         drop(state);
         Ok(locked.finish())
     }
@@ -2820,6 +2985,23 @@ impl RuntimeFilterChannel {
         self.make_unavailable_with_events(state, reason, outcome, Vec::new())
     }
 
+    fn make_final_resource_unavailable(
+        &self,
+        state: &mut ChannelState,
+        identity: ContributionIdentity,
+        outcome: SubmitOutcome,
+    ) -> LockedAction {
+        self.make_unavailable_with_events(
+            state,
+            UnavailableReason::ResourceLimit,
+            outcome,
+            vec![RuntimeFilterEvent::FinalDomainShardRejected {
+                identity,
+                rejection: FinalDomainRejectionKind::ResourceLimit,
+            }],
+        )
+    }
+
     fn make_unavailable_with_events(
         &self,
         state: &mut ChannelState,
@@ -3156,7 +3338,7 @@ mod tests {
         LogicalSnapshot, MembershipValues, ValueDomainDelta,
     };
 
-    use super::{ChannelAction, ChannelTerminal, RuntimeFilterChannel};
+    use super::{ChannelAction, ChannelTerminal, FinalDomainRejection, RuntimeFilterChannel};
 
     #[derive(Default)]
     struct Account {
@@ -6714,7 +6896,7 @@ mod tests {
             partition: u32,
             sequence: u64,
             shard: crate::runtime_filter::port::final_domain::FinalDomainShard,
-        ) -> Result<ChannelAction, RuntimeContractViolation> {
+        ) -> Result<ChannelAction, FinalDomainRejection> {
             let bytes = shard.canonical_contribution_bytes().unwrap();
             channel.complete_final(
                 BindingId::new(binding),
