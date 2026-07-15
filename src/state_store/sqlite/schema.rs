@@ -20,12 +20,15 @@ use uuid::{Uuid, Version};
 
 use crate::state_store::{StateStoreError, StateStoreErrorKind, StoreIdentity};
 
+use super::sqlite_error;
+
 pub(super) const CURRENT_SCHEMA_VERSION: u32 = 1;
 pub(super) const SCHEMA_VERSION_KEY: &[u8] = b"schema_version";
 pub(super) const CLUSTER_ID_KEY: &[u8] = b"cluster_id";
 pub(super) const STORE_ID_KEY: &[u8] = b"store_id";
 pub(super) const INITIAL_INCARNATION_KEY: &[u8] = b"initial_incarnation";
 pub(super) const DEPLOYMENT_OWNER_KEY: &[u8] = b"deployment_owner";
+pub(super) const DATABASE_PATH_KEY: &[u8] = b"database_path";
 pub(super) const CURRENT_REVISION_KEY: &[u8] = b"current_revision";
 
 const INITIAL_INCARNATION: u64 = 1;
@@ -35,8 +38,18 @@ pub(super) fn initialize(
     connection: &mut Connection,
     cluster_id: &[u8],
     deployment_owner: &[u8],
+    database_path: &[u8],
 ) -> Result<StoreIdentity, StateStoreError> {
-    connection
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| {
+            sqlite_error(
+                &error,
+                StateStoreErrorKind::Internal,
+                "failed to start SQLite initialization transaction",
+            )
+        })?;
+    transaction
         .execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS state_store_meta (
@@ -64,21 +77,28 @@ pub(super) fn initialize(
             );
             "#,
         )
-        .map_err(|_| schema_error("failed to create SQLite state store schema"))?;
+        .map_err(|error| {
+            sqlite_error(
+                &error,
+                StateStoreErrorKind::Internal,
+                "failed to create SQLite state store schema",
+            )
+        })?;
 
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|_| schema_error("failed to start SQLite identity transaction"))?;
     let identity = match load_optional(&transaction, SCHEMA_VERSION_KEY)? {
-        None => initialize_identity(&transaction, cluster_id, deployment_owner)?,
+        None => initialize_identity(&transaction, cluster_id, deployment_owner, database_path)?,
         Some(version) => {
             validate_schema_version(&version)?;
-            load_identity(&transaction, cluster_id, deployment_owner)?
+            load_identity(&transaction, cluster_id, deployment_owner, database_path)?
         }
     };
-    transaction
-        .commit()
-        .map_err(|_| schema_error("failed to commit SQLite identity transaction"))?;
+    transaction.commit().map_err(|error| {
+        sqlite_error(
+            &error,
+            StateStoreErrorKind::Internal,
+            "failed to commit SQLite initialization transaction",
+        )
+    })?;
     Ok(identity)
 }
 
@@ -86,12 +106,19 @@ fn initialize_identity(
     transaction: &Transaction<'_>,
     cluster_id: &[u8],
     deployment_owner: &[u8],
+    database_path: &[u8],
 ) -> Result<StoreIdentity, StateStoreError> {
     let existing_rows: i64 = transaction
         .query_row("SELECT COUNT(*) FROM state_store_meta", [], |row| {
             row.get(0)
         })
-        .map_err(|_| schema_error("failed to inspect SQLite state store identity"))?;
+        .map_err(|error| {
+            sqlite_error(
+                &error,
+                StateStoreErrorKind::Corruption,
+                "failed to inspect SQLite state store identity",
+            )
+        })?;
     if existing_rows != 0 {
         return Err(schema_error(
             "SQLite state store identity is partially initialized",
@@ -112,6 +139,7 @@ fn initialize_identity(
         &INITIAL_INCARNATION.to_be_bytes(),
     )?;
     insert_meta(transaction, DEPLOYMENT_OWNER_KEY, deployment_owner)?;
+    insert_meta(transaction, DATABASE_PATH_KEY, database_path)?;
     insert_meta(
         transaction,
         CURRENT_REVISION_KEY,
@@ -130,6 +158,7 @@ fn load_identity(
     transaction: &Transaction<'_>,
     cluster_id: &[u8],
     deployment_owner: &[u8],
+    database_path: &[u8],
 ) -> Result<StoreIdentity, StateStoreError> {
     let stored_cluster_id = load_required(transaction, CLUSTER_ID_KEY)?;
     if stored_cluster_id != cluster_id {
@@ -144,6 +173,14 @@ fn load_identity(
         return Err(StateStoreError::new(
             StateStoreErrorKind::InvalidConfiguration,
             "SQLite state store deployment owner does not match configuration",
+        ));
+    }
+
+    let stored_database_path = load_required(transaction, DATABASE_PATH_KEY)?;
+    if stored_database_path != database_path {
+        return Err(StateStoreError::new(
+            StateStoreErrorKind::InvalidConfiguration,
+            "SQLite state store database path does not match initialized identity",
         ));
     }
 
@@ -203,7 +240,13 @@ fn insert_meta(
             "INSERT INTO state_store_meta(key, value) VALUES (?1, ?2)",
             params![key, value],
         )
-        .map_err(|_| schema_error("failed to initialize SQLite state store identity"))?;
+        .map_err(|error| {
+            sqlite_error(
+                &error,
+                StateStoreErrorKind::Internal,
+                "failed to initialize SQLite state store identity",
+            )
+        })?;
     Ok(())
 }
 
@@ -223,7 +266,13 @@ fn load_optional(
             |row| row.get(0),
         )
         .optional()
-        .map_err(|_| schema_error("failed to read SQLite state store identity"))
+        .map_err(|error| {
+            sqlite_error(
+                &error,
+                StateStoreErrorKind::Corruption,
+                "failed to read SQLite state store identity",
+            )
+        })
 }
 
 const fn schema_error(message: &'static str) -> StateStoreError {

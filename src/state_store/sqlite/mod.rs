@@ -19,10 +19,10 @@ mod schema;
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
+use rusqlite::ffi::ErrorCode as SqliteErrorCode;
 use rusqlite::{Connection, OpenFlags};
 
 use crate::state_store::{
@@ -90,12 +90,14 @@ fn open_blocking(
     limits: StateStoreLimits,
 ) -> Result<SqliteStateStore, StateStoreError> {
     let path = canonicalize_database_path(&config.path)?;
+    let database_path = database_path_bytes(&path)?;
     let owner_lock = acquire_owner_lock(&path)?;
     let mut connection = open_connection(&path)?;
     let identity = schema::initialize(
         &mut connection,
         config.cluster_id.as_bytes(),
         config.deployment_owner.as_bytes(),
+        &database_path,
     )?;
 
     Ok(SqliteStateStore {
@@ -110,32 +112,64 @@ pub(super) fn open_connection(path: &Path) -> Result<Connection, StateStoreError
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_CREATE
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW
         | OpenFlags::SQLITE_OPEN_EXRESCODE;
-    let connection = Connection::open_with_flags(path, flags).map_err(|_| {
-        StateStoreError::new(
+    let connection = Connection::open_with_flags(path, flags).map_err(|error| {
+        sqlite_error(
+            &error,
             StateStoreErrorKind::ProviderUnavailable,
             "failed to open SQLite state store database",
         )
     })?;
     let journal_mode = connection
         .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
-        .map_err(|_| connection_configuration_error())?;
+        .map_err(|error| {
+            sqlite_error(
+                &error,
+                StateStoreErrorKind::ProviderUnavailable,
+                "failed to configure SQLite state store connection",
+            )
+        })?;
     if !journal_mode.eq_ignore_ascii_case("wal") {
         return Err(connection_configuration_error());
     }
     connection
         .pragma_update(None, "synchronous", "FULL")
-        .map_err(|_| connection_configuration_error())?;
+        .map_err(|error| {
+            sqlite_error(
+                &error,
+                StateStoreErrorKind::ProviderUnavailable,
+                "failed to configure SQLite state store connection",
+            )
+        })?;
     connection
         .pragma_update(None, "foreign_keys", "ON")
-        .map_err(|_| connection_configuration_error())?;
+        .map_err(|error| {
+            sqlite_error(
+                &error,
+                StateStoreErrorKind::ProviderUnavailable,
+                "failed to configure SQLite state store connection",
+            )
+        })?;
 
     let synchronous = connection
         .pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))
-        .map_err(|_| connection_configuration_error())?;
+        .map_err(|error| {
+            sqlite_error(
+                &error,
+                StateStoreErrorKind::ProviderUnavailable,
+                "failed to inspect SQLite state store connection configuration",
+            )
+        })?;
     let foreign_keys = connection
         .pragma_query_value(None, "foreign_keys", |row| row.get::<_, i64>(0))
-        .map_err(|_| connection_configuration_error())?;
+        .map_err(|error| {
+            sqlite_error(
+                &error,
+                StateStoreErrorKind::ProviderUnavailable,
+                "failed to inspect SQLite state store connection configuration",
+            )
+        })?;
     if synchronous != 2 || foreign_keys != 1 {
         return Err(connection_configuration_error());
     }
@@ -166,24 +200,26 @@ fn canonicalize_database_path(path: &Path) -> Result<PathBuf, StateStoreError> {
         .map_err(|_| path_error("failed to create SQLite state store directory"))?;
     let canonical_parent = fs::canonicalize(parent)
         .map_err(|_| path_error("failed to canonicalize SQLite state store directory"))?;
-    let candidate = canonical_parent.join(file_name);
+    Ok(canonical_parent.join(file_name))
+}
 
-    match fs::canonicalize(&candidate) {
-        Ok(canonical) => Ok(canonical),
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            match fs::symlink_metadata(&candidate) {
-                Err(metadata_error) if metadata_error.kind() == ErrorKind::NotFound => {
-                    Ok(candidate)
-                }
-                _ => Err(path_error(
-                    "SQLite state store path exists but cannot be canonicalized",
-                )),
-            }
-        }
-        Err(_) => Err(path_error(
-            "failed to canonicalize SQLite state store database",
-        )),
-    }
+#[cfg(unix)]
+fn database_path_bytes(path: &Path) -> Result<Vec<u8>, StateStoreError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    Ok(path.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(not(unix))]
+fn database_path_bytes(path: &Path) -> Result<Vec<u8>, StateStoreError> {
+    path.to_str()
+        .map(|path| path.as_bytes().to_vec())
+        .ok_or_else(|| {
+            StateStoreError::new(
+                StateStoreErrorKind::InvalidConfiguration,
+                "SQLite state store database path is not valid UTF-8",
+            )
+        })
 }
 
 fn acquire_owner_lock(path: &Path) -> Result<File, StateStoreError> {
@@ -228,13 +264,50 @@ const fn path_error(message: &'static str) -> StateStoreError {
     StateStoreError::new(StateStoreErrorKind::ProviderUnavailable, message)
 }
 
+fn sqlite_error(
+    error: &rusqlite::Error,
+    fallback: StateStoreErrorKind,
+    message: &'static str,
+) -> StateStoreError {
+    StateStoreError::new(sqlite_error_kind(error, fallback), message)
+}
+
+fn sqlite_error_kind(
+    error: &rusqlite::Error,
+    fallback: StateStoreErrorKind,
+) -> StateStoreErrorKind {
+    match error.sqlite_error_code() {
+        Some(SqliteErrorCode::DatabaseBusy | SqliteErrorCode::DatabaseLocked) => {
+            StateStoreErrorKind::Transient
+        }
+        Some(
+            SqliteErrorCode::CannotOpen
+            | SqliteErrorCode::SystemIoFailure
+            | SqliteErrorCode::ReadOnly
+            | SqliteErrorCode::DiskFull
+            | SqliteErrorCode::PermissionDenied
+            | SqliteErrorCode::AuthorizationForStatementDenied,
+        ) => StateStoreErrorKind::ProviderUnavailable,
+        Some(
+            SqliteErrorCode::DatabaseCorrupt
+            | SqliteErrorCode::NotADatabase
+            | SqliteErrorCode::SchemaChanged,
+        ) => StateStoreErrorKind::Corruption,
+        _ => fallback,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::io::ErrorKind;
     use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
 
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
     use bytes::Bytes;
-    use rusqlite::{Connection, OptionalExtension, params};
+    use rusqlite::{Connection, OptionalExtension, ffi, params};
     use tempfile::TempDir;
     use tokio::runtime::{Builder, Runtime};
     use uuid::Version;
@@ -341,7 +414,8 @@ mod tests {
         assert_eq!(identity.cluster_id, "cluster-a");
         assert_eq!(identity.initial_incarnation, 1);
 
-        let connection = open_connection(&path).expect("configured SQLite connection");
+        let connection =
+            open_connection(&store.path).expect("configured SQLite connection on canonical path");
         assert_eq!(
             connection
                 .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
@@ -399,8 +473,16 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("owner identity row");
+        let database_path: Vec<u8> = connection
+            .query_row(
+                "SELECT value FROM state_store_meta WHERE key = ?1",
+                params![b"database_path".as_slice()],
+                |row| row.get(0),
+            )
+            .expect("database path identity row");
         assert_eq!(cluster, b"cluster-a");
         assert_eq!(owner, b"fe-a");
+        assert_eq!(database_path, database_path_bytes(&store.path).unwrap());
     }
 
     #[test]
@@ -443,6 +525,71 @@ mod tests {
             .expect("restart after lock release");
 
         assert_eq!(restarted.identity_snapshot(), &first_identity);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_open_rejects_final_component_symlink_without_touching_target_schema() {
+        let temp = TempDir::new().expect("temp dir");
+        let target = temp.path().join("target.sqlite");
+        let configured_path = temp.path().join("state-store.sqlite");
+        let connection = Connection::open(&target).expect("create target database");
+        connection
+            .execute_batch("CREATE TABLE target_sentinel(value TEXT NOT NULL);")
+            .expect("create target sentinel");
+        drop(connection);
+        symlink(&target, &configured_path).expect("create final-component symlink");
+
+        let error = open_error(
+            &runtime(),
+            config(&configured_path, "cluster-a", "fe-a"),
+            deployment(1),
+        );
+
+        assert_eq!(error.kind(), StateStoreErrorKind::ProviderUnavailable);
+        let connection = Connection::open(&target).expect("reopen target database");
+        let state_store_tables: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name LIKE 'state_store_%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count target state store tables");
+        assert_eq!(
+            state_store_tables, 0,
+            "symlink target must remain untouched"
+        );
+    }
+
+    #[test]
+    fn sqlite_open_rejects_hardlink_alternate_path_for_initialized_database() {
+        let temp = TempDir::new().expect("temp dir");
+        let primary_path = temp.path().join("primary.sqlite");
+        let alternate_path = temp.path().join("alternate.sqlite");
+        let runtime = runtime();
+        let first = runtime
+            .block_on(SqliteStateStore::open(
+                config(&primary_path, "cluster-a", "fe-a"),
+                deployment(1),
+            ))
+            .expect("initialize primary database path");
+        drop(first);
+
+        if let Err(error) = fs::hard_link(&primary_path, &alternate_path) {
+            if error.kind() == ErrorKind::Unsupported {
+                eprintln!("skipping hardlink identity test: platform does not support hardlinks");
+                return;
+            }
+            panic!("create hardlink alternate path: {error}");
+        }
+
+        let error = open_error(
+            &runtime,
+            config(&alternate_path, "cluster-a", "fe-a"),
+            deployment(1),
+        );
+
+        assert_eq!(error.kind(), StateStoreErrorKind::InvalidConfiguration);
     }
 
     #[test]
@@ -523,5 +670,111 @@ mod tests {
 
         let error = open_error(&runtime, config(&path, "cluster-a", "fe-a"), deployment(1));
         assert_eq!(error.kind(), StateStoreErrorKind::Corruption);
+    }
+
+    #[test]
+    fn sqlite_open_rolls_back_schema_creation_for_unknown_initial_metadata() {
+        let temp = TempDir::new().expect("temp dir");
+        let path = temp.path().join("state-store.sqlite");
+        let connection = Connection::open(&path).expect("create malformed database");
+        connection
+            .execute_batch(
+                "CREATE TABLE state_store_meta (key BLOB PRIMARY KEY, value BLOB NOT NULL);",
+            )
+            .expect("create state store metadata table");
+        connection
+            .execute(
+                "INSERT INTO state_store_meta(key, value) VALUES (?1, ?2)",
+                params![b"unknown_key".as_slice(), b"unknown_value".as_slice()],
+            )
+            .expect("insert unknown metadata");
+        drop(connection);
+
+        let error = open_error(
+            &runtime(),
+            config(&path, "cluster-a", "fe-a"),
+            deployment(1),
+        );
+
+        assert_eq!(error.kind(), StateStoreErrorKind::Corruption);
+        let connection = Connection::open(&path).expect("reopen malformed database");
+        let mut statement = connection
+            .prepare(
+                "SELECT name FROM sqlite_schema \
+                 WHERE type = 'table' AND name LIKE 'state_store_%' ORDER BY name",
+            )
+            .expect("prepare table query");
+        let tables = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query tables")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect tables");
+        assert_eq!(tables, ["state_store_meta"]);
+        let metadata: Vec<u8> = connection
+            .query_row(
+                "SELECT value FROM state_store_meta WHERE key = ?1",
+                params![b"unknown_key".as_slice()],
+                |row| row.get(0),
+            )
+            .expect("unknown metadata must remain unchanged");
+        assert_eq!(metadata, b"unknown_value");
+    }
+
+    #[test]
+    fn sqlite_open_classifies_immediate_transaction_contention_as_transient() {
+        let temp = TempDir::new().expect("temp dir");
+        let path = temp.path().join("state-store.sqlite");
+        let runtime = runtime();
+        let first = runtime
+            .block_on(SqliteStateStore::open(
+                config(&path, "cluster-a", "fe-a"),
+                deployment(1),
+            ))
+            .expect("initialize state store");
+        drop(first);
+
+        let blocker = Connection::open(&path).expect("open external connection");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold immediate transaction");
+
+        let error = open_error(&runtime, config(&path, "cluster-a", "fe-a"), deployment(1));
+
+        assert_eq!(error.kind(), StateStoreErrorKind::Transient);
+        blocker
+            .execute_batch("ROLLBACK")
+            .expect("release external transaction");
+    }
+
+    #[test]
+    fn sqlite_open_classifies_sqlite_primary_error_codes() {
+        let cases = [
+            (ffi::SQLITE_BUSY, StateStoreErrorKind::Transient),
+            (ffi::SQLITE_LOCKED, StateStoreErrorKind::Transient),
+            (
+                ffi::SQLITE_CANTOPEN,
+                StateStoreErrorKind::ProviderUnavailable,
+            ),
+            (ffi::SQLITE_IOERR, StateStoreErrorKind::ProviderUnavailable),
+            (
+                ffi::SQLITE_READONLY,
+                StateStoreErrorKind::ProviderUnavailable,
+            ),
+            (ffi::SQLITE_FULL, StateStoreErrorKind::ProviderUnavailable),
+            (ffi::SQLITE_PERM, StateStoreErrorKind::ProviderUnavailable),
+            (ffi::SQLITE_AUTH, StateStoreErrorKind::ProviderUnavailable),
+            (ffi::SQLITE_CORRUPT, StateStoreErrorKind::Corruption),
+            (ffi::SQLITE_NOTADB, StateStoreErrorKind::Corruption),
+            (ffi::SQLITE_SCHEMA, StateStoreErrorKind::Corruption),
+        ];
+
+        for (code, expected) in cases {
+            let error = rusqlite::Error::SqliteFailure(ffi::Error::new(code), None);
+            assert_eq!(
+                sqlite_error_kind(&error, StateStoreErrorKind::Internal),
+                expected,
+                "SQLite result code {code}"
+            );
+        }
     }
 }
