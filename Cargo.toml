@@ -60,10 +60,11 @@ libm = "0.2"
 num-traits = "0.2"
 ordered-float = "4"
 async-trait = "0.1"
-uuid = { version = "1", features = ["v4", "v7"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
 fs2 = "0.4"
 as-any = "0.3"
 opensrv-mysql = { version = "0.7", default-features = false }
+foundationdb = { version = "=0.11.0", optional = true, default-features = false, features = ["embedded-fdb-include", "fdb-7_3"] }
 
 # starust core
 thrift = "0.17"
@@ -106,6 +107,8 @@ mockito = "1"
 syn = { version = "2", features = ["full", "visit"] }
 
 [features]
+foundationdb-provider = ["dep:foundationdb"]
+state-store-test-hooks = []
 ssb = []
 compat = []
 

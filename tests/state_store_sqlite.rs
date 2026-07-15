@@ -90,11 +90,12 @@ async fn open_store_with_limits(
 ) -> Arc<dyn StateStore> {
     open_state_store(
         StateStoreConfig {
-            provider: StateStoreProviderConfig::Sqlite,
-            path: temp.path().join("state-store.sqlite"),
             cluster_id: "cluster-a".to_owned(),
-            deployment_owner: owner.to_owned(),
             limits,
+            provider: StateStoreProviderConfig::Sqlite {
+                path: temp.path().join("state-store.sqlite"),
+                deployment_owner: owner.to_owned(),
+            },
         },
         FeDeploymentView {
             active_fe_count: NonZeroUsize::new(1).expect("one FE"),
@@ -123,10 +124,7 @@ fn conformance_factory() -> StateStoreFactory {
             let path = temp.path().join("state-store.sqlite");
             let store = open_state_store(
                 StateStoreConfig {
-                    provider: StateStoreProviderConfig::Sqlite,
-                    path: path.clone(),
                     cluster_id: "conformance-cluster".to_owned(),
-                    deployment_owner: "conformance-fe".to_owned(),
                     limits: StateStoreLimitOverrides {
                         max_key_bytes: Some(64),
                         max_value_bytes: Some(128),
@@ -135,6 +133,10 @@ fn conformance_factory() -> StateStoreFactory {
                         max_transaction_bytes: Some(1_024),
                         transaction_deadline_ms: Some(250),
                         runner_max_attempts: Some(3),
+                    },
+                    provider: StateStoreProviderConfig::Sqlite {
+                        path: path.clone(),
+                        deployment_owner: "conformance-fe".to_owned(),
                     },
                 },
                 FeDeploymentView {
@@ -532,11 +534,12 @@ mod conformance {
         let identity = first.identity().await.expect("first owner identity");
         let second = open_state_store(
             StateStoreConfig {
-                provider: StateStoreProviderConfig::Sqlite,
-                path: temp.path().join("state-store.sqlite"),
                 cluster_id: "cluster-a".to_owned(),
-                deployment_owner: "fe-b".to_owned(),
                 limits: StateStoreLimitOverrides::default(),
+                provider: StateStoreProviderConfig::Sqlite {
+                    path: temp.path().join("state-store.sqlite"),
+                    deployment_owner: "fe-b".to_owned(),
+                },
             },
             FeDeploymentView {
                 active_fe_count: NonZeroUsize::new(1).expect("one FE"),
@@ -1834,11 +1837,12 @@ async fn sqlite_concurrent_first_open_has_exactly_one_schema_owner() {
             gate.wait().await;
             open_state_store(
                 StateStoreConfig {
-                    provider: StateStoreProviderConfig::Sqlite,
-                    path,
                     cluster_id: "race-cluster".to_owned(),
-                    deployment_owner: "race-fe".to_owned(),
                     limits: StateStoreLimitOverrides::default(),
+                    provider: StateStoreProviderConfig::Sqlite {
+                        path,
+                        deployment_owner: "race-fe".to_owned(),
+                    },
                 },
                 FeDeploymentView {
                     active_fe_count: NonZeroUsize::new(1).expect("one FE"),
@@ -1883,11 +1887,12 @@ async fn sqlite_concurrent_first_open_has_exactly_one_schema_owner() {
 
     let reopened = open_state_store(
         StateStoreConfig {
-            provider: StateStoreProviderConfig::Sqlite,
-            path,
             cluster_id: "race-cluster".to_owned(),
-            deployment_owner: "race-fe".to_owned(),
             limits: StateStoreLimitOverrides::default(),
+            provider: StateStoreProviderConfig::Sqlite {
+                path,
+                deployment_owner: "race-fe".to_owned(),
+            },
         },
         FeDeploymentView {
             active_fe_count: NonZeroUsize::new(1).expect("one FE"),

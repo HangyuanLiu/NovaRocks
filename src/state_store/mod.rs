@@ -27,7 +27,7 @@ pub mod runner;
 
 mod sqlite;
 
-pub use config::{StateStoreConfig, StateStoreProviderConfig};
+pub use config::{FoundationDbClientConfig, StateStoreConfig, StateStoreProviderConfig};
 pub use contract::{
     ChangeHint, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution,
     FeDeploymentView, Key, OperationId, Precondition, RangePage, ReadTransaction, StateRecord,
@@ -46,9 +46,21 @@ pub async fn open_state_store(
     config: StateStoreConfig,
     deployment: FeDeploymentView,
 ) -> Result<Arc<dyn StateStore>, StateStoreError> {
-    match config.provider {
-        StateStoreProviderConfig::Sqlite => Ok(Arc::new(
+    match &config.provider {
+        StateStoreProviderConfig::Sqlite { .. } => Ok(Arc::new(
             sqlite::SqliteStateStore::open(config, deployment).await?,
         )),
+        StateStoreProviderConfig::Foundationdb { .. } => {
+            #[cfg(not(feature = "foundationdb-provider"))]
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::InvalidConfiguration,
+                "FoundationDB provider is not compiled in",
+            ));
+            #[cfg(feature = "foundationdb-provider")]
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::InvalidConfiguration,
+                "FoundationDB provider runtime is not configured",
+            ));
+        }
     }
 }

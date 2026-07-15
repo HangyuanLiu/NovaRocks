@@ -47,6 +47,25 @@ const FORBIDDEN_STATE_STORE_TOKENS: &[&str] = &[
 
 const SQLITE_ONLY_EXTERNAL_OWNERS: &[&str] = &["fs2", "rusqlite"];
 const SQLITE_ONLY_FFI_TOKENS: &[&str] = &["SQLITE_BUSY", "SQLITE_BUSY_SNAPSHOT"];
+const FOUNDATIONDB_EXTERNAL_OWNERS: &[&str] = &["foundationdb", "foundationdb_sys"];
+const FOUNDATIONDB_RAW_TOKENS: &[&str] = &[
+    "FdbError",
+    "FdbResult",
+    "DatabaseOption",
+    "NetworkOption",
+    "TransactionOption",
+    "MutationType",
+    "Versionstamp",
+];
+const FOUNDATIONDB_FORBIDDEN_OWNER_TOKENS: &[&str] = &[
+    "run",
+    "transact",
+    "on_error",
+    "watch",
+    "tuple",
+    "directory",
+    "fallback",
+];
 
 #[derive(Clone)]
 struct GuardSource {
@@ -73,6 +92,14 @@ fn is_connector_source(path: &str) -> bool {
 
 fn is_state_store_sqlite_source(path: &str) -> bool {
     path == "src/state_store/sqlite.rs" || path.starts_with("src/state_store/sqlite/")
+}
+
+fn is_state_store_foundationdb_source(path: &str) -> bool {
+    path.starts_with("src/state_store/foundationdb/")
+}
+
+fn is_foundationdb_native_owner(path: &str) -> bool {
+    is_state_store_foundationdb_source(path) || path == "src/state_store/runtime.rs"
 }
 
 fn path_starts_with(path: &[String], prefix: &[&str]) -> bool {
@@ -191,6 +218,61 @@ fn state_store_boundary_violations(sources: &[GuardSource]) -> Vec<String> {
                 if production_tokens.iter().any(|actual| actual == token) {
                     violations.push(format!(
                         "state-store-sqlite-ffi-outside-owner: {} -> {token}",
+                        source.path
+                    ));
+                }
+            }
+        }
+
+        if !is_foundationdb_native_owner(&source.path) {
+            for path in &paths {
+                for owner in FOUNDATIONDB_EXTERNAL_OWNERS {
+                    if let Some(owner_index) = path.iter().position(|segment| segment == owner)
+                        && (!declares_module(&production_tokens, owner)
+                            || references_absolute_or_extern_owner(&production_tokens, owner))
+                    {
+                        violations.push(format!(
+                            "state-store-foundationdb-native-outside-owner: {} -> {}",
+                            source.path,
+                            path[owner_index..].join("::")
+                        ));
+                    }
+                }
+            }
+            for owner in FOUNDATIONDB_EXTERNAL_OWNERS {
+                if production_tokens.iter().any(|token| token == owner)
+                    && (!declares_module(&production_tokens, owner)
+                        || references_absolute_or_extern_owner(&production_tokens, owner))
+                {
+                    violations.push(format!(
+                        "state-store-foundationdb-native-outside-owner: {} -> {owner}",
+                        source.path
+                    ));
+                }
+            }
+            for token in FOUNDATIONDB_RAW_TOKENS {
+                if production_tokens.iter().any(|actual| actual == token) {
+                    violations.push(format!(
+                        "state-store-foundationdb-token-outside-owner: {} -> {token}",
+                        source.path
+                    ));
+                }
+            }
+        }
+
+        if is_state_store_foundationdb_source(&source.path) {
+            for token in FOUNDATIONDB_FORBIDDEN_OWNER_TOKENS {
+                let is_member_api = matches!(*token, "run" | "transact" | "on_error");
+                let present = if is_member_api {
+                    production_tokens.windows(2).any(|tokens| {
+                        matches!(tokens[0].as_str(), "." | "::") && tokens[1] == *token
+                    })
+                } else {
+                    production_tokens.iter().any(|actual| actual == token)
+                };
+                if present {
+                    violations.push(format!(
+                        "state-store-foundationdb-forbidden-api: {} -> {token}",
                         source.path
                     ));
                 }
@@ -484,6 +566,147 @@ fn state_store_boundary_detector_allows_sqlite_external_crates_and_ffi_tokens_in
     )];
 
     assert!(state_store_boundary_violations(&sources).is_empty());
+}
+
+#[test]
+fn state_store_boundary_detector_rejects_foundationdb_native_leaks_outside_owner() {
+    let sources = [
+        GuardSource::new(
+            "src/state_store/config.rs",
+            "use foundationdb::options::NetworkOption;",
+        ),
+        GuardSource::new(
+            "src/state_store/runner.rs",
+            "extern crate foundationdb_sys as fdb; fn leak(_: FdbError) {}",
+        ),
+        GuardSource::new(
+            "src/connector/state_store.rs",
+            "use crate::safe::Versionstamp;",
+        ),
+    ];
+
+    let violations = state_store_boundary_violations(&sources);
+    for (path, token) in [
+        ("src/state_store/config.rs", "foundationdb"),
+        ("src/state_store/config.rs", "NetworkOption"),
+        ("src/state_store/runner.rs", "foundationdb_sys"),
+        ("src/state_store/runner.rs", "FdbError"),
+        ("src/connector/state_store.rs", "Versionstamp"),
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(path) && violation.contains(token)),
+            "FoundationDB native detail escaped at {path}: {token}; violations={violations:?}"
+        );
+    }
+}
+
+#[test]
+fn state_store_boundary_detector_allows_foundationdb_native_details_only_in_owner() {
+    let sources = [
+        GuardSource::new(
+            "src/state_store/foundationdb/mod.rs",
+            "use foundationdb::{Database, FdbError, options::TransactionOption};",
+        ),
+        GuardSource::new(
+            "src/state_store/runtime.rs",
+            "use foundationdb::options::NetworkOption;",
+        ),
+    ];
+
+    assert!(state_store_boundary_violations(&sources).is_empty());
+}
+
+#[test]
+fn state_store_boundary_detector_rejects_foundationdb_owner_domain_and_forbidden_apis() {
+    let sources = [
+        GuardSource::new(
+            "src/state_store/foundationdb/mod.rs",
+            "use crate::engine::Engine; fn bad(db: Database) { db.run(); db.transact(); Database::run(); }",
+        ),
+        GuardSource::new(
+            "src/state_store/foundationdb/txn.rs",
+            "fn bad(tx: Transaction) { tx.on_error(); tx.watch(); tuple(); directory(); fallback(); }",
+        ),
+    ];
+
+    let violations = state_store_boundary_violations(&sources);
+    for token in [
+        "crate::engine",
+        "run",
+        "transact",
+        "on_error",
+        "watch",
+        "tuple",
+        "directory",
+        "fallback",
+    ] {
+        assert!(
+            violations.iter().any(|violation| violation.contains(token)),
+            "forbidden FoundationDB owner token escaped: {token}; violations={violations:?}"
+        );
+    }
+}
+
+#[test]
+fn state_store_foundationdb_boundary_denylist_matches_ss2_contract() {
+    assert_eq!(
+        FOUNDATIONDB_EXTERNAL_OWNERS,
+        ["foundationdb", "foundationdb_sys"]
+    );
+    assert_eq!(
+        FOUNDATIONDB_RAW_TOKENS,
+        [
+            "FdbError",
+            "FdbResult",
+            "DatabaseOption",
+            "NetworkOption",
+            "TransactionOption",
+            "MutationType",
+            "Versionstamp",
+        ]
+    );
+    assert_eq!(
+        FOUNDATIONDB_FORBIDDEN_OWNER_TOKENS,
+        [
+            "run",
+            "transact",
+            "on_error",
+            "watch",
+            "tuple",
+            "directory",
+            "fallback",
+        ]
+    );
+}
+
+#[test]
+fn state_store_foundationdb_provider_variant_is_feature_independent() {
+    let config = src_dir().join("state_store/config.rs");
+    let syntax = syn::parse_file(&fs::read_to_string(&config).expect("read state store config"))
+        .expect("parse state store config");
+    let provider = syntax
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Enum(item) if item.ident == "StateStoreProviderConfig" => Some(item),
+            _ => None,
+        })
+        .expect("StateStoreProviderConfig must exist in production config");
+    let foundationdb = provider
+        .variants
+        .iter()
+        .find(|variant| variant.ident == "Foundationdb")
+        .expect("Foundationdb provider variant must exist when the feature is off");
+
+    assert!(
+        foundationdb
+            .attrs
+            .iter()
+            .all(|attribute| !attribute.path().is_ident("cfg")),
+        "Foundationdb config variant must not be feature-gated"
+    );
 }
 
 #[test]
