@@ -49,6 +49,57 @@ pub(super) enum CommitRegistryState {
     NotCommitted,
 }
 
+struct RecoveryReservation {
+    // Commit attempts and other resolvers only observe this InFlight entry. The blocking
+    // resolver closure that created the guard is the sole terminal publisher.
+    registry: CommitRegistry,
+    transaction_id: TransactionId,
+    active: bool,
+}
+
+impl RecoveryReservation {
+    fn new(registry: &CommitRegistry, transaction_id: TransactionId) -> Self {
+        Self {
+            registry: Arc::clone(registry),
+            transaction_id,
+            active: true,
+        }
+    }
+
+    fn publish(
+        mut self,
+        terminal: CommitRegistryState,
+    ) -> Result<CommitResolution, StateStoreError> {
+        let resolution = registry_resolution(&terminal);
+        let mut registry = lock_registry(&self.registry)?;
+        if !matches!(
+            registry.get(&self.transaction_id),
+            Some(CommitRegistryState::InFlight)
+        ) {
+            return Err(internal_error());
+        }
+        registry.insert(self.transaction_id, terminal);
+        self.active = false;
+        Ok(resolution)
+    }
+}
+
+impl Drop for RecoveryReservation {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Ok(mut registry) = self.registry.lock()
+            && matches!(
+                registry.get(&self.transaction_id),
+                Some(CommitRegistryState::InFlight)
+            )
+        {
+            registry.remove(&self.transaction_id);
+        }
+    }
+}
+
 pub(super) fn new_commit_registry() -> CommitRegistry {
     Arc::new(Mutex::new(HashMap::new()))
 }
@@ -209,29 +260,22 @@ impl SqliteStateStore {
         let test_hooks = Arc::clone(&self.test_hooks);
         let transaction_id = *transaction_id;
         tokio::task::spawn_blocking(move || {
-            let mut registry = lock_registry(&registry)?;
-            if let Some(state) = registry.get(&transaction_id).cloned() {
-                return Ok(match state {
-                    CommitRegistryState::InFlight => CommitResolution::Unresolved,
-                    CommitRegistryState::Committed(receipt) => CommitResolution::Committed(receipt),
-                    CommitRegistryState::NotCommitted => CommitResolution::NotCommitted,
-                });
-            }
+            let reservation = {
+                let mut registry_guard = lock_registry(&registry)?;
+                if let Some(state) = registry_guard.get(&transaction_id) {
+                    return Ok(registry_resolution(state));
+                }
+                registry_guard.insert(transaction_id, CommitRegistryState::InFlight);
+                RecoveryReservation::new(&registry, transaction_id)
+            };
 
-            let (resolution, terminal) = match lookup_commit(&path, transaction_id)? {
-                Some(receipt) => (
-                    CommitResolution::Committed(receipt.clone()),
-                    CommitRegistryState::Committed(receipt),
-                ),
-                None => (
-                    CommitResolution::NotCommitted,
-                    CommitRegistryState::NotCommitted,
-                ),
+            let terminal = match lookup_commit(&path, transaction_id)? {
+                Some(receipt) => CommitRegistryState::Committed(receipt),
+                None => CommitRegistryState::NotCommitted,
             };
             #[cfg(test)]
             test_hooks.pause_resolve_after_lookup();
-            registry.insert(transaction_id, terminal);
-            Ok(resolution)
+            reservation.publish(terminal)
         })
         .await
         .map_err(|_| worker_error())?
@@ -747,7 +791,7 @@ fn commit_blocking(
 
     match lookup_commit_on_connection(&state.connection, transaction_id) {
         Ok(Some(receipt)) => {
-            return rollback_outcome(state, CommitOutcome::Committed(receipt));
+            return authoritative_committed_outcome(state, receipt);
         }
         Ok(None) => {}
         Err(error) => {
@@ -1072,6 +1116,15 @@ fn rollback_outcome(state: &mut SqliteTxnState, outcome: CommitOutcome) -> Commi
     }
 }
 
+fn authoritative_committed_outcome(
+    state: &mut SqliteTxnState,
+    receipt: CommitReceipt,
+) -> CommitOutcome {
+    let _ = rollback(state);
+    state.active = false;
+    CommitOutcome::Committed(receipt)
+}
+
 enum RegisterOutcome {
     Registered,
     AlreadyCommitted(CommitReceipt),
@@ -1167,6 +1220,14 @@ fn lock_registry(
 ) -> Result<std::sync::MutexGuard<'_, HashMap<TransactionId, CommitRegistryState>>, StateStoreError>
 {
     registry.lock().map_err(|_| internal_error())
+}
+
+fn registry_resolution(state: &CommitRegistryState) -> CommitResolution {
+    match state {
+        CommitRegistryState::InFlight => CommitResolution::Unresolved,
+        CommitRegistryState::Committed(receipt) => CommitResolution::Committed(receipt.clone()),
+        CommitRegistryState::NotCommitted => CommitResolution::NotCommitted,
+    }
 }
 
 fn is_busy_snapshot(error: &rusqlite::Error) -> bool {
@@ -1876,7 +1937,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sqlite_transaction_resolver_race_never_reverses_not_committed() {
+    async fn sqlite_transaction_recovery_reservation_rejects_commit_without_blocking_publish() {
         let temp = TempDir::new().expect("temp dir");
         let store = store(&temp).await;
         let raced_id = transaction_id();
@@ -1900,7 +1961,16 @@ mod tests {
         let resolver = tokio::spawn(async move { resolver_store.resolve_commit(&raced_id).await });
         resolver_gate.wait_reached().await;
 
-        let commit = tokio::spawn(async move { transaction.commit().await });
+        let second_resolver_store = Arc::clone(&store);
+        let mut second_resolver =
+            tokio::spawn(async move { second_resolver_store.resolve_commit(&raced_id).await });
+        let mut commit = tokio::spawn(async move { transaction.commit().await });
+        let prepublish = tokio::time::timeout(Duration::from_secs(1), async {
+            let second_resolution = (&mut second_resolver).await;
+            let commit_outcome = (&mut commit).await;
+            (second_resolution, commit_outcome)
+        })
+        .await;
         resolver_gate.release().await;
         assert_eq!(
             resolver
@@ -1909,11 +1979,25 @@ mod tests {
                 .expect("resolve raced transaction"),
             CommitResolution::NotCommitted
         );
-        match commit.await.expect("commit task") {
-            CommitOutcome::DefiniteFailure(error) => {
-                assert_eq!(error.kind(), StateStoreErrorKind::InvalidRequest)
+        let (second_resolution, commit_outcome) = match prepublish {
+            Ok(results) => results,
+            Err(_) => {
+                let _ = second_resolver.await;
+                let _ = commit.await;
+                panic!("resolver reservation blocked concurrent registry operations")
             }
-            other => panic!("expected terminal id rejection, got {other:?}"),
+        };
+        assert_eq!(
+            second_resolution
+                .expect("second resolver task")
+                .expect("resolve recovery reservation"),
+            CommitResolution::Unresolved
+        );
+        match commit_outcome.expect("commit task") {
+            CommitOutcome::CommitUnknown(error) => {
+                assert_eq!(error.kind(), StateStoreErrorKind::Conflict)
+            }
+            other => panic!("expected uncertain recovery-reservation rejection, got {other:?}"),
         }
         assert_eq!(read_value(&store, &item).await, None);
         assert_eq!(
@@ -1985,6 +2069,130 @@ mod tests {
                 .expect("resolve committed transaction"),
             CommitResolution::Committed(receipt)
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sqlite_transaction_cancelled_commit_worker_rolls_back_before_not_committed() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = store(&temp).await;
+        let cancelled_id = transaction_id();
+        let cancelled_key = key(b"cancelled-commit");
+        let durable_before = durable_counts(&store).await;
+        let mut transaction = store
+            .begin_write(cancelled_id)
+            .await
+            .expect("begin transaction");
+        transaction
+            .put(
+                cancelled_key.clone(),
+                value(b"must-not-apply"),
+                Precondition::Any,
+            )
+            .await
+            .expect("stage transaction");
+
+        let commit_gate = TestGate::new();
+        *store
+            .test_hooks
+            .commit_after_inflight
+            .lock()
+            .expect("commit test hook") = Some(commit_gate.clone());
+        let commit = tokio::spawn(async move { transaction.commit().await });
+        commit_gate.wait_reached().await;
+        commit.abort();
+        assert!(
+            commit
+                .await
+                .expect_err("commit task must be cancelled")
+                .is_cancelled(),
+            "commit task cancellation must drop the commit future"
+        );
+        assert_eq!(
+            store
+                .resolve_commit(&cancelled_id)
+                .await
+                .expect("resolve paused cancelled commit"),
+            CommitResolution::Unresolved
+        );
+
+        commit_gate.release().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match store
+                    .resolve_commit(&cancelled_id)
+                    .await
+                    .expect("resolve cancelled commit")
+                {
+                    CommitResolution::Unresolved => tokio::task::yield_now().await,
+                    CommitResolution::NotCommitted => break,
+                    CommitResolution::Committed(receipt) => {
+                        panic!("cancelled commit became committed: {receipt:?}")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("cancelled commit must reach a terminal state");
+
+        assert_eq!(read_value(&store, &cancelled_key).await, None);
+        assert_eq!(durable_counts(&store).await, durable_before);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sqlite_transaction_authoritative_receipt_survives_cleanup_failure() {
+        let temp = TempDir::new().expect("temp dir");
+        let duplicate_id = transaction_id();
+        let duplicate_key = key(b"cleanup-failure");
+        let initial_store = store(&temp).await;
+        let mut original = initial_store
+            .begin_write(duplicate_id)
+            .await
+            .expect("begin original transaction");
+        original
+            .put(key(b"committed"), value(b"value"), Precondition::Any)
+            .await
+            .expect("stage original transaction");
+        let original_receipt = committed(original.commit().await);
+        let durable_before = durable_counts(&initial_store).await;
+        drop(initial_store);
+
+        let reopened = store(&temp).await;
+        let mut duplicate = reopened
+            .begin_write(duplicate_id)
+            .await
+            .expect("begin duplicate transaction");
+        duplicate
+            .put(
+                duplicate_key.clone(),
+                value(b"must-not-apply"),
+                Precondition::Any,
+            )
+            .await
+            .expect("stage duplicate transaction");
+        let duplicate_state = Arc::clone(
+            &duplicate
+                .owner()
+                .expect("duplicate transaction owner")
+                .state,
+        );
+        tokio::task::spawn_blocking(move || {
+            let state = duplicate_state.lock().expect("duplicate transaction state");
+            state
+                .connection
+                .execute_batch("ROLLBACK")
+                .expect("force cleanup failure precondition");
+            assert!(state.active, "test must leave the owner marked active");
+        })
+        .await
+        .expect("cleanup fault worker");
+
+        assert_eq!(
+            committed(duplicate.commit().await),
+            original_receipt,
+            "the authoritative ledger receipt must survive cleanup failure"
+        );
+        assert_eq!(read_value(&reopened, &duplicate_key).await, None);
+        assert_eq!(durable_counts(&reopened).await, durable_before);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
