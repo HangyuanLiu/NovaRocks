@@ -814,11 +814,38 @@ impl TopNHeapAdapter {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IndependentOrder {
+    AscNullsLast,
+    DescNullsFirst,
+}
+
+impl IndependentOrder {
+    const fn direction(self) -> SortDirection {
+        match self {
+            Self::AscNullsLast => SortDirection::Ascending,
+            Self::DescNullsFirst => SortDirection::Descending,
+        }
+    }
+
+    const fn null_order(self) -> NullOrder {
+        match self {
+            Self::AscNullsLast => NullOrder::Last,
+            Self::DescNullsFirst => NullOrder::First,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExpectedBound(Option<i64>);
+
 struct TopNCase {
+    order: IndependentOrder,
     contract: Arc<RuntimeOrderContract>,
+    raw_values: Vec<Option<i64>>,
     rows: Vec<OrderedTuple>,
-    final_topn: Vec<OrderedTuple>,
-    expected_publications: Vec<bool>,
+    final_topn_values: Vec<Option<i64>>,
+    expected_bounds: Vec<Option<ExpectedBound>>,
 }
 
 fn tuple(contract: &RuntimeOrderContract, value: Option<i64>) -> OrderedTuple {
@@ -826,69 +853,95 @@ fn tuple(contract: &RuntimeOrderContract, value: Option<i64>) -> OrderedTuple {
         .expect("finite TopN sample matches the Int64 order contract")
 }
 
-fn oracle_topn(
-    contract: &RuntimeOrderContract,
-    rows: &[OrderedTuple],
-    k: usize,
-) -> Vec<OrderedTuple> {
+fn independent_ordering(
+    order: IndependentOrder,
+    left: &Option<i64>,
+    right: &Option<i64>,
+) -> Ordering {
+    match order {
+        IndependentOrder::AscNullsLast => match (left, right) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(left), Some(right)) => left.cmp(right),
+        },
+        IndependentOrder::DescNullsFirst => match (left, right) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Less,
+            (Some(_), None) => Ordering::Greater,
+            (Some(left), Some(right)) => right.cmp(left),
+        },
+    }
+}
+
+fn independent_topn(order: IndependentOrder, rows: &[Option<i64>], k: usize) -> Vec<Option<i64>> {
     let mut ranked = rows.to_vec();
-    ranked.sort_by(|left, right| {
-        contract
-            .compare(left, right)
-            .expect("oracle rows match their runtime order contract")
-    });
+    ranked.sort_by(|left, right| independent_ordering(order, left, right));
     ranked.truncate(k);
     ranked
 }
 
-fn oracle_publication_schedule(
-    contract: &RuntimeOrderContract,
-    rows: &[OrderedTuple],
+fn independent_publication_bounds(
+    order: IndependentOrder,
+    rows: &[Option<i64>],
     k: usize,
-) -> Vec<bool> {
+) -> Vec<Option<ExpectedBound>> {
     let mut prefix = Vec::with_capacity(rows.len());
-    let mut previous_bound: Option<OrderedTuple> = None;
+    let mut previous_bound: Option<Option<i64>> = None;
     rows.iter()
         .map(|row| {
-            prefix.push(row.clone());
-            let ranked = oracle_topn(contract, &prefix, k);
-            let Some(bound) = ranked.get(k - 1).cloned() else {
-                return false;
+            prefix.push(*row);
+            let ranked = independent_topn(order, &prefix, k);
+            let Some(bound) = ranked.get(k - 1).copied() else {
+                return None;
             };
             let publish = previous_bound.as_ref().is_none_or(|previous| {
-                contract.compare(&bound, previous).unwrap() == Ordering::Less
+                independent_ordering(order, &bound, previous) == Ordering::Less
             });
             previous_bound = Some(bound);
-            publish
+            publish.then_some(ExpectedBound(bound))
         })
         .collect()
 }
 
-fn topn_case(
-    direction: SortDirection,
-    null_order: NullOrder,
-    values: impl IntoIterator<Item = Option<i64>>,
-) -> TopNCase {
-    let (_, contract) = order_plan(direction, null_order);
-    let rows = values
-        .into_iter()
+fn topn_case(order: IndependentOrder, values: impl IntoIterator<Item = Option<i64>>) -> TopNCase {
+    let (_, contract) = order_plan(order.direction(), order.null_order());
+    let raw_values = values.into_iter().collect::<Vec<_>>();
+    let rows = raw_values
+        .iter()
+        .copied()
         .map(|value| tuple(&contract, value))
         .collect::<Vec<_>>();
-    let final_topn = oracle_topn(&contract, &rows, 3);
-    let expected_publications = oracle_publication_schedule(&contract, &rows, 3);
+    let final_topn_values = independent_topn(order, &raw_values, 3);
+    let expected_bounds = independent_publication_bounds(order, &raw_values, 3);
     TopNCase {
+        order,
         contract,
+        raw_values,
         rows,
-        final_topn,
-        expected_publications,
+        final_topn_values,
+        expected_bounds,
+    }
+}
+
+fn lcg_next(state: &mut u64) -> u64 {
+    *state = state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    *state
+}
+
+fn lcg_shuffle<T>(state: &mut u64, values: &mut [T]) {
+    for upper in (1..values.len()).rev() {
+        let index = (lcg_next(state) % (upper as u64 + 1)) as usize;
+        values.swap(upper, index);
     }
 }
 
 fn topn_cases_with_fixed_seed() -> Vec<TopNCase> {
     let mut cases = vec![
         topn_case(
-            SortDirection::Ascending,
-            NullOrder::Last,
+            IndependentOrder::AscNullsLast,
             [
                 Some(30),
                 Some(20),
@@ -902,8 +955,7 @@ fn topn_cases_with_fixed_seed() -> Vec<TopNCase> {
             ],
         ),
         topn_case(
-            SortDirection::Descending,
-            NullOrder::First,
+            IndependentOrder::DescNullsFirst,
             [
                 Some(10),
                 Some(20),
@@ -918,51 +970,126 @@ fn topn_cases_with_fixed_seed() -> Vec<TopNCase> {
         ),
     ];
     let mut state = 0x4d59_5df4_d0f3_3173_u64;
-    for index in 0..62 {
-        state = state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        let base = ((state >> 32) % 20_000) as i64 - 10_000;
+    for index in 0..64 {
+        let base = ((lcg_next(&mut state) >> 32) % 20_000) as i64 - 10_000;
+        let mode = index % 4;
         if index % 2 == 0 {
-            cases.push(topn_case(
-                SortDirection::Ascending,
-                NullOrder::Last,
-                [
-                    Some(base + 30),
-                    Some(base + 20),
-                    Some(base + 10),
-                    Some(base + 100),
-                    Some(base + 30),
-                    Some(base + 5),
-                    Some(base + 20),
-                    Some(base + 1),
-                ],
-            ));
+            let mut initial = vec![Some(base + 30), Some(base + 20), Some(base + 10)];
+            lcg_shuffle(&mut state, &mut initial);
+            let mut tail = vec![Some(base + 5), Some(base + 1)];
+            match mode {
+                0 => tail.extend([Some(base + 100), Some(base + 30)]),
+                1 => tail.extend([None, Some(base + 100), Some(base + 20)]),
+                2 => tail.extend([Some(base + 80), Some(base + 70)]),
+                3 => tail.extend([None, None, Some(base + 10), Some(base + 90)]),
+                _ => unreachable!(),
+            }
+            lcg_shuffle(&mut state, &mut tail);
+            initial.extend(tail);
+            cases.push(topn_case(IndependentOrder::AscNullsLast, initial));
         } else {
-            cases.push(topn_case(
-                SortDirection::Descending,
-                NullOrder::First,
-                [
-                    Some(base + 10),
-                    Some(base + 20),
-                    Some(base + 30),
-                    Some(base - 100),
-                    Some(base + 10),
-                    Some(base + 40),
-                    Some(base + 20),
-                    Some(base + 50),
-                ],
-            ));
+            let mut initial = vec![Some(base + 10), Some(base + 20), Some(base + 30)];
+            lcg_shuffle(&mut state, &mut initial);
+            let mut tail = vec![Some(base + 40), Some(base + 50)];
+            match mode {
+                0 => tail.extend([Some(base - 100), Some(base + 10)]),
+                1 => tail.extend([None, Some(base - 100), Some(base + 20)]),
+                2 => tail.extend([Some(base - 80), Some(base - 70)]),
+                3 => tail.extend([None, None, Some(base + 30), Some(base - 90)]),
+                _ => unreachable!(),
+            }
+            lcg_shuffle(&mut state, &mut tail);
+            initial.extend(tail);
+            cases.push(topn_case(IndependentOrder::DescNullsFirst, initial));
         }
     }
-    assert_eq!(cases.len(), 64);
+    assert_eq!(cases.len(), 66);
     cases
+}
+
+fn relative_value_pattern(values: &[Option<i64>]) -> Vec<Option<usize>> {
+    let unique = values
+        .iter()
+        .flatten()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    values
+        .iter()
+        .map(|value| value.map(|value| unique.binary_search(&value).unwrap()))
+        .collect()
+}
+
+fn published_expected_bounds(case: &TopNCase) -> Vec<Option<i64>> {
+    case.expected_bounds
+        .iter()
+        .flatten()
+        .map(|bound| bound.0)
+        .collect()
+}
+
+fn assert_fixed_seed_case_diversity(cases: &[TopNCase]) {
+    assert_eq!(cases.len(), 66, "two fixed plus 64 LCG-generated cases");
+    assert_eq!(cases[0].final_topn_values, vec![Some(1), Some(5), Some(10)]);
+    assert_eq!(
+        published_expected_bounds(&cases[0]),
+        vec![Some(30), Some(20), Some(10)]
+    );
+    assert_eq!(cases[1].final_topn_values, vec![None, Some(50), Some(40)]);
+    assert_eq!(
+        published_expected_bounds(&cases[1]),
+        vec![Some(10), Some(20), Some(30), Some(40)]
+    );
+
+    let generated = &cases[2..];
+    assert_eq!(generated.len(), 64);
+    assert!(generated.iter().any(|case| case.raw_values.contains(&None)));
+    assert!(
+        generated
+            .iter()
+            .any(|case| !case.raw_values.contains(&None))
+    );
+    assert!(generated.iter().any(|case| {
+        let mut seen = BTreeSet::new();
+        case.raw_values.iter().any(|value| !seen.insert(*value))
+    }));
+    assert!(generated.iter().any(|case| {
+        let mut seen = BTreeSet::new();
+        case.raw_values.iter().all(|value| seen.insert(*value))
+    }));
+    assert!(generated.iter().all(|case| {
+        case.expected_bounds
+            .iter()
+            .filter(|bound| bound.is_some())
+            .count()
+            >= 3
+    }));
+
+    let relative_patterns = generated
+        .iter()
+        .map(|case| relative_value_pattern(&case.raw_values))
+        .collect::<BTreeSet<_>>();
+    let tightening_cadences = generated
+        .iter()
+        .map(|case| {
+            case.expected_bounds
+                .iter()
+                .enumerate()
+                .filter_map(|(index, bound)| bound.map(|_| index))
+                .collect::<Vec<_>>()
+        })
+        .collect::<BTreeSet<_>>();
+    assert!(relative_patterns.len() >= 16);
+    assert!(tightening_cadences.len() >= 8);
 }
 
 fn assert_bound_is_sound_for_final_topn(
     live: &Arc<dyn NonBlockingLiveSubscription>,
     version: LogicalVersion,
-    final_topn: &[OrderedTuple],
+    order: IndependentOrder,
+    expected_bound: ExpectedBound,
+    final_topn: &[Option<i64>],
 ) -> Arc<ArtifactBundle> {
     let LivePollOutcome::Updated {
         bundle,
@@ -976,14 +1103,46 @@ fn assert_bound_is_sound_for_final_topn(
         panic!("ordered TopN must materialize exactly one Range artifact")
     };
     let range = artifact.range().expect("Range leaf owns ordered data");
+    let [actual_bound] = range.bound().values() else {
+        panic!("TopN fixture expects a single-key Range bound")
+    };
+    let actual_bound = match actual_bound {
+        None => None,
+        Some(OrderedScalar::Int64(value)) => Some(*value),
+        Some(_) => panic!("TopN fixture expects an Int64 Range bound"),
+    };
+    assert_eq!(actual_bound, expected_bound.0);
+    let [key] = range.contract().keys() else {
+        panic!("TopN fixture expects a single-key order contract")
+    };
+    assert_eq!(key.direction(), order.direction());
+    assert_eq!(key.null_order(), order.null_order());
     for row in final_topn {
-        assert_ne!(
-            range.contract().compare(row, range.bound()).unwrap(),
-            Ordering::Greater,
+        assert!(
+            independent_bound_survives(order, *row, actual_bound),
             "visible TopN bound must not eliminate a row in the final TopN"
         );
     }
     bundle
+}
+
+fn independent_bound_survives(
+    order: IndependentOrder,
+    row: Option<i64>,
+    bound: Option<i64>,
+) -> bool {
+    match order {
+        IndependentOrder::AscNullsLast => match (row, bound) {
+            (_, None) => true,
+            (None, Some(_)) => false,
+            (Some(row), Some(bound)) => row <= bound,
+        },
+        IndependentOrder::DescNullsFirst => match (row, bound) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(row), Some(bound)) => row >= bound,
+        },
+    }
 }
 
 fn assert_immutable_version_history(
@@ -1031,11 +1190,12 @@ impl TopKSummaryHarness {
         instance: UniqueId,
         values: &[i64],
     ) -> Result<SubmitOutcome, RuntimeContractViolation> {
-        let mut candidates = values
+        let mut values = values.to_vec();
+        values.sort_unstable();
+        let candidates = values
             .iter()
             .map(|value| tuple(self.contract.order(), Some(*value)))
             .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| self.contract.order().compare(left, right).unwrap());
         self.producer(binding, instance).submit_summary(
             PartitionId::new(0),
             ProducerSequence::new(0),
@@ -1122,12 +1282,19 @@ fn assert_sound_topk_bound(bundle: &ArtifactBundle, final_topk: &[i64]) {
     let [Some(OrderedScalar::Int64(actual_bound))] = range.bound().values() else {
         panic!("TopKSummary fixture expects one non-null Int64 bound")
     };
+    let [key] = range.contract().keys() else {
+        panic!("TopKSummary fixture expects a single-key order contract")
+    };
+    assert_eq!(key.direction(), SortDirection::Ascending);
+    assert_eq!(key.null_order(), NullOrder::Last);
     assert_eq!(Some(actual_bound), final_topk.last());
     for value in final_topk {
-        let row = tuple(range.contract(), Some(*value));
-        assert_ne!(
-            range.contract().compare(&row, range.bound()).unwrap(),
-            Ordering::Greater,
+        assert!(
+            independent_bound_survives(
+                IndependentOrder::AscNullsLast,
+                Some(*value),
+                Some(*actual_bound),
+            ),
             "merged TopK bound must not eliminate a final TopK row"
         );
     }
@@ -1179,11 +1346,13 @@ fn m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_art
 
 #[test]
 fn m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds() {
-    for case in topn_cases_with_fixed_seed() {
+    let cases = topn_cases_with_fixed_seed();
+    assert_fixed_seed_case_diversity(&cases);
+    for case in cases {
         let harness = direct_topn_harness(case.contract.clone());
         let mut adapter = TopNHeapAdapter::new(3, case.contract.clone(), harness.producer.clone());
-        assert!(!case.expected_publications[0]);
-        assert!(!case.expected_publications[1]);
+        assert!(case.expected_bounds[0].is_none());
+        assert!(case.expected_bounds[1].is_none());
         assert!(adapter.push(case.rows[0].clone()).unwrap().is_none());
         assert!(adapter.push(case.rows[1].clone()).unwrap().is_none());
         assert!(matches!(
@@ -1193,10 +1362,16 @@ fn m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bound
         let mut observed = Vec::new();
         for (index, row) in case.rows.into_iter().enumerate().skip(2) {
             let published = adapter.push(row).unwrap();
-            assert_eq!(published.is_some(), case.expected_publications[index]);
+            assert_eq!(published.is_some(), case.expected_bounds[index].is_some());
             if let Some(version) = published {
-                let bundle =
-                    assert_bound_is_sound_for_final_topn(&harness.live, version, &case.final_topn);
+                let bundle = assert_bound_is_sound_for_final_topn(
+                    &harness.live,
+                    version,
+                    case.order,
+                    case.expected_bounds[index]
+                        .expect("an expected publication carries its independent oracle bound"),
+                    &case.final_topn_values,
+                );
                 observed.push((bundle.clone(), bundle.version(), bundle.canonical_digest()));
             }
         }
