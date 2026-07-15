@@ -1382,6 +1382,39 @@ impl RuntimeFilterChannel {
         Ok(locked.finish())
     }
 
+    pub(crate) fn reject_ordered_submit_resource_exhausted(
+        &self,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        partition_id: PartitionId,
+        sequence: ProducerSequence,
+        update: &OrderedBoundUpdate,
+    ) -> Result<ChannelAction, RuntimeContractViolation> {
+        let stream_id = ProducerStreamId::new(binding_id, fragment_instance_id, partition_id);
+        let mut state = self.state.lock().unwrap();
+        partition_state(&state, binding_id, fragment_instance_id, partition_id)?;
+        let ordered = state.ordered.as_ref().ok_or_else(|| {
+            violation(
+                RuntimeContractViolationKind::ProducerPortMismatch,
+                "membership channel cannot accept ordered bounds",
+            )
+        })?;
+        ordered
+            .reducer
+            .validate_tombstone_update(stream_id, sequence, update)?;
+        if !matches!(state.terminal, ChannelTerminal::Collecting) {
+            return Ok(terminal_action_from_state(&state));
+        }
+        let locked = self.make_ordered_unavailable_or_degraded(
+            &mut state,
+            UnavailableReason::ResourceLimit,
+            SubmitOutcome::TerminalNoop,
+            Vec::new(),
+        );
+        drop(state);
+        Ok(locked.finish())
+    }
+
     pub(crate) fn resource_exhausted(&self) -> ChannelAction {
         let mut state = self.state.lock().unwrap();
         if !matches!(state.terminal, ChannelTerminal::Collecting) {

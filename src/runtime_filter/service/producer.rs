@@ -170,11 +170,29 @@ impl OrderedBoundProducerAdapter for ServiceProducerAdapter {
         self.channel
             .authorize_submit(self.binding_id, self.fragment_instance_id, partition_id)?;
         let Some(bytes) = update.canonical_contribution_bytes() else {
-            return self.finish(self.channel.resource_exhausted());
+            return self
+                .channel
+                .reject_ordered_submit_resource_exhausted(
+                    self.binding_id,
+                    self.fragment_instance_id,
+                    partition_id,
+                    sequence,
+                    &update,
+                )
+                .and_then(|action| self.finish(action));
         };
         let Ok(lease) = TemporaryContributionLease::try_new(self.memory_account.clone(), bytes)
         else {
-            return self.finish(self.channel.resource_exhausted());
+            return self
+                .channel
+                .reject_ordered_submit_resource_exhausted(
+                    self.binding_id,
+                    self.fragment_instance_id,
+                    partition_id,
+                    sequence,
+                    &update,
+                )
+                .and_then(|action| self.finish(action));
         };
         self.channel
             .submit_ordered(

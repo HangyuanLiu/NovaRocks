@@ -1200,7 +1200,8 @@ mod tests {
     use crate::runtime_filter::port::identity::*;
     use crate::runtime_filter::port::install::*;
     use crate::runtime_filter::port::ordered_bound::{
-        COMPARATOR_ALGORITHM_VERSION, RuntimeOrderContract, comparator_digest_for_test,
+        COMPARATOR_ALGORITHM_VERSION, OrderedBoundUpdate, OrderedScalar, OrderedTuple,
+        RuntimeOrderContract, comparator_digest_for_test,
     };
     use crate::runtime_filter::port::producer::{
         InstallOutcome, ProducerAdapter, ProducerHandle, ProducerPortKind,
@@ -1396,6 +1397,27 @@ mod tests {
         armed: AtomicBool,
         armed_calls: AtomicUsize,
         current: AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct ArmableRejectingMemoryAccount {
+        armed: AtomicBool,
+        current: AtomicUsize,
+    }
+
+    impl RuntimeFilterMemoryAccount for ArmableRejectingMemoryAccount {
+        fn try_consume(&self, bytes: usize) -> Result<(), MemoryAccountError> {
+            if self.armed.load(Ordering::SeqCst) {
+                return Err(MemoryAccountError::CapacityExceeded);
+            }
+            self.current.fetch_add(bytes, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn release(&self, bytes: usize) {
+            let previous = self.current.fetch_sub(bytes, Ordering::SeqCst);
+            assert!(previous >= bytes);
+        }
     }
 
     impl RuntimeFilterMemoryAccount for PanicWhenArmedMemoryAccount {
@@ -1659,7 +1681,22 @@ mod tests {
     }
 
     fn installed_ordered_service_fixture() -> Arc<RuntimeFilterService> {
-        let fixture = fixture();
+        installed_ordered_service_with_account(MemTrackerMemoryAccount::new_root_for_test(
+            "ordered-runtime-filter-test-query",
+        ))
+        .0
+    }
+
+    fn installed_ordered_service_with_account(
+        memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
+    ) -> (Arc<RuntimeFilterService>, Arc<RuntimeOrderContract>) {
+        let started = Instant::now();
+        let service = Arc::new(RuntimeFilterService::new_with_dependencies(
+            uid(0),
+            Arc::new(Clock(started)),
+            Arc::new(Events::default()),
+            memory_account,
+        ));
         let keys = vec![OrderKeyContract {
             data_type: DataType::Int64,
             direction: SortDirection::Ascending,
@@ -1670,7 +1707,8 @@ mod tests {
             keys,
             inclusive: true,
         };
-        let order_digest = RuntimeOrderContract::try_from_plan(&plan).unwrap().digest();
+        let contract = Arc::new(RuntimeOrderContract::try_from_plan(&plan).unwrap());
+        let order_digest = contract.digest();
         let witness = CoverageWitnessId::new(1);
         let channel = RuntimeFilterChannelDeployment::new(
             ChannelId::new(1),
@@ -1709,8 +1747,16 @@ mod tests {
                 ),
             )]),
         );
-        fixture.service.install(view([channel])).unwrap();
-        fixture.service
+        service.install(view([channel])).unwrap();
+        (service, contract)
+    }
+
+    fn ordered_update(contract: &RuntimeOrderContract, value: i64) -> OrderedBoundUpdate {
+        OrderedBoundUpdate::new(
+            contract,
+            OrderedTuple::try_new(contract, [Some(OrderedScalar::Int64(value))]).unwrap(),
+        )
+        .unwrap()
     }
 
     fn install_one(fixture: &Fixture) {
@@ -4529,6 +4575,125 @@ mod tests {
                 .unwrap()
                 .kind(),
             RuntimeContractViolationKind::ConsumerPortMismatch
+        );
+    }
+
+    #[test]
+    fn ordered_rejected_lease_preserves_terminal_range_violation_precedence() {
+        let account = Arc::new(ArmableRejectingMemoryAccount::default());
+        let (service, contract) = installed_ordered_service_with_account(account.clone());
+        let ProducerHandle::OrderedBound(producer) = service
+            .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+            .unwrap()
+        else {
+            panic!("ordered fixture must return ordered producer")
+        };
+        assert_eq!(
+            producer
+                .submit_bound(
+                    PartitionId::new(0),
+                    ProducerSequence::new(0),
+                    ordered_update(&contract, 40),
+                )
+                .unwrap(),
+            SubmitOutcome::Published
+        );
+        assert_eq!(
+            producer
+                .close_partition(PartitionId::new(0), ProducerSequence::new(1))
+                .unwrap(),
+            SubmitOutcome::Completed
+        );
+        account.armed.store(true, Ordering::SeqCst);
+
+        let error = producer
+            .submit_bound(
+                PartitionId::new(0),
+                ProducerSequence::new(1),
+                ordered_update(&contract, 30),
+            )
+            .err()
+            .expect("terminal-range violation must precede rejected temporary lease");
+        assert_eq!(
+            error.kind(),
+            RuntimeContractViolationKind::SequenceOutsideTerminalRange
+        );
+    }
+
+    #[test]
+    fn ordered_rejected_lease_preserves_replay_and_contract_violation_precedence() {
+        let account = Arc::new(ArmableRejectingMemoryAccount::default());
+        let (service, contract) = installed_ordered_service_with_account(account.clone());
+        let ProducerHandle::OrderedBound(producer) = service
+            .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+            .unwrap()
+        else {
+            panic!("ordered fixture must return ordered producer")
+        };
+        assert_eq!(
+            producer
+                .submit_bound(
+                    PartitionId::new(0),
+                    ProducerSequence::new(0),
+                    ordered_update(&contract, 40),
+                )
+                .unwrap(),
+            SubmitOutcome::Published
+        );
+        let retained_before = account.current.load(Ordering::SeqCst);
+        account.armed.store(true, Ordering::SeqCst);
+
+        let replay_error = producer
+            .submit_bound(
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                ordered_update(&contract, 30),
+            )
+            .err()
+            .expect("conflicting replay must precede rejected temporary lease");
+        assert_eq!(
+            replay_error.kind(),
+            RuntimeContractViolationKind::ConflictingReplay
+        );
+
+        let mismatched_keys = vec![OrderKeyContract {
+            data_type: DataType::Int64,
+            direction: SortDirection::Descending,
+            null_order: NullOrder::Last,
+        }];
+        let mismatched_contract = RuntimeOrderContract::try_from_plan(&OrderContract {
+            comparator_digest: comparator_digest_for_test(
+                &mismatched_keys,
+                COMPARATOR_ALGORITHM_VERSION,
+            ),
+            keys: mismatched_keys,
+            inclusive: true,
+        })
+        .unwrap();
+        let contract_error = producer
+            .submit_bound(
+                PartitionId::new(0),
+                ProducerSequence::new(1),
+                ordered_update(&mismatched_contract, 30),
+            )
+            .err()
+            .expect("order-contract violation must precede rejected temporary lease");
+        assert_eq!(
+            contract_error.kind(),
+            RuntimeContractViolationKind::OrderedContractMismatch
+        );
+        assert_eq!(account.current.load(Ordering::SeqCst), retained_before);
+
+        account.armed.store(false, Ordering::SeqCst);
+        assert_eq!(
+            producer
+                .submit_bound(
+                    PartitionId::new(0),
+                    ProducerSequence::new(1),
+                    ordered_update(&contract, 40),
+                )
+                .unwrap(),
+            SubmitOutcome::SequenceAdvancedEqual
         );
     }
 }
