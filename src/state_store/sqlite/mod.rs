@@ -203,23 +203,37 @@ fn canonicalize_database_path(path: &Path) -> Result<PathBuf, StateStoreError> {
     Ok(canonical_parent.join(file_name))
 }
 
-#[cfg(unix)]
 fn database_path_bytes(path: &Path) -> Result<Vec<u8>, StateStoreError> {
-    use std::os::unix::ffi::OsStrExt;
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
 
-    Ok(path.as_os_str().as_bytes().to_vec())
-}
+        let native_path = path.as_os_str().as_bytes();
+        let mut encoded = Vec::with_capacity(b"unix\0".len() + native_path.len());
+        encoded.extend_from_slice(b"unix\0");
+        encoded.extend_from_slice(native_path);
+        return Ok(encoded);
+    }
 
-#[cfg(not(unix))]
-fn database_path_bytes(path: &Path) -> Result<Vec<u8>, StateStoreError> {
-    path.to_str()
-        .map(|path| path.as_bytes().to_vec())
-        .ok_or_else(|| {
-            StateStoreError::new(
-                StateStoreErrorKind::InvalidConfiguration,
-                "SQLite state store database path is not valid UTF-8",
-            )
-        })
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        let mut encoded = b"windows-utf16le\0".to_vec();
+        for code_unit in path.as_os_str().encode_wide() {
+            encoded.extend_from_slice(&code_unit.to_le_bytes());
+        }
+        return Ok(encoded);
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(StateStoreError::new(
+            StateStoreErrorKind::InvalidConfiguration,
+            "SQLite state store native path identity encoding is unsupported on this target",
+        ))
+    }
 }
 
 fn acquire_owner_lock(path: &Path) -> Result<File, StateStoreError> {
@@ -299,12 +313,17 @@ fn sqlite_error_kind(
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::io::ErrorKind;
     use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
 
     #[cfg(unix)]
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
+    #[cfg(windows)]
+    use std::os::windows::ffi::OsStringExt;
 
     use bytes::Bytes;
     use rusqlite::{Connection, OptionalExtension, ffi, params};
@@ -525,6 +544,77 @@ mod tests {
             .expect("restart after lock release");
 
         assert_eq!(restarted.identity_snapshot(), &first_identity);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_open_preserves_tagged_non_utf8_native_path_identity() {
+        let temp = TempDir::new().expect("temp dir");
+        let file_name = OsString::from_vec(b"state-store-\xff.sqlite".to_vec());
+        let path = temp.path().join(file_name);
+        let canonical_path = canonicalize_database_path(&path).expect("canonical database path");
+        let mut expected = b"unix\0".to_vec();
+        expected.extend_from_slice(canonical_path.as_os_str().as_bytes());
+
+        assert_eq!(database_path_bytes(&canonical_path).unwrap(), expected);
+
+        match OpenOptions::new().create_new(true).write(true).open(&path) {
+            Ok(probe) => {
+                drop(probe);
+                fs::remove_file(&path).expect("remove native-path filesystem probe");
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+                ) || error.raw_os_error() == Some(libc::EILSEQ) =>
+            {
+                eprintln!(
+                    "skipping non-UTF-8 SQLite open roundtrip: filesystem rejected native path: {error}"
+                );
+                return;
+            }
+            Err(error) => panic!("probe non-UTF-8 native path support: {error}"),
+        }
+
+        let runtime = runtime();
+        let first = runtime
+            .block_on(SqliteStateStore::open(
+                config(&path, "cluster-a", "fe-a"),
+                deployment(1),
+            ))
+            .expect("open SQLite database with non-UTF-8 path");
+        let first_identity = first.identity_snapshot().clone();
+        let connection = open_connection(&first.path).expect("reopen non-UTF-8 database path");
+        let stored_path: Vec<u8> = connection
+            .query_row(
+                "SELECT value FROM state_store_meta WHERE key = ?1",
+                params![b"database_path".as_slice()],
+                |row| row.get(0),
+            )
+            .expect("database path identity row");
+        assert_eq!(stored_path, expected);
+        drop(connection);
+        drop(first);
+
+        let restarted = runtime
+            .block_on(SqliteStateStore::open(
+                config(&path, "cluster-a", "fe-a"),
+                deployment(1),
+            ))
+            .expect("restart SQLite database with non-UTF-8 path");
+        assert_eq!(restarted.identity_snapshot(), &first_identity);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sqlite_path_identity_encodes_unpaired_surrogate_as_tagged_utf16le() {
+        let path = PathBuf::from(OsString::from_wide(&[0x0061, 0xd800, 0x0062]));
+
+        assert_eq!(
+            database_path_bytes(&path).unwrap(),
+            b"windows-utf16le\0a\0\0\xd8b\0"
+        );
     }
 
     #[cfg(unix)]
