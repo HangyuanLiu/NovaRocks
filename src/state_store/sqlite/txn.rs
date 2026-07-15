@@ -36,6 +36,9 @@ use super::{SqliteStateStore, open_connection, schema};
 
 const MUTATION_ENVELOPE_BYTES: usize = 32;
 const SQLITE_BUSY_SNAPSHOT: i32 = ffi::SQLITE_BUSY_SNAPSHOT;
+const PROVISIONAL_VERSION_TAG: &[u8] = b"sqlite-provisional-v1\0";
+const SQLITE_BUSY_RETRY_LIMIT: Duration = Duration::from_millis(50);
+const SQLITE_BUSY_RETRY_DELAY: Duration = Duration::from_millis(1);
 
 pub(super) type CommitRegistry = Arc<Mutex<HashMap<TransactionId, CommitRegistryState>>>;
 
@@ -50,11 +53,88 @@ pub(super) fn new_commit_registry() -> CommitRegistry {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+#[cfg(test)]
+pub(super) type TestHooks = Arc<TestHookState>;
+
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct TestHookState {
+    resolve_after_lookup: Mutex<Option<TestGate>>,
+    commit_after_inflight: Mutex<Option<TestGate>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(super) struct TestGate {
+    reached: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+impl TestGate {
+    fn new() -> Self {
+        Self {
+            reached: Arc::new(std::sync::Barrier::new(2)),
+            release: Arc::new(std::sync::Barrier::new(2)),
+        }
+    }
+
+    fn pause(&self) {
+        self.reached.wait();
+        self.release.wait();
+    }
+
+    async fn wait_reached(&self) {
+        let reached = Arc::clone(&self.reached);
+        tokio::task::spawn_blocking(move || reached.wait())
+            .await
+            .expect("test gate reach worker");
+    }
+
+    async fn release(&self) {
+        let release = Arc::clone(&self.release);
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .expect("test gate release worker");
+    }
+}
+
+#[cfg(test)]
+impl TestHookState {
+    fn pause_resolve_after_lookup(&self) {
+        if let Some(gate) = self
+            .resolve_after_lookup
+            .lock()
+            .expect("resolve test hook")
+            .take()
+        {
+            gate.pause();
+        }
+    }
+
+    fn pause_commit_after_inflight(&self) {
+        if let Some(gate) = self
+            .commit_after_inflight
+            .lock()
+            .expect("commit test hook")
+            .take()
+        {
+            gate.pause();
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn new_test_hooks() -> TestHooks {
+    Arc::new(TestHookState::default())
+}
+
 #[derive(Clone, Debug)]
 pub(super) enum Mutation {
     Put {
         value: Value,
         precondition: Precondition,
+        provisional_version: VersionToken,
     },
     Delete {
         precondition: Precondition,
@@ -94,6 +174,8 @@ pub(super) struct SqliteWriteTransaction {
     transaction_id: TransactionId,
     path: PathBuf,
     commit_registry: CommitRegistry,
+    #[cfg(test)]
+    test_hooks: TestHooks,
 }
 
 impl SqliteStateStore {
@@ -112,6 +194,8 @@ impl SqliteStateStore {
             transaction_id,
             path: self.path.clone(),
             commit_registry: Arc::clone(&self.commit_registry),
+            #[cfg(test)]
+            test_hooks: Arc::clone(&self.test_hooks),
         })
     }
 
@@ -119,42 +203,44 @@ impl SqliteStateStore {
         &self,
         transaction_id: &TransactionId,
     ) -> Result<CommitResolution, StateStoreError> {
-        if let Some(state) = lock_registry(&self.commit_registry)?
-            .get(transaction_id)
-            .cloned()
-        {
-            return Ok(match state {
-                CommitRegistryState::InFlight => CommitResolution::Unresolved,
-                CommitRegistryState::Committed(receipt) => CommitResolution::Committed(receipt),
-                CommitRegistryState::NotCommitted => CommitResolution::NotCommitted,
-            });
-        }
-
         let path = self.path.clone();
-        let recovery_lock = Arc::clone(&self.recovery_lock);
+        let registry = Arc::clone(&self.commit_registry);
+        #[cfg(test)]
+        let test_hooks = Arc::clone(&self.test_hooks);
         let transaction_id = *transaction_id;
-        let resolution = tokio::task::spawn_blocking(move || {
-            let _recovery_guard = recovery_lock.lock().map_err(|_| internal_error())?;
-            match lookup_commit(&path, transaction_id)? {
-                Some(receipt) => Ok(CommitResolution::Committed(receipt)),
-                None => Ok(CommitResolution::NotCommitted),
+        tokio::task::spawn_blocking(move || {
+            let mut registry = lock_registry(&registry)?;
+            if let Some(state) = registry.get(&transaction_id).cloned() {
+                return Ok(match state {
+                    CommitRegistryState::InFlight => CommitResolution::Unresolved,
+                    CommitRegistryState::Committed(receipt) => CommitResolution::Committed(receipt),
+                    CommitRegistryState::NotCommitted => CommitResolution::NotCommitted,
+                });
             }
+
+            let (resolution, terminal) = match lookup_commit(&path, transaction_id)? {
+                Some(receipt) => (
+                    CommitResolution::Committed(receipt.clone()),
+                    CommitRegistryState::Committed(receipt),
+                ),
+                None => (
+                    CommitResolution::NotCommitted,
+                    CommitRegistryState::NotCommitted,
+                ),
+            };
+            #[cfg(test)]
+            test_hooks.pause_resolve_after_lookup();
+            registry.insert(transaction_id, terminal);
+            Ok(resolution)
         })
         .await
-        .map_err(|_| worker_error())??;
-
-        let terminal = match &resolution {
-            CommitResolution::Committed(receipt) => CommitRegistryState::Committed(receipt.clone()),
-            CommitResolution::NotCommitted => CommitRegistryState::NotCommitted,
-            CommitResolution::Unresolved => unreachable!("recovery lookup is terminal"),
-        };
-        lock_registry(&self.commit_registry)?.insert(transaction_id, terminal);
-        Ok(resolution)
+        .map_err(|_| worker_error())?
     }
 }
 
 impl SqliteReadTransaction {
     pub(super) async fn get(&mut self, key: &Key) -> Result<Option<StateRecord>, StateStoreError> {
+        validate_key_value(key, None, &self.owner()?.limits)?;
         get(self.owner()?, key.clone()).await
     }
 
@@ -182,6 +268,7 @@ impl Drop for SqliteReadTransaction {
 
 impl SqliteWriteTransaction {
     pub(super) async fn get(&mut self, key: &Key) -> Result<Option<StateRecord>, StateStoreError> {
+        validate_key_value(key, None, &self.owner()?.limits)?;
         get(self.owner()?, key.clone()).await
     }
 
@@ -193,14 +280,19 @@ impl SqliteWriteTransaction {
     ) -> Result<(), StateStoreError> {
         validate_key_value(&key, Some(&value), &self.owner()?.limits)?;
         let owner = self.owner()?.clone();
+        let transaction_id = self.transaction_id;
         run_operation(&owner, move |state| {
+            let next_operation = next_operation_count(state)?;
+            let provisional_version = provisional_version(transaction_id, next_operation);
             stage_mutation(
                 state,
                 key,
                 Mutation::Put {
                     value,
                     precondition,
+                    provisional_version,
                 },
+                next_operation,
             )
         })
         .await
@@ -214,7 +306,13 @@ impl SqliteWriteTransaction {
         validate_key_value(&key, None, &self.owner()?.limits)?;
         let owner = self.owner()?.clone();
         run_operation(&owner, move |state| {
-            stage_mutation(state, key, Mutation::Delete { precondition })
+            let next_operation = next_operation_count(state)?;
+            stage_mutation(
+                state,
+                key,
+                Mutation::Delete { precondition },
+                next_operation,
+            )
         })
         .await
     }
@@ -231,11 +329,25 @@ impl SqliteWriteTransaction {
         };
 
         match register_inflight(&self.commit_registry, self.transaction_id) {
-            Ok(Some(receipt)) => {
+            Ok(RegisterOutcome::AlreadyCommitted(receipt)) => {
                 schedule_rollback(owner);
                 return CommitOutcome::Committed(receipt);
             }
-            Ok(None) => {}
+            Ok(RegisterOutcome::Registered) => {}
+            Ok(RegisterOutcome::NotCommitted) => {
+                schedule_rollback(owner);
+                return CommitOutcome::DefiniteFailure(StateStoreError::new(
+                    StateStoreErrorKind::InvalidRequest,
+                    "SQLite transaction id is terminally not committed",
+                ));
+            }
+            Ok(RegisterOutcome::InFlight) => {
+                schedule_rollback(owner);
+                return CommitOutcome::CommitUnknown(StateStoreError::new(
+                    StateStoreErrorKind::Conflict,
+                    "SQLite transaction id commit is already in flight",
+                ));
+            }
             Err(error) => {
                 schedule_rollback(owner);
                 return CommitOutcome::CommitUnknown(error);
@@ -246,8 +358,12 @@ impl SqliteWriteTransaction {
         let registry = Arc::clone(&self.commit_registry);
         let transaction_id = self.transaction_id;
         let path = self.path.clone();
+        #[cfg(test)]
+        let test_hooks = Arc::clone(&self.test_hooks);
         let mut cancel_guard = CancelOnDrop::new(&owner);
         let mut worker = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            test_hooks.pause_commit_after_inflight();
             let outcome = match state.lock() {
                 Ok(mut state) => commit_blocking(&mut state, transaction_id, &path),
                 Err(_) => CommitOutcome::CommitUnknown(internal_error()),
@@ -410,17 +526,15 @@ async fn get(owner: &TxnOwner, key: Key) -> Result<Option<StateRecord>, StateSto
         if let Some(mutation) = state.overlay.get(&key).cloned() {
             return match mutation {
                 Mutation::Delete { .. } => Ok(None),
-                Mutation::Put { value, .. } => {
-                    let version = load_record(&state.connection, &key)?
-                        .map(|record| record.version)
-                        .unwrap_or_else(zero_version);
-                    state.snapshot_established = true;
-                    Ok(Some(StateRecord {
-                        key,
-                        value,
-                        version,
-                    }))
-                }
+                Mutation::Put {
+                    value,
+                    provisional_version,
+                    ..
+                } => Ok(Some(StateRecord {
+                    key,
+                    value,
+                    version: provisional_version,
+                })),
             };
         }
         let record = load_record(&state.connection, &key)?;
@@ -547,19 +661,13 @@ fn stage_mutation(
     state: &mut SqliteTxnState,
     key: Key,
     mutation: Mutation,
+    next_operations: usize,
 ) -> Result<(), StateStoreError> {
     if state.range_frozen {
         return Err(StateStoreError::new(
             StateStoreErrorKind::InvalidRequest,
             "writes are frozen after paginated range reads",
         ));
-    }
-    let next_operations = state
-        .operation_count
-        .checked_add(1)
-        .ok_or_else(|| limit_error("transaction operation limit exceeded"))?;
-    if next_operations > state.limits.max_transaction_operations {
-        return Err(limit_error("transaction operation limit exceeded"));
     }
     let mutation_bytes = accounted_mutation_bytes(&key, &mutation)?;
     let next_bytes = state
@@ -577,12 +685,28 @@ fn stage_mutation(
     Ok(())
 }
 
+fn next_operation_count(state: &SqliteTxnState) -> Result<usize, StateStoreError> {
+    let next_operations = state
+        .operation_count
+        .checked_add(1)
+        .ok_or_else(|| limit_error("transaction operation limit exceeded"))?;
+    if next_operations > state.limits.max_transaction_operations {
+        return Err(limit_error("transaction operation limit exceeded"));
+    }
+    Ok(next_operations)
+}
+
 fn accounted_mutation_bytes(key: &Key, mutation: &Mutation) -> Result<usize, StateStoreError> {
     let value_bytes = match mutation {
         Mutation::Put {
             value,
             precondition,
-        } => value.as_bytes().len() + precondition_bytes(precondition),
+            provisional_version,
+        } => {
+            value.as_bytes().len()
+                + precondition_bytes(precondition)
+                + provisional_version.as_bytes().len()
+        }
         Mutation::Delete { precondition } => precondition_bytes(precondition),
     };
     key.as_bytes()
@@ -621,10 +745,20 @@ fn commit_blocking(
         );
     }
 
+    match lookup_commit_on_connection(&state.connection, transaction_id) {
+        Ok(Some(receipt)) => {
+            return rollback_outcome(state, CommitOutcome::Committed(receipt));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return rollback_outcome(state, classify_precommit_error(error));
+        }
+    }
+
     let current_revision = match load_current_revision(&state.connection) {
         Ok(revision) => revision,
         Err(error) => {
-            return rollback_outcome(state, CommitOutcome::DefiniteFailure(error));
+            return rollback_outcome(state, classify_precommit_error(error));
         }
     };
     state.snapshot_established = true;
@@ -644,16 +778,21 @@ fn commit_blocking(
     let mutations = state.mutations.clone();
     let mut changed_keys = Vec::new();
     let mut seen_changed_keys = HashSet::new();
+    let mut logical_versions = HashMap::<Key, Option<VersionToken>>::new();
     for (key, mutation) in mutations {
         if state.cancelled.load(Ordering::Acquire) || Instant::now() >= state.deadline {
             return rollback_outcome(state, CommitOutcome::DefiniteFailure(deadline_error()));
         }
-        let existing_version = match load_version(&state.connection, &key) {
-            Ok(version) => version,
-            Err(error) => {
-                return rollback_outcome(state, CommitOutcome::DefiniteFailure(error));
-            }
-        };
+        if !logical_versions.contains_key(&key) {
+            let existing_version = match load_version(&state.connection, &key) {
+                Ok(version) => version.map(revision_version),
+                Err(error) => {
+                    return rollback_outcome(state, classify_precommit_error(error));
+                }
+            };
+            logical_versions.insert(key.clone(), existing_version);
+        }
+        let existing_version = logical_versions.get(&key).and_then(Option::as_ref);
         if !precondition_matches(mutation_precondition(&mutation), existing_version) {
             return rollback_outcome(
                 state,
@@ -664,16 +803,31 @@ fn commit_blocking(
             );
         }
 
-        let apply_result = apply_mutation(&state.connection, &key, &mutation, revision);
+        let apply_result = apply_mutation_with_busy_retry(
+            &state.connection,
+            &key,
+            &mutation,
+            revision,
+            state.deadline,
+            &state.cancelled,
+        );
         let changed = match apply_result {
             Ok(changed) => changed,
-            Err(error) => {
-                let outcome = classify_apply_error(&error, state.snapshot_established);
-                return rollback_outcome(state, outcome);
-            }
+            Err(outcome) => return rollback_outcome(state, outcome),
         };
         if changed && seen_changed_keys.insert(key.clone()) {
-            changed_keys.push(key);
+            changed_keys.push(key.clone());
+        }
+        match &mutation {
+            Mutation::Put {
+                provisional_version,
+                ..
+            } => {
+                logical_versions.insert(key, Some(provisional_version.clone()));
+            }
+            Mutation::Delete { .. } => {
+                logical_versions.insert(key, None);
+            }
         }
     }
 
@@ -683,7 +837,7 @@ fn commit_blocking(
             "INSERT INTO state_store_changes(revision, sequence, key) VALUES (?1, ?2, ?3)",
             params![revision_i64, sequence as i64, key.as_bytes()],
         ) {
-            let outcome = classify_apply_error(&error, state.snapshot_established);
+            let outcome = classify_apply_error(&error);
             return rollback_outcome(state, outcome);
         }
     }
@@ -697,7 +851,7 @@ fn commit_blocking(
         "INSERT INTO state_store_commits(transaction_id, revision, committed_at_ms) VALUES (?1, ?2, ?3)",
         params![transaction_id.as_uuid().as_bytes(), revision_i64, committed_at_ms],
     ) {
-        let outcome = classify_apply_error(&error, state.snapshot_established);
+        let outcome = classify_apply_error(&error);
         return rollback_outcome(state, outcome);
     }
     match state.connection.execute(
@@ -718,7 +872,7 @@ fn commit_blocking(
             );
         }
         Err(error) => {
-            let outcome = classify_apply_error(&error, state.snapshot_established);
+            let outcome = classify_apply_error(&error);
             return rollback_outcome(state, outcome);
         }
     }
@@ -758,20 +912,53 @@ fn apply_mutation(
     }
 }
 
+fn apply_mutation_with_busy_retry(
+    connection: &Connection,
+    key: &Key,
+    mutation: &Mutation,
+    revision: u64,
+    transaction_deadline: Instant,
+    cancelled: &AtomicBool,
+) -> Result<bool, CommitOutcome> {
+    let retry_deadline = transaction_deadline.min(Instant::now() + SQLITE_BUSY_RETRY_LIMIT);
+    loop {
+        match apply_mutation(connection, key, mutation, revision) {
+            Ok(changed) => return Ok(changed),
+            Err(error) if is_base_busy(&error) => {
+                if cancelled.load(Ordering::Acquire) || Instant::now() >= transaction_deadline {
+                    return Err(CommitOutcome::DefiniteFailure(deadline_error()));
+                }
+                if Instant::now() >= retry_deadline {
+                    return Err(CommitOutcome::TransientBeforeCommit(operation_error(
+                        &error,
+                        "SQLite transaction remained busy before commit",
+                    )));
+                }
+                std::thread::sleep(
+                    SQLITE_BUSY_RETRY_DELAY
+                        .min(retry_deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            Err(error) => return Err(classify_apply_error(&error)),
+        }
+    }
+}
+
 fn mutation_precondition(mutation: &Mutation) -> &Precondition {
     match mutation {
         Mutation::Put { precondition, .. } | Mutation::Delete { precondition } => precondition,
     }
 }
 
-fn precondition_matches(precondition: &Precondition, existing_version: Option<u64>) -> bool {
+fn precondition_matches(
+    precondition: &Precondition,
+    existing_version: Option<&VersionToken>,
+) -> bool {
     match precondition {
         Precondition::Any => true,
         Precondition::Absent => existing_version.is_none(),
         Precondition::Present => existing_version.is_some(),
-        Precondition::Version(expected) => existing_version
-            .map(|version| expected.as_bytes() == version.to_be_bytes())
-            .unwrap_or(false),
+        Precondition::Version(expected) => existing_version == Some(expected),
     }
 }
 
@@ -820,14 +1007,8 @@ fn load_current_revision(connection: &Connection) -> Result<u64, StateStoreError
     Ok(u64::from_be_bytes(bytes))
 }
 
-fn classify_apply_error(error: &rusqlite::Error, snapshot_established: bool) -> CommitOutcome {
-    if is_busy_snapshot(error)
-        || (snapshot_established
-            && matches!(
-                error.sqlite_error_code(),
-                Some(ffi::ErrorCode::DatabaseBusy | ffi::ErrorCode::DatabaseLocked)
-            ))
-    {
+fn classify_apply_error(error: &rusqlite::Error) -> CommitOutcome {
+    if is_busy_snapshot(error) {
         return CommitOutcome::Conflict(StateStoreError::new(
             StateStoreErrorKind::Conflict,
             "SQLite transaction snapshot conflicted",
@@ -856,7 +1037,11 @@ fn classify_commit_error(
     let mapped = operation_error(error, "SQLite transaction commit failed");
     if !state.connection.is_autocommit() {
         if rollback(state).is_ok() {
-            return CommitOutcome::DefiniteFailure(mapped);
+            return if mapped.kind() == StateStoreErrorKind::Transient {
+                CommitOutcome::TransientBeforeCommit(mapped)
+            } else {
+                CommitOutcome::DefiniteFailure(mapped)
+            };
         }
         return CommitOutcome::CommitUnknown(mapped);
     }
@@ -887,20 +1072,27 @@ fn rollback_outcome(state: &mut SqliteTxnState, outcome: CommitOutcome) -> Commi
     }
 }
 
+enum RegisterOutcome {
+    Registered,
+    AlreadyCommitted(CommitReceipt),
+    InFlight,
+    NotCommitted,
+}
+
 fn register_inflight(
     registry: &CommitRegistry,
     transaction_id: TransactionId,
-) -> Result<Option<CommitReceipt>, StateStoreError> {
+) -> Result<RegisterOutcome, StateStoreError> {
     let mut registry = lock_registry(registry)?;
     match registry.get(&transaction_id) {
-        Some(CommitRegistryState::Committed(receipt)) => Ok(Some(receipt.clone())),
-        Some(CommitRegistryState::InFlight) => Err(StateStoreError::new(
-            StateStoreErrorKind::Internal,
-            "SQLite transaction id is already in flight",
-        )),
-        Some(CommitRegistryState::NotCommitted) | None => {
+        Some(CommitRegistryState::Committed(receipt)) => {
+            Ok(RegisterOutcome::AlreadyCommitted(receipt.clone()))
+        }
+        Some(CommitRegistryState::InFlight) => Ok(RegisterOutcome::InFlight),
+        Some(CommitRegistryState::NotCommitted) => Ok(RegisterOutcome::NotCommitted),
+        None => {
             registry.insert(transaction_id, CommitRegistryState::InFlight);
-            Ok(None)
+            Ok(RegisterOutcome::Registered)
         }
     }
 }
@@ -935,6 +1127,13 @@ fn lookup_commit(
     transaction_id: TransactionId,
 ) -> Result<Option<CommitReceipt>, StateStoreError> {
     let connection = open_connection(path)?;
+    lookup_commit_on_connection(&connection, transaction_id)
+}
+
+fn lookup_commit_on_connection(
+    connection: &Connection,
+    transaction_id: TransactionId,
+) -> Result<Option<CommitReceipt>, StateStoreError> {
     let revision = connection
         .query_row(
             "SELECT revision FROM state_store_commits WHERE transaction_id = ?1",
@@ -954,6 +1153,15 @@ fn lookup_commit(
         .transpose()
 }
 
+fn classify_precommit_error(error: StateStoreError) -> CommitOutcome {
+    match error.kind() {
+        StateStoreErrorKind::Transient
+        | StateStoreErrorKind::ProviderUnavailable
+        | StateStoreErrorKind::DeadlineExceeded => CommitOutcome::TransientBeforeCommit(error),
+        _ => CommitOutcome::DefiniteFailure(error),
+    }
+}
+
 fn lock_registry(
     registry: &CommitRegistry,
 ) -> Result<std::sync::MutexGuard<'_, HashMap<TransactionId, CommitRegistryState>>, StateStoreError>
@@ -965,6 +1173,13 @@ fn is_busy_snapshot(error: &rusqlite::Error) -> bool {
     matches!(
         error,
         rusqlite::Error::SqliteFailure(error, _) if error.extended_code == SQLITE_BUSY_SNAPSHOT
+    )
+}
+
+fn is_base_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(error, _) if error.extended_code == ffi::SQLITE_BUSY
     )
 }
 
@@ -999,8 +1214,12 @@ fn revision_version(revision: u64) -> VersionToken {
         .expect("u64 version is non-empty")
 }
 
-fn zero_version() -> VersionToken {
-    revision_version(0)
+fn provisional_version(transaction_id: TransactionId, operation: usize) -> VersionToken {
+    let mut bytes = Vec::with_capacity(PROVISIONAL_VERSION_TAG.len() + 16 + 8);
+    bytes.extend_from_slice(PROVISIONAL_VERSION_TAG);
+    bytes.extend_from_slice(transaction_id.as_uuid().as_bytes());
+    bytes.extend_from_slice(&(operation as u64).to_be_bytes());
+    VersionToken::try_from(Bytes::from(bytes)).expect("provisional version is non-empty")
 }
 
 fn remaining(deadline: Instant) -> Duration {
@@ -1077,6 +1296,13 @@ mod tests {
     }
 
     async fn store(temp: &TempDir) -> Arc<SqliteStateStore> {
+        store_with_limits(temp, StateStoreLimitOverrides::default()).await
+    }
+
+    async fn store_with_limits(
+        temp: &TempDir,
+        limits: StateStoreLimitOverrides,
+    ) -> Arc<SqliteStateStore> {
         Arc::new(
             SqliteStateStore::open(
                 StateStoreConfig {
@@ -1084,7 +1310,7 @@ mod tests {
                     path: temp.path().join("state-store.sqlite"),
                     cluster_id: "cluster-a".to_owned(),
                     deployment_owner: "fe-a".to_owned(),
-                    limits: StateStoreLimitOverrides::default(),
+                    limits,
                 },
                 FeDeploymentView {
                     active_fe_count: NonZeroUsize::new(1).expect("one FE"),
@@ -1094,6 +1320,27 @@ mod tests {
             .await
             .expect("open SQLite store"),
         )
+    }
+
+    async fn durable_counts(store: &SqliteStateStore) -> (u64, i64, i64) {
+        let path = store.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let connection = open_connection(&path).expect("inspection connection");
+            let revision = load_current_revision(&connection).expect("current revision");
+            let changes = connection
+                .query_row("SELECT COUNT(*) FROM state_store_changes", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("change count");
+            let commits = connection
+                .query_row("SELECT COUNT(*) FROM state_store_commits", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("commit count");
+            (revision, changes, commits)
+        })
+        .await
+        .expect("inspection worker")
     }
 
     fn committed(outcome: CommitOutcome) -> CommitReceipt {
@@ -1171,17 +1418,19 @@ mod tests {
             .put(item.clone(), value(b"v1"), Precondition::Absent)
             .await
             .expect("stage first put");
-        assert_eq!(
-            transaction
-                .get(&item)
-                .await
-                .expect("read overlay")
-                .expect("overlay record")
-                .value,
-            value(b"v1")
+        let first_overlay = transaction
+            .get(&item)
+            .await
+            .expect("read overlay")
+            .expect("overlay record");
+        assert_eq!(first_overlay.value, value(b"v1"));
+        assert_ne!(
+            first_overlay.version.as_bytes().len(),
+            std::mem::size_of::<i64>(),
+            "transaction-local versions must not collide with persisted revisions"
         );
         transaction
-            .delete(item.clone(), Precondition::Present)
+            .delete(item.clone(), Precondition::Version(first_overlay.version))
             .await
             .expect("stage delete");
         assert_eq!(transaction.get(&item).await.expect("read delete"), None);
@@ -1257,6 +1506,7 @@ mod tests {
         let guarded = key(b"guarded");
         let partial = key(b"must-not-commit");
         put_committed(&store, guarded.clone(), value(b"original")).await;
+        let durable_before = durable_counts(&store).await;
 
         let mut transaction = store
             .begin_write(transaction_id())
@@ -1279,6 +1529,11 @@ mod tests {
                 .expect("guarded record")
                 .value,
             value(b"original")
+        );
+        assert_eq!(
+            durable_counts(&store).await,
+            durable_before,
+            "rollback must preserve revision, change rows, and commit ledger"
         );
     }
 
@@ -1528,5 +1783,316 @@ mod tests {
                 .expect("resolve in-flight transaction"),
             CommitResolution::Unresolved
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sqlite_transaction_not_committed_id_cannot_be_reused() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = store(&temp).await;
+        let reused_id = transaction_id();
+        let item = key(b"must-stay-absent");
+
+        assert_eq!(
+            store
+                .resolve_commit(&reused_id)
+                .await
+                .expect("resolve missing transaction"),
+            CommitResolution::NotCommitted
+        );
+
+        let mut transaction = store
+            .begin_write(reused_id)
+            .await
+            .expect("begin reused transaction");
+        transaction
+            .put(item.clone(), value(b"forbidden"), Precondition::Any)
+            .await
+            .expect("stage reused transaction");
+        match transaction.commit().await {
+            CommitOutcome::DefiniteFailure(error) => {
+                assert_eq!(error.kind(), StateStoreErrorKind::InvalidRequest)
+            }
+            other => panic!("expected definite invalid-request failure, got {other:?}"),
+        }
+
+        assert_eq!(read_value(&store, &item).await, None);
+        assert_eq!(
+            store
+                .resolve_commit(&reused_id)
+                .await
+                .expect("resolve terminal transaction"),
+            CommitResolution::NotCommitted
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sqlite_transaction_restart_duplicate_id_returns_original_receipt_without_mutating() {
+        let temp = TempDir::new().expect("temp dir");
+        let original_key = key(b"original-key");
+        let duplicate_key = key(b"duplicate-key");
+        let duplicate_id = transaction_id();
+
+        let initial_store = store(&temp).await;
+        let mut original = initial_store
+            .begin_write(duplicate_id)
+            .await
+            .expect("begin original transaction");
+        original
+            .put(original_key.clone(), value(b"original"), Precondition::Any)
+            .await
+            .expect("stage original transaction");
+        let original_receipt = committed(original.commit().await);
+        let durable_before = durable_counts(&initial_store).await;
+        drop(initial_store);
+
+        let reopened = store(&temp).await;
+        let mut duplicate = reopened
+            .begin_write(duplicate_id)
+            .await
+            .expect("begin duplicate transaction");
+        duplicate
+            .put(
+                duplicate_key.clone(),
+                value(b"must-not-apply"),
+                Precondition::Any,
+            )
+            .await
+            .expect("stage duplicate transaction");
+        assert_eq!(
+            committed(duplicate.commit().await),
+            original_receipt,
+            "the persistent ledger receipt must remain authoritative"
+        );
+
+        assert_eq!(read_value(&reopened, &duplicate_key).await, None);
+        assert_eq!(
+            read_value(&reopened, &original_key)
+                .await
+                .expect("original record")
+                .value,
+            value(b"original")
+        );
+        assert_eq!(durable_counts(&reopened).await, durable_before);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sqlite_transaction_resolver_race_never_reverses_not_committed() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = store(&temp).await;
+        let raced_id = transaction_id();
+        let item = key(b"resolver-race");
+        let mut transaction = store
+            .begin_write(raced_id)
+            .await
+            .expect("begin raced transaction");
+        transaction
+            .put(item.clone(), value(b"must-not-commit"), Precondition::Any)
+            .await
+            .expect("stage raced mutation");
+
+        let resolver_gate = TestGate::new();
+        *store
+            .test_hooks
+            .resolve_after_lookup
+            .lock()
+            .expect("resolve test hook") = Some(resolver_gate.clone());
+        let resolver_store = Arc::clone(&store);
+        let resolver = tokio::spawn(async move { resolver_store.resolve_commit(&raced_id).await });
+        resolver_gate.wait_reached().await;
+
+        let commit = tokio::spawn(async move { transaction.commit().await });
+        resolver_gate.release().await;
+        assert_eq!(
+            resolver
+                .await
+                .expect("resolver task")
+                .expect("resolve raced transaction"),
+            CommitResolution::NotCommitted
+        );
+        match commit.await.expect("commit task") {
+            CommitOutcome::DefiniteFailure(error) => {
+                assert_eq!(error.kind(), StateStoreErrorKind::InvalidRequest)
+            }
+            other => panic!("expected terminal id rejection, got {other:?}"),
+        }
+        assert_eq!(read_value(&store, &item).await, None);
+        assert_eq!(
+            store
+                .resolve_commit(&raced_id)
+                .await
+                .expect("resolve terminal race"),
+            CommitResolution::NotCommitted
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sqlite_transaction_real_commit_worker_transitions_inflight_to_terminal() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = store(&temp).await;
+        let committed_id = transaction_id();
+        let mut transaction = store
+            .begin_write(committed_id)
+            .await
+            .expect("begin transaction");
+        transaction
+            .put(key(b"inflight"), value(b"value"), Precondition::Any)
+            .await
+            .expect("stage transaction");
+
+        let commit_gate = TestGate::new();
+        *store
+            .test_hooks
+            .commit_after_inflight
+            .lock()
+            .expect("commit test hook") = Some(commit_gate.clone());
+        let commit = tokio::spawn(async move { transaction.commit().await });
+        commit_gate.wait_reached().await;
+        assert_eq!(
+            store
+                .resolve_commit(&committed_id)
+                .await
+                .expect("resolve in-flight commit"),
+            CommitResolution::Unresolved
+        );
+
+        let duplicate_key = key(b"duplicate-inflight");
+        let mut duplicate = store
+            .begin_write(committed_id)
+            .await
+            .expect("begin duplicate transaction");
+        duplicate
+            .put(
+                duplicate_key.clone(),
+                value(b"must-not-apply"),
+                Precondition::Any,
+            )
+            .await
+            .expect("stage duplicate transaction");
+        match duplicate.commit().await {
+            CommitOutcome::CommitUnknown(error) => {
+                assert_eq!(error.kind(), StateStoreErrorKind::Conflict)
+            }
+            other => panic!("expected uncertain in-flight duplicate, got {other:?}"),
+        }
+        assert_eq!(read_value(&store, &duplicate_key).await, None);
+
+        commit_gate.release().await;
+        let receipt = committed(commit.await.expect("commit task"));
+        assert_eq!(
+            store
+                .resolve_commit(&committed_id)
+                .await
+                .expect("resolve committed transaction"),
+            CommitResolution::Committed(receipt)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sqlite_transaction_provider_key_limit_precedes_sqlite_io() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = store_with_limits(
+            &temp,
+            StateStoreLimitOverrides {
+                max_key_bytes: Some(3),
+                ..StateStoreLimitOverrides::default()
+            },
+        )
+        .await;
+        let oversized = key(b"four");
+
+        let mut reader = store.begin_read().await.expect("begin read");
+        let error = reader.get(&oversized).await.expect_err("read key limit");
+        assert_eq!(error.kind(), StateStoreErrorKind::LimitExceeded);
+        assert!(
+            !reader
+                .owner()
+                .expect("reader owner")
+                .state
+                .lock()
+                .expect("reader state")
+                .snapshot_established,
+            "rejected get must not establish a SQLite snapshot"
+        );
+        reader.abort().await.expect("abort read");
+
+        let mut writer = store
+            .begin_write(transaction_id())
+            .await
+            .expect("begin write");
+        let error = writer
+            .put(oversized, value(b"value"), Precondition::Any)
+            .await
+            .expect_err("write key limit");
+        assert_eq!(error.kind(), StateStoreErrorKind::LimitExceeded);
+        {
+            let state = writer
+                .owner()
+                .expect("writer owner")
+                .state
+                .lock()
+                .expect("writer state");
+            assert_eq!(state.operation_count, 0);
+            assert!(state.overlay.is_empty());
+            assert!(!state.snapshot_established);
+        }
+        writer.abort().await.expect("abort write");
+    }
+
+    #[test]
+    fn sqlite_transaction_busy_classifier_only_treats_snapshot_code_as_conflict() {
+        let base_busy = rusqlite::Error::SqliteFailure(
+            ffi::Error::new(ffi::SQLITE_BUSY),
+            Some("base busy".to_owned()),
+        );
+        let locked = rusqlite::Error::SqliteFailure(
+            ffi::Error::new(ffi::SQLITE_LOCKED),
+            Some("locked".to_owned()),
+        );
+        let busy_snapshot = rusqlite::Error::SqliteFailure(
+            ffi::Error::new(SQLITE_BUSY_SNAPSHOT),
+            Some("busy snapshot".to_owned()),
+        );
+
+        assert!(matches!(
+            classify_apply_error(&base_busy),
+            CommitOutcome::TransientBeforeCommit(_)
+        ));
+        assert!(matches!(
+            classify_apply_error(&locked),
+            CommitOutcome::TransientBeforeCommit(_)
+        ));
+        assert!(matches!(
+            classify_apply_error(&busy_snapshot),
+            CommitOutcome::Conflict(_)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sqlite_transaction_persistent_writer_contention_is_transient_not_conflict() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = store(&temp).await;
+        let item = key(b"contended");
+        let mut transaction = store
+            .begin_write(transaction_id())
+            .await
+            .expect("begin transaction");
+        assert_eq!(
+            transaction.get(&item).await.expect("establish snapshot"),
+            None
+        );
+        transaction
+            .put(item, value(b"value"), Precondition::Any)
+            .await
+            .expect("stage mutation");
+
+        let blocker = open_connection(&store.path).expect("blocker connection");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold SQLite writer lock");
+        let outcome = transaction.commit().await;
+        blocker
+            .execute_batch("ROLLBACK")
+            .expect("release writer lock");
+        assert!(matches!(outcome, CommitOutcome::TransientBeforeCommit(_)));
     }
 }

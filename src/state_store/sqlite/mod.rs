@@ -21,7 +21,6 @@ mod txn;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
 use fs2::FileExt;
 use rusqlite::ffi::ErrorCode as SqliteErrorCode;
@@ -37,7 +36,8 @@ pub(super) struct SqliteStateStore {
     pub(super) path: PathBuf,
     pub(super) limits: StateStoreLimits,
     commit_registry: txn::CommitRegistry,
-    recovery_lock: Arc<Mutex<()>>,
+    #[cfg(test)]
+    test_hooks: txn::TestHooks,
     identity: StoreIdentity,
     _owner_lock: File,
 }
@@ -108,7 +108,8 @@ fn open_blocking(
         path,
         limits,
         commit_registry: txn::new_commit_registry(),
-        recovery_lock: Arc::new(Mutex::new(())),
+        #[cfg(test)]
+        test_hooks: txn::new_test_hooks(),
         identity,
         _owner_lock: owner_lock,
     })
