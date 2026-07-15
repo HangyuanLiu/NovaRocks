@@ -46,6 +46,7 @@ use crate::runtime_filter::port::subscription::{SubscriptionHandle, Subscription
 use crate::runtime_filter::port::support::{
     ArtifactRetainedBudget, ArtifactScratchBudget, RuntimeFilterClock, RuntimeFilterMemoryAccount,
 };
+use crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract;
 use crate::runtime_filter::port::value_domain::MembershipValues;
 use crate::runtime_filter::router::loopback::LoopbackRouter;
 
@@ -851,13 +852,10 @@ fn build_routing(
                     channel_id: *channel_id,
                     channel: channel.clone(),
                     expected_instances: producer.expected_fragment_instances().clone(),
-                    kind: match deployment.logical_domain() {
-                        RuntimeFilterLogicalDomain::Membership { .. } => {
-                            ProducerPortKind::Membership
-                        }
-                        RuntimeFilterLogicalDomain::OrderedBound(_) => {
-                            ProducerPortKind::OrderedBound
-                        }
+                    kind: match deployment.reduction_requirement() {
+                        ReductionRequirement::SetUnion => ProducerPortKind::Membership,
+                        ReductionRequirement::TightenOrderedBound => ProducerPortKind::OrderedBound,
+                        ReductionRequirement::MergeTopKSummary(_) => ProducerPortKind::TopKSummary,
                     },
                 },
             );
@@ -1216,19 +1214,60 @@ fn validate_ordered_channel<'a>(
             format!("ordered channel has an invalid order contract: {error:?}"),
         )
     })?;
-    if channel.lifecycle() != RuntimeFilterLifecycle::MonotonicUpdates
-        || channel.reduction_requirement() != ReductionRequirement::TightenOrderedBound
-        || channel.allowed_contribution_kinds()
-            != &BTreeSet::from([
-                ContributionKind::OrderedBoundUpdate,
-                ContributionKind::ProducerClosed,
-            ])
-        || channel.completion_requirement() != CompletionRequirement::ProducerClosed
-    {
-        return Err(install_error(
-            InstallContractErrorKind::UnsupportedChannelContract,
-            "channel does not match the MonotonicUpdates OrderedBound M3A matrix",
-        ));
+    match channel.reduction_requirement() {
+        ReductionRequirement::TightenOrderedBound => {
+            if channel.lifecycle() != RuntimeFilterLifecycle::MonotonicUpdates
+                || channel.allowed_contribution_kinds()
+                    != &BTreeSet::from([
+                        ContributionKind::OrderedBoundUpdate,
+                        ContributionKind::ProducerClosed,
+                    ])
+                || channel.completion_requirement() != CompletionRequirement::ProducerClosed
+            {
+                return Err(install_error(
+                    InstallContractErrorKind::UnsupportedChannelContract,
+                    "channel does not match the MonotonicUpdates OrderedBound M3A matrix",
+                ));
+            }
+        }
+        ReductionRequirement::MergeTopKSummary(requirement) => {
+            RuntimeTopKSummaryContract::try_from_plan(plan, requirement).map_err(|error| {
+                install_error(
+                    InstallContractErrorKind::UnsupportedChannelContract,
+                    format!("ordered channel has an invalid top-k summary contract: {error:?}"),
+                )
+            })?;
+            if !channel
+                .availability_coverage()
+                .is_canonically_equivalent_to(channel.terminal_coverage())
+            {
+                return Err(install_error(
+                    InstallContractErrorKind::InvalidCoverage,
+                    "top-k summary availability and terminal coverage must be canonically equivalent",
+                ));
+            }
+            if channel.lifecycle() != RuntimeFilterLifecycle::MonotonicUpdates
+                || channel.allowed_contribution_kinds()
+                    != &BTreeSet::from([
+                        ContributionKind::TopKSummary,
+                        ContributionKind::ProducerClosed,
+                    ])
+                || channel.completion_requirement() != CompletionRequirement::ProducerClosed
+                || !channel.availability_coverage().is_all_of_only()
+                || !channel.terminal_coverage().is_all_of_only()
+            {
+                return Err(install_error(
+                    InstallContractErrorKind::UnsupportedChannelContract,
+                    "channel does not match the MonotonicUpdates OrderedBound TopKSummary M3B matrix",
+                ));
+            }
+        }
+        ReductionRequirement::SetUnion => {
+            return Err(install_error(
+                InstallContractErrorKind::UnsupportedChannelContract,
+                "ordered channel cannot use SetUnion reduction",
+            ));
+        }
     }
     if channel.producers().is_empty() || channel.consumers().is_empty() {
         return Err(install_error(
@@ -1763,6 +1802,194 @@ mod tests {
                 ),
             )]),
         ))
+    }
+
+    struct TopKDeploymentFixture(RuntimeFilterChannelDeployment);
+
+    impl std::ops::Deref for TopKDeploymentFixture {
+        type Target = RuntimeFilterChannelDeployment;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl TopKDeploymentFixture {
+        fn rebuild(
+            &self,
+            availability: Coverage,
+            reduction: ReductionRequirement,
+            contributions: BTreeSet<ContributionKind>,
+            consumer: ConsumerDeployment,
+        ) -> RuntimeFilterChannelDeployment {
+            let consumer_binding = *self.0.consumers().keys().next().unwrap();
+            RuntimeFilterChannelDeployment::new(
+                self.0.channel_id(),
+                self.0.logical_domain().clone(),
+                self.0.lifecycle(),
+                availability,
+                self.0.terminal_coverage().clone(),
+                reduction,
+                contributions,
+                self.0.completion_requirement(),
+                self.0.policy(),
+                self.0.core_budget(),
+                self.0.materialization_policy(),
+                self.0.producers().clone(),
+                BTreeMap::from([(consumer_binding, consumer)]),
+            )
+        }
+
+        fn consumer(&self) -> &ConsumerDeployment {
+            self.0.consumers().values().next().unwrap()
+        }
+    }
+
+    fn topk_deployment_fixture() -> TopKDeploymentFixture {
+        let direct = ordered_deployment_fixture();
+        let witness = direct
+            .producers()
+            .values()
+            .next()
+            .unwrap()
+            .coverage_witness_id();
+        TopKDeploymentFixture(RuntimeFilterChannelDeployment::new(
+            direct.channel_id(),
+            direct.logical_domain().clone(),
+            direct.lifecycle(),
+            Coverage::Leaf(witness),
+            Coverage::Leaf(witness),
+            ReductionRequirement::MergeTopKSummary(TopKSummaryRequirement::try_new(4).unwrap()),
+            BTreeSet::from([
+                ContributionKind::TopKSummary,
+                ContributionKind::ProducerClosed,
+            ]),
+            direct.completion_requirement(),
+            direct.policy(),
+            direct.core_budget(),
+            direct.materialization_policy(),
+            direct.producers().clone(),
+            direct.consumers().clone(),
+        ))
+    }
+
+    #[test]
+    fn topk_install_accepts_exact_k4_summary_matrix_and_preserves_direct_matrix() {
+        assert!(validate_channel_contract(&topk_deployment_fixture()).is_ok());
+        assert!(validate_channel_contract(&ordered_deployment_fixture()).is_ok());
+    }
+
+    #[test]
+    fn topk_install_rejects_non_equivalent_allof_coverages() {
+        let fixture = topk_deployment_fixture();
+        let mismatched = fixture.rebuild(
+            Coverage::AllOf(vec![fixture.availability_coverage().clone()]),
+            fixture.reduction_requirement(),
+            fixture.allowed_contribution_kinds().clone(),
+            fixture.consumer().clone(),
+        );
+
+        assert_eq!(
+            validate_channel_contract(&mismatched).unwrap_err().kind(),
+            InstallContractErrorKind::InvalidCoverage
+        );
+    }
+
+    #[test]
+    fn topk_producer_route_kind_follows_summary_reduction_not_ordered_domain() {
+        let registry = registry();
+        registry
+            .install(view([(1, topk_deployment_fixture().0)]))
+            .unwrap();
+        let installed = registry.active_installation().unwrap();
+
+        assert_eq!(
+            installed.producer(BindingId::new(10)).unwrap().kind,
+            crate::runtime_filter::port::producer::ProducerPortKind::TopKSummary
+        );
+    }
+
+    #[test]
+    fn topk_install_rejects_wrong_reduction_or_mixed_direct_contribution_matrix() {
+        let fixture = topk_deployment_fixture();
+        let consumer = fixture.consumer().clone();
+        let wrong_reduction = fixture.rebuild(
+            fixture.availability_coverage().clone(),
+            ReductionRequirement::TightenOrderedBound,
+            fixture.allowed_contribution_kinds().clone(),
+            consumer.clone(),
+        );
+        assert!(validate_channel_contract(&wrong_reduction).is_err());
+
+        let mixed = fixture.rebuild(
+            fixture.availability_coverage().clone(),
+            fixture.reduction_requirement(),
+            BTreeSet::from([
+                ContributionKind::TopKSummary,
+                ContributionKind::OrderedBoundUpdate,
+                ContributionKind::ProducerClosed,
+            ]),
+            consumer,
+        );
+        assert!(validate_channel_contract(&mixed).is_err());
+    }
+
+    #[test]
+    fn topk_install_rejects_anyof_blocking_consumer_and_wrong_range_digest() {
+        let fixture = topk_deployment_fixture();
+        let consumer = fixture.consumer();
+        let any_of = fixture.rebuild(
+            Coverage::AnyOf(vec![fixture.availability_coverage().clone()]),
+            fixture.reduction_requirement(),
+            fixture.allowed_contribution_kinds().clone(),
+            consumer.clone(),
+        );
+        assert!(validate_channel_contract(&any_of).is_err());
+
+        let blocking = fixture.rebuild(
+            fixture.availability_coverage().clone(),
+            fixture.reduction_requirement(),
+            fixture.allowed_contribution_kinds().clone(),
+            ConsumerDeployment::with_profile(
+                ConsumerActivation::BlockingSnapshot,
+                consumer.capabilities().clone(),
+                consumer.artifact_profile().clone(),
+                consumer.loopback_route_edge_id(),
+                consumer.expected_fragment_instances().clone(),
+            ),
+        );
+        assert!(validate_channel_contract(&blocking).is_err());
+
+        let keys = vec![OrderKeyContract {
+            data_type: DataType::Int64,
+            direction: SortDirection::Descending,
+            null_order: NullOrder::Last,
+        }];
+        let wrong_plan = OrderContract {
+            comparator_digest:
+                crate::runtime_filter::port::ordered_bound::comparator_digest_for_test(
+                    &keys,
+                    crate::runtime_filter::port::ordered_bound::COMPARATOR_ALGORITHM_VERSION,
+                ),
+            keys,
+            inclusive: true,
+        };
+        let wrong_digest = RuntimeOrderContract::try_from_plan(&wrong_plan)
+            .unwrap()
+            .digest();
+        let wrong_range = fixture.rebuild(
+            fixture.availability_coverage().clone(),
+            fixture.reduction_requirement(),
+            fixture.allowed_contribution_kinds().clone(),
+            ConsumerDeployment::with_profile(
+                consumer.activation(),
+                consumer.capabilities().clone(),
+                ConsumerArtifactProfile::new_ordered_range(wrong_digest).unwrap(),
+                consumer.loopback_route_edge_id(),
+                consumer.expected_fragment_instances().clone(),
+            ),
+        );
+        assert!(validate_channel_contract(&wrong_range).is_err());
     }
 
     #[test]

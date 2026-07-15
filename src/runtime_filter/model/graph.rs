@@ -266,7 +266,6 @@ pub(super) mod tests {
             reduction_requirement: ReductionRequirement::TightenOrderedBound,
             allowed_contribution_kinds: BTreeSet::from([
                 ContributionKind::OrderedBoundUpdate,
-                ContributionKind::TopKSummary,
                 ContributionKind::ProducerClosed,
             ]),
             required_consumer_capabilities: BTreeSet::from([ArtifactCapability::OrderedRange]),

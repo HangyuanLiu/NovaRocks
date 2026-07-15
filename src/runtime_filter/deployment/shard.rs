@@ -289,6 +289,44 @@ mod tests {
         }
     }
 
+    fn top_k_summary_channel(id: u32) -> ChannelProjectionSpec {
+        let keys = vec![OrderKeyContract {
+            data_type: DataType::Int64,
+            direction: SortDirection::Descending,
+            null_order: NullOrder::Last,
+        }];
+        ChannelProjectionSpec {
+            channel_id: ChannelId::new(id),
+            logical_domain: RuntimeFilterLogicalDomain::OrderedBound(OrderContract {
+                comparator_digest:
+                    crate::runtime_filter::port::ordered_bound::comparator_digest_for_test(
+                        &keys,
+                        crate::runtime_filter::port::ordered_bound::COMPARATOR_ALGORITHM_VERSION,
+                    ),
+                keys,
+                inclusive: true,
+            }),
+            lifecycle: RuntimeFilterLifecycle::MonotonicUpdates,
+            availability_coverage: Coverage::Leaf(CoverageWitnessId::new(1)),
+            terminal_coverage: Coverage::Leaf(CoverageWitnessId::new(1)),
+            reduction_requirement: ReductionRequirement::MergeTopKSummary(
+                TopKSummaryRequirement::try_new(3).unwrap(),
+            ),
+            allowed_contribution_kinds: BTreeSet::from([
+                ContributionKind::TopKSummary,
+                ContributionKind::ProducerClosed,
+            ]),
+            completion_requirement: CompletionRequirement::ProducerClosed,
+            policy: RuntimeFilterPolicyRequirement {
+                max_contribution_bytes: 64,
+                max_artifact_bytes: 128,
+                deadline_ms: 1000,
+                max_retries: 3,
+            },
+            producer_witness: BTreeMap::from([(BindingId::new(10), CoverageWitnessId::new(1))]),
+        }
+    }
+
     /// M2 Membership consumers must declare both `Membership` and `EmptyDomain`
     /// semantics (RFD-3/M2 install收紧 §158); the derived profile then accepts
     /// `{ValueSet, EmptyDomain}`.
@@ -336,6 +374,44 @@ mod tests {
             &BTreeSet::from([ArtifactKind::Range])
         );
         assert_eq!(profile.order_contract_digest(), Some(expected));
+    }
+
+    #[test]
+    fn projection_preserves_top_k_summary_requirement() {
+        let participant = RuntimeFilterParticipantId::new(0);
+        let mut channel_graph = ChannelRoleGraph::empty(ChannelId::new(5));
+        channel_graph
+            .producers
+            .insert(participant, BTreeSet::from([BindingId::new(10)]));
+        let mut role_graph = RoleGraph::default();
+        role_graph.channels.insert(ChannelId::new(5), channel_graph);
+
+        let projected = top_k_summary_channel(5);
+        assert_eq!(
+            projected.reduction_requirement,
+            ReductionRequirement::MergeTopKSummary(TopKSummaryRequirement::try_new(3).unwrap())
+        );
+        let channel_specs = BTreeMap::from([(ChannelId::new(5), projected)]);
+        let instances = BTreeMap::from([(
+            (ChannelId::new(5), BindingId::new(10), participant),
+            BTreeSet::from([UniqueId { hi: 1, lo: 2 }]),
+        )]);
+
+        let views = project_install_views(
+            DeploymentEpoch::new(9),
+            &role_graph,
+            &channel_specs,
+            &BTreeMap::new(),
+            &instances,
+            crate::runtime_filter::port::install::RuntimeFilterCoreBudget::new(512),
+            MaterializationPolicy::for_test(),
+        )
+        .expect("projection succeeds");
+        let deployment = &views[&participant].channels()[&ChannelId::new(5)];
+        assert_eq!(
+            deployment.reduction_requirement(),
+            ReductionRequirement::MergeTopKSummary(TopKSummaryRequirement::try_new(3).unwrap())
+        );
     }
 
     #[test]

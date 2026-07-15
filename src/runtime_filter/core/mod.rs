@@ -21,3 +21,4 @@ pub(crate) mod error;
 pub(crate) mod ordered_reducer;
 pub(crate) mod reducer;
 pub(crate) mod state;
+pub(crate) mod topk_reducer;

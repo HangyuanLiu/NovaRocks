@@ -24,6 +24,8 @@ mod producer;
 // contract. Item-level privacy inside `registry.rs` is unaffected.
 #[cfg(test)]
 mod m3a_tests;
+#[cfg(test)]
+mod m3b_tests;
 pub(crate) mod registry;
 mod subscription;
 
@@ -40,7 +42,7 @@ use crate::runtime_filter::port::install::RuntimeFilterInstallView;
 use crate::runtime_filter::port::producer::{
     InstallContractError, InstallOutcome, OrderedBoundProducerAdapter, ProducerAdapter,
     ProducerHandle, ProducerHandleWeak, ProducerPortKind, RuntimeContractViolation,
-    RuntimeContractViolationKind,
+    RuntimeContractViolationKind, TopKSummaryProducerAdapter,
 };
 use crate::runtime_filter::port::subscription::{
     ArtifactDeliveryOutcome, LiveTerminal, SubscriptionHandle, SubscriptionKind,
@@ -1141,6 +1143,10 @@ impl RuntimeFilterService {
             ProducerPortKind::OrderedBound => {
                 let ordered: Arc<dyn OrderedBoundProducerAdapter> = concrete;
                 ProducerHandle::OrderedBound(ordered)
+            }
+            ProducerPortKind::TopKSummary => {
+                let summary: Arc<dyn TopKSummaryProducerAdapter> = concrete;
+                ProducerHandle::TopKSummary(summary)
             }
         };
         handles.insert(key, handle.downgrade());

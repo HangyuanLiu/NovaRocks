@@ -23,4 +23,5 @@ pub(crate) mod ordered_bound;
 pub(crate) mod producer;
 pub(crate) mod subscription;
 pub(crate) mod support;
+pub(crate) mod topk_summary;
 pub(crate) mod value_domain;

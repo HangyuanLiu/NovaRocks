@@ -23,6 +23,7 @@ use crate::runtime_filter::model::contract::BindingId;
 
 use super::identity::{PartitionId, ProducerSequence};
 use super::ordered_bound::OrderedBoundUpdate;
+use super::topk_summary::TopKSummary;
 use super::value_domain::ValueDomainDelta;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -239,15 +240,37 @@ pub(crate) trait OrderedBoundProducerAdapter: Send + Sync {
     ) -> Result<SubmitOutcome, RuntimeContractViolation>;
 }
 
+pub(crate) trait TopKSummaryProducerAdapter: Send + Sync {
+    fn submit_summary(
+        &self,
+        partition_id: PartitionId,
+        sequence: ProducerSequence,
+        summary: TopKSummary,
+    ) -> Result<SubmitOutcome, RuntimeContractViolation>;
+
+    fn close_partition(
+        &self,
+        partition_id: PartitionId,
+        terminal: ProducerSequence,
+    ) -> Result<SubmitOutcome, RuntimeContractViolation>;
+
+    fn fail(
+        &self,
+        reason: ProducerFailureReason,
+    ) -> Result<SubmitOutcome, RuntimeContractViolation>;
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProducerPortKind {
     Membership,
     OrderedBound,
+    TopKSummary,
 }
 
 pub(crate) enum ProducerHandle {
     Membership(Arc<dyn ProducerAdapter>),
     OrderedBound(Arc<dyn OrderedBoundProducerAdapter>),
+    TopKSummary(Arc<dyn TopKSummaryProducerAdapter>),
 }
 
 impl fmt::Debug for ProducerHandle {
@@ -264,6 +287,7 @@ impl ProducerHandle {
         match self {
             Self::Membership(_) => ProducerPortKind::Membership,
             Self::OrderedBound(_) => ProducerPortKind::OrderedBound,
+            Self::TopKSummary(_) => ProducerPortKind::TopKSummary,
         }
     }
 
@@ -271,6 +295,7 @@ impl ProducerHandle {
         match self {
             Self::Membership(handle) => ProducerHandleWeak::Membership(Arc::downgrade(handle)),
             Self::OrderedBound(handle) => ProducerHandleWeak::OrderedBound(Arc::downgrade(handle)),
+            Self::TopKSummary(handle) => ProducerHandleWeak::TopKSummary(Arc::downgrade(handle)),
         }
     }
 
@@ -283,6 +308,10 @@ impl ProducerHandle {
                 RuntimeContractViolationKind::ProducerPortMismatch,
                 "ordered producer handle cannot be used as a membership producer",
             )),
+            Self::TopKSummary(_) => Err(RuntimeContractViolation::new(
+                RuntimeContractViolationKind::ProducerPortMismatch,
+                "top-k summary producer handle cannot be used as a membership producer",
+            )),
         }
     }
 }
@@ -290,6 +319,7 @@ impl ProducerHandle {
 pub(crate) enum ProducerHandleWeak {
     Membership(Weak<dyn ProducerAdapter>),
     OrderedBound(Weak<dyn OrderedBoundProducerAdapter>),
+    TopKSummary(Weak<dyn TopKSummaryProducerAdapter>),
 }
 
 impl ProducerHandleWeak {
@@ -297,6 +327,7 @@ impl ProducerHandleWeak {
         match self {
             Self::Membership(_) => ProducerPortKind::Membership,
             Self::OrderedBound(_) => ProducerPortKind::OrderedBound,
+            Self::TopKSummary(_) => ProducerPortKind::TopKSummary,
         }
     }
 
@@ -304,13 +335,50 @@ impl ProducerHandleWeak {
         match self {
             Self::Membership(handle) => handle.upgrade().map(ProducerHandle::Membership),
             Self::OrderedBound(handle) => handle.upgrade().map(ProducerHandle::OrderedBound),
+            Self::TopKSummary(handle) => handle.upgrade().map(ProducerHandle::TopKSummary),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::RuntimeContractViolationKind;
+    use std::sync::Arc;
+
+    use crate::runtime_filter::port::identity::{PartitionId, ProducerSequence};
+    use crate::runtime_filter::port::topk_summary::TopKSummary;
+
+    use super::{
+        ProducerFailureReason, ProducerHandle, ProducerPortKind, RuntimeContractViolation,
+        RuntimeContractViolationKind, SubmitOutcome, TopKSummaryProducerAdapter,
+    };
+
+    struct TopKAdapter;
+
+    impl TopKSummaryProducerAdapter for TopKAdapter {
+        fn submit_summary(
+            &self,
+            _partition_id: PartitionId,
+            _sequence: ProducerSequence,
+            _summary: TopKSummary,
+        ) -> Result<SubmitOutcome, RuntimeContractViolation> {
+            unreachable!("typed handle tests do not submit")
+        }
+
+        fn close_partition(
+            &self,
+            _partition_id: PartitionId,
+            _terminal: ProducerSequence,
+        ) -> Result<SubmitOutcome, RuntimeContractViolation> {
+            unreachable!("typed handle tests do not close")
+        }
+
+        fn fail(
+            &self,
+            _reason: ProducerFailureReason,
+        ) -> Result<SubmitOutcome, RuntimeContractViolation> {
+            unreachable!("typed handle tests do not fail")
+        }
+    }
 
     fn contract_violation_name(kind: RuntimeContractViolationKind) -> &'static str {
         match kind {
@@ -350,6 +418,20 @@ mod tests {
         assert_eq!(
             contract_violation_name(RuntimeContractViolationKind::TypeMismatch),
             "type-mismatch"
+        );
+    }
+
+    #[test]
+    fn topk_summary_handle_downgrades_and_upgrades_without_losing_kind() {
+        let adapter: Arc<dyn TopKSummaryProducerAdapter> = Arc::new(TopKAdapter);
+        let handle = ProducerHandle::TopKSummary(adapter);
+        let weak = handle.downgrade();
+
+        assert_eq!(handle.kind(), ProducerPortKind::TopKSummary);
+        assert_eq!(weak.kind(), ProducerPortKind::TopKSummary);
+        assert_eq!(
+            weak.upgrade().expect("strong typed handle is alive").kind(),
+            ProducerPortKind::TopKSummary
         );
     }
 }

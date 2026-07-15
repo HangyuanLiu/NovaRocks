@@ -63,6 +63,9 @@ pub(crate) enum GraphValidationErrorKind {
     MembershipContributionMissing,
     MembershipContributionMismatch,
     FinalDomainShardRequiresNullSafeEqual,
+    TopKSummaryCoverageMismatch,
+    TopKSummaryMissingCoverageWitness(CoverageWitnessId),
+    TopKSummaryConsumerCapabilityMismatch,
     OrderedBoundReductionMismatch,
     OrderedBoundContributionMissing,
     OrderedBoundContributionMismatch(ContributionKind),
@@ -398,8 +401,58 @@ fn validate_channel_matrix(channel: &RuntimeFilterChannelSpec) -> Result<(), Gra
                 ));
             }
             let required_contribution = match channel.reduction_requirement {
-                ReductionRequirement::TightenOrderedBound => ContributionKind::OrderedBoundUpdate,
-                ReductionRequirement::MergeTopKSummary => ContributionKind::TopKSummary,
+                ReductionRequirement::TightenOrderedBound => {
+                    let expected = BTreeSet::from([
+                        ContributionKind::OrderedBoundUpdate,
+                        ContributionKind::ProducerClosed,
+                    ]);
+                    if let Some(forbidden) = channel
+                        .allowed_contribution_kinds
+                        .difference(&expected)
+                        .next()
+                    {
+                        return Err(channel_error(
+                            channel.channel_id,
+                            GraphValidationErrorKind::OrderedBoundContributionMismatch(*forbidden),
+                        ));
+                    }
+                    ContributionKind::OrderedBoundUpdate
+                }
+                ReductionRequirement::MergeTopKSummary(_) => {
+                    if !channel.availability_coverage.is_all_of_only()
+                        || !channel
+                            .availability_coverage
+                            .is_canonically_equivalent_to(&channel.terminal_coverage)
+                    {
+                        return Err(channel_error(
+                            channel.channel_id,
+                            GraphValidationErrorKind::TopKSummaryCoverageMismatch,
+                        ));
+                    }
+                    if channel.required_consumer_capabilities
+                        != BTreeSet::from([ArtifactCapability::OrderedRange])
+                    {
+                        return Err(channel_error(
+                            channel.channel_id,
+                            GraphValidationErrorKind::TopKSummaryConsumerCapabilityMismatch,
+                        ));
+                    }
+                    let expected = BTreeSet::from([
+                        ContributionKind::TopKSummary,
+                        ContributionKind::ProducerClosed,
+                    ]);
+                    if let Some(forbidden) = channel
+                        .allowed_contribution_kinds
+                        .difference(&expected)
+                        .next()
+                    {
+                        return Err(channel_error(
+                            channel.channel_id,
+                            GraphValidationErrorKind::OrderedBoundContributionMismatch(*forbidden),
+                        ));
+                    }
+                    ContributionKind::TopKSummary
+                }
                 ReductionRequirement::SetUnion => {
                     return Err(channel_error(
                         channel.channel_id,
@@ -473,7 +526,7 @@ fn validate_producer(
         RuntimeFilterLogicalDomain::OrderedBound(_) => {
             let reduction_contribution = match channel.reduction_requirement {
                 ReductionRequirement::TightenOrderedBound => ContributionKind::OrderedBoundUpdate,
-                ReductionRequirement::MergeTopKSummary => ContributionKind::TopKSummary,
+                ReductionRequirement::MergeTopKSummary(_) => ContributionKind::TopKSummary,
                 ReductionRequirement::SetUnion => unreachable!(
                     "ordered-bound reduction was validated before producer relationships"
                 ),
@@ -525,6 +578,16 @@ fn validate_coverage_ownership(
             GraphValidationErrorKind::UnknownCoverageWitness(*witness_id),
         ));
     }
+    if matches!(
+        channel.reduction_requirement,
+        ReductionRequirement::MergeTopKSummary(_)
+    ) && let Some(witness_id) = producer_witnesses.difference(&witness_ids).next()
+    {
+        return Err(channel_error(
+            channel.channel_id,
+            GraphValidationErrorKind::TopKSummaryMissingCoverageWitness(*witness_id),
+        ));
+    }
     Ok(())
 }
 
@@ -533,6 +596,16 @@ fn validate_consumer(
     binding: &RuntimeFilterBindingSpec,
     requirement: &ConsumerRequirement,
 ) -> Result<(), GraphValidationError> {
+    if matches!(
+        channel.reduction_requirement,
+        ReductionRequirement::MergeTopKSummary(_)
+    ) && requirement.capabilities != BTreeSet::from([ArtifactCapability::OrderedRange])
+    {
+        return Err(binding_error(
+            binding,
+            GraphValidationErrorKind::TopKSummaryConsumerCapabilityMismatch,
+        ));
+    }
     if let Some(missing) = channel
         .required_consumer_capabilities
         .difference(&requirement.capabilities)
@@ -586,7 +659,7 @@ mod tests {
         ArtifactCapability, BindingId, ChannelId, CompletionFenceKind, CompletionRequirement,
         ConsumerActivation, ContributionKind, CoverageWitnessId, LateApplyGranularity,
         NullSemantics, PlanFragmentId, PlanNodeId, ReductionRequirement,
-        RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
+        RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement, TopKSummaryRequirement,
     };
     use super::super::coverage::{Coverage, CoverageShapeError};
     use super::super::graph::tests::*;
@@ -638,6 +711,28 @@ mod tests {
                 },
             ))
             .unwrap();
+        graph
+    }
+
+    fn topk_summary_graph() -> RuntimeFilterGraph {
+        let mut graph = topn_graph();
+        let summary = TopKSummaryRequirement::try_new(3).unwrap();
+        let channel = graph.channel_mut_for_test(ChannelId::new(1)).unwrap();
+        channel.availability_coverage = Coverage::Leaf(CoverageWitnessId::new(1));
+        channel.terminal_coverage = Coverage::Leaf(CoverageWitnessId::new(1));
+        channel.reduction_requirement = ReductionRequirement::MergeTopKSummary(summary);
+        channel.allowed_contribution_kinds = BTreeSet::from([
+            ContributionKind::TopKSummary,
+            ContributionKind::ProducerClosed,
+        ]);
+        if let RuntimeFilterBindingRole::Producer(requirement) =
+            &mut graph.binding_mut_for_test(BindingId::new(1)).unwrap().role
+        {
+            requirement.contribution_kinds = BTreeSet::from([
+                ContributionKind::TopKSummary,
+                ContributionKind::ProducerClosed,
+            ]);
+        }
         graph
     }
 
@@ -699,20 +794,179 @@ mod tests {
             graph.validate().unwrap();
         }
 
-        let mut topk_graph = topn_graph();
-        let channel = topk_graph.channel_mut_for_test(ChannelId::new(1)).unwrap();
-        channel.reduction_requirement = ReductionRequirement::MergeTopKSummary;
-        if let RuntimeFilterBindingRole::Producer(requirement) = &mut topk_graph
+        topk_summary_graph().validate().unwrap();
+    }
+
+    #[test]
+    fn validate_top_k_summary_requires_exact_all_of_coverage() {
+        let mut any_of = topk_summary_graph();
+        let channel = any_of.channel_mut_for_test(ChannelId::new(1)).unwrap();
+        channel.availability_coverage =
+            Coverage::AllOf(vec![Coverage::AnyOf(vec![Coverage::Leaf(
+                CoverageWitnessId::new(1),
+            )])]);
+        channel.terminal_coverage = Coverage::AllOf(vec![Coverage::AnyOf(vec![Coverage::Leaf(
+            CoverageWitnessId::new(1),
+        )])]);
+        assert_kind(
+            &any_of,
+            GraphValidationErrorKind::TopKSummaryCoverageMismatch,
+        );
+
+        let mut mismatched = topk_summary_graph();
+        mismatched
+            .channel_mut_for_test(ChannelId::new(1))
+            .unwrap()
+            .terminal_coverage = Coverage::AllOf(vec![Coverage::Leaf(CoverageWitnessId::new(2))]);
+        assert_kind(
+            &mismatched,
+            GraphValidationErrorKind::TopKSummaryCoverageMismatch,
+        );
+    }
+
+    #[test]
+    fn validate_top_k_summary_rejects_direct_contribution_mixing() {
+        let mut channel_mixing = topk_summary_graph();
+        channel_mixing
+            .channel_mut_for_test(ChannelId::new(1))
+            .unwrap()
+            .allowed_contribution_kinds
+            .insert(ContributionKind::OrderedBoundUpdate);
+        assert_kind(
+            &channel_mixing,
+            GraphValidationErrorKind::OrderedBoundContributionMismatch(
+                ContributionKind::OrderedBoundUpdate,
+            ),
+        );
+
+        let mut producer_mixing = topk_summary_graph();
+        if let RuntimeFilterBindingRole::Producer(requirement) = &mut producer_mixing
             .binding_mut_for_test(BindingId::new(1))
             .unwrap()
             .role
         {
-            requirement.contribution_kinds = BTreeSet::from([
-                ContributionKind::TopKSummary,
-                ContributionKind::ProducerClosed,
-            ]);
+            requirement
+                .contribution_kinds
+                .insert(ContributionKind::OrderedBoundUpdate);
         }
-        topk_graph.validate().unwrap();
+        assert_kind(
+            &producer_mixing,
+            GraphValidationErrorKind::UnsupportedProducerContribution(
+                ContributionKind::OrderedBoundUpdate,
+            ),
+        );
+    }
+
+    #[test]
+    fn validate_direct_ordered_bound_rejects_summary_contribution_mixing() {
+        let mut channel_mixing = topn_graph();
+        channel_mixing
+            .channel_mut_for_test(ChannelId::new(1))
+            .unwrap()
+            .allowed_contribution_kinds
+            .insert(ContributionKind::TopKSummary);
+        assert_kind(
+            &channel_mixing,
+            GraphValidationErrorKind::OrderedBoundContributionMismatch(
+                ContributionKind::TopKSummary,
+            ),
+        );
+
+        let mut producer_mixing = topn_graph();
+        if let RuntimeFilterBindingRole::Producer(requirement) = &mut producer_mixing
+            .binding_mut_for_test(BindingId::new(1))
+            .unwrap()
+            .role
+        {
+            requirement
+                .contribution_kinds
+                .insert(ContributionKind::TopKSummary);
+        }
+        assert_kind(
+            &producer_mixing,
+            GraphValidationErrorKind::UnsupportedProducerContribution(
+                ContributionKind::TopKSummary,
+            ),
+        );
+    }
+
+    #[test]
+    fn validate_top_k_summary_requires_every_producer_witness() {
+        let mut graph = topk_summary_graph();
+        graph
+            .insert_binding(producer_binding(
+                BindingId::new(3),
+                ChannelId::new(1),
+                CoverageWitnessId::new(2),
+                BTreeSet::from([
+                    ContributionKind::TopKSummary,
+                    ContributionKind::ProducerClosed,
+                ]),
+                CompletionRequirement::ProducerClosed,
+            ))
+            .unwrap();
+
+        assert_kind(
+            &graph,
+            GraphValidationErrorKind::TopKSummaryMissingCoverageWitness(CoverageWitnessId::new(2)),
+        );
+    }
+
+    #[test]
+    fn validate_top_k_summary_requires_exact_channel_consumer_capability() {
+        let mut graph = topk_summary_graph();
+        graph
+            .channel_mut_for_test(ChannelId::new(1))
+            .unwrap()
+            .required_consumer_capabilities
+            .insert(ArtifactCapability::Membership);
+
+        assert_kind(
+            &graph,
+            GraphValidationErrorKind::TopKSummaryConsumerCapabilityMismatch,
+        );
+    }
+
+    #[test]
+    fn validate_top_k_summary_requires_exact_consumer_binding_capability() {
+        for capabilities in [
+            BTreeSet::from([ArtifactCapability::Membership]),
+            BTreeSet::from([
+                ArtifactCapability::OrderedRange,
+                ArtifactCapability::Membership,
+            ]),
+        ] {
+            let mut graph = topk_summary_graph();
+            let RuntimeFilterBindingRole::Consumer(requirement) =
+                &mut graph.binding_mut_for_test(BindingId::new(2)).unwrap().role
+            else {
+                unreachable!("top-k summary fixture has a consumer")
+            };
+            requirement.capabilities = capabilities;
+
+            assert_kind(
+                &graph,
+                GraphValidationErrorKind::TopKSummaryConsumerCapabilityMismatch,
+            );
+        }
+    }
+
+    #[test]
+    fn validate_top_k_summary_requires_non_blocking_consumer() {
+        let mut graph = topk_summary_graph();
+        let RuntimeFilterBindingRole::Consumer(requirement) =
+            &mut graph.binding_mut_for_test(BindingId::new(2)).unwrap().role
+        else {
+            unreachable!("top-k summary fixture has a consumer")
+        };
+        requirement.activation = ConsumerActivation::BlockingSnapshot;
+
+        assert_kind(&graph, GraphValidationErrorKind::BlockingFeedbackConsumer);
+    }
+
+    #[test]
+    fn validate_accepts_exact_top_k_summary_consumer_matrix() {
+        topk_summary_graph().validate().unwrap();
     }
 
     #[test]
@@ -1184,10 +1438,15 @@ mod tests {
             ContributionKind::ProducerClosed,
         ] {
             let mut graph = topn_graph();
-            graph
-                .channel_mut_for_test(ChannelId::new(1))
-                .unwrap()
-                .reduction_requirement = ReductionRequirement::MergeTopKSummary;
+            let channel = graph.channel_mut_for_test(ChannelId::new(1)).unwrap();
+            channel.availability_coverage = Coverage::Leaf(CoverageWitnessId::new(1));
+            channel.terminal_coverage = Coverage::Leaf(CoverageWitnessId::new(1));
+            channel.reduction_requirement =
+                ReductionRequirement::MergeTopKSummary(TopKSummaryRequirement::try_new(3).unwrap());
+            channel.allowed_contribution_kinds = BTreeSet::from([
+                ContributionKind::TopKSummary,
+                ContributionKind::ProducerClosed,
+            ]);
             if let RuntimeFilterBindingRole::Producer(requirement) =
                 &mut graph.binding_mut_for_test(BindingId::new(1)).unwrap().role
             {

@@ -63,6 +63,14 @@ impl Coverage {
         CanonicalCoverage::from(self) == CanonicalCoverage::from(other)
     }
 
+    pub(crate) fn is_all_of_only(&self) -> bool {
+        match self {
+            Self::Leaf(_) => true,
+            Self::AllOf(children) => children.iter().all(Self::is_all_of_only),
+            Self::AnyOf(_) => false,
+        }
+    }
+
     pub(crate) fn witness_ids_in_order(&self) -> Vec<CoverageWitnessId> {
         let mut witness_ids = BTreeSet::new();
         self.collect_witness_ids(&mut witness_ids);
