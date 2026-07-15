@@ -24,8 +24,8 @@ use arrow::record_batch::RecordBatch;
 use regex::Regex;
 use sqlparser::ast as sqlast;
 
-use crate::engine::sql_expr::sqlparser_expr_to_custom_expr;
 use crate::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
+use crate::sql::literal::sqlparser_expr_to_custom_expr;
 use crate::sql::parser::ast::{
     ArithmeticOp, Expr, InsertSource, Literal, ObjectName, OverwriteMode,
 };

@@ -50,7 +50,7 @@ use crate::connector::iceberg::fs_io;
 use crate::connector::iceberg::variant_write::parse_variant_shredding_properties;
 use crate::engine::catalog::{ColumnDef, normalize_identifier};
 use crate::engine::parquet::parse_datetime_string_to_nanos;
-use crate::engine::sql_expr::literal_to_i128_for_integer;
+use crate::sql::literal::literal_to_i128_for_integer;
 use crate::sql::{ColumnAggregation, Literal, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
 
 #[derive(Default)]
@@ -2687,7 +2687,7 @@ fn build_literal_array(
         }
         DataType::LargeBinary => {
             // Variant columns: the literal extractor (`parse_json` arm in
-            // `engine/sql_expr.rs::sqlparser_function_to_literal`) packs the
+            // `sql::literal::sqlparser_function_to_literal`) packs the
             // [size:u32 LE | metadata | value] payload as a Latin-1 String.
             // We unpack via the same convention `to_binary` uses.
             use arrow::array::LargeBinaryBuilder;
@@ -2695,8 +2695,9 @@ fn build_literal_array(
             for literal in values {
                 match literal {
                     Literal::Null => builder.append_null(),
-                    Literal::String(value) => builder
-                        .append_value(crate::engine::sql_expr::latin1_string_to_bytes(value)?),
+                    Literal::String(value) => {
+                        builder.append_value(crate::sql::literal::latin1_string_to_bytes(value)?)
+                    }
                     other => {
                         return Err(format!(
                             "literal {:?} is not valid for VARIANT column",

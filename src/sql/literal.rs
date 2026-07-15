@@ -15,35 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! sqlparser AST → NovaRocks `Expr`/`Literal` conversion, plus literal
-//! utilities (compare, cast, arithmetic, encoding, keying) and small
-//! property/tokenizer helpers used across the standalone engine.
+//! sqlparser AST -> NovaRocks `Expr`/`Literal` conversion, plus literal
+//! utilities (compare, cast, arithmetic, encoding, and keying) used across
+//! SQL planning and standalone execution.
 //!
-//! Extracted from `engine/mod.rs` during the PR1 refactor; all items here are
-//! pure functions with no standalone-runtime state — they just translate
-//! between sqlparser tokens/expressions and NovaRocks types.
+//! All items here are pure functions with no standalone-runtime state. They
+//! translate between sqlparser tokens/expressions and NovaRocks types.
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use arrow::record_batch::RecordBatch;
+use arrow::array::ArrayRef;
+use arrow::datatypes::{DataType, Field, TimeUnit};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 
-use crate::engine::record_batch_to_chunk;
-use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use crate::sql::parser::ast::{ArithmeticOp, Expr, Literal, SqlType};
-
-pub(crate) fn strip_optional_identifier_quotes(token: &str) -> &str {
-    token.trim_end_matches(';').trim_matches('`')
-}
-
-pub(crate) fn canonicalize_sql_for_match(sql: &str) -> String {
-    sql.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase()
-}
 
 pub(crate) fn sqlparser_expr_to_custom_expr(expr: &sqlparser::ast::Expr) -> Result<Expr, String> {
     use sqlparser::ast as sqlast;
@@ -1032,194 +1017,6 @@ pub(crate) fn eval_array_generate_literal(args: &[Literal]) -> Result<Literal, S
 }
 
 // ---------------------------------------------------------------------------
-// SELECT without FROM helpers
-// ---------------------------------------------------------------------------
-
-/// Check if a query is a SELECT without any FROM clause.
-pub(crate) fn is_select_without_from(query: &sqlparser::ast::Query) -> bool {
-    if let sqlparser::ast::SetExpr::Select(ref select) = *query.body {
-        select.from.is_empty()
-    } else {
-        false
-    }
-}
-
-/// Evaluate a constant SELECT expression (no FROM) and return a single-row result.
-pub(crate) fn evaluate_constant_select(
-    query: &sqlparser::ast::Query,
-) -> Result<QueryResult, String> {
-    use sqlparser::ast as sqlast;
-
-    let select = match query.body.as_ref() {
-        sqlast::SetExpr::Select(s) => s.as_ref(),
-        _ => return Err("only simple SELECT is supported for constant evaluation".into()),
-    };
-
-    let mut columns = Vec::new();
-    let mut arrays: Vec<ArrayRef> = Vec::new();
-
-    for (idx, item) in select.projection.iter().enumerate() {
-        match item {
-            sqlast::SelectItem::UnnamedExpr(expr) => {
-                let (col_name, array) = evaluate_const_expr(expr, idx)?;
-                columns.push(QueryResultColumn {
-                    name: col_name,
-                    data_type: array.data_type().clone(),
-                    nullable: true,
-                    logical_type: None,
-                });
-                arrays.push(array);
-            }
-            sqlast::SelectItem::ExprWithAlias { expr, alias } => {
-                let (_, array) = evaluate_const_expr(expr, idx)?;
-                columns.push(QueryResultColumn {
-                    name: alias.value.clone(),
-                    data_type: array.data_type().clone(),
-                    nullable: true,
-                    logical_type: None,
-                });
-                arrays.push(array);
-            }
-            other => {
-                return Err(format!(
-                    "unsupported projection item in constant SELECT: {:?}",
-                    other
-                ));
-            }
-        }
-    }
-
-    let fields: Vec<Field> = columns
-        .iter()
-        .map(|c| Field::new(&c.name, c.data_type.clone(), c.nullable))
-        .collect();
-    let schema = Arc::new(Schema::new(fields));
-    let batch = RecordBatch::try_new(schema, arrays)
-        .map_err(|e| format!("build constant SELECT batch failed: {e}"))?;
-    let chunk = record_batch_to_chunk(batch)?;
-    Ok(QueryResult {
-        columns,
-        chunks: vec![chunk],
-    })
-}
-
-/// Evaluate a constant expression and return (column_name, single-element array).
-pub(crate) fn evaluate_const_expr(
-    expr: &sqlparser::ast::Expr,
-    idx: usize,
-) -> Result<(String, ArrayRef), String> {
-    use arrow::array::*;
-    use sqlparser::ast as sqlast;
-
-    match expr {
-        sqlast::Expr::Value(value_with_span) => match &value_with_span.value {
-            sqlast::Value::Number(n, _) => {
-                if let Ok(i) = n.parse::<i64>() {
-                    Ok((n.clone(), Arc::new(Int64Array::from(vec![i])) as ArrayRef))
-                } else if let Ok(f) = n.parse::<f64>() {
-                    Ok((n.clone(), Arc::new(Float64Array::from(vec![f])) as ArrayRef))
-                } else {
-                    Err(format!("cannot parse number literal `{n}`"))
-                }
-            }
-            sqlast::Value::SingleQuotedString(s) | sqlast::Value::DoubleQuotedString(s) => Ok((
-                s.clone(),
-                Arc::new(StringArray::from(vec![s.as_str()])) as ArrayRef,
-            )),
-            sqlast::Value::Boolean(b) => Ok((
-                b.to_string(),
-                Arc::new(BooleanArray::from(vec![*b])) as ArrayRef,
-            )),
-            sqlast::Value::Null => Ok((
-                "NULL".to_string(),
-                Arc::new(arrow::array::NullArray::new(1)) as ArrayRef,
-            )),
-            other => Err(format!("unsupported constant value: {:?}", other)),
-        },
-        sqlast::Expr::BinaryOp { left, op, right } => {
-            let (_, left_arr) = evaluate_const_expr(left, idx)?;
-            let (_, right_arr) = evaluate_const_expr(right, idx)?;
-            let left_val = extract_numeric_scalar(&left_arr)?;
-            let right_val = extract_numeric_scalar(&right_arr)?;
-            let result = match op {
-                sqlast::BinaryOperator::Plus => left_val + right_val,
-                sqlast::BinaryOperator::Minus => left_val - right_val,
-                sqlast::BinaryOperator::Multiply => left_val * right_val,
-                sqlast::BinaryOperator::Divide => {
-                    if right_val == 0.0 {
-                        return Err("division by zero".to_string());
-                    }
-                    left_val / right_val
-                }
-                sqlast::BinaryOperator::Modulo => left_val % right_val,
-                other => return Err(format!("unsupported binary operator: {:?}", other)),
-            };
-            // Return as int if both inputs were int and result is whole
-            if left_arr.data_type() == &DataType::Int64
-                && right_arr.data_type() == &DataType::Int64
-                && result.fract() == 0.0
-                && !matches!(op, sqlast::BinaryOperator::Divide)
-            {
-                Ok((
-                    format!("_col{idx}"),
-                    Arc::new(Int64Array::from(vec![result as i64])) as ArrayRef,
-                ))
-            } else {
-                Ok((
-                    format!("_col{idx}"),
-                    Arc::new(Float64Array::from(vec![result])) as ArrayRef,
-                ))
-            }
-        }
-        sqlast::Expr::UnaryOp {
-            op: sqlast::UnaryOperator::Minus,
-            expr: inner,
-        } => {
-            let (_, arr) = evaluate_const_expr(inner, idx)?;
-            let val = extract_numeric_scalar(&arr)?;
-            if arr.data_type() == &DataType::Int64 {
-                Ok((
-                    format!("_col{idx}"),
-                    Arc::new(Int64Array::from(vec![(-val) as i64])) as ArrayRef,
-                ))
-            } else {
-                Ok((
-                    format!("_col{idx}"),
-                    Arc::new(Float64Array::from(vec![-val])) as ArrayRef,
-                ))
-            }
-        }
-        sqlast::Expr::Nested(inner) => evaluate_const_expr(inner, idx),
-        other => Err(format!(
-            "unsupported expression in constant SELECT: {:?}",
-            other
-        )),
-    }
-}
-
-/// Extract a numeric scalar value from a single-element array.
-pub(crate) fn extract_numeric_scalar(arr: &ArrayRef) -> Result<f64, String> {
-    use arrow::array::*;
-    match arr.data_type() {
-        DataType::Int64 => {
-            let a = arr
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or("downcast Int64Array")?;
-            Ok(a.value(0) as f64)
-        }
-        DataType::Float64 => {
-            let a = arr
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or("downcast Float64Array")?;
-            Ok(a.value(0))
-        }
-        other => Err(format!("cannot extract numeric from {:?}", other)),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Local parquet table helpers
 // ---------------------------------------------------------------------------
 
@@ -1602,46 +1399,6 @@ pub(crate) fn format_decimal128_value(value: i128, scale: i8) -> Result<String, 
     ))
 }
 
-pub(crate) fn parse_kv_properties(
-    parser: &mut sqlparser::parser::Parser<'_>,
-) -> Result<Vec<(String, String)>, String> {
-    use sqlparser::tokenizer::Token;
-
-    let mut props = Vec::new();
-    if !parser.consume_token(&Token::LParen) {
-        return Ok(props);
-    }
-    loop {
-        if parser.consume_token(&Token::RParen) {
-            break;
-        }
-        if !props.is_empty() {
-            let _ = parser.consume_token(&Token::Comma);
-            if parser.consume_token(&Token::RParen) {
-                break;
-            }
-        }
-        let key = parse_prop_string_or_ident(parser)?;
-        let _ = parser.consume_token(&Token::Eq);
-        let value = parse_prop_string_or_ident(parser)?;
-        props.push((key, value));
-    }
-    Ok(props)
-}
-
-pub(crate) fn parse_prop_string_or_ident(
-    parser: &mut sqlparser::parser::Parser<'_>,
-) -> Result<String, String> {
-    use sqlparser::tokenizer::Token;
-    let token = parser.next_token();
-    match token.token {
-        Token::SingleQuotedString(s) | Token::DoubleQuotedString(s) => Ok(s),
-        Token::Word(w) => Ok(w.value),
-        Token::Number(n, _) => Ok(n),
-        other => Err(format!("expected string or identifier, got {other}")),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1811,6 +1568,35 @@ mod tests {
             err.contains("parse_json expects 1 argument"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn bitmap_constant_folds_round_trip_through_runtime_codec() {
+        use std::collections::BTreeSet;
+
+        for (sql, expected) in [
+            ("bitmap_empty()", BTreeSet::new()),
+            ("to_bitmap(7)", BTreeSet::from([7])),
+            ("bitmap_from_string('7, 9, 7')", BTreeSet::from([7, 9])),
+        ] {
+            let raw = parse_expr(sql);
+            let sqlparser::ast::Expr::Function(ref func) = raw else {
+                panic!("expected Function node for `{sql}`");
+            };
+            let Literal::String(packed) =
+                sqlparser_function_to_literal(func).expect("bitmap constant fold")
+            else {
+                panic!("expected packed bitmap literal for `{sql}`");
+            };
+            let bytes = latin1_string_to_bytes(&packed).expect("latin1 decode");
+
+            assert_eq!(
+                crate::exec::expr::function::object::bitmap_common::decode_bitmap(&bytes)
+                    .expect("runtime bitmap decode"),
+                expected,
+                "runtime codec disagrees with constant fold for `{sql}`"
+            );
+        }
     }
 
     #[test]

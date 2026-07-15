@@ -34,7 +34,7 @@ use super::parquet::{
     normalize_map_entries_nullability, parse_date_string_to_days, parse_datetime_string_to_micros,
     parse_datetime_string_to_nanos,
 };
-use super::sql_expr::{latin1_string_to_bytes, literal_to_i128_for_integer};
+use crate::sql::literal::{latin1_string_to_bytes, literal_to_i128_for_integer};
 use crate::sql::parser::ast::Literal;
 
 pub(crate) fn reorder_insert_rows(
@@ -383,7 +383,7 @@ fn build_local_literal_array(
         DataType::LargeBinary => {
             // VARIANT lowers to LargeBinary; INSERT VALUES carries the encoded
             // variant bytes packed into Literal::String via Latin-1 (see
-            // `parse_json` / `to_binary` in src/engine/sql_expr.rs).
+            // `parse_json` / `to_binary` in `sql::literal`).
             let mut builder = LargeBinaryBuilder::new();
             for literal in values {
                 match literal {
@@ -720,7 +720,7 @@ mod tests {
 
     #[test]
     fn build_local_literal_array_large_binary_accepts_latin1_packed_bytes() {
-        use crate::engine::sql_expr::bytes_to_latin1_string;
+        use crate::sql::literal::bytes_to_latin1_string;
         use arrow::array::{Array, LargeBinaryArray};
 
         let raw: &[u8] = &[1u8, 2, 3];

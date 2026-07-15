@@ -1068,7 +1068,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 // down to 2 (`ef`) and is the cause of `join_large_in_predicate`
                 // step 59 silently dropping the backslash row from the IN
                 // result. INSERT VALUES already trusts sqlparser's output
-                // (`sql_expr.rs` clones the string as-is); SELECT now matches.
+                // (`sql::literal` clones the string as-is); SELECT now matches.
                 Ok(TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::String(s.clone())),
                     data_type: DataType::Utf8,

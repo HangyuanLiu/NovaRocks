@@ -3332,7 +3332,7 @@ mod tests {
         use crate::sql::parser::ast::SqlType;
         use arrow::datatypes::{DataType, TimeUnit};
         assert_eq!(
-            crate::engine::sql_expr::sql_type_to_arrow_type(&SqlType::DateTimeNs),
+            crate::sql::literal::sql_type_to_arrow_type(&SqlType::DateTimeNs),
             Ok(DataType::Timestamp(TimeUnit::Nanosecond, None))
         );
     }
