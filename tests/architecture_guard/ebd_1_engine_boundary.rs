@@ -1411,6 +1411,13 @@ fn is_legacy_ebd_2_owner_path(path: &[String]) -> bool {
         && matches!(path[2].as_str(), "sql_expr" | "procedure")
 }
 
+fn is_legacy_ebd_3a_owner_path(path: &[String]) -> bool {
+    path.len() >= 3
+        && path[0] == "crate"
+        && path[1] == "engine"
+        && matches!(path[2].as_str(), "parquet" | "stream_load")
+}
+
 fn is_standalone_state_path(path: &[String]) -> bool {
     is_engine_path(path) && path.get(2).is_some_and(|item| item == "StandaloneState")
 }
@@ -2176,6 +2183,199 @@ mod tests {
             .map(str::to_string)
             .collect::<Vec<_>>(),
         ])
+    );
+}
+
+#[test]
+fn ebd_3a_format_io_has_canonical_owners() {
+    const NEW_FORMAT_OWNER: &str = "src/formats/parquet/local_io.rs";
+    const SQL_LITERAL_OWNER: &str = "src/sql/literal.rs";
+    const OLD_OWNERS: &[&str] = &["src/engine/parquet.rs", "src/engine/stream_load.rs"];
+    const FORBIDDEN_FORMAT_IDENTIFIERS: &[&str] = &[
+        "Chunk",
+        "ColumnDef",
+        "Literal",
+        "QueryResult",
+        "StandaloneSession",
+        "StandaloneState",
+        "TableDef",
+    ];
+    const TEMPORAL_PARSER_SYMBOLS: &[&str] = &[
+        "parse_date_string_to_days",
+        "parse_datetime_string_to_micros",
+        "parse_datetime_string_to_nanos",
+    ];
+
+    let repo = Path::new(manifest_dir());
+    let src = src_dir();
+    let mut violations = BTreeSet::new();
+
+    let format_owner_path = repo.join(NEW_FORMAT_OWNER);
+    if !format_owner_path.is_file() {
+        violations.insert(format!("new-owner-missing: {NEW_FORMAT_OWNER}"));
+    } else {
+        let text = fs::read_to_string(&format_owner_path)
+            .unwrap_or_else(|error| panic!("failed to read {NEW_FORMAT_OWNER}: {error}"));
+        let all_source = rust_lexically_sanitized(&text);
+        for dependency in rust_all_source_canonical_paths(&text, NEW_FORMAT_OWNER)
+            .into_iter()
+            .filter(|dependency| {
+                is_engine_path(dependency)
+                    || dependency.len() >= 2 && dependency[0] == "crate" && dependency[1] == "sql"
+            })
+        {
+            violations.insert(format!(
+                "new-format-owner-forbidden-dependency: {NEW_FORMAT_OWNER}|{}",
+                dependency.join("::")
+            ));
+        }
+        for identifier in rust_source_tokens(&all_source)
+            .into_iter()
+            .map(|token| token.text)
+            .filter(|identifier| FORBIDDEN_FORMAT_IDENTIFIERS.contains(&identifier.as_str()))
+        {
+            violations.insert(format!(
+                "new-format-owner-forbidden-identifier: {NEW_FORMAT_OWNER}|{identifier}"
+            ));
+        }
+    }
+
+    let sql_literal_path = repo.join(SQL_LITERAL_OWNER);
+    if !sql_literal_path.is_file() {
+        violations.insert(format!("new-owner-missing: {SQL_LITERAL_OWNER}"));
+    } else {
+        let text = fs::read_to_string(&sql_literal_path)
+            .unwrap_or_else(|error| panic!("failed to read {SQL_LITERAL_OWNER}: {error}"));
+        let production = rust_sanitized_production_text(&text);
+        for dependency in rust_all_source_canonical_paths(&text, SQL_LITERAL_OWNER)
+            .into_iter()
+            .filter(|dependency| is_engine_path(dependency))
+        {
+            violations.insert(format!(
+                "sql-literal-owner-engine-dependency: {SQL_LITERAL_OWNER}|{}",
+                dependency.join("::")
+            ));
+        }
+        let tokens = rust_source_tokens(&production)
+            .into_iter()
+            .map(|token| token.text)
+            .collect::<Vec<_>>();
+        for symbol in TEMPORAL_PARSER_SYMBOLS {
+            if !tokens
+                .windows(2)
+                .any(|tokens| tokens[0] == "fn" && tokens[1] == *symbol)
+            {
+                violations.insert(format!(
+                    "temporal-parser-symbol-missing: {SQL_LITERAL_OWNER}|{symbol}"
+                ));
+            }
+        }
+    }
+
+    for owner in OLD_OWNERS {
+        if repo.join(owner).exists() {
+            violations.insert(format!("old-owner-still-present: {owner}"));
+        }
+    }
+
+    for path in production_rs_files_from_entries(&src, &[src.join("lib.rs"), src.join("main.rs")]) {
+        let source = rel(&path);
+        if OLD_OWNERS.contains(&source.as_str()) {
+            continue;
+        }
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {source}: {error}"));
+        let production = rust_sanitized_production_text(&text);
+        for dependency in rust_production_canonical_paths(&production, &source)
+            .into_iter()
+            .filter(|dependency| is_legacy_ebd_3a_owner_path(dependency))
+        {
+            violations.insert(format!(
+                "old-canonical-path: {source}|{}",
+                dependency.join("::")
+            ));
+        }
+    }
+
+    for root in [&src, &repo.join("tests")] {
+        for path in rs_files(root) {
+            let source = rel(&path);
+            if OLD_OWNERS.contains(&source.as_str()) {
+                continue;
+            }
+            let text = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("failed to read {source}: {error}"));
+            for dependency in rust_all_source_canonical_paths(&text, &source)
+                .into_iter()
+                .filter(|dependency| is_legacy_ebd_3a_owner_path(dependency))
+            {
+                violations.insert(format!(
+                    "old-canonical-path: {source}|{}",
+                    dependency.join("::")
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "EBD-3A format I/O owner boundary failed:\n{}",
+        violations.into_iter().collect::<Vec<_>>().join("\n")
+    );
+}
+
+#[test]
+fn ebd_3a_all_source_detector_covers_test_aliases_and_ignores_noise() {
+    let source = r#"
+// use crate::engine::parquet as legacy_parquet;
+const DOCUMENTATION: &str = "crate::engine::stream_load::parse_stream_load_payload";
+
+#[cfg(test)]
+mod tests {
+    use crate::engine::parquet as legacy_parquet;
+    use crate::engine::stream_load as legacy_stream_load;
+
+    fn legacy_paths() {
+        let _ = legacy_parquet::cast_batch_to_schema;
+        let _ = legacy_stream_load::parse_stream_load_payload;
+    }
+}
+"#;
+
+    let production = rust_sanitized_production_text(source);
+    assert!(
+        rust_production_canonical_paths(&production, "src/formats/parquet/local_io.rs")
+            .into_iter()
+            .all(|path| !is_legacy_ebd_3a_owner_path(&path)),
+        "production scan must continue to ignore cfg(test) source"
+    );
+
+    let legacy_paths = rust_all_source_canonical_paths(source, "src/formats/parquet/local_io.rs")
+        .into_iter()
+        .filter(|path| is_legacy_ebd_3a_owner_path(path))
+        .collect::<BTreeSet<_>>();
+    assert!(
+        legacy_paths.contains(
+            &vec!["crate", "engine", "parquet", "cast_batch_to_schema"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        ),
+        "all-source scan must resolve the cfg(test) parquet alias"
+    );
+    assert!(
+        legacy_paths.contains(
+            &vec![
+                "crate",
+                "engine",
+                "stream_load",
+                "parse_stream_load_payload"
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+        ),
+        "all-source scan must resolve the cfg(test) stream-load alias"
     );
 }
 
