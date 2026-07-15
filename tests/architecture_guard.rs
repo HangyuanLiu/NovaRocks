@@ -214,9 +214,8 @@ fn rust_module_items_in_range(
                 is_external: false,
                 name: tokens[cursor + 1].text.clone(),
             });
-            if attributes
-                .iter()
-                .any(|attribute| cfg_attribute_requires_test(attribute))
+            if cfg_attributes_test_requirement(attributes.iter().map(String::as_str))
+                == CfgTestRequirement::RequiresTest
             {
                 start = close + 1;
                 continue;
@@ -433,9 +432,19 @@ fn cfg_parse_predicate(tokens: &[String], start: usize) -> Option<(CfgPredicate,
 fn cfg_predicate_test_requirement_with_budget(
     tokens: &[String],
     start: usize,
-    mut work_budget: usize,
+    work_budget: usize,
 ) -> Option<(CfgTestRequirement, usize)> {
     let (predicate, end) = cfg_parse_predicate(tokens, start)?;
+    Some((
+        cfg_test_requirement_for_predicate(&predicate, work_budget),
+        end,
+    ))
+}
+
+fn cfg_test_requirement_for_predicate(
+    predicate: &CfgPredicate,
+    mut work_budget: usize,
+) -> CfgTestRequirement {
     let mut atoms = BTreeSet::new();
     predicate.collect_atoms(&mut atoms);
     let atoms = atoms.into_iter().collect::<Vec<_>>();
@@ -445,12 +454,11 @@ fn cfg_predicate_test_requirement_with_budget(
         &mut BTreeMap::new(),
         &mut work_budget,
     );
-    let requirement = match satisfiability {
+    match satisfiability {
         CfgSatisfiability::Satisfiable => CfgTestRequirement::ProductionPossible,
         CfgSatisfiability::Unsatisfiable => CfgTestRequirement::RequiresTest,
         CfgSatisfiability::Unproven => CfgTestRequirement::Unproven,
-    };
-    Some((requirement, end))
+    }
 }
 
 fn cfg_predicate_test_requirement(
@@ -479,6 +487,114 @@ fn cfg_attribute_test_requirement(attribute: &str) -> Option<CfgTestRequirement>
 
 fn cfg_attribute_requires_test(attribute: &str) -> bool {
     cfg_attribute_test_requirement(attribute) == Some(CfgTestRequirement::RequiresTest)
+}
+
+fn cfg_meta_end(tokens: &[String], start: usize, limit: usize) -> Option<usize> {
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    for index in start..limit {
+        match tokens[index].as_str() {
+            "(" => paren_depth += 1,
+            ")" => paren_depth = paren_depth.checked_sub(1)?,
+            "[" => bracket_depth += 1,
+            "]" => bracket_depth = bracket_depth.checked_sub(1)?,
+            "{" => brace_depth += 1,
+            "}" => brace_depth = brace_depth.checked_sub(1)?,
+            "," if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                return Some(index);
+            }
+            _ => {}
+        }
+    }
+    Some(limit)
+}
+
+fn cfg_generated_meta_presence_predicate(
+    tokens: &[String],
+    start: usize,
+    limit: usize,
+) -> Option<(Option<CfgPredicate>, usize)> {
+    match tokens.get(start)?.as_str() {
+        "cfg" => {
+            if tokens.get(start + 1).is_none_or(|token| token != "(") {
+                return None;
+            }
+            let close = runtime_filter_matching_delimiter(tokens, start + 1, "(", ")")?;
+            if close >= limit {
+                return None;
+            }
+            let (predicate, end) = cfg_parse_predicate(tokens, start + 2)?;
+            (end == close).then_some((Some(predicate), close + 1))
+        }
+        "cfg_attr" => {
+            if tokens.get(start + 1).is_none_or(|token| token != "(") {
+                return None;
+            }
+            let close = runtime_filter_matching_delimiter(tokens, start + 1, "(", ")")?;
+            if close >= limit {
+                return None;
+            }
+            let (condition, mut cursor) = cfg_parse_predicate(tokens, start + 2)?;
+            if tokens.get(cursor).is_none_or(|token| token != ",") {
+                return None;
+            }
+            cursor += 1;
+            let mut generated = Vec::new();
+            while cursor < close {
+                let (predicate, end) = cfg_generated_meta_presence_predicate(tokens, cursor, close)
+                    .or_else(|| cfg_meta_end(tokens, cursor, close).map(|end| (None, end)))?;
+                if let Some(predicate) = predicate {
+                    generated.push(predicate);
+                }
+                cursor = end;
+                if tokens.get(cursor).is_some_and(|token| token == ",") {
+                    cursor += 1;
+                }
+            }
+            let presence = CfgPredicate::Any(vec![
+                CfgPredicate::Not(Box::new(condition)),
+                CfgPredicate::All(generated),
+            ]);
+            Some((Some(presence), close + 1))
+        }
+        _ => cfg_meta_end(tokens, start, limit).map(|end| (None, end)),
+    }
+}
+
+fn cfg_attribute_presence_predicate(attribute: &str) -> Result<Option<CfgPredicate>, ()> {
+    let tokens = rust_use_tokens(attribute);
+    let open = tokens.iter().position(|token| token == "[").ok_or(())?;
+    let head = open + 1;
+    match tokens.get(head).map(String::as_str) {
+        Some("cfg") => {
+            if tokens.get(head + 1).is_none_or(|token| token != "(") {
+                return Err(());
+            }
+            let close = runtime_filter_matching_delimiter(&tokens, head + 1, "(", ")").ok_or(())?;
+            let (predicate, end) = cfg_parse_predicate(&tokens, head + 2).ok_or(())?;
+            (end == close).then_some(Some(predicate)).ok_or(())
+        }
+        Some("cfg_attr") => cfg_generated_meta_presence_predicate(&tokens, head, tokens.len())
+            .and_then(|(predicate, _)| predicate)
+            .map(Some)
+            .ok_or(()),
+        _ => Ok(None),
+    }
+}
+
+fn cfg_attributes_test_requirement<'a>(
+    attributes: impl IntoIterator<Item = &'a str>,
+) -> CfgTestRequirement {
+    let mut predicates = Vec::new();
+    for attribute in attributes {
+        match cfg_attribute_presence_predicate(attribute) {
+            Ok(Some(predicate)) => predicates.push(predicate),
+            Ok(None) => {}
+            Err(()) => return CfgTestRequirement::Unproven,
+        }
+    }
+    cfg_test_requirement_for_predicate(&CfgPredicate::All(predicates), CFG_SAT_WORK_BUDGET)
 }
 
 fn decode_rust_string_literal(literal: &str) -> Option<String> {
@@ -758,10 +874,8 @@ fn production_rs_files_from_entries(root: &Path, entries: &[PathBuf]) -> Vec<Pat
             .into_iter()
             .filter(|item| item.is_external)
         {
-            if item
-                .attributes
-                .iter()
-                .any(|attribute| cfg_attribute_requires_test(attribute))
+            if cfg_attributes_test_requirement(item.attributes.iter().map(String::as_str))
+                == CfgTestRequirement::RequiresTest
             {
                 continue;
             }
@@ -2645,9 +2759,8 @@ fn rust_test_only_item_spans(text: &str) -> Vec<std::ops::Range<usize>> {
             attributes.push(text[tokens[cursor].start..tokens[close].end].to_string());
             cursor = close + 1;
         }
-        if !attributes
-            .iter()
-            .any(|attribute| cfg_attribute_requires_test(attribute))
+        if cfg_attributes_test_requirement(attributes.iter().map(String::as_str))
+            != CfgTestRequirement::RequiresTest
         {
             start += 1;
             continue;
@@ -11476,14 +11589,10 @@ fn runtime_filter_finish_binding_audit(block: &syn::Block) -> (bool, usize, usiz
 fn runtime_filter_action_dispatch_boundary_violations(producer: &str) -> Vec<String> {
     let production = rust_sanitized_production_text(producer);
     let mut violations = Vec::new();
-    let parsed = match syn::parse_file(&production) {
+    let mut parsed = match syn::parse_file(&production) {
         Ok(file) => file,
         Err(production_error) => match syn::parse_file(producer) {
-            Ok(mut file) => {
-                file.items
-                    .retain(|item| !runtime_filter_syn_item_requires_test(item));
-                file
-            }
+            Ok(file) => file,
             Err(raw_error) => {
                 return vec![format!(
                     "Service producer production source must parse for action audit: sanitized={production_error}; raw={raw_error}"
@@ -11491,7 +11600,7 @@ fn runtime_filter_action_dispatch_boundary_violations(producer: &str) -> Vec<Str
             }
         },
     };
-    if runtime_filter_file_has_unproven_cfg(&parsed) {
+    if runtime_filter_filter_cfg_file(&mut parsed).is_err() {
         return vec![
             "Service producer bounded cfg analysis was unproven; action audit fails closed"
                 .to_string(),
@@ -11801,8 +11910,8 @@ fn runtime_filter_type_is_option_arc_artifact_bundle(ty: &syn::Type) -> bool {
         )
 }
 
-fn runtime_filter_syn_item_requires_test(item: &syn::Item) -> bool {
-    let attributes = match item {
+fn runtime_filter_syn_item_attributes(item: &syn::Item) -> &[syn::Attribute] {
+    match item {
         syn::Item::Const(item) => &item.attrs,
         syn::Item::Enum(item) => &item.attrs,
         syn::Item::ExternCrate(item) => &item.attrs,
@@ -11818,47 +11927,166 @@ fn runtime_filter_syn_item_requires_test(item: &syn::Item) -> bool {
         syn::Item::Type(item) => &item.attrs,
         syn::Item::Union(item) => &item.attrs,
         syn::Item::Use(item) => &item.attrs,
-        _ => return false,
-    };
-    attributes.iter().any(|attribute| {
-        attribute.path().is_ident("cfg")
-            && matches!(&attribute.meta, syn::Meta::List(list) if cfg_attribute_requires_test(&format!("#[cfg({})]", list.tokens)))
-    })
-}
-
-#[derive(Default)]
-struct RuntimeFilterUnprovenCfgAudit {
-    found: bool,
-}
-
-impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterUnprovenCfgAudit {
-    fn visit_attribute(&mut self, attribute: &'ast syn::Attribute) {
-        if attribute.path().is_ident("cfg")
-            && matches!(&attribute.meta, syn::Meta::List(list)
-                if cfg_attribute_test_requirement(&format!("#[cfg({})]", list.tokens))
-                    == Some(CfgTestRequirement::Unproven))
-        {
-            self.found = true;
-        }
+        _ => &[],
     }
 }
 
-fn runtime_filter_file_has_unproven_cfg(file: &syn::File) -> bool {
-    let mut audit = RuntimeFilterUnprovenCfgAudit::default();
-    syn::visit::Visit::visit_file(&mut audit, file);
-    audit.found
+fn runtime_filter_syn_attributes_test_requirement(
+    attributes: &[syn::Attribute],
+) -> CfgTestRequirement {
+    let mut cfg_attributes = Vec::new();
+    for attribute in attributes {
+        let name = if attribute.path().is_ident("cfg") {
+            "cfg"
+        } else if attribute.path().is_ident("cfg_attr") {
+            "cfg_attr"
+        } else {
+            continue;
+        };
+        let syn::Meta::List(list) = &attribute.meta else {
+            return CfgTestRequirement::Unproven;
+        };
+        cfg_attributes.push(format!("#[{name}({})]", list.tokens));
+    }
+    cfg_attributes_test_requirement(cfg_attributes.iter().map(String::as_str))
+}
+
+fn runtime_filter_cfg_node_is_kept(attributes: &[syn::Attribute]) -> Result<bool, ()> {
+    match runtime_filter_syn_attributes_test_requirement(attributes) {
+        CfgTestRequirement::RequiresTest => Ok(false),
+        CfgTestRequirement::ProductionPossible => Ok(true),
+        CfgTestRequirement::Unproven => Err(()),
+    }
+}
+
+fn runtime_filter_filter_cfg_fields(
+    fields: &mut syn::punctuated::Punctuated<syn::Field, syn::Token![,]>,
+) -> Result<(), ()> {
+    let mut retained = syn::punctuated::Punctuated::new();
+    for field in std::mem::take(fields) {
+        if runtime_filter_cfg_node_is_kept(&field.attrs)? {
+            retained.push(field);
+        }
+    }
+    *fields = retained;
+    Ok(())
+}
+
+fn runtime_filter_filter_cfg_field_set(fields: &mut syn::Fields) -> Result<(), ()> {
+    match fields {
+        syn::Fields::Named(fields) => runtime_filter_filter_cfg_fields(&mut fields.named),
+        syn::Fields::Unnamed(fields) => runtime_filter_filter_cfg_fields(&mut fields.unnamed),
+        syn::Fields::Unit => Ok(()),
+    }
+}
+
+fn runtime_filter_trait_item_attributes(item: &syn::TraitItem) -> &[syn::Attribute] {
+    match item {
+        syn::TraitItem::Const(item) => &item.attrs,
+        syn::TraitItem::Fn(item) => &item.attrs,
+        syn::TraitItem::Type(item) => &item.attrs,
+        syn::TraitItem::Macro(item) => &item.attrs,
+        syn::TraitItem::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn runtime_filter_impl_item_attributes(item: &syn::ImplItem) -> &[syn::Attribute] {
+    match item {
+        syn::ImplItem::Const(item) => &item.attrs,
+        syn::ImplItem::Fn(item) => &item.attrs,
+        syn::ImplItem::Type(item) => &item.attrs,
+        syn::ImplItem::Macro(item) => &item.attrs,
+        syn::ImplItem::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn runtime_filter_foreign_item_attributes(item: &syn::ForeignItem) -> &[syn::Attribute] {
+    match item {
+        syn::ForeignItem::Fn(item) => &item.attrs,
+        syn::ForeignItem::Static(item) => &item.attrs,
+        syn::ForeignItem::Type(item) => &item.attrs,
+        syn::ForeignItem::Macro(item) => &item.attrs,
+        syn::ForeignItem::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn runtime_filter_filter_cfg_item_members(item: &mut syn::Item) -> Result<(), ()> {
+    match item {
+        syn::Item::Enum(item) => {
+            let mut retained = syn::punctuated::Punctuated::new();
+            for mut variant in std::mem::take(&mut item.variants) {
+                if runtime_filter_cfg_node_is_kept(&variant.attrs)? {
+                    runtime_filter_filter_cfg_field_set(&mut variant.fields)?;
+                    retained.push(variant);
+                }
+            }
+            item.variants = retained;
+        }
+        syn::Item::Struct(item) => runtime_filter_filter_cfg_field_set(&mut item.fields)?,
+        syn::Item::Union(item) => runtime_filter_filter_cfg_fields(&mut item.fields.named)?,
+        syn::Item::Trait(item) => {
+            let mut retained = Vec::new();
+            for member in std::mem::take(&mut item.items) {
+                if runtime_filter_cfg_node_is_kept(runtime_filter_trait_item_attributes(&member))? {
+                    retained.push(member);
+                }
+            }
+            item.items = retained;
+        }
+        syn::Item::Impl(item) => {
+            let mut retained = Vec::new();
+            for member in std::mem::take(&mut item.items) {
+                if runtime_filter_cfg_node_is_kept(runtime_filter_impl_item_attributes(&member))? {
+                    retained.push(member);
+                }
+            }
+            item.items = retained;
+        }
+        syn::Item::ForeignMod(item) => {
+            let mut retained = Vec::new();
+            for member in std::mem::take(&mut item.items) {
+                if runtime_filter_cfg_node_is_kept(runtime_filter_foreign_item_attributes(&member))?
+                {
+                    retained.push(member);
+                }
+            }
+            item.items = retained;
+        }
+        syn::Item::Mod(item) => {
+            if let Some((_, items)) = &mut item.content {
+                runtime_filter_filter_cfg_items(items)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn runtime_filter_filter_cfg_items(items: &mut Vec<syn::Item>) -> Result<(), ()> {
+    let mut retained = Vec::new();
+    for mut item in std::mem::take(items) {
+        if runtime_filter_cfg_node_is_kept(runtime_filter_syn_item_attributes(&item))? {
+            runtime_filter_filter_cfg_item_members(&mut item)?;
+            retained.push(item);
+        }
+    }
+    *items = retained;
+    Ok(())
+}
+
+fn runtime_filter_filter_cfg_file(file: &mut syn::File) -> Result<(), ()> {
+    runtime_filter_filter_cfg_items(&mut file.items)
 }
 
 fn runtime_filter_subscription_artifact_surface_violations(text: &str) -> Vec<String> {
     let production = rust_sanitized_production_text(text);
-    let file = match syn::parse_file(&production) {
+    let mut file = match syn::parse_file(&production) {
         Ok(file) => file,
         Err(production_error) => match syn::parse_file(text) {
-            Ok(mut file) => {
-                file.items
-                    .retain(|item| !runtime_filter_syn_item_requires_test(item));
-                file
-            }
+            Ok(file) => file,
             Err(raw_error) => {
                 return vec![format!(
                     "artifact subscription production source must parse: sanitized={production_error}; raw={raw_error}"
@@ -11866,7 +12094,7 @@ fn runtime_filter_subscription_artifact_surface_violations(text: &str) -> Vec<St
             }
         },
     };
-    if runtime_filter_file_has_unproven_cfg(&file) {
+    if runtime_filter_filter_cfg_file(&mut file).is_err() {
         return vec![
             "artifact subscription bounded cfg analysis was unproven; raw fallback fails closed"
                 .to_string(),
@@ -12748,6 +12976,42 @@ fn runtime_filter_shared_binding_is_preserved(statements: &[syn::Stmt], binding:
     !audit.invalid
 }
 
+#[derive(Default)]
+struct RuntimeFilterTopnCaseIdentityAudit {
+    invalid: bool,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterTopnCaseIdentityAudit {
+    fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
+        if pattern.ident == "case" {
+            self.invalid = true;
+        }
+        syn::visit::visit_pat_ident(self, pattern);
+    }
+
+    fn visit_expr_assign(&mut self, assignment: &'ast syn::ExprAssign) {
+        if runtime_filter_expr_mentions_binding(&assignment.left, "case") {
+            self.invalid = true;
+        }
+        syn::visit::visit_expr_assign(self, assignment);
+    }
+
+    fn visit_expr_reference(&mut self, reference: &'ast syn::ExprReference) {
+        if reference.mutability.is_some()
+            && runtime_filter_expr_mentions_binding(&reference.expr, "case")
+        {
+            self.invalid = true;
+        }
+        syn::visit::visit_expr_reference(self, reference);
+    }
+}
+
+fn runtime_filter_topn_case_identity_is_preserved(loop_expression: &syn::ExprForLoop) -> bool {
+    let mut audit = RuntimeFilterTopnCaseIdentityAudit::default();
+    syn::visit::Visit::visit_block(&mut audit, &loop_expression.body);
+    !audit.invalid
+}
+
 fn runtime_filter_topn_loop_is_controlled(function: &syn::ItemFn) -> bool {
     let statements = &function.block.stmts;
     let Some(binding_index) = statements.iter().position(|statement| {
@@ -12769,6 +13033,7 @@ fn runtime_filter_topn_loop_is_controlled(function: &syn::ItemFn) -> bool {
         return false;
     };
     runtime_filter_function_has_one_binding(function, "cases")
+        && runtime_filter_function_has_one_binding(function, "case")
         && runtime_filter_function_has_one_binding_loop(function, "cases")
         && runtime_filter_asserts_binding_directly(
             assertion,
@@ -12777,6 +13042,7 @@ fn runtime_filter_topn_loop_is_controlled(function: &syn::ItemFn) -> bool {
         )
         && runtime_filter_expr_is_binding_path(&loop_expression.expr, "cases")
         && runtime_filter_pat_is_immutable_ident(&loop_expression.pat, "case")
+        && runtime_filter_topn_case_identity_is_preserved(loop_expression)
 }
 
 fn runtime_filter_join_loop_is_controlled(function: &syn::ItemFn) -> bool {
@@ -13839,6 +14105,30 @@ fn runtime_filter_manifest_controlled_loops_require_live_immutable_bindings() {
         "for (index, row) in case.rows.into_iter().enumerate().skip(2) {",
         "for (index, row) in case.rows.into_iter().enumerate().skip(2).filter(|_| false) {",
     );
+    let topn_case_shadowed = runtime_filter_replace_in_function_body(
+        &harness,
+        "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+        "for (index, row) in case.rows.into_iter().enumerate().skip(2) {",
+        "let case = TopNCase { rows: Vec::new(), ..case };\n        for (index, row) in case.rows.into_iter().enumerate().skip(2) {",
+    );
+    let topn_case_assigned = runtime_filter_replace_in_function_body(
+        &harness,
+        "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+        "for (index, row) in case.rows.into_iter().enumerate().skip(2) {",
+        "case = empty_topn_case();\n        for (index, row) in case.rows.into_iter().enumerate().skip(2) {",
+    );
+    let topn_case_mutably_borrowed = runtime_filter_replace_in_function_body(
+        &harness,
+        "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+        "for (index, row) in case.rows.into_iter().enumerate().skip(2) {",
+        "let _case_mut = &mut case;\n        for (index, row) in case.rows.into_iter().enumerate().skip(2) {",
+    );
+    let topn_case_closure_shadowed = runtime_filter_replace_in_function_body(
+        &harness,
+        "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+        "for (index, row) in case.rows.into_iter().enumerate().skip(2) {",
+        "let _shadow = |case| case;\n        for (index, row) in case.rows.into_iter().enumerate().skip(2) {",
+    );
     let join_clear = runtime_filter_replace_in_function_body(
         &harness,
         "join_harness",
@@ -13881,6 +14171,10 @@ fn runtime_filter_manifest_controlled_loops_require_live_immutable_bindings() {
         ("topn filter-to-empty", topn_filtered),
         ("topn nested empty iterator", topn_nested_empty),
         ("topn nested filter-to-empty", topn_nested_filtered),
+        ("topn case shadow", topn_case_shadowed),
+        ("topn case assignment", topn_case_assigned),
+        ("topn case mutable borrow", topn_case_mutably_borrowed),
+        ("topn case closure shadow", topn_case_closure_shadowed),
         ("join clear", join_clear),
         ("join rebound", join_rebound),
         ("join filter-to-empty", join_filtered),
@@ -14570,6 +14864,122 @@ fn force_sanitizer_failure() {
     assert!(
         !runtime_filter_subscription_artifact_surface_violations(cfg_test_only).is_empty(),
         "cfg(test)-only contract items must not satisfy the production subscription surface"
+    );
+
+    let cfg_contradictory_items = r#"
+use std::sync::Arc;
+use crate::runtime_filter::port::artifact::ArtifactBundle;
+#[cfg(feature = "x")]
+#[cfg(not(feature = "x"))]
+enum ArtifactAcquireOutcome { Published(Arc<ArtifactBundle>) }
+#[cfg(feature = "x")]
+#[cfg(not(feature = "x"))]
+enum ArtifactDeliveryOutcome { Published(Arc<ArtifactBundle>) }
+#[cfg(feature = "x")]
+#[cfg(not(feature = "x"))]
+trait BlockingSnapshotSubscription {
+    fn snapshot(&self) -> Option<Arc<ArtifactBundle>>;
+}
+fn force_sanitizer_failure() {
+    let _value = 1 + #[cfg(test)] 2;
+}
+"#;
+    assert!(
+        syn::parse_file(cfg_contradictory_items).is_ok()
+            && syn::parse_file(&rust_sanitized_production_text(cfg_contradictory_items)).is_err(),
+        "contradictory CFG fixture must exercise the raw fallback"
+    );
+    let cfg_test_only_variant = r#"
+use std::sync::Arc;
+use crate::runtime_filter::port::artifact::ArtifactBundle;
+enum ArtifactAcquireOutcome { #[cfg(test)] Published(Arc<ArtifactBundle>) }
+enum ArtifactDeliveryOutcome { #[cfg(test)] Published(Arc<ArtifactBundle>) }
+trait BlockingSnapshotSubscription {
+    fn snapshot(&self) -> Option<Arc<ArtifactBundle>>;
+}
+fn force_sanitizer_failure() {
+    let _value = 1 + #[cfg(test)] 2;
+}
+"#;
+    let cfg_test_only_snapshot = r#"
+use std::sync::Arc;
+use crate::runtime_filter::port::artifact::ArtifactBundle;
+enum ArtifactAcquireOutcome { Published(Arc<ArtifactBundle>) }
+enum ArtifactDeliveryOutcome { Published(Arc<ArtifactBundle>) }
+trait BlockingSnapshotSubscription {
+    #[cfg(test)]
+    fn snapshot(&self) -> Option<Arc<ArtifactBundle>>;
+}
+fn force_sanitizer_failure() {
+    let _value = 1 + #[cfg(test)] 2;
+}
+"#;
+    let cfg_attr_test_only_variant = r#"
+use std::sync::Arc;
+use crate::runtime_filter::port::artifact::ArtifactBundle;
+enum ArtifactAcquireOutcome {
+    #[cfg_attr(not(test), cfg(test))]
+    Published(Arc<ArtifactBundle>)
+}
+enum ArtifactDeliveryOutcome {
+    #[cfg_attr(not(test), cfg(test))]
+    Published(Arc<ArtifactBundle>)
+}
+trait BlockingSnapshotSubscription {
+    fn snapshot(&self) -> Option<Arc<ArtifactBundle>>;
+}
+fn force_sanitizer_failure() {
+    let _value = 1 + #[cfg(test)] 2;
+}
+"#;
+    let accepted_cfg_fallbacks = [
+        (
+            "contradictory item CFG conjunction",
+            cfg_contradictory_items,
+        ),
+        ("cfg(test) Published variant", cfg_test_only_variant),
+        ("cfg(test) snapshot method", cfg_test_only_snapshot),
+        (
+            "cfg_attr-generated test-only variant",
+            cfg_attr_test_only_variant,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(label, source)| {
+        assert!(
+            syn::parse_file(source).is_ok()
+                && syn::parse_file(&rust_sanitized_production_text(source)).is_err(),
+            "{label} fixture must exercise the raw fallback"
+        );
+        runtime_filter_subscription_artifact_surface_violations(source)
+            .is_empty()
+            .then_some(label)
+    })
+    .collect::<Vec<_>>();
+    assert!(
+        accepted_cfg_fallbacks.is_empty(),
+        "raw fallback must reject cfg-hidden subscription evidence: {accepted_cfg_fallbacks:?}"
+    );
+
+    let cfg_attr_production_possible = r#"
+use std::sync::Arc;
+use crate::runtime_filter::port::artifact::ArtifactBundle;
+enum ArtifactAcquireOutcome {
+    #[cfg_attr(feature = "x", cfg(test))]
+    Published(Arc<ArtifactBundle>)
+}
+enum ArtifactDeliveryOutcome { Published(Arc<ArtifactBundle>) }
+trait BlockingSnapshotSubscription {
+    fn snapshot(&self) -> Option<Arc<ArtifactBundle>>;
+}
+fn force_sanitizer_failure() {
+    let _value = 1 + #[cfg(test)] 2;
+}
+"#;
+    assert!(
+        runtime_filter_subscription_artifact_surface_violations(cfg_attr_production_possible)
+            .is_empty(),
+        "a cfg_attr member that remains possible in production must stay visible"
     );
 
     let cfg_not_test_shadow = r#"
@@ -15299,6 +15709,32 @@ fn fail(&self) { self.channel.fail_instance().map(|action| self.finish(action));
     assert!(
         runtime_filter_action_dispatch_boundary_violations(&try_wrapped).is_empty(),
         "finish may use a top-level try wrapper around the exact dispatch"
+    );
+    let cfg_test_only_impl_finish = r#"
+macro_rules! finish_token_decoy {
+    () => {
+        fn finish(&self, action: crate::runtime_filter::core::channel::ChannelAction) {
+            self.dispatcher.dispatch(self.channel_id, action);
+        }
+    };
+}
+struct Producer;
+impl Producer {
+    #[cfg(test)]
+    fn finish(&self, action: crate::runtime_filter::core::channel::ChannelAction) {
+        self.dispatcher.dispatch(self.channel_id, action);
+    }
+}
+fn submit(&self) { self.channel.submit().map(|action| self.finish(action)); }
+fn close_partition(&self) { self.channel.close_partition().map(|action| self.finish(action)); }
+fn fail(&self) { self.channel.fail_instance().map(|action| self.finish(action)); }
+fn force_sanitizer_failure() {
+    let _value = 1 + #[cfg(test)] 2;
+}
+"#;
+    assert!(
+        !runtime_filter_action_dispatch_boundary_violations(cfg_test_only_impl_finish).is_empty(),
+        "a cfg(test)-only impl finish must not satisfy the raw action fallback"
     );
     for bad in [
         good.replace("ChannelAction", "SubmitOutcome"),
