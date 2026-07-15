@@ -23,6 +23,8 @@ pub mod metrics;
 pub mod range;
 pub mod runner;
 
+mod sqlite;
+
 pub use config::{StateStoreConfig, StateStoreProviderConfig};
 pub use contract::{
     ChangeHint, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution,
