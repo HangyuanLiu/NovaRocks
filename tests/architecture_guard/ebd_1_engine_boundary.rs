@@ -453,11 +453,6 @@ const ENGINE_FILE_OWNERS: &[EngineFileOwner] = &[
         migration_task: "EBD-4",
     },
     EngineFileOwner {
-        path: "src/engine/query_options.rs",
-        target_owner: "split:frontend,runtime",
-        migration_task: "EBD-3B",
-    },
-    EngineFileOwner {
         path: "src/engine/query_prep.rs",
         target_owner: "split:catalog,connector,frontend,mv,sql",
         migration_task: "EBD-5A/EBD-15/EBD-20",
@@ -540,7 +535,6 @@ const ENGINE_MODULE_DECLARATIONS: &[&str] = &[
     "src/engine/mod.rs||external|path=default|mv_rewrite_prep",
     "src/engine/mod.rs||external|path=default|mv_scheduler",
     "src/engine/mod.rs||external|path=default|name_resolve",
-    "src/engine/mod.rs||external|path=default|query_options",
     "src/engine/mod.rs||external|path=default|query_prep",
     "src/engine/mod.rs||external|path=default|query_stats",
     "src/engine/mod.rs||external|path=default|statement",
@@ -1007,7 +1001,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "crate::engine::mv_maintenance::start_maintenance_coordinator_for_server",
             "crate::engine::mv_scheduler::RefreshCoordinatorConfig",
             "crate::engine::mv_scheduler::start_refresh_coordinator_for_server",
-            "crate::engine::query_options::StandaloneQueryOptions",
             "crate::engine::statement::looks_like_show_alter_table_optimize",
             "crate::engine::statement::looks_like_show_create_table",
             "crate::engine::statement::looks_like_show_create_view",
@@ -2086,7 +2079,7 @@ fn baseline_arrays_are_canonical() -> bool {
 fn ebd_1_engine_migration_firewall_matches_source_tree() {
     let actual = current_source_tree_snapshot();
     assert!(
-        actual.engine_files.len() >= 90,
+        actual.engine_files.len() >= 89,
         "EBD-1 must scan the full engine tree, found only {} files",
         actual.engine_files.len()
     );
