@@ -244,14 +244,29 @@ fn rust_module_items(text: &str) -> Vec<RustModuleItem> {
     items
 }
 
-fn cfg_predicate_requires_test(tokens: &[String], start: usize) -> Option<(bool, usize)> {
+#[derive(Clone, Copy)]
+struct CfgPredicatePossibilities {
+    can_be_false: bool,
+    can_be_true: bool,
+}
+
+fn cfg_predicate_possibilities(
+    tokens: &[String],
+    start: usize,
+) -> Option<(CfgPredicatePossibilities, usize)> {
     let owner = tokens.get(start)?;
     if owner == "test"
         && tokens
             .get(start + 1)
             .is_none_or(|token| matches!(token.as_str(), "," | ")"))
     {
-        return Some((true, start + 1));
+        return Some((
+            CfgPredicatePossibilities {
+                can_be_false: true,
+                can_be_true: false,
+            },
+            start + 1,
+        ));
     }
     if !matches!(owner.as_str(), "all" | "any" | "not")
         || tokens.get(start + 1).is_none_or(|token| token != "(")
@@ -263,27 +278,48 @@ fn cfg_predicate_requires_test(tokens: &[String], start: usize) -> Option<(bool,
         {
             cursor += 1;
         }
-        return Some((false, cursor));
+        return Some((
+            CfgPredicatePossibilities {
+                can_be_false: true,
+                can_be_true: true,
+            },
+            cursor,
+        ));
     }
 
     let mut children = Vec::new();
     let mut cursor = start + 2;
     while tokens.get(cursor).is_some_and(|token| token != ")") {
-        let (requires_test, next) = cfg_predicate_requires_test(tokens, cursor)?;
-        children.push(requires_test);
+        let (possibilities, next) = cfg_predicate_possibilities(tokens, cursor)?;
+        children.push(possibilities);
         cursor = next;
         if tokens.get(cursor).is_some_and(|token| token == ",") {
             cursor += 1;
         }
     }
     let end = (tokens.get(cursor)? == ")").then_some(cursor + 1)?;
-    let requires_test = match owner.as_str() {
-        "all" => children.into_iter().any(|child| child),
-        "any" => !children.is_empty() && children.into_iter().all(|child| child),
-        "not" => false,
+    let possibilities = match owner.as_str() {
+        "all" => CfgPredicatePossibilities {
+            can_be_false: children.iter().any(|child| child.can_be_false),
+            can_be_true: children.iter().all(|child| child.can_be_true),
+        },
+        "any" => CfgPredicatePossibilities {
+            can_be_false: children.iter().all(|child| child.can_be_false),
+            can_be_true: children.iter().any(|child| child.can_be_true),
+        },
+        "not" if children.len() == 1 => CfgPredicatePossibilities {
+            can_be_false: children[0].can_be_true,
+            can_be_true: children[0].can_be_false,
+        },
+        "not" => return None,
         _ => unreachable!(),
     };
-    Some((requires_test, end))
+    Some((possibilities, end))
+}
+
+fn cfg_predicate_requires_test(tokens: &[String], start: usize) -> Option<(bool, usize)> {
+    let (possibilities, end) = cfg_predicate_possibilities(tokens, start)?;
+    Some((!possibilities.can_be_true, end))
 }
 
 fn cfg_attribute_requires_test(attribute: &str) -> bool {
@@ -7800,7 +7836,7 @@ fn runtime_filter_query_context_export_surface_violations(text: &str) -> Vec<Str
     violations
 }
 
-fn runtime_filter_task4_exact_path_ledger(source_rel: &str, canonical: &[String]) -> Option<bool> {
+fn runtime_filter_task4_whole_exact_inventory(source_rel: &str) -> Option<&'static str> {
     let exact_inventory = match source_rel {
         "src/runtime_filter/core/ordered_reducer.rs" => Some(
             r#"
@@ -8576,12 +8612,11 @@ std::time::Instant::now
         ),
         _ => None,
     };
-    if let Some(exact_inventory) = exact_inventory {
-        let dependency = canonical.join("::");
-        return Some(exact_inventory.lines().any(|allowed| allowed == dependency));
-    }
-    let dependency = canonical.join("::");
-    let added_prefixes: &[&str] = match source_rel {
+    exact_inventory
+}
+
+fn runtime_filter_task4_added_dependency_prefixes(source_rel: &str) -> &'static [&'static str] {
+    match source_rel {
         "src/runtime_filter/core/channel.rs" => &[
             "crate::runtime_filter::core::ordered_reducer",
             "crate::runtime_filter::core::topk_reducer",
@@ -8627,16 +8662,32 @@ std::time::Instant::now
             &["crate::runtime_filter::model::contract::ConsumerActivation"]
         }
         _ => &[],
-    };
+    }
+}
+
+fn runtime_filter_task4_exact_path_ledger(source_rel: &str, canonical: &[String]) -> Option<bool> {
+    if let Some(exact_inventory) = runtime_filter_task4_whole_exact_inventory(source_rel) {
+        let dependency = canonical.join("::");
+        return Some(exact_inventory.lines().any(|allowed| allowed == dependency));
+    }
+    let dependency = canonical.join("::");
+    let added_prefixes = runtime_filter_task4_added_dependency_prefixes(source_rel);
     if added_prefixes.iter().any(|prefix| {
         dependency == *prefix
             || dependency
                 .strip_prefix(prefix)
                 .is_some_and(|suffix| suffix.starts_with("::"))
     }) {
-        let exact_added_inventory = match source_rel {
-            "src/runtime_filter/core/channel.rs" => {
-                r#"
+        return runtime_filter_task4_added_exact_inventory(source_rel)
+            .map(|exact_inventory| exact_inventory.lines().any(|allowed| allowed == dependency));
+    }
+    None
+}
+
+fn runtime_filter_task4_added_exact_inventory(source_rel: &str) -> Option<&'static str> {
+    let exact_added_inventory = match source_rel {
+        "src/runtime_filter/core/channel.rs" => {
+            r#"
 crate::runtime_filter::core::ordered_reducer::OrderedApplyOutcome
 crate::runtime_filter::core::ordered_reducer::OrderedApplyOutcome::Duplicate
 crate::runtime_filter::core::ordered_reducer::OrderedApplyOutcome::GlobalTightened
@@ -8678,14 +8729,14 @@ crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract
 crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract::try_from_plan
 crate::runtime_filter::port::topk_summary::TopKSummary
 "#
-            }
-            "src/runtime_filter/core/state.rs" => {
-                r#"
+        }
+        "src/runtime_filter/core/state.rs" => {
+            r#"
 crate::runtime_filter::port::subscription::UnavailableReason
 "#
-            }
-            "src/runtime_filter/materializer/codec.rs" => {
-                r#"
+        }
+        "src/runtime_filter/materializer/codec.rs" => {
+            r#"
 arrow::datatypes::DataType
 arrow::datatypes::DataType::Boolean
 arrow::datatypes::DataType::Date32
@@ -8723,12 +8774,11 @@ crate::runtime_filter::port::ordered_bound::RuntimeOrderContract::from_codec
 crate::runtime_filter::port::ordered_bound::RuntimeOrderContract::validate_codec_contract_digest
 crate::runtime_filter::port::ordered_bound::RuntimeOrderKey
 crate::runtime_filter::port::ordered_bound::RuntimeOrderKey::from_codec
-Membership must not materialize ArtifactKind::Range
 std::mem::size_of
 "#
-            }
-            "src/runtime_filter/port/artifact.rs" => {
-                r#"
+        }
+        "src/runtime_filter/port/artifact.rs" => {
+            r#"
 crate::runtime_filter::port::ordered_bound::OrderContractDigest
 crate::runtime_filter::port::ordered_bound::OrderedScalar
 crate::runtime_filter::port::ordered_bound::OrderedScalar::Boolean
@@ -8745,15 +8795,15 @@ crate::runtime_filter::port::ordered_bound::OrderedTuple
 crate::runtime_filter::port::ordered_bound::RuntimeOrderContract
 crate::runtime_filter::port::ordered_bound::RuntimeOrderKey
 "#
-            }
-            "src/runtime_filter/port/events.rs" => {
-                r#"
+        }
+        "src/runtime_filter/port/events.rs" => {
+            r#"
 crate::runtime_filter::port::producer::RuntimeContractViolationKind
 crate::runtime_filter::port::subscription::LiveTerminal
 "#
-            }
-            "src/runtime_filter/port/producer.rs" => {
-                r#"
+        }
+        "src/runtime_filter/port/producer.rs" => {
+            r#"
 crate::runtime_filter::port::final_domain::FinalDomainShard
 crate::runtime_filter::port::ordered_bound::OrderedBoundUpdate
 crate::runtime_filter::port::topk_summary::TopKSummary
@@ -8761,9 +8811,9 @@ std::sync::Arc
 std::sync::Arc::downgrade
 std::sync::Weak
 "#
-            }
-            "src/runtime_filter/port/subscription.rs" => {
-                r#"
+        }
+        "src/runtime_filter/port/subscription.rs" => {
+            r#"
 crate::runtime_filter::port::identity::LogicalVersion
 crate::runtime_filter::port::producer::RuntimeContractViolation
 crate::runtime_filter::port::producer::RuntimeContractViolation::new
@@ -8772,56 +8822,50 @@ std::fmt::Debug
 std::fmt::Formatter
 std::fmt::Result
 "#
-            }
-            "src/runtime_filter/port/value_domain.rs" => {
-                r#"
+        }
+        "src/runtime_filter/port/value_domain.rs" => {
+            r#"
 crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain
 "#
-            }
-            "src/runtime_filter/service/subscription.rs" => {
-                r#"
+        }
+        "src/runtime_filter/service/subscription.rs" => {
+            r#"
 crate::runtime_filter::model::contract::ConsumerActivation
 crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot
 crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive
 "#
-            }
-            _ => "",
-        };
-        return Some(
-            exact_added_inventory
-                .lines()
-                .any(|allowed| allowed == dependency),
-        );
-    }
-    let ordered_bound_prefix = ["crate", "runtime_filter", "port", "ordered_bound"];
-    if source_rel == "src/runtime_filter/port/artifact.rs"
-        && canonical.len() >= ordered_bound_prefix.len()
-        && canonical
-            .iter()
-            .zip(ordered_bound_prefix)
-            .all(|(actual, expected)| actual == expected)
-    {
-        let exact_inventory = r#"
-crate::runtime_filter::port::ordered_bound::OrderContractDigest
-crate::runtime_filter::port::ordered_bound::OrderedScalar
-crate::runtime_filter::port::ordered_bound::OrderedScalar::Boolean
-crate::runtime_filter::port::ordered_bound::OrderedScalar::Date32
-crate::runtime_filter::port::ordered_bound::OrderedScalar::Decimal128
-crate::runtime_filter::port::ordered_bound::OrderedScalar::Int16
-crate::runtime_filter::port::ordered_bound::OrderedScalar::Int32
-crate::runtime_filter::port::ordered_bound::OrderedScalar::Int64
-crate::runtime_filter::port::ordered_bound::OrderedScalar::Int8
-crate::runtime_filter::port::ordered_bound::OrderedScalar::LargeInt
-crate::runtime_filter::port::ordered_bound::OrderedScalar::Timestamp
-crate::runtime_filter::port::ordered_bound::OrderedScalar::Utf8
-crate::runtime_filter::port::ordered_bound::OrderedTuple
-crate::runtime_filter::port::ordered_bound::RuntimeOrderContract
-crate::runtime_filter::port::ordered_bound::RuntimeOrderKey
-"#;
-        let dependency = canonical.join("::");
-        return Some(exact_inventory.lines().any(|allowed| allowed == dependency));
-    }
-    None
+        }
+        _ => "",
+    };
+    Some(exact_added_inventory).filter(|inventory| !inventory.is_empty())
+}
+
+fn runtime_filter_runtime_dependencies_are_allowed(source_rel: &str, text: &str) -> bool {
+    let Some(allowed_prefixes) = runtime_filter_runtime_dependency_allowlist(source_rel) else {
+        return false;
+    };
+    let local_roots = runtime_filter_runtime_local_roots(text);
+    let canonical_allowed = rust_production_canonical_paths(text, source_rel)
+        .into_iter()
+        .map(|canonical| runtime_filter_dependency_path(&canonical, source_rel))
+        .filter(|canonical| {
+            !canonical
+                .first()
+                .is_some_and(|root| local_roots.contains(root))
+                && !runtime_filter_path_is_rust_prelude(canonical)
+        })
+        .all(|canonical| {
+            runtime_filter_task4_exact_path_ledger(source_rel, &canonical).unwrap_or_else(|| {
+                runtime_filter_path_is_allowlisted(&canonical, &allowed_prefixes)
+            })
+        });
+    canonical_allowed
+        && runtime_filter_runtime_extern_crates(text)
+            .into_iter()
+            .all(|path| {
+                runtime_filter_task4_exact_path_ledger(source_rel, &path)
+                    .unwrap_or_else(|| runtime_filter_path_is_allowlisted(&path, &allowed_prefixes))
+            })
 }
 
 fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> Vec<String> {
@@ -8911,7 +8955,7 @@ fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> V
         )];
     };
     let local_roots = runtime_filter_runtime_local_roots(text);
-    let mut violations = rust_production_canonical_paths(text, source_rel)
+    let canonical_dependencies = rust_production_canonical_paths(text, source_rel)
         .into_iter()
         .map(|canonical| runtime_filter_dependency_path(&canonical, source_rel))
         .filter(|canonical| {
@@ -8919,21 +8963,46 @@ fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> V
                 .first()
                 .is_some_and(|root| local_roots.contains(root))
                 && !runtime_filter_path_is_rust_prelude(canonical)
-                && !runtime_filter_task4_exact_path_ledger(source_rel, canonical).unwrap_or_else(
-                    || runtime_filter_path_is_allowlisted(canonical, &allowed_prefixes),
-                )
+        })
+        .collect::<BTreeSet<_>>();
+    let external_dependencies = runtime_filter_runtime_extern_crates(text);
+    let mut violations = canonical_dependencies
+        .iter()
+        .filter(|canonical| {
+            !runtime_filter_task4_exact_path_ledger(source_rel, canonical)
+                .unwrap_or_else(|| runtime_filter_path_is_allowlisted(canonical, &allowed_prefixes))
         })
         .map(|canonical| format!("{source_rel}: {}", canonical.join("::")))
         .collect::<BTreeSet<_>>();
     violations.extend(
-        runtime_filter_runtime_extern_crates(text)
-            .into_iter()
+        external_dependencies
+            .iter()
             .filter(|path| {
                 !runtime_filter_task4_exact_path_ledger(source_rel, path)
                     .unwrap_or_else(|| runtime_filter_path_is_allowlisted(path, &allowed_prefixes))
             })
             .map(|path| format!("{source_rel}: external {}", path.join("::"))),
     );
+    if let Some(exact_inventory) = runtime_filter_task4_whole_exact_inventory(source_rel)
+        .or_else(|| runtime_filter_task4_added_exact_inventory(source_rel))
+    {
+        let expected = exact_inventory
+            .lines()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        let actual = canonical_dependencies
+            .iter()
+            .chain(external_dependencies.iter())
+            .map(|path| path.join("::"))
+            .collect::<BTreeSet<_>>();
+        violations.extend(
+            expected
+                .difference(&actual)
+                .map(|path| format!("{source_rel}: stale exact dependency {path}")),
+        );
+    }
     let production_tokens = rust_use_tokens(&rust_sanitized_production_text(text));
     let production_source_tokens = rust_source_tokens(&rust_sanitized_production_text(text));
     let has_path_attribute = production_source_tokens
@@ -10724,43 +10793,252 @@ fn runtime_filter_query_context_lock_discipline_violations(text: &str) -> Vec<St
     violations
 }
 
+#[derive(Debug, Default)]
+struct RuntimeFilterReachableAudit {
+    calls: BTreeSet<Vec<String>>,
+    direct_calls: BTreeSet<Vec<String>>,
+    methods: BTreeSet<String>,
+    paths: BTreeSet<Vec<String>>,
+    shadows_action: bool,
+    parameter_dispatches: usize,
+}
+
+impl RuntimeFilterReachableAudit {
+    fn has_method(&self, method: &str) -> bool {
+        self.methods.contains(method)
+    }
+
+    fn has_call(&self, expected: &[&str]) -> bool {
+        Self::has_exact_path(&self.calls, expected)
+    }
+
+    fn has_direct_call(&self, expected: &[&str]) -> bool {
+        Self::has_exact_path(&self.direct_calls, expected)
+    }
+
+    fn has_path(&self, expected: &[&str]) -> bool {
+        Self::has_exact_path(&self.paths, expected)
+    }
+
+    fn has_exact_path(paths: &BTreeSet<Vec<String>>, expected: &[&str]) -> bool {
+        paths.iter().any(|path| {
+            path.len() == expected.len()
+                && path
+                    .iter()
+                    .zip(expected)
+                    .all(|(actual, expected)| actual == expected)
+        })
+    }
+
+    fn path_segments(path: &syn::Path) -> Vec<String> {
+        path.segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect()
+    }
+
+    fn literal_bool(expression: &syn::Expr) -> Option<bool> {
+        match expression {
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Bool(value),
+                ..
+            }) => Some(value.value),
+            syn::Expr::Paren(paren) => Self::literal_bool(&paren.expr),
+            syn::Expr::Group(group) => Self::literal_bool(&group.expr),
+            _ => None,
+        }
+    }
+
+    fn self_field(expression: &syn::Expr, field: &str) -> bool {
+        matches!(expression, syn::Expr::Field(access)
+            if matches!(access.base.as_ref(), syn::Expr::Path(path) if path.path.is_ident("self"))
+                && matches!(&access.member, syn::Member::Named(member) if member == field))
+    }
+
+    fn audit_reachable_block(&mut self, block: &syn::Block) {
+        syn::visit::Visit::visit_block(self, block);
+    }
+}
+
+#[derive(Default)]
+struct RuntimeFilterDirectCallAudit {
+    calls: BTreeSet<Vec<String>>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterDirectCallAudit {
+    fn visit_expr_async(&mut self, _expression: &'ast syn::ExprAsync) {}
+
+    fn visit_expr_block(&mut self, _expression: &'ast syn::ExprBlock) {}
+
+    fn visit_expr_closure(&mut self, _expression: &'ast syn::ExprClosure) {}
+
+    fn visit_expr_for_loop(&mut self, expression: &'ast syn::ExprForLoop) {
+        syn::visit::Visit::visit_expr(self, &expression.expr);
+    }
+
+    fn visit_expr_if(&mut self, expression: &'ast syn::ExprIf) {
+        syn::visit::Visit::visit_expr(self, &expression.cond);
+    }
+
+    fn visit_expr_loop(&mut self, _expression: &'ast syn::ExprLoop) {}
+
+    fn visit_expr_match(&mut self, expression: &'ast syn::ExprMatch) {
+        syn::visit::Visit::visit_expr(self, &expression.expr);
+    }
+
+    fn visit_expr_while(&mut self, expression: &'ast syn::ExprWhile) {
+        syn::visit::Visit::visit_expr(self, &expression.cond);
+    }
+
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(path) = call.func.as_ref()
+            && path.qself.is_none()
+            && path.path.leading_colon.is_none()
+        {
+            self.calls
+                .insert(RuntimeFilterReachableAudit::path_segments(&path.path));
+        } else {
+            syn::visit::Visit::visit_expr(self, &call.func);
+        }
+        for argument in &call.args {
+            syn::visit::Visit::visit_expr(self, argument);
+        }
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterReachableAudit {
+    fn visit_block(&mut self, block: &'ast syn::Block) {
+        for statement in &block.stmts {
+            if let syn::Stmt::Expr(syn::Expr::Return(ret), _) = statement {
+                if let Some(expression) = &ret.expr {
+                    syn::visit::Visit::visit_expr(self, expression);
+                }
+                break;
+            }
+            syn::visit::Visit::visit_stmt(self, statement);
+        }
+    }
+
+    fn visit_expr_async(&mut self, _expression: &'ast syn::ExprAsync) {}
+
+    fn visit_expr_closure(&mut self, expression: &'ast syn::ExprClosure) {
+        for input in &expression.inputs {
+            syn::visit::Visit::visit_pat(self, input);
+        }
+    }
+
+    fn visit_expr_if(&mut self, expression: &'ast syn::ExprIf) {
+        if Self::literal_bool(&expression.cond) == Some(false) {
+            syn::visit::Visit::visit_expr(self, &expression.cond);
+            if let Some((_, fallback)) = &expression.else_branch {
+                syn::visit::Visit::visit_expr(self, fallback);
+            }
+            return;
+        }
+        syn::visit::visit_expr_if(self, expression);
+    }
+
+    fn visit_expr_while(&mut self, expression: &'ast syn::ExprWhile) {
+        syn::visit::Visit::visit_expr(self, &expression.cond);
+        if Self::literal_bool(&expression.cond) != Some(false) {
+            syn::visit::Visit::visit_block(self, &expression.body);
+        }
+    }
+
+    fn visit_expr_binary(&mut self, expression: &'ast syn::ExprBinary) {
+        syn::visit::Visit::visit_expr(self, &expression.left);
+        let short_circuits = matches!(expression.op, syn::BinOp::And(_))
+            && Self::literal_bool(&expression.left) == Some(false)
+            || matches!(expression.op, syn::BinOp::Or(_))
+                && Self::literal_bool(&expression.left) == Some(true);
+        if !short_circuits {
+            syn::visit::Visit::visit_expr(self, &expression.right);
+        }
+    }
+
+    fn visit_expr_match(&mut self, expression: &'ast syn::ExprMatch) {
+        syn::visit::Visit::visit_expr(self, &expression.expr);
+    }
+
+    fn visit_expr_for_loop(&mut self, expression: &'ast syn::ExprForLoop) {
+        syn::visit::Visit::visit_expr(self, &expression.expr);
+        syn::visit::Visit::visit_pat(self, &expression.pat);
+        syn::visit::Visit::visit_block(self, &expression.body);
+    }
+
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(path) = call.func.as_ref()
+            && path.qself.is_none()
+            && path.path.leading_colon.is_none()
+        {
+            let path = Self::path_segments(&path.path);
+            self.calls.insert(path.clone());
+            self.paths.insert(path);
+        } else {
+            syn::visit::Visit::visit_expr(self, &call.func);
+        }
+        for argument in &call.args {
+            syn::visit::Visit::visit_expr(self, argument);
+        }
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        self.methods.insert(call.method.to_string());
+        if call.method == "dispatch"
+            && Self::self_field(&call.receiver, "dispatcher")
+            && call.args.len() == 2
+            && call
+                .args
+                .first()
+                .is_some_and(|argument| Self::self_field(argument, "channel_id"))
+            && matches!(call.args.last(), Some(syn::Expr::Path(path)) if path.path.is_ident("action"))
+        {
+            self.parameter_dispatches += 1;
+        }
+        syn::visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+        if path.qself.is_none() && path.path.leading_colon.is_none() {
+            self.paths.insert(Self::path_segments(&path.path));
+        }
+        syn::visit::visit_expr_path(self, path);
+    }
+
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        if path.leading_colon.is_none() {
+            self.paths.insert(Self::path_segments(path));
+        }
+        syn::visit::visit_path(self, path);
+    }
+
+    fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
+        if pattern.ident == "action" {
+            self.shadows_action = true;
+        }
+        syn::visit::visit_pat_ident(self, pattern);
+    }
+
+    fn visit_macro(&mut self, item: &'ast syn::Macro) {
+        let supported = item.path.segments.last().is_some_and(|segment| {
+            matches!(
+                segment.ident.to_string().as_str(),
+                "assert" | "assert_eq" | "assert_ne"
+            )
+        });
+        if supported
+            && let Ok(tuple) = syn::parse_str::<syn::ExprTuple>(&format!("({})", item.tokens))
+        {
+            for expression in &tuple.elems {
+                syn::visit::Visit::visit_expr(self, expression);
+            }
+        }
+    }
+}
+
 fn runtime_filter_action_dispatch_boundary_violations(producer: &str) -> Vec<String> {
     let production = rust_sanitized_production_text(producer);
     let mut violations = Vec::new();
-    #[derive(Default)]
-    struct FinishBindingAudit {
-        parameter_dispatches: usize,
-        shadows_action: bool,
-    }
-    impl<'ast> syn::visit::Visit<'ast> for FinishBindingAudit {
-        fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
-            if pattern.ident == "action" {
-                self.shadows_action = true;
-            }
-            syn::visit::visit_pat_ident(self, pattern);
-        }
-
-        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-            let self_field = |expression: &syn::Expr, field: &str| {
-                matches!(expression, syn::Expr::Field(access)
-                    if matches!(access.base.as_ref(), syn::Expr::Path(path) if path.path.is_ident("self"))
-                        && matches!(&access.member, syn::Member::Named(member) if member == field))
-            };
-            if call.method == "dispatch"
-                && self_field(&call.receiver, "dispatcher")
-                && call.args.len() == 2
-                && call
-                    .args
-                    .first()
-                    .is_some_and(|argument| self_field(argument, "channel_id"))
-                && matches!(call.args.last(), Some(syn::Expr::Path(path)) if path.path.is_ident("action"))
-            {
-                self.parameter_dispatches += 1;
-            }
-            syn::visit::visit_expr_method_call(self, call);
-        }
-    }
-
     let parsed = match syn::parse_file(&production) {
         Ok(file) => file,
         Err(production_error) => match syn::parse_file(producer) {
@@ -10780,8 +11058,8 @@ fn runtime_filter_action_dispatch_boundary_violations(producer: &str) -> Vec<Str
     for item in &parsed.items {
         match item {
             syn::Item::Fn(function) if function.sig.ident == "finish" => {
-                let mut audit = FinishBindingAudit::default();
-                syn::visit::Visit::visit_block(&mut audit, &function.block);
+                let mut audit = RuntimeFilterReachableAudit::default();
+                audit.audit_reachable_block(&function.block);
                 finish_audits.push(audit);
             }
             syn::Item::Impl(item_impl) => {
@@ -10789,8 +11067,8 @@ fn runtime_filter_action_dispatch_boundary_violations(producer: &str) -> Vec<Str
                     if let syn::ImplItem::Fn(method) = item
                         && method.sig.ident == "finish"
                     {
-                        let mut audit = FinishBindingAudit::default();
-                        syn::visit::Visit::visit_block(&mut audit, &method.block);
+                        let mut audit = RuntimeFilterReachableAudit::default();
+                        audit.audit_reachable_block(&method.block);
                         finish_audits.push(audit);
                     }
                 }
@@ -11760,104 +12038,7 @@ fn runtime_filter_materializer_semantic_violations(source_rel: &str, text: &str)
     violations
 }
 
-#[derive(Debug, Default)]
-struct RuntimeFilterManifestBodyAudit {
-    methods: BTreeSet<String>,
-    paths: BTreeSet<Vec<String>>,
-}
-
-impl RuntimeFilterManifestBodyAudit {
-    fn has_method(&self, method: &str) -> bool {
-        self.methods.contains(method)
-    }
-
-    fn has_path(&self, expected: &[&str]) -> bool {
-        self.paths.iter().any(|path| {
-            path.len() == expected.len()
-                && path
-                    .iter()
-                    .zip(expected)
-                    .all(|(actual, expected)| actual == expected)
-        })
-    }
-
-    fn audit_reachable_block(&mut self, block: &syn::Block) {
-        for statement in &block.stmts {
-            if let syn::Stmt::Expr(syn::Expr::Return(ret), _) = statement {
-                if let Some(expr) = &ret.expr {
-                    syn::visit::Visit::visit_expr(self, expr);
-                }
-                break;
-            }
-            syn::visit::Visit::visit_stmt(self, statement);
-        }
-    }
-}
-
-impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterManifestBodyAudit {
-    fn visit_block(&mut self, block: &'ast syn::Block) {
-        self.audit_reachable_block(block);
-    }
-
-    fn visit_expr_closure(&mut self, _closure: &'ast syn::ExprClosure) {}
-
-    fn visit_expr_if(&mut self, expression: &'ast syn::ExprIf) {
-        let literal = matches!(expression.cond.as_ref(), syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Bool(value), .. }) if !value.value);
-        if literal {
-            if let Some((_, fallback)) = &expression.else_branch {
-                syn::visit::Visit::visit_expr(self, fallback);
-            }
-            return;
-        }
-        syn::visit::visit_expr_if(self, expression);
-    }
-
-    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-        self.methods.insert(call.method.to_string());
-        syn::visit::visit_expr_method_call(self, call);
-    }
-
-    fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
-        if path.qself.is_none() {
-            self.paths.insert(
-                path.path
-                    .segments
-                    .iter()
-                    .map(|segment| segment.ident.to_string())
-                    .collect(),
-            );
-        }
-        syn::visit::visit_expr_path(self, path);
-    }
-
-    fn visit_path(&mut self, path: &'ast syn::Path) {
-        if path.leading_colon.is_none() {
-            self.paths.insert(
-                path.segments
-                    .iter()
-                    .map(|segment| segment.ident.to_string())
-                    .collect(),
-            );
-        }
-        syn::visit::visit_path(self, path);
-    }
-
-    fn visit_macro(&mut self, item: &'ast syn::Macro) {
-        let supported = item.path.segments.last().is_some_and(|segment| {
-            matches!(
-                segment.ident.to_string().as_str(),
-                "assert" | "assert_eq" | "assert_ne"
-            )
-        });
-        if supported
-            && let Ok(tuple) = syn::parse_str::<syn::ExprTuple>(&format!("({})", item.tokens))
-        {
-            for expression in &tuple.elems {
-                syn::visit::Visit::visit_expr(self, expression);
-            }
-        }
-    }
-}
+type RuntimeFilterManifestBodyAudit = RuntimeFilterReachableAudit;
 
 fn runtime_filter_manifest_function_audit(
     file: &syn::File,
@@ -11875,7 +12056,15 @@ fn runtime_filter_manifest_function_audit(
         return None;
     };
     let mut audit = RuntimeFilterManifestBodyAudit::default();
-    syn::visit::Visit::visit_block(&mut audit, &function.block);
+    audit.audit_reachable_block(&function.block);
+    let mut direct = RuntimeFilterDirectCallAudit::default();
+    for statement in &function.block.stmts {
+        syn::visit::Visit::visit_stmt(&mut direct, statement);
+        if matches!(statement, syn::Stmt::Expr(syn::Expr::Return(_), _)) {
+            break;
+        }
+    }
+    audit.direct_calls = direct.calls;
     Some(audit)
 }
 
@@ -11906,11 +12095,22 @@ fn runtime_filter_manifest_method_audit(
         return None;
     };
     let mut audit = RuntimeFilterManifestBodyAudit::default();
-    syn::visit::Visit::visit_block(&mut audit, &method.block);
+    audit.audit_reachable_block(&method.block);
     Some(audit)
 }
 
 fn runtime_filter_manifest_body_has(
+    audit: Option<RuntimeFilterManifestBodyAudit>,
+    methods: &[&str],
+    calls: &[&[&str]],
+) -> bool {
+    audit.is_some_and(|audit| {
+        methods.iter().all(|method| audit.has_method(method))
+            && calls.iter().all(|call| audit.has_call(call))
+    })
+}
+
+fn runtime_filter_manifest_body_has_paths(
     audit: Option<RuntimeFilterManifestBodyAudit>,
     methods: &[&str],
     paths: &[&[&str]],
@@ -12149,7 +12349,7 @@ fn runtime_filter_conformance_manifest_violations(
             ][..],
         ),
     ] {
-        if !runtime_filter_manifest_body_has(
+        if !runtime_filter_manifest_body_has_paths(
             runtime_filter_manifest_function_audit(&file, function),
             methods,
             paths,
@@ -12175,7 +12375,7 @@ fn runtime_filter_conformance_manifest_violations(
             ][..],
         ),
     ] {
-        if !runtime_filter_manifest_body_has(
+        if !runtime_filter_manifest_body_has_paths(
             runtime_filter_manifest_method_audit(&file, owner, "producer"),
             &["open_producer"],
             paths,
@@ -12213,7 +12413,7 @@ fn runtime_filter_conformance_manifest_violations(
         if audit.as_ref().is_none_or(|audit| {
             required_callees
                 .iter()
-                .any(|callee| !audit.has_path(&[callee]))
+                .any(|callee| !audit.has_direct_call(&[callee]))
         }) {
             violations.push(format!(
                 "M4 conformance helper call graph is missing reachable edge from {owner}"
@@ -12534,6 +12734,56 @@ fn m4_aggregate_conformance_requires_frozen_allof_and_separates_empty_unavailabl
         !runtime_filter_conformance_manifest_violations(valid_root, &helper_closure_hidden)
             .is_empty(),
         "required helper-owner calls must not be accepted only inside a closure"
+    );
+    for (label, prefix, suffix) in [
+        ("while false", "\nwhile false {", "\n}\n"),
+        (
+            "unreachable match arm",
+            "\nmatch 0 { 1 => {",
+            "\n}, _ => {} }\n",
+        ),
+        ("unpolled async", "\nlet _future = async {", "\n};\n"),
+        (
+            "short-circuit false RHS",
+            "\nlet _never = false && {",
+            "\ntrue };\n",
+        ),
+    ] {
+        let hidden = runtime_filter_rewrite_function_body(
+            &harness,
+            "m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts",
+            prefix,
+            suffix,
+        );
+        assert!(
+            !runtime_filter_conformance_manifest_violations(valid_root, &hidden).is_empty(),
+            "required stable-test calls must not be accepted from {label}"
+        );
+    }
+    let function_value_only = runtime_filter_rewrite_function_body(
+        &harness.replacen(
+            "install_service(compile_install_view(",
+            "install_service(removed_compile_call(",
+            1,
+        ),
+        "join_harness",
+        "\nlet _ = compile_install_view;\n",
+        "",
+    );
+    assert!(
+        !runtime_filter_conformance_manifest_violations(valid_root, &function_value_only)
+            .is_empty(),
+        "function-value ExprPath must not satisfy a required call edge"
+    );
+    let nested_owner_edges = runtime_filter_rewrite_function_body(
+        &harness,
+        "join_harness",
+        "\nif true {",
+        "\n}\npanic!(\"nested owner-edge decoy\")\n",
+    );
+    assert!(
+        !runtime_filter_conformance_manifest_violations(valid_root, &nested_owner_edges).is_empty(),
+        "key helper call edges must be direct top-level calls"
     );
     let local_shadow = runtime_filter_rewrite_function_body(
         &harness,
@@ -12890,6 +13140,46 @@ fn runtime_filter_task4_exact_dependency_ledger_rejects_unused_children() {
 }
 
 #[test]
+fn runtime_filter_task4_exact_dependency_ledger_rejects_stale_entries() {
+    let repo = Path::new(manifest_dir());
+    let source_rel = "src/runtime_filter/service/m3a_tests.rs";
+    let source = fs::read_to_string(repo.join(source_rel)).unwrap();
+    let removed_dependency = source.replace(
+        "    let weak_service = Arc::downgrade(&service);\n\
+         \x20   drop(service);\n\
+         \x20   assert!(weak_service.upgrade().is_none());",
+        "    drop(service);",
+    );
+    assert_ne!(
+        removed_dependency, source,
+        "fixture must remove Arc::downgrade"
+    );
+    assert!(
+        !runtime_filter_runtime_boundary_violations(source_rel, &removed_dependency).is_empty(),
+        "removing a frozen dependency must report stale exact-ledger entries"
+    );
+
+    let source_rel = "src/runtime_filter/core/state.rs";
+    let source = fs::read_to_string(repo.join(source_rel)).unwrap();
+    let removed_added_dependency = source
+        .replace(
+            "use crate::runtime_filter::port::subscription::UnavailableReason;\n",
+            "",
+        )
+        .replace("DegradedLogical(UnavailableReason)", "DegradedLogical")
+        .replace("Unavailable(UnavailableReason)", "Unavailable");
+    assert_ne!(
+        removed_added_dependency, source,
+        "fixture must remove UnavailableReason"
+    );
+    assert!(
+        !runtime_filter_runtime_boundary_violations(source_rel, &removed_added_dependency)
+            .is_empty(),
+        "removing a Task 4 added dependency must report stale exact-ledger entries"
+    );
+}
+
+#[test]
 fn runtime_filter_model_root_surface_rejects_extra_production_items() {
     const EXACT_ROOT: &str = r#"
 pub(crate) mod contract;
@@ -12932,27 +13222,18 @@ fn runtime_filter_runtime_boundary_detector_defaults_model_dependencies_to_deny(
         );
     }
 
-    assert!(
-        runtime_filter_runtime_boundary_violations(
-            source_rel,
-            "use crate::runtime_filter::model::contract::ChannelId;"
-        )
-        .is_empty()
-    );
-    assert!(
-        runtime_filter_runtime_boundary_violations(
-            source_rel,
-            "use crate::runtime_filter::model::coverage::Coverage;"
-        )
-        .is_empty()
-    );
-    assert!(
-        runtime_filter_runtime_boundary_violations(
-            source_rel,
-            "use crate::runtime_filter::model::contract as owner; use owner::ChannelId;"
-        )
-        .is_empty()
-    );
+    assert!(runtime_filter_runtime_dependencies_are_allowed(
+        source_rel,
+        "use crate::runtime_filter::model::contract::ChannelId;"
+    ));
+    assert!(runtime_filter_runtime_dependencies_are_allowed(
+        source_rel,
+        "use crate::runtime_filter::model::coverage::Coverage;"
+    ));
+    assert!(runtime_filter_runtime_dependencies_are_allowed(
+        source_rel,
+        "use crate::runtime_filter::model::contract as owner; use owner::ChannelId;"
+    ));
 }
 
 #[test]
@@ -13032,7 +13313,7 @@ fn runtime_filter_materializer_boundary_detector_rejects_synthetic_bypasses() {
         ),
     ] {
         assert!(
-            runtime_filter_runtime_boundary_violations(source_rel, source).is_empty(),
+            runtime_filter_runtime_dependencies_are_allowed(source_rel, source),
             "materializer detector must allow neutral/pure contract dependency: {source}"
         );
     }
@@ -13246,6 +13527,33 @@ impl LoopbackRouter {
         assert!(
             !runtime_filter_router_artifact_surface_violations(&bad).is_empty(),
             "router surface must reject logical/action/shadow decoy:\n{bad}"
+        );
+    }
+}
+
+#[test]
+fn runtime_filter_cfg_requires_test_handles_nested_boolean_predicates() {
+    for attribute in [
+        "#[cfg(test)]",
+        "#[cfg(not(not(test)))]",
+        "#[cfg(all(feature = \"x\", not(not(test))))]",
+        "#[cfg(not(any(not(test), feature = \"x\")))]",
+        "#[cfg(all(any(feature = \"x\", test), not(not(test))))]",
+    ] {
+        assert!(
+            cfg_attribute_requires_test(attribute),
+            "predicate cannot be true when test=false: {attribute}"
+        );
+    }
+    for attribute in [
+        "#[cfg(not(test))]",
+        "#[cfg(any(test, feature = \"x\"))]",
+        "#[cfg(all(not(test), feature = \"x\"))]",
+        "#[cfg(not(any(test, feature = \"x\")))]",
+    ] {
+        assert!(
+            !cfg_attribute_requires_test(attribute),
+            "predicate can be true when test=false: {attribute}"
         );
     }
 }
@@ -13783,6 +14091,26 @@ fn fail(&self) { self.channel.fail_instance().map(|action| self.finish(action));
             "match action { action => self.dispatcher.dispatch(self.channel_id, action) }",
         ),
         good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "let _dispatch = || { self.dispatcher.dispatch(self.channel_id, action); };",
+        ),
+        good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "let _dispatch = async { self.dispatcher.dispatch(self.channel_id, action); };",
+        ),
+        good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "if false { self.dispatcher.dispatch(self.channel_id, action); }",
+        ),
+        good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "while false { self.dispatcher.dispatch(self.channel_id, action); }",
+        ),
+        good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "return; self.dispatcher.dispatch(self.channel_id, action);",
+        ),
+        good.replace(
             "self.channel.submit().map(|action| self.finish(action))",
             "self.channel.submit().map(|action| action.outcome())",
         ),
@@ -13797,7 +14125,7 @@ fn fail(&self) { self.channel.fail_instance().map(|action| self.finish(action));
     ] {
         assert!(
             !runtime_filter_action_dispatch_boundary_violations(&bad).is_empty(),
-            "dispatch detector must reject mutation-callback or action-free dispatch"
+            "dispatch detector must reject mutation-callback or action-free dispatch:\n{bad}"
         );
     }
 }
