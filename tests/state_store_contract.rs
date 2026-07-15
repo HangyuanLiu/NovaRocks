@@ -289,28 +289,6 @@ async fn fault_injecting_state_store_scripts_all_contract_boundaries() {
             ),
             "unexpected injected outcome"
         );
-        let resolution = fault
-            .resolve_commit(&transaction_id)
-            .await
-            .expect("resolve injected pre-commit outcome");
-        assert!(
-            matches!(
-                (result, resolution),
-                (
-                    ScriptedCommitResult::Committed,
-                    CommitResolution::Committed(_)
-                ) | (
-                    ScriptedCommitResult::Conflict
-                        | ScriptedCommitResult::TransientBeforeCommit
-                        | ScriptedCommitResult::DefiniteFailure,
-                    CommitResolution::NotCommitted
-                ) | (
-                    ScriptedCommitResult::CommitUnknown,
-                    CommitResolution::Unresolved
-                )
-            ),
-            "injected resolution must agree with the scripted commit phase"
-        );
     }
 
     fault.fail_next_change_poll(injected_error());
@@ -335,24 +313,14 @@ async fn fault_injecting_state_store_scripts_all_contract_boundaries() {
     fault.pause_next_post_dispatch(gate.clone());
     let commit = tokio::spawn(async move { transaction.commit().await });
     gate.wait_reached().await;
-    assert_eq!(
-        fault
-            .resolve_commit(&post_dispatch_id)
-            .await
-            .expect("resolve post-dispatch fault"),
-        CommitResolution::Unresolved
+    assert!(
+        !commit.is_finished(),
+        "post-dispatch reply must remain gated"
     );
     gate.release().await;
     assert!(matches!(
         commit.await.expect("post-dispatch commit task"),
         CommitOutcome::Committed(_)
-    ));
-    assert!(matches!(
-        fault
-            .resolve_commit(&post_dispatch_id)
-            .await
-            .expect("resolve terminal post-dispatch fault"),
-        CommitResolution::Committed(_)
     ));
 }
 

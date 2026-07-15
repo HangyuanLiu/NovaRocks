@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Mutex};
+use std::task::Poll;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -26,9 +26,10 @@ use novarocks::state_store::limits::MAX_KEY_BYTES;
 use novarocks::state_store::{
     ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution, Direction, Key,
     KeyRange, Precondition, RangePage, RangeRequest, ReadTransaction, StateRecord, StateStore,
-    StateStoreError, StateStoreErrorKind, StateStoreLimits, StoreIdentity, StoreRevision,
-    TransactionId, Value, WriteTransaction,
+    StateStoreError, StateStoreErrorKind, StateStoreLimits, StoreIdentity, TransactionId, Value,
+    WriteTransaction,
 };
+use tokio::sync::Barrier;
 use uuid::Uuid;
 
 pub type StoreFuture =
@@ -44,12 +45,8 @@ pub async fn run_state_store_conformance(factory: StateStoreFactory) {
     forward_reverse_pages(&factory).await;
     same_revision_change_pages(&factory).await;
     atomic_commit(&factory).await;
-    commit_resolution_after_cancel(&factory).await;
-    resolve_does_not_report_not_committed_while_inflight(&factory).await;
     limits_before_io(&factory).await;
-    deadline_interrupts_blocking_sql(&factory).await;
     arbitrary_binary_payloads(&factory).await;
-    second_owner_rejected(&factory).await;
 }
 
 fn key(bytes: impl Into<Vec<u8>>) -> Key {
@@ -107,6 +104,10 @@ pub async fn snapshot_repeatable_read(factory: &StateStoreFactory) {
     commit_puts(&store, &[(item.clone(), value(b"before".to_vec()))]).await;
     let mut reader = store.begin_read().await.expect("begin snapshot read");
     let before = reader.get(&item).await.expect("first snapshot read");
+    assert_eq!(
+        before.as_ref().expect("initial snapshot value").value,
+        value(b"before".to_vec())
+    );
     commit_puts(&store, &[(item.clone(), value(b"after".to_vec()))]).await;
     assert_eq!(
         reader.get(&item).await.expect("repeat snapshot read"),
@@ -214,6 +215,40 @@ pub async fn range_phantom_conflict(factory: &StateStoreFactory) {
         .expect("stage second phantom");
     committed(first.commit().await);
     assert_conflict(second.commit().await);
+
+    let deleted = key(vec![14, 1]);
+    commit_puts(&store, &[(deleted.clone(), value(b"present".to_vec()))]).await;
+    let delete_request = conformance_range(14, Direction::Forward, 10);
+    let mut delete_first = store
+        .begin_write(transaction_id(), "delete phantom first")
+        .await
+        .expect("begin first delete phantom write");
+    let mut delete_second = store
+        .begin_write(transaction_id(), "delete phantom second")
+        .await
+        .expect("begin second delete phantom write");
+    delete_first
+        .range(&delete_request)
+        .await
+        .expect("first delete phantom range");
+    delete_second
+        .range(&delete_request)
+        .await
+        .expect("second delete phantom range");
+    delete_first
+        .delete(deleted, Precondition::Any)
+        .await
+        .expect("stage phantom delete");
+    delete_second
+        .put(
+            key(vec![14, 2]),
+            value(b"insert".to_vec()),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage competing phantom insert");
+    committed(delete_first.commit().await);
+    assert_conflict(delete_second.commit().await);
 }
 
 pub async fn preconditions(factory: &StateStoreFactory) {
@@ -269,11 +304,50 @@ pub async fn preconditions(factory: &StateStoreFactory) {
         .put(
             item.clone(),
             value(b"stale".to_vec()),
-            Precondition::Version(original.version),
+            Precondition::Version(original.version.clone()),
         )
         .await
         .expect("stage stale write");
     assert_conflict(stale.commit().await);
+
+    let mut absent_failure = store
+        .begin_write(transaction_id(), "absent precondition failure")
+        .await
+        .expect("begin absent failure");
+    absent_failure
+        .put(
+            item.clone(),
+            value(b"absent-failure".to_vec()),
+            Precondition::Absent,
+        )
+        .await
+        .expect("stage absent failure");
+    assert_conflict(absent_failure.commit().await);
+
+    let missing = key(b"c05/missing".to_vec());
+    let mut present_failure = store
+        .begin_write(transaction_id(), "present precondition failure")
+        .await
+        .expect("begin present failure");
+    present_failure
+        .put(
+            missing.clone(),
+            value(b"present-failure".to_vec()),
+            Precondition::Present,
+        )
+        .await
+        .expect("stage present failure");
+    assert_conflict(present_failure.commit().await);
+
+    let mut missing_version = store
+        .begin_write(transaction_id(), "missing version failure")
+        .await
+        .expect("begin missing version failure");
+    missing_version
+        .delete(missing, Precondition::Version(original.version.clone()))
+        .await
+        .expect("stage missing version failure");
+    assert_conflict(missing_version.commit().await);
 
     let mut any = store
         .begin_write(transaction_id(), "any precondition")
@@ -318,6 +392,78 @@ pub async fn forward_reverse_pages(factory: &StateStoreFactory) {
         .collect::<Vec<_>>();
     assert_eq!(forward, expected);
     assert_eq!(reverse, expected.into_iter().rev().collect::<Vec<_>>());
+
+    let boundary_rows = [
+        (key(vec![0]), value(vec![0])),
+        (key(vec![0, 0xff]), value(vec![1])),
+        (key(vec![0xff]), value(vec![2])),
+        (key(vec![0xff, 0xff]), value(vec![3])),
+    ];
+    commit_puts(&store, &boundary_rows).await;
+    let boundary_request = RangeRequest {
+        range: KeyRange::new(key(Vec::new()), key(vec![0xff, 0xff, 0xff]))
+            .expect("bounded binary edge range"),
+        direction: Direction::Forward,
+        page_size: 2,
+        continuation: None,
+    };
+    let mut reader = store.begin_read().await.expect("begin token read");
+    let first = reader
+        .range(&boundary_request)
+        .await
+        .expect("first binary edge page");
+    let token = first.continuation.expect("binary edge continuation");
+    assert_eq!(first.records.len(), 2);
+    let wrong_direction = RangeRequest {
+        direction: Direction::Reverse,
+        continuation: Some(token.clone()),
+        ..boundary_request.clone()
+    };
+    assert_eq!(
+        reader
+            .range(&wrong_direction)
+            .await
+            .expect_err("token direction mismatch")
+            .kind(),
+        StateStoreErrorKind::InvalidRequest
+    );
+    let wrong_range = RangeRequest {
+        range: KeyRange::new(key(vec![0]), key(vec![0xff, 0xff, 0xff]))
+            .expect("different token range"),
+        continuation: Some(token),
+        ..boundary_request.clone()
+    };
+    assert_eq!(
+        reader
+            .range(&wrong_range)
+            .await
+            .expect_err("token range mismatch")
+            .kind(),
+        StateStoreErrorKind::InvalidRequest
+    );
+    reader.abort().await.expect("abort token read");
+
+    let mut writer = store
+        .begin_write(transaction_id(), "write range freeze")
+        .await
+        .expect("begin write range freeze");
+    assert!(
+        writer
+            .range(&boundary_request)
+            .await
+            .expect("paginated write range")
+            .continuation
+            .is_some()
+    );
+    assert_eq!(
+        writer
+            .put(key(vec![1]), value(vec![1]), Precondition::Any)
+            .await
+            .expect_err("write must freeze after continuation")
+            .kind(),
+        StateStoreErrorKind::InvalidRequest
+    );
+    writer.abort().await.expect("abort frozen writer");
 }
 
 pub async fn same_revision_change_pages(factory: &StateStoreFactory) {
@@ -364,6 +510,8 @@ pub async fn same_revision_change_pages(factory: &StateStoreFactory) {
         .await
         .expect("poll final same-revision page");
     assert_eq!(third.hints.len(), 1);
+    let tail_cursor = third.next_cursor.clone();
+    let high_watermark = third.high_watermark.clone();
     let hints = first
         .hints
         .into_iter()
@@ -379,6 +527,35 @@ pub async fn same_revision_change_pages(factory: &StateStoreFactory) {
         rows.iter()
             .map(|(key, _)| key.as_bytes().to_vec())
             .collect::<Vec<_>>()
+    );
+
+    let fault = FaultInjectingStateStore::new(Arc::clone(&store));
+    fault.script_next_change_page(ChangePage {
+        hints: Vec::new(),
+        next_cursor: tail_cursor.clone(),
+        high_watermark,
+        resync_required: true,
+    });
+    let gap = fault
+        .poll_changes(&ChangePollRequest {
+            after: Some(tail_cursor),
+            page_size: 2,
+        })
+        .await
+        .expect("inject retention gap");
+    assert!(gap.resync_required);
+    assert!(gap.hints.is_empty());
+    let authoritative = collect_pages(
+        &(fault as Arc<dyn StateStore>),
+        conformance_range(7, Direction::Forward, 2),
+    )
+    .await;
+    assert_eq!(
+        authoritative,
+        rows.iter()
+            .map(|(key, _)| key.as_bytes().to_vec())
+            .collect::<Vec<_>>(),
+        "retention gaps require a bounded authoritative reload"
     );
 }
 
@@ -411,6 +588,137 @@ pub async fn atomic_commit(factory: &StateStoreFactory) {
         .expect("stage conflicting row");
     assert_conflict(transaction.commit().await);
     assert_eq!(read_record(&store, &partial).await, None);
+
+    let mut baseline_cursor = None;
+    loop {
+        let page = store
+            .poll_changes(&ChangePollRequest {
+                after: baseline_cursor,
+                page_size: store.limits().max_page_size,
+            })
+            .await
+            .expect("poll scripted commit baseline");
+        let page_is_full = page.hints.len() == store.limits().max_page_size;
+        baseline_cursor = Some(page.next_cursor);
+        if !page_is_full {
+            break;
+        }
+    }
+    let fault = FaultInjectingStateStore::new(Arc::clone(&store));
+    let scripted_id = transaction_id();
+    let scripted_key = key(b"c08/scripted-committed".to_vec());
+    let mut scripted = fault
+        .begin_write(scripted_id, "scripted real commit")
+        .await
+        .expect("begin scripted committed transaction");
+    scripted
+        .put(
+            scripted_key.clone(),
+            value(b"durable".to_vec()),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage scripted committed row");
+    fault.script_next_pre_commit(ScriptedCommitResult::Committed);
+    let scripted_receipt = committed(scripted.commit().await);
+    assert_eq!(
+        fault
+            .resolve_commit(&scripted_id)
+            .await
+            .expect("resolve scripted committed transaction"),
+        CommitResolution::Committed(scripted_receipt.clone())
+    );
+    assert_eq!(
+        read_record(&store, &scripted_key)
+            .await
+            .expect("scripted committed row must be durable")
+            .value,
+        value(b"durable".to_vec())
+    );
+    let change = store
+        .poll_changes(&ChangePollRequest {
+            after: baseline_cursor,
+            page_size: store.limits().max_page_size,
+        })
+        .await
+        .expect("poll scripted committed change");
+    assert!(
+        change
+            .hints
+            .iter()
+            .any(|hint| { hint.key == scripted_key && hint.revision == scripted_receipt.revision })
+    );
+
+    let failure_cursor = Some(change.next_cursor);
+    let mut failure_keys = Vec::new();
+    for (suffix, result) in [
+        ("conflict", ScriptedCommitResult::Conflict),
+        (
+            "transient-before-commit",
+            ScriptedCommitResult::TransientBeforeCommit,
+        ),
+        ("definite-failure", ScriptedCommitResult::DefiniteFailure),
+        ("commit-unknown", ScriptedCommitResult::CommitUnknown),
+    ] {
+        let transaction_id = transaction_id();
+        let item = key(format!("c08/scripted-{suffix}").into_bytes());
+        let mut transaction = fault
+            .begin_write(transaction_id, "scripted failure must abort")
+            .await
+            .expect("begin scripted failure transaction");
+        transaction
+            .put(
+                item.clone(),
+                value(b"must-not-commit".to_vec()),
+                Precondition::Any,
+            )
+            .await
+            .expect("stage scripted failure row");
+        fault.script_next_pre_commit(result);
+        let outcome = transaction.commit().await;
+        assert!(
+            matches!(
+                (result, outcome),
+                (ScriptedCommitResult::Conflict, CommitOutcome::Conflict(_))
+                    | (
+                        ScriptedCommitResult::TransientBeforeCommit,
+                        CommitOutcome::TransientBeforeCommit(_)
+                    )
+                    | (
+                        ScriptedCommitResult::DefiniteFailure,
+                        CommitOutcome::DefiniteFailure(_)
+                    )
+                    | (
+                        ScriptedCommitResult::CommitUnknown,
+                        CommitOutcome::CommitUnknown(_)
+                    )
+            ),
+            "unexpected scripted failure outcome"
+        );
+        assert_eq!(
+            fault
+                .resolve_commit(&transaction_id)
+                .await
+                .expect("resolve scripted failure transaction"),
+            CommitResolution::NotCommitted
+        );
+        assert_eq!(read_record(&store, &item).await, None);
+        failure_keys.push(item);
+    }
+    let failure_changes = store
+        .poll_changes(&ChangePollRequest {
+            after: failure_cursor,
+            page_size: store.limits().max_page_size,
+        })
+        .await
+        .expect("poll scripted failure changes");
+    assert!(
+        failure_changes
+            .hints
+            .iter()
+            .all(|hint| !failure_keys.contains(&hint.key)),
+        "scripted failure outcomes must not publish change hints"
+    );
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -437,28 +745,16 @@ impl FaultGate {
     }
 
     async fn pause(&self) {
-        let reached = Arc::clone(&self.reached);
-        tokio::task::spawn_blocking(move || reached.wait())
-            .await
-            .expect("fault gate reached worker");
-        let release = Arc::clone(&self.release);
-        tokio::task::spawn_blocking(move || release.wait())
-            .await
-            .expect("fault gate release worker");
+        self.reached.wait().await;
+        self.release.wait().await;
     }
 
     pub async fn wait_reached(&self) {
-        let reached = Arc::clone(&self.reached);
-        tokio::task::spawn_blocking(move || reached.wait())
-            .await
-            .expect("wait for fault gate");
+        self.reached.wait().await;
     }
 
     pub async fn release(&self) {
-        let release = Arc::clone(&self.release);
-        tokio::task::spawn_blocking(move || release.wait())
-            .await
-            .expect("release fault gate");
+        self.release.wait().await;
     }
 }
 
@@ -475,12 +771,12 @@ struct FaultScript {
     pre_commit: Option<ScriptedCommitResult>,
     post_dispatch: Option<FaultGate>,
     change_poll: Option<StateStoreError>,
+    change_page: Option<ChangePage>,
 }
 
 pub struct FaultInjectingStateStore {
     inner: Arc<dyn StateStore>,
     script: Arc<Mutex<FaultScript>>,
-    resolutions: Arc<Mutex<HashMap<TransactionId, CommitResolution>>>,
 }
 
 impl FaultInjectingStateStore {
@@ -488,7 +784,6 @@ impl FaultInjectingStateStore {
         Arc::new(Self {
             inner,
             script: Arc::new(Mutex::new(FaultScript::default())),
-            resolutions: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -512,6 +807,10 @@ impl FaultInjectingStateStore {
         self.script.lock().expect("fault script").change_poll = Some(error);
     }
 
+    pub fn script_next_change_page(&self, page: ChangePage) {
+        self.script.lock().expect("fault script").change_page = Some(page);
+    }
+
     fn take_begin_error(&self) -> Option<StateStoreError> {
         self.script.lock().expect("fault script").begin.take()
     }
@@ -525,7 +824,6 @@ struct FaultReadTransaction {
 struct FaultWriteTransaction {
     inner: Box<dyn WriteTransaction>,
     script: Arc<Mutex<FaultScript>>,
-    resolutions: Arc<Mutex<HashMap<TransactionId, CommitResolution>>>,
 }
 
 fn take_operation_error(script: &Mutex<FaultScript>) -> Option<StateStoreError> {
@@ -580,31 +878,17 @@ impl ReadTransaction for FaultWriteTransaction {
     }
 }
 
-fn scripted_outcome(id: TransactionId, result: ScriptedCommitResult) -> CommitOutcome {
+fn scripted_failure(result: ScriptedCommitResult) -> CommitOutcome {
     let error =
         || StateStoreError::new(StateStoreErrorKind::Internal, "injected state store fault");
     match result {
-        ScriptedCommitResult::Committed => CommitOutcome::Committed(CommitReceipt {
-            transaction_id: id,
-            revision: StoreRevision::try_from(Bytes::from_static(b"fault-revision"))
-                .expect("fault revision"),
-        }),
+        ScriptedCommitResult::Committed => unreachable!("committed faults use the real provider"),
         ScriptedCommitResult::Conflict => CommitOutcome::Conflict(error()),
         ScriptedCommitResult::TransientBeforeCommit => {
             CommitOutcome::TransientBeforeCommit(error())
         }
         ScriptedCommitResult::DefiniteFailure => CommitOutcome::DefiniteFailure(error()),
         ScriptedCommitResult::CommitUnknown => CommitOutcome::CommitUnknown(error()),
-    }
-}
-
-fn resolution_for(outcome: &CommitOutcome) -> Option<CommitResolution> {
-    match outcome {
-        CommitOutcome::Committed(receipt) => Some(CommitResolution::Committed(receipt.clone())),
-        CommitOutcome::Conflict(_)
-        | CommitOutcome::TransientBeforeCommit(_)
-        | CommitOutcome::DefiniteFailure(_) => Some(CommitResolution::NotCommitted),
-        CommitOutcome::CommitUnknown(_) => None,
     }
 }
 
@@ -638,54 +922,37 @@ impl WriteTransaction for FaultWriteTransaction {
     }
 
     async fn commit(self: Box<Self>) -> CommitOutcome {
-        let id = *self.inner.transaction_id();
         let (pre_commit, post_dispatch) = {
             let mut script = self.script.lock().expect("fault script");
             (script.pre_commit.take(), script.post_dispatch.take())
         };
         if let Some(result) = pre_commit {
-            let outcome = scripted_outcome(id, result);
-            let resolution = resolution_for(&outcome).unwrap_or(CommitResolution::Unresolved);
-            self.resolutions
-                .lock()
-                .expect("fault resolutions")
-                .insert(id, resolution);
-            return outcome;
+            if matches!(result, ScriptedCommitResult::Committed) {
+                return self.inner.commit().await;
+            }
+            return match self.inner.abort().await {
+                Ok(()) => scripted_failure(result),
+                Err(error) => CommitOutcome::DefiniteFailure(error),
+            };
         }
         let Some(gate) = post_dispatch else {
             return self.inner.commit().await;
         };
-
-        self.resolutions
-            .lock()
-            .expect("fault resolutions")
-            .insert(id, CommitResolution::Unresolved);
-        let resolutions = Arc::clone(&self.resolutions);
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let commit = tokio::spawn(async move { self.inner.commit().await });
-            gate.pause().await;
-            let outcome = commit.await.unwrap_or_else(|_| {
-                CommitOutcome::CommitUnknown(StateStoreError::new(
-                    StateStoreErrorKind::Internal,
-                    "injected commit worker failed",
-                ))
-            });
-            let mut resolutions = resolutions.lock().expect("fault resolutions");
-            if let Some(resolution) = resolution_for(&outcome) {
-                resolutions.insert(id, resolution);
-            } else {
-                resolutions.remove(&id);
+        let mut commit = self.inner.commit();
+        let mut ready = None;
+        std::future::poll_fn(|context| {
+            match commit.as_mut().poll(context) {
+                Poll::Ready(outcome) => ready = Some(outcome),
+                Poll::Pending => {}
             }
-            drop(resolutions);
-            let _ = sender.send(outcome);
-        });
-        receiver.await.unwrap_or_else(|_| {
-            CommitOutcome::CommitUnknown(StateStoreError::new(
-                StateStoreErrorKind::Internal,
-                "injected commit response was cancelled",
-            ))
+            Poll::Ready(())
         })
+        .await;
+        gate.pause().await;
+        match ready {
+            Some(outcome) => outcome,
+            None => commit.await,
+        }
     }
 }
 
@@ -720,7 +987,6 @@ impl StateStore for FaultInjectingStateStore {
         Ok(Box::new(FaultWriteTransaction {
             inner: self.inner.begin_write(transaction_id, purpose).await?,
             script: Arc::clone(&self.script),
-            resolutions: Arc::clone(&self.resolutions),
         }))
     }
 
@@ -728,8 +994,15 @@ impl StateStore for FaultInjectingStateStore {
         &self,
         request: &ChangePollRequest,
     ) -> Result<ChangePage, StateStoreError> {
-        if let Some(error) = self.script.lock().expect("fault script").change_poll.take() {
+        let (error, page) = {
+            let mut script = self.script.lock().expect("fault script");
+            (script.change_poll.take(), script.change_page.take())
+        };
+        if let Some(error) = error {
             return Err(error);
+        }
+        if let Some(page) = page {
+            return Ok(page);
         }
         self.inner.poll_changes(request).await
     }
@@ -742,129 +1015,8 @@ impl StateStore for FaultInjectingStateStore {
         &self,
         transaction_id: &TransactionId,
     ) -> Result<CommitResolution, StateStoreError> {
-        if let Some(resolution) = self
-            .resolutions
-            .lock()
-            .expect("fault resolutions")
-            .get(transaction_id)
-            .cloned()
-        {
-            return Ok(resolution);
-        }
         self.inner.resolve_commit(transaction_id).await
     }
-}
-
-async fn cancelled_commit_resolution(factory: &StateStoreFactory, prefix: u8) {
-    let fault = FaultInjectingStateStore::new(open(factory).await);
-    let id = transaction_id();
-    let first = key(vec![prefix, 1]);
-    let second = key(vec![prefix, 2]);
-    let mut transaction = fault
-        .begin_write(id, "cancelled conformance commit")
-        .await
-        .expect("begin cancelled commit");
-    transaction
-        .put(first.clone(), value(b"first".to_vec()), Precondition::Any)
-        .await
-        .expect("stage first cancelled row");
-    transaction
-        .put(second.clone(), value(b"second".to_vec()), Precondition::Any)
-        .await
-        .expect("stage second cancelled row");
-    let gate = FaultGate::new();
-    fault.pause_next_post_dispatch(gate.clone());
-    let commit = tokio::spawn(async move { transaction.commit().await });
-    gate.wait_reached().await;
-    commit.abort();
-    assert!(
-        commit
-            .await
-            .expect_err("commit waiter cancelled")
-            .is_cancelled()
-    );
-    assert_eq!(
-        fault
-            .resolve_commit(&id)
-            .await
-            .expect("resolve in-flight commit"),
-        CommitResolution::Unresolved
-    );
-    gate.release().await;
-    let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            match fault
-                .resolve_commit(&id)
-                .await
-                .expect("resolve terminal commit")
-            {
-                CommitResolution::Unresolved => tokio::task::yield_now().await,
-                terminal => break terminal,
-            }
-        }
-    })
-    .await
-    .expect("commit reconciliation must terminate");
-    let first_row = read_record(&(fault.clone() as Arc<dyn StateStore>), &first).await;
-    let second_row = read_record(&(fault as Arc<dyn StateStore>), &second).await;
-    match terminal {
-        CommitResolution::Committed(_) => {
-            assert!(first_row.is_some());
-            assert!(second_row.is_some());
-        }
-        CommitResolution::NotCommitted => {
-            assert!(first_row.is_none());
-            assert!(second_row.is_none());
-        }
-        CommitResolution::Unresolved => unreachable!(),
-    }
-}
-
-pub async fn commit_resolution_after_cancel(factory: &StateStoreFactory) {
-    cancelled_commit_resolution(factory, 9).await;
-}
-
-pub async fn resolve_does_not_report_not_committed_while_inflight(factory: &StateStoreFactory) {
-    let fault = FaultInjectingStateStore::new(open(factory).await);
-    let id = transaction_id();
-    let item = key(vec![10, 1]);
-    let mut transaction = fault
-        .begin_write(id, "observable in-flight commit")
-        .await
-        .expect("begin observable in-flight commit");
-    transaction
-        .put(item.clone(), value(b"value".to_vec()), Precondition::Any)
-        .await
-        .expect("stage observable in-flight row");
-    let gate = FaultGate::new();
-    fault.pause_next_post_dispatch(gate.clone());
-    let commit = tokio::spawn(async move { transaction.commit().await });
-    gate.wait_reached().await;
-    for _ in 0..3 {
-        assert_eq!(
-            fault
-                .resolve_commit(&id)
-                .await
-                .expect("resolve in-flight commit"),
-            CommitResolution::Unresolved
-        );
-    }
-    gate.release().await;
-    let receipt = committed(commit.await.expect("join observable commit"));
-    assert_eq!(
-        fault
-            .resolve_commit(&id)
-            .await
-            .expect("resolve committed transaction"),
-        CommitResolution::Committed(receipt)
-    );
-    assert_eq!(
-        read_record(&(fault as Arc<dyn StateStore>), &item)
-            .await
-            .expect("committed in-flight row")
-            .value,
-        value(b"value".to_vec())
-    );
 }
 
 pub async fn limits_before_io(factory: &StateStoreFactory) {
@@ -990,21 +1142,6 @@ pub async fn limits_before_io(factory: &StateStoreFactory) {
     committed(byte_writer.commit().await);
 }
 
-pub async fn deadline_interrupts_blocking_sql(factory: &StateStoreFactory) {
-    let store = open(factory).await;
-    let deadline = store.limits().transaction_deadline;
-    let mut reader = store.begin_read().await.expect("begin deadline read");
-    tokio::time::sleep(deadline + std::time::Duration::from_millis(10)).await;
-    assert_eq!(
-        reader
-            .get(&key(b"c12/deadline".to_vec()))
-            .await
-            .expect_err("transaction deadline covers operations")
-            .kind(),
-        StateStoreErrorKind::DeadlineExceeded
-    );
-}
-
 pub async fn arbitrary_binary_payloads(factory: &StateStoreFactory) {
     let store = open(factory).await;
     let item = key(vec![13, 0, 0xff, 0, 0xfe]);
@@ -1016,19 +1153,4 @@ pub async fn arbitrary_binary_payloads(factory: &StateStoreFactory) {
     assert_eq!(record.key, item);
     assert_eq!(record.value, payload);
     assert!(!record.version.as_bytes().is_empty());
-}
-
-pub async fn second_owner_rejected(factory: &StateStoreFactory) {
-    let first = open(factory).await;
-    let error = match factory().await {
-        Ok(_) => panic!("second owner must fail while first handle is live"),
-        Err(error) => error,
-    };
-    assert!(matches!(
-        error.kind(),
-        StateStoreErrorKind::ProviderUnavailable
-            | StateStoreErrorKind::InvalidRequest
-            | StateStoreErrorKind::UnsupportedDeployment
-    ));
-    drop(first);
 }

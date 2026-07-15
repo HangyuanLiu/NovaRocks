@@ -27,12 +27,12 @@ use novarocks::state_store::{
     Key, KeyRange, Precondition, RangeRequest, StateStore, StateStoreConfig, StateStoreErrorKind,
     StateStoreLimitOverrides, StateStoreProviderConfig, TransactionId, Value, open_state_store,
 };
-use rusqlite::params;
+use rusqlite::{Connection, params};
 use tempfile::TempDir;
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
-use common::state_store_conformance::StateStoreFactory;
+use common::state_store_conformance::{FaultGate, FaultInjectingStateStore, StateStoreFactory};
 
 fn key(bytes: impl Into<Vec<u8>>) -> Key {
     Key::try_from(Bytes::from(bytes.into())).expect("valid key")
@@ -72,6 +72,16 @@ async fn open_store_with_limits(
     .expect("open public SQLite state store")
 }
 
+async fn read_state_record(
+    store: &Arc<dyn StateStore>,
+    item: &Key,
+) -> Option<novarocks::state_store::StateRecord> {
+    let mut reader = store.begin_read().await.expect("begin state record read");
+    let record = reader.get(item).await.expect("read state record");
+    reader.abort().await.expect("abort state record read");
+    record
+}
+
 fn conformance_factory() -> StateStoreFactory {
     let temp = Arc::new(TempDir::new().expect("conformance temp dir"));
     Arc::new(move || {
@@ -107,6 +117,65 @@ mod conformance {
     use super::*;
     use common::state_store_conformance;
 
+    fn hold_sqlite_writer_lock(path: &std::path::Path) -> Connection {
+        let connection = Connection::open(path).expect("open SQLite conformance blocker");
+        connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold SQLite conformance writer lock");
+        connection
+    }
+
+    fn durable_counts(path: &std::path::Path) -> (i64, i64, i64) {
+        let connection = Connection::open(path).expect("open SQLite durable-state observer");
+        (
+            connection
+                .query_row("SELECT COUNT(*) FROM state_store_kv", [], |row| row.get(0))
+                .expect("count durable KV rows"),
+            connection
+                .query_row("SELECT COUNT(*) FROM state_store_changes", [], |row| {
+                    row.get(0)
+                })
+                .expect("count durable change rows"),
+            connection
+                .query_row("SELECT COUNT(*) FROM state_store_commits", [], |row| {
+                    row.get(0)
+                })
+                .expect("count durable commit rows"),
+        )
+    }
+
+    async fn wait_for_resolution(
+        store: &Arc<dyn StateStore>,
+        transaction_id: &TransactionId,
+        expected: CommitResolution,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let resolution = store
+                    .resolve_commit(transaction_id)
+                    .await
+                    .expect("resolve SQLite conformance commit");
+                if resolution == expected {
+                    break;
+                }
+                assert_eq!(resolution, CommitResolution::Unresolved);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("SQLite commit resolution must become terminal");
+        for _ in 0..3 {
+            assert_eq!(
+                store
+                    .resolve_commit(transaction_id)
+                    .await
+                    .expect("repeat terminal SQLite resolution"),
+                expected,
+                "terminal resolution must not regress"
+            );
+        }
+    }
+
     macro_rules! conformance_test {
         ($name:ident) => {
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -125,12 +194,193 @@ mod conformance {
     conformance_test!(forward_reverse_pages);
     conformance_test!(same_revision_change_pages);
     conformance_test!(atomic_commit);
-    conformance_test!(commit_resolution_after_cancel);
-    conformance_test!(resolve_does_not_report_not_committed_while_inflight);
     conformance_test!(limits_before_io);
-    conformance_test!(deadline_interrupts_blocking_sql);
     conformance_test!(arbitrary_binary_payloads);
-    conformance_test!(second_owner_rejected);
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn commit_resolution_after_cancel() {
+        let temp = TempDir::new().expect("cancelled commit temp dir");
+        let path = temp.path().join("state-store.sqlite");
+        let store = open_store(&temp, "fe-a").await;
+        let fault = FaultInjectingStateStore::new(Arc::clone(&store));
+        let transaction_id = transaction_id();
+        let keys = [key(b"cancelled-a".to_vec()), key(b"cancelled-b".to_vec())];
+        let mut transaction = fault
+            .begin_write(transaction_id, "cancelled real commit")
+            .await
+            .expect("begin cancelled real commit");
+        for item in &keys {
+            transaction
+                .put(item.clone(), value(b"value"), Precondition::Any)
+                .await
+                .expect("stage cancelled real commit row");
+        }
+
+        let blocker = hold_sqlite_writer_lock(&path);
+        let gate = FaultGate::new();
+        fault.pause_next_post_dispatch(gate.clone());
+        let waiter = tokio::spawn(async move { transaction.commit().await });
+        gate.wait_reached().await;
+        waiter.abort();
+        assert!(
+            waiter
+                .await
+                .expect_err("cancel commit waiter")
+                .is_cancelled()
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                store
+                    .resolve_commit(&transaction_id)
+                    .await
+                    .expect("resolve cancelled in-flight commit"),
+                CommitResolution::Unresolved,
+                "a cancelled waiter must not publish NotCommitted while its worker is blocked"
+            );
+        }
+        assert_eq!(durable_counts(&path), (0, 0, 0));
+
+        blocker
+            .execute_batch("ROLLBACK")
+            .expect("release cancelled commit writer lock");
+        gate.release().await;
+        wait_for_resolution(&store, &transaction_id, CommitResolution::NotCommitted).await;
+        assert_eq!(durable_counts(&path), (0, 0, 0));
+        for item in keys {
+            assert!(read_state_record(&store, &item).await.is_none());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn resolve_does_not_report_not_committed_while_inflight() {
+        let temp = TempDir::new().expect("committed in-flight temp dir");
+        let path = temp.path().join("state-store.sqlite");
+        let store = open_store(&temp, "fe-a").await;
+        let fault = FaultInjectingStateStore::new(Arc::clone(&store));
+        let transaction_id = transaction_id();
+        let keys = [key(b"committed-a".to_vec()), key(b"committed-b".to_vec())];
+        let mut transaction = fault
+            .begin_write(transaction_id, "blocked real commit")
+            .await
+            .expect("begin blocked real commit");
+        for item in &keys {
+            transaction
+                .put(item.clone(), value(b"value"), Precondition::Any)
+                .await
+                .expect("stage blocked real commit row");
+        }
+
+        let blocker = hold_sqlite_writer_lock(&path);
+        let gate = FaultGate::new();
+        fault.pause_next_post_dispatch(gate.clone());
+        let waiter = tokio::spawn(async move { transaction.commit().await });
+        gate.wait_reached().await;
+        for _ in 0..3 {
+            assert_eq!(
+                store
+                    .resolve_commit(&transaction_id)
+                    .await
+                    .expect("resolve blocked real commit"),
+                CommitResolution::Unresolved
+            );
+        }
+        assert_eq!(durable_counts(&path), (0, 0, 0));
+
+        blocker
+            .execute_batch("ROLLBACK")
+            .expect("release committed writer lock");
+        gate.release().await;
+        let receipt = match waiter.await.expect("join committed waiter") {
+            CommitOutcome::Committed(receipt) => receipt,
+            other => panic!("expected committed real outcome, got {other:?}"),
+        };
+        wait_for_resolution(
+            &store,
+            &transaction_id,
+            CommitResolution::Committed(receipt),
+        )
+        .await;
+        assert_eq!(durable_counts(&path), (2, 2, 1));
+        for item in keys {
+            assert_eq!(
+                read_state_record(&store, &item)
+                    .await
+                    .expect("committed real row")
+                    .value,
+                value(b"value")
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn deadline_interrupts_blocking_sql() {
+        let temp = TempDir::new().expect("deadline temp dir");
+        let path = temp.path().join("state-store.sqlite");
+        let store = open_store_with_limits(
+            &temp,
+            "fe-a",
+            StateStoreLimitOverrides {
+                transaction_deadline_ms: Some(50),
+                ..StateStoreLimitOverrides::default()
+            },
+        )
+        .await;
+        let item = key(b"deadline-blocked".to_vec());
+        let mut transaction = store
+            .begin_write(transaction_id(), "deadline blocked SQL")
+            .await
+            .expect("begin deadline blocked transaction");
+        transaction
+            .put(item.clone(), value(b"must-not-commit"), Precondition::Any)
+            .await
+            .expect("stage deadline blocked row");
+        let blocker = hold_sqlite_writer_lock(&path);
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), transaction.commit())
+            .await
+            .expect("deadline must interrupt blocking SQLite commit");
+        blocker
+            .execute_batch("ROLLBACK")
+            .expect("release deadline writer lock");
+        match outcome {
+            CommitOutcome::DefiniteFailure(error) => {
+                assert_eq!(error.kind(), StateStoreErrorKind::DeadlineExceeded)
+            }
+            other => panic!("expected definite deadline failure, got {other:?}"),
+        }
+        assert_eq!(durable_counts(&path), (0, 0, 0));
+        assert!(read_state_record(&store, &item).await.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn second_owner_rejected() {
+        let temp = TempDir::new().expect("owner lifecycle temp dir");
+        let first = open_store(&temp, "fe-a").await;
+        let identity = first.identity().await.expect("first owner identity");
+        let second = open_state_store(
+            StateStoreConfig {
+                provider: StateStoreProviderConfig::Sqlite,
+                path: temp.path().join("state-store.sqlite"),
+                cluster_id: "cluster-a".to_owned(),
+                deployment_owner: "fe-b".to_owned(),
+                limits: StateStoreLimitOverrides::default(),
+            },
+            FeDeploymentView {
+                active_fe_count: NonZeroUsize::new(1).expect("one FE"),
+                topology_revision: Bytes::from_static(b"topology-r1"),
+            },
+        )
+        .await;
+        assert!(second.is_err(), "second live SQLite owner must be rejected");
+        drop(first);
+        let restarted = open_store(&temp, "fe-a").await;
+        assert_eq!(
+            restarted
+                .identity()
+                .await
+                .expect("restarted owner identity"),
+            identity
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
