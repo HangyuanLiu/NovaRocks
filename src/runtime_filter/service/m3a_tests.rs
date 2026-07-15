@@ -159,6 +159,78 @@ fn ordered_service_update_and_completed_terminal_are_one_live_snapshot() {
 }
 
 #[test]
+fn ordered_completion_cannot_overtake_first_bundle_delivery() {
+    let (service, contract) = installed_ordered_service_with_account(
+        super::memory::MemTrackerMemoryAccount::new_root_for_test(
+            "ordered-live-first-bundle-completion-race",
+        ),
+    );
+    let live = live_handle(&service);
+    let ProducerHandle::OrderedBound(producer) = service
+        .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+        .unwrap()
+    else {
+        panic!("ordered fixture returned membership producer")
+    };
+    let (owner_finished_tx, owner_finished_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    service.set_after_owner_finish_hook(Arc::new(move || {
+        owner_finished_tx.send(()).unwrap();
+        release_rx.lock().unwrap().recv().unwrap();
+    }));
+
+    let submitter = {
+        let producer = producer.clone();
+        let contract = contract.clone();
+        std::thread::spawn(move || {
+            producer.submit_bound(
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                ordered_update(&contract, 100),
+            )
+        })
+    };
+    owner_finished_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first version must pause after the publish gate");
+    let (close_tx, close_rx) = mpsc::channel();
+    let closer = {
+        let producer = producer.clone();
+        std::thread::spawn(move || {
+            close_tx
+                .send(producer.close_partition(PartitionId::new(0), ProducerSequence::new(1)))
+                .unwrap();
+        })
+    };
+
+    if close_rx.recv_timeout(Duration::from_millis(100)).is_ok() {
+        let visible = live.poll_after(None);
+        assert!(
+            matches!(
+                visible,
+                LivePollOutcome::Updated {
+                    terminal: Some(LiveTerminal::Completed),
+                    ..
+                }
+            ),
+            "completion became visible before its first bundle: {visible:?}"
+        );
+    }
+
+    release_tx.send(()).unwrap();
+    submitter.join().unwrap().unwrap();
+    closer.join().unwrap();
+    assert!(matches!(
+        live.poll_after(None),
+        LivePollOutcome::Updated {
+            terminal: Some(LiveTerminal::Completed),
+            ..
+        }
+    ));
+}
+
+#[test]
 fn ordered_service_completed_without_artifact_is_exact_live_terminal() {
     let service = installed_ordered_service_fixture();
     let live = live_handle(&service);

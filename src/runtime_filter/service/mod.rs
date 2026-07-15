@@ -36,6 +36,7 @@ use crate::common::types::UniqueId;
 use crate::runtime_filter::core::channel::ChannelAction;
 use crate::runtime_filter::model::contract::{BindingId, ChannelId, ConsumerActivation};
 use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
+use crate::runtime_filter::port::identity::ContributionIdentity;
 use crate::runtime_filter::port::install::RuntimeFilterInstallView;
 use crate::runtime_filter::port::producer::{
     InstallContractError, InstallOutcome, OrderedBoundProducerAdapter, ProducerAdapter,
@@ -407,6 +408,20 @@ fn action_needs_materialization_launch_prefix(action: &ChannelAction) -> bool {
 }
 
 impl ActionDispatcher {
+    fn emit_ordered_rejection(
+        &self,
+        identity: ContributionIdentity,
+        violation: RuntimeContractViolationKind,
+    ) {
+        let batch = self
+            .events
+            .prequeue([RuntimeFilterEvent::OrderedUpdateRejected {
+                identity,
+                violation,
+            }]);
+        self.events.publish(batch);
+    }
+
     fn finish_publishing_action(
         flight: Arc<ChannelDispatchFlight>,
         order: u64,
@@ -878,6 +893,7 @@ impl ActionDispatcher {
                         events.push(RuntimeFilterEvent::ArtifactPublishStaleSkipped { identity });
                         continue;
                     };
+                    let mut delivered_before_notify = false;
                     let decision = match work.claim {
                         MaterializationWorkClaim::Owner(owner) => {
                             #[cfg(test)]
@@ -889,7 +905,20 @@ impl ActionDispatcher {
                             {
                                 hook();
                             }
-                            match owner.finish(outcome.clone()) {
+                            let route_edges = work.group.route_edges().to_vec();
+                            match owner.finish_after_delivery(
+                                outcome.clone(),
+                                |decision, committed| {
+                                    if decision == PublishCommitOutcome::Published {
+                                        installed.router().route_live(
+                                            &route_edges,
+                                            Some(committed),
+                                            terminal,
+                                        );
+                                        delivered_before_notify = true;
+                                    }
+                                },
+                            ) {
                                 Ok(decision) => {
                                     #[cfg(test)]
                                     if let Some(hook) = self
@@ -952,11 +981,13 @@ impl ActionDispatcher {
                             }
                         }
                     }
-                    deliveries.push((
-                        work.group.route_edges().to_vec(),
-                        delivery_outcome,
-                        terminal,
-                    ));
+                    if !delivered_before_notify {
+                        deliveries.push((
+                            work.group.route_edges().to_vec(),
+                            delivery_outcome,
+                            terminal,
+                        ));
+                    }
                 }
             }
             ChannelAction::Unavailable { reason, .. } => {
@@ -1940,6 +1971,76 @@ mod tests {
         (service, contract)
     }
 
+    fn installed_ordered_allof_service_with_events(
+        events: Arc<Events>,
+    ) -> (Arc<RuntimeFilterService>, Arc<RuntimeOrderContract>) {
+        let service = Arc::new(RuntimeFilterService::new_with_dependencies(
+            uid(0),
+            Arc::new(Clock(Instant::now())),
+            events,
+            MemTrackerMemoryAccount::new_root_for_test("ordered-allof-observability-test"),
+        ));
+        let keys = vec![OrderKeyContract {
+            data_type: DataType::Int64,
+            direction: SortDirection::Ascending,
+            null_order: NullOrder::Last,
+        }];
+        let plan = OrderContract {
+            comparator_digest: comparator_digest_for_test(&keys, COMPARATOR_ALGORITHM_VERSION),
+            keys,
+            inclusive: true,
+        };
+        let contract = Arc::new(RuntimeOrderContract::try_from_plan(&plan).unwrap());
+        let order_digest = contract.digest();
+        let witnesses = [CoverageWitnessId::new(1), CoverageWitnessId::new(2)];
+        let coverage = Coverage::AllOf(witnesses.into_iter().map(Coverage::Leaf).collect());
+        let channel = RuntimeFilterChannelDeployment::new(
+            ChannelId::new(1),
+            RuntimeFilterLogicalDomain::OrderedBound(plan),
+            RuntimeFilterLifecycle::MonotonicUpdates,
+            coverage.clone(),
+            coverage,
+            ReductionRequirement::TightenOrderedBound,
+            BTreeSet::from([
+                ContributionKind::OrderedBoundUpdate,
+                ContributionKind::ProducerClosed,
+            ]),
+            CompletionRequirement::ProducerClosed,
+            RuntimeFilterPolicyRequirement {
+                max_contribution_bytes: 1024,
+                max_artifact_bytes: 1024,
+                deadline_ms: 100,
+                max_retries: 0,
+            },
+            RuntimeFilterCoreBudget::new(4096),
+            MaterializationPolicy::for_test(),
+            BTreeMap::from([
+                (
+                    BindingId::new(1),
+                    ProducerDeployment::new(witnesses[0], BTreeSet::from([uid(1)])),
+                ),
+                (
+                    BindingId::new(3),
+                    ProducerDeployment::new(witnesses[1], BTreeSet::from([uid(3)])),
+                ),
+            ]),
+            BTreeMap::from([(
+                BindingId::new(2),
+                ConsumerDeployment::with_profile(
+                    ConsumerActivation::NonBlockingLive {
+                        late_apply: LateApplyGranularity::Batch,
+                    },
+                    BTreeSet::from([ArtifactCapability::OrderedRange]),
+                    ConsumerArtifactProfile::new_ordered_range(order_digest).unwrap(),
+                    RouteEdgeId::new(1),
+                    BTreeSet::from([uid(2)]),
+                ),
+            )]),
+        );
+        service.install(view([channel])).unwrap();
+        (service, contract)
+    }
+
     pub(super) fn ordered_update(
         contract: &RuntimeOrderContract,
         value: i64,
@@ -1981,6 +2082,78 @@ mod tests {
                 kind: ArtifactKind::Range,
                 ..
             }
+        )));
+    }
+
+    #[test]
+    fn ordered_updates_emit_applied_and_typed_rejected_events_before_return() {
+        let events = Arc::new(Events::default());
+        let (service, contract) = installed_ordered_allof_service_with_events(events.clone());
+        let ProducerHandle::OrderedBound(producer) = service
+            .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+            .unwrap()
+        else {
+            panic!("ordered fixture must return ordered producer")
+        };
+
+        producer
+            .submit_bound(
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                ordered_update(&contract, 100),
+            )
+            .unwrap();
+        let recorded = events.0.lock().unwrap().clone();
+        assert!(recorded.iter().any(|event| matches!(
+            event,
+            RuntimeFilterEvent::OrderedUpdateApplied { identity }
+                if identity.stream().binding_id() == BindingId::new(1)
+                    && identity.sequence() == ProducerSequence::new(0)
+        )));
+        assert!(
+            !recorded
+                .iter()
+                .any(|event| matches!(event, RuntimeFilterEvent::LogicalVersionPublished { .. }))
+        );
+
+        events.0.lock().unwrap().clear();
+        let loosened = producer
+            .submit_bound(
+                PartitionId::new(0),
+                ProducerSequence::new(1),
+                ordered_update(&contract, 101),
+            )
+            .unwrap_err();
+        assert_eq!(
+            loosened.kind(),
+            RuntimeContractViolationKind::OrderedBoundLoosened
+        );
+        let recorded = events.0.lock().unwrap().clone();
+        assert!(recorded.iter().any(|event| matches!(
+            event,
+            RuntimeFilterEvent::OrderedUpdateRejected { identity, violation }
+                if identity.sequence() == ProducerSequence::new(1)
+                    && *violation == RuntimeContractViolationKind::OrderedBoundLoosened
+        )));
+
+        events.0.lock().unwrap().clear();
+        let conflict = producer
+            .submit_bound(
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                ordered_update(&contract, 90),
+            )
+            .unwrap_err();
+        assert_eq!(
+            conflict.kind(),
+            RuntimeContractViolationKind::ConflictingReplay
+        );
+        let recorded = events.0.lock().unwrap().clone();
+        assert!(recorded.iter().any(|event| matches!(
+            event,
+            RuntimeFilterEvent::OrderedUpdateRejected { identity, violation }
+                if identity.sequence() == ProducerSequence::new(0)
+                    && *violation == RuntimeContractViolationKind::ConflictingReplay
         )));
     }
 

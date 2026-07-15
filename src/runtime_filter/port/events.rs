@@ -22,7 +22,7 @@ use crate::runtime_filter::port::artifact::{ArtifactKind, ConsumerProfileId};
 use super::identity::{
     ContributionIdentity, DeploymentEpoch, LogicalVersion, RouteEdgeId, RuntimeFilterParticipantId,
 };
-use super::producer::ProducerFailureReason;
+use super::producer::{ProducerFailureReason, RuntimeContractViolationKind};
 use super::subscription::{ArtifactUnsupportedReason, LiveTerminal, UnavailableReason};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -205,6 +205,13 @@ pub(crate) enum RuntimeFilterEvent {
     },
     OrderedUpdateStale {
         identity: ContributionIdentity,
+    },
+    OrderedUpdateApplied {
+        identity: ContributionIdentity,
+    },
+    OrderedUpdateRejected {
+        identity: ContributionIdentity,
+        violation: RuntimeContractViolationKind,
     },
     OrderedUpdateEqual {
         identity: ContributionIdentity,

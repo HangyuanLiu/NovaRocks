@@ -243,6 +243,8 @@ impl From<&RuntimeFilterEvent> for RuntimeFilterChannelEventCoordinate {
             RuntimeFilterEvent::DeltaAccepted { identity }
             | RuntimeFilterEvent::DeltaDuplicateIgnored { identity }
             | RuntimeFilterEvent::OrderedUpdateStale { identity }
+            | RuntimeFilterEvent::OrderedUpdateApplied { identity }
+            | RuntimeFilterEvent::OrderedUpdateRejected { identity, .. }
             | RuntimeFilterEvent::OrderedUpdateEqual { identity }
             | RuntimeFilterEvent::OrderedStreamTightened { identity }
             | RuntimeFilterEvent::OrderedGlobalTightened { identity, .. }
@@ -544,8 +546,10 @@ mod tests {
         RuntimeFilterEvent, RuntimeFilterEventIdentity, RuntimeFilterEventSink,
     };
     use crate::runtime_filter::port::identity::{
-        DeploymentEpoch, LogicalVersion, RouteEdgeId, RuntimeFilterParticipantId,
+        ContributionIdentity, DeploymentEpoch, LogicalVersion, PartitionId, ProducerSequence,
+        ProducerStreamId, RouteEdgeId, RuntimeFilterParticipantId,
     };
+    use crate::runtime_filter::port::producer::RuntimeContractViolationKind;
     use crate::runtime_filter::port::subscription::{
         ArtifactUnsupportedReason, LiveTerminal, UnavailableReason,
     };
@@ -609,6 +613,44 @@ mod tests {
 
         let snapshot = registry.snapshot(query).expect("query snapshot");
         assert_eq!(channel_events(&snapshot), vec![event]);
+    }
+
+    #[test]
+    fn ordered_applied_and_rejected_events_keep_contribution_coordinates() {
+        let registry = RuntimeFilterLifecycleRegistry::new();
+        let query = QueryKey::from_hi_lo(31, 32);
+        let sink = RegistryRuntimeFilterEventSink::new(&registry, query);
+        let common = channel_identity(query);
+        let identity = ContributionIdentity::new(
+            common.query_id(),
+            common.participant_id(),
+            common.channel_id(),
+            common.epoch(),
+            ProducerStreamId::new(
+                BindingId::new(6),
+                UniqueId { hi: 7, lo: 8 },
+                PartitionId::new(9),
+            ),
+            ProducerSequence::new(10),
+        );
+        let events = vec![
+            RuntimeFilterEvent::OrderedUpdateApplied { identity },
+            RuntimeFilterEvent::OrderedUpdateRejected {
+                identity,
+                violation: RuntimeContractViolationKind::OrderedBoundLoosened,
+            },
+        ];
+        for event in &events {
+            sink.record(event.clone());
+        }
+
+        let snapshot = registry.snapshot(query).expect("query snapshot");
+        assert_eq!(
+            snapshot
+                .channel_events
+                .get(&RuntimeFilterChannelEventCoordinate::Contribution(identity)),
+            Some(&events)
+        );
     }
 
     #[test]

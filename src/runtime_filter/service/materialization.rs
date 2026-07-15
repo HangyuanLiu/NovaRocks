@@ -184,6 +184,28 @@ impl ArtifactJobOwner {
             self.generation,
             &self.flight,
             outcome,
+            |_, _| {},
+        )
+    }
+
+    pub(super) fn finish_after_delivery(
+        mut self,
+        outcome: ArtifactDeliveryOutcome,
+        deliver: impl FnOnce(PublishCommitOutcome, &ArtifactDeliveryOutcome),
+    ) -> Result<PublishCommitOutcome, RuntimeContractViolation> {
+        self.finished = true;
+        let Some(state) = self.gate.upgrade() else {
+            self.flight.finish(ArtifactDeliveryOutcome::Cancelled);
+            return Ok(PublishCommitOutcome::Cancelled);
+        };
+        finish_job(
+            &state,
+            self.key,
+            self.version,
+            self.generation,
+            &self.flight,
+            outcome,
+            deliver,
         )
     }
 }
@@ -204,6 +226,7 @@ impl Drop for ArtifactJobOwner {
             self.generation,
             &self.flight,
             ArtifactDeliveryOutcome::Cancelled,
+            |_, _| {},
         );
     }
 }
@@ -231,6 +254,14 @@ impl ArtifactPublishGate {
                 flight: JobFlight::completed(ArtifactDeliveryOutcome::Cancelled),
             });
         }
+        let generation = key_state.generation;
+        if let Some(flight) = key_state.in_flight.get(&(version, generation)) {
+            #[cfg(test)]
+            flight.followers.fetch_add(1, Ordering::SeqCst);
+            return ArtifactJobClaim::Follower(ArtifactJobFollower {
+                flight: flight.clone(),
+            });
+        }
         if let Some((latest_version, outcome)) = &key_state.latest {
             if version < *latest_version {
                 return ArtifactJobClaim::Stale;
@@ -240,14 +271,6 @@ impl ArtifactPublishGate {
                     flight: JobFlight::completed(outcome.clone()),
                 });
             }
-        }
-        let generation = key_state.generation;
-        if let Some(flight) = key_state.in_flight.get(&(version, generation)) {
-            #[cfg(test)]
-            flight.followers.fetch_add(1, Ordering::SeqCst);
-            return ArtifactJobClaim::Follower(ArtifactJobFollower {
-                flight: flight.clone(),
-            });
         }
         let flight = Arc::new(JobFlight::default());
         key_state
@@ -347,6 +370,7 @@ fn finish_job(
     generation: u64,
     flight: &Arc<JobFlight>,
     outcome: ArtifactDeliveryOutcome,
+    before_notify: impl FnOnce(PublishCommitOutcome, &ArtifactDeliveryOutcome),
 ) -> Result<PublishCommitOutcome, RuntimeContractViolation> {
     let result = {
         let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
@@ -361,7 +385,6 @@ fn finish_job(
                 ArtifactDeliveryOutcome::Cancelled,
             ))
         } else {
-            key_state.in_flight.remove(&(version, generation));
             commit_locked(key_state, generation, version, outcome.clone()).map(|decision| {
                 let follower = if decision == PublishCommitOutcome::Cancelled {
                     ArtifactDeliveryOutcome::Cancelled
@@ -374,10 +397,36 @@ fn finish_job(
     };
     match result {
         Ok((decision, follower_outcome)) => {
+            let delivery = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                before_notify(decision, &follower_outcome);
+            }));
+            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+            let key_state = state.keys.entry(key).or_default();
+            if key_state
+                .in_flight
+                .get(&(version, generation))
+                .is_some_and(|active| Arc::ptr_eq(active, flight))
+            {
+                key_state.in_flight.remove(&(version, generation));
+            }
+            drop(state);
             flight.finish(follower_outcome);
+            if let Err(payload) = delivery {
+                std::panic::resume_unwind(payload);
+            }
             Ok(decision)
         }
         Err(error) => {
+            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+            let key_state = state.keys.entry(key).or_default();
+            if key_state
+                .in_flight
+                .get(&(version, generation))
+                .is_some_and(|active| Arc::ptr_eq(active, flight))
+            {
+                key_state.in_flight.remove(&(version, generation));
+            }
+            drop(state);
             flight.finish(ArtifactDeliveryOutcome::Cancelled);
             Err(error)
         }

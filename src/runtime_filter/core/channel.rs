@@ -235,6 +235,19 @@ impl LockedAction {
         drop(self.release_after_unlock);
         self.action
     }
+
+    fn add_release_after_unlock(&mut self, release: RetainedMemoryReservation) {
+        if release.bytes() == 0 {
+            return;
+        }
+        if let Some(existing) = self.release_after_unlock.as_mut() {
+            existing
+                .absorb(release)
+                .expect("deferred releases share the channel memory account");
+        } else {
+            self.release_after_unlock = Some(release);
+        }
+    }
 }
 
 pub(crate) struct RuntimeFilterChannel {
@@ -252,6 +265,23 @@ pub(crate) struct RuntimeFilterChannel {
 }
 
 impl RuntimeFilterChannel {
+    pub(crate) fn contribution_identity(
+        &self,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        partition_id: PartitionId,
+        sequence: ProducerSequence,
+    ) -> ContributionIdentity {
+        ContributionIdentity::new(
+            self.event_identity.query_id(),
+            self.event_identity.participant_id(),
+            self.channel_id,
+            self.event_identity.epoch(),
+            ProducerStreamId::new(binding_id, fragment_instance_id, partition_id),
+            sequence,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         query_id: UniqueId,
@@ -428,14 +458,8 @@ impl RuntimeFilterChannel {
                 "ordered channel cannot accept membership deltas",
             ));
         };
-        let identity = ContributionIdentity::new(
-            self.event_identity.query_id(),
-            self.event_identity.participant_id(),
-            self.channel_id,
-            self.event_identity.epoch(),
-            ProducerStreamId::new(binding_id, fragment_instance_id, partition_id),
-            sequence,
-        );
+        let identity =
+            self.contribution_identity(binding_id, fragment_instance_id, partition_id, sequence);
         let mut incoming_reservation: Option<RetainedMemoryReservation> = None;
         let mut reservation_failed_for = None;
         loop {
@@ -679,14 +703,8 @@ impl RuntimeFilterChannel {
                 "temporary contribution lease does not match canonical ordered payload size",
             ));
         }
-        let identity = ContributionIdentity::new(
-            self.event_identity.query_id(),
-            self.event_identity.participant_id(),
-            self.channel_id,
-            self.event_identity.epoch(),
-            ProducerStreamId::new(binding_id, fragment_instance_id, partition_id),
-            sequence,
-        );
+        let identity =
+            self.contribution_identity(binding_id, fragment_instance_id, partition_id, sequence);
         let stream_id = identity.stream();
         let mut metadata_reservation = None;
         let mut snapshot_reservation = None;
@@ -738,7 +756,12 @@ impl RuntimeFilterChannel {
                     "ordered reducer retained size overflowed",
                 )
             })?;
-            let metadata_growth = after_bytes.saturating_sub(before_bytes);
+            debug_assert_eq!(
+                state.reservation.bytes(),
+                before_bytes,
+                "ordered reducer reservation tracks current retained bytes"
+            );
+            let metadata_growth = after_bytes.saturating_sub(state.reservation.bytes());
             let mut availability_witnesses = ordered.availability_witnesses.clone();
             if !matches!(
                 apply_outcome,
@@ -785,11 +808,7 @@ impl RuntimeFilterChannel {
             } else {
                 (None, 0)
             };
-            let projected_bytes = state
-                .reservation
-                .bytes()
-                .checked_add(metadata_growth)
-                .and_then(|bytes| bytes.checked_add(snapshot_bytes));
+            let projected_bytes = after_bytes.checked_add(snapshot_bytes);
             if projected_bytes
                 .and_then(|bytes| u64::try_from(bytes).ok())
                 .is_none_or(|bytes| bytes > self.max_reducer_bytes)
@@ -870,6 +889,12 @@ impl RuntimeFilterChannel {
                 }
                 OrderedApplyOutcome::GlobalTightened(_) => Vec::new(),
             };
+            if !matches!(
+                apply_outcome,
+                OrderedApplyOutcome::Stale | OrderedApplyOutcome::Duplicate
+            ) {
+                events.insert(0, RuntimeFilterEvent::OrderedUpdateApplied { identity });
+            }
             let outcome = match apply_outcome {
                 OrderedApplyOutcome::Stale => SubmitOutcome::Stale,
                 OrderedApplyOutcome::Duplicate => SubmitOutcome::Duplicate,
@@ -881,6 +906,7 @@ impl RuntimeFilterChannel {
                 evaluate(&self.availability_coverage, &ordered.availability_witnesses)
                     == CoverageProgress::Satisfied
             });
+            let release_after_unlock = state.reservation.split_off_excess(after_bytes);
             let ordered = state
                 .ordered
                 .as_mut()
@@ -916,8 +942,9 @@ impl RuntimeFilterChannel {
                 snapshot
             });
             refresh_ordered_instance_progress(&mut state, binding_id, fragment_instance_id);
-            let locked =
+            let mut locked =
                 self.refresh_after_ordered_progress(&mut state, outcome, published, events);
+            locked.add_release_after_unlock(release_after_unlock);
             drop(state);
             return Ok(locked.finish());
         }
@@ -3623,6 +3650,20 @@ mod tests {
         max_contribution_bytes: u64,
         memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
     ) -> Arc<RuntimeFilterChannel> {
+        ordered_single_channel_with_reducer_budget(
+            plan,
+            max_contribution_bytes,
+            4096,
+            memory_account,
+        )
+    }
+
+    fn ordered_single_channel_with_reducer_budget(
+        plan: OrderContract,
+        max_contribution_bytes: u64,
+        max_reducer_bytes: u64,
+        memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
+    ) -> Arc<RuntimeFilterChannel> {
         let witness = CoverageWitnessId::new(1);
         let deployment = RuntimeFilterChannelDeployment::new(
             ChannelId::new(1),
@@ -3642,7 +3683,7 @@ mod tests {
                 deadline_ms: 100,
                 max_retries: 0,
             },
-            RuntimeFilterCoreBudget::new(4096),
+            RuntimeFilterCoreBudget::new(max_reducer_bytes),
             MaterializationPolicy::for_test(),
             BTreeMap::from([(
                 BindingId::new(10),
@@ -4193,6 +4234,79 @@ mod tests {
                 }
             ));
             drop(action);
+            drop(channel);
+            assert_eq!(account.current.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn ordered_reservation_tracks_current_utf8_bound_under_exact_budget() {
+            let (plan, contract) = utf8_order_contract();
+            let probe_account = Arc::new(Account::default());
+            let probe = ordered_single_channel(plan.clone(), 4096, probe_account.clone());
+            let first = OrderedBoundUpdate::new(
+                &contract,
+                OrderedTuple::try_new(
+                    &contract,
+                    [Some(OrderedScalar::Utf8(Arc::from("z".repeat(256))))],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let first_bytes = first.canonical_contribution_bytes().unwrap();
+            let first_action = probe
+                .submit_ordered(
+                    BindingId::new(10),
+                    uid(10),
+                    PartitionId::new(0),
+                    ProducerSequence::new(0),
+                    first,
+                    TemporaryContributionLease::new(probe_account.clone(), first_bytes),
+                )
+                .unwrap();
+            drop(first_action);
+            let exact_budget = probe_account.current.load(Ordering::SeqCst);
+            drop(probe);
+            assert_eq!(probe_account.current.load(Ordering::SeqCst), 0);
+
+            let account = Arc::new(Account::default());
+            let channel = ordered_single_channel_with_reducer_budget(
+                plan,
+                4096,
+                u64::try_from(exact_budget).unwrap(),
+                account.clone(),
+            );
+            for (sequence, value) in [
+                (0, "z".repeat(256)),
+                (1, "y".to_owned()),
+                (2, "x".repeat(256)),
+            ] {
+                let update = OrderedBoundUpdate::new(
+                    &contract,
+                    OrderedTuple::try_new(&contract, [Some(OrderedScalar::Utf8(Arc::from(value)))])
+                        .unwrap(),
+                )
+                .unwrap();
+                let bytes = update.canonical_contribution_bytes().unwrap();
+                let action = channel
+                    .submit_ordered(
+                        BindingId::new(10),
+                        uid(10),
+                        PartitionId::new(0),
+                        ProducerSequence::new(sequence),
+                        update,
+                        TemporaryContributionLease::new(account.clone(), bytes),
+                    )
+                    .unwrap();
+                assert!(matches!(action, ChannelAction::VisibleSnapshot { .. }));
+                drop(action);
+                let state = channel.state.lock().unwrap();
+                let ordered = state.ordered.as_ref().unwrap();
+                assert_eq!(
+                    state.reservation.bytes(),
+                    ordered.reducer.estimated_retained_bytes().unwrap()
+                );
+            }
+            assert!(account.current.load(Ordering::SeqCst) <= exact_budget);
             drop(channel);
             assert_eq!(account.current.load(Ordering::SeqCst), 0);
         }

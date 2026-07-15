@@ -87,6 +87,32 @@ impl ServiceProducerAdapter {
         self.dispatcher.dispatch(self.channel_id, action)?;
         Ok(outcome)
     }
+
+    fn finish_ordered(
+        &self,
+        partition_id: PartitionId,
+        sequence: ProducerSequence,
+        result: Result<
+            crate::runtime_filter::core::channel::ChannelAction,
+            RuntimeContractViolation,
+        >,
+    ) -> Result<SubmitOutcome, RuntimeContractViolation> {
+        match result {
+            Ok(action) => self.finish(action),
+            Err(error) => {
+                self.dispatcher.emit_ordered_rejection(
+                    self.channel.contribution_identity(
+                        self.binding_id,
+                        self.fragment_instance_id,
+                        partition_id,
+                        sequence,
+                    ),
+                    error.kind(),
+                );
+                Err(error)
+            }
+        }
+    }
 }
 
 impl ProducerAdapter for ServiceProducerAdapter {
@@ -194,16 +220,15 @@ impl OrderedBoundProducerAdapter for ServiceProducerAdapter {
                 )
                 .and_then(|action| self.finish(action));
         };
-        self.channel
-            .submit_ordered(
-                self.binding_id,
-                self.fragment_instance_id,
-                partition_id,
-                sequence,
-                update,
-                lease,
-            )
-            .and_then(|action| self.finish(action))
+        let result = self.channel.submit_ordered(
+            self.binding_id,
+            self.fragment_instance_id,
+            partition_id,
+            sequence,
+            update,
+            lease,
+        );
+        self.finish_ordered(partition_id, sequence, result)
     }
 
     fn close_partition(
