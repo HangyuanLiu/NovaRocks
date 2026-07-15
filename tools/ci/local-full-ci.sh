@@ -39,9 +39,21 @@ WITH_COMPAT="false"
 REQUESTED_SUITES=()
 CI_RUNTIME_PREPARED="false"
 NOVA_CI_CARGO_PROFILE="${NOVA_CI_CARGO_PROFILE:-dev-opt}"
-SQL_CLUSTER_MODE="${SQL_CLUSTER_MODE:-all-in-one}"
-SQL_CLUSTER_SIZE="${SQL_CLUSTER_SIZE:-1}"
-NOVA_CI_NATIVE_CROSS_PROCESS_CORE="${NOVA_CI_NATIVE_CROSS_PROCESS_CORE:-1}"
+SQL_CLUSTER_MODE="${SQL_CLUSTER_MODE:-cross-process}"
+if [ -n "${SQL_CLUSTER_SIZE:-}" ]; then
+  SQL_CLUSTER_SIZE_EXPLICIT="true"
+else
+  SQL_CLUSTER_SIZE_EXPLICIT="false"
+  case "$SQL_CLUSTER_MODE" in
+    all-in-one)
+      SQL_CLUSTER_SIZE="1"
+      ;;
+    *)
+      SQL_CLUSTER_SIZE="3"
+      ;;
+  esac
+fi
+NOVA_CI_NATIVE_CROSS_PROCESS_CORE="${NOVA_CI_NATIVE_CROSS_PROCESS_CORE:-0}"
 NOVA_CI_NATIVE_CROSS_PROCESS_FULL="${NOVA_CI_NATIVE_CROSS_PROCESS_FULL:-0}"
 NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED="${NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED:-0}"
 
@@ -56,10 +68,11 @@ Rust tests are executed with --test-threads=1 for the same reason.
 Cargo build/test/run stages use NOVA_CI_CARGO_PROFILE, defaulting to dev-opt.
 Clippy runs in warning-only mode until the repository has a clean strict-clippy
 baseline.
-The native 1FE+3BE cross-process matrix is retained as focused distributed
-execution coverage. Set NOVA_CI_NATIVE_CROSS_PROCESS_CORE=0 to disable it,
-NOVA_CI_NATIVE_CROSS_PROCESS_FULL=1 to run the stable full-suite matrix, and
-NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED=1 to make its failures fail CI.
+Selected SQL suites run once on a native 1FE+3BE cross-process cluster by
+default. Set NOVA_CI_NATIVE_CROSS_PROCESS_CORE=1 to append the focused native
+cross-process matrix, NOVA_CI_NATIVE_CROSS_PROCESS_FULL=1 to append the stable
+full-suite matrix, and NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED=1 to make failures
+in an appended matrix fail CI.
 
 Options:
   --all-discovered      Run every suite discovered from sql-tests/*/sql.
@@ -68,8 +81,8 @@ Options:
   --from <run-dir>      Reclassify an existing logs/ci-full run without rerun.
   --skip-cargo-test     Skip cargo test. Intended only for runner debugging.
   --with-compat         Append StarRocks compat clippy, build, and test gates.
-  --cluster-mode <mode> SQL runner cluster mode: all-in-one or cross-process.
-  --cluster-size <n>    Number of BE processes for cross-process mode.
+  --cluster-mode <mode> SQL runner cluster mode. Default: cross-process.
+  --cluster-size <n>    Number of BE processes. Default: 3, or 1 for all-in-one.
   --keep-runtime        Keep this worktree's docker/iceberg-rest runtime entry.
   -h, --help            Show this help text.
 EOF
@@ -160,6 +173,16 @@ parse_args() {
           exit 2
         fi
         SQL_CLUSTER_MODE="$2"
+        if [ "$SQL_CLUSTER_SIZE_EXPLICIT" != "true" ]; then
+          case "$SQL_CLUSTER_MODE" in
+            all-in-one)
+              SQL_CLUSTER_SIZE="1"
+              ;;
+            *)
+              SQL_CLUSTER_SIZE="3"
+              ;;
+          esac
+        fi
         shift 2
         ;;
       --cluster-size)
@@ -168,6 +191,7 @@ parse_args() {
           exit 2
         fi
         SQL_CLUSTER_SIZE="$2"
+        SQL_CLUSTER_SIZE_EXPLICIT="true"
         shift 2
         ;;
       --keep-runtime)
@@ -301,6 +325,8 @@ prepare_runtime() {
     echo "NOVAROCKS_SPARK_DEFAULTS=${NOVAROCKS_SPARK_DEFAULTS:-}"
     echo "NOVA_CI_CARGO_PROFILE=$NOVA_CI_CARGO_PROFILE"
     echo "WITH_COMPAT=$WITH_COMPAT"
+    echo "SQL_CLUSTER_MODE=$SQL_CLUSTER_MODE"
+    echo "SQL_CLUSTER_SIZE=$SQL_CLUSTER_SIZE"
     echo "NOVA_CI_NATIVE_CROSS_PROCESS_CORE=$NOVA_CI_NATIVE_CROSS_PROCESS_CORE"
     echo "NOVA_CI_NATIVE_CROSS_PROCESS_FULL=$NOVA_CI_NATIVE_CROSS_PROCESS_FULL"
     echo "NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED=$NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED"
