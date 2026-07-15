@@ -20,12 +20,17 @@ services:
     image: foundationdb/foundationdb:7.3.69
     platform: linux/amd64
     environment:
+      FDB_CLUSTER_FILE: "${NOVA_FDB_CONTAINER_CLUSTER_FILE}"
       FDB_NETWORKING_MODE: container
     ports:
       - "${NOVA_FDB_PORT}:${NOVA_FDB_PORT}/tcp"
     volumes:
       - ./runtime/${NOVA_FDB_ENV_ID}/data:/var/fdb/data
       - ./runtime/${NOVA_FDB_ENV_ID}/logs:/var/fdb/logs
+      - type: bind
+        source: "${NOVA_FDB_CLUSTER_FILE}"
+        target: "${NOVA_FDB_CONTAINER_CLUSTER_FILE}"
+        read_only: true
     # The stock container entrypoint publishes its private container address in
     # container mode. Publish the mapped loopback address explicitly so the
     # generated host cluster file remains usable on Docker Desktop and Linux.
@@ -33,6 +38,7 @@ services:
     command:
       - >-
         exec fdbserver
+        --cluster-file ${NOVA_FDB_CONTAINER_CLUSTER_FILE}
         --listen-address 0.0.0.0:${NOVA_FDB_PORT}
         --public-address 127.0.0.1:${NOVA_FDB_PORT}
         --datadir /var/fdb/data

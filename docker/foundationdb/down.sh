@@ -21,14 +21,18 @@ set -euo pipefail
 run_with_timeout() {
   local timeout_seconds="$1"
   shift
+  # Give the command and all descendants a dedicated process group so a
+  # timeout cannot leave a Compose CLI plugin running.
+  set -m
   "$@" &
   local child="$!"
+  set +m
   local elapsed=0
   while kill -0 "$child" >/dev/null 2>&1; do
     if (( elapsed >= timeout_seconds )); then
-      kill "$child" >/dev/null 2>&1 || true
+      kill -TERM -- "-$child" >/dev/null 2>&1 || true
       sleep 1
-      kill -9 "$child" >/dev/null 2>&1 || true
+      kill -KILL -- "-$child" >/dev/null 2>&1 || true
       wait "$child" 2>/dev/null || true
       echo "command timed out after ${timeout_seconds}s: $*" >&2
       return 124

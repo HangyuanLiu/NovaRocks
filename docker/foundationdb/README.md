@@ -40,7 +40,12 @@ docker/foundationdb/status.sh
 ```
 
 `status.sh` prints the cluster-file path, but never prints its contents. The
-host cluster file points at the worktree-specific published port.
+host cluster file points at the worktree-specific published port. Compose uses
+that absolute worktree runtime path as a read-only bind mount at
+`/var/fdb/fdb.cluster`; both the container's `FDB_CLUSTER_FILE` and explicit
+`fdbserver --cluster-file` argument select the mounted file. This keeps the
+server and host `fdbcli` on the same connection string even though the fixture
+overrides the stock image entrypoint to publish a host-reachable address.
 
 Remove only this worktree's generated runtime while leaving Docker untouched:
 

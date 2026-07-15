@@ -42,14 +42,18 @@ sha256_text() {
 run_with_timeout() {
   local timeout_seconds="$1"
   shift
+  # Give the command and all descendants a dedicated process group so a
+  # timeout cannot leave a Compose CLI plugin or downloader running.
+  set -m
   "$@" &
   local child="$!"
+  set +m
   local elapsed=0
   while kill -0 "$child" >/dev/null 2>&1; do
     if (( elapsed >= timeout_seconds )); then
-      kill "$child" >/dev/null 2>&1 || true
+      kill -TERM -- "-$child" >/dev/null 2>&1 || true
       sleep 1
-      kill -9 "$child" >/dev/null 2>&1 || true
+      kill -KILL -- "-$child" >/dev/null 2>&1 || true
       wait "$child" 2>/dev/null || true
       echo "command timed out after ${timeout_seconds}s: $*" >&2
       return 124
@@ -150,6 +154,8 @@ chmod 600 "$cluster_file"
 {
   printf 'NOVA_FDB_ENV_ID=%s\n' "$env_id"
   printf 'NOVA_FDB_PORT=%s\n' "$port"
+  printf 'NOVA_FDB_CLUSTER_FILE=%s\n' "$cluster_file"
+  printf 'NOVA_FDB_CONTAINER_CLUSTER_FILE=/var/fdb/fdb.cluster\n'
 } > "$compose_env"
 
 {
