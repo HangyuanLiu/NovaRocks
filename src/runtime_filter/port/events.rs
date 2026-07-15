@@ -23,7 +23,7 @@ use super::identity::{
     ContributionIdentity, DeploymentEpoch, LogicalVersion, RouteEdgeId, RuntimeFilterParticipantId,
 };
 use super::producer::ProducerFailureReason;
-use super::subscription::{ArtifactUnsupportedReason, UnavailableReason};
+use super::subscription::{ArtifactUnsupportedReason, LiveTerminal, UnavailableReason};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct RuntimeFilterEventIdentity {
@@ -299,6 +299,21 @@ pub(crate) enum RuntimeFilterEvent {
     },
     SubscriptionCancelled {
         identity: ConsumerEventIdentity,
+    },
+    LiveSubscriptionUpdated {
+        identity: ConsumerEventIdentity,
+        version: LogicalVersion,
+        terminal: Option<LiveTerminal>,
+    },
+    LiveSubscriptionIdle {
+        identity: ConsumerEventIdentity,
+        latest_version: Option<LogicalVersion>,
+        terminal: Option<LiveTerminal>,
+    },
+    LiveSubscriptionTerminal {
+        identity: ConsumerEventIdentity,
+        terminal: LiveTerminal,
+        retained_version: Option<LogicalVersion>,
     },
 }
 

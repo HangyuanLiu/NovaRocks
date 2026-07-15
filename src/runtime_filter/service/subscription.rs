@@ -27,7 +27,9 @@ use crate::runtime_filter::port::events::{
 };
 use crate::runtime_filter::port::identity::RouteEdgeId;
 use crate::runtime_filter::port::subscription::{
-    ArtifactAcquireOutcome, ArtifactDelivery, ArtifactDeliveryOutcome, BlockingSnapshotSubscription,
+    ArtifactAcquireOutcome, ArtifactDelivery, ArtifactDeliveryOutcome,
+    BlockingSnapshotSubscription, LivePollOutcome, LiveTerminal, NonBlockingLiveSubscription,
+    SubscriptionHandle, SubscriptionKind, UnavailableReason,
 };
 
 use super::EventBatchCompletion;
@@ -149,19 +151,215 @@ impl BlockingSnapshotSubscription for SubscriptionSlot {
     }
 }
 
+#[derive(Default)]
+struct LiveSubscriptionState {
+    latest: Option<Arc<crate::runtime_filter::port::artifact::ArtifactBundle>>,
+    terminal: Option<LiveTerminal>,
+}
+
+pub(super) struct LiveSubscriptionSlot {
+    identity: ConsumerEventIdentity,
+    events: Arc<dyn RuntimeFilterEventSink>,
+    state: Mutex<LiveSubscriptionState>,
+    cancellation_event_barrier: Mutex<Option<Arc<EventBatchCompletion>>>,
+}
+
+impl LiveSubscriptionSlot {
+    pub(super) fn new(
+        identity: ConsumerEventIdentity,
+        events: Arc<dyn RuntimeFilterEventSink>,
+    ) -> Self {
+        Self {
+            identity,
+            events,
+            state: Mutex::new(LiveSubscriptionState::default()),
+            cancellation_event_barrier: Mutex::new(None),
+        }
+    }
+
+    fn arm_cancellation_event(&self, barrier: Arc<EventBatchCompletion>) {
+        *self
+            .cancellation_event_barrier
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(barrier);
+    }
+
+    fn merge_terminal(current: &mut Option<LiveTerminal>, incoming: LiveTerminal) {
+        let incoming_is_logical = matches!(
+            incoming,
+            LiveTerminal::Completed
+                | LiveTerminal::CompletedWithoutArtifact
+                | LiveTerminal::DegradedLogical(_)
+                | LiveTerminal::Unavailable(_)
+                | LiveTerminal::Cancelled
+        );
+        let current_is_logical = current.is_some_and(|terminal| {
+            matches!(
+                terminal,
+                LiveTerminal::Completed
+                    | LiveTerminal::CompletedWithoutArtifact
+                    | LiveTerminal::DegradedLogical(_)
+                    | LiveTerminal::Unavailable(_)
+                    | LiveTerminal::Cancelled
+            )
+        });
+        if current.is_none() || incoming_is_logical && !current_is_logical {
+            *current = Some(incoming);
+        }
+    }
+
+    pub(super) fn deliver(
+        &self,
+        bundle: Arc<crate::runtime_filter::port::artifact::ArtifactBundle>,
+        terminal: Option<LiveTerminal>,
+    ) {
+        self.apply_delivery(Some(ArtifactDeliveryOutcome::Published(bundle)), terminal);
+    }
+
+    pub(super) fn terminal(&self, terminal: LiveTerminal) {
+        self.apply_delivery(None, Some(terminal));
+    }
+
+    fn apply_delivery(
+        &self,
+        outcome: Option<ArtifactDeliveryOutcome>,
+        terminal: Option<LiveTerminal>,
+    ) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let previous_terminal = state.terminal;
+        if let Some(outcome) = outcome {
+            match outcome {
+                ArtifactDeliveryOutcome::Published(bundle) => {
+                    if state
+                        .latest
+                        .as_ref()
+                        .is_none_or(|latest| bundle.version() > latest.version())
+                    {
+                        state.latest = Some(bundle);
+                    }
+                }
+                ArtifactDeliveryOutcome::Unsupported(_) => Self::merge_terminal(
+                    &mut state.terminal,
+                    LiveTerminal::DegradedArtifact(UnavailableReason::MaterializationFailed),
+                ),
+                ArtifactDeliveryOutcome::Unavailable(UnavailableReason::RouteUnavailable) => {
+                    Self::merge_terminal(
+                        &mut state.terminal,
+                        LiveTerminal::DegradedDelivery(UnavailableReason::RouteUnavailable),
+                    );
+                }
+                ArtifactDeliveryOutcome::Unavailable(reason) => Self::merge_terminal(
+                    &mut state.terminal,
+                    LiveTerminal::DegradedArtifact(reason),
+                ),
+                ArtifactDeliveryOutcome::Cancelled => {
+                    Self::merge_terminal(&mut state.terminal, LiveTerminal::Cancelled);
+                }
+            }
+        }
+        if let Some(terminal) = terminal {
+            Self::merge_terminal(&mut state.terminal, terminal);
+        }
+        let terminal_event = if state.terminal != previous_terminal {
+            Some((
+                state.terminal.expect("changed live terminal is present"),
+                state.latest.as_ref().map(|bundle| bundle.version()),
+            ))
+        } else {
+            None
+        };
+        drop(state);
+        if let Some((terminal, retained_version)) = terminal_event {
+            let event = RuntimeFilterEvent::LiveSubscriptionTerminal {
+                identity: self.identity,
+                terminal,
+                retained_version,
+            };
+            if matches!(terminal, LiveTerminal::Cancelled) {
+                let barrier = self
+                    .cancellation_event_barrier
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone();
+                if let Some(barrier) = barrier {
+                    let events = self.events.clone();
+                    barrier.on_complete(move || events.record(event));
+                    return;
+                }
+            }
+            self.events.record(event);
+        }
+    }
+}
+
+impl NonBlockingLiveSubscription for LiveSubscriptionSlot {
+    fn snapshot(&self) -> Option<Arc<crate::runtime_filter::port::artifact::ArtifactBundle>> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .latest
+            .clone()
+    }
+
+    fn poll_after(
+        &self,
+        observed: Option<crate::runtime_filter::port::identity::LogicalVersion>,
+    ) -> LivePollOutcome {
+        let (latest, terminal) = {
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            (state.latest.clone(), state.terminal)
+        };
+        let outcome = match latest {
+            Some(bundle) if observed.is_none_or(|version| bundle.version() > version) => {
+                LivePollOutcome::Updated { bundle, terminal }
+            }
+            latest => LivePollOutcome::Idle {
+                latest_version: latest.as_ref().map(|bundle| bundle.version()),
+                terminal,
+            },
+        };
+        let event = match &outcome {
+            LivePollOutcome::Updated { bundle, terminal } => {
+                RuntimeFilterEvent::LiveSubscriptionUpdated {
+                    identity: self.identity,
+                    version: bundle.version(),
+                    terminal: *terminal,
+                }
+            }
+            LivePollOutcome::Idle {
+                latest_version,
+                terminal,
+            } => RuntimeFilterEvent::LiveSubscriptionIdle {
+                identity: self.identity,
+                latest_version: *latest_version,
+                terminal: *terminal,
+            },
+        };
+        self.events.record(event);
+        outcome
+    }
+}
+
 pub(super) struct SubscriptionGroup {
     route_edge_id: RouteEdgeId,
-    slots: BTreeMap<UniqueId, Arc<SubscriptionSlot>>,
+    activation: crate::runtime_filter::model::contract::ConsumerActivation,
+    slots: BTreeMap<UniqueId, InstalledSubscriptionSlot>,
     #[cfg(test)]
     before_deliver: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     delivery_call_count: AtomicUsize,
 }
 
+enum InstalledSubscriptionSlot {
+    Blocking(Arc<SubscriptionSlot>),
+    Live(Arc<LiveSubscriptionSlot>),
+}
+
 impl SubscriptionGroup {
     pub(super) fn new(
         common: RuntimeFilterEventIdentity,
         binding_id: crate::runtime_filter::model::contract::BindingId,
+        activation: crate::runtime_filter::model::contract::ConsumerActivation,
         route_edge_id: RouteEdgeId,
         instances: impl IntoIterator<Item = UniqueId>,
         events: Arc<dyn RuntimeFilterEventSink>,
@@ -171,15 +369,26 @@ impl SubscriptionGroup {
             .map(|instance| {
                 (
                     instance,
-                    Arc::new(SubscriptionSlot::new(
-                        ConsumerEventIdentity::new(common, binding_id, instance),
-                        events.clone(),
-                    )),
+                    match activation {
+                        crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot => {
+                            InstalledSubscriptionSlot::Blocking(Arc::new(SubscriptionSlot::new(
+                                ConsumerEventIdentity::new(common, binding_id, instance),
+                                events.clone(),
+                            )))
+                        }
+                        crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive { .. } => {
+                            InstalledSubscriptionSlot::Live(Arc::new(LiveSubscriptionSlot::new(
+                                ConsumerEventIdentity::new(common, binding_id, instance),
+                                events.clone(),
+                            )))
+                        }
+                    },
                 )
             })
             .collect();
         Self {
             route_edge_id,
+            activation,
             slots,
             #[cfg(test)]
             before_deliver: Mutex::new(None),
@@ -188,8 +397,40 @@ impl SubscriptionGroup {
         }
     }
 
-    pub(super) fn slot(&self, instance: UniqueId) -> Option<Arc<SubscriptionSlot>> {
-        self.slots.get(&instance).cloned()
+    pub(super) fn handle(
+        &self,
+        instance: UniqueId,
+        requested: SubscriptionKind,
+    ) -> Option<SubscriptionHandle> {
+        let installed = match self.activation {
+            crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot => {
+                SubscriptionKind::BlockingSnapshot
+            }
+            crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive {
+                ..
+            } => SubscriptionKind::NonBlockingLive,
+        };
+        if installed != requested {
+            return None;
+        }
+        let slot = self.slots.get(&instance)?;
+        match (slot, requested) {
+            (InstalledSubscriptionSlot::Blocking(slot), SubscriptionKind::BlockingSnapshot) => {
+                Some(SubscriptionHandle::Blocking(slot.clone()))
+            }
+            (InstalledSubscriptionSlot::Live(slot), SubscriptionKind::NonBlockingLive) => {
+                Some(SubscriptionHandle::Live(slot.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn live_route_edge_id(&self) -> Option<RouteEdgeId> {
+        matches!(
+            self.activation,
+            crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive { .. }
+        )
+        .then_some(self.route_edge_id)
     }
 
     pub(super) fn arm_cancellation_event(
@@ -201,7 +442,14 @@ impl SubscriptionGroup {
             return;
         }
         for slot in self.slots.values() {
-            slot.arm_cancellation_event(barrier.clone());
+            match slot {
+                InstalledSubscriptionSlot::Blocking(slot) => {
+                    slot.arm_cancellation_event(barrier.clone());
+                }
+                InstalledSubscriptionSlot::Live(slot) => {
+                    slot.arm_cancellation_event(barrier.clone());
+                }
+            }
         }
     }
 
@@ -218,6 +466,15 @@ impl SubscriptionGroup {
 
 impl ArtifactDelivery for SubscriptionGroup {
     fn deliver(&self, route_edge_id: RouteEdgeId, outcome: ArtifactDeliveryOutcome) {
+        self.deliver_live(route_edge_id, Some(outcome), None);
+    }
+
+    fn deliver_live(
+        &self,
+        route_edge_id: RouteEdgeId,
+        outcome: Option<ArtifactDeliveryOutcome>,
+        terminal: Option<LiveTerminal>,
+    ) {
         if route_edge_id != self.route_edge_id {
             return;
         }
@@ -228,7 +485,308 @@ impl ArtifactDelivery for SubscriptionGroup {
             hook();
         }
         for slot in self.slots.values() {
-            slot.deliver(outcome.clone());
+            match slot {
+                InstalledSubscriptionSlot::Blocking(slot) => {
+                    if let Some(outcome) = outcome.clone() {
+                        slot.deliver(outcome);
+                    }
+                }
+                InstalledSubscriptionSlot::Live(slot) => {
+                    slot.apply_delivery(outcome.clone(), terminal);
+                }
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, Mutex, Weak};
+
+    use arrow::datatypes::DataType;
+
+    use crate::runtime_filter::model::contract::{BindingId, ChannelId, NullSemantics};
+    use crate::runtime_filter::port::artifact::{
+        ArtifactBundle, ArtifactKind, ArtifactSchemaDigest, ConsumerArtifactProfile,
+        PhysicalArtifact,
+    };
+    use crate::runtime_filter::port::events::{
+        ConsumerEventIdentity, RuntimeFilterEvent, RuntimeFilterEventIdentity,
+        RuntimeFilterEventSink,
+    };
+    use crate::runtime_filter::port::identity::{
+        DeploymentEpoch, LogicalVersion, RuntimeFilterParticipantId,
+    };
+    use crate::runtime_filter::port::subscription::{
+        ArtifactDeliveryOutcome, LivePollOutcome, LiveTerminal, NonBlockingLiveSubscription,
+        UnavailableReason,
+    };
+
+    use super::LiveSubscriptionSlot;
+
+    #[derive(Default)]
+    struct NoopEvents(Mutex<Vec<RuntimeFilterEvent>>);
+
+    impl RuntimeFilterEventSink for NoopEvents {
+        fn record(&self, event: RuntimeFilterEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    #[derive(Default)]
+    struct StateCheckingEvents {
+        events: Mutex<Vec<RuntimeFilterEvent>>,
+        live: Mutex<Option<Weak<LiveSubscriptionSlot>>>,
+    }
+
+    impl RuntimeFilterEventSink for StateCheckingEvents {
+        fn record(&self, event: RuntimeFilterEvent) {
+            if let Some(live) = self.live.lock().unwrap().as_ref().and_then(Weak::upgrade) {
+                assert!(
+                    live.state.try_lock().is_ok(),
+                    "live event callback must run outside the subscription state lock"
+                );
+            }
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    fn bundle(version: LogicalVersion, byte: u8) -> Arc<ArtifactBundle> {
+        let profile = ConsumerArtifactProfile::new(
+            BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
+            None,
+        )
+        .unwrap();
+        let schema =
+            ArtifactSchemaDigest::for_membership(&DataType::Int64, NullSemantics::NeverMatches)
+                .unwrap();
+        let artifact = Arc::new(PhysicalArtifact::new_test(
+            ArtifactKind::ValueSet,
+            schema,
+            version,
+            false,
+            Arc::from([byte]),
+        ));
+        Arc::new(
+            ArtifactBundle::new(
+                ChannelId::new(1),
+                version,
+                &profile,
+                vec![(ArtifactKind::ValueSet, artifact)],
+                usize::MAX,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn slot() -> LiveSubscriptionSlot {
+        let common = RuntimeFilterEventIdentity::new(
+            crate::common::types::UniqueId { hi: 1, lo: 2 },
+            RuntimeFilterParticipantId::new(3),
+            ChannelId::new(1),
+            DeploymentEpoch::new(1),
+        );
+        LiveSubscriptionSlot::new(
+            ConsumerEventIdentity::new(
+                common,
+                BindingId::new(2),
+                crate::common::types::UniqueId { hi: 4, lo: 5 },
+            ),
+            Arc::new(NoopEvents::default()),
+        )
+    }
+
+    fn updated_version(outcome: LivePollOutcome) -> LogicalVersion {
+        match outcome {
+            LivePollOutcome::Updated { bundle, .. } => bundle.version(),
+            other => panic!("expected live update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn live_poll_none_then_v1_then_latest_v3_without_shared_cursor() {
+        let live = slot();
+        assert!(matches!(
+            live.poll_after(None),
+            LivePollOutcome::Idle {
+                latest_version: None,
+                terminal: None
+            }
+        ));
+
+        live.deliver(bundle(LogicalVersion::new(1), 100), None);
+        assert_eq!(
+            updated_version(live.poll_after(None)),
+            LogicalVersion::new(1)
+        );
+
+        live.deliver(bundle(LogicalVersion::new(3), 70), None);
+        assert_eq!(
+            updated_version(live.poll_after(Some(LogicalVersion::new(1)))),
+            LogicalVersion::new(3)
+        );
+        assert_eq!(
+            updated_version(live.poll_after(None)),
+            LogicalVersion::new(3)
+        );
+    }
+
+    #[test]
+    fn update_and_terminal_are_observed_atomically() {
+        let live = slot();
+        live.deliver(
+            bundle(LogicalVersion::FIRST, 100),
+            Some(LiveTerminal::Completed),
+        );
+
+        assert!(matches!(
+            live.poll_after(None),
+            LivePollOutcome::Updated {
+                terminal: Some(LiveTerminal::Completed),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn completed_without_artifact_is_not_unavailable_or_empty_domain() {
+        let live = slot();
+        live.terminal(LiveTerminal::CompletedWithoutArtifact);
+
+        assert!(matches!(
+            live.poll_after(None),
+            LivePollOutcome::Idle {
+                latest_version: None,
+                terminal: Some(LiveTerminal::CompletedWithoutArtifact)
+            }
+        ));
+    }
+
+    #[test]
+    fn artifact_failure_retains_latest_bundle() {
+        let live = slot();
+        live.deliver(bundle(LogicalVersion::FIRST, 100), None);
+        live.terminal(LiveTerminal::DegradedArtifact(
+            UnavailableReason::MaterializationFailed,
+        ));
+
+        assert_eq!(live.snapshot().unwrap().version(), LogicalVersion::FIRST);
+        assert!(matches!(
+            live.poll_after(Some(LogicalVersion::FIRST)),
+            LivePollOutcome::Idle {
+                latest_version: Some(LogicalVersion::FIRST),
+                terminal: Some(LiveTerminal::DegradedArtifact(
+                    UnavailableReason::MaterializationFailed
+                ))
+            }
+        ));
+    }
+
+    #[test]
+    fn delivery_failure_retains_latest_bundle() {
+        let live = slot();
+        live.deliver(bundle(LogicalVersion::FIRST, 100), None);
+        live.apply_delivery(
+            Some(ArtifactDeliveryOutcome::Unavailable(
+                UnavailableReason::RouteUnavailable,
+            )),
+            None,
+        );
+
+        assert_eq!(live.snapshot().unwrap().version(), LogicalVersion::FIRST);
+        assert!(matches!(
+            live.poll_after(Some(LogicalVersion::FIRST)),
+            LivePollOutcome::Idle {
+                latest_version: Some(LogicalVersion::FIRST),
+                terminal: Some(LiveTerminal::DegradedDelivery(
+                    UnavailableReason::RouteUnavailable
+                ))
+            }
+        ));
+    }
+
+    #[test]
+    fn cancellation_retains_latest_bundle() {
+        let live = slot();
+        live.deliver(bundle(LogicalVersion::FIRST, 100), None);
+        live.apply_delivery(Some(ArtifactDeliveryOutcome::Cancelled), None);
+
+        assert_eq!(live.snapshot().unwrap().version(), LogicalVersion::FIRST);
+        assert!(matches!(
+            live.poll_after(Some(LogicalVersion::FIRST)),
+            LivePollOutcome::Idle {
+                latest_version: Some(LogicalVersion::FIRST),
+                terminal: Some(LiveTerminal::Cancelled)
+            }
+        ));
+    }
+
+    #[test]
+    fn lower_delivery_is_rejected_without_rolling_back_latest() {
+        let live = slot();
+        live.deliver(bundle(LogicalVersion::new(3), 70), None);
+        live.deliver(bundle(LogicalVersion::new(2), 80), None);
+
+        assert_eq!(live.snapshot().unwrap().version(), LogicalVersion::new(3));
+    }
+
+    #[test]
+    fn live_poll_and_terminal_events_are_exhaustive_and_state_precedes_callback() {
+        let common = RuntimeFilterEventIdentity::new(
+            crate::common::types::UniqueId { hi: 1, lo: 2 },
+            RuntimeFilterParticipantId::new(3),
+            ChannelId::new(1),
+            DeploymentEpoch::new(1),
+        );
+        let events = Arc::new(StateCheckingEvents::default());
+        let live = Arc::new(LiveSubscriptionSlot::new(
+            ConsumerEventIdentity::new(
+                common,
+                BindingId::new(2),
+                crate::common::types::UniqueId { hi: 4, lo: 5 },
+            ),
+            events.clone(),
+        ));
+        *events.live.lock().unwrap() = Some(Arc::downgrade(&live));
+
+        assert!(matches!(
+            live.poll_after(None),
+            LivePollOutcome::Idle { .. }
+        ));
+        live.deliver(bundle(LogicalVersion::FIRST, 1), None);
+        assert!(matches!(
+            live.poll_after(None),
+            LivePollOutcome::Updated { .. }
+        ));
+        live.terminal(LiveTerminal::DegradedDelivery(
+            UnavailableReason::RouteUnavailable,
+        ));
+
+        let recorded = events.events.lock().unwrap();
+        assert!(matches!(
+            recorded[0],
+            RuntimeFilterEvent::LiveSubscriptionIdle {
+                latest_version: None,
+                terminal: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            recorded[1],
+            RuntimeFilterEvent::LiveSubscriptionUpdated {
+                version: LogicalVersion::FIRST,
+                terminal: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            recorded[2],
+            RuntimeFilterEvent::LiveSubscriptionTerminal {
+                terminal: LiveTerminal::DegradedDelivery(UnavailableReason::RouteUnavailable),
+                retained_version: Some(LogicalVersion::FIRST),
+                ..
+            }
+        ));
     }
 }

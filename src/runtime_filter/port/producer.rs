@@ -104,6 +104,7 @@ pub(crate) enum RuntimeContractViolationKind {
     LogicalVersionOverflow,
     ProducerPortMismatch,
     ConsumerPortMismatch,
+    SubscriptionActivationMismatch,
     ServiceUnavailable,
 }
 
@@ -337,6 +338,9 @@ mod tests {
             RuntimeContractViolationKind::LogicalVersionOverflow => "logical-version-overflow",
             RuntimeContractViolationKind::ProducerPortMismatch => "producer-port-mismatch",
             RuntimeContractViolationKind::ConsumerPortMismatch => "consumer-port-mismatch",
+            RuntimeContractViolationKind::SubscriptionActivationMismatch => {
+                "subscription-activation-mismatch"
+            }
             RuntimeContractViolationKind::ServiceUnavailable => "service-unavailable",
         }
     }

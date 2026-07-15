@@ -19,7 +19,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::runtime_filter::port::identity::RouteEdgeId;
-use crate::runtime_filter::port::subscription::{ArtifactDelivery, ArtifactDeliveryOutcome};
+use crate::runtime_filter::port::subscription::{
+    ArtifactDelivery, ArtifactDeliveryOutcome, LiveTerminal,
+};
 
 pub(crate) struct LoopbackRouter {
     routes: BTreeMap<RouteEdgeId, Arc<dyn ArtifactDelivery>>,
@@ -50,6 +52,30 @@ impl LoopbackRouter {
             .collect::<Vec<_>>();
         for (route_edge_id, delivery) in &deliveries {
             delivery.deliver(*route_edge_id, outcome.clone());
+        }
+        deliveries
+            .into_iter()
+            .map(|(route_edge_id, _)| route_edge_id)
+            .collect()
+    }
+
+    pub(crate) fn route_live(
+        &self,
+        route_edge_ids: &[RouteEdgeId],
+        outcome: Option<&ArtifactDeliveryOutcome>,
+        terminal: Option<LiveTerminal>,
+    ) -> Vec<RouteEdgeId> {
+        let deliveries = route_edge_ids
+            .iter()
+            .filter_map(|route_edge_id| {
+                self.routes
+                    .get(route_edge_id)
+                    .cloned()
+                    .map(|delivery| (*route_edge_id, delivery))
+            })
+            .collect::<Vec<_>>();
+        for (route_edge_id, delivery) in &deliveries {
+            delivery.deliver_live(*route_edge_id, outcome.cloned(), terminal);
         }
         deliveries
             .into_iter()

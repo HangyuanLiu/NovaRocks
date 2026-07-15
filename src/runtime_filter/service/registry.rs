@@ -42,6 +42,7 @@ use crate::runtime_filter::port::ordered_bound::RuntimeOrderContract;
 use crate::runtime_filter::port::producer::{
     InstallContractError, InstallContractErrorKind, InstallOutcome, ProducerPortKind,
 };
+use crate::runtime_filter::port::subscription::{SubscriptionHandle, SubscriptionKind};
 use crate::runtime_filter::port::support::{
     ArtifactRetainedBudget, ArtifactScratchBudget, RuntimeFilterClock, RuntimeFilterMemoryAccount,
 };
@@ -49,7 +50,7 @@ use crate::runtime_filter::port::value_domain::MembershipValues;
 use crate::runtime_filter::router::loopback::LoopbackRouter;
 
 use super::materialization::{ArtifactPublishGate, ArtifactPublishKey};
-use super::subscription::{SubscriptionGroup, SubscriptionSlot};
+use super::subscription::SubscriptionGroup;
 use super::{EventBatchCompletion, EventEmitter};
 
 #[derive(Debug)]
@@ -201,10 +202,11 @@ impl InstalledDeployment {
         &self,
         binding_id: BindingId,
         instance: UniqueId,
-    ) -> Option<Arc<SubscriptionSlot>> {
+        requested: SubscriptionKind,
+    ) -> Option<SubscriptionHandle> {
         self.subscriptions
             .get(&binding_id)
-            .and_then(|group| group.slot(instance))
+            .and_then(|group| group.handle(instance, requested))
     }
 
     pub(super) fn consumer_activation(&self, binding_id: BindingId) -> Option<ConsumerActivation> {
@@ -290,6 +292,22 @@ impl InstalledDeployment {
                 .entry(key.channel_id())
                 .or_default()
                 .extend_from_slice(self.routes_for_profile(key.channel_id(), key.profile_id()));
+        }
+        let live_routes = self
+            .subscriptions
+            .values()
+            .filter_map(|subscription| subscription.live_route_edge_id())
+            .collect::<BTreeSet<_>>();
+        for (channel_id, plan) in &self.artifact_channels {
+            for group in plan.groups() {
+                routes.entry(*channel_id).or_default().extend(
+                    group
+                        .route_edges()
+                        .iter()
+                        .copied()
+                        .filter(|route| live_routes.contains(route)),
+                );
+            }
         }
         for channel_routes in routes.values_mut() {
             channel_routes.sort_unstable();
@@ -857,16 +875,11 @@ fn build_routing(
                     "consumer profile digest collision carried different canonical bytes",
                 ));
             }
-            if matches!(
-                consumer.activation(),
-                ConsumerActivation::NonBlockingLive { .. }
-            ) {
-                continue;
-            }
             let route_edge_id = consumer.loopback_route_edge_id();
             let group = Arc::new(SubscriptionGroup::new(
                 common,
                 *binding_id,
+                consumer.activation(),
                 route_edge_id,
                 consumer.expected_fragment_instances().iter().copied(),
                 events.clone(),

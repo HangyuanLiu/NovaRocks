@@ -264,7 +264,12 @@ impl From<&RuntimeFilterEvent> for RuntimeFilterChannelEventCoordinate {
             | RuntimeFilterEvent::SubscriptionTimedOut { identity }
             | RuntimeFilterEvent::SubscriptionUnavailable { identity, .. }
             | RuntimeFilterEvent::SubscriptionUnsupported { identity, .. }
-            | RuntimeFilterEvent::SubscriptionCancelled { identity } => Self::Consumer(*identity),
+            | RuntimeFilterEvent::SubscriptionCancelled { identity }
+            | RuntimeFilterEvent::LiveSubscriptionUpdated { identity, .. }
+            | RuntimeFilterEvent::LiveSubscriptionIdle { identity, .. }
+            | RuntimeFilterEvent::LiveSubscriptionTerminal { identity, .. } => {
+                Self::Consumer(*identity)
+            }
         }
     }
 }
@@ -541,7 +546,9 @@ mod tests {
     use crate::runtime_filter::port::identity::{
         DeploymentEpoch, LogicalVersion, RouteEdgeId, RuntimeFilterParticipantId,
     };
-    use crate::runtime_filter::port::subscription::{ArtifactUnsupportedReason, UnavailableReason};
+    use crate::runtime_filter::port::subscription::{
+        ArtifactUnsupportedReason, LiveTerminal, UnavailableReason,
+    };
     use std::thread;
 
     fn channel_identity(query: QueryKey) -> RuntimeFilterEventIdentity {
@@ -661,6 +668,26 @@ mod tests {
         let subscription_cancelled =
             RuntimeFilterEvent::SubscriptionCancelled { identity: consumer };
         sink.record(subscription_cancelled.clone());
+        let live_events = vec![
+            RuntimeFilterEvent::LiveSubscriptionUpdated {
+                identity: consumer,
+                version: LogicalVersion::new(7),
+                terminal: None,
+            },
+            RuntimeFilterEvent::LiveSubscriptionIdle {
+                identity: consumer,
+                latest_version: Some(LogicalVersion::new(7)),
+                terminal: None,
+            },
+            RuntimeFilterEvent::LiveSubscriptionTerminal {
+                identity: consumer,
+                terminal: LiveTerminal::DegradedDelivery(UnavailableReason::RouteUnavailable),
+                retained_version: Some(LogicalVersion::new(7)),
+            },
+        ];
+        for event in &live_events {
+            sink.record(event.clone());
+        }
 
         let snapshot = registry.snapshot(query).expect("query snapshot");
         assert_eq!(
@@ -681,7 +708,11 @@ mod tests {
             snapshot
                 .channel_events
                 .get(&RuntimeFilterChannelEventCoordinate::Consumer(consumer)),
-            Some(&vec![subscription_cancelled])
+            Some(
+                &std::iter::once(subscription_cancelled)
+                    .chain(live_events)
+                    .collect::<Vec<_>>()
+            )
         );
     }
 

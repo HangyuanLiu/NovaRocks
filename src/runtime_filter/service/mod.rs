@@ -22,6 +22,8 @@ mod producer;
 // deployment-compiler tests can reach `registry::validate_view_for_test`
 // (see registry.rs) to prove compiler output satisfies the BE install
 // contract. Item-level privacy inside `registry.rs` is unaffected.
+#[cfg(test)]
+mod m3a_tests;
 pub(crate) mod registry;
 mod subscription;
 
@@ -41,7 +43,7 @@ use crate::runtime_filter::port::producer::{
     RuntimeContractViolationKind,
 };
 use crate::runtime_filter::port::subscription::{
-    ArtifactDeliveryOutcome, BlockingSnapshotSubscription,
+    ArtifactDeliveryOutcome, LiveTerminal, SubscriptionHandle, SubscriptionKind,
 };
 use crate::runtime_filter::port::support::{RuntimeFilterClock, RuntimeFilterMemoryAccount};
 
@@ -795,12 +797,33 @@ impl ActionDispatcher {
         let mut deliveries = Vec::new();
         let mut error = None;
         match action {
-            ChannelAction::None
-            | ChannelAction::Progress { .. }
-            | ChannelAction::CompletedWithoutArtifact { .. }
-            | ChannelAction::DegradedLogical { .. } => {}
+            ChannelAction::None | ChannelAction::Progress { .. } => {}
+            ChannelAction::CompletedWithoutArtifact { .. } => {
+                if let Some(plan) = installed.artifact_plan(channel_id) {
+                    for group in plan.groups() {
+                        deliveries.push((
+                            group.route_edges().to_vec(),
+                            None,
+                            Some(LiveTerminal::CompletedWithoutArtifact),
+                        ));
+                    }
+                }
+            }
+            ChannelAction::DegradedLogical { reason, .. } => {
+                if let Some(plan) = installed.artifact_plan(channel_id) {
+                    for group in plan.groups() {
+                        deliveries.push((
+                            group.route_edges().to_vec(),
+                            None,
+                            Some(LiveTerminal::DegradedLogical(*reason)),
+                        ));
+                    }
+                }
+            }
             ChannelAction::VisibleSnapshot { snapshot, .. }
             | ChannelAction::Completed { snapshot, .. } => {
+                let terminal = matches!(action, ChannelAction::Completed { .. })
+                    .then_some(LiveTerminal::Completed);
                 let Some(claimed) = claimed else {
                     return (None, None);
                 };
@@ -888,7 +911,7 @@ impl ActionDispatcher {
                         MaterializationWorkClaim::Follower => PublishCommitOutcome::Idempotent,
                         MaterializationWorkClaim::Stale => PublishCommitOutcome::Stale,
                     };
-                    match decision {
+                    let delivery_outcome = match decision {
                         PublishCommitOutcome::Published => {
                             if let ArtifactDeliveryOutcome::Published(bundle) = &outcome {
                                 let (kind, _) = bundle
@@ -902,6 +925,7 @@ impl ActionDispatcher {
                                     digest: bundle.canonical_digest(),
                                 });
                             }
+                            Some(outcome)
                         }
                         PublishCommitOutcome::Stale => {
                             events
@@ -909,23 +933,30 @@ impl ActionDispatcher {
                             continue;
                         }
                         PublishCommitOutcome::Cancelled => continue,
-                        PublishCommitOutcome::Idempotent => continue,
-                    }
-                    for route_edge_id in work.group.route_edges() {
-                        if installed.router().contains_route(*route_edge_id) {
-                            events.extend(
-                                installed
-                                    .route_event_identities(*route_edge_id)
-                                    .iter()
-                                    .copied()
-                                    .map(|identity| RuntimeFilterEvent::LoopbackDelivered {
-                                        identity,
-                                        version: snapshot.version(),
-                                    }),
-                            );
+                        PublishCommitOutcome::Idempotent if terminal.is_none() => continue,
+                        PublishCommitOutcome::Idempotent => None,
+                    };
+                    if delivery_outcome.is_some() {
+                        for route_edge_id in work.group.route_edges() {
+                            if installed.router().contains_route(*route_edge_id) {
+                                events.extend(
+                                    installed
+                                        .route_event_identities(*route_edge_id)
+                                        .iter()
+                                        .copied()
+                                        .map(|identity| RuntimeFilterEvent::LoopbackDelivered {
+                                            identity,
+                                            version: snapshot.version(),
+                                        }),
+                                );
+                            }
                         }
                     }
-                    deliveries.push((work.group.route_edges().to_vec(), outcome));
+                    deliveries.push((
+                        work.group.route_edges().to_vec(),
+                        delivery_outcome,
+                        terminal,
+                    ));
                 }
             }
             ChannelAction::Unavailable { reason, .. } => {
@@ -933,7 +964,8 @@ impl ActionDispatcher {
                     for group in plan.groups() {
                         deliveries.push((
                             group.route_edges().to_vec(),
-                            ArtifactDeliveryOutcome::Unavailable(*reason),
+                            Some(ArtifactDeliveryOutcome::Unavailable(*reason)),
+                            Some(LiveTerminal::Unavailable(*reason)),
                         ));
                     }
                 }
@@ -943,8 +975,10 @@ impl ActionDispatcher {
             }
         }
         let batch = self.events.prequeue(events);
-        for (route_edges, outcome) in deliveries {
-            installed.router().route(&route_edges, &outcome);
+        for (route_edges, outcome, terminal) in deliveries {
+            installed
+                .router()
+                .route_live(&route_edges, outcome.as_ref(), terminal);
         }
         (batch, error)
     }
@@ -1101,7 +1135,8 @@ impl RuntimeFilterService {
         &self,
         binding_id: BindingId,
         fragment_instance_id: UniqueId,
-    ) -> Result<Arc<dyn BlockingSnapshotSubscription>, RuntimeContractViolation> {
+        requested: SubscriptionKind,
+    ) -> Result<SubscriptionHandle, RuntimeContractViolation> {
         let _operation = self
             .operation
             .lock()
@@ -1116,21 +1151,41 @@ impl RuntimeFilterService {
                 "consumer binding is not installed on this participant",
             ));
         };
-        if !matches!(activation, ConsumerActivation::BlockingSnapshot) {
+        let installed_kind = match activation {
+            ConsumerActivation::BlockingSnapshot => SubscriptionKind::BlockingSnapshot,
+            ConsumerActivation::NonBlockingLive { .. } => SubscriptionKind::NonBlockingLive,
+        };
+        if installed_kind != requested {
             return Err(violation(
-                RuntimeContractViolationKind::ConsumerPortMismatch,
-                "non-blocking live consumer cannot open a blocking snapshot subscription",
+                RuntimeContractViolationKind::SubscriptionActivationMismatch,
+                "requested subscription kind does not match install-frozen consumer activation",
             ));
         }
         installed
-            .subscription(binding_id, fragment_instance_id)
-            .map(|subscription| subscription as Arc<dyn BlockingSnapshotSubscription>)
+            .subscription(binding_id, fragment_instance_id, requested)
             .ok_or_else(|| {
                 violation(
                     RuntimeContractViolationKind::UnauthorizedFragmentInstance,
                     "consumer fragment instance is not installed for this binding",
                 )
             })
+    }
+
+    #[cfg(test)]
+    fn subscribe_blocking(
+        &self,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+    ) -> Result<
+        Arc<dyn crate::runtime_filter::port::subscription::BlockingSnapshotSubscription>,
+        RuntimeContractViolation,
+    > {
+        self.subscribe(
+            binding_id,
+            fragment_instance_id,
+            SubscriptionKind::BlockingSnapshot,
+        )?
+        .into_blocking()
     }
 
     pub(crate) fn expire_deadlines(&self, now: Instant) {
@@ -1333,7 +1388,7 @@ mod tests {
     };
     use crate::runtime_filter::port::subscription::{
         ArtifactAcquireOutcome, ArtifactDelivery, ArtifactDeliveryOutcome,
-        BlockingSnapshotSubscription, UnavailableReason,
+        BlockingSnapshotSubscription, SubscriptionKind, UnavailableReason,
     };
     use crate::runtime_filter::port::support::{
         MemoryAccountError, RuntimeFilterClock, RuntimeFilterMemoryAccount,
@@ -1642,7 +1697,7 @@ mod tests {
                 .expect("service installed before clock use");
             assert_eq!(
                 service
-                    .subscribe(BindingId::new(30), uid(30))
+                    .subscribe_blocking(BindingId::new(30), uid(30))
                     .err()
                     .expect("service must remain unavailable during installation")
                     .kind(),
@@ -1804,14 +1859,14 @@ mod tests {
         }
     }
 
-    fn installed_ordered_service_fixture() -> Arc<RuntimeFilterService> {
+    pub(super) fn installed_ordered_service_fixture() -> Arc<RuntimeFilterService> {
         installed_ordered_service_with_account(MemTrackerMemoryAccount::new_root_for_test(
             "ordered-runtime-filter-test-query",
         ))
         .0
     }
 
-    fn installed_ordered_service_with_account(
+    pub(super) fn installed_ordered_service_with_account(
         memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
     ) -> (Arc<RuntimeFilterService>, Arc<RuntimeOrderContract>) {
         installed_ordered_service_with_account_and_events(
@@ -1885,7 +1940,10 @@ mod tests {
         (service, contract)
     }
 
-    fn ordered_update(contract: &RuntimeOrderContract, value: i64) -> OrderedBoundUpdate {
+    pub(super) fn ordered_update(
+        contract: &RuntimeOrderContract,
+        value: i64,
+    ) -> OrderedBoundUpdate {
         OrderedBoundUpdate::new(
             contract,
             OrderedTuple::try_new(contract, [Some(OrderedScalar::Int64(value))]).unwrap(),
@@ -2227,7 +2285,7 @@ mod tests {
     ) {
         let subscription = fixture
             .service
-            .subscribe(BindingId::new(30), uid(30))
+            .subscribe_blocking(BindingId::new(30), uid(30))
             .unwrap();
         let producer = fixture
             .service
@@ -2760,11 +2818,16 @@ mod tests {
         let direct_group = Arc::new(SubscriptionGroup::new(
             common,
             BindingId::new(50),
+            ConsumerActivation::BlockingSnapshot,
             RouteEdgeId::new(70),
             [uid(50)],
             direct_events,
         ));
-        let direct_slot = direct_group.slot(uid(50)).unwrap();
+        let direct_slot = direct_group
+            .handle(uid(50), SubscriptionKind::BlockingSnapshot)
+            .unwrap()
+            .into_blocking()
+            .unwrap();
         let direct_router = LoopbackRouter::new(BTreeMap::from([(
             RouteEdgeId::new(70),
             direct_group as Arc<dyn ArtifactDelivery>,
@@ -2778,11 +2841,16 @@ mod tests {
         let codec_group = Arc::new(SubscriptionGroup::new(
             common,
             BindingId::new(51),
+            ConsumerActivation::BlockingSnapshot,
             RouteEdgeId::new(71),
             [uid(51)],
             codec_events,
         ));
-        let codec_slot = codec_group.slot(uid(51)).unwrap();
+        let codec_slot = codec_group
+            .handle(uid(51), SubscriptionKind::BlockingSnapshot)
+            .unwrap()
+            .into_blocking()
+            .unwrap();
         let codec_router = LoopbackRouter::new(BTreeMap::from([(
             RouteEdgeId::new(71),
             codec_group as Arc<dyn ArtifactDelivery>,
@@ -2842,11 +2910,11 @@ mod tests {
             .unwrap();
         let first = fixture
             .service
-            .subscribe(BindingId::new(30), uid(30))
+            .subscribe_blocking(BindingId::new(30), uid(30))
             .unwrap();
         let second = fixture
             .service
-            .subscribe(BindingId::new(31), uid(31))
+            .subscribe_blocking(BindingId::new(31), uid(31))
             .unwrap();
         let installed = fixture.service.registry.active_installation().unwrap();
         let plan = installed.artifact_plan(ChannelId::new(1)).unwrap();
@@ -3052,11 +3120,11 @@ mod tests {
             .unwrap();
         let value_set_subscription = fixture
             .service
-            .subscribe(BindingId::new(30), uid(30))
+            .subscribe_blocking(BindingId::new(30), uid(30))
             .unwrap();
         let bitset_subscription = fixture
             .service
-            .subscribe(BindingId::new(31), uid(31))
+            .subscribe_blocking(BindingId::new(31), uid(31))
             .unwrap();
         let producer = fixture
             .service
@@ -3463,8 +3531,12 @@ mod tests {
             ])]))
             .unwrap();
         let subscriptions = [
-            service.subscribe(BindingId::new(30), uid(30)).unwrap(),
-            service.subscribe(BindingId::new(31), uid(31)).unwrap(),
+            service
+                .subscribe_blocking(BindingId::new(30), uid(30))
+                .unwrap(),
+            service
+                .subscribe_blocking(BindingId::new(31), uid(31))
+                .unwrap(),
         ];
         let producer = service
             .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
@@ -3500,7 +3572,7 @@ mod tests {
                     .upgrade()
                     .expect("service is live before shutdown");
                 let (binding_id, instance_id) = profile_binding[&profile_id];
-                service.subscribe(binding_id, instance_id).unwrap();
+                service.subscribe_blocking(binding_id, instance_id).unwrap();
                 reentered.fetch_add(1, Ordering::SeqCst);
                 drop(service);
                 entered_tx.send(()).unwrap();
@@ -3726,7 +3798,9 @@ mod tests {
         service
             .install(view([deployment(1, 10, 30, 40, [10], [30], 100)]))
             .unwrap();
-        let subscription = service.subscribe(BindingId::new(30), uid(30)).unwrap();
+        let subscription = service
+            .subscribe_blocking(BindingId::new(30), uid(30))
+            .unwrap();
         let producer = service
             .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
             .unwrap()
@@ -3789,8 +3863,12 @@ mod tests {
             ])]))
             .unwrap();
         let subscriptions = [
-            service.subscribe(BindingId::new(30), uid(30)).unwrap(),
-            service.subscribe(BindingId::new(31), uid(31)).unwrap(),
+            service
+                .subscribe_blocking(BindingId::new(30), uid(30))
+                .unwrap(),
+            service
+                .subscribe_blocking(BindingId::new(31), uid(31))
+                .unwrap(),
         ];
         let producer = service
             .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
@@ -3916,11 +3994,11 @@ mod tests {
             .unwrap();
         let completed_subscription = fixture
             .service
-            .subscribe(BindingId::new(30), uid(30))
+            .subscribe_blocking(BindingId::new(30), uid(30))
             .unwrap();
         let incomplete_subscription = fixture
             .service
-            .subscribe(BindingId::new(31), uid(31))
+            .subscribe_blocking(BindingId::new(31), uid(31))
             .unwrap();
         let producer = fixture
             .service
@@ -3967,7 +4045,7 @@ mod tests {
         assert_eq!(
             fixture
                 .service
-                .subscribe(BindingId::new(99), uid(30))
+                .subscribe_blocking(BindingId::new(99), uid(30))
                 .err()
                 .unwrap()
                 .kind(),
@@ -3976,7 +4054,7 @@ mod tests {
         assert_eq!(
             fixture
                 .service
-                .subscribe(BindingId::new(30), uid(99))
+                .subscribe_blocking(BindingId::new(30), uid(99))
                 .err()
                 .unwrap()
                 .kind(),
@@ -4218,7 +4296,7 @@ mod tests {
         install_one(&fixture);
         let subscription = fixture
             .service
-            .subscribe(BindingId::new(30), uid(30))
+            .subscribe_blocking(BindingId::new(30), uid(30))
             .unwrap();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -4239,7 +4317,7 @@ mod tests {
         assert!(
             fixture
                 .service
-                .subscribe(BindingId::new(30), uid(30))
+                .subscribe_blocking(BindingId::new(30), uid(30))
                 .is_err()
         );
         assert!(
@@ -4289,7 +4367,7 @@ mod tests {
                 let service = weak_service.upgrade().unwrap();
                 assert_eq!(
                     service
-                        .subscribe(BindingId::new(30), uid(30))
+                        .subscribe_blocking(BindingId::new(30), uid(30))
                         .err()
                         .unwrap()
                         .kind(),
@@ -4463,7 +4541,7 @@ mod tests {
             .unwrap();
         let subscription = fixture
             .service
-            .subscribe(BindingId::new(30), uid(30))
+            .subscribe_blocking(BindingId::new(30), uid(30))
             .unwrap();
 
         let (ready0_tx, ready0_rx) = mpsc::channel();
@@ -4677,7 +4755,9 @@ mod tests {
         service
             .install(view([deployment(1, 10, 30, 40, [10], [30], 100)]))
             .unwrap();
-        let subscription = service.subscribe(BindingId::new(30), uid(30)).unwrap();
+        let subscription = service
+            .subscribe_blocking(BindingId::new(30), uid(30))
+            .unwrap();
         *sink.subscription.lock().unwrap() = Some(Arc::downgrade(&subscription));
         let producer = service
             .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
@@ -4865,7 +4945,9 @@ mod tests {
                 .unwrap(),
             InstallOutcome::Installed
         );
-        let subscription = service.subscribe(BindingId::new(30), uid(30)).unwrap();
+        let subscription = service
+            .subscribe_blocking(BindingId::new(30), uid(30))
+            .unwrap();
         let producer = service
             .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
             .unwrap()
@@ -5000,7 +5082,7 @@ mod tests {
         let subscribe_service = service.clone();
         let (done_tx, done_rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let kind = match subscribe_service.subscribe(BindingId::new(2), uid(2)) {
+            let kind = match subscribe_service.subscribe_blocking(BindingId::new(2), uid(2)) {
                 Ok(_) => None,
                 Err(error) => Some(error.kind()),
             };
@@ -5008,17 +5090,30 @@ mod tests {
         });
         assert_eq!(
             done_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            Some(RuntimeContractViolationKind::ConsumerPortMismatch)
+            Some(RuntimeContractViolationKind::SubscriptionActivationMismatch)
         );
         let installed = service.registry.active_installation().unwrap();
-        assert!(installed.subscription(BindingId::new(2), uid(2)).is_none());
+        assert!(
+            installed
+                .subscription(
+                    BindingId::new(2),
+                    uid(2),
+                    SubscriptionKind::BlockingSnapshot
+                )
+                .is_none()
+        );
+        assert!(
+            installed
+                .subscription(BindingId::new(2), uid(2), SubscriptionKind::NonBlockingLive)
+                .is_some()
+        );
         assert_eq!(
             service
-                .subscribe(BindingId::new(2), uid(2))
+                .subscribe_blocking(BindingId::new(2), uid(2))
                 .err()
                 .unwrap()
                 .kind(),
-            RuntimeContractViolationKind::ConsumerPortMismatch
+            RuntimeContractViolationKind::SubscriptionActivationMismatch
         );
     }
 
