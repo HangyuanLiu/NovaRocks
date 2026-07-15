@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod common;
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -32,6 +34,8 @@ use novarocks::state_store::{
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+use common::state_store_conformance::{FaultGate, FaultInjectingStateStore, ScriptedCommitResult};
 
 fn key(bytes: &'static [u8]) -> Key {
     Key::try_from(Bytes::from_static(bytes)).expect("valid key")
@@ -203,6 +207,153 @@ impl StateStore for ScriptedStore {
     ) -> Result<CommitResolution, StateStoreError> {
         unreachable!("runner tests do not resolve commits")
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fault_injecting_state_store_scripts_all_contract_boundaries() {
+    let scripted = Arc::new(ScriptedStore::new(std::iter::repeat_n(
+        ScriptedCommit::Committed,
+        8,
+    )));
+    let fault = FaultInjectingStateStore::new(scripted as Arc<dyn StateStore>);
+    let injected_error = || {
+        StateStoreError::new(
+            StateStoreErrorKind::ProviderUnavailable,
+            "injected contract fault",
+        )
+    };
+
+    fault.fail_next_begin(injected_error());
+    let begin_error = match fault
+        .begin_write(Uuid::now_v7().into(), "injected begin")
+        .await
+    {
+        Ok(_) => panic!("begin fault must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(begin_error.kind(), StateStoreErrorKind::ProviderUnavailable);
+
+    let mut operation = fault
+        .begin_write(Uuid::now_v7().into(), "injected operation")
+        .await
+        .expect("begin operation fault transaction");
+    fault.fail_next_operation(injected_error());
+    assert_eq!(
+        operation
+            .put(
+                key(b"fault"),
+                Value::try_from(Bytes::from_static(b"value")).expect("value"),
+                Precondition::Any
+            )
+            .await
+            .expect_err("operation fault must fail")
+            .kind(),
+        StateStoreErrorKind::ProviderUnavailable
+    );
+    operation
+        .abort()
+        .await
+        .expect("abort operation fault transaction");
+
+    for result in [
+        ScriptedCommitResult::Committed,
+        ScriptedCommitResult::Conflict,
+        ScriptedCommitResult::TransientBeforeCommit,
+        ScriptedCommitResult::DefiniteFailure,
+        ScriptedCommitResult::CommitUnknown,
+    ] {
+        let transaction_id = Uuid::now_v7().into();
+        let transaction = fault
+            .begin_write(transaction_id, "injected pre-commit")
+            .await
+            .expect("begin pre-commit fault transaction");
+        fault.script_next_pre_commit(result);
+        let outcome = transaction.commit().await;
+        assert!(
+            matches!(
+                (result, outcome),
+                (ScriptedCommitResult::Committed, CommitOutcome::Committed(_))
+                    | (ScriptedCommitResult::Conflict, CommitOutcome::Conflict(_))
+                    | (
+                        ScriptedCommitResult::TransientBeforeCommit,
+                        CommitOutcome::TransientBeforeCommit(_)
+                    )
+                    | (
+                        ScriptedCommitResult::DefiniteFailure,
+                        CommitOutcome::DefiniteFailure(_)
+                    )
+                    | (
+                        ScriptedCommitResult::CommitUnknown,
+                        CommitOutcome::CommitUnknown(_)
+                    )
+            ),
+            "unexpected injected outcome"
+        );
+        let resolution = fault
+            .resolve_commit(&transaction_id)
+            .await
+            .expect("resolve injected pre-commit outcome");
+        assert!(
+            matches!(
+                (result, resolution),
+                (
+                    ScriptedCommitResult::Committed,
+                    CommitResolution::Committed(_)
+                ) | (
+                    ScriptedCommitResult::Conflict
+                        | ScriptedCommitResult::TransientBeforeCommit
+                        | ScriptedCommitResult::DefiniteFailure,
+                    CommitResolution::NotCommitted
+                ) | (
+                    ScriptedCommitResult::CommitUnknown,
+                    CommitResolution::Unresolved
+                )
+            ),
+            "injected resolution must agree with the scripted commit phase"
+        );
+    }
+
+    fault.fail_next_change_poll(injected_error());
+    assert_eq!(
+        fault
+            .poll_changes(&ChangePollRequest {
+                after: None,
+                page_size: 1,
+            })
+            .await
+            .expect_err("change poll fault must fail")
+            .kind(),
+        StateStoreErrorKind::ProviderUnavailable
+    );
+
+    let post_dispatch_id = Uuid::now_v7().into();
+    let transaction = fault
+        .begin_write(post_dispatch_id, "injected post-dispatch")
+        .await
+        .expect("begin post-dispatch fault transaction");
+    let gate = FaultGate::new();
+    fault.pause_next_post_dispatch(gate.clone());
+    let commit = tokio::spawn(async move { transaction.commit().await });
+    gate.wait_reached().await;
+    assert_eq!(
+        fault
+            .resolve_commit(&post_dispatch_id)
+            .await
+            .expect("resolve post-dispatch fault"),
+        CommitResolution::Unresolved
+    );
+    gate.release().await;
+    assert!(matches!(
+        commit.await.expect("post-dispatch commit task"),
+        CommitOutcome::Committed(_)
+    ));
+    assert!(matches!(
+        fault
+            .resolve_commit(&post_dispatch_id)
+            .await
+            .expect("resolve terminal post-dispatch fault"),
+        CommitResolution::Committed(_)
+    ));
 }
 
 #[test]

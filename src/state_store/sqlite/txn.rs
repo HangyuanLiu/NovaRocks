@@ -2398,6 +2398,47 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sqlite_transaction_deadline_interrupts_blocking_sql() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = store_with_limits(
+            &temp,
+            StateStoreLimitOverrides {
+                transaction_deadline_ms: Some(50),
+                ..StateStoreLimitOverrides::default()
+            },
+        )
+        .await;
+        let item = key(b"deadline-blocked");
+        let mut transaction = store
+            .begin_write(transaction_id())
+            .await
+            .expect("begin deadline transaction");
+        transaction
+            .put(item.clone(), value(b"must-not-commit"), Precondition::Any)
+            .await
+            .expect("stage deadline mutation");
+
+        let blocker = open_connection(&store.path).expect("open deterministic SQL blocker");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold SQLite writer lock");
+        let outcome = tokio::time::timeout(Duration::from_secs(2), transaction.commit())
+            .await
+            .expect("transaction deadline must interrupt blocking SQL");
+        blocker
+            .execute_batch("ROLLBACK")
+            .expect("release SQLite writer lock");
+
+        match outcome {
+            CommitOutcome::DefiniteFailure(error) => {
+                assert_eq!(error.kind(), StateStoreErrorKind::DeadlineExceeded)
+            }
+            other => panic!("expected definite deadline failure, got {other:?}"),
+        }
+        assert_eq!(read_value(&store, &item).await, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn sqlite_transaction_cancelled_range_stops_before_another_refill() {
         let temp = TempDir::new().expect("temp dir");
         let store = store(&temp).await;

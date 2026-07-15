@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod common;
+
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -29,6 +31,8 @@ use rusqlite::params;
 use tempfile::TempDir;
 use tokio::sync::Barrier;
 use uuid::Uuid;
+
+use common::state_store_conformance::StateStoreFactory;
 
 fn key(bytes: impl Into<Vec<u8>>) -> Key {
     Key::try_from(Bytes::from(bytes.into())).expect("valid key")
@@ -66,6 +70,67 @@ async fn open_store_with_limits(
     )
     .await
     .expect("open public SQLite state store")
+}
+
+fn conformance_factory() -> StateStoreFactory {
+    let temp = Arc::new(TempDir::new().expect("conformance temp dir"));
+    Arc::new(move || {
+        let temp = Arc::clone(&temp);
+        Box::pin(async move {
+            open_state_store(
+                StateStoreConfig {
+                    provider: StateStoreProviderConfig::Sqlite,
+                    path: temp.path().join("state-store.sqlite"),
+                    cluster_id: "conformance-cluster".to_owned(),
+                    deployment_owner: "conformance-fe".to_owned(),
+                    limits: StateStoreLimitOverrides {
+                        max_key_bytes: Some(64),
+                        max_value_bytes: Some(128),
+                        max_page_size: Some(10),
+                        max_transaction_operations: Some(8),
+                        max_transaction_bytes: Some(1_024),
+                        transaction_deadline_ms: Some(250),
+                        runner_max_attempts: Some(3),
+                    },
+                },
+                FeDeploymentView {
+                    active_fe_count: NonZeroUsize::new(1).expect("one FE"),
+                    topology_revision: Bytes::from_static(b"conformance-topology"),
+                },
+            )
+            .await
+        })
+    })
+}
+
+mod conformance {
+    use super::*;
+    use common::state_store_conformance;
+
+    macro_rules! conformance_test {
+        ($name:ident) => {
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn $name() {
+                let factory = conformance_factory();
+                state_store_conformance::$name(&factory).await;
+            }
+        };
+    }
+
+    conformance_test!(snapshot_repeatable_read);
+    conformance_test!(same_key_conflict);
+    conformance_test!(write_skew_conflict);
+    conformance_test!(range_phantom_conflict);
+    conformance_test!(preconditions);
+    conformance_test!(forward_reverse_pages);
+    conformance_test!(same_revision_change_pages);
+    conformance_test!(atomic_commit);
+    conformance_test!(commit_resolution_after_cancel);
+    conformance_test!(resolve_does_not_report_not_committed_while_inflight);
+    conformance_test!(limits_before_io);
+    conformance_test!(deadline_interrupts_blocking_sql);
+    conformance_test!(arbitrary_binary_payloads);
+    conformance_test!(second_owner_rejected);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
