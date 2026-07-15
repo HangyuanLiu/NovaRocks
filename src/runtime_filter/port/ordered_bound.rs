@@ -32,6 +32,8 @@ const ORDER_CONTRACT_VERSION: u16 = 1;
 pub(crate) const COMPARATOR_ALGORITHM_VERSION: u16 = 1;
 const COMPARATOR_DOMAIN: &[u8] = b"novarocks.runtime-filter.comparator";
 const ORDER_CONTRACT_DOMAIN: &[u8] = b"novarocks.runtime-filter.order-contract";
+const REPLAY_DIGEST_DOMAIN: &[u8] = b"novarocks.runtime-filter.ordered-bound-replay";
+const REPLAY_DIGEST_VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct OrderContractDigest([u8; 32]);
@@ -127,9 +129,9 @@ impl OrderedBoundUpdate {
     pub(crate) fn new(
         contract: &RuntimeOrderContract,
         bound: OrderedTuple,
-        replay_digest: [u8; 32],
     ) -> Result<Self, OrderedTupleError> {
         validate_tuple(contract, &bound)?;
+        let replay_digest = canonical_replay_digest(contract, &bound);
         Ok(Self {
             order_contract_digest: contract.digest(),
             bound,
@@ -352,12 +354,60 @@ fn scalar_matches_type(value: &OrderedScalar, data_type: &DataType) -> bool {
         | (OrderedScalar::Int64(_), DataType::Int64)
         | (OrderedScalar::Utf8(_), DataType::Utf8)
         | (OrderedScalar::Date32(_), DataType::Date32)
-        | (OrderedScalar::Timestamp(_), DataType::Timestamp(_, _))
-        | (OrderedScalar::Decimal128(_), DataType::Decimal128(_, _)) => true,
+        | (OrderedScalar::Timestamp(_), DataType::Timestamp(_, _)) => true,
+        (OrderedScalar::Decimal128(value), DataType::Decimal128(precision, _)) => {
+            decimal128_fits_precision(*value, *precision)
+        }
         (OrderedScalar::LargeInt(_), DataType::FixedSizeBinary(width)) => {
             *width == LARGEINT_BYTE_WIDTH
         }
         _ => false,
+    }
+}
+
+fn decimal128_fits_precision(value: i128, precision: u8) -> bool {
+    let Some(limit) = 10_i128.checked_pow(u32::from(precision)) else {
+        return false;
+    };
+    value > -limit && value < limit
+}
+
+fn canonical_replay_digest(contract: &RuntimeOrderContract, bound: &OrderedTuple) -> [u8; 32] {
+    let mut canonical = Vec::with_capacity(64 + bound.values().len() * 17);
+    canonical.extend_from_slice(REPLAY_DIGEST_DOMAIN);
+    canonical.extend_from_slice(&REPLAY_DIGEST_VERSION.to_be_bytes());
+    canonical.extend_from_slice(&contract.digest().bytes());
+    canonical.extend_from_slice(&(bound.values().len() as u64).to_be_bytes());
+    for value in bound.values() {
+        match value {
+            None => canonical.push(0),
+            Some(value) => {
+                canonical.push(1);
+                encode_ordered_scalar(value, &mut canonical);
+            }
+        }
+    }
+    Sha256::digest(canonical).into()
+}
+
+fn encode_ordered_scalar(value: &OrderedScalar, canonical: &mut Vec<u8>) {
+    match value {
+        OrderedScalar::Boolean(value) => canonical.push(u8::from(*value)),
+        OrderedScalar::Int8(value) => canonical.extend_from_slice(&value.to_be_bytes()),
+        OrderedScalar::Int16(value) => canonical.extend_from_slice(&value.to_be_bytes()),
+        OrderedScalar::Int32(value) | OrderedScalar::Date32(value) => {
+            canonical.extend_from_slice(&value.to_be_bytes());
+        }
+        OrderedScalar::Int64(value) | OrderedScalar::Timestamp(value) => {
+            canonical.extend_from_slice(&value.to_be_bytes());
+        }
+        OrderedScalar::LargeInt(value) | OrderedScalar::Decimal128(value) => {
+            canonical.extend_from_slice(&value.to_be_bytes());
+        }
+        OrderedScalar::Utf8(value) => {
+            canonical.extend_from_slice(&(value.len() as u64).to_be_bytes());
+            canonical.extend_from_slice(value.as_bytes());
+        }
     }
 }
 
@@ -614,5 +664,73 @@ mod tests {
                 Ordering::Greater
             );
         }
+    }
+
+    #[test]
+    fn decimal128_tuple_rejects_values_outside_declared_precision() {
+        for (precision, valid_limit) in [
+            (3, 10_i128.checked_pow(3).unwrap()),
+            (38, 10_i128.checked_pow(38).unwrap()),
+        ] {
+            let contract = RuntimeOrderContract::try_from_plan(&test_order_contract(
+                DataType::Decimal128(precision, 0),
+                SortDirection::Ascending,
+                NullOrder::Last,
+            ))
+            .unwrap();
+
+            for value in [valid_limit - 1, -(valid_limit - 1)] {
+                assert!(
+                    OrderedTuple::try_new(&contract, [Some(OrderedScalar::Decimal128(value))])
+                        .is_ok()
+                );
+            }
+            for value in [valid_limit, -valid_limit, i128::MIN] {
+                assert_eq!(
+                    OrderedTuple::try_new(&contract, [Some(OrderedScalar::Decimal128(value))]),
+                    Err(OrderedTupleError::TypeMismatch)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_bound_replay_digest_is_derived_from_contract_and_tuple() {
+        let ascending = RuntimeOrderContract::try_from_plan(&test_order_contract(
+            DataType::Int64,
+            SortDirection::Ascending,
+            NullOrder::Last,
+        ))
+        .unwrap();
+        let descending = RuntimeOrderContract::try_from_plan(&test_order_contract(
+            DataType::Int64,
+            SortDirection::Descending,
+            NullOrder::Last,
+        ))
+        .unwrap();
+        let first = OrderedBoundUpdate::new(
+            &ascending,
+            tuple(&ascending, [Some(OrderedScalar::Int64(7))]),
+        )
+        .unwrap();
+        let same = OrderedBoundUpdate::new(
+            &ascending,
+            tuple(&ascending, [Some(OrderedScalar::Int64(7))]),
+        )
+        .unwrap();
+        let different_bound = OrderedBoundUpdate::new(
+            &ascending,
+            tuple(&ascending, [Some(OrderedScalar::Int64(8))]),
+        )
+        .unwrap();
+        let different_contract = OrderedBoundUpdate::new(
+            &descending,
+            tuple(&descending, [Some(OrderedScalar::Int64(7))]),
+        )
+        .unwrap();
+
+        assert_eq!(first.replay_digest(), same.replay_digest());
+        assert_ne!(first.replay_digest(), different_bound.replay_digest());
+        assert_ne!(first.replay_digest(), different_contract.replay_digest());
     }
 }
