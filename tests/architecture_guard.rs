@@ -7646,13 +7646,23 @@ fn runtime_filter_path_is_allowlisted(canonical: &[String], allowed_prefixes: &[
     })
 }
 
+fn runtime_filter_path_is_exactly_allowlisted(
+    canonical: &[String],
+    allowed_paths: &[&[&str]],
+) -> bool {
+    allowed_paths.iter().any(|allowed| {
+        canonical.len() == allowed.len()
+            && canonical
+                .iter()
+                .zip(allowed.iter())
+                .all(|(actual, expected)| actual == expected)
+    })
+}
+
 fn runtime_filter_model_dependency_violations(source_rel: &str, text: &str) -> Vec<String> {
     let allowed_prefixes: &[&[&str]] = match source_rel {
         "src/runtime_filter/model/mod.rs" => &[],
-        "src/runtime_filter/model/contract.rs" => &[
-            &["arrow", "datatypes", "DataType"],
-            &["std", "num", "NonZeroU32"],
-        ],
+        "src/runtime_filter/model/contract.rs" => &[&["arrow", "datatypes", "DataType"]],
         "src/runtime_filter/model/coverage.rs" => &[
             &["std", "collections", "BTreeSet"],
             &["crate", "runtime_filter", "model", "contract"],
@@ -7675,6 +7685,13 @@ fn runtime_filter_model_dependency_violations(source_rel: &str, text: &str) -> V
         _ => return vec![format!("{source_rel}: unrecognized model source")],
     };
     let local_roots = runtime_filter_model_local_roots(text);
+    let allowed_exact: &[&[&str]] = match source_rel {
+        "src/runtime_filter/model/contract.rs" => &[
+            &["std", "num", "NonZeroU32"],
+            &["std", "num", "NonZeroU32", "new"],
+        ],
+        _ => &[],
+    };
 
     let mut violations = rust_production_canonical_paths(text, source_rel)
         .into_iter()
@@ -7684,13 +7701,17 @@ fn runtime_filter_model_dependency_violations(source_rel: &str, text: &str) -> V
                 .first()
                 .is_some_and(|root| local_roots.contains(root))
                 && !runtime_filter_path_is_allowlisted(canonical, allowed_prefixes)
+                && !runtime_filter_path_is_exactly_allowlisted(canonical, allowed_exact)
         })
         .map(|canonical| format!("{source_rel}: {}", canonical.join("::")))
         .collect::<BTreeSet<_>>();
     violations.extend(
         runtime_filter_external_paths(text)
             .into_iter()
-            .filter(|path| !runtime_filter_path_is_allowlisted(path, allowed_prefixes))
+            .filter(|path| {
+                !runtime_filter_path_is_allowlisted(path, allowed_prefixes)
+                    && !runtime_filter_path_is_exactly_allowlisted(path, allowed_exact)
+            })
             .map(|path| format!("{source_rel}: external {}", path.join("::"))),
     );
     violations.into_iter().collect()
@@ -7777,6 +7798,238 @@ fn runtime_filter_query_context_export_surface_violations(text: &str) -> Vec<Str
         }
     }
     violations
+}
+
+fn runtime_filter_task4_exact_symbol_ledger(
+    source_rel: &str,
+    canonical: &[String],
+) -> Option<bool> {
+    let entries: &[(&[&str], &[&str], bool)] = match source_rel {
+        "src/runtime_filter/materializer/range.rs" => &[(
+            &["crate", "runtime_filter", "port", "support"],
+            &[
+                "ArtifactRetainedBudget",
+                "ArtifactRetention",
+                "ArtifactScratchBudget",
+                "ArtifactScratchReservation",
+                "RuntimeFilterMemoryAccount",
+            ],
+            false,
+        )],
+        "src/runtime_filter/port/artifact.rs" => &[(
+            &["crate", "runtime_filter", "port", "ordered_bound"],
+            &[
+                "OrderContractDigest",
+                "OrderedScalar",
+                "OrderedTuple",
+                "RuntimeOrderContract",
+                "RuntimeOrderKey",
+            ],
+            false,
+        )],
+        "src/runtime_filter/service/m4_conformance_tests.rs" => &[
+            (
+                &["crate", "coordinator", "scheduler"],
+                &[
+                    "FragmentInstancePlacement",
+                    "LiveBackendSnapshot",
+                    "SchedulingPlan",
+                ],
+                false,
+            ),
+            (
+                &["crate", "runtime_filter", "deployment"],
+                &["RuntimeFilterDeploymentPolicy", "compiler"],
+                false,
+            ),
+            (
+                &["crate", "runtime_filter", "materializer", "codec"],
+                &[
+                    "ArtifactDecodeExpectations",
+                    "decode_leaf",
+                    "encode_physical_leaf",
+                ],
+                false,
+            ),
+            (
+                &["crate", "runtime_filter", "model", "contract"],
+                &[
+                    "ArtifactCapability",
+                    "BindingId",
+                    "ChannelId",
+                    "CompletionFenceKind",
+                    "CompletionRequirement",
+                    "ConsumerActivation",
+                    "ContributionKind",
+                    "CoverageWitnessId",
+                    "LateApplyGranularity",
+                    "NullOrder",
+                    "NullSemantics",
+                    "OrderContract",
+                    "OrderKeyContract",
+                    "PlanFragmentId",
+                    "PlanNodeId",
+                    "ReductionRequirement",
+                    "RuntimeFilterLifecycle",
+                    "RuntimeFilterLogicalDomain",
+                    "RuntimeFilterPolicyRequirement",
+                    "SortDirection",
+                    "TopKSummaryRequirement",
+                ],
+                false,
+            ),
+            (
+                &["crate", "runtime_filter", "model", "graph"],
+                &[
+                    "ApplyPoint",
+                    "ConsumerRequirement",
+                    "PlanLocation",
+                    "ProducerRequirement",
+                    "RuntimeFilterBindingRole",
+                    "RuntimeFilterBindingSpec",
+                    "RuntimeFilterChannelSpec",
+                    "RuntimeFilterGraph",
+                ],
+                false,
+            ),
+            (
+                &["crate", "runtime_filter", "port", "artifact"],
+                &[
+                    "ArtifactBundle",
+                    "ArtifactKind",
+                    "ArtifactMembershipSchema",
+                    "ConsumerArtifactProfile",
+                    "PhysicalArtifact",
+                ],
+                false,
+            ),
+            (
+                &["crate", "runtime_filter", "port", "events"],
+                &["RuntimeFilterEvent", "RuntimeFilterEventSink"],
+                false,
+            ),
+            (
+                &["crate", "runtime_filter", "port", "final_domain"],
+                &[
+                    "CollectingFinalDomainTestIssuer",
+                    "FinalDomainTestIssuerTransition",
+                    "FrozenFinalDomainTestIssuer",
+                ],
+                false,
+            ),
+            (
+                &["crate", "runtime_filter", "port", "identity"],
+                &[
+                    "DeploymentEpoch",
+                    "LogicalVersion",
+                    "PartitionId",
+                    "ProducerSequence",
+                    "ProducerStreamId",
+                    "RuntimeFilterParticipantId",
+                ],
+                false,
+            ),
+            (
+                &["crate", "runtime_filter", "port", "install"],
+                &[
+                    "MaterializationPolicy",
+                    "RuntimeFilterCoreBudget",
+                    "RuntimeFilterInstallView",
+                ],
+                false,
+            ),
+            (
+                &["crate", "runtime_filter", "port", "ordered_bound"],
+                &[
+                    "COMPARATOR_ALGORITHM_VERSION",
+                    "OrderedBoundUpdate",
+                    "OrderedScalar",
+                    "OrderedTuple",
+                    "RuntimeOrderContract",
+                    "comparator_digest_for_test",
+                ],
+                false,
+            ),
+            (
+                &["crate", "runtime_filter", "port", "producer"],
+                &[
+                    "FinalDomainProducerAdapter",
+                    "InstallOutcome",
+                    "OrderedBoundProducerAdapter",
+                    "ProducerAdapter",
+                    "ProducerHandle",
+                    "ProducerPortKind",
+                    "RuntimeContractViolation",
+                    "RuntimeContractViolationKind",
+                    "SubmitOutcome",
+                    "TopKSummaryProducerAdapter",
+                ],
+                false,
+            ),
+            (
+                &["crate", "runtime_filter", "port", "subscription"],
+                &[
+                    "BlockingSnapshotSubscription",
+                    "LivePollOutcome",
+                    "LiveTerminal",
+                    "NonBlockingLiveSubscription",
+                    "SubscriptionHandle",
+                    "SubscriptionKind",
+                    "UnavailableReason",
+                ],
+                false,
+            ),
+            (
+                &["crate", "runtime_filter", "port", "support"],
+                &[
+                    "ArtifactRetainedBudget",
+                    "MemoryAccountError",
+                    "RuntimeFilterClock",
+                    "RuntimeFilterMemoryAccount",
+                ],
+                false,
+            ),
+            (
+                &["crate", "runtime_filter", "port", "topk_summary"],
+                &["RuntimeTopKSummaryContract", "TopKSummary"],
+                false,
+            ),
+            (
+                &["crate", "runtime_filter", "port", "value_domain"],
+                &["MembershipValues", "ValueDomainDelta"],
+                false,
+            ),
+            (
+                &["crate", "sql", "analysis"],
+                &["ExprKind", "LiteralValue", "TypedExpr"],
+                false,
+            ),
+            (
+                &["crate", "sql", "planner", "distributed"],
+                &[
+                    "DataPartition",
+                    "FragmentEdge",
+                    "FragmentEdgeKind",
+                    "FragmentStreamKind",
+                ],
+                false,
+            ),
+        ],
+        _ => return None,
+    };
+    entries.iter().find_map(|(prefix, symbols, allow_root)| {
+        let matches_prefix = canonical.len() >= prefix.len()
+            && canonical
+                .iter()
+                .zip(prefix.iter())
+                .all(|(actual, expected)| actual == expected);
+        matches_prefix.then(|| {
+            (canonical.len() == prefix.len() && *allow_root)
+                || canonical
+                    .get(prefix.len())
+                    .is_some_and(|symbol| symbols.contains(&symbol.as_str()))
+        })
+    })
 }
 
 fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> Vec<String> {
@@ -7874,14 +8127,19 @@ fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> V
                 .first()
                 .is_some_and(|root| local_roots.contains(root))
                 && !runtime_filter_path_is_rust_prelude(canonical)
-                && !runtime_filter_path_is_allowlisted(canonical, &allowed_prefixes)
+                && !runtime_filter_task4_exact_symbol_ledger(source_rel, canonical).unwrap_or_else(
+                    || runtime_filter_path_is_allowlisted(canonical, &allowed_prefixes),
+                )
         })
         .map(|canonical| format!("{source_rel}: {}", canonical.join("::")))
         .collect::<BTreeSet<_>>();
     violations.extend(
         runtime_filter_runtime_extern_crates(text)
             .into_iter()
-            .filter(|path| !runtime_filter_path_is_allowlisted(path, &allowed_prefixes))
+            .filter(|path| {
+                !runtime_filter_task4_exact_symbol_ledger(source_rel, path)
+                    .unwrap_or_else(|| runtime_filter_path_is_allowlisted(path, &allowed_prefixes))
+            })
             .map(|path| format!("{source_rel}: external {}", path.join("::"))),
     );
     let production_tokens = rust_use_tokens(&rust_sanitized_production_text(text));
@@ -9677,6 +9935,62 @@ fn runtime_filter_query_context_lock_discipline_violations(text: &str) -> Vec<St
 fn runtime_filter_action_dispatch_boundary_violations(producer: &str) -> Vec<String> {
     let production = rust_sanitized_production_text(producer);
     let mut violations = Vec::new();
+    #[derive(Default)]
+    struct FinishBindingAudit {
+        shadows_action: bool,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for FinishBindingAudit {
+        fn visit_local(&mut self, local: &'ast syn::Local) {
+            if runtime_filter_local_pattern_contains(local, "action") {
+                self.shadows_action = true;
+            }
+            syn::visit::visit_local(self, local);
+        }
+    }
+
+    let parsed = match syn::parse_file(&production) {
+        Ok(file) => file,
+        Err(production_error) => match syn::parse_file(producer) {
+            Ok(mut file) => {
+                file.items
+                    .retain(|item| !runtime_filter_syn_item_requires_test(item));
+                file
+            }
+            Err(raw_error) => {
+                return vec![format!(
+                    "Service producer production source must parse for action audit: sanitized={production_error}; raw={raw_error}"
+                )];
+            }
+        },
+    };
+    let mut finish_audits = Vec::new();
+    for item in &parsed.items {
+        match item {
+            syn::Item::Fn(function) if function.sig.ident == "finish" => {
+                let mut audit = FinishBindingAudit::default();
+                syn::visit::Visit::visit_block(&mut audit, &function.block);
+                finish_audits.push(audit);
+            }
+            syn::Item::Impl(item_impl) => {
+                for item in &item_impl.items {
+                    if let syn::ImplItem::Fn(method) = item
+                        && method.sig.ident == "finish"
+                    {
+                        let mut audit = FinishBindingAudit::default();
+                        syn::visit::Visit::visit_block(&mut audit, &method.block);
+                        finish_audits.push(audit);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if !matches!(finish_audits.as_slice(), [audit] if !audit.shadows_action) {
+        violations.push(
+            "Service producer finish must dispatch its input action without shadowing or rebinding"
+                .to_string(),
+        );
+    }
     let finish_tokens = runtime_filter_function_tokens(&production, "finish").unwrap_or_default();
     if runtime_filter_token_sequence(
         &finish_tokens,
@@ -9957,15 +10271,47 @@ fn runtime_filter_type_is_option_arc_artifact_bundle(ty: &syn::Type) -> bool {
         )
 }
 
+fn runtime_filter_syn_item_requires_test(item: &syn::Item) -> bool {
+    let attributes = match item {
+        syn::Item::Const(item) => &item.attrs,
+        syn::Item::Enum(item) => &item.attrs,
+        syn::Item::ExternCrate(item) => &item.attrs,
+        syn::Item::Fn(item) => &item.attrs,
+        syn::Item::ForeignMod(item) => &item.attrs,
+        syn::Item::Impl(item) => &item.attrs,
+        syn::Item::Macro(item) => &item.attrs,
+        syn::Item::Mod(item) => &item.attrs,
+        syn::Item::Static(item) => &item.attrs,
+        syn::Item::Struct(item) => &item.attrs,
+        syn::Item::Trait(item) => &item.attrs,
+        syn::Item::TraitAlias(item) => &item.attrs,
+        syn::Item::Type(item) => &item.attrs,
+        syn::Item::Union(item) => &item.attrs,
+        syn::Item::Use(item) => &item.attrs,
+        _ => return false,
+    };
+    attributes.iter().any(|attribute| {
+        attribute.path().is_ident("cfg")
+            && matches!(&attribute.meta, syn::Meta::List(list) if list.tokens.to_string().split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_').any(|token| token == "test"))
+    })
+}
+
 fn runtime_filter_subscription_artifact_surface_violations(text: &str) -> Vec<String> {
     let production = rust_sanitized_production_text(text);
-    let file = match syn::parse_file(&production).or_else(|_| syn::parse_file(text)) {
+    let file = match syn::parse_file(&production) {
         Ok(file) => file,
-        Err(error) => {
-            return vec![format!(
-                "artifact subscription production source must parse: {error}"
-            )];
-        }
+        Err(production_error) => match syn::parse_file(text) {
+            Ok(mut file) => {
+                file.items
+                    .retain(|item| !runtime_filter_syn_item_requires_test(item));
+                file
+            }
+            Err(raw_error) => {
+                return vec![format!(
+                    "artifact subscription production source must parse: sanitized={production_error}; raw={raw_error}"
+                )];
+            }
+        },
     };
     let mut violations = Vec::new();
     let local_roots = file
@@ -10600,6 +10946,132 @@ fn runtime_filter_materializer_semantic_violations(source_rel: &str, text: &str)
     violations
 }
 
+#[derive(Debug, Default)]
+struct RuntimeFilterManifestBodyAudit {
+    methods: BTreeSet<String>,
+    paths: BTreeSet<Vec<String>>,
+}
+
+impl RuntimeFilterManifestBodyAudit {
+    fn has_method(&self, method: &str) -> bool {
+        self.methods.contains(method)
+    }
+
+    fn has_path(&self, expected: &[&str]) -> bool {
+        self.paths.iter().any(|path| {
+            path.len() == expected.len()
+                && path
+                    .iter()
+                    .zip(expected)
+                    .all(|(actual, expected)| actual == expected)
+        })
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterManifestBodyAudit {
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        self.methods.insert(call.method.to_string());
+        syn::visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+        if path.qself.is_none() {
+            self.paths.insert(
+                path.path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect(),
+            );
+        }
+        syn::visit::visit_expr_path(self, path);
+    }
+
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        if path.leading_colon.is_none() {
+            self.paths.insert(
+                path.segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect(),
+            );
+        }
+        syn::visit::visit_path(self, path);
+    }
+
+    fn visit_macro(&mut self, item: &'ast syn::Macro) {
+        let tokens = rust_use_tokens(&item.tokens.to_string());
+        for window in tokens.windows(3) {
+            if window[0] == "." && window[2] == "(" {
+                self.methods.insert(window[1].clone());
+            }
+        }
+        syn::visit::visit_macro(self, item);
+    }
+}
+
+fn runtime_filter_manifest_function_audit(
+    file: &syn::File,
+    name: &str,
+) -> Option<RuntimeFilterManifestBodyAudit> {
+    let functions = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Fn(function) if function.sig.ident == name => Some(function),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [function] = functions.as_slice() else {
+        return None;
+    };
+    let mut audit = RuntimeFilterManifestBodyAudit::default();
+    syn::visit::Visit::visit_block(&mut audit, &function.block);
+    Some(audit)
+}
+
+fn runtime_filter_manifest_method_audit(
+    file: &syn::File,
+    owner: &str,
+    name: &str,
+) -> Option<RuntimeFilterManifestBodyAudit> {
+    let methods = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Impl(item_impl)
+                if item_impl.trait_.is_none()
+                    && matches!(item_impl.self_ty.as_ref(), syn::Type::Path(path) if path.path.segments.last().is_some_and(|segment| segment.ident == owner)) =>
+            {
+                Some(item_impl)
+            }
+            _ => None,
+        })
+        .flat_map(|item_impl| &item_impl.items)
+        .filter_map(|item| match item {
+            syn::ImplItem::Fn(method) if method.sig.ident == name => Some(method),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [method] = methods.as_slice() else {
+        return None;
+    };
+    let mut audit = RuntimeFilterManifestBodyAudit::default();
+    syn::visit::Visit::visit_block(&mut audit, &method.block);
+    Some(audit)
+}
+
+fn runtime_filter_manifest_body_has(
+    audit: Option<RuntimeFilterManifestBodyAudit>,
+    methods: &[&str],
+    paths: &[&[&str]],
+) -> bool {
+    audit.is_some_and(|audit| {
+        methods.iter().all(|method| audit.has_method(method))
+            && paths.iter().all(|path| audit.has_path(path))
+    })
+}
+
 fn runtime_filter_conformance_manifest_violations(
     service_root: &str,
     harness: &str,
@@ -10628,94 +11100,294 @@ fn runtime_filter_conformance_manifest_violations(
         violations.push("M4 conformance harness must sanitize to no production source".to_string());
     }
 
+    let file = match syn::parse_file(harness) {
+        Ok(file) => file,
+        Err(error) => {
+            violations.push(format!("M4 conformance harness must parse: {error}"));
+            return violations;
+        }
+    };
     let tokens = rust_use_tokens(&rust_lexically_sanitized(harness));
-    for test_name in [
-        "m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts",
-        "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
-        "m4_topk_summary_conformance_merges_incomplete_shards_only_after_allof",
-        "m4_aggregate_conformance_requires_frozen_allof_and_separates_empty_unavailable",
-    ] {
-        let expected = ["#", "[", "test", "]", "fn", test_name, "("];
-        let count = tokens
-            .windows(expected.len())
-            .filter(|window| {
-                window
-                    .iter()
-                    .zip(expected)
-                    .all(|(actual, expected)| actual == expected)
+
+    let stable_tests = [
+        (
+            "m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts",
+            &["producer", "submit_values", "close", "snapshot"][..],
+            &[
+                &["join_allof_harness"][..],
+                &["assert_membership_values"][..],
+                &["assert_fixture_remote_equivalent"][..],
+                &["join_anyof_harness"][..],
+                &["publish_membership"][..],
+            ][..],
+        ),
+        (
+            "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+            &["push", "poll_after", "published_versions"][..],
+            &[
+                &["topn_cases_with_fixed_seed"][..],
+                &["assert_fixed_seed_case_diversity"][..],
+                &["direct_topn_harness"][..],
+                &["TopNHeapAdapter", "new"][..],
+                &["assert_bound_is_sound_for_final_topn"][..],
+                &["assert_immutable_version_history"][..],
+            ][..],
+        ),
+        (
+            "m4_topk_summary_conformance_merges_incomplete_shards_only_after_allof",
+            &["submit_summary", "poll_after", "close_all"][..],
+            &[
+                &["topk_allof_harness"][..],
+                &["expect_live_update"][..],
+                &["assert_sound_topk_bound"][..],
+                &["assert_completed_without_new_unsound_version"][..],
+            ][..],
+        ),
+        (
+            "m4_aggregate_conformance_requires_frozen_allof_and_separates_empty_unavailable",
+            &[
+                "collecting_issuer",
+                "freeze",
+                "complete",
+                "close",
+                "snapshot",
+            ][..],
+            &[
+                &["aggregate_allof_harness"][..],
+                &["expect_collecting"][..],
+                &["expect_frozen"][..],
+                &["expect_live_completed"][..],
+                &["assert_explicit_empty_is_empty_domain"][..],
+                &["assert_resource_failure_is_unavailable"][..],
+            ][..],
+        ),
+    ];
+    for (test_name, methods, paths) in stable_tests {
+        let definitions = file
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                syn::Item::Fn(function) if function.sig.ident == test_name => Some(function),
+                _ => None,
             })
-            .count();
-        if count != 1 {
+            .collect::<Vec<_>>();
+        let exact_test = matches!(definitions.as_slice(), [function] if function.attrs.iter().any(|attribute| attribute.path().is_ident("test")));
+        let audit = runtime_filter_manifest_function_audit(&file, test_name);
+        let audit_debug = format!("{audit:?}");
+        if !exact_test || !runtime_filter_manifest_body_has(audit, methods, paths) {
             violations.push(format!(
-                "M4 conformance harness must define exactly one #[test] fn {test_name}"
+                "M4 conformance harness must define one substantive #[test] fn {test_name}: {audit_debug}"
             ));
         }
     }
 
-    for (label, expected) in [
+    for (label, audit, methods, paths) in [
         (
-            "deployment compiler",
-            &["compiler", "::", "compile", "("][..],
+            "compiler/install helper",
+            runtime_filter_manifest_function_audit(&file, "compile_install_view"),
+            &[][..],
+            &[&["compiler", "compile"][..]][..],
         ),
-        ("Service install", &[".", "install", "("][..]),
-        ("Service producer open", &[".", "open_producer", "("][..]),
-        ("Service subscription", &[".", "subscribe", "("][..]),
-        ("membership submit", &[".", "submit", "("][..]),
-        ("ordered submit", &[".", "submit_bound", "("][..]),
-        ("TopK submit", &[".", "submit_summary", "("][..]),
-        ("fenced-final complete", &[".", "complete", "("][..]),
-        ("producer completion", &[".", "close_partition", "("][..]),
+        (
+            "Service install helper",
+            runtime_filter_manifest_function_audit(&file, "install_service_with_memory"),
+            &["install"][..],
+            &[&["RuntimeFilterService", "new_with_dependencies"][..]][..],
+        ),
+        (
+            "Membership submit adapter",
+            runtime_filter_manifest_method_audit(&file, "MembershipProducer", "submit_values"),
+            &["submit"][..],
+            &[&["ProducerSequence", "new"][..]][..],
+        ),
+        (
+            "Membership close adapter",
+            runtime_filter_manifest_method_audit(&file, "MembershipProducer", "close"),
+            &["close_partition"][..],
+            &[&["ProducerSequence", "new"][..]][..],
+        ),
+        (
+            "Ordered TopN adapter",
+            runtime_filter_manifest_method_audit(&file, "TopNHeapAdapter", "push"),
+            &["submit_bound"][..],
+            &[&["ProducerSequence", "new"][..]][..],
+        ),
+        (
+            "TopK submit adapter",
+            runtime_filter_manifest_method_audit(&file, "TopKSummaryHarness", "submit_summary"),
+            &["submit_summary"][..],
+            &[&["ProducerSequence", "new"][..]][..],
+        ),
+        (
+            "TopK close adapter",
+            runtime_filter_manifest_method_audit(&file, "TopKSummaryHarness", "close_all"),
+            &["close_partition"][..],
+            &[][..],
+        ),
+        (
+            "Final-domain complete adapter",
+            runtime_filter_manifest_method_audit(&file, "AggregateHarness", "complete"),
+            &["complete"][..],
+            &[&["ProducerSequence", "new"][..]][..],
+        ),
+        (
+            "Final-domain close adapter",
+            runtime_filter_manifest_method_audit(&file, "AggregateHarness", "close"),
+            &["close_partition"][..],
+            &[&["ProducerSequence", "new"][..]][..],
+        ),
     ] {
-        if runtime_filter_token_sequence(&tokens, expected).is_none() {
+        let audit_debug = format!("{audit:?}");
+        if !runtime_filter_manifest_body_has(audit, methods, paths) {
             violations.push(format!(
-                "M4 conformance harness is missing {label} call surface"
+                "M4 conformance harness is missing substantive {label}: {audit_debug}"
             ));
         }
     }
 
-    for (label, expected) in [
+    for (label, function, methods, paths) in [
         (
-            "Membership producer handle",
-            &["ProducerHandle", "::", "Membership"][..],
+            "Membership public ports",
+            "join_harness",
+            &["open_producer", "subscribe"][..],
+            &[
+                &["ProducerHandle", "Membership"][..],
+                &["ProducerPortKind", "Membership"][..],
+            ][..],
         ),
         (
-            "OrderedBound producer handle",
-            &["ProducerHandle", "::", "OrderedBound"][..],
+            "OrderedBound public ports",
+            "direct_topn_harness",
+            &["open_producer", "subscribe"][..],
+            &[
+                &["ProducerHandle", "OrderedBound"][..],
+                &["ProducerPortKind", "OrderedBound"][..],
+            ][..],
         ),
         (
-            "TopKSummary producer handle",
-            &["ProducerHandle", "::", "TopKSummary"][..],
+            "TopKSummary public ports",
+            "topk_allof_harness",
+            &["subscribe"][..],
+            &[][..],
         ),
         (
-            "FinalDomain producer handle",
-            &["ProducerHandle", "::", "FinalDomain"][..],
-        ),
-        (
-            "Membership producer kind",
-            &["ProducerPortKind", "::", "Membership"][..],
-        ),
-        (
-            "OrderedBound producer kind",
-            &["ProducerPortKind", "::", "OrderedBound"][..],
-        ),
-        (
-            "TopKSummary producer kind",
-            &["ProducerPortKind", "::", "TopKSummary"][..],
-        ),
-        (
-            "FinalDomain producer kind",
-            &["ProducerPortKind", "::", "FinalDomain"][..],
+            "FinalDomain public ports",
+            "aggregate_harness_with_memory",
+            &["open_producer", "subscribe"][..],
+            &[
+                &["ProducerHandle", "FinalDomain"][..],
+                &["ProducerPortKind", "FinalDomain"][..],
+            ][..],
         ),
     ] {
-        if runtime_filter_token_sequence(&tokens, expected).is_none() {
-            violations.push(format!("M4 conformance harness is missing typed {label}"));
+        if !runtime_filter_manifest_body_has(
+            runtime_filter_manifest_function_audit(&file, function),
+            methods,
+            paths,
+        ) {
+            violations.push(format!("M4 conformance harness is missing {label}"));
         }
     }
-    for surface in ["ProducerSequence", "LogicalVersion", "ArtifactBundle"] {
-        if !tokens.iter().any(|token| token == surface) {
+    for (label, owner, paths) in [
+        (
+            "Membership typed producer",
+            "MembershipHarness",
+            &[
+                &["ProducerHandle", "Membership"][..],
+                &["ProducerPortKind", "Membership"][..],
+            ][..],
+        ),
+        (
+            "TopKSummary typed producer",
+            "TopKSummaryHarness",
+            &[
+                &["ProducerHandle", "TopKSummary"][..],
+                &["ProducerPortKind", "TopKSummary"][..],
+            ][..],
+        ),
+    ] {
+        if !runtime_filter_manifest_body_has(
+            runtime_filter_manifest_method_audit(&file, owner, "producer"),
+            &["open_producer"],
+            paths,
+        ) {
+            violations.push(format!("M4 conformance harness is missing {label}"));
+        }
+    }
+
+    let canonical = rust_all_source_canonical_paths(
+        harness,
+        "src/runtime_filter/service/m4_conformance_tests.rs",
+    );
+    for required in [
+        &["crate", "runtime_filter", "deployment", "compiler"][..],
+        &[
+            "crate",
+            "runtime_filter",
+            "port",
+            "artifact",
+            "ArtifactBundle",
+        ][..],
+        &[
+            "crate",
+            "runtime_filter",
+            "port",
+            "identity",
+            "LogicalVersion",
+        ][..],
+        &[
+            "crate",
+            "runtime_filter",
+            "port",
+            "identity",
+            "ProducerSequence",
+        ][..],
+        &[
+            "crate",
+            "runtime_filter",
+            "port",
+            "producer",
+            "ProducerHandle",
+        ][..],
+        &[
+            "crate",
+            "runtime_filter",
+            "port",
+            "producer",
+            "ProducerPortKind",
+        ][..],
+    ] {
+        if !canonical
+            .iter()
+            .any(|path| runtime_filter_path_is_exactly_allowlisted(path, &[required]))
+        {
             violations.push(format!(
-                "M4 conformance harness is missing {surface} surface"
+                "M4 conformance harness must depend on canonical {}",
+                required.join("::")
             ));
+        }
+    }
+
+    let protected_names = [
+        "ArtifactBundle",
+        "LogicalVersion",
+        "ProducerHandle",
+        "ProducerPortKind",
+        "ProducerSequence",
+    ];
+    for item in &file.items {
+        let local = match item {
+            syn::Item::Enum(item) => Some(item.ident.to_string()),
+            syn::Item::Struct(item) => Some(item.ident.to_string()),
+            syn::Item::Trait(item) => Some(item.ident.to_string()),
+            syn::Item::Type(item) => Some(item.ident.to_string()),
+            syn::Item::Union(item) => Some(item.ident.to_string()),
+            _ => None,
+        };
+        if local.is_some_and(|name| protected_names.contains(&name.as_str())) {
+            violations.push(
+                "M4 conformance harness must not shadow canonical contract types".to_string(),
+            );
         }
     }
 
@@ -10799,12 +11471,26 @@ fn runtime_filter_conformance_manifest_rejects_missing_or_fake_surfaces() {
         ".install(",
         ".open_producer(",
         ".subscribe(",
+        ".submit(",
         ".submit_bound(",
         ".submit_summary(",
         ".complete(",
+        ".close_partition(",
+        "ProducerHandle::Membership",
+        "ProducerHandle::OrderedBound",
+        "ProducerHandle::TopKSummary",
+        "ProducerHandle::FinalDomain",
+        "ProducerPortKind::Membership",
+        "ProducerPortKind::OrderedBound",
+        "ProducerPortKind::TopKSummary",
+        "ProducerPortKind::FinalDomain",
         "ProducerSequence",
         "LogicalVersion",
         "ArtifactBundle",
+        "m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts",
+        "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+        "m4_topk_summary_conformance_merges_incomplete_shards_only_after_allof",
+        "m4_aggregate_conformance_requires_frozen_allof_and_separates_empty_unavailable",
     ] {
         let invalid = harness.replace(missing, "removed_surface");
         assert!(
@@ -10812,6 +11498,65 @@ fn runtime_filter_conformance_manifest_rejects_missing_or_fake_surfaces() {
             "manifest detector must reject missing {missing}"
         );
     }
+
+    let relocated = harness.replace(
+        "fn m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts()",
+        "fn decoy_m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts()",
+    ) + "\n#[test]\nfn m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts() {}\n";
+    assert!(
+        !runtime_filter_conformance_manifest_violations(valid_root, &relocated).is_empty(),
+        "stable test names must not be relocated onto empty decoys"
+    );
+
+    let centralized_decoy = r#"
+fn centralized_decoy() {
+    compiler::compile();
+    service.install();
+    service.open_producer();
+    service.subscribe();
+    producer.submit();
+    producer.submit_bound();
+    producer.submit_summary();
+    producer.complete();
+    producer.close_partition();
+    let _ = ProducerHandle::Membership;
+    let _ = ProducerHandle::OrderedBound;
+    let _ = ProducerHandle::TopKSummary;
+    let _ = ProducerHandle::FinalDomain;
+    let _ = ProducerPortKind::Membership;
+    let _ = ProducerPortKind::OrderedBound;
+    let _ = ProducerPortKind::TopKSummary;
+    let _ = ProducerPortKind::FinalDomain;
+    let _: ProducerSequence;
+    let _: LogicalVersion;
+    let _: ArtifactBundle;
+}
+#[test]
+fn m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts() {}
+#[test]
+fn m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds() {}
+#[test]
+fn m4_topk_summary_conformance_merges_incomplete_shards_only_after_allof() {}
+#[test]
+fn m4_aggregate_conformance_requires_frozen_allof_and_separates_empty_unavailable() {}
+"#;
+    assert!(
+        !runtime_filter_conformance_manifest_violations(valid_root, centralized_decoy).is_empty(),
+        "centralized token decoys must not satisfy the per-test manifest"
+    );
+
+    let shadowed = format!(
+        "{harness}\n\
+         enum ProducerHandle {{ Membership(()), OrderedBound(()), TopKSummary(()), FinalDomain(()) }}\n\
+         enum ProducerPortKind {{ Membership, OrderedBound, TopKSummary, FinalDomain }}\n\
+         struct ProducerSequence;\n\
+         struct LogicalVersion;\n\
+         struct ArtifactBundle;\n"
+    );
+    assert!(
+        !runtime_filter_conformance_manifest_violations(valid_root, &shadowed).is_empty(),
+        "local contract-type shadows must not satisfy the canonical manifest"
+    );
     assert!(
         !runtime_filter_conformance_manifest_violations("mod m4_conformance_tests;", &harness)
             .is_empty(),
@@ -11066,6 +11811,14 @@ fn runtime_filter_model_dependency_allowlist_rejects_forbidden_synthetic_imports
         "contract vocabulary may use NonZeroU32 to make zero-valued requirements unrepresentable"
     );
     assert!(
+        !runtime_filter_model_dependency_violations(
+            source_rel,
+            "fn unused() { let _ = std::num::NonZeroU32::MIN; }",
+        )
+        .is_empty(),
+        "model contract must allow NonZeroU32/new only, not arbitrary associated surfaces"
+    );
+    assert!(
         runtime_filter_model_dependency_violations(
             source_rel,
             "mod arrow {} use ::arrow::datatypes::DataType;"
@@ -11081,6 +11834,41 @@ fn runtime_filter_model_dependency_allowlist_rejects_forbidden_synthetic_imports
         assert!(
             runtime_filter_model_dependency_violations(source_rel, source).is_empty(),
             "file-top-level local type/module path must remain allowed: {source}"
+        );
+    }
+}
+
+#[test]
+fn runtime_filter_task4_exact_dependency_ledger_rejects_unused_children() {
+    for (source_rel, source) in [
+        (
+            "src/runtime_filter/materializer/range.rs",
+            "use crate::runtime_filter::port::support::ArtifactRetainedLease;",
+        ),
+        (
+            "src/runtime_filter/port/artifact.rs",
+            "use crate::runtime_filter::port::ordered_bound::FutureOrderedSurface;",
+        ),
+        (
+            "src/runtime_filter/service/m4_conformance_tests.rs",
+            "use crate::coordinator::scheduler::FragmentScheduler;",
+        ),
+        (
+            "src/runtime_filter/service/m4_conformance_tests.rs",
+            "use crate::runtime_filter::model::graph::FutureGraphFixture;",
+        ),
+        (
+            "src/runtime_filter/service/m4_conformance_tests.rs",
+            "use crate::runtime_filter::port::artifact::FutureArtifactSurface;",
+        ),
+        (
+            "src/runtime_filter/service/m4_conformance_tests.rs",
+            "use crate::sql::analysis::FutureAnalysisSurface;",
+        ),
+    ] {
+        assert!(
+            !runtime_filter_runtime_boundary_violations(source_rel, source).is_empty(),
+            "Task 4 exact dependency ledger must reject {source_rel}: {source}"
         );
     }
 }
@@ -11362,6 +12150,31 @@ trait BlockingSnapshotSubscription {
             "subscription surface must reject logical/shadow decoy:\n{bad}"
         );
     }
+
+    let cfg_test_only = r#"
+use std::sync::Arc;
+use crate::runtime_filter::port::artifact::ArtifactBundle;
+#[cfg(test)]
+enum ArtifactAcquireOutcome { Published(Arc<ArtifactBundle>) }
+#[cfg(test)]
+enum ArtifactDeliveryOutcome { Published(Arc<ArtifactBundle>) }
+#[cfg(test)]
+trait BlockingSnapshotSubscription {
+    fn snapshot(&self) -> Option<Arc<ArtifactBundle>>;
+}
+fn force_sanitizer_failure() {
+    let _value = 1 + #[cfg(test)] 2;
+}
+"#;
+    assert!(
+        syn::parse_file(cfg_test_only).is_ok()
+            && syn::parse_file(&rust_sanitized_production_text(cfg_test_only)).is_err(),
+        "fixture must exercise the sanitizer parse-failure fallback"
+    );
+    assert!(
+        !runtime_filter_subscription_artifact_surface_violations(cfg_test_only).is_empty(),
+        "cfg(test)-only contract items must not satisfy the production subscription surface"
+    );
 
     const GOOD_ROUTER: &str = r#"
 use crate::runtime_filter::port::subscription::ArtifactDeliveryOutcome;
@@ -11909,6 +12722,10 @@ fn fail(&self) { self.channel.fail_instance().map(|action| self.finish(action));
         good.replace(
             "self.dispatcher.dispatch(self.channel_id, action);",
             "self.dispatcher.flush();",
+        ),
+        good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "let action = crate::runtime_filter::core::channel::ChannelAction::None; self.dispatcher.dispatch(self.channel_id, action);",
         ),
         good.replace(
             "self.channel.submit().map(|action| self.finish(action))",
