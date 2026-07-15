@@ -1461,16 +1461,23 @@ fn legacy_ebd_3b_references(text: &str, source_rel: &str) -> BTreeSet<String> {
     references
 }
 
-fn engine_root_query_options_forwarding_surfaces(text: &str) -> BTreeSet<String> {
-    let source = GuardSource::new("src/engine/mod.rs", &rust_all_source_text(text));
-    let mut snapshot = EngineBoundarySnapshot::default();
-    collect_source_dependencies(&mut snapshot, &source);
-    snapshot
-        .forwarding_reexports
+fn engine_root_query_options_export_surfaces(text: &str) -> BTreeSet<String> {
+    rust_raw_production_use_statements(&rust_all_source_text(text))
         .into_iter()
-        .filter(|export| {
-            let fields = export.split('|').collect::<Vec<_>>();
-            fields.get(1) == Some(&"crate::engine") && fields.get(3) == Some(&"query_options")
+        .filter(|import| import.inline_modules.is_empty() && import.visibility != "private")
+        .filter_map(|import| {
+            let export_name = match import.path.alias.as_deref() {
+                Some("_") => None,
+                Some(alias) => Some(alias),
+                None => import.path.segments.last().map(String::as_str),
+            }?;
+            (export_name == "query_options").then(|| {
+                format!(
+                    "{}|{}|query_options",
+                    import.visibility,
+                    import.path.segments.join("::")
+                )
+            })
         })
         .collect()
 }
@@ -1493,6 +1500,18 @@ fn has_top_level_production_struct(text: &str, name: &str) -> bool {
         }
     }
     false
+}
+
+fn additional_query_options_owner_paths<'a>(
+    sources: impl IntoIterator<Item = &'a GuardSource>,
+    canonical_owner: &str,
+) -> BTreeSet<String> {
+    sources
+        .into_iter()
+        .filter(|source| source.path.starts_with("src/") && source.path != canonical_owner)
+        .filter(|source| has_top_level_production_struct(&source.text, "QueryOptions"))
+        .map(|source| source.path.clone())
+        .collect()
 }
 
 fn is_standalone_state_path(path: &[String]) -> bool {
@@ -2523,8 +2542,21 @@ fn ebd_3b_query_options_have_one_runtime_owner() {
     {
         violations.insert("old-module-still-declared: src/engine/mod.rs|query_options".to_string());
     }
-    for export in engine_root_query_options_forwarding_surfaces(&engine_root_text) {
+    for export in engine_root_query_options_export_surfaces(&engine_root_text) {
         violations.insert(format!("engine-query-options-surface-reexport: {export}"));
+    }
+
+    let src_sources = rs_files(&src)
+        .into_iter()
+        .map(|path| {
+            let source = rel(&path);
+            let text = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("failed to read {source}: {error}"));
+            GuardSource::new(&source, &text)
+        })
+        .collect::<Vec<_>>();
+    for duplicate_owner in additional_query_options_owner_paths(&src_sources, RUNTIME_OWNER) {
+        violations.insert(format!("duplicate-query-options-owner: {duplicate_owner}"));
     }
 
     for root in [&src, &repo.join("tests")] {
@@ -2641,7 +2673,7 @@ pub(crate) use crate::runtime::query_options as query_options;
         test_only_direct_reverse,
         test_only_reverse,
     ] {
-        let surfaces = engine_root_query_options_forwarding_surfaces(source);
+        let surfaces = engine_root_query_options_export_surfaces(source);
         assert_eq!(
             surfaces.len(),
             1,
@@ -2656,8 +2688,20 @@ mod nested {
 }
 "#;
     assert!(
-        engine_root_query_options_forwarding_surfaces(unrelated).is_empty(),
+        engine_root_query_options_export_surfaces(unrelated).is_empty(),
         "a type export or nested namespace must not reconstruct crate::engine::query_options"
+    );
+
+    let transitive_reverse = r#"
+mod bridge {
+    pub(crate) use crate::runtime::query_options as query_options;
+}
+pub(crate) use bridge::query_options;
+"#;
+    assert_eq!(
+        engine_root_query_options_export_surfaces(transitive_reverse),
+        BTreeSet::from(["pub(crate)|bridge::query_options|query_options".to_string()]),
+        "the root local export name must reject a transitive query_options surface"
     );
 }
 
@@ -2687,6 +2731,28 @@ fn ebd_3b_runtime_owner_requires_top_level_production_struct() {
         )
         .is_empty(),
         "unrelated same-name test structs are not legacy EBD-3B references"
+    );
+
+    let sources = [
+        GuardSource::new(
+            "src/runtime/query_options.rs",
+            "pub(crate) struct QueryOptions {}",
+        ),
+        GuardSource::new("src/other.rs", "pub(crate) struct QueryOptions {}"),
+        GuardSource::new(
+            "src/nested.rs",
+            "mod nested { pub(crate) struct QueryOptions {} }",
+        ),
+        GuardSource::new(
+            "src/test_only.rs",
+            "#[cfg(test)] pub(crate) struct QueryOptions;",
+        ),
+        GuardSource::new("tests/fixture.rs", "pub(crate) struct QueryOptions {}"),
+    ];
+    assert_eq!(
+        additional_query_options_owner_paths(&sources, "src/runtime/query_options.rs"),
+        BTreeSet::from(["src/other.rs".to_string()]),
+        "only a second top-level production owner under src must be rejected"
     );
 }
 
