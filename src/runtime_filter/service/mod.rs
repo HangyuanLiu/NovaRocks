@@ -22,6 +22,8 @@ mod producer;
 // deployment-compiler tests can reach `registry::validate_view_for_test`
 // (see registry.rs) to prove compiler output satisfies the BE install
 // contract. Item-level privacy inside `registry.rs` is unaffected.
+#[cfg(test)]
+mod m3a_tests;
 pub(crate) mod registry;
 mod subscription;
 
@@ -32,23 +34,27 @@ use std::time::Instant;
 
 use crate::common::types::UniqueId;
 use crate::runtime_filter::core::channel::ChannelAction;
-use crate::runtime_filter::model::contract::{BindingId, ChannelId};
+use crate::runtime_filter::model::contract::{BindingId, ChannelId, ConsumerActivation};
 use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
 use crate::runtime_filter::port::install::RuntimeFilterInstallView;
 use crate::runtime_filter::port::producer::{
-    InstallContractError, InstallOutcome, ProducerAdapter, RuntimeContractViolation,
+    InstallContractError, InstallOutcome, OrderedBoundProducerAdapter, ProducerAdapter,
+    ProducerHandle, ProducerHandleWeak, ProducerPortKind, RuntimeContractViolation,
     RuntimeContractViolationKind,
 };
 use crate::runtime_filter::port::subscription::{
-    ArtifactDeliveryOutcome, BlockingSnapshotSubscription,
+    ArtifactDeliveryOutcome, LiveTerminal, SubscriptionHandle, SubscriptionKind,
 };
 use crate::runtime_filter::port::support::{RuntimeFilterClock, RuntimeFilterMemoryAccount};
 
+#[cfg(test)]
+use self::materialization::run_materialization_jobs;
 use self::materialization::{
-    MaterializationWorkClaim, PublishCommitOutcome, run_materialization_jobs,
+    ClaimedMaterializationJob, MaterializationWorkClaim, PublishCommitOutcome,
+    claim_materialization_jobs, execute_materialization_jobs, take_materialization_launch_events,
 };
 use self::producer::ServiceProducerAdapter;
-use self::registry::DeploymentRegistry;
+use self::registry::{DeploymentRegistry, InstalledDeployment};
 
 struct EventQueueState {
     draining: bool,
@@ -220,34 +226,6 @@ impl EventEmitter {
         Some(EventBatchHandle { id, completion })
     }
 
-    fn merge_into_reserved(
-        &self,
-        target: Option<&EventBatchHandle>,
-        source: Option<EventBatchHandle>,
-    ) -> Option<EventBatchHandle> {
-        let Some(target) = target else { return source };
-        let Some(source) = source else { return None };
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let source_index = state
-            .batches
-            .iter()
-            .position(|batch| batch.id == source.id)
-            .expect("artifact event batch remains reserved");
-        let mut source_batch = state
-            .batches
-            .remove(source_index)
-            .expect("artifact event batch index is valid");
-        let target_batch = state
-            .batches
-            .iter_mut()
-            .find(|batch| batch.id == target.id)
-            .expect("core event batch remains reserved");
-        target_batch.events.append(&mut source_batch.events);
-        drop(state);
-        source_batch.completion.complete();
-        None
-    }
-
     fn publish(&self, batch: Option<EventBatchHandle>) {
         let Some(batch) = batch else {
             return;
@@ -370,6 +348,10 @@ struct ActionDispatcher {
     #[cfg(test)]
     after_claim: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
+    before_materialization_admission: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    after_materialization_gate_claim: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
     before_encode: Mutex<
         Option<Arc<dyn Fn(crate::runtime_filter::port::artifact::ConsumerProfileId) + Send + Sync>>,
     >,
@@ -387,6 +369,9 @@ struct ActionDispatcher {
 struct ChannelDispatchState {
     next_order: u64,
     draining: bool,
+    // Blocks a later cancel core from entering the event FIFO until this action's
+    // owner launch prefix has either been reserved or proven unnecessary.
+    launch_prefix_pending: bool,
     active_completion: Option<Arc<EventBatchCompletion>>,
     pending: BTreeMap<u64, PendingDispatch>,
     completed_errors: BTreeMap<u64, RuntimeContractViolation>,
@@ -398,12 +383,27 @@ struct PendingDispatch {
     action: ChannelAction,
     core_batch: Option<EventBatchHandle>,
     completion: Arc<EventBatchCompletion>,
+    needs_drainer: bool,
 }
 
 #[derive(Default)]
 struct ChannelDispatchFlight {
     state: Mutex<ChannelDispatchState>,
     changed: Condvar,
+}
+
+struct ClaimedActionMaterialization {
+    installed: Arc<InstalledDeployment>,
+    snapshot: Arc<crate::runtime_filter::port::value_domain::LogicalSnapshot>,
+    jobs: Vec<ClaimedMaterializationJob>,
+    launch_batch: Option<EventBatchHandle>,
+}
+
+fn action_needs_materialization_launch_prefix(action: &ChannelAction) -> bool {
+    matches!(
+        action,
+        ChannelAction::VisibleSnapshot { .. } | ChannelAction::Completed { .. }
+    )
 }
 
 impl ActionDispatcher {
@@ -441,6 +441,7 @@ impl ActionDispatcher {
         if order == state.next_order && !state.reserved_core.contains_key(&order) {
             if let Some(batch) = self.events.reserve_unready(action.events().iter().cloned()) {
                 state.reserved_core.insert(order, batch);
+                state.launch_prefix_pending = action_needs_materialization_launch_prefix(action);
             }
         }
     }
@@ -504,11 +505,6 @@ impl ActionDispatcher {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             if order < state.next_order {
-                let result = state
-                    .completed_errors
-                    .get(&order)
-                    .cloned()
-                    .map_or(Ok(()), Err);
                 let completion = state
                     .publishing_completions
                     .get(&order)
@@ -518,6 +514,14 @@ impl ActionDispatcher {
                 if wait && !self.events.is_draining_on_current_thread() {
                     completion.wait();
                 }
+                let result = flight
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .completed_errors
+                    .get(&order)
+                    .cloned()
+                    .map_or(Ok(()), Err);
                 return (result, completion);
             }
             if state.draining && order == state.next_order {
@@ -540,6 +544,7 @@ impl ActionDispatcher {
                 let predecessor_reserved =
                     state.draining || state.reserved_core.contains_key(&state.next_order);
                 let reserve_contiguous_cancel = predecessor_reserved
+                    && !state.launch_prefix_pending
                     && order == state.next_order.saturating_add(1)
                     && matches!(&action, ChannelAction::Cancelled { .. });
                 let previously_reserved = state.reserved_core.remove(&order);
@@ -558,9 +563,13 @@ impl ActionDispatcher {
                             action,
                             core_batch,
                             completion,
+                            needs_drainer: !wait,
                         });
                     }
-                    std::collections::btree_map::Entry::Occupied(entry) => {
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        if wait {
+                            entry.get_mut().needs_drainer = false;
+                        }
                         caller_completion = Some(entry.get().completion.clone());
                     }
                 }
@@ -581,119 +590,207 @@ impl ActionDispatcher {
             }
             let next_order = state.next_order;
             let PendingDispatch {
-                mut action,
+                action,
                 core_batch: reserved_core_batch,
-                completion: mut action_completion,
+                completion: action_completion,
+                ..
             } = state
                 .pending
                 .remove(&next_order)
                 .expect("next ordered runtime filter action is pending");
-            let mut core_batch = reserved_core_batch
+            let core_batch = reserved_core_batch
                 .or_else(|| self.events.reserve_unready(action.events().iter().cloned()));
             state.draining = true;
+            state.launch_prefix_pending = action_needs_materialization_launch_prefix(&action);
             state.active_completion = Some(action_completion.clone());
             drop(state);
-            let mut caller_result = None;
             let caller_completion = caller_completion.unwrap_or_else(|| action_completion.clone());
-            loop {
-                #[cfg(test)]
-                if let Some(hook) = self
-                    .after_claim
+            let result = self.process_claimed_action(
+                channel_id,
+                flight.clone(),
+                action,
+                core_batch,
+                action_completion,
+            );
+            self.drain_ready_nonblocking(channel_id, flight);
+            return (result, caller_completion);
+        }
+    }
+
+    fn drain_ready_nonblocking(&self, channel_id: ChannelId, flight: Arc<ChannelDispatchFlight>) {
+        loop {
+            let mut state = flight
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if state.draining {
+                return;
+            }
+            let next_order = state.next_order;
+            if !state
+                .pending
+                .get(&next_order)
+                .is_some_and(|pending| pending.needs_drainer)
+            {
+                return;
+            }
+            let PendingDispatch {
+                action,
+                core_batch,
+                completion,
+                ..
+            } = state
+                .pending
+                .remove(&next_order)
+                .expect("ready nonblocking dispatch remains pending");
+            let core_batch =
+                core_batch.or_else(|| self.events.reserve_unready(action.events().iter().cloned()));
+            state.draining = true;
+            state.launch_prefix_pending = action_needs_materialization_launch_prefix(&action);
+            state.active_completion = Some(completion.clone());
+            drop(state);
+            let _ = self.process_claimed_action(
+                channel_id,
+                flight.clone(),
+                action,
+                core_batch,
+                completion,
+            );
+        }
+    }
+
+    fn process_claimed_action(
+        &self,
+        channel_id: ChannelId,
+        flight: Arc<ChannelDispatchFlight>,
+        action: ChannelAction,
+        core_batch: Option<EventBatchHandle>,
+        action_completion: Arc<EventBatchCompletion>,
+    ) -> Result<(), RuntimeContractViolation> {
+        #[cfg(test)]
+        if let Some(hook) = self
+            .after_claim
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            hook();
+        }
+        let mut claimed = self.claim_action_materialization(channel_id, &action);
+        let launch_batch = claimed
+            .as_mut()
+            .and_then(|claimed| claimed.launch_batch.take());
+        let core_completion = core_batch.as_ref().map(|batch| batch.completion.clone());
+
+        let mut state = flight
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.launch_prefix_pending = false;
+        state.next_order = state
+            .next_order
+            .checked_add(1)
+            .expect("runtime filter dispatch order exhausted");
+        let completed_order = state.next_order - 1;
+        state.active_completion = None;
+        state.draining = false;
+        state
+            .publishing_completions
+            .insert(completed_order, action_completion.clone());
+        drop(state);
+        flight.changed.notify_all();
+
+        self.events.publish(core_batch);
+        self.events.publish(launch_batch);
+        #[cfg(test)]
+        let before_materialization_admission = claimed.is_some().then(|| {
+            self.before_materialization_admission
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+        });
+        #[cfg(test)]
+        if let Some(Some(hook)) = before_materialization_admission {
+            hook();
+        }
+        let (artifact_batch, error) = self.route_and_prequeue(channel_id, &action, claimed);
+        let result = error.map_or(Ok(()), Err);
+        if let Err(error) = &result {
+            flight
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .completed_errors
+                .insert(completed_order, error.clone());
+        }
+
+        let final_event_completion = artifact_batch
+            .as_ref()
+            .map(|batch| batch.completion.clone())
+            .or(core_completion);
+        if let Some(event_completion) = final_event_completion {
+            let flight = flight.clone();
+            let action_completion = action_completion.clone();
+            event_completion.on_complete(move || {
+                Self::finish_publishing_action(flight, completed_order, action_completion);
+            });
+        } else {
+            Self::finish_publishing_action(flight, completed_order, action_completion);
+        }
+        self.events.publish(artifact_batch);
+        result
+    }
+
+    fn claim_action_materialization(
+        &self,
+        channel_id: ChannelId,
+        action: &ChannelAction,
+    ) -> Option<ClaimedActionMaterialization> {
+        let snapshot = match action {
+            ChannelAction::VisibleSnapshot { snapshot, .. }
+            | ChannelAction::Completed { snapshot, .. } => snapshot.clone(),
+            _ => return None,
+        };
+        let installed = self.registry.installation_for_dispatch()?;
+        let plan = installed.artifact_plan(channel_id)?;
+        let mut jobs =
+            claim_materialization_jobs(plan, installed.publish_gate(), snapshot.version());
+        #[cfg(test)]
+        let after_materialization_gate_claim = jobs
+            .iter()
+            .any(|job| matches!(job, ClaimedMaterializationJob::Owner { .. }))
+            .then(|| {
+                self.after_materialization_gate_claim
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .take()
-                {
-                    hook();
-                }
-                let (artifact_batch, error) = self.route_and_prequeue(channel_id, &action);
-                let artifact_batch = self
-                    .events
-                    .merge_into_reserved(core_batch.as_ref(), artifact_batch);
-                let result = error.map_or(Ok(()), Err);
-                let mut state = flight
-                    .state
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                state.next_order = state
-                    .next_order
-                    .checked_add(1)
-                    .expect("runtime filter dispatch order exhausted");
-                let completed_order = state
-                    .next_order
-                    .checked_sub(1)
-                    .expect("completed runtime filter dispatch has an order");
-                state.active_completion = None;
-                state.draining = false;
-                state
-                    .publishing_completions
-                    .insert(completed_order, action_completion.clone());
-                if let Err(error) = &result {
-                    state
-                        .completed_errors
-                        .insert(completed_order, error.clone());
-                }
-                drop(state);
-
-                let final_event_completion = artifact_batch
-                    .as_ref()
-                    .or(core_batch.as_ref())
-                    .map(|batch| batch.completion.clone());
-                if let Some(event_completion) = final_event_completion {
-                    let flight = flight.clone();
-                    let action_completion = action_completion.clone();
-                    event_completion.on_complete(move || {
-                        Self::finish_publishing_action(flight, completed_order, action_completion);
-                    });
-                } else {
-                    Self::finish_publishing_action(
-                        flight.clone(),
-                        completed_order,
-                        action_completion.clone(),
-                    );
-                }
-
-                self.events.publish(core_batch);
-                self.events.publish(artifact_batch);
-
-                let mut state = flight
-                    .state
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                if completed_order == order {
-                    caller_result = Some(result);
-                }
-                if state.draining || !state.pending.contains_key(&state.next_order) {
-                    return (caller_result.unwrap_or(Ok(())), caller_completion);
-                }
-                let next_order = state.next_order;
-                let PendingDispatch {
-                    action: next_action,
-                    core_batch: reserved_core_batch,
-                    completion: next_completion,
-                } = state
-                    .pending
-                    .remove(&next_order)
-                    .expect("next ordered runtime filter action is pending");
-                let next_core_batch = reserved_core_batch.or_else(|| {
-                    self.events
-                        .reserve_unready(next_action.events().iter().cloned())
-                });
-                state.draining = true;
-                state.active_completion = Some(next_completion.clone());
-                drop(state);
-                action = next_action;
-                core_batch = next_core_batch;
-                action_completion = next_completion;
-            }
+            });
+        #[cfg(test)]
+        if let Some(Some(hook)) = after_materialization_gate_claim {
+            hook();
         }
+        let launch_batch = self
+            .events
+            .reserve_unready(take_materialization_launch_events(&mut jobs));
+        Some(ClaimedActionMaterialization {
+            installed,
+            snapshot,
+            jobs,
+            launch_batch,
+        })
     }
 
     fn route_and_prequeue(
         &self,
         channel_id: ChannelId,
         action: &ChannelAction,
+        claimed: Option<ClaimedActionMaterialization>,
     ) -> (Option<EventBatchHandle>, Option<RuntimeContractViolation>) {
-        let Some(installed) = self.registry.installation_for_dispatch() else {
+        let installed = claimed
+            .as_ref()
+            .map(|claimed| claimed.installed.clone())
+            .or_else(|| self.registry.installation_for_dispatch());
+        let Some(installed) = installed else {
             return (None, None);
         };
         let mut events = Vec::new();
@@ -701,13 +798,41 @@ impl ActionDispatcher {
         let mut error = None;
         match action {
             ChannelAction::None | ChannelAction::Progress { .. } => {}
-            ChannelAction::Completed { snapshot, .. } => {
+            ChannelAction::CompletedWithoutArtifact { .. } => {
+                if let Some(plan) = installed.artifact_plan(channel_id) {
+                    for group in plan.groups() {
+                        deliveries.push((
+                            group.route_edges().to_vec(),
+                            None,
+                            Some(LiveTerminal::CompletedWithoutArtifact),
+                        ));
+                    }
+                }
+            }
+            ChannelAction::DegradedLogical { reason, .. } => {
+                if let Some(plan) = installed.artifact_plan(channel_id) {
+                    for group in plan.groups() {
+                        deliveries.push((
+                            group.route_edges().to_vec(),
+                            None,
+                            Some(LiveTerminal::DegradedLogical(*reason)),
+                        ));
+                    }
+                }
+            }
+            ChannelAction::VisibleSnapshot { snapshot, .. }
+            | ChannelAction::Completed { snapshot, .. } => {
+                let terminal = matches!(action, ChannelAction::Completed { .. })
+                    .then_some(LiveTerminal::Completed);
+                let Some(claimed) = claimed else {
+                    return (None, None);
+                };
+                debug_assert!(Arc::ptr_eq(snapshot, &claimed.snapshot));
                 let Some(plan) = installed.artifact_plan(channel_id) else {
                     return (None, None);
                 };
-                for work in run_materialization_jobs(
+                for work in execute_materialization_jobs(
                     plan,
-                    installed.publish_gate(),
                     snapshot,
                     self.memory_account.clone(),
                     {
@@ -736,6 +861,7 @@ impl ActionDispatcher {
                             None
                         }
                     },
+                    claimed.jobs,
                 ) {
                     let identity =
                         crate::runtime_filter::port::events::ArtifactMaterializationIdentity::new(
@@ -744,10 +870,15 @@ impl ActionDispatcher {
                             snapshot.version(),
                         );
                     events.extend(work.events);
+                    if let Some(violation) = work.contract_violation {
+                        error.get_or_insert(violation);
+                        continue;
+                    }
                     let Some(outcome) = work.outcome else {
                         events.push(RuntimeFilterEvent::ArtifactPublishStaleSkipped { identity });
                         continue;
                     };
+                    let mut delivered_before_notify = false;
                     let decision = match work.claim {
                         MaterializationWorkClaim::Owner(owner) => {
                             #[cfg(test)]
@@ -759,7 +890,20 @@ impl ActionDispatcher {
                             {
                                 hook();
                             }
-                            match owner.finish(outcome.clone()) {
+                            let route_edges = work.group.route_edges().to_vec();
+                            match owner.finish_after_delivery(
+                                outcome.clone(),
+                                |decision, committed| {
+                                    if decision == PublishCommitOutcome::Published {
+                                        installed.router().route_live(
+                                            &route_edges,
+                                            Some(committed),
+                                            terminal,
+                                        );
+                                        delivered_before_notify = true;
+                                    }
+                                },
+                            ) {
                                 Ok(decision) => {
                                     #[cfg(test)]
                                     if let Some(hook) = self
@@ -781,7 +925,7 @@ impl ActionDispatcher {
                         MaterializationWorkClaim::Follower => PublishCommitOutcome::Idempotent,
                         MaterializationWorkClaim::Stale => PublishCommitOutcome::Stale,
                     };
-                    match decision {
+                    let delivery_outcome = match decision {
                         PublishCommitOutcome::Published => {
                             if let ArtifactDeliveryOutcome::Published(bundle) = &outcome {
                                 let (kind, _) = bundle
@@ -795,6 +939,7 @@ impl ActionDispatcher {
                                     digest: bundle.canonical_digest(),
                                 });
                             }
+                            Some(outcome)
                         }
                         PublishCommitOutcome::Stale => {
                             events
@@ -802,23 +947,32 @@ impl ActionDispatcher {
                             continue;
                         }
                         PublishCommitOutcome::Cancelled => continue,
-                        PublishCommitOutcome::Idempotent => continue,
-                    }
-                    for route_edge_id in work.group.route_edges() {
-                        if installed.router().contains_route(*route_edge_id) {
-                            events.extend(
-                                installed
-                                    .route_event_identities(*route_edge_id)
-                                    .iter()
-                                    .copied()
-                                    .map(|identity| RuntimeFilterEvent::LoopbackDelivered {
-                                        identity,
-                                        version: snapshot.version(),
-                                    }),
-                            );
+                        PublishCommitOutcome::Idempotent if terminal.is_none() => continue,
+                        PublishCommitOutcome::Idempotent => None,
+                    };
+                    if delivery_outcome.is_some() {
+                        for route_edge_id in work.group.route_edges() {
+                            if installed.router().contains_route(*route_edge_id) {
+                                events.extend(
+                                    installed
+                                        .route_event_identities(*route_edge_id)
+                                        .iter()
+                                        .copied()
+                                        .map(|identity| RuntimeFilterEvent::LoopbackDelivered {
+                                            identity,
+                                            version: snapshot.version(),
+                                        }),
+                                );
+                            }
                         }
                     }
-                    deliveries.push((work.group.route_edges().to_vec(), outcome));
+                    if !delivered_before_notify {
+                        deliveries.push((
+                            work.group.route_edges().to_vec(),
+                            delivery_outcome,
+                            terminal,
+                        ));
+                    }
                 }
             }
             ChannelAction::Unavailable { reason, .. } => {
@@ -826,7 +980,8 @@ impl ActionDispatcher {
                     for group in plan.groups() {
                         deliveries.push((
                             group.route_edges().to_vec(),
-                            ArtifactDeliveryOutcome::Unavailable(*reason),
+                            Some(ArtifactDeliveryOutcome::Unavailable(*reason)),
+                            Some(LiveTerminal::Unavailable(*reason)),
                         ));
                     }
                 }
@@ -836,8 +991,10 @@ impl ActionDispatcher {
             }
         }
         let batch = self.events.prequeue(events);
-        for (route_edges, outcome) in deliveries {
-            installed.router().route(&route_edges, &outcome);
+        for (route_edges, outcome, terminal) in deliveries {
+            installed
+                .router()
+                .route_live(&route_edges, outcome.as_ref(), terminal);
         }
         (batch, error)
     }
@@ -849,7 +1006,9 @@ pub(crate) struct RuntimeFilterService {
     memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
     registry: Arc<DeploymentRegistry>,
     dispatcher: Arc<ActionDispatcher>,
-    producer_handles: Mutex<BTreeMap<(BindingId, UniqueId), Weak<ServiceProducerAdapter>>>,
+    producer_handles: Mutex<BTreeMap<(BindingId, UniqueId), ProducerHandleWeak>>,
+    #[cfg(test)]
+    producer_test_handles: Mutex<BTreeMap<(BindingId, UniqueId), Weak<ServiceProducerAdapter>>>,
     operation: Mutex<()>,
 }
 
@@ -875,6 +1034,10 @@ impl RuntimeFilterService {
             #[cfg(test)]
             after_claim: Mutex::new(None),
             #[cfg(test)]
+            before_materialization_admission: Mutex::new(None),
+            #[cfg(test)]
+            after_materialization_gate_claim: Mutex::new(None),
+            #[cfg(test)]
             before_encode: Mutex::new(None),
             #[cfg(test)]
             after_encode: Mutex::new(None),
@@ -890,6 +1053,8 @@ impl RuntimeFilterService {
             registry,
             dispatcher,
             producer_handles: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            producer_test_handles: Mutex::new(BTreeMap::new()),
             operation: Mutex::new(()),
         }
     }
@@ -908,7 +1073,8 @@ impl RuntimeFilterService {
         binding_id: BindingId,
         fragment_instance_id: UniqueId,
         local_partition_count: u32,
-    ) -> Result<Arc<dyn ProducerAdapter>, RuntimeContractViolation> {
+        requested: ProducerPortKind,
+    ) -> Result<ProducerHandle, RuntimeContractViolation> {
         let _operation = self
             .operation
             .lock()
@@ -929,6 +1095,12 @@ impl RuntimeFilterService {
                 "producer fragment instance is not installed for this binding",
             ));
         }
+        if route.kind != requested {
+            return Err(violation(
+                RuntimeContractViolationKind::ProducerPortMismatch,
+                "requested producer port does not match the installed channel contract",
+            ));
+        }
         route
             .channel
             .open_producer(binding_id, fragment_instance_id, local_partition_count)?;
@@ -937,10 +1109,18 @@ impl RuntimeFilterService {
             .producer_handles
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if let Some(handle) = handles.get(&key).and_then(Weak::upgrade) {
-            return Ok(handle);
+        if let Some(cached) = handles.get(&key) {
+            if cached.kind() != requested {
+                return Err(violation(
+                    RuntimeContractViolationKind::ProducerPortMismatch,
+                    "cached producer port does not match the requested channel contract",
+                ));
+            }
+            if let Some(handle) = cached.upgrade() {
+                return Ok(handle);
+            }
         }
-        let handle = Arc::new(ServiceProducerAdapter::new(
+        let concrete = Arc::new(ServiceProducerAdapter::new(
             route.channel_id,
             route.channel.clone(),
             binding_id,
@@ -948,7 +1128,22 @@ impl RuntimeFilterService {
             self.memory_account.clone(),
             self.dispatcher.clone(),
         ));
-        handles.insert(key, Arc::downgrade(&handle));
+        #[cfg(test)]
+        self.producer_test_handles
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(key, Arc::downgrade(&concrete));
+        let handle = match requested {
+            ProducerPortKind::Membership => {
+                let membership: Arc<dyn ProducerAdapter> = concrete;
+                ProducerHandle::Membership(membership)
+            }
+            ProducerPortKind::OrderedBound => {
+                let ordered: Arc<dyn OrderedBoundProducerAdapter> = concrete;
+                ProducerHandle::OrderedBound(ordered)
+            }
+        };
+        handles.insert(key, handle.downgrade());
         Ok(handle)
     }
 
@@ -956,7 +1151,8 @@ impl RuntimeFilterService {
         &self,
         binding_id: BindingId,
         fragment_instance_id: UniqueId,
-    ) -> Result<Arc<dyn BlockingSnapshotSubscription>, RuntimeContractViolation> {
+        requested: SubscriptionKind,
+    ) -> Result<SubscriptionHandle, RuntimeContractViolation> {
         let _operation = self
             .operation
             .lock()
@@ -965,21 +1161,47 @@ impl RuntimeFilterService {
             .registry
             .active_installation()
             .ok_or_else(service_cancelled)?;
-        if !installed.has_consumer(binding_id) {
+        let Some(activation) = installed.consumer_activation(binding_id) else {
             return Err(violation(
                 RuntimeContractViolationKind::UnauthorizedBinding,
                 "consumer binding is not installed on this participant",
             ));
+        };
+        let installed_kind = match activation {
+            ConsumerActivation::BlockingSnapshot => SubscriptionKind::BlockingSnapshot,
+            ConsumerActivation::NonBlockingLive { .. } => SubscriptionKind::NonBlockingLive,
+        };
+        if installed_kind != requested {
+            return Err(violation(
+                RuntimeContractViolationKind::SubscriptionActivationMismatch,
+                "requested subscription kind does not match install-frozen consumer activation",
+            ));
         }
         installed
-            .subscription(binding_id, fragment_instance_id)
-            .map(|subscription| subscription as Arc<dyn BlockingSnapshotSubscription>)
+            .subscription(binding_id, fragment_instance_id, requested)
             .ok_or_else(|| {
                 violation(
                     RuntimeContractViolationKind::UnauthorizedFragmentInstance,
                     "consumer fragment instance is not installed for this binding",
                 )
             })
+    }
+
+    #[cfg(test)]
+    fn subscribe_blocking(
+        &self,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+    ) -> Result<
+        Arc<dyn crate::runtime_filter::port::subscription::BlockingSnapshotSubscription>,
+        RuntimeContractViolation,
+    > {
+        self.subscribe(
+            binding_id,
+            fragment_instance_id,
+            SubscriptionKind::BlockingSnapshot,
+        )?
+        .into_blocking()
     }
 
     pub(crate) fn expire_deadlines(&self, now: Instant) {
@@ -1035,7 +1257,7 @@ impl RuntimeFilterService {
         hook: Arc<dyn Fn() + Send + Sync>,
     ) {
         if let Some(handle) = self
-            .producer_handles
+            .producer_test_handles
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .get(&(binding_id, fragment_instance_id))
@@ -1050,6 +1272,24 @@ impl RuntimeFilterService {
         *self
             .dispatcher
             .after_claim
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn set_before_materialization_admission_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .dispatcher
+            .before_materialization_admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn set_after_materialization_gate_claim_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .dispatcher
+            .after_materialization_gate_claim
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(hook);
     }
@@ -1154,15 +1394,21 @@ mod tests {
     };
     use crate::runtime_filter::port::identity::*;
     use crate::runtime_filter::port::install::*;
+    use crate::runtime_filter::port::ordered_bound::{
+        COMPARATOR_ALGORITHM_VERSION, OrderedBoundUpdate, OrderedScalar, OrderedTuple,
+        RuntimeOrderContract, comparator_digest_for_test,
+    };
     use crate::runtime_filter::port::producer::{
-        InstallOutcome, ProducerAdapter, RuntimeContractViolationKind, SubmitOutcome,
+        InstallOutcome, ProducerAdapter, ProducerFailureReason, ProducerHandle, ProducerPortKind,
+        RuntimeContractViolationKind, SubmitOutcome,
     };
     use crate::runtime_filter::port::subscription::{
         ArtifactAcquireOutcome, ArtifactDelivery, ArtifactDeliveryOutcome,
-        BlockingSnapshotSubscription, UnavailableReason,
+        BlockingSnapshotSubscription, SubscriptionKind, UnavailableReason,
     };
     use crate::runtime_filter::port::support::{
         MemoryAccountError, RuntimeFilterClock, RuntimeFilterMemoryAccount,
+        TemporaryContributionLease,
     };
     use crate::runtime_filter::port::value_domain::{
         LogicalSnapshot, MembershipValues, ReducedMembershipDomain, ValueDomainDelta,
@@ -1349,6 +1595,27 @@ mod tests {
         current: AtomicUsize,
     }
 
+    #[derive(Default)]
+    struct ArmableRejectingMemoryAccount {
+        armed: AtomicBool,
+        current: AtomicUsize,
+    }
+
+    impl RuntimeFilterMemoryAccount for ArmableRejectingMemoryAccount {
+        fn try_consume(&self, bytes: usize) -> Result<(), MemoryAccountError> {
+            if self.armed.load(Ordering::SeqCst) {
+                return Err(MemoryAccountError::CapacityExceeded);
+            }
+            self.current.fetch_add(bytes, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn release(&self, bytes: usize) {
+            let previous = self.current.fetch_sub(bytes, Ordering::SeqCst);
+            assert!(previous >= bytes);
+        }
+    }
+
     impl RuntimeFilterMemoryAccount for PanicWhenArmedMemoryAccount {
         fn try_consume(&self, bytes: usize) -> Result<(), MemoryAccountError> {
             assert!(
@@ -1447,7 +1714,7 @@ mod tests {
                 .expect("service installed before clock use");
             assert_eq!(
                 service
-                    .subscribe(BindingId::new(30), uid(30))
+                    .subscribe_blocking(BindingId::new(30), uid(30))
                     .err()
                     .expect("service must remain unavailable during installation")
                     .kind(),
@@ -1469,9 +1736,9 @@ mod tests {
         producer_instances: impl IntoIterator<Item = i64>,
         consumer_instances: impl IntoIterator<Item = i64>,
         deadline_ms: u64,
-    ) -> CompleteOnceChannelDeployment {
+    ) -> RuntimeFilterChannelDeployment {
         let witness = CoverageWitnessId::new(channel_id + 100);
-        CompleteOnceChannelDeployment::new(
+        RuntimeFilterChannelDeployment::new(
             ChannelId::new(channel_id),
             RuntimeFilterLogicalDomain::Membership {
                 value_type: DataType::Int64,
@@ -1511,7 +1778,7 @@ mod tests {
     }
 
     fn view(
-        channels: impl IntoIterator<Item = CompleteOnceChannelDeployment>,
+        channels: impl IntoIterator<Item = RuntimeFilterChannelDeployment>,
     ) -> RuntimeFilterInstallView {
         RuntimeFilterInstallView::new(
             DeploymentEpoch::new(9),
@@ -1525,7 +1792,7 @@ mod tests {
 
     fn deployment_with_profiles(
         consumers: impl IntoIterator<Item = (u32, u32, i64, ConsumerArtifactProfile)>,
-    ) -> CompleteOnceChannelDeployment {
+    ) -> RuntimeFilterChannelDeployment {
         let consumers = consumers.into_iter().collect::<Vec<_>>();
         let max_concurrent_jobs = consumers
             .iter()
@@ -1538,7 +1805,7 @@ mod tests {
     fn deployment_with_profiles_and_concurrency(
         consumers: impl IntoIterator<Item = (u32, u32, i64, ConsumerArtifactProfile)>,
         max_concurrent_jobs: usize,
-    ) -> CompleteOnceChannelDeployment {
+    ) -> RuntimeFilterChannelDeployment {
         let base = deployment(1, 10, 30, 40, [10], [30], 100);
         let consumers = consumers
             .into_iter()
@@ -1558,7 +1825,7 @@ mod tests {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        CompleteOnceChannelDeployment::new(
+        RuntimeFilterChannelDeployment::new(
             base.channel_id(),
             base.logical_domain().clone(),
             base.lifecycle(),
@@ -1609,6 +1876,716 @@ mod tests {
         }
     }
 
+    pub(super) fn installed_ordered_service_fixture() -> Arc<RuntimeFilterService> {
+        installed_ordered_service_with_account(MemTrackerMemoryAccount::new_root_for_test(
+            "ordered-runtime-filter-test-query",
+        ))
+        .0
+    }
+
+    pub(super) fn installed_ordered_service_with_account(
+        memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
+    ) -> (Arc<RuntimeFilterService>, Arc<RuntimeOrderContract>) {
+        installed_ordered_service_with_account_and_events(
+            memory_account,
+            Arc::new(Events::default()),
+        )
+    }
+
+    fn installed_ordered_service_with_account_and_events(
+        memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
+        events: Arc<Events>,
+    ) -> (Arc<RuntimeFilterService>, Arc<RuntimeOrderContract>) {
+        let started = Instant::now();
+        let service = Arc::new(RuntimeFilterService::new_with_dependencies(
+            uid(0),
+            Arc::new(Clock(started)),
+            events,
+            memory_account,
+        ));
+        let keys = vec![OrderKeyContract {
+            data_type: DataType::Int64,
+            direction: SortDirection::Ascending,
+            null_order: NullOrder::Last,
+        }];
+        let plan = OrderContract {
+            comparator_digest: comparator_digest_for_test(&keys, COMPARATOR_ALGORITHM_VERSION),
+            keys,
+            inclusive: true,
+        };
+        let contract = Arc::new(RuntimeOrderContract::try_from_plan(&plan).unwrap());
+        let order_digest = contract.digest();
+        let witness = CoverageWitnessId::new(1);
+        let channel = RuntimeFilterChannelDeployment::new(
+            ChannelId::new(1),
+            RuntimeFilterLogicalDomain::OrderedBound(plan),
+            RuntimeFilterLifecycle::MonotonicUpdates,
+            Coverage::Leaf(witness),
+            Coverage::Leaf(witness),
+            ReductionRequirement::TightenOrderedBound,
+            BTreeSet::from([
+                ContributionKind::OrderedBoundUpdate,
+                ContributionKind::ProducerClosed,
+            ]),
+            CompletionRequirement::ProducerClosed,
+            RuntimeFilterPolicyRequirement {
+                max_contribution_bytes: 1024,
+                max_artifact_bytes: 1024,
+                deadline_ms: 100,
+                max_retries: 0,
+            },
+            RuntimeFilterCoreBudget::new(4096),
+            MaterializationPolicy::for_test(),
+            BTreeMap::from([(
+                BindingId::new(1),
+                ProducerDeployment::new(witness, BTreeSet::from([uid(1)])),
+            )]),
+            BTreeMap::from([(
+                BindingId::new(2),
+                ConsumerDeployment::with_profile(
+                    ConsumerActivation::NonBlockingLive {
+                        late_apply: LateApplyGranularity::Batch,
+                    },
+                    BTreeSet::from([ArtifactCapability::OrderedRange]),
+                    ConsumerArtifactProfile::new_ordered_range(order_digest).unwrap(),
+                    RouteEdgeId::new(1),
+                    BTreeSet::from([uid(2)]),
+                ),
+            )]),
+        );
+        service.install(view([channel])).unwrap();
+        (service, contract)
+    }
+
+    fn installed_ordered_allof_service_with_events(
+        events: Arc<Events>,
+    ) -> (Arc<RuntimeFilterService>, Arc<RuntimeOrderContract>) {
+        let service = Arc::new(RuntimeFilterService::new_with_dependencies(
+            uid(0),
+            Arc::new(Clock(Instant::now())),
+            events,
+            MemTrackerMemoryAccount::new_root_for_test("ordered-allof-observability-test"),
+        ));
+        let keys = vec![OrderKeyContract {
+            data_type: DataType::Int64,
+            direction: SortDirection::Ascending,
+            null_order: NullOrder::Last,
+        }];
+        let plan = OrderContract {
+            comparator_digest: comparator_digest_for_test(&keys, COMPARATOR_ALGORITHM_VERSION),
+            keys,
+            inclusive: true,
+        };
+        let contract = Arc::new(RuntimeOrderContract::try_from_plan(&plan).unwrap());
+        let order_digest = contract.digest();
+        let witnesses = [CoverageWitnessId::new(1), CoverageWitnessId::new(2)];
+        let coverage = Coverage::AllOf(witnesses.into_iter().map(Coverage::Leaf).collect());
+        let channel = RuntimeFilterChannelDeployment::new(
+            ChannelId::new(1),
+            RuntimeFilterLogicalDomain::OrderedBound(plan),
+            RuntimeFilterLifecycle::MonotonicUpdates,
+            coverage.clone(),
+            coverage,
+            ReductionRequirement::TightenOrderedBound,
+            BTreeSet::from([
+                ContributionKind::OrderedBoundUpdate,
+                ContributionKind::ProducerClosed,
+            ]),
+            CompletionRequirement::ProducerClosed,
+            RuntimeFilterPolicyRequirement {
+                max_contribution_bytes: 1024,
+                max_artifact_bytes: 1024,
+                deadline_ms: 100,
+                max_retries: 0,
+            },
+            RuntimeFilterCoreBudget::new(4096),
+            MaterializationPolicy::for_test(),
+            BTreeMap::from([
+                (
+                    BindingId::new(1),
+                    ProducerDeployment::new(witnesses[0], BTreeSet::from([uid(1)])),
+                ),
+                (
+                    BindingId::new(3),
+                    ProducerDeployment::new(witnesses[1], BTreeSet::from([uid(3)])),
+                ),
+            ]),
+            BTreeMap::from([(
+                BindingId::new(2),
+                ConsumerDeployment::with_profile(
+                    ConsumerActivation::NonBlockingLive {
+                        late_apply: LateApplyGranularity::Batch,
+                    },
+                    BTreeSet::from([ArtifactCapability::OrderedRange]),
+                    ConsumerArtifactProfile::new_ordered_range(order_digest).unwrap(),
+                    RouteEdgeId::new(1),
+                    BTreeSet::from([uid(2)]),
+                ),
+            )]),
+        );
+        service.install(view([channel])).unwrap();
+        (service, contract)
+    }
+
+    pub(super) fn ordered_update(
+        contract: &RuntimeOrderContract,
+        value: i64,
+    ) -> OrderedBoundUpdate {
+        OrderedBoundUpdate::new(
+            contract,
+            OrderedTuple::try_new(contract, [Some(OrderedScalar::Int64(value))]).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ordered_visible_snapshot_materializes_range_without_waiting_for_terminal() {
+        let events = Arc::new(Events::default());
+        let (service, contract) = installed_ordered_service_with_account_and_events(
+            MemTrackerMemoryAccount::new_root_for_test("ordered-range-materialization-test"),
+            events.clone(),
+        );
+        let ProducerHandle::OrderedBound(producer) = service
+            .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+            .unwrap()
+        else {
+            panic!("ordered fixture must return ordered producer")
+        };
+
+        assert_eq!(
+            producer
+                .submit_bound(
+                    PartitionId::new(0),
+                    ProducerSequence::new(0),
+                    ordered_update(&contract, 40),
+                )
+                .unwrap(),
+            SubmitOutcome::Published
+        );
+        assert!(events.0.lock().unwrap().iter().any(|event| matches!(
+            event,
+            RuntimeFilterEvent::ArtifactMaterialized {
+                kind: ArtifactKind::Range,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn ordered_updates_emit_applied_and_typed_rejected_events_before_return() {
+        let events = Arc::new(Events::default());
+        let (service, contract) = installed_ordered_allof_service_with_events(events.clone());
+        let ProducerHandle::OrderedBound(producer) = service
+            .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+            .unwrap()
+        else {
+            panic!("ordered fixture must return ordered producer")
+        };
+
+        producer
+            .submit_bound(
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                ordered_update(&contract, 100),
+            )
+            .unwrap();
+        let recorded = events.0.lock().unwrap().clone();
+        assert!(recorded.iter().any(|event| matches!(
+            event,
+            RuntimeFilterEvent::OrderedUpdateApplied { identity }
+                if identity.stream().binding_id() == BindingId::new(1)
+                    && identity.sequence() == ProducerSequence::new(0)
+        )));
+        assert!(
+            !recorded
+                .iter()
+                .any(|event| matches!(event, RuntimeFilterEvent::LogicalVersionPublished { .. }))
+        );
+
+        events.0.lock().unwrap().clear();
+        let loosened = producer
+            .submit_bound(
+                PartitionId::new(0),
+                ProducerSequence::new(1),
+                ordered_update(&contract, 101),
+            )
+            .unwrap_err();
+        assert_eq!(
+            loosened.kind(),
+            RuntimeContractViolationKind::OrderedBoundLoosened
+        );
+        let recorded = events.0.lock().unwrap().clone();
+        assert!(recorded.iter().any(|event| matches!(
+            event,
+            RuntimeFilterEvent::OrderedUpdateRejected { identity, violation }
+                if identity.sequence() == ProducerSequence::new(1)
+                    && *violation == RuntimeContractViolationKind::OrderedBoundLoosened
+        )));
+
+        events.0.lock().unwrap().clear();
+        let conflict = producer
+            .submit_bound(
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                ordered_update(&contract, 90),
+            )
+            .unwrap_err();
+        assert_eq!(
+            conflict.kind(),
+            RuntimeContractViolationKind::ConflictingReplay
+        );
+        let recorded = events.0.lock().unwrap().clone();
+        assert!(recorded.iter().any(|event| matches!(
+            event,
+            RuntimeFilterEvent::OrderedUpdateRejected { identity, violation }
+                if identity.sequence() == ProducerSequence::new(0)
+                    && *violation == RuntimeContractViolationKind::ConflictingReplay
+        )));
+    }
+
+    #[test]
+    fn ordered_authorize_rejection_emits_typed_event_before_return() {
+        let events = Arc::new(Events::default());
+        let account = Arc::new(ArmableRejectingMemoryAccount::default());
+        let (service, contract) =
+            installed_ordered_service_with_account_and_events(account.clone(), events.clone());
+        let ProducerHandle::OrderedBound(producer) = service
+            .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+            .unwrap()
+        else {
+            panic!("ordered fixture must return ordered producer")
+        };
+
+        events.0.lock().unwrap().clear();
+        let invalid_partition = producer
+            .submit_bound(
+                PartitionId::new(1),
+                ProducerSequence::new(0),
+                ordered_update(&contract, 100),
+            )
+            .unwrap_err();
+        assert_eq!(
+            invalid_partition.kind(),
+            RuntimeContractViolationKind::InvalidPartition
+        );
+        assert!(events.0.lock().unwrap().iter().any(|event| matches!(
+            event,
+            RuntimeFilterEvent::OrderedUpdateRejected { identity, violation }
+                if identity.stream().partition_id() == PartitionId::new(1)
+                    && identity.sequence() == ProducerSequence::new(0)
+                    && *violation == RuntimeContractViolationKind::InvalidPartition
+        )));
+    }
+
+    #[test]
+    fn ordered_resource_preflight_rejection_emits_typed_event_before_return() {
+        let events = Arc::new(Events::default());
+        let account = Arc::new(ArmableRejectingMemoryAccount::default());
+        let (service, contract) =
+            installed_ordered_service_with_account_and_events(account.clone(), events.clone());
+        let ProducerHandle::OrderedBound(producer) = service
+            .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+            .unwrap()
+        else {
+            panic!("ordered fixture must return ordered producer")
+        };
+
+        producer
+            .submit_bound(
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                ordered_update(&contract, 100),
+            )
+            .unwrap();
+        events.0.lock().unwrap().clear();
+        account.armed.store(true, Ordering::SeqCst);
+        let mismatched_keys = vec![OrderKeyContract {
+            data_type: DataType::Int64,
+            direction: SortDirection::Descending,
+            null_order: NullOrder::Last,
+        }];
+        let mismatched_contract = RuntimeOrderContract::try_from_plan(&OrderContract {
+            comparator_digest: comparator_digest_for_test(
+                &mismatched_keys,
+                COMPARATOR_ALGORITHM_VERSION,
+            ),
+            keys: mismatched_keys,
+            inclusive: true,
+        })
+        .unwrap();
+        let contract_error = producer
+            .submit_bound(
+                PartitionId::new(0),
+                ProducerSequence::new(1),
+                ordered_update(&mismatched_contract, 90),
+            )
+            .unwrap_err();
+        assert_eq!(
+            contract_error.kind(),
+            RuntimeContractViolationKind::OrderedContractMismatch
+        );
+        assert!(events.0.lock().unwrap().iter().any(|event| matches!(
+            event,
+            RuntimeFilterEvent::OrderedUpdateRejected { identity, violation }
+                if identity.stream().partition_id() == PartitionId::new(0)
+                    && identity.sequence() == ProducerSequence::new(1)
+                    && *violation == RuntimeContractViolationKind::OrderedContractMismatch
+        )));
+    }
+
+    #[test]
+    fn ordered_rejection_waits_for_earlier_accepted_action_without_test_reservation() {
+        let events = Arc::new(Events::default());
+        let (service, contract) = installed_ordered_allof_service_with_events(events.clone());
+        let ProducerHandle::OrderedBound(producer) = service
+            .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+            .unwrap()
+        else {
+            panic!("ordered fixture must return ordered producer")
+        };
+        let channel = service
+            .registry
+            .active_installation()
+            .unwrap()
+            .channels()
+            .next()
+            .unwrap()
+            .1;
+        events.0.lock().unwrap().clear();
+
+        let accepted_update = ordered_update(&contract, 100);
+        let accepted_bytes = accepted_update.canonical_contribution_bytes().unwrap();
+        let accepted = channel
+            .submit_ordered(
+                BindingId::new(1),
+                uid(1),
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                accepted_update,
+                TemporaryContributionLease::new(
+                    MemTrackerMemoryAccount::new_root_for_test("ordered-event-order-test"),
+                    accepted_bytes,
+                ),
+            )
+            .unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let rejected_producer = producer.clone();
+        let rejected_contract = contract.clone();
+        let rejected = std::thread::spawn(move || {
+            let error = rejected_producer
+                .submit_bound(
+                    PartitionId::new(0),
+                    ProducerSequence::new(1),
+                    ordered_update(&rejected_contract, 101),
+                )
+                .unwrap_err();
+            done_tx.send(error.kind()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while service.dispatcher.pending_action_count(ChannelId::new(1)) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "later rejection never reached dispatcher"
+            );
+            std::thread::yield_now();
+        }
+        assert!(events.0.lock().unwrap().is_empty());
+
+        service
+            .dispatcher
+            .dispatch(ChannelId::new(1), accepted)
+            .unwrap();
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeContractViolationKind::OrderedBoundLoosened
+        );
+        rejected.join().unwrap();
+        let ordered_events = events
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeFilterEvent::OrderedUpdateApplied { identity } => {
+                    Some((identity.sequence(), None))
+                }
+                RuntimeFilterEvent::OrderedUpdateRejected {
+                    identity,
+                    violation,
+                } => Some((identity.sequence(), Some(*violation))),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered_events,
+            vec![
+                (ProducerSequence::new(0), None),
+                (
+                    ProducerSequence::new(1),
+                    Some(RuntimeContractViolationKind::OrderedBoundLoosened),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn ordered_launch_events_follow_claim_order_while_newer_version_commits_first() {
+        struct ReleaseOnDrop(Arc<(Mutex<bool>, Condvar)>);
+
+        impl ReleaseOnDrop {
+            fn release(&self) {
+                let (lock, changed) = &*self.0;
+                *lock.lock().unwrap_or_else(|error| error.into_inner()) = true;
+                changed.notify_all();
+            }
+        }
+
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.release();
+            }
+        }
+
+        let events = Arc::new(Events::default());
+        let (service, contract) = installed_ordered_service_with_account_and_events(
+            MemTrackerMemoryAccount::new_root_for_test("ordered-out-of-order-publish-test"),
+            events.clone(),
+        );
+        let ProducerHandle::OrderedBound(producer) = service
+            .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+            .unwrap()
+        else {
+            panic!("ordered fixture must return ordered producer")
+        };
+
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_on_drop = ReleaseOnDrop(release.clone());
+        let (older_claimed_tx, older_claimed_rx) = mpsc::channel();
+        service.set_before_materialization_admission_hook(Arc::new({
+            let release = release.clone();
+            move || {
+                older_claimed_tx.send(()).unwrap();
+                let (lock, changed) = &*release;
+                let mut released = lock.lock().unwrap_or_else(|error| error.into_inner());
+                while !*released {
+                    released = changed
+                        .wait(released)
+                        .unwrap_or_else(|error| error.into_inner());
+                }
+            }
+        }));
+
+        let (older_tx, older_rx) = mpsc::channel();
+        let older_producer = producer.clone();
+        let older_contract = contract.clone();
+        let older = std::thread::spawn(move || {
+            older_tx
+                .send(older_producer.submit_bound(
+                    PartitionId::new(0),
+                    ProducerSequence::new(0),
+                    ordered_update(&older_contract, 40),
+                ))
+                .unwrap();
+        });
+        older_claimed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("older version must advance before materialization admission");
+
+        let (newer_tx, newer_rx) = mpsc::channel();
+        let newer_producer = producer.clone();
+        let newer_contract = contract.clone();
+        let newer = std::thread::spawn(move || {
+            newer_tx
+                .send(newer_producer.submit_bound(
+                    PartitionId::new(0),
+                    ProducerSequence::new(1),
+                    ordered_update(&newer_contract, 30),
+                ))
+                .unwrap();
+        });
+        assert_eq!(
+            newer_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("newer version must publish before the older encode is released")
+                .unwrap(),
+            SubmitOutcome::Published
+        );
+
+        release_on_drop.release();
+        assert_eq!(
+            older_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap(),
+            SubmitOutcome::Published
+        );
+        older.join().unwrap();
+        newer.join().unwrap();
+
+        let events = events.0.lock().unwrap();
+        let started_versions = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeFilterEvent::MaterializationStarted { identity } => Some(identity.version()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            started_versions,
+            [LogicalVersion::FIRST, LogicalVersion::new(2)],
+            "owner launch events must remain in ordered action-claim order"
+        );
+        let newer_published = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeFilterEvent::ArtifactPublished { identity, .. }
+                        if identity.version() == LogicalVersion::new(2)
+                )
+            })
+            .expect("newer version must publish");
+        let older_stale = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeFilterEvent::ArtifactPublishStaleSkipped { identity }
+                        if identity.version() == LogicalVersion::FIRST
+                )
+            })
+            .expect("older version must become stale");
+        assert!(newer_published < older_stale);
+    }
+
+    #[test]
+    fn claimed_owner_launch_prefix_precedes_contiguous_cancel_without_deadlock() {
+        let fixture = fixture();
+        let value_set = ConsumerArtifactProfile::new(
+            BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
+            None,
+        )
+        .unwrap();
+        let bitset = ConsumerArtifactProfile::new(
+            BTreeSet::from([ArtifactKind::Bitset, ArtifactKind::EmptyDomain]),
+            None,
+        )
+        .unwrap();
+        fixture
+            .service
+            .install(view([deployment_with_profiles([
+                (30, 40, 30, value_set),
+                (31, 41, 31, bitset),
+            ])]))
+            .unwrap();
+        let producer = fixture
+            .service
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
+            .unwrap();
+
+        let (owner_claimed_tx, owner_claimed_rx) = mpsc::channel();
+        let (claim_release_tx, claim_release_rx) = mpsc::channel();
+        let claim_release_rx = Mutex::new(claim_release_rx);
+        fixture
+            .service
+            .set_after_materialization_gate_claim_hook(Arc::new(move || {
+                owner_claimed_tx.send(()).unwrap();
+                claim_release_rx.lock().unwrap().recv().unwrap();
+            }));
+
+        let (complete_tx, complete_rx) = mpsc::channel();
+        let completing_producer = producer.clone();
+        let completing = std::thread::spawn(move || {
+            complete(&completing_producer, 23);
+            complete_tx.send(()).unwrap();
+        });
+        owner_claimed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("completion must claim at least one materialization owner");
+
+        let (cancel_started_tx, cancel_started_rx) = mpsc::channel();
+        let (cancel_done_tx, cancel_done_rx) = mpsc::channel();
+        let cancelling_dispatcher = fixture.service.dispatcher.clone();
+        let cancelling = std::thread::spawn(move || {
+            cancel_started_tx.send(()).unwrap();
+            cancelling_dispatcher.dispatch_nonblocking(
+                ChannelId::new(1),
+                ChannelAction::Cancelled {
+                    order: 2,
+                    events: vec![RuntimeFilterEvent::ChannelCancelled {
+                        identity: RuntimeFilterEventIdentity::new(
+                            uid(0),
+                            RuntimeFilterParticipantId::new(3),
+                            ChannelId::new(1),
+                            DeploymentEpoch::new(9),
+                        ),
+                    }],
+                },
+            );
+            cancel_done_tx.send(()).unwrap();
+        });
+        cancel_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let cancel_completed_before_release = cancel_done_rx
+            .recv_timeout(Duration::from_millis(200))
+            .is_ok();
+        claim_release_tx.send(()).unwrap();
+
+        let completed_without_rescue = complete_rx.recv_timeout(Duration::from_millis(300)).is_ok();
+        if !completed_without_rescue {
+            let flight = fixture
+                .service
+                .dispatcher
+                .channels
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(&ChannelId::new(1))
+                .cloned()
+                .expect("channel dispatch flight must exist");
+            fixture
+                .service
+                .dispatcher
+                .drain_ready_nonblocking(ChannelId::new(1), flight);
+            complete_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("rescue drain must release the old deadlock window");
+        }
+        if !cancel_completed_before_release {
+            cancel_done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("cancel must finish after the launch prefix is reserved");
+        }
+        completing.join().unwrap();
+        cancelling.join().unwrap();
+
+        let events = fixture.events.0.lock().unwrap();
+        let started = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| {
+                matches!(event, RuntimeFilterEvent::MaterializationStarted { .. }).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let cancelled = events
+            .iter()
+            .position(|event| matches!(event, RuntimeFilterEvent::ChannelCancelled { .. }))
+            .expect("contiguous cancel must emit its causal event");
+        assert_eq!(
+            started.len(),
+            2,
+            "both canonical profile owners must launch"
+        );
+        assert!(
+            completed_without_rescue,
+            "launch publication must not wait behind its contiguous cancel core"
+        );
+        assert!(started.into_iter().all(|index| index < cancelled));
+    }
+
     fn install_one(fixture: &Fixture) {
         assert_eq!(
             fixture
@@ -1619,6 +2596,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn membership_open_rejects_ordered_port_before_caching_handle() {
+        let fixture = fixture();
+        install_one(&fixture);
+        let error = fixture
+            .service
+            .open_producer(
+                BindingId::new(10),
+                uid(10),
+                1,
+                ProducerPortKind::OrderedBound,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            RuntimeContractViolationKind::ProducerPortMismatch
+        );
+        assert!(matches!(
+            fixture
+                .service
+                .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership,)
+                .unwrap(),
+            ProducerHandle::Membership(_)
+        ));
+    }
+
     fn open_and_subscribe(
         fixture: &Fixture,
     ) -> (
@@ -1627,11 +2630,13 @@ mod tests {
     ) {
         let subscription = fixture
             .service
-            .subscribe(BindingId::new(30), uid(30))
+            .subscribe_blocking(BindingId::new(30), uid(30))
             .unwrap();
         let producer = fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         (producer, subscription)
     }
@@ -1685,7 +2690,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatcher_owner_does_not_return_after_claiming_an_earlier_pending_order() {
+    fn each_pending_dispatch_order_is_drained_by_its_caller() {
         fn action(order: u64) -> ChannelAction {
             ChannelAction::Progress {
                 order: Some(order),
@@ -1722,6 +2727,7 @@ mod tests {
                     action: action(1),
                     core_batch: None,
                     completion: Arc::new(EventBatchCompletion::default()),
+                    needs_drainer: false,
                 },
             );
             state.pending.insert(
@@ -1730,6 +2736,7 @@ mod tests {
                     action: action(2),
                     core_batch: None,
                     completion: Arc::new(EventBatchCompletion::default()),
+                    needs_drainer: false,
                 },
             );
         }
@@ -1749,8 +2756,6 @@ mod tests {
             dispatcher.dispatch(channel_id, action(2)).unwrap();
             second_tx.send(()).unwrap();
         });
-        second_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-
         let dispatcher = fixture.service.dispatcher.clone();
         let (first_tx, first_rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -1758,6 +2763,7 @@ mod tests {
             first_tx.send(()).unwrap();
         });
         first_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        second_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
         let state = flight.state.lock().unwrap();
         assert_eq!(state.next_order, 3);
@@ -1913,7 +2919,9 @@ mod tests {
         ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let producer = fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         let (submit_tx, submit_rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -2155,11 +3163,16 @@ mod tests {
         let direct_group = Arc::new(SubscriptionGroup::new(
             common,
             BindingId::new(50),
+            ConsumerActivation::BlockingSnapshot,
             RouteEdgeId::new(70),
             [uid(50)],
             direct_events,
         ));
-        let direct_slot = direct_group.slot(uid(50)).unwrap();
+        let direct_slot = direct_group
+            .handle(uid(50), SubscriptionKind::BlockingSnapshot)
+            .unwrap()
+            .into_blocking()
+            .unwrap();
         let direct_router = LoopbackRouter::new(BTreeMap::from([(
             RouteEdgeId::new(70),
             direct_group as Arc<dyn ArtifactDelivery>,
@@ -2173,11 +3186,16 @@ mod tests {
         let codec_group = Arc::new(SubscriptionGroup::new(
             common,
             BindingId::new(51),
+            ConsumerActivation::BlockingSnapshot,
             RouteEdgeId::new(71),
             [uid(51)],
             codec_events,
         ));
-        let codec_slot = codec_group.slot(uid(51)).unwrap();
+        let codec_slot = codec_group
+            .handle(uid(51), SubscriptionKind::BlockingSnapshot)
+            .unwrap()
+            .into_blocking()
+            .unwrap();
         let codec_router = LoopbackRouter::new(BTreeMap::from([(
             RouteEdgeId::new(71),
             codec_group as Arc<dyn ArtifactDelivery>,
@@ -2237,11 +3255,11 @@ mod tests {
             .unwrap();
         let first = fixture
             .service
-            .subscribe(BindingId::new(30), uid(30))
+            .subscribe_blocking(BindingId::new(30), uid(30))
             .unwrap();
         let second = fixture
             .service
-            .subscribe(BindingId::new(31), uid(31))
+            .subscribe_blocking(BindingId::new(31), uid(31))
             .unwrap();
         let installed = fixture.service.registry.active_installation().unwrap();
         let plan = installed.artifact_plan(ChannelId::new(1)).unwrap();
@@ -2249,7 +3267,9 @@ mod tests {
         assert_eq!(plan.groups()[0].route_edges().len(), 2);
         let producer = fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         complete(&producer, 11);
         let (ArtifactAcquireOutcome::Published(first), ArtifactAcquireOutcome::Published(second)) = (
@@ -2445,15 +3465,17 @@ mod tests {
             .unwrap();
         let value_set_subscription = fixture
             .service
-            .subscribe(BindingId::new(30), uid(30))
+            .subscribe_blocking(BindingId::new(30), uid(30))
             .unwrap();
         let bitset_subscription = fixture
             .service
-            .subscribe(BindingId::new(31), uid(31))
+            .subscribe_blocking(BindingId::new(31), uid(31))
             .unwrap();
         let producer = fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         complete(&producer, 11);
 
@@ -2473,15 +3495,20 @@ mod tests {
         assert_eq!(value_set_bundle.profile_id(), value_set.id());
         assert_eq!(bitset_bundle.profile_id(), bitset.id());
 
-        let materialization_profiles = fixture
-            .events
-            .0
-            .lock()
-            .unwrap()
+        let events = fixture.events.0.lock().unwrap();
+        let started_profiles = events
             .iter()
             .filter_map(|event| match event {
-                RuntimeFilterEvent::MaterializationStarted { identity }
-                | RuntimeFilterEvent::ArtifactMaterialized { identity, .. }
+                RuntimeFilterEvent::MaterializationStarted { identity } => {
+                    Some(identity.profile_id())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let completed_profiles = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeFilterEvent::ArtifactMaterialized { identity, .. }
                 | RuntimeFilterEvent::ArtifactPublished { identity, .. } => {
                     Some(identity.profile_id())
                 }
@@ -2490,11 +3517,12 @@ mod tests {
             .collect::<Vec<_>>();
         let mut expected_profiles = vec![value_set.id(), bitset.id()];
         expected_profiles.sort_unstable();
+        assert_eq!(started_profiles, expected_profiles);
         assert_eq!(
-            materialization_profiles,
+            completed_profiles,
             expected_profiles
                 .into_iter()
-                .flat_map(|profile| [profile; 3])
+                .flat_map(|profile| [profile; 2])
                 .collect::<Vec<_>>()
         );
     }
@@ -2535,7 +3563,9 @@ mod tests {
         }));
         let producer = fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         complete(&producer, 19);
         assert_eq!(peak.load(Ordering::SeqCst), 2);
@@ -2646,7 +3676,9 @@ mod tests {
 
         let producer = fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         complete(&producer, 19);
         assert_eq!(peak.load(Ordering::SeqCst), 2);
@@ -2661,26 +3693,32 @@ mod tests {
             *completed.lock().unwrap(),
             vec![canonical[1], canonical[0], canonical[2]]
         );
-        let materialization_profiles = fixture
-            .events
-            .0
-            .lock()
-            .unwrap()
+        let events = fixture.events.0.lock().unwrap();
+        let started_profiles = events
             .iter()
             .filter_map(|event| match event {
-                RuntimeFilterEvent::MaterializationStarted { identity }
-                | RuntimeFilterEvent::ArtifactMaterialized { identity, .. }
+                RuntimeFilterEvent::MaterializationStarted { identity } => {
+                    Some(identity.profile_id())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let completed_profiles = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeFilterEvent::ArtifactMaterialized { identity, .. }
                 | RuntimeFilterEvent::ArtifactPublished { identity, .. } => {
                     Some(identity.profile_id())
                 }
                 _ => None,
             })
             .collect::<Vec<_>>();
+        assert_eq!(started_profiles, canonical);
         assert_eq!(
-            materialization_profiles,
+            completed_profiles,
             canonical
                 .iter()
-                .flat_map(|profile_id| [*profile_id; 3])
+                .flat_map(|profile_id| [*profile_id; 2])
                 .collect::<Vec<_>>()
         );
     }
@@ -2838,11 +3876,17 @@ mod tests {
             ])]))
             .unwrap();
         let subscriptions = [
-            service.subscribe(BindingId::new(30), uid(30)).unwrap(),
-            service.subscribe(BindingId::new(31), uid(31)).unwrap(),
+            service
+                .subscribe_blocking(BindingId::new(30), uid(30))
+                .unwrap(),
+            service
+                .subscribe_blocking(BindingId::new(31), uid(31))
+                .unwrap(),
         ];
         let producer = service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         producer
             .submit(
@@ -2873,7 +3917,7 @@ mod tests {
                     .upgrade()
                     .expect("service is live before shutdown");
                 let (binding_id, instance_id) = profile_binding[&profile_id];
-                service.subscribe(binding_id, instance_id).unwrap();
+                service.subscribe_blocking(binding_id, instance_id).unwrap();
                 reentered.fetch_add(1, Ordering::SeqCst);
                 drop(service);
                 entered_tx.send(()).unwrap();
@@ -2944,7 +3988,9 @@ mod tests {
         install_one(&fixture);
         let producer = fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         producer
             .submit(
@@ -2958,7 +4004,9 @@ mod tests {
         let group = &plan.groups()[0];
         let artifact = Arc::new(PhysicalArtifact::new_test(
             ArtifactKind::ValueSet,
-            plan.schema().digest(),
+            plan.schema()
+                .expect("membership artifact plan has schema")
+                .digest(),
             LogicalVersion::FIRST,
             false,
             Arc::from([99]),
@@ -3050,10 +4098,15 @@ mod tests {
         };
         let channel = fixture.service.registry.channel(ChannelId::new(1)).unwrap();
         let repeated = channel.terminal_action();
-        let (batch, error) = fixture
+        let claimed = fixture
             .service
             .dispatcher
-            .route_and_prequeue(ChannelId::new(1), &repeated);
+            .claim_action_materialization(ChannelId::new(1), &repeated);
+        let (batch, error) =
+            fixture
+                .service
+                .dispatcher
+                .route_and_prequeue(ChannelId::new(1), &repeated, claimed);
         assert!(error.is_none());
         fixture.service.dispatcher.events.publish(batch);
         let ArtifactAcquireOutcome::Published(second) = subscription.acquire(Duration::ZERO) else {
@@ -3090,9 +4143,13 @@ mod tests {
         service
             .install(view([deployment(1, 10, 30, 40, [10], [30], 100)]))
             .unwrap();
-        let subscription = service.subscribe(BindingId::new(30), uid(30)).unwrap();
+        let subscription = service
+            .subscribe_blocking(BindingId::new(30), uid(30))
+            .unwrap();
         let producer = service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         producer
             .submit(
@@ -3151,11 +4208,17 @@ mod tests {
             ])]))
             .unwrap();
         let subscriptions = [
-            service.subscribe(BindingId::new(30), uid(30)).unwrap(),
-            service.subscribe(BindingId::new(31), uid(31)).unwrap(),
+            service
+                .subscribe_blocking(BindingId::new(30), uid(30))
+                .unwrap(),
+            service
+                .subscribe_blocking(BindingId::new(31), uid(31))
+                .unwrap(),
         ];
         let producer = service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         producer
             .submit(
@@ -3276,15 +4339,17 @@ mod tests {
             .unwrap();
         let completed_subscription = fixture
             .service
-            .subscribe(BindingId::new(30), uid(30))
+            .subscribe_blocking(BindingId::new(30), uid(30))
             .unwrap();
         let incomplete_subscription = fixture
             .service
-            .subscribe(BindingId::new(31), uid(31))
+            .subscribe_blocking(BindingId::new(31), uid(31))
             .unwrap();
         let producer = fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         complete(&producer, 1);
         fixture
@@ -3307,7 +4372,7 @@ mod tests {
         assert_eq!(
             fixture
                 .service
-                .open_producer(BindingId::new(99), uid(10), 1)
+                .open_producer(BindingId::new(99), uid(10), 1, ProducerPortKind::Membership)
                 .err()
                 .unwrap()
                 .kind(),
@@ -3316,7 +4381,7 @@ mod tests {
         assert_eq!(
             fixture
                 .service
-                .open_producer(BindingId::new(10), uid(99), 1)
+                .open_producer(BindingId::new(10), uid(99), 1, ProducerPortKind::Membership)
                 .err()
                 .unwrap()
                 .kind(),
@@ -3325,7 +4390,7 @@ mod tests {
         assert_eq!(
             fixture
                 .service
-                .subscribe(BindingId::new(99), uid(30))
+                .subscribe_blocking(BindingId::new(99), uid(30))
                 .err()
                 .unwrap()
                 .kind(),
@@ -3334,7 +4399,7 @@ mod tests {
         assert_eq!(
             fixture
                 .service
-                .subscribe(BindingId::new(30), uid(99))
+                .subscribe_blocking(BindingId::new(30), uid(99))
                 .err()
                 .unwrap()
                 .kind(),
@@ -3342,7 +4407,9 @@ mod tests {
         );
         let producer = fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         assert!(
             producer
@@ -3370,7 +4437,9 @@ mod tests {
             .install(view([deployment(1, 10, 30, 40, [10], [30], 100)]))
             .unwrap();
         let producer = service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         assert_eq!(
             producer
@@ -3412,7 +4481,9 @@ mod tests {
             .install(view([deployment(1, 10, 30, 40, [10], [30], 100)]))
             .unwrap();
         let producer = service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         let first = producer.clone();
         let (first_tx, first_rx) = mpsc::channel();
@@ -3533,11 +4604,15 @@ mod tests {
         install_one(&fixture);
         let first = fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 2)
+            .open_producer(BindingId::new(10), uid(10), 2, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         let second = fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 2)
+            .open_producer(BindingId::new(10), uid(10), 2, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         assert!(Arc::ptr_eq(&first, &second));
     }
@@ -3548,12 +4623,14 @@ mod tests {
         install_one(&fixture);
         fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         assert!(
             fixture
                 .service
-                .open_producer(BindingId::new(10), uid(10), 2)
+                .open_producer(BindingId::new(10), uid(10), 2, ProducerPortKind::Membership)
                 .is_err()
         );
     }
@@ -3564,7 +4641,7 @@ mod tests {
         install_one(&fixture);
         let subscription = fixture
             .service
-            .subscribe(BindingId::new(30), uid(30))
+            .subscribe_blocking(BindingId::new(30), uid(30))
             .unwrap();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -3579,13 +4656,13 @@ mod tests {
         assert!(
             fixture
                 .service
-                .open_producer(BindingId::new(10), uid(10), 1)
+                .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
                 .is_err()
         );
         assert!(
             fixture
                 .service
-                .subscribe(BindingId::new(30), uid(30))
+                .subscribe_blocking(BindingId::new(30), uid(30))
                 .is_err()
         );
         assert!(
@@ -3635,7 +4712,7 @@ mod tests {
                 let service = weak_service.upgrade().unwrap();
                 assert_eq!(
                     service
-                        .subscribe(BindingId::new(30), uid(30))
+                        .subscribe_blocking(BindingId::new(30), uid(30))
                         .err()
                         .unwrap()
                         .kind(),
@@ -3743,7 +4820,9 @@ mod tests {
         install_one(&fixture);
         let producer = fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         let (ready_tx, ready_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -3801,11 +4880,13 @@ mod tests {
         fixture.events.0.lock().unwrap().clear();
         let producer = fixture
             .service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         let subscription = fixture
             .service
-            .subscribe(BindingId::new(30), uid(30))
+            .subscribe_blocking(BindingId::new(30), uid(30))
             .unwrap();
 
         let (ready0_tx, ready0_rx) = mpsc::channel();
@@ -4019,10 +5100,14 @@ mod tests {
         service
             .install(view([deployment(1, 10, 30, 40, [10], [30], 100)]))
             .unwrap();
-        let subscription = service.subscribe(BindingId::new(30), uid(30)).unwrap();
+        let subscription = service
+            .subscribe_blocking(BindingId::new(30), uid(30))
+            .unwrap();
         *sink.subscription.lock().unwrap() = Some(Arc::downgrade(&subscription));
         let producer = service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         complete(&producer, 41);
         assert!(sink.panicked.load(Ordering::SeqCst));
@@ -4205,9 +5290,13 @@ mod tests {
                 .unwrap(),
             InstallOutcome::Installed
         );
-        let subscription = service.subscribe(BindingId::new(30), uid(30)).unwrap();
+        let subscription = service
+            .subscribe_blocking(BindingId::new(30), uid(30))
+            .unwrap();
         let producer = service
-            .open_producer(BindingId::new(10), uid(10), 1)
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap()
+            .into_membership()
             .unwrap();
         complete(&producer, 7);
         assert!(matches!(
@@ -4312,5 +5401,283 @@ mod tests {
             matches!(early_return, Err(mpsc::RecvTimeoutError::Timeout)),
             "concurrent duplicate returned before the nested event batch published"
         );
+    }
+
+    #[test]
+    fn ordered_open_returns_ordered_handle_and_rejects_membership_request() {
+        let service = installed_ordered_service_fixture();
+        let error = service
+            .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::Membership)
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            RuntimeContractViolationKind::ProducerPortMismatch
+        );
+        assert!(matches!(
+            service
+                .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+                .unwrap(),
+            ProducerHandle::OrderedBound(_)
+        ));
+    }
+
+    #[test]
+    fn ordered_live_consumer_rejects_blocking_subscribe_without_cache_or_hang() {
+        let service = installed_ordered_service_fixture();
+        let subscribe_service = service.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let kind = match subscribe_service.subscribe_blocking(BindingId::new(2), uid(2)) {
+                Ok(_) => None,
+                Err(error) => Some(error.kind()),
+            };
+            done_tx.send(kind).unwrap();
+        });
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Some(RuntimeContractViolationKind::SubscriptionActivationMismatch)
+        );
+        let installed = service.registry.active_installation().unwrap();
+        assert!(
+            installed
+                .subscription(
+                    BindingId::new(2),
+                    uid(2),
+                    SubscriptionKind::BlockingSnapshot
+                )
+                .is_none()
+        );
+        assert!(
+            installed
+                .subscription(BindingId::new(2), uid(2), SubscriptionKind::NonBlockingLive)
+                .is_some()
+        );
+        assert_eq!(
+            service
+                .subscribe_blocking(BindingId::new(2), uid(2))
+                .err()
+                .unwrap()
+                .kind(),
+            RuntimeContractViolationKind::SubscriptionActivationMismatch
+        );
+    }
+
+    #[test]
+    fn ordered_rejected_lease_preserves_terminal_range_violation_precedence() {
+        let account = Arc::new(ArmableRejectingMemoryAccount::default());
+        let (service, contract) = installed_ordered_service_with_account(account.clone());
+        let ProducerHandle::OrderedBound(producer) = service
+            .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+            .unwrap()
+        else {
+            panic!("ordered fixture must return ordered producer")
+        };
+        assert_eq!(
+            producer
+                .submit_bound(
+                    PartitionId::new(0),
+                    ProducerSequence::new(0),
+                    ordered_update(&contract, 40),
+                )
+                .unwrap(),
+            SubmitOutcome::Published
+        );
+        assert_eq!(
+            producer
+                .close_partition(PartitionId::new(0), ProducerSequence::new(1))
+                .unwrap(),
+            SubmitOutcome::Completed
+        );
+        account.armed.store(true, Ordering::SeqCst);
+
+        let error = producer
+            .submit_bound(
+                PartitionId::new(0),
+                ProducerSequence::new(1),
+                ordered_update(&contract, 30),
+            )
+            .err()
+            .expect("terminal-range violation must precede rejected temporary lease");
+        assert_eq!(
+            error.kind(),
+            RuntimeContractViolationKind::SequenceOutsideTerminalRange
+        );
+    }
+
+    #[test]
+    fn ordered_rejected_lease_preserves_replay_and_contract_violation_precedence() {
+        let account = Arc::new(ArmableRejectingMemoryAccount::default());
+        let (service, contract) = installed_ordered_service_with_account(account.clone());
+        let ProducerHandle::OrderedBound(producer) = service
+            .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+            .unwrap()
+        else {
+            panic!("ordered fixture must return ordered producer")
+        };
+        assert_eq!(
+            producer
+                .submit_bound(
+                    PartitionId::new(0),
+                    ProducerSequence::new(0),
+                    ordered_update(&contract, 40),
+                )
+                .unwrap(),
+            SubmitOutcome::Published
+        );
+        let retained_before = account.current.load(Ordering::SeqCst);
+        account.armed.store(true, Ordering::SeqCst);
+
+        let replay_error = producer
+            .submit_bound(
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                ordered_update(&contract, 30),
+            )
+            .err()
+            .expect("conflicting replay must precede rejected temporary lease");
+        assert_eq!(
+            replay_error.kind(),
+            RuntimeContractViolationKind::ConflictingReplay
+        );
+
+        let mismatched_keys = vec![OrderKeyContract {
+            data_type: DataType::Int64,
+            direction: SortDirection::Descending,
+            null_order: NullOrder::Last,
+        }];
+        let mismatched_contract = RuntimeOrderContract::try_from_plan(&OrderContract {
+            comparator_digest: comparator_digest_for_test(
+                &mismatched_keys,
+                COMPARATOR_ALGORITHM_VERSION,
+            ),
+            keys: mismatched_keys,
+            inclusive: true,
+        })
+        .unwrap();
+        let contract_error = producer
+            .submit_bound(
+                PartitionId::new(0),
+                ProducerSequence::new(1),
+                ordered_update(&mismatched_contract, 30),
+            )
+            .err()
+            .expect("order-contract violation must precede rejected temporary lease");
+        assert_eq!(
+            contract_error.kind(),
+            RuntimeContractViolationKind::OrderedContractMismatch
+        );
+        assert_eq!(account.current.load(Ordering::SeqCst), retained_before);
+
+        account.armed.store(false, Ordering::SeqCst);
+        assert_eq!(
+            producer
+                .submit_bound(
+                    PartitionId::new(0),
+                    ProducerSequence::new(1),
+                    ordered_update(&contract, 40),
+                )
+                .unwrap(),
+            SubmitOutcome::SequenceAdvancedEqual
+        );
+    }
+
+    #[test]
+    fn ordered_rejected_lease_preserves_collecting_loosen_violation_and_state() {
+        let account = Arc::new(ArmableRejectingMemoryAccount::default());
+        let (service, contract) = installed_ordered_service_with_account(account.clone());
+        let ProducerHandle::OrderedBound(producer) = service
+            .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+            .unwrap()
+        else {
+            panic!("ordered fixture must return ordered producer")
+        };
+        assert_eq!(
+            producer
+                .submit_bound(
+                    PartitionId::new(0),
+                    ProducerSequence::new(0),
+                    ordered_update(&contract, 40),
+                )
+                .unwrap(),
+            SubmitOutcome::Published
+        );
+        let retained_before = account.current.load(Ordering::SeqCst);
+        account.armed.store(true, Ordering::SeqCst);
+
+        let error = producer
+            .submit_bound(
+                PartitionId::new(0),
+                ProducerSequence::new(1),
+                ordered_update(&contract, 50),
+            )
+            .err()
+            .expect("higher-sequence loosen violation must precede rejected temporary lease");
+        assert_eq!(
+            error.kind(),
+            RuntimeContractViolationKind::OrderedBoundLoosened
+        );
+        assert_eq!(account.current.load(Ordering::SeqCst), retained_before);
+
+        account.armed.store(false, Ordering::SeqCst);
+        assert_eq!(
+            producer
+                .submit_bound(
+                    PartitionId::new(0),
+                    ProducerSequence::new(1),
+                    ordered_update(&contract, 30),
+                )
+                .unwrap(),
+            SubmitOutcome::Published
+        );
+        let installed = service.registry.active_installation().unwrap();
+        let snapshot = installed.channels().next().unwrap().1.snapshot().unwrap();
+        assert_eq!(
+            snapshot.version(),
+            LogicalVersion::FIRST.checked_next().unwrap()
+        );
+    }
+
+    #[test]
+    fn ordered_rejected_lease_preserves_degraded_loosen_violation_and_version() {
+        let account = Arc::new(ArmableRejectingMemoryAccount::default());
+        let (service, contract) = installed_ordered_service_with_account(account.clone());
+        let ProducerHandle::OrderedBound(producer) = service
+            .open_producer(BindingId::new(1), uid(1), 1, ProducerPortKind::OrderedBound)
+            .unwrap()
+        else {
+            panic!("ordered fixture must return ordered producer")
+        };
+        assert_eq!(
+            producer
+                .submit_bound(
+                    PartitionId::new(0),
+                    ProducerSequence::new(0),
+                    ordered_update(&contract, 40),
+                )
+                .unwrap(),
+            SubmitOutcome::Published
+        );
+        producer
+            .fail(ProducerFailureReason::ExecutionFailed)
+            .unwrap();
+        let retained_before = account.current.load(Ordering::SeqCst);
+        account.armed.store(true, Ordering::SeqCst);
+
+        let error = producer
+            .submit_bound(
+                PartitionId::new(0),
+                ProducerSequence::new(1),
+                ordered_update(&contract, 50),
+            )
+            .err()
+            .expect("degraded full reducer must preserve ordered loosen violation");
+        assert_eq!(
+            error.kind(),
+            RuntimeContractViolationKind::OrderedBoundLoosened
+        );
+        assert_eq!(account.current.load(Ordering::SeqCst), retained_before);
+        let installed = service.registry.active_installation().unwrap();
+        let snapshot = installed.channels().next().unwrap().1.snapshot().unwrap();
+        assert_eq!(snapshot.version(), LogicalVersion::FIRST);
     }
 }

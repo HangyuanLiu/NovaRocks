@@ -818,10 +818,16 @@ impl ReducedMembershipDomain {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LogicalSnapshotDomain {
+    Membership(Arc<ReducedMembershipDomain>),
+    OrderedBound(Arc<crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain>),
+}
+
 pub(crate) struct LogicalSnapshot {
     channel_id: ChannelId,
     version: LogicalVersion,
-    domain: ReducedMembershipDomain,
+    domain: LogicalSnapshotDomain,
     retained_memory_reservation: RetainedMemoryReservation,
 }
 
@@ -834,7 +840,21 @@ impl LogicalSnapshot {
         Self {
             channel_id,
             version: LogicalVersion::FIRST,
-            domain,
+            domain: LogicalSnapshotDomain::Membership(Arc::new(domain)),
+            retained_memory_reservation,
+        }
+    }
+
+    pub(crate) fn ordered(
+        channel_id: ChannelId,
+        version: LogicalVersion,
+        domain: Arc<crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain>,
+        retained_memory_reservation: RetainedMemoryReservation,
+    ) -> Self {
+        Self {
+            channel_id,
+            version,
+            domain: LogicalSnapshotDomain::OrderedBound(domain),
             retained_memory_reservation,
         }
     }
@@ -847,8 +867,26 @@ impl LogicalSnapshot {
         self.version
     }
 
-    pub(crate) const fn domain(&self) -> &ReducedMembershipDomain {
+    pub(crate) fn domain(&self) -> &ReducedMembershipDomain {
+        match &self.domain {
+            LogicalSnapshotDomain::Membership(domain) => domain,
+            LogicalSnapshotDomain::OrderedBound(_) => {
+                panic!("ordered logical snapshot is not a membership domain")
+            }
+        }
+    }
+
+    pub(crate) const fn logical_domain(&self) -> &LogicalSnapshotDomain {
         &self.domain
+    }
+
+    pub(crate) const fn ordered_bound(
+        &self,
+    ) -> Option<&Arc<crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain>> {
+        match &self.domain {
+            LogicalSnapshotDomain::Membership(_) => None,
+            LogicalSnapshotDomain::OrderedBound(domain) => Some(domain),
+        }
     }
 
     pub(crate) const fn retained_memory_bytes(&self) -> usize {

@@ -28,9 +28,13 @@ use crate::common::largeint::LARGEINT_BYTE_WIDTH;
 use crate::runtime_filter::model::contract::{ChannelId, NullSemantics};
 
 use super::identity::LogicalVersion;
+use super::ordered_bound::{
+    OrderContractDigest, OrderedScalar, OrderedTuple, RuntimeOrderContract, RuntimeOrderKey,
+};
 use super::support::ArtifactRetention;
 
 const PROFILE_VERSION: u8 = 1;
+const ORDERED_PROFILE_VERSION: u8 = 2;
 const SCHEMA_VERSION: u8 = 1;
 pub(crate) const LEAF_CODEC_VERSION: u16 = 1;
 
@@ -296,7 +300,10 @@ impl<'a> SchemaCursor<'a> {
     }
 }
 
-fn encode_schema(data_type: &DataType, output: &mut Vec<u8>) -> Result<(), ArtifactContractError> {
+pub(super) fn encode_schema(
+    data_type: &DataType,
+    output: &mut Vec<u8>,
+) -> Result<(), ArtifactContractError> {
     match data_type {
         DataType::Boolean => output.push(1),
         DataType::Int8 => output.push(2),
@@ -346,6 +353,7 @@ fn encode_schema(data_type: &DataType, output: &mut Vec<u8>) -> Result<(), Artif
 pub(crate) struct ConsumerArtifactProfile {
     accepted_kinds: BTreeSet<ArtifactKind>,
     bloom_hash_contract: Option<HashContractDigest>,
+    order_contract_digest: Option<OrderContractDigest>,
     canonical_bytes: Arc<[u8]>,
     id: ConsumerProfileId,
 }
@@ -354,6 +362,24 @@ impl ConsumerArtifactProfile {
     pub(crate) fn new(
         accepted_kinds: BTreeSet<ArtifactKind>,
         bloom_hash_contract: Option<HashContractDigest>,
+    ) -> Result<Self, ArtifactContractError> {
+        Self::new_with_order_contract(accepted_kinds, bloom_hash_contract, None)
+    }
+
+    pub(crate) fn new_ordered_range(
+        order_contract_digest: OrderContractDigest,
+    ) -> Result<Self, ArtifactContractError> {
+        Self::new_with_order_contract(
+            BTreeSet::from([ArtifactKind::Range]),
+            None,
+            Some(order_contract_digest),
+        )
+    }
+
+    fn new_with_order_contract(
+        accepted_kinds: BTreeSet<ArtifactKind>,
+        bloom_hash_contract: Option<HashContractDigest>,
+        order_contract_digest: Option<OrderContractDigest>,
     ) -> Result<Self, ArtifactContractError> {
         if accepted_kinds.is_empty() {
             return Err(ArtifactContractError::EmptyProfile);
@@ -364,7 +390,11 @@ impl ConsumerArtifactProfile {
         let count = u16::try_from(accepted_kinds.len())
             .map_err(|_| ArtifactContractError::LengthOverflow)?;
         let mut canonical = Vec::with_capacity(4 + accepted_kinds.len() + 32);
-        canonical.extend_from_slice(&[PROFILE_VERSION]);
+        canonical.extend_from_slice(&[if order_contract_digest.is_some() {
+            ORDERED_PROFILE_VERSION
+        } else {
+            PROFILE_VERSION
+        }]);
         canonical.extend_from_slice(&count.to_be_bytes());
         canonical.extend(accepted_kinds.iter().map(|kind| kind.tag()));
         match bloom_hash_contract {
@@ -374,10 +404,21 @@ impl ConsumerArtifactProfile {
             }
             None => canonical.push(0),
         }
+        match order_contract_digest {
+            Some(digest) => {
+                if !accepted_kinds.contains(&ArtifactKind::Range) {
+                    return Err(ArtifactContractError::RangeOrderContractMismatch);
+                }
+                canonical.push(1);
+                canonical.extend_from_slice(&digest.bytes());
+            }
+            None => {}
+        }
         let id = ConsumerProfileId(Sha256::digest(&canonical).into());
         Ok(Self {
             accepted_kinds,
             bloom_hash_contract,
+            order_contract_digest,
             canonical_bytes: canonical.into(),
             id,
         })
@@ -404,6 +445,10 @@ impl ConsumerArtifactProfile {
         self.bloom_hash_contract
     }
 
+    pub(crate) const fn order_contract_digest(&self) -> Option<OrderContractDigest> {
+        self.order_contract_digest
+    }
+
     pub(crate) fn canonical_bytes(&self) -> &[u8] {
         &self.canonical_bytes
     }
@@ -423,6 +468,7 @@ impl ConsumerArtifactProfile {
 pub(crate) enum ArtifactContractError {
     EmptyProfile,
     BloomHashContractMismatch,
+    RangeOrderContractMismatch,
     UnsupportedSchema,
     NonCanonicalSchema,
     LengthOverflow,
@@ -449,6 +495,228 @@ impl fmt::Display for ArtifactContractError {
 
 impl Error for ArtifactContractError {}
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ArtifactSemanticDigest([u8; 32]);
+
+impl ArtifactSemanticDigest {
+    pub(crate) const fn bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RangeArtifactData {
+    contract: Arc<RuntimeOrderContract>,
+    bound: OrderedTuple,
+    semantic_digest: ArtifactSemanticDigest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RangeArtifactResidentLayout {
+    pub(crate) key_count: usize,
+    pub(crate) timezone_count: usize,
+    pub(crate) timezone_bytes: usize,
+    pub(crate) tuple_arity: usize,
+    pub(crate) utf8_count: usize,
+    pub(crate) utf8_bytes: usize,
+}
+
+impl RangeArtifactResidentLayout {
+    pub(crate) fn from_data(
+        contract: &RuntimeOrderContract,
+        bound: &OrderedTuple,
+    ) -> Result<Self, ArtifactContractError> {
+        let (timezone_count, timezone_bytes) =
+            contract
+                .keys()
+                .iter()
+                .try_fold((0usize, 0usize), |(count, bytes), key| {
+                    match key.data_type() {
+                        DataType::Timestamp(_, Some(timezone)) => Ok((
+                            count
+                                .checked_add(1)
+                                .ok_or(ArtifactContractError::ResidentSizeOverflow)?,
+                            bytes
+                                .checked_add(timezone.len())
+                                .ok_or(ArtifactContractError::ResidentSizeOverflow)?,
+                        )),
+                        _ => Ok((count, bytes)),
+                    }
+                })?;
+        let (utf8_count, utf8_bytes) = bound.values().iter().try_fold(
+            (0usize, 0usize),
+            |(count, bytes), value| match value {
+                Some(OrderedScalar::Utf8(value)) => Ok((
+                    count
+                        .checked_add(1)
+                        .ok_or(ArtifactContractError::ResidentSizeOverflow)?,
+                    bytes
+                        .checked_add(value.len())
+                        .ok_or(ArtifactContractError::ResidentSizeOverflow)?,
+                )),
+                _ => Ok((count, bytes)),
+            },
+        )?;
+        Ok(Self {
+            key_count: contract.keys().len(),
+            timezone_count,
+            timezone_bytes,
+            tuple_arity: bound.values().len(),
+            utf8_count,
+            utf8_bytes,
+        })
+    }
+
+    pub(crate) fn decode_temporary_bytes(self) -> Result<usize, ArtifactContractError> {
+        self.key_count
+            .checked_mul(size_of::<RuntimeOrderKey>())
+            .and_then(|bytes| {
+                self.tuple_arity
+                    .checked_mul(size_of::<Option<OrderedScalar>>())
+                    .and_then(|tuple| bytes.checked_add(tuple))
+            })
+            .ok_or(ArtifactContractError::ResidentSizeOverflow)
+    }
+}
+
+impl RangeArtifactData {
+    pub(crate) fn new(
+        contract: Arc<RuntimeOrderContract>,
+        bound: OrderedTuple,
+        logical_version: LogicalVersion,
+    ) -> Result<Self, ArtifactContractError> {
+        contract
+            .compare(&bound, &bound)
+            .map_err(|_| ArtifactContractError::SchemaMismatch)?;
+        let mut semantic = Sha256::new();
+        semantic.update(b"novarocks.runtime-filter.range-semantic");
+        semantic.update([1]);
+        semantic.update(logical_version.get().to_be_bytes());
+        semantic.update(contract.digest().bytes());
+        semantic.update((bound.values().len() as u64).to_be_bytes());
+        for value in bound.values() {
+            match value {
+                None => semantic.update([0]),
+                Some(value) => {
+                    semantic.update([1]);
+                    hash_ordered_scalar(&mut semantic, value);
+                }
+            }
+        }
+        Ok(Self {
+            contract,
+            bound,
+            semantic_digest: ArtifactSemanticDigest(semantic.finalize().into()),
+        })
+    }
+
+    pub(crate) const fn contract(&self) -> &Arc<RuntimeOrderContract> {
+        &self.contract
+    }
+
+    pub(crate) const fn bound(&self) -> &OrderedTuple {
+        &self.bound
+    }
+
+    pub(crate) const fn semantic_digest(&self) -> ArtifactSemanticDigest {
+        self.semantic_digest
+    }
+
+    pub(crate) fn accounted_resident_bytes(&self) -> Result<usize, ArtifactContractError> {
+        Self::accounted_resident_bytes_for_layout(RangeArtifactResidentLayout::from_data(
+            &self.contract,
+            &self.bound,
+        )?)
+    }
+
+    pub(crate) fn accounted_resident_bytes_for_layout(
+        layout: RangeArtifactResidentLayout,
+    ) -> Result<usize, ArtifactContractError> {
+        let arc_header = 2usize
+            .checked_mul(size_of::<usize>())
+            .ok_or(ArtifactContractError::ResidentSizeOverflow)?;
+        size_of::<Self>()
+            .checked_add(arc_header)
+            .and_then(|bytes| bytes.checked_add(size_of::<RuntimeOrderContract>()))
+            .and_then(|bytes| bytes.checked_add(arc_header))
+            .and_then(|bytes| {
+                layout
+                    .key_count
+                    .checked_mul(size_of::<RuntimeOrderKey>())
+                    .and_then(|keys| bytes.checked_add(keys))
+            })
+            .and_then(|bytes| bytes.checked_add(arc_header))
+            .and_then(|bytes| {
+                layout
+                    .timezone_count
+                    .checked_mul(arc_header)
+                    .and_then(|headers| bytes.checked_add(headers))
+            })
+            .and_then(|bytes| bytes.checked_add(layout.timezone_bytes))
+            .and_then(|bytes| {
+                layout
+                    .tuple_arity
+                    .checked_mul(size_of::<Option<OrderedScalar>>())
+                    .and_then(|values| bytes.checked_add(values))
+            })
+            .and_then(|bytes| bytes.checked_add(arc_header))
+            .and_then(|bytes| {
+                layout
+                    .utf8_count
+                    .checked_mul(arc_header)
+                    .and_then(|headers| bytes.checked_add(headers))
+            })
+            .and_then(|bytes| bytes.checked_add(layout.utf8_bytes))
+            .ok_or(ArtifactContractError::ResidentSizeOverflow)
+    }
+}
+
+fn hash_ordered_scalar(digest: &mut Sha256, value: &OrderedScalar) {
+    match value {
+        OrderedScalar::Boolean(value) => digest.update([1, u8::from(*value)]),
+        OrderedScalar::Int8(value) => digest.update([2, *value as u8]),
+        OrderedScalar::Int16(value) => {
+            digest.update([3]);
+            digest.update(value.to_be_bytes());
+        }
+        OrderedScalar::Int32(value) => {
+            digest.update([4]);
+            digest.update(value.to_be_bytes());
+        }
+        OrderedScalar::Int64(value) => {
+            digest.update([5]);
+            digest.update(value.to_be_bytes());
+        }
+        OrderedScalar::LargeInt(value) => {
+            digest.update([6]);
+            digest.update(value.to_be_bytes());
+        }
+        OrderedScalar::Utf8(value) => {
+            digest.update([9]);
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value.as_bytes());
+        }
+        OrderedScalar::Date32(value) => {
+            digest.update([10]);
+            digest.update(value.to_be_bytes());
+        }
+        OrderedScalar::Timestamp(value) => {
+            digest.update([11]);
+            digest.update(value.to_be_bytes());
+        }
+        OrderedScalar::Decimal128(value) => {
+            digest.update([12]);
+            digest.update(value.to_be_bytes());
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum PhysicalArtifactPayload {
+    Membership,
+    Range(Arc<RangeArtifactData>),
+}
+
 pub(crate) struct PhysicalArtifact {
     kind: ArtifactKind,
     codec_version: u16,
@@ -457,6 +725,7 @@ pub(crate) struct PhysicalArtifact {
     contains_null: bool,
     canonical_bytes: Arc<[u8]>,
     canonical_digest: [u8; 32],
+    payload: PhysicalArtifactPayload,
     retained_memory: Option<Arc<ArtifactRetention>>,
 }
 
@@ -502,6 +771,7 @@ impl PhysicalArtifact {
             contains_null,
             canonical_bytes,
             canonical_digest,
+            payload: PhysicalArtifactPayload::Membership,
             retained_memory: Some(Arc::new(retained_memory)),
         })
     }
@@ -533,6 +803,7 @@ impl PhysicalArtifact {
             contains_null,
             canonical_bytes,
             canonical_digest,
+            payload: PhysicalArtifactPayload::Membership,
             retained_memory: Some(retained_memory),
         })
     }
@@ -554,8 +825,95 @@ impl PhysicalArtifact {
             contains_null,
             canonical_bytes,
             canonical_digest,
+            payload: PhysicalArtifactPayload::Membership,
             retained_memory: None,
         }
+    }
+
+    pub(crate) fn accounted_range_resident_component_bytes(
+        encoded_bytes: usize,
+        data: &RangeArtifactData,
+    ) -> Result<usize, ArtifactContractError> {
+        Self::accounted_range_resident_component_bytes_for_layout(
+            encoded_bytes,
+            RangeArtifactResidentLayout::from_data(data.contract(), data.bound())?,
+        )
+    }
+
+    pub(crate) fn accounted_range_resident_component_bytes_for_layout(
+        encoded_bytes: usize,
+        layout: RangeArtifactResidentLayout,
+    ) -> Result<usize, ArtifactContractError> {
+        let arc_header = 2usize
+            .checked_mul(size_of::<usize>())
+            .ok_or(ArtifactContractError::ResidentSizeOverflow)?;
+        size_of::<Self>()
+            .checked_add(arc_header)
+            .and_then(|bytes| bytes.checked_add(encoded_bytes))
+            .and_then(|bytes| bytes.checked_add(arc_header))
+            .and_then(|bytes| {
+                RangeArtifactData::accounted_resident_bytes_for_layout(layout)
+                    .ok()
+                    .and_then(|data| bytes.checked_add(data))
+            })
+            .ok_or(ArtifactContractError::ResidentSizeOverflow)
+    }
+
+    pub(crate) fn from_range_retained(
+        version: LogicalVersion,
+        data: RangeArtifactData,
+        canonical_bytes: Arc<[u8]>,
+        retained_memory: ArtifactRetention,
+    ) -> Result<Self, ArtifactContractError> {
+        let accounted =
+            Self::accounted_range_resident_component_bytes(canonical_bytes.len(), &data)?
+                .checked_add(size_of::<ArtifactRetention>())
+                .and_then(|bytes| bytes.checked_add(2 * size_of::<usize>()))
+                .ok_or(ArtifactContractError::ResidentSizeOverflow)?;
+        if retained_memory.bytes() != accounted || retained_memory.budget_bytes() != accounted {
+            return Err(ArtifactContractError::RetentionSizeMismatch);
+        }
+        Self::from_range_shared_retained(
+            version,
+            data,
+            canonical_bytes,
+            accounted - size_of::<ArtifactRetention>() - 2 * size_of::<usize>(),
+            accounted,
+            Arc::new(retained_memory),
+        )
+    }
+
+    pub(crate) fn from_range_shared_retained(
+        version: LogicalVersion,
+        data: RangeArtifactData,
+        canonical_bytes: Arc<[u8]>,
+        accounted_component_bytes: usize,
+        total_accounted_bytes: usize,
+        retained_memory: Arc<ArtifactRetention>,
+    ) -> Result<Self, ArtifactContractError> {
+        if accounted_component_bytes
+            != Self::accounted_range_resident_component_bytes(canonical_bytes.len(), &data)?
+            || accounted_component_bytes > total_accounted_bytes
+            || retained_memory.bytes() != total_accounted_bytes
+            || retained_memory.budget_bytes() != total_accounted_bytes
+        {
+            return Err(ArtifactContractError::RetentionSizeMismatch);
+        }
+        let schema_digest =
+            ArtifactSchemaDigest::from_canonical_bytes(data.contract().digest().bytes());
+        let contains_null = data.bound().values().iter().any(Option::is_none);
+        let canonical_digest = Sha256::digest(&canonical_bytes).into();
+        Ok(Self {
+            kind: ArtifactKind::Range,
+            codec_version: LEAF_CODEC_VERSION,
+            schema_digest,
+            version,
+            contains_null,
+            canonical_bytes,
+            canonical_digest,
+            payload: PhysicalArtifactPayload::Range(Arc::new(data)),
+            retained_memory: Some(retained_memory),
+        })
     }
 
     pub(crate) const fn kind(&self) -> ArtifactKind {
@@ -579,6 +937,12 @@ impl PhysicalArtifact {
     pub(crate) const fn canonical_digest(&self) -> [u8; 32] {
         self.canonical_digest
     }
+    pub(crate) fn range(&self) -> Option<&RangeArtifactData> {
+        match &self.payload {
+            PhysicalArtifactPayload::Membership => None,
+            PhysicalArtifactPayload::Range(data) => Some(data),
+        }
+    }
     pub(crate) fn retained_memory_bytes(&self) -> usize {
         self.retained_memory
             .as_ref()
@@ -589,6 +953,17 @@ impl PhysicalArtifact {
         self.retained_memory
             .as_ref()
             .is_some_and(|owned| Arc::ptr_eq(owned, retention))
+    }
+
+    fn accounted_component_bytes(&self) -> Result<usize, ArtifactContractError> {
+        match &self.payload {
+            PhysicalArtifactPayload::Membership => {
+                Self::accounted_resident_component_bytes(self.canonical_bytes.len())
+            }
+            PhysicalArtifactPayload::Range(data) => {
+                Self::accounted_range_resident_component_bytes(self.canonical_bytes.len(), data)
+            }
+        }
     }
 }
 
@@ -661,6 +1036,23 @@ impl ArtifactBundle {
             .ok_or(ArtifactContractError::ResidentSizeOverflow)
     }
 
+    pub(crate) fn accounted_range_resident_overhead(
+        artifact_count: usize,
+    ) -> Result<usize, ArtifactContractError> {
+        let arc_header = 2usize
+            .checked_mul(size_of::<usize>())
+            .ok_or(ArtifactContractError::ResidentSizeOverflow)?;
+        let refs = artifact_count
+            .checked_mul(size_of::<(ArtifactKind, Arc<PhysicalArtifact>)>())
+            .ok_or(ArtifactContractError::ResidentSizeOverflow)?;
+        size_of::<Self>()
+            .checked_add(arc_header)
+            .and_then(|bytes| bytes.checked_add(refs))
+            .and_then(|bytes| bytes.checked_add(size_of::<ArtifactRetention>()))
+            .and_then(|bytes| bytes.checked_add(arc_header))
+            .ok_or(ArtifactContractError::ResidentSizeOverflow)
+    }
+
     pub(crate) fn new(
         channel_id: ChannelId,
         version: LogicalVersion,
@@ -686,16 +1078,21 @@ impl ArtifactBundle {
         max_artifact_bytes: usize,
         retained_memory: Arc<ArtifactRetention>,
     ) -> Result<Self, ArtifactContractError> {
-        let expected = artifacts.iter().try_fold(
-            Self::accounted_resident_overhead(profile, artifacts.len())?,
-            |bytes, (_, artifact)| {
+        let overhead = if artifacts
+            .iter()
+            .all(|(_, artifact)| artifact.kind() == ArtifactKind::Range)
+        {
+            Self::accounted_range_resident_overhead(artifacts.len())?
+        } else {
+            Self::accounted_resident_overhead(profile, artifacts.len())?
+        };
+        let expected = artifacts
+            .iter()
+            .try_fold(overhead, |bytes, (_, artifact)| {
                 bytes
-                    .checked_add(PhysicalArtifact::accounted_resident_component_bytes(
-                        artifact.canonical_bytes().len(),
-                    )?)
+                    .checked_add(artifact.accounted_component_bytes()?)
                     .ok_or(ArtifactContractError::ResidentSizeOverflow)
-            },
-        )?;
+            })?;
         if retained_memory.bytes() != expected || retained_memory.budget_bytes() != expected {
             return Err(ArtifactContractError::RetentionSizeMismatch);
         }
@@ -874,6 +1271,23 @@ mod tests {
 
         assert_eq!(left.canonical_bytes(), right.canonical_bytes());
         assert_eq!(left.id(), right.id());
+    }
+
+    #[test]
+    fn membership_profile_preserves_v1_canonical_identity() {
+        let profile =
+            ConsumerArtifactProfile::new(BTreeSet::from([ArtifactKind::ValueSet]), None).unwrap();
+
+        assert_eq!(
+            profile.canonical_bytes(),
+            &[
+                super::PROFILE_VERSION,
+                0,
+                1,
+                ArtifactKind::ValueSet.tag(),
+                0,
+            ]
+        );
     }
 
     #[test]

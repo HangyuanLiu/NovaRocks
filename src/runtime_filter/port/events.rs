@@ -22,8 +22,8 @@ use crate::runtime_filter::port::artifact::{ArtifactKind, ConsumerProfileId};
 use super::identity::{
     ContributionIdentity, DeploymentEpoch, LogicalVersion, RouteEdgeId, RuntimeFilterParticipantId,
 };
-use super::producer::ProducerFailureReason;
-use super::subscription::{ArtifactUnsupportedReason, UnavailableReason};
+use super::producer::{ProducerFailureReason, RuntimeContractViolationKind};
+use super::subscription::{ArtifactUnsupportedReason, LiveTerminal, UnavailableReason};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct RuntimeFilterEventIdentity {
@@ -203,6 +203,33 @@ pub(crate) enum RuntimeFilterEvent {
     DeltaDuplicateIgnored {
         identity: ContributionIdentity,
     },
+    OrderedUpdateStale {
+        identity: ContributionIdentity,
+    },
+    OrderedUpdateApplied {
+        identity: ContributionIdentity,
+    },
+    OrderedUpdateRejected {
+        identity: ContributionIdentity,
+        violation: RuntimeContractViolationKind,
+    },
+    OrderedUpdateEqual {
+        identity: ContributionIdentity,
+    },
+    OrderedStreamTightened {
+        identity: ContributionIdentity,
+    },
+    OrderedGlobalTightened {
+        identity: ContributionIdentity,
+        version: LogicalVersion,
+    },
+    OrderedAvailabilityReached {
+        identity: RuntimeFilterEventIdentity,
+    },
+    LogicalVersionPublished {
+        identity: RuntimeFilterEventIdentity,
+        version: LogicalVersion,
+    },
     SequenceGapObserved {
         identity: ContributionIdentity,
     },
@@ -216,6 +243,14 @@ pub(crate) enum RuntimeFilterEvent {
     ChannelCompleted {
         identity: RuntimeFilterEventIdentity,
         version: LogicalVersion,
+    },
+    ChannelCompletedWithoutArtifact {
+        identity: RuntimeFilterEventIdentity,
+    },
+    ChannelLogicalDegraded {
+        identity: RuntimeFilterEventIdentity,
+        reason: UnavailableReason,
+        retained_version: LogicalVersion,
     },
     ChannelUnavailable {
         identity: RuntimeFilterEventIdentity,
@@ -271,6 +306,21 @@ pub(crate) enum RuntimeFilterEvent {
     },
     SubscriptionCancelled {
         identity: ConsumerEventIdentity,
+    },
+    LiveSubscriptionUpdated {
+        identity: ConsumerEventIdentity,
+        version: LogicalVersion,
+        terminal: Option<LiveTerminal>,
+    },
+    LiveSubscriptionIdle {
+        identity: ConsumerEventIdentity,
+        latest_version: Option<LogicalVersion>,
+        terminal: Option<LiveTerminal>,
+    },
+    LiveSubscriptionTerminal {
+        identity: ConsumerEventIdentity,
+        terminal: LiveTerminal,
+        retained_version: Option<LogicalVersion>,
     },
 }
 

@@ -1534,7 +1534,7 @@ mod runtime_filter_service_lifecycle_tests {
         DeploymentEpoch, RouteEdgeId, RuntimeFilterParticipantId,
     };
     use crate::runtime_filter::port::install::{
-        CompleteOnceChannelDeployment, ConsumerDeployment, ProducerDeployment,
+        ConsumerDeployment, ProducerDeployment, RuntimeFilterChannelDeployment,
         RuntimeFilterCoreBudget, RuntimeFilterInstallView,
     };
     use crate::runtime_filter::port::producer::{InstallContractErrorKind, InstallOutcome};
@@ -1558,7 +1558,7 @@ mod runtime_filter_service_lifecycle_tests {
     fn install_view() -> RuntimeFilterInstallView {
         let channel_id = ChannelId::new(1);
         let witness_id = CoverageWitnessId::new(2);
-        let deployment = CompleteOnceChannelDeployment::new(
+        let deployment = RuntimeFilterChannelDeployment::new(
             channel_id,
             RuntimeFilterLogicalDomain::Membership {
                 value_type: DataType::Int64,

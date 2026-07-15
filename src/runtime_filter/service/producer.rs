@@ -21,8 +21,10 @@ use crate::common::types::UniqueId;
 use crate::runtime_filter::core::channel::RuntimeFilterChannel;
 use crate::runtime_filter::model::contract::{BindingId, ChannelId};
 use crate::runtime_filter::port::identity::{PartitionId, ProducerSequence};
+use crate::runtime_filter::port::ordered_bound::OrderedBoundUpdate;
 use crate::runtime_filter::port::producer::{
-    ProducerAdapter, ProducerFailureReason, RuntimeContractViolation, SubmitOutcome,
+    OrderedBoundProducerAdapter, ProducerAdapter, ProducerFailureReason, RuntimeContractViolation,
+    SubmitOutcome,
 };
 use crate::runtime_filter::port::support::{
     RuntimeFilterMemoryAccount, TemporaryContributionLease,
@@ -85,6 +87,35 @@ impl ServiceProducerAdapter {
         self.dispatcher.dispatch(self.channel_id, action)?;
         Ok(outcome)
     }
+
+    fn finish_ordered(
+        &self,
+        partition_id: PartitionId,
+        sequence: ProducerSequence,
+        result: Result<
+            crate::runtime_filter::core::channel::ChannelAction,
+            RuntimeContractViolation,
+        >,
+    ) -> Result<SubmitOutcome, RuntimeContractViolation> {
+        match result {
+            Ok(action) => self.finish(action),
+            Err(error) => {
+                let identity = self.channel.contribution_identity(
+                    self.binding_id,
+                    self.fragment_instance_id,
+                    partition_id,
+                    sequence,
+                );
+                let action = self
+                    .channel
+                    .ordered_rejection_action(identity, error.kind());
+                self.dispatcher
+                    .dispatch(self.channel_id, action)
+                    .expect("ordered rejection-only dispatch cannot materialize or route");
+                Err(error)
+            }
+        }
+    }
 }
 
 impl ProducerAdapter for ServiceProducerAdapter {
@@ -140,6 +171,75 @@ impl ProducerAdapter for ServiceProducerAdapter {
     ) -> Result<SubmitOutcome, RuntimeContractViolation> {
         self.channel
             .close_partition(
+                self.binding_id,
+                self.fragment_instance_id,
+                partition_id,
+                terminal_sequence,
+            )
+            .and_then(|action| self.finish(action))
+    }
+
+    fn fail(
+        &self,
+        reason: ProducerFailureReason,
+    ) -> Result<SubmitOutcome, RuntimeContractViolation> {
+        self.channel
+            .fail_instance(self.binding_id, self.fragment_instance_id, reason)
+            .and_then(|action| self.finish(action))
+    }
+}
+
+impl OrderedBoundProducerAdapter for ServiceProducerAdapter {
+    fn submit_bound(
+        &self,
+        partition_id: PartitionId,
+        sequence: ProducerSequence,
+        update: OrderedBoundUpdate,
+    ) -> Result<SubmitOutcome, RuntimeContractViolation> {
+        let result = (|| {
+            self.channel.authorize_submit(
+                self.binding_id,
+                self.fragment_instance_id,
+                partition_id,
+            )?;
+            let Some(bytes) = update.canonical_contribution_bytes() else {
+                return self.channel.reject_ordered_submit_resource_exhausted(
+                    self.binding_id,
+                    self.fragment_instance_id,
+                    partition_id,
+                    sequence,
+                    &update,
+                );
+            };
+            let Ok(lease) = TemporaryContributionLease::try_new(self.memory_account.clone(), bytes)
+            else {
+                return self.channel.reject_ordered_submit_resource_exhausted(
+                    self.binding_id,
+                    self.fragment_instance_id,
+                    partition_id,
+                    sequence,
+                    &update,
+                );
+            };
+            self.channel.submit_ordered(
+                self.binding_id,
+                self.fragment_instance_id,
+                partition_id,
+                sequence,
+                update,
+                lease,
+            )
+        })();
+        self.finish_ordered(partition_id, sequence, result)
+    }
+
+    fn close_partition(
+        &self,
+        partition_id: PartitionId,
+        terminal_sequence: ProducerSequence,
+    ) -> Result<SubmitOutcome, RuntimeContractViolation> {
+        self.channel
+            .close_ordered_partition(
                 self.binding_id,
                 self.fragment_instance_id,
                 partition_id,

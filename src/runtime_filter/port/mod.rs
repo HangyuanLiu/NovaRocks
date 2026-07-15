@@ -19,6 +19,7 @@ pub(crate) mod artifact;
 pub(crate) mod events;
 pub(crate) mod identity;
 pub(crate) mod install;
+pub(crate) mod ordered_bound;
 pub(crate) mod producer;
 pub(crate) mod subscription;
 pub(crate) mod support;

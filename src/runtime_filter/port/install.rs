@@ -239,7 +239,7 @@ impl ConsumerDeployment {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CompleteOnceChannelDeployment {
+pub(crate) struct RuntimeFilterChannelDeployment {
     channel_id: ChannelId,
     logical_domain: RuntimeFilterLogicalDomain,
     lifecycle: RuntimeFilterLifecycle,
@@ -255,7 +255,7 @@ pub(crate) struct CompleteOnceChannelDeployment {
     consumers: BTreeMap<BindingId, ConsumerDeployment>,
 }
 
-impl CompleteOnceChannelDeployment {
+impl RuntimeFilterChannelDeployment {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         channel_id: ChannelId,
@@ -334,14 +334,14 @@ impl CompleteOnceChannelDeployment {
 pub(crate) struct RuntimeFilterInstallView {
     epoch: DeploymentEpoch,
     local_participant_id: RuntimeFilterParticipantId,
-    channels: BTreeMap<ChannelId, CompleteOnceChannelDeployment>,
+    channels: BTreeMap<ChannelId, RuntimeFilterChannelDeployment>,
 }
 
 impl RuntimeFilterInstallView {
     pub(crate) fn new(
         epoch: DeploymentEpoch,
         local_participant_id: RuntimeFilterParticipantId,
-        channels: BTreeMap<ChannelId, CompleteOnceChannelDeployment>,
+        channels: BTreeMap<ChannelId, RuntimeFilterChannelDeployment>,
     ) -> Self {
         Self {
             epoch,
@@ -356,7 +356,7 @@ impl RuntimeFilterInstallView {
     pub(crate) const fn local_participant_id(&self) -> RuntimeFilterParticipantId {
         self.local_participant_id
     }
-    pub(crate) const fn channels(&self) -> &BTreeMap<ChannelId, CompleteOnceChannelDeployment> {
+    pub(crate) const fn channels(&self) -> &BTreeMap<ChannelId, RuntimeFilterChannelDeployment> {
         &self.channels
     }
     pub(crate) fn is_empty(&self) -> bool {
@@ -387,7 +387,7 @@ mod tests {
             BTreeSet::from([UniqueId { hi: 10, lo: 11 }, UniqueId { hi: 12, lo: 13 }]);
         let consumer_instances = BTreeSet::from([UniqueId { hi: 14, lo: 15 }]);
 
-        let deployment = CompleteOnceChannelDeployment::new(
+        let deployment = RuntimeFilterChannelDeployment::new(
             channel_id,
             RuntimeFilterLogicalDomain::Membership {
                 value_type: DataType::Int64,

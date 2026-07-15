@@ -21,6 +21,8 @@ use crate::common::types::UniqueId;
 use crate::runtime_filter::model::contract::BindingId;
 use crate::runtime_filter::port::artifact::ArtifactBundle;
 
+use super::producer::RuntimeContractViolation;
+
 use super::identity::RouteEdgeId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,11 +93,104 @@ impl ArtifactDeliveryOutcome {
 
 pub(crate) trait ArtifactDelivery: Send + Sync {
     fn deliver(&self, route_edge_id: RouteEdgeId, outcome: ArtifactDeliveryOutcome);
+
+    fn deliver_live(
+        &self,
+        route_edge_id: RouteEdgeId,
+        outcome: Option<ArtifactDeliveryOutcome>,
+        terminal: Option<LiveTerminal>,
+    ) {
+        let _ = terminal;
+        if let Some(outcome) = outcome {
+            self.deliver(route_edge_id, outcome);
+        }
+    }
 }
 
 pub(crate) trait BlockingSnapshotSubscription: Send + Sync {
     fn acquire(&self, timeout: Duration) -> ArtifactAcquireOutcome;
     fn snapshot(&self) -> Option<Arc<ArtifactBundle>>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LiveTerminal {
+    Completed,
+    CompletedWithoutArtifact,
+    DegradedLogical(UnavailableReason),
+    DegradedArtifact(UnavailableReason),
+    DegradedDelivery(UnavailableReason),
+    Unavailable(UnavailableReason),
+    Cancelled,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum LivePollOutcome {
+    Updated {
+        bundle: Arc<ArtifactBundle>,
+        terminal: Option<LiveTerminal>,
+    },
+    Idle {
+        latest_version: Option<super::identity::LogicalVersion>,
+        terminal: Option<LiveTerminal>,
+    },
+}
+
+pub(crate) trait NonBlockingLiveSubscription: Send + Sync {
+    fn snapshot(&self) -> Option<Arc<ArtifactBundle>>;
+    fn poll_after(&self, observed: Option<super::identity::LogicalVersion>) -> LivePollOutcome;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SubscriptionKind {
+    BlockingSnapshot,
+    NonBlockingLive,
+}
+
+pub(crate) enum SubscriptionHandle {
+    Blocking(Arc<dyn BlockingSnapshotSubscription>),
+    Live(Arc<dyn NonBlockingLiveSubscription>),
+}
+
+impl std::fmt::Debug for SubscriptionHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("SubscriptionHandle")
+            .field(&self.kind())
+            .finish()
+    }
+}
+
+impl SubscriptionHandle {
+    pub(crate) const fn kind(&self) -> SubscriptionKind {
+        match self {
+            Self::Blocking(_) => SubscriptionKind::BlockingSnapshot,
+            Self::Live(_) => SubscriptionKind::NonBlockingLive,
+        }
+    }
+
+    pub(crate) fn into_blocking(
+        self,
+    ) -> Result<Arc<dyn BlockingSnapshotSubscription>, RuntimeContractViolation> {
+        match self {
+            Self::Blocking(subscription) => Ok(subscription),
+            Self::Live(_) => Err(RuntimeContractViolation::new(
+                super::producer::RuntimeContractViolationKind::SubscriptionActivationMismatch,
+                "live subscription handle cannot be used as a blocking subscription",
+            )),
+        }
+    }
+
+    pub(crate) fn into_live(
+        self,
+    ) -> Result<Arc<dyn NonBlockingLiveSubscription>, RuntimeContractViolation> {
+        match self {
+            Self::Live(subscription) => Ok(subscription),
+            Self::Blocking(_) => Err(RuntimeContractViolation::new(
+                super::producer::RuntimeContractViolationKind::SubscriptionActivationMismatch,
+                "blocking subscription handle cannot be used as a live subscription",
+            )),
+        }
+    }
 }
 
 #[cfg(test)]

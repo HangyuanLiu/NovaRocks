@@ -18,5 +18,6 @@
 pub(crate) mod channel;
 pub(crate) mod coverage;
 pub(crate) mod error;
+pub(crate) mod ordered_reducer;
 pub(crate) mod reducer;
 pub(crate) mod state;

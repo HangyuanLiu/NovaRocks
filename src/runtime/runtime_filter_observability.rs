@@ -234,10 +234,20 @@ impl From<&RuntimeFilterEvent> for RuntimeFilterChannelEventCoordinate {
             },
             RuntimeFilterEvent::ChannelPlanned { identity }
             | RuntimeFilterEvent::ChannelCompleted { identity, .. }
+            | RuntimeFilterEvent::OrderedAvailabilityReached { identity }
+            | RuntimeFilterEvent::LogicalVersionPublished { identity, .. }
+            | RuntimeFilterEvent::ChannelCompletedWithoutArtifact { identity }
+            | RuntimeFilterEvent::ChannelLogicalDegraded { identity, .. }
             | RuntimeFilterEvent::ChannelUnavailable { identity, .. }
             | RuntimeFilterEvent::ChannelCancelled { identity } => Self::Channel(*identity),
             RuntimeFilterEvent::DeltaAccepted { identity }
             | RuntimeFilterEvent::DeltaDuplicateIgnored { identity }
+            | RuntimeFilterEvent::OrderedUpdateStale { identity }
+            | RuntimeFilterEvent::OrderedUpdateApplied { identity }
+            | RuntimeFilterEvent::OrderedUpdateRejected { identity, .. }
+            | RuntimeFilterEvent::OrderedUpdateEqual { identity }
+            | RuntimeFilterEvent::OrderedStreamTightened { identity }
+            | RuntimeFilterEvent::OrderedGlobalTightened { identity, .. }
             | RuntimeFilterEvent::SequenceGapObserved { identity } => Self::Contribution(*identity),
             RuntimeFilterEvent::ProducerInstanceClosed { identity }
             | RuntimeFilterEvent::ProducerInstanceFailed { identity, .. } => {
@@ -256,7 +266,12 @@ impl From<&RuntimeFilterEvent> for RuntimeFilterChannelEventCoordinate {
             | RuntimeFilterEvent::SubscriptionTimedOut { identity }
             | RuntimeFilterEvent::SubscriptionUnavailable { identity, .. }
             | RuntimeFilterEvent::SubscriptionUnsupported { identity, .. }
-            | RuntimeFilterEvent::SubscriptionCancelled { identity } => Self::Consumer(*identity),
+            | RuntimeFilterEvent::SubscriptionCancelled { identity }
+            | RuntimeFilterEvent::LiveSubscriptionUpdated { identity, .. }
+            | RuntimeFilterEvent::LiveSubscriptionIdle { identity, .. }
+            | RuntimeFilterEvent::LiveSubscriptionTerminal { identity, .. } => {
+                Self::Consumer(*identity)
+            }
         }
     }
 }
@@ -531,9 +546,13 @@ mod tests {
         RuntimeFilterEvent, RuntimeFilterEventIdentity, RuntimeFilterEventSink,
     };
     use crate::runtime_filter::port::identity::{
-        DeploymentEpoch, LogicalVersion, RouteEdgeId, RuntimeFilterParticipantId,
+        ContributionIdentity, DeploymentEpoch, LogicalVersion, PartitionId, ProducerSequence,
+        ProducerStreamId, RouteEdgeId, RuntimeFilterParticipantId,
     };
-    use crate::runtime_filter::port::subscription::{ArtifactUnsupportedReason, UnavailableReason};
+    use crate::runtime_filter::port::producer::RuntimeContractViolationKind;
+    use crate::runtime_filter::port::subscription::{
+        ArtifactUnsupportedReason, LiveTerminal, UnavailableReason,
+    };
     use std::thread;
 
     fn channel_identity(query: QueryKey) -> RuntimeFilterEventIdentity {
@@ -597,6 +616,44 @@ mod tests {
     }
 
     #[test]
+    fn ordered_applied_and_rejected_events_keep_contribution_coordinates() {
+        let registry = RuntimeFilterLifecycleRegistry::new();
+        let query = QueryKey::from_hi_lo(31, 32);
+        let sink = RegistryRuntimeFilterEventSink::new(&registry, query);
+        let common = channel_identity(query);
+        let identity = ContributionIdentity::new(
+            common.query_id(),
+            common.participant_id(),
+            common.channel_id(),
+            common.epoch(),
+            ProducerStreamId::new(
+                BindingId::new(6),
+                UniqueId { hi: 7, lo: 8 },
+                PartitionId::new(9),
+            ),
+            ProducerSequence::new(10),
+        );
+        let events = vec![
+            RuntimeFilterEvent::OrderedUpdateApplied { identity },
+            RuntimeFilterEvent::OrderedUpdateRejected {
+                identity,
+                violation: RuntimeContractViolationKind::OrderedBoundLoosened,
+            },
+        ];
+        for event in &events {
+            sink.record(event.clone());
+        }
+
+        let snapshot = registry.snapshot(query).expect("query snapshot");
+        assert_eq!(
+            snapshot
+                .channel_events
+                .get(&RuntimeFilterChannelEventCoordinate::Contribution(identity)),
+            Some(&events)
+        );
+    }
+
+    #[test]
     fn materialization_adapter_preserves_terminal_reasons_and_cancel_coordinates() {
         let registry = RuntimeFilterLifecycleRegistry::new();
         let query = QueryKey::from_hi_lo(23, 24);
@@ -653,6 +710,26 @@ mod tests {
         let subscription_cancelled =
             RuntimeFilterEvent::SubscriptionCancelled { identity: consumer };
         sink.record(subscription_cancelled.clone());
+        let live_events = vec![
+            RuntimeFilterEvent::LiveSubscriptionUpdated {
+                identity: consumer,
+                version: LogicalVersion::new(7),
+                terminal: None,
+            },
+            RuntimeFilterEvent::LiveSubscriptionIdle {
+                identity: consumer,
+                latest_version: Some(LogicalVersion::new(7)),
+                terminal: None,
+            },
+            RuntimeFilterEvent::LiveSubscriptionTerminal {
+                identity: consumer,
+                terminal: LiveTerminal::DegradedDelivery(UnavailableReason::RouteUnavailable),
+                retained_version: Some(LogicalVersion::new(7)),
+            },
+        ];
+        for event in &live_events {
+            sink.record(event.clone());
+        }
 
         let snapshot = registry.snapshot(query).expect("query snapshot");
         assert_eq!(
@@ -673,7 +750,11 @@ mod tests {
             snapshot
                 .channel_events
                 .get(&RuntimeFilterChannelEventCoordinate::Consumer(consumer)),
-            Some(&vec![subscription_cancelled])
+            Some(
+                &std::iter::once(subscription_cancelled)
+                    .chain(live_events)
+                    .collect::<Vec<_>>()
+            )
         );
     }
 

@@ -21,19 +21,27 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::runtime_filter::model::contract::NullSemantics;
+use crate::runtime_filter::model::contract::{ComparatorDigest, NullOrder, SortDirection};
 use crate::runtime_filter::port::artifact::{
     ArtifactKind, ArtifactMembershipSchema, ArtifactMembershipSchemaView, ArtifactSchemaDigest,
-    HashContractDigest, LEAF_CODEC_VERSION, PhysicalArtifact,
+    HashContractDigest, LEAF_CODEC_VERSION, PhysicalArtifact, RangeArtifactData,
+    RangeArtifactResidentLayout,
 };
 use crate::runtime_filter::port::identity::LogicalVersion;
+use crate::runtime_filter::port::ordered_bound::{
+    OrderContractDigest, OrderedScalar, OrderedTuple, RuntimeOrderContract, RuntimeOrderKey,
+};
 use crate::runtime_filter::port::support::{
-    ArtifactRetainedBudget, ArtifactRetention, RetainedReservationError, RuntimeFilterMemoryAccount,
+    ArtifactRetainedBudget, ArtifactRetention, RetainedReservationError,
+    RuntimeFilterMemoryAccount, TemporaryContributionLease,
 };
 use crate::runtime_filter::port::value_domain::{ContributionSizeError, ReducedMembershipDomain};
 
 use super::bloom::{BLOOM_METADATA_BYTES, BloomHashContract};
 
 const MAGIC: &[u8; 4] = b"NRFL";
+const RANGE_MAGIC: &[u8; 4] = b"NRRG";
+const RANGE_CODEC_VERSION: u16 = 1;
 const FLAG_CONTAINS_NULL: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,7 +53,16 @@ pub(crate) struct ArtifactDecodeExpectations {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RangeDecodeExpectations {
+    pub expected_order_digest: OrderContractDigest,
+    pub expected_logical_version: LogicalVersion,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ArtifactCodecError {
+    ContractViolation,
+    Malformed,
+    ResourceUnavailable,
     Truncated,
     UnknownVersion,
     UnknownKind,
@@ -622,6 +639,680 @@ fn validate_decimal(
     )
 }
 
+pub(crate) fn encoded_range_leaf_len(
+    contract: &RuntimeOrderContract,
+    bound: &OrderedTuple,
+) -> Result<usize, ArtifactCodecError> {
+    contract
+        .compare(bound, bound)
+        .map_err(|_| ArtifactCodecError::ContractViolation)?;
+    let contract_len = encoded_order_contract_len(contract)?;
+    let tuple_len = encoded_order_tuple_len(contract, bound)?;
+    u32::try_from(contract_len).map_err(|_| ArtifactCodecError::ResourceUnavailable)?;
+    u64::try_from(tuple_len).map_err(|_| ArtifactCodecError::ResourceUnavailable)?;
+    4usize
+        .checked_add(2 + 1 + 32 + 8 + 4)
+        .and_then(|bytes| bytes.checked_add(contract_len))
+        .and_then(|bytes| bytes.checked_add(8))
+        .and_then(|bytes| bytes.checked_add(tuple_len))
+        .ok_or(ArtifactCodecError::ResourceUnavailable)
+}
+
+pub(crate) fn encode_range_leaf(
+    contract: &RuntimeOrderContract,
+    bound: &OrderedTuple,
+    logical_version: LogicalVersion,
+) -> Result<Vec<u8>, ArtifactCodecError> {
+    let capacity = encoded_range_leaf_len(contract, bound)?;
+    let contract_len = encoded_order_contract_len(contract)?;
+    let tuple_len = encoded_order_tuple_len(contract, bound)?;
+    let mut encoded = Vec::with_capacity(capacity);
+    encoded.extend_from_slice(RANGE_MAGIC);
+    encoded.extend_from_slice(&RANGE_CODEC_VERSION.to_be_bytes());
+    encoded.push(ArtifactKind::Range.tag());
+    encoded.extend_from_slice(&contract.digest().bytes());
+    encoded.extend_from_slice(&logical_version.get().to_be_bytes());
+    encoded.extend_from_slice(&(contract_len as u32).to_be_bytes());
+    encode_order_contract(contract, &mut encoded)?;
+    encoded.extend_from_slice(&(tuple_len as u64).to_be_bytes());
+    encode_order_tuple(contract, bound, &mut encoded)?;
+    debug_assert_eq!(encoded.len(), capacity);
+    Ok(encoded)
+}
+
+pub(crate) fn decode_range(
+    encoded: &[u8],
+    expectations: RangeDecodeExpectations,
+    max_artifact_bytes: usize,
+    retained_budget: Arc<ArtifactRetainedBudget>,
+    memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
+) -> Result<Arc<PhysicalArtifact>, ArtifactCodecError> {
+    if encoded.len() > max_artifact_bytes {
+        return Err(ArtifactCodecError::ResourceUnavailable);
+    }
+    let header = parse_range_header(encoded).map_err(|_| ArtifactCodecError::Malformed)?;
+    if header.kind != ArtifactKind::Range
+        || header.order_digest != expectations.expected_order_digest
+        || header.logical_version != expectations.expected_logical_version
+    {
+        return Err(ArtifactCodecError::ContractViolation);
+    }
+    let resident_layout =
+        validate_range_contract_and_tuple(header.contract, header.tuple, header.order_digest)
+            .map_err(|_| ArtifactCodecError::Malformed)?;
+    let component_bytes = PhysicalArtifact::accounted_range_resident_component_bytes_for_layout(
+        encoded.len(),
+        resident_layout,
+    )
+    .map_err(|_| ArtifactCodecError::ResourceUnavailable)?;
+    let total_bytes = component_bytes
+        .checked_add(std::mem::size_of::<ArtifactRetention>())
+        .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<usize>()))
+        .ok_or(ArtifactCodecError::ResourceUnavailable)?;
+    let retention = Arc::new(
+        ArtifactRetention::try_new(total_bytes, retained_budget, memory_account.clone())
+            .map_err(|_| ArtifactCodecError::ResourceUnavailable)?,
+    );
+    let _temporary = TemporaryContributionLease::try_new(
+        memory_account,
+        resident_layout
+            .decode_temporary_bytes()
+            .map_err(|_| ArtifactCodecError::ResourceUnavailable)?,
+    )
+    .map_err(|_| ArtifactCodecError::ResourceUnavailable)?;
+
+    let contract = Arc::new(
+        decode_order_contract(header.contract, header.order_digest).map_err(range_decode_error)?,
+    );
+    if contract.digest() != header.order_digest {
+        return Err(ArtifactCodecError::Malformed);
+    }
+    let bound = decode_order_tuple(&contract, header.tuple).map_err(range_decode_error)?;
+    let data = RangeArtifactData::new(contract, bound, header.logical_version)
+        .map_err(|_| ArtifactCodecError::Malformed)?;
+    let bytes: Arc<[u8]> = Arc::from(encoded);
+    let artifact = PhysicalArtifact::from_range_shared_retained(
+        header.logical_version,
+        data,
+        bytes,
+        component_bytes,
+        total_bytes,
+        retention,
+    )
+    .map_err(|_| ArtifactCodecError::ResourceUnavailable)?;
+    Ok(Arc::new(artifact))
+}
+
+const fn range_decode_error(error: ArtifactCodecError) -> ArtifactCodecError {
+    match error {
+        ArtifactCodecError::ResourceUnavailable => ArtifactCodecError::ResourceUnavailable,
+        _ => ArtifactCodecError::Malformed,
+    }
+}
+
+struct ParsedRangeHeader<'a> {
+    kind: ArtifactKind,
+    order_digest: OrderContractDigest,
+    logical_version: LogicalVersion,
+    contract: &'a [u8],
+    tuple: &'a [u8],
+}
+
+fn parse_range_header(encoded: &[u8]) -> Result<ParsedRangeHeader<'_>, ArtifactCodecError> {
+    let mut reader = Reader::new(encoded);
+    if reader.read_exact(4)? != RANGE_MAGIC || reader.read_u16()? != RANGE_CODEC_VERSION {
+        return Err(ArtifactCodecError::NonCanonicalPayload);
+    }
+    let kind = ArtifactKind::from_tag(reader.read_u8()?).ok_or(ArtifactCodecError::UnknownKind)?;
+    let order_digest = OrderContractDigest::from_bytes_for_codec(reader.read_array::<32>()?);
+    let logical_version = LogicalVersion::new(reader.read_u64()?);
+    let contract_len =
+        usize::try_from(reader.read_u32()?).map_err(|_| ArtifactCodecError::LengthOverflow)?;
+    let contract = reader.read_exact(contract_len)?;
+    let tuple_len =
+        usize::try_from(reader.read_u64()?).map_err(|_| ArtifactCodecError::LengthOverflow)?;
+    let tuple = reader.read_exact(tuple_len)?;
+    if !reader.is_empty() {
+        return Err(ArtifactCodecError::TrailingBytes);
+    }
+    Ok(ParsedRangeHeader {
+        kind,
+        order_digest,
+        logical_version,
+        contract,
+        tuple,
+    })
+}
+
+fn encoded_order_contract_len(
+    contract: &RuntimeOrderContract,
+) -> Result<usize, ArtifactCodecError> {
+    contract
+        .keys()
+        .iter()
+        .try_fold(4usize, |bytes, key| {
+            bytes
+                .checked_add(encoded_order_type_len(key.data_type())?)
+                .and_then(|bytes| bytes.checked_add(2))
+                .ok_or(ArtifactCodecError::ResourceUnavailable)
+        })?
+        .checked_add(32)
+        .ok_or(ArtifactCodecError::ResourceUnavailable)
+}
+
+fn encoded_order_type_len(
+    data_type: &arrow::datatypes::DataType,
+) -> Result<usize, ArtifactCodecError> {
+    use arrow::datatypes::DataType;
+    match data_type {
+        DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::FixedSizeBinary(16)
+        | DataType::Utf8
+        | DataType::Date32 => Ok(1),
+        DataType::Timestamp(_, timezone) => {
+            let timezone_len = timezone
+                .as_ref()
+                .map_or(Some(0), |value| 4usize.checked_add(value.len()))
+                .ok_or(ArtifactCodecError::ResourceUnavailable)?;
+            3usize
+                .checked_add(timezone_len)
+                .ok_or(ArtifactCodecError::ResourceUnavailable)
+        }
+        DataType::Decimal128(_, _) => Ok(3),
+        _ => Err(ArtifactCodecError::ContractViolation),
+    }
+}
+
+fn encode_order_contract(
+    contract: &RuntimeOrderContract,
+    output: &mut Vec<u8>,
+) -> Result<(), ArtifactCodecError> {
+    output.extend_from_slice(
+        &u32::try_from(contract.keys().len())
+            .map_err(|_| ArtifactCodecError::ResourceUnavailable)?
+            .to_be_bytes(),
+    );
+    for key in contract.keys() {
+        encode_order_type(key.data_type(), output)?;
+        output.push(match key.direction() {
+            SortDirection::Ascending => 1,
+            SortDirection::Descending => 2,
+        });
+        output.push(match key.null_order() {
+            NullOrder::First => 1,
+            NullOrder::Last => 2,
+        });
+    }
+    output.extend_from_slice(&contract.plan_comparator_digest().get());
+    Ok(())
+}
+
+fn encode_order_type(
+    data_type: &arrow::datatypes::DataType,
+    output: &mut Vec<u8>,
+) -> Result<(), ArtifactCodecError> {
+    use arrow::datatypes::{DataType, TimeUnit};
+    match data_type {
+        DataType::Boolean => output.push(1),
+        DataType::Int8 => output.push(2),
+        DataType::Int16 => output.push(3),
+        DataType::Int32 => output.push(4),
+        DataType::Int64 => output.push(5),
+        DataType::FixedSizeBinary(16) => output.push(6),
+        DataType::Utf8 => output.push(9),
+        DataType::Date32 => output.push(10),
+        DataType::Timestamp(unit, timezone) => {
+            output.push(11);
+            output.push(match unit {
+                TimeUnit::Second => 1,
+                TimeUnit::Millisecond => 2,
+                TimeUnit::Microsecond => 3,
+                TimeUnit::Nanosecond => 4,
+            });
+            match timezone {
+                None => output.push(0),
+                Some(value) => {
+                    output.push(1);
+                    output.extend_from_slice(
+                        &u32::try_from(value.len())
+                            .map_err(|_| ArtifactCodecError::ResourceUnavailable)?
+                            .to_be_bytes(),
+                    );
+                    output.extend_from_slice(value.as_bytes());
+                }
+            }
+        }
+        DataType::Decimal128(precision, scale) => {
+            output.extend_from_slice(&[12, *precision, *scale as u8]);
+        }
+        _ => return Err(ArtifactCodecError::ContractViolation),
+    }
+    Ok(())
+}
+
+fn encoded_order_tuple_len(
+    contract: &RuntimeOrderContract,
+    bound: &OrderedTuple,
+) -> Result<usize, ArtifactCodecError> {
+    contract
+        .compare(bound, bound)
+        .map_err(|_| ArtifactCodecError::ContractViolation)?;
+    contract
+        .keys()
+        .iter()
+        .zip(bound.values())
+        .try_fold(4usize, |bytes, (key, value)| {
+            let scalar = match value {
+                None => 0,
+                Some(OrderedScalar::Boolean(_) | OrderedScalar::Int8(_)) => 1,
+                Some(OrderedScalar::Int16(_)) => 2,
+                Some(OrderedScalar::Int32(_) | OrderedScalar::Date32(_)) => 4,
+                Some(OrderedScalar::Int64(_) | OrderedScalar::Timestamp(_)) => 8,
+                Some(OrderedScalar::LargeInt(_) | OrderedScalar::Decimal128(_)) => 16,
+                Some(OrderedScalar::Utf8(value)) => 8usize
+                    .checked_add(value.len())
+                    .ok_or(ArtifactCodecError::ResourceUnavailable)?,
+            };
+            if value
+                .as_ref()
+                .is_some_and(|value| !scalar_matches_key(value, key.data_type()))
+            {
+                return Err(ArtifactCodecError::ContractViolation);
+            }
+            bytes
+                .checked_add(1)
+                .and_then(|bytes| bytes.checked_add(scalar))
+                .ok_or(ArtifactCodecError::ResourceUnavailable)
+        })
+}
+
+fn encode_order_tuple(
+    contract: &RuntimeOrderContract,
+    bound: &OrderedTuple,
+    output: &mut Vec<u8>,
+) -> Result<(), ArtifactCodecError> {
+    let start = output.len();
+    output.extend_from_slice(
+        &u32::try_from(bound.values().len())
+            .map_err(|_| ArtifactCodecError::ResourceUnavailable)?
+            .to_be_bytes(),
+    );
+    for value in bound.values() {
+        let Some(value) = value else {
+            output.push(0);
+            continue;
+        };
+        output.push(1);
+        match value {
+            OrderedScalar::Boolean(value) => output.push(u8::from(*value)),
+            OrderedScalar::Int8(value) => output.push(*value as u8),
+            OrderedScalar::Int16(value) => output.extend_from_slice(&value.to_be_bytes()),
+            OrderedScalar::Int32(value) | OrderedScalar::Date32(value) => {
+                output.extend_from_slice(&value.to_be_bytes())
+            }
+            OrderedScalar::Int64(value) | OrderedScalar::Timestamp(value) => {
+                output.extend_from_slice(&value.to_be_bytes())
+            }
+            OrderedScalar::LargeInt(value) | OrderedScalar::Decimal128(value) => {
+                output.extend_from_slice(&value.to_be_bytes())
+            }
+            OrderedScalar::Utf8(value) => {
+                output.extend_from_slice(&(value.len() as u64).to_be_bytes());
+                output.extend_from_slice(value.as_bytes());
+            }
+        }
+    }
+    debug_assert_eq!(
+        output.len() - start,
+        encoded_order_tuple_len(contract, bound)?
+    );
+    Ok(())
+}
+
+fn scalar_matches_key(value: &OrderedScalar, data_type: &arrow::datatypes::DataType) -> bool {
+    use arrow::datatypes::DataType;
+    matches!(
+        (value, data_type),
+        (OrderedScalar::Boolean(_), DataType::Boolean)
+            | (OrderedScalar::Int8(_), DataType::Int8)
+            | (OrderedScalar::Int16(_), DataType::Int16)
+            | (OrderedScalar::Int32(_), DataType::Int32)
+            | (OrderedScalar::Int64(_), DataType::Int64)
+            | (OrderedScalar::LargeInt(_), DataType::FixedSizeBinary(16))
+            | (OrderedScalar::Utf8(_), DataType::Utf8)
+            | (OrderedScalar::Date32(_), DataType::Date32)
+            | (OrderedScalar::Timestamp(_), DataType::Timestamp(_, _))
+            | (OrderedScalar::Decimal128(_), DataType::Decimal128(_, _))
+    )
+}
+
+fn validate_range_contract_and_tuple(
+    contract_bytes: &[u8],
+    tuple_bytes: &[u8],
+    expected_order_digest: OrderContractDigest,
+) -> Result<RangeArtifactResidentLayout, ArtifactCodecError> {
+    let mut contract = Reader::new(contract_bytes);
+    let key_count =
+        usize::try_from(contract.read_u32()?).map_err(|_| ArtifactCodecError::LengthOverflow)?;
+    if key_count == 0 {
+        return Err(ArtifactCodecError::NonCanonicalPayload);
+    }
+    let mut tuple = Reader::new(tuple_bytes);
+    let arity =
+        usize::try_from(tuple.read_u32()?).map_err(|_| ArtifactCodecError::LengthOverflow)?;
+    if arity != key_count {
+        return Err(ArtifactCodecError::NonCanonicalPayload);
+    }
+    let mut timezone_count = 0usize;
+    let mut timezone_bytes = 0usize;
+    let mut utf8_count = 0usize;
+    let mut utf8_bytes = 0usize;
+    for _ in 0..key_count {
+        let (data_type, timezone_len) = scan_order_type(&mut contract)?;
+        if let Some(timezone_len) = timezone_len {
+            timezone_count = timezone_count
+                .checked_add(1)
+                .ok_or(ArtifactCodecError::LengthOverflow)?;
+            timezone_bytes = timezone_bytes
+                .checked_add(timezone_len)
+                .ok_or(ArtifactCodecError::LengthOverflow)?;
+        }
+        if !matches!(contract.read_u8()?, 1 | 2) || !matches!(contract.read_u8()?, 1 | 2) {
+            return Err(ArtifactCodecError::NonCanonicalPayload);
+        }
+        let null_flag = tuple.read_u8()?;
+        if null_flag == 0 {
+            continue;
+        }
+        if null_flag != 1 {
+            return Err(ArtifactCodecError::NonCanonicalPayload);
+        }
+        if let Some(utf8_len) = scan_order_scalar(&mut tuple, data_type)? {
+            utf8_count = utf8_count
+                .checked_add(1)
+                .ok_or(ArtifactCodecError::LengthOverflow)?;
+            utf8_bytes = utf8_bytes
+                .checked_add(utf8_len)
+                .ok_or(ArtifactCodecError::LengthOverflow)?;
+        }
+    }
+    let canonical_keys_len = contract_bytes
+        .len()
+        .checked_sub(contract.remaining_len())
+        .ok_or(ArtifactCodecError::LengthOverflow)?;
+    let comparator_digest = contract.read_array::<32>()?;
+    if !contract.is_empty() || !tuple.is_empty() {
+        return Err(ArtifactCodecError::TrailingBytes);
+    }
+    if RuntimeOrderContract::validate_codec_contract_digest(
+        &contract_bytes[..canonical_keys_len],
+        comparator_digest,
+    )
+    .map_err(|_| ArtifactCodecError::NonCanonicalPayload)?
+        != expected_order_digest
+    {
+        return Err(ArtifactCodecError::NonCanonicalPayload);
+    }
+    Ok(RangeArtifactResidentLayout {
+        key_count,
+        timezone_count,
+        timezone_bytes,
+        tuple_arity: arity,
+        utf8_count,
+        utf8_bytes,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum RangeTypeView {
+    Boolean,
+    Int8,
+    Int16,
+    Int32,
+    Int64,
+    LargeInt,
+    Utf8,
+    Date32,
+    Timestamp,
+    Decimal128 { precision: u8, scale: i8 },
+}
+
+fn scan_order_type<'a>(
+    reader: &mut Reader<'a>,
+) -> Result<(RangeTypeView, Option<usize>), ArtifactCodecError> {
+    Ok(match reader.read_u8()? {
+        1 => (RangeTypeView::Boolean, None),
+        2 => (RangeTypeView::Int8, None),
+        3 => (RangeTypeView::Int16, None),
+        4 => (RangeTypeView::Int32, None),
+        5 => (RangeTypeView::Int64, None),
+        6 => (RangeTypeView::LargeInt, None),
+        9 => (RangeTypeView::Utf8, None),
+        10 => (RangeTypeView::Date32, None),
+        11 => {
+            if !matches!(reader.read_u8()?, 1..=4) {
+                return Err(ArtifactCodecError::NonCanonicalPayload);
+            }
+            let timezone_len = match reader.read_u8()? {
+                0 => None,
+                1 => {
+                    let len = usize::try_from(reader.read_u32()?)
+                        .map_err(|_| ArtifactCodecError::LengthOverflow)?;
+                    std::str::from_utf8(reader.read_exact(len)?)
+                        .map_err(|_| ArtifactCodecError::NonCanonicalPayload)?;
+                    Some(len)
+                }
+                _ => return Err(ArtifactCodecError::NonCanonicalPayload),
+            };
+            (RangeTypeView::Timestamp, timezone_len)
+        }
+        12 => {
+            let precision = reader.read_u8()?;
+            let scale = reader.read_u8()? as i8;
+            if precision == 0
+                || precision > arrow::datatypes::DECIMAL128_MAX_PRECISION
+                || scale > arrow::datatypes::DECIMAL128_MAX_SCALE
+                || (scale > 0 && scale as u8 > precision)
+            {
+                return Err(ArtifactCodecError::NonCanonicalPayload);
+            }
+            (RangeTypeView::Decimal128 { precision, scale }, None)
+        }
+        _ => return Err(ArtifactCodecError::NonCanonicalPayload),
+    })
+}
+
+fn scan_order_scalar(
+    reader: &mut Reader<'_>,
+    data_type: RangeTypeView,
+) -> Result<Option<usize>, ArtifactCodecError> {
+    match data_type {
+        RangeTypeView::Boolean => match reader.read_u8()? {
+            0 | 1 => Ok(None),
+            _ => Err(ArtifactCodecError::NonCanonicalPayload),
+        },
+        RangeTypeView::Int8 => {
+            reader.read_u8()?;
+            Ok(None)
+        }
+        RangeTypeView::Int16 => {
+            reader.read_exact(2)?;
+            Ok(None)
+        }
+        RangeTypeView::Int32 | RangeTypeView::Date32 => {
+            reader.read_exact(4)?;
+            Ok(None)
+        }
+        RangeTypeView::Int64 | RangeTypeView::Timestamp => {
+            reader.read_exact(8)?;
+            Ok(None)
+        }
+        RangeTypeView::LargeInt => {
+            reader.read_exact(16)?;
+            Ok(None)
+        }
+        RangeTypeView::Decimal128 { precision, scale } => {
+            let value = reader.read_i128()?;
+            let bound = 10_i128
+                .checked_pow(u32::from(precision))
+                .ok_or(ArtifactCodecError::NonCanonicalPayload)?;
+            if value <= -bound || value >= bound {
+                return Err(ArtifactCodecError::NonCanonicalPayload);
+            }
+            let _ = scale;
+            Ok(None)
+        }
+        RangeTypeView::Utf8 => {
+            let len = usize::try_from(reader.read_u64()?)
+                .map_err(|_| ArtifactCodecError::LengthOverflow)?;
+            std::str::from_utf8(reader.read_exact(len)?)
+                .map_err(|_| ArtifactCodecError::NonCanonicalPayload)?;
+            Ok(Some(len))
+        }
+        _ => Err(ArtifactCodecError::NonCanonicalPayload),
+    }
+}
+
+fn decode_order_contract(
+    bytes: &[u8],
+    order_contract_digest: OrderContractDigest,
+) -> Result<RuntimeOrderContract, ArtifactCodecError> {
+    let mut reader = Reader::new(bytes);
+    let count =
+        usize::try_from(reader.read_u32()?).map_err(|_| ArtifactCodecError::LengthOverflow)?;
+    if count == 0 {
+        return Err(ArtifactCodecError::NonCanonicalPayload);
+    }
+    let mut keys = Vec::new();
+    keys.try_reserve_exact(count)
+        .map_err(|_| ArtifactCodecError::ResourceUnavailable)?;
+    for _ in 0..count {
+        let data_type = decode_order_type(&mut reader)?;
+        let direction = match reader.read_u8()? {
+            1 => SortDirection::Ascending,
+            2 => SortDirection::Descending,
+            _ => return Err(ArtifactCodecError::NonCanonicalPayload),
+        };
+        let null_order = match reader.read_u8()? {
+            1 => NullOrder::First,
+            2 => NullOrder::Last,
+            _ => return Err(ArtifactCodecError::NonCanonicalPayload),
+        };
+        keys.push(RuntimeOrderKey::from_codec(
+            data_type, direction, null_order,
+        ));
+    }
+    let comparator_digest = ComparatorDigest::new(reader.read_array::<32>()?);
+    if !reader.is_empty() {
+        return Err(ArtifactCodecError::TrailingBytes);
+    }
+    RuntimeOrderContract::from_codec(keys, comparator_digest, order_contract_digest)
+        .map_err(|_| ArtifactCodecError::NonCanonicalPayload)
+}
+
+fn decode_order_type(
+    reader: &mut Reader<'_>,
+) -> Result<arrow::datatypes::DataType, ArtifactCodecError> {
+    use arrow::datatypes::{DataType, TimeUnit};
+    Ok(match reader.read_u8()? {
+        1 => DataType::Boolean,
+        2 => DataType::Int8,
+        3 => DataType::Int16,
+        4 => DataType::Int32,
+        5 => DataType::Int64,
+        6 => DataType::FixedSizeBinary(16),
+        9 => DataType::Utf8,
+        10 => DataType::Date32,
+        11 => {
+            let unit = match reader.read_u8()? {
+                1 => TimeUnit::Second,
+                2 => TimeUnit::Millisecond,
+                3 => TimeUnit::Microsecond,
+                4 => TimeUnit::Nanosecond,
+                _ => return Err(ArtifactCodecError::NonCanonicalPayload),
+            };
+            let timezone = match reader.read_u8()? {
+                0 => None,
+                1 => {
+                    let len = usize::try_from(reader.read_u32()?)
+                        .map_err(|_| ArtifactCodecError::LengthOverflow)?;
+                    Some(
+                        std::str::from_utf8(reader.read_exact(len)?)
+                            .map_err(|_| ArtifactCodecError::NonCanonicalPayload)?
+                            .into(),
+                    )
+                }
+                _ => return Err(ArtifactCodecError::NonCanonicalPayload),
+            };
+            DataType::Timestamp(unit, timezone)
+        }
+        12 => DataType::Decimal128(reader.read_u8()?, reader.read_u8()? as i8),
+        _ => return Err(ArtifactCodecError::NonCanonicalPayload),
+    })
+}
+
+fn decode_order_tuple(
+    contract: &RuntimeOrderContract,
+    bytes: &[u8],
+) -> Result<OrderedTuple, ArtifactCodecError> {
+    let mut reader = Reader::new(bytes);
+    let count =
+        usize::try_from(reader.read_u32()?).map_err(|_| ArtifactCodecError::LengthOverflow)?;
+    if count != contract.keys().len() {
+        return Err(ArtifactCodecError::NonCanonicalPayload);
+    }
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| ArtifactCodecError::ResourceUnavailable)?;
+    for key in contract.keys() {
+        values.push(match reader.read_u8()? {
+            0 => None,
+            1 => Some(decode_order_scalar(&mut reader, key.data_type())?),
+            _ => return Err(ArtifactCodecError::NonCanonicalPayload),
+        });
+    }
+    if !reader.is_empty() {
+        return Err(ArtifactCodecError::TrailingBytes);
+    }
+    OrderedTuple::try_from_codec(contract, values)
+        .map_err(|_| ArtifactCodecError::NonCanonicalPayload)
+}
+
+fn decode_order_scalar(
+    reader: &mut Reader<'_>,
+    data_type: &arrow::datatypes::DataType,
+) -> Result<OrderedScalar, ArtifactCodecError> {
+    use arrow::datatypes::DataType;
+    Ok(match data_type {
+        DataType::Boolean => OrderedScalar::Boolean(match reader.read_u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(ArtifactCodecError::NonCanonicalPayload),
+        }),
+        DataType::Int8 => OrderedScalar::Int8(reader.read_u8()? as i8),
+        DataType::Int16 => OrderedScalar::Int16(reader.read_i16()?),
+        DataType::Int32 => OrderedScalar::Int32(reader.read_i32()?),
+        DataType::Int64 => OrderedScalar::Int64(reader.read_i64()?),
+        DataType::FixedSizeBinary(16) => OrderedScalar::LargeInt(reader.read_i128()?),
+        DataType::Utf8 => {
+            let len = usize::try_from(reader.read_u64()?)
+                .map_err(|_| ArtifactCodecError::LengthOverflow)?;
+            let value = std::str::from_utf8(reader.read_exact(len)?)
+                .map_err(|_| ArtifactCodecError::NonCanonicalPayload)?;
+            OrderedScalar::Utf8(value.into())
+        }
+        DataType::Date32 => OrderedScalar::Date32(reader.read_i32()?),
+        DataType::Timestamp(_, _) => OrderedScalar::Timestamp(reader.read_i64()?),
+        DataType::Decimal128(_, _) => OrderedScalar::Decimal128(reader.read_i128()?),
+        _ => return Err(ArtifactCodecError::NonCanonicalPayload),
+    })
+}
+
 struct Reader<'a> {
     remaining: &'a [u8],
 }
@@ -718,23 +1409,392 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
+    use crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain;
     use crate::runtime_filter::model::contract::NullSemantics;
+    use crate::runtime_filter::model::contract::{
+        ChannelId, NullOrder, OrderContract, OrderKeyContract, SortDirection,
+    };
     use crate::runtime_filter::port::artifact::{
         ArtifactKind, ArtifactMembershipSchema, ArtifactSchemaDigest, HashContractDigest,
         PhysicalArtifact,
     };
     use crate::runtime_filter::port::identity::LogicalVersion;
     use crate::runtime_filter::port::install::MaterializationPolicy;
-    use crate::runtime_filter::port::support::{
-        ArtifactRetainedBudget, MemoryAccountError, RuntimeFilterMemoryAccount,
+    use crate::runtime_filter::port::ordered_bound::{
+        COMPARATOR_ALGORITHM_VERSION, ComparatorDigestV1, OrderedScalar, OrderedTuple,
+        RuntimeOrderContract,
     };
-    use crate::runtime_filter::port::value_domain::{MembershipValues, ReducedMembershipDomain};
+    use crate::runtime_filter::port::support::RetainedMemoryReservation;
+    use crate::runtime_filter::port::support::{
+        ArtifactRetainedBudget, ArtifactRetention, MemoryAccountError, RuntimeFilterMemoryAccount,
+    };
+    use crate::runtime_filter::port::value_domain::{
+        LogicalSnapshot, MembershipValues, ReducedMembershipDomain,
+    };
 
     use super::super::bloom::{BloomHashContract, build_bits};
     use super::{
-        ArtifactCodecError, ArtifactDecodeExpectations, decode_leaf,
-        decode_leaf_unretained_for_test, encode_membership_leaf, encode_physical_leaf,
+        ArtifactCodecError, ArtifactDecodeExpectations, RangeDecodeExpectations, decode_leaf,
+        decode_leaf_unretained_for_test, decode_range, encode_membership_leaf,
+        encode_physical_leaf, encode_range_leaf,
     };
+
+    fn range_codec_fixture() -> (
+        Arc<LogicalSnapshot>,
+        crate::runtime_filter::port::artifact::ConsumerArtifactProfile,
+    ) {
+        let keys = vec![OrderKeyContract {
+            data_type: DataType::Int64,
+            direction: SortDirection::Ascending,
+            null_order: NullOrder::Last,
+        }];
+        let comparator =
+            ComparatorDigestV1::for_contract(&keys, COMPARATOR_ALGORITHM_VERSION).unwrap();
+        let contract = Arc::new(
+            RuntimeOrderContract::try_from_plan(&OrderContract {
+                keys,
+                inclusive: true,
+                comparator_digest: comparator,
+            })
+            .unwrap(),
+        );
+        let tuple = OrderedTuple::try_new(&contract, [Some(OrderedScalar::Int64(11))]).unwrap();
+        (
+            Arc::new(LogicalSnapshot::ordered(
+                ChannelId::new(9),
+                LogicalVersion::new(5),
+                Arc::new(OrderedBoundDomain::new(contract.clone(), tuple)),
+                RetainedMemoryReservation::empty(),
+            )),
+            crate::runtime_filter::port::artifact::ConsumerArtifactProfile::new_ordered_range(
+                contract.digest(),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn range_codec_hop_preserves_contract_version_bound_and_semantic_digest() {
+        let (snapshot, profile) = range_codec_fixture();
+        let direct = crate::runtime_filter::materializer::range::RangeMaterializer::materialize(
+            snapshot.clone(),
+            &profile,
+            usize::MAX,
+            Arc::new(ArtifactRetainedBudget::new(1 << 20)),
+            Arc::new(
+                crate::runtime_filter::port::support::ArtifactScratchBudget::new(1 << 20, 1 << 20)
+                    .unwrap(),
+            ),
+            Arc::new(CountingAccount::default()),
+        );
+        let crate::runtime_filter::materializer::range::RangeMaterializationOutcome::Published(
+            bundle,
+        ) = direct
+        else {
+            panic!("Range materialization must publish")
+        };
+        let direct = bundle.artifacts()[0].1.clone();
+        let decoded = decode_range(
+            direct.canonical_bytes(),
+            RangeDecodeExpectations {
+                expected_order_digest: snapshot.ordered_bound().unwrap().contract().digest(),
+                expected_logical_version: snapshot.version(),
+            },
+            direct.canonical_bytes().len(),
+            Arc::new(ArtifactRetainedBudget::new(1 << 20)),
+            Arc::new(CountingAccount::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            direct.range().unwrap().semantic_digest(),
+            decoded.range().unwrap().semantic_digest()
+        );
+        assert_eq!(
+            direct.range().unwrap().bound(),
+            decoded.range().unwrap().bound()
+        );
+        assert_eq!(decoded.version(), LogicalVersion::new(5));
+    }
+
+    #[test]
+    fn range_codec_round_trips_every_supported_ordered_scalar_contract() {
+        use arrow::datatypes::TimeUnit;
+
+        let typed_values = vec![
+            (DataType::Boolean, Some(OrderedScalar::Boolean(true))),
+            (DataType::Int8, Some(OrderedScalar::Int8(-8))),
+            (DataType::Int16, Some(OrderedScalar::Int16(-16))),
+            (DataType::Int32, Some(OrderedScalar::Int32(-32))),
+            (DataType::Int64, Some(OrderedScalar::Int64(-64))),
+            (
+                DataType::FixedSizeBinary(16),
+                Some(OrderedScalar::LargeInt(-128)),
+            ),
+            (
+                DataType::Utf8,
+                Some(OrderedScalar::Utf8("ordered-bytes".into())),
+            ),
+            (DataType::Date32, Some(OrderedScalar::Date32(20_000))),
+            (
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("Asia/Shanghai".into())),
+                Some(OrderedScalar::Timestamp(1_234_567_890)),
+            ),
+            (
+                DataType::Decimal128(18, 3),
+                Some(OrderedScalar::Decimal128(123_456)),
+            ),
+        ];
+        let keys = typed_values
+            .iter()
+            .map(|(data_type, _)| OrderKeyContract {
+                data_type: data_type.clone(),
+                direction: SortDirection::Ascending,
+                null_order: NullOrder::Last,
+            })
+            .collect::<Vec<_>>();
+        let comparator =
+            ComparatorDigestV1::for_contract(&keys, COMPARATOR_ALGORITHM_VERSION).unwrap();
+        let contract = Arc::new(
+            RuntimeOrderContract::try_from_plan(&OrderContract {
+                keys,
+                inclusive: true,
+                comparator_digest: comparator,
+            })
+            .unwrap(),
+        );
+        let bound =
+            OrderedTuple::try_new(&contract, typed_values.into_iter().map(|(_, value)| value))
+                .unwrap();
+        let encoded = encode_range_leaf(&contract, &bound, LogicalVersion::new(8)).unwrap();
+        let header = super::parse_range_header(&encoded).unwrap();
+        let layout = super::validate_range_contract_and_tuple(
+            header.contract,
+            header.tuple,
+            contract.digest(),
+        )
+        .unwrap();
+        let exact_bytes = PhysicalArtifact::accounted_range_resident_component_bytes_for_layout(
+            encoded.len(),
+            layout,
+        )
+        .unwrap()
+            + std::mem::size_of::<ArtifactRetention>()
+            + 2 * std::mem::size_of::<usize>();
+        let exact_budget = Arc::new(ArtifactRetainedBudget::new(exact_bytes));
+        let exact_account = Arc::new(CountingAccount::default());
+        let decoded = decode_range(
+            &encoded,
+            RangeDecodeExpectations {
+                expected_order_digest: contract.digest(),
+                expected_logical_version: LogicalVersion::new(8),
+            },
+            encoded.len(),
+            exact_budget.clone(),
+            exact_account.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            decoded.range().unwrap().contract().as_ref(),
+            contract.as_ref()
+        );
+        assert_eq!(decoded.range().unwrap().bound(), &bound);
+        assert_eq!(exact_budget.retained_bytes(), exact_bytes);
+        drop(decoded);
+        assert_eq!(exact_budget.retained_bytes(), 0);
+        assert_eq!(exact_account.retained.load(Ordering::SeqCst), 0);
+
+        let one_under = Arc::new(ArtifactRetainedBudget::new(exact_bytes - 1));
+        let one_under_account = Arc::new(CountingAccount::default());
+        assert_eq!(
+            decode_range(
+                &encoded,
+                RangeDecodeExpectations {
+                    expected_order_digest: contract.digest(),
+                    expected_logical_version: LogicalVersion::new(8),
+                },
+                encoded.len(),
+                one_under.clone(),
+                one_under_account.clone(),
+            )
+            .unwrap_err(),
+            ArtifactCodecError::ResourceUnavailable
+        );
+        assert_eq!(one_under.retained_bytes(), 0);
+        assert_eq!(one_under_account.retained.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn range_codec_classifies_expected_mismatch_malformed_and_resource_failures() {
+        let (snapshot, profile) = range_codec_fixture();
+        let direct = crate::runtime_filter::materializer::range::RangeMaterializer::materialize(
+            snapshot.clone(),
+            &profile,
+            usize::MAX,
+            Arc::new(ArtifactRetainedBudget::new(1 << 20)),
+            Arc::new(
+                crate::runtime_filter::port::support::ArtifactScratchBudget::new(1 << 20, 1 << 20)
+                    .unwrap(),
+            ),
+            Arc::new(CountingAccount::default()),
+        );
+        let crate::runtime_filter::materializer::range::RangeMaterializationOutcome::Published(
+            bundle,
+        ) = direct
+        else {
+            panic!("Range materialization must publish")
+        };
+        let encoded = bundle.artifacts()[0].1.canonical_bytes();
+        let expectations = RangeDecodeExpectations {
+            expected_order_digest: snapshot.ordered_bound().unwrap().contract().digest(),
+            expected_logical_version: snapshot.version(),
+        };
+        let failure_budget = Arc::new(ArtifactRetainedBudget::new(1 << 20));
+        let failure_account = Arc::new(CountingAccount::default());
+        let decode = |bytes: &[u8], expected: RangeDecodeExpectations, max: usize| {
+            decode_range(
+                bytes,
+                expected,
+                max,
+                failure_budget.clone(),
+                failure_account.clone(),
+            )
+        };
+
+        let mut wrong = expectations;
+        wrong.expected_logical_version = LogicalVersion::new(99);
+        assert_eq!(
+            decode(encoded, wrong, encoded.len()).unwrap_err(),
+            ArtifactCodecError::ContractViolation
+        );
+        let mut wrong = expectations;
+        wrong.expected_order_digest =
+            crate::runtime_filter::port::ordered_bound::OrderContractDigest::from_bytes_for_codec(
+                [99; 32],
+            );
+        assert_eq!(
+            decode(encoded, wrong, encoded.len()).unwrap_err(),
+            ArtifactCodecError::ContractViolation
+        );
+        let mut wrong_kind = encoded.to_vec();
+        wrong_kind[6] = ArtifactKind::ValueSet.tag();
+        assert_eq!(
+            decode(&wrong_kind, expectations, wrong_kind.len()).unwrap_err(),
+            ArtifactCodecError::ContractViolation
+        );
+        assert_eq!(
+            decode(&encoded[..encoded.len() - 1], expectations, encoded.len()).unwrap_err(),
+            ArtifactCodecError::Malformed
+        );
+        let mut trailing = encoded.to_vec();
+        trailing.push(0);
+        assert_eq!(
+            decode(&trailing, expectations, trailing.len()).unwrap_err(),
+            ArtifactCodecError::Malformed
+        );
+        assert_eq!(
+            decode(encoded, expectations, encoded.len() - 1).unwrap_err(),
+            ArtifactCodecError::ResourceUnavailable
+        );
+
+        for malformed in [
+            {
+                let mut bytes = encoded.to_vec();
+                bytes[0] ^= 0xff;
+                bytes
+            },
+            {
+                let mut bytes = encoded.to_vec();
+                bytes[4..6].copy_from_slice(&99_u16.to_be_bytes());
+                bytes
+            },
+            {
+                let mut bytes = encoded.to_vec();
+                bytes[6] = 99;
+                bytes
+            },
+            {
+                let mut bytes = encoded.to_vec();
+                bytes[47..51].copy_from_slice(&u32::MAX.to_be_bytes());
+                bytes
+            },
+        ] {
+            assert_eq!(
+                decode(&malformed, expectations, malformed.len()).unwrap_err(),
+                ArtifactCodecError::Malformed
+            );
+        }
+
+        let contract_len = u32::from_be_bytes(encoded[47..51].try_into().unwrap()) as usize;
+        let contract_start = 51;
+        let tuple_len_offset = contract_start + contract_len;
+        let tuple_start = tuple_len_offset + 8;
+        for malformed in [
+            {
+                let mut bytes = encoded.to_vec();
+                bytes[contract_start + 4] = 99;
+                bytes
+            },
+            {
+                let mut bytes = encoded.to_vec();
+                bytes[tuple_start..tuple_start + 4].copy_from_slice(&2_u32.to_be_bytes());
+                bytes
+            },
+            {
+                let mut bytes = encoded.to_vec();
+                bytes[tuple_start + 4] = 2;
+                bytes
+            },
+            {
+                let mut bytes = encoded.to_vec();
+                bytes[tuple_len_offset..tuple_len_offset + 8]
+                    .copy_from_slice(&u64::MAX.to_be_bytes());
+                bytes
+            },
+        ] {
+            assert_eq!(
+                decode(&malformed, expectations, malformed.len()).unwrap_err(),
+                ArtifactCodecError::Malformed
+            );
+        }
+
+        let budget = Arc::new(ArtifactRetainedBudget::new(0));
+        let account = Arc::new(CountingAccount::default());
+        assert_eq!(
+            decode_range(
+                encoded,
+                expectations,
+                encoded.len(),
+                budget.clone(),
+                account.clone(),
+            )
+            .unwrap_err(),
+            ArtifactCodecError::ResourceUnavailable
+        );
+        assert_eq!(budget.retained_bytes(), 0);
+        assert_eq!(account.retained.load(Ordering::SeqCst), 0);
+
+        let budget = Arc::new(ArtifactRetainedBudget::new(1 << 20));
+        let rejecting = Arc::new(CountingAccount {
+            retained: AtomicUsize::new(0),
+            reject: true,
+        });
+        assert_eq!(
+            decode_range(
+                encoded,
+                expectations,
+                encoded.len(),
+                budget.clone(),
+                rejecting.clone(),
+            )
+            .unwrap_err(),
+            ArtifactCodecError::ResourceUnavailable
+        );
+        assert_eq!(budget.retained_bytes(), 0);
+        assert_eq!(rejecting.retained.load(Ordering::SeqCst), 0);
+        assert_eq!(failure_budget.retained_bytes(), 0);
+        assert_eq!(failure_account.retained.load(Ordering::SeqCst), 0);
+    }
 
     #[derive(Default)]
     struct CountingAccount {
