@@ -23,7 +23,7 @@ mod conversion;
 mod iceberg;
 mod internal;
 pub(crate) mod local;
-pub(crate) mod metadata;
+mod metadata;
 pub(crate) mod provider;
 
 use metadata::{CatalogRuntimeBinding, CatalogRuntimeMetadata};
@@ -79,4 +79,31 @@ pub(crate) trait IcebergMetadataTableProvider {
         table: &str,
         metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
     ) -> Result<TableDef, String>;
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    #[test]
+    fn runtime_metadata_module_remains_private_to_sql_catalog() {
+        let source = include_str!("catalog.rs");
+
+        assert!(
+            source.lines().any(|line| line.trim() == "mod metadata;"),
+            "CatalogRuntimeMetadata must remain behind a private sql::catalog module"
+        );
+        assert!(
+            !source
+                .lines()
+                .any(|line| line.trim() == "pub(crate) mod metadata;"),
+            "sql::catalog siblings must not name the runtime metadata module"
+        );
+        assert!(
+            !source.lines().any(|line| {
+                let line = line.trim();
+                (line.starts_with("pub use ") || line.starts_with("pub(crate) use "))
+                    && line.contains("CatalogRuntimeMetadata")
+            }),
+            "sql::catalog must not re-export CatalogRuntimeMetadata"
+        );
+    }
 }
