@@ -19,6 +19,7 @@
 #![allow(unused_imports)]
 
 pub mod meta_provider_conformance;
+pub mod state_store_conformance;
 
 use std::path::PathBuf;
 use std::time::Duration;

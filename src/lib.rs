@@ -36,6 +36,7 @@ pub(crate) mod runtime_filter;
 pub mod server;
 pub mod service;
 pub mod sql;
+pub mod state_store;
 pub mod types;
 pub mod version;
 // StarRocks-BE-like folder layout, with `novarocks_*` convenience aliases.
