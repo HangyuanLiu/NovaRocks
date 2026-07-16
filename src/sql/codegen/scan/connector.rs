@@ -19,14 +19,14 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::catalog::schema::ColumnDef;
 use crate::common::min_max_predicate::MinMaxPredicate;
+use crate::connector::iceberg::scan_model::{
+    IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
+};
 use crate::connector::iceberg::scan_planner::{
     IcebergScanHandle, iceberg_scan_handle, iceberg_split,
 };
 use crate::connector::scan_planning::{ScanHandle, Split, validate_split_connectors};
 use crate::runtime::scan_range;
-use crate::sql::planner::table::{
-    IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
-};
 use arrow::datatypes::DataType;
 
 const ICEBERG_SCAN_SPLIT_TARGET_BYTES: i64 = 128 * 1024 * 1024;
@@ -444,9 +444,9 @@ fn native_file_pruning_min_max_values(
 }
 
 fn find_column_stats<'a>(
-    stats: &'a HashMap<String, crate::sql::planner::table::IcebergColumnStats>,
+    stats: &'a HashMap<String, crate::connector::iceberg::scan_model::IcebergColumnStats>,
     column: &str,
-) -> Option<&'a crate::sql::planner::table::IcebergColumnStats> {
+) -> Option<&'a crate::connector::iceberg::scan_model::IcebergColumnStats> {
     stats.get(column).or_else(|| {
         stats
             .iter()
@@ -456,7 +456,7 @@ fn find_column_stats<'a>(
 }
 
 fn native_min_max_value_from_stats(
-    stats: &crate::sql::planner::table::IcebergColumnStats,
+    stats: &crate::connector::iceberg::scan_model::IcebergColumnStats,
     data_type: &DataType,
 ) -> Option<scan_range::FilePruningMinMaxValue> {
     let has_null = stats.null_count.unwrap_or(0) > 0;

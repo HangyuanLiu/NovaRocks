@@ -20,10 +20,10 @@ use std::fmt;
 use std::sync::{Arc, RwLock};
 
 use crate::connector::iceberg::catalog::registry::IcebergCatalogRegistry;
+use crate::connector::iceberg::scan_model::{IcebergDataFileInfo, IcebergTableInfo};
 use crate::connector::scan_planning::{
     ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle, ScanHandle, Split,
 };
-use crate::sql::planner::table::{IcebergDataFileInfo, IcebergTableInfo};
 
 const CONNECTOR_ID: &str = "iceberg";
 
@@ -255,8 +255,8 @@ mod tests {
     use std::sync::{Arc, RwLock};
 
     use crate::catalog::schema::SqlType;
+    use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::connector::scan_planning::{ScanHandle, Split, validate_split_connectors};
-    use crate::sql::planner::table::{IcebergSchemaDef, IcebergTableInfo};
     use crate::sql::{Literal, TableColumnDef};
 
     fn dummy_iceberg_table_info() -> IcebergTableInfo {
@@ -301,7 +301,7 @@ mod tests {
             current_snapshot_id: Some(7),
             schema_id: 0,
             location: "s3://bucket/t".to_string(),
-            schema: crate::sql::planner::table::IcebergSchemaDef { fields: vec![] },
+            schema: crate::connector::iceberg::scan_model::IcebergSchemaDef { fields: vec![] },
             serialized_metadata: None,
             serialized_metadata_rows: None,
         }

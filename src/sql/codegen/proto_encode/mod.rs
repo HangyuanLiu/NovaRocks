@@ -578,12 +578,12 @@ mod tests {
                 logical_type: None,
             })
             .collect::<Vec<_>>();
-        let schema = crate::sql::planner::table::IcebergSchemaDef {
+        let schema = crate::connector::iceberg::scan_model::IcebergSchemaDef {
             fields: names
                 .iter()
                 .enumerate()
                 .map(
-                    |(idx, name)| crate::sql::planner::table::IcebergSchemaFieldDef {
+                    |(idx, name)| crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
                         field_id: i32::try_from(idx + 1).expect("field id"),
                         name: (*name).to_string(),
                         initial_default: None,
@@ -595,7 +595,7 @@ mod tests {
                 )
                 .collect(),
         };
-        let iceberg_table = crate::sql::planner::table::IcebergTableInfo {
+        let iceberg_table = crate::connector::iceberg::scan_model::IcebergTableInfo {
             catalog: "ice".to_string(),
             namespace: "db".to_string(),
             table: "sc2".to_string(),
@@ -615,7 +615,8 @@ mod tests {
                 table: iceberg_table,
                 files: Vec::new(),
                 cloud_properties: std::collections::BTreeMap::new(),
-                binding: crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
+                binding:
+                    crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
             },
         }
     }
@@ -1224,22 +1225,24 @@ mod tests {
 
     #[test]
     fn native_scan_encoder_preserves_iceberg_write_defaults() {
-        let schema = crate::sql::planner::table::IcebergSchemaDef {
-            fields: vec![crate::sql::planner::table::IcebergSchemaFieldDef {
-                field_id: 1,
-                name: "amount".to_string(),
-                initial_default: Some(iceberg::spec::Literal::Primitive(
-                    iceberg::spec::PrimitiveLiteral::Int(5),
-                )),
-                write_default: Some(iceberg::spec::Literal::Primitive(
-                    iceberg::spec::PrimitiveLiteral::Int(7),
-                )),
-                initial_default_json: Some("5".to_string()),
-                write_default_json: Some("7".to_string()),
-                children: vec![],
-            }],
+        let schema = crate::connector::iceberg::scan_model::IcebergSchemaDef {
+            fields: vec![
+                crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
+                    field_id: 1,
+                    name: "amount".to_string(),
+                    initial_default: Some(iceberg::spec::Literal::Primitive(
+                        iceberg::spec::PrimitiveLiteral::Int(5),
+                    )),
+                    write_default: Some(iceberg::spec::Literal::Primitive(
+                        iceberg::spec::PrimitiveLiteral::Int(7),
+                    )),
+                    initial_default_json: Some("5".to_string()),
+                    write_default_json: Some("7".to_string()),
+                    children: vec![],
+                },
+            ],
         };
-        let iceberg_table = crate::sql::planner::table::IcebergTableInfo {
+        let iceberg_table = crate::connector::iceberg::scan_model::IcebergTableInfo {
             catalog: "ice".to_string(),
             namespace: "db".to_string(),
             table: "orders".to_string(),
@@ -1269,7 +1272,8 @@ mod tests {
                 table: iceberg_table,
                 files: vec![],
                 cloud_properties: std::collections::BTreeMap::new(),
-                binding: crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
+                binding:
+                    crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
             },
         };
         let scan = crate::sql::planner::distributed::DistributedNode {
@@ -1351,7 +1355,7 @@ mod tests {
             }],
             iceberg_row_lineage_metadata_columns: vec![],
             source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
-                table: crate::sql::planner::table::IcebergTableInfo {
+                table: crate::connector::iceberg::scan_model::IcebergTableInfo {
                     catalog: "ice".to_string(),
                     namespace: "db".to_string(),
                     table: "orders".to_string(),
@@ -1359,13 +1363,16 @@ mod tests {
                     current_snapshot_id: Some(10),
                     schema_id: 1,
                     location: "s3://warehouse/db/orders".to_string(),
-                    schema: crate::sql::planner::table::IcebergSchemaDef { fields: vec![] },
+                    schema: crate::connector::iceberg::scan_model::IcebergSchemaDef {
+                        fields: vec![],
+                    },
                     serialized_metadata: None,
                     serialized_metadata_rows: None,
                 },
                 files: vec![],
                 cloud_properties: std::collections::BTreeMap::new(),
-                binding: crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
+                binding:
+                    crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
             },
         };
         let scan = crate::sql::planner::distributed::DistributedNode {

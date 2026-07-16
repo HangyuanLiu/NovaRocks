@@ -22,7 +22,7 @@ use thrift::OrderedFloat;
 
 use crate::catalog::schema::ColumnDef;
 use crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata;
-use crate::sql::planner::table::{IcebergColumnStats, IcebergDataFileInfo};
+use crate::connector::iceberg::scan_model::{IcebergColumnStats, IcebergDataFileInfo};
 use crate::thrift::{exprs, plan_nodes};
 
 pub(crate) fn iceberg_file_pruning_metadata_to_thrift(

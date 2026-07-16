@@ -18,6 +18,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::catalog::schema::ColumnDef;
+use crate::connector::iceberg::scan_model::{
+    IcebergDataFileBinding, IcebergDataFileInfo, IcebergTableInfo,
+};
 use crate::runtime::scan_range::ScanRangeParams;
 use crate::sql::analysis::OutputColumn;
 use crate::sql::codegen::scan::{
@@ -26,7 +29,6 @@ use crate::sql::codegen::scan::{
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::FragmentId;
 use crate::sql::planner::payload::PlanScanNode;
-use crate::sql::planner::table::{IcebergDataFileBinding, IcebergDataFileInfo, IcebergTableInfo};
 
 pub(crate) trait ScanBindingResolver: Send + Sync {
     fn resolve_scan(

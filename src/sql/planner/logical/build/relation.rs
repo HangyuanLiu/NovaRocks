@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::connector::iceberg::scan_model::{IcebergDataFileInfo, IcebergDeleteFileContent};
 use crate::sql::analysis::cte::CTERegistry;
 use crate::sql::analysis::*;
 use crate::sql::column_id::ColumnRefFactory;
 use crate::sql::planner::logical::*;
 use crate::sql::planner::payload::*;
-use crate::sql::planner::table::{IcebergDataFileInfo, IcebergDeleteFileContent};
 
 use super::output::adapt_plan_output_with_qualifier;
 use super::query::plan_scoped_query;
@@ -522,7 +522,7 @@ fn plan_iceberg_delta_scan(
 
 fn iceberg_table_info(
     source: &crate::sql::planner::table::ScanSource,
-) -> Option<&crate::sql::planner::table::IcebergTableInfo> {
+) -> Option<&crate::connector::iceberg::scan_model::IcebergTableInfo> {
     match source {
         crate::sql::planner::table::ScanSource::IcebergDataFiles { table, .. }
         | crate::sql::planner::table::ScanSource::IcebergMetadataTable { table, .. }

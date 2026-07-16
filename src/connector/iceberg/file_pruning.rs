@@ -21,8 +21,10 @@ use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateOp, MinMa
 use crate::common::scan_predicate::{
     MembershipPredicate, ScanPredicate, ScanPredicateDomain, ScanPredicateSource,
 };
+use crate::connector::iceberg::scan_model::{
+    IcebergColumnStats, IcebergDataFileInfo, IcebergPartitionValue,
+};
 use crate::fs::scan_context::FileScanRange;
-use crate::sql::planner::table::{IcebergColumnStats, IcebergDataFileInfo, IcebergPartitionValue};
 
 #[derive(Clone, Debug)]
 pub struct IcebergFilePruningMetadata {
@@ -650,8 +652,8 @@ mod tests {
     use crate::connector::iceberg::file_pruning_wire::{
         iceberg_file_pruning_metadata_from_thrift, iceberg_file_pruning_metadata_to_thrift,
     };
+    use crate::connector::iceberg::scan_model::{IcebergColumnStats, IcebergDataFileInfo};
     use crate::fs::scan_context::FileScanRange;
-    use crate::sql::planner::table::{IcebergColumnStats, IcebergDataFileInfo};
     use crate::thrift::{descriptors, exprs, plan_nodes, types};
 
     use super::{
@@ -971,7 +973,7 @@ mod tests {
     fn identity_partition_point_can_skip_file() {
         let mut file = IcebergDataFileInfo::for_test("s3://bucket/data.parquet", 10, 1);
         file.partition_values.push(
-            crate::sql::planner::table::IcebergPartitionFieldValue::identity_int64_for_test(
+            crate::connector::iceberg::scan_model::IcebergPartitionFieldValue::identity_int64_for_test(
                 "k1", 7,
             ),
         );
@@ -1137,7 +1139,7 @@ mod tests {
     fn data_file_with_identity_i64_partition(column: &str, value: i64) -> IcebergDataFileInfo {
         let mut file = IcebergDataFileInfo::for_test("s3://bucket/data.parquet", 10, 1);
         file.partition_values.push(
-            crate::sql::planner::table::IcebergPartitionFieldValue::identity_int64_for_test(
+            crate::connector::iceberg::scan_model::IcebergPartitionFieldValue::identity_int64_for_test(
                 column, value,
             ),
         );

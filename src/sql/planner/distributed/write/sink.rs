@@ -19,7 +19,8 @@ use std::collections::BTreeMap;
 
 use crate::catalog::schema::ColumnDef;
 use crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorInput;
-use crate::sql::planner::table::{IcebergTableInfo, TableDef};
+use crate::connector::iceberg::scan_model::IcebergTableInfo;
+use crate::sql::planner::table::TableDef;
 
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergWriteSinkSpec {
@@ -95,7 +96,8 @@ pub(crate) mod test_support {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::sql::planner::table::{IcebergSchemaDef, IcebergSchemaFieldDef, ScanSource};
+    use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergSchemaFieldDef};
+    use crate::sql::planner::table::ScanSource;
 
     pub(crate) fn simple_sink_spec() -> IcebergWriteSinkSpec {
         let iceberg = IcebergTableInfo {
@@ -134,7 +136,8 @@ pub(crate) mod test_support {
                 table: iceberg.clone(),
                 files: Vec::new(),
                 cloud_properties: Default::default(),
-                binding: crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
+                binding:
+                    crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
             },
         };
 

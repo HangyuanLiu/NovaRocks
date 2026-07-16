@@ -675,7 +675,7 @@ fn collect_branch_base_identities(
 }
 
 fn plan_base_identity(
-    table: &crate::sql::planner::table::IcebergTableInfo,
+    table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
     source_kind: BranchSourceKind,
 ) -> Result<PlanBaseIdentity, String> {
     let table_uuid = table.table_uuid.clone().ok_or_else(|| {
@@ -1526,6 +1526,7 @@ mod tests {
 
     use super::*;
     use crate::catalog::schema::ColumnDef;
+    use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context;
     use crate::sql::analysis::{BinOp, ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
@@ -1543,7 +1544,7 @@ mod tests {
     };
     use crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr;
     use crate::sql::planner::payload::{PlanProjectNode, PlanScanNode};
-    use crate::sql::planner::table::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     #[test]
     fn supported_join_delta_kinds_are_inner_and_cross_only() {
@@ -2276,7 +2277,7 @@ mod tests {
                         files: Vec::new(),
                         cloud_properties: BTreeMap::new(),
                         binding:
-                            crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
+                            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 },
                 alias: None,

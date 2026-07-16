@@ -33,14 +33,16 @@ use arrow::datatypes::{DataType, TimeUnit};
 use iceberg::spec::Schema;
 
 use crate::connector::iceberg::catalog::registry::{IcebergCatalogEntry, IcebergCatalogRegistry};
+use crate::connector::iceberg::scan_model::{
+    IcebergDataFileInfo, IcebergPartitionFieldValue, IcebergPartitionValue, IcebergSchemaDef,
+    IcebergSchemaFieldDef, IcebergTableInfo,
+};
 use crate::engine::mv::refresh_pin::RefreshSnapshotPin;
 use crate::engine::mv::table_ref::IcebergTableRef;
 use crate::meta::repository::mv::StoredMvDefinition;
 use crate::meta::repository::mv_contract::MvSchemaContract;
 use crate::sql::planner::table::{
-    IcebergDataFileInfo, IcebergMvTargetLocatorScan, IcebergMvTargetStateScan,
-    IcebergPartitionFieldValue, IcebergPartitionValue, IcebergSchemaDef, IcebergSchemaFieldDef,
-    IcebergTableInfo, ScanSource,
+    IcebergMvTargetLocatorScan, IcebergMvTargetStateScan, ScanSource,
 };
 
 use super::iceberg_refresh::IcebergMvTarget;
@@ -837,7 +839,7 @@ impl IcebergMvRefreshContext {
             table: table.clone(),
             files,
             cloud_properties: entry.cloud_properties_map(),
-            binding: crate::sql::planner::table::IcebergDataFileBinding::ExplicitFiles,
+            binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
         })
     }
 
@@ -960,7 +962,7 @@ impl IcebergMvRefreshContext {
             table: target_table_info(self, scan)?,
             files,
             cloud_properties: self.target_entry.cloud_properties_map(),
-            binding: crate::sql::planner::table::IcebergDataFileBinding::ExplicitFiles,
+            binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
         })
     }
 
@@ -1043,7 +1045,7 @@ impl IcebergMvRefreshContext {
             table: target_locator_table_info(self, scan)?,
             files,
             cloud_properties: self.target_entry.cloud_properties_map(),
-            binding: crate::sql::planner::table::IcebergDataFileBinding::ExplicitFiles,
+            binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
         })
     }
 
@@ -2813,7 +2815,7 @@ mod tests {
         };
         assert_eq!(
             binding,
-            crate::sql::planner::table::IcebergDataFileBinding::ExplicitFiles
+            crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles
         );
         assert_eq!(table.catalog, "tgt");
         assert_eq!(table.namespace, "db");
@@ -2896,7 +2898,7 @@ mod tests {
                 },
             ],
             cloud_properties: BTreeMap::new(),
-            binding: crate::sql::planner::table::IcebergDataFileBinding::ExplicitFiles,
+            binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
         }
     }
 

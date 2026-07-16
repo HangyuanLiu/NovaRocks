@@ -27,11 +27,11 @@ use crate::connector::iceberg::catalog::backend::{
     data_file_with_stats_to_iceberg_data_file_info, iceberg_schema_def_for_codegen,
 };
 use crate::connector::iceberg::catalog::registry::{extract_data_files_with_stats_at, load_table};
+use crate::connector::iceberg::scan_model::IcebergTableInfo;
 use crate::connector::stats::{
     ScanSourceIdentity, StatsProviderError, TableSnapshotRef, TableStatsProvider, TableStatsRequest,
 };
 use crate::sql::optimizer::stats_input::{BaseTableStatistics, StatsMissingReason};
-use crate::sql::planner::table::IcebergTableInfo;
 
 pub(crate) struct IcebergTableStatsProvider {
     registry: Arc<RwLock<IcebergCatalogRegistry>>,

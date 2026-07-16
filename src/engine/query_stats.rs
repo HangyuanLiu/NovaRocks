@@ -284,6 +284,9 @@ mod tests {
 
     use super::*;
     use crate::catalog::schema::ColumnDef;
+    use crate::connector::iceberg::scan_model::{
+        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
+    };
     use crate::connector::stats::StatsProviderError;
     use crate::sql::column_id::ColumnId;
     use crate::sql::column_id::ColumnRefFactory;
@@ -291,9 +294,7 @@ mod tests {
     use crate::sql::optimizer::operator::{LogicalJoinOp, Operator, ScanOp};
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::stats_input::{StatValue, StatsSource};
-    use crate::sql::planner::table::{
-        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
-    };
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     #[test]
     fn collector_binds_each_scan_in_the_same_opt_expr_traversal() {

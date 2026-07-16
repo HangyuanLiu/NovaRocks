@@ -757,8 +757,9 @@ fn stamp_delta_table_def_change_ops(
 
 #[cfg(test)]
 mod tests {
+    use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::engine::query_prep::IcebergFileForQuery;
-    use crate::sql::planner::table::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     fn test_iceberg_table_info() -> IcebergTableInfo {
         IcebergTableInfo {
@@ -882,7 +883,7 @@ mod tests {
         ) -> Result<TableDef, String> {
             Ok(table_def_with_binding(
                 table,
-                crate::sql::planner::table::IcebergDataFileBinding::ExplicitFiles,
+                crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
             ))
         }
 
@@ -892,14 +893,14 @@ mod tests {
         ) -> Result<TableDef, String> {
             Ok(table_def_with_binding(
                 table,
-                crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
+                crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
             ))
         }
     }
 
     fn table_def_with_binding(
         table: &crate::connector::backend::ResolvedTable,
-        binding: crate::sql::planner::table::IcebergDataFileBinding,
+        binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding,
     ) -> TableDef {
         let mut iceberg = test_iceberg_table_info();
         iceberg.catalog = table.catalog.clone();
@@ -929,7 +930,7 @@ mod tests {
         };
         let table_def = table_def_with_binding(
             &table,
-            crate::sql::planner::table::IcebergDataFileBinding::ExplicitFiles,
+            crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
         );
 
         super::register_synthetic_table_for_query(&state, "scratch", table_def)
@@ -1065,7 +1066,7 @@ mod tests {
             iceberg_row_lineage_metadata_columns: vec![],
             source: ScanSource::IcebergDataFiles {
                 table: test_iceberg_table_info(),
-                files: vec![crate::sql::planner::table::IcebergDataFileInfo {
+                files: vec![crate::connector::iceberg::scan_model::IcebergDataFileInfo {
                     path: "file:///tmp/data.parquet".to_string(),
                     size: 10,
                     row_count: Some(1),
@@ -1081,7 +1082,8 @@ mod tests {
                     partition_values: vec![],
                 }],
                 cloud_properties: Default::default(),
-                binding: crate::sql::planner::table::IcebergDataFileBinding::ExplicitFiles,
+                binding:
+                    crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
             },
         };
 
@@ -1138,7 +1140,7 @@ mod tests {
             ],
             source: ScanSource::IcebergDataFiles {
                 table: test_iceberg_table_info(),
-                files: vec![crate::sql::planner::table::IcebergDataFileInfo {
+                files: vec![crate::connector::iceberg::scan_model::IcebergDataFileInfo {
                     path: "file:///tmp/data.parquet".to_string(),
                     size: 10,
                     row_count: Some(1),
@@ -1154,7 +1156,8 @@ mod tests {
                     partition_values: vec![],
                 }],
                 cloud_properties: Default::default(),
-                binding: crate::sql::planner::table::IcebergDataFileBinding::ExplicitFiles,
+                binding:
+                    crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
             },
         };
 
@@ -1201,7 +1204,8 @@ mod tests {
                 table: test_iceberg_table_info(),
                 files: Vec::new(),
                 cloud_properties: Default::default(),
-                binding: crate::sql::planner::table::IcebergDataFileBinding::ExplicitFiles,
+                binding:
+                    crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
             },
         };
 

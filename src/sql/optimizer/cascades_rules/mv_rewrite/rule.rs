@@ -664,6 +664,9 @@ fn same_iceberg_table(
 mod tests {
     use super::*;
     use crate::catalog::schema::ColumnDef;
+    use crate::connector::iceberg::scan_model::{
+        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
+    };
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::cascades_rules::mv_rewrite::descriptor::{
@@ -676,9 +679,7 @@ mod tests {
     };
     use crate::sql::planner::optimizer_bridge::scalar::materialize;
     use crate::sql::planner::payload::{AggregateCall, PlanFilterNode, PlanScanNode};
-    use crate::sql::planner::table::{
-        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
-    };
+    use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
 
     // --- fixture helpers --------------------------------------------------

@@ -90,11 +90,12 @@ mod tests {
     use crate::connector::backend::{
         CatalogBackend, CreateTableRequest, ResolvedTable, TableSource,
     };
+    use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::engine::catalog_mgr::CatalogMgr;
     use crate::engine::catalog_mgr::catalog::Catalog;
     use crate::engine::catalog_mgr::metadata::TableBinding;
     use crate::sql::parser::ast::AlterIcebergPartitionSpecStmt;
-    use crate::sql::planner::table::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
+    use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -191,7 +192,7 @@ mod tests {
                     },
                     files: vec![],
                     cloud_properties: Default::default(),
-                    binding: crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
+                    binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
                 },
             }
         }

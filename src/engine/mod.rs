@@ -4953,7 +4953,7 @@ path = "{metadata_path}"
                 table: &crate::connector::backend::ResolvedTable,
             ) -> Result<crate::sql::planner::table::TableDef, String> {
                 self.schema_calls.fetch_add(1, Ordering::SeqCst);
-                let iceberg = crate::sql::planner::table::IcebergTableInfo {
+                let iceberg = crate::connector::iceberg::scan_model::IcebergTableInfo {
                     catalog: table.catalog.clone(),
                     namespace: table.namespace.clone(),
                     table: table.table.clone(),
@@ -4961,7 +4961,9 @@ path = "{metadata_path}"
                     current_snapshot_id: Some(1),
                     schema_id: 1,
                     location: "file:///ice/db/parted".to_string(),
-                    schema: crate::sql::planner::table::IcebergSchemaDef { fields: vec![] },
+                    schema: crate::connector::iceberg::scan_model::IcebergSchemaDef {
+                        fields: vec![],
+                    },
                     serialized_metadata: None,
                     serialized_metadata_rows: None,
                 };
@@ -4974,7 +4976,7 @@ path = "{metadata_path}"
                         files: Vec::new(),
                         cloud_properties: Default::default(),
                         binding:
-                            crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
+                            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 })
             }
@@ -5797,7 +5799,7 @@ mysql_port = 47892
                     ],
                     iceberg_row_lineage_metadata_columns: Vec::new(),
                     source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
-                        table: crate::sql::planner::table::IcebergTableInfo {
+                        table: crate::connector::iceberg::scan_model::IcebergTableInfo {
                             catalog: "ice".to_string(),
                             namespace: "db".to_string(),
                             table: "b".to_string(),
@@ -5805,9 +5807,9 @@ mysql_port = 47892
                             current_snapshot_id: Some(22),
                             schema_id: 1,
                             location: "file:///ice/db/b".to_string(),
-                            schema: crate::sql::planner::table::IcebergSchemaDef {
+                            schema: crate::connector::iceberg::scan_model::IcebergSchemaDef {
                                 fields: vec![
-                                    crate::sql::planner::table::IcebergSchemaFieldDef {
+                                    crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
                                         field_id: 1,
                                         name: "k".to_string(),
                                         initial_default: None,
@@ -5816,7 +5818,7 @@ mysql_port = 47892
                                         write_default_json: None,
                                         children: Vec::new(),
                                     },
-                                    crate::sql::planner::table::IcebergSchemaFieldDef {
+                                    crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
                                         field_id: 2,
                                         name: "v".to_string(),
                                         initial_default: None,
@@ -5833,7 +5835,7 @@ mysql_port = 47892
                         files: Vec::new(),
                         cloud_properties: Default::default(),
                         binding:
-                            crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
+                            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 },
             )

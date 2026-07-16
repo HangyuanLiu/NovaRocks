@@ -28,6 +28,7 @@ use iceberg::spec::{ListType, MapType, NestedField, PrimitiveType, StructType, T
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use super::expr::{encode_expr, encode_sort_items, encode_window_frame};
+use crate::connector::iceberg::scan_model as iceberg_scan_model;
 use crate::coordinator::prepare::scan::{
     ResolvedScanBinding, ResolvedScanColumnKind, ResolvedScanExecution, ScanExecutionBindings,
 };
@@ -1658,10 +1659,10 @@ fn encode_scan_source(
                     .collect::<Result<Vec<_>, _>>()?,
                 cloud_properties: files.cloud_properties.clone().into_iter().collect(),
                 binding: match files.binding {
-                    table_model::IcebergDataFileBinding::CurrentSnapshot => {
+                    iceberg_scan_model::IcebergDataFileBinding::CurrentSnapshot => {
                         plan::IcebergDataFileBinding::CurrentSnapshot as i32
                     }
-                    table_model::IcebergDataFileBinding::ExplicitFiles => {
+                    iceberg_scan_model::IcebergDataFileBinding::ExplicitFiles => {
                         plan::IcebergDataFileBinding::ExplicitFiles as i32
                     }
                 },
@@ -1716,10 +1717,10 @@ fn encode_scan_source(
                     .collect::<Result<Vec<_>, _>>()?,
                 cloud_properties: cloud_properties.clone().into_iter().collect(),
                 binding: match binding {
-                    table_model::IcebergDataFileBinding::CurrentSnapshot => {
+                    iceberg_scan_model::IcebergDataFileBinding::CurrentSnapshot => {
                         plan::IcebergDataFileBinding::CurrentSnapshot as i32
                     }
-                    table_model::IcebergDataFileBinding::ExplicitFiles => {
+                    iceberg_scan_model::IcebergDataFileBinding::ExplicitFiles => {
                         plan::IcebergDataFileBinding::ExplicitFiles as i32
                     }
                 },
@@ -2124,7 +2125,7 @@ fn encode_mv_target_state_row_filter(
 }
 
 fn encode_iceberg_table_info(
-    src: &table_model::IcebergTableInfo,
+    src: &iceberg_scan_model::IcebergTableInfo,
 ) -> Result<plan::IcebergTableInfo, String> {
     Ok(plan::IcebergTableInfo {
         catalog: src.catalog.clone(),
@@ -2141,7 +2142,7 @@ fn encode_iceberg_table_info(
 }
 
 fn encode_iceberg_schema_def(
-    src: &table_model::IcebergSchemaDef,
+    src: &iceberg_scan_model::IcebergSchemaDef,
 ) -> Result<plan::IcebergSchemaDef, String> {
     Ok(plan::IcebergSchemaDef {
         fields: src
@@ -2153,7 +2154,7 @@ fn encode_iceberg_schema_def(
 }
 
 fn encode_iceberg_schema_field(
-    src: &table_model::IcebergSchemaFieldDef,
+    src: &iceberg_scan_model::IcebergSchemaFieldDef,
 ) -> Result<plan::IcebergSchemaFieldDef, String> {
     Ok(plan::IcebergSchemaFieldDef {
         field_id: src.field_id,
@@ -2191,7 +2192,7 @@ fn encode_iceberg_schema_default_json(
 }
 
 fn encode_iceberg_data_file_info(
-    src: &table_model::IcebergDataFileInfo,
+    src: &iceberg_scan_model::IcebergDataFileInfo,
 ) -> Result<plan::IcebergDataFileInfo, String> {
     Ok(plan::IcebergDataFileInfo {
         path: src.path.clone(),
@@ -2231,7 +2232,9 @@ fn encode_iceberg_data_file_info(
     })
 }
 
-fn encode_iceberg_column_stats(src: &table_model::IcebergColumnStats) -> plan::IcebergColumnStats {
+fn encode_iceberg_column_stats(
+    src: &iceberg_scan_model::IcebergColumnStats,
+) -> plan::IcebergColumnStats {
     plan::IcebergColumnStats {
         null_count: src.null_count,
         value_count: src.value_count,
@@ -2242,23 +2245,23 @@ fn encode_iceberg_column_stats(src: &table_model::IcebergColumnStats) -> plan::I
 }
 
 fn encode_iceberg_delete_file_info(
-    src: &table_model::IcebergDeleteFileInfo,
+    src: &iceberg_scan_model::IcebergDeleteFileInfo,
 ) -> plan::IcebergDeleteFileInfo {
     plan::IcebergDeleteFileInfo {
         path: src.path.clone(),
         file_format: match src.file_format {
-            table_model::IcebergDeleteFileFormat::Parquet => {
+            iceberg_scan_model::IcebergDeleteFileFormat::Parquet => {
                 plan::IcebergDeleteFileFormat::Parquet as i32
             }
-            table_model::IcebergDeleteFileFormat::Puffin => {
+            iceberg_scan_model::IcebergDeleteFileFormat::Puffin => {
                 plan::IcebergDeleteFileFormat::Puffin as i32
             }
         },
         file_content: match src.file_content {
-            table_model::IcebergDeleteFileContent::Position => {
+            iceberg_scan_model::IcebergDeleteFileContent::Position => {
                 plan::IcebergDeleteFileContent::Position as i32
             }
-            table_model::IcebergDeleteFileContent::Equality => {
+            iceberg_scan_model::IcebergDeleteFileContent::Equality => {
                 plan::IcebergDeleteFileContent::Equality as i32
             }
         },
@@ -2274,7 +2277,7 @@ fn encode_iceberg_delete_file_info(
 }
 
 fn encode_iceberg_partition_field_value(
-    src: &table_model::IcebergPartitionFieldValue,
+    src: &iceberg_scan_model::IcebergPartitionFieldValue,
 ) -> plan::IcebergPartitionFieldValue {
     plan::IcebergPartitionFieldValue {
         source_column: src.source_column.clone(),
@@ -2285,19 +2288,23 @@ fn encode_iceberg_partition_field_value(
 }
 
 fn encode_iceberg_partition_value(
-    src: &table_model::IcebergPartitionValue,
+    src: &iceberg_scan_model::IcebergPartitionValue,
 ) -> plan::IcebergPartitionValue {
     use plan::iceberg_partition_value::Value;
 
     plan::IcebergPartitionValue {
         value: Some(match src {
-            table_model::IcebergPartitionValue::Boolean(value) => Value::BoolValue(*value),
-            table_model::IcebergPartitionValue::Int32(value) => Value::Int32Value(*value),
-            table_model::IcebergPartitionValue::Int64(value) => Value::Int64Value(*value),
-            table_model::IcebergPartitionValue::Float(value) => Value::FloatValue(*value),
-            table_model::IcebergPartitionValue::Double(value) => Value::DoubleValue(*value),
-            table_model::IcebergPartitionValue::String(value) => Value::StringValue(value.clone()),
-            table_model::IcebergPartitionValue::Binary(value) => Value::BinaryValue(value.clone()),
+            iceberg_scan_model::IcebergPartitionValue::Boolean(value) => Value::BoolValue(*value),
+            iceberg_scan_model::IcebergPartitionValue::Int32(value) => Value::Int32Value(*value),
+            iceberg_scan_model::IcebergPartitionValue::Int64(value) => Value::Int64Value(*value),
+            iceberg_scan_model::IcebergPartitionValue::Float(value) => Value::FloatValue(*value),
+            iceberg_scan_model::IcebergPartitionValue::Double(value) => Value::DoubleValue(*value),
+            iceberg_scan_model::IcebergPartitionValue::String(value) => {
+                Value::StringValue(value.clone())
+            }
+            iceberg_scan_model::IcebergPartitionValue::Binary(value) => {
+                Value::BinaryValue(value.clone())
+            }
         }),
     }
 }
@@ -3451,7 +3458,7 @@ mod tests {
             table: table.clone(),
             files: Vec::new(),
             cloud_properties: BTreeMap::from([("region".to_string(), "test".to_string())]),
-            binding: table_model::IcebergDataFileBinding::CurrentSnapshot,
+            binding: iceberg_scan_model::IcebergDataFileBinding::CurrentSnapshot,
         };
         scan.required_columns = Some(vec!["order_id".to_string()]);
         let plan = plan.seal().expect("seal ordinary Iceberg fixture");
@@ -3462,7 +3469,7 @@ mod tests {
             .insert_binding(file_binding_for_test(
                 10,
                 table,
-                table_model::IcebergDataFileBinding::CurrentSnapshot,
+                iceberg_scan_model::IcebergDataFileBinding::CurrentSnapshot,
                 vec![bound_column_for_test(
                     1,
                     "order_id",
@@ -3549,7 +3556,7 @@ mod tests {
             resolved_table
                 .schema
                 .fields
-                .push(table_model::IcebergSchemaFieldDef {
+                .push(iceberg_scan_model::IcebergSchemaFieldDef {
                     field_id: 2,
                     name: "tenant_id".to_string(),
                     initial_default: None,
@@ -3563,7 +3570,7 @@ mod tests {
                 .insert_binding(file_binding_for_test(
                     10,
                     resolved_table,
-                    table_model::IcebergDataFileBinding::ExplicitFiles,
+                    iceberg_scan_model::IcebergDataFileBinding::ExplicitFiles,
                     vec![
                         ResolvedScanColumn {
                             planner: output_column(1, "bound_order_id", DataType::Int64),
@@ -3702,7 +3709,7 @@ mod tests {
             .insert_binding(file_binding_for_test(
                 10,
                 iceberg_table_info_for_test(),
-                table_model::IcebergDataFileBinding::ExplicitFiles,
+                iceberg_scan_model::IcebergDataFileBinding::ExplicitFiles,
                 vec![bound_column_for_test(
                     1,
                     "order_id",
@@ -3740,7 +3747,7 @@ mod tests {
             table: table.clone(),
             files: Vec::new(),
             cloud_properties: BTreeMap::new(),
-            binding: table_model::IcebergDataFileBinding::ExplicitFiles,
+            binding: iceberg_scan_model::IcebergDataFileBinding::ExplicitFiles,
         };
         scan.columns = vec![
             output_column(1, "v", DataType::LargeBinary),
@@ -3768,7 +3775,7 @@ mod tests {
             .insert_binding(file_binding_for_test(
                 10,
                 table,
-                table_model::IcebergDataFileBinding::ExplicitFiles,
+                iceberg_scan_model::IcebergDataFileBinding::ExplicitFiles,
                 vec![ResolvedScanColumn {
                     planner: output_column(1, "v", DataType::LargeBinary),
                     source: column_def_for_test("v", DataType::LargeBinary, false),
@@ -3840,8 +3847,8 @@ mod tests {
 
     fn file_binding_for_test(
         node_id: i32,
-        table: table_model::IcebergTableInfo,
-        file_binding: table_model::IcebergDataFileBinding,
+        table: iceberg_scan_model::IcebergTableInfo,
+        file_binding: iceberg_scan_model::IcebergDataFileBinding,
         physical_columns: Vec<ResolvedScanColumn>,
         required_reads: Vec<ResolvedReadColumn>,
     ) -> ResolvedScanBinding {
@@ -3979,8 +3986,8 @@ mod tests {
         }
     }
 
-    fn iceberg_table_info_for_test() -> table_model::IcebergTableInfo {
-        table_model::IcebergTableInfo {
+    fn iceberg_table_info_for_test() -> iceberg_scan_model::IcebergTableInfo {
+        iceberg_scan_model::IcebergTableInfo {
             catalog: "ice".to_string(),
             namespace: "db".to_string(),
             table: "orders".to_string(),
@@ -3988,8 +3995,8 @@ mod tests {
             current_snapshot_id: Some(2),
             schema_id: 1,
             location: "file:///warehouse/orders".to_string(),
-            schema: table_model::IcebergSchemaDef {
-                fields: vec![table_model::IcebergSchemaFieldDef {
+            schema: iceberg_scan_model::IcebergSchemaDef {
+                fields: vec![iceberg_scan_model::IcebergSchemaFieldDef {
                     field_id: 1,
                     name: "order_id".to_string(),
                     initial_default: None,

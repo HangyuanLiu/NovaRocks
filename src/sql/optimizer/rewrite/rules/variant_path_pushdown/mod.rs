@@ -31,6 +31,9 @@ mod tests {
 
     use super::VariantPathPushdownRule;
     use crate::catalog::schema::ColumnDef;
+    use crate::connector::iceberg::scan_model::{
+        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
+    };
     use crate::sql::analysis::{
         BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
@@ -41,9 +44,7 @@ mod tests {
     use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
     use crate::sql::planner::optimizer_bridge::logical::{to_logical_plan, to_optimizer_expr};
     use crate::sql::planner::payload::{PlanFilterNode, PlanProjectNode, PlanScanNode};
-    use crate::sql::planner::table::{
-        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
-    };
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     fn add_column(
         factory: &Rc<RefCell<ColumnRefFactory>>,
