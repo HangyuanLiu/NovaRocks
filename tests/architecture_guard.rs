@@ -30412,10 +30412,6 @@ fn coor_3b_preparation_owner_contract_violations(sources: &[Cgo8GuardSource]) ->
     let mut counts =
         BTreeMap::from_iter(required.iter().map(|&(kind, name)| ((kind, name), 0usize)));
     for source in sources {
-        if !source.path.starts_with("src/coordinator/prepare/") {
-            violations.push(format!("prepare-source-outside-owner: {}", source.path));
-            continue;
-        }
         let production = rust_sanitized_production_text(&source.text);
         if let Err(error) = syn::parse_file(&source.text) {
             violations.push(format!("prepare-source-parse: {}: {error}", source.path));
@@ -30428,6 +30424,12 @@ fn coor_3b_preparation_owner_contract_violations(sources: &[Cgo8GuardSource]) ->
                 "trait" => rust_named_trait_declaration_count(&production, name),
                 _ => unreachable!(),
             };
+            if count > 0 && !source.path.starts_with("src/coordinator/prepare/") {
+                violations.push(format!(
+                    "definition-outside-preparation-owner: {kind} {name} path={}",
+                    source.path
+                ));
+            }
             *counts.get_mut(&(kind, name)).expect("required owner count") += count;
         }
     }
@@ -30586,6 +30588,26 @@ fn coordinator_preparation_owner_detector_rejects_comment_only_positive_definiti
 }
 
 #[test]
+fn coordinator_preparation_owner_detector_rejects_reachable_definition_outside_owner() {
+    let sources = [
+        Cgo8GuardSource::new(
+            "src/coordinator/prepare/mod.rs",
+            "fn prepare_fragments() {}\nfn prepare_scan_bindings() {}\nstruct PreparedFragmentSet;\nstruct FragmentSchedulingView;\nstruct ScanExecutionBindings;\ntrait ScanBindingResolver {}\n",
+        ),
+        Cgo8GuardSource::new("src/coordinator/shadow.rs", "struct PreparedFragmentSet;\n"),
+    ];
+    let violations = coor_3b_preparation_owner_contract_violations(&sources);
+    assert!(
+        violations.iter().any(|violation| {
+            violation.contains("definition-outside-preparation-owner")
+                && violation.contains("PreparedFragmentSet")
+                && violation.contains("src/coordinator/shadow.rs")
+        }),
+        "reachable production definitions outside the owner must fail: {violations:?}"
+    );
+}
+
+#[test]
 fn coordinator_preparation_owner() {
     let repo = Path::new(manifest_dir());
     let prepare_sources = coor_3b_direct_prepare_sources(repo);
@@ -30593,13 +30615,6 @@ fn coordinator_preparation_owner() {
         !prepare_sources.is_empty(),
         "COOR-3B preparation owner file scan must be non-empty"
     );
-    let owner_violations = coor_3b_preparation_owner_contract_violations(&prepare_sources);
-    assert!(
-        owner_violations.is_empty(),
-        "COOR-3B preparation owner definitions must be unique, parsed and non-vacuous:\n{}",
-        owner_violations.join("\n")
-    );
-
     let sources = coor_3b_production_guard_sources(repo);
     let source_paths = sources
         .iter()
@@ -30612,6 +30627,12 @@ fn coordinator_preparation_owner() {
             prepare.path
         );
     }
+    let owner_violations = coor_3b_preparation_owner_contract_violations(&sources);
+    assert!(
+        owner_violations.is_empty(),
+        "COOR-3B preparation owner definitions must be globally unique, owner-scoped, parsed and non-vacuous:\n{}",
+        owner_violations.join("\n")
+    );
     for root in [
         "src/coordinator/scheduler/",
         "src/sql/codegen/scan/",

@@ -2080,7 +2080,7 @@ mod native_contract_tests {
         submissions: Mutex<Vec<(usize, FragmentId, UniqueId)>>,
         submit_count: AtomicUsize,
         fail_on_submit: Option<usize>,
-        cancellations: Mutex<Vec<UniqueId>>,
+        cancellations: Mutex<Vec<(usize, Vec<UniqueId>)>>,
         fetch_behavior: TestFetchBehavior,
         fetch_count: AtomicUsize,
         first_fetch: std::sync::atomic::AtomicBool,
@@ -2169,11 +2169,11 @@ mod native_contract_tests {
             }
         }
 
-        fn cancel_fragments(&self, _backend_idx: usize, finst_ids: &[UniqueId]) {
+        fn cancel_fragments(&self, backend_idx: usize, finst_ids: &[UniqueId]) {
             self.cancellations
                 .lock()
                 .unwrap()
-                .extend_from_slice(finst_ids);
+                .push((backend_idx, finst_ids.to_vec()));
         }
 
         fn backend_count(&self) -> usize {
@@ -2472,7 +2472,7 @@ mod native_contract_tests {
         assert!(err.contains("native submit failed on call 2"), "{err}");
         assert_eq!(
             *inner.cancellations.lock().unwrap(),
-            vec![UniqueId { hi: 92_000, lo: 1 }]
+            vec![(1, vec![UniqueId { hi: 92_000, lo: 1 }])]
         );
         assert_eq!(observer.0.load(Ordering::SeqCst), 1);
     }
@@ -2768,10 +2768,13 @@ mod native_contract_tests {
             .expect_err("native lifecycle failure must surface");
             assert!(err.contains(expected), "{err}");
             let mut canceled = inner.cancellations.lock().unwrap().clone();
-            canceled.sort();
+            canceled.sort_by_key(|(backend_idx, _)| *backend_idx);
             assert_eq!(
                 canceled,
-                vec![UniqueId { hi, lo: 1 }, UniqueId { hi, lo: 2 }]
+                vec![
+                    (0, vec![UniqueId { hi, lo: 2 }]),
+                    (1, vec![UniqueId { hi, lo: 1 }]),
+                ]
             );
         }
 
@@ -2809,10 +2812,13 @@ mod native_contract_tests {
         .expect_err("disconnect must surface");
         assert!(err.contains("client disconnected"), "{err}");
         let mut canceled = inner.cancellations.lock().unwrap().clone();
-        canceled.sort();
+        canceled.sort_by_key(|(backend_idx, _)| *backend_idx);
         assert_eq!(
             canceled,
-            vec![UniqueId { hi, lo: 1 }, UniqueId { hi, lo: 2 }]
+            vec![
+                (0, vec![UniqueId { hi, lo: 2 }]),
+                (1, vec![UniqueId { hi, lo: 1 }]),
+            ]
         );
     }
 

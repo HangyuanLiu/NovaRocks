@@ -460,28 +460,51 @@ backends = [{backends_list}]
         self.fe_mysql
     }
 
-    fn wait_for_any_be_output_contains(&mut self, marker: &str, detail: &str, timeout: Duration) {
+    fn wait_for_be_submit_cancel_match(
+        &mut self,
+        expected_instance_count: usize,
+        cancel_detail: &str,
+        timeout: Duration,
+    ) {
         let deadline = Instant::now() + timeout;
         let mut stdout = vec![Vec::new(); self.bes.len()];
+        let mut submitted = vec![0usize; self.bes.len()];
+        let mut canceled = vec![0usize; self.bes.len()];
         loop {
             for (index, be) in self.bes.iter_mut().enumerate() {
                 if let Some(status) = be.child.try_wait().expect("poll BE child") {
                     panic!(
-                        "BE {index} exited before marker `{marker}` with detail `{detail}` with status {status}; stdout={:?}; stderr={}",
+                        "BE {index} exited before submit/cancel pairing completed with status {status}; stdout={:?}; stderr={}",
                         stdout[index],
                         be.read_stderr()
                     );
                 }
                 while let Ok(line) = be.stdout_rx.try_recv() {
-                    if line.contains(marker) && line.contains(detail) {
-                        return;
+                    if line.contains("NOVAROCKS_GRPC_SUBMIT") {
+                        submitted[index] += 1;
+                    }
+                    if line.contains("NOVAROCKS_CANCEL") && line.contains(cancel_detail) {
+                        let finsts = line
+                            .split_ascii_whitespace()
+                            .find_map(|field| field.strip_prefix("finsts="))
+                            .and_then(|value| value.parse::<usize>().ok())
+                            .unwrap_or_else(|| panic!("cancel marker lacks finsts count: {line}"));
+                        canceled[index] += finsts;
                     }
                     stdout[index].push(line);
                 }
             }
+            let submitted_total = submitted.iter().sum::<usize>();
+            let canceled_total = canceled.iter().sum::<usize>();
+            if submitted_total == expected_instance_count
+                && canceled_total == expected_instance_count
+                && submitted == canceled
+            {
+                return;
+            }
             assert!(
                 Instant::now() < deadline,
-                "no BE emitted marker `{marker}` with detail `{detail}`; stdout={stdout:?}"
+                "expected submit/cancel identity for {expected_instance_count} instances; submitted={submitted:?} canceled={canceled:?} stdout={stdout:?}"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -1022,6 +1045,7 @@ fn three_be_query_timeout_cancels_remote_fragments() {
         r#"
 [debug]
 emit_cancel_marker = true
+emit_grpc_fragment_marker = true
 "#,
         "",
     );
@@ -1039,11 +1063,7 @@ emit_cancel_marker = true
         "expected timeout error, got: {err_str}"
     );
 
-    cluster.wait_for_any_be_output_contains(
-        "NOVAROCKS_CANCEL",
-        "reason=coordinator cancel",
-        Duration::from_secs(5),
-    );
+    cluster.wait_for_be_submit_cancel_match(2, "reason=coordinator cancel", Duration::from_secs(5));
 }
 
 #[test]
@@ -1059,10 +1079,11 @@ fn three_be_partial_submit_failure_cancels_accepted_fragments() {
         r#"
 [debug]
 emit_cancel_marker = true
+emit_grpc_fragment_marker = true
 "#,
         r#"
 [debug]
-fault_inject_submit_fail_after = 1
+fault_inject_submit_fail_after = 2
 "#,
     );
 
@@ -1081,11 +1102,7 @@ fault_inject_submit_fail_after = 1
         "expected injected submit failure, got: {err_str}"
     );
 
-    cluster.wait_for_any_be_output_contains(
-        "NOVAROCKS_CANCEL",
-        "finsts=1 reason=coordinator cancel",
-        Duration::from_secs(5),
-    );
+    cluster.wait_for_be_submit_cancel_match(2, "reason=coordinator cancel", Duration::from_secs(5));
 }
 
 #[test]
