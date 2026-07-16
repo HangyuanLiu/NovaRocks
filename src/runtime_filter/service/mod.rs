@@ -1460,6 +1460,7 @@ mod tests {
         InstallOutcome, ProducerAdapter, ProducerFailureReason, ProducerHandle, ProducerPortKind,
         RuntimeContractViolationKind, SubmitOutcome,
     };
+    use crate::runtime_filter::port::routing::RuntimeFilterRouteRole;
     use crate::runtime_filter::port::subscription::{
         ArtifactAcquireOutcome, ArtifactDelivery, ArtifactDeliveryOutcome,
         BlockingSnapshotSubscription, SubscriptionKind, UnavailableReason,
@@ -1468,11 +1469,15 @@ mod tests {
         MemoryAccountError, RuntimeFilterClock, RuntimeFilterMemoryAccount,
         TemporaryContributionLease,
     };
+    use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeKind;
     use crate::runtime_filter::port::value_domain::{
         LogicalSnapshot, MembershipValues, ReducedMembershipDomain, ValueDomainDelta,
     };
     use crate::runtime_filter::router::loopback::LoopbackRouter;
     use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
+    use crate::sql::planner::distributed::{
+        DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
+    };
 
     use super::materialization::MaterializationWorkClaim;
     use super::memory::MemTrackerMemoryAccount;
@@ -1628,6 +1633,25 @@ mod tests {
     impl RuntimeFilterClock for DynamicClock {
         fn now(&self) -> Instant {
             Instant::now()
+        }
+    }
+
+    struct NearMaxClock;
+
+    impl RuntimeFilterClock for NearMaxClock {
+        fn now(&self) -> Instant {
+            let base = Instant::now();
+            let mut lower = 0u64;
+            let mut upper = u64::MAX;
+            while lower < upper {
+                let midpoint = lower + (upper - lower) / 2 + 1;
+                if base.checked_add(Duration::from_secs(midpoint)).is_some() {
+                    lower = midpoint;
+                } else {
+                    upper = midpoint - 1;
+                }
+            }
+            base.checked_add(Duration::from_secs(lower)).unwrap()
         }
     }
 
@@ -1998,6 +2022,180 @@ mod tests {
             .remove(&participant)
             .expect("compiler projects the matching routing shard");
         RuntimeFilterParticipantInstall::new(core_view, routing_shard)
+    }
+
+    fn compiled_three_backend_all_of_aggregator_install()
+    -> (RuntimeFilterParticipantInstall, BindingId, UniqueId) {
+        let channel_id = ChannelId::new(5);
+        let producer_binding = BindingId::new(10);
+        let consumer_binding = BindingId::new(11);
+        let witness = CoverageWitnessId::new(1);
+        let coverage = Coverage::AllOf(vec![Coverage::Leaf(witness)]);
+        let contributions = BTreeSet::from([
+            ContributionKind::ValueDomainDelta,
+            ContributionKind::ProducerClosed,
+        ]);
+        let capabilities = BTreeSet::from([
+            ArtifactCapability::Membership,
+            ArtifactCapability::EmptyDomain,
+        ]);
+        let expression = TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Int(1)),
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+        let mut graph = RuntimeFilterGraph::default();
+        graph
+            .insert_channel(RuntimeFilterChannelSpec {
+                channel_id,
+                logical_domain: RuntimeFilterLogicalDomain::Membership {
+                    value_type: DataType::Int64,
+                    null_semantics: NullSemantics::NeverMatches,
+                },
+                lifecycle: RuntimeFilterLifecycle::CompleteOnce,
+                availability_coverage: coverage.clone(),
+                terminal_coverage: coverage,
+                reduction_requirement: ReductionRequirement::SetUnion,
+                allowed_contribution_kinds: contributions.clone(),
+                required_consumer_capabilities: capabilities.clone(),
+                policy: RuntimeFilterPolicyRequirement {
+                    max_contribution_bytes: 1024,
+                    max_artifact_bytes: 1024,
+                    deadline_ms: 100,
+                    max_retries: 1,
+                },
+            })
+            .unwrap();
+        graph
+            .insert_binding(RuntimeFilterBindingSpec {
+                binding_id: producer_binding,
+                channel_id,
+                coverage_witness_id: Some(witness),
+                location: PlanLocation {
+                    fragment_id: PlanFragmentId::new(2),
+                    node_id: PlanNodeId::new(1),
+                },
+                expression: expression.clone(),
+                apply_point: ApplyPoint::NodeOutput,
+                role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
+                    contribution_kinds: contributions,
+                    completion_requirement: CompletionRequirement::ProducerClosed,
+                }),
+            })
+            .unwrap();
+        graph
+            .insert_binding(RuntimeFilterBindingSpec {
+                binding_id: consumer_binding,
+                channel_id,
+                coverage_witness_id: None,
+                location: PlanLocation {
+                    fragment_id: PlanFragmentId::new(1),
+                    node_id: PlanNodeId::new(2),
+                },
+                expression,
+                apply_point: ApplyPoint::NodeInput,
+                role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
+                    capabilities,
+                    activation: ConsumerActivation::BlockingSnapshot,
+                }),
+            })
+            .unwrap();
+
+        let placement = |fragment_id: u32,
+                         instance_index: usize,
+                         backend_idx: usize,
+                         finst_id: UniqueId,
+                         endpoint: &str| FragmentInstancePlacement {
+            fragment_id,
+            instance_index,
+            finst_id,
+            backend_idx,
+            endpoint: RuntimeEndpoint::from_socket_addr(endpoint.parse().unwrap()),
+            scan_ranges: BTreeMap::new(),
+            destinations: Vec::new(),
+            runtime_filter_prober_params: BTreeMap::new(),
+            per_exch_num_senders: BTreeMap::new(),
+        };
+        let local_producer = UniqueId { hi: 1, lo: 3 };
+        let remote_producer = UniqueId { hi: 1, lo: 4 };
+        let scheduling = SchedulingPlan {
+            root_fragment_id: 1,
+            by_fragment: BTreeMap::from([
+                (
+                    1,
+                    vec![
+                        placement(1, 0, 2, UniqueId { hi: 1, lo: 1 }, "10.0.0.2:9060"),
+                        placement(1, 1, 11, UniqueId { hi: 1, lo: 2 }, "10.0.0.11:9060"),
+                    ],
+                ),
+                (
+                    2,
+                    vec![
+                        placement(2, 0, 2, local_producer, "10.0.0.2:9060"),
+                        placement(2, 1, 7, remote_producer, "10.0.0.7:9060"),
+                    ],
+                ),
+            ]),
+            root_finst_id: UniqueId { hi: 1, lo: 1 },
+            root_backend_idx: 2,
+        };
+        let edges = vec![FragmentEdge {
+            source_fragment_id: 2,
+            target_fragment_id: 1,
+            target_exchange_node_id: 1,
+            output_partition: DataPartition::unpartitioned(),
+            stream_kind: FragmentStreamKind::Gather,
+            edge_kind: FragmentEdgeKind::Stream,
+            output_slot_ids: Vec::new(),
+        }];
+        let backends = LiveBackendSnapshot::new(vec![
+            (2, "10.0.0.2:9060".parse().unwrap()),
+            (7, "10.0.0.7:9060".parse().unwrap()),
+            (11, "10.0.0.11:9060".parse().unwrap()),
+        ]);
+        let policy = RuntimeFilterDeploymentPolicy {
+            core_budget: RuntimeFilterCoreBudget::new(8192),
+            replica_redundancy: 2,
+            materialization: MaterializationPolicy::for_test(),
+        };
+        let mut plan = compile(
+            &graph,
+            &scheduling,
+            &edges,
+            &backends,
+            &policy,
+            DeploymentEpoch::new(9),
+        )
+        .unwrap();
+        let aggregator = plan
+            .routing_shards
+            .iter()
+            .find_map(|(participant, shard)| {
+                shard
+                    .channel(channel_id)
+                    .filter(|channel| {
+                        channel
+                            .local_roles()
+                            .contains(&RuntimeFilterRouteRole::Aggregator)
+                    })
+                    .map(|_| *participant)
+            })
+            .expect("AllOf compiler plan has an aggregator participant");
+        let routing_channel = plan.routing_shards[&aggregator]
+            .channel(channel_id)
+            .unwrap();
+        assert_eq!(
+            routing_channel.producer_participant(producer_binding, remote_producer),
+            Some(RuntimeFilterParticipantId::new(7))
+        );
+        assert_ne!(aggregator, RuntimeFilterParticipantId::new(7));
+        let core_view = plan.install_views.remove(&aggregator).unwrap();
+        let routing_shard = plan.routing_shards.remove(&aggregator).unwrap();
+        (
+            RuntimeFilterParticipantInstall::new(core_view, routing_shard),
+            producer_binding,
+            remote_producer,
+        )
     }
 
     fn view(
@@ -3250,6 +3448,174 @@ mod tests {
             events[2],
             RuntimeFilterEvent::DeltaAccepted { .. }
         ));
+    }
+
+    #[test]
+    fn installing_exposes_neither_core_nor_role_router() {
+        let fixture = fixture();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        fixture
+            .service
+            .set_before_commit_clock_hook(Arc::new(move || {
+                ready_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }));
+        let service = fixture.service.clone();
+        let (install_tx, install_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            install_tx
+                .send(service.install(view([deployment(1, 10, 30, 40, [10], [30], 100)])))
+                .unwrap();
+        });
+
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(fixture.service.registry.active_installation().is_none());
+        assert!(
+            fixture
+                .service
+                .registry
+                .channel(ChannelId::new(1))
+                .is_none()
+        );
+
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            install_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap(),
+            InstallOutcome::Installed
+        );
+    }
+
+    #[test]
+    fn logical_commit_exposes_core_and_role_router_together_before_event_publish_returns() {
+        let fixture = fixture();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        fixture
+            .service
+            .set_after_commit_before_publish_hook(Arc::new(move || {
+                ready_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }));
+        let service = fixture.service.clone();
+        let (install_tx, install_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            install_tx
+                .send(service.install(view([deployment(1, 10, 30, 40, [10], [30], 100)])))
+                .unwrap();
+        });
+
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let installed = fixture
+            .service
+            .registry
+            .active_installation()
+            .expect("logical commit exposes the installed snapshot");
+        assert_eq!(installed.channels().count(), 1);
+        let _role_router = installed.role_router();
+        assert!(install_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            install_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap(),
+            InstallOutcome::Installed
+        );
+    }
+
+    #[test]
+    fn candidate_failure_leaves_no_active_core_or_role_router() {
+        let service = RuntimeFilterService::new_with_dependencies(
+            uid(0),
+            Arc::new(NearMaxClock),
+            Arc::new(Events::default()),
+            MemTrackerMemoryAccount::new_root_for_test("failed-install-candidate"),
+        );
+
+        assert!(
+            service
+                .install(view([deployment(1, 10, 30, 40, [10], [30], 1000)]))
+                .is_err()
+        );
+        assert!(service.registry.active_installation().is_none());
+        assert!(service.registry.channel(ChannelId::new(1)).is_none());
+    }
+
+    #[test]
+    fn cancel_during_install_leaves_no_half_installed_role_router() {
+        let fixture = fixture();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        fixture
+            .service
+            .set_before_commit_clock_hook(Arc::new(move || {
+                ready_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }));
+        let service = fixture.service.clone();
+        let (install_tx, install_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            install_tx
+                .send(service.install(view([deployment(1, 10, 30, 40, [10], [30], 100)])))
+                .unwrap();
+        });
+
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        fixture.service.cancel();
+        assert!(fixture.service.registry.active_installation().is_none());
+        assert!(
+            fixture
+                .service
+                .registry
+                .channel(ChannelId::new(1))
+                .is_none()
+        );
+
+        release_tx.send(()).unwrap();
+        assert!(
+            install_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_err()
+        );
+        assert!(fixture.service.registry.active_installation().is_none());
+    }
+
+    #[test]
+    fn installed_role_router_authorizes_compiler_projected_remote_producer() {
+        let (install, producer_binding, remote_producer) =
+            compiled_three_backend_all_of_aggregator_install();
+        let channel_id = ChannelId::new(5);
+        let epoch = install.core_view().epoch();
+        let service = RuntimeFilterService::new_with_dependencies(
+            uid(0),
+            Arc::new(Clock(Instant::now())),
+            Arc::new(Events::default()),
+            MemTrackerMemoryAccount::new_root_for_test("installed-role-router"),
+        );
+
+        assert_eq!(service.install(install).unwrap(), InstallOutcome::Installed);
+        let installed = service.registry.active_installation().unwrap();
+        assert!(
+            installed
+                .role_router()
+                .authorize_contribution(
+                    epoch,
+                    channel_id,
+                    producer_binding,
+                    remote_producer,
+                    RuntimeFilterEnvelopeKind::Contribution,
+                )
+                .is_ok()
+        );
     }
 
     #[test]

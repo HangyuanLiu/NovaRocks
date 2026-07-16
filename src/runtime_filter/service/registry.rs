@@ -57,6 +57,7 @@ use crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract;
 use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeKind;
 use crate::runtime_filter::port::value_domain::MembershipValues;
 use crate::runtime_filter::router::loopback::LoopbackRouter;
+use crate::runtime_filter::router::role_graph::RoleRouter;
 
 use super::materialization::{ArtifactPublishGate, ArtifactPublishKey};
 use super::subscription::SubscriptionGroup;
@@ -187,6 +188,7 @@ pub(super) struct InstalledDeployment {
     consumer_activations: BTreeMap<BindingId, ConsumerActivation>,
     subscriptions: BTreeMap<BindingId, Arc<SubscriptionGroup>>,
     router: Arc<LoopbackRouter>,
+    role_router: Arc<RoleRouter>,
     channel_routes: BTreeMap<ChannelId, Vec<RouteEdgeId>>,
     route_event_identities: BTreeMap<RouteEdgeId, Vec<RouteEventIdentity>>,
     artifact_channels: BTreeMap<ChannelId, ChannelArtifactPlan>,
@@ -282,6 +284,10 @@ impl InstalledDeployment {
 
     pub(super) fn router(&self) -> &LoopbackRouter {
         &self.router
+    }
+
+    pub(super) fn role_router(&self) -> &RoleRouter {
+        &self.role_router
     }
 
     pub(super) fn routes_for_channel(&self, channel_id: ChannelId) -> &[RouteEdgeId] {
@@ -516,6 +522,7 @@ impl DeploymentRegistry {
         }
 
         let candidate = (|| {
+            let role_router = Arc::new(RoleRouter::new(Arc::new(install.routing_shard().clone())));
             let built = build_channels(self.query_id, &view, self.memory_account.clone())?;
             let routing = build_routing(
                 self.query_id,
@@ -524,9 +531,9 @@ impl DeploymentRegistry {
                 &built.final_domain_seeds,
                 self.events.clone(),
             )?;
-            Ok::<_, InstallContractError>((built.channels, routing))
+            Ok::<_, InstallContractError>((built.channels, routing, role_router))
         })();
-        let (channels, routing) = match candidate {
+        let (channels, routing, role_router) = match candidate {
             Ok(candidate) => candidate,
             Err(error) => {
                 let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -611,6 +618,7 @@ impl DeploymentRegistry {
             consumer_activations: routing.consumer_activations,
             subscriptions: routing.subscriptions,
             router: Arc::new(LoopbackRouter::new(routing.routes)),
+            role_router,
             channel_routes: routing.channel_routes,
             route_event_identities: routing.route_event_identities,
             artifact_channels: routing.artifact_channels,
