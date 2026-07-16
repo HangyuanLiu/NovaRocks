@@ -9927,93 +9927,84 @@ fn runtime_filter_transport_use_expands_visibility(import: &str) -> bool {
     )
 }
 
-fn runtime_filter_transport_cfg_requires_test(attributes: &[syn::Attribute]) -> bool {
+fn production_cfg_requires_test(attributes: &[syn::Attribute]) -> bool {
     matches!(
         runtime_filter_syn_attributes_test_requirement(attributes),
         CfgTestRequirement::RequiresTest
     )
 }
 
-fn runtime_filter_transport_extern_self_alias_violations(
-    source_rel: &str,
-    text: &str,
-) -> Vec<String> {
+fn production_crate_self_alias_violations(source_rel: &str, text: &str) -> Vec<String> {
     #[derive(Default)]
     struct ExternSelfAudit {
         aliases: Vec<String>,
     }
     impl<'ast> syn::visit::Visit<'ast> for ExternSelfAudit {
         fn visit_item(&mut self, item: &'ast syn::Item) {
-            if runtime_filter_transport_cfg_requires_test(runtime_filter_syn_item_attributes(item))
-            {
+            if production_cfg_requires_test(runtime_filter_syn_item_attributes(item)) {
                 return;
             }
             syn::visit::visit_item(self, item);
         }
 
         fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
-            if runtime_filter_transport_cfg_requires_test(runtime_filter_impl_item_attributes(item))
-            {
+            if production_cfg_requires_test(runtime_filter_impl_item_attributes(item)) {
                 return;
             }
             syn::visit::visit_impl_item(self, item);
         }
 
         fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
-            if runtime_filter_transport_cfg_requires_test(runtime_filter_trait_item_attributes(
-                item,
-            )) {
+            if production_cfg_requires_test(runtime_filter_trait_item_attributes(item)) {
                 return;
             }
             syn::visit::visit_trait_item(self, item);
         }
 
         fn visit_foreign_item(&mut self, item: &'ast syn::ForeignItem) {
-            if runtime_filter_transport_cfg_requires_test(runtime_filter_foreign_item_attributes(
-                item,
-            )) {
+            if production_cfg_requires_test(runtime_filter_foreign_item_attributes(item)) {
                 return;
             }
             syn::visit::visit_foreign_item(self, item);
         }
 
         fn visit_stmt(&mut self, statement: &'ast syn::Stmt) {
-            if runtime_filter_transport_cfg_requires_test(nfe_4_syn_stmt_attrs(statement)) {
+            if production_cfg_requires_test(nfe_4_syn_stmt_attrs(statement)) {
                 return;
             }
             syn::visit::visit_stmt(self, statement);
         }
 
         fn visit_expr(&mut self, expression: &'ast syn::Expr) {
-            if runtime_filter_transport_cfg_requires_test(nfe_4_syn_expr_attrs(expression)) {
+            if production_cfg_requires_test(nfe_4_syn_expr_attrs(expression)) {
                 return;
             }
             syn::visit::visit_expr(self, expression);
         }
 
         fn visit_arm(&mut self, arm: &'ast syn::Arm) {
-            if runtime_filter_transport_cfg_requires_test(&arm.attrs) {
+            if production_cfg_requires_test(&arm.attrs) {
                 return;
             }
             syn::visit::visit_arm(self, arm);
         }
 
         fn visit_field(&mut self, field: &'ast syn::Field) {
-            if runtime_filter_transport_cfg_requires_test(&field.attrs) {
+            if production_cfg_requires_test(&field.attrs) {
                 return;
             }
             syn::visit::visit_field(self, field);
         }
 
         fn visit_variant(&mut self, variant: &'ast syn::Variant) {
-            if runtime_filter_transport_cfg_requires_test(&variant.attrs) {
+            if production_cfg_requires_test(&variant.attrs) {
                 return;
             }
             syn::visit::visit_variant(self, variant);
         }
 
         fn visit_field_value(&mut self, field: &'ast syn::FieldValue) {
-            if runtime_filter_transport_cfg_requires_test(&field.attrs) {
+            if production_cfg_requires_test(&field.attrs) {
                 return;
             }
             syn::visit::visit_field_value(self, field);
@@ -10041,349 +10032,10 @@ fn runtime_filter_transport_extern_self_alias_violations(
         .into_iter()
         .map(|alias| {
             format!(
-                "{source_rel}: native runtime-filter transport owner must not declare production crate-root alias {alias}"
+                "{source_rel}: production Rust sources must use canonical `crate::` paths, not `extern crate self as {alias}`"
             )
         })
         .collect()
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum RuntimeFilterCrateAliasBinding {
-    SelfCrate,
-    OtherCrate,
-    Use(Vec<String>),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct RuntimeFilterExpandedUse {
-    target: Vec<String>,
-    local_name: Option<String>,
-}
-
-fn runtime_filter_transport_expand_use_tree(
-    tree: &syn::UseTree,
-    prefix: &mut Vec<String>,
-    expanded: &mut Vec<RuntimeFilterExpandedUse>,
-) {
-    match tree {
-        syn::UseTree::Path(path) => {
-            prefix.push(path.ident.to_string());
-            runtime_filter_transport_expand_use_tree(&path.tree, prefix, expanded);
-            prefix.pop();
-        }
-        syn::UseTree::Name(name) => {
-            if name.ident == "self" {
-                expanded.push(RuntimeFilterExpandedUse {
-                    target: prefix.clone(),
-                    local_name: prefix.last().cloned(),
-                });
-            } else {
-                prefix.push(name.ident.to_string());
-                expanded.push(RuntimeFilterExpandedUse {
-                    target: prefix.clone(),
-                    local_name: Some(name.ident.to_string()),
-                });
-                prefix.pop();
-            }
-        }
-        syn::UseTree::Rename(rename) => {
-            let target = if rename.ident == "self" {
-                prefix.clone()
-            } else {
-                prefix.push(rename.ident.to_string());
-                let target = prefix.clone();
-                prefix.pop();
-                target
-            };
-            expanded.push(RuntimeFilterExpandedUse {
-                target,
-                local_name: Some(rename.rename.to_string()),
-            });
-        }
-        syn::UseTree::Glob(_) => {
-            prefix.push("*".to_string());
-            expanded.push(RuntimeFilterExpandedUse {
-                target: prefix.clone(),
-                local_name: None,
-            });
-            prefix.pop();
-        }
-        syn::UseTree::Group(group) => {
-            for item in &group.items {
-                runtime_filter_transport_expand_use_tree(item, prefix, expanded);
-            }
-        }
-    }
-}
-
-fn runtime_filter_transport_immediate_crate_aliases<'a>(
-    items: impl IntoIterator<Item = &'a syn::Item>,
-) -> BTreeMap<String, RuntimeFilterCrateAliasBinding> {
-    let mut aliases = BTreeMap::new();
-    for item in items {
-        if runtime_filter_transport_cfg_requires_test(runtime_filter_syn_item_attributes(item)) {
-            continue;
-        }
-        match item {
-            syn::Item::ExternCrate(extern_crate) => {
-                let local_name = extern_crate.rename.as_ref().map_or_else(
-                    || extern_crate.ident.to_string(),
-                    |(_, alias)| alias.to_string(),
-                );
-                aliases.insert(
-                    local_name,
-                    if extern_crate.ident.to_string() == "self" {
-                        RuntimeFilterCrateAliasBinding::SelfCrate
-                    } else {
-                        RuntimeFilterCrateAliasBinding::OtherCrate
-                    },
-                );
-            }
-            syn::Item::Use(item_use) => {
-                let mut expanded = Vec::new();
-                runtime_filter_transport_expand_use_tree(
-                    &item_use.tree,
-                    &mut Vec::new(),
-                    &mut expanded,
-                );
-                for path in expanded {
-                    let Some(local_name) = path.local_name else {
-                        continue;
-                    };
-                    aliases.insert(
-                        local_name,
-                        if item_use.leading_colon.is_some() {
-                            RuntimeFilterCrateAliasBinding::OtherCrate
-                        } else {
-                            RuntimeFilterCrateAliasBinding::Use(path.target)
-                        },
-                    );
-                }
-            }
-            _ => {}
-        }
-    }
-    aliases
-}
-
-fn runtime_filter_transport_crate_self_paths(text: &str) -> Vec<Vec<String>> {
-    #[derive(Default)]
-    struct CrateSelfPathAudit {
-        scopes: Vec<BTreeMap<String, RuntimeFilterCrateAliasBinding>>,
-        paths: BTreeSet<Vec<String>>,
-    }
-
-    impl CrateSelfPathAudit {
-        fn resolve_segments(
-            &self,
-            segments: &[String],
-            max_scope: usize,
-            resolving: &mut BTreeSet<(usize, String)>,
-            depth: usize,
-        ) -> Option<Vec<String>> {
-            let root = segments.first()?;
-            if root == "crate" {
-                return Some(segments.to_vec());
-            }
-            let binding_budget = self.scopes.iter().map(BTreeMap::len).sum::<usize>();
-            if depth > binding_budget {
-                return None;
-            }
-            let (scope_index, binding) = (0..=max_scope).rev().find_map(|scope_index| {
-                self.scopes[scope_index]
-                    .get(root)
-                    .cloned()
-                    .map(|binding| (scope_index, binding))
-            })?;
-            match binding {
-                RuntimeFilterCrateAliasBinding::SelfCrate => {
-                    let mut canonical = vec!["crate".to_string()];
-                    canonical.extend_from_slice(&segments[1..]);
-                    Some(canonical)
-                }
-                RuntimeFilterCrateAliasBinding::OtherCrate => None,
-                RuntimeFilterCrateAliasBinding::Use(target) => {
-                    let key = (scope_index, root.clone());
-                    if !resolving.insert(key.clone()) {
-                        return None;
-                    }
-                    let resolved =
-                        self.resolve_segments(&target, scope_index, resolving, depth + 1);
-                    resolving.remove(&key);
-                    let mut canonical = resolved?;
-                    canonical.extend_from_slice(&segments[1..]);
-                    Some(canonical)
-                }
-            }
-        }
-
-        fn record_segments(&mut self, segments: Vec<String>) {
-            let Some(max_scope) = self.scopes.len().checked_sub(1) else {
-                return;
-            };
-            let Some(canonical) =
-                self.resolve_segments(&segments, max_scope, &mut BTreeSet::new(), 0)
-            else {
-                return;
-            };
-            let transport = ["crate", "runtime_filter", "port", "transport"];
-            let adapter = ["crate", "service", "grpc_runtime_filter_adapter"];
-            if [transport.as_slice(), adapter.as_slice()]
-                .into_iter()
-                .any(|prefix| {
-                    canonical.len() >= prefix.len()
-                        && canonical
-                            .iter()
-                            .zip(prefix)
-                            .all(|(actual, expected)| actual == expected)
-                })
-            {
-                self.paths.insert(canonical);
-            }
-        }
-
-        fn push_item_scope<'a>(&mut self, items: impl IntoIterator<Item = &'a syn::Item>) {
-            self.scopes
-                .push(runtime_filter_transport_immediate_crate_aliases(items));
-        }
-    }
-
-    impl<'ast> syn::visit::Visit<'ast> for CrateSelfPathAudit {
-        fn visit_file(&mut self, file: &'ast syn::File) {
-            self.push_item_scope(&file.items);
-            syn::visit::visit_file(self, file);
-            self.scopes.pop();
-        }
-
-        fn visit_item(&mut self, item: &'ast syn::Item) {
-            if runtime_filter_transport_cfg_requires_test(runtime_filter_syn_item_attributes(item))
-            {
-                return;
-            }
-            syn::visit::visit_item(self, item);
-        }
-
-        fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
-            let Some((_, items)) = &module.content else {
-                syn::visit::visit_item_mod(self, module);
-                return;
-            };
-            self.push_item_scope(items);
-            syn::visit::visit_item_mod(self, module);
-            self.scopes.pop();
-        }
-
-        fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
-            if runtime_filter_transport_cfg_requires_test(runtime_filter_impl_item_attributes(item))
-            {
-                return;
-            }
-            syn::visit::visit_impl_item(self, item);
-        }
-
-        fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
-            if runtime_filter_transport_cfg_requires_test(runtime_filter_trait_item_attributes(
-                item,
-            )) {
-                return;
-            }
-            syn::visit::visit_trait_item(self, item);
-        }
-
-        fn visit_foreign_item(&mut self, item: &'ast syn::ForeignItem) {
-            if runtime_filter_transport_cfg_requires_test(runtime_filter_foreign_item_attributes(
-                item,
-            )) {
-                return;
-            }
-            syn::visit::visit_foreign_item(self, item);
-        }
-
-        fn visit_block(&mut self, block: &'ast syn::Block) {
-            self.push_item_scope(block.stmts.iter().filter_map(|statement| match statement {
-                syn::Stmt::Item(item) => Some(item),
-                _ => None,
-            }));
-            syn::visit::visit_block(self, block);
-            self.scopes.pop();
-        }
-
-        fn visit_stmt(&mut self, statement: &'ast syn::Stmt) {
-            if runtime_filter_transport_cfg_requires_test(nfe_4_syn_stmt_attrs(statement)) {
-                return;
-            }
-            syn::visit::visit_stmt(self, statement);
-        }
-
-        fn visit_expr(&mut self, expression: &'ast syn::Expr) {
-            if runtime_filter_transport_cfg_requires_test(nfe_4_syn_expr_attrs(expression)) {
-                return;
-            }
-            syn::visit::visit_expr(self, expression);
-        }
-
-        fn visit_arm(&mut self, arm: &'ast syn::Arm) {
-            if runtime_filter_transport_cfg_requires_test(&arm.attrs) {
-                return;
-            }
-            syn::visit::visit_arm(self, arm);
-        }
-
-        fn visit_field(&mut self, field: &'ast syn::Field) {
-            if runtime_filter_transport_cfg_requires_test(&field.attrs) {
-                return;
-            }
-            syn::visit::visit_field(self, field);
-        }
-
-        fn visit_variant(&mut self, variant: &'ast syn::Variant) {
-            if runtime_filter_transport_cfg_requires_test(&variant.attrs) {
-                return;
-            }
-            syn::visit::visit_variant(self, variant);
-        }
-
-        fn visit_field_value(&mut self, field: &'ast syn::FieldValue) {
-            if runtime_filter_transport_cfg_requires_test(&field.attrs) {
-                return;
-            }
-            syn::visit::visit_field_value(self, field);
-        }
-
-        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
-            if item.leading_colon.is_none() {
-                let mut expanded = Vec::new();
-                runtime_filter_transport_expand_use_tree(
-                    &item.tree,
-                    &mut Vec::new(),
-                    &mut expanded,
-                );
-                for path in expanded {
-                    self.record_segments(path.target);
-                }
-            }
-            syn::visit::visit_item_use(self, item);
-        }
-
-        fn visit_path(&mut self, path: &'ast syn::Path) {
-            if path.leading_colon.is_none() {
-                self.record_segments(
-                    path.segments
-                        .iter()
-                        .map(|segment| segment.ident.to_string())
-                        .collect(),
-                );
-            }
-            syn::visit::visit_path(self, path);
-        }
-    }
-
-    let Ok(file) = syn::parse_file(text) else {
-        return Vec::new();
-    };
-    let mut audit = CrateSelfPathAudit::default();
-    syn::visit::Visit::visit_file(&mut audit, &file);
-    audit.paths.into_iter().collect()
 }
 
 fn runtime_filter_transport_ingress_boundary_violations(
@@ -10398,12 +10050,7 @@ fn runtime_filter_transport_ingress_boundary_violations(
         return Vec::new();
     }
 
-    let canonical = rust_production_canonical_paths(text, source_rel)
-        .into_iter()
-        .chain(runtime_filter_transport_crate_self_paths(text))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
+    let canonical = rust_production_canonical_paths(text, source_rel);
     let transport_prefix = [
         "crate".to_string(),
         "runtime_filter".to_string(),
@@ -10417,9 +10064,7 @@ fn runtime_filter_transport_ingress_boundary_violations(
 
     let mut export_violations = Vec::new();
     if matches!(source_rel, ADAPTER | SERVICE_INJECTION_OWNER) {
-        export_violations.extend(runtime_filter_transport_extern_self_alias_violations(
-            source_rel, text,
-        ));
+        export_violations.extend(production_crate_self_alias_violations(source_rel, text));
         export_violations.extend(
             rust_production_scoped_use_statements(text)
                 .into_iter()
@@ -10573,6 +10218,11 @@ fn runtime_filter_transport_ingress_boundary_violations(
 }
 
 fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> Vec<String> {
+    let crate_root_violations = production_crate_self_alias_violations(source_rel, text);
+    if !crate_root_violations.is_empty() {
+        return crate_root_violations;
+    }
+
     if !source_rel.starts_with("src/runtime_filter/") {
         let production = rust_sanitized_production_text(text);
         let canonical = rust_production_canonical_paths(text, source_rel);
@@ -15934,6 +15584,19 @@ fn runtime_filter_channel_service_boundaries_are_default_deny_and_harness_only()
             "RFD-4/M1 native ingress source inventory requires {source_rel}"
         );
     }
+    let alternate_crate_root_violations = rs_files(&repo.join("src"))
+        .into_iter()
+        .flat_map(|path| {
+            let source_rel = rel(&path);
+            let text = fs::read_to_string(path).expect("production source must be readable");
+            production_crate_self_alias_violations(&source_rel, &text)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        alternate_crate_root_violations.is_empty(),
+        "production Rust source must use canonical `crate::` paths:\n{}",
+        alternate_crate_root_violations.join("\n")
+    );
     let transport_prefix = [
         "crate".to_string(),
         "runtime_filter".to_string(),
@@ -15949,8 +15612,7 @@ fn runtime_filter_channel_service_boundaries_are_default_deny_and_harness_only()
             }
             let text = fs::read_to_string(path).expect("production source must be readable");
             rust_production_canonical_paths(&text, &source_rel)
-                .into_iter()
-                .chain(runtime_filter_transport_crate_self_paths(&text))
+                .iter()
                 .any(|path| path.starts_with(&transport_prefix))
                 .then_some(source_rel)
         })
@@ -17195,8 +16857,67 @@ fn runtime_filter_harness_only_detector_rejects_operator_rpc_and_encoder_calls()
     }
 }
 
+fn assert_production_sources_require_the_canonical_crate_root() {
+    for (source_rel, source) in [
+        (
+            "src/service/unknown_runtime_filter_adapter.rs",
+            "extern crate self as root; use root::local::Thing;",
+        ),
+        (
+            "src/service/grpc_client.rs",
+            "extern crate self as root; use root::runtime_filter::port::transport::RuntimeFilterEnvelope;",
+        ),
+        (
+            "src/exec/operators/hash_join/build.rs",
+            "fn leak() { extern crate self as root; }",
+        ),
+        (
+            "src/service/grpc_runtime_filter_adapter.rs",
+            "mod nested { extern crate self as root; }",
+        ),
+        (
+            "src/service/grpc_server.rs",
+            "struct S; impl S { fn leak() { extern crate self as root; } }",
+        ),
+        (
+            "src/service/unknown_runtime_filter_adapter.rs",
+            "fn leak() { #[cfg(any(test, feature = \"compat\"))] { extern crate self as root; } }",
+        ),
+        (
+            "src/service/unknown_runtime_filter_adapter.rs",
+            "fn leak() { #[cfg_attr(test, allow(dead_code))] { extern crate self as root; } }",
+        ),
+    ] {
+        assert!(
+            !production_crate_self_alias_violations(source_rel, source).is_empty(),
+            "production source must use canonical `crate::` paths: {source_rel}: {source}"
+        );
+    }
+
+    for source in [
+        "#[cfg(test)] extern crate self as root;",
+        "#[cfg(test)] fn fixture() { extern crate self as root; }",
+        "fn fixture() { #[cfg(test)] { extern crate self as root; } }",
+        "struct S; impl S { #[cfg(test)] fn fixture() { extern crate self as root; } }",
+        "trait T { #[cfg_attr(not(test), cfg(test))] fn fixture() { extern crate self as root; } }",
+        "extern crate reqwest;",
+        "extern crate reqwest as root;",
+    ] {
+        assert!(
+            production_crate_self_alias_violations(
+                "src/service/unknown_runtime_filter_adapter.rs",
+                source,
+            )
+            .is_empty(),
+            "test-only aliases and ordinary external crates remain legal: {source}"
+        );
+    }
+}
+
 #[test]
 fn rfd4_m1_transport_ingress_detector_is_named_adapter_only_and_default_deny() {
+    assert_production_sources_require_the_canonical_crate_root();
+
     let adapter = "src/service/grpc_runtime_filter_adapter.rs";
     assert!(
         runtime_filter_transport_ingress_boundary_violations(
@@ -17243,85 +16964,6 @@ fn rfd4_m1_transport_ingress_detector_is_named_adapter_only_and_default_deny() {
             )
             .is_empty(),
             "transport ingress must default-deny {source_rel}"
-        );
-    }
-
-    for (source_rel, source) in [
-        (
-            "src/service/unknown_runtime_filter_adapter.rs",
-            "extern crate self as root; use root::runtime_filter::port::transport::RuntimeFilterEnvelope;",
-        ),
-        (
-            "src/service/grpc_client.rs",
-            "extern crate self as root; use root::runtime_filter::port::transport::RuntimeFilterEnvelope;",
-        ),
-        (
-            "src/exec/operators/hash_join/build.rs",
-            "extern crate self as root; use root::runtime_filter::port::transport::RuntimeFilterEnvelope;",
-        ),
-        (
-            "src/service/unknown_runtime_filter_adapter.rs",
-            "extern crate self as root; use root::service::grpc_runtime_filter_adapter::{default_runtime_filter_envelope_ingress, handle_runtime_filter_envelope};",
-        ),
-        (
-            "src/service/unknown_runtime_filter_adapter.rs",
-            "fn leak() { extern crate self as root; use root::runtime_filter::port::transport::RuntimeFilterEnvelope; let _: Option<RuntimeFilterEnvelope> = None; }",
-        ),
-        (
-            "src/service/unknown_runtime_filter_adapter.rs",
-            "fn leak() { extern crate self as root; let _ = root::service::grpc_runtime_filter_adapter::default_runtime_filter_envelope_ingress(); }",
-        ),
-        (
-            "src/service/unknown_runtime_filter_adapter.rs",
-            "extern crate self as root; use root::runtime_filter::port as ports; use ports::transport::RuntimeFilterEnvelope;",
-        ),
-        (
-            "src/service/unknown_runtime_filter_adapter.rs",
-            "extern crate self as root; use root as alias; use alias::runtime_filter::port::transport::RuntimeFilterEnvelope;",
-        ),
-        (
-            "src/service/unknown_runtime_filter_adapter.rs",
-            "extern crate self as root; use root as first; use first as second; use second::runtime_filter::port::transport::RuntimeFilterEnvelope;",
-        ),
-        (
-            "src/service/unknown_runtime_filter_adapter.rs",
-            "extern crate self as root; use root::service::{grpc_runtime_filter_adapter as adapter}; use adapter::{default_runtime_filter_envelope_ingress as default_ingress};",
-        ),
-        (
-            "src/service/unknown_runtime_filter_adapter.rs",
-            "mod nested { extern crate self as root; use root::runtime_filter::port as ports; use ports::transport::RuntimeFilterEnvelope; }",
-        ),
-        (
-            "src/service/unknown_runtime_filter_adapter.rs",
-            "fn leak() { extern crate self as root; use root as alias; use alias::runtime_filter::port::transport::RuntimeFilterEnvelope; }",
-        ),
-    ] {
-        assert!(
-            !runtime_filter_transport_ingress_boundary_violations(source_rel, source).is_empty(),
-            "crate-self aliases must not bypass the global transport consumer ledger: {source_rel}: {source}"
-        );
-    }
-
-    for source in [
-        "extern crate self as root; use root::local::Thing;",
-        "extern crate reqwest as root; use root::runtime_filter::port::transport::RuntimeFilterEnvelope;",
-        "#[cfg(test)] extern crate self as root; #[cfg(test)] use root::runtime_filter::port::transport::RuntimeFilterEnvelope;",
-        "extern crate self as root; mod nested { extern crate reqwest as root; use root::runtime_filter::port::transport::RuntimeFilterEnvelope; }",
-        "fn f() { { extern crate self as root; } { extern crate reqwest as root; use root::runtime_filter::port::transport::RuntimeFilterEnvelope; } }",
-        "extern crate self as root; mod nested { use crate::other as root; use root::runtime_filter::port::transport::RuntimeFilterEnvelope; }",
-        "extern crate self as root; use root as alias; mod nested { use crate::other as alias; use alias::runtime_filter::port::transport::RuntimeFilterEnvelope; }",
-        "mod first { extern crate self as root; use root as alias; } mod second { use crate::other as alias; use alias::runtime_filter::port::transport::RuntimeFilterEnvelope; }",
-        "extern crate self as root; #[cfg(test)] use root as alias; #[cfg(test)] use alias::runtime_filter::port::transport::RuntimeFilterEnvelope;",
-        "extern crate reqwest as root; use root as alias; use alias::runtime_filter::port::transport::RuntimeFilterEnvelope;",
-        "extern crate self as root; use root::local as alias; use alias::runtime_filter::port::transport::RuntimeFilterEnvelope;",
-    ] {
-        assert!(
-            runtime_filter_transport_ingress_boundary_violations(
-                "src/service/unknown_runtime_filter_adapter.rs",
-                source,
-            )
-            .is_empty(),
-            "unrelated or lexically shadowed crate aliases must remain legal: {source}"
         );
     }
 
