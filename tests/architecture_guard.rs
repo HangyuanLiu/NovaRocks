@@ -9931,28 +9931,26 @@ fn runtime_filter_transport_extern_self_alias_violations(
     source_rel: &str,
     text: &str,
 ) -> Vec<String> {
-    fn collect(items: &[syn::Item], aliases: &mut Vec<String>) {
-        for item in items {
+    #[derive(Default)]
+    struct ExternSelfAudit {
+        aliases: Vec<String>,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for ExternSelfAudit {
+        fn visit_item(&mut self, item: &'ast syn::Item) {
             if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
-                continue;
+                return;
             }
-            match item {
-                syn::Item::ExternCrate(extern_crate)
-                    if extern_crate.ident.to_string() == "self" =>
-                {
-                    aliases.push(
-                        extern_crate
-                            .rename
-                            .as_ref()
-                            .map_or_else(|| "self".to_string(), |(_, alias)| alias.to_string()),
-                    );
-                }
-                syn::Item::Mod(module) => {
-                    if let Some((_, items)) = &module.content {
-                        collect(items, aliases);
-                    }
-                }
-                _ => {}
+            syn::visit::visit_item(self, item);
+        }
+
+        fn visit_item_extern_crate(&mut self, extern_crate: &'ast syn::ItemExternCrate) {
+            if extern_crate.ident.to_string() == "self" {
+                self.aliases.push(
+                    extern_crate
+                        .rename
+                        .as_ref()
+                        .map_or_else(|| "self".to_string(), |(_, alias)| alias.to_string()),
+                );
             }
         }
     }
@@ -9960,9 +9958,10 @@ fn runtime_filter_transport_extern_self_alias_violations(
     let Ok(file) = syn::parse_file(text) else {
         return Vec::new();
     };
-    let mut aliases = Vec::new();
-    collect(&file.items, &mut aliases);
-    aliases
+    let mut audit = ExternSelfAudit::default();
+    syn::visit::Visit::visit_file(&mut audit, &file);
+    audit
+        .aliases
         .into_iter()
         .map(|alias| {
             format!(
@@ -16920,6 +16919,30 @@ fn rfd4_m1_transport_ingress_detector_is_named_adapter_only_and_default_deny() {
             adapter,
             "extern crate self as root; pub(in crate::service) type Hidden = root::runtime_filter::port::transport::RuntimeFilterEnvelope;",
         ),
+        (
+            adapter,
+            "fn leak() { extern crate self as root; let _: Option<root::runtime_filter::port::transport::RuntimeFilterEnvelope> = None; }",
+        ),
+        (
+            adapter,
+            "const _: () = { extern crate self as root; let _: Option<root::runtime_filter::core::channel::RuntimeFilterChannel> = None; };",
+        ),
+        (
+            adapter,
+            "fn leak() { { extern crate self as root; let _: Option<root::runtime_filter::router::loopback::LoopbackRouter> = None; } }",
+        ),
+        (
+            "src/service/grpc_server.rs",
+            "fn leak() { extern crate self as root; let _: Option<root::runtime_filter::port::transport::RuntimeFilterEnvelope> = None; }",
+        ),
+        (
+            "src/service/grpc_server.rs",
+            "const _: () = { extern crate self as root; let _: Option<root::runtime_filter::core::channel::RuntimeFilterChannel> = None; };",
+        ),
+        (
+            "src/service/grpc_server.rs",
+            "fn leak() { { extern crate self as root; let _: Option<root::runtime_filter::router::loopback::LoopbackRouter> = None; } }",
+        ),
     ] {
         assert!(
             !runtime_filter_transport_ingress_boundary_violations(source_rel, source).is_empty(),
@@ -16954,6 +16977,10 @@ fn rfd4_m1_transport_ingress_detector_is_named_adapter_only_and_default_deny() {
         "struct Local; mod nested { pub(crate) use super::Local as Hidden; }",
         "pub(crate) use super::super::super::local::Thing as Hidden;",
         "#[cfg(test)] extern crate self as root;",
+        "#[cfg(test)] fn fixture() { extern crate self as root; let _: Option<root::runtime_filter::port::transport::RuntimeFilterEnvelope> = None; }",
+        "fn fixture() { #[cfg(test)] extern crate self as root; }",
+        "#[cfg(test)] const _: () = { extern crate self as root; };",
+        "#[cfg(test)] mod tests { fn fixture() { extern crate self as root; let _: Option<root::runtime_filter::router::loopback::LoopbackRouter> = None; } }",
         "extern crate reqwest;",
         "extern crate reqwest as network;",
     ] {
