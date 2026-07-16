@@ -459,6 +459,33 @@ backends = [{backends_list}]
     fn fe_mysql_port(&self) -> u16 {
         self.fe_mysql
     }
+
+    fn wait_for_any_be_output_contains(&mut self, marker: &str, detail: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        let mut stdout = vec![Vec::new(); self.bes.len()];
+        loop {
+            for (index, be) in self.bes.iter_mut().enumerate() {
+                if let Some(status) = be.child.try_wait().expect("poll BE child") {
+                    panic!(
+                        "BE {index} exited before marker `{marker}` with detail `{detail}` with status {status}; stdout={:?}; stderr={}",
+                        stdout[index],
+                        be.read_stderr()
+                    );
+                }
+                while let Ok(line) = be.stdout_rx.try_recv() {
+                    if line.contains(marker) && line.contains(detail) {
+                        return;
+                    }
+                    stdout[index].push(line);
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no BE emitted marker `{marker}` with detail `{detail}`; stdout={stdout:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 fn coordinated_query_sql() -> &'static str {
@@ -566,6 +593,26 @@ fn send_mysql_query_and_disconnect(port: u16, sql: &str) {
 
 fn show_backends(conn: &mut MysqlConn) -> Vec<Row> {
     conn.query("SHOW BACKENDS").expect("SHOW BACKENDS")
+}
+
+fn assert_exact_live_backends(conn: &mut MysqlConn, expected: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let rows = show_backends(conn);
+        if rows.len() == expected
+            && rows
+                .iter()
+                .all(|row| row.get::<String, usize>(3).as_deref() == Some("Live"))
+        {
+            println!("SHOW BACKENDS {expected}/{expected} Live");
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected exactly {expected} Live backends; rows={rows:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn backend_row_by_port(rows: &[Row], port: u16) -> Option<&Row> {
@@ -960,6 +1007,85 @@ emit_cancel_marker = true
     cluster
         .be
         .wait_for_output_contains("NOVAROCKS_CANCEL count=1", Duration::from_secs(5));
+}
+
+#[test]
+fn three_be_query_timeout_cancels_remote_fragments() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
+    if !binary.exists() {
+        return;
+    }
+    let _lock = lock_cluster_mvp();
+
+    let mut cluster = MultiBeClusterHarness::start_n_be(
+        3,
+        r#"
+[debug]
+emit_cancel_marker = true
+"#,
+        "",
+    );
+
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    conn.query_drop("SET query_timeout = 1")
+        .expect("set query timeout");
+    let err = conn
+        .query::<String, _>(coordinated_sleep_query_sql())
+        .expect_err("query should time out while the 3-BE cluster is executing");
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("timed out") || err_str.contains("timeout"),
+        "expected timeout error, got: {err_str}"
+    );
+
+    cluster.wait_for_any_be_output_contains(
+        "NOVAROCKS_CANCEL",
+        "reason=coordinator cancel",
+        Duration::from_secs(5),
+    );
+}
+
+#[test]
+fn three_be_partial_submit_failure_cancels_accepted_fragments() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
+    if !binary.exists() {
+        return;
+    }
+    let _lock = lock_cluster_mvp();
+
+    let mut cluster = MultiBeClusterHarness::start_n_be(
+        3,
+        r#"
+[debug]
+emit_cancel_marker = true
+"#,
+        r#"
+[debug]
+fault_inject_submit_fail_after = 1
+"#,
+    );
+
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    let err = conn
+        .query::<String, _>(multi_submit_query_sql())
+        .expect_err("a later fragment submit should hit the injected fault");
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("submit_fragment") || err_str.contains("submit"),
+        "expected submit failure, got: {err_str}"
+    );
+    assert!(
+        err_str.contains("debug submit fault injected"),
+        "expected injected submit failure, got: {err_str}"
+    );
+
+    cluster.wait_for_any_be_output_contains(
+        "NOVAROCKS_CANCEL",
+        "finsts=1 reason=coordinator cancel",
+        Duration::from_secs(5),
+    );
 }
 
 #[test]
