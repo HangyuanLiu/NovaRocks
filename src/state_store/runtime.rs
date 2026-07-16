@@ -21,12 +21,8 @@ use super::{StateStoreError, StateStoreErrorKind};
 
 #[cfg(feature = "foundationdb-provider")]
 use {
-    super::{
-        ChangePage, ChangePollRequest, CommitResolution, FoundationDbClientConfig, ReadTransaction,
-        StateStore, StateStoreConfig, StateStoreLimits, StoreIdentity, TransactionId,
-        WriteTransaction,
-    },
-    async_trait::async_trait,
+    super::foundationdb::FoundationDbStateStore,
+    super::{FoundationDbClientConfig, StateStore, StateStoreConfig, StateStoreLimits},
     foundationdb::Database,
     foundationdb::api::{FdbApiBuilder, NetworkRunner, NetworkStop},
     foundationdb::options::NetworkOption,
@@ -94,7 +90,7 @@ impl StateStoreRuntime {
     }
 
     #[cfg(feature = "foundationdb-provider")]
-    pub(crate) fn open_foundationdb_store(
+    pub(crate) async fn open_foundationdb_store(
         &self,
         config: &StateStoreConfig,
     ) -> Result<Arc<dyn StateStore>, StateStoreError> {
@@ -103,7 +99,7 @@ impl StateStoreRuntime {
                 StateStoreErrorKind::InvalidConfiguration,
                 "FoundationDB state store requires a FoundationDB runtime",
             )),
-            RuntimeInner::FoundationDb(runtime) => runtime.open_store(config),
+            RuntimeInner::FoundationDb(runtime) => runtime.open_store(config).await,
         }
     }
 }
@@ -324,7 +320,7 @@ impl FoundationDbRuntime {
         })
     }
 
-    fn open_store(
+    async fn open_store(
         &self,
         config: &StateStoreConfig,
     ) -> Result<Arc<dyn StateStore>, StateStoreError> {
@@ -335,8 +331,11 @@ impl FoundationDbRuntime {
             )
         })?;
         let opening = self.shared.acquire_operation()?;
-        let cluster_file = match &config.provider {
-            super::StateStoreProviderConfig::Foundationdb { cluster_file, .. } => cluster_file,
+        let (cluster_file, keyspace_id) = match &config.provider {
+            super::StateStoreProviderConfig::Foundationdb {
+                cluster_file,
+                keyspace_id,
+            } => (cluster_file, *keyspace_id),
             super::StateStoreProviderConfig::Sqlite { .. } => {
                 return Err(StateStoreError::new(
                     StateStoreErrorKind::InvalidConfiguration,
@@ -363,8 +362,11 @@ impl FoundationDbRuntime {
             )
         })?;
         let lease = ProviderHandle::new(Arc::clone(&self.shared), Arc::new(database))?;
+        let store =
+            FoundationDbStateStore::open(lease, limits, config.cluster_id.clone(), keyspace_id)
+                .await?;
         drop(opening);
-        Ok(Arc::new(FoundationDbRuntimeStore { lease, limits }))
+        Ok(Arc::new(store))
     }
 
     async fn shutdown(&mut self) -> Result<(), StateStoreError> {
@@ -595,7 +597,7 @@ impl FoundationDbRuntimeShared {
 }
 
 #[cfg(feature = "foundationdb-provider")]
-struct ProviderHandle {
+pub(super) struct ProviderHandle {
     shared: Arc<FoundationDbRuntimeShared>,
     database_id: u64,
 }
@@ -640,7 +642,7 @@ impl ProviderHandle {
     }
 
     #[allow(dead_code)]
-    fn database(&self) -> Result<Arc<Database>, StateStoreError> {
+    pub(super) fn database(&self) -> Result<Arc<Database>, StateStoreError> {
         let databases = self.shared.databases.lock().map_err(|_| {
             StateStoreError::new(
                 StateStoreErrorKind::Internal,
@@ -656,7 +658,7 @@ impl ProviderHandle {
     }
 
     #[allow(dead_code)]
-    fn acquire_operation(&self) -> Result<OperationHandle, StateStoreError> {
+    pub(super) fn acquire_operation(&self) -> Result<OperationHandle, StateStoreError> {
         self.shared.acquire_operation()
     }
 }
@@ -676,7 +678,7 @@ impl Drop for ProviderHandle {
 
 #[cfg(feature = "foundationdb-provider")]
 #[allow(dead_code)]
-struct OperationHandle {
+pub(super) struct OperationHandle {
     shared: Arc<FoundationDbRuntimeShared>,
 }
 
@@ -685,69 +687,6 @@ impl Drop for OperationHandle {
     fn drop(&mut self) {
         self.shared.in_flight.fetch_sub(1, Ordering::AcqRel);
         self.shared.drained.notify_one();
-    }
-}
-
-#[cfg(feature = "foundationdb-provider")]
-struct FoundationDbRuntimeStore {
-    lease: ProviderHandle,
-    limits: StateStoreLimits,
-}
-
-#[cfg(feature = "foundationdb-provider")]
-impl FoundationDbRuntimeStore {
-    fn unavailable() -> StateStoreError {
-        StateStoreError::new(
-            StateStoreErrorKind::ProviderUnavailable,
-            "FoundationDB state store operations are not initialized",
-        )
-    }
-}
-
-#[cfg(feature = "foundationdb-provider")]
-#[async_trait]
-impl StateStore for FoundationDbRuntimeStore {
-    fn provider_name(&self) -> &'static str {
-        "foundationdb"
-    }
-
-    fn limits(&self) -> &StateStoreLimits {
-        &self.limits
-    }
-
-    fn metrics_snapshot(&self) -> super::StateStoreMetricsSnapshot {
-        super::StateStoreMetrics::new("foundationdb").snapshot()
-    }
-
-    async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
-        let _ = &self.lease;
-        Err(Self::unavailable())
-    }
-
-    async fn begin_write(
-        &self,
-        _transaction_id: TransactionId,
-        _purpose: &str,
-    ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
-        Err(Self::unavailable())
-    }
-
-    async fn poll_changes(
-        &self,
-        _request: &ChangePollRequest,
-    ) -> Result<ChangePage, StateStoreError> {
-        Err(Self::unavailable())
-    }
-
-    async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
-        Err(Self::unavailable())
-    }
-
-    async fn resolve_commit(
-        &self,
-        _transaction_id: &TransactionId,
-    ) -> Result<CommitResolution, StateStoreError> {
-        Err(Self::unavailable())
     }
 }
 

@@ -28,6 +28,9 @@ mod runtime;
 
 mod sqlite;
 
+#[cfg(feature = "foundationdb-provider")]
+mod foundationdb;
+
 pub use config::{FoundationDbClientConfig, StateStoreConfig, StateStoreProviderConfig};
 pub use contract::{
     ChangeHint, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution,
@@ -63,7 +66,7 @@ pub async fn open_state_store(
                 "FoundationDB provider is not compiled in",
             ));
             #[cfg(feature = "foundationdb-provider")]
-            return runtime.open_foundationdb_store(&config);
+            return runtime.open_foundationdb_store(&config).await;
         }
     }
 }
