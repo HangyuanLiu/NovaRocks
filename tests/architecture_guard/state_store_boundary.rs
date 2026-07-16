@@ -264,9 +264,20 @@ fn state_store_boundary_violations(sources: &[GuardSource]) -> Vec<String> {
             for token in FOUNDATIONDB_FORBIDDEN_OWNER_TOKENS {
                 let is_member_api = matches!(*token, "run" | "transact" | "on_error");
                 let present = if is_member_api {
-                    production_tokens.windows(2).any(|tokens| {
-                        matches!(tokens[0].as_str(), "." | "::") && tokens[1] == *token
-                    })
+                    production_tokens
+                        .windows(2)
+                        .enumerate()
+                        .any(|(index, tokens)| {
+                            if !matches!(tokens[0].as_str(), "." | "::") || tokens[1] != *token {
+                                return false;
+                            }
+                            let explicit_network_runner = *token == "run"
+                                && source.path == "src/state_store/runtime.rs"
+                                && tokens[0] == "::"
+                                && index > 0
+                                && production_tokens[index - 1] == "NetworkRunner";
+                            !explicit_network_runner
+                        })
                 } else {
                     production_tokens.iter().any(|actual| actual == token)
                 };
@@ -611,7 +622,8 @@ fn state_store_boundary_detector_allows_foundationdb_native_details_only_in_owne
         ),
         GuardSource::new(
             "src/state_store/runtime.rs",
-            "use foundationdb::options::NetworkOption;",
+            "use foundationdb::{api::NetworkRunner, options::NetworkOption}; \
+             fn start(runner: NetworkRunner) { unsafe { NetworkRunner::run(runner); } }",
         ),
     ];
 

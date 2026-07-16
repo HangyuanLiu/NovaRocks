@@ -24,6 +24,7 @@ pub mod limits;
 pub mod metrics;
 pub mod range;
 pub mod runner;
+mod runtime;
 
 mod sqlite;
 
@@ -41,15 +42,20 @@ pub use metrics::{
 };
 pub use range::{ChangeCursor, ContinuationToken, Direction, KeyRange, RangeRequest};
 pub use runner::{RunFailure, RunSuccess, derive_transaction_id, run_side_effect_free};
+pub use runtime::StateStoreRuntime;
 
 pub async fn open_state_store(
+    runtime: &StateStoreRuntime,
     config: StateStoreConfig,
     deployment: FeDeploymentView,
 ) -> Result<Arc<dyn StateStore>, StateStoreError> {
     match &config.provider {
-        StateStoreProviderConfig::Sqlite { .. } => Ok(Arc::new(
-            sqlite::SqliteStateStore::open(config, deployment).await?,
-        )),
+        StateStoreProviderConfig::Sqlite { .. } => {
+            runtime.accepts_local()?;
+            Ok(Arc::new(
+                sqlite::SqliteStateStore::open(config, deployment).await?,
+            ))
+        }
         StateStoreProviderConfig::Foundationdb { .. } => {
             #[cfg(not(feature = "foundationdb-provider"))]
             return Err(StateStoreError::new(
@@ -57,10 +63,7 @@ pub async fn open_state_store(
                 "FoundationDB provider is not compiled in",
             ));
             #[cfg(feature = "foundationdb-provider")]
-            return Err(StateStoreError::new(
-                StateStoreErrorKind::InvalidConfiguration,
-                "FoundationDB provider runtime is not configured",
-            ));
+            return runtime.open_foundationdb_store(&config);
         }
     }
 }

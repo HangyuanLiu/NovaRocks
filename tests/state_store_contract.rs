@@ -32,8 +32,9 @@ use novarocks::state_store::{
     OperationId, Precondition, RangePage, RangeRequest, ReadTransaction, RunFailure, StateStore,
     StateStoreConfig, StateStoreError, StateStoreErrorKind, StateStoreLimitOverrides,
     StateStoreLimits, StateStoreMetrics, StateStoreOperation, StateStoreOutcome,
-    StateStoreProviderConfig, StoreIdentity, StoreRevision, TransactionId, Value, VersionToken,
-    WriteTransaction, derive_transaction_id, open_state_store, run_side_effect_free,
+    StateStoreProviderConfig, StateStoreRuntime, StoreIdentity, StoreRevision, TransactionId,
+    Value, VersionToken, WriteTransaction, derive_transaction_id, open_state_store,
+    run_side_effect_free,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -408,7 +409,9 @@ disable_multi_version_client = true
     .expect("write config");
     let loaded = novarocks::common::app_config::NovaRocksConfig::load_from_file(config_path.path())
         .expect("load FoundationDB config from TOML");
+    let runtime = StateStoreRuntime::local().expect("create feature-off local runtime");
     let error = match open_state_store(
+        &runtime,
         loaded.state_store.expect("state store config"),
         FeDeploymentView {
             active_fe_count: NonZeroUsize::new(3).expect("three FEs"),

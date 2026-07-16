@@ -1,0 +1,197 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+#![cfg(feature = "foundationdb-provider")]
+
+use std::num::NonZeroUsize;
+use std::path::PathBuf;
+use std::process::Command;
+
+use bytes::Bytes;
+use novarocks::state_store::{
+    FeDeploymentView, FoundationDbClientConfig, StateStoreConfig, StateStoreErrorKind,
+    StateStoreLimitOverrides, StateStoreProviderConfig, StateStoreRuntime, open_state_store,
+};
+use tempfile::TempDir;
+use uuid::Uuid;
+
+fn client_config() -> FoundationDbClientConfig {
+    FoundationDbClientConfig {
+        disable_multi_version_client: true,
+        tls_cert_path: None,
+        tls_key_path: None,
+        tls_ca_path: None,
+        tls_verify_peers: None,
+        tls_password_env: None,
+    }
+}
+
+fn fdb_store_config() -> StateStoreConfig {
+    StateStoreConfig {
+        cluster_id: "runtime-cluster".to_owned(),
+        limits: StateStoreLimitOverrides::default(),
+        provider: StateStoreProviderConfig::Foundationdb {
+            cluster_file: PathBuf::from(
+                std::env::var("NOVAROCKS_FDB_CLUSTER_FILE")
+                    .expect("FoundationDB fixture cluster file"),
+            ),
+            keyspace_id: Uuid::parse_str(
+                &std::env::var("NOVAROCKS_FDB_KEYSPACE_ID")
+                    .expect("FoundationDB fixture keyspace id"),
+            )
+            .expect("valid FoundationDB fixture keyspace id"),
+        },
+    }
+}
+
+fn deployment(active_fe_count: usize) -> FeDeploymentView {
+    FeDeploymentView {
+        active_fe_count: NonZeroUsize::new(active_fe_count).expect("non-zero FE count"),
+        topology_revision: Bytes::from_static(b"runtime-topology"),
+    }
+}
+
+#[tokio::test]
+async fn foundationdb_runtime_lifecycle() {
+    let temp = TempDir::new().expect("SQLite runtime temp dir");
+    let mut local = StateStoreRuntime::local().expect("create local runtime");
+    let sqlite = open_state_store(
+        &local,
+        StateStoreConfig {
+            cluster_id: "local-runtime-cluster".to_owned(),
+            limits: StateStoreLimitOverrides::default(),
+            provider: StateStoreProviderConfig::Sqlite {
+                path: temp.path().join("state-store.sqlite"),
+                deployment_owner: "runtime-fe".to_owned(),
+            },
+        },
+        deployment(1),
+    )
+    .await
+    .expect("open SQLite through local runtime");
+    assert_eq!(sqlite.provider_name(), "sqlite");
+    drop(sqlite);
+    let wrong_local_provider =
+        match open_state_store(&local, fdb_store_config(), deployment(2)).await {
+            Ok(_) => panic!("local runtime must reject the FoundationDB provider"),
+            Err(error) => error,
+        };
+    assert_eq!(
+        wrong_local_provider.kind(),
+        StateStoreErrorKind::InvalidConfiguration
+    );
+    local.shutdown().await.expect("shutdown local runtime");
+
+    let mut runtime = StateStoreRuntime::foundationdb(client_config())
+        .expect("boot process-owned FoundationDB runtime");
+
+    let duplicate = StateStoreRuntime::foundationdb(client_config())
+        .expect_err("a process cannot boot FoundationDB twice");
+    assert_eq!(duplicate.kind(), StateStoreErrorKind::InvalidConfiguration);
+    assert!(duplicate.to_string().contains("already"));
+
+    let tls = TempDir::new().expect("TLS config temp dir");
+    let cert = tls.path().join("client.crt");
+    let key = tls.path().join("client.key");
+    let ca = tls.path().join("ca.crt");
+    std::fs::write(&cert, b"cert").expect("write cert fixture");
+    std::fs::write(&key, b"key").expect("write key fixture");
+    std::fs::write(&ca, b"ca").expect("write CA fixture");
+    let different = StateStoreRuntime::foundationdb(FoundationDbClientConfig {
+        disable_multi_version_client: true,
+        tls_cert_path: Some(cert),
+        tls_key_path: Some(key),
+        tls_ca_path: Some(ca),
+        tls_verify_peers: Some("Check.Valid=1".to_owned()),
+        tls_password_env: None,
+    })
+    .expect_err("a different process-global client config must fail closed");
+    assert_eq!(different.kind(), StateStoreErrorKind::InvalidConfiguration);
+    assert!(different.to_string().contains("different"));
+
+    let child = Command::new(std::env::current_exe().expect("current test binary"))
+        .args([
+            "--ignored",
+            "--exact",
+            "runtime_child_boot",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .status()
+        .expect("exec runtime child");
+    assert!(
+        child.success(),
+        "fresh exec process must boot independently"
+    );
+
+    let wrong_fdb_provider = match open_state_store(
+        &runtime,
+        StateStoreConfig {
+            cluster_id: "runtime-cluster".to_owned(),
+            limits: StateStoreLimitOverrides::default(),
+            provider: StateStoreProviderConfig::Sqlite {
+                path: temp.path().join("wrong-runtime.sqlite"),
+                deployment_owner: "runtime-fe".to_owned(),
+            },
+        },
+        deployment(1),
+    )
+    .await
+    {
+        Ok(_) => panic!("FoundationDB runtime must reject the SQLite provider"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        wrong_fdb_provider.kind(),
+        StateStoreErrorKind::InvalidConfiguration
+    );
+
+    let store = open_state_store(&runtime, fdb_store_config(), deployment(2))
+        .await
+        .expect("open FoundationDB runtime handle");
+    let held = runtime
+        .shutdown()
+        .await
+        .expect_err("shutdown must retain ownership while a store handle is alive");
+    assert_eq!(held.kind(), StateStoreErrorKind::DeadlineExceeded);
+
+    let retry_store = open_state_store(&runtime, fdb_store_config(), deployment(2))
+        .await
+        .expect("timed-out shutdown restores accepting state");
+    drop(retry_store);
+    drop(store);
+    runtime
+        .shutdown()
+        .await
+        .expect("shutdown is retryable after provider handles drain");
+
+    let restart = StateStoreRuntime::foundationdb(client_config())
+        .expect_err("FoundationDB cannot restart after a successful stop");
+    assert_eq!(restart.kind(), StateStoreErrorKind::InvalidConfiguration);
+    assert!(restart.to_string().contains("stopped"));
+}
+
+#[tokio::test]
+#[ignore = "exec helper used by foundationdb_runtime_lifecycle"]
+async fn runtime_child_boot() {
+    let mut runtime = StateStoreRuntime::foundationdb(client_config())
+        .expect("fresh exec process boots FoundationDB");
+    runtime
+        .shutdown()
+        .await
+        .expect("fresh exec process stops FoundationDB");
+}

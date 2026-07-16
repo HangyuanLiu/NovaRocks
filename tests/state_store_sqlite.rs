@@ -29,7 +29,8 @@ use novarocks::state_store::{
     ChangeCursor, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution, Direction,
     FeDeploymentView, Key, KeyRange, Precondition, RangeRequest, StateStore, StateStoreConfig,
     StateStoreErrorKind, StateStoreLimitOverrides, StateStoreOperation, StateStoreOutcome,
-    StateStoreProviderConfig, StoreRevision, TransactionId, Value, open_state_store,
+    StateStoreProviderConfig, StateStoreRuntime, StoreRevision, TransactionId, Value,
+    open_state_store,
 };
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -88,7 +89,9 @@ async fn open_store_with_limits(
     owner: &str,
     limits: StateStoreLimitOverrides,
 ) -> Arc<dyn StateStore> {
+    let runtime = StateStoreRuntime::local().expect("create local state store runtime");
     open_state_store(
+        &runtime,
         StateStoreConfig {
             cluster_id: "cluster-a".to_owned(),
             limits,
@@ -122,7 +125,9 @@ fn conformance_factory() -> StateStoreFactory {
         let temp = Arc::clone(&temp);
         Box::pin(async move {
             let path = temp.path().join("state-store.sqlite");
+            let runtime = StateStoreRuntime::local()?;
             let store = open_state_store(
+                &runtime,
                 StateStoreConfig {
                     cluster_id: "conformance-cluster".to_owned(),
                     limits: StateStoreLimitOverrides {
@@ -532,7 +537,9 @@ mod conformance {
         let temp = TempDir::new().expect("owner lifecycle temp dir");
         let first = open_store(&temp, "fe-a").await;
         let identity = first.identity().await.expect("first owner identity");
+        let runtime = StateStoreRuntime::local().expect("create local state store runtime");
         let second = open_state_store(
+            &runtime,
             StateStoreConfig {
                 cluster_id: "cluster-a".to_owned(),
                 limits: StateStoreLimitOverrides::default(),
@@ -1835,7 +1842,9 @@ async fn sqlite_concurrent_first_open_has_exactly_one_schema_owner() {
         let gate = Arc::clone(&gate);
         opens.push(tokio::spawn(async move {
             gate.wait().await;
+            let runtime = StateStoreRuntime::local().expect("create local state store runtime");
             open_state_store(
+                &runtime,
                 StateStoreConfig {
                     cluster_id: "race-cluster".to_owned(),
                     limits: StateStoreLimitOverrides::default(),
@@ -1885,7 +1894,9 @@ async fn sqlite_concurrent_first_open_has_exactly_one_schema_owner() {
     drop(connection);
     drop(winner);
 
+    let runtime = StateStoreRuntime::local().expect("create local state store runtime");
     let reopened = open_state_store(
+        &runtime,
         StateStoreConfig {
             cluster_id: "race-cluster".to_owned(),
             limits: StateStoreLimitOverrides::default(),
