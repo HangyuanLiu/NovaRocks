@@ -1365,6 +1365,162 @@
           "reserved_numbers": [],
           "reserved_names": []
         },
+        "RuntimeFilterContributionRouteIdentity": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "producer_binding_id",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "fragment_instance_id",
+              "type_name": "novarocks.common.UniqueId",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "partition_id",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "sequence",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterDeliveryRouteIdentity": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "route_edge_id",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "sequence",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterEnvelope": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "kind",
+              "type_name": "RuntimeFilterEnvelopeKind",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "query_id",
+              "type_name": "novarocks.common.UniqueId",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "channel_id",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "deployment_epoch",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "5": {
+              "number": 5,
+              "name": "route_identity",
+              "type_name": "RuntimeFilterRouteIdentity",
+              "label": "singular",
+              "oneof": null
+            },
+            "6": {
+              "number": 6,
+              "name": "schema_digest",
+              "type_name": "bytes",
+              "label": "singular",
+              "oneof": null
+            },
+            "7": {
+              "number": 7,
+              "name": "payload",
+              "type_name": "bytes",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterEnvelopeResponse": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "acked_route_identity",
+              "type_name": "RuntimeFilterRouteIdentity",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "accept_status",
+              "type_name": "RuntimeFilterAcceptStatus",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "rejection_reason",
+              "type_name": "string",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterRouteIdentity": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "contribution",
+              "type_name": "RuntimeFilterContributionRouteIdentity",
+              "label": "singular",
+              "oneof": "value"
+            },
+            "2": {
+              "number": 2,
+              "name": "delivery",
+              "type_name": "RuntimeFilterDeliveryRouteIdentity",
+              "label": "singular",
+              "oneof": "value"
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
         "TransmitRuntimeFilterRequest": {
           "fields": {
             "1": {
@@ -1434,7 +1590,60 @@
           "reserved_names": []
         }
       },
-      "enums": {},
+      "enums": {
+        "RuntimeFilterAcceptStatus": {
+          "values": [
+            {
+              "number": 0,
+              "name": "RUNTIME_FILTER_ACCEPT_STATUS_UNSPECIFIED"
+            },
+            {
+              "number": 1,
+              "name": "RUNTIME_FILTER_ACCEPT_STATUS_ACCEPTED"
+            },
+            {
+              "number": 2,
+              "name": "RUNTIME_FILTER_ACCEPT_STATUS_DUPLICATE"
+            },
+            {
+              "number": 3,
+              "name": "RUNTIME_FILTER_ACCEPT_STATUS_REJECTED"
+            }
+          ],
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterEnvelopeKind": {
+          "values": [
+            {
+              "number": 0,
+              "name": "RUNTIME_FILTER_ENVELOPE_KIND_UNSPECIFIED"
+            },
+            {
+              "number": 1,
+              "name": "RUNTIME_FILTER_ENVELOPE_KIND_CONTRIBUTION"
+            },
+            {
+              "number": 2,
+              "name": "RUNTIME_FILTER_ENVELOPE_KIND_ARTIFACT"
+            },
+            {
+              "number": 3,
+              "name": "RUNTIME_FILTER_ENVELOPE_KIND_PRODUCER_CLOSED"
+            },
+            {
+              "number": 4,
+              "name": "RUNTIME_FILTER_ENVELOPE_KIND_UNAVAILABLE"
+            },
+            {
+              "number": 5,
+              "name": "RUNTIME_FILTER_ENVELOPE_KIND_ACK"
+            }
+          ],
+          "reserved_numbers": [],
+          "reserved_names": []
+        }
+      },
       "services": {}
     },
     "idl/novarocks/plan.proto": {
@@ -7916,6 +8125,12 @@
             "TransmitRuntimeFilter": {
               "request": "novarocks.filter.TransmitRuntimeFilterRequest",
               "response": "novarocks.filter.TransmitRuntimeFilterResponse",
+              "client_streaming": false,
+              "server_streaming": false
+            },
+            "TransmitRuntimeFilterEnvelope": {
+              "request": "novarocks.filter.RuntimeFilterEnvelope",
+              "response": "novarocks.filter.RuntimeFilterEnvelopeResponse",
               "client_streaming": false,
               "server_streaming": false
             }

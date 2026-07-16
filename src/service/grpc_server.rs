@@ -258,6 +258,15 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         ))
     }
 
+    async fn transmit_runtime_filter_envelope(
+        &self,
+        _request: tonic::Request<proto::filter::RuntimeFilterEnvelope>,
+    ) -> Result<tonic::Response<proto::filter::RuntimeFilterEnvelopeResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "RFD-4/M1 adapter is not installed",
+        ))
+    }
+
     async fn lookup(
         &self,
         request: tonic::Request<proto::filter::LookupRequest>,

@@ -368,6 +368,15 @@ mod tests {
             Err(Status::unimplemented("mock"))
         }
 
+        async fn transmit_runtime_filter_envelope(
+            &self,
+            _request: Request<proto::filter::RuntimeFilterEnvelope>,
+        ) -> Result<Response<proto::filter::RuntimeFilterEnvelopeResponse>, Status> {
+            Err(Status::unimplemented(
+                "RFD-4/M1 adapter is not installed",
+            ))
+        }
+
         async fn lookup(
             &self,
             _request: Request<LookupRequest>,

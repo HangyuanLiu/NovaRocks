@@ -64,3 +64,54 @@ message Column {
   int64 data_size = 2;                          // decoded byte size for accounting
   bytes data = 3;                               // Arrow IPC streaming (opaque)
 }
+
+enum RuntimeFilterEnvelopeKind {
+  RUNTIME_FILTER_ENVELOPE_KIND_UNSPECIFIED = 0;
+  RUNTIME_FILTER_ENVELOPE_KIND_CONTRIBUTION = 1;
+  RUNTIME_FILTER_ENVELOPE_KIND_ARTIFACT = 2;
+  RUNTIME_FILTER_ENVELOPE_KIND_PRODUCER_CLOSED = 3;
+  RUNTIME_FILTER_ENVELOPE_KIND_UNAVAILABLE = 4;
+  RUNTIME_FILTER_ENVELOPE_KIND_ACK = 5;
+}
+
+message RuntimeFilterContributionRouteIdentity {
+  uint32 producer_binding_id = 1;
+  novarocks.common.UniqueId fragment_instance_id = 2;
+  uint32 partition_id = 3;
+  uint64 sequence = 4;
+}
+
+message RuntimeFilterDeliveryRouteIdentity {
+  uint32 route_edge_id = 1;
+  uint64 sequence = 2;
+}
+
+message RuntimeFilterRouteIdentity {
+  oneof value {
+    RuntimeFilterContributionRouteIdentity contribution = 1;
+    RuntimeFilterDeliveryRouteIdentity delivery = 2;
+  }
+}
+
+message RuntimeFilterEnvelope {
+  RuntimeFilterEnvelopeKind kind = 1;
+  novarocks.common.UniqueId query_id = 2;
+  uint32 channel_id = 3;
+  uint64 deployment_epoch = 4;
+  RuntimeFilterRouteIdentity route_identity = 5;
+  bytes schema_digest = 6;
+  bytes payload = 7;
+}
+
+enum RuntimeFilterAcceptStatus {
+  RUNTIME_FILTER_ACCEPT_STATUS_UNSPECIFIED = 0;
+  RUNTIME_FILTER_ACCEPT_STATUS_ACCEPTED = 1;
+  RUNTIME_FILTER_ACCEPT_STATUS_DUPLICATE = 2;
+  RUNTIME_FILTER_ACCEPT_STATUS_REJECTED = 3;
+}
+
+message RuntimeFilterEnvelopeResponse {
+  RuntimeFilterRouteIdentity acked_route_identity = 1;
+  RuntimeFilterAcceptStatus accept_status = 2;
+  string rejection_reason = 3;
+}

@@ -19599,6 +19599,255 @@ fn nidl_d3b_proto_schema_parser_parses_all_native_proto_files() {
 }
 
 #[test]
+fn rfd4_m1_runtime_filter_envelope_schema_is_typed_and_additive() {
+    let schema =
+        parse_current_novarocks_proto_schema().expect("current native proto schema should parse");
+    let filter = &schema.files["idl/novarocks/filter.proto"];
+    let envelope = &filter.messages["RuntimeFilterEnvelope"];
+
+    assert_eq!(envelope.fields.len(), 7);
+    assert_eq!(envelope.fields[&1].name, "kind");
+    assert_eq!(envelope.fields[&2].type_name, "novarocks.common.UniqueId");
+    assert_eq!(envelope.fields[&3].name, "channel_id");
+    assert_eq!(envelope.fields[&4].name, "deployment_epoch");
+    assert_eq!(
+        envelope.fields[&5].type_name,
+        "RuntimeFilterRouteIdentity"
+    );
+    assert_eq!(envelope.fields[&6].name, "schema_digest");
+    assert_eq!(envelope.fields[&7].name, "payload");
+    assert_eq!(
+        filter.enums["RuntimeFilterEnvelopeKind"]
+            .values
+            .iter()
+            .map(|value| (value.number, value.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, "RUNTIME_FILTER_ENVELOPE_KIND_UNSPECIFIED"),
+            (1, "RUNTIME_FILTER_ENVELOPE_KIND_CONTRIBUTION"),
+            (2, "RUNTIME_FILTER_ENVELOPE_KIND_ARTIFACT"),
+            (3, "RUNTIME_FILTER_ENVELOPE_KIND_PRODUCER_CLOSED"),
+            (4, "RUNTIME_FILTER_ENVELOPE_KIND_UNAVAILABLE"),
+            (5, "RUNTIME_FILTER_ENVELOPE_KIND_ACK"),
+        ]
+    );
+
+    let contribution = &filter.messages["RuntimeFilterContributionRouteIdentity"];
+    assert_eq!(
+        contribution
+            .fields
+            .values()
+            .map(|field| (
+                field.number,
+                field.name.as_str(),
+                field.type_name.as_str(),
+                field.label.as_str(),
+                field.oneof.as_deref(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, "producer_binding_id", "uint32", "singular", None),
+            (
+                2,
+                "fragment_instance_id",
+                "novarocks.common.UniqueId",
+                "singular",
+                None,
+            ),
+            (3, "partition_id", "uint32", "singular", None),
+            (4, "sequence", "uint64", "singular", None),
+        ]
+    );
+    let delivery = &filter.messages["RuntimeFilterDeliveryRouteIdentity"];
+    assert_eq!(
+        delivery
+            .fields
+            .values()
+            .map(|field| (
+                field.number,
+                field.name.as_str(),
+                field.type_name.as_str(),
+                field.label.as_str(),
+                field.oneof.as_deref(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, "route_edge_id", "uint32", "singular", None),
+            (2, "sequence", "uint64", "singular", None),
+        ]
+    );
+    let route = &filter.messages["RuntimeFilterRouteIdentity"];
+    assert_eq!(
+        route
+            .fields
+            .values()
+            .map(|field| (
+                field.number,
+                field.name.as_str(),
+                field.type_name.as_str(),
+                field.label.as_str(),
+                field.oneof.as_deref(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                1,
+                "contribution",
+                "RuntimeFilterContributionRouteIdentity",
+                "singular",
+                Some("value"),
+            ),
+            (
+                2,
+                "delivery",
+                "RuntimeFilterDeliveryRouteIdentity",
+                "singular",
+                Some("value"),
+            ),
+        ]
+    );
+    assert_eq!(
+        filter.enums["RuntimeFilterAcceptStatus"]
+            .values
+            .iter()
+            .map(|value| (value.number, value.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, "RUNTIME_FILTER_ACCEPT_STATUS_UNSPECIFIED"),
+            (1, "RUNTIME_FILTER_ACCEPT_STATUS_ACCEPTED"),
+            (2, "RUNTIME_FILTER_ACCEPT_STATUS_DUPLICATE"),
+            (3, "RUNTIME_FILTER_ACCEPT_STATUS_REJECTED"),
+        ]
+    );
+    let response = &filter.messages["RuntimeFilterEnvelopeResponse"];
+    assert_eq!(
+        response
+            .fields
+            .values()
+            .map(|field| (
+                field.number,
+                field.name.as_str(),
+                field.type_name.as_str(),
+                field.label.as_str(),
+                field.oneof.as_deref(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                1,
+                "acked_route_identity",
+                "RuntimeFilterRouteIdentity",
+                "singular",
+                None,
+            ),
+            (
+                2,
+                "accept_status",
+                "RuntimeFilterAcceptStatus",
+                "singular",
+                None,
+            ),
+            (3, "rejection_reason", "string", "singular", None),
+        ]
+    );
+
+    let service = &schema.files["idl/novarocks/service.proto"].services["NovaRocksGrpc"];
+    let rpc = &service.rpcs["TransmitRuntimeFilterEnvelope"];
+    assert_eq!(rpc.request, "novarocks.filter.RuntimeFilterEnvelope");
+    assert_eq!(
+        rpc.response,
+        "novarocks.filter.RuntimeFilterEnvelopeResponse"
+    );
+    assert!(!rpc.client_streaming);
+    assert!(!rpc.server_streaming);
+
+    let legacy_request = &filter.messages["TransmitRuntimeFilterRequest"];
+    assert_eq!(
+        legacy_request
+            .fields
+            .values()
+            .map(|field| (
+                field.number,
+                field.name.as_str(),
+                field.type_name.as_str(),
+                field.label.as_str(),
+                field.oneof.as_deref(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, "is_partial", "bool", "singular", None),
+            (
+                2,
+                "query_id",
+                "novarocks.common.UniqueId",
+                "singular",
+                None,
+            ),
+            (3, "filter_id", "int32", "singular", None),
+            (4, "data", "bytes", "singular", None),
+            (5, "build_be_number", "int32", "singular", None),
+            (
+                6,
+                "column_type",
+                "novarocks.common.TypeDesc",
+                "singular",
+                None,
+            ),
+        ]
+    );
+    let legacy_response = &filter.messages["TransmitRuntimeFilterResponse"];
+    assert_eq!(
+        legacy_response
+            .fields
+            .values()
+            .map(|field| (
+                field.number,
+                field.name.as_str(),
+                field.type_name.as_str(),
+                field.label.as_str(),
+                field.oneof.as_deref(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                1,
+                "status",
+                "novarocks.common.Status",
+                "singular",
+                None,
+            ),
+            (2, "filter_id", "int32", "singular", None),
+        ]
+    );
+    let legacy_rpc = &service.rpcs["TransmitRuntimeFilter"];
+    assert_eq!(
+        legacy_rpc.request,
+        "novarocks.filter.TransmitRuntimeFilterRequest"
+    );
+    assert_eq!(
+        legacy_rpc.response,
+        "novarocks.filter.TransmitRuntimeFilterResponse"
+    );
+    assert!(!legacy_rpc.client_streaming);
+    assert!(!legacy_rpc.server_streaming);
+
+    let filter_source = fs::read_to_string(
+        Path::new(manifest_dir()).join("idl/novarocks/filter.proto"),
+    )
+    .expect("read filter.proto");
+    let envelope_start = filter_source
+        .find("enum RuntimeFilterEnvelopeKind {")
+        .expect("runtime-filter envelope schema region must exist");
+    let envelope_region = remove_proto_comments(
+        "idl/novarocks/filter.proto envelope schema region",
+        &filter_source[envelope_start..],
+    )
+    .expect("runtime-filter envelope schema region comments should parse");
+    assert!(!envelope_region.contains("is_partial"), "{envelope_region}");
+    assert!(!envelope_region.contains("starrocks"), "{envelope_region}");
+}
+
+#[test]
 fn nidl_d3b_current_schema_matches_baseline() {
     let current =
         parse_current_novarocks_proto_schema().expect("current native proto schema should parse");
