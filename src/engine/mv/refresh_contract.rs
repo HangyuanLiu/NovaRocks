@@ -139,15 +139,20 @@ mod tests {
     use crate::sql::analysis::{
         ExprKind, LiteralValue, QueryBody, SortItem, SubqueryKind, TypedExpr,
     };
-    use crate::sql::catalog::CatalogProvider;
+    use crate::sql::catalog::PlannerTableProvider;
     use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
 
     struct TestIcebergCatalog;
 
-    impl CatalogProvider for TestIcebergCatalog {
-        fn get_table(&self, database: &str, table: &str) -> Result<TableDef, String> {
-            Ok(TableDef {
+    impl PlannerTableProvider for TestIcebergCatalog {
+        fn resolve_table_for_analysis(
+            &self,
+            catalog: Option<&str>,
+            database: &str,
+            table: &str,
+        ) -> Result<crate::sql::catalog::ResolvedAnalyzerTable, String> {
+            let planner = TableDef {
                 name: table.to_string(),
                 columns: vec![
                     column("id", DataType::Int64, false),
@@ -162,7 +167,10 @@ mod tests {
                     cloud_properties: Default::default(),
                     binding: IcebergDataFileBinding::CurrentSnapshot,
                 },
-            })
+            };
+            Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+                catalog, database, planner,
+            ))
         }
     }
 
@@ -196,9 +204,14 @@ mod tests {
     /// actual StarRocks scan, matching production semantics.
     struct TestStarRocksCatalog;
 
-    impl CatalogProvider for TestStarRocksCatalog {
-        fn get_table(&self, _database: &str, table: &str) -> Result<TableDef, String> {
-            Ok(TableDef {
+    impl PlannerTableProvider for TestStarRocksCatalog {
+        fn resolve_table_for_analysis(
+            &self,
+            catalog: Option<&str>,
+            database: &str,
+            table: &str,
+        ) -> Result<crate::sql::catalog::ResolvedAnalyzerTable, String> {
+            let planner = TableDef {
                 name: table.to_string(),
                 columns: vec![
                     column("id", DataType::Int64, false),
@@ -211,7 +224,10 @@ mod tests {
                     db_id: 1,
                     table_id: 1,
                 },
-            })
+            };
+            Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+                catalog, database, planner,
+            ))
         }
     }
 
@@ -222,7 +238,7 @@ mod tests {
     fn parse_and_analyze_mv_query_with_catalog(
         sql: &str,
         table_refs: &[&str],
-        catalog: &dyn CatalogProvider,
+        catalog: &dyn PlannerTableProvider,
     ) -> MvAnalysis {
         let stmt = crate::sql::parser::parse_sql_raw(sql).expect("parse query");
         let sqlparser::ast::Statement::Query(query) = stmt else {

@@ -38,7 +38,7 @@ pub(crate) mod mv_lineage;
 use arrow::datatypes::DataType;
 use sqlparser::ast as sqlast;
 
-use crate::sql::catalog::CatalogProvider;
+use crate::sql::catalog::PlannerTableProvider;
 use crate::sql::column_id::ColumnId;
 
 use crate::sql::analysis::{
@@ -65,7 +65,7 @@ struct RepeatGroupBySpec {
 /// along with a registry of all non-recursive CTE definitions.
 pub(crate) fn analyze(
     query: &sqlast::Query,
-    catalog: &dyn CatalogProvider,
+    catalog: &dyn PlannerTableProvider,
     current_database: &str,
 ) -> Result<
     (
@@ -89,7 +89,7 @@ pub(crate) fn analyze(
 /// the MV defining SQL inside an already-planned user query).
 pub(crate) fn analyze_with_factory(
     query: &sqlast::Query,
-    catalog: &dyn CatalogProvider,
+    catalog: &dyn PlannerTableProvider,
     current_database: &str,
     factory: crate::sql::column_id::ColumnRefFactory,
 ) -> Result<
@@ -125,7 +125,7 @@ pub(crate) fn analyze_with_factory(
 // ---------------------------------------------------------------------------
 
 pub(super) struct AnalyzerContext<'a> {
-    pub(super) catalog: &'a dyn CatalogProvider,
+    pub(super) catalog: &'a dyn PlannerTableProvider,
     pub(super) current_database: &'a str,
     /// Shared factory for allocating globally unique ColumnIds.
     pub(super) factory: std::rc::Rc<std::cell::RefCell<crate::sql::column_id::ColumnRefFactory>>,
@@ -3955,7 +3955,7 @@ mod tests {
         ApplyClause, ApplyPredicateSpec, ApplyScalarSpec, BinOp, ExprKind, LiteralValue, Relation,
         SubqueryKind,
     };
-    use crate::sql::catalog::TableLookupMode;
+    use crate::sql::catalog::IcebergMetadataTableProvider;
     use crate::sql::planner::table::{ScanSource, TableDef};
 
     struct TestCatalog;
@@ -3988,7 +3988,7 @@ mod tests {
         test_iceberg_table_info_for("test_catalog", "test_db", "test_table")
     }
 
-    impl crate::sql::catalog::CatalogProvider for TestCatalog {
+    impl TestCatalog {
         fn get_table(&self, _db: &str, table: &str) -> Result<TableDef, String> {
             match table {
                 "t1" | "t2" | "t3" => {
@@ -4410,27 +4410,46 @@ mod tests {
                 _ => Err(format!("table not found: {table}")),
             }
         }
+    }
 
-        fn get_table_with_mode(
+    impl crate::sql::catalog::PlannerTableProvider for TestCatalog {
+        fn resolve_table_for_analysis(
             &self,
             catalog: Option<&str>,
             database: &str,
             table: &str,
-            mode: TableLookupMode,
+        ) -> Result<crate::sql::catalog::ResolvedAnalyzerTable, String> {
+            let planner = self.get_table(database, table)?;
+            Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+                catalog, database, planner,
+            ))
+        }
+
+        fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
+            Some(self)
+        }
+    }
+
+    impl IcebergMetadataTableProvider for TestCatalog {
+        fn get_iceberg_metadata_table(
+            &self,
+            catalog: Option<&str>,
+            database: &str,
+            table: &str,
+            _metadata_table_type: IcebergMetadataTableType,
         ) -> Result<TableDef, String> {
             let mut table_def = self.get_table(database, table)?;
-            if matches!(mode, TableLookupMode::IcebergMetadata { .. }) {
-                table_def.source = ScanSource::IcebergDataFiles {
-                    table: test_iceberg_table_info_for(
-                        catalog.unwrap_or("default_catalog"),
-                        database,
-                        table,
-                    ),
-                    files: vec![],
-                    cloud_properties: Default::default(),
-                    binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-                };
-            }
+            table_def.source = ScanSource::IcebergDataFiles {
+                table: test_iceberg_table_info_for(
+                    catalog.unwrap_or("default_catalog"),
+                    database,
+                    table,
+                ),
+                files: vec![],
+                cloud_properties: Default::default(),
+                binding:
+                    crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
+            };
             Ok(table_def)
         }
     }
@@ -6589,32 +6608,34 @@ mod tests {
         }
     }
 
-    impl crate::sql::catalog::CatalogProvider for CatalogAwareTestCatalog {
-        fn get_table(&self, database: &str, table: &str) -> Result<TableDef, String> {
-            self.get_table_in_catalog(None, database, table)
-        }
-
-        fn get_table_in_catalog(
+    impl crate::sql::catalog::PlannerTableProvider for CatalogAwareTestCatalog {
+        fn resolve_table_for_analysis(
             &self,
             catalog: Option<&str>,
             database: &str,
             table: &str,
-        ) -> Result<TableDef, String> {
-            Ok(Self::starrocks_table_def(catalog, database, table))
+        ) -> Result<crate::sql::catalog::ResolvedAnalyzerTable, String> {
+            Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+                catalog,
+                database,
+                Self::starrocks_table_def(catalog, database, table),
+            ))
         }
 
-        fn get_table_with_mode(
+        fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
+            Some(self)
+        }
+    }
+
+    impl IcebergMetadataTableProvider for CatalogAwareTestCatalog {
+        fn get_iceberg_metadata_table(
             &self,
             catalog: Option<&str>,
             database: &str,
             table: &str,
-            mode: TableLookupMode,
+            _metadata_table_type: IcebergMetadataTableType,
         ) -> Result<TableDef, String> {
-            if matches!(mode, TableLookupMode::IcebergMetadata { .. }) {
-                Ok(Self::iceberg_table_def(catalog, database, table))
-            } else {
-                self.get_table_in_catalog(catalog, database, table)
-            }
+            Ok(Self::iceberg_table_def(catalog, database, table))
         }
     }
 
@@ -6661,27 +6682,39 @@ mod tests {
     }
 
     #[test]
-    fn analyzer_uses_metadata_lookup_mode_for_partitions_table() {
+    fn analyzer_uses_metadata_provider_for_partitions_table() {
         struct MetadataModeCatalog(std::cell::Cell<bool>);
-        impl crate::sql::catalog::CatalogProvider for MetadataModeCatalog {
-            fn get_table(&self, database: &str, table: &str) -> Result<TableDef, String> {
-                self.get_table_with_mode(None, database, table, TableLookupMode::SchemaOnly)
-            }
-
-            fn get_table_with_mode(
+        impl crate::sql::catalog::PlannerTableProvider for MetadataModeCatalog {
+            fn resolve_table_for_analysis(
                 &self,
                 catalog: Option<&str>,
                 database: &str,
                 table: &str,
-                mode: TableLookupMode,
+            ) -> Result<crate::sql::catalog::ResolvedAnalyzerTable, String> {
+                CatalogAwareTestCatalog.resolve_table_for_analysis(catalog, database, table)
+            }
+
+            fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
+                Some(self)
+            }
+        }
+
+        impl IcebergMetadataTableProvider for MetadataModeCatalog {
+            fn get_iceberg_metadata_table(
+                &self,
+                catalog: Option<&str>,
+                database: &str,
+                table: &str,
+                metadata_table_type: IcebergMetadataTableType,
             ) -> Result<TableDef, String> {
-                self.0.set(matches!(
-                    mode,
-                    TableLookupMode::IcebergMetadata {
-                        metadata_table_type: IcebergMetadataTableType::Partitions,
-                    }
-                ));
-                CatalogAwareTestCatalog.get_table_with_mode(catalog, database, table, mode)
+                self.0
+                    .set(metadata_table_type == IcebergMetadataTableType::Partitions);
+                CatalogAwareTestCatalog.get_iceberg_metadata_table(
+                    catalog,
+                    database,
+                    table,
+                    metadata_table_type,
+                )
             }
         }
 
@@ -6696,35 +6729,47 @@ mod tests {
         let _ = analyze(&query, &catalog, "default").expect("analyze");
         assert!(
             catalog.0.get(),
-            "partitions metadata lookup mode was not requested"
+            "partitions metadata provider was not requested"
         );
     }
 
     #[test]
-    fn analyzer_uses_lowercase_catalog_for_metadata_lookup_mode() {
+    fn analyzer_uses_lowercase_catalog_for_metadata_provider() {
         struct LowercaseMetadataModeCatalog(std::cell::Cell<bool>);
-        impl crate::sql::catalog::CatalogProvider for LowercaseMetadataModeCatalog {
-            fn get_table(&self, database: &str, table: &str) -> Result<TableDef, String> {
-                self.get_table_with_mode(None, database, table, TableLookupMode::SchemaOnly)
-            }
-
-            fn get_table_with_mode(
+        impl crate::sql::catalog::PlannerTableProvider for LowercaseMetadataModeCatalog {
+            fn resolve_table_for_analysis(
                 &self,
                 catalog: Option<&str>,
                 database: &str,
                 table: &str,
-                mode: TableLookupMode,
+            ) -> Result<crate::sql::catalog::ResolvedAnalyzerTable, String> {
+                CatalogAwareTestCatalog.resolve_table_for_analysis(catalog, database, table)
+            }
+
+            fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
+                Some(self)
+            }
+        }
+
+        impl IcebergMetadataTableProvider for LowercaseMetadataModeCatalog {
+            fn get_iceberg_metadata_table(
+                &self,
+                catalog: Option<&str>,
+                database: &str,
+                table: &str,
+                metadata_table_type: IcebergMetadataTableType,
             ) -> Result<TableDef, String> {
                 assert_eq!(catalog, Some("ice"));
                 assert_eq!(database, "db");
                 assert_eq!(table, "orders");
-                self.0.set(matches!(
-                    mode,
-                    TableLookupMode::IcebergMetadata {
-                        metadata_table_type: IcebergMetadataTableType::Partitions,
-                    }
-                ));
-                CatalogAwareTestCatalog.get_table_with_mode(catalog, database, table, mode)
+                self.0
+                    .set(metadata_table_type == IcebergMetadataTableType::Partitions);
+                CatalogAwareTestCatalog.get_iceberg_metadata_table(
+                    catalog,
+                    database,
+                    table,
+                    metadata_table_type,
+                )
             }
         }
 
@@ -6739,7 +6784,7 @@ mod tests {
         let _ = analyze(&query, &catalog, "default").expect("analyze");
         assert!(
             catalog.0.get(),
-            "partitions metadata lookup mode was not requested"
+            "partitions metadata provider was not requested"
         );
     }
 

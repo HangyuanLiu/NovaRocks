@@ -114,8 +114,7 @@ pub struct StandaloneOptions {
     pub config_path: Option<PathBuf>,
 }
 
-pub use crate::sql::catalog::CatalogProvider;
-use crate::sql::catalog::LegacyRangePartition;
+use crate::catalog::partition::LegacyRangePartition;
 use crate::sql::parser::procedure::{looks_like_call_procedure, parse_call_procedure_sql};
 
 #[cfg(feature = "compat")]
@@ -2643,7 +2642,7 @@ fn prepare_explain_query(
 #[allow(clippy::too_many_arguments)]
 fn explain_analyze_query(
     query: &sqlparser::ast::Query,
-    analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,
+    analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
     _codegen_catalog: &InMemoryCatalog,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
@@ -2813,7 +2812,7 @@ fn format_explain_analyze_duration(duration: std::time::Duration) -> String {
 /// optimizing or building the DistributedPlan IR.
 fn explain_logical_query(
     query: &sqlparser::ast::Query,
-    analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,
+    analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
     current_database: &str,
     level: crate::sql::explain::ExplainLevel,
 ) -> Result<QueryResult, String> {
@@ -2827,7 +2826,7 @@ fn explain_logical_query(
 /// Produce EXPLAIN output for a query without executing it.
 fn explain_query(
     query: &sqlparser::ast::Query,
-    analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,
+    analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
     _codegen_catalog: &InMemoryCatalog,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
@@ -3330,7 +3329,7 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_query_with_catalog_provider(
     query: &sqlparser::ast::Query,
-    analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,
+    analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
     codegen_catalog: &InMemoryCatalog,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
@@ -3464,7 +3463,7 @@ pub(crate) struct PlannedIcebergChangeStreamRefreshQuery {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
     query: &sqlparser::ast::Query,
-    analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,
+    analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
@@ -3567,7 +3566,7 @@ pub(crate) fn plan_logical_for_iceberg_change_stream_refresh(
 #[allow(clippy::too_many_arguments)]
 fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     query: &sqlparser::ast::Query,
-    analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,
+    analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
     _codegen_catalog: &InMemoryCatalog,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
@@ -9057,14 +9056,18 @@ path = "meta/operations.sqlite"
 
     #[test]
     fn iceberg_write_root_shuffle_by_output_name_uses_logical_output_column_id() {
-        use crate::sql::catalog::CatalogProvider;
+        use crate::sql::catalog::PlannerTableProvider;
         use crate::sql::column_id::ColumnId;
         use crate::sql::optimizer::property::{DistributionSpec, HashSource};
-        use crate::sql::planner::table::TableDef;
 
         struct EmptyCatalog;
-        impl CatalogProvider for EmptyCatalog {
-            fn get_table(&self, _database: &str, table: &str) -> Result<TableDef, String> {
+        impl PlannerTableProvider for EmptyCatalog {
+            fn resolve_table_for_analysis(
+                &self,
+                _catalog: Option<&str>,
+                _database: &str,
+                table: &str,
+            ) -> Result<crate::sql::catalog::ResolvedAnalyzerTable, String> {
                 Err(format!("table not found: {table}"))
             }
         }

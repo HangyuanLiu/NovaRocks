@@ -1665,14 +1665,14 @@ mod is_known_rule_name_tests {
     fn optimize_with_root_distribution_overrides_default_gather_root() {
         use crate::catalog::schema::ColumnDef;
         use crate::sql::analysis::ExprKind;
-        use crate::sql::catalog::CatalogProvider;
+        use crate::sql::catalog::PlannerTableProvider;
         use crate::sql::column_id::ColumnRefFactory;
         use crate::sql::optimizer::property::DistributionSpec;
         use crate::sql::planner::logical::LogicalPlanKind;
         use crate::sql::planner::table::{ScanSource, TableDef};
 
         struct MinimalCatalog;
-        impl CatalogProvider for MinimalCatalog {
+        impl MinimalCatalog {
             fn get_table(&self, _db: &str, table: &str) -> Result<TableDef, String> {
                 match table {
                     "t1" => Ok(TableDef {
@@ -1692,6 +1692,19 @@ mod is_known_rule_name_tests {
                     }),
                     other => Err(format!("table not found: {other}")),
                 }
+            }
+        }
+        impl PlannerTableProvider for MinimalCatalog {
+            fn resolve_table_for_analysis(
+                &self,
+                catalog: Option<&str>,
+                database: &str,
+                table: &str,
+            ) -> Result<crate::sql::catalog::ResolvedAnalyzerTable, String> {
+                let planner = self.get_table(database, table)?;
+                Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+                    catalog, database, planner,
+                ))
             }
         }
 
@@ -1752,13 +1765,13 @@ mod is_known_rule_name_tests {
     fn optimize_preserves_ranking_window_partition_topn_sort() {
         use crate::catalog::schema::ColumnDef;
         use crate::exec::node::sort::SortTopNType;
-        use crate::sql::catalog::CatalogProvider;
+        use crate::sql::catalog::PlannerTableProvider;
         use crate::sql::optimizer::operator::Operator;
         use crate::sql::optimizer::optimized_tree::OptimizedOperatorNode;
         use crate::sql::planner::table::{ScanSource, TableDef};
 
         struct RankingCatalog;
-        impl CatalogProvider for RankingCatalog {
+        impl RankingCatalog {
             fn get_table(&self, _db: &str, table: &str) -> Result<TableDef, String> {
                 match table {
                     "rw_sales" => Ok(TableDef {
@@ -1787,6 +1800,19 @@ mod is_known_rule_name_tests {
                     }),
                     other => Err(format!("table not found: {other}")),
                 }
+            }
+        }
+        impl PlannerTableProvider for RankingCatalog {
+            fn resolve_table_for_analysis(
+                &self,
+                catalog: Option<&str>,
+                database: &str,
+                table: &str,
+            ) -> Result<crate::sql::catalog::ResolvedAnalyzerTable, String> {
+                let planner = self.get_table(database, table)?;
+                Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+                    catalog, database, planner,
+                ))
             }
         }
 
@@ -1880,14 +1906,14 @@ mod is_known_rule_name_tests {
     #[test]
     fn scalar_subquery_decorrelates_to_join() {
         use crate::catalog::schema::ColumnDef;
-        use crate::sql::catalog::CatalogProvider;
+        use crate::sql::catalog::PlannerTableProvider;
         use crate::sql::column_id::ColumnRefFactory;
         use crate::sql::planner::table::{ScanSource, TableDef};
 
         // Minimal catalog providing t1(k1, k2) and t2(k1, k2) — the same
         // shape the planner and analyzer test modules use.
         struct MinimalCatalog;
-        impl CatalogProvider for MinimalCatalog {
+        impl MinimalCatalog {
             fn get_table(&self, _db: &str, table: &str) -> Result<TableDef, String> {
                 match table {
                     "t1" | "t2" => Ok(TableDef {
@@ -1916,6 +1942,19 @@ mod is_known_rule_name_tests {
                     }),
                     other => Err(format!("table not found: {other}")),
                 }
+            }
+        }
+        impl PlannerTableProvider for MinimalCatalog {
+            fn resolve_table_for_analysis(
+                &self,
+                catalog: Option<&str>,
+                database: &str,
+                table: &str,
+            ) -> Result<crate::sql::catalog::ResolvedAnalyzerTable, String> {
+                let planner = self.get_table(database, table)?;
+                Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+                    catalog, database, planner,
+                ))
             }
         }
 

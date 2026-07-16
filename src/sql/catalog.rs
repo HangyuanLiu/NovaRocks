@@ -15,59 +15,59 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::catalog::identifier::TableIdentity;
+use crate::catalog::table::CatalogTable;
 use crate::sql::planner::table::TableDef;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LegacyRangePartition {
-    pub name: String,
-    pub column: String,
-    pub lower_sql: String,
-    pub upper_sql: String,
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedAnalyzerTable {
+    pub(crate) catalog: CatalogTable,
+    pub(crate) planner: TableDef,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TableLookupMode {
-    SchemaOnly,
-    IcebergMetadata {
-        metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
-    },
+impl ResolvedAnalyzerTable {
+    pub(crate) fn from_planner(catalog: Option<&str>, database: &str, planner: TableDef) -> Self {
+        let identity = TableIdentity::new(
+            catalog.unwrap_or("default_catalog"),
+            database,
+            &planner.name,
+        );
+        let table = CatalogTable {
+            identity,
+            columns: planner.columns.clone(),
+            hidden_columns: planner.iceberg_row_lineage_metadata_columns.clone(),
+        };
+        Self {
+            catalog: table,
+            planner,
+        }
+    }
 }
 
-/// Catalog abstraction for SQL analysis.
+/// Planner-facing table materialization extension.
 ///
-/// This remains the analyzer adapter surface. Engine entrypoints that resolve
-/// standalone external catalogs should construct a `CatalogMgrProvider` instead
-/// of reintroducing query-scoped global `InMemoryCatalog` registration.
-pub trait CatalogProvider {
-    fn get_table(&self, database: &str, table: &str) -> Result<TableDef, String>;
-
-    fn get_table_in_catalog(
+/// This is the only ordinary analyzer/planner lookup seam: implementations
+/// must return the neutral schema and planner binding from one authoritative
+/// resolution.
+pub(crate) trait PlannerTableProvider {
+    fn resolve_table_for_analysis(
         &self,
         catalog: Option<&str>,
         database: &str,
         table: &str,
-    ) -> Result<TableDef, String> {
-        let _ = catalog;
-        self.get_table(database, table)
-    }
+    ) -> Result<ResolvedAnalyzerTable, String>;
 
-    fn get_table_with_mode(
+    fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
+        None
+    }
+}
+
+pub(crate) trait IcebergMetadataTableProvider {
+    fn get_iceberg_metadata_table(
         &self,
         catalog: Option<&str>,
         database: &str,
         table: &str,
-        mode: TableLookupMode,
-    ) -> Result<TableDef, String> {
-        let _ = mode;
-        self.get_table_in_catalog(catalog, database, table)
-    }
-
-    fn get_legacy_range_partition(
-        &self,
-        _database: &str,
-        _table: &str,
-        _partition: &str,
-    ) -> Result<Option<LegacyRangePartition>, String> {
-        Ok(None)
-    }
+        metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
+    ) -> Result<TableDef, String>;
 }

@@ -21,7 +21,7 @@ use super::query::*;
 use crate::catalog::schema::ColumnDef;
 use crate::sql::analysis::cte::CTERegistry;
 use crate::sql::analysis::*;
-use crate::sql::catalog::CatalogProvider;
+use crate::sql::catalog::PlannerTableProvider;
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use crate::sql::planner::logical::*;
 use crate::sql::planner::payload::*;
@@ -30,7 +30,7 @@ use arrow::datatypes::DataType;
 
 struct TestCatalog;
 
-impl CatalogProvider for TestCatalog {
+impl TestCatalog {
     fn get_table(&self, _db: &str, table: &str) -> Result<TableDef, String> {
         match table {
             "orders" => Ok(TableDef {
@@ -192,6 +192,20 @@ impl CatalogProvider for TestCatalog {
             }
             other => Err(format!("unknown test table: {other}")),
         }
+    }
+}
+
+impl PlannerTableProvider for TestCatalog {
+    fn resolve_table_for_analysis(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+    ) -> Result<crate::sql::catalog::ResolvedAnalyzerTable, String> {
+        let planner = self.get_table(database, table)?;
+        Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+            catalog, database, planner,
+        ))
     }
 }
 

@@ -22,12 +22,12 @@ use super::boundary_schema::{BoundarySchemaReport, project_boundary_reports};
 use crate::connector::ConnectorRegistry;
 use crate::coordinator::prepare::scan::ScanBindingResolver;
 use crate::coordinator::prepare::{PreparedFragmentSet, prepare_fragments};
-use crate::sql::catalog::CatalogProvider;
+use crate::sql::catalog::PlannerTableProvider;
 use crate::sql::planner::distributed::DistributedPlan;
 
 struct TestBuildRequest<'a> {
     distributed_plan: &'a DistributedPlan,
-    catalog: &'a dyn CatalogProvider,
+    catalog: &'a dyn PlannerTableProvider,
     connectors: &'a ConnectorRegistry,
     scan_binding_resolver: Option<&'a dyn ScanBindingResolver>,
 }
@@ -35,7 +35,7 @@ struct TestBuildRequest<'a> {
 impl<'a> TestBuildRequest<'a> {
     fn result(
         distributed_plan: &'a DistributedPlan,
-        catalog: &'a dyn CatalogProvider,
+        catalog: &'a dyn PlannerTableProvider,
         connectors: &'a ConnectorRegistry,
         scan_binding_resolver: Option<&'a dyn ScanBindingResolver>,
     ) -> Self {
@@ -89,7 +89,7 @@ mod tests {
     use crate::runtime_filter::model::graph::RuntimeFilterGraph;
     use crate::sql::analysis::cte::CteId;
     use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, TypedExpr};
-    use crate::sql::catalog::CatalogProvider;
+    use crate::sql::catalog::PlannerTableProvider;
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed::{
         BoundaryContract, BoundaryKind as PlannerBoundaryKind, DataPartition, DistributedNode,
@@ -102,8 +102,13 @@ mod tests {
 
     struct EmptyCatalog;
 
-    impl CatalogProvider for EmptyCatalog {
-        fn get_table(&self, database: &str, table: &str) -> Result<TableDef, String> {
+    impl PlannerTableProvider for EmptyCatalog {
+        fn resolve_table_for_analysis(
+            &self,
+            _catalog: Option<&str>,
+            database: &str,
+            table: &str,
+        ) -> Result<crate::sql::catalog::ResolvedAnalyzerTable, String> {
             Err(format!("unexpected table lookup {database}.{table}"))
         }
     }

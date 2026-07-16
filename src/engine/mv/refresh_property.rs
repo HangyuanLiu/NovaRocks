@@ -1854,15 +1854,20 @@ mod tests {
     use crate::connector::iceberg::scan_model::{
         IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
     };
-    use crate::sql::catalog::CatalogProvider;
+    use crate::sql::catalog::PlannerTableProvider;
     use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
 
     struct TestIcebergCatalog;
 
-    impl CatalogProvider for TestIcebergCatalog {
-        fn get_table(&self, database: &str, table: &str) -> Result<TableDef, String> {
-            Ok(TableDef {
+    impl PlannerTableProvider for TestIcebergCatalog {
+        fn resolve_table_for_analysis(
+            &self,
+            catalog: Option<&str>,
+            database: &str,
+            table: &str,
+        ) -> Result<crate::sql::catalog::ResolvedAnalyzerTable, String> {
+            let planner = TableDef {
                 name: table.to_string(),
                 columns: vec![
                     column("id", DataType::Int64, false),
@@ -1877,7 +1882,10 @@ mod tests {
                     cloud_properties: Default::default(),
                     binding: IcebergDataFileBinding::CurrentSnapshot,
                 },
-            })
+            };
+            Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+                catalog, database, planner,
+            ))
         }
     }
 

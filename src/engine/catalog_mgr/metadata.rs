@@ -27,6 +27,7 @@ use std::collections::BTreeMap;
 
 use crate::catalog::identifier::TableIdentity;
 use crate::catalog::schema::ColumnDef;
+use crate::catalog::table::CatalogTable;
 use crate::connector::iceberg::scan_model::IcebergTableInfo;
 use crate::sql::planner::table::{ScanSource, TableDef};
 
@@ -54,6 +55,14 @@ pub(crate) struct TableMetadata {
 }
 
 impl TableMetadata {
+    pub(crate) fn to_catalog_table(&self) -> CatalogTable {
+        CatalogTable {
+            identity: self.identity.clone(),
+            columns: self.columns.clone(),
+            hidden_columns: self.iceberg_row_lineage_columns.clone(),
+        }
+    }
+
     /// Build schema-level metadata from a legacy `TableDef`, dropping any
     /// scan-binding data (Iceberg files). Only catalog base-table sources are
     /// accepted; synthetic plan-time sources are rejected (fail fast).

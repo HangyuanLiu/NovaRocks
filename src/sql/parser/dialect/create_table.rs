@@ -21,9 +21,9 @@ use sqlparser::tokenizer::Token;
 
 use super::{StarRocksDialect, convert_object_name, convert_sql_type, peek_word_eq};
 use crate::catalog::identifier::normalize_identifier;
+use crate::catalog::partition::LegacyRangePartition;
 use crate::catalog::schema::SqlType;
 use crate::sql::analyzer::iceberg_ref::split_ref_suffix;
-use crate::sql::catalog::LegacyRangePartition;
 use crate::sql::parser::ast::{
     ColumnAggregation, CreateTableKind, CreateTableStmt, DefaultLiteral, IcebergPartitionFieldExpr,
     TableColumnDef, TableKeyDesc, TableKeyKind,

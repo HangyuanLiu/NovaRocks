@@ -26,13 +26,13 @@ use std::sync::Arc;
 
 use crate::catalog::identifier::normalize_identifier;
 use crate::catalog::identifier::resolve_local_table_name;
+use crate::catalog::partition::LegacyRangePartition;
 use crate::catalog::schema::SqlType;
 use crate::engine::{
     StandaloneState, StatementResult, delete_iceberg_catalog_if_needed,
     delete_iceberg_namespace_if_needed, delete_iceberg_table_if_needed,
     persist_iceberg_namespace_if_needed, persist_iceberg_table_if_needed,
 };
-use crate::sql::catalog::LegacyRangePartition;
 use crate::sql::parser::ast::{CreateTableKind, DefaultLiteral, InsertSource, Literal, ObjectName};
 use crate::sql::parser::dialect::StarRocksDialect;
 use sqlparser::keywords::Keyword;

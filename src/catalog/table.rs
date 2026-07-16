@@ -15,8 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod identifier;
-pub(crate) mod partition;
-pub(crate) mod provider;
-pub(crate) mod schema;
-pub(crate) mod table;
+use crate::catalog::identifier::TableIdentity;
+use crate::catalog::schema::ColumnDef;
+
+#[derive(Clone, Debug)]
+pub(crate) struct CatalogTable {
+    pub(crate) identity: TableIdentity,
+    pub(crate) columns: Vec<ColumnDef>,
+    pub(crate) hidden_columns: Vec<ColumnDef>,
+}
