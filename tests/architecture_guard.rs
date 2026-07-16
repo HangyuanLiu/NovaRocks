@@ -9780,6 +9780,153 @@ fn runtime_filter_runtime_dependencies_are_allowed(source_rel: &str, text: &str)
         })
 }
 
+fn runtime_filter_transport_public_alias_violations(source_rel: &str, text: &str) -> Vec<String> {
+    #[derive(Clone)]
+    struct TypeAliasDeclaration {
+        name: String,
+        scope: Vec<String>,
+        expands_visibility: bool,
+        targets: Vec<Vec<String>>,
+    }
+
+    #[derive(Default)]
+    struct TypePathAudit {
+        paths: Vec<Vec<String>>,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for TypePathAudit {
+        fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
+            if path.qself.is_none() {
+                self.paths.push(
+                    path.path
+                        .segments
+                        .iter()
+                        .map(|segment| segment.ident.to_string())
+                        .collect(),
+                );
+            }
+            syn::visit::visit_type_path(self, path);
+        }
+    }
+
+    fn collect_aliases(
+        items: &[syn::Item],
+        scope: &mut Vec<String>,
+        declarations: &mut Vec<TypeAliasDeclaration>,
+    ) {
+        for item in items {
+            if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+                continue;
+            }
+            match item {
+                syn::Item::Type(alias) => {
+                    let mut audit = TypePathAudit::default();
+                    syn::visit::Visit::visit_type(&mut audit, &alias.ty);
+                    let expands_visibility = match &alias.vis {
+                        syn::Visibility::Inherited => false,
+                        syn::Visibility::Public(_) => true,
+                        syn::Visibility::Restricted(restricted) => {
+                            !restricted.path.is_ident("self")
+                        }
+                    };
+                    declarations.push(TypeAliasDeclaration {
+                        name: alias.ident.to_string(),
+                        scope: scope.clone(),
+                        expands_visibility,
+                        targets: audit.paths,
+                    });
+                }
+                syn::Item::Mod(module) => {
+                    let Some((_, items)) = &module.content else {
+                        continue;
+                    };
+                    scope.push(module.ident.to_string());
+                    collect_aliases(items, scope, declarations);
+                    scope.pop();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let production = rust_sanitized_production_text(text);
+    let file = match syn::parse_file(&production).or_else(|_| syn::parse_file(text)) {
+        Ok(file) => file,
+        Err(error) => {
+            return vec![format!(
+                "{source_rel}: native runtime-filter transport alias surface must parse: {error}"
+            )];
+        }
+    };
+    let mut declarations = Vec::new();
+    collect_aliases(&file.items, &mut Vec::new(), &mut declarations);
+
+    let mut aliases = rust_production_scoped_aliases(text);
+    for declaration in &declarations {
+        let entry = aliases
+            .entry((declaration.scope.clone(), declaration.name.clone()))
+            .or_default();
+        for target in &declaration.targets {
+            let candidate = RustScopedUsePath {
+                segments: target.clone(),
+                inline_modules: declaration.scope.clone(),
+            };
+            if !entry.contains(&candidate) {
+                entry.push(candidate);
+            }
+        }
+    }
+
+    let transport_prefix = ["crate", "runtime_filter", "port", "transport"];
+    declarations
+        .into_iter()
+        .filter(|declaration| declaration.expands_visibility)
+        .filter_map(|declaration| {
+            let exposes_transport = declaration.targets.iter().any(|target| {
+                let resolved = rust_resolve_scoped_paths(
+                    target,
+                    &declaration.scope,
+                    &aliases,
+                    &mut BTreeSet::new(),
+                    0,
+                )
+                .unwrap_or_else(|| {
+                    vec![RustScopedUsePath {
+                        segments: target.clone(),
+                        inline_modules: declaration.scope.clone(),
+                    }]
+                });
+                resolved.into_iter().any(|resolved| {
+                    rust_canonical_path_segments_in_scope(
+                        &resolved.segments,
+                        source_rel,
+                        &resolved.inline_modules,
+                    )
+                    .is_some_and(|canonical| {
+                        canonical.len() >= transport_prefix.len()
+                            && canonical
+                                .iter()
+                                .zip(transport_prefix)
+                                .all(|(actual, expected)| actual == expected)
+                    })
+                })
+            });
+            exposes_transport.then(|| {
+                format!(
+                    "{source_rel}: native runtime-filter transport owner must not expose transport type alias {}",
+                    declaration.name
+                )
+            })
+        })
+        .collect()
+}
+
+fn runtime_filter_transport_use_expands_visibility(import: &str) -> bool {
+    !matches!(
+        rust_use_visibility(import),
+        "private" | "pub(self)" | "pub(inself)"
+    )
+}
+
 fn runtime_filter_transport_ingress_boundary_violations(
     source_rel: &str,
     text: &str,
@@ -9809,7 +9956,7 @@ fn runtime_filter_transport_ingress_boundary_violations(
         export_violations.extend(
             rust_production_use_statements(text)
                 .into_iter()
-                .filter(|import| rust_use_is_public(import))
+                .filter(|import| runtime_filter_transport_use_expands_visibility(import))
                 .filter(|import| {
                     rust_use_path(import)
                         .split("::")
@@ -9825,40 +9972,9 @@ fn runtime_filter_transport_ingress_boundary_violations(
                 }),
         );
 
-        let production = rust_sanitized_production_text(text);
-        match syn::parse_file(&production).or_else(|_| syn::parse_file(text)) {
-            Ok(file) => {
-                #[derive(Default)]
-                struct PublicTypeAliasAudit {
-                    aliases: BTreeSet<String>,
-                }
-                impl<'ast> syn::visit::Visit<'ast> for PublicTypeAliasAudit {
-                    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
-                        if !nfe_4_syn_attrs_require_test(&item.attrs) {
-                            syn::visit::visit_item_mod(self, item);
-                        }
-                    }
-
-                    fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
-                        if !nfe_4_syn_attrs_require_test(&item.attrs)
-                            && !matches!(item.vis, syn::Visibility::Inherited)
-                        {
-                            self.aliases.insert(item.ident.to_string());
-                        }
-                    }
-                }
-                let mut audit = PublicTypeAliasAudit::default();
-                syn::visit::Visit::visit_file(&mut audit, &file);
-                export_violations.extend(audit.aliases.into_iter().map(|alias| {
-                        format!(
-                            "{source_rel}: native runtime-filter transport owner must not expose public type alias {alias}"
-                        )
-                    }));
-            }
-            Err(error) => export_violations.push(format!(
-                "{source_rel}: native runtime-filter transport export surface must parse: {error}"
-            )),
-        }
+        export_violations.extend(runtime_filter_transport_public_alias_violations(
+            source_rel, text,
+        ));
     }
 
     if source_rel == ADAPTER {
@@ -16707,6 +16823,14 @@ fn rfd4_m1_transport_ingress_detector_is_named_adapter_only_and_default_deny() {
             adapter,
             "use crate::runtime_filter::port::transport::RuntimeFilterEnvelope as PrivateEnvelope; pub(in crate::service) type Hidden = PrivateEnvelope;",
         ),
+        (
+            adapter,
+            "use crate::runtime_filter::port::transport::RuntimeFilterEnvelope as PrivateEnvelope; type PrivateAlias = PrivateEnvelope; pub(crate) type Hidden = PrivateAlias;",
+        ),
+        (
+            adapter,
+            "mod leak { use crate::runtime_filter::port::transport::RuntimeFilterEnvelope as PrivateEnvelope; pub(crate) type Hidden = PrivateEnvelope; }",
+        ),
     ] {
         assert!(
             !runtime_filter_transport_ingress_boundary_violations(source_rel, source).is_empty(),
@@ -16730,6 +16854,18 @@ fn rfd4_m1_transport_ingress_detector_is_named_adapter_only_and_default_deny() {
         .is_empty(),
         "test-only type aliases do not expand the production export surface"
     );
+    for source in [
+        "pub(crate) type Unrelated = usize;",
+        "struct Local; pub(crate) type Unrelated = Local;",
+        "use std::sync::Arc; pub(crate) type Unrelated = Arc<usize>;",
+        "pub(self) type PrivateEnvelope = crate::runtime_filter::port::transport::RuntimeFilterEnvelope;",
+        "pub(self) use crate::runtime_filter::port::transport::RuntimeFilterEnvelope as PrivateEnvelope;",
+    ] {
+        assert!(
+            runtime_filter_transport_ingress_boundary_violations(adapter, source).is_empty(),
+            "unrelated or module-private type aliases must remain legal: {source}"
+        );
+    }
 }
 
 #[test]
