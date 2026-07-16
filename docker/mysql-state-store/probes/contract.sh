@@ -78,16 +78,6 @@ mysql_client() {
     --batch --skip-column-names --unbuffered "$@"
 }
 
-mysql_admin() {
-  run_with_timeout 25 docker compose \
-    --env-file "$NOVA_MYSQL_COMPOSE_ENV" \
-    -p "$NOVA_MYSQL_COMPOSE_PROJECT" \
-    -f "$NOVA_MYSQL_COMPOSE_FILE" \
-    exec -T mysql mysql \
-    --defaults-extra-file=/run/secrets/novarocks-mysql-provisioner.cnf \
-    --protocol=socket --batch --skip-column-names --raw "$@"
-}
-
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/novarocks-ss3-probes.XXXXXX")"
 background_pids=()
 cleanup() {
@@ -440,14 +430,11 @@ if [[ "$deadlock_a_rc" = "0" ]]; then
 else
   test "$deadlock_b_rc" = "0"
 fi
-cat "$tmp_dir/deadlock-a.err" "$tmp_dir/deadlock-b.err" | grep -F 'ERROR 1213 (40001)' >/dev/null
-mysql_admin --execute="SHOW ENGINE INNODB STATUS;" >"$tmp_dir/deadlock-innodb-status.out"
-grep -F 'LATEST DETECTED DEADLOCK' "$tmp_dir/deadlock-innodb-status.out" >/dev/null
-test "$(grep -c 'RECORD LOCKS' "$tmp_dir/deadlock-innodb-status.out")" -ge 2
-grep -F 'ss3_probe_locks' "$tmp_dir/deadlock-innodb-status.out" >/dev/null
-grep -F 'WHERE id = 1' "$tmp_dir/deadlock-innodb-status.out" >/dev/null
-grep -F 'WHERE id = 2' "$tmp_dir/deadlock-innodb-status.out" >/dev/null
-! grep -F 'GET_LOCK' "$tmp_dir/deadlock-innodb-status.out" >/dev/null
+deadlock_1213_count="$(
+  cat "$tmp_dir/deadlock-a.err" "$tmp_dir/deadlock-b.err" \
+    | grep -c 'ERROR 1213 (40001)' || true
+)"
+test "$deadlock_1213_count" = "1"
 printf 'PASS SS3_MYSQL_PROBE_DEADLOCK_1213_PASS\n'
 
 lock_gate="${barrier_prefix}_lock_gate"

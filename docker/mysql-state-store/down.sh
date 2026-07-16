@@ -91,7 +91,6 @@ if [[ ! -f "$compose_env" ]]; then
   {
     printf 'NOVA_MYSQL_PORT=43000\n'
     printf 'NOVA_MYSQL_RUNTIME_DIR=%s\n' "$runtime_dir"
-    printf 'NOVA_MYSQL_PROVISIONER_PASSWORD=cleanup-placeholder\n'
   } > "$temporary_compose_env"
   chmod 600 "$temporary_compose_env"
   compose_env="$temporary_compose_env"

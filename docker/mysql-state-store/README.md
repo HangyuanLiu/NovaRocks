@@ -50,8 +50,10 @@ snapshot, deadlock, and lock-timeout ordering does not depend on fixed sleeps.
 The deadlock probe gives each transaction an independent gate. Only after both
 transactions hold their initial InnoDB record lock does the coordinator release
 both gates, allowing each transaction to request the other row. The acceptance
-check then verifies that `SHOW ENGINE INNODB STATUS` reports the two PRIMARY
-record-lock waits and contains no named-lock operation.
+check requires one transaction to commit and exactly one transaction to receive
+MySQL error 1213. Physical probes use only the ordinary provider credential;
+the provisioner client configuration remains confined to fixture startup and
+unique-database provisioning.
 
 ## Auxiliary mechanism evidence
 
