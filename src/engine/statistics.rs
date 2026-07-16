@@ -1611,7 +1611,7 @@ pub(crate) fn catalog_base_table_statistics(
     state: &Arc<StandaloneState>,
     database: &str,
     table: &str,
-    columns: &[crate::sql::catalog::ColumnDef],
+    columns: &[crate::catalog::schema::ColumnDef],
     source: crate::sql::optimizer::stats_input::StatsSource,
 ) -> Result<Option<crate::sql::optimizer::stats_input::BaseTableStatistics>, String> {
     use crate::sql::optimizer::statistics::Confidence;
@@ -2545,7 +2545,7 @@ mod tests {
 
     #[test]
     fn catalog_base_table_statistics_reads_analyze_rows_without_name_heuristics() {
-        use crate::sql::catalog::ColumnDef;
+        use crate::catalog::schema::ColumnDef;
         use crate::sql::optimizer::statistics::Confidence;
         use crate::sql::optimizer::stats_input::{StatValue, StatsSource};
 

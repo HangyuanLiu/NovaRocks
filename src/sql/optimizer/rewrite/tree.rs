@@ -126,8 +126,9 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::rewrite_with_rule;
+    use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::OutputColumn;
-    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
         Operator, ProjectOp, ScalarProjectItem, ScanOp, ValuesOp,

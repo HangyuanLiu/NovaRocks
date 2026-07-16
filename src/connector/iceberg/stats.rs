@@ -21,6 +21,7 @@ use std::sync::{Arc, RwLock};
 
 use arrow::datatypes::DataType;
 
+use crate::catalog::schema::ColumnDef;
 use crate::connector::iceberg::catalog::IcebergCatalogRegistry;
 use crate::connector::iceberg::catalog::backend::{
     data_file_with_stats_to_iceberg_data_file_info, iceberg_schema_def_for_codegen,
@@ -29,7 +30,7 @@ use crate::connector::iceberg::catalog::registry::{extract_data_files_with_stats
 use crate::connector::stats::{
     ScanSourceIdentity, StatsProviderError, TableSnapshotRef, TableStatsProvider, TableStatsRequest,
 };
-use crate::sql::catalog::{ColumnDef, IcebergTableInfo};
+use crate::sql::catalog::IcebergTableInfo;
 use crate::sql::optimizer::stats_input::{BaseTableStatistics, StatsMissingReason};
 
 pub(crate) struct IcebergTableStatsProvider {

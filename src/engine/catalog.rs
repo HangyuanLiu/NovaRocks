@@ -25,12 +25,10 @@
 use std::collections::HashMap;
 
 use crate::catalog::identifier::normalize_identifier;
-// Re-export from sql::catalog so callers can use either
-// `crate::engine::catalog::*` or `crate::sql::catalog::*`
-// interchangeably without double-defining the types.
+// Transitional catalog-model re-exports remain until EBD-4B3.
 use crate::sql::catalog::LegacyRangePartition;
 pub use crate::sql::catalog::{
-    CatalogProvider, ColumnDef, PhysicalTableLayout, ScanSource, StarRocksTabletRef, TableDef,
+    CatalogProvider, PhysicalTableLayout, ScanSource, StarRocksTabletRef, TableDef,
 };
 
 #[derive(Clone, Debug)]
@@ -337,6 +335,7 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
+    use crate::catalog::schema::ColumnDef;
 
     fn test_table(name: &str) -> TableDef {
         TableDef {

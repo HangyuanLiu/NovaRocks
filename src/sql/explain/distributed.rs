@@ -1520,12 +1520,13 @@ mod tests {
         explain_distributed_plan_analyze, explain_fragment_order,
         format_distributed_shared_plan_node_header,
     };
+    use crate::catalog::schema::ColumnDef;
     use crate::coordinator::profile::correlate::{ActualMetrics, DistributedProfileSummary};
     use crate::exec::node::sort::SortTopNType;
     use crate::sql::analysis::{
         ExprKind, JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr,
     };
-    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::explain::distributed::explain_distributed_plan;
     use crate::sql::explain::{ExplainLevel, PlanNodeExplainStage};

@@ -15175,7 +15175,7 @@ fn build_imv_change_stream_branches(
 
 fn output_ordinals_for_sink_columns(
     output_columns: &[OutputColumn],
-    sink_columns: &[crate::engine::catalog::ColumnDef],
+    sink_columns: &[crate::catalog::schema::ColumnDef],
 ) -> Result<Vec<usize>, String> {
     sink_columns
         .iter()

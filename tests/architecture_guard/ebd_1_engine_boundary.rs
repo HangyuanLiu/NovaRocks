@@ -604,10 +604,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "src/connector/iceberg/catalog/registry.rs",
-        &["crate::engine::catalog::ColumnDef"],
-    ),
-    (
         "src/connector/iceberg/catalog/schema_update.rs",
         &[
             "crate::engine::StandaloneState",
@@ -691,7 +687,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
     (
         "src/connector/starrocks/table/catalog.rs",
         &[
-            "crate::engine::catalog::ColumnDef",
             "crate::engine::catalog::InMemoryCatalog",
             "crate::engine::catalog::PhysicalTableLayout",
             "crate::engine::catalog::ScanSource",
@@ -816,7 +811,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "crate::engine::StandaloneState",
             "crate::engine::StatementResult",
             "crate::engine::build_local_insert_batch",
-            "crate::engine::catalog::ColumnDef",
             "crate::engine::dictionary::maintenance::mark_starrocks_table_stale",
             "crate::engine::execute_query",
             "crate::engine::mv::agg_state::mv_agg_state",
@@ -1270,7 +1264,6 @@ const STANDALONE_STATE_DEPENDENCIES: &[(&str, &[&str])] = &[
 
 const FORWARDING_REEXPORTS: &[&str] = &[
     "src/engine/catalog.rs|crate::engine::catalog|pub|CatalogProvider|crate::sql::catalog::CatalogProvider",
-    "src/engine/catalog.rs|crate::engine::catalog|pub|ColumnDef|crate::sql::catalog::ColumnDef",
     "src/engine/catalog.rs|crate::engine::catalog|pub|PhysicalTableLayout|crate::sql::catalog::PhysicalTableLayout",
     "src/engine/catalog.rs|crate::engine::catalog|pub|ScanSource|crate::sql::catalog::ScanSource",
     "src/engine/catalog.rs|crate::engine::catalog|pub|StarRocksTabletRef|crate::sql::catalog::StarRocksTabletRef",
@@ -1283,7 +1276,6 @@ const FORWARDING_REEXPORTS: &[&str] = &[
     "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|QueryDictionarySelection|crate::sql::common::dictionary::QueryDictionarySelection",
     "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|StarRocksTabletWatermark|crate::sql::common::dictionary::StarRocksTabletWatermark",
     "src/engine/mod.rs|crate::engine|pub|CatalogProvider|crate::sql::catalog::CatalogProvider",
-    "src/engine/mod.rs|crate::engine|pub|ColumnDef|crate::sql::catalog::ColumnDef",
     "src/engine/mod.rs|crate::engine|pub|ScanSource|crate::sql::catalog::ScanSource",
     "src/engine/mod.rs|crate::engine|pub|TableDef|crate::sql::catalog::TableDef",
 ];
@@ -3969,9 +3961,10 @@ fn ebd_4b1_audit_schema_dependencies(source: &GuardSource) -> BTreeSet<String> {
                 .iter()
                 .map(|segment| segment.ident.to_string())
                 .collect::<Vec<_>>();
-            if segments
-                .first()
-                .is_some_and(|root| matches!(root.as_str(), "crate" | "self" | "super"))
+            if segments.len() > 1
+                && segments
+                    .first()
+                    .is_some_and(|root| matches!(root.as_str(), "crate" | "self" | "super"))
             {
                 self.violations.insert(format!(
                     "catalog-schema-forbidden-local-path: {}|{}",
@@ -3985,6 +3978,26 @@ fn ebd_4b1_audit_schema_dependencies(source: &GuardSource) -> BTreeSet<String> {
 
     let mut violations = ebd_4a_audit_catalog_dependencies(source);
     if let Ok(file) = syn::parse_file(&source.text) {
+        let has_column_data_type_exception = file.items.iter().any(|item| {
+            let syn::Item::Struct(item) = item else {
+                return false;
+            };
+            item.ident == "ColumnDef"
+                && item.fields.iter().any(|field| {
+                    field
+                        .ident
+                        .as_ref()
+                        .is_some_and(|ident| ident == "data_type")
+                        && ebd_4b2b_path_segments(&field.ty)
+                            .is_some_and(|(path, _)| path == ["arrow", "datatypes", "DataType"])
+                })
+        });
+        if has_column_data_type_exception {
+            violations.remove(&format!(
+                "catalog-forbidden-external-path: {}|arrow::datatypes::DataType",
+                source.path
+            ));
+        }
         let mut audit = CratePathAudit {
             source: &source.path,
             violations: BTreeSet::new(),
@@ -3992,6 +4005,7 @@ fn ebd_4b1_audit_schema_dependencies(source: &GuardSource) -> BTreeSet<String> {
         syn::visit::Visit::visit_file(&mut audit, &file);
         violations.extend(audit.violations);
     }
+    violations.extend(ebd_4b2b_audit_schema_dependencies(source));
     violations
 }
 
@@ -4966,14 +4980,12 @@ fn ebd_4b1_catalog_logical_type_boundary_is_complete() {
     } else {
         violations.insert(format!("catalog-identifier-owner-missing: {EBD_4A_OWNER}"));
     }
-    if let Some(catalog) = sources
-        .iter()
-        .find(|source| source.path == "src/sql/catalog.rs")
-    {
-        violations.extend(ebd_4b1_audit_column_def(catalog));
+    if let Some(owner) = sources.iter().find(|source| source.path == EBD_4B1_OWNER) {
+        violations.extend(ebd_4b1_audit_column_def(owner));
     } else {
-        violations
-            .insert("catalog-schema-column-def-owner-missing: src/sql/catalog.rs".to_string());
+        violations.insert(format!(
+            "catalog-schema-column-def-owner-missing: {EBD_4B1_OWNER}"
+        ));
     }
     violations.extend(ebd_4b1_audit_definitions(&sources));
     violations.extend(ebd_4b1_audit_legacy_paths_and_forwarding(&sources));
@@ -6926,15 +6938,20 @@ fn ebd_4b2a_catalog_write_default_boundary_is_complete() {
     } else {
         violations.insert(format!("catalog-default-owner-missing: {EBD_4B2A_OWNER}"));
     }
+    if let Some(owner) = sources.iter().find(|source| source.path == EBD_4B2A_OWNER) {
+        violations.extend(ebd_4b2a_audit_column_def(owner));
+    } else {
+        violations.insert(format!(
+            "catalog-default-column-def-owner-missing: {EBD_4B2A_OWNER}"
+        ));
+    }
     if let Some(catalog) = sources
         .iter()
         .find(|source| source.path == "src/sql/catalog.rs")
     {
-        violations.extend(ebd_4b2a_audit_column_def(catalog));
         violations.extend(ebd_4b2a_audit_catalog_raw_iceberg_literals(catalog));
     } else {
-        violations
-            .insert("catalog-default-column-def-owner-missing: src/sql/catalog.rs".to_string());
+        violations.insert("catalog-default-model-owner-missing: src/sql/catalog.rs".to_string());
     }
     if let Some(parser) = sources
         .iter()
@@ -6965,7 +6982,7 @@ fn ebd_4b2a_catalog_write_default_boundary_is_complete() {
             .sum(),
         actual.forwarding_reexports.len(),
     ];
-    let expected_counts = [88, 86, 224, 58, 17];
+    let expected_counts = [88, 86, 221, 58, 15];
     if actual_counts != expected_counts {
         violations.insert(format!(
             "catalog-default-ebd-1-baseline-drift: expected={expected_counts:?} actual={actual_counts:?}"
@@ -6975,6 +6992,908 @@ fn ebd_4b2a_catalog_write_default_boundary_is_complete() {
     assert!(
         violations.is_empty(),
         "EBD-4B2A catalog write-default boundary failed:\n{}",
+        violations.into_iter().collect::<Vec<_>>().join("\n")
+    );
+}
+
+const EBD_4B2B_OWNER: &str = "src/catalog/schema.rs";
+
+fn ebd_4b2b_path_segments(ty: &syn::Type) -> Option<(Vec<String>, bool)> {
+    let syn::Type::Path(path) = ty else {
+        return None;
+    };
+    if path.qself.is_some()
+        || path
+            .path
+            .segments
+            .iter()
+            .any(|segment| !matches!(segment.arguments, syn::PathArguments::None))
+    {
+        return None;
+    }
+    Some((
+        path.path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect(),
+        path.path.leading_colon.is_some(),
+    ))
+}
+
+fn ebd_4b2b_plain_name_is_shadowed(
+    file: &syn::File,
+    aliases: &RustScopedAliases,
+    name: &str,
+) -> bool {
+    aliases.contains_key(&(Vec::new(), name.to_string()))
+        || ebd_4b1_file_defines_root_type_name(file, name)
+}
+
+fn ebd_4b2b_root_is_shadowed(file: &syn::File, aliases: &RustScopedAliases, root: &str) -> bool {
+    ebd_4b2b_plain_name_is_shadowed(file, aliases, root)
+        || file.items.iter().any(|item| {
+            let syn::Item::ExternCrate(item) = item else {
+                return false;
+            };
+            item.rename
+                .as_ref()
+                .map_or_else(|| item.ident == root, |(_, rename)| rename == root)
+        })
+}
+
+fn ebd_4b2b_option_inner_name(
+    file: &syn::File,
+    aliases: &RustScopedAliases,
+    ty: &syn::Type,
+) -> Option<String> {
+    let syn::Type::Path(option) = ty else {
+        return None;
+    };
+    let root = option.path.segments.first()?.ident.to_string();
+    if matches!(root.as_str(), "std" | "core" | "alloc")
+        && ebd_4b2b_root_is_shadowed(file, aliases, &root)
+    {
+        return None;
+    }
+    let Some((inner, plain_prelude)) = ebd_4b1_option_inner_path(ty) else {
+        return None;
+    };
+    if plain_prelude && ebd_4b2b_plain_name_is_shadowed(file, aliases, "Option") {
+        return None;
+    }
+    (inner.len() == 1).then(|| inner[0].clone())
+}
+
+fn ebd_4b2b_struct_derive_set(item: &syn::ItemStruct) -> Option<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    for attribute in item
+        .attrs
+        .iter()
+        .filter(|attribute| ebd_4b1_attribute_is(attribute, "derive"))
+    {
+        let paths = attribute
+            .parse_args_with(
+                syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+            )
+            .ok()?;
+        names.extend(paths.into_iter().map(|path| {
+            path.segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::")
+        }));
+    }
+    Some(names)
+}
+
+fn ebd_4b2b_audit_column_def_owner(source: &GuardSource) -> BTreeSet<String> {
+    let Ok(file) = syn::parse_file(&source.text) else {
+        return BTreeSet::from([format!(
+            "catalog-column-owner-missing: {}|parse-failed",
+            source.path
+        )]);
+    };
+    let root_columns = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Struct(item) if item.ident == "ColumnDef" => Some(item),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if root_columns.len() != 1 {
+        return BTreeSet::from([format!(
+            "catalog-column-owner-missing: {}|expected=1 actual={}",
+            source.path,
+            root_columns.len()
+        )]);
+    }
+    let column = root_columns[0];
+    let mut violations = BTreeSet::new();
+    if !ebd_4b1_is_pub(&column.vis)
+        || !column.generics.params.is_empty()
+        || column.generics.where_clause.is_some()
+    {
+        violations.insert(format!(
+            "catalog-column-owner-fields: {}|visibility-or-generics",
+            source.path
+        ));
+    }
+    if column.attrs.iter().any(|attribute| {
+        !ebd_4b1_attribute_is(attribute, "derive") && !ebd_4b1_attribute_is(attribute, "doc")
+    }) {
+        violations.insert(format!(
+            "catalog-column-owner-fields: {}|semantic-attribute",
+            source.path
+        ));
+    }
+    let expected_derives = BTreeSet::from([
+        "Clone".to_string(),
+        "Debug".to_string(),
+        "PartialEq".to_string(),
+    ]);
+    if ebd_4b2b_struct_derive_set(column).as_ref() != Some(&expected_derives) {
+        violations.insert(format!(
+            "catalog-column-owner-fields: {}|derives",
+            source.path
+        ));
+    }
+
+    let syn::Fields::Named(fields) = &column.fields else {
+        violations.insert(format!(
+            "catalog-column-owner-fields: {}|named-fields-required",
+            source.path
+        ));
+        return violations;
+    };
+    let actual_names = fields
+        .named
+        .iter()
+        .filter_map(|field| field.ident.as_ref().map(ToString::to_string))
+        .collect::<Vec<_>>();
+    let expected_names = [
+        "name",
+        "data_type",
+        "nullable",
+        "write_default",
+        "logical_type",
+    ];
+    if actual_names != expected_names {
+        violations.insert(format!(
+            "catalog-column-owner-fields: {}|expected={expected_names:?} actual={actual_names:?}",
+            source.path
+        ));
+        return violations;
+    }
+    if fields.named.iter().any(|field| {
+        !ebd_4b1_is_pub(&field.vis)
+            || field
+                .attrs
+                .iter()
+                .any(|attribute| !ebd_4b1_attribute_is(attribute, "doc"))
+    }) {
+        violations.insert(format!(
+            "catalog-column-owner-fields: {}|field-visibility-or-attribute",
+            source.path
+        ));
+    }
+
+    let (_, aliases) = ebd_4b1_module_scope_inputs(&file);
+    let name_ok = ebd_4b2b_path_segments(&fields.named[0].ty).is_some_and(|(path, _)| {
+        (path == ["std", "string", "String"] && !ebd_4b2b_root_is_shadowed(&file, &aliases, "std"))
+            || (path == ["alloc", "string", "String"]
+                && !ebd_4b2b_root_is_shadowed(&file, &aliases, "alloc"))
+            || (path == ["String"] && !ebd_4b2b_plain_name_is_shadowed(&file, &aliases, "String"))
+    });
+    let data_type_ok = ebd_4b2b_path_segments(&fields.named[1].ty)
+        .is_some_and(|(path, _)| path == ["arrow", "datatypes", "DataType"])
+        && !ebd_4b2b_root_is_shadowed(&file, &aliases, "arrow");
+    let nullable_ok =
+        ebd_4b2b_path_segments(&fields.named[2].ty).is_some_and(|(path, _)| path == ["bool"]);
+    let write_default_ok = ebd_4b2b_option_inner_name(&file, &aliases, &fields.named[3].ty)
+        .as_deref()
+        == Some("ColumnDefault");
+    let logical_type_ok = ebd_4b2b_option_inner_name(&file, &aliases, &fields.named[4].ty)
+        .as_deref()
+        == Some("SqlType");
+    for (name, valid) in [
+        ("name", name_ok),
+        ("data_type", data_type_ok),
+        ("nullable", nullable_ok),
+        ("write_default", write_default_ok),
+        ("logical_type", logical_type_ok),
+    ] {
+        if !valid {
+            violations.insert(format!(
+                "catalog-column-owner-field-type: {}|{name}",
+                source.path
+            ));
+        }
+    }
+    violations
+}
+
+fn ebd_4b2b_audit_schema_dependencies(source: &GuardSource) -> BTreeSet<String> {
+    struct SchemaDependencyAudit<'a> {
+        source: &'a str,
+        dependency_roots: &'a BTreeSet<String>,
+        in_column_data_type: bool,
+        violations: BTreeSet<String>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for SchemaDependencyAudit<'_> {
+        fn visit_item_extern_crate(&mut self, item: &'ast syn::ItemExternCrate) {
+            if !matches!(item.ident.to_string().as_str(), "std" | "core" | "alloc") {
+                self.violations.insert(format!(
+                    "catalog-column-arrow-dependency-forbidden: {}|extern-crate:{}",
+                    self.source, item.ident
+                ));
+            }
+            syn::visit::visit_item_extern_crate(self, item);
+        }
+
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            if item.ident == "ColumnDef" {
+                for field in &item.fields {
+                    self.in_column_data_type = field
+                        .ident
+                        .as_ref()
+                        .is_some_and(|ident| ident == "data_type");
+                    syn::visit::Visit::visit_field(self, field);
+                    self.in_column_data_type = false;
+                }
+                return;
+            }
+            syn::visit::visit_item_struct(self, item);
+        }
+
+        fn visit_path(&mut self, path: &'ast syn::Path) {
+            let segments = path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>();
+            let permitted_arrow =
+                self.in_column_data_type && segments == ["arrow", "datatypes", "DataType"];
+            let forbidden_external = segments.first().is_some_and(|root| {
+                self.dependency_roots.contains(root)
+                    && !matches!(root.as_str(), "std" | "core" | "alloc")
+                    && !permitted_arrow
+            });
+            let forbidden_local = segments.len() > 1
+                && segments
+                    .first()
+                    .is_some_and(|root| matches!(root.as_str(), "crate" | "self" | "super"));
+            if forbidden_external || forbidden_local {
+                self.violations.insert(format!(
+                    "catalog-column-arrow-dependency-forbidden: {}|{}",
+                    self.source,
+                    segments.join("::")
+                ));
+            }
+            syn::visit::visit_path(self, path);
+        }
+    }
+
+    let Ok(file) = syn::parse_file(&source.text) else {
+        return BTreeSet::from([format!(
+            "catalog-column-arrow-dependency-forbidden: {}|parse-failed",
+            source.path
+        )]);
+    };
+    let dependency_roots = ebd_4a_dependency_crate_roots();
+    let mut audit = SchemaDependencyAudit {
+        source: &source.path,
+        dependency_roots: &dependency_roots,
+        in_column_data_type: false,
+        violations: BTreeSet::new(),
+    };
+    syn::visit::Visit::visit_file(&mut audit, &file);
+    audit.violations
+}
+
+fn ebd_4b2b_is_legacy_column_def_path(path: &[String]) -> bool {
+    let segments = path.iter().map(String::as_str).collect::<Vec<_>>();
+    segments.starts_with(&["crate", "sql", "catalog", "ColumnDef"])
+        || segments.starts_with(&["crate", "engine", "catalog", "ColumnDef"])
+        || segments.starts_with(&["crate", "engine", "ColumnDef"])
+}
+
+fn ebd_4b2b_is_canonical_column_def_path(path: &[String]) -> bool {
+    let segments = path.iter().map(String::as_str).collect::<Vec<_>>();
+    segments.starts_with(&["crate", "catalog", "schema", "ColumnDef"])
+}
+
+fn ebd_4b2b_is_canonical_schema_forward_target(path: &[String]) -> bool {
+    let segments = path.iter().map(String::as_str).collect::<Vec<_>>();
+    segments == ["crate", "catalog", "schema"]
+        || segments == ["crate", "catalog", "schema", "*"]
+        || ebd_4b2b_is_canonical_column_def_path(path)
+}
+
+fn ebd_4b2b_is_legacy_column_def_glob(path: &[String]) -> bool {
+    let segments = path.iter().map(String::as_str).collect::<Vec<_>>();
+    segments == ["crate", "sql", "catalog", "*"]
+        || segments == ["crate", "engine", "catalog", "*"]
+        || segments == ["crate", "engine", "*"]
+}
+
+fn ebd_4b2b_macro_defines_column_def(item: &syn::ItemMacro) -> bool {
+    ebd_4b1_macro_rule_transcribers(item).iter().any(|tokens| {
+        tokens.windows(2).any(|pair| {
+            matches!(
+                pair[0].as_str(),
+                "enum" | "struct" | "union" | "trait" | "type" | "mod"
+            ) && pair[1] == "ColumnDef"
+        })
+    })
+}
+
+fn ebd_4b2b_macro_invokes_column_def(item: &syn::ItemMacro) -> bool {
+    item.ident.is_none()
+        && rust_source_tokens(&item.mac.tokens.to_string())
+            .iter()
+            .any(|token| token.text == "ColumnDef")
+}
+
+fn ebd_4b2b_type_contains_canonical_column_def(
+    ty: &syn::Type,
+    source: &GuardSource,
+    aliases: &RustScopedAliases,
+    inline_modules: &[String],
+) -> bool {
+    struct ColumnPathAudit<'a> {
+        source: &'a GuardSource,
+        aliases: &'a RustScopedAliases,
+        inline_modules: &'a [String],
+        found: bool,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for ColumnPathAudit<'_> {
+        fn visit_path(&mut self, path: &'ast syn::Path) {
+            let segments = path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>();
+            if let Some(resolved) = rust_resolve_scoped_paths(
+                &segments,
+                self.inline_modules,
+                self.aliases,
+                &mut BTreeSet::new(),
+                0,
+            ) {
+                self.found |= resolved.into_iter().any(|resolved| {
+                    rust_canonical_path_segments_in_scope(
+                        &resolved.segments,
+                        &self.source.path,
+                        &resolved.inline_modules,
+                    )
+                    .is_some_and(|canonical| ebd_4b2b_is_canonical_column_def_path(&canonical))
+                });
+            }
+            syn::visit::visit_path(self, path);
+        }
+    }
+    let mut audit = ColumnPathAudit {
+        source,
+        aliases,
+        inline_modules,
+        found: false,
+    };
+    syn::visit::Visit::visit_type(&mut audit, ty);
+    audit.found
+}
+
+fn ebd_4b2b_audit_legacy_paths_and_forwarding(sources: &[GuardSource]) -> BTreeSet<String> {
+    struct ColumnDefinitionAudit<'a> {
+        source: &'a GuardSource,
+        aliases: &'a RustScopedAliases,
+        inline_modules: Vec<String>,
+        violations: BTreeSet<String>,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for ColumnDefinitionAudit<'_> {
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            let canonical = self.source.path == EBD_4B2B_OWNER
+                && self.inline_modules.is_empty()
+                && item.ident == "ColumnDef";
+            if item.ident == "ColumnDef" && !canonical {
+                self.violations.insert(format!(
+                    "catalog-column-secondary-definition: {}|struct|ColumnDef",
+                    self.source.path
+                ));
+            }
+            if !canonical
+                && item.fields.len() == 1
+                && item.fields.iter().any(|field| {
+                    ebd_4b2b_type_contains_canonical_column_def(
+                        &field.ty,
+                        self.source,
+                        self.aliases,
+                        &self.inline_modules,
+                    )
+                })
+            {
+                self.violations.insert(format!(
+                    "catalog-column-forwarding-reexport: {}|wrapper|{}",
+                    self.source.path, item.ident
+                ));
+            }
+            syn::visit::visit_item_struct(self, item);
+        }
+        fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+            if item.ident == "ColumnDef" {
+                self.violations.insert(format!(
+                    "catalog-column-secondary-definition: {}|enum|ColumnDef",
+                    self.source.path
+                ));
+            }
+            syn::visit::visit_item_enum(self, item);
+        }
+        fn visit_item_union(&mut self, item: &'ast syn::ItemUnion) {
+            if item.ident == "ColumnDef" {
+                self.violations.insert(format!(
+                    "catalog-column-secondary-definition: {}|union|ColumnDef",
+                    self.source.path
+                ));
+            }
+            syn::visit::visit_item_union(self, item);
+        }
+        fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
+            if item.ident == "ColumnDef" {
+                self.violations.insert(format!(
+                    "catalog-column-secondary-definition: {}|trait|ColumnDef",
+                    self.source.path
+                ));
+            }
+            syn::visit::visit_item_trait(self, item);
+        }
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            if item.ident == "ColumnDef"
+                || ebd_4b2b_type_contains_canonical_column_def(
+                    &item.ty,
+                    self.source,
+                    self.aliases,
+                    &self.inline_modules,
+                )
+            {
+                self.violations.insert(format!(
+                    "catalog-column-forwarding-reexport: {}|type-alias|{}",
+                    self.source.path, item.ident
+                ));
+            }
+            syn::visit::visit_item_type(self, item);
+        }
+        fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+            if ebd_4b2b_macro_defines_column_def(item) || ebd_4b2b_macro_invokes_column_def(item) {
+                self.violations.insert(format!(
+                    "catalog-column-secondary-definition: {}|macro|ColumnDef",
+                    self.source.path
+                ));
+            }
+        }
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if item.ident == "ColumnDef" {
+                self.violations.insert(format!(
+                    "catalog-column-secondary-definition: {}|module|ColumnDef",
+                    self.source.path
+                ));
+            }
+            let Some((_, items)) = &item.content else {
+                return;
+            };
+            self.inline_modules.push(item.ident.to_string());
+            for item in items {
+                syn::visit::Visit::visit_item(self, item);
+            }
+            self.inline_modules.pop();
+        }
+    }
+
+    let mut violations = BTreeSet::new();
+    for source in sources {
+        for path in remove_redundant_descendant_paths(
+            rust_all_source_canonical_paths(&source.text, &source.path)
+                .into_iter()
+                .filter(|path| ebd_4b2b_is_legacy_column_def_path(path))
+                .collect(),
+        ) {
+            violations.insert(format!(
+                "catalog-column-legacy-path: {}|{}",
+                source.path,
+                path.join("::")
+            ));
+        }
+        let Ok(file) = syn::parse_file(&source.text) else {
+            violations.insert(format!(
+                "catalog-column-secondary-definition: {}|parse-failed",
+                source.path
+            ));
+            continue;
+        };
+        let (imports, aliases) = ebd_4b1_module_scope_inputs(&file);
+        let mut audit = ColumnDefinitionAudit {
+            source,
+            aliases: &aliases,
+            inline_modules: Vec::new(),
+            violations: BTreeSet::new(),
+        };
+        syn::visit::Visit::visit_file(&mut audit, &file);
+        violations.extend(audit.violations);
+
+        if source.path == EBD_4B2B_OWNER {
+            continue;
+        }
+        for import in imports {
+            let Some(resolved) = resolve_forwarding_paths(
+                &import.segments,
+                &source.path,
+                &import.inline_modules,
+                &aliases,
+                &mut BTreeSet::new(),
+                0,
+            ) else {
+                continue;
+            };
+            for target in resolved {
+                let Some(canonical) = rust_canonical_path_segments_in_scope(
+                    &target.segments,
+                    &source.path,
+                    &target.inline_modules,
+                ) else {
+                    continue;
+                };
+                if import.visibility != "private"
+                    && (ebd_4b2b_is_canonical_schema_forward_target(&canonical)
+                        || ebd_4b2b_is_legacy_column_def_path(&canonical))
+                {
+                    violations.insert(format!(
+                        "catalog-column-forwarding-reexport: {}|{}|{}",
+                        source.path,
+                        import.visibility,
+                        canonical.join("::")
+                    ));
+                } else if import
+                    .segments
+                    .first()
+                    .is_some_and(|segment| segment == "crate")
+                    && ebd_4b2b_is_legacy_column_def_glob(&canonical)
+                {
+                    violations.insert(format!(
+                        "catalog-column-legacy-path: {}|{}",
+                        source.path,
+                        canonical.join("::")
+                    ));
+                }
+            }
+        }
+    }
+    violations
+}
+
+#[test]
+fn ebd_4b2b_detector_requires_exact_column_def_owner() {
+    let valid = GuardSource::new(
+        EBD_4B2B_OWNER,
+        r#"
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColumnDef {
+    pub name: String,
+    pub data_type: arrow::datatypes::DataType,
+    pub nullable: bool,
+    pub write_default: Option<ColumnDefault>,
+    pub logical_type: Option<SqlType>,
+}
+"#,
+    );
+    assert!(
+        ebd_4b2b_audit_column_def_owner(&valid).is_empty(),
+        "exact ColumnDef owner fixture must pass"
+    );
+
+    for (from, to) in [
+        ("pub struct ColumnDef", "pub(crate) struct ColumnDef"),
+        (
+            "#[derive(Clone, Debug, PartialEq)]",
+            "#[derive(Clone, Debug, PartialEq, Eq)]",
+        ),
+        ("pub struct ColumnDef", "#[repr(C)]\npub struct ColumnDef"),
+        ("pub struct ColumnDef", "#[cfg(test)]\npub struct ColumnDef"),
+        ("pub struct ColumnDef", "pub struct ColumnDef<T>"),
+        ("pub name: String", "name: String"),
+        (
+            "pub name: String,\n    pub data_type: arrow::datatypes::DataType,",
+            "pub data_type: arrow::datatypes::DataType,\n    pub name: String,",
+        ),
+    ] {
+        let invalid = GuardSource::new(EBD_4B2B_OWNER, &valid.text.replacen(from, to, 1));
+        assert!(
+            !ebd_4b2b_audit_column_def_owner(&invalid).is_empty(),
+            "owner mutation was missed: {from:?} -> {to:?}"
+        );
+    }
+}
+
+#[test]
+fn ebd_4b2b_detector_rejects_arrow_shadow_and_noncanonical_fields() {
+    let valid = GuardSource::new(
+        EBD_4B2B_OWNER,
+        r#"
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColumnDef {
+    pub name: std::string::String,
+    pub data_type: ::arrow::datatypes::DataType,
+    pub nullable: bool,
+    pub write_default: core::option::Option<ColumnDefault>,
+    pub logical_type: std::option::Option<SqlType>,
+}
+"#,
+    );
+    assert!(ebd_4b2b_audit_column_def_owner(&valid).is_empty());
+    assert!(ebd_4b2b_audit_schema_dependencies(&valid).is_empty());
+
+    for text in [
+        r#"
+type String = Vec<u8>;
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColumnDef { pub name: String, pub data_type: arrow::datatypes::DataType, pub nullable: bool, pub write_default: Option<ColumnDefault>, pub logical_type: Option<SqlType> }
+"#,
+        r#"
+struct Option<T>(T);
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColumnDef { pub name: String, pub data_type: arrow::datatypes::DataType, pub nullable: bool, pub write_default: Option<ColumnDefault>, pub logical_type: Option<SqlType> }
+"#,
+        r#"
+mod std { pub mod string { pub struct String; } }
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColumnDef { pub name: std::string::String, pub data_type: arrow::datatypes::DataType, pub nullable: bool, pub write_default: Option<ColumnDefault>, pub logical_type: Option<SqlType> }
+"#,
+        r#"
+mod alloc { pub mod string { pub struct String; } }
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColumnDef { pub name: alloc::string::String, pub data_type: arrow::datatypes::DataType, pub nullable: bool, pub write_default: Option<ColumnDefault>, pub logical_type: Option<SqlType> }
+"#,
+        r#"
+mod core { pub mod option { pub struct Option<T>(T); } }
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColumnDef { pub name: String, pub data_type: arrow::datatypes::DataType, pub nullable: bool, pub write_default: core::option::Option<ColumnDefault>, pub logical_type: Option<SqlType> }
+"#,
+        r#"
+mod arrow { pub mod datatypes { pub struct DataType; } }
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColumnDef { pub name: String, pub data_type: arrow::datatypes::DataType, pub nullable: bool, pub write_default: Option<ColumnDefault>, pub logical_type: Option<SqlType> }
+"#,
+        r#"
+type arrow = std::marker::PhantomData<()>;
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColumnDef { pub name: String, pub data_type: arrow::datatypes::DataType, pub nullable: bool, pub write_default: Option<ColumnDefault>, pub logical_type: Option<SqlType> }
+"#,
+        r#"
+extern crate arrow;
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColumnDef { pub name: String, pub data_type: arrow::datatypes::DataType, pub nullable: bool, pub write_default: Option<ColumnDefault>, pub logical_type: Option<SqlType> }
+"#,
+        r#"
+extern crate self as arrow;
+pub mod datatypes { pub struct DataType; }
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColumnDef { pub name: String, pub data_type: arrow::datatypes::DataType, pub nullable: bool, pub write_default: Option<ColumnDefault>, pub logical_type: Option<SqlType> }
+"#,
+        r#"
+use arrow::datatypes::DataType as ArrowType;
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColumnDef { pub name: String, pub data_type: ArrowType, pub nullable: bool, pub write_default: Option<ColumnDefault>, pub logical_type: Option<SqlType> }
+"#,
+        r#"
+use arrow::datatypes::*;
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColumnDef { pub name: String, pub data_type: DataType, pub nullable: bool, pub write_default: Option<ColumnDefault>, pub logical_type: Option<SqlType> }
+"#,
+        r#"
+use arrow::{datatypes::DataType, array::ArrayRef};
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColumnDef { pub name: String, pub data_type: DataType, pub nullable: bool, pub write_default: Option<ColumnDefault>, pub logical_type: Option<SqlType> }
+"#,
+        r#"
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColumnDef { pub name: String, pub data_type: arrow::datatypes::DataType, pub nullable: bool, pub write_default: Option<crate::catalog::schema::ColumnDefault>, pub logical_type: Option<SqlType> }
+"#,
+        r#"
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColumnDef { pub name: String, pub data_type: arrow::datatypes::DataType, pub nullable: bool, pub write_default: Option<ColumnDefault>, pub logical_type: Option<SqlType> }
+fn forbidden(_: arrow::array::ArrayRef) {}
+"#,
+    ] {
+        let invalid = GuardSource::new(EBD_4B2B_OWNER, text);
+        let mut violations = ebd_4b2b_audit_column_def_owner(&invalid);
+        violations.extend(ebd_4b2b_audit_schema_dependencies(&invalid));
+        assert!(
+            !violations.is_empty(),
+            "noncanonical field or Arrow escape was missed: {text}"
+        );
+    }
+}
+
+#[test]
+fn ebd_4b2b_detector_rejects_legacy_paths_forwarding_and_ignores_proto_noise() {
+    let allowed = [
+        GuardSource::new(
+            "src/sql/consumer.rs",
+            r###"
+use crate::catalog::schema::ColumnDef;
+fn consume(value: ColumnDef) { let _ = value; }
+const TEXT: &str = "crate::sql::catalog::ColumnDef";
+const RAW: &str = r#"pub use crate::engine::ColumnDef"#;
+// struct ColumnDef;
+"###,
+        ),
+        GuardSource::new(
+            "src/lower/novarocks/scan/common.rs",
+            "fn encode(value: plan::ColumnDef) { let _ = value; }",
+        ),
+        GuardSource::new(
+            "src/sql/parser/ast/ddl.rs",
+            "pub struct TableColumnDef { pub name: String }",
+        ),
+        GuardSource::new(
+            "src/sql/catalog.rs",
+            "pub struct IcebergSchemaFieldDef { pub children: Vec<IcebergSchemaFieldDef> }",
+        ),
+        GuardSource::new(
+            EBD_4B2B_OWNER,
+            "#[derive(Clone, Debug, PartialEq)] pub struct ColumnDef { pub name: String, pub data_type: arrow::datatypes::DataType, pub nullable: bool, pub write_default: Option<ColumnDefault>, pub logical_type: Option<SqlType> }",
+        ),
+    ];
+    assert!(
+        ebd_4b2b_audit_legacy_paths_and_forwarding(&allowed).is_empty(),
+        "canonical consumers and same-name protocol/parser noise must pass"
+    );
+
+    let invalid = [
+        GuardSource::new(
+            "src/sql/direct.rs",
+            "fn consume(_: crate::sql::catalog::ColumnDef) {}",
+        ),
+        GuardSource::new(
+            "src/sql/alias.rs",
+            "use crate::engine::ColumnDef as OldColumn; fn consume(_: OldColumn) {}",
+        ),
+        GuardSource::new(
+            "src/sql/module_alias.rs",
+            "use crate::sql::catalog; fn consume(_: catalog::ColumnDef) {}",
+        ),
+        GuardSource::new(
+            "src/sql/glob.rs",
+            "use crate::engine::catalog::*; fn consume(_: ColumnDef) {}",
+        ),
+        GuardSource::new(
+            "src/sql/relative.rs",
+            "fn consume(_: super::catalog::ColumnDef) {}",
+        ),
+        GuardSource::new(
+            "src/sql/forward.rs",
+            "pub use crate::catalog::schema::ColumnDef;",
+        ),
+        GuardSource::new(
+            "src/sql/forward_glob.rs",
+            "pub use crate::catalog::schema::*;",
+        ),
+        GuardSource::new(
+            "src/sql/forward_module.rs",
+            "pub use crate::catalog::schema as model;",
+        ),
+        GuardSource::new(
+            "src/sql/alias_owner.rs",
+            "type OldColumn = crate::catalog::schema::ColumnDef;",
+        ),
+        GuardSource::new(
+            "src/sql/wrapper.rs",
+            "struct ColumnEnvelope(crate::catalog::schema::ColumnDef);",
+        ),
+        GuardSource::new(
+            "src/sql/named_wrapper.rs",
+            "struct ColumnEnvelope { value: crate::catalog::schema::ColumnDef }",
+        ),
+        GuardSource::new(
+            "src/sql/secondary.rs",
+            "#[cfg(test)] mod tests { pub struct ColumnDef; }",
+        ),
+        GuardSource::new(
+            "src/sql/macro_owner.rs",
+            "macro_rules! owner { () => { struct ColumnDef; } } owner!();",
+        ),
+        GuardSource::new(
+            "src/sql/macro_parameter_owner.rs",
+            "macro_rules! owner { ($name:ident) => { struct $name; } } owner!(ColumnDef);",
+        ),
+    ];
+    let violations = ebd_4b2b_audit_legacy_paths_and_forwarding(&invalid);
+    for path in [
+        "direct.rs",
+        "alias.rs",
+        "module_alias.rs",
+        "glob.rs",
+        "relative.rs",
+        "forward.rs",
+        "forward_glob.rs",
+        "forward_module.rs",
+        "alias_owner.rs",
+        "wrapper.rs",
+        "named_wrapper.rs",
+        "secondary.rs",
+        "macro_owner.rs",
+        "macro_parameter_owner.rs",
+    ] {
+        assert!(
+            violations.iter().any(|violation| violation.contains(path)),
+            "legacy or secondary fixture was missed: {path}; got {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn ebd_4b2b_catalog_column_def_owner_is_complete() {
+    let sources = ebd_4b1_collect_repo_sources();
+    let mut violations = BTreeSet::new();
+    if let Some(owner) = sources.iter().find(|source| source.path == EBD_4B2B_OWNER) {
+        violations.extend(ebd_4b2b_audit_column_def_owner(owner));
+        violations.extend(ebd_4b2b_audit_schema_dependencies(owner));
+    } else {
+        violations.insert(format!("catalog-column-owner-missing: {EBD_4B2B_OWNER}"));
+    }
+    violations.extend(ebd_4b2b_audit_legacy_paths_and_forwarding(&sources));
+
+    for (source, dependency) in [
+        (
+            "src/connector/iceberg/catalog/registry.rs",
+            "crate::engine::catalog::ColumnDef",
+        ),
+        (
+            "src/connector/starrocks/table/catalog.rs",
+            "crate::engine::catalog::ColumnDef",
+        ),
+        (
+            "src/connector/starrocks/table/txn.rs",
+            "crate::engine::catalog::ColumnDef",
+        ),
+    ] {
+        if EXTERNAL_ENGINE_DEPENDENCIES
+            .iter()
+            .any(|(path, dependencies)| *path == source && dependencies.contains(&dependency))
+        {
+            violations.insert(format!(
+                "catalog-column-external-engine-dependency: {source}|{dependency}"
+            ));
+        }
+    }
+
+    let actual = current_source_tree_snapshot();
+    let actual_counts = [
+        actual.engine_files.len(),
+        actual.engine_module_declarations.len(),
+        actual
+            .external_engine_dependencies
+            .values()
+            .map(BTreeSet::len)
+            .sum(),
+        actual
+            .standalone_state_dependencies
+            .values()
+            .map(BTreeSet::len)
+            .sum(),
+        actual.forwarding_reexports.len(),
+    ];
+    let expected_counts = [88, 86, 221, 58, 15];
+    if actual_counts != expected_counts {
+        violations.insert(format!(
+            "catalog-column-ebd-1-baseline-drift: expected={expected_counts:?} actual={actual_counts:?}"
+        ));
+    }
+
+    assert!(
+        violations.is_empty(),
+        "EBD-4B2B catalog ColumnDef owner failed:\n{}",
         violations.into_iter().collect::<Vec<_>>().join("\n")
     );
 }
@@ -7004,7 +7923,11 @@ fn ebd_4a_catalog_identifier_boundary_is_ast_free() {
         .iter()
         .filter(|source| source.path.starts_with("src/catalog/"))
     {
-        violations.extend(ebd_4a_audit_catalog_dependencies(source));
+        if source.path == EBD_4B2B_OWNER {
+            violations.extend(ebd_4b1_audit_schema_dependencies(source));
+        } else {
+            violations.extend(ebd_4a_audit_catalog_dependencies(source));
+        }
     }
 
     let old_owner = repo.join("src/engine/name_resolve.rs");

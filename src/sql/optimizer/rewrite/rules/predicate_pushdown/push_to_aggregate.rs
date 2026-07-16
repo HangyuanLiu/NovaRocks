@@ -186,9 +186,10 @@ fn aggregate_child_is_repeat(expr: &OptExpr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::TypedExpr;
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn};
-    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
         AggregateOutputLayout, LogicalAggregateOp, RepeatOp, ScalarAggregateSpec, ScanOp,

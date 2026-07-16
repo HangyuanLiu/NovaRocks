@@ -174,12 +174,11 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
+    use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::{
         ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
-    use crate::sql::catalog::{
-        ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
-    };
+    use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
     use std::cell::RefCell;
     use std::rc::Rc;
 

@@ -368,7 +368,7 @@ fn target_partition_source_ordinals(
 
 fn output_ordinals_for_sink_columns(
     output_columns: &[OutputColumn],
-    sink_columns: &[crate::engine::catalog::ColumnDef],
+    sink_columns: &[crate::catalog::schema::ColumnDef],
 ) -> Result<Vec<usize>, String> {
     sink_columns
         .iter()
@@ -482,8 +482,8 @@ mod tests {
         ]
     }
 
-    fn column(name: &str) -> crate::engine::catalog::ColumnDef {
-        crate::engine::catalog::ColumnDef {
+    fn column(name: &str) -> crate::catalog::schema::ColumnDef {
+        crate::catalog::schema::ColumnDef {
             name: name.to_string(),
             data_type: DataType::Int32,
             nullable: false,

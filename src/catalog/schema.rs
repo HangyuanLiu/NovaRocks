@@ -15,6 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColumnDef {
+    pub name: String,
+    pub data_type: arrow::datatypes::DataType,
+    pub nullable: bool,
+    pub write_default: Option<ColumnDefault>,
+    /// Logical (StarRocks) type when the Arrow `data_type` collapses several
+    /// distinct logical kinds onto the same storage representation. Today the
+    /// consumers are logical types such as JSON, BITMAP, and HLL when they
+    /// materialise as generic Arrow storage. The analyzer uses this side table
+    /// to preserve StarRocks semantics that are not encoded in Arrow alone.
+    /// `None` means "the Arrow type is the authoritative type".
+    pub logical_type: Option<SqlType>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ColumnDefault {
     Null,

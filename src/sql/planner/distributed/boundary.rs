@@ -422,10 +422,10 @@ fn find_node(node: &DistributedNode, node_id: i32) -> Option<&DistributedNode> {
 mod tests {
     use arrow::datatypes::DataType;
 
+    use crate::catalog::schema::ColumnDef;
     use crate::runtime_filter::model::graph::RuntimeFilterGraph;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::analysis::cte::CteId;
-    use crate::sql::catalog::ColumnDef;
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed::test_support::DistributedPlanDraftBuilder;
     use crate::sql::planner::distributed::write::change_stream::{

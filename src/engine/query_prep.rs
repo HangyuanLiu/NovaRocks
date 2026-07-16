@@ -21,13 +21,14 @@
 
 use std::sync::Arc;
 
+use crate::catalog::schema::ColumnDef;
 use crate::engine::StandaloneState;
 use crate::engine::StatementResult;
 use crate::engine::backend_resolver::resolve_table_target;
 use crate::engine::statement::parse_add_files_sql;
 use crate::runtime::query_result::build_string_query_result;
 use crate::sql::analyzer::iceberg_ref::resolve_read_binding;
-use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+use crate::sql::catalog::{ScanSource, TableDef};
 use crate::sql::parser::ast::ObjectName;
 
 #[derive(Clone, Debug)]
@@ -1107,28 +1108,28 @@ mod tests {
             name: "t".to_string(),
             columns: vec![],
             iceberg_row_lineage_metadata_columns: vec![
-                crate::sql::catalog::ColumnDef {
+                crate::catalog::schema::ColumnDef {
                     name: "_file".to_string(),
                     data_type: arrow::datatypes::DataType::Utf8,
                     nullable: false,
                     write_default: None,
                     logical_type: None,
                 },
-                crate::sql::catalog::ColumnDef {
+                crate::catalog::schema::ColumnDef {
                     name: "_pos".to_string(),
                     data_type: arrow::datatypes::DataType::Int64,
                     nullable: false,
                     write_default: None,
                     logical_type: None,
                 },
-                crate::sql::catalog::ColumnDef {
+                crate::catalog::schema::ColumnDef {
                     name: "_row_id".to_string(),
                     data_type: arrow::datatypes::DataType::Int64,
                     nullable: false,
                     write_default: None,
                     logical_type: None,
                 },
-                crate::sql::catalog::ColumnDef {
+                crate::catalog::schema::ColumnDef {
                     name: "_last_updated_sequence_number".to_string(),
                     data_type: arrow::datatypes::DataType::Int64,
                     nullable: false,

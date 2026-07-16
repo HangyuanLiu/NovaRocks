@@ -254,8 +254,9 @@ impl LogicalRewriteRule for PruneScanColumns {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::OutputColumn;
-    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{Operator, ScanOp};
     use crate::sql::optimizer::opt_expr::OptExpr;

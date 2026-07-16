@@ -290,9 +290,10 @@ mod tests {
     use crate::sql::planner::payload::*;
     use arrow::datatypes::DataType;
 
+    use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
     use crate::sql::catalog::{
-        ColumnDef, IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, TableDef,
+        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, TableDef,
     };
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::logical::LogicalPlanKind;

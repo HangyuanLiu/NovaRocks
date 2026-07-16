@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use crate::catalog::schema::ColumnDef;
 use crate::common::min_max_predicate::MinMaxPredicate;
 use crate::connector::iceberg::scan_planner::{
     IcebergScanHandle, iceberg_scan_handle, iceberg_split,
@@ -24,8 +25,7 @@ use crate::connector::iceberg::scan_planner::{
 use crate::connector::scan_planning::{ScanHandle, Split, validate_split_connectors};
 use crate::runtime::scan_range;
 use crate::sql::catalog::{
-    ColumnDef, IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
-    IcebergDeleteFileInfo,
+    IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
 };
 use arrow::datatypes::DataType;
 

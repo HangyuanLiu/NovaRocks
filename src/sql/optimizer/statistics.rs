@@ -482,7 +482,7 @@ pub fn build_table_statistics(
 /// `DataType` for decoding.
 pub fn build_table_statistics_with_columns(
     files: &[crate::sql::catalog::IcebergDataFileInfo],
-    columns: &[crate::sql::catalog::ColumnDef],
+    columns: &[crate::catalog::schema::ColumnDef],
 ) -> Option<TableStatistics> {
     build_table_statistics_with_ndv(files, columns, &HashMap::new(), &HashMap::new())
 }
@@ -503,7 +503,7 @@ pub fn build_table_statistics_with_columns(
 /// string columns look almost unique, which causes severe join-order mistakes.
 pub fn build_table_statistics_with_ndv(
     files: &[crate::sql::catalog::IcebergDataFileInfo],
-    columns: &[crate::sql::catalog::ColumnDef],
+    columns: &[crate::catalog::schema::ColumnDef],
     ndv_by_name: &HashMap<String, f64>,
     _name_to_field_id: &HashMap<String, i32>,
 ) -> Option<TableStatistics> {
@@ -621,7 +621,7 @@ pub fn build_table_statistics_with_ndv(
 #[allow(dead_code)] // Task 5 consumes this through QueryStatsCollector.
 pub(crate) fn build_base_table_statistics_with_ndv(
     files: &[crate::sql::catalog::IcebergDataFileInfo],
-    columns: &[crate::sql::catalog::ColumnDef],
+    columns: &[crate::catalog::schema::ColumnDef],
     ndv_by_name: &HashMap<String, f64>,
     name_to_field_id: &HashMap<String, i32>,
 ) -> crate::sql::optimizer::stats_input::BaseTableStatistics {
@@ -1348,7 +1348,8 @@ mod tests {
 
     #[test]
     fn build_table_statistics_decodes_int_min_max_without_using_value_count_as_ndv() {
-        use crate::sql::catalog::{ColumnDef, IcebergColumnStats, IcebergDataFileInfo};
+        use crate::catalog::schema::ColumnDef;
+        use crate::sql::catalog::{IcebergColumnStats, IcebergDataFileInfo};
 
         let file = IcebergDataFileInfo {
             path: "f1.parquet".to_string(),
@@ -1394,7 +1395,8 @@ mod tests {
 
     #[test]
     fn build_table_statistics_skips_string_bounds() {
-        use crate::sql::catalog::{ColumnDef, IcebergColumnStats, IcebergDataFileInfo};
+        use crate::catalog::schema::ColumnDef;
+        use crate::sql::catalog::{IcebergColumnStats, IcebergDataFileInfo};
 
         let file = IcebergDataFileInfo {
             path: "f1.parquet".to_string(),
@@ -1472,7 +1474,8 @@ mod tests {
 
     #[test]
     fn build_table_statistics_with_ndv_overrides_value_count_heuristic() {
-        use crate::sql::catalog::{ColumnDef, IcebergColumnStats, IcebergDataFileInfo};
+        use crate::catalog::schema::ColumnDef;
+        use crate::sql::catalog::{IcebergColumnStats, IcebergDataFileInfo};
 
         let file = IcebergDataFileInfo {
             path: "f1.parquet".to_string(),
@@ -1534,7 +1537,8 @@ mod tests {
 
     #[test]
     fn build_table_statistics_with_ndv_clamps_to_non_null_count() {
-        use crate::sql::catalog::{ColumnDef, IcebergColumnStats, IcebergDataFileInfo};
+        use crate::catalog::schema::ColumnDef;
+        use crate::sql::catalog::{IcebergColumnStats, IcebergDataFileInfo};
 
         let file = IcebergDataFileInfo {
             path: "f1.parquet".to_string(),
@@ -1620,7 +1624,8 @@ mod tests {
 
     #[test]
     fn build_base_table_statistics_keeps_puffin_ndv_without_manifest_column_stats() {
-        use crate::sql::catalog::{ColumnDef, IcebergDataFileInfo};
+        use crate::catalog::schema::ColumnDef;
+        use crate::sql::catalog::IcebergDataFileInfo;
 
         let file = IcebergDataFileInfo {
             path: "f1.parquet".to_string(),
@@ -1671,7 +1676,8 @@ mod tests {
 
     #[test]
     fn build_base_table_statistics_marks_heuristic_ndv_missing() {
-        use crate::sql::catalog::{ColumnDef, IcebergColumnStats, IcebergDataFileInfo};
+        use crate::catalog::schema::ColumnDef;
+        use crate::sql::catalog::{IcebergColumnStats, IcebergDataFileInfo};
 
         let file = IcebergDataFileInfo {
             path: "f1.parquet".to_string(),
@@ -1743,7 +1749,8 @@ mod tests {
 
     #[test]
     fn build_base_table_statistics_marks_missing_manifest_fields_missing() {
-        use crate::sql::catalog::{ColumnDef, IcebergColumnStats, IcebergDataFileInfo};
+        use crate::catalog::schema::ColumnDef;
+        use crate::sql::catalog::{IcebergColumnStats, IcebergDataFileInfo};
 
         let file = IcebergDataFileInfo {
             path: "f1.parquet".to_string(),
@@ -1809,7 +1816,8 @@ mod tests {
 
     #[test]
     fn build_base_table_statistics_treats_non_finite_float_bounds_as_missing() {
-        use crate::sql::catalog::{ColumnDef, IcebergColumnStats, IcebergDataFileInfo};
+        use crate::catalog::schema::ColumnDef;
+        use crate::sql::catalog::{IcebergColumnStats, IcebergDataFileInfo};
 
         let file = IcebergDataFileInfo {
             path: "f1.parquet".to_string(),
@@ -1898,7 +1906,8 @@ mod tests {
 
     #[test]
     fn build_base_table_statistics_preserves_puffin_ndv() {
-        use crate::sql::catalog::{ColumnDef, IcebergColumnStats, IcebergDataFileInfo};
+        use crate::catalog::schema::ColumnDef;
+        use crate::sql::catalog::{IcebergColumnStats, IcebergDataFileInfo};
 
         let file = IcebergDataFileInfo {
             path: "f1.parquet".to_string(),
@@ -1946,7 +1955,8 @@ mod tests {
 
     #[test]
     fn build_base_table_statistics_preserves_zero_puffin_ndv() {
-        use crate::sql::catalog::{ColumnDef, IcebergDataFileInfo};
+        use crate::catalog::schema::ColumnDef;
+        use crate::sql::catalog::IcebergDataFileInfo;
 
         let file = IcebergDataFileInfo {
             path: "f1.parquet".to_string(),

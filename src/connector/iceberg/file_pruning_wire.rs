@@ -20,8 +20,9 @@ use std::collections::{BTreeMap, HashMap};
 use arrow::datatypes::DataType;
 use thrift::OrderedFloat;
 
+use crate::catalog::schema::ColumnDef;
 use crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata;
-use crate::sql::catalog::{ColumnDef, IcebergColumnStats, IcebergDataFileInfo};
+use crate::sql::catalog::{IcebergColumnStats, IcebergDataFileInfo};
 use crate::thrift::{exprs, plan_nodes};
 
 pub(crate) fn iceberg_file_pruning_metadata_to_thrift(

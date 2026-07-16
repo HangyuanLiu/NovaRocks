@@ -29,8 +29,8 @@ use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
-use super::catalog::ColumnDef;
 use crate::catalog::identifier::normalize_identifier;
+use crate::catalog::schema::ColumnDef;
 use crate::formats::parquet::local_io::normalize_map_entries_nullability;
 use crate::sql::literal::{
     latin1_string_to_bytes, literal_to_i128_for_integer, parse_date_string_to_days,
@@ -661,8 +661,8 @@ fn build_local_literal_array(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::schema::ColumnDef;
     use crate::catalog::schema::ColumnDefault;
-    use crate::sql::catalog::ColumnDef;
     use arrow::datatypes::{DataType, Field, Fields};
 
     fn test_column(

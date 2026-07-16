@@ -646,7 +646,8 @@ impl ExpressionKindHint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::catalog::{CatalogProvider, ColumnDef, ScanSource, TableDef};
+    use crate::catalog::schema::ColumnDef;
+    use crate::sql::catalog::{CatalogProvider, ScanSource, TableDef};
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use std::sync::Arc;
 

@@ -642,6 +642,7 @@ mod tests {
     use arrow::datatypes::DataType;
     use thrift::OrderedFloat;
 
+    use crate::catalog::schema::ColumnDef;
     use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
     use crate::common::scan_predicate::{
         MembershipPredicate, ScanPredicate, ScanPredicateDomain, ScanPredicateSource,
@@ -650,7 +651,7 @@ mod tests {
         iceberg_file_pruning_metadata_from_thrift, iceberg_file_pruning_metadata_to_thrift,
     };
     use crate::fs::scan_context::FileScanRange;
-    use crate::sql::catalog::{ColumnDef, IcebergColumnStats, IcebergDataFileInfo};
+    use crate::sql::catalog::{IcebergColumnStats, IcebergDataFileInfo};
     use crate::thrift::{descriptors, exprs, plan_nodes, types};
 
     use super::{

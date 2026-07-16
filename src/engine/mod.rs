@@ -115,7 +115,7 @@ pub struct StandaloneOptions {
 }
 
 use crate::sql::catalog::LegacyRangePartition;
-pub use crate::sql::catalog::{CatalogProvider, ColumnDef, ScanSource, TableDef};
+pub use crate::sql::catalog::{CatalogProvider, ScanSource, TableDef};
 use crate::sql::parser::procedure::{looks_like_call_procedure, parse_call_procedure_sql};
 
 #[cfg(feature = "compat")]
@@ -4892,7 +4892,7 @@ path = "{metadata_path}"
                     catalog: catalog.to_string(),
                     namespace: namespace.to_string(),
                     table: table.to_string(),
-                    columns: vec![crate::sql::catalog::ColumnDef {
+                    columns: vec![crate::catalog::schema::ColumnDef {
                         name: "id".to_string(),
                         data_type: DataType::Int64,
                         nullable: false,
@@ -5365,9 +5365,8 @@ mysql_port = 47892
         crate::sql::codegen::fragment::NativeFragmentBundle,
         Option<crate::sql::codegen::fragment::RuntimeFilterPlanResult>,
     ) {
-        use crate::sql::catalog::{
-            ColumnDef, PhysicalTableLayout, ScanSource, StarRocksTabletRef, TableDef,
-        };
+        use crate::catalog::schema::ColumnDef;
+        use crate::sql::catalog::{PhysicalTableLayout, ScanSource, StarRocksTabletRef, TableDef};
         use crate::sql::parser::dialect::{StarRocksDialect, normalize_for_raw_parse};
 
         let mut catalog = super::InMemoryCatalog::default();
@@ -5716,14 +5715,14 @@ mysql_port = 47892
                 crate::sql::catalog::TableDef {
                     name: "b".to_string(),
                     columns: vec![
-                        crate::sql::catalog::ColumnDef {
+                        crate::catalog::schema::ColumnDef {
                             name: "k".to_string(),
                             data_type: DataType::Int64,
                             nullable: false,
                             write_default: None,
                             logical_type: None,
                         },
-                        crate::sql::catalog::ColumnDef {
+                        crate::catalog::schema::ColumnDef {
                             name: "v".to_string(),
                             data_type: DataType::Int64,
                             nullable: true,
@@ -5927,7 +5926,7 @@ mysql_port = 47892
 
     #[test]
     fn build_local_insert_batch_supports_array_columns() {
-        use crate::sql::catalog::ColumnDef;
+        use crate::catalog::schema::ColumnDef;
         use crate::sql::parser::ast::Literal;
 
         let columns = vec![
@@ -5998,8 +5997,8 @@ mysql_port = 47892
 
     #[test]
     fn build_local_insert_batch_supports_largeint_columns() {
+        use crate::catalog::schema::ColumnDef;
         use crate::common::largeint;
-        use crate::sql::catalog::ColumnDef;
         use crate::sql::parser::ast::Literal;
 
         let columns = vec![ColumnDef {
@@ -6041,7 +6040,7 @@ mysql_port = 47892
 
     #[test]
     fn build_local_insert_batch_accepts_integral_float_literals_for_bigint_arrays() {
-        use crate::sql::catalog::ColumnDef;
+        use crate::catalog::schema::ColumnDef;
         use crate::sql::parser::ast::Literal;
 
         let columns = vec![ColumnDef {
@@ -6074,7 +6073,7 @@ mysql_port = 47892
 
     #[test]
     fn build_local_insert_batch_drops_null_map_keys() {
-        use crate::sql::catalog::ColumnDef;
+        use crate::catalog::schema::ColumnDef;
         use crate::sql::parser::ast::Literal;
 
         // Arrow's Map layout requires `entries.key` to be non-nullable; map
@@ -6132,7 +6131,7 @@ mysql_port = 47892
 
     #[test]
     fn cast_batch_to_schema_relaxes_map_key_nullability() {
-        use crate::sql::catalog::ColumnDef;
+        use crate::catalog::schema::ColumnDef;
         use crate::sql::parser::ast::Literal;
 
         let source_entries_field = Arc::new(Field::new(
@@ -6196,7 +6195,7 @@ mysql_port = 47892
 
     #[test]
     fn local_parquet_round_trip_drops_null_map_keys() {
-        use crate::sql::catalog::ColumnDef;
+        use crate::catalog::schema::ColumnDef;
         use crate::sql::parser::ast::Literal;
 
         // Arrow's Map layout requires non-null keys; when a literal carries a

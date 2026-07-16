@@ -28,6 +28,7 @@ use arrow::array::{Array, BinaryArray, LargeBinaryArray, LargeStringArray, Strin
 use arrow::datatypes::DataType;
 
 use crate::catalog::identifier::normalize_identifier;
+use crate::catalog::schema::ColumnDef;
 use crate::engine::StandaloneState;
 use crate::engine::dictionary::model::{
     DictionaryOwner, DictionarySnapshot, DictionaryState, DictionaryValue, DictionaryWatermark,
@@ -37,7 +38,7 @@ use crate::meta::repository::id_scopes;
 use crate::runtime::query_result::QueryResult;
 #[cfg(test)]
 use crate::runtime::query_result::record_batch_to_chunk;
-use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+use crate::sql::catalog::{ScanSource, TableDef};
 
 /// Rebuild active dictionary snapshots for `database.table`'s string-typed
 /// columns. Returns the number of snapshots that were persisted. Both

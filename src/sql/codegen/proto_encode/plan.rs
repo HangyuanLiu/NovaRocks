@@ -1294,7 +1294,10 @@ fn scan_source_requires_resolved_binding(source: &catalog::ScanSource) -> bool {
 
 fn resolved_binding_table_columns(
     binding: &ResolvedScanBinding,
-) -> (Vec<catalog::ColumnDef>, Vec<catalog::ColumnDef>) {
+) -> (
+    Vec<crate::catalog::schema::ColumnDef>,
+    Vec<crate::catalog::schema::ColumnDef>,
+) {
     let mut columns = Vec::new();
     let mut metadata_columns = Vec::new();
     let mut seen = HashSet::new();
@@ -1323,7 +1326,10 @@ fn merged_bound_table_columns(
     src: &catalog::TableDef,
     scan_columns: &[AnalysisOutputColumn],
     binding: &ResolvedScanBinding,
-) -> (Vec<catalog::ColumnDef>, Vec<catalog::ColumnDef>) {
+) -> (
+    Vec<crate::catalog::schema::ColumnDef>,
+    Vec<crate::catalog::schema::ColumnDef>,
+) {
     let mut columns = src.columns.clone();
     let mut metadata_columns = src.iceberg_row_lineage_metadata_columns.clone();
     for bound in &binding.physical_columns {
@@ -1354,10 +1360,10 @@ fn merged_bound_table_columns(
 }
 
 fn overlay_bound_column(
-    columns: &mut Vec<catalog::ColumnDef>,
+    columns: &mut Vec<crate::catalog::schema::ColumnDef>,
     planner_name: &str,
     planner_source_name: Option<&str>,
-    source: &catalog::ColumnDef,
+    source: &crate::catalog::schema::ColumnDef,
 ) {
     if let Some(index) = columns.iter().position(|column| {
         column.name.eq_ignore_ascii_case(planner_name)
@@ -1370,7 +1376,10 @@ fn overlay_bound_column(
     }
 }
 
-fn replace_column_by_name(columns: &mut [catalog::ColumnDef], source: &catalog::ColumnDef) -> bool {
+fn replace_column_by_name(
+    columns: &mut [crate::catalog::schema::ColumnDef],
+    source: &crate::catalog::schema::ColumnDef,
+) -> bool {
     let Some(column) = columns
         .iter_mut()
         .find(|column| column.name.eq_ignore_ascii_case(&source.name))
@@ -1381,7 +1390,7 @@ fn replace_column_by_name(columns: &mut [catalog::ColumnDef], source: &catalog::
     true
 }
 
-fn encode_column_def(src: &catalog::ColumnDef) -> Result<plan::ColumnDef, String> {
+fn encode_column_def(src: &crate::catalog::schema::ColumnDef) -> Result<plan::ColumnDef, String> {
     Ok(plan::ColumnDef {
         name: src.name.clone(),
         data_type: Some(encode_type(&src.data_type)?),
@@ -1396,7 +1405,7 @@ fn encode_column_def(src: &catalog::ColumnDef) -> Result<plan::ColumnDef, String
 }
 
 fn encode_column_write_default_json(
-    column: &catalog::ColumnDef,
+    column: &crate::catalog::schema::ColumnDef,
     value: &ColumnDefault,
 ) -> Result<String, String> {
     validate_column_default(value)?;
@@ -1441,7 +1450,7 @@ fn encode_column_write_default_json(
     })
 }
 
-fn iceberg_type_for_column_def(column: &catalog::ColumnDef) -> Result<Type, String> {
+fn iceberg_type_for_column_def(column: &crate::catalog::schema::ColumnDef) -> Result<Type, String> {
     if let Some(logical_type) = column.logical_type.as_ref() {
         let mut next_field_id = 1;
         return crate::connector::iceberg::catalog::registry::iceberg_type_for_sql_type(
@@ -2655,7 +2664,7 @@ mod tests {
         data_type: DataType,
         value: ColumnDefault,
     ) -> Result<Option<String>, String> {
-        encode_column_def(&catalog::ColumnDef {
+        encode_column_def(&crate::catalog::schema::ColumnDef {
             name: "defaulted".to_string(),
             data_type,
             nullable: true,
@@ -3320,7 +3329,7 @@ mod tests {
         use crate::sql::codegen::proto_encode::plan;
 
         let plan = iceberg_delta_distributed_plan_for_test();
-        let source_column = catalog::ColumnDef {
+        let source_column = crate::catalog::schema::ColumnDef {
             name: "physical_order_id".to_string(),
             data_type: DataType::Int64,
             nullable: false,
@@ -3894,8 +3903,12 @@ mod tests {
         }
     }
 
-    fn column_def_for_test(name: &str, data_type: DataType, nullable: bool) -> catalog::ColumnDef {
-        catalog::ColumnDef {
+    fn column_def_for_test(
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+    ) -> crate::catalog::schema::ColumnDef {
+        crate::catalog::schema::ColumnDef {
             name: name.to_string(),
             data_type,
             nullable,
@@ -3948,7 +3961,7 @@ mod tests {
     fn iceberg_delta_table_for_test() -> catalog::TableDef {
         catalog::TableDef {
             name: "orders".to_string(),
-            columns: vec![catalog::ColumnDef {
+            columns: vec![crate::catalog::schema::ColumnDef {
                 name: "order_id".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,

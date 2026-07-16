@@ -635,12 +635,12 @@ mod tests {
         ExplainLevel, PlanNodeExplainStage, explain_plan, format_expr, format_project_item,
         format_shared_plan_node_header,
     };
+    use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::{
         BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
     };
     use crate::sql::catalog::{
-        ColumnDef, IcebergMvTargetLocatorScan, IcebergSchemaDef, IcebergTableInfo, ScanSource,
-        TableDef,
+        IcebergMvTargetLocatorScan, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::ApplyKind;
