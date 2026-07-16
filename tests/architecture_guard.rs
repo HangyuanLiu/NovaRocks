@@ -9804,6 +9804,63 @@ fn runtime_filter_transport_ingress_boundary_violations(
         .filter(|path| path.starts_with(&transport_prefix))
         .collect::<Vec<_>>();
 
+    let mut export_violations = Vec::new();
+    if matches!(source_rel, ADAPTER | SERVICE_INJECTION_OWNER) {
+        export_violations.extend(
+            rust_production_use_statements(text)
+                .into_iter()
+                .filter(|import| rust_use_is_public(import))
+                .filter(|import| {
+                    rust_use_path(import)
+                        .split("::")
+                        .eq(["crate", "runtime_filter", "port", "transport"])
+                        || rust_use_path(import)
+                            .strip_prefix("crate::runtime_filter::port::transport::")
+                            .is_some()
+                })
+                .map(|import| {
+                    format!(
+                        "{source_rel}: native runtime-filter transport surface must not be re-exported: {import}"
+                    )
+                }),
+        );
+
+        let production = rust_sanitized_production_text(text);
+        match syn::parse_file(&production).or_else(|_| syn::parse_file(text)) {
+            Ok(file) => {
+                #[derive(Default)]
+                struct PublicTypeAliasAudit {
+                    aliases: BTreeSet<String>,
+                }
+                impl<'ast> syn::visit::Visit<'ast> for PublicTypeAliasAudit {
+                    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+                        if !nfe_4_syn_attrs_require_test(&item.attrs) {
+                            syn::visit::visit_item_mod(self, item);
+                        }
+                    }
+
+                    fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+                        if !nfe_4_syn_attrs_require_test(&item.attrs)
+                            && !matches!(item.vis, syn::Visibility::Inherited)
+                        {
+                            self.aliases.insert(item.ident.to_string());
+                        }
+                    }
+                }
+                let mut audit = PublicTypeAliasAudit::default();
+                syn::visit::Visit::visit_file(&mut audit, &file);
+                export_violations.extend(audit.aliases.into_iter().map(|alias| {
+                        format!(
+                            "{source_rel}: native runtime-filter transport owner must not expose public type alias {alias}"
+                        )
+                    }));
+            }
+            Err(error) => export_violations.push(format!(
+                "{source_rel}: native runtime-filter transport export surface must parse: {error}"
+            )),
+        }
+    }
+
     if source_rel == ADAPTER {
         let forbidden_prefixes: &[&[&str]] = &[
             &["crate", "runtime_filter", "core"],
@@ -9818,28 +9875,31 @@ fn runtime_filter_transport_ingress_boundary_violations(
             &["crate", "service", "grpc_client"],
             &["crate", "service", "exchange_sender"],
         ];
-        return canonical
-            .iter()
-            .filter(|path| {
-                forbidden_prefixes.iter().any(|prefix| {
-                    path.iter()
-                        .map(String::as_str)
-                        .zip(prefix.iter().copied())
-                        .all(|(actual, expected)| actual == expected)
-                        && path.len() >= prefix.len()
+        export_violations.extend(
+            canonical
+                .iter()
+                .filter(|path| {
+                    forbidden_prefixes.iter().any(|prefix| {
+                        path.iter()
+                            .map(String::as_str)
+                            .zip(prefix.iter().copied())
+                            .all(|(actual, expected)| actual == expected)
+                            && path.len() >= prefix.len()
+                    })
                 })
-            })
-            .map(|path| {
-                format!(
-                    "{source_rel}: native runtime-filter ingress adapter cannot own {}",
-                    path.join("::")
-                )
-            })
-            .collect();
+                .map(|path| {
+                    format!(
+                        "{source_rel}: native runtime-filter ingress adapter cannot own {}",
+                        path.join("::")
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        return export_violations;
     }
 
     if source_rel == SERVICE_INJECTION_OWNER {
-        return transport_paths
+        export_violations.extend(transport_paths
             .into_iter()
             .filter(|path| {
                 path.as_slice()
@@ -9857,10 +9917,47 @@ fn runtime_filter_transport_ingress_boundary_violations(
                     path.join("::")
                 )
             })
-            .collect();
+            .collect::<Vec<_>>());
+        let allowed_adapter_paths: &[&[&str]] = &[
+            &[
+                "crate",
+                "service",
+                "grpc_runtime_filter_adapter",
+                "default_runtime_filter_envelope_ingress",
+            ],
+            &[
+                "crate",
+                "service",
+                "grpc_runtime_filter_adapter",
+                "handle_runtime_filter_envelope",
+            ],
+        ];
+        export_violations.extend(
+            canonical
+                .iter()
+                .filter(|path| {
+                    path.starts_with(&[
+                        "crate".to_string(),
+                        "service".to_string(),
+                        "grpc_runtime_filter_adapter".to_string(),
+                    ]) && !runtime_filter_path_is_exactly_allowlisted(path, allowed_adapter_paths)
+                })
+                .map(|path| {
+                    format!(
+                        "{source_rel}: GrpcService may consume only the two named adapter functions: {}",
+                        path.join("::")
+                    )
+                }),
+        );
+        return export_violations;
     }
 
-    transport_paths
+    let adapter_prefix = [
+        "crate".to_string(),
+        "service".to_string(),
+        "grpc_runtime_filter_adapter".to_string(),
+    ];
+    export_violations.extend(transport_paths
         .into_iter()
         .map(|path| {
             format!(
@@ -9868,7 +9965,19 @@ fn runtime_filter_transport_ingress_boundary_violations(
                 path.join("::")
             )
         })
-        .collect()
+        .collect::<Vec<_>>());
+    export_violations.extend(
+        canonical
+            .iter()
+            .filter(|path| path.starts_with(&adapter_prefix))
+            .map(|path| {
+                format!(
+                    "{source_rel}: runtime-filter transport adapter surface is private to GrpcService: {}",
+                    path.join("::")
+                )
+            }),
+    );
+    export_violations
 }
 
 fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> Vec<String> {
@@ -15243,6 +15352,9 @@ fn runtime_filter_channel_service_boundaries_are_default_deny_and_harness_only()
         .into_iter()
         .filter_map(|path| {
             let source_rel = rel(&path);
+            if source_rel == transport_source {
+                return None;
+            }
             let text = fs::read_to_string(path).expect("production source must be readable");
             rust_production_canonical_paths(&text, &source_rel)
                 .iter()
@@ -16556,6 +16668,67 @@ fn rfd4_m1_transport_ingress_detector_is_named_adapter_only_and_default_deny() {
         )
         .is_empty(),
         "GrpcService must not consume transport DTOs"
+    );
+
+    for (source_rel, source) in [
+        (
+            adapter,
+            "pub use crate::runtime_filter::port::transport::RuntimeFilterEnvelope as Hidden;",
+        ),
+        (
+            adapter,
+            "pub(crate) use crate::runtime_filter::port::transport::RuntimeFilterEnvelope as Hidden;",
+        ),
+        (
+            adapter,
+            "use crate::runtime_filter::port::transport::RuntimeFilterEnvelope as PrivateEnvelope; pub type Hidden = PrivateEnvelope;",
+        ),
+        (
+            adapter,
+            "use crate::runtime_filter::port::transport::RuntimeFilterEnvelope as PrivateEnvelope; pub(crate) type Hidden = PrivateEnvelope;",
+        ),
+        (
+            "src/service/grpc_server.rs",
+            "pub use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeIngress as Hidden;",
+        ),
+        (
+            "src/service/grpc_server.rs",
+            "pub(crate) use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeIngress as Hidden;",
+        ),
+        (
+            "src/service/grpc_server.rs",
+            "use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeIngress as PrivateIngress; pub type Hidden = PrivateIngress;",
+        ),
+        (
+            adapter,
+            "pub mod leak { pub type Hidden = crate::runtime_filter::port::transport::RuntimeFilterEnvelope; }",
+        ),
+        (
+            adapter,
+            "use crate::runtime_filter::port::transport::RuntimeFilterEnvelope as PrivateEnvelope; pub(in crate::service) type Hidden = PrivateEnvelope;",
+        ),
+    ] {
+        assert!(
+            !runtime_filter_transport_ingress_boundary_violations(source_rel, source).is_empty(),
+            "native ingress owners must not re-export or alias the transport surface: {source}"
+        );
+    }
+
+    assert!(
+        !runtime_filter_transport_ingress_boundary_violations(
+            "src/service/unknown_consumer.rs",
+            "use crate::service::grpc_runtime_filter_adapter::Hidden;",
+        )
+        .is_empty(),
+        "an indirect adapter-namespace alias must not bypass the transport owner ledger"
+    );
+    assert!(
+        runtime_filter_transport_ingress_boundary_violations(
+            adapter,
+            "#[cfg(test)] mod tests { pub type Fixture = crate::runtime_filter::port::transport::RuntimeFilterEnvelope; }",
+        )
+        .is_empty(),
+        "test-only type aliases do not expand the production export surface"
     );
 }
 
