@@ -34,6 +34,12 @@ pub(crate) enum RuntimeFilterEnvelopeKind {
     Ack,
 }
 
+impl RuntimeFilterEnvelopeKind {
+    const fn requires_producer_open(self) -> bool {
+        matches!(self, Self::Contribution | Self::ProducerClosed)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeFilterTransportError {
     kind: RuntimeFilterTransportErrorKind,
@@ -287,9 +293,30 @@ impl ProducerOpenMetadata {
         })
     }
 
+    pub(crate) fn try_from_raw_for_kind(
+        kind: RuntimeFilterEnvelopeKind,
+        local_partition_count: Option<u32>,
+    ) -> Result<Option<Self>, RuntimeFilterTransportError> {
+        validate_producer_open_presence(kind, local_partition_count.is_some())?;
+        local_partition_count.map(Self::try_new).transpose()
+    }
+
     pub(crate) const fn local_partition_count(self) -> NonZeroU32 {
         self.local_partition_count
     }
+}
+
+fn validate_producer_open_presence(
+    kind: RuntimeFilterEnvelopeKind,
+    is_present: bool,
+) -> Result<(), RuntimeFilterTransportError> {
+    if kind.requires_producer_open() && !is_present {
+        return Err(RuntimeFilterTransportError::producer_open_required(kind));
+    }
+    if !kind.requires_producer_open() && is_present {
+        return Err(RuntimeFilterTransportError::producer_open_forbidden(kind));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -331,16 +358,7 @@ impl RuntimeFilterEnvelope {
                 schema_digest.len(),
             ));
         }
-        let producer_open_required = matches!(
-            kind,
-            RuntimeFilterEnvelopeKind::Contribution | RuntimeFilterEnvelopeKind::ProducerClosed
-        );
-        if producer_open_required && producer_open.is_none() {
-            return Err(RuntimeFilterTransportError::producer_open_required(kind));
-        }
-        if !producer_open_required && producer_open.is_some() {
-            return Err(RuntimeFilterTransportError::producer_open_forbidden(kind));
-        }
+        validate_producer_open_presence(kind, producer_open.is_some())?;
         let identity_matches = match kind {
             RuntimeFilterEnvelopeKind::Contribution | RuntimeFilterEnvelopeKind::ProducerClosed => {
                 route_identity.as_contribution().is_some()

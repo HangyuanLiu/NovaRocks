@@ -55,10 +55,11 @@ pub(crate) fn handle_runtime_filter_envelope(
     let route_identity = route_identity
         .ok_or_else(|| invalid_argument("runtime filter route identity is missing"))?;
     let domain_route_identity = decode_route_identity(&route_identity)?;
-    let producer_open = producer_open
-        .map(|metadata| ProducerOpenMetadata::try_new(metadata.local_partition_count))
-        .transpose()
-        .map_err(transport_error)?;
+    let producer_open = ProducerOpenMetadata::try_from_raw_for_kind(
+        kind,
+        producer_open.map(|metadata| metadata.local_partition_count),
+    )
+    .map_err(transport_error)?;
     let envelope = RuntimeFilterEnvelope::try_new(
         kind,
         query_id,
@@ -482,6 +483,40 @@ mod tests {
                 "invalid producer-open metadata must be rejected"
             );
             assert_eq!(result.unwrap_err().code(), Code::InvalidArgument);
+            assert!(ingress.is_empty());
+        }
+    }
+
+    #[test]
+    fn forbidden_producer_open_presence_precedes_zero_count_validation() {
+        for kind in [
+            proto::filter::RuntimeFilterEnvelopeKind::Artifact,
+            proto::filter::RuntimeFilterEnvelopeKind::Unavailable,
+            proto::filter::RuntimeFilterEnvelopeKind::Ack,
+        ] {
+            let ingress = Arc::new(RecordingIngress::new(RuntimeFilterIngressResult::accepted()));
+            let mut request = valid_wire_envelope(kind);
+            request.producer_open = Some(proto::filter::RuntimeFilterProducerOpenMetadata {
+                local_partition_count: 0,
+            });
+
+            let error = handle_runtime_filter_envelope(ingress.clone(), request).unwrap_err();
+            assert_eq!(error.code(), Code::InvalidArgument);
+            assert_eq!(
+                error.message(),
+                format!(
+                    "runtime filter envelope kind {:?} forbids producer-open metadata",
+                    match kind {
+                        proto::filter::RuntimeFilterEnvelopeKind::Artifact =>
+                            RuntimeFilterEnvelopeKind::Artifact,
+                        proto::filter::RuntimeFilterEnvelopeKind::Unavailable =>
+                            RuntimeFilterEnvelopeKind::Unavailable,
+                        proto::filter::RuntimeFilterEnvelopeKind::Ack =>
+                            RuntimeFilterEnvelopeKind::Ack,
+                        _ => unreachable!(),
+                    }
+                )
+            );
             assert!(ingress.is_empty());
         }
     }
