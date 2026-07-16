@@ -187,6 +187,12 @@ impl RouteEventIdentity {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FinalDomainRejectionKind {
+    Contract(RuntimeContractViolationKind),
+    ResourceLimit,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeFilterEvent {
     DeploymentInstalled {
@@ -202,6 +208,16 @@ pub(crate) enum RuntimeFilterEvent {
     },
     DeltaDuplicateIgnored {
         identity: ContributionIdentity,
+    },
+    FinalDomainShardAccepted {
+        identity: ContributionIdentity,
+    },
+    FinalDomainShardDuplicate {
+        identity: ContributionIdentity,
+    },
+    FinalDomainShardRejected {
+        identity: ContributionIdentity,
+        rejection: FinalDomainRejectionKind,
     },
     OrderedUpdateStale {
         identity: ContributionIdentity,

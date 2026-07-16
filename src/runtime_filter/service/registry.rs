@@ -23,9 +23,9 @@ use crate::common::types::UniqueId;
 use crate::runtime_filter::core::channel::RuntimeFilterChannel;
 use crate::runtime_filter::materializer::bloom::BloomHashContract;
 use crate::runtime_filter::model::contract::{
-    ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
-    ContributionKind, CoverageWitnessId, ReductionRequirement, RuntimeFilterLifecycle,
-    RuntimeFilterLogicalDomain,
+    ArtifactCapability, BindingId, ChannelId, CompletionFenceKind, CompletionRequirement,
+    ConsumerActivation, ContributionKind, CoverageWitnessId, ReductionRequirement,
+    RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
 };
 use crate::runtime_filter::model::coverage::Coverage;
 use crate::runtime_filter::port::artifact::{
@@ -34,6 +34,9 @@ use crate::runtime_filter::port::artifact::{
 use crate::runtime_filter::port::events::{
     RouteEventIdentity, RuntimeFilterEvent, RuntimeFilterEventIdentity, RuntimeFilterEventSink,
 };
+use crate::runtime_filter::port::final_domain::{
+    CompletionFenceAuthority, RuntimeCompletionFenceContract,
+};
 use crate::runtime_filter::port::identity::{DeploymentEpoch, RouteEdgeId};
 use crate::runtime_filter::port::install::{
     RuntimeFilterChannelDeployment, RuntimeFilterInstallView,
@@ -41,6 +44,7 @@ use crate::runtime_filter::port::install::{
 use crate::runtime_filter::port::ordered_bound::RuntimeOrderContract;
 use crate::runtime_filter::port::producer::{
     InstallContractError, InstallContractErrorKind, InstallOutcome, ProducerPortKind,
+    RuntimeContractViolation, RuntimeContractViolationKind,
 };
 use crate::runtime_filter::port::subscription::{SubscriptionHandle, SubscriptionKind};
 use crate::runtime_filter::port::support::{
@@ -80,6 +84,32 @@ pub(super) struct ProducerRoute {
     pub(super) channel: Arc<RuntimeFilterChannel>,
     pub(super) expected_instances: BTreeSet<UniqueId>,
     pub(super) kind: ProducerPortKind,
+    pub(super) final_domain_seed: Option<FinalDomainAuthoritySeed>,
+}
+
+#[derive(Clone)]
+pub(super) struct FinalDomainAuthoritySeed {
+    contract: Arc<RuntimeCompletionFenceContract>,
+}
+
+impl FinalDomainAuthoritySeed {
+    fn new(contract: Arc<RuntimeCompletionFenceContract>) -> Self {
+        Self { contract }
+    }
+
+    pub(super) fn derive(
+        &self,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+    ) -> Result<CompletionFenceAuthority, RuntimeContractViolation> {
+        CompletionFenceAuthority::try_new(self.contract.clone(), binding_id, fragment_instance_id)
+            .map_err(|_| {
+                RuntimeContractViolation::new(
+                    RuntimeContractViolationKind::ProducerPortMismatch,
+                    "completion-fence authority could not be derived from the installed seed",
+                )
+            })
+    }
 }
 
 #[derive(Clone)]
@@ -474,9 +504,15 @@ impl DeploymentRegistry {
         }
 
         let candidate = (|| {
-            let channels = build_channels(self.query_id, &view, self.memory_account.clone())?;
-            let routing = build_routing(self.query_id, &view, &channels, self.events.clone())?;
-            Ok::<_, InstallContractError>((channels, routing))
+            let built = build_channels(self.query_id, &view, self.memory_account.clone())?;
+            let routing = build_routing(
+                self.query_id,
+                &view,
+                &built.channels,
+                &built.final_domain_seeds,
+                self.events.clone(),
+            )?;
+            Ok::<_, InstallContractError>((built.channels, routing))
         })();
         let (channels, routing) = match candidate {
             Ok(candidate) => candidate,
@@ -819,6 +855,7 @@ fn build_routing(
     query_id: UniqueId,
     view: &RuntimeFilterInstallView,
     channels: &BTreeMap<ChannelId, Arc<RuntimeFilterChannel>>,
+    final_domain_seeds: &BTreeMap<ChannelId, FinalDomainAuthoritySeed>,
     events: Arc<dyn RuntimeFilterEventSink>,
 ) -> Result<RoutingBuild, InstallContractError> {
     let mut build = RoutingBuild {
@@ -853,10 +890,21 @@ fn build_routing(
                     channel: channel.clone(),
                     expected_instances: producer.expected_fragment_instances().clone(),
                     kind: match deployment.reduction_requirement() {
+                        ReductionRequirement::SetUnion
+                            if matches!(
+                                deployment.completion_requirement(),
+                                CompletionRequirement::FencedFinalDomain(
+                                    CompletionFenceKind::CommittedDomainFrozen
+                                )
+                            ) =>
+                        {
+                            ProducerPortKind::FinalDomain
+                        }
                         ReductionRequirement::SetUnion => ProducerPortKind::Membership,
                         ReductionRequirement::TightenOrderedBound => ProducerPortKind::OrderedBound,
                         ReductionRequirement::MergeTopKSummary(_) => ProducerPortKind::TopKSummary,
                     },
+                    final_domain_seed: final_domain_seeds.get(channel_id).cloned(),
                 },
             );
         }
@@ -998,18 +1046,30 @@ fn validate_channel<'a>(
             "M1 supports only Membership logical domains",
         ));
     };
-    if channel.lifecycle() != RuntimeFilterLifecycle::CompleteOnce
-        || channel.reduction_requirement() != ReductionRequirement::SetUnion
-        || channel.allowed_contribution_kinds()
-            != &BTreeSet::from([
+    let ordinary = channel.lifecycle() == RuntimeFilterLifecycle::CompleteOnce
+        && channel.reduction_requirement() == ReductionRequirement::SetUnion
+        && channel.allowed_contribution_kinds()
+            == &BTreeSet::from([
                 ContributionKind::ValueDomainDelta,
                 ContributionKind::ProducerClosed,
             ])
-        || channel.completion_requirement() != CompletionRequirement::ProducerClosed
-    {
+        && channel.completion_requirement() == CompletionRequirement::ProducerClosed;
+    let fenced_final = channel.lifecycle() == RuntimeFilterLifecycle::CompleteOnce
+        && channel.reduction_requirement() == ReductionRequirement::SetUnion
+        && channel.allowed_contribution_kinds()
+            == &BTreeSet::from([
+                ContributionKind::FinalDomainShard,
+                ContributionKind::ProducerClosed,
+            ])
+        && channel.completion_requirement()
+            == CompletionRequirement::FencedFinalDomain(CompletionFenceKind::CommittedDomainFrozen)
+        && *null_semantics == crate::runtime_filter::model::contract::NullSemantics::NullSafeEqual
+        && channel.availability_coverage().is_all_of_only()
+        && channel.terminal_coverage().is_all_of_only();
+    if !ordinary && !fenced_final {
         return Err(install_error(
             InstallContractErrorKind::UnsupportedChannelContract,
-            "channel does not match the CompleteOnce Membership SetUnion M1 matrix",
+            "channel does not match the CompleteOnce Membership SetUnion matrix",
         ));
     }
     if MembershipValues::empty_for_data_type(value_type).is_none() {
@@ -1105,10 +1165,21 @@ fn validate_channel<'a>(
                 "consumer expected fragment instance set must be non-empty",
             ));
         }
-        if consumer.activation() != ConsumerActivation::BlockingSnapshot {
+        if ordinary && consumer.activation() != ConsumerActivation::BlockingSnapshot {
             return Err(install_error(
                 InstallContractErrorKind::InvalidConsumerActivation,
                 "M1 consumers must use BlockingSnapshot activation",
+            ));
+        }
+        if fenced_final
+            && !matches!(
+                consumer.activation(),
+                ConsumerActivation::NonBlockingLive { .. }
+            )
+        {
+            return Err(install_error(
+                InstallContractErrorKind::InvalidConsumerActivation,
+                "fenced-final consumers must use NonBlockingLive activation",
             ));
         }
         let capabilities = consumer.capabilities();
@@ -1120,6 +1191,20 @@ fn validate_channel<'a>(
             return Err(install_error(
                 InstallContractErrorKind::MissingMembershipCapability,
                 "M2 Membership consumers must declare Membership and EmptyDomain semantics",
+            ));
+        }
+        if fenced_final
+            && (capabilities
+                != &BTreeSet::from([
+                    ArtifactCapability::Membership,
+                    ArtifactCapability::EmptyDomain,
+                ])
+                || profile.accepted_kinds()
+                    != &BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]))
+        {
+            return Err(install_error(
+                InstallContractErrorKind::UnsupportedChannelContract,
+                "fenced-final consumers require exact Membership and EmptyDomain semantics",
             ));
         }
         if !profile.accepts(ArtifactKind::EmptyDomain) {
@@ -1471,30 +1556,78 @@ fn compute_deadlines(
         .collect()
 }
 
+struct BuiltChannels {
+    channels: BTreeMap<ChannelId, Arc<RuntimeFilterChannel>>,
+    final_domain_seeds: BTreeMap<ChannelId, FinalDomainAuthoritySeed>,
+}
+
 fn build_channels(
     query_id: UniqueId,
     view: &RuntimeFilterInstallView,
     memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
-) -> Result<BTreeMap<ChannelId, Arc<RuntimeFilterChannel>>, InstallContractError> {
-    view.channels()
-        .iter()
-        .map(|(channel_id, deployment)| {
-            RuntimeFilterChannel::new_unanchored(
-                query_id,
-                view.local_participant_id(),
-                view.epoch(),
-                deployment,
-                memory_account.clone(),
+) -> Result<BuiltChannels, InstallContractError> {
+    let mut channels = BTreeMap::new();
+    let mut final_domain_seeds = BTreeMap::new();
+    for (channel_id, deployment) in view.channels() {
+        let final_domain_contract = match (
+            deployment.logical_domain(),
+            deployment.completion_requirement(),
+        ) {
+            (
+                RuntimeFilterLogicalDomain::Membership {
+                    value_type,
+                    null_semantics,
+                },
+                CompletionRequirement::FencedFinalDomain(fence_kind),
+            ) => {
+                let schema =
+                    ArtifactMembershipSchema::new(value_type, *null_semantics).map_err(|_| {
+                        install_error(
+                            InstallContractErrorKind::UnsupportedChannelContract,
+                            "fenced-final channel has an unsupported membership schema",
+                        )
+                    })?;
+                Some(Arc::new(
+                    RuntimeCompletionFenceContract::try_from_install(
+                        query_id,
+                        view.epoch(),
+                        *channel_id,
+                        fence_kind,
+                        &schema,
+                    )
+                    .map_err(|error| {
+                        install_error(
+                            InstallContractErrorKind::UnsupportedChannelContract,
+                            error.to_string(),
+                        )
+                    })?,
+                ))
+            }
+            _ => None,
+        };
+        let channel = RuntimeFilterChannel::new_unanchored_with_final_domain_contract(
+            query_id,
+            view.local_participant_id(),
+            view.epoch(),
+            deployment,
+            memory_account.clone(),
+            final_domain_contract.clone(),
+        )
+        .map_err(|error| {
+            install_error(
+                InstallContractErrorKind::UnsupportedChannelContract,
+                error.to_string(),
             )
-            .map(|channel| (*channel_id, Arc::new(channel)))
-            .map_err(|error| {
-                install_error(
-                    InstallContractErrorKind::UnsupportedChannelContract,
-                    error.to_string(),
-                )
-            })
-        })
-        .collect()
+        })?;
+        channels.insert(*channel_id, Arc::new(channel));
+        if let Some(contract) = final_domain_contract {
+            final_domain_seeds.insert(*channel_id, FinalDomainAuthoritySeed::new(contract));
+        }
+    }
+    Ok(BuiltChannels {
+        channels,
+        final_domain_seeds,
+    })
 }
 
 fn install_views_equivalent(
@@ -1683,6 +1816,126 @@ mod tests {
                 ),
             )]),
         )
+    }
+
+    fn fenced_final_channel() -> RuntimeFilterChannelDeployment {
+        let witness = CoverageWitnessId::new(20);
+        let coverage = Coverage::AllOf(vec![Coverage::Leaf(witness)]);
+        RuntimeFilterChannelDeployment::new(
+            ChannelId::new(1),
+            RuntimeFilterLogicalDomain::Membership {
+                value_type: DataType::Int64,
+                null_semantics: NullSemantics::NullSafeEqual,
+            },
+            RuntimeFilterLifecycle::CompleteOnce,
+            coverage.clone(),
+            coverage,
+            ReductionRequirement::SetUnion,
+            BTreeSet::from([
+                ContributionKind::FinalDomainShard,
+                ContributionKind::ProducerClosed,
+            ]),
+            CompletionRequirement::FencedFinalDomain(CompletionFenceKind::CommittedDomainFrozen),
+            RuntimeFilterPolicyRequirement {
+                max_contribution_bytes: 1024,
+                max_artifact_bytes: 1024,
+                deadline_ms: 100,
+                max_retries: 3,
+            },
+            RuntimeFilterCoreBudget::new(4096),
+            MaterializationPolicy::for_test(),
+            BTreeMap::from([(
+                BindingId::new(10),
+                ProducerDeployment::new(witness, BTreeSet::from([uid(10)])),
+            )]),
+            BTreeMap::from([(
+                BindingId::new(30),
+                ConsumerDeployment::with_profile(
+                    ConsumerActivation::NonBlockingLive {
+                        late_apply: LateApplyGranularity::Batch,
+                    },
+                    BTreeSet::from([
+                        ArtifactCapability::Membership,
+                        ArtifactCapability::EmptyDomain,
+                    ]),
+                    ConsumerArtifactProfile::new(
+                        BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
+                        None,
+                    )
+                    .unwrap(),
+                    RouteEdgeId::new(40),
+                    BTreeSet::from([uid(30)]),
+                ),
+            )]),
+        )
+    }
+
+    #[test]
+    fn fenced_final_install_accepts_only_the_exact_aggregate_matrix_and_routes_typed_port() {
+        let deployment = fenced_final_channel();
+        assert!(validate_channel_contract(&deployment).is_ok());
+
+        let registry = registry();
+        registry.install(view([(1, deployment)])).unwrap();
+        assert_eq!(
+            registry
+                .active_installation()
+                .unwrap()
+                .producer(BindingId::new(10))
+                .unwrap()
+                .kind,
+            crate::runtime_filter::port::producer::ProducerPortKind::FinalDomain
+        );
+    }
+
+    #[test]
+    fn fenced_final_install_rejects_non_allof_or_blocking_consumer_contracts() {
+        let valid = fenced_final_channel();
+        let not_all_of = RuntimeFilterChannelDeployment::new(
+            valid.channel_id(),
+            valid.logical_domain().clone(),
+            valid.lifecycle(),
+            Coverage::AnyOf(vec![Coverage::Leaf(CoverageWitnessId::new(20))]),
+            Coverage::AnyOf(vec![Coverage::Leaf(CoverageWitnessId::new(20))]),
+            valid.reduction_requirement(),
+            valid.allowed_contribution_kinds().clone(),
+            valid.completion_requirement(),
+            valid.policy(),
+            valid.core_budget(),
+            valid.materialization_policy(),
+            valid.producers().clone(),
+            valid.consumers().clone(),
+        );
+        assert!(validate_channel_contract(&not_all_of).is_err());
+
+        let mut consumers = valid.consumers().clone();
+        let consumer = consumers.get(&BindingId::new(30)).unwrap();
+        consumers.insert(
+            BindingId::new(30),
+            ConsumerDeployment::with_profile(
+                ConsumerActivation::BlockingSnapshot,
+                consumer.capabilities().clone(),
+                consumer.artifact_profile().clone(),
+                consumer.loopback_route_edge_id(),
+                consumer.expected_fragment_instances().clone(),
+            ),
+        );
+        let blocking = RuntimeFilterChannelDeployment::new(
+            valid.channel_id(),
+            valid.logical_domain().clone(),
+            valid.lifecycle(),
+            valid.availability_coverage().clone(),
+            valid.terminal_coverage().clone(),
+            valid.reduction_requirement(),
+            valid.allowed_contribution_kinds().clone(),
+            valid.completion_requirement(),
+            valid.policy(),
+            valid.core_budget(),
+            valid.materialization_policy(),
+            valid.producers().clone(),
+            consumers,
+        );
+        assert!(validate_channel_contract(&blocking).is_err());
     }
 
     struct OrderedDeploymentFixture(RuntimeFilterChannelDeployment);

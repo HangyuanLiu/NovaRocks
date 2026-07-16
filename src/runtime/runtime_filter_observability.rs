@@ -242,6 +242,9 @@ impl From<&RuntimeFilterEvent> for RuntimeFilterChannelEventCoordinate {
             | RuntimeFilterEvent::ChannelCancelled { identity } => Self::Channel(*identity),
             RuntimeFilterEvent::DeltaAccepted { identity }
             | RuntimeFilterEvent::DeltaDuplicateIgnored { identity }
+            | RuntimeFilterEvent::FinalDomainShardAccepted { identity }
+            | RuntimeFilterEvent::FinalDomainShardDuplicate { identity }
+            | RuntimeFilterEvent::FinalDomainShardRejected { identity, .. }
             | RuntimeFilterEvent::OrderedUpdateStale { identity }
             | RuntimeFilterEvent::OrderedUpdateApplied { identity }
             | RuntimeFilterEvent::OrderedUpdateRejected { identity, .. }

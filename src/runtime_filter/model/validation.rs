@@ -63,6 +63,7 @@ pub(crate) enum GraphValidationErrorKind {
     MembershipContributionMissing,
     MembershipContributionMismatch,
     FinalDomainShardRequiresNullSafeEqual,
+    FencedFinalDomainCoverageMismatch,
     TopKSummaryCoverageMismatch,
     TopKSummaryMissingCoverageWitness(CoverageWitnessId),
     TopKSummaryConsumerCapabilityMismatch,
@@ -365,6 +366,12 @@ fn validate_channel_matrix(channel: &RuntimeFilterChannelSpec) -> Result<(), Gra
                 return Err(channel_error(
                     channel.channel_id,
                     GraphValidationErrorKind::FinalDomainShardRequiresNullSafeEqual,
+                ));
+            }
+            if has_final_shard && !channel.availability_coverage.is_all_of_only() {
+                return Err(channel_error(
+                    channel.channel_id,
+                    GraphValidationErrorKind::FencedFinalDomainCoverageMismatch,
                 ));
             }
             if !has_value_delta && !has_final_shard {
@@ -795,6 +802,80 @@ mod tests {
         }
 
         topk_summary_graph().validate().unwrap();
+    }
+
+    #[test]
+    fn validate_fenced_final_requires_exact_all_of_coverage() {
+        aggregate_graph()
+            .validate()
+            .expect("Aggregate helper must produce valid AllOf-only coverage");
+
+        let mut any_of = aggregate_graph();
+        let channel = any_of.channel_mut_for_test(ChannelId::new(1)).unwrap();
+        channel.availability_coverage =
+            Coverage::AnyOf(vec![Coverage::Leaf(CoverageWitnessId::new(1))]);
+        channel.terminal_coverage =
+            Coverage::AnyOf(vec![Coverage::Leaf(CoverageWitnessId::new(1))]);
+
+        assert_kind(
+            &any_of,
+            GraphValidationErrorKind::FencedFinalDomainCoverageMismatch,
+        );
+
+        let mut join_any_of = join_graph();
+        let channel = join_any_of.channel_mut_for_test(ChannelId::new(1)).unwrap();
+        channel.availability_coverage =
+            Coverage::AnyOf(vec![Coverage::Leaf(CoverageWitnessId::new(1))]);
+        channel.terminal_coverage =
+            Coverage::AnyOf(vec![Coverage::Leaf(CoverageWitnessId::new(1))]);
+        join_any_of
+            .validate()
+            .expect("ordinary Join membership may use equivalent AnyOf coverage");
+    }
+
+    #[test]
+    fn validate_fenced_final_keeps_exact_contribution_completion_and_activation() {
+        let mut mixed = aggregate_graph();
+        mixed
+            .channel_mut_for_test(ChannelId::new(1))
+            .unwrap()
+            .allowed_contribution_kinds
+            .insert(ContributionKind::ValueDomainDelta);
+        assert_kind(
+            &mixed,
+            GraphValidationErrorKind::MembershipContributionMismatch,
+        );
+
+        let mut wrong_completion = aggregate_graph();
+        if let RuntimeFilterBindingRole::Producer(requirement) = &mut wrong_completion
+            .binding_mut_for_test(BindingId::new(1))
+            .unwrap()
+            .role
+        {
+            requirement.completion_requirement = CompletionRequirement::ProducerClosed;
+        }
+        assert_kind(
+            &wrong_completion,
+            GraphValidationErrorKind::ProducerCompletionMismatch {
+                expected: CompletionRequirement::FencedFinalDomain(
+                    CompletionFenceKind::CommittedDomainFrozen,
+                ),
+                actual: CompletionRequirement::ProducerClosed,
+            },
+        );
+
+        let mut blocking = aggregate_graph();
+        if let RuntimeFilterBindingRole::Consumer(requirement) = &mut blocking
+            .binding_mut_for_test(BindingId::new(2))
+            .unwrap()
+            .role
+        {
+            requirement.activation = ConsumerActivation::BlockingSnapshot;
+        }
+        assert_kind(
+            &blocking,
+            GraphValidationErrorKind::BlockingFeedbackConsumer,
+        );
     }
 
     #[test]

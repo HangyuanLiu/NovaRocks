@@ -19,7 +19,6 @@ use std::collections::BTreeMap;
 
 use crate::runtime_filter::port::identity::{PartitionId, ProducerSequence};
 use crate::runtime_filter::port::subscription::UnavailableReason;
-use crate::runtime_filter::port::value_domain::ContributionFingerprint;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LogicalTerminal {
@@ -39,7 +38,7 @@ pub(crate) enum TerminalProgress {
 
 #[derive(Debug)]
 pub(crate) struct PartitionState {
-    pub(crate) seen: BTreeMap<ProducerSequence, ContributionFingerprint>,
+    pub(crate) seen: BTreeMap<ProducerSequence, [u8; 32]>,
     pub(crate) terminal_sequence: Option<ProducerSequence>,
     pub(crate) progress: TerminalProgress,
 }
@@ -151,7 +150,7 @@ mod tests {
         let delta = ValueDomainDelta::new(MembershipValues::int64([1]), false);
         partition
             .seen
-            .insert(ProducerSequence::new(999_999), delta.fingerprint());
+            .insert(ProducerSequence::new(999_999), delta.fingerprint().bytes());
         partition.terminal_sequence = Some(ProducerSequence::new(1_000_000));
         assert!(!partition.is_gapless());
 
@@ -159,7 +158,7 @@ mod tests {
         for sequence in [2_u64, 0, 1] {
             partition
                 .seen
-                .insert(ProducerSequence::new(sequence), delta.fingerprint());
+                .insert(ProducerSequence::new(sequence), delta.fingerprint().bytes());
         }
         partition.terminal_sequence = Some(ProducerSequence::new(3));
         assert!(partition.is_gapless());
