@@ -48,9 +48,9 @@
 //!
 //! # Scan-split policy (Scheme C)
 //!
-//! D2 scan split policy: scheme C — partition the codegen-built per_node_scan_ranges
+//! D2 scan split policy: scheme C — partition the preparation-built per_node_scan_ranges
 //! across instances. The scheduler never re-invokes to_thrift_scan, so the
-//! min_max/cloud_props/change_op context (only known at codegen) is preserved.
+//! min_max/cloud_props/change_op context (known during preparation) is preserved.
 //!
 //! Round-robin: `range[i]` goes to `instance[i % count]`.
 

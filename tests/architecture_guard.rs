@@ -2231,7 +2231,7 @@ fn planner_runtime_filter_source_inventory_covers_entire_src_tree() {
     fs::remove_dir_all(&root).ok();
     for relative in [
         "src/sql/planner/physical/runtime_filter.rs",
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "src/runtime/runtime_filter_duplicate.rs",
     ] {
         let path = root.join(relative);
@@ -2248,8 +2248,8 @@ fn planner_runtime_filter_source_inventory_covers_entire_src_tree() {
     assert_eq!(
         actual,
         BTreeSet::from([
+            "src/coordinator/scheduler/runtime_filter.rs".to_string(),
             "src/runtime/runtime_filter_duplicate.rs".to_string(),
-            "src/sql/codegen/fragment/runtime_filter.rs".to_string(),
             "src/sql/planner/physical/runtime_filter.rs".to_string(),
         ]),
         "runtime-filter type uniqueness must inspect every Rust source file"
@@ -3145,7 +3145,7 @@ fn coordinator_prepare_dependency_detector_is_source_aware() {
 
     assert_eq!(
         coordinator_prepare_dependency_violations_in(
-            "src/sql/codegen/scan/connector.rs",
+            "src/sql/codegen/proto_encode/plan.rs",
             "use crate::engine::*;",
         ),
         Vec::<String>::new(),
@@ -7649,9 +7649,9 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
     let planner = repo.join("src/sql/planner");
     let physical_owner = planner.join("physical/runtime_filter.rs");
     let distributed_owner = planner.join("distributed/runtime_filter.rs");
-    let codegen_owner = repo.join("src/sql/codegen/fragment/runtime_filter.rs");
+    let scheduler_owner = repo.join("src/coordinator/scheduler/runtime_filter.rs");
 
-    for owner in [&codegen_owner, &distributed_owner, &physical_owner] {
+    for owner in [&scheduler_owner, &distributed_owner, &physical_owner] {
         assert!(
             owner.is_file(),
             "missing runtime-filter stage owner: {}",
@@ -7683,7 +7683,7 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
                 "RuntimeFilterGraphProjection",
             ][..],
         ),
-        (&codegen_owner, &["PlannedRuntimeFilter"][..]),
+        (&scheduler_owner, &["PlannedRuntimeFilter"][..]),
     ] {
         for item in items {
             let declarations = lifecycle_sources
@@ -7757,10 +7757,10 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
         "distributed/mod.rs must not flat re-export runtime-filter projection types: {distributed_uses:?}"
     );
 
-    let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/fragment/mod.rs")).unwrap();
+    let scheduler_mod = fs::read_to_string(repo.join("src/coordinator/scheduler/mod.rs")).unwrap();
     assert!(
-        has_non_comment_line(&codegen_mod, "mod runtime_filter;"),
-        "codegen/fragment/mod.rs must declare its Planned runtime-filter owner"
+        has_non_comment_line(&scheduler_mod, "mod runtime_filter;"),
+        "coordinator/scheduler/mod.rs must declare its planned runtime-filter owner"
     );
 
     let builder_path = planner.join("distributed/build/runtime_filter_binding.rs");
@@ -22311,9 +22311,11 @@ fn nfe_4_ledger_audit_native_structure_and_external_ingress_are_fixed() {
 
     for source in [
         "src/sql/codegen/fragment/bundle.rs",
-        "src/sql/codegen/fragment/runtime_filter.rs",
-        "src/sql/codegen/scan/connector.rs",
-        "src/sql/codegen/scan/iceberg_delta.rs",
+        "src/connector/iceberg/scan_range.rs",
+        "src/connector/scan_model/starrocks.rs",
+        "src/connector/scan_planning/starrocks.rs",
+        "src/coordinator/prepare/iceberg_delta.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "src/sql/codegen/proto_encode/iceberg_delta_scan.rs",
         "src/sql/planner/distributed/build/runtime_filter_binding.rs",
     ] {
@@ -23784,8 +23786,11 @@ fn nfe_3_fe_owned_helpers_are_raw_starrocks_idl_free() {
         "src/runtime/fragment_exec_params.rs",
         "src/runtime/scan_range.rs",
         "src/runtime/native_fragment_wire.rs",
-        "src/sql/codegen/scan/connector.rs",
-        "src/sql/codegen/scan/iceberg_delta.rs",
+        "src/connector/iceberg/scan_range.rs",
+        "src/connector/scan_model/starrocks.rs",
+        "src/connector/scan_planning/starrocks.rs",
+        "src/coordinator/prepare/iceberg_delta.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "src/sql/codegen/proto_encode/iceberg_delta_scan.rs",
         "src/sql/planner/distributed/build/runtime_filter_binding.rs",
     ] {
@@ -23832,12 +23837,18 @@ fn nfe_3_fe_owned_helpers_are_raw_starrocks_idl_free() {
 fn nfe_3_native_planning_owners_are_named_explicitly() {
     let repo = Path::new(manifest_dir());
     let expected_owners = [
-        "src/sql/codegen/scan/iceberg_delta.rs",
+        "src/connector/iceberg/scan_range.rs",
+        "src/connector/scan_model/starrocks.rs",
+        "src/connector/scan_planning/starrocks.rs",
+        "src/coordinator/prepare/iceberg_delta.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "src/sql/codegen/proto_encode/iceberg_delta_scan.rs",
         "src/sql/planner/distributed/build/runtime_filter_binding.rs",
     ];
     let retired_owners = [
+        "src/sql/codegen/scan/mod.rs",
         "src/sql/codegen/scan/connector.rs",
+        "src/sql/codegen/scan/iceberg_delta.rs",
         "src/sql/codegen/connector_scan_wire.rs",
         "src/sql/codegen/iceberg_delta_scan_wire.rs",
         "src/sql/planner/distributed/build/runtime_filter_wire.rs",
@@ -23859,15 +23870,21 @@ fn nfe_3_native_planning_owners_are_named_explicitly() {
         }
     }
 
-    let scan_mod = fs::read_to_string(repo.join("src/sql/codegen/scan/mod.rs")).unwrap();
+    let prepare_mod = fs::read_to_string(repo.join("src/coordinator/prepare/mod.rs")).unwrap();
+    let scheduler_mod = fs::read_to_string(repo.join("src/coordinator/scheduler/mod.rs")).unwrap();
     let build_mod =
         fs::read_to_string(repo.join("src/sql/planner/distributed/build/mod.rs")).unwrap();
     let proto_mod = fs::read_to_string(repo.join("src/sql/codegen/proto_encode/mod.rs")).unwrap();
     for (source, text, required) in [
         (
-            "src/sql/codegen/scan/mod.rs",
-            scan_mod.as_str(),
-            &["pub(crate) mod iceberg_delta;"][..],
+            "src/coordinator/prepare/mod.rs",
+            prepare_mod.as_str(),
+            &["mod iceberg_delta;"][..],
+        ),
+        (
+            "src/coordinator/scheduler/mod.rs",
+            scheduler_mod.as_str(),
+            &["mod runtime_filter;"][..],
         ),
         (
             "src/sql/planner/distributed/build/mod.rs",
@@ -23888,7 +23905,8 @@ fn nfe_3_native_planning_owners_are_named_explicitly() {
         }
     }
     for (source, text) in [
-        ("src/sql/codegen/scan/mod.rs", scan_mod.as_str()),
+        ("src/coordinator/prepare/mod.rs", prepare_mod.as_str()),
+        ("src/coordinator/scheduler/mod.rs", scheduler_mod.as_str()),
         (
             "src/sql/planner/distributed/build/mod.rs",
             build_mod.as_str(),
@@ -24002,8 +24020,11 @@ fn nfe_3_native_planning_owners_are_named_explicitly() {
     }
 
     for source in [
-        "src/sql/codegen/scan/connector.rs",
-        "src/sql/codegen/scan/iceberg_delta.rs",
+        "src/connector/iceberg/scan_range.rs",
+        "src/connector/scan_model/starrocks.rs",
+        "src/connector/scan_planning/starrocks.rs",
+        "src/coordinator/prepare/iceberg_delta.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "src/sql/planner/distributed/build/runtime_filter_binding.rs",
     ] {
         if let Ok(text) = fs::read_to_string(repo.join(source)) {
@@ -24588,11 +24609,8 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
     let codegen_root = repo.join("src/sql/codegen");
     let codegen_mod = fs::read_to_string(codegen_root.join("mod.rs")).unwrap();
     let actual_root_modules = rust_module_item_declarations(&codegen_mod);
-    let expected_root_modules = BTreeSet::from([
-        "fragment".to_string(),
-        "proto_encode".to_string(),
-        "scan".to_string(),
-    ]);
+    let expected_root_modules =
+        BTreeSet::from(["fragment".to_string(), "proto_encode".to_string()]);
     if actual_root_modules != expected_root_modules {
         violations.push(format!(
             "src/sql/codegen/mod.rs: production modules must be exactly {expected_root_modules:?}, got {actual_root_modules:?}"
@@ -24601,6 +24619,7 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
 
     for retired in [
         "src/sql/codegen/ir",
+        "src/sql/codegen/scan/mod.rs",
         "src/sql/codegen/fragment_builder.rs",
         "src/sql/codegen/scalar_materialize.rs",
         "src/sql/codegen/fragment_request.rs",
@@ -24623,8 +24642,7 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
     let fragment_mod = fs::read_to_string(&fragment_mod_path).unwrap();
     let fragment_production = rust_sanitized_production_text(&fragment_mod);
     let actual_fragment_modules = rust_module_item_declarations(&fragment_production);
-    let expected_fragment_modules =
-        BTreeSet::from(["bundle".to_string(), "runtime_filter".to_string()]);
+    let expected_fragment_modules = BTreeSet::from(["bundle".to_string()]);
     if actual_fragment_modules != expected_fragment_modules {
         violations.push(format!(
             "src/sql/codegen/fragment/mod.rs: production modules must be exactly {expected_fragment_modules:?}, got {actual_fragment_modules:?}"
@@ -24635,6 +24653,7 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
         .into_iter()
         .map(|path| (rel(&path), fs::read_to_string(path).unwrap()))
         .collect::<Vec<_>>();
+    let production_sources = cgo_8_production_source_texts(repo);
     for (name, expected_owner) in [
         (
             "NativeFragmentBundle",
@@ -24642,11 +24661,15 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
         ),
         (
             "RuntimeFilterPlanResult",
-            "src/sql/codegen/fragment/runtime_filter.rs (1)",
+            "src/coordinator/scheduler/runtime_filter.rs (1)",
+        ),
+        (
+            "StarRocksScanSourceDescriptor",
+            "src/connector/scan_model/starrocks.rs (1)",
         ),
     ] {
         let owners = rust_named_declaration_owners(
-            &codegen_sources,
+            &production_sources,
             name,
             rust_named_type_declaration_count,
         );
@@ -26764,7 +26787,7 @@ fn nidl_e3_planner_ir_uses_native_partition_and_runtime_filter_types() {
         "src/sql/planner/physical/runtime_filter_placement.rs",
         "src/sql/planner/physical/stats.rs",
         "src/sql/planner/physical/vocab.rs",
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
     ] {
         let text = fs::read_to_string(repo.join(source)).unwrap();
         let text = rust_production_text_without_cfg_test(&text);
@@ -37431,6 +37454,17 @@ fn coor_3b_forbidden_path_violations(sources: &[Cgo8GuardSource]) -> Vec<String>
         let compact = compact_line(&production);
         let tokens = rust_use_tokens(&production);
 
+        if tokens
+            .iter()
+            .any(|token| token == "project_runtime_filters")
+            && !matches!(
+                source.path.as_str(),
+                "src/coordinator/prepare/mod.rs" | "src/sql/planner/distributed/runtime_filter.rs"
+            )
+        {
+            violations.push(format!("runtime-filter-projection-owner: {}", source.path));
+        }
+
         if matches!(
             source.path.as_str(),
             "src/sql/codegen/scan/binding.rs" | "src/sql/codegen/scan/preparation.rs"
@@ -37676,7 +37710,7 @@ fn coordinator_preparation_owner_guard_rejects_grouped_aliased_scan_reexport() {
 #[test]
 fn coordinator_preparation_owner_guard_allows_scan_binding_parameter() {
     let sources = [Cgo8GuardSource::new(
-        "src/sql/codegen/scan/connector.rs",
+        "src/coordinator/prepare/scan.rs",
         "fn encode(binding: &ScanBinding) { let _ = binding; }",
     )];
     assert!(
@@ -38325,16 +38359,34 @@ fn coordinator_scheduler_guard_rejects_terminal_reconstruction() {
 #[test]
 fn coordinator_runtime_filter_guard_rejects_graph_requirement() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "fn plan_runtime_filters(plan: &DistributedPlan) { let graph = plan.runtime_filter_graph(); assert!(!graph.is_empty()); }",
         "graph-derived-runtime-filter",
     );
 }
 
 #[test]
+fn coordinator_runtime_filter_guard_rejects_codegen_projection_call() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/codegen/fragment/bundle.rs",
+        "fn encode(plan: &DistributedPlan) { let _ = project_runtime_filters(plan); }",
+        "runtime-filter-projection-owner",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_scheduler_projection_call() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/scheduler/runtime_filter.rs",
+        "fn plan(plan: &DistributedPlan) { let _ = project_runtime_filters(plan); }",
+        "runtime-filter-projection-owner",
+    );
+}
+
+#[test]
 fn coordinator_runtime_filter_guard_rejects_raw_graph_method() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "fn plan_runtime_filters(plan: &DistributedPlan) { let _ = plan.r#runtime_filter_graph(); }",
         "graph-derived-runtime-filter",
     );
@@ -38343,7 +38395,7 @@ fn coordinator_runtime_filter_guard_rejects_raw_graph_method() {
 #[test]
 fn coordinator_runtime_filter_guard_rejects_aliased_graph_requirement() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "fn plan_runtime_filters(plan: &DistributedPlan) { let graph = plan.graph(); require_non_empty(graph); }",
         "graph-derived-runtime-filter",
     );
@@ -38352,7 +38404,7 @@ fn coordinator_runtime_filter_guard_rejects_aliased_graph_requirement() {
 #[test]
 fn coordinator_runtime_filter_guard_rejects_graph_ufcs() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "fn plan_runtime_filters(plan: &DistributedPlan) { let _ = DistributedPlan::runtime_filter_graph(plan); }",
         "graph-derived-runtime-filter",
     );
@@ -38361,7 +38413,7 @@ fn coordinator_runtime_filter_guard_rejects_graph_ufcs() {
 #[test]
 fn coordinator_runtime_filter_guard_rejects_scoped_graph_function_item() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "fn plan_runtime_filters(plan: &DistributedPlan) { let read = DistributedPlan::runtime_filter_graph; let _ = read(plan); }",
         "graph-derived-runtime-filter",
     );
@@ -38370,7 +38422,7 @@ fn coordinator_runtime_filter_guard_rejects_scoped_graph_function_item() {
 #[test]
 fn coordinator_runtime_filter_guard_rejects_parenthesized_graph_ufcs() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "fn plan_runtime_filters(plan: &DistributedPlan) { let _ = (DistributedPlan::runtime_filter_graph)(plan); }",
         "graph-derived-runtime-filter",
     );
@@ -38379,7 +38431,7 @@ fn coordinator_runtime_filter_guard_rejects_parenthesized_graph_ufcs() {
 #[test]
 fn coordinator_runtime_filter_guard_rejects_graph_field_access() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "fn plan_runtime_filters(plan: &DistributedPlan) { let _ = plan.runtime_filter_graph; }",
         "graph-derived-runtime-filter",
     );
@@ -38397,7 +38449,7 @@ fn coordinator_preparation_owner_guard_rejects_production_include_macro() {
 #[test]
 fn coordinator_runtime_filter_guard_rejects_graph_expr_struct_field() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "struct Holder { runtime_filter_graph: usize } fn make() { let _ = Holder { runtime_filter_graph: 0 }; }",
         "graph-derived-runtime-filter",
     );
@@ -38406,7 +38458,7 @@ fn coordinator_runtime_filter_guard_rejects_graph_expr_struct_field() {
 #[test]
 fn coordinator_runtime_filter_guard_rejects_graph_pattern_struct_field() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "struct Holder { graph: usize } fn read(holder: Holder) { let Holder { graph: _ } = holder; }",
         "graph-derived-runtime-filter",
     );
@@ -38415,7 +38467,7 @@ fn coordinator_runtime_filter_guard_rejects_graph_pattern_struct_field() {
 #[test]
 fn coordinator_runtime_filter_guard_rejects_graph_expression_macro_tokens() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "fn read() { inspect!(r#runtime_filter_graph); }",
         "graph-derived-runtime-filter",
     );
@@ -38424,7 +38476,7 @@ fn coordinator_runtime_filter_guard_rejects_graph_expression_macro_tokens() {
 #[test]
 fn coordinator_runtime_filter_guard_rejects_graph_read_through_self_field() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "struct Holder { plan: DistributedPlan } impl Holder { fn leak(&self) { let _ = self.plan.graph(); } }",
         "graph-derived-runtime-filter",
     );
@@ -38433,7 +38485,7 @@ fn coordinator_runtime_filter_guard_rejects_graph_read_through_self_field() {
 #[test]
 fn coordinator_runtime_filter_guard_rejects_graph_field_through_aliased_self_field() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "struct Holder { plan: DistributedPlan } impl Holder { fn leak(&self) { let first = &self.plan; let second = first; let _ = (*second).runtime_filter_graph; } }",
         "graph-derived-runtime-filter",
     );
@@ -38442,7 +38494,7 @@ fn coordinator_runtime_filter_guard_rejects_graph_field_through_aliased_self_fie
 #[test]
 fn coordinator_runtime_filter_guard_rejects_graph_read_through_parameter_type_alias() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "type P = DistributedPlan; fn leak(p: &P) { let _ = p.graph(); }",
         "graph-derived-runtime-filter",
     );
@@ -38451,7 +38503,7 @@ fn coordinator_runtime_filter_guard_rejects_graph_read_through_parameter_type_al
 #[test]
 fn coordinator_runtime_filter_guard_rejects_graph_read_through_aliased_named_self_field() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "type P = DistributedPlan; struct Holder { plan: P } impl Holder { fn leak(&self) { let _ = self.plan.graph(); } }",
         "graph-derived-runtime-filter",
     );
@@ -38460,7 +38512,7 @@ fn coordinator_runtime_filter_guard_rejects_graph_read_through_aliased_named_sel
 #[test]
 fn coordinator_runtime_filter_guard_rejects_graph_read_through_tuple_self_field() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "struct Holder(DistributedPlan); impl Holder { fn leak(&self) { let _ = self.0.graph(); } }",
         "graph-derived-runtime-filter",
     );
@@ -38469,28 +38521,28 @@ fn coordinator_runtime_filter_guard_rejects_graph_read_through_tuple_self_field(
 #[test]
 fn coordinator_runtime_filter_guard_rejects_graph_type_dependency() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "use crate::runtime_filter::model::graph::RuntimeFilterGraph; fn require(graph: &RuntimeFilterGraph) {}",
         "graph-derived-runtime-filter",
     );
 }
 
 #[test]
-fn coordinator_runtime_filter_guard_allows_read_only_graph_projection_owner() {
+fn coordinator_preparation_runtime_filter_guard_allows_projection_owner() {
     let sources = [Cgo8GuardSource::new(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/prepare/mod.rs",
         "use crate::sql::planner::distributed::runtime_filter::{RuntimeFilterGraphProjection, project_runtime_filters}; fn plan(plan: &DistributedPlan) { let _ = project_runtime_filters(plan); }",
     )];
     assert!(
         coor_3b_forbidden_path_violations(&sources).is_empty(),
-        "the independent RF sidecar owner may consume the sealed Graph projection API"
+        "preparation may consume the sealed Graph projection API"
     );
 }
 
 #[test]
 fn coordinator_runtime_filter_guard_rejects_unrelated_graph_method_in_opaque_scope() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "struct Other; impl Other { fn graph(&self) {} } fn inspect(other: &Other) { other.graph(); }",
         "graph-derived-runtime-filter",
     );
@@ -38523,7 +38575,7 @@ fn coordinator_runtime_filter_guard_allows_unrelated_self_field_graph_method() {
 #[test]
 fn coordinator_runtime_filter_guard_ignores_test_only_self_field_graph_read() {
     let sources = [Cgo8GuardSource::new(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "#[cfg(test)] struct Holder { plan: DistributedPlan } #[cfg(test)] impl Holder { fn leak(&self) { let _ = self.plan.runtime_filter_graph; } }",
     )];
     assert!(
@@ -38535,7 +38587,7 @@ fn coordinator_runtime_filter_guard_ignores_test_only_self_field_graph_read() {
 #[test]
 fn coordinator_runtime_filter_guard_ignores_test_only_impl_method_graph_read() {
     let sources = [Cgo8GuardSource::new(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "struct Other; impl Other { #[cfg(test)] fn inspect(&self) { self.graph(); } }",
     )];
     assert!(
@@ -38841,8 +38893,8 @@ fn coordinator_preparation_owner() {
         owner_violations.join("\n")
     );
     for root in [
+        "src/coordinator/prepare/",
         "src/coordinator/scheduler/",
-        "src/sql/codegen/scan/",
         "src/sql/codegen/fragment/",
         "src/sql/codegen/proto_encode/",
     ] {
@@ -38965,6 +39017,7 @@ fn cgo_13_preparation_owns_native_scan_and_runtime_filter_projection() {
         );
     }
     for retired in [
+        "src/sql/codegen/scan/mod.rs",
         "src/sql/codegen/scan/connector.rs",
         "src/sql/codegen/scan/iceberg_delta.rs",
         "src/sql/codegen/fragment/runtime_filter.rs",
@@ -38999,6 +39052,11 @@ fn cgo_13_preparation_owns_native_scan_and_runtime_filter_projection() {
     assert!(
         !repo.join("src/coordinator/prepare/native_scan.rs").exists(),
         "coordinator must not duplicate canonical connector scan models or planning"
+    );
+    let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/mod.rs")).unwrap();
+    assert!(
+        !has_module_declaration(&codegen_mod, "scan"),
+        "retired codegen scan module shell must be absent"
     );
 }
 

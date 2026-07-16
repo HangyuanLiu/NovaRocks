@@ -6395,15 +6395,15 @@ mysql_port = 47892
         assert!(text.contains("Profile: active="), "{text}");
     }
 
-    /// OQ-5 Task 6: codegen must project the query-global runtime-filter Graph
-    /// into native descriptors on the join node and an independent
-    /// coordinator-facing `RuntimeFilterPlanResult`. Exercises the full
+    /// OQ-5 Task 6: preparation must project the query-global runtime-filter
+    /// Graph for native descriptors on the join node and the scheduler-facing
+    /// `RuntimeFilterPlanResult`. Exercises the full
     /// standalone pipeline (analyze -> plan -> optimize -> planner RF Graph ->
-    /// codegen) over the test catalog's fact-like `tbl(id int, name varchar)`
-    /// joined to the small `date_dim` fixture on `id`.
+    /// preparation -> encode/schedule) over the test catalog's fact-like
+    /// `tbl(id int, name varchar)` joined to the small `date_dim` fixture on `id`.
     #[test]
     #[cfg(feature = "compat")]
-    fn codegen_projects_graph_runtime_filters_into_native_and_coordinator_artifacts() {
+    fn preparation_projects_graph_runtime_filters_into_native_and_scheduler_artifacts() {
         let (_prepared, native_bundle, runtime_filters) =
             build_fragments_for_query("SELECT count(*) FROM tbl a JOIN date_dim b ON a.id = b.id");
         fn has_build_filter(node: &crate::proto::plan::DistributedNode) -> bool {
