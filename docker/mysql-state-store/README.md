@@ -20,22 +20,33 @@ source docker/mysql-state-store/runtime/current/env.sh
 
 `up.sh --prepare-only` creates the private runtime files without starting
 Docker. `up.sh` starts MySQL, provisions a non-destructive readiness database
-through the sole database owner, and verifies real SQL readiness. `status.sh`
-repeats the SQL checks. `down.sh` removes only this worktree runtime by default;
-`down.sh --docker` also stops its Compose project and is safe before prepare or
-after a partial startup.
+through the sole database owner, removes any prior readiness database owned by
+the same worktree, and verifies real SQL readiness. `status.sh` repeats the SQL
+checks. While the Compose project is running, `down.sh` retains its backing
+runtime so the container cannot lose its generated secrets or configuration.
+`down.sh --docker` stops the derived worktree Compose project and then removes
+the runtime; both forms derive the project identity and are safe before prepare
+or after a partial startup.
 
 Tests that mutate schema or coordinate multiple processes must request a unique
 database:
 
 ```bash
 db="$(docker/mysql-state-store/provision-test-database.sh create my-case)"
-trap 'docker/mysql-state-store/provision-test-database.sh drop "$db" || true' EXIT
+trap 'docker/mysql-state-store/provision-test-database.sh drop "$db"' EXIT
 ```
 
-The ordinary provider user has only table DDL/DML privileges inside databases
-created by this helper. The independent provisioner credential never belongs
-in provider configuration, helper protocols, or debug output.
+The ordinary provider user has only table DDL/DML privileges on the fixed
+state-store, readiness, and physical-probe table names inside databases created
+by this helper. It cannot create or drop databases. The independent provisioner
+credential never belongs in provider configuration, helper protocols, process
+arguments, or debug output.
+
+Concurrent physical probes use explicit MySQL named-lock barriers. Each worker
+publishes a readiness marker only after establishing the transaction state
+under test, then blocks behind a gate connection until the coordinator performs
+the competing operation. Gate release uses the discovered connection ID, so
+snapshot, deadlock, and lock-timeout ordering does not depend on fixed sleeps.
 
 ## Auxiliary mechanism evidence
 

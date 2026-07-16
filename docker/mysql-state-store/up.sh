@@ -176,6 +176,7 @@ else
   provisioner_password="$(random_hex 24)"
   database=""
 fi
+previous_database="$database"
 
 write_runtime_files "$database"
 rm -f "$current_link"
@@ -204,7 +205,7 @@ pinned_image="$(run_with_timeout 15 docker compose \
   -p "$compose_project" \
   -f "$compose_file" \
   config --images | awk 'NF { print; exit }')"
-if docker image inspect "$pinned_image" >/dev/null 2>&1; then
+if run_with_timeout 15 docker image inspect "$pinned_image" >/dev/null 2>&1; then
   echo "Using locally verified pinned MySQL image"
 else
   run_with_timeout "$docker_timeout" docker compose \
@@ -236,6 +237,9 @@ done
 if [[ -z "$ready_database" ]]; then
   echo "MySQL did not become ready for provisioned SQL within ${ready_timeout}s" >&2
   exit 1
+fi
+if [[ -n "$previous_database" && "$previous_database" != "$ready_database" ]]; then
+  "$SCRIPT_DIR/provision-test-database.sh" drop "$previous_database"
 fi
 
 write_runtime_files "$ready_database"

@@ -32,6 +32,19 @@ test -n "$NOVA_MYSQL_PROVISIONER_PASSWORD"
 test -n "$NOVAROCKS_MYSQL_USERNAME"
 test -n "$NOVAROCKS_MYSQL_PASSWORD"
 
+PROVIDER_TABLE_PRIVILEGES="SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX"
+PROVIDER_TABLES=(
+  state_store_meta
+  state_store_kv
+  state_store_changes
+  state_store_commits
+  fixture_readiness
+  ss3_probe_keys
+  ss3_probe_snapshot
+  ss3_probe_locks
+  ss3_probe_key_3073
+)
+
 run_with_timeout() {
   local timeout_seconds="$1"
   shift
@@ -72,8 +85,14 @@ usage() {
 
 drop_database() {
   local database="$1"
-  mysql_admin --execute="REVOKE ALL PRIVILEGES ON \`${database}\`.* FROM '${NOVAROCKS_MYSQL_USERNAME}'@'%';" >/dev/null 2>&1 || true
-  mysql_admin --execute="DROP DATABASE IF EXISTS \`${database}\`;" >/dev/null
+  {
+    local table
+    for table in "${PROVIDER_TABLES[@]}"; do
+      printf "REVOKE IF EXISTS %s ON \`%s\`.\`%s\` FROM '%s'@'%%';\n" \
+        "$PROVIDER_TABLE_PRIVILEGES" "$database" "$table" "$NOVAROCKS_MYSQL_USERNAME"
+    done
+  } | mysql_admin >/dev/null
+  printf 'DROP DATABASE IF EXISTS `%s`;\n' "$database" | mysql_admin >/dev/null
 }
 
 if [[ "$#" -ne 2 ]]; then
@@ -96,16 +115,26 @@ case "$action" in
     database="${database:0:64}"
     created_database="$database"
     rollback_create() {
-      drop_database "$created_database" || true
+      local original_status="$?"
+      trap - EXIT
+      if ! drop_database "$created_database"; then
+        echo "failed to roll back test database creation: $created_database" >&2
+        exit 1
+      fi
+      exit "$original_status"
     }
     trap rollback_create EXIT
-    mysql_admin --execute="
-      CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
-      CREATE USER IF NOT EXISTS '${NOVAROCKS_MYSQL_USERNAME}'@'%' IDENTIFIED BY '${NOVAROCKS_MYSQL_PASSWORD}';
-      GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX ON \`${database}\`.* TO '${NOVAROCKS_MYSQL_USERNAME}'@'%';
-    " >/dev/null
-    trap - EXIT
+    {
+      printf 'CREATE DATABASE `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;\n' "$database"
+      printf "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED BY '%s';\n" \
+        "$NOVAROCKS_MYSQL_USERNAME" "$NOVAROCKS_MYSQL_PASSWORD"
+      for table in "${PROVIDER_TABLES[@]}"; do
+        printf "GRANT %s ON \`%s\`.\`%s\` TO '%s'@'%%';\n" \
+          "$PROVIDER_TABLE_PRIVILEGES" "$database" "$table" "$NOVAROCKS_MYSQL_USERNAME"
+      done
+    } | mysql_admin >/dev/null
     printf '%s\n' "$database"
+    trap - EXIT
     ;;
   drop)
     if [[ ! "$argument" =~ ^novarocks_ss3_[A-Za-z0-9_]{1,49}$ || "${#argument}" -gt 64 ]]; then

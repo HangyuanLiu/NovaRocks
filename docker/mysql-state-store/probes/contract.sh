@@ -75,16 +75,136 @@ mysql_client() {
     exec -T mysql mysql \
     --defaults-extra-file=/run/secrets/novarocks-mysql-provider.cnf \
     --database="$NOVAROCKS_MYSQL_DATABASE" \
-    --batch --skip-column-names "$@"
+    --batch --skip-column-names --unbuffered "$@"
 }
 
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/novarocks-ss3-probes.XXXXXX")"
+background_pids=()
 cleanup() {
-  rm -rf "$tmp_dir"
+  local original_status="$?"
+  local pid
+  local cleanup_deadline
+  trap - EXIT
+  for pid in "${background_pids[@]}"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1; then
+      kill -TERM -- "-$pid" >/dev/null 2>&1 || true
+    fi
+  done
+  cleanup_deadline=$((SECONDS + 5))
+  while (( SECONDS < cleanup_deadline )); do
+    local running=false
+    for pid in "${background_pids[@]}"; do
+      if [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1; then
+        running=true
+        break
+      fi
+    done
+    if [[ "$running" == false ]]; then
+      break
+    fi
+    sleep 0.1
+  done
+  for pid in "${background_pids[@]}"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1; then
+      kill -KILL -- "-$pid" >/dev/null 2>&1 || true
+    fi
+  done
+  for pid in "${background_pids[@]}"; do
+    if [[ -n "$pid" ]]; then
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+  if ! run_with_timeout 10 rm -rf "$tmp_dir"; then
+    echo "failed to remove MySQL physical probe temporary directory" >&2
+    exit 1
+  fi
+  exit "$original_status"
 }
 trap cleanup EXIT
 
+forget_background_pid() {
+  local completed_pid="$1"
+  local retained=()
+  local pid
+  for pid in "${background_pids[@]}"; do
+    if [[ "$pid" != "$completed_pid" ]]; then
+      retained+=("$pid")
+    fi
+  done
+  background_pids=("${retained[@]}")
+}
+
+wait_for_marker() {
+  local file="$1"
+  local marker="$2"
+  local deadline=$((SECONDS + 15))
+  while (( SECONDS < deadline )); do
+    if grep -Fx "$marker" "$file" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "timed out waiting for probe barrier: $marker" >&2
+  return 1
+}
+
+barrier_prefix="ss3_${BASHPID}"
+gate_pid=""
+gate_connection_id=""
+start_gate() {
+  local gate_name="$1"
+  local gate_label="$2"
+  set -m
+  (
+    set +e
+    mysql_client --execute="
+      SELECT CONCAT('gate_connection=', CONNECTION_ID());
+      SELECT CONCAT('gate_ready=', GET_LOCK('${gate_name}', 0));
+      SELECT SLEEP(30);
+    " >"$tmp_dir/${gate_label}.out" 2>"$tmp_dir/${gate_label}.err"
+    printf '%s\n' "$?" > "$tmp_dir/${gate_label}.rc"
+  ) &
+  gate_pid="$!"
+  set +m
+  background_pids+=("$gate_pid")
+  wait_for_marker "$tmp_dir/${gate_label}.out" "gate_ready=1"
+  gate_connection_id="$(sed -n 's/^gate_connection=//p' "$tmp_dir/${gate_label}.out")"
+  if [[ ! "$gate_connection_id" =~ ^[1-9][0-9]*$ ]]; then
+    echo "failed to discover MySQL gate connection for $gate_label" >&2
+    return 1
+  fi
+}
+
+release_gate() {
+  local gate_label="$1"
+  mysql_client --execute="KILL CONNECTION ${gate_connection_id};" >/dev/null
+  set +e
+  wait "$gate_pid"
+  local gate_rc="$?"
+  set -e
+  forget_background_pid "$gate_pid"
+  test "$gate_rc" -ne 124
+  gate_pid=""
+  gate_connection_id=""
+  grep -E 'ERROR (1317|2013) ' "$tmp_dir/${gate_label}.err" >/dev/null
+}
+
 mysql_client < "$SCRIPT_DIR/schema.sql"
+
+database_keyword="DATABASE"
+create_keyword="CREATE"
+drop_keyword="DROP"
+for denied_keyword in "$create_keyword" "$drop_keyword"; do
+  set +e
+  mysql_client --execute="${denied_keyword} ${database_keyword} novarocks_ss3_forbidden_privilege" \
+    >"$tmp_dir/privilege-${denied_keyword}.out" \
+    2>"$tmp_dir/privilege-${denied_keyword}.err"
+  denied_rc="$?"
+  set -e
+  test "$denied_rc" -ne 0
+  grep -E 'ERROR (1044|1045) \(42000\)' "$tmp_dir/privilege-${denied_keyword}.err" >/dev/null
+done
+printf 'CHECK SS3_MYSQL_PROBE_PRIVILEGE_SEPARATION_PASS\n'
 
 mysql_client --execute="
   INSERT INTO ss3_probe_keys(key_bytes, value_bytes)
@@ -155,22 +275,33 @@ mysql_client --execute="
   DELETE FROM ss3_probe_snapshot;
   INSERT INTO ss3_probe_snapshot VALUES (1, 10);
 "
+snapshot_gate="${barrier_prefix}_snapshot_gate"
+snapshot_ready="${barrier_prefix}_snapshot_ready"
+start_gate "$snapshot_gate" "snapshot-gate"
+set -m
 (
   set +e
   mysql_client --execute="
     SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
     START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY;
     SELECT CONCAT('before=', value_bytes) FROM ss3_probe_snapshot WHERE id = 1;
-    DO SLEEP(3);
+    SELECT CONCAT('snapshot_reader_ready=', GET_LOCK('${snapshot_ready}', 0));
+    SELECT GET_LOCK('${snapshot_gate}', 15);
     SELECT CONCAT('after=', value_bytes) FROM ss3_probe_snapshot WHERE id = 1;
+    SELECT RELEASE_LOCK('${snapshot_gate}');
+    SELECT RELEASE_LOCK('${snapshot_ready}');
     COMMIT;
   " >"$tmp_dir/snapshot-reader.out" 2>"$tmp_dir/snapshot-reader.err"
   printf '%s\n' "$?" > "$tmp_dir/snapshot-reader.rc"
 ) &
 snapshot_reader="$!"
-sleep 1
+set +m
+background_pids+=("$snapshot_reader")
+wait_for_marker "$tmp_dir/snapshot-reader.out" "snapshot_reader_ready=1"
 mysql_client --execute="UPDATE ss3_probe_snapshot SET value_bytes = 20 WHERE id = 1;"
+release_gate "snapshot-gate"
 wait "$snapshot_reader"
+forget_background_pid "$snapshot_reader"
 test "$(cat "$tmp_dir/snapshot-reader.rc")" = "0"
 grep -Fx 'before=10' "$tmp_dir/snapshot-reader.out" >/dev/null
 grep -Fx 'after=10' "$tmp_dir/snapshot-reader.out" >/dev/null
@@ -178,63 +309,103 @@ test "$(mysql_client --execute="SELECT value_bytes FROM ss3_probe_snapshot WHERE
 printf 'PASS SS3_MYSQL_PROBE_RR_SNAPSHOT_PASS\n'
 
 mysql_client --execute="DELETE FROM ss3_probe_snapshot;"
+dual_gate="${barrier_prefix}_dual_gate"
+start_gate "$dual_gate" "dual-gate"
 for reader in one two; do
+  reader_ready="${barrier_prefix}_reader_${reader}_ready"
+  set -m
   (
     set +e
     mysql_client --execute="
       SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
       START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY;
-      SELECT CONCAT('observed=', COUNT(*))
+      SELECT CONCAT('observed_before=', COUNT(*))
       FROM ss3_probe_snapshot
       WHERE id >= 100 AND id < 200;
-      DO SLEEP(2);
+      SELECT CONCAT('reader_${reader}_ready=', GET_LOCK('${reader_ready}', 0));
+      SELECT GET_LOCK('${dual_gate}', 15);
+      SELECT CONCAT('observed_after=', COUNT(*))
+      FROM ss3_probe_snapshot
+      WHERE id >= 100 AND id < 200;
+      SELECT RELEASE_LOCK('${dual_gate}');
+      SELECT RELEASE_LOCK('${reader_ready}');
       COMMIT;
     " >"$tmp_dir/reader-${reader}.out" 2>"$tmp_dir/reader-${reader}.err"
     printf '%s\n' "$?" > "$tmp_dir/reader-${reader}.rc"
   ) &
+  set +m
   eval "reader_${reader}=$!"
+  background_pids+=("$!")
 done
+wait_for_marker "$tmp_dir/reader-one.out" "reader_one_ready=1"
+wait_for_marker "$tmp_dir/reader-two.out" "reader_two_ready=1"
+mysql_client --execute="INSERT INTO ss3_probe_snapshot VALUES (100, 100);"
+release_gate "dual-gate"
 wait "$reader_one"
+forget_background_pid "$reader_one"
 wait "$reader_two"
+forget_background_pid "$reader_two"
 for reader in one two; do
   test "$(cat "$tmp_dir/reader-${reader}.rc")" = "0"
-  grep -Fx 'observed=0' "$tmp_dir/reader-${reader}.out" >/dev/null
+  grep -Fx 'observed_before=0' "$tmp_dir/reader-${reader}.out" >/dev/null
+  grep -Fx 'observed_after=0' "$tmp_dir/reader-${reader}.out" >/dev/null
 done
+test "$(mysql_client --execute="SELECT COUNT(*) FROM ss3_probe_snapshot WHERE id = 100;")" = "1"
 printf 'PASS SS3_MYSQL_PROBE_RR_DUAL_NONLOCKING_READERS_PASS\n'
 
 mysql_client --execute="
   DELETE FROM ss3_probe_locks;
   INSERT INTO ss3_probe_locks VALUES (1, 0), (2, 0), (3, 0), (4, 0);
 "
+deadlock_gate="${barrier_prefix}_deadlock_gate"
+deadlock_a_ready="${barrier_prefix}_deadlock_a_ready"
+deadlock_b_ready="${barrier_prefix}_deadlock_b_ready"
+start_gate "$deadlock_gate" "deadlock-gate"
+set -m
 (
   set +e
   mysql_client --execute="
     SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
     START TRANSACTION;
     UPDATE ss3_probe_locks SET value_bytes = value_bytes + 1 WHERE id = 1;
-    DO SLEEP(2);
+    SELECT CONCAT('deadlock_a_ready=', GET_LOCK('${deadlock_a_ready}', 0));
+    SELECT GET_LOCK('${deadlock_gate}', 15);
     UPDATE ss3_probe_locks SET value_bytes = value_bytes + 1 WHERE id = 2;
+    SELECT RELEASE_LOCK('${deadlock_gate}');
+    SELECT RELEASE_LOCK('${deadlock_a_ready}');
     COMMIT;
   " >"$tmp_dir/deadlock-a.out" 2>"$tmp_dir/deadlock-a.err"
   printf '%s\n' "$?" > "$tmp_dir/deadlock-a.rc"
 ) &
 deadlock_a="$!"
-sleep 1
+set +m
+background_pids+=("$deadlock_a")
+set -m
 (
   set +e
   mysql_client --execute="
     SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
     START TRANSACTION;
     UPDATE ss3_probe_locks SET value_bytes = value_bytes + 1 WHERE id = 2;
-    DO SLEEP(2);
+    SELECT CONCAT('deadlock_b_ready=', GET_LOCK('${deadlock_b_ready}', 0));
+    SELECT GET_LOCK('${deadlock_gate}', 15);
     UPDATE ss3_probe_locks SET value_bytes = value_bytes + 1 WHERE id = 1;
+    SELECT RELEASE_LOCK('${deadlock_gate}');
+    SELECT RELEASE_LOCK('${deadlock_b_ready}');
     COMMIT;
   " >"$tmp_dir/deadlock-b.out" 2>"$tmp_dir/deadlock-b.err"
   printf '%s\n' "$?" > "$tmp_dir/deadlock-b.rc"
 ) &
 deadlock_b="$!"
+set +m
+background_pids+=("$deadlock_b")
+wait_for_marker "$tmp_dir/deadlock-a.out" "deadlock_a_ready=1"
+wait_for_marker "$tmp_dir/deadlock-b.out" "deadlock_b_ready=1"
+release_gate "deadlock-gate"
 wait "$deadlock_a"
+forget_background_pid "$deadlock_a"
 wait "$deadlock_b"
+forget_background_pid "$deadlock_b"
 deadlock_a_rc="$(cat "$tmp_dir/deadlock-a.rc")"
 deadlock_b_rc="$(cat "$tmp_dir/deadlock-b.rc")"
 if [[ "$deadlock_a_rc" = "0" ]]; then
@@ -245,18 +416,27 @@ fi
 cat "$tmp_dir/deadlock-a.err" "$tmp_dir/deadlock-b.err" | grep -F 'ERROR 1213 (40001)' >/dev/null
 printf 'PASS SS3_MYSQL_PROBE_DEADLOCK_1213_PASS\n'
 
+lock_gate="${barrier_prefix}_lock_gate"
+lock_holder_ready="${barrier_prefix}_lock_holder_ready"
+start_gate "$lock_gate" "lock-gate"
+set -m
 (
   set +e
   mysql_client --execute="
     START TRANSACTION;
     UPDATE ss3_probe_locks SET value_bytes = value_bytes + 1 WHERE id = 3;
-    DO SLEEP(4);
+    SELECT CONCAT('lock_holder_ready=', GET_LOCK('${lock_holder_ready}', 0));
+    SELECT GET_LOCK('${lock_gate}', 15);
+    SELECT RELEASE_LOCK('${lock_gate}');
+    SELECT RELEASE_LOCK('${lock_holder_ready}');
     COMMIT;
   " >"$tmp_dir/lock-holder.out" 2>"$tmp_dir/lock-holder.err"
   printf '%s\n' "$?" > "$tmp_dir/lock-holder.rc"
 ) &
 lock_holder="$!"
-sleep 1
+set +m
+background_pids+=("$lock_holder")
+wait_for_marker "$tmp_dir/lock-holder.out" "lock_holder_ready=1"
 set +e
 printf '%s\n' \
   'SET SESSION innodb_lock_wait_timeout = 1;' \
@@ -269,7 +449,9 @@ printf '%s\n' \
   | mysql_client --force >"$tmp_dir/lock-timeout.out" 2>"$tmp_dir/lock-timeout.err"
 lock_timeout_rc="$?"
 set -e
+release_gate "lock-gate"
 wait "$lock_holder"
+forget_background_pid "$lock_holder"
 test "$(cat "$tmp_dir/lock-holder.rc")" = "0"
 test "$lock_timeout_rc" -ne 124
 grep -F 'ERROR 1205 (HY000)' "$tmp_dir/lock-timeout.err" >/dev/null
