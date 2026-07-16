@@ -8950,7 +8950,7 @@ fn ebd_4b3b_resolution_helper_is_metadata_only(block: &syn::Block) -> bool {
         catalog_from_metadata && planner_from_metadata
     }
 
-    fn resolution_branch_is_exact(block: &syn::Block) -> bool {
+    fn resolution_branch_is_exact(block: &syn::Block, external_catalog: &str) -> bool {
         let [
             syn::Stmt::Local(metadata_local),
             syn::Stmt::Local(planner_local),
@@ -8968,7 +8968,12 @@ fn ebd_4b3b_resolution_helper_is_metadata_only(block: &syn::Block) -> bool {
         let Some(resolve) = method_call(&metadata_init.expr, "resolve") else {
             return false;
         };
-        if method_count(&resolve.receiver, "registry") != 1 {
+        if method_count(&resolve.receiver, "registry") != 1
+            || resolve.args.len() != 3
+            || resolve.args.first().and_then(path_ident).as_deref() != Some(external_catalog)
+            || resolve.args.iter().nth(1).and_then(path_ident).as_deref() != Some("database")
+            || resolve.args.iter().nth(2).and_then(path_ident).as_deref() != Some("table")
+        {
             return false;
         }
 
@@ -8988,7 +8993,30 @@ fn ebd_4b3b_resolution_helper_is_metadata_only(block: &syn::Block) -> bool {
         result_uses_resolved_metadata(result, &metadata_binding, &planner_binding)
     }
 
-    fn is_external_catalog_pattern(pattern: &syn::Pat) -> bool {
+    fn external_catalog_binding(pattern: &syn::Pat) -> Option<String> {
+        let syn::Pat::TupleStruct(pattern) = pattern else {
+            return None;
+        };
+        if !ebd_4b3b_path_ends_with(&pattern.path, "Some") || pattern.elems.len() != 1 {
+            return None;
+        }
+        let Some(syn::Pat::Ident(binding)) = pattern.elems.first() else {
+            return None;
+        };
+        if binding.by_ref.is_some()
+            || binding.mutability.is_some()
+            || binding.subpat.is_some()
+            || matches!(
+                binding.ident.to_string().as_str(),
+                "self" | "database" | "table"
+            )
+        {
+            return None;
+        }
+        Some(binding.ident.to_string())
+    }
+
+    fn is_default_catalog_some_pattern(pattern: &syn::Pat) -> bool {
         let syn::Pat::TupleStruct(pattern) = pattern else {
             return false;
         };
@@ -8996,8 +9024,47 @@ fn ebd_4b3b_resolution_helper_is_metadata_only(block: &syn::Block) -> bool {
             && pattern.elems.len() == 1
             && matches!(
                 pattern.elems.first(),
-                Some(syn::Pat::Ident(binding)) if binding.subpat.is_none()
+                Some(syn::Pat::Lit(literal))
+                    if matches!(
+                        &literal.lit,
+                        syn::Lit::Str(value) if value.value() == "default_catalog"
+                    )
             )
+    }
+
+    fn is_none_pattern(pattern: &syn::Pat) -> bool {
+        matches!(
+            pattern,
+            syn::Pat::Ident(none)
+                if none.ident == "None"
+                    && none.by_ref.is_none()
+                    && none.mutability.is_none()
+                    && none.subpat.is_none()
+        ) || matches!(
+            pattern,
+            syn::Pat::Path(path) if ebd_4b3b_path_ends_with(&path.path, "None")
+        )
+    }
+
+    fn is_default_catalog_pattern(pattern: &syn::Pat) -> bool {
+        let syn::Pat::Or(pattern) = pattern else {
+            return false;
+        };
+        if pattern.cases.len() != 2 {
+            return false;
+        }
+        let mut default_some = 0;
+        let mut none = 0;
+        for case in &pattern.cases {
+            if is_default_catalog_some_pattern(case) {
+                default_some += 1;
+            } else if is_none_pattern(case) {
+                none += 1;
+            } else {
+                return false;
+            }
+        }
+        default_some == 1 && none == 1
     }
 
     fn external_resolution_tail_is_exact(block: &syn::Block) -> bool {
@@ -9022,21 +9089,28 @@ fn ebd_4b3b_resolution_helper_is_metadata_only(block: &syn::Block) -> bool {
             return false;
         }
 
-        let external_arms = match_expr
-            .arms
-            .iter()
-            .filter(|arm| is_external_catalog_pattern(&arm.pat))
-            .collect::<Vec<_>>();
-        let [external_arm] = external_arms.as_slice() else {
-            return false;
-        };
-        if external_arm.guard.is_some() {
+        if match_expr.arms.len() != 2 || match_expr.arms.iter().any(|arm| arm.guard.is_some()) {
             return false;
         }
+        let mut default_arms = Vec::new();
+        let mut external_arms = Vec::new();
+        for arm in &match_expr.arms {
+            if is_default_catalog_pattern(&arm.pat) {
+                default_arms.push(arm);
+            } else if let Some(binding) = external_catalog_binding(&arm.pat) {
+                external_arms.push((arm, binding));
+            } else {
+                return false;
+            }
+        }
+        if default_arms.len() != 1 || external_arms.len() != 1 {
+            return false;
+        }
+        let (external_arm, external_catalog) = &external_arms[0];
         let syn::Expr::Block(external_body) = unwrap_expr(&external_arm.body) else {
             return false;
         };
-        resolution_branch_is_exact(&external_body.block)
+        resolution_branch_is_exact(&external_body.block, external_catalog)
     }
 
     #[derive(Default)]
@@ -9503,6 +9577,114 @@ impl CatalogServiceProvider {
             .any(|item| item.contains("neutral-resolution-helper-shape")),
         "unreachable metadata provenance must not validate a fake tail result: {violations:?}"
     );
+}
+
+#[test]
+fn ebd_4b3b_detector_rejects_shadowed_or_misbound_external_catalog_arms() {
+    for (case, match_arms) in [
+        (
+            "preceding Some wildcard",
+            r#"
+            Some(_) => Ok(ResolvedAnalyzerTable {
+                catalog: CatalogTable::default(),
+                planner: TableDef::default(),
+            }),
+            Some(catalog) => {
+                let metadata = self
+                    .service
+                    .registry()
+                    .read()
+                    .expect("catalog service registry read lock")
+                    .resolve(catalog, database, table)?;
+                let planner = metadata.to_table_def();
+                Ok(ResolvedAnalyzerTable {
+                    catalog: metadata.table,
+                    planner,
+                })
+            }
+            Some("default_catalog") | None => Ok(ResolvedAnalyzerTable {
+                catalog: CatalogTable::default(),
+                planner: TableDef::default(),
+            }),
+"#,
+        ),
+        (
+            "preceding catch all",
+            r#"
+            Some("default_catalog") | None => Ok(ResolvedAnalyzerTable {
+                catalog: CatalogTable::default(),
+                planner: TableDef::default(),
+            }),
+            _ => Ok(ResolvedAnalyzerTable {
+                catalog: CatalogTable::default(),
+                planner: TableDef::default(),
+            }),
+            Some(catalog) => {
+                let metadata = self
+                    .service
+                    .registry()
+                    .read()
+                    .expect("catalog service registry read lock")
+                    .resolve(catalog, database, table)?;
+                let planner = metadata.to_table_def();
+                Ok(ResolvedAnalyzerTable {
+                    catalog: metadata.table,
+                    planner,
+                })
+            }
+"#,
+        ),
+        (
+            "misbound resolve catalog",
+            r#"
+            Some("default_catalog") | None => Ok(ResolvedAnalyzerTable {
+                catalog: CatalogTable::default(),
+                planner: TableDef::default(),
+            }),
+            Some(catalog) => {
+                let metadata = self
+                    .service
+                    .registry()
+                    .read()
+                    .expect("catalog service registry read lock")
+                    .resolve(other_catalog, database, table)?;
+                let planner = metadata.to_table_def();
+                Ok(ResolvedAnalyzerTable {
+                    catalog: metadata.table,
+                    planner,
+                })
+            }
+"#,
+        ),
+    ] {
+        let source = format!(
+            r#"
+struct CatalogServiceProvider;
+impl CatalogServiceProvider {{
+    fn resolve_table_for_analysis_once(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+    ) -> Result<ResolvedAnalyzerTable, String> {{
+        match self.effective_catalog(catalog) {{
+{match_arms}
+        }}
+    }}
+}}
+"#
+        );
+        let violations = ebd_4b3b_audit_statistics_lookup_decoupling(&[GuardSource::new(
+            EBD_4B3B_PROVIDER,
+            &source,
+        )]);
+        assert!(
+            violations
+                .iter()
+                .any(|item| item.contains("neutral-resolution-helper-shape")),
+            "{case} must not satisfy the external catalog resolution partition: {violations:?}"
+        );
+    }
 }
 
 #[test]
