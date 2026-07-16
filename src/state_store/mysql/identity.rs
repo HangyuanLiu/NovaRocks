@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 use sha2::{Digest, Sha256};
 use uuid::{Uuid, Version};
 
+use super::super::limits::MYSQL_MAX_META_VALUE_BYTES;
 use super::super::{StateStoreError, StateStoreErrorKind, StoreIdentity};
 use super::codec::MysqlCodec;
 
@@ -51,6 +52,16 @@ pub(crate) struct MysqlIdentitySnapshot {
 pub(super) fn advisory_lock_name(database: &str) -> String {
     let digest = Sha256::digest(database.as_bytes());
     format!("novarocks-ss3-{}", hex::encode(&digest[..24]))
+}
+
+pub(super) fn validate_cluster_id(cluster_id: &str) -> Result<(), StateStoreError> {
+    if cluster_id.len() > MYSQL_MAX_META_VALUE_BYTES {
+        return Err(StateStoreError::new(
+            StateStoreErrorKind::InvalidConfiguration,
+            "MySQL state store configuration is invalid",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn initial_meta_rows(

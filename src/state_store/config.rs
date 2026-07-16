@@ -24,7 +24,9 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Deserializer};
 use uuid::Uuid;
 
-use super::limits::{MYSQL_MAX_KEY_BYTES, StateStoreLimitOverrides, StateStoreLimits};
+use super::limits::{
+    MYSQL_MAX_KEY_BYTES, MYSQL_MAX_META_VALUE_BYTES, StateStoreLimitOverrides, StateStoreLimits,
+};
 
 const MYSQL_MAX_CONNECT_TIMEOUT_MS: u64 = 60_000;
 const MYSQL_MAX_INACTIVE_CONNECTION_TTL_MS: u64 = 86_400_000;
@@ -164,6 +166,11 @@ impl StateStoreConfig {
                 StateStoreLimits::from_overrides(&self.limits)?;
             }
             StateStoreProviderConfig::Mysql { database } => {
+                if self.cluster_id.len() > MYSQL_MAX_META_VALUE_BYTES {
+                    bail!(
+                        "InvalidStateStoreConfig: MySQL cluster_id exceeds the physical meta value limit"
+                    );
+                }
                 if database.is_empty()
                     || database.len() > 64
                     || !database

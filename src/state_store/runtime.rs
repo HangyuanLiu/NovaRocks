@@ -27,7 +27,6 @@ use super::mysql::client::delayed_active_readiness as mysql_delayed_active_readi
 #[cfg(feature = "mysql-state-store-provider")]
 use {
     super::limits::MYSQL_MAX_KEY_BYTES,
-    super::mysql::MysqlStateStore,
     super::mysql::client::{
         PoolLifecycle, ResolvedMysqlClient, active_readiness as mysql_active_readiness,
         checkout_hygienic_connection, pollute_session as mysql_pollute_session,
@@ -36,13 +35,14 @@ use {
         MysqlHeldAdvisoryLock, MysqlHeldConnection, MysqlReadinessSnapshot, MysqlRuntimeOwner,
         MysqlSchemaMutation, MysqlSchemaSnapshot, MysqlStoreReadinessSnapshot, MysqlTestHandle,
     },
+    super::mysql::{MysqlOpenCancellation, MysqlStateStore},
     super::{FeDeploymentView, MySqlClientConfig, StateStore, StateStoreConfig, StateStoreLimits},
     std::collections::HashMap,
     std::sync::Arc,
     std::sync::Mutex,
     std::sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     std::time::Duration,
-    tokio::sync::Notify,
+    tokio::sync::{Notify, oneshot},
     tokio::time::{Instant, timeout_at},
 };
 
@@ -454,6 +454,12 @@ struct MysqlRuntime {
 }
 
 #[cfg(feature = "mysql-state-store-provider")]
+struct MysqlOpenWaiterGuard {
+    cancellation: MysqlOpenCancellation,
+    armed: bool,
+}
+
+#[cfg(feature = "mysql-state-store-provider")]
 struct MysqlRuntimeShared {
     owner: MysqlRuntimeOwner,
     accepting: AtomicBool,
@@ -557,12 +563,52 @@ impl MysqlRuntime {
         let opening = self.acquire_operation()?;
         let pool = self.get_or_create_pool(&database)?;
         let deadline = Instant::now() + limits.transaction_deadline;
+        let cancellation = MysqlOpenCancellation::new();
+        let waiter = MysqlOpenWaiterGuard::new(cancellation.clone());
+        let shared = Arc::clone(&self.shared);
+        let cluster_id = config.cluster_id.clone();
+        let (sender, receiver) = oneshot::channel();
+        tokio::spawn(async move {
+            let result = Self::open_store_owned(
+                shared,
+                pool,
+                database,
+                cluster_id,
+                limits,
+                deadline,
+                cancellation,
+                opening,
+            )
+            .await;
+            let _ = sender.send(result);
+        });
+        let result = receiver.await.map_err(|_| {
+            StateStoreError::new(
+                StateStoreErrorKind::ProviderUnavailable,
+                "MySQL state store open task stopped unexpectedly",
+            )
+        });
+        waiter.complete();
+        result?
+    }
+
+    async fn open_store_owned(
+        shared: Arc<MysqlRuntimeShared>,
+        pool: Arc<dyn PoolLifecycle>,
+        database: String,
+        cluster_id: String,
+        limits: StateStoreLimits,
+        deadline: Instant,
+        cancellation: MysqlOpenCancellation,
+        _opening: MysqlRuntimeGuard,
+    ) -> Result<Arc<dyn StateStore>, StateStoreError> {
+        cancellation.check()?;
         mysql_active_readiness(Arc::clone(&pool), deadline).await?;
-        let lease = MysqlProviderHandle::new(Arc::clone(&self.shared), pool)?;
+        cancellation.check()?;
+        let lease = MysqlProviderHandle::new(shared, pool)?;
         let store =
-            MysqlStateStore::open(lease, database, config.cluster_id.clone(), limits, deadline)
+            MysqlStateStore::open(lease, database, cluster_id, limits, deadline, cancellation)
                 .await?;
-        drop(opening);
         Ok(Arc::new(store))
     }
 
@@ -772,6 +818,7 @@ impl MysqlRuntime {
             cluster_id,
             MYSQL_MAX_KEY_BYTES,
             Instant::now() + total_deadline,
+            &MysqlOpenCancellation::new(),
         )
         .await?;
         Ok(readiness)
@@ -902,6 +949,29 @@ impl MysqlRuntime {
         })?;
         *lifecycle = MysqlRuntimeLifecycle::Stopped;
         Ok(())
+    }
+}
+
+#[cfg(feature = "mysql-state-store-provider")]
+impl MysqlOpenWaiterGuard {
+    fn new(cancellation: MysqlOpenCancellation) -> Self {
+        Self {
+            cancellation,
+            armed: true,
+        }
+    }
+
+    fn complete(mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(feature = "mysql-state-store-provider")]
+impl Drop for MysqlOpenWaiterGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancellation.cancel();
+        }
     }
 }
 

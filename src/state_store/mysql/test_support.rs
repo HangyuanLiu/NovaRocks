@@ -19,6 +19,8 @@ use super::super::{StateStoreError, StateStoreErrorKind, StateStoreRuntime};
 use super::client::MysqlPoolConnection;
 use std::time::Duration;
 
+#[cfg(feature = "state-store-test-hooks")]
+pub use super::open_test_hooks::{MysqlOpenGateControl, MysqlOpenGatePhase, arm_mysql_open_gate};
 pub use super::schema::{
     SchemaColumnSnapshot as MysqlSchemaColumnSnapshot, SchemaMutation as MysqlSchemaMutation,
     SchemaSnapshot as MysqlSchemaSnapshot, SchemaTableSnapshot as MysqlSchemaTableSnapshot,

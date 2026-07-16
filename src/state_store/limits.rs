@@ -22,6 +22,7 @@ use serde::Deserialize;
 
 pub const MAX_KEY_BYTES: usize = 8 * 1024;
 pub const MYSQL_MAX_KEY_BYTES: usize = 3072;
+pub const MYSQL_MAX_META_VALUE_BYTES: usize = 4096;
 pub const MAX_VALUE_BYTES: usize = 64 * 1024;
 pub const MAX_PAGE_SIZE: usize = 1_000;
 pub const MAX_TRANSACTION_OPERATIONS: usize = 10_000;

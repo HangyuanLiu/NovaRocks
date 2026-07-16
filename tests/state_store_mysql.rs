@@ -23,6 +23,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use bytes::Bytes;
+#[cfg(feature = "state-store-test-hooks")]
+use novarocks::state_store::mysql::test_support::{MysqlOpenGatePhase, arm_mysql_open_gate};
 use novarocks::state_store::mysql::test_support::{
     MysqlSchemaColumnSnapshot, MysqlSchemaMutation, MysqlSchemaTableSnapshot,
     acquire_schema_advisory_lock, active_readiness, advisory_lock_name, apply_schema_mutation,
@@ -530,6 +532,46 @@ async fn mysql_schema_never_creates_database_alters_or_drops_objects() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mysql_schema_rejects_cluster_id_beyond_meta_limit_before_ddl() {
+    let boundary = TestDatabase::provision(
+        "mysql_schema_rejects_cluster_id_beyond_meta_limit_before_ddl",
+        "boundary",
+    );
+    let oversized = TestDatabase::provision(
+        "mysql_schema_rejects_cluster_id_beyond_meta_limit_before_ddl",
+        "oversized",
+    );
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+
+    let boundary_cluster_id = "c".repeat(4096);
+    let store = open_store(&runtime, &boundary.name, &boundary_cluster_id, 4_000)
+        .await
+        .expect("4096-byte cluster identity must fit meta value");
+    drop(store);
+
+    let oversized_cluster_id = "c".repeat(4097);
+    let error = match open_store(&runtime, &oversized.name, &oversized_cluster_id, 4_000).await {
+        Ok(_) => panic!("4097-byte cluster identity must fail before DDL"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), StateStoreErrorKind::InvalidConfiguration);
+    assert_eq!(
+        error.to_string(),
+        "InvalidConfiguration: MySQL state store configuration is invalid"
+    );
+    let snapshot = schema_snapshot(&runtime, &oversized.name, Duration::from_secs(4))
+        .await
+        .expect("oversized cluster inventory snapshot");
+    assert!(snapshot.tables.is_empty());
+    assert!(snapshot.views.is_empty());
+    assert!(snapshot.triggers.is_empty());
+    assert!(snapshot.meta_keys.is_empty());
+
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mysql_store_readiness_validates_inventory_identity_and_transactions() {
     let database = TestDatabase::provision(
         "mysql_store_readiness_validates_inventory_identity_and_transactions",
@@ -618,4 +660,141 @@ async fn mysql_store_readiness_rejects_schema_or_identity_drift_after_pool_check
     assert_eq!(mismatch.kind(), StateStoreErrorKind::InvalidConfiguration);
 
     runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mysql_schema_cancellation_after_lock_is_safely_disposed() {
+    let database = TestDatabase::provision(
+        "mysql_schema_cancellation_after_lock_is_safely_disposed",
+        "lock",
+    );
+    let mut client_config = fixture_client_config();
+    client_config.pool_max = 1;
+    let observer_client_config = client_config.clone();
+    let runtime = std::sync::Arc::new(
+        StateStoreRuntime::mysql(client_config).expect("construct MySQL runtime"),
+    );
+    let gate = arm_mysql_open_gate(&database.name, MysqlOpenGatePhase::AfterAdvisoryLock)
+        .expect("arm advisory-lock cancellation gate");
+    let waiter_runtime = std::sync::Arc::clone(&runtime);
+    let waiter_database = database.name.clone();
+    let waiter = tokio::spawn(async move {
+        open_store(&waiter_runtime, &waiter_database, CLUSTER_ID, 4_000).await
+    });
+
+    tokio::time::timeout(Duration::from_secs(4), gate.wait_reached())
+        .await
+        .expect("advisory-lock gate reached");
+    let original_connection_id = gate.connection_id();
+    assert_ne!(original_connection_id, 0);
+    waiter.abort();
+    match waiter.await {
+        Err(error) if error.is_cancelled() => {}
+        _ => panic!("open waiter must be cancelled"),
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), gate.wait_completed())
+            .await
+            .is_err(),
+        "provider-owned open must remain alive after waiter cancellation"
+    );
+    let mut runtime = std::sync::Arc::try_unwrap(runtime).expect("sole runtime owner");
+    let mut shutdown = tokio::spawn(async move { runtime.shutdown().await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut shutdown)
+            .await
+            .is_err(),
+        "shutdown must wait for advisory-lock cancellation cleanup"
+    );
+    gate.release();
+    tokio::time::timeout(Duration::from_secs(4), gate.wait_completed())
+        .await
+        .expect("advisory-lock disposition completed");
+    shutdown
+        .await
+        .expect("join MySQL runtime shutdown")
+        .expect("shutdown MySQL runtime");
+
+    let mut observer =
+        StateStoreRuntime::mysql(observer_client_config).expect("construct observer runtime");
+    let replacement = active_readiness(&observer, &database.name, Duration::from_secs(4))
+        .await
+        .expect("readiness after cancelled advisory lock");
+    assert_ne!(replacement.connection_id, original_connection_id);
+    assert!(
+        is_schema_advisory_lock_free(&observer, &database.name, Duration::from_secs(4))
+            .await
+            .expect("lock state after waiter cancellation")
+    );
+    observer
+        .shutdown()
+        .await
+        .expect("shutdown observer runtime");
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mysql_store_readiness_cancellation_after_start_is_safely_disposed() {
+    let database = TestDatabase::provision(
+        "mysql_store_readiness_cancellation_after_start_is_safely_disposed",
+        "transaction",
+    );
+    let mut client_config = fixture_client_config();
+    client_config.pool_max = 1;
+    let observer_client_config = client_config.clone();
+    let runtime = std::sync::Arc::new(
+        StateStoreRuntime::mysql(client_config).expect("construct MySQL runtime"),
+    );
+    let gate = arm_mysql_open_gate(&database.name, MysqlOpenGatePhase::AfterReadOnlyStart)
+        .expect("arm transaction cancellation gate");
+    let waiter_runtime = std::sync::Arc::clone(&runtime);
+    let waiter_database = database.name.clone();
+    let waiter = tokio::spawn(async move {
+        open_store(&waiter_runtime, &waiter_database, CLUSTER_ID, 4_000).await
+    });
+
+    tokio::time::timeout(Duration::from_secs(4), gate.wait_reached())
+        .await
+        .expect("transaction gate reached");
+    let original_connection_id = gate.connection_id();
+    assert_ne!(original_connection_id, 0);
+    waiter.abort();
+    match waiter.await {
+        Err(error) if error.is_cancelled() => {}
+        _ => panic!("open waiter must be cancelled"),
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), gate.wait_completed())
+            .await
+            .is_err(),
+        "provider-owned readiness must remain alive after waiter cancellation"
+    );
+    let mut runtime = std::sync::Arc::try_unwrap(runtime).expect("sole runtime owner");
+    let mut shutdown = tokio::spawn(async move { runtime.shutdown().await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut shutdown)
+            .await
+            .is_err(),
+        "shutdown must wait for transaction cancellation cleanup"
+    );
+    gate.release();
+    tokio::time::timeout(Duration::from_secs(4), gate.wait_completed())
+        .await
+        .expect("transaction disposition completed");
+    shutdown
+        .await
+        .expect("join MySQL runtime shutdown")
+        .expect("shutdown MySQL runtime");
+
+    let mut observer =
+        StateStoreRuntime::mysql(observer_client_config).expect("construct observer runtime");
+    let replacement = active_readiness(&observer, &database.name, Duration::from_secs(4))
+        .await
+        .expect("readiness after cancelled transaction");
+    assert_ne!(replacement.connection_id, original_connection_id);
+    observer
+        .shutdown()
+        .await
+        .expect("shutdown observer runtime");
 }

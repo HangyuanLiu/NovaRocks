@@ -26,6 +26,7 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use super::super::{StateStoreError, StateStoreErrorKind};
+use super::MysqlOpenCancellation;
 use super::client::{
     MysqlPoolConnection, PoolLifecycle, checkout_hygienic_connection, execute_owned_with_deadline,
 };
@@ -33,8 +34,10 @@ use super::codec::MysqlCodec;
 use super::identity::{
     CHANGE_RETENTION_FLOOR_KEY, CLUSTER_ID_KEY, CURRENT_REVISION_KEY, INITIAL_INCARNATION_KEY,
     MysqlIdentitySnapshot, SCHEMA_DIGEST_KEY, SCHEMA_VERSION_KEY, STORE_ID_KEY, advisory_lock_name,
-    decode_meta_rows, initial_meta_rows,
+    decode_meta_rows, initial_meta_rows, validate_cluster_id,
 };
+#[cfg(feature = "state-store-test-hooks")]
+use super::open_test_hooks::{MysqlOpenGatePhase, take_mysql_open_gate};
 
 const SCHEMA_MANIFEST: &str = concat!(
     "CREATE TABLE state_store_meta (\n",
@@ -190,11 +193,23 @@ pub(super) async fn bootstrap_and_validate(
     cluster_id: &str,
     max_key_bytes: usize,
     deadline: Instant,
+    cancellation: &MysqlOpenCancellation,
 ) -> Result<MysqlIdentitySnapshot, StateStoreError> {
+    validate_cluster_id(cluster_id)?;
     let codec = MysqlCodec::new(max_key_bytes)?;
     let connection = checkout_hygienic_connection(pool, deadline).await?;
     let mut session = SchemaSession::new(connection, deadline);
     let lock_name = session.acquire_advisory_lock(database).await?;
+    #[cfg(feature = "state-store-test-hooks")]
+    let open_gate = take_mysql_open_gate(database, MysqlOpenGatePhase::AfterAdvisoryLock);
+    #[cfg(feature = "state-store-test-hooks")]
+    if let Some(gate) = open_gate.as_ref() {
+        gate.pause(session.connection_id().await?).await;
+    }
+    if let Err(error) = cancellation.check() {
+        session.destroy_connection().await;
+        return Err(error);
+    }
     let result = bootstrap_locked(&mut session, &codec, cluster_id).await;
     if session.has_connection() {
         let release = session
@@ -210,12 +225,13 @@ pub(super) async fn bootstrap_and_validate(
     }
 }
 
-pub(crate) async fn validate_store_readiness(
+pub(in crate::state_store) async fn validate_store_readiness(
     pool: Arc<dyn PoolLifecycle>,
     database: &str,
     cluster_id: &str,
     max_key_bytes: usize,
     deadline: Instant,
+    cancellation: &MysqlOpenCancellation,
 ) -> Result<(MysqlIdentitySnapshot, StoreReadinessSnapshot), StateStoreError> {
     let identity = bootstrap_and_validate(
         Arc::clone(&pool),
@@ -223,15 +239,27 @@ pub(crate) async fn validate_store_readiness(
         cluster_id,
         max_key_bytes,
         deadline,
+        cancellation,
     )
     .await?;
     run_transaction_readiness(
         Arc::clone(&pool),
+        database,
         "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY",
+        true,
         deadline,
+        cancellation,
     )
     .await?;
-    run_transaction_readiness(pool, "START TRANSACTION WITH CONSISTENT SNAPSHOT", deadline).await?;
+    run_transaction_readiness(
+        pool,
+        database,
+        "START TRANSACTION WITH CONSISTENT SNAPSHOT",
+        false,
+        deadline,
+        cancellation,
+    )
+    .await?;
     Ok((
         identity,
         StoreReadinessSnapshot {
@@ -243,8 +271,11 @@ pub(crate) async fn validate_store_readiness(
 
 async fn run_transaction_readiness(
     pool: Arc<dyn PoolLifecycle>,
+    database: &str,
     start_sql: &'static str,
+    is_read_only: bool,
     deadline: Instant,
+    cancellation: &MysqlOpenCancellation,
 ) -> Result<(), StateStoreError> {
     let connection = checkout_hygienic_connection(pool, deadline).await?;
     let mut session = SchemaSession::new(connection, deadline);
@@ -256,6 +287,20 @@ async fn run_transaction_readiness(
     session
         .run(move |connection| Box::pin(connection.query_drop(start_sql)))
         .await?;
+    #[cfg(feature = "state-store-test-hooks")]
+    let open_gate = is_read_only
+        .then(|| take_mysql_open_gate(database, MysqlOpenGatePhase::AfterReadOnlyStart))
+        .flatten();
+    #[cfg(feature = "state-store-test-hooks")]
+    if let Some(gate) = open_gate.as_ref() {
+        gate.pause(session.connection_id().await?).await;
+    }
+    #[cfg(not(feature = "state-store-test-hooks"))]
+    let _ = (database, is_read_only);
+    if let Err(error) = cancellation.check() {
+        session.destroy_connection().await;
+        return Err(error);
+    }
     if let Err(error) = session
         .run(|connection| Box::pin(connection.query_drop("ROLLBACK")))
         .await
@@ -534,6 +579,15 @@ impl SchemaSession {
             execute_owned_with_deadline(connection, self.deadline, operation).await?;
         self.connection = Some(connection);
         result
+    }
+
+    #[cfg(feature = "state-store-test-hooks")]
+    async fn connection_id(&mut self) -> Result<u64, StateStoreError> {
+        let row: Option<(u64,)> = self
+            .run(|connection| Box::pin(connection.query_first("SELECT CONNECTION_ID()")))
+            .await?;
+        row.map(|(connection_id,)| connection_id)
+            .ok_or_else(provider_error)
     }
 
     async fn acquire_advisory_lock(&mut self, database: &str) -> Result<String, StateStoreError> {

@@ -19,12 +19,15 @@ pub(crate) mod client;
 pub(crate) mod codec;
 pub(crate) mod error;
 pub(crate) mod identity;
+#[cfg(feature = "state-store-test-hooks")]
+pub(crate) mod open_test_hooks;
 pub(crate) mod schema;
 
 #[doc(hidden)]
 pub mod test_support;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use tokio::time::Instant;
@@ -45,6 +48,11 @@ pub(super) struct MysqlStateStore {
     metrics: Arc<StateStoreMetrics>,
 }
 
+#[derive(Clone)]
+pub(super) struct MysqlOpenCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
 impl MysqlStateStore {
     pub(super) async fn open(
         lease: MysqlProviderHandle,
@@ -52,6 +60,7 @@ impl MysqlStateStore {
         cluster_id: String,
         limits: StateStoreLimits,
         deadline: Instant,
+        cancellation: MysqlOpenCancellation,
     ) -> Result<Self, StateStoreError> {
         let (identity, _) = schema::validate_store_readiness(
             lease.pool(),
@@ -59,8 +68,10 @@ impl MysqlStateStore {
             &cluster_id,
             limits.max_key_bytes,
             deadline,
+            &cancellation,
         )
         .await?;
+        cancellation.check()?;
         tracing::info!(
             provider = "mysql",
             client_status = "ready",
@@ -83,6 +94,28 @@ impl MysqlStateStore {
             StateStoreErrorKind::ProviderUnavailable,
             "MySQL state transactions are not initialized",
         )
+    }
+}
+
+impl MysqlOpenCancellation {
+    pub(super) fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(super) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub(super) fn check(&self) -> Result<(), StateStoreError> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::ProviderUnavailable,
+                "MySQL state store open waiter was cancelled",
+            ));
+        }
+        Ok(())
     }
 }
 
