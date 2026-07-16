@@ -468,10 +468,24 @@ impl FoundationDbRuntime {
 #[cfg(feature = "foundationdb-provider")]
 impl Drop for FoundationDbRuntime {
     fn drop(&mut self) {
-        if matches!(self.network, FoundationDbNetworkLifecycle::Running(_)) {
+        let shutdown_required_reason = match &mut self.network {
+            FoundationDbNetworkLifecycle::Running(_) => Some("runtime_still_running"),
+            FoundationDbNetworkLifecycle::Failed { thread, .. }
+                if thread.as_ref().is_some_and(|thread| !thread.is_finished()) =>
+            {
+                Some("network_thread_still_running")
+            }
+            FoundationDbNetworkLifecycle::Failed { thread, .. } => {
+                FoundationDbNetworkLifecycle::reap_finished_thread(thread);
+                None
+            }
+            FoundationDbNetworkLifecycle::Stopped => None,
+        };
+        if let Some(reason) = shutdown_required_reason {
             tracing::error!(
                 provider = "foundationdb",
                 lifecycle = "shutdown_required",
+                reason,
                 process_id = self.shared.pid,
                 "FoundationDB state store runtime dropped before shutdown"
             );
@@ -1153,20 +1167,20 @@ mod tests {
     }
 
     #[test]
-    fn failed_lifecycle_drop_is_inert() {
+    fn failed_runtime_with_running_thread_drop_fails_fast() {
         let child = Command::new(std::env::current_exe().expect("current test binary"))
             .args([
                 "--ignored",
                 "--exact",
-                "state_store::runtime::tests::failed_lifecycle_drop_child",
+                "state_store::runtime::tests::failed_runtime_with_running_thread_drop_child",
                 "--nocapture",
                 "--test-threads=1",
             ])
             .status()
-            .expect("exec failed lifecycle drop child");
+            .expect("exec failed runtime drop child");
         assert!(
-            child.success(),
-            "dropping a failed lifecycle must not abort, stop, or join"
+            !child.success(),
+            "dropping a failed runtime with a live network thread must fail fast"
         );
     }
 
@@ -1225,37 +1239,70 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "exec helper used by failed_lifecycle_drop_is_inert"]
-    fn failed_lifecycle_drop_child() {
+    #[ignore = "exec helper used by failed_runtime_with_running_thread_drop_fails_fast"]
+    fn failed_runtime_with_running_thread_drop_child() {
         let stop_calls = Arc::new(AtomicUsize::new(0));
         let observed_stop_calls = Arc::clone(&stop_calls);
-        let (release_tx, release_rx) = mpsc::channel();
-        let completed = Arc::new(AtomicBool::new(false));
-        let thread_completed = Arc::clone(&completed);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
         let thread = std::thread::spawn(move || {
             release_rx.recv().expect("release failed network thread");
-            thread_completed.store(true, Ordering::Release);
             Ok(())
         });
-        let mut lifecycle = FoundationDbNetworkLifecycle::Running(FoundationDbNetworkOwner {
-            stop: Some(test_stop(move || {
+        let mut runtime = test_runtime(
+            test_stop(move || {
                 observed_stop_calls.fetch_add(1, Ordering::AcqRel);
                 Err(StateStoreError::new(
                     StateStoreErrorKind::ProviderUnavailable,
                     "injected network stop failure",
                 ))
-            })),
-            thread: Some(thread),
-        });
-        lifecycle
+            }),
+            thread,
+        );
+        runtime
+            .network
             .stop_and_join()
             .expect_err("injected stop failure must enter Failed");
         assert_eq!(stop_calls.load(Ordering::Acquire), 1);
+        let runtime = StateStoreRuntime {
+            inner: RuntimeInner::FoundationDb(runtime),
+        };
 
-        drop(lifecycle);
+        std::mem::forget(release_tx);
+        drop(runtime);
+    }
 
+    #[test]
+    fn failed_runtime_with_finished_thread_drop_is_safe() {
+        let stop_calls = Arc::new(AtomicUsize::new(0));
+        let observed_stop_calls = Arc::clone(&stop_calls);
+        let (release_tx, release_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            release_rx.recv().expect("release failed network thread");
+            Ok(())
+        });
+        let mut runtime = test_runtime(
+            test_stop(move || {
+                observed_stop_calls.fetch_add(1, Ordering::AcqRel);
+                Err(StateStoreError::new(
+                    StateStoreErrorKind::ProviderUnavailable,
+                    "injected network stop failure",
+                ))
+            }),
+            thread,
+        );
+        runtime
+            .network
+            .stop_and_join()
+            .expect_err("injected stop failure must enter Failed");
+        release_tx.send(()).expect("release failed network thread");
+        while !runtime.network.failed_thread_is_finished() {
+            std::thread::yield_now();
+        }
+        let runtime = StateStoreRuntime {
+            inner: RuntimeInner::FoundationDb(runtime),
+        };
+
+        drop(runtime);
         assert_eq!(stop_calls.load(Ordering::Acquire), 1);
-        assert!(!completed.load(Ordering::Acquire));
-        release_tx.send(()).expect("release detached test thread");
     }
 }
