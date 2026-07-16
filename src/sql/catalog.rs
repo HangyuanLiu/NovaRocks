@@ -19,6 +19,13 @@ use crate::catalog::identifier::TableIdentity;
 use crate::catalog::table::CatalogTable;
 use crate::sql::planner::table::TableDef;
 
+mod conversion;
+mod iceberg;
+mod internal;
+mod metadata;
+
+use metadata::{CatalogRuntimeBinding, CatalogRuntimeMetadata};
+
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedAnalyzerTable {
     pub(crate) catalog: CatalogTable,
