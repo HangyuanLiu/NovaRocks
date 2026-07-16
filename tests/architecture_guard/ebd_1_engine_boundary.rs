@@ -9089,28 +9089,22 @@ fn ebd_4b3b_resolution_helper_is_metadata_only(block: &syn::Block) -> bool {
             return false;
         }
 
-        if match_expr.arms.len() != 2 || match_expr.arms.iter().any(|arm| arm.guard.is_some()) {
+        let [default_arm, external_arm] = match_expr.arms.as_slice() else {
+            return false;
+        };
+        if default_arm.guard.is_some()
+            || external_arm.guard.is_some()
+            || !is_default_catalog_pattern(&default_arm.pat)
+        {
             return false;
         }
-        let mut default_arms = Vec::new();
-        let mut external_arms = Vec::new();
-        for arm in &match_expr.arms {
-            if is_default_catalog_pattern(&arm.pat) {
-                default_arms.push(arm);
-            } else if let Some(binding) = external_catalog_binding(&arm.pat) {
-                external_arms.push((arm, binding));
-            } else {
-                return false;
-            }
-        }
-        if default_arms.len() != 1 || external_arms.len() != 1 {
+        let Some(external_catalog) = external_catalog_binding(&external_arm.pat) else {
             return false;
-        }
-        let (external_arm, external_catalog) = &external_arms[0];
+        };
         let syn::Expr::Block(external_body) = unwrap_expr(&external_arm.body) else {
             return false;
         };
-        resolution_branch_is_exact(&external_body.block, external_catalog)
+        resolution_branch_is_exact(&external_body.block, &external_catalog)
     }
 
     #[derive(Default)]
@@ -9685,6 +9679,52 @@ impl CatalogServiceProvider {{
             "{case} must not satisfy the external catalog resolution partition: {violations:?}"
         );
     }
+}
+
+#[test]
+fn ebd_4b3b_detector_rejects_external_catalog_arm_before_default_arm() {
+    let sources = vec![GuardSource::new(
+        EBD_4B3B_PROVIDER,
+        r#"
+struct CatalogServiceProvider;
+impl CatalogServiceProvider {
+    fn resolve_table_for_analysis_once(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+    ) -> Result<ResolvedAnalyzerTable, String> {
+        match self.effective_catalog(catalog) {
+            Some(catalog) => {
+                let metadata = self
+                    .service
+                    .registry()
+                    .read()
+                    .expect("catalog service registry read lock")
+                    .resolve(catalog, database, table)?;
+                let planner = metadata.to_table_def();
+                Ok(ResolvedAnalyzerTable {
+                    catalog: metadata.table,
+                    planner,
+                })
+            }
+            Some("default_catalog") | None => Ok(ResolvedAnalyzerTable {
+                catalog: CatalogTable::default(),
+                planner: TableDef::default(),
+            }),
+        }
+    }
+}
+"#,
+    )];
+
+    let violations = ebd_4b3b_audit_statistics_lookup_decoupling(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|item| item.contains("neutral-resolution-helper-shape")),
+        "external catalog arm before default arm must not satisfy the resolution partition: {violations:?}"
+    );
 }
 
 #[test]
