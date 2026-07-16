@@ -344,9 +344,8 @@ impl RuntimeFilterDeliveryRouteIntent {
             envelope_kind,
             RuntimeFilterEnvelopeKind::Artifact | RuntimeFilterEnvelopeKind::Unavailable
         ) {
-            return Err(RuntimeFilterRouteContractError::ForbiddenOutboundKind {
+            return Err(RuntimeFilterRouteContractError::ForbiddenDeliveryKind {
                 channel: channel_id,
-                role: RuntimeFilterRouteRole::Aggregator,
                 kind: envelope_kind,
             });
         }
@@ -395,18 +394,19 @@ pub(crate) struct RuntimeFilterRemoteRoute {
 }
 
 impl RuntimeFilterRemoteRoute {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         route_edge_id: RouteEdgeId,
         peer_participant_id: RuntimeFilterParticipantId,
         endpoint: RuntimeEndpoint,
         target_role: RuntimeFilterRouteRole,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, RuntimeFilterRouteContractError> {
+        reject_zero(route_edge_id.get(), "route edge id")?;
+        Ok(Self {
             route_edge_id,
             peer_participant_id,
             endpoint,
             target_role,
-        }
+        })
     }
 
     pub(crate) const fn route_edge_id(&self) -> RouteEdgeId {
@@ -436,13 +436,30 @@ impl RuntimeFilterRouteDecision {
     pub(crate) fn new(
         mut loopback_route_edge_ids: Vec<RouteEdgeId>,
         mut remote_routes: Vec<RuntimeFilterRemoteRoute>,
-    ) -> Self {
+    ) -> Result<Self, RuntimeFilterRouteContractError> {
         loopback_route_edge_ids.sort_unstable();
         remote_routes.sort_unstable_by_key(RuntimeFilterRemoteRoute::route_edge_id);
-        Self {
+        validate_route_edge_ids(loopback_route_edge_ids.iter().copied(), "route edge id")?;
+        validate_route_edge_ids(
+            remote_routes
+                .iter()
+                .map(RuntimeFilterRemoteRoute::route_edge_id),
+            "route edge id",
+        )?;
+        let remote_route_edge_ids = remote_routes
+            .iter()
+            .map(RuntimeFilterRemoteRoute::route_edge_id)
+            .collect::<BTreeSet<_>>();
+        if let Some(edge) = loopback_route_edge_ids
+            .iter()
+            .find(|edge| remote_route_edge_ids.contains(edge))
+        {
+            return Err(RuntimeFilterRouteContractError::DuplicateRouteEdge { edge: *edge });
+        }
+        Ok(Self {
             loopback_route_edge_ids,
             remote_routes,
-        }
+        })
     }
 
     pub(crate) fn loopback_route_edge_ids(&self) -> &[RouteEdgeId] {
@@ -499,6 +516,10 @@ pub(crate) enum RuntimeFilterRouteContractError {
     ForbiddenOutboundKind {
         channel: ChannelId,
         role: RuntimeFilterRouteRole,
+        kind: RuntimeFilterEnvelopeKind,
+    },
+    ForbiddenDeliveryKind {
+        channel: ChannelId,
         kind: RuntimeFilterEnvelopeKind,
     },
     UnknownOutboundRoute {
@@ -574,6 +595,21 @@ fn validate_channel_edges(
             });
         }
         previous = Some(edge.route_edge_id);
+    }
+    Ok(())
+}
+
+fn validate_route_edge_ids(
+    route_edge_ids: impl IntoIterator<Item = RouteEdgeId>,
+    identity: &'static str,
+) -> Result<(), RuntimeFilterRouteContractError> {
+    let mut previous = None;
+    for edge in route_edge_ids {
+        reject_zero(edge.get(), identity)?;
+        if previous == Some(edge) {
+            return Err(RuntimeFilterRouteContractError::DuplicateRouteEdge { edge });
+        }
+        previous = Some(edge);
     }
     Ok(())
 }
@@ -1272,11 +1308,98 @@ mod tests {
                 RuntimeFilterEnvelopeKind::ProducerClosed,
             )
             .unwrap_err(),
-            RuntimeFilterRouteContractError::ForbiddenOutboundKind {
+            RuntimeFilterRouteContractError::ForbiddenDeliveryKind {
                 channel: ChannelId::new(1),
-                role: RuntimeFilterRouteRole::Aggregator,
                 kind: RuntimeFilterEnvelopeKind::ProducerClosed,
             }
+        );
+        assert_eq!(
+            RuntimeFilterDeliveryRouteIntent::new(
+                DeploymentEpoch::new(3),
+                ChannelId::new(1),
+                vec![RouteEdgeId::new(3)],
+                RuntimeFilterEnvelopeKind::Contribution,
+            )
+            .unwrap_err(),
+            RuntimeFilterRouteContractError::ForbiddenDeliveryKind {
+                channel: ChannelId::new(1),
+                kind: RuntimeFilterEnvelopeKind::Contribution,
+            }
+        );
+    }
+
+    #[test]
+    fn route_decision_rejects_zero_duplicate_and_conflicting_edges() {
+        assert_eq!(
+            RuntimeFilterRemoteRoute::new(
+                RouteEdgeId::new(0),
+                RuntimeFilterParticipantId::new(7),
+                RuntimeEndpoint::new("be-7", 9060).unwrap(),
+                RuntimeFilterRouteRole::Consumer(BindingId::new(20)),
+            )
+            .unwrap_err(),
+            RuntimeFilterRouteContractError::ZeroIdentity("route edge id")
+        );
+
+        let remote = || {
+            RuntimeFilterRemoteRoute::new(
+                RouteEdgeId::new(9),
+                RuntimeFilterParticipantId::new(7),
+                RuntimeEndpoint::new("be-7", 9060).unwrap(),
+                RuntimeFilterRouteRole::Consumer(BindingId::new(20)),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            RuntimeFilterRouteDecision::new(vec![RouteEdgeId::new(0)], Vec::new()).unwrap_err(),
+            RuntimeFilterRouteContractError::ZeroIdentity("route edge id")
+        );
+        let invalid_remote = RuntimeFilterRemoteRoute {
+            route_edge_id: RouteEdgeId::new(0),
+            peer_participant_id: RuntimeFilterParticipantId::new(7),
+            endpoint: RuntimeEndpoint::new("be-7", 9060).unwrap(),
+            target_role: RuntimeFilterRouteRole::Consumer(BindingId::new(20)),
+        };
+        assert_eq!(
+            RuntimeFilterRouteDecision::new(Vec::new(), vec![invalid_remote]).unwrap_err(),
+            RuntimeFilterRouteContractError::ZeroIdentity("route edge id")
+        );
+        assert_eq!(
+            RuntimeFilterRouteDecision::new(
+                vec![RouteEdgeId::new(3), RouteEdgeId::new(3)],
+                Vec::new(),
+            )
+            .unwrap_err(),
+            RuntimeFilterRouteContractError::DuplicateRouteEdge {
+                edge: RouteEdgeId::new(3)
+            }
+        );
+        assert_eq!(
+            RuntimeFilterRouteDecision::new(Vec::new(), vec![remote(), remote()]).unwrap_err(),
+            RuntimeFilterRouteContractError::DuplicateRouteEdge {
+                edge: RouteEdgeId::new(9)
+            }
+        );
+        assert_eq!(
+            RuntimeFilterRouteDecision::new(vec![RouteEdgeId::new(9)], vec![remote()]).unwrap_err(),
+            RuntimeFilterRouteContractError::DuplicateRouteEdge {
+                edge: RouteEdgeId::new(9)
+            }
+        );
+
+        let decision = RuntimeFilterRouteDecision::new(
+            vec![RouteEdgeId::new(5), RouteEdgeId::new(3)],
+            vec![remote()],
+        )
+        .unwrap();
+        assert_eq!(
+            decision.loopback_route_edge_ids(),
+            &[RouteEdgeId::new(3), RouteEdgeId::new(5)]
+        );
+        assert_eq!(
+            decision.remote_routes()[0].route_edge_id(),
+            RouteEdgeId::new(9)
         );
     }
 }
