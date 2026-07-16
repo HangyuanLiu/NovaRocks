@@ -9960,12 +9960,17 @@ fn runtime_filter_transport_ingress_boundary_violations(
                     runtime_filter_transport_use_expands_visibility(&import.import)
                 })
                 .filter(|import| {
-                    rust_use_path(&import.import)
-                        .split("::")
-                        .eq(["crate", "runtime_filter", "port", "transport"])
-                        || rust_use_path(&import.import)
-                            .strip_prefix("crate::runtime_filter::port::transport::")
-                            .is_some()
+                    rust_canonical_use_segments_in_scope(
+                        &import.import,
+                        source_rel,
+                        &import.inline_modules,
+                    )
+                    .is_some_and(|canonical| {
+                        runtime_filter_path_is_allowlisted(
+                            &canonical,
+                            &[&["crate", "runtime_filter", "port", "transport"]],
+                        )
+                    })
                 })
                 .map(|import| {
                     format!(
@@ -16839,6 +16844,22 @@ fn rfd4_m1_transport_ingress_detector_is_named_adapter_only_and_default_deny() {
             adapter,
             "mod leak { use crate::runtime_filter::port::transport::RuntimeFilterEnvelope as Shared; pub(crate) use Shared as Hidden; }",
         ),
+        (
+            adapter,
+            "pub(crate) use super::super::runtime_filter::port::transport::RuntimeFilterEnvelope as Hidden;",
+        ),
+        (
+            adapter,
+            "mod leak { pub(in crate::service) use super::super::super::runtime_filter::port::transport::RuntimeFilterEnvelope as Hidden; }",
+        ),
+        (
+            adapter,
+            "use crate::runtime_filter::port as ports; pub(crate) use self::ports::transport::RuntimeFilterEnvelope as Hidden;",
+        ),
+        (
+            adapter,
+            "mod leak { use crate::runtime_filter::port as ports; pub(super) use self::ports::transport::RuntimeFilterEnvelope as Hidden; }",
+        ),
     ] {
         assert!(
             !runtime_filter_transport_ingress_boundary_violations(source_rel, source).is_empty(),
@@ -16869,6 +16890,9 @@ fn rfd4_m1_transport_ingress_detector_is_named_adapter_only_and_default_deny() {
         "pub(self) type PrivateEnvelope = crate::runtime_filter::port::transport::RuntimeFilterEnvelope;",
         "pub(self) use crate::runtime_filter::port::transport::RuntimeFilterEnvelope as PrivateEnvelope;",
         "mod a { use crate::runtime_filter::port::transport::RuntimeFilterEnvelope as Shared; } mod b { use crate::local::Thing as Shared; pub(crate) use Shared as Hidden; }",
+        "struct Local; pub(crate) use self::Local as Hidden;",
+        "struct Local; mod nested { pub(crate) use super::Local as Hidden; }",
+        "pub(crate) use super::super::super::local::Thing as Hidden;",
     ] {
         assert!(
             runtime_filter_transport_ingress_boundary_violations(adapter, source).is_empty(),
