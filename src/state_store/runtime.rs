@@ -542,20 +542,6 @@ impl FoundationDbNetworkLifecycle {
 }
 
 #[cfg(feature = "foundationdb-provider")]
-impl Drop for FoundationDbNetworkLifecycle {
-    fn drop(&mut self) {
-        let Self::Failed { thread, .. } = self else {
-            return;
-        };
-        Self::reap_finished_thread(thread);
-        if thread.is_some() {
-            eprintln!("FoundationDB failed network thread still owns process-global native state");
-            std::process::abort();
-        }
-    }
-}
-
-#[cfg(feature = "foundationdb-provider")]
 impl FoundationDbRuntimeShared {
     fn validate_pid(&self) -> Result<(), StateStoreError> {
         if self.pid != std::process::id() {
@@ -916,6 +902,7 @@ fn mark_process_network_failed(pid: u32, error: StateStoreError) {
 #[cfg(all(test, feature = "foundationdb-provider"))]
 mod tests {
     use super::*;
+    use std::process::Command;
     use std::sync::mpsc;
     use std::time::Instant as StdInstant;
 
@@ -1109,5 +1096,58 @@ mod tests {
             .await
             .expect("shutdown must retry after operation drain");
         reset_process_state();
+    }
+
+    #[test]
+    fn failed_lifecycle_drop_is_inert() {
+        let child = Command::new(std::env::current_exe().expect("current test binary"))
+            .args([
+                "--ignored",
+                "--exact",
+                "state_store::runtime::tests::failed_lifecycle_drop_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .status()
+            .expect("exec failed lifecycle drop child");
+        assert!(
+            child.success(),
+            "dropping a failed lifecycle must not abort, stop, or join"
+        );
+    }
+
+    #[test]
+    #[ignore = "exec helper used by failed_lifecycle_drop_is_inert"]
+    fn failed_lifecycle_drop_child() {
+        let stop_calls = Arc::new(AtomicUsize::new(0));
+        let observed_stop_calls = Arc::clone(&stop_calls);
+        let (release_tx, release_rx) = mpsc::channel();
+        let completed = Arc::new(AtomicBool::new(false));
+        let thread_completed = Arc::clone(&completed);
+        let thread = std::thread::spawn(move || {
+            release_rx.recv().expect("release failed network thread");
+            thread_completed.store(true, Ordering::Release);
+            Ok(())
+        });
+        let mut lifecycle = FoundationDbNetworkLifecycle::Running(FoundationDbNetworkOwner {
+            stop: Some(test_stop(move || {
+                observed_stop_calls.fetch_add(1, Ordering::AcqRel);
+                Err(StateStoreError::new(
+                    StateStoreErrorKind::ProviderUnavailable,
+                    "injected network stop failure",
+                ))
+            })),
+            thread: Some(thread),
+        });
+        lifecycle
+            .stop_and_join()
+            .expect_err("injected stop failure must enter Failed");
+        assert_eq!(stop_calls.load(Ordering::Acquire), 1);
+
+        drop(lifecycle);
+
+        assert_eq!(stop_calls.load(Ordering::Acquire), 1);
+        assert!(!completed.load(Ordering::Acquire));
+        release_tx.send(()).expect("release detached test thread");
     }
 }
