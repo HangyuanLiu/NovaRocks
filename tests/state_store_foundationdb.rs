@@ -509,15 +509,22 @@ async fn durable_commit_and_change_scenarios(runtime: &StateStoreRuntime) {
         .put(
             key(Bytes::from_static(b"tombstoned")),
             value(Bytes::from_static(b"must-not-commit")),
-            Precondition::Any,
+            Precondition::Present,
         )
         .await
-        .expect("stage tombstoned transaction");
+        .expect("stage mismatched tombstoned transaction");
     assert!(matches!(
         rejected.commit().await,
         CommitOutcome::DefiniteFailure(ref error)
             if error.kind() == StateStoreErrorKind::InvalidRequest
     ));
+    assert_eq!(
+        store
+            .resolve_commit(&tombstoned)
+            .await
+            .expect("resolve tombstone after rejected mismatched commit"),
+        CommitResolution::NotCommitted
+    );
 
     let precondition_id = TransactionId::from(Uuid::new_v4());
     seed(store.as_ref(), &[(b"precondition", b"present")]).await;

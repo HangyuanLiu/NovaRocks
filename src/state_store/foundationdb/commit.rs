@@ -65,9 +65,17 @@ pub(super) enum ReservationDecision {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PreDispatchFailureDecision {
     PersistNotCommitted,
-    ReturnLocal,
+    RejectReuse,
     ReturnCommitted([u8; REVISION_BYTES]),
     PendingUnknown,
+}
+
+enum ReservationCommitFailureDecision {
+    Retry {
+        reservation_may_exist: bool,
+        foreign_state_may_exist: bool,
+    },
+    Outcome(CommitOutcome),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -328,12 +336,43 @@ fn decide_pre_dispatch_failure(
 ) -> PreDispatchFailureDecision {
     match observed {
         None => PreDispatchFailureDecision::PersistNotCommitted,
-        Some(DurableCommitState::NotCommitted) => PreDispatchFailureDecision::ReturnLocal,
+        Some(DurableCommitState::NotCommitted) => PreDispatchFailureDecision::RejectReuse,
         Some(DurableCommitState::Committed(revision)) => {
             PreDispatchFailureDecision::ReturnCommitted(*revision)
         }
         Some(DurableCommitState::Pending(_)) => PreDispatchFailureDecision::PendingUnknown,
     }
+}
+
+fn decide_reservation_commit_failure(
+    error: FdbError,
+    has_remaining_attempt: bool,
+) -> ReservationCommitFailureDecision {
+    let disposition = classify_native_commit_error(error);
+    if disposition == NativeCommitDisposition::DefiniteNotCommitted {
+        return ReservationCommitFailureDecision::Outcome(CommitOutcome::DefiniteFailure(
+            deterministic_commit_error(error.code()),
+        ));
+    }
+    if has_remaining_attempt && should_retry_auxiliary_commit(error) {
+        return ReservationCommitFailureDecision::Retry {
+            reservation_may_exist: disposition == NativeCommitDisposition::Unknown,
+            foreign_state_may_exist: disposition == NativeCommitDisposition::ConflictNotCommitted,
+        };
+    }
+    let outcome = match disposition {
+        NativeCommitDisposition::ConflictNotCommitted => {
+            CommitOutcome::CommitUnknown(conflict_error())
+        }
+        NativeCommitDisposition::RetryableNotCommitted => {
+            CommitOutcome::TransientBeforeCommit(provider_transient())
+        }
+        NativeCommitDisposition::Unknown => {
+            CommitOutcome::TransientBeforeCommit(provider_transient())
+        }
+        NativeCommitDisposition::DefiniteNotCommitted => unreachable!(),
+    };
+    ReservationCommitFailureDecision::Outcome(outcome)
 }
 
 pub(super) fn decide_reservation(
@@ -459,7 +498,9 @@ async fn persist_pre_dispatch_failure(
             PreDispatchFailureDecision::PendingUnknown => {
                 return CommitOutcome::CommitUnknown(foreign_pending());
             }
-            PreDispatchFailureDecision::ReturnLocal => return local_outcome,
+            PreDispatchFailureDecision::RejectReuse => {
+                return CommitOutcome::DefiniteFailure(invalid_reuse());
+            }
             PreDispatchFailureDecision::PersistNotCommitted => {
                 transaction.set(&state_key, &prepared.codec.not_committed_value());
                 match timeout_at(deadline, transaction.commit()).await {
@@ -627,6 +668,7 @@ async fn reserve_commit_state(
     let deadline = auxiliary_deadline(public_deadline);
     let mut budget = AuxiliaryAttemptBudget::new();
     let mut reservation_may_exist = false;
+    let mut foreign_state_may_exist = false;
     let state_key = codec.commit_state_key(*transaction_id.as_uuid().as_bytes());
     loop {
         let transaction = match create_auxiliary_transaction(
@@ -643,6 +685,7 @@ async fn reserve_commit_state(
                 return ReservationResult::Outcome(classify_reservation_read_error(
                     error,
                     reservation_may_exist,
+                    foreign_state_may_exist,
                 ));
             }
         };
@@ -665,9 +708,12 @@ async fn reserve_commit_state(
                 return ReservationResult::Outcome(classify_reservation_read_error(
                     error,
                     reservation_may_exist,
+                    foreign_state_may_exist,
                 ));
             }
         };
+        reservation_may_exist = false;
+        foreign_state_may_exist = false;
         match decide_reservation(observed.as_ref(), reservation_token) {
             ReservationDecision::Dispatch => return ReservationResult::Dispatch,
             ReservationDecision::ReturnCommitted(revision) => {
@@ -696,18 +742,21 @@ async fn reserve_commit_state(
                             error,
                             disposition,
                         );
-                        if disposition == NativeCommitDisposition::DefiniteNotCommitted {
-                            return ReservationResult::Outcome(CommitOutcome::DefiniteFailure(
-                                deterministic_commit_error(error.code()),
-                            ));
+                        let has_remaining_attempt =
+                            budget.has_remaining() && Instant::now() < deadline;
+                        match decide_reservation_commit_failure(error, has_remaining_attempt) {
+                            ReservationCommitFailureDecision::Retry {
+                                reservation_may_exist: own_state_may_exist,
+                                foreign_state_may_exist: competing_state_may_exist,
+                            } => {
+                                reservation_may_exist |= own_state_may_exist;
+                                foreign_state_may_exist |= competing_state_may_exist;
+                                continue;
+                            }
+                            ReservationCommitFailureDecision::Outcome(outcome) => {
+                                return ReservationResult::Outcome(outcome);
+                            }
                         }
-                        reservation_may_exist |= disposition == NativeCommitDisposition::Unknown;
-                        if budget.has_remaining() && Instant::now() < deadline {
-                            continue;
-                        }
-                        return ReservationResult::Outcome(CommitOutcome::TransientBeforeCommit(
-                            provider_transient(),
-                        ));
                     }
                     Err(_) => {
                         record_auxiliary_metric(metrics, AuxiliaryMetricEvent::Deadline);
@@ -951,7 +1000,11 @@ fn auxiliary_attempts_exhausted() -> StateStoreError {
 fn classify_reservation_read_error(
     error: StateStoreError,
     reservation_commit_unknown: bool,
+    foreign_state_may_exist: bool,
 ) -> CommitOutcome {
+    if foreign_state_may_exist {
+        return CommitOutcome::CommitUnknown(error);
+    }
     match error.kind() {
         StateStoreErrorKind::Transient
         | StateStoreErrorKind::ProviderUnavailable
@@ -1105,11 +1158,11 @@ mod tests {
             StateStoreErrorKind::DeadlineExceeded,
         ] {
             assert!(matches!(
-                classify_reservation_read_error(StateStoreError::new(kind, "test"), false),
+                classify_reservation_read_error(StateStoreError::new(kind, "test"), false, false),
                 CommitOutcome::TransientBeforeCommit(_)
             ));
             assert!(matches!(
-                classify_reservation_read_error(StateStoreError::new(kind, "test"), true),
+                classify_reservation_read_error(StateStoreError::new(kind, "test"), true, false),
                 CommitOutcome::TransientBeforeCommit(_)
             ));
         }
@@ -1121,14 +1174,45 @@ mod tests {
             StateStoreErrorKind::Internal,
         ] {
             assert!(matches!(
-                classify_reservation_read_error(StateStoreError::new(kind, "test"), false),
+                classify_reservation_read_error(StateStoreError::new(kind, "test"), false, false),
                 CommitOutcome::DefiniteFailure(_)
             ));
             assert!(matches!(
-                classify_reservation_read_error(StateStoreError::new(kind, "test"), true),
+                classify_reservation_read_error(StateStoreError::new(kind, "test"), true, false),
                 CommitOutcome::CommitUnknown(_)
             ));
         }
+    }
+
+    #[test]
+    fn reservation_conflict_requires_authoritative_reload_before_safe_retry() {
+        let ReservationCommitFailureDecision::Retry {
+            reservation_may_exist,
+            foreign_state_may_exist,
+        } = decide_reservation_commit_failure(FdbError::from_code(1020), true)
+        else {
+            panic!("reservation conflict with reload budget must retry");
+        };
+        assert!(!reservation_may_exist);
+        assert!(foreign_state_may_exist);
+        assert!(matches!(
+            classify_reservation_read_error(
+                provider_error(),
+                reservation_may_exist,
+                foreign_state_may_exist
+            ),
+            CommitOutcome::CommitUnknown(ref error)
+                if error.kind() == StateStoreErrorKind::ProviderUnavailable
+        ));
+        assert!(matches!(
+            classify_reservation_read_error(
+                deadline_error(),
+                reservation_may_exist,
+                foreign_state_may_exist
+            ),
+            CommitOutcome::CommitUnknown(ref error)
+                if error.kind() == StateStoreErrorKind::DeadlineExceeded
+        ));
     }
 
     #[test]
@@ -1139,7 +1223,7 @@ mod tests {
         );
         assert_eq!(
             decide_pre_dispatch_failure(Some(&DurableCommitState::NotCommitted)),
-            PreDispatchFailureDecision::ReturnLocal
+            PreDispatchFailureDecision::RejectReuse
         );
         assert_eq!(
             decide_pre_dispatch_failure(Some(&DurableCommitState::Committed([0x44; 10]))),
@@ -1149,6 +1233,49 @@ mod tests {
             decide_pre_dispatch_failure(Some(&DurableCommitState::Pending([0x55; 16]))),
             PreDispatchFailureDecision::PendingUnknown
         );
+    }
+
+    #[test]
+    fn exhausted_reservation_conflict_fails_closed_without_widening_safe_transients() {
+        let mut budget = AuxiliaryAttemptBudget::new();
+        for _ in 0..AUXILIARY_MAX_ATTEMPTS {
+            assert!(budget.try_consume());
+        }
+        assert!(!budget.has_remaining());
+
+        assert!(matches!(
+            decide_reservation_commit_failure(
+                FdbError::from_code(1020),
+                budget.has_remaining()
+            ),
+            ReservationCommitFailureDecision::Outcome(CommitOutcome::CommitUnknown(ref error))
+                if error.kind() == StateStoreErrorKind::Conflict
+        ));
+        assert!(matches!(
+            decide_reservation_commit_failure(
+                FdbError::from_code(1007),
+                budget.has_remaining()
+            ),
+            ReservationCommitFailureDecision::Outcome(
+                CommitOutcome::TransientBeforeCommit(ref error)
+            ) if error.kind() == StateStoreErrorKind::Transient
+        ));
+        assert!(matches!(
+            decide_reservation_commit_failure(
+                FdbError::from_code(1021),
+                budget.has_remaining()
+            ),
+            ReservationCommitFailureDecision::Outcome(
+                CommitOutcome::TransientBeforeCommit(ref error)
+            ) if error.kind() == StateStoreErrorKind::Transient
+        ));
+        assert!(matches!(
+            decide_reservation_commit_failure(FdbError::from_code(1007), true),
+            ReservationCommitFailureDecision::Retry {
+                reservation_may_exist: false,
+                foreign_state_may_exist: false,
+            }
+        ));
     }
 
     #[test]
