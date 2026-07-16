@@ -1,0 +1,52 @@
+name: FoundationDB state store
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/foundationdb-state-store.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "docker/foundationdb/**"
+      - "novarocks.toml.example"
+      - "src/common/app_config.rs"
+      - "src/state_store/**"
+      - "tests/architecture_guard/state_store_boundary.rs"
+      - "tests/cluster_mvp.rs"
+      - "tests/common/mod.rs"
+      - "tests/common/state_store_conformance.rs"
+      - "tests/state_store_*.rs"
+      - "tests/support/state_store_foundationdb_helper.rs"
+      - "tools/ci/foundationdb-provider.sh"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  foundationdb-state-store:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang libclang-dev dpkg curl
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Install current Docker engine
+        uses: docker/setup-docker-action@v4
+
+      - name: Prepare FoundationDB fixture
+        run: docker/foundationdb/up.sh
+
+      - name: Run FoundationDB production gate
+        run: tools/ci/foundationdb-provider.sh
+
+      - name: Stop FoundationDB fixture
+        if: always()
+        run: docker/foundationdb/down.sh --docker

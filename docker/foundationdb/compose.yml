@@ -1,0 +1,48 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+services:
+  foundationdb:
+    image: foundationdb/foundationdb:7.3.69
+    platform: linux/amd64
+    environment:
+      FDB_CLUSTER_FILE: "${NOVA_FDB_CONTAINER_CLUSTER_FILE}"
+      FDB_NETWORKING_MODE: container
+    ports:
+      - "${NOVA_FDB_PORT}:${NOVA_FDB_PORT}/tcp"
+    volumes:
+      - ./runtime/${NOVA_FDB_ENV_ID}/data:/var/fdb/data
+      - ./runtime/${NOVA_FDB_ENV_ID}/logs:/var/fdb/logs
+      - type: bind
+        source: "${NOVA_FDB_CLUSTER_FILE}"
+        target: "${NOVA_FDB_CONTAINER_CLUSTER_FILE}"
+        read_only: true
+    # The stock container entrypoint publishes its private container address in
+    # container mode. Publish the mapped loopback address explicitly so the
+    # generated host cluster file remains usable on Docker Desktop and Linux.
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - >-
+        exec fdbserver
+        --cluster-file ${NOVA_FDB_CONTAINER_CLUSTER_FILE}
+        --listen-address 0.0.0.0:${NOVA_FDB_PORT}
+        --public-address 127.0.0.1:${NOVA_FDB_PORT}
+        --datadir /var/fdb/data
+        --logdir /var/fdb/logs
+        --locality-zoneid=${NOVA_FDB_ENV_ID}
+        --locality-machineid=${NOVA_FDB_ENV_ID}
+        --class unset

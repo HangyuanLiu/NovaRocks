@@ -1863,11 +1863,12 @@ mod tests {
         Arc::new(
             SqliteStateStore::open(
                 StateStoreConfig {
-                    provider: StateStoreProviderConfig::Sqlite,
-                    path: temp.path().join("state-store.sqlite"),
                     cluster_id: "cluster-a".to_owned(),
-                    deployment_owner: "fe-a".to_owned(),
                     limits,
+                    provider: StateStoreProviderConfig::Sqlite {
+                        path: temp.path().join("state-store.sqlite"),
+                        deployment_owner: "fe-a".to_owned(),
+                    },
                 },
                 FeDeploymentView {
                     active_fe_count: NonZeroUsize::new(1).expect("one FE"),

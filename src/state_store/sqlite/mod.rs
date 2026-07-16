@@ -32,7 +32,8 @@ use rusqlite::{Connection, OpenFlags};
 use crate::state_store::{
     ChangePage, ChangePollRequest, CommitResolution, FeDeploymentView, ReadTransaction, StateStore,
     StateStoreConfig, StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetrics,
-    StateStoreMetricsSnapshot, StoreIdentity, TransactionId, WriteTransaction,
+    StateStoreMetricsSnapshot, StateStoreProviderConfig, StoreIdentity, TransactionId,
+    WriteTransaction,
 };
 
 pub(super) struct SqliteStateStore {
@@ -129,7 +130,16 @@ impl SqliteStateStore {
                 "SQLite state store configuration is invalid",
             )
         })?;
-        if is_memory_path(&config.path) {
+        let path = match &config.provider {
+            StateStoreProviderConfig::Sqlite { path, .. } => path,
+            StateStoreProviderConfig::Foundationdb { .. } => {
+                return Err(StateStoreError::new(
+                    StateStoreErrorKind::InvalidConfiguration,
+                    "SQLite state store requires sqlite provider configuration",
+                ));
+            }
+        };
+        if is_memory_path(path) {
             return Err(StateStoreError::new(
                 StateStoreErrorKind::InvalidConfiguration,
                 "SQLite state store requires a persistent file path",
@@ -162,14 +172,29 @@ fn open_blocking(
     config: StateStoreConfig,
     limits: StateStoreLimits,
 ) -> Result<SqliteStateStore, StateStoreError> {
-    let path = canonicalize_database_path(&config.path)?;
+    let StateStoreConfig {
+        cluster_id,
+        provider,
+        ..
+    } = config;
+    let StateStoreProviderConfig::Sqlite {
+        path,
+        deployment_owner,
+    } = provider
+    else {
+        return Err(StateStoreError::new(
+            StateStoreErrorKind::InvalidConfiguration,
+            "SQLite state store requires sqlite provider configuration",
+        ));
+    };
+    let path = canonicalize_database_path(&path)?;
     let database_path = database_path_bytes(&path)?;
     let owner_lock = acquire_owner_lock(&path)?;
     let mut connection = open_connection(&path)?;
     let identity = schema::initialize(
         &mut connection,
-        config.cluster_id.as_bytes(),
-        config.deployment_owner.as_bytes(),
+        cluster_id.as_bytes(),
+        deployment_owner.as_bytes(),
         &database_path,
     )?;
 
@@ -428,11 +453,12 @@ mod tests {
         deployment_owner: &str,
     ) -> StateStoreConfig {
         StateStoreConfig {
-            provider: StateStoreProviderConfig::Sqlite,
-            path: path.into(),
             cluster_id: cluster_id.to_owned(),
-            deployment_owner: deployment_owner.to_owned(),
             limits: StateStoreLimitOverrides::default(),
+            provider: StateStoreProviderConfig::Sqlite {
+                path: path.into(),
+                deployment_owner: deployment_owner.to_owned(),
+            },
         }
     }
 

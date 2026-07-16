@@ -24,10 +24,18 @@ pub mod limits;
 pub mod metrics;
 pub mod range;
 pub mod runner;
+mod runtime;
 
 mod sqlite;
 
-pub use config::{StateStoreConfig, StateStoreProviderConfig};
+#[cfg(feature = "foundationdb-provider")]
+mod foundationdb;
+
+#[cfg(all(feature = "foundationdb-provider", feature = "state-store-test-hooks"))]
+#[doc(hidden)]
+pub use foundationdb::test_support::{FoundationDbCommitGateControl, arm_next_foundationdb_commit};
+
+pub use config::{FoundationDbClientConfig, StateStoreConfig, StateStoreProviderConfig};
 pub use contract::{
     ChangeHint, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution,
     FeDeploymentView, Key, OperationId, Precondition, RangePage, ReadTransaction, StateRecord,
@@ -41,14 +49,28 @@ pub use metrics::{
 };
 pub use range::{ChangeCursor, ContinuationToken, Direction, KeyRange, RangeRequest};
 pub use runner::{RunFailure, RunSuccess, derive_transaction_id, run_side_effect_free};
+pub use runtime::StateStoreRuntime;
 
 pub async fn open_state_store(
+    runtime: &StateStoreRuntime,
     config: StateStoreConfig,
     deployment: FeDeploymentView,
 ) -> Result<Arc<dyn StateStore>, StateStoreError> {
-    match config.provider {
-        StateStoreProviderConfig::Sqlite => Ok(Arc::new(
-            sqlite::SqliteStateStore::open(config, deployment).await?,
-        )),
+    match &config.provider {
+        StateStoreProviderConfig::Sqlite { .. } => {
+            runtime.accepts_local()?;
+            Ok(Arc::new(
+                sqlite::SqliteStateStore::open(config, deployment).await?,
+            ))
+        }
+        StateStoreProviderConfig::Foundationdb { .. } => {
+            #[cfg(not(feature = "foundationdb-provider"))]
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::InvalidConfiguration,
+                "FoundationDB provider is not compiled in",
+            ));
+            #[cfg(feature = "foundationdb-provider")]
+            return runtime.open_foundationdb_store(&config).await;
+        }
     }
 }

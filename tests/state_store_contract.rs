@@ -18,6 +18,8 @@
 mod common;
 
 use std::collections::VecDeque;
+use std::num::NonZeroUsize;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -26,16 +28,408 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use novarocks::state_store::{
     ChangeCursor, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution,
-    ContinuationToken, Direction, Key, KeyRange, OperationId, Precondition, RangePage,
-    RangeRequest, ReadTransaction, RunFailure, StateStore, StateStoreError, StateStoreErrorKind,
-    StateStoreLimits, StateStoreMetrics, StateStoreOperation, StateStoreOutcome, StoreIdentity,
-    StoreRevision, TransactionId, Value, VersionToken, WriteTransaction, derive_transaction_id,
+    ContinuationToken, Direction, FeDeploymentView, FoundationDbClientConfig, Key, KeyRange,
+    OperationId, Precondition, RangePage, RangeRequest, ReadTransaction, RunFailure, StateStore,
+    StateStoreConfig, StateStoreError, StateStoreErrorKind, StateStoreLimitOverrides,
+    StateStoreLimits, StateStoreMetrics, StateStoreOperation, StateStoreOutcome,
+    StateStoreProviderConfig, StateStoreRuntime, StoreIdentity, StoreRevision, TransactionId,
+    Value, VersionToken, WriteTransaction, derive_transaction_id, open_state_store,
     run_side_effect_free,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use common::state_store_conformance::{FaultGate, FaultInjectingStateStore, ScriptedCommitResult};
+
+#[test]
+fn foundationdb_config_parses_exact_tagged_provider() -> anyhow::Result<()> {
+    let config: StateStoreConfig = toml::from_str(
+        r#"
+provider = "foundationdb"
+cluster_id = "cluster-a"
+cluster_file = "/tmp/fdb.cluster"
+keyspace_id = "22db595e-3031-48eb-8212-f56d3626ee41"
+"#,
+    )?;
+
+    assert!(matches!(
+        config.provider,
+        StateStoreProviderConfig::Foundationdb { keyspace_id, .. }
+            if keyspace_id == Uuid::parse_str("22db595e-3031-48eb-8212-f56d3626ee41")?
+    ));
+    Ok(())
+}
+
+#[test]
+fn foundationdb_config_rejects_missing_provider_and_cross_provider_fields() {
+    for input in [
+        r#"
+cluster_id = "cluster-a"
+cluster_file = "/tmp/fdb.cluster"
+keyspace_id = "22db595e-3031-48eb-8212-f56d3626ee41"
+"#,
+        r#"
+provider = "sqlite"
+cluster_id = "cluster-a"
+path = "meta/state-store.sqlite"
+deployment_owner = "fe-a"
+cluster_file = "/tmp/fdb.cluster"
+"#,
+        r#"
+provider = "foundationdb"
+cluster_id = "cluster-a"
+cluster_file = "/tmp/fdb.cluster"
+keyspace_id = "22db595e-3031-48eb-8212-f56d3626ee41"
+path = "meta/state-store.sqlite"
+"#,
+        r#"
+provider = "sqlite"
+provider = "foundationdb"
+cluster_id = "cluster-a"
+cluster_file = "/tmp/fdb.cluster"
+keyspace_id = "22db595e-3031-48eb-8212-f56d3626ee41"
+"#,
+    ] {
+        toml::from_str::<StateStoreConfig>(input)
+            .expect_err("missing and cross-provider fields must fail closed");
+    }
+}
+
+#[test]
+fn foundationdb_config_rejects_empty_cluster_id_and_invalid_cluster_files() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let missing = temp.path().join("missing.cluster");
+    let fixtures = [
+        StateStoreConfig {
+            cluster_id: " ".to_owned(),
+            limits: StateStoreLimitOverrides::default(),
+            provider: StateStoreProviderConfig::Foundationdb {
+                cluster_file: temp.path().join("fdb.cluster"),
+                keyspace_id: Uuid::nil(),
+            },
+        },
+        StateStoreConfig {
+            cluster_id: "cluster-a".to_owned(),
+            limits: StateStoreLimitOverrides::default(),
+            provider: StateStoreProviderConfig::Foundationdb {
+                cluster_file: PathBuf::new(),
+                keyspace_id: Uuid::nil(),
+            },
+        },
+        StateStoreConfig {
+            cluster_id: "cluster-a".to_owned(),
+            limits: StateStoreLimitOverrides::default(),
+            provider: StateStoreProviderConfig::Foundationdb {
+                cluster_file: missing,
+                keyspace_id: Uuid::nil(),
+            },
+        },
+        StateStoreConfig {
+            cluster_id: "cluster-a".to_owned(),
+            limits: StateStoreLimitOverrides::default(),
+            provider: StateStoreProviderConfig::Foundationdb {
+                cluster_file: temp.path().to_path_buf(),
+                keyspace_id: Uuid::nil(),
+            },
+        },
+        StateStoreConfig {
+            cluster_id: "cluster-a".to_owned(),
+            limits: StateStoreLimitOverrides::default(),
+            provider: StateStoreProviderConfig::Foundationdb {
+                cluster_file: PathBuf::from("bad\0cluster-file"),
+                keyspace_id: Uuid::nil(),
+            },
+        },
+    ];
+
+    for config in fixtures {
+        config
+            .validate()
+            .expect_err("invalid FoundationDB configuration must fail closed");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn foundationdb_config_rejects_non_utf8_cluster_file_path() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let config = StateStoreConfig {
+        cluster_id: "cluster-a".to_owned(),
+        limits: StateStoreLimitOverrides::default(),
+        provider: StateStoreProviderConfig::Foundationdb {
+            cluster_file: PathBuf::from(OsString::from_vec(b"/tmp/fdb-\xff.cluster".to_vec())),
+            keyspace_id: Uuid::nil(),
+        },
+    };
+
+    let error = config
+        .validate()
+        .expect_err("non-UTF-8 FoundationDB cluster_file must fail closed");
+    assert_eq!(
+        error.to_string(),
+        "InvalidStateStoreConfig: cluster_file must be valid UTF-8"
+    );
+}
+
+#[test]
+fn foundationdb_config_rejects_invalid_client_configuration() -> anyhow::Result<()> {
+    let cluster_file = tempfile::NamedTempFile::new()?;
+    let config_path = tempfile::NamedTempFile::new()?;
+    let state_store = format!(
+        r#"
+[state_store]
+provider = "foundationdb"
+cluster_id = "cluster-a"
+cluster_file = "{}"
+keyspace_id = "22db595e-3031-48eb-8212-f56d3626ee41"
+"#,
+        cluster_file.path().display()
+    );
+
+    for client in [
+        r#"
+[foundationdb_client]
+disable_multi_version_client = false
+"#,
+        r#"
+[foundationdb_client]
+"#,
+        r#"
+[foundationdb_client]
+disable_multi_version_client = true
+tls_cert_path = "/tmp/client.crt"
+"#,
+        r#"
+[foundationdb_client]
+disable_multi_version_client = true
+tls_password = "plaintext-secret"
+"#,
+    ] {
+        std::fs::write(config_path.path(), format!("{state_store}{client}"))?;
+        if novarocks::common::app_config::NovaRocksConfig::load_from_file(config_path.path())
+            .is_ok()
+        {
+            panic!("invalid FoundationDB client configuration must fail closed");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn foundationdb_config_rejects_missing_or_orphaned_client_configuration() -> anyhow::Result<()> {
+    let cluster_file = tempfile::NamedTempFile::new()?;
+    let config_path = tempfile::NamedTempFile::new()?;
+    let fixtures = [
+        format!(
+            r#"
+[state_store]
+provider = "foundationdb"
+cluster_id = "cluster-a"
+cluster_file = "{}"
+keyspace_id = "22db595e-3031-48eb-8212-f56d3626ee41"
+"#,
+            cluster_file.path().display()
+        ),
+        r#"
+[state_store]
+provider = "sqlite"
+cluster_id = "cluster-a"
+path = "meta/state-store.sqlite"
+deployment_owner = "fe-a"
+
+[foundationdb_client]
+disable_multi_version_client = true
+"#
+        .to_owned(),
+        r#"
+[foundationdb_client]
+disable_multi_version_client = true
+"#
+        .to_owned(),
+    ];
+
+    for fixture in fixtures {
+        std::fs::write(config_path.path(), fixture)?;
+        if novarocks::common::app_config::NovaRocksConfig::load_from_file(config_path.path())
+            .is_ok()
+        {
+            panic!("missing or orphaned FoundationDB client config must fail closed");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn foundationdb_config_client_debug_redacts_paths_and_password_environment_name() {
+    let config = FoundationDbClientConfig {
+        disable_multi_version_client: true,
+        tls_cert_path: Some(PathBuf::from("/secret/client.crt")),
+        tls_key_path: Some(PathBuf::from("/secret/client.key")),
+        tls_ca_path: Some(PathBuf::from("/secret/ca.crt")),
+        tls_verify_peers: Some("Check.Valid=1".to_owned()),
+        tls_password_env: Some("FDB_TLS_PASSWORD_SECRET".to_owned()),
+    };
+
+    let debug = format!("{config:?}");
+    for secret in [
+        "/secret/client.crt",
+        "/secret/client.key",
+        "/secret/ca.crt",
+        "Check.Valid=1",
+        "FDB_TLS_PASSWORD_SECRET",
+    ] {
+        assert!(!debug.contains(secret), "Debug leaked {secret}: {debug}");
+    }
+    assert!(debug.contains("tls_cert_path_configured: true"));
+    assert!(debug.contains("tls_password_env_configured: true"));
+}
+
+#[test]
+fn foundationdb_config_loads_complete_tls_client_configuration() -> anyhow::Result<()> {
+    const FIXTURE_ENV: &str = "NOVAROCKS_TEST_FDB_TLS_CONFIG_FIXTURE";
+    const PASSWORD_ENV: &str = "NOVAROCKS_TEST_FDB_TLS_PASSWORD";
+
+    if let Some(config_path) = std::env::var_os(FIXTURE_ENV) {
+        return assert_complete_tls_client_configuration(PathBuf::from(config_path), PASSWORD_ENV);
+    }
+
+    let fixture_dir = tempfile::tempdir()?;
+    let cluster_file = fixture_dir.path().join("fdb.cluster");
+    let tls_cert = fixture_dir.path().join("client.crt");
+    let tls_key = fixture_dir.path().join("client.key");
+    let tls_ca = fixture_dir.path().join("ca.crt");
+    let config_path = fixture_dir.path().join("novarocks.toml");
+    for path in [&cluster_file, &tls_cert, &tls_key, &tls_ca] {
+        std::fs::write(path, b"")?;
+    }
+    let config_text = format!(
+        r#"
+[state_store]
+provider = "foundationdb"
+cluster_id = "cluster-a"
+cluster_file = "{}"
+keyspace_id = "22db595e-3031-48eb-8212-f56d3626ee41"
+
+[foundationdb_client]
+disable_multi_version_client = true
+tls_cert_path = "{}"
+tls_key_path = "{}"
+tls_ca_path = "{}"
+tls_verify_peers = "Check.Valid=1"
+tls_password_env = "{}"
+"#,
+        cluster_file.display(),
+        tls_cert.display(),
+        tls_key.display(),
+        tls_ca.display(),
+        PASSWORD_ENV,
+    );
+    std::fs::write(&config_path, config_text)?;
+
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .arg("--exact")
+        .arg("foundationdb_config_loads_complete_tls_client_configuration")
+        .arg("--nocapture")
+        .env(FIXTURE_ENV, &config_path)
+        .env(PASSWORD_ENV, "test-password")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "isolated TLS config test failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+fn assert_complete_tls_client_configuration(
+    config_path: PathBuf,
+    password_env: &str,
+) -> anyhow::Result<()> {
+    let fixture_dir = config_path.parent().expect("fixture directory");
+    let cluster_file = fixture_dir.join("fdb.cluster");
+    let tls_cert = fixture_dir.join("client.crt");
+    let tls_key = fixture_dir.join("client.key");
+    let tls_ca = fixture_dir.join("ca.crt");
+    let loaded = novarocks::common::app_config::NovaRocksConfig::load_from_file(&config_path)?;
+
+    let state_store = loaded.state_store.expect("state store config");
+    assert!(matches!(
+        state_store.provider,
+        StateStoreProviderConfig::Foundationdb { cluster_file: loaded, keyspace_id }
+            if loaded == cluster_file
+                && keyspace_id == Uuid::parse_str("22db595e-3031-48eb-8212-f56d3626ee41")?
+    ));
+
+    let client = loaded
+        .foundationdb_client
+        .expect("FoundationDB client config");
+    assert_eq!(client.tls_cert_path.as_deref(), Some(tls_cert.as_path()));
+    assert_eq!(client.tls_key_path.as_deref(), Some(tls_key.as_path()));
+    assert_eq!(client.tls_ca_path.as_deref(), Some(tls_ca.as_path()));
+    assert_eq!(client.tls_verify_peers.as_deref(), Some("Check.Valid=1"));
+    assert_eq!(client.tls_password_env.as_deref(), Some(password_env));
+
+    let debug = format!("{client:?}");
+    for secret in [
+        tls_cert.to_string_lossy().as_ref(),
+        tls_key.to_string_lossy().as_ref(),
+        tls_ca.to_string_lossy().as_ref(),
+        "Check.Valid=1",
+        password_env,
+    ] {
+        assert!(!debug.contains(secret), "Debug leaked {secret}: {debug}");
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "foundationdb-provider"))]
+#[tokio::test]
+async fn foundationdb_config_feature_off_open_fails_without_fallback() {
+    let cluster_file = tempfile::NamedTempFile::new().expect("cluster file");
+    let config_path = tempfile::NamedTempFile::new().expect("config file");
+    std::fs::write(
+        config_path.path(),
+        format!(
+            r#"
+[state_store]
+provider = "foundationdb"
+cluster_id = "cluster-a"
+cluster_file = "{}"
+keyspace_id = "22db595e-3031-48eb-8212-f56d3626ee41"
+
+[foundationdb_client]
+disable_multi_version_client = true
+"#,
+            cluster_file.path().display()
+        ),
+    )
+    .expect("write config");
+    let loaded = novarocks::common::app_config::NovaRocksConfig::load_from_file(config_path.path())
+        .expect("load FoundationDB config from TOML");
+    let runtime = StateStoreRuntime::local().expect("create feature-off local runtime");
+    let error = match open_state_store(
+        &runtime,
+        loaded.state_store.expect("state store config"),
+        FeDeploymentView {
+            active_fe_count: NonZeroUsize::new(3).expect("three FEs"),
+            topology_revision: Bytes::from_static(b"topology-r1"),
+        },
+    )
+    .await
+    {
+        Ok(_) => panic!("feature-off FoundationDB open must fail without SQLite fallback"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.kind(), StateStoreErrorKind::InvalidConfiguration);
+    assert_eq!(
+        error.to_string(),
+        "InvalidConfiguration: FoundationDB provider is not compiled in"
+    );
+}
 
 fn key(bytes: &'static [u8]) -> Key {
     Key::try_from(Bytes::from_static(bytes)).expect("valid key")

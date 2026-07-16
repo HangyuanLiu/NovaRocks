@@ -19,7 +19,9 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
-use crate::state_store::config::StateStoreConfig;
+use crate::state_store::config::{
+    FoundationDbClientConfig, StateStoreConfig, StateStoreProviderConfig,
+};
 
 static CONFIG: OnceLock<RwLock<&'static NovaRocksConfig>> = OnceLock::new();
 pub use crate::common::memory_limit::DEFAULT_MEM_LIMIT_SPEC;
@@ -286,6 +288,9 @@ pub struct NovaRocksConfig {
     pub state_store: Option<StateStoreConfig>,
 
     #[serde(default)]
+    pub foundationdb_client: Option<FoundationDbClientConfig>,
+
+    #[serde(default)]
     pub standalone_server: Option<StandaloneServerConfig>,
 
     #[serde(default)]
@@ -308,9 +313,7 @@ impl NovaRocksConfig {
         let cfg: NovaRocksConfig = value
             .try_into()
             .with_context(|| format!("parse toml: {}", path.display()))?;
-        if let Some(state_store) = &cfg.state_store {
-            state_store.validate()?;
-        }
+        validate_state_store_configuration(&cfg)?;
         Ok(cfg)
     }
 
@@ -346,11 +349,53 @@ impl Default for NovaRocksConfig {
             jdbc: None,
             metadata: None,
             state_store: None,
+            foundationdb_client: None,
             standalone_server: None,
             spill: SpillStorageConfig::default(),
             starrocks: StarRocksConfig::default(),
             cluster: ClusterConfig::default(),
         }
+    }
+}
+
+fn validate_state_store_configuration(config: &NovaRocksConfig) -> Result<()> {
+    if let Some(state_store) = &config.state_store {
+        state_store.validate()?;
+    }
+
+    match (&config.state_store, &config.foundationdb_client) {
+        (None, None)
+        | (
+            Some(StateStoreConfig {
+                provider: StateStoreProviderConfig::Sqlite { .. },
+                ..
+            }),
+            None,
+        ) => Ok(()),
+        (
+            Some(StateStoreConfig {
+                provider: StateStoreProviderConfig::Foundationdb { .. },
+                ..
+            }),
+            Some(client),
+        ) => client.validate(),
+        (
+            Some(StateStoreConfig {
+                provider: StateStoreProviderConfig::Foundationdb { .. },
+                ..
+            }),
+            None,
+        ) => bail!("InvalidStateStoreConfig: foundationdb provider requires [foundationdb_client]"),
+        (None, Some(_))
+        | (
+            Some(StateStoreConfig {
+                provider: StateStoreProviderConfig::Sqlite { .. },
+                ..
+            }),
+            Some(_),
+        ) => bail!(
+            "InvalidStateStoreConfig: [foundationdb_client] requires the foundationdb state store provider"
+        ),
     }
 }
 
@@ -1584,10 +1629,10 @@ deployment_owner = "fe-a"
 
         let cfg = NovaRocksConfig::load_from_file(temp.path())?;
 
-        assert_eq!(
+        assert!(matches!(
             cfg.state_store.expect("state store config").provider,
-            StateStoreProviderConfig::Sqlite
-        );
+            StateStoreProviderConfig::Sqlite { .. }
+        ));
         Ok(())
     }
 
@@ -1614,7 +1659,7 @@ deployment_owner = "fe-a"
     }
 
     #[test]
-    fn state_store_config_rejects_unimplemented_provider() -> anyhow::Result<()> {
+    fn state_store_config_rejects_cross_provider_fields() -> anyhow::Result<()> {
         let temp = tempfile::NamedTempFile::new()?;
         std::fs::write(
             temp.path(),
@@ -1628,7 +1673,7 @@ deployment_owner = "fe-a"
         )?;
 
         let error = match NovaRocksConfig::load_from_file(temp.path()) {
-            Ok(_) => panic!("unimplemented providers must fail closed"),
+            Ok(_) => panic!("cross-provider fields must fail closed"),
             Err(error) => error,
         };
 

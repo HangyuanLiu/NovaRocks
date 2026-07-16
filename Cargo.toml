@@ -24,6 +24,13 @@ build = "src/build.rs"
 [lib]
 doctest = false
 
+[[bin]]
+name = "state-store-foundationdb-helper"
+path = "tests/support/state_store_foundationdb_helper.rs"
+required-features = ["foundationdb-provider", "state-store-test-hooks"]
+test = false
+bench = false
+
 [dependencies]
 # logging/config
 tracing = "0.1"
@@ -60,10 +67,11 @@ libm = "0.2"
 num-traits = "0.2"
 ordered-float = "4"
 async-trait = "0.1"
-uuid = { version = "1", features = ["v4", "v7"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
 fs2 = "0.4"
 as-any = "0.3"
 opensrv-mysql = { version = "0.7", default-features = false }
+foundationdb = { version = "=0.11.0", optional = true, default-features = false, features = ["embedded-fdb-include", "fdb-7_3"] }
 
 # starust core
 thrift = "0.17"
@@ -73,7 +81,7 @@ bytes = "1"
 csv = "1"
 hashbrown = { version = "0.14", features = ["raw"] }
 prost = "0.13"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tonic = { version = "0.12", features = ["transport"] }
 axum = "0.7"
 tokio-stream = "0.1"
@@ -106,6 +114,8 @@ mockito = "1"
 syn = { version = "2", features = ["full", "visit"] }
 
 [features]
+foundationdb-provider = ["dep:foundationdb"]
+state-store-test-hooks = []
 ssb = []
 compat = []
 

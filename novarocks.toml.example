@@ -10,6 +10,30 @@ log_level = "info"
 # Example: "info,novarocks=debug,h2=off,hyper=off,tonic=off"
 # log_filter = "info"
 
+# Optional durable state store. Select exactly one provider configuration.
+# SQLite is restricted to deployments with exactly one active FE.
+# [state_store]
+# provider = "sqlite"
+# cluster_id = "cluster-a"
+# path = "meta/state-store.sqlite"
+# deployment_owner = "fe-a"
+
+# FoundationDB requires a build with `foundationdb-provider`, an explicit readable
+# cluster file, a stable keyspace UUID, and the process-global client section.
+# [state_store]
+# provider = "foundationdb"
+# cluster_id = "cluster-a"
+# cluster_file = "/etc/foundationdb/fdb.cluster"
+# keyspace_id = "22db595e-3031-48eb-8212-f56d3626ee41"
+
+# [foundationdb_client]
+# disable_multi_version_client = true
+# tls_cert_path = "/run/secrets/fdb-client.crt"
+# tls_key_path = "/run/secrets/fdb-client.key"
+# tls_ca_path = "/run/secrets/fdb-ca.crt"
+# tls_verify_peers = "Check.Valid=1"
+# tls_password_env = "FDB_TLS_PASSWORD"
+
 [server]
 # Service bind host. Default: "127.0.0.1".
 host = "127.0.0.1"

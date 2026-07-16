@@ -29,7 +29,8 @@ use novarocks::state_store::{
     ChangeCursor, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution, Direction,
     FeDeploymentView, Key, KeyRange, Precondition, RangeRequest, StateStore, StateStoreConfig,
     StateStoreErrorKind, StateStoreLimitOverrides, StateStoreOperation, StateStoreOutcome,
-    StateStoreProviderConfig, StoreRevision, TransactionId, Value, open_state_store,
+    StateStoreProviderConfig, StateStoreRuntime, StoreRevision, TransactionId, Value,
+    open_state_store,
 };
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -88,13 +89,16 @@ async fn open_store_with_limits(
     owner: &str,
     limits: StateStoreLimitOverrides,
 ) -> Arc<dyn StateStore> {
+    let runtime = StateStoreRuntime::local().expect("create local state store runtime");
     open_state_store(
+        &runtime,
         StateStoreConfig {
-            provider: StateStoreProviderConfig::Sqlite,
-            path: temp.path().join("state-store.sqlite"),
             cluster_id: "cluster-a".to_owned(),
-            deployment_owner: owner.to_owned(),
             limits,
+            provider: StateStoreProviderConfig::Sqlite {
+                path: temp.path().join("state-store.sqlite"),
+                deployment_owner: owner.to_owned(),
+            },
         },
         FeDeploymentView {
             active_fe_count: NonZeroUsize::new(1).expect("one FE"),
@@ -117,16 +121,15 @@ async fn read_state_record(
 
 fn conformance_factory() -> StateStoreFactory {
     let temp = Arc::new(TempDir::new().expect("conformance temp dir"));
-    Arc::new(move || {
+    std::rc::Rc::new(move || {
         let temp = Arc::clone(&temp);
         Box::pin(async move {
             let path = temp.path().join("state-store.sqlite");
+            let runtime = StateStoreRuntime::local()?;
             let store = open_state_store(
+                &runtime,
                 StateStoreConfig {
-                    provider: StateStoreProviderConfig::Sqlite,
-                    path: path.clone(),
                     cluster_id: "conformance-cluster".to_owned(),
-                    deployment_owner: "conformance-fe".to_owned(),
                     limits: StateStoreLimitOverrides {
                         max_key_bytes: Some(64),
                         max_value_bytes: Some(128),
@@ -135,6 +138,10 @@ fn conformance_factory() -> StateStoreFactory {
                         max_transaction_bytes: Some(1_024),
                         transaction_deadline_ms: Some(250),
                         runner_max_attempts: Some(3),
+                    },
+                    provider: StateStoreProviderConfig::Sqlite {
+                        path: path.clone(),
+                        deployment_owner: "conformance-fe".to_owned(),
                     },
                 },
                 FeDeploymentView {
@@ -530,13 +537,16 @@ mod conformance {
         let temp = TempDir::new().expect("owner lifecycle temp dir");
         let first = open_store(&temp, "fe-a").await;
         let identity = first.identity().await.expect("first owner identity");
+        let runtime = StateStoreRuntime::local().expect("create local state store runtime");
         let second = open_state_store(
+            &runtime,
             StateStoreConfig {
-                provider: StateStoreProviderConfig::Sqlite,
-                path: temp.path().join("state-store.sqlite"),
                 cluster_id: "cluster-a".to_owned(),
-                deployment_owner: "fe-b".to_owned(),
                 limits: StateStoreLimitOverrides::default(),
+                provider: StateStoreProviderConfig::Sqlite {
+                    path: temp.path().join("state-store.sqlite"),
+                    deployment_owner: "fe-b".to_owned(),
+                },
             },
             FeDeploymentView {
                 active_fe_count: NonZeroUsize::new(1).expect("one FE"),
@@ -1832,13 +1842,16 @@ async fn sqlite_concurrent_first_open_has_exactly_one_schema_owner() {
         let gate = Arc::clone(&gate);
         opens.push(tokio::spawn(async move {
             gate.wait().await;
+            let runtime = StateStoreRuntime::local().expect("create local state store runtime");
             open_state_store(
+                &runtime,
                 StateStoreConfig {
-                    provider: StateStoreProviderConfig::Sqlite,
-                    path,
                     cluster_id: "race-cluster".to_owned(),
-                    deployment_owner: "race-fe".to_owned(),
                     limits: StateStoreLimitOverrides::default(),
+                    provider: StateStoreProviderConfig::Sqlite {
+                        path,
+                        deployment_owner: "race-fe".to_owned(),
+                    },
                 },
                 FeDeploymentView {
                     active_fe_count: NonZeroUsize::new(1).expect("one FE"),
@@ -1881,13 +1894,16 @@ async fn sqlite_concurrent_first_open_has_exactly_one_schema_owner() {
     drop(connection);
     drop(winner);
 
+    let runtime = StateStoreRuntime::local().expect("create local state store runtime");
     let reopened = open_state_store(
+        &runtime,
         StateStoreConfig {
-            provider: StateStoreProviderConfig::Sqlite,
-            path,
             cluster_id: "race-cluster".to_owned(),
-            deployment_owner: "race-fe".to_owned(),
             limits: StateStoreLimitOverrides::default(),
+            provider: StateStoreProviderConfig::Sqlite {
+                path,
+                deployment_owner: "race-fe".to_owned(),
+            },
         },
         FeDeploymentView {
             active_fe_count: NonZeroUsize::new(1).expect("one FE"),
