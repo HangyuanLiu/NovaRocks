@@ -29,10 +29,10 @@ use arrow::record_batch::RecordBatch;
 use tokio::runtime::Handle;
 
 use crate::engine::mv::refresh_context::MvRefreshPruningLimits;
-use crate::engine::query_options::StandaloneQueryOptions;
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::novarocks_config;
 use crate::runtime::global_async_runtime::data_block_on;
+use crate::runtime::query_options::QueryOptions;
 
 use self::catalog::{DEFAULT_DATABASE, InMemoryCatalog, normalize_identifier};
 use crate::connector::{
@@ -76,7 +76,6 @@ pub(crate) mod mv_maintenance;
 pub(crate) mod mv_rewrite_prep;
 pub(crate) mod mv_scheduler;
 pub(crate) mod name_resolve;
-pub(crate) mod query_options;
 pub(crate) mod query_prep;
 mod query_stats;
 pub(crate) mod statement;
@@ -774,7 +773,7 @@ impl StandaloneSession {
         sql: &str,
         current_catalog: Option<&str>,
         current_database: &str,
-        query_opts: Option<StandaloneQueryOptions>,
+        query_opts: Option<QueryOptions>,
     ) -> Result<StatementResult, String> {
         // Install the per-statement dictionary provider so optimizer
         // calls reached through nested engine entry points (insert,
@@ -796,7 +795,7 @@ impl StandaloneSession {
         sql: &str,
         current_catalog: Option<&str>,
         current_database: &str,
-        query_opts: Option<StandaloneQueryOptions>,
+        query_opts: Option<QueryOptions>,
     ) -> Result<StatementResult, String> {
         use crate::sql::parser::dialect::{
             StarRocksDialect, looks_like_create_catalog, looks_like_create_database,
@@ -1957,7 +1956,7 @@ impl StandaloneSession {
         insert: &sqlparser::ast::Insert,
         current_catalog: Option<&str>,
         current_database: &str,
-        query_opts: Option<&StandaloneQueryOptions>,
+        query_opts: Option<&QueryOptions>,
     ) -> Result<StatementResult, String> {
         self.execute_insert_via_custom_parser(insert, current_catalog, current_database, query_opts)
     }
@@ -1969,7 +1968,7 @@ impl StandaloneSession {
         insert: &sqlparser::ast::Insert,
         current_catalog: Option<&str>,
         current_database: &str,
-        query_opts: Option<&StandaloneQueryOptions>,
+        query_opts: Option<&QueryOptions>,
     ) -> Result<StatementResult, String> {
         let insert_stmt = convert_sqlparser_insert_to_custom(insert)?;
         execute_insert_statement(
@@ -2694,7 +2693,7 @@ fn explain_analyze_query(
     codegen_catalog: &InMemoryCatalog,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
-    query_opts: Option<StandaloneQueryOptions>,
+    query_opts: Option<QueryOptions>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
     use crate::sql::explain::ExplainLevel;
@@ -2747,11 +2746,9 @@ fn explain_analyze_query(
     )?;
     let planning_elapsed = planning_start.elapsed();
 
-    let mut query_opts = query_opts.unwrap_or_default();
-    query_opts.enable_profile = true;
+    let query_opts = query_options_for_explain_analyze(query_opts);
     let (execution_ports, scheduler) = coordinated_execution_services()?;
     let execution_start = std::time::Instant::now();
-    let query_opts = query_opts.to_runtime();
     let outcome = crate::coordinator::execution::ExecutionCoordinator::new(
         build_result,
         execution_ports,
@@ -2803,6 +2800,12 @@ fn explain_analyze_query(
         Some(&per_fragment),
     ));
     build_string_query_result("Explain String", lines)
+}
+
+fn query_options_for_explain_analyze(query_options: Option<QueryOptions>) -> QueryOptions {
+    let mut query_options = query_options.unwrap_or_default();
+    query_options.enable_profile = true;
+    query_options
 }
 
 const ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES: &[&str] = &[
@@ -2932,7 +2935,7 @@ pub(crate) fn execute_query(
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
-    query_opts: Option<StandaloneQueryOptions>,
+    query_opts: Option<QueryOptions>,
 ) -> Result<QueryResult, String> {
     execute_query_with_catalog_provider(
         query,
@@ -2951,7 +2954,7 @@ pub(crate) fn execute_query_with_catalog_mgr(
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
-    query_opts: Option<StandaloneQueryOptions>,
+    query_opts: Option<QueryOptions>,
 ) -> Result<QueryResult, String> {
     let catalog_snapshot = state
         .catalog
@@ -3050,7 +3053,7 @@ pub(crate) fn execute_query_as_iceberg_write(
     current_database: &str,
     query: &sqlparser::ast::Query,
     sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
-    query_opts: Option<StandaloneQueryOptions>,
+    query_opts: Option<QueryOptions>,
     root_distribution_resolver: Option<IcebergWriteRootDistributionResolver>,
 ) -> Result<crate::coordinator::execution::CoordinatedQueryResult, String> {
     // Time-travel: a branch DML write's scan carries `FOR VERSION AS OF '<branch>'`
@@ -3139,7 +3142,7 @@ pub(crate) fn execute_query_as_iceberg_write(
         build_result,
         execution_ports,
         scheduler,
-        StandaloneQueryOptions::optional_to_runtime(query_opts.as_ref()),
+        query_opts,
     )
     .execute_with_write_outcome()
 }
@@ -3315,15 +3318,14 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
 
 pub(crate) fn execute_planned_iceberg_change_stream_write(
     build_result: crate::sql::codegen::fragment::MultiFragmentBuildResult,
-    query_opts: Option<StandaloneQueryOptions>,
+    query_opts: Option<QueryOptions>,
 ) -> Result<crate::coordinator::execution::CoordinatedQueryResult, String> {
     let (execution_ports, scheduler) = coordinated_execution_services()?;
-    let query_options = StandaloneQueryOptions::optional_to_runtime(query_opts.as_ref());
     crate::coordinator::execution::ExecutionCoordinator::new(
         build_result,
         execution_ports,
         scheduler,
-        query_options,
+        query_opts,
     )
     .execute_with_write_outcome()
 }
@@ -3335,7 +3337,7 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
     current_database: &str,
     optimized_tree: &crate::sql::optimizer::OptimizedOperatorNode,
     dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
-    query_opts: Option<StandaloneQueryOptions>,
+    query_opts: Option<QueryOptions>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
 ) -> Result<crate::coordinator::execution::CoordinatedQueryResult, String> {
     let planned = build_physical_plan_as_iceberg_change_stream_write(
@@ -3362,7 +3364,7 @@ pub(crate) fn execute_query_with_catalog_provider(
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
-    query_opts: Option<StandaloneQueryOptions>,
+    query_opts: Option<QueryOptions>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
     execute_query_with_options_and_imv_validator_with_catalog_provider(
@@ -3401,7 +3403,7 @@ pub(crate) fn execute_query_with_options(
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
-    query_opts: Option<StandaloneQueryOptions>,
+    query_opts: Option<QueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
@@ -3428,7 +3430,7 @@ pub(crate) fn execute_query_with_options_and_imv_validator(
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
-    query_opts: Option<StandaloneQueryOptions>,
+    query_opts: Option<QueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
@@ -3459,7 +3461,7 @@ pub(crate) fn execute_preexpanded_mv_refresh_query_with_options(
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
-    query_opts: Option<StandaloneQueryOptions>,
+    query_opts: Option<QueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
@@ -3599,7 +3601,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
-    query_opts: Option<StandaloneQueryOptions>,
+    query_opts: Option<QueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
@@ -3699,7 +3701,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         build_result,
         execution_ports,
         scheduler,
-        StandaloneQueryOptions::optional_to_runtime(query_opts.as_ref()),
+        query_opts,
     )
     .execute()
 }
@@ -3712,7 +3714,7 @@ pub(crate) fn execute_logical_plan_with_options(
     connectors: &crate::connector::ConnectorRegistry,
     _current_database: &str,
     exchange_port: u16,
-    query_opts: Option<StandaloneQueryOptions>,
+    query_opts: Option<QueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
@@ -3758,7 +3760,7 @@ pub(crate) fn execute_logical_plan_with_options(
         build_result,
         execution_ports,
         scheduler,
-        StandaloneQueryOptions::optional_to_runtime(query_opts.as_ref()),
+        query_opts,
     )
     .execute()
 }
@@ -4487,7 +4489,9 @@ mod tests {
     use crate::connector::starrocks::lake::context::lock_runtime_test_state;
     #[cfg(feature = "compat")]
     use crate::connector::starrocks::table::config::StarRocksTableConfig;
+    use crate::exec::spill::{SpillConfig, SpillMode};
     use crate::meta::MetaStoreProvider;
+    use crate::runtime::query_options::QueryOptions;
     use arrow::array::{
         Array, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray, StringArray,
     };
@@ -4495,6 +4499,43 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[test]
+    fn explain_analyze_query_options_only_enable_profile() {
+        assert_eq!(
+            super::query_options_for_explain_analyze(None),
+            QueryOptions {
+                enable_profile: true,
+                ..Default::default()
+            }
+        );
+
+        let spill = SpillConfig {
+            enable_spill: true,
+            spill_mode: SpillMode::Auto,
+            spill_mem_limit_threshold: Some(0.7),
+            spill_operator_min_bytes: Some(64),
+            spill_operator_max_bytes: Some(1024),
+            spill_encode_level: Some(3),
+            enable_spill_buffer_read: Some(true),
+            max_spill_read_buffer_bytes_per_driver: Some(4096),
+            spill_mem_table_size: Some(256),
+            spill_mem_table_num: Some(4),
+        };
+        let options = QueryOptions {
+            pipeline_dop: Some(3),
+            query_timeout: Some(90),
+            spill: Some(spill),
+            ..Default::default()
+        };
+        let mut expected = options.clone();
+        expected.enable_profile = true;
+
+        assert_eq!(
+            super::query_options_for_explain_analyze(Some(options)),
+            expected
+        );
+    }
 
     fn string_cell(result: &QueryResult, row: usize, col: usize) -> String {
         let batch = &result.chunks[0].batch;

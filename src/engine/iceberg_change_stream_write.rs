@@ -21,10 +21,10 @@ use crate::connector::iceberg::commit::{
 use crate::coordinator::execution::CoordinatedQueryResult;
 use crate::coordinator::write::report::WriteCommitInput;
 use crate::engine::StandaloneState;
-use crate::engine::query_options::StandaloneQueryOptions;
 use crate::engine::write_transaction::{
     IcebergWriteCommitExecutor, IcebergWriteTransactionExecutor, IcebergWriteTransactionSpec,
 };
+use crate::runtime::query_options::QueryOptions;
 use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::optimizer::OptimizedOperatorNode;
 use crate::sql::planner::distributed::FragmentId;
@@ -234,7 +234,7 @@ pub(crate) struct ChangeStreamPhysicalBuildInput {
     pub(crate) current_database: String,
     pub(crate) optimized_tree: OptimizedOperatorNode,
     pub(crate) dag: ChangeStreamWriteDagSpec,
-    pub(crate) query_opts: Option<StandaloneQueryOptions>,
+    pub(crate) query_opts: Option<QueryOptions>,
     pub(crate) mv_refresh_ctx:
         Option<Arc<crate::engine::mv::refresh_context::IcebergMvRefreshContext>>,
 }

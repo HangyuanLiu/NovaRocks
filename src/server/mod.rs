@@ -1266,15 +1266,14 @@ async fn execute_sql_in_worker(
     let optimizer_settings = shim.optimizer_settings.clone();
     let allow_throw_exception =
         crate::sql::parser::set_var_hint::extract_allow_throw_exception(&sql);
-    let query_options = crate::engine::query_options::StandaloneQueryOptions {
-        group_concat_max_len: Some(shim.group_concat_max_len),
-        query_timeout: query_timeout.and_then(|secs| i32::try_from(secs).ok()),
-        pipeline_dop: shim.pipeline_dop,
-        runtime_filter_scan_wait_time_ms: shim.runtime_filter_scan_wait_time_ms,
-        runtime_filter_wait_timeout_ms: shim.runtime_filter_wait_timeout_ms,
+    let query_options = build_request_query_options(
+        shim.group_concat_max_len,
+        query_timeout,
+        shim.pipeline_dop,
+        shim.runtime_filter_scan_wait_time_ms,
+        shim.runtime_filter_wait_timeout_ms,
         allow_throw_exception,
-        ..Default::default()
-    };
+    );
     let client_disconnect_signal = Arc::clone(&shim.client_disconnect_signal);
 
     let join_handle = task::spawn_blocking(move || {
@@ -1319,6 +1318,25 @@ async fn execute_sql_in_worker(
             ErrorKind::ER_UNKNOWN_ERROR,
             format!("standalone query worker failed: {err}"),
         )),
+    }
+}
+
+fn build_request_query_options(
+    group_concat_max_len: i64,
+    query_timeout_secs: Option<u64>,
+    pipeline_dop: Option<i32>,
+    runtime_filter_scan_wait_time_ms: Option<i64>,
+    runtime_filter_wait_timeout_ms: Option<i32>,
+    allow_throw_exception: bool,
+) -> crate::runtime::query_options::QueryOptions {
+    crate::runtime::query_options::QueryOptions {
+        group_concat_max_len: Some(group_concat_max_len),
+        query_timeout: query_timeout_secs.and_then(|secs| i32::try_from(secs).ok()),
+        pipeline_dop,
+        runtime_filter_scan_wait_time_ms,
+        runtime_filter_wait_timeout_ms,
+        allow_throw_exception,
+        ..Default::default()
     }
 }
 
@@ -1789,6 +1807,24 @@ fn strip_string_quotes(raw: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_query_options_projection_preserves_session_fields_and_runtime_defaults() {
+        let actual =
+            build_request_query_options(65_535, Some(60), Some(8), Some(250), Some(5_000), true);
+        let expected = crate::runtime::query_options::QueryOptions {
+            group_concat_max_len: Some(65_535),
+            query_timeout: Some(60),
+            pipeline_dop: Some(8),
+            runtime_filter_scan_wait_time_ms: Some(250),
+            runtime_filter_wait_timeout_ms: Some(5_000),
+            allow_throw_exception: true,
+            ..Default::default()
+        };
+
+        assert_eq!(actual, expected);
+        assert!(!actual.enable_profile);
+    }
 
     #[test]
     fn client_disconnect_watcher_treats_unexpected_peek_errors_as_disconnects() {

@@ -20,7 +20,7 @@ use std::sync::Arc;
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
 use crate::coordinator::execution::CoordinatedQueryResult;
 use crate::engine::StandaloneState;
-use crate::engine::query_options::StandaloneQueryOptions;
+use crate::runtime::query_options::QueryOptions;
 use crate::sql::analysis::OutputColumn;
 use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::optimizer::OptimizedOperatorNode;
@@ -266,7 +266,7 @@ pub(crate) fn execute_dml_change_stream_write(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
     mut plan: DmlChangeStreamWritePlan,
-    query_opts: Option<&StandaloneQueryOptions>,
+    query_opts: Option<&QueryOptions>,
 ) -> Result<DmlChangeStreamWriteExecution, String> {
     let crate::engine::PlannedIcebergChangeStreamWrite {
         build_result,
