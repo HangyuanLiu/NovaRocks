@@ -44,6 +44,8 @@ service NovaRocksGrpc {
   // Runtime-filter propagation.
   rpc TransmitRuntimeFilter(novarocks.filter.TransmitRuntimeFilterRequest)
       returns (novarocks.filter.TransmitRuntimeFilterResponse);
+  rpc TransmitRuntimeFilterEnvelope(novarocks.filter.RuntimeFilterEnvelope)
+      returns (novarocks.filter.RuntimeFilterEnvelopeResponse);
   // Point lookup (fetch-by-key).
   rpc Lookup(novarocks.filter.LookupRequest)
       returns (novarocks.filter.LookupResponse);

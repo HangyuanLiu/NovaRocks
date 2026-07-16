@@ -1,0 +1,627 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::sync::Arc;
+
+use crate::common::types::UniqueId;
+use crate::proto;
+use crate::runtime_filter::model::contract::{BindingId, ChannelId};
+use crate::runtime_filter::port::identity::{
+    DeploymentEpoch, PartitionId, ProducerSequence, RouteEdgeId,
+};
+use crate::runtime_filter::port::transport::{
+    ContributionRouteIdentity, DeliveryRouteIdentity, RuntimeFilterAcceptStatus,
+    RuntimeFilterEnvelope, RuntimeFilterEnvelopeIngress, RuntimeFilterEnvelopeKind,
+    RuntimeFilterIngressResult, RuntimeFilterRouteIdentity, RuntimeFilterTransportError,
+};
+
+pub(crate) fn handle_runtime_filter_envelope(
+    ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
+    request: proto::filter::RuntimeFilterEnvelope,
+) -> Result<proto::filter::RuntimeFilterEnvelopeResponse, tonic::Status> {
+    let proto::filter::RuntimeFilterEnvelope {
+        kind,
+        query_id,
+        channel_id,
+        deployment_epoch,
+        route_identity,
+        schema_digest,
+        payload,
+    } = request;
+
+    let kind = decode_kind(kind)?;
+    let query_id =
+        query_id.ok_or_else(|| invalid_argument("runtime filter query id is missing"))?;
+    let query_id = UniqueId {
+        hi: query_id.hi,
+        lo: query_id.lo,
+    };
+    let route_identity = route_identity
+        .ok_or_else(|| invalid_argument("runtime filter route identity is missing"))?;
+    let domain_route_identity = decode_route_identity(&route_identity)?;
+    let envelope = RuntimeFilterEnvelope::try_new(
+        kind,
+        query_id,
+        ChannelId::new(channel_id),
+        DeploymentEpoch::new(deployment_epoch),
+        domain_route_identity,
+        &schema_digest,
+        payload,
+    )
+    .map_err(transport_error)?;
+
+    let acked_route_identity = Some(route_identity.clone());
+    let result = ingress.accept(envelope);
+    let (accept_status, rejection_reason) = match result.accept_status() {
+        RuntimeFilterAcceptStatus::Accepted => (
+            proto::filter::RuntimeFilterAcceptStatus::Accepted,
+            String::new(),
+        ),
+        RuntimeFilterAcceptStatus::Duplicate => (
+            proto::filter::RuntimeFilterAcceptStatus::Duplicate,
+            String::new(),
+        ),
+        RuntimeFilterAcceptStatus::Rejected => (
+            proto::filter::RuntimeFilterAcceptStatus::Rejected,
+            result
+                .rejection_reason()
+                .expect("rejected ingress result has a non-empty reason")
+                .to_string(),
+        ),
+    };
+
+    Ok(proto::filter::RuntimeFilterEnvelopeResponse {
+        acked_route_identity,
+        accept_status: accept_status as i32,
+        rejection_reason,
+    })
+}
+
+pub(crate) fn default_runtime_filter_envelope_ingress() -> Arc<dyn RuntimeFilterEnvelopeIngress> {
+    Arc::new(DefaultRuntimeFilterEnvelopeIngress)
+}
+
+fn decode_kind(kind: i32) -> Result<RuntimeFilterEnvelopeKind, tonic::Status> {
+    let kind = proto::filter::RuntimeFilterEnvelopeKind::try_from(kind)
+        .map_err(|_| invalid_argument("runtime filter envelope kind is unknown"))?;
+    match kind {
+        proto::filter::RuntimeFilterEnvelopeKind::Unspecified => Err(invalid_argument(
+            "runtime filter envelope kind must be specified",
+        )),
+        proto::filter::RuntimeFilterEnvelopeKind::Contribution => {
+            Ok(RuntimeFilterEnvelopeKind::Contribution)
+        }
+        proto::filter::RuntimeFilterEnvelopeKind::Artifact => {
+            Ok(RuntimeFilterEnvelopeKind::Artifact)
+        }
+        proto::filter::RuntimeFilterEnvelopeKind::ProducerClosed => {
+            Ok(RuntimeFilterEnvelopeKind::ProducerClosed)
+        }
+        proto::filter::RuntimeFilterEnvelopeKind::Unavailable => {
+            Ok(RuntimeFilterEnvelopeKind::Unavailable)
+        }
+        proto::filter::RuntimeFilterEnvelopeKind::Ack => Ok(RuntimeFilterEnvelopeKind::Ack),
+    }
+}
+
+fn decode_route_identity(
+    route_identity: &proto::filter::RuntimeFilterRouteIdentity,
+) -> Result<RuntimeFilterRouteIdentity, tonic::Status> {
+    use proto::filter::runtime_filter_route_identity::Value;
+
+    match route_identity.value.as_ref() {
+        Some(Value::Contribution(identity)) => {
+            let fragment_instance_id = identity.fragment_instance_id.ok_or_else(|| {
+                invalid_argument("runtime filter fragment instance id is missing")
+            })?;
+            let identity = ContributionRouteIdentity::try_new(
+                BindingId::new(identity.producer_binding_id),
+                UniqueId {
+                    hi: fragment_instance_id.hi,
+                    lo: fragment_instance_id.lo,
+                },
+                PartitionId::new(identity.partition_id),
+                ProducerSequence::new(identity.sequence),
+            )
+            .map_err(transport_error)?;
+            Ok(RuntimeFilterRouteIdentity::contribution(identity))
+        }
+        Some(Value::Delivery(identity)) => {
+            let identity = DeliveryRouteIdentity::try_new(
+                RouteEdgeId::new(identity.route_edge_id),
+                ProducerSequence::new(identity.sequence),
+            )
+            .map_err(transport_error)?;
+            Ok(RuntimeFilterRouteIdentity::delivery(identity))
+        }
+        None => Err(invalid_argument(
+            "runtime filter route identity value is missing",
+        )),
+    }
+}
+
+fn transport_error(error: RuntimeFilterTransportError) -> tonic::Status {
+    invalid_argument(error.to_string())
+}
+
+fn invalid_argument(message: impl Into<String>) -> tonic::Status {
+    tonic::Status::invalid_argument(message.into())
+}
+
+#[derive(Debug)]
+struct DefaultRuntimeFilterEnvelopeIngress;
+
+impl RuntimeFilterEnvelopeIngress for DefaultRuntimeFilterEnvelopeIngress {
+    fn accept(&self, _envelope: RuntimeFilterEnvelope) -> RuntimeFilterIngressResult {
+        RuntimeFilterIngressResult::rejected(
+            "runtime filter envelope ingress is not configured".to_string(),
+        )
+        .expect("non-empty static rejection reason")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use tonic::Code;
+
+    use crate::common::types::UniqueId;
+    use crate::proto;
+    use crate::runtime_filter::model::contract::{BindingId, ChannelId};
+    use crate::runtime_filter::port::identity::{
+        DeploymentEpoch, PartitionId, ProducerSequence, RouteEdgeId,
+    };
+    use crate::runtime_filter::port::transport::{
+        RuntimeFilterEnvelope, RuntimeFilterEnvelopeIngress, RuntimeFilterEnvelopeKind,
+        RuntimeFilterIngressResult,
+    };
+
+    use super::{default_runtime_filter_envelope_ingress, handle_runtime_filter_envelope};
+
+    #[derive(Debug)]
+    struct RecordingIngress {
+        envelopes: Mutex<Vec<RuntimeFilterEnvelope>>,
+        result: RuntimeFilterIngressResult,
+    }
+
+    impl RecordingIngress {
+        fn new(result: RuntimeFilterIngressResult) -> Self {
+            Self {
+                envelopes: Mutex::new(Vec::new()),
+                result,
+            }
+        }
+
+        fn take(&self) -> Vec<RuntimeFilterEnvelope> {
+            std::mem::take(&mut *self.envelopes.lock().unwrap())
+        }
+
+        fn is_empty(&self) -> bool {
+            self.envelopes.lock().unwrap().is_empty()
+        }
+    }
+
+    impl RuntimeFilterEnvelopeIngress for RecordingIngress {
+        fn accept(&self, envelope: RuntimeFilterEnvelope) -> RuntimeFilterIngressResult {
+            self.envelopes.lock().unwrap().push(envelope);
+            self.result.clone()
+        }
+    }
+
+    fn contribution_route() -> proto::filter::RuntimeFilterRouteIdentity {
+        proto::filter::RuntimeFilterRouteIdentity {
+            value: Some(
+                proto::filter::runtime_filter_route_identity::Value::Contribution(
+                    proto::filter::RuntimeFilterContributionRouteIdentity {
+                        producer_binding_id: 17,
+                        fragment_instance_id: Some(proto::common::UniqueId { hi: 18, lo: 19 }),
+                        partition_id: 20,
+                        sequence: 21,
+                    },
+                ),
+            ),
+        }
+    }
+
+    fn delivery_route() -> proto::filter::RuntimeFilterRouteIdentity {
+        proto::filter::RuntimeFilterRouteIdentity {
+            value: Some(
+                proto::filter::runtime_filter_route_identity::Value::Delivery(
+                    proto::filter::RuntimeFilterDeliveryRouteIdentity {
+                        route_edge_id: 22,
+                        sequence: 23,
+                    },
+                ),
+            ),
+        }
+    }
+
+    fn valid_wire_envelope(
+        kind: proto::filter::RuntimeFilterEnvelopeKind,
+    ) -> proto::filter::RuntimeFilterEnvelope {
+        let (route_identity, payload) = match kind {
+            proto::filter::RuntimeFilterEnvelopeKind::Contribution => {
+                (contribution_route(), b"contribution".to_vec())
+            }
+            proto::filter::RuntimeFilterEnvelopeKind::Artifact => {
+                (delivery_route(), b"artifact".to_vec())
+            }
+            proto::filter::RuntimeFilterEnvelopeKind::ProducerClosed => {
+                (contribution_route(), Vec::new())
+            }
+            proto::filter::RuntimeFilterEnvelopeKind::Unavailable => {
+                (delivery_route(), b"unavailable".to_vec())
+            }
+            proto::filter::RuntimeFilterEnvelopeKind::Ack => (contribution_route(), Vec::new()),
+            proto::filter::RuntimeFilterEnvelopeKind::Unspecified => {
+                panic!("unspecified kind is not a valid fixture")
+            }
+        };
+        proto::filter::RuntimeFilterEnvelope {
+            kind: kind as i32,
+            query_id: Some(proto::common::UniqueId { hi: 11, lo: 12 }),
+            channel_id: 13,
+            deployment_epoch: 14,
+            route_identity: Some(route_identity),
+            schema_digest: vec![15; 32],
+            payload,
+        }
+    }
+
+    #[test]
+    fn all_valid_kinds_reach_ingress_with_exact_domain_values() {
+        let cases = [
+            (
+                proto::filter::RuntimeFilterEnvelopeKind::Contribution,
+                RuntimeFilterEnvelopeKind::Contribution,
+                b"contribution".as_slice(),
+            ),
+            (
+                proto::filter::RuntimeFilterEnvelopeKind::Artifact,
+                RuntimeFilterEnvelopeKind::Artifact,
+                b"artifact".as_slice(),
+            ),
+            (
+                proto::filter::RuntimeFilterEnvelopeKind::ProducerClosed,
+                RuntimeFilterEnvelopeKind::ProducerClosed,
+                b"".as_slice(),
+            ),
+            (
+                proto::filter::RuntimeFilterEnvelopeKind::Unavailable,
+                RuntimeFilterEnvelopeKind::Unavailable,
+                b"unavailable".as_slice(),
+            ),
+            (
+                proto::filter::RuntimeFilterEnvelopeKind::Ack,
+                RuntimeFilterEnvelopeKind::Ack,
+                b"".as_slice(),
+            ),
+        ];
+
+        for (wire_kind, domain_kind, expected_payload) in cases {
+            let ingress = Arc::new(RecordingIngress::new(RuntimeFilterIngressResult::accepted()));
+            handle_runtime_filter_envelope(ingress.clone(), valid_wire_envelope(wire_kind))
+                .unwrap();
+
+            let envelopes = ingress.take();
+            assert_eq!(envelopes.len(), 1);
+            let envelope = &envelopes[0];
+            assert_eq!(envelope.kind(), domain_kind);
+            assert_eq!(envelope.query_id(), UniqueId { hi: 11, lo: 12 });
+            assert_eq!(envelope.channel_id(), ChannelId::new(13));
+            assert_eq!(envelope.deployment_epoch(), DeploymentEpoch::new(14));
+            assert_eq!(envelope.schema_digest(), &[15; 32]);
+            assert_eq!(envelope.payload(), expected_payload);
+
+            match domain_kind {
+                RuntimeFilterEnvelopeKind::Contribution
+                | RuntimeFilterEnvelopeKind::ProducerClosed
+                | RuntimeFilterEnvelopeKind::Ack => {
+                    let identity = envelope
+                        .route_identity()
+                        .as_contribution()
+                        .expect("contribution identity");
+                    assert_eq!(identity.producer_binding_id(), BindingId::new(17));
+                    assert_eq!(identity.fragment_instance_id(), UniqueId { hi: 18, lo: 19 });
+                    assert_eq!(identity.partition_id(), PartitionId::new(20));
+                    assert_eq!(identity.sequence(), ProducerSequence::new(21));
+                }
+                RuntimeFilterEnvelopeKind::Artifact | RuntimeFilterEnvelopeKind::Unavailable => {
+                    let identity = envelope
+                        .route_identity()
+                        .as_delivery()
+                        .expect("delivery identity");
+                    assert_eq!(identity.route_edge_id(), RouteEdgeId::new(22));
+                    assert_eq!(identity.sequence(), ProducerSequence::new(23));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partial_unique_ids_reach_ingress_as_exact_domain_values() {
+        let cases = [
+            (UniqueId { hi: 0, lo: 29 }, UniqueId { hi: 18, lo: 19 }),
+            (UniqueId { hi: 31, lo: 0 }, UniqueId { hi: 18, lo: 19 }),
+            (UniqueId { hi: 11, lo: 12 }, UniqueId { hi: 0, lo: 37 }),
+            (UniqueId { hi: 11, lo: 12 }, UniqueId { hi: 41, lo: 0 }),
+        ];
+
+        for (query_id, fragment_instance_id) in cases {
+            let ingress = Arc::new(RecordingIngress::new(RuntimeFilterIngressResult::accepted()));
+            let mut request =
+                valid_wire_envelope(proto::filter::RuntimeFilterEnvelopeKind::Contribution);
+            request.query_id = Some(proto::common::UniqueId {
+                hi: query_id.hi,
+                lo: query_id.lo,
+            });
+            let Some(proto::filter::runtime_filter_route_identity::Value::Contribution(identity)) =
+                request.route_identity.as_mut().unwrap().value.as_mut()
+            else {
+                unreachable!()
+            };
+            identity.fragment_instance_id = Some(proto::common::UniqueId {
+                hi: fragment_instance_id.hi,
+                lo: fragment_instance_id.lo,
+            });
+
+            let response = handle_runtime_filter_envelope(ingress.clone(), request).unwrap();
+            assert_eq!(
+                response.accept_status,
+                proto::filter::RuntimeFilterAcceptStatus::Accepted as i32
+            );
+
+            let envelopes = ingress.take();
+            assert_eq!(envelopes.len(), 1);
+            let envelope = &envelopes[0];
+            assert_eq!(envelope.query_id(), query_id);
+            let identity = envelope
+                .route_identity()
+                .as_contribution()
+                .expect("contribution identity");
+            assert_eq!(identity.fragment_instance_id(), fragment_instance_id);
+        }
+    }
+
+    #[test]
+    fn ingress_results_map_exactly_and_echo_validated_route() {
+        let cases = [
+            (
+                RuntimeFilterIngressResult::accepted(),
+                proto::filter::RuntimeFilterAcceptStatus::Accepted,
+                "",
+            ),
+            (
+                RuntimeFilterIngressResult::duplicate(),
+                proto::filter::RuntimeFilterAcceptStatus::Duplicate,
+                "",
+            ),
+            (
+                RuntimeFilterIngressResult::rejected("not authorized").unwrap(),
+                proto::filter::RuntimeFilterAcceptStatus::Rejected,
+                "not authorized",
+            ),
+        ];
+
+        for (result, expected_status, expected_reason) in cases {
+            let ingress = Arc::new(RecordingIngress::new(result));
+            let request =
+                valid_wire_envelope(proto::filter::RuntimeFilterEnvelopeKind::Contribution);
+            let expected_route = request.route_identity.clone();
+            let response = handle_runtime_filter_envelope(ingress.clone(), request).unwrap();
+
+            assert_eq!(response.accept_status, expected_status as i32);
+            assert_eq!(response.rejection_reason, expected_reason);
+            assert_eq!(response.acked_route_identity, expected_route);
+            assert_eq!(ingress.take().len(), 1);
+        }
+    }
+
+    #[test]
+    fn malformed_wire_is_invalid_argument_and_never_reaches_ingress() {
+        let mut malformed = Vec::new();
+
+        let mut request =
+            valid_wire_envelope(proto::filter::RuntimeFilterEnvelopeKind::Contribution);
+        request.kind = proto::filter::RuntimeFilterEnvelopeKind::Unspecified as i32;
+        malformed.push(request);
+        let mut request =
+            valid_wire_envelope(proto::filter::RuntimeFilterEnvelopeKind::Contribution);
+        request.kind = 99;
+        malformed.push(request);
+
+        let mut request =
+            valid_wire_envelope(proto::filter::RuntimeFilterEnvelopeKind::Contribution);
+        request.query_id = None;
+        malformed.push(request);
+        let mut request =
+            valid_wire_envelope(proto::filter::RuntimeFilterEnvelopeKind::Contribution);
+        request.query_id = Some(proto::common::UniqueId { hi: 0, lo: 0 });
+        malformed.push(request);
+        let mut request =
+            valid_wire_envelope(proto::filter::RuntimeFilterEnvelopeKind::Contribution);
+        request.channel_id = 0;
+        malformed.push(request);
+        let mut request =
+            valid_wire_envelope(proto::filter::RuntimeFilterEnvelopeKind::Contribution);
+        request.deployment_epoch = 0;
+        malformed.push(request);
+
+        let mut request =
+            valid_wire_envelope(proto::filter::RuntimeFilterEnvelopeKind::Contribution);
+        request.route_identity = None;
+        malformed.push(request);
+        let mut request =
+            valid_wire_envelope(proto::filter::RuntimeFilterEnvelopeKind::Contribution);
+        request.route_identity = Some(proto::filter::RuntimeFilterRouteIdentity { value: None });
+        malformed.push(request);
+
+        for mutate in [
+            |identity: &mut proto::filter::RuntimeFilterContributionRouteIdentity| {
+                identity.producer_binding_id = 0
+            },
+            |identity: &mut proto::filter::RuntimeFilterContributionRouteIdentity| {
+                identity.fragment_instance_id = None
+            },
+            |identity: &mut proto::filter::RuntimeFilterContributionRouteIdentity| {
+                identity.fragment_instance_id = Some(proto::common::UniqueId { hi: 0, lo: 0 })
+            },
+            |identity: &mut proto::filter::RuntimeFilterContributionRouteIdentity| {
+                identity.partition_id = 0
+            },
+            |identity: &mut proto::filter::RuntimeFilterContributionRouteIdentity| {
+                identity.sequence = 0
+            },
+        ] {
+            let mut request =
+                valid_wire_envelope(proto::filter::RuntimeFilterEnvelopeKind::Contribution);
+            let Some(proto::filter::runtime_filter_route_identity::Value::Contribution(identity)) =
+                request.route_identity.as_mut().unwrap().value.as_mut()
+            else {
+                unreachable!()
+            };
+            mutate(identity);
+            malformed.push(request);
+        }
+
+        for mutate in [
+            |identity: &mut proto::filter::RuntimeFilterDeliveryRouteIdentity| {
+                identity.route_edge_id = 0
+            },
+            |identity: &mut proto::filter::RuntimeFilterDeliveryRouteIdentity| {
+                identity.sequence = 0
+            },
+        ] {
+            let mut request =
+                valid_wire_envelope(proto::filter::RuntimeFilterEnvelopeKind::Artifact);
+            let Some(proto::filter::runtime_filter_route_identity::Value::Delivery(identity)) =
+                request.route_identity.as_mut().unwrap().value.as_mut()
+            else {
+                unreachable!()
+            };
+            mutate(identity);
+            malformed.push(request);
+        }
+
+        for (kind, wrong_route) in [
+            (
+                proto::filter::RuntimeFilterEnvelopeKind::Contribution,
+                delivery_route(),
+            ),
+            (
+                proto::filter::RuntimeFilterEnvelopeKind::Artifact,
+                contribution_route(),
+            ),
+            (
+                proto::filter::RuntimeFilterEnvelopeKind::ProducerClosed,
+                delivery_route(),
+            ),
+            (
+                proto::filter::RuntimeFilterEnvelopeKind::Unavailable,
+                contribution_route(),
+            ),
+        ] {
+            let mut request = valid_wire_envelope(kind);
+            request.route_identity = Some(wrong_route);
+            malformed.push(request);
+        }
+
+        for digest_len in [0, 31, 33] {
+            let mut request =
+                valid_wire_envelope(proto::filter::RuntimeFilterEnvelopeKind::Contribution);
+            request.schema_digest = vec![15; digest_len];
+            malformed.push(request);
+        }
+
+        for (kind, payload) in [
+            (
+                proto::filter::RuntimeFilterEnvelopeKind::Contribution,
+                Vec::new(),
+            ),
+            (
+                proto::filter::RuntimeFilterEnvelopeKind::Artifact,
+                Vec::new(),
+            ),
+            (
+                proto::filter::RuntimeFilterEnvelopeKind::ProducerClosed,
+                b"unexpected".to_vec(),
+            ),
+            (
+                proto::filter::RuntimeFilterEnvelopeKind::Unavailable,
+                Vec::new(),
+            ),
+            (
+                proto::filter::RuntimeFilterEnvelopeKind::Ack,
+                b"unexpected".to_vec(),
+            ),
+        ] {
+            let mut request = valid_wire_envelope(kind);
+            request.payload = payload;
+            malformed.push(request);
+        }
+
+        assert_eq!(malformed.len(), 27);
+        for request in malformed {
+            let ingress = Arc::new(RecordingIngress::new(RuntimeFilterIngressResult::accepted()));
+            let error = handle_runtime_filter_envelope(ingress.clone(), request).unwrap_err();
+            assert_eq!(error.code(), Code::InvalidArgument, "{error}");
+            assert!(ingress.is_empty());
+        }
+    }
+
+    #[test]
+    fn default_ingress_rejects_with_stable_reason() {
+        let ingress = default_runtime_filter_envelope_ingress();
+        let request = valid_wire_envelope(proto::filter::RuntimeFilterEnvelopeKind::Artifact);
+        let response = handle_runtime_filter_envelope(ingress, request).unwrap();
+
+        assert_eq!(
+            response.accept_status,
+            proto::filter::RuntimeFilterAcceptStatus::Rejected as i32
+        );
+        assert_eq!(
+            response.rejection_reason,
+            "runtime filter envelope ingress is not configured"
+        );
+    }
+
+    #[test]
+    fn adapter_source_has_no_legacy_partial_or_handler_dependency() {
+        let source = include_str!("grpc_runtime_filter_adapter.rs");
+        assert!(!source.contains(concat!("is_", "partial")));
+        assert!(!source.contains(concat!("handle_transmit_", "runtime_filter(")));
+    }
+
+    #[test]
+    fn domain_rejection_is_not_a_tonic_error() {
+        let ingress = Arc::new(RecordingIngress::new(
+            RuntimeFilterIngressResult::rejected("semantic rejection").unwrap(),
+        ));
+        let response = handle_runtime_filter_envelope(
+            ingress,
+            valid_wire_envelope(proto::filter::RuntimeFilterEnvelopeKind::Ack),
+        )
+        .expect("domain rejection must produce a response");
+
+        assert_eq!(
+            response.accept_status,
+            proto::filter::RuntimeFilterAcceptStatus::Rejected as i32
+        );
+        assert_eq!(response.rejection_reason, "semantic rejection");
+    }
+}

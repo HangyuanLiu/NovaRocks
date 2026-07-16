@@ -51,6 +51,10 @@ use crate::novarocks_logging::warn;
 use crate::novarocks_logging::{error, info};
 #[cfg(feature = "compat")]
 use crate::runtime::starlet_shard_registry;
+use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeIngress;
+use crate::service::grpc_runtime_filter_adapter::{
+    default_runtime_filter_envelope_ingress, handle_runtime_filter_envelope,
+};
 use crate::service::internal_rpc;
 #[cfg(feature = "compat")]
 use crate::service::stream_load_http;
@@ -85,6 +89,7 @@ fn grpc_server_state() -> &'static Mutex<GrpcServerState> {
 pub struct GrpcService {
     allow_local_execution: bool,
     report_handler: Arc<dyn CoordinatorReportHandler>,
+    runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
 }
 
 impl std::fmt::Debug for GrpcService {
@@ -109,10 +114,11 @@ impl GrpcService {
     pub(crate) fn full_execution_with_report_handler(
         report_handler: Arc<dyn CoordinatorReportHandler>,
     ) -> Self {
-        Self {
-            allow_local_execution: true,
+        Self::with_handlers(
+            true,
             report_handler,
-        }
+            default_runtime_filter_envelope_ingress(),
+        )
     }
 
     pub fn report_only() -> Self {
@@ -122,10 +128,39 @@ impl GrpcService {
     pub(crate) fn report_only_with_report_handler(
         report_handler: Arc<dyn CoordinatorReportHandler>,
     ) -> Self {
-        Self {
-            allow_local_execution: false,
+        Self::with_handlers(
+            false,
             report_handler,
+            default_runtime_filter_envelope_ingress(),
+        )
+    }
+
+    fn with_handlers(
+        allow_local_execution: bool,
+        report_handler: Arc<dyn CoordinatorReportHandler>,
+        runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
+    ) -> Self {
+        Self {
+            allow_local_execution,
+            report_handler,
+            runtime_filter_envelope_ingress,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn full_execution_with_handlers(
+        report_handler: Arc<dyn CoordinatorReportHandler>,
+        runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
+    ) -> Self {
+        Self::with_handlers(true, report_handler, runtime_filter_envelope_ingress)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn report_only_with_handlers(
+        report_handler: Arc<dyn CoordinatorReportHandler>,
+        runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
+    ) -> Self {
+        Self::with_handlers(false, report_handler, runtime_filter_envelope_ingress)
     }
 
     fn require_local_execution(&self, rpc_name: &str) -> Result<(), tonic::Status> {
@@ -256,6 +291,24 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         Ok(tonic::Response::new(
             internal_rpc::handle_transmit_runtime_filter(request.into_inner()),
         ))
+    }
+
+    async fn transmit_runtime_filter_envelope(
+        &self,
+        request: tonic::Request<proto::filter::RuntimeFilterEnvelope>,
+    ) -> Result<tonic::Response<proto::filter::RuntimeFilterEnvelopeResponse>, tonic::Status> {
+        self.require_local_execution("TransmitRuntimeFilterEnvelope")?;
+        let ingress = self.runtime_filter_envelope_ingress.clone();
+        let request = request.into_inner();
+        let response =
+            tokio::task::spawn_blocking(move || handle_runtime_filter_envelope(ingress, request))
+                .await
+                .map_err(|error| {
+                    tonic::Status::internal(format!(
+                        "transmit_runtime_filter_envelope handler panicked: {error}"
+                    ))
+                })??;
+        Ok(tonic::Response::new(response))
     }
 
     async fn lookup(
@@ -1275,6 +1328,7 @@ mod tests {
 #[cfg(test)]
 mod pr3_tests {
     use super::GrpcService;
+    use super::proto;
     use super::proto::common::{Status as ProtoStatus, UniqueId as ProtoUniqueId};
     use super::proto::novarocks::fetch_result_response::Status as FetchStatus;
     use super::proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc as _;
@@ -1287,6 +1341,10 @@ mod pr3_tests {
     use crate::common::engine_error::EngineError;
     use crate::common::types::UniqueId;
     use crate::coordinator::ports::CoordinatorReportHandler;
+    use crate::runtime_filter::port::transport::{
+        RuntimeFilterEnvelope, RuntimeFilterEnvelopeIngress, RuntimeFilterIngressResult,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tonic::Request;
 
@@ -1323,6 +1381,54 @@ mod pr3_tests {
                 Some((call, error)) if reports.len() == *call => Err(error.clone()),
                 _ => Ok(()),
             }
+        }
+    }
+
+    struct RecordingEnvelopeIngress {
+        calls: AtomicUsize,
+        result: RuntimeFilterIngressResult,
+    }
+
+    impl RecordingEnvelopeIngress {
+        fn accepting() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                result: RuntimeFilterIngressResult::accepted(),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl RuntimeFilterEnvelopeIngress for RecordingEnvelopeIngress {
+        fn accept(&self, _envelope: RuntimeFilterEnvelope) -> RuntimeFilterIngressResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.result.clone()
+        }
+    }
+
+    fn valid_runtime_filter_envelope() -> proto::filter::RuntimeFilterEnvelope {
+        proto::filter::RuntimeFilterEnvelope {
+            kind: proto::filter::RuntimeFilterEnvelopeKind::Contribution as i32,
+            query_id: Some(ProtoUniqueId { hi: 11, lo: 12 }),
+            channel_id: 13,
+            deployment_epoch: 14,
+            route_identity: Some(proto::filter::RuntimeFilterRouteIdentity {
+                value: Some(
+                    proto::filter::runtime_filter_route_identity::Value::Contribution(
+                        proto::filter::RuntimeFilterContributionRouteIdentity {
+                            producer_binding_id: 15,
+                            fragment_instance_id: Some(ProtoUniqueId { hi: 16, lo: 17 }),
+                            partition_id: 18,
+                            sequence: 19,
+                        },
+                    ),
+                ),
+            }),
+            schema_digest: vec![20; 32],
+            payload: b"contribution".to_vec(),
         }
     }
 
@@ -1379,6 +1485,101 @@ mod pr3_tests {
             message: message.to_string(),
         });
         report
+    }
+
+    #[tokio::test]
+    async fn runtime_filter_envelope_full_execution_invokes_ingress_and_accepts() {
+        let ingress = Arc::new(RecordingEnvelopeIngress::accepting());
+        let svc = GrpcService::full_execution_with_handlers(
+            Arc::new(CapturingReportHandler::accepting()),
+            ingress.clone(),
+        );
+
+        let response = svc
+            .transmit_runtime_filter_envelope(Request::new(valid_runtime_filter_envelope()))
+            .await
+            .expect("valid envelope must be handled")
+            .into_inner();
+
+        assert_eq!(
+            response.accept_status,
+            proto::filter::RuntimeFilterAcceptStatus::Accepted as i32
+        );
+        assert_eq!(ingress.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_filter_envelope_report_only_rejects_before_ingress() {
+        let ingress = Arc::new(RecordingEnvelopeIngress::accepting());
+        let svc = GrpcService::report_only_with_handlers(
+            Arc::new(CapturingReportHandler::accepting()),
+            ingress.clone(),
+        );
+
+        let error = svc
+            .transmit_runtime_filter_envelope(Request::new(valid_runtime_filter_envelope()))
+            .await
+            .expect_err("report-only service must reject local envelope ingress");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(ingress.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_filter_envelope_report_only_gate_precedes_wire_validation() {
+        let ingress = Arc::new(RecordingEnvelopeIngress::accepting());
+        let svc = GrpcService::report_only_with_handlers(
+            Arc::new(CapturingReportHandler::accepting()),
+            ingress.clone(),
+        );
+        let mut request = valid_runtime_filter_envelope();
+        request.channel_id = 0;
+        request.route_identity = None;
+
+        let error = svc
+            .transmit_runtime_filter_envelope(Request::new(request))
+            .await
+            .expect_err("report-only gate must run before envelope decoding");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(ingress.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_filter_envelope_default_full_execution_rejects_unconfigured_ingress() {
+        let response = GrpcService::full_execution()
+            .transmit_runtime_filter_envelope(Request::new(valid_runtime_filter_envelope()))
+            .await
+            .expect("default ingress rejection is a normal response")
+            .into_inner();
+
+        assert_eq!(
+            response.accept_status,
+            proto::filter::RuntimeFilterAcceptStatus::Rejected as i32
+        );
+        assert_eq!(
+            response.rejection_reason,
+            "runtime filter envelope ingress is not configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_filter_envelope_malformed_request_never_reaches_ingress() {
+        let ingress = Arc::new(RecordingEnvelopeIngress::accepting());
+        let svc = GrpcService::full_execution_with_handlers(
+            Arc::new(CapturingReportHandler::accepting()),
+            ingress.clone(),
+        );
+        let mut request = valid_runtime_filter_envelope();
+        request.channel_id = 0;
+
+        let error = svc
+            .transmit_runtime_filter_envelope(Request::new(request))
+            .await
+            .expect_err("malformed envelope must fail validation");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(ingress.calls(), 0);
     }
 
     #[tokio::test]
