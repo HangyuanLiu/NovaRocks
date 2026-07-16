@@ -44,7 +44,7 @@ use crate::version;
 
 use self::encoding::write_query_result;
 use crate::catalog::identifier::normalize_identifier;
-use crate::engine::catalog::DEFAULT_DATABASE;
+use crate::catalog::memory::DEFAULT_DATABASE;
 use crate::engine::mv_maintenance::MaintenanceCoordinatorConfig;
 use crate::engine::mv_scheduler::RefreshCoordinatorConfig;
 use crate::engine::statement::{

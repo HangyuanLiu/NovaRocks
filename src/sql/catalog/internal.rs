@@ -117,14 +117,13 @@ mod tests {
 
     #[test]
     fn default_catalog_preserves_local_missing_table_error() {
-        let catalog = InternalCatalog::new(
-            "default_catalog",
-            Arc::new(RwLock::new(PlannerMemoryCatalog::default())),
-        );
+        let mut local = PlannerMemoryCatalog::default();
+        local.create_database("sales").expect("create database");
+        let catalog = InternalCatalog::new("default_catalog", Arc::new(RwLock::new(local)));
 
         assert_eq!(
             catalog.get_table_metadata("sales", "missing").unwrap_err(),
-            "unknown database: sales"
+            "unknown table: missing"
         );
     }
 }

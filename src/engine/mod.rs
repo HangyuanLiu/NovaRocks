@@ -62,8 +62,6 @@ use crate::sql::catalog::local::PlannerMemoryCatalog;
 pub(crate) mod aggregate;
 pub(crate) mod backend_ops;
 pub(crate) mod backend_resolver;
-pub(crate) mod catalog;
-pub(crate) mod catalog_mgr;
 pub(crate) mod dml_change_stream;
 pub(crate) mod iceberg_change_stream_write;
 pub(crate) mod iceberg_ctas;

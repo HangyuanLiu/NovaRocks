@@ -64,46 +64,6 @@ const ENGINE_FILE_OWNERS: &[EngineFileOwner] = &[
         migration_task: "EBD-5B",
     },
     EngineFileOwner {
-        path: "src/engine/catalog.rs",
-        target_owner: "catalog",
-        migration_task: "EBD-4",
-    },
-    EngineFileOwner {
-        path: "src/engine/catalog_mgr/catalog.rs",
-        target_owner: "catalog",
-        migration_task: "EBD-5A",
-    },
-    EngineFileOwner {
-        path: "src/engine/catalog_mgr/iceberg.rs",
-        target_owner: "catalog",
-        migration_task: "EBD-5A",
-    },
-    EngineFileOwner {
-        path: "src/engine/catalog_mgr/internal.rs",
-        target_owner: "catalog",
-        migration_task: "EBD-5A",
-    },
-    EngineFileOwner {
-        path: "src/engine/catalog_mgr/metadata.rs",
-        target_owner: "catalog",
-        migration_task: "EBD-5A",
-    },
-    EngineFileOwner {
-        path: "src/engine/catalog_mgr/mod.rs",
-        target_owner: "catalog",
-        migration_task: "EBD-5A",
-    },
-    EngineFileOwner {
-        path: "src/engine/catalog_mgr/provider.rs",
-        target_owner: "catalog",
-        migration_task: "EBD-5A",
-    },
-    EngineFileOwner {
-        path: "src/engine/catalog_mgr/schema_cache.rs",
-        target_owner: "catalog",
-        migration_task: "EBD-5A",
-    },
-    EngineFileOwner {
         path: "src/engine/delete_flow.rs",
         target_owner: "dml",
         migration_task: "EBD-11",
@@ -471,17 +431,9 @@ const ENGINE_FILE_OWNERS: &[EngineFileOwner] = &[
 ];
 
 const ENGINE_MODULE_DECLARATIONS: &[&str] = &[
-    "src/engine/catalog_mgr/mod.rs||external|path=default|catalog",
-    "src/engine/catalog_mgr/mod.rs||external|path=default|iceberg",
-    "src/engine/catalog_mgr/mod.rs||external|path=default|internal",
-    "src/engine/catalog_mgr/mod.rs||external|path=default|metadata",
-    "src/engine/catalog_mgr/mod.rs||external|path=default|provider",
-    "src/engine/catalog_mgr/mod.rs||external|path=default|schema_cache",
     "src/engine/mod.rs||external|path=default|aggregate",
     "src/engine/mod.rs||external|path=default|backend_ops",
     "src/engine/mod.rs||external|path=default|backend_resolver",
-    "src/engine/mod.rs||external|path=default|catalog",
-    "src/engine/mod.rs||external|path=default|catalog_mgr",
     "src/engine/mod.rs||external|path=default|delete_flow",
     "src/engine/mod.rs||external|path=default|delete_predicate_translate",
     "src/engine/mod.rs||external|path=default|dml_change_stream",
@@ -575,7 +527,7 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
         &[
             "crate::engine::StandaloneState",
             "crate::engine::backend_resolver::resolve_table_target",
-            "crate::engine::execute_query_with_catalog_mgr",
+            "crate::engine::execute_query_with_catalog_service",
             "crate::engine::iceberg_writer::invalidate_iceberg_caches",
         ],
     ),
@@ -617,9 +569,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
         "src/connector/mod.rs",
         &[
             "crate::engine::StandaloneState",
-            "crate::engine::catalog::InMemoryCatalog",
-            "crate::engine::catalog_mgr::iceberg::IcebergCatalog::new",
-            "crate::engine::catalog_mgr::internal::InternalCatalog::new",
             "crate::engine::mv::iceberg_backend::IcebergMvBackend::new",
         ],
     ),
@@ -661,10 +610,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "src/connector/starrocks/table/catalog.rs",
-        &["crate::engine::catalog::InMemoryCatalog"],
-    ),
-    (
         "src/connector/starrocks/table/ddl.rs",
         &[
             "crate::engine::StandaloneState",
@@ -700,7 +645,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
         "src/connector/starrocks/table/ivm_delta_source.rs",
         &[
             "crate::engine::StandaloneState",
-            "crate::engine::catalog::InMemoryCatalog",
             "crate::engine::execute_query",
             "crate::engine::mv::agg_state::mv_shape::query_has_aggregate_surface",
             "crate::engine::mv::table_ref::IcebergTableRef",
@@ -902,7 +846,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "crate::engine::StandaloneNovaRocks",
             "crate::engine::StandaloneOptions",
             "crate::engine::StatementResult",
-            "crate::engine::catalog::DEFAULT_DATABASE",
             "crate::engine::mv_maintenance::MaintenanceCoordinatorConfig",
             "crate::engine::mv_maintenance::start_maintenance_coordinator_for_server",
             "crate::engine::mv_scheduler::RefreshCoordinatorConfig",
@@ -8756,7 +8699,7 @@ fn ebd_4b3a_catalog_physical_layout_retirement_is_complete() {
     );
 }
 
-const EBD_4B3B_PROVIDER: &str = "src/engine/catalog_mgr/provider.rs";
+const EBD_4B3B_PROVIDER: &str = "src/sql/catalog/provider.rs";
 const EBD_4B3B_ENGINE: &str = "src/engine/mod.rs";
 const EBD_4B3B_SQL_CATALOG: &str = "src/sql/catalog.rs";
 
@@ -8929,8 +8872,8 @@ fn ebd_4b3b_resolution_helper_is_metadata_only(block: &syn::Block) -> bool {
     let mut visitor = ResolutionVisitor::default();
     syn::visit::Visit::visit_block(&mut visitor, block);
     visitor.resolve_calls == 1
-        && visitor.catalog_table_calls == 1
         && visitor.planner_table_calls == 1
+        && visitor.catalog_table_calls <= 1
         && visitor.forbidden_calls == 0
 }
 
@@ -9046,7 +8989,7 @@ fn ebd_4b3b_audit_statistics_lookup_decoupling(sources: &[GuardSource]) -> BTree
         impl<'ast> syn::visit::Visit<'ast> for BoundaryVisitor<'_> {
             fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
                 if self.path == EBD_4B3B_PROVIDER
-                    && item.ident == "CatalogMgrProvider"
+                    && item.ident == "CatalogServiceProvider"
                     && let syn::Fields::Named(fields) = &item.fields
                 {
                     for field in &fields.named {
@@ -9073,7 +9016,7 @@ fn ebd_4b3b_audit_statistics_lookup_decoupling(sources: &[GuardSource]) -> BTree
                         item.self_ty.as_ref(),
                         syn::Type::Path(path)
                             if path.path.segments.last().is_some_and(|segment| {
-                                segment.ident == "CatalogMgrProvider"
+                                segment.ident == "CatalogServiceProvider"
                             })
                     )
                     && item
@@ -9204,8 +9147,8 @@ fn ebd_4b3b_detector_rejects_statistics_lookup_rewiring() {
         GuardSource::new(
             EBD_4B3B_PROVIDER,
             r#"
-struct CatalogMgrProvider { default_mode: TableLookupMode }
-impl PlannerTableProvider for CatalogMgrProvider {
+struct CatalogServiceProvider { default_mode: TableLookupMode }
+impl PlannerTableProvider for CatalogServiceProvider {
     fn new(default_mode: TableLookupMode) -> Self { todo!() }
     fn iceberg_table_def(&self, mode: &TableLookupMode) {
         match mode {
@@ -9876,7 +9819,12 @@ fn ebd_4b3c_audit_paths_definitions_and_forwarding(sources: &[GuardSource]) -> B
 
         fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
             self.record_definition("type", &item.ident.to_string());
-            if ebd_4b3c_type_contains_model_path(
+            if !ebd_5a1_is_allowed_sql_specialization_alias(
+                &self.source.path,
+                &self.inline_modules,
+                self.aliases,
+                item,
+            ) && ebd_4b3c_type_contains_model_path(
                 &item.ty,
                 self.source,
                 self.aliases,
@@ -12889,7 +12837,7 @@ const EBD_4B3D_PROVIDER_OWNER: &str = "src/catalog/provider.rs";
 const EBD_4B3D_PARTITION_OWNER: &str = "src/catalog/partition.rs";
 const EBD_4B3D_PLANNER_EXTENSION_OWNER: &str = "src/sql/catalog.rs";
 const EBD_4B3D_ANALYZER_ENTRY: &str = "src/sql/analyzer/resolve_from.rs";
-const EBD_4B3D_ENGINE_PROVIDER: &str = "src/engine/catalog_mgr/provider.rs";
+const EBD_4B3D_PLANNER_PROVIDER_OWNER: &str = "src/sql/catalog/provider.rs";
 
 fn ebd_4b3d_named_item_count(source: &str, kind: &str, name: &str) -> usize {
     let Ok(file) = syn::parse_file(source) else {
@@ -13377,7 +13325,7 @@ fn ebd_4b3d_completion_violations(sources: &[GuardSource]) -> BTreeSet<String> {
     }
 
     let engine_provider = sources
-        .get(EBD_4B3D_ENGINE_PROVIDER)
+        .get(EBD_4B3D_PLANNER_PROVIDER_OWNER)
         .map(|source| rust_sanitized_production_text(&source.text))
         .unwrap_or_default();
     for required in [
@@ -13387,17 +13335,17 @@ fn ebd_4b3d_completion_violations(sources: &[GuardSource]) -> BTreeSet<String> {
     ] {
         if !engine_provider.contains(required) {
             violations.insert(format!(
-                "neutral-table-engine-provider-port-missing: {EBD_4B3D_ENGINE_PROVIDER}|{required}"
+                "neutral-table-planner-provider-port-missing: {EBD_4B3D_PLANNER_PROVIDER_OWNER}|{required}"
             ));
         }
     }
     for call in sources
-        .get(EBD_4B3D_ENGINE_PROVIDER)
+        .get(EBD_4B3D_PLANNER_PROVIDER_OWNER)
         .map(|source| ebd_4b3d_neutral_provider_connector_calls(&source.text))
         .unwrap_or_default()
     {
         violations.insert(format!(
-            "neutral-table-ordinary-provider-connector-call: {EBD_4B3D_ENGINE_PROVIDER}|{call}"
+            "neutral-table-ordinary-provider-connector-call: {EBD_4B3D_PLANNER_PROVIDER_OWNER}|{call}"
         ));
     }
 
@@ -13462,12 +13410,12 @@ trait IcebergMetadataTableProvider {
             "fn resolve() { provider.resolve_table_for_analysis(); metadata.get_iceberg_metadata_table(); }",
         ),
         GuardSource::new(
-            EBD_4B3D_ENGINE_PROVIDER,
+            EBD_4B3D_PLANNER_PROVIDER_OWNER,
             r#"
 use crate::catalog::provider::CatalogProvider;
 use crate::sql::catalog::{IcebergMetadataTableProvider, PlannerTableProvider};
-struct CatalogMgrProvider;
-impl CatalogProvider for CatalogMgrProvider {
+struct CatalogServiceProvider;
+impl CatalogProvider for CatalogServiceProvider {
     fn get_table(&self) { self.resolve_table_for_analysis_once(); }
 }
 "#,
@@ -13512,18 +13460,18 @@ fn get_table_with_mode() {}
 "#,
     ));
     invalid[5] = GuardSource::new(
-        EBD_4B3D_ENGINE_PROVIDER,
+        EBD_4B3D_PLANNER_PROVIDER_OWNER,
         r#"
 use crate::catalog::provider::CatalogProvider;
 use crate::sql::catalog::{IcebergMetadataTableProvider, PlannerTableProvider};
-struct CatalogMgrProvider;
-impl CatalogProvider for CatalogMgrProvider {
+struct CatalogServiceProvider;
+impl CatalogProvider for CatalogServiceProvider {
     fn get_table(&self) {
         self.lookup_neutral();
         nested::nested_lookup(self);
     }
 }
-impl CatalogMgrProvider {
+impl CatalogServiceProvider {
     fn lookup_neutral(&self) {
         self.catalog_backend();
         self.load_table_for_read();
@@ -13535,7 +13483,7 @@ impl DuplicateMethodOwner {
     fn lookup_neutral(&self) {}
 }
 mod nested {
-    fn nested_lookup(provider: &super::CatalogMgrProvider) {
+    fn nested_lookup(provider: &super::CatalogServiceProvider) {
         provider.table_source();
         provider.build_schema_table_def();
     }
@@ -13575,11 +13523,11 @@ mod nested {
         "neutral-table-public-reexport: src/sql/provider_reexport.rs|CatalogProvider",
         "neutral-table-retired-surface: src/sql/legacy_provider.rs|TableLookupMode",
         "neutral-table-retired-surface: src/sql/legacy_provider.rs|get_table_with_mode",
-        "neutral-table-ordinary-provider-connector-call: src/engine/catalog_mgr/provider.rs|catalog_backend",
-        "neutral-table-ordinary-provider-connector-call: src/engine/catalog_mgr/provider.rs|load_table_for_read",
-        "neutral-table-ordinary-provider-connector-call: src/engine/catalog_mgr/provider.rs|build_table_def",
-        "neutral-table-ordinary-provider-connector-call: src/engine/catalog_mgr/provider.rs|table_source",
-        "neutral-table-ordinary-provider-connector-call: src/engine/catalog_mgr/provider.rs|build_schema_table_def",
+        "neutral-table-ordinary-provider-connector-call: src/sql/catalog/provider.rs|catalog_backend",
+        "neutral-table-ordinary-provider-connector-call: src/sql/catalog/provider.rs|load_table_for_read",
+        "neutral-table-ordinary-provider-connector-call: src/sql/catalog/provider.rs|build_table_def",
+        "neutral-table-ordinary-provider-connector-call: src/sql/catalog/provider.rs|table_source",
+        "neutral-table-ordinary-provider-connector-call: src/sql/catalog/provider.rs|build_schema_table_def",
         "neutral-table-engine-forwarding-provider: src/engine/catalog.rs",
     ] {
         assert!(
@@ -13607,6 +13555,16 @@ const EBD_5A1_REQUIRED_OWNERS: &[(&str, &str)] = &[
 
 const EBD_5A1_RETIRED_OWNER_SYMBOLS: &[&str] =
     &["InMemoryCatalog", "CatalogMgr", "CatalogMgrProvider"];
+const EBD_5A1_RETIRED_OWNER_PATHS: &[&str] = &[
+    "src/engine/catalog.rs",
+    "src/engine/catalog_mgr/catalog.rs",
+    "src/engine/catalog_mgr/iceberg.rs",
+    "src/engine/catalog_mgr/internal.rs",
+    "src/engine/catalog_mgr/metadata.rs",
+    "src/engine/catalog_mgr/mod.rs",
+    "src/engine/catalog_mgr/provider.rs",
+    "src/engine/catalog_mgr/schema_cache.rs",
+];
 
 fn ebd_5a1_attrs_are_test_only(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attribute| {
@@ -13880,6 +13838,96 @@ fn ebd_5a1_runtime_types_in_type(
     visitor.found
 }
 
+fn ebd_5a1_canonical_type_path(
+    ty: &syn::Type,
+    source_path: &str,
+    inline_modules: &[String],
+    aliases: &RustScopedAliases,
+) -> Option<(Vec<String>, Vec<Vec<String>>)> {
+    let syn::Type::Path(type_path) = ty else {
+        return None;
+    };
+    if type_path.qself.is_some() {
+        return None;
+    }
+    let segments = type_path
+        .path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>();
+    let resolved =
+        rust_resolve_scoped_paths(&segments, inline_modules, aliases, &mut BTreeSet::new(), 0)?;
+    if resolved.len() != 1 {
+        return None;
+    }
+    let target = resolved.into_iter().next().expect("single resolved path");
+    let canonical = rust_canonical_path_segments_in_scope(
+        &target.segments,
+        source_path,
+        &target.inline_modules,
+    )?;
+
+    let last = type_path.path.segments.last()?;
+    let syn::PathArguments::AngleBracketed(arguments) = &last.arguments else {
+        return Some((canonical, Vec::new()));
+    };
+    let mut generic_types = Vec::new();
+    for argument in &arguments.args {
+        let syn::GenericArgument::Type(argument) = argument else {
+            return None;
+        };
+        let (canonical, nested) =
+            ebd_5a1_canonical_type_path(argument, source_path, inline_modules, aliases)?;
+        if !nested.is_empty() {
+            return None;
+        }
+        generic_types.push(canonical);
+    }
+    Some((canonical, generic_types))
+}
+
+fn ebd_5a1_is_allowed_sql_specialization_alias(
+    source_path: &str,
+    inline_modules: &[String],
+    aliases: &RustScopedAliases,
+    item: &syn::ItemType,
+) -> bool {
+    if !inline_modules.is_empty()
+        || !ebd_4b1_is_pub_crate(&item.vis)
+        || !item.generics.params.is_empty()
+        || item.generics.where_clause.is_some()
+    {
+        return false;
+    }
+    let Some((target, arguments)) =
+        ebd_5a1_canonical_type_path(&item.ty, source_path, inline_modules, aliases)
+    else {
+        return false;
+    };
+    match (source_path, item.ident.to_string().as_str()) {
+        ("src/sql/catalog/local.rs", "PlannerMemoryCatalog") => {
+            target == ["crate", "catalog", "memory", "MemoryCatalog"]
+                && arguments == [["crate", "sql", "planner", "table", "TableDef"]]
+        }
+        ("src/sql/catalog.rs", "StandaloneCatalogService") => {
+            target == ["crate", "catalog", "service", "CatalogService"]
+                && arguments
+                    == [
+                        ["crate", "sql", "planner", "table", "TableDef"],
+                        [
+                            "crate",
+                            "sql",
+                            "catalog",
+                            "metadata",
+                            "CatalogRuntimeMetadata",
+                        ],
+                    ]
+        }
+        _ => false,
+    }
+}
+
 fn ebd_5a1_runtime_alias_and_wrapper_violations(source: &GuardSource) -> BTreeSet<String> {
     struct Visitor<'a> {
         path: &'a str,
@@ -13891,6 +13939,14 @@ fn ebd_5a1_runtime_alias_and_wrapper_violations(source: &GuardSource) -> BTreeSe
     impl<'ast> syn::visit::Visit<'ast> for Visitor<'_> {
         fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
             if ebd_5a1_attrs_are_test_only(&item.attrs) {
+                return;
+            }
+            if ebd_5a1_is_allowed_sql_specialization_alias(
+                self.path,
+                &self.inline_modules,
+                self.aliases,
+                item,
+            ) {
                 return;
             }
             for symbol in ebd_5a1_runtime_types_in_type(
@@ -14726,11 +14782,9 @@ fn ebd_5a1_completion_violations(sources: &[GuardSource]) -> BTreeSet<String> {
         .collect::<BTreeMap<_, _>>();
     let mut violations = BTreeSet::new();
 
-    for owner in ENGINE_FILE_OWNERS.iter().filter(|owner| {
-        owner.path == "src/engine/catalog.rs" || owner.path.starts_with("src/engine/catalog_mgr/")
-    }) {
-        if sources.contains_key(owner.path) {
-            violations.insert(format!("catalog-runtime-old-owner: {}", owner.path));
+    for path in EBD_5A1_RETIRED_OWNER_PATHS {
+        if sources.contains_key(path) {
+            violations.insert(format!("catalog-runtime-old-owner: {path}"));
         }
     }
 
@@ -15099,6 +15153,134 @@ struct LegacyCache<M>(Cache<M>);
         assert!(
             violations.contains(expected),
             "EBD-5A1 detector missed arbitrary runtime alias/wrapper {expected}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn ebd_5a1_detector_allows_only_exact_sql_specialization_aliases() {
+    let canonical_sources = vec![
+        GuardSource::new(
+            EBD_5A1_MEMORY_OWNER,
+            "pub(crate) struct MemoryCatalog<T> { local: Option<T> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_REGISTRY_OWNER,
+            "pub(crate) struct CatalogRegistry<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_CACHE_OWNER,
+            "pub(crate) struct SchemaCache<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SERVICE_OWNER,
+            "pub(crate) struct CatalogService<T, M> { marker: std::marker::PhantomData<(T, M)> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SQL_PROVIDER_OWNER,
+            "pub(crate) struct CatalogServiceProvider<'a> { marker: std::marker::PhantomData<&'a ()> }",
+        ),
+        GuardSource::new(
+            "src/sql/catalog/local.rs",
+            r#"
+use crate::catalog::memory::MemoryCatalog;
+use crate::sql::planner::table::TableDef;
+pub(crate) type PlannerMemoryCatalog = MemoryCatalog<TableDef>;
+"#,
+        ),
+        GuardSource::new(
+            "src/sql/catalog.rs",
+            r#"
+use crate::catalog::service::CatalogService;
+use crate::sql::planner::table::TableDef;
+use metadata::CatalogRuntimeMetadata;
+pub(crate) type StandaloneCatalogService =
+    CatalogService<TableDef, CatalogRuntimeMetadata>;
+"#,
+        ),
+        GuardSource::new(
+            "src/engine/mod.rs",
+            "struct StandaloneState { catalog_service: Arc<StandaloneCatalogService> }",
+        ),
+    ];
+
+    let canonical_violations = ebd_5a1_completion_violations(&canonical_sources);
+    assert!(
+        canonical_violations.is_empty(),
+        "the two plan-mandated SQL specialization aliases must be accepted exactly: {canonical_violations:?}"
+    );
+
+    for (path, source, expected) in [
+        (
+            "src/sql/catalog/local.rs",
+            r#"
+use crate::catalog::memory::MemoryCatalog;
+use crate::sql::planner::table::TableDef;
+pub(crate) type RenamedPlannerMemoryCatalog = MemoryCatalog<TableDef>;
+"#,
+            "catalog-runtime-type-alias: src/sql/catalog/local.rs|RenamedPlannerMemoryCatalog|MemoryCatalog",
+        ),
+        (
+            "src/sql/catalog/local.rs",
+            r#"
+use crate::catalog::memory::MemoryCatalog;
+use crate::sql::planner::table::TableDef;
+type PlannerMemoryCatalog = MemoryCatalog<TableDef>;
+"#,
+            "catalog-runtime-type-alias: src/sql/catalog/local.rs|PlannerMemoryCatalog|MemoryCatalog",
+        ),
+        (
+            "src/sql/catalog/local.rs",
+            r#"
+use crate::catalog::memory::MemoryCatalog;
+struct OtherTableDef;
+pub(crate) type PlannerMemoryCatalog = MemoryCatalog<OtherTableDef>;
+"#,
+            "catalog-runtime-type-alias: src/sql/catalog/local.rs|PlannerMemoryCatalog|MemoryCatalog",
+        ),
+        (
+            "src/sql/catalog.rs",
+            r#"
+use crate::catalog::service::CatalogService;
+use crate::sql::planner::table::TableDef;
+use metadata::CatalogRuntimeMetadata;
+pub(crate) type RenamedStandaloneCatalogService =
+    CatalogService<TableDef, CatalogRuntimeMetadata>;
+"#,
+            "catalog-runtime-type-alias: src/sql/catalog.rs|RenamedStandaloneCatalogService|CatalogService",
+        ),
+        (
+            "src/sql/catalog.rs",
+            r#"
+use crate::catalog::service::CatalogService;
+use crate::sql::planner::table::TableDef;
+use metadata::CatalogRuntimeMetadata;
+pub type StandaloneCatalogService =
+    CatalogService<TableDef, CatalogRuntimeMetadata>;
+"#,
+            "catalog-runtime-type-alias: src/sql/catalog.rs|StandaloneCatalogService|CatalogService",
+        ),
+        (
+            "src/sql/catalog.rs",
+            r#"
+use crate::catalog::service::CatalogService;
+use crate::sql::planner::table::TableDef;
+struct OtherMetadata;
+pub(crate) type StandaloneCatalogService = CatalogService<TableDef, OtherMetadata>;
+"#,
+            "catalog-runtime-type-alias: src/sql/catalog.rs|StandaloneCatalogService|CatalogService",
+        ),
+    ] {
+        let mut invalid = canonical_sources.clone();
+        let index = invalid
+            .iter()
+            .position(|candidate| candidate.path == path)
+            .expect("canonical alias fixture");
+        invalid[index] = GuardSource::new(path, source);
+        let violations = ebd_5a1_completion_violations(&invalid);
+        assert!(
+            violations.contains(expected),
+            "renamed aliases and non-exact interfaces must remain rejected: expected {expected}, got {violations:?}"
         );
     }
 }

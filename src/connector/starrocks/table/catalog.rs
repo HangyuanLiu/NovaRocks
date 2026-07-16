@@ -838,8 +838,8 @@ fn logical_type_from_tablet_column(column: &ColumnPb) -> Option<crate::catalog::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::memory::DEFAULT_DATABASE;
     use crate::connector::starrocks::table::model::{StarRocksTableKind, StoredStarRocksSchema};
-    use crate::engine::catalog::DEFAULT_DATABASE;
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::service::grpc_client::proto::starrocks::ColumnPb;
 
