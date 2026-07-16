@@ -83,6 +83,10 @@ pub struct MysqlOccTestApi;
 pub struct MysqlChangeTestApi;
 pub struct MysqlCommitTestApi;
 #[cfg(feature = "state-store-test-hooks")]
+pub struct MysqlPollQueryTestControl {
+    inner: super::changes::PollQueryHookControl,
+}
+#[cfg(feature = "state-store-test-hooks")]
 pub struct MysqlPostDispatchTestControl {
     inner: super::commit::CommitHookControl,
 }
@@ -191,6 +195,12 @@ impl MysqlOccTestApi {
 
 #[cfg(feature = "state-store-test-hooks")]
 impl MysqlChangeTestApi {
+    pub fn arm_delayed_poll_query() -> MysqlPollQueryTestControl {
+        MysqlPollQueryTestControl {
+            inner: super::changes::arm_delayed_poll_query(),
+        }
+    }
+
     pub async fn run_scenario(
         runtime: &StateStoreRuntime,
         database: &str,
@@ -294,6 +304,43 @@ impl MysqlChangeTestApi {
                 {
                     return Err(scenario_error());
                 }
+                let pool = runtime.mysql_test_pool(database)?;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+                let mut connection =
+                    super::client::checkout_hygienic_connection(pool, deadline).await?;
+                connection
+                    .exec_drop(
+                        "UPDATE state_store_meta SET meta_value = ? WHERE meta_key = ?",
+                        (
+                            super::codec::MysqlCodec::new(store.limits().max_key_bytes)?
+                                .encode_revision(2)
+                                .to_vec(),
+                            b"current_revision".to_vec(),
+                        ),
+                    )
+                    .await
+                    .map_err(super::error::MysqlNativeError::from)
+                    .map_err(super::error::MysqlNativeError::into_public)?;
+                let zero_change = ChangeCursor::new(
+                    identity.store_id,
+                    super::super::StoreRevision::try_from(Bytes::copy_from_slice(
+                        &2_u64.to_be_bytes(),
+                    ))?,
+                    u32::MAX,
+                )?;
+                let page = store
+                    .poll_changes(&ChangePollRequest {
+                        after: Some(zero_change),
+                        page_size: 1,
+                    })
+                    .await?;
+                let (_, next_sequence) = page.next_cursor.decode(identity.store_id)?;
+                if !page.hints.is_empty()
+                    || page.high_watermark.as_bytes() != 2_u64.to_be_bytes()
+                    || next_sequence != u32::MAX
+                {
+                    return Err(scenario_error());
+                }
                 Ok(())
             }
             "retention_gap" => {
@@ -344,23 +391,78 @@ impl MysqlChangeTestApi {
                 Ok(())
             }
             "duplicate_position" => {
-                if super::changes::validate_positions_for_test((0, u32::MAX), &[(1, 0), (1, 0)])
-                    .is_ok()
-                {
-                    return Err(scenario_error());
+                commit_keys(&store, &[(b"duplicate/real", b"value")]).await?;
+                super::changes::duplicate_next_poll_row();
+                let error = store
+                    .poll_changes(&ChangePollRequest {
+                        after: None,
+                        page_size: store.limits().max_page_size,
+                    })
+                    .await
+                    .expect_err("duplicate production result row must fail closed");
+                if error.kind() == StateStoreErrorKind::Corruption {
+                    Ok(())
+                } else {
+                    Err(error)
                 }
-                Ok(())
             }
             "cursor_sequence_gap" => {
-                for rows in [&[(1, 1)][..], &[(1, 0), (1, 2)][..]] {
-                    if super::changes::validate_positions_for_test((0, u32::MAX), rows).is_ok() {
-                        return Err(scenario_error());
-                    }
+                let receipt = commit_keys(&store, &[(b"cursor/real", b"value")]).await?;
+                let revision = u64::from_be_bytes(
+                    receipt
+                        .revision
+                        .as_bytes()
+                        .try_into()
+                        .map_err(|_| scenario_error())?,
+                );
+                let identity = store.identity().await?;
+                let nonexistent = ChangeCursor::new(identity.store_id, receipt.revision, 1)?;
+                let error = store
+                    .poll_changes(&ChangePollRequest {
+                        after: Some(nonexistent),
+                        page_size: 1,
+                    })
+                    .await
+                    .expect_err("nonexistent non-MAX cursor must fail closed");
+                if error.kind() != StateStoreErrorKind::Corruption {
+                    return Err(error);
                 }
-                Ok(())
+
+                let pool = runtime.mysql_test_pool(database)?;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+                let mut connection =
+                    super::client::checkout_hygienic_connection(pool, deadline).await?;
+                connection
+                    .exec_drop(
+                        "INSERT INTO state_store_changes (revision, sequence, key_bytes)
+                         VALUES (?, ?, ?)",
+                        (revision, 2_u32, b"cursor/injected-gap".to_vec()),
+                    )
+                    .await
+                    .map_err(super::error::MysqlNativeError::from)
+                    .map_err(super::error::MysqlNativeError::into_public)?;
+                let error = store
+                    .poll_changes(&ChangePollRequest {
+                        after: None,
+                        page_size: store.limits().max_page_size,
+                    })
+                    .await
+                    .expect_err("persisted same-revision sequence gap must fail closed");
+                if error.kind() == StateStoreErrorKind::Corruption {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
             }
             _ => Err(scenario_error()),
         }
+    }
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+impl MysqlPollQueryTestControl {
+    pub async fn wait_reached(&self) {
+        self.inner.wait_reached().await;
     }
 }
 
@@ -398,7 +500,7 @@ impl MysqlCommitTestApi {
     }
 
     pub async fn run_scenario(
-        runtime: &StateStoreRuntime,
+        runtime: &mut StateStoreRuntime,
         database: &str,
         store: Arc<dyn StateStore>,
         scenario: &str,
@@ -502,14 +604,21 @@ impl MysqlCommitTestApi {
                 Ok(())
             }
             "reservation_reload" => {
+                let transaction_id = TransactionId::from(Uuid::now_v7());
                 let ours = *Uuid::new_v4().as_bytes();
-                if !super::commit::reservation_requires_authoritative_reload_for_test(
-                    true, None, ours,
-                ) || super::commit::reservation_requires_authoritative_reload_for_test(
-                    true,
-                    Some(super::codec::DurableCommitState::Pending(ours)),
+                super::commit::lose_next_auxiliary_commit_response();
+                if super::commit::reserve_commit(
+                    Arc::clone(&pool),
+                    &codec,
+                    transaction_id,
                     ours,
-                ) {
+                    deadline,
+                )
+                .await?
+                    != super::commit::ReservationDecision::Reserved
+                    || read_ledger_row(pool, transaction_id, deadline).await?
+                        != Some((1, Some(ours.to_vec()), None))
+                {
                     return Err(scenario_error());
                 }
                 Ok(())
@@ -592,7 +701,49 @@ impl MysqlCommitTestApi {
                 }
                 Ok(())
             }
-            "dispatch_error_unknown" | "response_loss" => {
+            "dispatch_error_unknown" => {
+                let control =
+                    super::commit::arm_commit_hook(super::commit::CommitHookMode::RawDriverError);
+                let transaction_id = TransactionId::from(Uuid::now_v7());
+                let mut writer = store
+                    .begin_write(transaction_id, "raw commit error")
+                    .await?;
+                writer
+                    .put(
+                        Key::try_from(Bytes::from_static(b"dispatch/driver-error"))?,
+                        Value::try_from(Bytes::from_static(b"must-be-unknown"))?,
+                        Precondition::Any,
+                    )
+                    .await?;
+                let waiter = tokio::spawn(async move { writer.commit().await });
+                control.wait_reached().await;
+                let connection_id = control.connection_id();
+                if connection_id == 0 {
+                    control.release();
+                    return Err(scenario_error());
+                }
+                let mut killer =
+                    super::client::checkout_hygienic_connection(Arc::clone(&pool), deadline)
+                        .await?;
+                killer
+                    .query_drop(format!("KILL CONNECTION {connection_id}"))
+                    .await
+                    .map_err(super::error::MysqlNativeError::from)
+                    .map_err(super::error::MysqlNativeError::into_public)?;
+                control.release();
+                let outcome = waiter.await.map_err(|_| scenario_error())?;
+                if !matches!(outcome, CommitOutcome::CommitUnknown(_))
+                    || !control.driver_error_observed()
+                    || !matches!(
+                        read_ledger_row(pool, transaction_id, deadline).await?,
+                        Some((1, Some(_), None))
+                    )
+                {
+                    return Err(scenario_error());
+                }
+                Ok(())
+            }
+            "response_loss" => {
                 let control =
                     super::commit::arm_commit_hook(super::commit::CommitHookMode::ResponseLoss);
                 let transaction_id = TransactionId::from(Uuid::now_v7());
@@ -684,6 +835,7 @@ impl MysqlCommitTestApi {
                 Ok(())
             }
             "resolve_reservation_race" => {
+                let control = super::commit::arm_resolve_reservation_race();
                 let transaction_id = TransactionId::from(Uuid::now_v7());
                 let mut writer = store.begin_write(transaction_id, "resolve race").await?;
                 writer
@@ -699,16 +851,24 @@ impl MysqlCommitTestApi {
                         async move { resolver_store.resolve_commit(&transaction_id).await },
                     );
                 let commit = tokio::spawn(async move { writer.commit().await });
-                let _ = resolver.await.map_err(|_| scenario_error())??;
-                let _ = commit.await.map_err(|_| scenario_error())?;
+                control.wait_both_observed().await;
+                control.release();
+                let resolver = resolver.await.map_err(|_| scenario_error())?;
+                let commit = commit.await.map_err(|_| scenario_error())?;
                 let first = store.resolve_commit(&transaction_id).await?;
                 let second = store.resolve_commit(&transaction_id).await?;
-                if first != second
-                    || !matches!(
-                        first,
-                        CommitResolution::Committed(_) | CommitResolution::NotCommitted
-                    )
-                {
+                let loser_is_explicit = match (&first, resolver, commit) {
+                    (CommitResolution::Committed(_), Err(error), CommitOutcome::Committed(_)) => {
+                        error.kind() == StateStoreErrorKind::Conflict
+                    }
+                    (
+                        CommitResolution::NotCommitted,
+                        Ok(CommitResolution::NotCommitted),
+                        CommitOutcome::Conflict(error),
+                    ) => error.kind() == StateStoreErrorKind::Conflict,
+                    _ => false,
+                };
+                if first != second || !loser_is_explicit {
                     return Err(scenario_error());
                 }
                 Ok(())
@@ -804,6 +964,15 @@ impl MysqlCommitTestApi {
                     control.release();
                     return Err(scenario_error());
                 }
+                drop(store);
+                let shutdown_error = runtime
+                    .shutdown_with_timeout(Duration::from_millis(100))
+                    .await
+                    .expect_err("cleanup operation guard must block runtime shutdown");
+                if shutdown_error.kind() != StateStoreErrorKind::DeadlineExceeded {
+                    control.release();
+                    return Err(shutdown_error);
+                }
                 control.release();
                 for _ in 0..100 {
                     if read_ledger_row(Arc::clone(&pool), transaction_id, deadline).await?
@@ -826,6 +995,7 @@ impl MysqlCommitTestApi {
                     deadline,
                 )
                 .await?;
+                super::commit::fail_next_reservation_prepare();
                 let mut writer = store
                     .begin_write(transaction_id, "prepare fallback")
                     .await?;

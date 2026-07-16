@@ -2831,7 +2831,7 @@ async fn run_task6_commit_case(test_name: &str, scenario: &str) {
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL state store");
-    MysqlCommitTestApi::run_scenario(&runtime, &database.name, store, scenario)
+    MysqlCommitTestApi::run_scenario(&mut runtime, &database.name, store, scenario)
         .await
         .expect("run MySQL commit scenario");
     runtime.shutdown().await.expect("shutdown MySQL runtime");
@@ -2991,6 +2991,53 @@ async fn mysql_auxiliary_native_error_rolls_back_active_transaction() {
         .await
         .expect("rollback active auxiliary transaction after native error");
     drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_change_poll_cancellation_destroys_active_connection_and_holds_guard() {
+    let database = TestDatabase::provision("task6_poll_cancel", "poll_cancel");
+    let mut client = fixture_client_config();
+    client.pool_min = 1;
+    client.pool_max = 1;
+    let mut runtime = StateStoreRuntime::mysql(client).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 500)
+        .await
+        .expect("open MySQL state store");
+    let original_connection = active_readiness(&runtime, &database.name, Duration::from_secs(4))
+        .await
+        .expect("read original connection id")
+        .connection_id;
+    let control = MysqlChangeTestApi::arm_delayed_poll_query();
+    let poll_store = Arc::clone(&store);
+    let waiter = tokio::spawn(async move {
+        poll_store
+            .poll_changes(&novarocks::state_store::ChangePollRequest {
+                after: None,
+                page_size: 1,
+            })
+            .await
+    });
+    control.wait_reached().await;
+    waiter.abort();
+    assert!(
+        waiter.await.is_err_and(|error| error.is_cancelled()),
+        "public poll waiter must be cancelled"
+    );
+    drop(store);
+
+    let shutdown_error = runtime
+        .shutdown_with_timeout(Duration::from_millis(100))
+        .await
+        .expect_err("provider-owned poll must keep shutdown waiting");
+    assert_eq!(shutdown_error.kind(), StateStoreErrorKind::DeadlineExceeded);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let replacement = active_readiness(&runtime, &database.name, Duration::from_secs(4))
+        .await
+        .expect("read replacement connection id")
+        .connection_id;
+    assert_ne!(replacement, original_connection);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
 }
 

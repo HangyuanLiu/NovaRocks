@@ -164,8 +164,23 @@ impl StateStore for MysqlStateStore {
         &self,
         request: &ChangePollRequest,
     ) -> Result<ChangePage, StateStoreError> {
-        let _operation = self.lease.acquire_operation()?;
-        changes::poll_changes(self.lease.pool(), &self.identity, request, &self.limits).await
+        let operation = self.lease.acquire_operation()?;
+        let pool = self.lease.pool();
+        let identity = self.identity.clone();
+        let request = request.clone();
+        let limits = self.limits.clone();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _operation = operation;
+            let result = changes::poll_changes(pool, &identity, &request, &limits).await;
+            let _ = sender.send(result);
+        });
+        receiver.await.map_err(|_| {
+            StateStoreError::new(
+                StateStoreErrorKind::ProviderUnavailable,
+                "MySQL change polling supervisor stopped unexpectedly",
+            )
+        })?
     }
 
     async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {

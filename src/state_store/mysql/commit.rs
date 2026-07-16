@@ -23,7 +23,7 @@ use mysql_async::prelude::Queryable;
 #[cfg(feature = "state-store-test-hooks")]
 use std::sync::{Mutex, OnceLock};
 #[cfg(feature = "state-store-test-hooks")]
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 use tokio::time::{Duration, Instant, timeout_at};
 use uuid::Uuid;
 
@@ -60,6 +60,7 @@ pub(super) struct MysqlNativeCommitDispatcher;
 #[cfg(feature = "state-store-test-hooks")]
 #[derive(Clone, Copy)]
 pub(super) enum CommitHookMode {
+    RawDriverError,
     ResponseLoss,
     HoldAfterSuccess,
     DeadlineAfterSuccess,
@@ -72,6 +73,8 @@ struct CommitHook {
     mode: CommitHookMode,
     reached: Notify,
     release: Notify,
+    connection_id: std::sync::atomic::AtomicU64,
+    driver_error_observed: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -88,7 +91,29 @@ static DELAY_NEXT_RESERVATION: std::sync::atomic::AtomicBool =
 static DELAY_NEXT_RESOLUTION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(feature = "state-store-test-hooks")]
+static FAIL_NEXT_RESERVATION_PREPARE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "state-store-test-hooks")]
+static LOSE_NEXT_AUXILIARY_COMMIT_RESPONSE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "state-store-test-hooks")]
 static NEXT_CLEANUP_HOOK: OnceLock<Mutex<Option<Arc<CommitHook>>>> = OnceLock::new();
+#[cfg(feature = "state-store-test-hooks")]
+static NEXT_RESOLVE_RESERVATION_RACE_HOOK: OnceLock<
+    Mutex<Option<Arc<ResolveReservationRaceHook>>>,
+> = OnceLock::new();
+
+#[cfg(feature = "state-store-test-hooks")]
+struct ResolveReservationRaceHook {
+    observed: std::sync::atomic::AtomicUsize,
+    both_observed: Notify,
+    release: Semaphore,
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+pub(super) struct ResolveReservationRaceControl {
+    hook: Arc<ResolveReservationRaceHook>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum ReservationDecision {
@@ -96,18 +121,11 @@ pub(super) enum ReservationDecision {
     Committed(CommitReceipt),
 }
 
-#[cfg(feature = "state-store-test-hooks")]
-pub(super) fn reservation_requires_authoritative_reload_for_test(
-    native_dispatch_started: bool,
-    observed: Option<DurableCommitState>,
-    reservation_token: [u8; 16],
-) -> bool {
-    native_dispatch_started
-        && match observed {
-            Some(DurableCommitState::Pending(token)) => token != reservation_token,
-            Some(DurableCommitState::Committed(_)) => false,
-            Some(DurableCommitState::NotCommitted) | None => true,
-        }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum TerminalizeDecision {
+    NotCommitted,
+    Committed(CommitReceipt),
+    Unresolved,
 }
 
 impl NativeCommitDispatcher for MysqlNativeCommitDispatcher {
@@ -119,6 +137,34 @@ impl NativeCommitDispatcher for MysqlNativeCommitDispatcher {
         Box::pin(async move {
             #[cfg(feature = "state-store-test-hooks")]
             let hook = take_commit_hook();
+            #[cfg(feature = "state-store-test-hooks")]
+            if let Some(hook) = hook.as_ref()
+                && matches!(hook.mode, CommitHookMode::RawDriverError)
+            {
+                super::client::record_statement();
+                let connection_id =
+                    timeout_at(deadline, connection.query_first("SELECT CONNECTION_ID()")).await;
+                match connection_id {
+                    Ok(Ok(Some(connection_id))) => hook
+                        .connection_id
+                        .store(connection_id, std::sync::atomic::Ordering::Release),
+                    Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
+                        return NativeCommitResult {
+                            phase: NativeCommitPhase::BeforeDispatch,
+                            connection: Some(connection),
+                            result: Err(deadline_error()),
+                        };
+                    }
+                }
+                hook.reached.notify_one();
+                if timeout_at(deadline, hook.release.notified()).await.is_err() {
+                    return NativeCommitResult {
+                        phase: NativeCommitPhase::BeforeDispatch,
+                        connection: Some(connection),
+                        result: Err(deadline_error()),
+                    };
+                }
+            }
             #[cfg(feature = "state-store-test-hooks")]
             if let Some(hook) = hook.as_ref()
                 && matches!(
@@ -144,11 +190,20 @@ impl NativeCommitDispatcher for MysqlNativeCommitDispatcher {
                     if let Some(hook) = hook {
                         if !matches!(
                             hook.mode,
-                            CommitHookMode::SharedResponseLoss | CommitHookMode::SharedCancelWaiter
+                            CommitHookMode::RawDriverError
+                                | CommitHookMode::SharedResponseLoss
+                                | CommitHookMode::SharedCancelWaiter
                         ) {
                             hook.reached.notify_one();
                         }
                         match hook.mode {
+                            CommitHookMode::RawDriverError => {
+                                return NativeCommitResult {
+                                    phase: NativeCommitPhase::Terminal,
+                                    connection: Some(connection),
+                                    result: Ok(()),
+                                };
+                            }
                             CommitHookMode::ResponseLoss | CommitHookMode::SharedResponseLoss => {}
                             CommitHookMode::HoldAfterSuccess => hook.release.notified().await,
                             CommitHookMode::DeadlineAfterSuccess => {
@@ -177,6 +232,13 @@ impl NativeCommitDispatcher for MysqlNativeCommitDispatcher {
                     }
                 }
                 Ok(Err(_)) => {
+                    #[cfg(feature = "state-store-test-hooks")]
+                    if let Some(hook) = hook.as_ref()
+                        && matches!(hook.mode, CommitHookMode::RawDriverError)
+                    {
+                        hook.driver_error_observed
+                            .store(true, std::sync::atomic::Ordering::Release);
+                    }
                     connection.destroy().await;
                     NativeCommitResult {
                         phase,
@@ -212,10 +274,19 @@ pub(super) async fn reserve_commit(
     let mut connection = begin_serializable(pool.clone(), deadline).await?;
     let transaction_bytes = codec.encode_uuid(*transaction_id.as_uuid()).to_vec();
     let decision = async {
+        #[cfg(feature = "state-store-test-hooks")]
+        if FAIL_NEXT_RESERVATION_PREPARE.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::ProviderUnavailable,
+                "injected MySQL reservation prepare failure",
+            ));
+        }
         let row =
             read_ledger_for_update(&mut connection, transaction_bytes.clone(), deadline).await?;
         match decode_ledger(codec, row)? {
             None => {
+                #[cfg(feature = "state-store-test-hooks")]
+                wait_at_resolve_reservation_race().await;
                 execute(&mut connection, deadline, move |connection| {
                     Box::pin(connection.exec_drop(
                         "INSERT INTO state_store_commits
@@ -307,7 +378,7 @@ pub(super) async fn terminalize_undispatched(
     transaction_id: TransactionId,
     reservation_token: [u8; 16],
     deadline: Instant,
-) -> Result<(), StateStoreError> {
+) -> Result<TerminalizeDecision, StateStoreError> {
     #[cfg(feature = "state-store-test-hooks")]
     if let Some(hook) = take_cleanup_hook() {
         hook.reached.notify_one();
@@ -315,10 +386,10 @@ pub(super) async fn terminalize_undispatched(
     }
     let mut connection = begin_serializable(pool, deadline).await?;
     let transaction_bytes = codec.encode_uuid(*transaction_id.as_uuid()).to_vec();
-    let apply: Result<(), StateStoreError> = async {
+    let apply: Result<(TerminalizeDecision, bool), StateStoreError> = async {
         let row =
             read_ledger_for_update(&mut connection, transaction_bytes.clone(), deadline).await?;
-        match decode_ledger(codec, row)? {
+        let decision = match decode_ledger(codec, row)? {
             None => {
                 execute(&mut connection, deadline, move |connection| {
                     Box::pin(connection.exec_drop(
@@ -329,6 +400,7 @@ pub(super) async fn terminalize_undispatched(
                     ))
                 })
                 .await?;
+                (TerminalizeDecision::NotCommitted, true)
             }
             Some(DurableCommitState::Pending(token)) if token == reservation_token => {
                 execute(&mut connection, deadline, move |connection| {
@@ -346,19 +418,32 @@ pub(super) async fn terminalize_undispatched(
                     ))
                 })
                 .await?;
+                (TerminalizeDecision::NotCommitted, true)
             }
-            Some(_) => {}
-        }
-        Ok(())
+            Some(DurableCommitState::Pending(_)) => (TerminalizeDecision::Unresolved, false),
+            Some(DurableCommitState::Committed(revision)) => (
+                TerminalizeDecision::Committed(receipt(transaction_id, revision)?),
+                false,
+            ),
+            Some(DurableCommitState::NotCommitted) => (TerminalizeDecision::NotCommitted, false),
+        };
+        Ok(decision)
     }
     .await;
-    if let Err(error) = apply {
-        if error.kind() == StateStoreErrorKind::DeadlineExceeded {
-            return Err(error);
+    let (decision, mutated) = match apply {
+        Ok(decision) => decision,
+        Err(error) => {
+            if error.kind() == StateStoreErrorKind::DeadlineExceeded {
+                return Err(error);
+            }
+            return Err(dispose_active_error(connection, deadline, error).await);
         }
-        return Err(dispose_active_error(connection, deadline, error).await);
+    };
+    match dispatch_auxiliary_commit(connection, deadline).await.result {
+        Ok(()) => Ok(decision),
+        Err(_) if !mutated => Ok(decision),
+        Err(error) => Err(error),
     }
-    dispatch_auxiliary_commit(connection, deadline).await.result
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -395,6 +480,8 @@ pub(super) async fn resolve_commit(
         match decode_ledger(codec, row)? {
             Some(state) => Ok(state),
             None => {
+                #[cfg(feature = "state-store-test-hooks")]
+                wait_at_resolve_reservation_race().await;
                 execute(&mut connection, deadline, move |connection| {
                     Box::pin(connection.exec_drop(
                         "INSERT INTO state_store_commits
@@ -506,11 +593,23 @@ async fn dispatch_auxiliary_commit(
 ) -> NativeCommitResult {
     super::client::record_statement();
     match timeout_at(deadline, connection.query_drop("COMMIT")).await {
-        Ok(Ok(())) => NativeCommitResult {
-            phase: NativeCommitPhase::Terminal,
-            connection: Some(connection),
-            result: Ok(()),
-        },
+        Ok(Ok(())) => {
+            #[cfg(feature = "state-store-test-hooks")]
+            if LOSE_NEXT_AUXILIARY_COMMIT_RESPONSE.swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                connection.destroy().await;
+                return NativeCommitResult {
+                    phase: NativeCommitPhase::DispatchStarted,
+                    connection: None,
+                    result: Err(commit_unknown()),
+                };
+            }
+            NativeCommitResult {
+                phase: NativeCommitPhase::Terminal,
+                connection: Some(connection),
+                result: Ok(()),
+            }
+        }
         Ok(Err(_)) | Err(_) => {
             connection.destroy().await;
             NativeCommitResult {
@@ -669,6 +768,8 @@ pub(super) fn arm_commit_hook(mode: CommitHookMode) -> CommitHookControl {
         mode,
         reached: Notify::new(),
         release: Notify::new(),
+        connection_id: std::sync::atomic::AtomicU64::new(0),
+        driver_error_observed: std::sync::atomic::AtomicBool::new(false),
     });
     *NEXT_COMMIT_HOOK
         .get_or_init(|| Mutex::new(None))
@@ -697,17 +798,102 @@ pub(super) fn delay_next_resolution() {
 }
 
 #[cfg(feature = "state-store-test-hooks")]
+pub(super) fn fail_next_reservation_prepare() {
+    FAIL_NEXT_RESERVATION_PREPARE.store(true, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+pub(super) fn lose_next_auxiliary_commit_response() {
+    LOSE_NEXT_AUXILIARY_COMMIT_RESPONSE.store(true, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(feature = "state-store-test-hooks")]
 pub(super) fn arm_cleanup_hook() -> CommitHookControl {
     let hook = Arc::new(CommitHook {
         mode: CommitHookMode::HoldAfterSuccess,
         reached: Notify::new(),
         release: Notify::new(),
+        connection_id: std::sync::atomic::AtomicU64::new(0),
+        driver_error_observed: std::sync::atomic::AtomicBool::new(false),
     });
     *NEXT_CLEANUP_HOOK
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&hook));
     CommitHookControl { hook }
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+pub(super) fn arm_resolve_reservation_race() -> ResolveReservationRaceControl {
+    let hook = Arc::new(ResolveReservationRaceHook {
+        observed: std::sync::atomic::AtomicUsize::new(0),
+        both_observed: Notify::new(),
+        release: Semaphore::new(0),
+    });
+    *NEXT_RESOLVE_RESERVATION_RACE_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&hook));
+    ResolveReservationRaceControl { hook }
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+async fn wait_at_resolve_reservation_race() {
+    let hook = NEXT_RESOLVE_RESERVATION_RACE_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let Some(hook) = hook else {
+        return;
+    };
+    if hook
+        .observed
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+        == 1
+    {
+        hook.both_observed.notify_one();
+    }
+    let permit = hook
+        .release
+        .acquire()
+        .await
+        .expect("resolve/reservation race semaphore must stay open");
+    permit.forget();
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+impl ResolveReservationRaceControl {
+    pub(super) async fn wait_both_observed(&self) {
+        while self
+            .hook
+            .observed
+            .load(std::sync::atomic::Ordering::Acquire)
+            < 2
+        {
+            self.hook.both_observed.notified().await;
+        }
+    }
+
+    pub(super) fn release(&self) {
+        self.hook.release.add_permits(2);
+    }
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+impl Drop for ResolveReservationRaceControl {
+    fn drop(&mut self) {
+        let mut armed = NEXT_RESOLVE_RESERVATION_RACE_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if armed
+            .as_ref()
+            .is_some_and(|armed| Arc::ptr_eq(armed, &self.hook))
+        {
+            *armed = None;
+        }
+    }
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -718,6 +904,18 @@ impl CommitHookControl {
 
     pub(super) fn release(&self) {
         self.hook.release.notify_one();
+    }
+
+    pub(super) fn connection_id(&self) -> u64 {
+        self.hook
+            .connection_id
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(super) fn driver_error_observed(&self) -> bool {
+        self.hook
+            .driver_error_observed
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 }
 

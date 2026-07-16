@@ -16,10 +16,14 @@
 // under the License.
 
 use std::sync::Arc;
+#[cfg(feature = "state-store-test-hooks")]
+use std::sync::{Mutex, OnceLock};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use mysql_async::prelude::Queryable;
+#[cfg(feature = "state-store-test-hooks")]
+use tokio::sync::Notify;
 use tokio::time::{Instant, timeout_at};
 
 use super::client::{MysqlPoolConnection, PoolLifecycle, checkout_hygienic_connection};
@@ -37,20 +41,52 @@ struct ChangePosition {
 }
 
 #[cfg(feature = "state-store-test-hooks")]
-pub(super) fn validate_positions_for_test(
-    after: (u64, u32),
-    positions: &[(u64, u32)],
-) -> Result<(), StateStoreError> {
-    let mut previous = ChangePosition {
-        revision: after.0,
-        sequence: after.1,
-    };
-    for &(revision, sequence) in positions {
-        let position = ChangePosition { revision, sequence };
-        validate_next_position(previous, position)?;
-        previous = position;
+struct PollQueryHook {
+    reached: Notify,
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+pub(super) struct PollQueryHookControl {
+    hook: Arc<PollQueryHook>,
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+static NEXT_POLL_QUERY_HOOK: OnceLock<Mutex<Option<Arc<PollQueryHook>>>> = OnceLock::new();
+#[cfg(feature = "state-store-test-hooks")]
+static DUPLICATE_NEXT_POLL_ROW: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "state-store-test-hooks")]
+pub(super) fn arm_delayed_poll_query() -> PollQueryHookControl {
+    let hook = Arc::new(PollQueryHook {
+        reached: Notify::new(),
+    });
+    *NEXT_POLL_QUERY_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&hook));
+    PollQueryHookControl { hook }
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+impl PollQueryHookControl {
+    pub(super) async fn wait_reached(&self) {
+        self.hook.reached.notified().await;
     }
-    Ok(())
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+pub(super) fn duplicate_next_poll_row() {
+    DUPLICATE_NEXT_POLL_ROW.store(true, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+fn take_poll_query_hook() -> Option<Arc<PollQueryHook>> {
+    NEXT_POLL_QUERY_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
 }
 
 pub(super) async fn poll_changes(
@@ -118,9 +154,42 @@ async fn poll_snapshot(
     if after < floor {
         return build_page(identity, high_revision, floor, Vec::new(), true);
     }
+    if after.sequence != u32::MAX {
+        let exists: Option<u8> = execute(transaction, deadline, move |connection| {
+            Box::pin(connection.exec_first(
+                "SELECT 1 FROM state_store_changes
+                 WHERE revision = ? AND sequence = ?",
+                (after.revision, after.sequence),
+            ))
+        })
+        .await?;
+        if exists.is_none() {
+            return Err(corruption());
+        }
+    }
+
+    #[cfg(feature = "state-store-test-hooks")]
+    if let Some(hook) = take_poll_query_hook() {
+        execute(transaction, deadline, move |connection| {
+            Box::pin(async move {
+                let mut query = Box::pin(connection.query_drop("SELECT SLEEP(10)"));
+                let mut notified = false;
+                futures::future::poll_fn(move |context| {
+                    let result = std::future::Future::poll(query.as_mut(), context);
+                    if !notified {
+                        notified = true;
+                        hook.reached.notify_one();
+                    }
+                    result
+                })
+                .await
+            })
+        })
+        .await?;
+    }
 
     let limit = request.page_size.checked_add(1).ok_or_else(limit_error)?;
-    let rows: Vec<(u64, u32, Vec<u8>)> = execute(transaction, deadline, move |connection| {
+    let mut rows: Vec<(u64, u32, Vec<u8>)> = execute(transaction, deadline, move |connection| {
         Box::pin(connection.exec(
             "SELECT revision, sequence, key_bytes
              FROM state_store_changes
@@ -131,6 +200,12 @@ async fn poll_snapshot(
         ))
     })
     .await?;
+    #[cfg(feature = "state-store-test-hooks")]
+    if DUPLICATE_NEXT_POLL_ROW.swap(false, std::sync::atomic::Ordering::AcqRel)
+        && let Some(first) = rows.first().cloned()
+    {
+        rows.insert(1, first);
+    }
 
     let mut decoded = Vec::with_capacity(rows.len());
     let mut previous = after;

@@ -1401,18 +1401,17 @@ impl MysqlWriteActorState {
             Ok(super::commit::ReservationDecision::Reserved) => {}
             Err(error) => {
                 let cleanup_deadline = Instant::now() + std::time::Duration::from_secs(2);
-                return match super::commit::terminalize_undispatched(
-                    Arc::clone(&self.pool),
-                    &self.codec,
-                    self.transaction_id,
-                    reservation_token,
-                    cleanup_deadline,
-                )
-                .await
-                {
-                    Ok(()) => classify_prepare_error(error),
-                    Err(cleanup_error) => CommitOutcome::CommitUnknown(cleanup_error),
-                };
+                return classify_terminalized_prepare(
+                    error,
+                    super::commit::terminalize_undispatched(
+                        Arc::clone(&self.pool),
+                        &self.codec,
+                        self.transaction_id,
+                        reservation_token,
+                        cleanup_deadline,
+                    )
+                    .await,
+                );
             }
         }
 
@@ -1423,18 +1422,17 @@ impl MysqlWriteActorState {
                 Ok(transaction) => transaction,
                 Err(error) => {
                     let cleanup_deadline = Instant::now() + std::time::Duration::from_secs(2);
-                    return match super::commit::terminalize_undispatched(
-                        Arc::clone(&self.pool),
-                        &self.codec,
-                        self.transaction_id,
-                        reservation_token,
-                        cleanup_deadline,
-                    )
-                    .await
-                    {
-                        Ok(()) => classify_prepare_error(error),
-                        Err(cleanup_error) => CommitOutcome::CommitUnknown(cleanup_error),
-                    };
+                    return classify_terminalized_prepare(
+                        error,
+                        super::commit::terminalize_undispatched(
+                            Arc::clone(&self.pool),
+                            &self.codec,
+                            self.transaction_id,
+                            reservation_token,
+                            cleanup_deadline,
+                        )
+                        .await,
+                    );
                 }
             };
         self.transaction = Some(transaction);
@@ -1452,18 +1450,17 @@ impl MysqlWriteActorState {
                     }),
                     NativeDataCommitOutcome::BeforeDispatchFailure(error) => {
                         let cleanup_deadline = Instant::now() + std::time::Duration::from_secs(2);
-                        match super::commit::terminalize_undispatched(
-                            Arc::clone(&self.pool),
-                            &self.codec,
-                            self.transaction_id,
-                            reservation_token,
-                            cleanup_deadline,
+                        classify_terminalized_prepare(
+                            error,
+                            super::commit::terminalize_undispatched(
+                                Arc::clone(&self.pool),
+                                &self.codec,
+                                self.transaction_id,
+                                reservation_token,
+                                cleanup_deadline,
+                            )
+                            .await,
                         )
-                        .await
-                        {
-                            Ok(()) => classify_prepare_error(error),
-                            Err(cleanup_error) => CommitOutcome::CommitUnknown(cleanup_error),
-                        }
                     }
                     NativeDataCommitOutcome::Unknown(error) => CommitOutcome::CommitUnknown(error),
                 }
@@ -1477,18 +1474,15 @@ impl MysqlWriteActorState {
                     return CommitOutcome::DefiniteFailure(rollback_error);
                 }
                 let cleanup_deadline = Instant::now() + std::time::Duration::from_secs(2);
-                if let Err(cleanup_error) = super::commit::terminalize_undispatched(
+                let cleanup = super::commit::terminalize_undispatched(
                     Arc::clone(&self.pool),
                     &self.codec,
                     self.transaction_id,
                     reservation_token,
                     cleanup_deadline,
                 )
-                .await
-                {
-                    return CommitOutcome::CommitUnknown(cleanup_error);
-                }
-                classify_prepare_error(error)
+                .await;
+                classify_terminalized_prepare(error, cleanup)
             }
         }
     }
@@ -1889,6 +1883,27 @@ fn classify_prepare_error(error: StateStoreError) -> CommitOutcome {
             CommitOutcome::TransientBeforeCommit(error)
         }
         _ => CommitOutcome::DefiniteFailure(error),
+    }
+}
+
+fn classify_terminalized_prepare(
+    prepare_error: StateStoreError,
+    decision: Result<super::commit::TerminalizeDecision, StateStoreError>,
+) -> CommitOutcome {
+    match decision {
+        Ok(super::commit::TerminalizeDecision::Committed(receipt)) => {
+            CommitOutcome::Committed(receipt)
+        }
+        Ok(super::commit::TerminalizeDecision::NotCommitted) => {
+            classify_prepare_error(prepare_error)
+        }
+        Ok(super::commit::TerminalizeDecision::Unresolved) => {
+            CommitOutcome::CommitUnknown(StateStoreError::new(
+                StateStoreErrorKind::ProviderUnavailable,
+                "MySQL commit cleanup found an unresolved durable reservation",
+            ))
+        }
+        Err(cleanup_error) => CommitOutcome::CommitUnknown(cleanup_error),
     }
 }
 
