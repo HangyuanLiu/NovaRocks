@@ -43794,6 +43794,14 @@ fn rfd4_m2b2_normalized_node_tokens(node: &impl ToTokens) -> String {
     rust_use_tokens(&node.to_token_stream().to_string()).join(" ")
 }
 
+fn rfd4_m2b2_normalized_attributes(attributes: &[syn::Attribute]) -> String {
+    attributes
+        .iter()
+        .map(rfd4_m2b2_normalized_node_tokens)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn rfd4_m2b2_stable_ledger_digest(entries: &[String]) -> u64 {
     const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
     const PRIME: u64 = 0x100000001b3;
@@ -43814,23 +43822,9 @@ fn rfd4_m2b2_stable_ledger_digest(entries: &[String]) -> u64 {
 fn rfd4_m2b2_collect_outward_surface_items(
     items: &[syn::Item],
     namespace: &str,
+    outward_namespace: bool,
     entries: &mut BTreeSet<String>,
-) {
-    let outward_type_names = items
-        .iter()
-        .filter_map(|item| match item {
-            syn::Item::Enum(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
-                Some(item.ident.to_string())
-            }
-            syn::Item::Struct(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
-                Some(item.ident.to_string())
-            }
-            syn::Item::Union(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
-                Some(item.ident.to_string())
-            }
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
+) -> Result<(), String> {
     let qualify = |surface: String| {
         if namespace.is_empty() {
             surface
@@ -43840,43 +43834,106 @@ fn rfd4_m2b2_collect_outward_surface_items(
     };
     for item in items {
         match item {
-            syn::Item::Const(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
-                entries.insert(qualify(format!(
-                    "const {} {} : {}",
-                    rfd4_m2b2_normalized_node_tokens(&item.vis),
-                    item.ident,
-                    rfd4_m2b2_normalized_node_tokens(&item.ty)
-                )));
+            syn::Item::Const(item) => {
+                if outward_namespace && rfd4_m2b2_visibility_is_outward(&item.vis) {
+                    entries.insert(qualify(format!(
+                        "const {} {} {} {} : {}",
+                        rfd4_m2b2_normalized_attributes(&item.attrs),
+                        rfd4_m2b2_normalized_node_tokens(&item.vis),
+                        item.ident,
+                        rfd4_m2b2_normalized_node_tokens(&item.generics),
+                        rfd4_m2b2_normalized_node_tokens(&item.ty)
+                    )));
+                }
             }
-            syn::Item::Enum(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
-                entries.insert(qualify(format!(
-                    "enum {}",
-                    rfd4_m2b2_normalized_node_tokens(item)
-                )));
+            syn::Item::Enum(item) => {
+                if outward_namespace && rfd4_m2b2_visibility_is_outward(&item.vis) {
+                    entries.insert(qualify(format!(
+                        "enum {}",
+                        rfd4_m2b2_normalized_node_tokens(item)
+                    )));
+                }
             }
-            syn::Item::ExternCrate(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
-                entries.insert(qualify(format!(
-                    "extern-crate {}",
-                    rfd4_m2b2_normalized_node_tokens(item)
-                )));
+            syn::Item::ExternCrate(item) => {
+                if outward_namespace && rfd4_m2b2_visibility_is_outward(&item.vis) {
+                    entries.insert(qualify(format!(
+                        "extern-crate {}",
+                        rfd4_m2b2_normalized_node_tokens(item)
+                    )));
+                }
             }
-            syn::Item::Fn(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
-                entries.insert(qualify(format!(
-                    "fn {} {}",
-                    rfd4_m2b2_normalized_node_tokens(&item.vis),
-                    rfd4_m2b2_normalized_node_tokens(&item.sig)
-                )));
+            syn::Item::Fn(item) => {
+                if outward_namespace && rfd4_m2b2_visibility_is_outward(&item.vis) {
+                    entries.insert(qualify(format!(
+                        "fn {} {} {}",
+                        rfd4_m2b2_normalized_attributes(&item.attrs),
+                        rfd4_m2b2_normalized_node_tokens(&item.vis),
+                        rfd4_m2b2_normalized_node_tokens(&item.sig)
+                    )));
+                }
+            }
+            syn::Item::ForeignMod(item) => {
+                let mut members = Vec::new();
+                for member in &item.items {
+                    match member {
+                        syn::ForeignItem::Fn(member) => {
+                            if outward_namespace && rfd4_m2b2_visibility_is_outward(&member.vis) {
+                                members.push(format!(
+                                    "fn {} {} {}",
+                                    rfd4_m2b2_normalized_attributes(&member.attrs),
+                                    rfd4_m2b2_normalized_node_tokens(&member.vis),
+                                    rfd4_m2b2_normalized_node_tokens(&member.sig)
+                                ));
+                            }
+                        }
+                        syn::ForeignItem::Static(member) => {
+                            if outward_namespace && rfd4_m2b2_visibility_is_outward(&member.vis) {
+                                members.push(format!(
+                                    "static {} {} {} {} : {}",
+                                    rfd4_m2b2_normalized_attributes(&member.attrs),
+                                    rfd4_m2b2_normalized_node_tokens(&member.vis),
+                                    rfd4_m2b2_normalized_node_tokens(&member.mutability),
+                                    member.ident,
+                                    rfd4_m2b2_normalized_node_tokens(&member.ty)
+                                ));
+                            }
+                        }
+                        syn::ForeignItem::Type(member) => {
+                            if outward_namespace && rfd4_m2b2_visibility_is_outward(&member.vis) {
+                                members.push(format!(
+                                    "type {}",
+                                    rfd4_m2b2_normalized_node_tokens(member)
+                                ));
+                            }
+                        }
+                        syn::ForeignItem::Macro(member) => members.push(format!(
+                            "macro {}",
+                            rfd4_m2b2_normalized_node_tokens(member)
+                        )),
+                        syn::ForeignItem::Verbatim(tokens) => {
+                            return Err(format!(
+                                "{namespace}: unclassified foreign surface tokens: {}",
+                                rust_use_tokens(&tokens.to_string()).join(" ")
+                            ));
+                        }
+                        _ => {
+                            return Err(format!(
+                                "{namespace}: unhandled syn::ForeignItem surface variant"
+                            ));
+                        }
+                    }
+                }
+                if !members.is_empty() {
+                    let mut header = item.clone();
+                    header.items.clear();
+                    let header = rfd4_m2b2_normalized_node_tokens(&header);
+                    entries.insert(qualify(format!("foreign {header}")));
+                    for member in members {
+                        entries.insert(qualify(format!("foreign-member {header} :: {member}")));
+                    }
+                }
             }
             syn::Item::Impl(item) => {
-                let self_type_is_outward = match item.self_ty.as_ref() {
-                    syn::Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
-                        outward_type_names.contains(&segment.ident.to_string())
-                    }),
-                    _ => false,
-                };
-                if !self_type_is_outward {
-                    continue;
-                }
                 let mut header = item.clone();
                 header.items.clear();
                 let header = rfd4_m2b2_normalized_node_tokens(&header);
@@ -43887,147 +43944,248 @@ fn rfd4_m2b2_collect_outward_surface_items(
                         syn::ImplItem::Const(member)
                             if trait_impl || rfd4_m2b2_visibility_is_outward(&member.vis) =>
                         {
-                            members.push(format!(
-                                "const {} {} {} : {}",
+                            let surface = format!(
+                                "const {} {} {} {} : {}",
+                                rfd4_m2b2_normalized_attributes(&member.attrs),
                                 rfd4_m2b2_normalized_node_tokens(&member.vis),
                                 member.ident,
                                 rfd4_m2b2_normalized_node_tokens(&member.generics),
                                 rfd4_m2b2_normalized_node_tokens(&member.ty)
-                            ));
+                            );
+                            members.push(match &member.defaultness {
+                                Some(defaultness) => format!(
+                                    "{} {surface}",
+                                    rfd4_m2b2_normalized_node_tokens(defaultness)
+                                ),
+                                None => surface,
+                            });
                         }
                         syn::ImplItem::Fn(member)
                             if trait_impl || rfd4_m2b2_visibility_is_outward(&member.vis) =>
                         {
-                            members.push(format!(
-                                "fn {} {}",
+                            let surface = format!(
+                                "fn {} {} {}",
+                                rfd4_m2b2_normalized_attributes(&member.attrs),
                                 rfd4_m2b2_normalized_node_tokens(&member.vis),
                                 rfd4_m2b2_normalized_node_tokens(&member.sig)
-                            ));
+                            );
+                            members.push(match &member.defaultness {
+                                Some(defaultness) => format!(
+                                    "{} {surface}",
+                                    rfd4_m2b2_normalized_node_tokens(defaultness)
+                                ),
+                                None => surface,
+                            });
                         }
                         syn::ImplItem::Type(member)
                             if trait_impl || rfd4_m2b2_visibility_is_outward(&member.vis) =>
                         {
-                            members.push(format!(
-                                "type {} {} {} = {}",
+                            let surface = format!(
+                                "type {} {} {} {} = {}",
+                                rfd4_m2b2_normalized_attributes(&member.attrs),
                                 rfd4_m2b2_normalized_node_tokens(&member.vis),
                                 member.ident,
                                 rfd4_m2b2_normalized_node_tokens(&member.generics),
                                 rfd4_m2b2_normalized_node_tokens(&member.ty)
+                            );
+                            members.push(match &member.defaultness {
+                                Some(defaultness) => format!(
+                                    "{} {surface}",
+                                    rfd4_m2b2_normalized_node_tokens(defaultness)
+                                ),
+                                None => surface,
+                            });
+                        }
+                        syn::ImplItem::Macro(member) => members.push(format!(
+                            "macro {}",
+                            rfd4_m2b2_normalized_node_tokens(member)
+                        )),
+                        syn::ImplItem::Verbatim(tokens) => {
+                            return Err(format!(
+                                "{namespace}: unclassified impl surface tokens: {}",
+                                rust_use_tokens(&tokens.to_string()).join(" ")
                             ));
                         }
-                        _ => {}
+                        syn::ImplItem::Const(_) | syn::ImplItem::Fn(_) | syn::ImplItem::Type(_) => {
+                        }
+                        _ => {
+                            return Err(format!(
+                                "{namespace}: unhandled syn::ImplItem surface variant"
+                            ));
+                        }
                     }
                 }
-                if trait_impl || !members.is_empty() {
+                if !members.is_empty() {
                     entries.insert(qualify(format!("impl {header}")));
                     for member in members {
                         entries.insert(qualify(format!("impl-member {header} :: {member}")));
                     }
                 }
             }
-            syn::Item::Mod(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
+            syn::Item::Macro(item) => {
                 entries.insert(qualify(format!(
-                    "mod {} {}",
-                    rfd4_m2b2_normalized_node_tokens(&item.vis),
-                    item.ident
+                    "macro {}",
+                    rfd4_m2b2_normalized_node_tokens(item)
                 )));
+            }
+            syn::Item::Mod(item) => {
+                let nested_outward =
+                    outward_namespace && rfd4_m2b2_visibility_is_outward(&item.vis);
+                if nested_outward {
+                    entries.insert(qualify(format!(
+                        "mod {} {} {} inline={}",
+                        rfd4_m2b2_normalized_attributes(&item.attrs),
+                        rfd4_m2b2_normalized_node_tokens(&item.vis),
+                        item.ident,
+                        item.content.is_some()
+                    )));
+                }
                 if let Some((_, nested)) = &item.content {
                     let nested_namespace = if namespace.is_empty() {
                         item.ident.to_string()
                     } else {
                         format!("{namespace}::{}", item.ident)
                     };
-                    rfd4_m2b2_collect_outward_surface_items(nested, &nested_namespace, entries);
+                    rfd4_m2b2_collect_outward_surface_items(
+                        nested,
+                        &nested_namespace,
+                        nested_outward,
+                        entries,
+                    )?;
                 }
             }
-            syn::Item::Static(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
-                entries.insert(qualify(format!(
-                    "static {} {} {} : {}",
-                    rfd4_m2b2_normalized_node_tokens(&item.vis),
-                    rfd4_m2b2_normalized_node_tokens(&item.mutability),
-                    item.ident,
-                    rfd4_m2b2_normalized_node_tokens(&item.ty)
-                )));
-            }
-            syn::Item::Struct(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
-                let mut surface = item.clone();
-                match &mut surface.fields {
-                    syn::Fields::Named(fields) => {
-                        let mut outward = syn::punctuated::Punctuated::new();
-                        for field in std::mem::take(&mut fields.named) {
-                            if rfd4_m2b2_visibility_is_outward(&field.vis) {
-                                outward.push(field);
-                            }
-                        }
-                        fields.named = outward;
-                    }
-                    syn::Fields::Unnamed(fields) => {
-                        let mut outward = syn::punctuated::Punctuated::new();
-                        for field in std::mem::take(&mut fields.unnamed) {
-                            if rfd4_m2b2_visibility_is_outward(&field.vis) {
-                                outward.push(field);
-                            }
-                        }
-                        fields.unnamed = outward;
-                    }
-                    syn::Fields::Unit => {}
+            syn::Item::Static(item) => {
+                if outward_namespace && rfd4_m2b2_visibility_is_outward(&item.vis) {
+                    entries.insert(qualify(format!(
+                        "static {} {} {} {} : {}",
+                        rfd4_m2b2_normalized_attributes(&item.attrs),
+                        rfd4_m2b2_normalized_node_tokens(&item.vis),
+                        rfd4_m2b2_normalized_node_tokens(&item.mutability),
+                        item.ident,
+                        rfd4_m2b2_normalized_node_tokens(&item.ty)
+                    )));
                 }
-                entries.insert(qualify(format!(
-                    "struct {}",
-                    rfd4_m2b2_normalized_node_tokens(&surface)
-                )));
             }
-            syn::Item::Trait(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
+            syn::Item::Struct(item) => {
+                if outward_namespace && rfd4_m2b2_visibility_is_outward(&item.vis) {
+                    let mut surface = item.clone();
+                    match &mut surface.fields {
+                        syn::Fields::Named(fields) => {
+                            let mut outward = syn::punctuated::Punctuated::new();
+                            for field in std::mem::take(&mut fields.named) {
+                                if rfd4_m2b2_visibility_is_outward(&field.vis) {
+                                    outward.push(field);
+                                }
+                            }
+                            fields.named = outward;
+                        }
+                        syn::Fields::Unnamed(fields) => {
+                            let mut outward = syn::punctuated::Punctuated::new();
+                            for field in std::mem::take(&mut fields.unnamed) {
+                                if rfd4_m2b2_visibility_is_outward(&field.vis) {
+                                    outward.push(field);
+                                }
+                            }
+                            fields.unnamed = outward;
+                        }
+                        syn::Fields::Unit => {}
+                    }
+                    entries.insert(qualify(format!(
+                        "struct {}",
+                        rfd4_m2b2_normalized_node_tokens(&surface)
+                    )));
+                }
+            }
+            syn::Item::Trait(item) => {
+                let trait_outward = outward_namespace && rfd4_m2b2_visibility_is_outward(&item.vis);
                 let mut header = item.clone();
                 header.items.clear();
                 let header = rfd4_m2b2_normalized_node_tokens(&header);
-                entries.insert(qualify(format!("trait {header}")));
+                if trait_outward {
+                    entries.insert(qualify(format!("trait {header}")));
+                }
                 for member in &item.items {
                     let surface = match member {
-                        syn::TraitItem::Const(member) => format!(
-                            "const {} {} : {}",
-                            member.ident,
-                            rfd4_m2b2_normalized_node_tokens(&member.generics),
-                            rfd4_m2b2_normalized_node_tokens(&member.ty)
-                        ),
-                        syn::TraitItem::Fn(member) => {
-                            format!("fn {}", rfd4_m2b2_normalized_node_tokens(&member.sig))
+                        syn::TraitItem::Const(member) if trait_outward => Some(format!(
+                            "const {}",
+                            rfd4_m2b2_normalized_node_tokens(member)
+                        )),
+                        syn::TraitItem::Fn(member) if trait_outward => Some(format!(
+                            "fn {} {}",
+                            rfd4_m2b2_normalized_attributes(&member.attrs),
+                            rfd4_m2b2_normalized_node_tokens(&member.sig)
+                        )),
+                        syn::TraitItem::Type(member) if trait_outward => {
+                            Some(format!("type {}", rfd4_m2b2_normalized_node_tokens(member)))
                         }
-                        syn::TraitItem::Type(member) => {
-                            format!("type {}", rfd4_m2b2_normalized_node_tokens(member))
+                        syn::TraitItem::Macro(member) => Some(format!(
+                            "macro {}",
+                            rfd4_m2b2_normalized_node_tokens(member)
+                        )),
+                        syn::TraitItem::Verbatim(tokens) => {
+                            return Err(format!(
+                                "{namespace}: unclassified trait surface tokens: {}",
+                                rust_use_tokens(&tokens.to_string()).join(" ")
+                            ));
                         }
-                        _ => continue,
+                        syn::TraitItem::Const(_)
+                        | syn::TraitItem::Fn(_)
+                        | syn::TraitItem::Type(_) => None,
+                        _ => {
+                            return Err(format!(
+                                "{namespace}: unhandled syn::TraitItem surface variant"
+                            ));
+                        }
                     };
-                    entries.insert(qualify(format!("trait-member {header} :: {surface}")));
+                    if let Some(surface) = surface {
+                        entries.insert(qualify(format!("trait-member {header} :: {surface}")));
+                    }
                 }
             }
-            syn::Item::TraitAlias(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
-                entries.insert(qualify(format!(
-                    "trait-alias {}",
-                    rfd4_m2b2_normalized_node_tokens(item)
-                )));
+            syn::Item::TraitAlias(item) => {
+                if outward_namespace && rfd4_m2b2_visibility_is_outward(&item.vis) {
+                    entries.insert(qualify(format!(
+                        "trait-alias {}",
+                        rfd4_m2b2_normalized_node_tokens(item)
+                    )));
+                }
             }
-            syn::Item::Type(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
-                entries.insert(qualify(format!(
-                    "type {}",
-                    rfd4_m2b2_normalized_node_tokens(item)
-                )));
+            syn::Item::Type(item) => {
+                if outward_namespace && rfd4_m2b2_visibility_is_outward(&item.vis) {
+                    entries.insert(qualify(format!(
+                        "type {}",
+                        rfd4_m2b2_normalized_node_tokens(item)
+                    )));
+                }
             }
-            syn::Item::Union(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
-                entries.insert(qualify(format!(
-                    "union {}",
-                    rfd4_m2b2_normalized_node_tokens(item)
-                )));
+            syn::Item::Union(item) => {
+                if outward_namespace && rfd4_m2b2_visibility_is_outward(&item.vis) {
+                    entries.insert(qualify(format!(
+                        "union {}",
+                        rfd4_m2b2_normalized_node_tokens(item)
+                    )));
+                }
             }
-            syn::Item::Use(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
-                entries.insert(qualify(format!(
-                    "use {}",
-                    rfd4_m2b2_normalized_node_tokens(item)
-                )));
+            syn::Item::Use(item) => {
+                if outward_namespace && rfd4_m2b2_visibility_is_outward(&item.vis) {
+                    entries.insert(qualify(format!(
+                        "use {}",
+                        rfd4_m2b2_normalized_node_tokens(item)
+                    )));
+                }
             }
-            _ => {}
+            syn::Item::Verbatim(tokens) => {
+                return Err(format!(
+                    "{namespace}: unclassified outward item tokens: {}",
+                    rust_use_tokens(&tokens.to_string()).join(" ")
+                ));
+            }
+            _ => {
+                return Err(format!("{namespace}: unhandled syn::Item surface variant"));
+            }
         }
     }
+    Ok(())
 }
 
 fn rfd4_m2b2_outward_surface_inventory(text: &str) -> Result<Vec<String>, String> {
@@ -44035,20 +44193,20 @@ fn rfd4_m2b2_outward_surface_inventory(text: &str) -> Result<Vec<String>, String
     runtime_filter_filter_cfg_file(&mut file)
         .map_err(|_| "production cfg surface is unproven".to_string())?;
     let mut entries = BTreeSet::new();
-    rfd4_m2b2_collect_outward_surface_items(&file.items, "", &mut entries);
+    rfd4_m2b2_collect_outward_surface_items(&file.items, "", true, &mut entries)?;
     Ok(entries.into_iter().collect())
 }
 
 fn rfd4_m2b2_allowed_owner_surface_violations(source_rel: &str, text: &str) -> Vec<String> {
     let expected = match source_rel {
-        "src/runtime_filter/codec/contribution.rs" => (16, 3298738116778868376),
-        "src/runtime_filter/port/final_domain.rs" => (29, 1048925950792287758),
-        "src/runtime_filter/port/subscription.rs" => (30, 11963765021781840432),
-        "src/runtime_filter/router/loopback.rs" => (6, 12052013521078837082),
-        "src/runtime_filter/service/materialization.rs" => (31, 6587911673519581840),
-        "src/runtime_filter/service/mod.rs" => (11, 9284709797313322787),
-        "src/runtime_filter/service/registry.rs" => (54, 3681306317080543088),
-        "src/runtime_filter/service/subscription.rs" => (23, 10058530305415627337),
+        "src/runtime_filter/codec/contribution.rs" => (17, 13014293370287694829),
+        "src/runtime_filter/port/final_domain.rs" => (28, 14801809133929002992),
+        "src/runtime_filter/port/subscription.rs" => (30, 14320434944731310308),
+        "src/runtime_filter/router/loopback.rs" => (6, 10237917817399176402),
+        "src/runtime_filter/service/materialization.rs" => (31, 340993001141409597),
+        "src/runtime_filter/service/mod.rs" => (15, 17500648024670982950),
+        "src/runtime_filter/service/registry.rs" => (54, 6312524613270129975),
+        "src/runtime_filter/service/subscription.rs" => (23, 18199180618639638831),
         _ => return Vec::new(),
     };
     let inventory = match rfd4_m2b2_outward_surface_inventory(text) {
@@ -45837,6 +45995,227 @@ impl DeliveryWrapper {
     assert!(
         !rfd4_m2b2_artifact_delivery_facade_violations(&allowed_owner_laundering).is_empty(),
         "an allowed ArtifactDelivery owner must not launder delivery through new outward surfaces"
+    );
+}
+
+#[test]
+fn rfd4_m2b2_live_allowed_owners_reject_macro_and_foreign_impl_laundering() {
+    let codec_rel = "src/runtime_filter/codec/contribution.rs";
+    let final_domain_rel = "src/runtime_filter/port/final_domain.rs";
+    let codec = fs::read_to_string(Path::new(manifest_dir()).join(codec_rel))
+        .expect("read live contribution codec");
+    let final_domain = fs::read_to_string(Path::new(manifest_dir()).join(final_domain_rel))
+        .expect("read live final-domain owner");
+    let baseline = vec![
+        (codec_rel.to_string(), codec.clone()),
+        (final_domain_rel.to_string(), final_domain.clone()),
+    ];
+    assert!(
+        rfd4_m2b2_remote_reconstruction_violations(&baseline).is_empty(),
+        "live CompletionFence owner baseline must satisfy the surface ledger"
+    );
+
+    let exported_fence_macro = format!(
+        r#"{codec}
+#[macro_export]
+macro_rules! hidden_completion_fence_type {{
+    () => {{ crate::runtime_filter::port::final_domain::CompletionFence }};
+}}
+"#
+    );
+    let mutated = vec![
+        (codec_rel.to_string(), exported_fence_macro),
+        (final_domain_rel.to_string(), final_domain.clone()),
+    ];
+    assert!(
+        !rfd4_m2b2_remote_reconstruction_violations(&mutated).is_empty(),
+        "a live allowed CompletionFence owner must reject exported type-position macro laundering"
+    );
+
+    let nested_exported_fence_macro = format!(
+        r#"{codec}
+mod hidden_macro_owner {{
+    #[macro_export]
+    macro_rules! nested_hidden_completion_fence_type {{
+        () => {{ crate::runtime_filter::port::final_domain::CompletionFence }};
+    }}
+}}
+"#
+    );
+    let mutated = vec![
+        (codec_rel.to_string(), nested_exported_fence_macro),
+        (final_domain_rel.to_string(), final_domain.clone()),
+    ];
+    assert!(
+        !rfd4_m2b2_remote_reconstruction_violations(&mutated).is_empty(),
+        "an exported macro inside a private live-owner module must remain in the frozen surface"
+    );
+
+    let foreign_fence_impl = format!(
+        r#"{codec}
+impl crate::runtime_filter::port::final_domain::CompletionFence {{
+    pub(crate) fn hidden_fence_surface(&self) {{}}
+}}
+"#
+    );
+    let mutated = vec![
+        (codec_rel.to_string(), foreign_fence_impl),
+        (final_domain_rel.to_string(), final_domain),
+    ];
+    assert!(
+        !rfd4_m2b2_remote_reconstruction_violations(&mutated).is_empty(),
+        "a live allowed CompletionFence owner must reject foreign-type visible impl laundering"
+    );
+
+    let loopback_rel = "src/runtime_filter/router/loopback.rs";
+    let loopback = fs::read_to_string(Path::new(manifest_dir()).join(loopback_rel))
+        .expect("read live loopback owner");
+    let baseline = vec![(loopback_rel.to_string(), loopback.clone())];
+    assert!(
+        rfd4_m2b2_artifact_delivery_facade_violations(&baseline).is_empty(),
+        "live ArtifactDelivery owner baseline must satisfy the surface ledger"
+    );
+
+    let exported_delivery_macro = format!(
+        r#"{loopback}
+#[macro_export]
+macro_rules! hidden_artifact_delivery_type {{
+    () => {{ dyn crate::runtime_filter::port::subscription::ArtifactDelivery }};
+}}
+"#
+    );
+    let mutated = vec![(loopback_rel.to_string(), exported_delivery_macro)];
+    assert!(
+        !rfd4_m2b2_artifact_delivery_facade_violations(&mutated).is_empty(),
+        "a live allowed ArtifactDelivery owner must reject exported type-position macro laundering"
+    );
+
+    let foreign_delivery_impl = format!(
+        r#"{loopback}
+impl crate::runtime_filter::port::subscription::ArtifactDeliveryOutcome {{
+    pub(crate) fn hidden_delivery_surface(&self) {{}}
+}}
+"#
+    );
+    let mutated = vec![(loopback_rel.to_string(), foreign_delivery_impl)];
+    assert!(
+        !rfd4_m2b2_artifact_delivery_facade_violations(&mutated).is_empty(),
+        "a live allowed ArtifactDelivery owner must reject foreign-type visible impl laundering"
+    );
+}
+
+#[test]
+fn rfd4_m2b2_live_owner_surface_freezes_macros_and_production_attributes() {
+    let codec_rel = "src/runtime_filter/codec/contribution.rs";
+    let codec = fs::read_to_string(Path::new(manifest_dir()).join(codec_rel))
+        .expect("read live contribution codec");
+    assert!(
+        rfd4_m2b2_allowed_owner_surface_violations(codec_rel, &codec).is_empty(),
+        "live codec baseline must satisfy the outward surface ledger"
+    );
+
+    let top_level_attribute = codec.replacen(
+        "pub(crate) fn encoded_contribution_len(",
+        "#[deprecated]\npub(crate) fn encoded_contribution_len(",
+        1,
+    );
+    assert!(
+        !rfd4_m2b2_allowed_owner_surface_violations(codec_rel, &top_level_attribute).is_empty(),
+        "top-level outward function attributes must be frozen"
+    );
+
+    let production_cfg_attribute = codec.replacen(
+        "pub(crate) fn encoded_contribution_len(",
+        "#[cfg(any(test, feature = \"surface-guard-fixture\"))]\npub(crate) fn encoded_contribution_len(",
+        1,
+    );
+    assert!(
+        !rfd4_m2b2_allowed_owner_surface_violations(codec_rel, &production_cfg_attribute)
+            .is_empty(),
+        "production-possible cfg attributes must remain in the frozen surface"
+    );
+
+    let associated_attribute = codec.replacen(
+        "    pub(crate) fn payload(&self) -> &[u8] {",
+        "    #[deprecated]\n    pub(crate) fn payload(&self) -> &[u8] {",
+        1,
+    );
+    assert!(
+        !rfd4_m2b2_allowed_owner_surface_violations(codec_rel, &associated_attribute).is_empty(),
+        "visible inherent associated-item attributes must be frozen"
+    );
+
+    let associated_defaultness = codec.replacen(
+        "    pub(crate) fn payload(&self) -> &[u8] {",
+        "    pub(crate) default fn payload(&self) -> &[u8] {",
+        1,
+    );
+    assert!(
+        !rfd4_m2b2_allowed_owner_surface_violations(codec_rel, &associated_defaultness).is_empty(),
+        "visible inherent associated-item defaultness must be frozen"
+    );
+
+    let impl_macro = format!(
+        r#"{codec}
+impl EncodedContribution {{
+    expose_encoded_contribution_surface!();
+}}
+"#
+    );
+    assert!(
+        !rfd4_m2b2_allowed_owner_surface_violations(codec_rel, &impl_macro).is_empty(),
+        "impl macros that may expose associated items must be frozen"
+    );
+
+    let private_trait_macro = format!(
+        r#"{codec}
+trait PrivateSurfaceTrait {{
+    expose_private_trait_surface!();
+}}
+"#
+    );
+    assert!(
+        !rfd4_m2b2_allowed_owner_surface_violations(codec_rel, &private_trait_macro).is_empty(),
+        "all trait macros in an allowed owner must be frozen even when the trait is private"
+    );
+
+    let subscription_rel = "src/runtime_filter/port/subscription.rs";
+    let subscription = fs::read_to_string(Path::new(manifest_dir()).join(subscription_rel))
+        .expect("read live subscription owner");
+    assert!(
+        rfd4_m2b2_allowed_owner_surface_violations(subscription_rel, &subscription).is_empty(),
+        "live subscription baseline must satisfy the outward surface ledger"
+    );
+    let trait_attribute = subscription.replacen(
+        "    fn deliver(&self, route_edge_id: RouteEdgeId, outcome: ArtifactDeliveryOutcome);",
+        "    #[deprecated]\n    fn deliver(&self, route_edge_id: RouteEdgeId, outcome: ArtifactDeliveryOutcome);",
+        1,
+    );
+    assert!(
+        !rfd4_m2b2_allowed_owner_surface_violations(subscription_rel, &trait_attribute).is_empty(),
+        "outward trait-member attributes must be frozen"
+    );
+    let trait_macro = subscription.replacen(
+        "    fn deliver(&self, route_edge_id: RouteEdgeId, outcome: ArtifactDeliveryOutcome);",
+        "    fn deliver(&self, route_edge_id: RouteEdgeId, outcome: ArtifactDeliveryOutcome);\n    expose_artifact_delivery_surface!();",
+        1,
+    );
+    assert!(
+        !rfd4_m2b2_allowed_owner_surface_violations(subscription_rel, &trait_macro).is_empty(),
+        "trait macros that may expose associated items must be frozen"
+    );
+
+    let registry_rel = "src/runtime_filter/service/registry.rs";
+    let registry = fs::read_to_string(Path::new(manifest_dir()).join(registry_rel))
+        .expect("read live registry owner");
+    let field_attribute = registry.replacen(
+        "    pub(super) channel_id: ChannelId,",
+        "    #[deprecated]\n    pub(super) channel_id: ChannelId,",
+        1,
+    );
+    assert!(
+        !rfd4_m2b2_allowed_owner_surface_violations(registry_rel, &field_attribute).is_empty(),
+        "outward field attributes must be frozen"
     );
 }
 
