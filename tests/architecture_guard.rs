@@ -33965,39 +33965,41 @@ fn distributed_plan_seal_task2_enforces_private_draft_and_single_typed_seal() {
 
 // ---------------------------------------------------------------------------
 // CGO-9A Task 3: distributed-plan structural validation lives in the planner
-// seal, never in codegen.
+// seal, never in the native encoder.
 //
 // Task 3 moved `validate_distributed_plan` (and its helpers) out of
 // `src/sql/codegen/fragment/build.rs` into
 // `crate::sql::planner::distributed::validation`, where it runs inside
-// `seal_draft`. These guards keep it there: codegen must not (re)own the
+// `seal_draft`. These guards keep it there: the encoder must not (re)own the
 // structural validator, and the planner distributed module must define it.
 //
 // The detector keys on function *definitions* (`fn validate_distributed_plan`
-// / `fn validate_distributed_structure`), so codegen helpers that legitimately
+// / `fn validate_distributed_structure`), so encoder helpers that legitimately
 // stay (e.g. `validate_native_fragment_ownership`, `output_column_for_boundary`)
 // and prose comments referencing the planner module are not matched.
 // ---------------------------------------------------------------------------
 
-const CGO_9A_TASK3_CODEGEN_ROOT: &str = "src/sql/codegen/";
+const CGO_9A_TASK3_ENCODER_ROOT: &str = "src/protocol/native/encode/";
 const CGO_9A_TASK3_PLANNER_DISTRIBUTED_ROOT: &str = "src/sql/planner/distributed/";
 const CGO_9A_TASK3_STRUCTURAL_VALIDATOR_ENTRY: &str = "fn validate_distributed_structure(";
-const CGO_9A_TASK3_FORBIDDEN_CODEGEN_DEFS: [&str; 2] = [
+const CGO_9A_TASK3_FORBIDDEN_ENCODER_DEFS: [&str; 2] = [
     "fn validate_distributed_structure(",
     "fn validate_distributed_plan(",
 ];
 
 fn distributed_plan_seal_task3_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
     let mut violations = Vec::new();
+    let mut encoder_inventory = 0usize;
     let mut planner_defines_structural_validator = false;
 
     for source in sources {
-        if source.path.starts_with(CGO_9A_TASK3_CODEGEN_ROOT) {
-            for needle in CGO_9A_TASK3_FORBIDDEN_CODEGEN_DEFS {
+        if source.path.starts_with(CGO_9A_TASK3_ENCODER_ROOT) {
+            encoder_inventory += 1;
+            for needle in CGO_9A_TASK3_FORBIDDEN_ENCODER_DEFS {
                 if source.text.contains(needle) {
                     let function = needle.trim_start_matches("fn ").trim_end_matches('(');
                     violations.push(format!(
-                        "codegen-owns-structural-validator: {} defines `{function}`; distributed-plan structural validation must live under {}",
+                        "encoder-owns-structural-validator: {} defines `{function}`; distributed-plan structural validation must live under {}",
                         source.path, CGO_9A_TASK3_PLANNER_DISTRIBUTED_ROOT
                     ));
                 }
@@ -34014,6 +34016,11 @@ fn distributed_plan_seal_task3_violations(sources: &[Cgo8GuardSource]) -> Vec<St
         }
     }
 
+    if encoder_inventory == 0 {
+        violations.push(format!(
+            "empty-encoder-inventory: no production source found under {CGO_9A_TASK3_ENCODER_ROOT}"
+        ));
+    }
     if !planner_defines_structural_validator {
         violations.push(format!(
             "missing-planner-structural-validator: no {} source defines `{}`",
@@ -34030,7 +34037,7 @@ fn distributed_plan_seal_task3_violations(sources: &[Cgo8GuardSource]) -> Vec<St
 fn distributed_plan_seal_task3_detector_accepts_planner_owned_validator() {
     let sources = [
         Cgo8GuardSource::new(
-            "src/sql/codegen/fragment/build.rs",
+            "src/protocol/native/encode/build.rs",
             "fn build() {} fn output_column_for_boundary() {} fn validate_native_fragment_ownership() {}",
         ),
         Cgo8GuardSource::new(
@@ -34041,12 +34048,12 @@ fn distributed_plan_seal_task3_detector_accepts_planner_owned_validator() {
     let violations = distributed_plan_seal_task3_violations(&sources);
     assert!(
         violations.is_empty(),
-        "planner-owned structural validator with clean codegen must pass: {violations:?}"
+        "planner-owned structural validator with clean encoder must pass: {violations:?}"
     );
 }
 
 #[test]
-fn distributed_plan_seal_task3_detector_rejects_codegen_owned_validator() {
+fn distributed_plan_seal_task3_detector_rejects_encoder_owned_validator() {
     let planner_owner = Cgo8GuardSource::new(
         "src/sql/planner/distributed/validation.rs",
         "pub(in crate::sql::planner::distributed) fn validate_distributed_structure() {}",
@@ -34057,15 +34064,15 @@ fn distributed_plan_seal_task3_detector_rejects_codegen_owned_validator() {
         "pub(crate) fn validate_distributed_structure(dp: &DistributedPlan) { let _ = dp; }",
     ] {
         let sources = [
-            Cgo8GuardSource::new("src/sql/codegen/fragment/build.rs", forbidden),
+            Cgo8GuardSource::new("src/protocol/native/encode/build.rs", forbidden),
             planner_owner.clone(),
         ];
         let violations = distributed_plan_seal_task3_violations(&sources);
         assert!(
             violations
                 .iter()
-                .any(|violation| violation.contains("codegen-owns-structural-validator")),
-            "codegen re-owning the structural validator must fail closed for `{forbidden}`: {violations:?}"
+                .any(|violation| violation.contains("encoder-owns-structural-validator")),
+            "encoder re-owning the structural validator must fail closed for `{forbidden}`: {violations:?}"
         );
     }
 }
@@ -34073,7 +34080,7 @@ fn distributed_plan_seal_task3_detector_rejects_codegen_owned_validator() {
 #[test]
 fn distributed_plan_seal_task3_detector_requires_planner_owner() {
     let sources = [Cgo8GuardSource::new(
-        "src/sql/codegen/fragment/build.rs",
+        "src/protocol/native/encode/build.rs",
         "fn build() {} fn validate_native_fragment_ownership() {}",
     )];
     let violations = distributed_plan_seal_task3_violations(&sources);
@@ -34082,6 +34089,21 @@ fn distributed_plan_seal_task3_detector_requires_planner_owner() {
             .iter()
             .any(|violation| violation.contains("missing-planner-structural-validator")),
         "a tree with no planner-owned structural validator must fail closed: {violations:?}"
+    );
+}
+
+#[test]
+fn distributed_plan_seal_task3_detector_rejects_empty_encoder_inventory() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/planner/distributed/validation.rs",
+        "pub(in crate::sql::planner::distributed) fn validate_distributed_structure() {}",
+    )];
+    let violations = distributed_plan_seal_task3_violations(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("empty-encoder-inventory")),
+        "the structural-validation guard must fail closed without encoder sources: {violations:?}"
     );
 }
 
@@ -36956,7 +36978,53 @@ fn coor_3b_native_bundle_type_names(
     (names, violations)
 }
 
-fn coor_3b_native_bundle_binding_violations(source: &str) -> Result<Vec<String>, String> {
+fn coor_3b_native_bundle_binding_violations(
+    source: &str,
+    allow_canonical_facade_reexport: bool,
+) -> Result<Vec<String>, String> {
+    fn direct_bundle_name_count(tree: &syn::UseTree) -> usize {
+        match tree {
+            syn::UseTree::Name(name)
+                if coor_3b_ident_text(&name.ident) == "NativeFragmentBundle" =>
+            {
+                1
+            }
+            syn::UseTree::Group(group) => group.items.iter().map(direct_bundle_name_count).sum(),
+            syn::UseTree::Path(_)
+            | syn::UseTree::Name(_)
+            | syn::UseTree::Rename(_)
+            | syn::UseTree::Glob(_) => 0,
+        }
+    }
+
+    fn canonical_facade_bundle_reexport_count(item: &syn::ItemUse) -> usize {
+        let syn::Visibility::Restricted(visibility) = &item.vis else {
+            return 0;
+        };
+        if !visibility.path.is_ident("crate") {
+            return 0;
+        }
+        let syn::UseTree::Path(path) = &item.tree else {
+            return 0;
+        };
+        if coor_3b_ident_text(&path.ident) != "bundle" {
+            return 0;
+        }
+        direct_bundle_name_count(&path.tree)
+    }
+
+    fn use_imports_bundle(tree: &syn::UseTree) -> bool {
+        match tree {
+            syn::UseTree::Path(path) => use_imports_bundle(&path.tree),
+            syn::UseTree::Name(name) => coor_3b_ident_text(&name.ident) == "NativeFragmentBundle",
+            syn::UseTree::Rename(rename) => {
+                coor_3b_ident_text(&rename.ident) == "NativeFragmentBundle"
+            }
+            syn::UseTree::Group(group) => group.items.iter().any(use_imports_bundle),
+            syn::UseTree::Glob(_) => false,
+        }
+    }
+
     fn use_renames_bundle(tree: &syn::UseTree) -> bool {
         match tree {
             syn::UseTree::Path(path) => use_renames_bundle(&path.tree),
@@ -36969,8 +37037,9 @@ fn coor_3b_native_bundle_binding_violations(source: &str) -> Result<Vec<String>,
         }
     }
 
-    #[derive(Default)]
     struct Audit {
+        allow_canonical_facade_reexport: bool,
+        canonical_facade_bundle_reexports: usize,
         violations: Vec<String>,
     }
     struct NativeBundleMention {
@@ -37061,6 +37130,24 @@ fn coor_3b_native_bundle_binding_violations(source: &str) -> Result<Vec<String>,
                 self.violations
                     .push("forbidden NativeFragmentBundle import alias or re-export".to_string());
             }
+            if !matches!(item.vis, syn::Visibility::Inherited) && use_imports_bundle(&item.tree) {
+                let canonical_count = self
+                    .allow_canonical_facade_reexport
+                    .then(|| canonical_facade_bundle_reexport_count(item))
+                    .unwrap_or(0);
+                if canonical_count == 1 {
+                    self.canonical_facade_bundle_reexports += 1;
+                } else {
+                    self.violations
+                        .push("forbidden NativeFragmentBundle re-export".to_string());
+                    if self.allow_canonical_facade_reexport {
+                        self.violations.push(
+                            "NativeFragmentBundle facade re-export must be one pub(crate) direct export from `bundle`"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
             syn::visit::visit_item_use(self, item);
         }
 
@@ -37078,8 +37165,18 @@ fn coor_3b_native_bundle_binding_violations(source: &str) -> Result<Vec<String>,
 
     let file = syn::parse_file(source)
         .map_err(|error| format!("parse COOR-3B bundle binding source: {error}"))?;
-    let mut audit = Audit::default();
+    let mut audit = Audit {
+        allow_canonical_facade_reexport,
+        canonical_facade_bundle_reexports: 0,
+        violations: Vec::new(),
+    };
     syn::visit::Visit::visit_file(&mut audit, &file);
+    if allow_canonical_facade_reexport && audit.canonical_facade_bundle_reexports != 1 {
+        audit.violations.push(format!(
+            "NativeFragmentBundle facade re-export must appear exactly once, found {}",
+            audit.canonical_facade_bundle_reexports
+        ));
+    }
     audit.violations.sort();
     audit.violations.dedup();
     Ok(audit.violations)
@@ -38067,7 +38164,10 @@ fn coor_3b_forbidden_path_violations(sources: &[Cgo8GuardSource]) -> Vec<String>
         }
         let bundle_owner = source.path == "src/protocol/native/encode/bundle.rs";
         if !bundle_owner {
-            match coor_3b_native_bundle_binding_violations(&source.text) {
+            match coor_3b_native_bundle_binding_violations(
+                &source.text,
+                source.path == "src/protocol/native/encode/mod.rs",
+            ) {
                 Ok(binding_violations) => {
                     violations.extend(binding_violations.into_iter().map(|violation| {
                         format!("bundle-interface: {}: {violation}", source.path)
@@ -38612,7 +38712,7 @@ fn coordinator_artifact_guard_ignores_test_only_bundle_use_alias_impl() {
 fn coordinator_artifact_guard_allows_private_direct_bundle_import() {
     let sources = [Cgo8GuardSource::new(
         "src/coordinator/execution.rs",
-        "use crate::sql::codegen::fragment::NativeFragmentBundle; fn consume(_: &NativeFragmentBundle) {}",
+        "use crate::protocol::native::encode::NativeFragmentBundle; fn consume(_: &NativeFragmentBundle) {}",
     )];
     assert!(
         coor_3b_forbidden_path_violations(&sources).is_empty(),
@@ -38621,15 +38721,45 @@ fn coordinator_artifact_guard_allows_private_direct_bundle_import() {
 }
 
 #[test]
-fn coordinator_artifact_guard_allows_canonical_bundle_reexport() {
-    let sources = [Cgo8GuardSource::new(
+fn coordinator_artifact_guard_rejects_canonical_bundle_reexport() {
+    assert_coor_3b_fixture_rejected(
         "src/coordinator/execution.rs",
-        "pub(crate) use crate::sql::codegen::fragment::NativeFragmentBundle; fn consume(_: &NativeFragmentBundle) {}",
+        "pub(crate) use crate::protocol::native::encode::NativeFragmentBundle; fn consume(_: &NativeFragmentBundle) {}",
+        "forbidden NativeFragmentBundle re-export",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_allows_native_encoder_facade_reexport() {
+    let sources = [Cgo8GuardSource::new(
+        "src/protocol/native/encode/mod.rs",
+        "pub(crate) use bundle::NativeFragmentBundle;",
     )];
     assert!(
         coor_3b_forbidden_path_violations(&sources).is_empty(),
-        "a same-name canonical re-export does not introduce an alternate bundle type binding"
+        "the unique native encoder facade must retain its canonical same-name export"
     );
+}
+
+#[test]
+fn cgo_13_review_fix_rejects_non_exact_native_encoder_facade_reexports() {
+    for source in [
+        "pub use bundle::NativeFragmentBundle;",
+        "pub(crate) use shadow::NativeFragmentBundle;",
+        "pub(crate) use bundle::NativeFragmentBundle; pub(crate) use bundle::NativeFragmentBundle;",
+    ] {
+        let sources = [Cgo8GuardSource::new(
+            "src/protocol/native/encode/mod.rs",
+            source,
+        )];
+        let violations = coor_3b_forbidden_path_violations(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("NativeFragmentBundle facade re-export")),
+            "the encoder facade exception must allow exactly one pub(crate) re-export from `bundle`: {source}: {violations:?}"
+        );
+    }
 }
 
 #[test]
@@ -39535,14 +39665,14 @@ fn coor_3b_production_guard_sources(repo: &Path) -> Vec<Cgo8GuardSource> {
 }
 
 #[test]
-fn coordinator_preparation_owner_guard_recurses_new_scheduler_and_codegen_scan_modules() {
+fn coordinator_preparation_owner_guard_recurses_new_scheduler_and_encoder_modules() {
     let root = std::env::temp_dir().join(format!(
         "coor_3b_recursive_guard_{}_{}",
         std::process::id(),
         std::thread::current().name().unwrap_or("test")
     ));
     let files = [
-        ("src/lib.rs", "mod coordinator; mod sql;"),
+        ("src/lib.rs", "mod coordinator; mod protocol; mod sql;"),
         ("src/coordinator/mod.rs", "mod scheduler;"),
         ("src/coordinator/scheduler/mod.rs", "mod drift;"),
         (
@@ -39563,6 +39693,8 @@ fn coordinator_preparation_owner_guard_recurses_new_scheduler_and_codegen_scan_m
             "pub(crate) fn prepare_scan_bindings() {}",
         ),
         ("src/sql/codegen/fragment/mod.rs", ""),
+        ("src/protocol/mod.rs", "mod native;"),
+        ("src/protocol/native/mod.rs", "mod encode;"),
         ("src/protocol/native/encode/mod.rs", ""),
     ];
     for (relative, source) in files {
@@ -39580,6 +39712,7 @@ fn coordinator_preparation_owner_guard_recurses_new_scheduler_and_codegen_scan_m
         "src/coordinator/scheduler/drift.rs",
         "src/sql/codegen/scan/mod.rs",
         "src/sql/codegen/scan/preparation.rs",
+        "src/protocol/native/encode/mod.rs",
     ] {
         assert!(
             paths.contains(expected),
@@ -39808,6 +39941,416 @@ fn coordinator_prepared_fragment_set() {
     }
 }
 
+fn cgo_13_sql_encoder_surface_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
+    const ENCODER_ROOT: &[&str] = &["crate", "protocol", "native", "encode"];
+    const OLD_FRAGMENT_ROOT: &[&str] = &["crate", "sql", "codegen", "fragment"];
+    const OLD_PROTO_ROOT: &[&str] = &["crate", "sql", "codegen", "proto_encode"];
+    const FACADE_FUNCTIONS: &[&str] = &[
+        "encode_native_fragment_bundle",
+        "encode_data_partition",
+        "encode_instance_params",
+    ];
+
+    fn path_starts_with(path: &[String], prefix: &[&str]) -> bool {
+        path.len() >= prefix.len()
+            && path
+                .iter()
+                .zip(prefix)
+                .all(|(actual, expected)| actual == expected)
+    }
+
+    fn path_targets_encoder_source(path: &str) -> bool {
+        let normalized = path.replace('\\', "/");
+        normalized.contains("protocol/native/encode")
+            || normalized.contains("sql/codegen/fragment")
+            || normalized.contains("sql/codegen/proto_encode")
+    }
+
+    fn encoder_call_path(
+        expression: &syn::Expr,
+        imported_functions: &BTreeSet<String>,
+    ) -> Option<String> {
+        let expression = match expression {
+            syn::Expr::Return(returned) => returned.expr.as_deref()?,
+            syn::Expr::Try(try_expr) => try_expr.expr.as_ref(),
+            syn::Expr::Await(await_expr) => await_expr.base.as_ref(),
+            syn::Expr::Paren(paren) => paren.expr.as_ref(),
+            syn::Expr::Group(group) => group.expr.as_ref(),
+            expression => expression,
+        };
+        let syn::Expr::Call(call) = expression else {
+            return None;
+        };
+        let syn::Expr::Path(path) = call.func.as_ref() else {
+            return None;
+        };
+        let segments = path
+            .path
+            .segments
+            .iter()
+            .map(|segment| coor_3b_ident_text(&segment.ident))
+            .collect::<Vec<_>>();
+        let direct = path_starts_with(&segments, ENCODER_ROOT)
+            && segments
+                .get(ENCODER_ROOT.len())
+                .is_some_and(|name| FACADE_FUNCTIONS.contains(&name.as_str()));
+        let imported = segments.len() == 1 && imported_functions.contains(&segments[0]);
+        (direct || imported).then(|| segments.join("::"))
+    }
+
+    fn collect_forwarders(
+        items: &[syn::Item],
+        imported_functions: &BTreeSet<String>,
+        source_path: &str,
+        violations: &mut Vec<String>,
+    ) {
+        for item in items {
+            if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+                continue;
+            }
+            match item {
+                syn::Item::Fn(function) if !matches!(function.vis, syn::Visibility::Inherited) => {
+                    let expression = match function.block.stmts.last() {
+                        Some(syn::Stmt::Expr(expression, _)) => Some(expression),
+                        _ => None,
+                    };
+                    if let Some(path) = expression
+                        .and_then(|expression| encoder_call_path(expression, imported_functions))
+                    {
+                        violations.push(format!(
+                            "sql-encoder-forwarder: {source_path} visible function `{}` forwards directly to `{path}`",
+                            function.sig.ident
+                        ));
+                    }
+                }
+                syn::Item::Mod(module) => {
+                    if let Some((_, nested)) = &module.content {
+                        collect_forwarders(nested, imported_functions, source_path, violations);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn collect_include_indirections(
+        file: &syn::File,
+        source_path: &str,
+        violations: &mut Vec<String>,
+    ) {
+        struct Audit<'a> {
+            source_path: &'a str,
+            violations: &'a mut Vec<String>,
+        }
+
+        impl<'ast> syn::visit::Visit<'ast> for Audit<'_> {
+            fn visit_item(&mut self, item: &'ast syn::Item) {
+                if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+                    return;
+                }
+                syn::visit::visit_item(self, item);
+            }
+
+            fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+                if nfe_4_syn_attrs_require_test(nfe_4_syn_impl_item_attrs(item)) {
+                    return;
+                }
+                syn::visit::visit_impl_item(self, item);
+            }
+
+            fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+                if nfe_4_syn_attrs_require_test(nfe_4_syn_trait_item_attrs(item)) {
+                    return;
+                }
+                syn::visit::visit_trait_item(self, item);
+            }
+
+            fn visit_foreign_item(&mut self, item: &'ast syn::ForeignItem) {
+                if nfe_4_syn_attrs_require_test(nfe_4_syn_foreign_item_attrs(item)) {
+                    return;
+                }
+                syn::visit::visit_foreign_item(self, item);
+            }
+
+            fn visit_stmt(&mut self, stmt: &'ast syn::Stmt) {
+                if nfe_4_syn_attrs_require_test(nfe_4_syn_stmt_attrs(stmt)) {
+                    return;
+                }
+                syn::visit::visit_stmt(self, stmt);
+            }
+
+            fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+                if nfe_4_syn_attrs_require_test(nfe_4_syn_expr_attrs(expr)) {
+                    return;
+                }
+                syn::visit::visit_expr(self, expr);
+            }
+
+            fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+                if nfe_4_syn_attrs_require_test(&arm.attrs) {
+                    return;
+                }
+                syn::visit::visit_arm(self, arm);
+            }
+
+            fn visit_macro(&mut self, item: &'ast syn::Macro) {
+                if item.path.is_ident("include")
+                    && let Ok(path) = syn::parse2::<syn::LitStr>(item.tokens.clone())
+                    && path_targets_encoder_source(&path.value())
+                {
+                    self.violations.push(format!(
+                        "sql-encoder-source-indirection: {} includes an encoder source",
+                        self.source_path
+                    ));
+                }
+                syn::visit::visit_macro(self, item);
+            }
+        }
+
+        let mut audit = Audit {
+            source_path,
+            violations,
+        };
+        syn::visit::Visit::visit_file(&mut audit, file);
+    }
+
+    let mut violations = Vec::new();
+    for source in sources {
+        if !source.path.starts_with("src/sql/") {
+            continue;
+        }
+        let canonical_paths = rust_production_canonical_paths(&source.text, &source.path);
+        if canonical_paths.iter().any(|path| {
+            path_starts_with(path, OLD_FRAGMENT_ROOT) || path_starts_with(path, OLD_PROTO_ROOT)
+        }) {
+            violations.push(format!(
+                "old-sql-encoder-path: {} references a retired sql::codegen encoder owner",
+                source.path
+            ));
+        }
+
+        let scoped_aliases = rust_production_scoped_aliases(&source.text);
+        for raw in rust_raw_production_use_statements(&source.text) {
+            let resolved = rust_resolve_scoped_paths(
+                &raw.path.segments,
+                &raw.inline_modules,
+                &scoped_aliases,
+                &mut BTreeSet::new(),
+                0,
+            )
+            .unwrap_or_else(|| {
+                vec![RustScopedUsePath {
+                    segments: raw.path.segments.clone(),
+                    inline_modules: raw.inline_modules.clone(),
+                }]
+            });
+            let resolves_to_encoder = resolved.into_iter().any(|path| {
+                rust_canonical_path_segments_in_scope(
+                    &path.segments,
+                    &source.path,
+                    &path.inline_modules,
+                )
+                .is_some_and(|canonical| path_starts_with(&canonical, ENCODER_ROOT))
+            });
+            if resolves_to_encoder && !path_starts_with(&raw.path.segments, ENCODER_ROOT) {
+                violations.push(format!(
+                    "sql-encoder-alias-shell: {} imports the encoder through non-canonical path `{}`",
+                    source.path,
+                    raw.path.segments.join("::")
+                ));
+            }
+        }
+
+        let mut imported_functions = BTreeSet::new();
+        for import in rust_production_scoped_use_statements(&source.text) {
+            let path = rust_use_path(&import.import)
+                .split("::")
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if !path_starts_with(&path, ENCODER_ROOT) {
+                continue;
+            }
+            let tail = &path[ENCODER_ROOT.len()..];
+            let alias = import
+                .import
+                .split_once(" as ")
+                .map(|(_, alias)| alias.to_string());
+            if rust_use_is_public(&import.import) {
+                violations.push(format!(
+                    "sql-encoder-reexport: {} publicly re-exports `{}`",
+                    source.path,
+                    rust_use_path(&import.import)
+                ));
+            }
+            if tail.is_empty() || tail.first().is_some_and(|leaf| leaf == "*") || alias.is_some() {
+                violations.push(format!(
+                    "sql-encoder-alias-shell: {} imports the encoder through `{}`",
+                    source.path, import.import
+                ));
+            }
+            if tail.len() == 1 && FACADE_FUNCTIONS.contains(&tail[0].as_str()) && alias.is_none() {
+                imported_functions.insert(tail[0].clone());
+            }
+        }
+
+        for module in rust_module_items(&source.text) {
+            if cfg_attributes_test_requirement(module.attributes.iter().map(String::as_str))
+                == CfgTestRequirement::RequiresTest
+            {
+                continue;
+            }
+            let paths = module
+                .attributes
+                .iter()
+                .filter_map(|attribute| path_attribute_value(attribute))
+                .chain(
+                    module
+                        .attributes
+                        .iter()
+                        .flat_map(|attribute| cfg_attr_generated_path_values(attribute)),
+                );
+            if paths
+                .into_iter()
+                .any(|path| path_targets_encoder_source(&path))
+            {
+                violations.push(format!(
+                    "sql-encoder-source-indirection: {} module `{}` redirects to an encoder source",
+                    source.path, module.name
+                ));
+            }
+        }
+
+        match syn::parse_file(&source.text) {
+            Ok(file) => {
+                collect_forwarders(
+                    &file.items,
+                    &imported_functions,
+                    &source.path,
+                    &mut violations,
+                );
+                collect_include_indirections(&file, &source.path, &mut violations);
+            }
+            Err(error) => violations.push(format!(
+                "sql-encoder-source-parse: {} production AST parse failed: {error}",
+                source.path
+            )),
+        }
+    }
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+#[test]
+fn cgo_13_sql_encoder_surface_guard_rejects_old_path_reexport() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/codegen/mod.rs",
+        "pub(crate) use crate::sql::codegen::fragment::NativeFragmentBundle;",
+    )];
+    let violations = cgo_13_sql_encoder_surface_violations(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("old-sql-encoder-path")),
+        "old-path SQL encoder re-export must be rejected: {violations:?}"
+    );
+}
+
+#[test]
+fn cgo_13_sql_encoder_surface_guard_rejects_forwarding_wrapper() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/codegen/mod.rs",
+        "pub(crate) fn encode(plan: &DistributedPlan, prepared: &PreparedFragmentSet) -> Result<NativeFragmentBundle, String> { crate::protocol::native::encode::encode_native_fragment_bundle(plan, prepared) }",
+    )];
+    let violations = cgo_13_sql_encoder_surface_violations(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("sql-encoder-forwarder")),
+        "SQL forwarding wrapper must be rejected: {violations:?}"
+    );
+}
+
+#[test]
+fn cgo_13_sql_encoder_surface_guard_rejects_reexport_alias_and_indirection() {
+    let sources = [
+        Cgo8GuardSource::new(
+            "src/sql/codegen/reexport.rs",
+            "pub(crate) use crate::protocol::native::encode::NativeFragmentBundle;",
+        ),
+        Cgo8GuardSource::new(
+            "src/sql/codegen/alias.rs",
+            "use crate::protocol::native::encode as native_wire; fn consume(_: native_wire::NativeFragmentBundle) {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/sql/codegen/hidden.rs",
+            "#[path = \"../../protocol/native/encode/mod.rs\"] mod encode;",
+        ),
+    ];
+    let violations = cgo_13_sql_encoder_surface_violations(&sources);
+    for expected in [
+        "sql-encoder-reexport",
+        "sql-encoder-alias-shell",
+        "sql-encoder-source-indirection",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "SQL encoder surface guard must reject `{expected}`: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn cgo_13_sql_encoder_surface_guard_allows_canonical_private_consumption() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/planner/caller.rs",
+        "use crate::protocol::native::encode::{NativeFragmentBundle, encode_native_fragment_bundle}; fn consume(bundle: &NativeFragmentBundle) { let _ = bundle; } fn call(plan: &DistributedPlan, prepared: &PreparedFragmentSet) { let _ = encode_native_fragment_bundle(plan, prepared); }",
+    )];
+    let violations = cgo_13_sql_encoder_surface_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "ordinary canonical SQL consumers must remain legal: {violations:?}"
+    );
+}
+
+#[test]
+fn cgo_13_review_fix_rejects_chained_encoder_alias_and_visible_tail_forwarder() {
+    let sources = [
+        Cgo8GuardSource::new(
+            "src/sql/codegen/alias.rs",
+            "use crate::protocol::native as native_protocol; use native_protocol::encode::NativeFragmentBundle; fn consume(_: &NativeFragmentBundle) {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/sql/codegen/forwarder.rs",
+            "pub(crate) fn encode(plan: &DistributedPlan, prepared: &PreparedFragmentSet) -> Result<NativeFragmentBundle, String> { validate(plan)?; crate::protocol::native::encode::encode_native_fragment_bundle(plan, prepared) }",
+        ),
+    ];
+    let violations = cgo_13_sql_encoder_surface_violations(&sources);
+    for expected in ["sql-encoder-alias-shell", "sql-encoder-forwarder"] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "SQL encoder surface guard must reject `{expected}`: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn cgo_13_review_fix_ignores_test_only_include_indirection_with_production_include() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/codegen/mod.rs",
+        "include!(\"safe.rs\"); #[cfg(test)] include!(\"../../protocol/native/encode/mod.rs\");",
+    )];
+    let violations = cgo_13_sql_encoder_surface_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "test-only encoder include must stay outside the production surface: {violations:?}"
+    );
+}
+
 #[test]
 fn cgo_13_native_encoder_has_one_top_level_owner() {
     let repo = Path::new(manifest_dir());
@@ -39837,12 +40380,23 @@ fn cgo_13_native_encoder_has_one_top_level_owner() {
         "src/protocol/native/encode must contain exactly one production native bundle constructor"
     );
 
-    let sql_encoder_declarations = rs_files(&repo.join("src/sql"))
+    let sql_sources = rs_files(&repo.join("src/sql"))
         .into_iter()
-        .flat_map(|path| {
-            let production = rust_sanitized_production_text(
-                &fs::read_to_string(&path).expect("read SQL production source"),
-            );
+        .map(|path| {
+            Cgo8GuardSource::new(
+                rel(&path),
+                fs::read_to_string(&path).expect("read SQL production source"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !sql_sources.is_empty(),
+        "CGO-13 SQL production inventory must be non-empty"
+    );
+    let sql_encoder_declarations = sql_sources
+        .iter()
+        .flat_map(|source| {
+            let production = rust_sanitized_production_text(&source.text);
             [
                 "NativeFragmentBundle",
                 "NativePlanEncodeContext",
@@ -39856,7 +40410,7 @@ fn cgo_13_native_encoder_has_one_top_level_owner() {
             .filter_map(move |name| {
                 let declarations = rust_named_type_declaration_count(&production, name)
                     + rust_named_function_declaration_count(&production, name);
-                (declarations > 0).then(|| format!("{} declares `{name}`", rel(&path)))
+                (declarations > 0).then(|| format!("{} declares `{name}`", source.path))
             })
         })
         .collect::<Vec<_>>();
@@ -39864,6 +40418,12 @@ fn cgo_13_native_encoder_has_one_top_level_owner() {
         sql_encoder_declarations.is_empty(),
         "native protobuf encoder declarations must not remain under src/sql:\n{}",
         sql_encoder_declarations.join("\n")
+    );
+    let sql_surface_violations = cgo_13_sql_encoder_surface_violations(&sql_sources);
+    assert!(
+        sql_surface_violations.is_empty(),
+        "native protobuf encoder surfaces must not remain under src/sql:\n{}",
+        sql_surface_violations.join("\n")
     );
 }
 

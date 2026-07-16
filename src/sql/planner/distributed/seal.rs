@@ -79,8 +79,8 @@ impl DistributedPlan {
         &self.data.runtime_filter_graph
     }
 
-    // Consumed on the production codegen path (`project_boundary_reports` in
-    // `protocol::native::encode`) and, later, by CGO-9C occurrence allocation.
+    // Consumed by coordinator preparation for production boundary validation.
+    // `protocol::native::encode::project_boundary_reports` is test-only diagnostics.
     pub(crate) fn boundaries(&self) -> &BoundaryCatalog {
         &self.data.boundaries
     }
