@@ -23,7 +23,7 @@ use mysql_async::prelude::Queryable;
 use tokio::time::{Instant, timeout_at};
 
 use super::codec::MysqlCodec;
-use super::error::MysqlNativeError;
+use super::error::{MysqlNativeError, MysqlReadStatementError};
 use crate::state_store::{
     Direction, RangePage, RangeRequest, StateRecord, StateStoreError, StateStoreErrorKind, Value,
     VersionToken,
@@ -56,7 +56,7 @@ pub(super) async fn read_range_page(
     request: &RangeRequest,
     max_value_bytes: usize,
     deadline: Instant,
-) -> Result<RangePage, StateStoreError> {
+) -> Result<RangePage, MysqlReadStatementError> {
     let resume = request
         .continuation
         .as_ref()
@@ -108,12 +108,12 @@ pub(super) async fn read_range_page(
         }
     };
 
-    let has_more = rows.len() > request.page_size;
     let mut records = rows
         .into_iter()
-        .take(request.page_size)
         .map(|(key, value, version)| decode_record(codec, key, value, version, max_value_bytes))
         .collect::<Result<Vec<_>, _>>()?;
+    let has_more = records.len() > request.page_size;
+    records.truncate(request.page_size);
     let continuation = if has_more {
         records
             .last()
@@ -131,15 +131,17 @@ pub(super) async fn read_range_page(
 async fn execute<T>(
     deadline: Instant,
     operation: impl Future<Output = Result<T, mysql_async::Error>>,
-) -> Result<T, StateStoreError> {
+) -> Result<T, MysqlReadStatementError> {
     super::client::record_statement();
     match timeout_at(deadline, operation).await {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) => Err(MysqlNativeError::from(error).into_public()),
-        Err(_) => Err(StateStoreError::new(
+        Ok(Err(error)) => Err(MysqlReadStatementError::Native(MysqlNativeError::from(
+            error,
+        ))),
+        Err(_) => Err(MysqlReadStatementError::Deadline(StateStoreError::new(
             StateStoreErrorKind::DeadlineExceeded,
             "MySQL state transaction deadline exceeded",
-        )),
+        ))),
     }
 }
 

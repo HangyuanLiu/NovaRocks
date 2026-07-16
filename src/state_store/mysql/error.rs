@@ -55,6 +55,26 @@ fn classify_tls_error_class(class: MysqlTlsErrorClass) -> StateStoreErrorKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MysqlNativeError {
     public: StateStoreError,
+    transaction_disposition: MysqlTransactionDisposition,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MysqlTransactionDisposition {
+    RollbackRequired,
+    TransactionEnded,
+    DestroyConnection,
+}
+
+pub(super) enum MysqlReadStatementError {
+    Public(StateStoreError),
+    Native(MysqlNativeError),
+    Deadline(StateStoreError),
+}
+
+impl From<StateStoreError> for MysqlReadStatementError {
+    fn from(error: StateStoreError) -> Self {
+        Self::Public(error)
+    }
 }
 
 impl MysqlNativeError {
@@ -64,6 +84,7 @@ impl MysqlNativeError {
                 StateStoreErrorKind::ProviderUnavailable,
                 "MySQL provider operation failed",
             ),
+            transaction_disposition: MysqlTransactionDisposition::DestroyConnection,
         }
     }
 
@@ -73,6 +94,7 @@ impl MysqlNativeError {
                 StateStoreErrorKind::DeadlineExceeded,
                 "MySQL provider operation exceeded its deadline",
             ),
+            transaction_disposition: MysqlTransactionDisposition::DestroyConnection,
         }
     }
 
@@ -82,27 +104,35 @@ impl MysqlNativeError {
                 StateStoreErrorKind::InvalidConfiguration,
                 "MySQL provider configuration was rejected",
             ),
+            transaction_disposition: MysqlTransactionDisposition::DestroyConnection,
         }
     }
 
-    pub(crate) fn conflict() -> Self {
+    fn conflict(transaction_disposition: MysqlTransactionDisposition) -> Self {
         Self {
             public: StateStoreError::new(
                 StateStoreErrorKind::Conflict,
                 "MySQL transaction encountered a concurrent lock conflict",
             ),
+            transaction_disposition,
         }
     }
 
     pub(crate) fn into_public(self) -> StateStoreError {
         self.public
     }
+
+    pub(crate) const fn transaction_disposition(&self) -> MysqlTransactionDisposition {
+        self.transaction_disposition
+    }
 }
 
 impl From<Error> for MysqlNativeError {
     fn from(error: Error) -> Self {
         match error {
-            Error::Server(server) if matches!(server.code, 1205 | 1213) => Self::conflict(),
+            Error::Server(server) if matches!(server.code, 1205 | 1213) => {
+                Self::conflict(classify_server_transaction_disposition(server.code))
+            }
             Error::Server(server) if matches!(server.code, 1044 | 1045 | 1049) => {
                 Self::invalid_configuration()
             }
@@ -120,10 +150,26 @@ impl From<Error> for MysqlNativeError {
                 | DriverError::CleartextPluginDisabled
                 | DriverError::InvalidParsecSalt,
             ) => Self::invalid_configuration(),
-            Error::Driver(_) | Error::Io(IoError::Io(_)) | Error::Other(_) | Error::Server(_) => {
+            Error::Server(_) => Self {
+                public: StateStoreError::new(
+                    StateStoreErrorKind::ProviderUnavailable,
+                    "MySQL provider operation failed",
+                ),
+                transaction_disposition: MysqlTransactionDisposition::RollbackRequired,
+            },
+            Error::Driver(_) | Error::Io(IoError::Io(_)) | Error::Other(_) => {
                 Self::provider_unavailable()
             }
         }
+    }
+}
+
+const fn classify_server_transaction_disposition(code: u16) -> MysqlTransactionDisposition {
+    match code {
+        1205 => MysqlTransactionDisposition::RollbackRequired,
+        1213 => MysqlTransactionDisposition::TransactionEnded,
+        1044 | 1045 | 1049 => MysqlTransactionDisposition::DestroyConnection,
+        _ => MysqlTransactionDisposition::RollbackRequired,
     }
 }
 
@@ -152,6 +198,22 @@ mod tests {
         assert_eq!(
             classify_tls_error_class(MysqlTlsErrorClass::InvalidCertificateEncoding),
             StateStoreErrorKind::InvalidConfiguration
+        );
+    }
+
+    #[test]
+    fn native_lock_errors_preserve_transaction_disposition() {
+        assert_eq!(
+            classify_server_transaction_disposition(1205),
+            MysqlTransactionDisposition::RollbackRequired
+        );
+        assert_eq!(
+            classify_server_transaction_disposition(1213),
+            MysqlTransactionDisposition::TransactionEnded
+        );
+        assert_eq!(
+            classify_server_transaction_disposition(1045),
+            MysqlTransactionDisposition::DestroyConnection
         );
     }
 }

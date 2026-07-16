@@ -15,8 +15,33 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::mem::size_of;
+
 use crate::state_store::{Precondition, StateStoreError, StateStoreErrorKind, StateStoreLimits};
 
+const MUTATION_KIND_BYTES: usize = 1;
+const PRECONDITION_KIND_BYTES: usize = 1;
+const COMMIT_TRANSACTION_ID_BYTES: usize = 16;
+const COMMIT_STATE_BYTES: usize = size_of::<u8>();
+const COMMIT_RESERVATION_BYTES: usize = 16;
+const COMMIT_REVISION_BYTES: usize = size_of::<u64>();
+const COMMIT_UPDATED_AT_BYTES: usize = size_of::<u64>();
+const CURRENT_REVISION_BYTES: usize = size_of::<u64>();
+const CHANGE_REVISION_BYTES: usize = size_of::<u64>();
+const CHANGE_SEQUENCE_BYTES: usize = size_of::<u32>();
+const PERSISTED_VERSION_BYTES: usize = size_of::<u64>() + size_of::<u32>();
+const PROVISIONAL_VERSION_BYTES: usize = 21 + 16 + size_of::<u64>();
+
+// Account the complete v1 logical durability footprint, including the commit row and
+// current-revision update owned by Task 6. This is intentionally not a MySQL wire-size estimate.
+pub(super) const TRANSACTION_ENVELOPE_BYTES: usize = COMMIT_TRANSACTION_ID_BYTES
+    + COMMIT_STATE_BYTES
+    + COMMIT_RESERVATION_BYTES
+    + COMMIT_REVISION_BYTES
+    + COMMIT_UPDATED_AT_BYTES
+    + CURRENT_REVISION_BYTES;
+
+#[derive(Debug)]
 pub(super) struct TransactionBudget {
     limits: StateStoreLimits,
     operations: usize,
@@ -24,12 +49,15 @@ pub(super) struct TransactionBudget {
 }
 
 impl TransactionBudget {
-    pub(super) fn new(limits: StateStoreLimits) -> Self {
-        Self {
+    pub(super) fn new(limits: StateStoreLimits) -> Result<Self, StateStoreError> {
+        if TRANSACTION_ENVELOPE_BYTES > limits.max_transaction_bytes {
+            return Err(byte_limit());
+        }
+        Ok(Self {
             limits,
             operations: 0,
-            bytes: 0,
-        }
+            bytes: TRANSACTION_ENVELOPE_BYTES,
+        })
     }
 
     pub(super) fn stage_put(
@@ -38,7 +66,7 @@ impl TransactionBudget {
         value: &[u8],
         precondition: &Precondition,
     ) -> Result<u64, StateStoreError> {
-        self.stage(accounted_bytes(key.len(), value.len(), precondition)?)
+        self.stage(accounted_put_bytes(key, value, precondition)?)
     }
 
     pub(super) fn stage_delete(
@@ -46,7 +74,7 @@ impl TransactionBudget {
         key: &[u8],
         precondition: &Precondition,
     ) -> Result<u64, StateStoreError> {
-        self.stage(accounted_bytes(key.len(), 0, precondition)?)
+        self.stage(accounted_delete_bytes(key, precondition)?)
     }
 
     fn stage(&mut self, increment: usize) -> Result<u64, StateStoreError> {
@@ -64,21 +92,42 @@ impl TransactionBudget {
     }
 }
 
-fn accounted_bytes(
-    key_len: usize,
-    value_len: usize,
+pub(super) fn accounted_put_bytes(
+    key: &[u8],
+    value: &[u8],
     precondition: &Precondition,
 ) -> Result<usize, StateStoreError> {
-    let mut bytes = 2usize
-        .checked_add(key_len)
-        .and_then(|bytes| bytes.checked_add(value_len))
-        .ok_or_else(byte_limit)?;
-    if let Precondition::Version(version) = precondition {
-        bytes = bytes
-            .checked_add(version.as_bytes().len())
-            .ok_or_else(byte_limit)?;
-    }
+    let mut bytes = accounted_mutation_base(key, precondition)?;
+    bytes = checked_add(bytes, value.len())?;
+    bytes = checked_add(bytes, PROVISIONAL_VERSION_BYTES)?;
+    bytes = checked_add(bytes, PERSISTED_VERSION_BYTES)?;
     Ok(bytes)
+}
+
+pub(super) fn accounted_delete_bytes(
+    key: &[u8],
+    precondition: &Precondition,
+) -> Result<usize, StateStoreError> {
+    accounted_mutation_base(key, precondition)
+}
+
+fn accounted_mutation_base(
+    key: &[u8],
+    precondition: &Precondition,
+) -> Result<usize, StateStoreError> {
+    let mut bytes = MUTATION_KIND_BYTES;
+    bytes = checked_add(bytes, key.len())?;
+    bytes = checked_add(bytes, PRECONDITION_KIND_BYTES)?;
+    if let Precondition::Version(version) = precondition {
+        bytes = checked_add(bytes, version.as_bytes().len())?;
+    }
+    bytes = checked_add(bytes, key.len())?;
+    bytes = checked_add(bytes, CHANGE_REVISION_BYTES)?;
+    checked_add(bytes, CHANGE_SEQUENCE_BYTES)
+}
+
+fn checked_add(total: usize, increment: usize) -> Result<usize, StateStoreError> {
+    total.checked_add(increment).ok_or_else(byte_limit)
 }
 
 const fn operation_limit() -> StateStoreError {
@@ -93,4 +142,96 @@ const fn byte_limit() -> StateStoreError {
         StateStoreErrorKind::LimitExceeded,
         "transaction byte limit exceeded",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use super::{
+        TRANSACTION_ENVELOPE_BYTES, TransactionBudget, accounted_delete_bytes, accounted_put_bytes,
+    };
+    use crate::state_store::{Precondition, StateStoreErrorKind, StateStoreLimits, VersionToken};
+
+    fn limits(bytes: usize, operations: usize) -> StateStoreLimits {
+        StateStoreLimits {
+            max_transaction_bytes: bytes,
+            max_transaction_operations: operations,
+            ..StateStoreLimits::default()
+        }
+    }
+
+    #[test]
+    fn mysql_transaction_budget_checks_fixed_envelope_exactly() {
+        let error = TransactionBudget::new(limits(TRANSACTION_ENVELOPE_BYTES - 1, 100))
+            .expect_err("fixed envelope minus one must fail");
+        assert_eq!(error.kind(), StateStoreErrorKind::LimitExceeded);
+
+        TransactionBudget::new(limits(TRANSACTION_ENVELOPE_BYTES, 100))
+            .expect("exact fixed envelope must fit");
+    }
+
+    #[test]
+    fn mysql_transaction_budget_accounts_put_and_delete_physical_boundaries() {
+        let version =
+            VersionToken::try_from(Bytes::from_static(b"expected-version")).expect("version token");
+        let put_bytes = accounted_put_bytes(b"key", b"value", &Precondition::Version(version))
+            .expect("put bytes");
+        let delete_bytes =
+            accounted_delete_bytes(b"other", &Precondition::Present).expect("delete bytes");
+        let exact = TRANSACTION_ENVELOPE_BYTES + put_bytes + delete_bytes;
+
+        let mut budget = TransactionBudget::new(limits(exact, 100)).expect("exact budget");
+        budget
+            .stage_put(
+                b"key",
+                b"value",
+                &Precondition::Version(
+                    VersionToken::try_from(Bytes::from_static(b"expected-version"))
+                        .expect("version token"),
+                ),
+            )
+            .expect("exact put");
+        budget
+            .stage_delete(b"other", &Precondition::Present)
+            .expect("exact delete");
+
+        let mut under = TransactionBudget::new(limits(exact - 1, 100)).expect("under budget");
+        under
+            .stage_put(
+                b"key",
+                b"value",
+                &Precondition::Version(
+                    VersionToken::try_from(Bytes::from_static(b"expected-version"))
+                        .expect("version token"),
+                ),
+            )
+            .expect("first mutation fits");
+        assert_eq!(
+            under
+                .stage_delete(b"other", &Precondition::Present)
+                .expect_err("exact minus one must reject")
+                .kind(),
+            StateStoreErrorKind::LimitExceeded
+        );
+    }
+
+    #[test]
+    fn mysql_transaction_budget_operation_limit_is_independent() {
+        let mutation_bytes =
+            accounted_delete_bytes(b"k", &Precondition::Any).expect("delete bytes");
+        let mut budget =
+            TransactionBudget::new(limits(TRANSACTION_ENVELOPE_BYTES + mutation_bytes * 2, 1))
+                .expect("byte budget fits two operations");
+        budget
+            .stage_delete(b"k", &Precondition::Any)
+            .expect("one operation fits");
+        assert_eq!(
+            budget
+                .stage_delete(b"k", &Precondition::Any)
+                .expect_err("second operation exceeds operation limit")
+                .kind(),
+            StateStoreErrorKind::LimitExceeded
+        );
+    }
 }

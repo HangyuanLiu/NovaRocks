@@ -60,6 +60,10 @@ pub struct MysqlHeldAdvisoryLock {
     lock_name: String,
 }
 
+pub struct MysqlHeldKvLock {
+    inner: Option<super::txn::MysqlHeldKvLock>,
+}
+
 pub struct MysqlTransactionTestApi;
 pub struct MysqlWriteTestApi;
 pub struct MysqlOccTestApi;
@@ -71,13 +75,54 @@ impl MysqlStatementTestApi {
     pub fn statement_count() -> u64 {
         super::client::statement_count_for_test()
     }
+
+    pub fn last_write_actor_connection_id() -> u64 {
+        super::txn::last_write_actor_connection_id_for_test()
+    }
 }
 
 impl MysqlWriteTestApi {
-    pub fn assert_task5_api() {}
+    pub fn transaction_envelope_bytes() -> usize {
+        super::budget::TRANSACTION_ENVELOPE_BYTES
+    }
+
+    pub fn put_accounted_bytes(
+        key: &[u8],
+        value: &[u8],
+        precondition: &super::super::Precondition,
+    ) -> Result<usize, StateStoreError> {
+        super::budget::accounted_put_bytes(key, value, precondition)
+    }
+
+    pub fn delete_accounted_bytes(
+        key: &[u8],
+        precondition: &super::super::Precondition,
+    ) -> Result<usize, StateStoreError> {
+        super::budget::accounted_delete_bytes(key, precondition)
+    }
 }
 
 impl MysqlOccTestApi {
+    #[cfg(feature = "state-store-test-hooks")]
+    pub fn last_touched_lock_order() -> Vec<Vec<u8>> {
+        super::txn::last_touched_lock_order_for_test()
+    }
+
+    pub async fn hold_kv_lock(
+        runtime: &StateStoreRuntime,
+        database: &str,
+        key: &[u8],
+        deadline: Duration,
+    ) -> Result<MysqlHeldKvLock, StateStoreError> {
+        Ok(MysqlHeldKvLock {
+            inner: Some(
+                runtime
+                    .mysql_test_hold_kv_lock(database, key, deadline)
+                    .await?,
+            ),
+        })
+    }
+
     pub async fn deadlock_1213_maps_to_conflict(
         runtime: &StateStoreRuntime,
         database: &str,
@@ -122,6 +167,21 @@ impl MysqlOccTestApi {
             ));
         }
         Ok(())
+    }
+}
+
+impl MysqlHeldKvLock {
+    pub async fn release(mut self) -> Result<(), StateStoreError> {
+        self.inner
+            .take()
+            .ok_or_else(|| {
+                StateStoreError::new(
+                    StateStoreErrorKind::InvalidRequest,
+                    "MySQL key lock is already released",
+                )
+            })?
+            .release()
+            .await
     }
 }
 

@@ -466,6 +466,19 @@ impl StateStoreRuntime {
         }
     }
 
+    #[cfg(feature = "mysql-state-store-provider")]
+    pub(crate) async fn mysql_test_hold_kv_lock(
+        &self,
+        database: &str,
+        key: &[u8],
+        deadline: Duration,
+    ) -> Result<super::mysql::txn::MysqlHeldKvLock, StateStoreError> {
+        match &self.inner {
+            RuntimeInner::Mysql(runtime) => runtime.hold_kv_lock(database, key, deadline).await,
+            _ => Err(mysql_runtime_mismatch()),
+        }
+    }
+
     #[cfg(all(
         feature = "mysql-state-store-provider",
         feature = "state-store-test-hooks"
@@ -938,6 +951,24 @@ impl MysqlRuntime {
             pool,
             first_operation,
             second_operation,
+            Instant::now() + total_deadline,
+        )
+        .await
+    }
+
+    async fn hold_kv_lock(
+        &self,
+        database: &str,
+        key: &[u8],
+        total_deadline: Duration,
+    ) -> Result<super::mysql::txn::MysqlHeldKvLock, StateStoreError> {
+        self.validate_process_and_context()?;
+        let operation = self.acquire_operation()?;
+        let pool = self.get_or_create_pool(database)?;
+        super::mysql::txn::hold_kv_lock_for_test(
+            pool,
+            operation,
+            key,
             Instant::now() + total_deadline,
         )
         .await

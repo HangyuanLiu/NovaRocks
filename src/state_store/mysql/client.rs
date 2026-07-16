@@ -247,13 +247,10 @@ pub(crate) async fn execute_owned_with_deadline<T>(
     mut connection: MysqlPoolConnection,
     deadline: Instant,
     operation: impl for<'a> FnOnce(&'a mut Conn) -> BoxFuture<'a, Result<T, mysql_async::Error>>,
-) -> Result<(MysqlPoolConnection, Result<T, StateStoreError>), StateStoreError> {
+) -> Result<(MysqlPoolConnection, Result<T, MysqlNativeError>), StateStoreError> {
     record_statement();
     match timeout_at(deadline, operation(&mut connection)).await {
-        Ok(result) => Ok((
-            connection,
-            result.map_err(|error| MysqlNativeError::from(error).into_public()),
-        )),
+        Ok(result) => Ok((connection, result.map_err(MysqlNativeError::from))),
         Err(_) => {
             connection.destroy().await;
             Err(mysql_deadline_error())
@@ -408,6 +405,10 @@ impl PoolLifecycle for MysqlAsyncPoolLifecycle {
 
 impl MysqlPoolConnection {
     pub(crate) async fn destroy(mut self) {
+        self.destroy_in_place().await;
+    }
+
+    pub(crate) async fn destroy_in_place(&mut self) {
         if let Some(connection) = self.connection.take() {
             let _ = tokio::time::timeout(Duration::from_secs(1), connection.disconnect()).await;
         }

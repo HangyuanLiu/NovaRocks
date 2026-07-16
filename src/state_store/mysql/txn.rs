@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "state-store-test-hooks")]
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant as StdInstant;
 
 use async_trait::async_trait;
@@ -31,17 +33,22 @@ use super::client::{
     MysqlPoolConnection, PoolLifecycle, checkout_hygienic_connection, execute_owned_with_deadline,
 };
 use super::codec::MysqlCodec;
+use super::error::{MysqlNativeError, MysqlReadStatementError, MysqlTransactionDisposition};
 use super::range::{decode_record, read_range_page};
 use crate::state_store::runtime::MysqlRuntimeGuard;
 use crate::state_store::{
-    CommitOutcome, CommitReceipt, Direction, Key, Precondition, RangePage, RangeRequest,
-    ReadTransaction, StateRecord, StateStoreError, StateStoreErrorKind, StateStoreLimits,
-    StateStoreMetrics, StateStoreOperation, StateStoreOutcome, StoreRevision, TransactionId, Value,
-    VersionToken, WriteTransaction,
+    CommitOutcome, CommitReceipt, ContinuationToken, Direction, Key, Precondition, RangePage,
+    RangeRequest, ReadTransaction, StateRecord, StateStoreError, StateStoreErrorKind,
+    StateStoreLimits, StateStoreMetrics, StateStoreOperation, StateStoreOutcome, StoreRevision,
+    TransactionId, Value, VersionToken, WriteTransaction,
 };
 
 const PROVISIONAL_VERSION_TAG: &[u8] = b"mysql-provisional-v1\0";
 static EXPLICIT_ROLLBACKS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "state-store-test-hooks")]
+static LAST_WRITE_ACTOR_CONNECTION_ID: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "state-store-test-hooks")]
+static LAST_TOUCHED_LOCK_ORDER: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
 
 pub(super) struct OwnedMysqlTransaction {
     connection: Option<MysqlPoolConnection>,
@@ -55,6 +62,7 @@ pub(super) struct MysqlReadTransaction {
     commands: Option<mpsc::Sender<ReadCommand>>,
     limits: StateStoreLimits,
     metrics: Arc<StateStoreMetrics>,
+    issued_continuations: HashSet<ContinuationToken>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,6 +96,7 @@ pub(super) struct MysqlWriteTransaction {
     transaction_id: TransactionId,
     limits: StateStoreLimits,
     metrics: Arc<StateStoreMetrics>,
+    issued_continuations: HashSet<ContinuationToken>,
 }
 
 struct MysqlWriteActorState {
@@ -102,6 +111,7 @@ struct MysqlWriteActorState {
     overlay: BTreeMap<Key, Mutation>,
     budget: TransactionBudget,
     range_frozen: bool,
+    issued_continuations: HashSet<ContinuationToken>,
 }
 
 enum WriteCommand {
@@ -146,9 +156,35 @@ enum ReadCommand {
     },
 }
 
+#[derive(Clone, Copy)]
 enum ReadActorDisposition {
-    Rollback,
+    Reuse,
     Destroy,
+}
+
+struct ReadActorExit {
+    disposition: ReadActorDisposition,
+    pending_error: Option<(ReadCommand, StateStoreError)>,
+}
+
+impl ReadActorExit {
+    const fn complete(disposition: ReadActorDisposition) -> Self {
+        Self {
+            disposition,
+            pending_error: None,
+        }
+    }
+
+    const fn error(
+        disposition: ReadActorDisposition,
+        command: ReadCommand,
+        error: StateStoreError,
+    ) -> Self {
+        Self {
+            disposition,
+            pending_error: Some((command, error)),
+        }
+    }
 }
 
 pub(super) async fn begin_read(
@@ -182,6 +218,7 @@ pub(super) async fn begin_read(
         commands: Some(commands),
         limits,
         metrics,
+        issued_continuations: HashSet::new(),
     })
 }
 
@@ -217,6 +254,7 @@ pub(super) async fn begin_write(
         transaction_id,
         limits,
         metrics,
+        issued_continuations: HashSet::new(),
     })
 }
 
@@ -245,10 +283,20 @@ async fn write_actor(
     while let Some(command) = commands.recv().await {
         match command {
             WriteCommand::Get { key, response } => {
-                let _ = response.send(state.get_inner(&key).await);
+                let result = state.get_inner(&key).await;
+                let terminal = !state.transaction_active();
+                let _ = response.send(result);
+                if terminal {
+                    return;
+                }
             }
             WriteCommand::Range { request, response } => {
-                let _ = response.send(state.range_inner(&request).await);
+                let result = state.range_inner(&request).await;
+                let terminal = !state.transaction_active();
+                let _ = response.send(result);
+                if terminal {
+                    return;
+                }
             }
             WriteCommand::Put {
                 key,
@@ -289,7 +337,18 @@ async fn initialize_write_actor(
     limits: StateStoreLimits,
     deadline: Instant,
 ) -> Result<MysqlWriteActorState, StateStoreError> {
-    let mut transaction = OwnedMysqlTransaction::begin(pool, operation, deadline, false).await?;
+    let budget = TransactionBudget::new(limits.clone())?;
+    let mut transaction = OwnedMysqlTransaction::begin(pool, operation, deadline).await?;
+    #[cfg(feature = "state-store-test-hooks")]
+    {
+        let connection_id: Option<u64> = transaction
+            .run(|connection| Box::pin(connection.query_first("SELECT CONNECTION_ID()")))
+            .await?;
+        LAST_WRITE_ACTOR_CONNECTION_ID.store(
+            connection_id.ok_or_else(persisted_corruption)?,
+            Ordering::Release,
+        );
+    }
     let revision_bytes: Option<Vec<u8>> = transaction
         .run(|connection| {
             Box::pin(connection.exec_first(
@@ -311,8 +370,9 @@ async fn initialize_write_actor(
         range_observed: false,
         mutations: Vec::new(),
         overlay: BTreeMap::new(),
-        budget: TransactionBudget::new(limits),
+        budget,
         range_frozen: false,
+        issued_continuations: HashSet::new(),
     })
 }
 
@@ -366,22 +426,47 @@ async fn run_read_actor(
         .with_consistent_snapshot(true)
         .with_readonly(true);
     super::client::record_statement();
-    let mut transaction = match timeout_at(deadline, connection.start_transaction(options)).await {
-        Ok(Ok(transaction)) => transaction,
-        Ok(Err(error)) => {
-            respond_read_start_error(
+    let exit = match timeout_at(deadline, connection.start_transaction(options)).await {
+        Ok(Ok(transaction)) => {
+            run_started_read_actor(
+                transaction,
+                codec,
+                limits,
+                deadline,
                 first_command,
-                super::error::MysqlNativeError::from(error).into_public(),
-            );
-            return ReadActorDisposition::Destroy;
+                commands,
+            )
+            .await
         }
-        Err(_) => {
-            respond_read_start_error(first_command, deadline_error());
-            return ReadActorDisposition::Destroy;
-        }
+        Ok(Err(error)) => ReadActorExit::error(
+            ReadActorDisposition::Destroy,
+            first_command,
+            MysqlNativeError::from(error).into_public(),
+        ),
+        Err(_) => ReadActorExit::error(
+            ReadActorDisposition::Destroy,
+            first_command,
+            deadline_error(),
+        ),
     };
+    if matches!(exit.disposition, ReadActorDisposition::Destroy) {
+        connection.destroy_in_place().await;
+    }
+    if let Some((command, error)) = exit.pending_error {
+        respond_read_start_error(command, error);
+    }
+    exit.disposition
+}
 
-    let mut disposition = ReadActorDisposition::Rollback;
+async fn run_started_read_actor(
+    mut transaction: Transaction<'_>,
+    codec: &MysqlCodec,
+    limits: &StateStoreLimits,
+    deadline: Instant,
+    first_command: ReadCommand,
+    commands: &mut mpsc::Receiver<ReadCommand>,
+) -> ReadActorExit {
+    let mut issued_continuations = HashSet::new();
     let mut next_command = Some(first_command);
     while let Some(command) = match next_command.take() {
         Some(command) => Some(command),
@@ -389,76 +474,96 @@ async fn run_read_actor(
     } {
         match command {
             ReadCommand::Get { key, response } => {
-                let result = actor_get(&mut transaction, &codec, &limits, &key, deadline).await;
-                let terminal = result
-                    .as_ref()
-                    .err()
-                    .is_some_and(|error| error.kind() == StateStoreErrorKind::DeadlineExceeded);
-                let _ = response.send(result);
-                if terminal {
-                    disposition = ReadActorDisposition::Destroy;
-                    break;
+                match actor_get(&mut transaction, codec, limits, &key, deadline).await {
+                    Ok(record) => {
+                        let _ = response.send(Ok(record));
+                    }
+                    Err(MysqlReadStatementError::Public(error)) => {
+                        let _ = response.send(Err(error));
+                    }
+                    Err(error) => {
+                        let (error, disposition) =
+                            dispose_read_statement_error(transaction, error, deadline).await;
+                        return ReadActorExit::error(
+                            disposition,
+                            ReadCommand::Get { key, response },
+                            error,
+                        );
+                    }
                 }
             }
             ReadCommand::Range { request, response } => {
-                let result = read_range_page(
-                    &mut transaction,
-                    &codec,
-                    &request,
-                    limits.max_value_bytes,
-                    deadline,
-                )
-                .await;
-                let terminal = result
-                    .as_ref()
-                    .err()
-                    .is_some_and(|error| error.kind() == StateStoreErrorKind::DeadlineExceeded);
-                let _ = response.send(result);
-                if terminal {
-                    disposition = ReadActorDisposition::Destroy;
-                    break;
+                let result = match validate_continuation_ownership(&request, &issued_continuations)
+                {
+                    Ok(()) => {
+                        read_range_page(
+                            &mut transaction,
+                            codec,
+                            &request,
+                            limits.max_value_bytes,
+                            deadline,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(MysqlReadStatementError::Public(error)),
+                };
+                match result {
+                    Ok(page) => {
+                        if let Some(continuation) = &page.continuation {
+                            issued_continuations.insert(continuation.clone());
+                        }
+                        let _ = response.send(Ok(page));
+                    }
+                    Err(MysqlReadStatementError::Public(error)) => {
+                        let _ = response.send(Err(error));
+                    }
+                    Err(error) => {
+                        let (error, disposition) =
+                            dispose_read_statement_error(transaction, error, deadline).await;
+                        return ReadActorExit::error(
+                            disposition,
+                            ReadCommand::Range { request, response },
+                            error,
+                        );
+                    }
                 }
             }
             ReadCommand::Abort { response } => {
-                let rollback = timeout_at(deadline, transaction.rollback()).await;
-                match rollback {
+                let result = timeout_at(deadline, transaction.rollback()).await;
+                match result {
                     Ok(Ok(())) => {
                         EXPLICIT_ROLLBACKS.fetch_add(1, Ordering::Relaxed);
                         let _ = response.send(Ok(()));
-                        return ReadActorDisposition::Rollback;
+                        return ReadActorExit::complete(ReadActorDisposition::Reuse);
                     }
                     Ok(Err(error)) => {
-                        let _ = response.send(Err(
-                            super::error::MysqlNativeError::from(error).into_public()
-                        ));
-                        return ReadActorDisposition::Destroy;
+                        return ReadActorExit::error(
+                            ReadActorDisposition::Destroy,
+                            ReadCommand::Abort { response },
+                            MysqlNativeError::from(error).into_public(),
+                        );
                     }
                     Err(_) => {
-                        let _ = response.send(Err(deadline_error()));
-                        return ReadActorDisposition::Destroy;
+                        return ReadActorExit::error(
+                            ReadActorDisposition::Destroy,
+                            ReadCommand::Abort { response },
+                            deadline_error(),
+                        );
                     }
                 }
             }
         }
     }
 
-    match disposition {
-        ReadActorDisposition::Rollback => {
-            let rollback = timeout_at(
-                Instant::now() + std::time::Duration::from_secs(1),
-                transaction.rollback(),
-            )
-            .await;
-            if matches!(rollback, Ok(Ok(()))) {
-                ReadActorDisposition::Rollback
-            } else {
-                ReadActorDisposition::Destroy
-            }
-        }
-        ReadActorDisposition::Destroy => {
-            drop(transaction);
-            ReadActorDisposition::Destroy
-        }
+    let rollback = timeout_at(
+        Instant::now() + std::time::Duration::from_secs(1),
+        transaction.rollback(),
+    )
+    .await;
+    if matches!(rollback, Ok(Ok(()))) {
+        ReadActorExit::complete(ReadActorDisposition::Reuse)
+    } else {
+        ReadActorExit::complete(ReadActorDisposition::Destroy)
     }
 }
 
@@ -476,13 +581,47 @@ fn respond_read_start_error(command: ReadCommand, error: StateStoreError) {
     }
 }
 
+async fn dispose_read_statement_error(
+    transaction: Transaction<'_>,
+    error: MysqlReadStatementError,
+    deadline: Instant,
+) -> (StateStoreError, ReadActorDisposition) {
+    match error {
+        MysqlReadStatementError::Public(error) => (error, ReadActorDisposition::Reuse),
+        MysqlReadStatementError::Deadline(error) => {
+            drop(transaction);
+            (error, ReadActorDisposition::Destroy)
+        }
+        MysqlReadStatementError::Native(error) => match error.transaction_disposition() {
+            MysqlTransactionDisposition::RollbackRequired => {
+                match timeout_at(deadline, transaction.rollback()).await {
+                    Ok(Ok(())) => (error.into_public(), ReadActorDisposition::Reuse),
+                    Ok(Err(rollback_error)) => (
+                        MysqlNativeError::from(rollback_error).into_public(),
+                        ReadActorDisposition::Destroy,
+                    ),
+                    Err(_) => (deadline_error(), ReadActorDisposition::Destroy),
+                }
+            }
+            MysqlTransactionDisposition::TransactionEnded => {
+                drop(transaction);
+                (error.into_public(), ReadActorDisposition::Reuse)
+            }
+            MysqlTransactionDisposition::DestroyConnection => {
+                drop(transaction);
+                (error.into_public(), ReadActorDisposition::Destroy)
+            }
+        },
+    }
+}
+
 async fn actor_get(
     transaction: &mut Transaction<'_>,
     codec: &MysqlCodec,
     limits: &StateStoreLimits,
     key: &Key,
     deadline: Instant,
-) -> Result<Option<StateRecord>, StateStoreError> {
+) -> Result<Option<StateRecord>, MysqlReadStatementError> {
     validate_key(key, limits)?;
     let key_bytes = key.as_bytes().to_vec();
     super::client::record_statement();
@@ -498,14 +637,17 @@ async fn actor_get(
     {
         Ok(Ok(row)) => row,
         Ok(Err(error)) => {
-            return Err(super::error::MysqlNativeError::from(error).into_public());
+            return Err(MysqlReadStatementError::Native(MysqlNativeError::from(
+                error,
+            )));
         }
-        Err(_) => return Err(deadline_error()),
+        Err(_) => return Err(MysqlReadStatementError::Deadline(deadline_error())),
     };
     row.map(|(key, value, version)| {
         decode_record(codec, key, value, version, limits.max_value_bytes)
     })
     .transpose()
+    .map_err(MysqlReadStatementError::Public)
 }
 
 impl OwnedMysqlTransaction {
@@ -513,7 +655,6 @@ impl OwnedMysqlTransaction {
         pool: Arc<dyn PoolLifecycle>,
         operation: MysqlRuntimeGuard,
         deadline: Instant,
-        read_only: bool,
     ) -> Result<Self, StateStoreError> {
         let connection = checkout_hygienic_connection(pool, deadline).await?;
         let mut transaction = Self {
@@ -528,22 +669,24 @@ impl OwnedMysqlTransaction {
                 Box::pin(connection.query_drop("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
             })
             .await?;
-        let started = if read_only {
-            transaction
-                .run(|connection| {
-                    Box::pin(
-                        connection
-                            .query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY"),
-                    )
-                })
-                .await
-        } else {
-            transaction
-                .run(|connection| {
-                    Box::pin(connection.query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT"))
-                })
-                .await
-        };
+        let lock_wait_timeout_seconds = deadline
+            .saturating_duration_since(Instant::now())
+            .as_secs()
+            .saturating_div(2)
+            .max(1);
+        transaction
+            .run(move |connection| {
+                Box::pin(connection.exec_drop(
+                    "SET SESSION innodb_lock_wait_timeout = ?",
+                    (lock_wait_timeout_seconds,),
+                ))
+            })
+            .await?;
+        let started = transaction
+            .run(|connection| {
+                Box::pin(connection.query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT"))
+            })
+            .await;
         if let Err(error) = started {
             if let Some(connection) = transaction.connection.take() {
                 connection.destroy().await;
@@ -568,8 +711,22 @@ impl OwnedMysqlTransaction {
                 Ok(value)
             }
             Ok((connection, Err(error))) => {
-                self.connection = Some(connection);
-                Err(error)
+                let disposition = error.transaction_disposition();
+                match disposition {
+                    MysqlTransactionDisposition::RollbackRequired if self.active => {
+                        self.rollback_after_statement_error(connection).await?;
+                    }
+                    MysqlTransactionDisposition::TransactionEnded => {
+                        self.active = false;
+                        self.connection = Some(connection);
+                    }
+                    MysqlTransactionDisposition::RollbackRequired
+                    | MysqlTransactionDisposition::DestroyConnection => {
+                        self.active = false;
+                        connection.destroy().await;
+                    }
+                }
+                Err(error.into_public())
             }
             Err(error) => {
                 self.active = false;
@@ -588,32 +745,72 @@ impl OwnedMysqlTransaction {
         if !self.active {
             return Err(transaction_finished());
         }
-        let result = self
-            .run(|connection| Box::pin(connection.query_drop("COMMIT")))
-            .await;
+        let connection = self.connection.take().ok_or_else(transaction_finished)?;
+        self.statement_in_flight = true;
+        let result = execute_owned_with_deadline(connection, self.deadline, |connection| {
+            Box::pin(connection.query_drop("COMMIT"))
+        })
+        .await;
+        self.statement_in_flight = false;
         self.active = false;
-        if result.is_err()
-            && let Some(connection) = self.connection.take()
-        {
-            connection.destroy().await;
+        match result {
+            Ok((connection, Ok(()))) => {
+                self.connection = Some(connection);
+                Ok(())
+            }
+            Ok((connection, Err(error))) => {
+                connection.destroy().await;
+                Err(error.into_public())
+            }
+            Err(error) => Err(error),
         }
-        result
     }
 
     async fn rollback_inner(&mut self) -> Result<(), StateStoreError> {
         if !self.active {
             return Ok(());
         }
-        let result = self
-            .run(|connection| Box::pin(connection.query_drop("ROLLBACK")))
-            .await;
+        let connection = self.connection.take().ok_or_else(transaction_finished)?;
+        self.statement_in_flight = true;
+        let result = execute_owned_with_deadline(connection, self.deadline, |connection| {
+            Box::pin(connection.query_drop("ROLLBACK"))
+        })
+        .await;
+        self.statement_in_flight = false;
         self.active = false;
-        if result.is_err()
-            && let Some(connection) = self.connection.take()
-        {
-            connection.destroy().await;
+        match result {
+            Ok((connection, Ok(()))) => {
+                self.connection = Some(connection);
+                Ok(())
+            }
+            Ok((connection, Err(error))) => {
+                connection.destroy().await;
+                Err(error.into_public())
+            }
+            Err(error) => Err(error),
         }
-        result
+    }
+
+    async fn rollback_after_statement_error(
+        &mut self,
+        connection: MysqlPoolConnection,
+    ) -> Result<(), StateStoreError> {
+        let result = execute_owned_with_deadline(connection, self.deadline, |connection| {
+            Box::pin(connection.query_drop("ROLLBACK"))
+        })
+        .await;
+        self.active = false;
+        match result {
+            Ok((connection, Ok(()))) => {
+                self.connection = Some(connection);
+                Ok(())
+            }
+            Ok((connection, Err(error))) => {
+                connection.destroy().await;
+                Err(error.into_public())
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -688,7 +885,9 @@ impl ReadTransaction for MysqlReadTransaction {
 
     async fn range(&mut self, request: &RangeRequest) -> Result<RangePage, StateStoreError> {
         let started = StdInstant::now();
-        let result = validate_range(request, &self.limits).and_then(|_| Ok(request.clone()));
+        let result = validate_range(request, &self.limits)
+            .and_then(|_| validate_continuation_ownership(request, &self.issued_continuations))
+            .map(|()| request.clone());
         let result = match result {
             Ok(request) => {
                 self.request(|response| ReadCommand::Range { request, response })
@@ -699,6 +898,9 @@ impl ReadTransaction for MysqlReadTransaction {
         record_result(&self.metrics, StateStoreOperation::Range, started, &result);
         if let Ok(page) = &result {
             self.metrics.record_page_records(page.records.len() as u64);
+            if let Some(continuation) = &page.continuation {
+                self.issued_continuations.insert(continuation.clone());
+            }
         }
         result
     }
@@ -716,6 +918,12 @@ impl ReadTransaction for MysqlReadTransaction {
 }
 
 impl MysqlWriteActorState {
+    fn transaction_active(&self) -> bool {
+        self.transaction
+            .as_ref()
+            .is_some_and(|transaction| transaction.active)
+    }
+
     fn transaction(&mut self) -> Result<&mut OwnedMysqlTransaction, StateStoreError> {
         self.transaction.as_mut().ok_or_else(transaction_finished)
     }
@@ -775,6 +983,7 @@ impl MysqlWriteActorState {
 
     async fn range_inner(&mut self, request: &RangeRequest) -> Result<RangePage, StateStoreError> {
         validate_range(request, &self.limits)?;
+        validate_continuation_ownership(request, &self.issued_continuations)?;
         self.range_observed = true;
         let resume = request
             .continuation
@@ -906,10 +1115,14 @@ impl MysqlWriteActorState {
         if continuation.is_some() {
             self.range_frozen = true;
         }
-        Ok(RangePage {
+        let page = RangePage {
             records,
             continuation,
-        })
+        };
+        if let Some(continuation) = &page.continuation {
+            self.issued_continuations.insert(continuation.clone());
+        }
+        Ok(page)
     }
 
     fn put_inner(
@@ -973,7 +1186,9 @@ impl ReadTransaction for MysqlWriteTransaction {
 
     async fn range(&mut self, request: &RangeRequest) -> Result<RangePage, StateStoreError> {
         let started = StdInstant::now();
-        let result = validate_range(request, &self.limits).and_then(|_| Ok(request.clone()));
+        let result = validate_range(request, &self.limits)
+            .and_then(|_| validate_continuation_ownership(request, &self.issued_continuations))
+            .map(|()| request.clone());
         let result = match result {
             Ok(request) => {
                 self.request(|response| WriteCommand::Range { request, response })
@@ -984,6 +1199,9 @@ impl ReadTransaction for MysqlWriteTransaction {
         record_result(&self.metrics, StateStoreOperation::Range, started, &result);
         if let Ok(page) = &result {
             self.metrics.record_page_records(page.records.len() as u64);
+            if let Some(continuation) = &page.continuation {
+                self.issued_continuations.insert(continuation.clone());
+            }
         }
         result
     }
@@ -1175,8 +1393,20 @@ impl MysqlWriteActorState {
             .iter()
             .map(|(key, _)| key.clone())
             .collect::<BTreeSet<_>>();
+        #[cfg(feature = "state-store-test-hooks")]
+        {
+            touched_lock_order()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+        }
         let mut state = BTreeMap::new();
         for key in &touched {
+            #[cfg(feature = "state-store-test-hooks")]
+            touched_lock_order()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(key.as_bytes().to_vec());
             state.insert(key.clone(), self.load_current_locking(key).await?);
         }
         let original = state.clone();
@@ -1204,7 +1434,13 @@ impl MysqlWriteActorState {
         }
         let changed = touched
             .into_iter()
-            .filter(|key| logical_value(original.get(key)) != logical_value(state.get(key)))
+            .filter(|key| match self.overlay.get(key) {
+                Some(Mutation::Put { .. }) => true,
+                Some(Mutation::Delete { .. }) => {
+                    original.get(key).and_then(Option::as_ref).is_some()
+                }
+                None => false,
+            })
             .collect::<Vec<_>>();
         let next_revision = self.codec.checked_next_revision(commit_base_revision)?;
         for (sequence, key) in changed.iter().enumerate() {
@@ -1331,12 +1567,6 @@ fn precondition_matches(precondition: &Precondition, current: Option<&StateRecor
     }
 }
 
-fn logical_value(record: Option<&Option<StateRecord>>) -> Option<&[u8]> {
-    record
-        .and_then(Option::as_ref)
-        .map(|record| record.value.as_bytes())
-}
-
 fn provisional_version(transaction_id: TransactionId, operation: u64) -> VersionToken {
     VersionToken::try_from(bytes::Bytes::from(
         [
@@ -1383,6 +1613,23 @@ fn validate_range(
     validate_key(&request.range.end, limits)?;
     if let Some(continuation) = &request.continuation {
         validate_key(&continuation.resume_after(request)?, limits)?;
+    }
+    Ok(())
+}
+
+fn validate_continuation_ownership(
+    request: &RangeRequest,
+    issued_continuations: &HashSet<ContinuationToken>,
+) -> Result<(), StateStoreError> {
+    if request
+        .continuation
+        .as_ref()
+        .is_some_and(|continuation| !issued_continuations.contains(continuation))
+    {
+        return Err(StateStoreError::new(
+            StateStoreErrorKind::InvalidRequest,
+            "MySQL continuation does not belong to this transaction",
+        ));
     }
     Ok(())
 }
@@ -1477,6 +1724,61 @@ pub(crate) fn explicit_rollback_count_for_test() -> u64 {
     EXPLICIT_ROLLBACKS.load(Ordering::Relaxed)
 }
 
+#[cfg(feature = "state-store-test-hooks")]
+pub(crate) fn last_write_actor_connection_id_for_test() -> u64 {
+    LAST_WRITE_ACTOR_CONNECTION_ID.load(Ordering::Acquire)
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+pub(crate) fn last_touched_lock_order_for_test() -> Vec<Vec<u8>> {
+    touched_lock_order()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+fn touched_lock_order() -> &'static Mutex<Vec<Vec<u8>>> {
+    LAST_TOUCHED_LOCK_ORDER.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+pub(in crate::state_store) struct MysqlHeldKvLock {
+    transaction: Option<OwnedMysqlTransaction>,
+}
+
+impl MysqlHeldKvLock {
+    pub(in crate::state_store) async fn release(mut self) -> Result<(), StateStoreError> {
+        self.transaction
+            .take()
+            .ok_or_else(transaction_finished)?
+            .rollback()
+            .await
+    }
+}
+
+pub(in crate::state_store) async fn hold_kv_lock_for_test(
+    pool: Arc<dyn PoolLifecycle>,
+    operation: MysqlRuntimeGuard,
+    key: &[u8],
+    deadline: Instant,
+) -> Result<MysqlHeldKvLock, StateStoreError> {
+    let mut transaction = OwnedMysqlTransaction::begin(pool, operation, deadline).await?;
+    let key = key.to_vec();
+    transaction
+        .run(move |connection| {
+            Box::pin(connection.exec_drop(
+                "INSERT INTO state_store_kv (key_bytes, value_bytes, version_bytes)
+                 VALUES (?, ?, ?)
+                 ON DUPLICATE KEY UPDATE value_bytes = VALUES(value_bytes)",
+                (key, vec![0x7f], vec![0; 12]),
+            ))
+        })
+        .await?;
+    Ok(MysqlHeldKvLock {
+        transaction: Some(transaction),
+    })
+}
+
 pub(crate) async fn insert_malformed_kv_row_for_test(
     pool: Arc<dyn PoolLifecycle>,
     key: &[u8],
@@ -1510,8 +1812,8 @@ pub(in crate::state_store) async fn deadlock_1213_maps_to_conflict_for_test(
     deadline: Instant,
 ) -> Result<(), StateStoreError> {
     let mut first =
-        OwnedMysqlTransaction::begin(Arc::clone(&pool), first_operation, deadline, false).await?;
-    let mut second = OwnedMysqlTransaction::begin(pool, second_operation, deadline, false).await?;
+        OwnedMysqlTransaction::begin(Arc::clone(&pool), first_operation, deadline).await?;
+    let mut second = OwnedMysqlTransaction::begin(pool, second_operation, deadline).await?;
     let first_key = b"task5-deadlock-a".to_vec();
     let second_key = b"task5-deadlock-b".to_vec();
     first
@@ -1593,9 +1895,9 @@ pub(in crate::state_store) async fn lock_timeout_1205_rolls_back_before_conflict
     deadline: Instant,
 ) -> Result<(), StateStoreError> {
     let mut holder =
-        OwnedMysqlTransaction::begin(Arc::clone(&pool), first_operation, deadline, false).await?;
+        OwnedMysqlTransaction::begin(Arc::clone(&pool), first_operation, deadline).await?;
     let mut waiter =
-        OwnedMysqlTransaction::begin(Arc::clone(&pool), second_operation, deadline, false).await?;
+        OwnedMysqlTransaction::begin(Arc::clone(&pool), second_operation, deadline).await?;
     waiter
         .run(|connection| {
             Box::pin(connection.query_drop("SET SESSION innodb_lock_wait_timeout = 1"))
@@ -1645,7 +1947,7 @@ pub(in crate::state_store) async fn lock_timeout_1205_rolls_back_before_conflict
         }
     })
     .await?;
-    let persisted: Option<u8> = persisted?;
+    let persisted: Option<u8> = persisted.map_err(super::error::MysqlNativeError::into_public)?;
     drop(connection);
     if persisted.is_some() {
         return Err(StateStoreError::new(

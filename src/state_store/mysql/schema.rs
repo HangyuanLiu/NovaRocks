@@ -578,7 +578,7 @@ impl SchemaSession {
         let (connection, result) =
             execute_owned_with_deadline(connection, self.deadline, operation).await?;
         self.connection = Some(connection);
-        result
+        result.map_err(super::error::MysqlNativeError::into_public)
     }
 
     #[cfg(feature = "state-store-test-hooks")]

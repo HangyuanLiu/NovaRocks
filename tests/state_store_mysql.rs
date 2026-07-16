@@ -26,15 +26,18 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+#[cfg(feature = "state-store-test-hooks")]
+use novarocks::state_store::ContinuationToken;
 use novarocks::state_store::mysql::test_support::{
     MysqlOccTestApi, MysqlSchemaColumnSnapshot, MysqlSchemaMutation, MysqlSchemaTableSnapshot,
-    MysqlStatementTestApi, MysqlTransactionTestApi, MysqlWriteTestApi,
-    acquire_schema_advisory_lock, active_readiness, advisory_lock_name, apply_schema_mutation,
-    is_schema_advisory_lock_free, schema_snapshot, schema_timeout_connection_is_destroyed,
-    store_readiness_snapshot,
+    MysqlTransactionTestApi, MysqlWriteTestApi, acquire_schema_advisory_lock, active_readiness,
+    advisory_lock_name, apply_schema_mutation, is_schema_advisory_lock_free, schema_snapshot,
+    schema_timeout_connection_is_destroyed, store_readiness_snapshot,
 };
 #[cfg(feature = "state-store-test-hooks")]
-use novarocks::state_store::mysql::test_support::{MysqlOpenGatePhase, arm_mysql_open_gate};
+use novarocks::state_store::mysql::test_support::{
+    MysqlOpenGatePhase, MysqlStatementTestApi, arm_mysql_open_gate,
+};
 use novarocks::state_store::{
     CommitOutcome, Direction, FeDeploymentView, Key, KeyRange, MySqlClientConfig, MySqlTlsMode,
     Precondition, RangeRequest, StateStore, StateStoreConfig, StateStoreErrorKind,
@@ -893,10 +896,320 @@ async fn mysql_range_continuation_stays_in_one_snapshot_and_binds_request() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_range_decodes_extra_row_before_forward_and_reverse_pagination() {
+    let database = TestDatabase::provision(
+        "mysql_range_decodes_extra_row_before_forward_and_reverse_pagination",
+        "extra_row",
+    );
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    let forward_valid = key(Bytes::from_static(b"extra-forward-a"));
+    let forward_malformed = b"extra-forward-b";
+    let reverse_malformed = b"extra-reverse-a";
+    let reverse_valid = key(Bytes::from_static(b"extra-reverse-b"));
+    let mut seed = store
+        .begin_write(transaction_id(), "extra row corruption seed")
+        .await
+        .expect("begin extra row seed");
+    seed.put(
+        forward_valid,
+        value(Bytes::from_static(b"forward-valid")),
+        Precondition::Any,
+    )
+    .await
+    .expect("stage forward valid row");
+    seed.put(
+        reverse_valid,
+        value(Bytes::from_static(b"reverse-valid")),
+        Precondition::Any,
+    )
+    .await
+    .expect("stage reverse valid row");
+    assert_committed(seed.commit().await);
+    MysqlTransactionTestApi::insert_malformed_kv_row(
+        &runtime,
+        &database.name,
+        forward_malformed,
+        Duration::from_secs(4),
+    )
+    .await
+    .expect("insert forward malformed extra row");
+    MysqlTransactionTestApi::insert_malformed_kv_row(
+        &runtime,
+        &database.name,
+        reverse_malformed,
+        Duration::from_secs(4),
+    )
+    .await
+    .expect("insert reverse malformed extra row");
+
+    let mut reader = store.begin_read().await.expect("begin extra row reader");
+    let forward = RangeRequest {
+        range: KeyRange::new(
+            key(Bytes::from_static(b"extra-forward-")),
+            key(Bytes::from_static(b"extra-forward-z")),
+        )
+        .expect("forward extra row range"),
+        direction: Direction::Forward,
+        page_size: 1,
+        continuation: None,
+    };
+    assert_eq!(
+        reader
+            .range(&forward)
+            .await
+            .expect_err("forward malformed extra row must fail")
+            .kind(),
+        StateStoreErrorKind::Corruption
+    );
+    let reverse = RangeRequest {
+        range: KeyRange::new(
+            key(Bytes::from_static(b"extra-reverse-")),
+            key(Bytes::from_static(b"extra-reverse-z")),
+        )
+        .expect("reverse extra row range"),
+        direction: Direction::Reverse,
+        page_size: 1,
+        continuation: None,
+    };
+    assert_eq!(
+        reader
+            .range(&reverse)
+            .await
+            .expect_err("reverse malformed extra row must fail")
+            .kind(),
+        StateStoreErrorKind::Corruption
+    );
+    reader.abort().await.expect("abort extra row reader");
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_read_continuation_rejects_cross_transaction_and_cross_store_before_io() {
+    let first_database = TestDatabase::provision(
+        "mysql_read_continuation_rejects_cross_transaction_and_cross_store_before_io",
+        "first",
+    );
+    let second_database = TestDatabase::provision(
+        "mysql_read_continuation_rejects_cross_transaction_and_cross_store_before_io",
+        "second",
+    );
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let first_store = open_store(&runtime, &first_database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open first MySQL store");
+    let second_store = open_store(&runtime, &second_database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open second MySQL store");
+    let range = KeyRange::new(key([0x61, 0].to_vec()), key([0x61, 0xff].to_vec()))
+        .expect("continuation ownership range");
+    let mut seed = first_store
+        .begin_write(transaction_id(), "read continuation ownership seed")
+        .await
+        .expect("begin continuation seed");
+    for suffix in 1_u8..=3 {
+        seed.put(
+            key([0x61, suffix].to_vec()),
+            value([suffix].to_vec()),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage continuation seed");
+    }
+    assert_committed(seed.commit().await);
+    let request = RangeRequest {
+        range,
+        direction: Direction::Forward,
+        page_size: 1,
+        continuation: None,
+    };
+    let mut owner = first_store
+        .begin_read()
+        .await
+        .expect("begin continuation owner");
+    let token = owner
+        .range(&request)
+        .await
+        .expect("owner first page")
+        .continuation
+        .expect("owner continuation");
+    let retry = RangeRequest {
+        continuation: Some(token.clone()),
+        ..request.clone()
+    };
+    let first_retry = owner.range(&retry).await.expect("first same-owner retry");
+    let second_retry = owner.range(&retry).await.expect("repeat same-owner retry");
+    assert_eq!(first_retry, second_retry);
+
+    let mut other_transaction = first_store
+        .begin_read()
+        .await
+        .expect("begin other transaction");
+    let before_transaction = MysqlStatementTestApi::statement_count();
+    assert_eq!(
+        other_transaction
+            .range(&retry)
+            .await
+            .expect_err("cross-transaction continuation must reject")
+            .kind(),
+        StateStoreErrorKind::InvalidRequest
+    );
+    assert_eq!(MysqlStatementTestApi::statement_count(), before_transaction);
+
+    let mut other_store = second_store
+        .begin_read()
+        .await
+        .expect("begin other-store transaction");
+    let before_store = MysqlStatementTestApi::statement_count();
+    assert_eq!(
+        other_store
+            .range(&retry)
+            .await
+            .expect_err("cross-store continuation must reject")
+            .kind(),
+        StateStoreErrorKind::InvalidRequest
+    );
+    assert_eq!(MysqlStatementTestApi::statement_count(), before_store);
+
+    let forged = RangeRequest {
+        continuation: Some(
+            ContinuationToken::try_from(Bytes::from_static(b"forged"))
+                .expect("opaque continuation"),
+        ),
+        ..request
+    };
+    let before_forged = MysqlStatementTestApi::statement_count();
+    assert_eq!(
+        owner
+            .range(&forged)
+            .await
+            .expect_err("forged continuation must reject")
+            .kind(),
+        StateStoreErrorKind::InvalidRequest
+    );
+    assert_eq!(MysqlStatementTestApi::statement_count(), before_forged);
+    owner.abort().await.expect("abort owner");
+    other_transaction
+        .abort()
+        .await
+        .expect("abort other transaction");
+    other_store.abort().await.expect("abort other store");
+    drop(first_store);
+    drop(second_store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_write_continuation_rejects_cross_transaction_and_cross_store_before_io() {
+    let first_database = TestDatabase::provision(
+        "mysql_write_continuation_rejects_cross_transaction_and_cross_store_before_io",
+        "first",
+    );
+    let second_database = TestDatabase::provision(
+        "mysql_write_continuation_rejects_cross_transaction_and_cross_store_before_io",
+        "second",
+    );
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let first_store = open_store(&runtime, &first_database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open first MySQL store");
+    let second_store = open_store(&runtime, &second_database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open second MySQL store");
+    let range = KeyRange::new(key([0x62, 0].to_vec()), key([0x62, 0xff].to_vec()))
+        .expect("write continuation ownership range");
+    let mut seed = first_store
+        .begin_write(transaction_id(), "write continuation ownership seed")
+        .await
+        .expect("begin write continuation seed");
+    for suffix in 1_u8..=3 {
+        seed.put(
+            key([0x62, suffix].to_vec()),
+            value([suffix].to_vec()),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage write continuation seed");
+    }
+    assert_committed(seed.commit().await);
+    let request = RangeRequest {
+        range,
+        direction: Direction::Forward,
+        page_size: 1,
+        continuation: None,
+    };
+    let mut owner = first_store
+        .begin_write(transaction_id(), "write continuation owner")
+        .await
+        .expect("begin write continuation owner");
+    let token = owner
+        .range(&request)
+        .await
+        .expect("write owner first page")
+        .continuation
+        .expect("write owner continuation");
+    let retry = RangeRequest {
+        continuation: Some(token),
+        ..request
+    };
+    owner.range(&retry).await.expect("same write actor retry");
+
+    let mut other_transaction = first_store
+        .begin_write(transaction_id(), "other write transaction")
+        .await
+        .expect("begin other write transaction");
+    let before_transaction = MysqlStatementTestApi::statement_count();
+    assert_eq!(
+        other_transaction
+            .range(&retry)
+            .await
+            .expect_err("write cross-transaction continuation must reject")
+            .kind(),
+        StateStoreErrorKind::InvalidRequest
+    );
+    assert_eq!(MysqlStatementTestApi::statement_count(), before_transaction);
+
+    let mut other_store = second_store
+        .begin_write(transaction_id(), "other store write transaction")
+        .await
+        .expect("begin other-store write transaction");
+    let before_store = MysqlStatementTestApi::statement_count();
+    assert_eq!(
+        other_store
+            .range(&retry)
+            .await
+            .expect_err("write cross-store continuation must reject")
+            .kind(),
+        StateStoreErrorKind::InvalidRequest
+    );
+    assert_eq!(MysqlStatementTestApi::statement_count(), before_store);
+    owner.abort().await.expect("abort write owner");
+    other_transaction
+        .abort()
+        .await
+        .expect("abort other write transaction");
+    other_store.abort().await.expect("abort other store write");
+    drop(first_store);
+    drop(second_store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mysql_shared_limits_before_io() {
     let database = TestDatabase::provision("mysql_shared_limits_before_io", "limits");
     let mut runtime =
         StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let max_transaction_bytes = MysqlWriteTestApi::transaction_envelope_bytes()
+        + 4 * MysqlWriteTestApi::put_accounted_bytes(&[11, 0xfe, 1], &[0; 32], &Precondition::Any)
+            .expect("physical conformance put budget");
     let config = transaction_store_config(
         &database.name,
         StateStoreLimitOverrides {
@@ -904,7 +1217,7 @@ async fn mysql_shared_limits_before_io() {
             max_value_bytes: Some(32),
             max_page_size: Some(2),
             max_transaction_operations: Some(4),
-            max_transaction_bytes: Some(256),
+            max_transaction_bytes: Some(max_transaction_bytes),
             transaction_deadline_ms: Some(4_000),
             runner_max_attempts: Some(2),
         },
@@ -974,7 +1287,6 @@ async fn mysql_read_rejects_malformed_persisted_rows_as_corruption() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mysql_write_overlay_is_ordered_and_read_your_writes() {
-    MysqlWriteTestApi::assert_task5_api();
     let database = TestDatabase::provision(
         "mysql_write_overlay_is_ordered_and_read_your_writes",
         "overlay",
@@ -984,51 +1296,62 @@ async fn mysql_write_overlay_is_ordered_and_read_your_writes() {
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
-    let item = key(Bytes::from_static(b"ordered-overlay"));
+    let keys = (1_u8..=5)
+        .map(|suffix| key([0x43, suffix].to_vec()))
+        .collect::<Vec<_>>();
+    let mut seed = store
+        .begin_write(transaction_id(), "ordered overlay seed")
+        .await
+        .expect("begin ordered overlay seed");
+    for suffix in 1_u8..=4 {
+        seed.put(
+            keys[usize::from(suffix - 1)].clone(),
+            value([suffix].to_vec()),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage ordered overlay seed");
+    }
+    assert_committed(seed.commit().await);
     let mut writer = store
         .begin_write(transaction_id(), "ordered overlay")
         .await
         .expect("begin ordered overlay");
     writer
         .put(
-            item.clone(),
-            value(Bytes::from_static(b"first")),
-            Precondition::Absent,
+            keys[1].clone(),
+            value(Bytes::from_static(b"intermediate")),
+            Precondition::Any,
         )
         .await
-        .expect("stage first put");
-    assert_eq!(
-        writer
-            .get(&item)
-            .await
-            .expect("read first overlay")
-            .expect("first overlay record")
-            .value
-            .as_bytes(),
-        b"first"
-    );
+        .expect("stage repeated key put");
     writer
-        .delete(item.clone(), Precondition::Present)
+        .delete(keys[1].clone(), Precondition::Any)
         .await
-        .expect("stage delete");
-    assert!(
-        writer
-            .get(&item)
-            .await
-            .expect("read delete overlay")
-            .is_none()
-    );
+        .expect("stage repeated key delete");
     writer
         .put(
-            item.clone(),
+            keys[1].clone(),
             value(Bytes::from_static(b"final")),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage repeated key final put");
+    writer
+        .delete(keys[2].clone(), Precondition::Any)
+        .await
+        .expect("stage base delete");
+    writer
+        .put(
+            keys[4].clone(),
+            value(Bytes::from_static(b"inserted")),
             Precondition::Absent,
         )
         .await
-        .expect("stage final put");
+        .expect("stage overlay insert");
     assert_eq!(
         writer
-            .get(&item)
+            .get(&keys[1])
             .await
             .expect("read final overlay")
             .expect("final overlay record")
@@ -1036,18 +1359,124 @@ async fn mysql_write_overlay_is_ordered_and_read_your_writes() {
             .as_bytes(),
         b"final"
     );
+    assert!(
+        writer
+            .get(&keys[2])
+            .await
+            .expect("read deleted overlay")
+            .is_none()
+    );
+    let range = KeyRange::new(key([0x43, 0].to_vec()), key([0x43, 0xff].to_vec()))
+        .expect("ordered overlay range");
+    let forward_first_request = RangeRequest {
+        range: range.clone(),
+        direction: Direction::Forward,
+        page_size: 2,
+        continuation: None,
+    };
+    let forward_first = writer
+        .range(&forward_first_request)
+        .await
+        .expect("read first forward overlay page");
+    assert_eq!(
+        forward_first
+            .records
+            .iter()
+            .map(|record| record.key.clone())
+            .collect::<Vec<_>>(),
+        vec![keys[0].clone(), keys[1].clone()]
+    );
+    let forward_second = writer
+        .range(&RangeRequest {
+            continuation: forward_first.continuation,
+            ..forward_first_request
+        })
+        .await
+        .expect("read second forward overlay page");
+    assert_eq!(
+        forward_second
+            .records
+            .iter()
+            .map(|record| record.key.clone())
+            .collect::<Vec<_>>(),
+        vec![keys[3].clone(), keys[4].clone()]
+    );
+    assert!(forward_second.continuation.is_none());
+    let reverse_first_request = RangeRequest {
+        range,
+        direction: Direction::Reverse,
+        page_size: 2,
+        continuation: None,
+    };
+    let reverse_first = writer
+        .range(&reverse_first_request)
+        .await
+        .expect("read first reverse overlay page");
+    assert_eq!(
+        reverse_first
+            .records
+            .iter()
+            .map(|record| record.key.clone())
+            .collect::<Vec<_>>(),
+        vec![keys[4].clone(), keys[3].clone()]
+    );
+    let reverse_second = writer
+        .range(&RangeRequest {
+            continuation: reverse_first.continuation,
+            ..reverse_first_request
+        })
+        .await
+        .expect("read second reverse overlay page");
+    assert_eq!(
+        reverse_second
+            .records
+            .iter()
+            .map(|record| record.key.clone())
+            .collect::<Vec<_>>(),
+        vec![keys[1].clone(), keys[0].clone()]
+    );
+    assert!(reverse_second.continuation.is_none());
+    assert_eq!(
+        writer
+            .put(
+                key([0x43, 6].to_vec()),
+                value([6].to_vec()),
+                Precondition::Any,
+            )
+            .await
+            .expect_err("pagination must freeze later mutations")
+            .kind(),
+        StateStoreErrorKind::InvalidRequest
+    );
     assert_committed(writer.commit().await);
 
     let mut reader = store.begin_read().await.expect("begin persisted read");
     assert_eq!(
         reader
-            .get(&item)
+            .get(&keys[1])
             .await
             .expect("read persisted final")
             .expect("persisted final record")
             .value
             .as_bytes(),
         b"final"
+    );
+    assert!(
+        reader
+            .get(&keys[2])
+            .await
+            .expect("read persisted delete")
+            .is_none()
+    );
+    assert_eq!(
+        reader
+            .get(&keys[4])
+            .await
+            .expect("read persisted insert")
+            .expect("persisted insert exists")
+            .value
+            .as_bytes(),
+        b"inserted"
     );
     reader.abort().await.expect("abort persisted read");
     drop(store);
@@ -1215,7 +1644,13 @@ async fn mysql_write_budget_accepts_and_rejects_exact_boundaries() {
             &database.name,
             StateStoreLimitOverrides {
                 max_transaction_operations: Some(2),
-                max_transaction_bytes: Some(64),
+                max_transaction_bytes: Some(
+                    MysqlWriteTestApi::transaction_envelope_bytes()
+                        + MysqlWriteTestApi::delete_accounted_bytes(b"a", &Precondition::Any)
+                            .expect("first delete accounting")
+                        + MysqlWriteTestApi::delete_accounted_bytes(b"b", &Precondition::Absent)
+                            .expect("second delete accounting"),
+                ),
                 transaction_deadline_ms: Some(4_000),
                 ..StateStoreLimitOverrides::default()
             },
@@ -1229,13 +1664,9 @@ async fn mysql_write_budget_accepts_and_rejects_exact_boundaries() {
         .await
         .expect("begin exact budget");
     writer
-        .put(
-            key(Bytes::from_static(b"a")),
-            value(Bytes::from_static(b"1234567890")),
-            Precondition::Any,
-        )
+        .delete(key(Bytes::from_static(b"a")), Precondition::Any)
         .await
-        .expect("stage first exact-budget put");
+        .expect("stage first exact-budget delete");
     writer
         .delete(key(Bytes::from_static(b"b")), Precondition::Absent)
         .await
@@ -1254,6 +1685,126 @@ async fn mysql_write_budget_accepts_and_rejects_exact_boundaries() {
     );
     assert_committed(writer.commit().await);
     drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mysql_write_budget_rejects_fixed_envelope_before_io() {
+    let database = TestDatabase::provision(
+        "mysql_write_budget_rejects_fixed_envelope_before_io",
+        "envelope",
+    );
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let envelope = MysqlWriteTestApi::transaction_envelope_bytes();
+    let under = open_state_store(
+        &runtime,
+        transaction_store_config(
+            &database.name,
+            StateStoreLimitOverrides {
+                max_transaction_operations: Some(100),
+                max_transaction_bytes: Some(envelope - 1),
+                transaction_deadline_ms: Some(4_000),
+                ..StateStoreLimitOverrides::default()
+            },
+        ),
+        deployment(),
+    )
+    .await
+    .expect("open under-envelope store");
+    let before = MysqlStatementTestApi::statement_count();
+    let error = match under
+        .begin_write(transaction_id(), "under fixed envelope")
+        .await
+    {
+        Ok(_) => panic!("fixed envelope minus one must reject"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), StateStoreErrorKind::LimitExceeded);
+    assert_eq!(MysqlStatementTestApi::statement_count(), before);
+    drop(under);
+
+    let exact = open_state_store(
+        &runtime,
+        transaction_store_config(
+            &database.name,
+            StateStoreLimitOverrides {
+                max_transaction_operations: Some(100),
+                max_transaction_bytes: Some(envelope),
+                transaction_deadline_ms: Some(4_000),
+                ..StateStoreLimitOverrides::default()
+            },
+        ),
+        deployment(),
+    )
+    .await
+    .expect("open exact-envelope store");
+    let writer = exact
+        .begin_write(transaction_id(), "exact fixed envelope")
+        .await
+        .expect("exact fixed envelope begins");
+    assert_committed(writer.commit().await);
+    drop(exact);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mysql_write_budget_accepts_exact_mutation_and_rejects_plus_one_before_io() {
+    let database = TestDatabase::provision(
+        "mysql_write_budget_accepts_exact_mutation_and_rejects_plus_one_before_io",
+        "mutation_budget",
+    );
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let item = b"exact-mutation";
+    let exact_value = vec![0x41; 16];
+    let exact_budget = MysqlWriteTestApi::transaction_envelope_bytes()
+        + MysqlWriteTestApi::put_accounted_bytes(item, &exact_value, &Precondition::Any)
+            .expect("exact put accounting");
+
+    for (value_bytes, should_fit) in [(15_usize, true), (16, true), (17, false)] {
+        let store = open_state_store(
+            &runtime,
+            transaction_store_config(
+                &database.name,
+                StateStoreLimitOverrides {
+                    max_transaction_operations: Some(100),
+                    max_transaction_bytes: Some(exact_budget),
+                    transaction_deadline_ms: Some(4_000),
+                    ..StateStoreLimitOverrides::default()
+                },
+            ),
+            deployment(),
+        )
+        .await
+        .expect("open exact-mutation store");
+        let mut writer = store
+            .begin_write(transaction_id(), "exact mutation boundary")
+            .await
+            .expect("begin exact-mutation writer");
+        let before = MysqlStatementTestApi::statement_count();
+        let result = writer
+            .put(
+                key(item.to_vec()),
+                value(vec![0x41; value_bytes]),
+                Precondition::Any,
+            )
+            .await;
+        assert_eq!(MysqlStatementTestApi::statement_count(), before);
+        if should_fit {
+            result.expect("mutation at or below exact boundary");
+            assert_committed(writer.commit().await);
+        } else {
+            assert_eq!(
+                result.expect_err("mutation plus one must reject").kind(),
+                StateStoreErrorKind::LimitExceeded
+            );
+            writer.abort().await.expect("abort rejected writer");
+        }
+        drop(store);
+    }
     runtime.shutdown().await.expect("shutdown MySQL runtime");
 }
 
@@ -1621,9 +2172,11 @@ async fn mysql_touched_keys_lock_in_stable_byte_order() {
         .begin_write(transaction_id(), "stable locks second")
         .await
         .expect("begin stable locks second");
+    #[cfg(feature = "state-store-test-hooks")]
+    let expected_lock_order = vec![low.as_bytes().to_vec(), high.as_bytes().to_vec()];
     second
         .put(
-            low,
+            low.clone(),
             value(Bytes::from_static(b"second-low")),
             Precondition::Any,
         )
@@ -1631,14 +2184,24 @@ async fn mysql_touched_keys_lock_in_stable_byte_order() {
         .expect("stage second low");
     second
         .put(
-            high,
+            high.clone(),
             value(Bytes::from_static(b"second-high")),
             Precondition::Any,
         )
         .await
         .expect("stage second high");
     assert_committed(first.commit().await);
+    #[cfg(feature = "state-store-test-hooks")]
+    assert_eq!(
+        MysqlOccTestApi::last_touched_lock_order(),
+        expected_lock_order
+    );
     assert_committed(second.commit().await);
+    #[cfg(feature = "state-store-test-hooks")]
+    assert_eq!(
+        MysqlOccTestApi::last_touched_lock_order(),
+        expected_lock_order
+    );
     drop(store);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
 }
@@ -1686,6 +2249,144 @@ async fn mysql_commit_replays_multiple_preconditions_in_call_order() {
         .await
         .expect("stage final absent put");
     assert_committed(writer.commit().await);
+
+    let guarded = key(Bytes::from_static(b"ordered-preconditions-guarded"));
+    let mut seed = store
+        .begin_write(transaction_id(), "ordered precondition failure seed")
+        .await
+        .expect("begin ordered failure seed");
+    seed.put(
+        guarded.clone(),
+        value(Bytes::from_static(b"original")),
+        Precondition::Any,
+    )
+    .await
+    .expect("stage ordered failure seed");
+    assert_committed(seed.commit().await);
+    let mut reader = store
+        .begin_read()
+        .await
+        .expect("begin original version read");
+    let original = reader
+        .get(&guarded)
+        .await
+        .expect("read original guarded value")
+        .expect("guarded value exists");
+    reader.abort().await.expect("abort original version read");
+    let mut failing = store
+        .begin_write(transaction_id(), "ordered intermediate failure")
+        .await
+        .expect("begin ordered intermediate failure");
+    failing
+        .put(
+            guarded.clone(),
+            value(Bytes::from_static(b"intermediate")),
+            Precondition::Version(original.version.clone()),
+        )
+        .await
+        .expect("stage valid first ordered mutation");
+    failing
+        .delete(
+            guarded.clone(),
+            Precondition::Version(original.version.clone()),
+        )
+        .await
+        .expect("stage invalid intermediate ordered mutation");
+    failing
+        .put(
+            guarded.clone(),
+            value(Bytes::from_static(b"must-not-win")),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage final mutation after invalid intermediate");
+    assert!(matches!(
+        failing.commit().await,
+        CommitOutcome::Conflict(ref error)
+            if error.kind() == StateStoreErrorKind::PreconditionFailed
+    ));
+    let mut reader = store
+        .begin_read()
+        .await
+        .expect("begin failed order verification");
+    assert_eq!(
+        reader
+            .get(&guarded)
+            .await
+            .expect("read guarded value after conflict")
+            .expect("guarded value remains")
+            .value,
+        original.value
+    );
+    reader
+        .abort()
+        .await
+        .expect("abort failed order verification");
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_same_value_put_assigns_new_version_and_conflicts_stale_observer() {
+    let database = TestDatabase::provision(
+        "mysql_same_value_put_assigns_new_version_and_conflicts_stale_observer",
+        "same_value",
+    );
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    let item = key(Bytes::from_static(b"same-value-version"));
+    let payload = value(Bytes::from_static(b"unchanged"));
+    let mut seed = store
+        .begin_write(transaction_id(), "same value seed")
+        .await
+        .expect("begin same value seed");
+    seed.put(item.clone(), payload.clone(), Precondition::Any)
+        .await
+        .expect("stage same value seed");
+    assert_committed(seed.commit().await);
+    let mut stale = store
+        .begin_write(transaction_id(), "same value stale observer")
+        .await
+        .expect("begin stale observer");
+    let original = stale
+        .get(&item)
+        .await
+        .expect("read original same value")
+        .expect("same value seed exists");
+    stale
+        .put(
+            item.clone(),
+            value(Bytes::from_static(b"stale-write")),
+            Precondition::Version(original.version.clone()),
+        )
+        .await
+        .expect("stage stale observer write");
+    let mut same_value = store
+        .begin_write(transaction_id(), "same value replacement")
+        .await
+        .expect("begin same value replacement");
+    same_value
+        .put(item.clone(), payload.clone(), Precondition::Any)
+        .await
+        .expect("stage same value replacement");
+    assert_committed(same_value.commit().await);
+    let mut reader = store.begin_read().await.expect("begin same value read");
+    let replaced = reader
+        .get(&item)
+        .await
+        .expect("read same value replacement")
+        .expect("same value replacement exists");
+    assert_eq!(replaced.value, payload);
+    assert_ne!(replaced.version, original.version);
+    reader.abort().await.expect("abort same value read");
+    assert!(matches!(
+        stale.commit().await,
+        CommitOutcome::Conflict(ref error)
+            if error.kind() == StateStoreErrorKind::Conflict
+    ));
     drop(store);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
 }
@@ -1720,33 +2421,111 @@ async fn mysql_lock_timeout_1205_rolls_back_before_conflict() {
     let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
         .await
         .expect("open MySQL transaction store");
-    MysqlOccTestApi::lock_timeout_1205_rolls_back_before_conflict(
+    let locked_key = key(Bytes::from_static(b"public-1205-lock"));
+    let holder = MysqlOccTestApi::hold_kv_lock(
         &runtime,
         &database.name,
+        locked_key.as_bytes(),
         Duration::from_secs(8),
     )
     .await
-    .expect("lock timeout mapping and rollback");
+    .expect("hold physical MySQL key lock");
+    let mut writer = store
+        .begin_write(transaction_id(), "public 1205 actor")
+        .await
+        .expect("begin public lock waiter");
+    writer
+        .put(
+            locked_key.clone(),
+            value(Bytes::from_static(b"must-not-persist")),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage blocked public put");
+    let outcome = writer.commit().await;
+    assert!(
+        matches!(
+            outcome,
+            CommitOutcome::Conflict(ref error)
+                if error.kind() == StateStoreErrorKind::Conflict
+        ),
+        "{outcome:?}"
+    );
+    holder.release().await.expect("release physical key lock");
+    let mut reader = store.begin_read().await.expect("begin verification read");
+    assert!(
+        reader
+            .get(&locked_key)
+            .await
+            .expect("read timed-out public key")
+            .is_none()
+    );
+    reader.abort().await.expect("abort verification read");
     drop(store);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
 }
 
 #[cfg(feature = "state-store-test-hooks")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mysql_statement_deadline_destroys_undrained_connection() {
     let database = TestDatabase::provision(
         "mysql_statement_deadline_destroys_undrained_connection",
         "statement_deadline",
     );
     let mut client = fixture_client_config();
-    client.pool_max = 1;
+    client.pool_max = 2;
     let mut runtime = StateStoreRuntime::mysql(client).expect("construct MySQL runtime");
-    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 400)
         .await
         .expect("open MySQL transaction store");
-    MysqlOccTestApi::statement_deadline_destroys_undrained_connection(&runtime, &database.name)
+    let locked_key = key(Bytes::from_static(b"public-deadline-lock"));
+    let holder = MysqlOccTestApi::hold_kv_lock(
+        &runtime,
+        &database.name,
+        locked_key.as_bytes(),
+        Duration::from_secs(8),
+    )
+    .await
+    .expect("hold physical MySQL key lock");
+    let mut writer = store
+        .begin_write(transaction_id(), "public deadline actor")
         .await
-        .expect("statement deadline disposition");
+        .expect("begin public deadline waiter");
+    let actor_connection_id = MysqlStatementTestApi::last_write_actor_connection_id();
+    assert_ne!(actor_connection_id, 0);
+    writer
+        .put(
+            locked_key.clone(),
+            value(Bytes::from_static(b"must-not-persist")),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage deadline-blocked public put");
+    let outcome = writer.commit().await;
+    assert!(
+        matches!(
+            outcome,
+            CommitOutcome::DefiniteFailure(ref error)
+                if error.kind() == StateStoreErrorKind::DeadlineExceeded
+        ),
+        "{outcome:?}"
+    );
+    let replacement_connection_id =
+        active_readiness(&runtime, &database.name, Duration::from_secs(4))
+            .await
+            .expect("checkout replacement after actor deadline")
+            .connection_id;
+    assert_ne!(replacement_connection_id, actor_connection_id);
+    holder.release().await.expect("release physical key lock");
+    let mut reader = store.begin_read().await.expect("begin verification read");
+    assert!(
+        reader
+            .get(&locked_key)
+            .await
+            .expect("read deadline public key")
+            .is_none()
+    );
+    reader.abort().await.expect("abort verification read");
     drop(store);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
 }
