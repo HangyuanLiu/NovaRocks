@@ -171,7 +171,7 @@ pub(crate) fn project_install_views(
             for (participant, bindings) in &cg.producers {
                 for binding in bindings {
                     let Some(_witness) = spec.producer_witness.get(binding) else {
-                        return Err(DeploymentError::InvalidRoutingShard {
+                        return Err(DeploymentError::InvalidInstallProjection {
                             detail: format!(
                                 "runtime filter aggregator projection missing producer witness \
                                  for channel {} binding {}",
@@ -182,7 +182,7 @@ pub(crate) fn project_install_views(
                     };
                     let Some(expected) = instances.get(&(*channel_id, *binding, *participant))
                     else {
-                        return Err(DeploymentError::InvalidRoutingShard {
+                        return Err(DeploymentError::InvalidInstallProjection {
                             detail: format!(
                                 "runtime filter aggregator projection missing producer placement \
                                  for channel {} binding {} participant {}",
@@ -193,7 +193,7 @@ pub(crate) fn project_install_views(
                         });
                     };
                     if expected.is_empty() {
-                        return Err(DeploymentError::InvalidRoutingShard {
+                        return Err(DeploymentError::InvalidInstallProjection {
                             detail: format!(
                                 "runtime filter aggregator projection missing producer placement \
                                  for channel {} binding {} participant {}",
@@ -417,18 +417,25 @@ mod tests {
     ) {
         let channel_id = ChannelId::new(5);
         let producer_binding = BindingId::new(10);
+        let second_producer_binding = BindingId::new(20);
         let consumer_binding = BindingId::new(11);
         let aggregator = pid(2);
         let remote_producer = pid(7);
+        let second_remote_producer = pid(13);
         let remote_consumer = pid(11);
 
         let mut channel = ChannelRoleGraph::empty(channel_id);
         channel
             .producers
             .insert(aggregator, BTreeSet::from([producer_binding]));
-        channel
-            .producers
-            .insert(remote_producer, BTreeSet::from([producer_binding]));
+        channel.producers.insert(
+            remote_producer,
+            BTreeSet::from([producer_binding, second_producer_binding]),
+        );
+        channel.producers.insert(
+            second_remote_producer,
+            BTreeSet::from([second_producer_binding]),
+        );
         channel
             .consumers
             .insert(remote_consumer, BTreeSet::from([consumer_binding]));
@@ -436,6 +443,19 @@ mod tests {
         channel.routes.push(RouteEdge {
             channel: channel_id,
             edge_id: RouteEdgeId::new(1),
+            kind: RouteKind::ToAggregator,
+            from: RouteEndpoint {
+                participant: aggregator,
+                binding: producer_binding,
+            },
+            to: RouteEndpoint {
+                participant: aggregator,
+                binding: producer_binding,
+            },
+        });
+        channel.routes.push(RouteEdge {
+            channel: channel_id,
+            edge_id: RouteEdgeId::new(2),
             kind: RouteKind::ToAggregator,
             from: RouteEndpoint {
                 participant: remote_producer,
@@ -448,7 +468,33 @@ mod tests {
         });
         channel.routes.push(RouteEdge {
             channel: channel_id,
-            edge_id: RouteEdgeId::new(2),
+            edge_id: RouteEdgeId::new(3),
+            kind: RouteKind::ToAggregator,
+            from: RouteEndpoint {
+                participant: remote_producer,
+                binding: second_producer_binding,
+            },
+            to: RouteEndpoint {
+                participant: aggregator,
+                binding: second_producer_binding,
+            },
+        });
+        channel.routes.push(RouteEdge {
+            channel: channel_id,
+            edge_id: RouteEdgeId::new(4),
+            kind: RouteKind::ToAggregator,
+            from: RouteEndpoint {
+                participant: second_remote_producer,
+                binding: second_producer_binding,
+            },
+            to: RouteEndpoint {
+                participant: aggregator,
+                binding: second_producer_binding,
+            },
+        });
+        channel.routes.push(RouteEdge {
+            channel: channel_id,
+            edge_id: RouteEdgeId::new(5),
             kind: RouteKind::FromAggregator,
             from: RouteEndpoint {
                 participant: aggregator,
@@ -470,16 +516,28 @@ mod tests {
                 BTreeSet::from([finst(7)]),
             ),
             (
+                (channel_id, second_producer_binding, remote_producer),
+                BTreeSet::from([finst(17)]),
+            ),
+            (
+                (channel_id, second_producer_binding, second_remote_producer),
+                BTreeSet::from([finst(13)]),
+            ),
+            (
                 (channel_id, consumer_binding, remote_consumer),
                 BTreeSet::from([finst(11)]),
             ),
         ]);
+        let mut channel_spec = membership_channel(5);
+        channel_spec
+            .producer_witness
+            .insert(second_producer_binding, CoverageWitnessId::new(2));
 
         (
             RoleGraph {
                 channels: BTreeMap::from([(channel_id, channel)]),
             },
-            BTreeMap::from([(channel_id, membership_channel(5))]),
+            BTreeMap::from([(channel_id, channel_spec)]),
             BTreeMap::from([membership_consumer_facts(11)]),
             instances,
         )
@@ -509,6 +567,11 @@ mod tests {
             aggregator_producer.expected_fragment_instances(),
             &BTreeSet::from([finst(2), finst(7)])
         );
+        assert_eq!(
+            views[&pid(2)].channels()[&ChannelId::new(5)].producers()[&BindingId::new(20)]
+                .expected_fragment_instances(),
+            &BTreeSet::from([finst(13), finst(17)])
+        );
     }
 
     #[test]
@@ -531,6 +594,16 @@ mod tests {
             views[&pid(7)].channels()[&ChannelId::new(5)].producers()[&BindingId::new(10)]
                 .expected_fragment_instances(),
             &BTreeSet::from([finst(7)])
+        );
+        assert_eq!(
+            views[&pid(7)].channels()[&ChannelId::new(5)].producers()[&BindingId::new(20)]
+                .expected_fragment_instances(),
+            &BTreeSet::from([finst(17)])
+        );
+        assert_eq!(
+            views[&pid(13)].channels()[&ChannelId::new(5)].producers()[&BindingId::new(20)]
+                .expected_fragment_instances(),
+            &BTreeSet::from([finst(13)])
         );
     }
 
@@ -564,7 +637,7 @@ mod tests {
 
         assert!(matches!(
             err,
-            DeploymentError::InvalidRoutingShard { detail }
+            DeploymentError::InvalidInstallProjection { detail }
                 if detail.contains("producer witness")
         ));
     }
@@ -588,7 +661,7 @@ mod tests {
 
         assert!(matches!(
             err,
-            DeploymentError::InvalidRoutingShard { detail }
+            DeploymentError::InvalidInstallProjection { detail }
                 if detail.contains("producer placement")
         ));
     }

@@ -82,6 +82,8 @@ pub(crate) enum DeploymentError {
     },
     /// A projected routing shard violates the native routing DTO contract.
     InvalidRoutingShard { detail: String },
+    /// A projected Core install view is incomplete or internally inconsistent.
+    InvalidInstallProjection { detail: String },
     /// The fragment edges supplied to the compiler formed a cycle; the
     /// execution dependency graph could not be built.
     FragmentCycle,
@@ -144,6 +146,9 @@ impl fmt::Display for DeploymentError {
             }
             Self::InvalidRoutingShard { detail } => {
                 write!(f, "invalid runtime filter routing shard: {detail}")
+            }
+            Self::InvalidInstallProjection { detail } => {
+                write!(f, "invalid runtime filter install projection: {detail}")
             }
             Self::FragmentCycle => {
                 write!(f, "fragment execution dependency graph contains a cycle")

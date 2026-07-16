@@ -103,6 +103,11 @@ pub(crate) fn compile(
                 .ok_or(DeploymentError::MissingPlacement {
                     fragment: binding.location.fragment_id,
                 })?;
+        if placements.is_empty() {
+            return Err(DeploymentError::MissingPlacement {
+                fragment: binding.location.fragment_id,
+            });
+        }
         let mut participants: BTreeSet<RuntimeFilterParticipantId> = BTreeSet::new();
         for p in placements {
             if !known_backends.contains(&p.backend_idx) {
@@ -774,6 +779,29 @@ mod tests {
             ),
             Err(DeploymentError::DuplicateBackend { backend_idx: 7 })
         ));
+    }
+
+    #[test]
+    fn compiler_rejects_fragment_with_empty_placements() {
+        let (graph, mut scheduling, edges, backends, policy) = all_of_compiler_fixture();
+        scheduling.by_fragment.insert(2, Vec::new());
+
+        let err = compile(
+            &graph,
+            &scheduling,
+            &edges,
+            &backends,
+            &policy,
+            DeploymentEpoch::new(9),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            DeploymentError::MissingPlacement {
+                fragment: PlanFragmentId::new(2)
+            }
+        );
     }
 
     #[test]
