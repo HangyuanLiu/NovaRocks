@@ -16,7 +16,11 @@
 // under the License.
 
 pub(crate) mod identifier;
+pub(crate) mod memory;
 pub(crate) mod partition;
 pub(crate) mod provider;
+pub(crate) mod registry;
 pub(crate) mod schema;
+pub(crate) mod schema_cache;
+pub(crate) mod service;
 pub(crate) mod table;
