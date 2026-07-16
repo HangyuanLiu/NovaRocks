@@ -20590,6 +20590,13 @@ fn rfd4_m1_runtime_filter_envelope_schema_is_typed_and_additive() {
             ),
             (6, "schema_digest", "bytes", "singular", None),
             (7, "payload", "bytes", "singular", None),
+            (
+                8,
+                "producer_open",
+                "RuntimeFilterProducerOpenMetadata",
+                "singular",
+                None,
+            ),
         ]
     );
     assert_eq!(
@@ -20808,6 +20815,49 @@ fn rfd4_m1_runtime_filter_envelope_schema_is_typed_and_additive() {
     .expect("runtime-filter envelope schema region comments should parse");
     assert!(!envelope_region.contains("is_partial"), "{envelope_region}");
     assert!(!envelope_region.contains("starrocks"), "{envelope_region}");
+}
+
+#[test]
+fn rfd4_m2b2_proto_declares_exact_producer_open_metadata() {
+    let schema =
+        parse_current_novarocks_proto_schema().expect("current native proto schema should parse");
+    let filter = &schema.files["idl/novarocks/filter.proto"];
+    let metadata = filter
+        .messages
+        .get("RuntimeFilterProducerOpenMetadata")
+        .expect("producer-open metadata message must exist");
+
+    assert_eq!(
+        metadata
+            .fields
+            .values()
+            .map(|field| (
+                field.number,
+                field.name.as_str(),
+                field.type_name.as_str(),
+                field.label.as_str(),
+                field.oneof.as_deref(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![(1, "local_partition_count", "uint32", "singular", None,)]
+    );
+}
+
+#[test]
+fn rfd4_m2b2_envelope_schema_adds_producer_open_at_field_eight() {
+    let schema =
+        parse_current_novarocks_proto_schema().expect("current native proto schema should parse");
+    let filter = &schema.files["idl/novarocks/filter.proto"];
+    let envelope = &filter.messages["RuntimeFilterEnvelope"];
+    let producer_open = envelope
+        .fields
+        .get(&8)
+        .expect("envelope producer_open field must exist");
+
+    assert_eq!(producer_open.number, 8);
+    assert_eq!(producer_open.type_name, "RuntimeFilterProducerOpenMetadata");
+    assert_eq!(producer_open.label, "singular");
+    assert_eq!(producer_open.oneof, None);
 }
 
 #[test]

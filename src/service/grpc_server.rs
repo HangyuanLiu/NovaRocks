@@ -1429,6 +1429,9 @@ mod pr3_tests {
             }),
             schema_digest: vec![20; 32],
             payload: b"contribution".to_vec(),
+            producer_open: Some(proto::filter::RuntimeFilterProducerOpenMetadata {
+                local_partition_count: 21,
+            }),
         }
     }
 

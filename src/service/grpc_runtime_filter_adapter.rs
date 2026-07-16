@@ -24,9 +24,10 @@ use crate::runtime_filter::port::identity::{
     DeploymentEpoch, PartitionId, ProducerSequence, RouteEdgeId,
 };
 use crate::runtime_filter::port::transport::{
-    ContributionRouteIdentity, DeliveryRouteIdentity, RuntimeFilterAcceptStatus,
-    RuntimeFilterEnvelope, RuntimeFilterEnvelopeIngress, RuntimeFilterEnvelopeKind,
-    RuntimeFilterIngressResult, RuntimeFilterRouteIdentity, RuntimeFilterTransportError,
+    ContributionRouteIdentity, DeliveryRouteIdentity, ProducerOpenMetadata,
+    RuntimeFilterAcceptStatus, RuntimeFilterEnvelope, RuntimeFilterEnvelopeIngress,
+    RuntimeFilterEnvelopeKind, RuntimeFilterIngressResult, RuntimeFilterRouteIdentity,
+    RuntimeFilterTransportError,
 };
 
 pub(crate) fn handle_runtime_filter_envelope(
@@ -41,6 +42,7 @@ pub(crate) fn handle_runtime_filter_envelope(
         route_identity,
         schema_digest,
         payload,
+        producer_open,
     } = request;
 
     let kind = decode_kind(kind)?;
@@ -53,12 +55,17 @@ pub(crate) fn handle_runtime_filter_envelope(
     let route_identity = route_identity
         .ok_or_else(|| invalid_argument("runtime filter route identity is missing"))?;
     let domain_route_identity = decode_route_identity(&route_identity)?;
+    let producer_open = producer_open
+        .map(|metadata| ProducerOpenMetadata::try_new(metadata.local_partition_count))
+        .transpose()
+        .map_err(transport_error)?;
     let envelope = RuntimeFilterEnvelope::try_new(
         kind,
         query_id,
         ChannelId::new(channel_id),
         DeploymentEpoch::new(deployment_epoch),
         domain_route_identity,
+        producer_open,
         &schema_digest,
         payload,
     )
@@ -254,20 +261,30 @@ mod tests {
     fn valid_wire_envelope(
         kind: proto::filter::RuntimeFilterEnvelopeKind,
     ) -> proto::filter::RuntimeFilterEnvelope {
-        let (route_identity, payload) = match kind {
-            proto::filter::RuntimeFilterEnvelopeKind::Contribution => {
-                (contribution_route(), b"contribution".to_vec())
-            }
+        let (route_identity, payload, producer_open) = match kind {
+            proto::filter::RuntimeFilterEnvelopeKind::Contribution => (
+                contribution_route(),
+                b"contribution".to_vec(),
+                Some(proto::filter::RuntimeFilterProducerOpenMetadata {
+                    local_partition_count: 24,
+                }),
+            ),
             proto::filter::RuntimeFilterEnvelopeKind::Artifact => {
-                (delivery_route(), b"artifact".to_vec())
+                (delivery_route(), b"artifact".to_vec(), None)
             }
-            proto::filter::RuntimeFilterEnvelopeKind::ProducerClosed => {
-                (contribution_route(), Vec::new())
-            }
+            proto::filter::RuntimeFilterEnvelopeKind::ProducerClosed => (
+                contribution_route(),
+                Vec::new(),
+                Some(proto::filter::RuntimeFilterProducerOpenMetadata {
+                    local_partition_count: 24,
+                }),
+            ),
             proto::filter::RuntimeFilterEnvelopeKind::Unavailable => {
-                (delivery_route(), b"unavailable".to_vec())
+                (delivery_route(), b"unavailable".to_vec(), None)
             }
-            proto::filter::RuntimeFilterEnvelopeKind::Ack => (contribution_route(), Vec::new()),
+            proto::filter::RuntimeFilterEnvelopeKind::Ack => {
+                (contribution_route(), Vec::new(), None)
+            }
             proto::filter::RuntimeFilterEnvelopeKind::Unspecified => {
                 panic!("unspecified kind is not a valid fixture")
             }
@@ -280,6 +297,7 @@ mod tests {
             route_identity: Some(route_identity),
             schema_digest: vec![15; 32],
             payload,
+            producer_open,
         }
     }
 
@@ -424,6 +442,74 @@ mod tests {
                 .expect("contribution identity");
             assert_eq!(identity.partition_id(), PartitionId::new(0));
             assert_eq!(identity.sequence(), ProducerSequence::new(0));
+        }
+    }
+
+    #[test]
+    fn adapter_rejects_missing_zero_and_forbidden_open_metadata_before_ingress() {
+        let mut malformed = Vec::new();
+        for kind in [
+            proto::filter::RuntimeFilterEnvelopeKind::Contribution,
+            proto::filter::RuntimeFilterEnvelopeKind::ProducerClosed,
+        ] {
+            let mut missing = valid_wire_envelope(kind);
+            missing.producer_open = None;
+            malformed.push(missing);
+
+            let mut zero = valid_wire_envelope(kind);
+            zero.producer_open = Some(proto::filter::RuntimeFilterProducerOpenMetadata {
+                local_partition_count: 0,
+            });
+            malformed.push(zero);
+        }
+        for kind in [
+            proto::filter::RuntimeFilterEnvelopeKind::Artifact,
+            proto::filter::RuntimeFilterEnvelopeKind::Unavailable,
+            proto::filter::RuntimeFilterEnvelopeKind::Ack,
+        ] {
+            let mut forbidden = valid_wire_envelope(kind);
+            forbidden.producer_open = Some(proto::filter::RuntimeFilterProducerOpenMetadata {
+                local_partition_count: 24,
+            });
+            malformed.push(forbidden);
+        }
+
+        for request in malformed {
+            let ingress = Arc::new(RecordingIngress::new(RuntimeFilterIngressResult::accepted()));
+            let result = handle_runtime_filter_envelope(ingress.clone(), request);
+            assert!(
+                result.is_err(),
+                "invalid producer-open metadata must be rejected"
+            );
+            assert_eq!(result.unwrap_err().code(), Code::InvalidArgument);
+            assert!(ingress.is_empty());
+        }
+    }
+
+    #[test]
+    fn adapter_preserves_exact_count_for_contribution_and_closed() {
+        for (kind, local_partition_count) in [
+            (proto::filter::RuntimeFilterEnvelopeKind::Contribution, 37),
+            (
+                proto::filter::RuntimeFilterEnvelopeKind::ProducerClosed,
+                u32::MAX,
+            ),
+        ] {
+            let ingress = Arc::new(RecordingIngress::new(RuntimeFilterIngressResult::accepted()));
+            let mut request = valid_wire_envelope(kind);
+            request.producer_open = Some(proto::filter::RuntimeFilterProducerOpenMetadata {
+                local_partition_count,
+            });
+
+            handle_runtime_filter_envelope(ingress.clone(), request).unwrap();
+            let envelopes = ingress.take();
+            assert_eq!(envelopes.len(), 1);
+            assert_eq!(
+                envelopes[0]
+                    .producer_open()
+                    .map(|metadata| metadata.local_partition_count().get()),
+                Some(local_partition_count)
+            );
         }
     }
 

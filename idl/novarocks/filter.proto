@@ -93,6 +93,10 @@ message RuntimeFilterRouteIdentity {
   }
 }
 
+message RuntimeFilterProducerOpenMetadata {
+  uint32 local_partition_count = 1;
+}
+
 message RuntimeFilterEnvelope {
   RuntimeFilterEnvelopeKind kind = 1;
   novarocks.common.UniqueId query_id = 2;
@@ -101,6 +105,7 @@ message RuntimeFilterEnvelope {
   RuntimeFilterRouteIdentity route_identity = 5;
   bytes schema_digest = 6;
   bytes payload = 7;
+  RuntimeFilterProducerOpenMetadata producer_open = 8;
 }
 
 enum RuntimeFilterAcceptStatus {

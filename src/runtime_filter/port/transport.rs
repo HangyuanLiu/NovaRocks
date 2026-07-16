@@ -17,6 +17,7 @@
 
 use std::error::Error;
 use std::fmt;
+use std::num::NonZeroU32;
 
 use crate::common::types::UniqueId;
 use crate::runtime_filter::model::contract::{BindingId, ChannelId};
@@ -45,6 +46,9 @@ enum RuntimeFilterTransportErrorKind {
     IdentityKindMismatch(RuntimeFilterEnvelopeKind),
     PayloadRequired(RuntimeFilterEnvelopeKind),
     PayloadForbidden(RuntimeFilterEnvelopeKind),
+    ZeroLocalPartitionCount,
+    ProducerOpenRequired(RuntimeFilterEnvelopeKind),
+    ProducerOpenForbidden(RuntimeFilterEnvelopeKind),
     EmptyRejectionReason,
 }
 
@@ -79,6 +83,24 @@ impl RuntimeFilterTransportError {
         }
     }
 
+    fn zero_local_partition_count() -> Self {
+        Self {
+            kind: RuntimeFilterTransportErrorKind::ZeroLocalPartitionCount,
+        }
+    }
+
+    fn producer_open_required(kind: RuntimeFilterEnvelopeKind) -> Self {
+        Self {
+            kind: RuntimeFilterTransportErrorKind::ProducerOpenRequired(kind),
+        }
+    }
+
+    fn producer_open_forbidden(kind: RuntimeFilterEnvelopeKind) -> Self {
+        Self {
+            kind: RuntimeFilterTransportErrorKind::ProducerOpenForbidden(kind),
+        }
+    }
+
     fn empty_rejection_reason() -> Self {
         Self {
             kind: RuntimeFilterTransportErrorKind::EmptyRejectionReason,
@@ -107,6 +129,17 @@ impl fmt::Display for RuntimeFilterTransportError {
             RuntimeFilterTransportErrorKind::PayloadForbidden(kind) => write!(
                 formatter,
                 "runtime filter envelope kind {kind:?} forbids a payload"
+            ),
+            RuntimeFilterTransportErrorKind::ZeroLocalPartitionCount => {
+                formatter.write_str("runtime filter local partition count must not be zero")
+            }
+            RuntimeFilterTransportErrorKind::ProducerOpenRequired(kind) => write!(
+                formatter,
+                "runtime filter envelope kind {kind:?} requires producer-open metadata"
+            ),
+            RuntimeFilterTransportErrorKind::ProducerOpenForbidden(kind) => write!(
+                formatter,
+                "runtime filter envelope kind {kind:?} forbids producer-open metadata"
             ),
             RuntimeFilterTransportErrorKind::EmptyRejectionReason => {
                 formatter.write_str("runtime filter rejection reason must not be empty")
@@ -240,6 +273,25 @@ impl RuntimeFilterRouteIdentity {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProducerOpenMetadata {
+    local_partition_count: NonZeroU32,
+}
+
+impl ProducerOpenMetadata {
+    pub(crate) fn try_new(local_partition_count: u32) -> Result<Self, RuntimeFilterTransportError> {
+        let local_partition_count = NonZeroU32::new(local_partition_count)
+            .ok_or_else(RuntimeFilterTransportError::zero_local_partition_count)?;
+        Ok(Self {
+            local_partition_count,
+        })
+    }
+
+    pub(crate) const fn local_partition_count(self) -> NonZeroU32 {
+        self.local_partition_count
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeFilterEnvelope {
     kind: RuntimeFilterEnvelopeKind,
@@ -247,6 +299,7 @@ pub(crate) struct RuntimeFilterEnvelope {
     channel_id: ChannelId,
     deployment_epoch: DeploymentEpoch,
     route_identity: RuntimeFilterRouteIdentity,
+    producer_open: Option<ProducerOpenMetadata>,
     schema_digest: [u8; 32],
     payload: Vec<u8>,
 }
@@ -258,6 +311,7 @@ impl RuntimeFilterEnvelope {
         channel_id: ChannelId,
         deployment_epoch: DeploymentEpoch,
         route_identity: RuntimeFilterRouteIdentity,
+        producer_open: Option<ProducerOpenMetadata>,
         schema_digest: &[u8],
         payload: Vec<u8>,
     ) -> Result<Self, RuntimeFilterTransportError> {
@@ -276,6 +330,16 @@ impl RuntimeFilterEnvelope {
             return Err(RuntimeFilterTransportError::invalid_schema_digest_length(
                 schema_digest.len(),
             ));
+        }
+        let producer_open_required = matches!(
+            kind,
+            RuntimeFilterEnvelopeKind::Contribution | RuntimeFilterEnvelopeKind::ProducerClosed
+        );
+        if producer_open_required && producer_open.is_none() {
+            return Err(RuntimeFilterTransportError::producer_open_required(kind));
+        }
+        if !producer_open_required && producer_open.is_some() {
+            return Err(RuntimeFilterTransportError::producer_open_forbidden(kind));
         }
         let identity_matches = match kind {
             RuntimeFilterEnvelopeKind::Contribution | RuntimeFilterEnvelopeKind::ProducerClosed => {
@@ -310,6 +374,7 @@ impl RuntimeFilterEnvelope {
             channel_id,
             deployment_epoch,
             route_identity,
+            producer_open,
             schema_digest: fixed_schema_digest,
             payload,
         })
@@ -333,6 +398,10 @@ impl RuntimeFilterEnvelope {
 
     pub(crate) const fn route_identity(&self) -> &RuntimeFilterRouteIdentity {
         &self.route_identity
+    }
+
+    pub(crate) const fn producer_open(&self) -> Option<ProducerOpenMetadata> {
+        self.producer_open
     }
 
     pub(crate) const fn schema_digest(&self) -> &[u8; 32] {
@@ -431,12 +500,18 @@ mod tests {
         route_identity: RuntimeFilterRouteIdentity,
         payload: &[u8],
     ) -> RuntimeFilterEnvelope {
+        let producer_open = matches!(
+            kind,
+            RuntimeFilterEnvelopeKind::Contribution | RuntimeFilterEnvelopeKind::ProducerClosed
+        )
+        .then(|| ProducerOpenMetadata::try_new(24).unwrap());
         RuntimeFilterEnvelope::try_new(
             kind,
             UniqueId { hi: 1, lo: 2 },
             ChannelId::new(3),
             DeploymentEpoch::new(4),
             route_identity,
+            producer_open,
             &[11; 32],
             payload.to_vec(),
         )
@@ -509,6 +584,7 @@ mod tests {
                 ChannelId::new(3),
                 DeploymentEpoch::new(4),
                 contribution_route(),
+                Some(ProducerOpenMetadata::try_new(24).unwrap()),
                 &[11; 32],
                 b"payload".to_vec(),
             )
@@ -596,6 +672,7 @@ mod tests {
                 channel_id,
                 deployment_epoch,
                 contribution_route(),
+                Some(ProducerOpenMetadata::try_new(24).unwrap()),
                 schema_digest,
                 b"payload".to_vec(),
             )
@@ -650,25 +727,29 @@ mod tests {
 
     #[test]
     fn envelope_rejects_kind_identity_mismatches() {
-        for (kind, route_identity, payload) in [
+        for (kind, route_identity, producer_open, payload) in [
             (
                 RuntimeFilterEnvelopeKind::Contribution,
                 delivery_route(),
+                Some(ProducerOpenMetadata::try_new(24).unwrap()),
                 &b"payload"[..],
             ),
             (
                 RuntimeFilterEnvelopeKind::Artifact,
                 contribution_route(),
+                None,
                 &b"payload"[..],
             ),
             (
                 RuntimeFilterEnvelopeKind::ProducerClosed,
                 delivery_route(),
+                Some(ProducerOpenMetadata::try_new(24).unwrap()),
                 &b""[..],
             ),
             (
                 RuntimeFilterEnvelopeKind::Unavailable,
                 contribution_route(),
+                None,
                 &b"reason"[..],
             ),
         ] {
@@ -679,6 +760,7 @@ mod tests {
                     ChannelId::new(3),
                     DeploymentEpoch::new(4),
                     route_identity,
+                    producer_open,
                     &[11; 32],
                     payload.to_vec(),
                 )
@@ -693,6 +775,7 @@ mod tests {
                 ChannelId::new(3),
                 DeploymentEpoch::new(4),
                 delivery_route(),
+                None,
                 &[11; 32],
                 Vec::new(),
             )
@@ -702,30 +785,35 @@ mod tests {
 
     #[test]
     fn envelope_rejects_required_and_forbidden_payload_mismatches() {
-        for (kind, route_identity, payload) in [
+        for (kind, route_identity, producer_open, payload) in [
             (
                 RuntimeFilterEnvelopeKind::Contribution,
                 contribution_route(),
+                Some(ProducerOpenMetadata::try_new(24).unwrap()),
                 &b""[..],
             ),
             (
                 RuntimeFilterEnvelopeKind::Artifact,
                 delivery_route(),
+                None,
                 &b""[..],
             ),
             (
                 RuntimeFilterEnvelopeKind::ProducerClosed,
                 contribution_route(),
+                Some(ProducerOpenMetadata::try_new(24).unwrap()),
                 &b"payload"[..],
             ),
             (
                 RuntimeFilterEnvelopeKind::Unavailable,
                 delivery_route(),
+                None,
                 &b""[..],
             ),
             (
                 RuntimeFilterEnvelopeKind::Ack,
                 delivery_route(),
+                None,
                 &b"payload"[..],
             ),
         ] {
@@ -736,12 +824,109 @@ mod tests {
                     ChannelId::new(3),
                     DeploymentEpoch::new(4),
                     route_identity,
+                    producer_open,
                     &[11; 32],
                     payload.to_vec(),
                 )
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn contribution_and_closed_require_nonzero_producer_open_metadata() {
+        assert!(ProducerOpenMetadata::try_new(0).is_err());
+        let producer_open = ProducerOpenMetadata::try_new(24);
+        assert!(
+            producer_open.is_ok(),
+            "positive local partition count must construct metadata"
+        );
+        let producer_open = producer_open.unwrap();
+        assert_eq!(
+            producer_open.local_partition_count(),
+            NonZeroU32::new(24).unwrap()
+        );
+
+        for (kind, payload) in [
+            (RuntimeFilterEnvelopeKind::Contribution, b"payload".to_vec()),
+            (RuntimeFilterEnvelopeKind::ProducerClosed, Vec::new()),
+        ] {
+            let build = |producer_open| {
+                RuntimeFilterEnvelope::try_new(
+                    kind,
+                    UniqueId { hi: 1, lo: 2 },
+                    ChannelId::new(3),
+                    DeploymentEpoch::new(4),
+                    contribution_route(),
+                    producer_open,
+                    &[11; 32],
+                    payload.clone(),
+                )
+            };
+
+            assert!(build(None).is_err(), "{kind:?} must require producer-open");
+            let envelope = build(Some(producer_open)).expect("valid producer-open metadata");
+            assert_eq!(envelope.producer_open(), Some(producer_open));
+        }
+    }
+
+    #[test]
+    fn delivery_and_ack_kinds_forbid_producer_open_metadata() {
+        let producer_open = ProducerOpenMetadata::try_new(24).unwrap();
+        for (kind, route_identity, payload) in [
+            (
+                RuntimeFilterEnvelopeKind::Artifact,
+                delivery_route(),
+                b"artifact".to_vec(),
+            ),
+            (
+                RuntimeFilterEnvelopeKind::Unavailable,
+                delivery_route(),
+                b"reason".to_vec(),
+            ),
+            (
+                RuntimeFilterEnvelopeKind::Ack,
+                contribution_route(),
+                Vec::new(),
+            ),
+        ] {
+            assert!(
+                RuntimeFilterEnvelope::try_new(
+                    kind,
+                    UniqueId { hi: 1, lo: 2 },
+                    ChannelId::new(3),
+                    DeploymentEpoch::new(4),
+                    route_identity,
+                    Some(producer_open),
+                    &[11; 32],
+                    payload,
+                )
+                .is_err(),
+                "{kind:?} must forbid producer-open metadata"
+            );
+        }
+    }
+
+    #[test]
+    fn producer_closed_keeps_payload_empty_while_carrying_open_metadata() {
+        let producer_open = ProducerOpenMetadata::try_new(24).unwrap();
+        let build = |payload| {
+            RuntimeFilterEnvelope::try_new(
+                RuntimeFilterEnvelopeKind::ProducerClosed,
+                UniqueId { hi: 1, lo: 2 },
+                ChannelId::new(3),
+                DeploymentEpoch::new(4),
+                contribution_route(),
+                Some(producer_open),
+                &[11; 32],
+                payload,
+            )
+        };
+
+        let envelope = build(Vec::new()).expect("empty producer-close payload");
+        assert_eq!(envelope.producer_open(), Some(producer_open));
+        assert!(envelope.payload().is_empty());
+        assert!(build(b"unexpected".to_vec()).is_err());
     }
 
     #[test]
