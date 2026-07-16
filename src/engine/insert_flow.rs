@@ -24,9 +24,10 @@ use arrow::array::{Array, ArrayRef, BinaryArray, StringArray, new_null_array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
+use crate::catalog::identifier::normalize_identifier;
 use crate::connector::backend::ResolvedTable;
 use crate::engine::backend_resolver::{TargetBackend, resolve_existing_table_target};
-use crate::engine::catalog::{ColumnDef, normalize_identifier};
+use crate::engine::catalog::ColumnDef;
 use crate::engine::insert::reorder_insert_rows;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::exec::expr::cast_with_special_rules;

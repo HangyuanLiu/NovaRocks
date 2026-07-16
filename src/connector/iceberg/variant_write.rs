@@ -65,7 +65,7 @@ pub(crate) fn parse_variant_shredding_properties(
 
     let mut columns_by_name = HashMap::new();
     for (idx, field) in iceberg_schema.as_struct().fields().iter().enumerate() {
-        let key = crate::engine::catalog::normalize_identifier(&field.name)?;
+        let key = crate::catalog::identifier::normalize_identifier(&field.name)?;
         columns_by_name.insert(key, (idx, field));
     }
 
@@ -74,7 +74,7 @@ pub(crate) fn parse_variant_shredding_properties(
         let Some(column_name) = key.strip_prefix(VARIANT_SHREDDING_PROPERTY_PREFIX) else {
             continue;
         };
-        let normalized_column = crate::engine::catalog::normalize_identifier(column_name)
+        let normalized_column = crate::catalog::identifier::normalize_identifier(column_name)
             .map_err(|e| format!("invalid variant shredding property `{key}`: {e}"))?;
         let Some((idx, field)) = columns_by_name.get(&normalized_column).copied() else {
             return Err(format!(

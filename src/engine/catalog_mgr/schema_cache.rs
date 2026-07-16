@@ -25,7 +25,8 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use crate::engine::catalog_mgr::metadata::{TableIdentity, TableMetadata};
+use crate::catalog::identifier::TableIdentity;
+use crate::engine::catalog_mgr::metadata::TableMetadata;
 
 struct CachedEntry {
     /// schema id the cached metadata was built for. `None` means "not tracked"
@@ -105,7 +106,7 @@ impl SchemaCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::catalog_mgr::metadata::{TableBinding, TableIdentity, TableMetadata};
+    use crate::engine::catalog_mgr::metadata::{TableBinding, TableMetadata};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

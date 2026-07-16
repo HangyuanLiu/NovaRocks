@@ -26,11 +26,11 @@ use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 
+use crate::catalog::identifier::normalize_identifier;
 use crate::connector::iceberg::catalog::registry::{
     IcebergCatalogEntry, block_on_iceberg, build_hadoop_catalog, load_table,
 };
 use crate::connector::iceberg::fs_io;
-use crate::engine::catalog::normalize_identifier;
 use crate::fs::object_store::ObjectStoreConfig;
 
 /// Execute ADD FILES: register parquet files from an S3 directory into an Iceberg table.

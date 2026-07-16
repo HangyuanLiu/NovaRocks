@@ -2238,6 +2238,7 @@ use iceberg::spec::{NestedField, NestedFieldRef, PrimitiveType, Schema, StructTy
 use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
 use iceberg::{TableRequirement, TableUpdate};
 
+use crate::catalog::identifier::normalize_identifier;
 use crate::connector::iceberg::catalog::registry::{
     TABLE_KEY_COLUMNS_PROPERTY, column_aggregation_property_key, logical_type_property_key,
     logical_type_property_value,
@@ -2248,7 +2249,6 @@ use crate::connector::iceberg::variant_write::{
 };
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::resolve_existing_table_target;
-use crate::engine::catalog::normalize_identifier;
 use crate::engine::statement::{
     AlterIcebergPropertiesStmt, AlterIcebergSchemaStmt, ColumnPath, IcebergSchemaChange,
     PropertiesOp,

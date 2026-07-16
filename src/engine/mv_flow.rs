@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use crate::engine::catalog::normalize_identifier;
+use crate::catalog::identifier::normalize_identifier;
 use crate::engine::mv::lifecycle::{
     CreateMvRequest, DropMvRequest, ListMvsRequest, MvStorageEngine, MvTarget, RefreshCtx,
     RefreshError, RefreshRequest,

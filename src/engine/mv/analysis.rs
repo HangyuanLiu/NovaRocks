@@ -25,8 +25,8 @@ use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
+use crate::catalog::identifier::normalize_identifier;
 use crate::engine::StandaloneState;
-use crate::engine::catalog::normalize_identifier;
 use crate::engine::mv::agg_state::mv_shape::AggregateMvShape;
 use crate::engine::mv::agg_state::physical_column::StarRocksPhysicalColumn;
 use crate::engine::mv::agg_state::sql_type::arrow_data_type_to_sql_type;

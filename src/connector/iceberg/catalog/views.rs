@@ -32,7 +32,7 @@ use super::registry::{
     IcebergCatalogEntry, IcebergCatalogKind, block_on_iceberg, build_iceberg_catalog,
     iceberg_type_for_sql_type,
 };
-use crate::engine::catalog::normalize_identifier;
+use crate::catalog::identifier::normalize_identifier;
 use crate::sql::parser::ast::TableColumnDef;
 
 /// Dialect tag NovaRocks writes into view representations. NovaRocks parses

@@ -527,7 +527,7 @@ fn resolve_iceberg_mv_target(
     }
     let (namespace, table) = resolve_mv_name(&stmt.name, current_database)?;
     Ok(IcebergMvTarget {
-        catalog: crate::engine::catalog::normalize_identifier(current_catalog)?,
+        catalog: crate::catalog::identifier::normalize_identifier(current_catalog)?,
         namespace,
         table,
     })
@@ -2641,7 +2641,7 @@ pub(crate) fn resolve_refresh_target(
     })?;
     let (namespace, table) = resolve_mv_name(name, current_database)?;
     Ok(IcebergMvTarget {
-        catalog: crate::engine::catalog::normalize_identifier(catalog)?,
+        catalog: crate::catalog::identifier::normalize_identifier(catalog)?,
         namespace,
         table,
     })
@@ -14560,9 +14560,9 @@ fn join_catalog_registration_key(
 ) -> Result<String, String> {
     Ok(format!(
         "{}.{}.{}",
-        crate::engine::catalog::normalize_identifier(catalog)?,
-        crate::engine::catalog::normalize_identifier(namespace)?,
-        crate::engine::catalog::normalize_identifier(table)?
+        crate::catalog::identifier::normalize_identifier(catalog)?,
+        crate::catalog::identifier::normalize_identifier(namespace)?,
+        crate::catalog::identifier::normalize_identifier(table)?
     ))
 }
 
@@ -15991,7 +15991,7 @@ fn resolve_drop_target(
     })?;
     let (namespace, table) = resolve_mv_name(name, current_database)?;
     Ok(IcebergMvTarget {
-        catalog: crate::engine::catalog::normalize_identifier(catalog)?,
+        catalog: crate::catalog::identifier::normalize_identifier(catalog)?,
         namespace,
         table,
     })

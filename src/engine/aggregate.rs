@@ -25,7 +25,7 @@ use std::collections::HashMap;
 
 use arrow::record_batch::RecordBatch;
 
-use crate::engine::catalog::normalize_identifier;
+use crate::catalog::identifier::normalize_identifier;
 use crate::sql::catalog::ColumnDef;
 use crate::sql::literal::{LiteralKey, compare_literals, literal_from_batch, literal_to_key};
 use crate::sql::parser::ast::{ColumnAggregation, Literal, TableKeyDesc, TableKeyKind};

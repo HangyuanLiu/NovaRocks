@@ -53,10 +53,11 @@ use crate::service::grpc_client::proto::starrocks::{
 use crate::sql::parser::ast::{InsertSource, Literal, ObjectName};
 
 use super::catalog::register_starrocks_table_in_catalog;
-use crate::engine::catalog::{ColumnDef, normalize_identifier};
+use crate::catalog::identifier::LocalTableIdentity;
+use crate::catalog::identifier::normalize_identifier;
+use crate::engine::catalog::ColumnDef;
 use crate::engine::{
-    ResolvedLocalTableName, StandaloneState, StatementResult, build_local_insert_batch,
-    execute_query, reorder_insert_rows,
+    StandaloneState, StatementResult, build_local_insert_batch, execute_query, reorder_insert_rows,
 };
 use crate::exec::expr::cast_with_special_rules;
 
@@ -137,7 +138,7 @@ pub(crate) fn insert_rows_into_starrocks_table(
     table: &str,
     rows: &[Vec<Literal>],
 ) -> Result<(), String> {
-    let resolved = ResolvedLocalTableName {
+    let resolved = LocalTableIdentity {
         database: normalize_identifier(database)?,
         table: normalize_identifier(table)?,
     };
@@ -157,7 +158,7 @@ pub(crate) fn insert_batch_into_starrocks_table(
     table: &str,
     batch: RecordBatch,
 ) -> Result<(), String> {
-    let resolved = ResolvedLocalTableName {
+    let resolved = LocalTableIdentity {
         database: normalize_identifier(database)?,
         table: normalize_identifier(table)?,
     };
@@ -214,7 +215,7 @@ pub(crate) struct MvRefreshWriteMetadata {
 
 pub(crate) fn load_insert_plan(
     state: &Arc<StandaloneState>,
-    resolved: &ResolvedLocalTableName,
+    resolved: &LocalTableIdentity,
     target: PartitionTarget,
 ) -> Result<StarRocksInsertPlan, String> {
     load_insert_plan_with_column_mode(
@@ -227,7 +228,7 @@ pub(crate) fn load_insert_plan(
 
 pub(crate) fn load_physical_insert_plan(
     state: &Arc<StandaloneState>,
-    resolved: &ResolvedLocalTableName,
+    resolved: &LocalTableIdentity,
     target: PartitionTarget,
 ) -> Result<StarRocksInsertPlan, String> {
     load_insert_plan_with_column_mode(state, resolved, target, StarRocksInsertColumnMode::Physical)
@@ -235,7 +236,7 @@ pub(crate) fn load_physical_insert_plan(
 
 fn load_insert_plan_with_column_mode(
     state: &Arc<StandaloneState>,
-    resolved: &ResolvedLocalTableName,
+    resolved: &LocalTableIdentity,
     target: PartitionTarget,
     column_mode: StarRocksInsertColumnMode,
 ) -> Result<StarRocksInsertPlan, String> {
@@ -538,7 +539,7 @@ pub(crate) fn delete_starrocks_table_pk_rows(
     table_name: &str,
     pk_chunks: &[Chunk],
 ) -> Result<(), String> {
-    let resolved = ResolvedLocalTableName {
+    let resolved = LocalTableIdentity {
         database: normalize_identifier(database_name)?,
         table: normalize_identifier(table_name)?,
     };
@@ -1151,7 +1152,7 @@ pub(crate) fn delete_starrocks_table_by_predicate(
         }
     }
 
-    let resolved = ResolvedLocalTableName {
+    let resolved = LocalTableIdentity {
         database: normalize_identifier(database_name)?,
         table: normalize_identifier(table_name)?,
     };
@@ -1374,7 +1375,7 @@ fn commit_catalog_visible_version(
 /// pipeline needs to run across multiple BEs.
 fn insert_from_query_into_starrocks_table(
     state: &Arc<StandaloneState>,
-    resolved: &ResolvedLocalTableName,
+    resolved: &LocalTableIdentity,
     plan: &StarRocksInsertPlan,
     insert_columns: &[String],
     query: &sqlparser::ast::Query,
@@ -1686,14 +1687,14 @@ mod tests {
 fn resolve_starrocks_name(
     name: &ObjectName,
     current_database: &str,
-) -> Result<ResolvedLocalTableName, String> {
-    use crate::engine::catalog::normalize_identifier;
+) -> Result<LocalTableIdentity, String> {
+    use crate::catalog::identifier::normalize_identifier;
     match name.parts.as_slice() {
-        [table] => Ok(ResolvedLocalTableName {
+        [table] => Ok(LocalTableIdentity {
             database: normalize_identifier(current_database)?,
             table: normalize_identifier(table)?,
         }),
-        [database, table] => Ok(ResolvedLocalTableName {
+        [database, table] => Ok(LocalTableIdentity {
             database: normalize_identifier(database)?,
             table: normalize_identifier(table)?,
         }),
@@ -1748,7 +1749,7 @@ mod mv_target_tests {
         let fixture = seed_state_with_staged_mv();
         let plan = load_insert_plan(
             &fixture.state,
-            &ResolvedLocalTableName {
+            &LocalTableIdentity {
                 database: "analytics".to_string(),
                 table: "orders_mv".to_string(),
             },
@@ -1774,7 +1775,7 @@ mod mv_target_tests {
     fn insert_plan_column_modes_split_visible_and_physical_columns() {
         let _guard = lock_runtime_test_state();
         let fixture = seed_state_with_hidden_physical_column_mv();
-        let resolved = ResolvedLocalTableName {
+        let resolved = LocalTableIdentity {
             database: "analytics".to_string(),
             table: "orders_mv".to_string(),
         };
@@ -1847,7 +1848,7 @@ mod mv_target_tests {
     fn visible_insert_plan_reports_hidden_distribution_keys() {
         let _guard = lock_runtime_test_state();
         let fixture = seed_state_with_hidden_only_key_mv();
-        let resolved = ResolvedLocalTableName {
+        let resolved = LocalTableIdentity {
             database: "analytics".to_string(),
             table: "orders_mv".to_string(),
         };
@@ -1871,7 +1872,7 @@ mod mv_target_tests {
         let fixture = seed_state_with_active_mv();
         let plan = load_insert_plan(
             &fixture.state,
-            &ResolvedLocalTableName {
+            &LocalTableIdentity {
                 database: "analytics".to_string(),
                 table: "orders_mv".to_string(),
             },
@@ -1918,7 +1919,7 @@ mod mv_target_tests {
         let fixture = seed_state_with_active_mv();
         let plan = load_insert_plan(
             &fixture.state,
-            &ResolvedLocalTableName {
+            &LocalTableIdentity {
                 database: "analytics".to_string(),
                 table: "orders_mv".to_string(),
             },
@@ -1992,7 +1993,7 @@ mod mv_target_tests {
     fn stale_insert_plan_revalidates_visible_version_before_publish() {
         let _guard = lock_runtime_test_state();
         let fixture = seed_state_with_active_mv();
-        let resolved = ResolvedLocalTableName {
+        let resolved = LocalTableIdentity {
             database: "analytics".to_string(),
             table: "orders_mv".to_string(),
         };
@@ -2046,7 +2047,7 @@ mod mv_target_tests {
             seed_state_with_active_mv_on_object_store(config).expect("object-store fixture");
         let plan = load_insert_plan(
             &fixture.state,
-            &ResolvedLocalTableName {
+            &LocalTableIdentity {
                 database: "analytics".to_string(),
                 table: "orders_mv".to_string(),
             },
@@ -2095,7 +2096,7 @@ mod mv_target_tests {
         let (layout, old_chunks) = aggregate_physical_chunks(&[1], &[2], &[30]);
         let old_plan = load_physical_insert_plan(
             &fixture.state,
-            &ResolvedLocalTableName {
+            &LocalTableIdentity {
                 database: "analytics".to_string(),
                 table: "orders_mv".to_string(),
             },
@@ -2108,7 +2109,7 @@ mod mv_target_tests {
         let delta_chunks = aggregate_physical_chunks(&[1], &[3], &[70]).1;
         let upsert_plan = load_physical_insert_plan(
             &fixture.state,
-            &ResolvedLocalTableName {
+            &LocalTableIdentity {
                 database: "analytics".to_string(),
                 table: "orders_mv".to_string(),
             },
@@ -2131,7 +2132,7 @@ mod mv_target_tests {
 
         let read_plan = load_physical_insert_plan(
             &fixture.state,
-            &ResolvedLocalTableName {
+            &LocalTableIdentity {
                 database: "analytics".to_string(),
                 table: "orders_mv".to_string(),
             },
@@ -2198,7 +2199,7 @@ mod mv_target_tests {
         let (layout, old_chunks) = aggregate_physical_chunks(&[1], &[2], &[30]);
         let old_plan = load_physical_insert_plan(
             &fixture.state,
-            &ResolvedLocalTableName {
+            &LocalTableIdentity {
                 database: "analytics".to_string(),
                 table: "orders_mv".to_string(),
             },
@@ -2211,7 +2212,7 @@ mod mv_target_tests {
         let delta_chunks = aggregate_physical_chunks(&[1], &[-2], &[-30]).1;
         let upsert_plan = load_physical_insert_plan(
             &fixture.state,
-            &ResolvedLocalTableName {
+            &LocalTableIdentity {
                 database: "analytics".to_string(),
                 table: "orders_mv".to_string(),
             },
@@ -2234,7 +2235,7 @@ mod mv_target_tests {
 
         let read_plan = load_physical_insert_plan(
             &fixture.state,
-            &ResolvedLocalTableName {
+            &LocalTableIdentity {
                 database: "analytics".to_string(),
                 table: "orders_mv".to_string(),
             },

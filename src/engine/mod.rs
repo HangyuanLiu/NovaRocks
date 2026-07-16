@@ -37,7 +37,8 @@ use crate::runtime::query_result::{
     QueryResult, QueryResultColumn, build_string_query_result, record_batch_to_chunk,
 };
 
-use self::catalog::{DEFAULT_DATABASE, InMemoryCatalog, normalize_identifier};
+use self::catalog::{DEFAULT_DATABASE, InMemoryCatalog};
+use crate::catalog::identifier::normalize_identifier;
 use crate::connector::{
     IcebergCatalogRegistry, StarRocksTableCatalog, StarRocksTableConfig, create_iceberg_namespace,
     iceberg_namespace_exists, register_existing_iceberg_table,
@@ -78,7 +79,6 @@ pub(crate) mod mv_flow;
 pub(crate) mod mv_maintenance;
 pub(crate) mod mv_rewrite_prep;
 pub(crate) mod mv_scheduler;
-pub(crate) mod name_resolve;
 pub(crate) mod query_prep;
 mod query_stats;
 pub(crate) mod statement;
@@ -87,8 +87,6 @@ pub(crate) mod view_rewrite;
 pub(crate) mod virtual_table;
 pub(crate) mod write_operation_lifecycle;
 mod write_transaction;
-
-pub(crate) use self::name_resolve::ResolvedLocalTableName;
 
 pub(crate) use self::insert::{build_local_insert_batch, reorder_insert_rows};
 use self::statement::{

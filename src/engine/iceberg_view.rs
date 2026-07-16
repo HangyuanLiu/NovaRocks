@@ -24,8 +24,8 @@
 
 use std::sync::Arc;
 
+use crate::catalog::identifier::normalize_identifier;
 use crate::connector::backend::CreateViewRequest;
-use crate::engine::catalog::normalize_identifier;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::sql::analysis::OutputColumn;
 use crate::sql::parser::ast::TableColumnDef;

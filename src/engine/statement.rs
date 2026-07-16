@@ -24,8 +24,8 @@
 
 use std::sync::Arc;
 
-use crate::engine::catalog::normalize_identifier;
-use crate::engine::name_resolve::resolve_local_table_name;
+use crate::catalog::identifier::normalize_identifier;
+use crate::catalog::identifier::resolve_local_table_name;
 use crate::engine::{
     StandaloneState, StatementResult, delete_iceberg_catalog_if_needed,
     delete_iceberg_namespace_if_needed, delete_iceberg_table_if_needed,
@@ -1189,7 +1189,7 @@ fn drop_local_catalog_table(
     current_database: &str,
     if_exists: bool,
 ) -> Result<StatementResult, String> {
-    let resolved = resolve_local_table_name(name, current_database)?;
+    let resolved = resolve_local_table_name(name.parts.as_slice(), current_database)?;
     let mut guard = state
         .catalog
         .write()

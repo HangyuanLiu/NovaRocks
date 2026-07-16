@@ -36,10 +36,10 @@ use super::model::{
     StarRocksTableState, StoredStarRocksColumn, StoredStarRocksDatabase, StoredStarRocksIndex,
     StoredStarRocksPartition, StoredStarRocksTable, StoredStarRocksTablet,
 };
+use crate::catalog::identifier::normalize_identifier;
 use crate::connector::starrocks::table::config::StarRocksTableConfig;
 use crate::engine::catalog::{
     ColumnDef, InMemoryCatalog, PhysicalTableLayout, ScanSource, StarRocksTabletRef, TableDef,
-    normalize_identifier,
 };
 
 #[derive(Clone, Debug, Default)]

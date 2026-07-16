@@ -378,7 +378,7 @@ pub(crate) fn refresh_mv(
             } else {
                 tagged_projection_change_chunks(delta_result)?
             };
-            let resolved_mv = crate::engine::ResolvedLocalTableName {
+            let resolved_mv = crate::catalog::identifier::LocalTableIdentity {
                 database: db_name.clone(),
                 table: mv_name.clone(),
             };
@@ -785,7 +785,7 @@ fn refresh_aggregate_mv_incremental(
 
     let plan = load_physical_insert_plan(
         ctx.state,
-        &crate::engine::ResolvedLocalTableName {
+        &crate::catalog::identifier::LocalTableIdentity {
             database: ctx.database.to_string(),
             table: ctx.mv_name.to_string(),
         },
@@ -934,7 +934,7 @@ where
 
     let plan = match load_physical_insert_plan(
         state,
-        &crate::engine::ResolvedLocalTableName {
+        &crate::catalog::identifier::LocalTableIdentity {
             database: database.to_string(),
             table: mv_name.to_string(),
         },
@@ -1432,13 +1432,13 @@ fn validate_incremental_mv_base_ref(
 ) -> Result<(), String> {
     let actual = normalize_three_part_base_table(base_table)?;
     let expected = (
-        crate::engine::catalog::normalize_identifier(&base_ref.catalog).map_err(|e| {
+        crate::catalog::identifier::normalize_identifier(&base_ref.catalog).map_err(|e| {
             format!("incremental MV refresh stored metadata has invalid catalog reference: {e}")
         })?,
-        crate::engine::catalog::normalize_identifier(&base_ref.namespace).map_err(|e| {
+        crate::catalog::identifier::normalize_identifier(&base_ref.namespace).map_err(|e| {
             format!("incremental MV refresh stored metadata has invalid namespace reference: {e}")
         })?,
-        crate::engine::catalog::normalize_identifier(&base_ref.table).map_err(|e| {
+        crate::catalog::identifier::normalize_identifier(&base_ref.table).map_err(|e| {
             format!("incremental MV refresh stored metadata has invalid table reference: {e}")
         })?,
     );
@@ -1459,7 +1459,7 @@ fn normalize_three_part_base_table(
         .iter()
         .map(|part| match part {
             sqlparser::ast::ObjectNamePart::Identifier(ident) => {
-                crate::engine::catalog::normalize_identifier(&ident.value).map_err(|e| {
+                crate::catalog::identifier::normalize_identifier(&ident.value).map_err(|e| {
                     format!(
                         "incremental MV refresh stored SQL has invalid base table reference: {e}"
                     )
@@ -1791,9 +1791,9 @@ pub(crate) fn parse_iceberg_table_refs(refs: &[String]) -> Result<Vec<IcebergTab
                 ));
             };
             Ok(IcebergTableRef {
-                catalog: crate::engine::catalog::normalize_identifier(catalog)?,
-                namespace: crate::engine::catalog::normalize_identifier(namespace)?,
-                table: crate::engine::catalog::normalize_identifier(table)?,
+                catalog: crate::catalog::identifier::normalize_identifier(catalog)?,
+                namespace: crate::catalog::identifier::normalize_identifier(namespace)?,
+                table: crate::catalog::identifier::normalize_identifier(table)?,
             })
         })
         .collect()
@@ -1837,23 +1837,23 @@ fn refresh_starrocks_catalog(state: &Arc<StandaloneState>) -> Result<(), String>
 fn resolve_mv_name(name: &ObjectName, current_database: &str) -> Result<(String, String), String> {
     match name.parts.as_slice() {
         [table] => Ok((
-            crate::engine::catalog::normalize_identifier(current_database)?,
-            crate::engine::catalog::normalize_identifier(table)?,
+            crate::catalog::identifier::normalize_identifier(current_database)?,
+            crate::catalog::identifier::normalize_identifier(table)?,
         )),
         [database, table] => Ok((
-            crate::engine::catalog::normalize_identifier(database)?,
-            crate::engine::catalog::normalize_identifier(table)?,
+            crate::catalog::identifier::normalize_identifier(database)?,
+            crate::catalog::identifier::normalize_identifier(table)?,
         )),
         [catalog, database, table] => {
-            let catalog = crate::engine::catalog::normalize_identifier(catalog)?;
+            let catalog = crate::catalog::identifier::normalize_identifier(catalog)?;
             if catalog != "default_catalog" {
                 return Err(format!(
                     "materialized view name catalog must be `default_catalog`, got `{catalog}`"
                 ));
             }
             Ok((
-                crate::engine::catalog::normalize_identifier(database)?,
-                crate::engine::catalog::normalize_identifier(table)?,
+                crate::catalog::identifier::normalize_identifier(database)?,
+                crate::catalog::identifier::normalize_identifier(table)?,
             ))
         }
         _ => Err(format!(
@@ -3566,7 +3566,7 @@ mod tests {
         let state = engine.state_for_test();
         let plan = load_physical_insert_plan(
             &state,
-            &crate::engine::ResolvedLocalTableName {
+            &crate::catalog::identifier::LocalTableIdentity {
                 database: "analytics".to_string(),
                 table: "orders_mv".to_string(),
             },

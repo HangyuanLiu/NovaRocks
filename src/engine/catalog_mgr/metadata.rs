@@ -25,25 +25,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::catalog::identifier::TableIdentity;
 use crate::sql::catalog::{ColumnDef, IcebergTableInfo, ScanSource, TableDef};
-
-/// Fully-qualified table identity. Used as the schema-cache key.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct TableIdentity {
-    pub catalog: String,
-    pub namespace: String,
-    pub table: String,
-}
-
-impl TableIdentity {
-    pub(crate) fn new(catalog: &str, namespace: &str, table: &str) -> Self {
-        Self {
-            catalog: catalog.to_string(),
-            namespace: namespace.to_string(),
-            table: table.to_string(),
-        }
-    }
-}
 
 /// Backend-specific locator for scan-binding. Carries identity only, never data.
 #[derive(Clone, Debug, PartialEq)]

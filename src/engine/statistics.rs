@@ -2343,7 +2343,7 @@ fn drop_multi_column_stats(state: &Arc<StandaloneState>, key: &TableKey) {
 }
 
 fn normalize_name(name: &str) -> Result<String, String> {
-    crate::engine::catalog::normalize_identifier(name.trim().trim_matches('`'))
+    crate::catalog::identifier::normalize_identifier(name.trim().trim_matches('`'))
 }
 
 fn ok_result() -> Result<QueryResult, String> {

@@ -23,11 +23,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::catalog::identifier::normalize_identifier;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::{get_tablet_runtime, remove_tablet_runtime};
 use crate::connector::starrocks::lake::schema::create_lake_tablet_from_req_with_schema_patch;
 use crate::connector::starrocks::lake::transactions::delete_tablet;
-use crate::engine::catalog::normalize_identifier;
 use crate::engine::query_prep::drop_local_table_registration_if_exists;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
 use crate::meta::MetaReadTxn;
