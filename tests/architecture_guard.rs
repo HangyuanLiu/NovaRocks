@@ -43539,6 +43539,7 @@ fn rfd4_m2b2_source_violations(source_rel: &str, text: &str) -> Vec<String> {
     }
 
     let paths = rust_production_canonical_paths(text, source_rel);
+    let mut artifact_delivery_dependency = false;
     for path in paths {
         if (is_transport || is_router || is_adapter)
             && rfd4_m2b2_path_is_concrete_contribution(&path)
@@ -43612,6 +43613,36 @@ fn rfd4_m2b2_source_violations(source_rel: &str, text: &str) -> Vec<String> {
                 path.join("::")
             ));
         }
+
+        if is_new_owner
+            && ([
+                &[
+                    "crate",
+                    "runtime_filter",
+                    "port",
+                    "subscription",
+                    "ArtifactDelivery",
+                ][..],
+                &[
+                    "crate",
+                    "runtime_filter",
+                    "port",
+                    "subscription",
+                    "ArtifactDeliveryOutcome",
+                ][..],
+                &["crate", "runtime_filter", "port", "subscription", "*"][..],
+            ]
+            .iter()
+            .any(|expected| {
+                path.len() == expected.len() && rfd4_m2b2_path_starts_with(&path, expected)
+            }))
+        {
+            artifact_delivery_dependency = true;
+            violations.push(format!(
+                "{source_rel}: out-of-scope artifact delivery dependency {}",
+                path.join("::")
+            ));
+        }
     }
 
     let calls = match rfd4_m2b2_production_call_names(text) {
@@ -43657,11 +43688,55 @@ fn rfd4_m2b2_source_violations(source_rel: &str, text: &str) -> Vec<String> {
                 ));
             }
         }
+        if artifact_delivery_dependency {
+            for forbidden in ["deliver", "deliver_live"] {
+                if calls.contains(forbidden) {
+                    violations.push(format!(
+                        "{source_rel}: out-of-scope artifact delivery call {forbidden}"
+                    ));
+                }
+            }
+        }
     }
 
     violations.sort();
     violations.dedup();
     violations
+}
+
+fn rfd4_m2b2_remote_constructor_call_count(text: &str, source_rel: &str) -> usize {
+    let sanitized = rust_sanitized_production_text(text);
+    let aliases = rust_production_scoped_aliases(text);
+    rust_raw_non_use_paths(&sanitized)
+        .into_iter()
+        .flat_map(|path| {
+            rust_resolve_scoped_paths(
+                &path.segments,
+                &path.inline_modules,
+                &aliases,
+                &mut BTreeSet::new(),
+                0,
+            )
+            .unwrap_or_else(|| vec![path])
+        })
+        .filter_map(|path| {
+            rust_canonical_path_segments_in_scope(&path.segments, source_rel, &path.inline_modules)
+        })
+        .filter(|path| {
+            path.len() == 6
+                && rfd4_m2b2_path_starts_with(
+                    path,
+                    &[
+                        "crate",
+                        "runtime_filter",
+                        "port",
+                        "final_domain",
+                        "CompletionFence",
+                        "try_from_remote_codec",
+                    ],
+                )
+        })
+        .count()
 }
 
 fn rfd4_m2b2_remote_reconstruction_violations(sources: &[(String, String)]) -> Vec<String> {
@@ -43678,6 +43753,7 @@ fn rfd4_m2b2_remote_reconstruction_violations(sources: &[(String, String)]) -> V
             ));
             continue;
         }
+        let call_count = rfd4_m2b2_remote_constructor_call_count(text, source_rel);
         let canonical_paths = rust_production_canonical_paths(text, source_rel);
         let canonical_remote = canonical_paths.iter().any(|path| {
             path.len() == 6
@@ -43744,16 +43820,22 @@ fn rfd4_m2b2_remote_reconstruction_violations(sources: &[(String, String)]) -> V
                         "{source_rel}: expected one remote constructor declaration, found {declarations}"
                     ));
                 }
+                if call_count != 0 {
+                    violations.push(format!(
+                        "{source_rel}: definition owner must not call remote reconstruction, found {call_count} call(s)"
+                    ));
+                }
             }
             CODEC_OWNER => {
-                if !canonical_remote {
+                if call_count != 1 {
                     violations.push(format!(
-                        "{source_rel}: contribution codec must be the remote constructor caller"
+                        "{source_rel}: contribution codec must make exactly one remote constructor call, found {call_count}"
                     ));
                 }
             }
             _ => {
-                if canonical_remote
+                if call_count != 0
+                    || canonical_remote
                     || final_domain_glob
                     || aliases_remote_type
                     || public_fence_facade
@@ -44262,6 +44344,22 @@ fn rfd4_m2b2_detector_rejects_alias_reexport_glob_inline_and_extern_crate_bypass
             "src/runtime_filter/codec/contribution.rs",
             "#[cfg(any(test, feature = \"hidden\"))] use crate::service::grpc_server;",
         ),
+        (
+            "src/service/grpc_runtime_filter_adapter.rs",
+            "use crate::runtime_filter::port::subscription::ArtifactDelivery as Delivery; fn f(_: &dyn Delivery) {}",
+        ),
+        (
+            "src/runtime_filter/codec/contribution.rs",
+            "pub(crate) use crate::runtime_filter::port::subscription::{ArtifactDelivery, ArtifactDeliveryOutcome};",
+        ),
+        (
+            "src/service/grpc_runtime_filter_adapter.rs",
+            "use crate::runtime_filter::port::subscription::*; fn f(delivery: &dyn ArtifactDelivery, outcome: ArtifactDeliveryOutcome) { delivery.deliver(crate::runtime_filter::port::identity::RouteEdgeId::new(1), outcome); }",
+        ),
+        (
+            "src/runtime_filter/codec/contribution.rs",
+            "use crate::runtime_filter::port::subscription::ArtifactDelivery; fn f(delivery: &dyn ArtifactDelivery) { delivery.deliver_live(todo!(), None, todo!()); }",
+        ),
     ];
     for (source_rel, source) in invalid {
         assert!(
@@ -44281,6 +44379,26 @@ mod tests {
         rfd4_m2b2_source_violations("src/service/grpc_runtime_filter_adapter.rs", cfg_test_only,)
             .is_empty(),
         "definite cfg(test) fixtures must not count as production dependencies"
+    );
+
+    let unrelated_local_delivery = r#"
+struct LocalDelivery;
+impl LocalDelivery {
+    fn deliver(&self) {}
+    fn deliver_live(&self) {}
+}
+fn f(delivery: &LocalDelivery) {
+    delivery.deliver();
+    delivery.deliver_live();
+}
+"#;
+    assert!(
+        rfd4_m2b2_source_violations(
+            "src/service/grpc_runtime_filter_adapter.rs",
+            unrelated_local_delivery,
+        )
+        .is_empty(),
+        "unrelated local deliver methods must not be treated as artifact delivery"
     );
 }
 
@@ -44359,6 +44477,40 @@ fn f() {
     assert!(
         !parse_failure.is_empty(),
         "remote reconstruction audit must fail closed on parse errors"
+    );
+
+    let definition_owner_wrapper = r#"
+struct CompletionFence;
+struct CompletionFenceContractDigest;
+struct ProducerStreamId;
+struct ProducerSequence;
+struct FinalDomainError;
+impl CompletionFence {
+    pub(crate) fn try_from_remote_codec(
+        _: CompletionFenceContractDigest,
+        _: ProducerStreamId,
+        _: ProducerSequence,
+        _: [u8; 32],
+    ) -> Result<Self, FinalDomainError> {
+        todo!()
+    }
+}
+fn rebuild(
+    digest: CompletionFenceContractDigest,
+    stream: ProducerStreamId,
+    sequence: ProducerSequence,
+    encoded: [u8; 32],
+) -> Result<CompletionFence, FinalDomainError> {
+    CompletionFence::try_from_remote_codec(digest, stream, sequence, encoded)
+}
+"#;
+    let definition_owner_violations = rfd4_m2b2_remote_reconstruction_violations(&[(
+        "src/runtime_filter/port/final_domain.rs".into(),
+        definition_owner_wrapper.into(),
+    )]);
+    assert!(
+        !definition_owner_violations.is_empty(),
+        "the definition owner must not gain a second production reconstruction caller"
     );
 }
 
