@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Deterministic instance sidecar-to-protobuf mapping for the native boundary.
+
 use std::collections::{BTreeMap, HashMap};
 
 use crate::common::types::UniqueId;

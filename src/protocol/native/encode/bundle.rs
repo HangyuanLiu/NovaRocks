@@ -51,15 +51,10 @@ pub(crate) fn encode_native_fragment_bundle(
     plan: &DistributedPlan,
     prepared: &PreparedFragmentSet,
 ) -> Result<NativeFragmentBundle, String> {
-    let encoded = crate::sql::codegen::proto_encode::plan::encode_distributed_plan_with_context(
+    let encoded = super::plan::encode_distributed_plan(
         plan,
-        crate::sql::codegen::proto_encode::plan::NativePlanEncodeContext {
-            scan_bindings: Some(prepared.scan_bindings()),
-            node_outputs: None,
-            fragment_edge_outputs: None,
-            write_contracts: None,
-            runtime_filter_projection: Some(prepared.runtime_filter_projection()),
-        },
+        prepared.scan_bindings(),
+        prepared.runtime_filter_projection(),
     )?;
     let sealed_ids = plan
         .fragments()

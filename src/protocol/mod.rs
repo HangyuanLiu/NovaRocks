@@ -15,12 +15,4 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(test)]
-mod boundary_schema;
-#[cfg(test)]
-mod build;
-mod bundle;
-
-#[cfg(test)]
-pub(crate) use bundle::{NativeBundleTestDrift, corrupt_native_fragment_bundle_for_execution_test};
-pub(crate) use bundle::{NativeFragmentBundle, encode_native_fragment_bundle};
+pub(crate) mod native;

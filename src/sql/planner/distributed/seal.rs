@@ -80,7 +80,7 @@ impl DistributedPlan {
     }
 
     // Consumed on the production codegen path (`project_boundary_reports` in
-    // `sql::codegen::fragment`) and, later, by CGO-9C occurrence allocation.
+    // `protocol::native::encode`) and, later, by CGO-9C occurrence allocation.
     pub(crate) fn boundaries(&self) -> &BoundaryCatalog {
         &self.data.boundaries
     }

@@ -15,4 +15,4 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Legacy SQL codegen namespace retained until CGO-13 Task 3 removes it.
+pub(crate) mod encode;

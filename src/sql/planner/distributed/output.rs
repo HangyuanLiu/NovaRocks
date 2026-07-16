@@ -1328,7 +1328,7 @@ fn project_edge_output_columns(
 ///
 /// SOLE OWNER: CGO-9C Task 5 deleted the native encoder's read-walk twin
 /// (`encoded_node_output_columns` / `encoded_fragment_root_output_columns` in
-/// `sql::codegen::proto_encode::plan`) and migrated its last consumer -- the
+/// `protocol::native::encode::plan`) and migrated its last consumer -- the
 /// coordinator's CTE-multicast sink, which now reads the fragment's sealed
 /// `output_columns` directly. This planner walk is now the single implementation
 /// of the wire per-node output; the encoder maps the sealed contract 1:1 and no

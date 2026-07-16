@@ -1423,7 +1423,7 @@ fn nidl_d3g_native_runtime_query_options_do_not_use_thrift_model() {
         "src/cache/mod.rs",
         "src/coordinator/execution.rs",
         "src/runtime/native_fragment_wire.rs",
-        "src/sql/codegen/proto_encode/instance.rs",
+        "src/protocol/native/encode/instance.rs",
     ];
     let repo = Path::new(manifest_dir());
     for path in forbidden {
@@ -1443,7 +1443,7 @@ fn nidl_d3h_native_runtime_filter_params_do_not_use_thrift_model() {
         "src/runtime/query_context.rs",
         "src/runtime/native_fragment_wire.rs",
         "src/coordinator/execution.rs",
-        "src/sql/codegen/proto_encode/instance.rs",
+        "src/protocol/native/encode/instance.rs",
         "src/lower/common/fragment_runtime.rs",
         "src/exec/operators/hashjoin/hash_join_build_sink.rs",
         "src/runtime/runtime_filter_worker.rs",
@@ -2004,7 +2004,7 @@ fn nidl_d2c_rust_wire_imports_stay_inside_owned_boundaries() {
         }
     }
 
-    for file in rs_files_under(&["src/sql/codegen/proto_encode"]) {
+    for file in rs_files_under(&["src/protocol/native/encode"]) {
         for (line, text) in rust_wire_reference_hits(&file, RustWirePolicy::StarRocksProtoOnly) {
             violations.push(format!("{}:{}: {}", rel(&file), line, text));
         }
@@ -3145,7 +3145,7 @@ fn coordinator_prepare_dependency_detector_is_source_aware() {
 
     assert_eq!(
         coordinator_prepare_dependency_violations_in(
-            "src/sql/codegen/proto_encode/plan.rs",
+            "src/protocol/native/encode/plan.rs",
             "use crate::engine::*;",
         ),
         Vec::<String>::new(),
@@ -4236,7 +4236,7 @@ fn native_lowering_codegen_dependency_detector_covers_bypasses() {
             "#[cfg(test)] use crate::sql::codegen::proto_encode::types::encode_type;",
         ),
         (
-            "src/sql/codegen/proto_encode/types.rs",
+            "src/protocol/native/encode/types.rs",
             "use crate::sql::*; type LocalOwner = codegen::Codegen;",
         ),
     ];
@@ -5447,7 +5447,7 @@ fn planner_logical_module_use_surface_is_closed() {
 fn planner_physical_legacy_owner_detector_distinguishes_sibling_and_unrelated_paths() {
     assert!(!rust_use_imports_legacy_planner_owner(
         "private|crate::proto::plan::plan_node::Kind",
-        "src/sql/codegen/proto_encode/plan.rs",
+        "src/protocol/native/encode/plan.rs",
     ));
     assert!(rust_use_imports_legacy_planner_owner(
         "private|crate::sql::planner::plan::PhysicalPlanNode",
@@ -13592,6 +13592,7 @@ fn runtime_filter_router_artifact_surface_violations(text: &str) -> Vec<String> 
 fn runtime_filter_m2_live_namespace_is_monitored(source_rel: &str) -> bool {
     source_rel.starts_with("src/exec/")
         || source_rel.starts_with("src/sql/")
+        || source_rel.starts_with("src/protocol/native/encode/")
         || source_rel.starts_with("src/lower/")
         || source_rel.starts_with("src/service/")
         || matches!(
@@ -15550,7 +15551,7 @@ fn runtime_filter_graph_model_has_planner_neutral_boundaries() {
     let graph_path = model.join("graph.rs");
     let fragment_path = repo.join("src/sql/planner/distributed/fragment.rs");
     let seal_path = repo.join("src/sql/planner/distributed/seal.rs");
-    let proto_encode = repo.join("src/sql/codegen/proto_encode");
+    let proto_encode = repo.join("src/protocol/native/encode");
 
     assert!(contract_path.is_file());
     assert!(graph_path.is_file());
@@ -16175,7 +16176,7 @@ fn runtime_filter_m2_live_boundary_detector_rejects_alias_glob_reexport_and_deco
             "pub use crate::runtime_filter::materializer::codec::decode_leaf as decode;",
         ),
         (
-            "src/sql/codegen/proto_encode/runtime_filter.rs",
+            "src/protocol/native/encode/runtime_filter.rs",
             "fn decoy() { if false { crate::runtime_filter::materializer::Materializer::plan(); } }",
         ),
         (
@@ -16220,7 +16221,7 @@ fn runtime_filter_m2_live_boundary_detector_rejects_source_indirection() {
             "#[path = \"../../../../runtime_filter/materializer/mod.rs\"] mod hidden;",
         ),
         (
-            "src/sql/codegen/proto_encode/runtime_filter.rs",
+            "src/protocol/native/encode/runtime_filter.rs",
             "#[cfg_attr(unix, path = \"../../../../runtime_filter/port/artifact.rs\")] mod hidden;",
         ),
         (
@@ -16883,7 +16884,7 @@ fn runtime_filter_harness_only_detector_rejects_operator_rpc_and_encoder_calls()
             "fn receive(service: &RuntimeFilterService) { service.open_producer(); }",
         ),
         (
-            "src/sql/codegen/proto_encode/runtime_filter.rs",
+            "src/protocol/native/encode/runtime_filter.rs",
             "fn encode(service: &RuntimeFilterService) { service.open_subscription(); }",
         ),
         (
@@ -20404,7 +20405,7 @@ fn nidl_d3f_native_runtime_layers_do_not_import_thrift_scan_ranges() {
     let repo = Path::new(manifest_dir());
     let guarded_files = [
         "src/coordinator/scheduler/mod.rs",
-        "src/sql/codegen/proto_encode/instance.rs",
+        "src/protocol/native/encode/instance.rs",
     ];
     let forbidden = ["TScanRangeParams", "THdfsScanRange", "TInternalScanRange"];
     let mut violations = Vec::new();
@@ -20947,7 +20948,7 @@ fn nidl_d3e_native_runtime_routing_has_no_thrift_shaped_endpoint_model() {
 
     let checked_sources = [
         "src/coordinator/scheduler/mod.rs",
-        "src/sql/codegen/proto_encode/instance.rs",
+        "src/protocol/native/encode/instance.rs",
     ];
     for source in checked_sources {
         let path = repo.join(source);
@@ -21063,10 +21064,10 @@ fn nidl_d3j_native_delta_scan_sidecar_is_not_patched_from_thrift_plan() {
         }
     }
 
-    let proto_plan = fs::read_to_string(repo.join("src/sql/codegen/proto_encode/plan.rs")).unwrap();
+    let proto_plan = fs::read_to_string(repo.join("src/protocol/native/encode/plan.rs")).unwrap();
     if proto_plan.contains("delta_plan: None") {
         violations.push(
-            "src/sql/codegen/proto_encode/plan.rs: IcebergDeltaTable native encoder must not leave delta_plan as None".to_string(),
+            "src/protocol/native/encode/plan.rs: IcebergDeltaTable native encoder must not leave delta_plan as None".to_string(),
         );
     }
 
@@ -21179,7 +21180,7 @@ fn nfe_1_task_2_native_fragment_build_owns_submission_payload() {
     let repo = Path::new(manifest_dir());
     let mut violations = Vec::new();
 
-    let bundle = fs::read_to_string(repo.join("src/sql/codegen/fragment/bundle.rs")).unwrap();
+    let bundle = fs::read_to_string(repo.join("src/protocol/native/encode/bundle.rs")).unwrap();
     let bundle_production = rust_sanitized_production_text(&bundle);
     let bundle_compact = compact_line(&bundle_production);
     if rust_named_type_declaration_count(&bundle_production, "NativeFragmentBundle") != 1
@@ -21188,7 +21189,7 @@ fn nfe_1_task_2_native_fragment_build_owns_submission_payload() {
         || bundle_compact.contains("pub(crate)by_fragment:")
     {
         violations.push(
-            "src/sql/codegen/fragment/bundle.rs: private NativeFragmentBundle must uniquely own required native fragments".to_string(),
+            "src/protocol/native/encode/bundle.rs: private NativeFragmentBundle must uniquely own required native fragments".to_string(),
         );
     }
 
@@ -22115,6 +22116,10 @@ fn nfe_4_fe_owned_raw_sources_are_starrocks_idl_free() {
             repo.join("src/service"),
             vec![repo.join("src/service/grpc_fragment_dispatcher.rs")],
         ),
+        (
+            repo.join("src/protocol"),
+            vec![repo.join("src/protocol/mod.rs")],
+        ),
         (runner.clone(), vec![runner.join("main.rs")]),
     ] {
         match nfe_4_collect_production_owner_files(&root, &entries) {
@@ -22128,7 +22133,7 @@ fn nfe_4_fe_owned_raw_sources_are_starrocks_idl_free() {
     let owner_rel = owners.iter().map(|path| rel(path)).collect::<BTreeSet<_>>();
     for required in [
         "src/sql/mod.rs",
-        "src/sql/codegen/fragment/bundle.rs",
+        "src/protocol/native/encode/bundle.rs",
         "src/engine/mod.rs",
         "src/engine/statement.rs",
         "src/coordinator/dispatch.rs",
@@ -22310,13 +22315,13 @@ fn nfe_4_ledger_audit_native_structure_and_external_ingress_are_fixed() {
     }
 
     for source in [
-        "src/sql/codegen/fragment/bundle.rs",
+        "src/protocol/native/encode/bundle.rs",
         "src/connector/iceberg/scan_range.rs",
         "src/connector/scan_model/starrocks.rs",
         "src/connector/scan_planning/starrocks.rs",
         "src/coordinator/prepare/iceberg_delta.rs",
         "src/coordinator/scheduler/runtime_filter.rs",
-        "src/sql/codegen/proto_encode/iceberg_delta_scan.rs",
+        "src/protocol/native/encode/iceberg_delta_scan.rs",
         "src/sql/planner/distributed/build/runtime_filter_binding.rs",
     ] {
         match fs::symlink_metadata(repo.join(source)) {
@@ -22327,11 +22332,11 @@ fn nfe_4_ledger_audit_native_structure_and_external_ingress_are_fixed() {
     }
 
     let fragment_bundle =
-        fs::read_to_string(repo.join("src/sql/codegen/fragment/bundle.rs")).unwrap();
+        fs::read_to_string(repo.join("src/protocol/native/encode/bundle.rs")).unwrap();
     let fragment_production = rust_sanitized_production_text(&fragment_bundle);
     if fragment_production.contains("cfg") && fragment_production.contains("compat") {
         violations.push(
-            "src/sql/codegen/fragment/bundle.rs: unique native bundle must be compat-neutral"
+            "src/protocol/native/encode/bundle.rs: unique native bundle must be compat-neutral"
                 .to_string(),
         );
     }
@@ -22339,7 +22344,7 @@ fn nfe_4_ledger_audit_native_structure_and_external_ingress_are_fixed() {
     let bundle_compact = compact_line(&fragment_production);
     if !bundle_compact.contains("by_fragment:BTreeMap<FragmentId,NativePlanFragment>") {
         violations.push(
-            "src/sql/codegen/fragment/bundle.rs: NativeFragmentBundle must own required native PlanFragment map"
+            "src/protocol/native/encode/bundle.rs: NativeFragmentBundle must own required native PlanFragment map"
                 .to_string(),
         );
     }
@@ -23791,7 +23796,7 @@ fn nfe_3_fe_owned_helpers_are_raw_starrocks_idl_free() {
         "src/connector/scan_planning/starrocks.rs",
         "src/coordinator/prepare/iceberg_delta.rs",
         "src/coordinator/scheduler/runtime_filter.rs",
-        "src/sql/codegen/proto_encode/iceberg_delta_scan.rs",
+        "src/protocol/native/encode/iceberg_delta_scan.rs",
         "src/sql/planner/distributed/build/runtime_filter_binding.rs",
     ] {
         let text = fs::read_to_string(repo.join(source)).expect(source);
@@ -23842,7 +23847,7 @@ fn nfe_3_native_planning_owners_are_named_explicitly() {
         "src/connector/scan_planning/starrocks.rs",
         "src/coordinator/prepare/iceberg_delta.rs",
         "src/coordinator/scheduler/runtime_filter.rs",
-        "src/sql/codegen/proto_encode/iceberg_delta_scan.rs",
+        "src/protocol/native/encode/iceberg_delta_scan.rs",
         "src/sql/planner/distributed/build/runtime_filter_binding.rs",
     ];
     let retired_owners = [
@@ -23874,7 +23879,7 @@ fn nfe_3_native_planning_owners_are_named_explicitly() {
     let scheduler_mod = fs::read_to_string(repo.join("src/coordinator/scheduler/mod.rs")).unwrap();
     let build_mod =
         fs::read_to_string(repo.join("src/sql/planner/distributed/build/mod.rs")).unwrap();
-    let proto_mod = fs::read_to_string(repo.join("src/sql/codegen/proto_encode/mod.rs")).unwrap();
+    let proto_mod = fs::read_to_string(repo.join("src/protocol/native/encode/mod.rs")).unwrap();
     for (source, text, required) in [
         (
             "src/coordinator/prepare/mod.rs",
@@ -23892,7 +23897,7 @@ fn nfe_3_native_planning_owners_are_named_explicitly() {
             &["mod runtime_filter_binding;"][..],
         ),
         (
-            "src/sql/codegen/proto_encode/mod.rs",
+            "src/protocol/native/encode/mod.rs",
             proto_mod.as_str(),
             &["mod iceberg_delta_scan;"][..],
         ),
@@ -23925,7 +23930,7 @@ fn nfe_3_native_planning_owners_are_named_explicitly() {
     }
 
     let planning_path = repo.join("src/connector/scan_model/starrocks.rs");
-    let encoder_path = repo.join("src/sql/codegen/proto_encode/plan.rs");
+    let encoder_path = repo.join("src/protocol/native/encode/plan.rs");
     if planning_path.is_file() {
         let planning = fs::read_to_string(&planning_path).unwrap();
         let encoder = fs::read_to_string(&encoder_path).unwrap();
@@ -23952,7 +23957,7 @@ fn nfe_3_native_planning_owners_are_named_explicitly() {
     }
 
     let delta_planning_path = repo.join("src/engine/mv/scan_binding.rs");
-    let delta_encoder_path = repo.join("src/sql/codegen/proto_encode/iceberg_delta_scan.rs");
+    let delta_encoder_path = repo.join("src/protocol/native/encode/iceberg_delta_scan.rs");
     if delta_planning_path.is_file() && delta_encoder_path.is_file() {
         let planning = fs::read_to_string(&delta_planning_path).unwrap();
         if rust_named_function_declaration_count(&planning, "encode_iceberg_delta_scan_plan_native")
@@ -24609,8 +24614,7 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
     let codegen_root = repo.join("src/sql/codegen");
     let codegen_mod = fs::read_to_string(codegen_root.join("mod.rs")).unwrap();
     let actual_root_modules = rust_module_item_declarations(&codegen_mod);
-    let expected_root_modules =
-        BTreeSet::from(["fragment".to_string(), "proto_encode".to_string()]);
+    let expected_root_modules = BTreeSet::new();
     if actual_root_modules != expected_root_modules {
         violations.push(format!(
             "src/sql/codegen/mod.rs: production modules must be exactly {expected_root_modules:?}, got {actual_root_modules:?}"
@@ -24628,6 +24632,8 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
         "src/sql/codegen/connector_scan_planning.rs",
         "src/sql/codegen/iceberg_delta_scan_planning.rs",
         "src/sql/codegen/iceberg_literal_json.rs",
+        "src/sql/codegen/fragment",
+        "src/sql/codegen/proto_encode",
     ] {
         match fs::symlink_metadata(repo.join(retired)) {
             Ok(_) => violations.push(format!("{retired}: retired path still exists")),
@@ -24638,17 +24644,6 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
         }
     }
 
-    let fragment_mod_path = codegen_root.join("fragment/mod.rs");
-    let fragment_mod = fs::read_to_string(&fragment_mod_path).unwrap();
-    let fragment_production = rust_sanitized_production_text(&fragment_mod);
-    let actual_fragment_modules = rust_module_item_declarations(&fragment_production);
-    let expected_fragment_modules = BTreeSet::from(["bundle".to_string()]);
-    if actual_fragment_modules != expected_fragment_modules {
-        violations.push(format!(
-            "src/sql/codegen/fragment/mod.rs: production modules must be exactly {expected_fragment_modules:?}, got {actual_fragment_modules:?}"
-        ));
-    }
-
     let codegen_sources = rs_files(&codegen_root)
         .into_iter()
         .map(|path| (rel(&path), fs::read_to_string(path).unwrap()))
@@ -24657,7 +24652,7 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
     for (name, expected_owner) in [
         (
             "NativeFragmentBundle",
-            "src/sql/codegen/fragment/bundle.rs (1)",
+            "src/protocol/native/encode/bundle.rs (1)",
         ),
         (
             "RuntimeFilterPlanResult",
@@ -24693,10 +24688,11 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
         &cgo_8_production_source_texts(repo),
     ));
 
-    let fragment_build = fs::read_to_string(codegen_root.join("fragment/bundle.rs")).unwrap();
+    let fragment_build =
+        fs::read_to_string(repo.join("src/protocol/native/encode/bundle.rs")).unwrap();
     let production = rust_sanitized_production_text(&fragment_build);
     violations.extend(nfe_3_raw_starrocks_idl_violations(
-        "src/sql/codegen/fragment/bundle.rs",
+        "src/protocol/native/encode/bundle.rs",
         &fragment_build,
     ));
     let production_tokens = rust_use_tokens(&production);
@@ -24706,7 +24702,7 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
         || production_tokens.iter().any(|token| token == "compat")
     {
         violations.push(
-            "src/sql/codegen/fragment/bundle.rs: unique native bundle must be feature-neutral"
+            "src/protocol/native/encode/bundle.rs: unique native bundle must be feature-neutral"
                 .to_string(),
         );
     }
@@ -24832,7 +24828,7 @@ fn nidl_d3l_native_mainline_thrift_usage_is_explicitly_allowlisted() {
         );
     }
 
-    for path in rs_files(&repo.join("src/sql/codegen/proto_encode")) {
+    for path in rs_files(&repo.join("src/protocol/native/encode")) {
         let source = rel(&path);
         let text = fs::read_to_string(&path).unwrap();
         let text = rust_production_text_without_cfg_test(&text);
@@ -26806,11 +26802,12 @@ fn nidl_e3_planner_ir_uses_native_partition_and_runtime_filter_types() {
         );
     }
 
-    let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/fragment/bundle.rs")).unwrap();
+    let codegen_mod =
+        fs::read_to_string(repo.join("src/protocol/native/encode/bundle.rs")).unwrap();
     let codegen_mod = rust_production_text_without_cfg_test(&codegen_mod);
     push_forbidden_terms(
         &mut violations,
-        "src/sql/codegen/fragment/bundle.rs",
+        "src/protocol/native/encode/bundle.rs",
         &codegen_mod,
         &[
             "pub compat_output_partition:",
@@ -26819,11 +26816,11 @@ fn nidl_e3_planner_ir_uses_native_partition_and_runtime_filter_types() {
         "codegen public IR must not expose thrift partition/RF descriptor fields",
     );
 
-    let proto_plan = fs::read_to_string(repo.join("src/sql/codegen/proto_encode/plan.rs")).unwrap();
+    let proto_plan = fs::read_to_string(repo.join("src/protocol/native/encode/plan.rs")).unwrap();
     let proto_plan = rust_production_text_without_cfg_test(&proto_plan);
     push_forbidden_terms(
         &mut violations,
-        "src/sql/codegen/proto_encode/plan.rs",
+        "src/protocol/native/encode/plan.rs",
         &proto_plan,
         &["crate::thrift::partitions", "TPartitionType"],
         "native proto encoder must encode ExchangeReceiver from native DataPartition",
@@ -29900,9 +29897,10 @@ fn cgo_8_ast_analysis(source: &Cgo8GuardSource) -> Result<Cgo8AstResult, String>
     let mut visitor = Cgo8AstVisitor {
         source: &source.path,
         codegen: source.path.starts_with("src/sql/codegen/")
+            || source.path.starts_with("src/protocol/native/encode/")
             || source.path == "src/coordinator/prepare/scan_preparation.rs",
         preparation: source.path == "src/coordinator/prepare/scan_preparation.rs",
-        encoder: source.path.starts_with("src/sql/codegen/proto_encode/"),
+        encoder: source.path.starts_with("src/protocol/native/encode/"),
         scopes: vec![Cgo8AstScope {
             module_path: rust_source_module_segments(&source.path)
                 .unwrap_or_else(|| vec!["crate".to_string()]),
@@ -29963,7 +29961,7 @@ fn cgo_8_delta_owner_violations(sources: &[(String, String)]) -> Vec<String> {
         ),
         (
             "encode_iceberg_delta_scan_plan_native",
-            "src/sql/codegen/proto_encode/iceberg_delta_scan.rs (1)",
+            "src/protocol/native/encode/iceberg_delta_scan.rs (1)",
             "delta-encoder-owner",
         ),
     ] {
@@ -29987,7 +29985,10 @@ fn cgo_8_immutable_scan_preparation_violations(sources: &[Cgo8GuardSource]) -> V
     ];
     let codegen = sources
         .iter()
-        .filter(|source| source.path.starts_with("src/sql/codegen/"))
+        .filter(|source| {
+            source.path.starts_with("src/sql/codegen/")
+                || source.path.starts_with("src/protocol/native/encode/")
+        })
         .collect::<Vec<_>>();
     let preparation = sources
         .iter()
@@ -29995,7 +29996,7 @@ fn cgo_8_immutable_scan_preparation_violations(sources: &[Cgo8GuardSource]) -> V
         .collect::<Vec<_>>();
     let encoders = sources
         .iter()
-        .filter(|source| source.path.starts_with("src/sql/codegen/proto_encode/"))
+        .filter(|source| source.path.starts_with("src/protocol/native/encode/"))
         .collect::<Vec<_>>();
     let mut violations = Vec::new();
     for (owner, collection) in [
@@ -30043,7 +30044,7 @@ fn cgo_8_immutable_scan_preparation_violations(sources: &[Cgo8GuardSource]) -> V
                 if source.path == "src/coordinator/prepare/scan_preparation.rs" {
                     preparation_functions += result.production_functions;
                 }
-                if source.path.starts_with("src/sql/codegen/proto_encode/") {
+                if source.path.starts_with("src/protocol/native/encode/") {
                     encoder_functions += result.production_functions;
                 }
             }
@@ -30066,14 +30067,14 @@ fn cgo_8_immutable_scan_preparation_violations(sources: &[Cgo8GuardSource]) -> V
 fn cgo_8_fixture_sources(preparation: &str, encoder: &str, other: &str) -> Vec<Cgo8GuardSource> {
     vec![
         Cgo8GuardSource::new("src/coordinator/prepare/scan_preparation.rs", preparation),
-        Cgo8GuardSource::new("src/sql/codegen/proto_encode/plan.rs", encoder),
+        Cgo8GuardSource::new("src/protocol/native/encode/plan.rs", encoder),
         Cgo8GuardSource::new("src/lib.rs", other),
         Cgo8GuardSource::new(
             "src/engine/mv/scan_binding.rs",
             "fn build_iceberg_delta_scan_runtime_plan() {}",
         ),
         Cgo8GuardSource::new(
-            "src/sql/codegen/proto_encode/iceberg_delta_scan.rs",
+            "src/protocol/native/encode/iceberg_delta_scan.rs",
             "fn encode_iceberg_delta_scan_plan_native() {}",
         ),
     ]
@@ -30383,7 +30384,7 @@ fn cgo_8_detector_closes_alias_generic_and_owner_bypasses() {
             !matches!(
                 source.path.as_str(),
                 "src/engine/mv/scan_binding.rs"
-                    | "src/sql/codegen/proto_encode/iceberg_delta_scan.rs"
+                    | "src/protocol/native/encode/iceberg_delta_scan.rs"
             )
         })
         .cloned()
@@ -30408,7 +30409,7 @@ fn cgo_8_detector_closes_alias_generic_and_owner_bypasses() {
         "fn build_iceberg_delta_scan_runtime_plan() {}",
     ));
     duplicate_owners.push(Cgo8GuardSource::new(
-        "src/sql/codegen/proto_encode/duplicate.rs",
+        "src/protocol/native/encode/duplicate.rs",
         "fn encode_iceberg_delta_scan_plan_native() {}",
     ));
     let duplicate_violations = cgo_8_immutable_scan_preparation_violations(&duplicate_owners);
@@ -30533,7 +30534,7 @@ fn local_fn_shadow() { fn plan_changes() {} plan_changes(); }
     assert!(
         parse_violations.iter().any(|violation| {
             violation.contains("ast-parse")
-                && violation.contains("src/sql/codegen/proto_encode/plan.rs")
+                && violation.contains("src/protocol/native/encode/plan.rs")
         }),
         "invalid production Rust must fail closed with its source path: {parse_violations:?}"
     );
@@ -34752,7 +34753,7 @@ fn planner_topology_contract() {
 // semantic repair.
 //
 // CGO-9C retired every "repair a stale/incomplete plan" surface from the
-// encoder (`src/sql/codegen/proto_encode/`). The planner seal now finalizes all
+// encoder (`src/protocol/native/encode/`). The planner seal now finalizes all
 // node / fragment / stream-edge / write / aggregate outputs
 // (`sql::planner::distributed`), and the encoder maps that sealed contract onto
 // the wire without re-deriving it. Task 5 deleted the last surviving repair --
@@ -34797,14 +34798,14 @@ fn planner_topology_contract() {
 // emits RF wire columns still passes.
 // ---------------------------------------------------------------------------
 
-const CGO_9C_ENCODER_ROOT: &str = "src/sql/codegen/proto_encode/";
+const CGO_9C_ENCODER_ROOT: &str = "src/protocol/native/encode/";
 const CGO_9C_PLANNER_DISTRIBUTED_ROOT: &str = "src/sql/planner/distributed/";
 const CGO_9C_AGGREGATE_TYPE_CONTRACT: &str = "src/types/aggregate.rs";
 
 // Retired encoder semantic-repair helpers. Reintroducing any of these names in
 // the encoder is a regression: it re-derives output the planner already sealed.
 // These are exactly the names the retired-inventory `rg` in the CGO-9C plan
-// bans under `src/sql/codegen/proto_encode`.
+// bans under `src/protocol/native/encode`.
 const CGO_9C_RETIRED_ENCODER_HELPERS: [&str; 6] = [
     "patch_exchange_receiver",
     "normalize_encoded_node_output",
@@ -34953,7 +34954,7 @@ fn cgo_9c_encoder_semantic_repair_detector_accepts_sealed_mapping_encoder() {
     // outputs through 1:1 enum/presence/range mappers, and reads the sealed
     // fragment/stream contract through its own (distinctly named) readers.
     let sources = [Cgo8GuardSource::new(
-        "src/sql/codegen/proto_encode/plan.rs",
+        "src/protocol/native/encode/plan.rs",
         "fn encode_distributed_plan(plan: &DistributedPlan) -> Result<Encoded, String> {\n\
              let _ = encode_data_partition(&plan.data_partition())?;\n\
              let _ = encode_type(&column.data_type)?;\n\
@@ -34973,7 +34974,7 @@ fn cgo_9c_encoder_semantic_repair_detector_accepts_sealed_mapping_encoder() {
 fn cgo_9c_encoder_semantic_repair_detector_rejects_each_retired_helper() {
     for helper in CGO_9C_RETIRED_ENCODER_HELPERS {
         let sources = [Cgo8GuardSource::new(
-            "src/sql/codegen/proto_encode/plan.rs",
+            "src/protocol/native/encode/plan.rs",
             format!("fn repair(node: &Node) {{ let _ = {helper}(node); }}"),
         )];
         let violations = cgo_9c_encoder_semantic_repair_violations(&sources);
@@ -34990,7 +34991,7 @@ fn cgo_9c_encoder_semantic_repair_detector_rejects_each_retired_helper() {
 fn cgo_9c_encoder_semantic_repair_detector_rejects_planner_finalizer_calls() {
     for finalizer in CGO_9C_PLANNER_OUTPUT_FINALIZERS {
         let sources = [Cgo8GuardSource::new(
-            "src/sql/codegen/proto_encode/plan.rs",
+            "src/protocol/native/encode/plan.rs",
             format!("fn encode(node: &Node) {{ let _ = {finalizer}(node); }}"),
         )];
         let violations = cgo_9c_encoder_semantic_repair_violations(&sources);
@@ -35006,7 +35007,7 @@ fn cgo_9c_encoder_semantic_repair_detector_rejects_planner_finalizer_calls() {
 #[test]
 fn cgo_9c_encoder_semantic_repair_detector_rejects_draft_and_mutable_borrow() {
     let draft = [Cgo8GuardSource::new(
-        "src/sql/codegen/proto_encode/plan.rs",
+        "src/protocol/native/encode/plan.rs",
         "fn encode(draft: DistributedPlanDraft) { let _ = draft; }",
     )];
     assert!(
@@ -35017,7 +35018,7 @@ fn cgo_9c_encoder_semantic_repair_detector_rejects_draft_and_mutable_borrow() {
     );
 
     let mutable = [Cgo8GuardSource::new(
-        "src/sql/codegen/proto_encode/plan.rs",
+        "src/protocol/native/encode/plan.rs",
         "fn encode(plan: &mut DistributedPlan) { let _ = plan; }",
     )];
     assert!(
@@ -35049,7 +35050,7 @@ fn cgo_9c_encoder_semantic_repair_detector_ignores_test_only_and_comment_surface
     // module is not production semantic repair; the sanitizer strips both, so the
     // detector must not trip.
     let sources = [Cgo8GuardSource::new(
-        "src/sql/codegen/proto_encode/plan.rs",
+        "src/protocol/native/encode/plan.rs",
         "fn encode(plan: &DistributedPlan) { let _ = plan; } // encoded_node_output_columns is retired\n\
          #[cfg(test)]\n\
          mod tests {\n    fn probe() { let _ = encoded_fragment_root_output_columns(&fragment); }\n}",
@@ -35080,7 +35081,7 @@ fn cgo_9c_encoder_semantic_repair_detector_accepts_runtime_filter_wire_encoding(
     // The encoder mapping node-carried runtime filters onto the wire is
     // legitimate 1:1 encoding, not semantic repair; it must pass.
     let sources = [Cgo8GuardSource::new(
-        "src/sql/codegen/proto_encode/plan.rs",
+        "src/protocol/native/encode/plan.rs",
         "fn encode_node(node: &DistributedNode) -> plan::DistributedNode {\n\
              plan::DistributedNode {\n\
                  build_runtime_filters: encode_runtime_filters(&node.build_runtime_filters),\n\
@@ -38054,7 +38055,7 @@ fn coor_3b_forbidden_path_violations(sources: &[Cgo8GuardSource]) -> Vec<String>
             }
         }
 
-        if source.path != "src/sql/codegen/fragment/bundle.rs"
+        if source.path != "src/protocol/native/encode/bundle.rs"
             && tokens.iter().any(|token| token == "by_fragment")
         {
             match coor_3b_native_bundle_field_accesses(&source.text) {
@@ -38064,7 +38065,7 @@ fn coor_3b_forbidden_path_violations(sources: &[Cgo8GuardSource]) -> Vec<String>
                 Err(error) => violations.push(format!("source-parse: {}: {error}", source.path)),
             }
         }
-        let bundle_owner = source.path == "src/sql/codegen/fragment/bundle.rs";
+        let bundle_owner = source.path == "src/protocol/native/encode/bundle.rs";
         if !bundle_owner {
             match coor_3b_native_bundle_binding_violations(&source.text) {
                 Ok(binding_violations) => {
@@ -38366,7 +38367,7 @@ fn coordinator_artifact_guard_allows_scheduling_plan_placement_map() {
 #[test]
 fn coordinator_artifact_guard_rejects_mutable_bundle_map_accessor() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/bundle.rs",
+        "src/protocol/native/encode/bundle.rs",
         "impl NativeFragmentBundle { fn get_mut(&mut self, id: FragmentId) -> Option<&mut NativePlanFragment> { self.by_fragment.get_mut(&id) } }",
         "get_mut",
     );
@@ -38394,7 +38395,7 @@ fn collect_native_fragment_bundle(by_fragment: BTreeMap<FragmentId, NativePlanFr
 fn coordinator_artifact_guard_rejects_arbitrary_mutable_bundle_method() {
     let fixture = coor_3b_bundle_interface_fixture("fn fragments_mut(&mut self) {}");
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/bundle.rs",
+        "src/protocol/native/encode/bundle.rs",
         &fixture,
         "fragments_mut",
     );
@@ -38662,7 +38663,7 @@ fn coordinator_artifact_guard_rejects_nested_owner_bundle_impl() {
         coor_3b_bundle_interface_fixture("")
     );
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/bundle.rs",
+        "src/protocol/native/encode/bundle.rs",
         &fixture,
         "nested NativeFragmentBundle impl",
     );
@@ -38675,7 +38676,7 @@ fn coordinator_artifact_guard_rejects_nested_owner_bundle_trait_impl() {
         coor_3b_bundle_interface_fixture("")
     );
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/bundle.rs",
+        "src/protocol/native/encode/bundle.rs",
         &fixture,
         "nested NativeFragmentBundle impl",
     );
@@ -38687,7 +38688,7 @@ fn coordinator_artifact_guard_rejects_mutable_bundle_return() {
         "fn payload_mut(&mut self) -> &mut BTreeMap<FragmentId, NativePlanFragment> { &mut self.by_fragment }",
     );
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/bundle.rs",
+        "src/protocol/native/encode/bundle.rs",
         &fixture,
         "payload_mut",
     );
@@ -38699,7 +38700,7 @@ fn coordinator_artifact_guard_rejects_bundle_as_mut_trait() {
         "{}\nimpl AsMut<BTreeMap<FragmentId, NativePlanFragment>> for NativeFragmentBundle {{ fn as_mut(&mut self) -> &mut BTreeMap<FragmentId, NativePlanFragment> {{ &mut self.by_fragment }} }}",
         coor_3b_bundle_interface_fixture("")
     );
-    assert_coor_3b_fixture_rejected("src/sql/codegen/fragment/bundle.rs", &fixture, "AsMut");
+    assert_coor_3b_fixture_rejected("src/protocol/native/encode/bundle.rs", &fixture, "AsMut");
 }
 
 #[test]
@@ -38708,7 +38709,7 @@ fn coordinator_artifact_guard_rejects_bundle_deref_mut_trait() {
         "{}\nimpl DerefMut for NativeFragmentBundle {{ fn deref_mut(&mut self) -> &mut Self::Target {{ &mut self.by_fragment }} }}",
         coor_3b_bundle_interface_fixture("")
     );
-    assert_coor_3b_fixture_rejected("src/sql/codegen/fragment/bundle.rs", &fixture, "DerefMut");
+    assert_coor_3b_fixture_rejected("src/protocol/native/encode/bundle.rs", &fixture, "DerefMut");
 }
 
 #[test]
@@ -38717,7 +38718,7 @@ fn coordinator_artifact_guard_rejects_bundle_map_as_ref_trait() {
         "{}\nimpl AsRef<BTreeMap<FragmentId, NativePlanFragment>> for NativeFragmentBundle {{ fn as_ref(&self) -> &BTreeMap<FragmentId, NativePlanFragment> {{ &self.by_fragment }} }}",
         coor_3b_bundle_interface_fixture("")
     );
-    assert_coor_3b_fixture_rejected("src/sql/codegen/fragment/bundle.rs", &fixture, "AsRef");
+    assert_coor_3b_fixture_rejected("src/protocol/native/encode/bundle.rs", &fixture, "AsRef");
 }
 
 #[test]
@@ -38726,7 +38727,7 @@ fn coordinator_artifact_guard_rejects_bundle_map_deref_trait() {
         "{}\nimpl Deref for NativeFragmentBundle {{ type Target = BTreeMap<FragmentId, NativePlanFragment>; fn deref(&self) -> &Self::Target {{ &self.by_fragment }} }}",
         coor_3b_bundle_interface_fixture("")
     );
-    assert_coor_3b_fixture_rejected("src/sql/codegen/fragment/bundle.rs", &fixture, "Deref");
+    assert_coor_3b_fixture_rejected("src/protocol/native/encode/bundle.rs", &fixture, "Deref");
 }
 
 #[test]
@@ -38735,14 +38736,14 @@ fn coordinator_artifact_guard_rejects_arbitrary_bundle_trait_impl() {
         "{}\nimpl Borrow<NativeFragmentBundle> for NativeFragmentBundle {{ fn borrow(&self) -> &NativeFragmentBundle {{ self }} }}",
         coor_3b_bundle_interface_fixture("")
     );
-    assert_coor_3b_fixture_rejected("src/sql/codegen/fragment/bundle.rs", &fixture, "Borrow");
+    assert_coor_3b_fixture_rejected("src/protocol/native/encode/bundle.rs", &fixture, "Borrow");
 }
 
 #[test]
 fn coordinator_artifact_guard_rejects_bundle_associated_item() {
     let fixture = coor_3b_bundle_interface_fixture("const LEAK: usize = 1;");
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/bundle.rs",
+        "src/protocol/native/encode/bundle.rs",
         &fixture,
         "associated item `const`",
     );
@@ -38756,7 +38757,7 @@ fn coordinator_artifact_guard_rejects_bundle_owner_derive_macro() {
         1,
     );
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/bundle.rs",
+        "src/protocol/native/encode/bundle.rs",
         &fixture,
         "bundle owner struct attributes",
     );
@@ -38770,7 +38771,7 @@ fn coordinator_artifact_guard_rejects_bundle_owner_impl_attribute_macro() {
         1,
     );
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/bundle.rs",
+        "src/protocol/native/encode/bundle.rs",
         &fixture,
         "bundle owner impl attributes",
     );
@@ -38779,7 +38780,7 @@ fn coordinator_artifact_guard_rejects_bundle_owner_impl_attribute_macro() {
 #[test]
 fn coordinator_artifact_guard_rejects_second_bundle_constructor() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/bundle.rs",
+        "src/protocol/native/encode/bundle.rs",
         "struct NativeFragmentBundle { by_fragment: BTreeMap<u32, NativePlanFragment> }\n\
          fn collect_native_fragment_bundle(by_fragment: BTreeMap<u32, NativePlanFragment>) -> NativeFragmentBundle { NativeFragmentBundle { by_fragment } }\n\
          fn assemble_payloads(by_fragment: BTreeMap<u32, NativePlanFragment>) -> NativeFragmentBundle { NativeFragmentBundle { by_fragment } }",
@@ -38817,7 +38818,7 @@ fn coordinator_preparation_owner_guard_rejects_engine_concrete_import() {
 #[test]
 fn coordinator_artifact_guard_rejects_encoder_semantic_repair() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/proto_encode/plan.rs",
+        "src/protocol/native/encode/plan.rs",
         "fn encode(node: &Node) { let _ = encoded_node_output_columns(node); }",
         "encoder-semantic-repair",
     );
@@ -38889,7 +38890,7 @@ fn coordinator_runtime_filter_guard_rejects_graph_requirement() {
 #[test]
 fn coordinator_runtime_filter_guard_rejects_codegen_projection_call() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/bundle.rs",
+        "src/protocol/native/encode/bundle.rs",
         "fn encode(plan: &DistributedPlan) { let _ = project_runtime_filters(plan); }",
         "runtime-filter-projection-owner",
     );
@@ -39075,7 +39076,7 @@ fn coordinator_runtime_filter_guard_rejects_consumer_of_projection_wrapper() {
             "fn prepare_fragments(plan: &DistributedPlan) { let _ = project_runtime_filters(plan); } pub(crate) fn reproject(plan: &DistributedPlan) { let _ = project_runtime_filters(plan); }",
         ),
         Cgo8GuardSource::new(
-            "src/sql/codegen/fragment/bundle.rs",
+            "src/protocol/native/encode/bundle.rs",
             "use crate::coordinator::prepare::reproject as reroute; fn encode(plan: &DistributedPlan) { reroute(plan); }",
         ),
     ];
@@ -39083,7 +39084,7 @@ fn coordinator_runtime_filter_guard_rejects_consumer_of_projection_wrapper() {
     assert!(
         violations.iter().any(|violation| {
             violation.contains("runtime-filter-projection-owner")
-                && violation.contains("src/sql/codegen/fragment/bundle.rs")
+                && violation.contains("src/protocol/native/encode/bundle.rs")
                 && violation.contains("reproject")
         }),
         "the aliased consumer of a preparation wrapper must be rejected explicitly: {violations:?}"
@@ -39562,7 +39563,7 @@ fn coordinator_preparation_owner_guard_recurses_new_scheduler_and_codegen_scan_m
             "pub(crate) fn prepare_scan_bindings() {}",
         ),
         ("src/sql/codegen/fragment/mod.rs", ""),
-        ("src/sql/codegen/proto_encode/mod.rs", ""),
+        ("src/protocol/native/encode/mod.rs", ""),
     ];
     for (relative, source) in files {
         let path = root.join(relative);
@@ -39702,8 +39703,7 @@ fn coordinator_preparation_owner() {
     for root in [
         "src/coordinator/prepare/",
         "src/coordinator/scheduler/",
-        "src/sql/codegen/fragment/",
-        "src/sql/codegen/proto_encode/",
+        "src/protocol/native/encode/",
     ] {
         assert!(
             source_paths.iter().any(|path| path.starts_with(root)),
@@ -39713,7 +39713,7 @@ fn coordinator_preparation_owner() {
     assert_eq!(
         source_paths
             .iter()
-            .filter(|path| **path == "src/sql/codegen/fragment/bundle.rs")
+            .filter(|path| **path == "src/protocol/native/encode/bundle.rs")
             .count(),
         1,
         "COOR-3B production inventory must contain exactly one native bundle owner"
@@ -39809,6 +39809,65 @@ fn coordinator_prepared_fragment_set() {
 }
 
 #[test]
+fn cgo_13_native_encoder_has_one_top_level_owner() {
+    let repo = Path::new(manifest_dir());
+    let encoder_root = repo.join("src/protocol/native/encode");
+    let encoder_sources = rs_files(&encoder_root);
+    assert!(
+        !encoder_sources.is_empty(),
+        "CGO-13 native encoder inventory must be non-empty under src/protocol/native/encode"
+    );
+
+    let encoder_production = encoder_sources
+        .iter()
+        .map(|path| {
+            rust_sanitized_production_text(
+                &fs::read_to_string(path).expect("read top-level native encoder source"),
+            )
+        })
+        .collect::<String>();
+    assert_eq!(
+        rust_named_type_declaration_count(&encoder_production, "NativeFragmentBundle"),
+        1,
+        "src/protocol/native/encode must contain exactly one production NativeFragmentBundle declaration"
+    );
+    assert_eq!(
+        rust_named_function_declaration_count(&encoder_production, "encode_native_fragment_bundle"),
+        1,
+        "src/protocol/native/encode must contain exactly one production native bundle constructor"
+    );
+
+    let sql_encoder_declarations = rs_files(&repo.join("src/sql"))
+        .into_iter()
+        .flat_map(|path| {
+            let production = rust_sanitized_production_text(
+                &fs::read_to_string(&path).expect("read SQL production source"),
+            );
+            [
+                "NativeFragmentBundle",
+                "NativePlanEncodeContext",
+                "encode_native_fragment_bundle",
+                "encode_distributed_plan",
+                "encode_distributed_plan_with_context",
+                "encode_data_partition",
+                "encode_instance_params",
+            ]
+            .into_iter()
+            .filter_map(move |name| {
+                let declarations = rust_named_type_declaration_count(&production, name)
+                    + rust_named_function_declaration_count(&production, name);
+                (declarations > 0).then(|| format!("{} declares `{name}`", rel(&path)))
+            })
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        sql_encoder_declarations.is_empty(),
+        "native protobuf encoder declarations must not remain under src/sql:\n{}",
+        sql_encoder_declarations.join("\n")
+    );
+}
+
+#[test]
 fn cgo_13_preparation_owns_native_scan_and_runtime_filter_projection() {
     let repo = Path::new(manifest_dir());
     for required in [
@@ -39838,11 +39897,11 @@ fn cgo_13_preparation_owns_native_scan_and_runtime_filter_projection() {
         fs::read_to_string(repo.join("src/coordinator/prepare/projection.rs")).unwrap();
     assert!(projection.contains("runtime_filter_projection: RuntimeFilterGraphProjection"));
     assert!(projection.contains("fn runtime_filter_projection(&self)"));
-    let bundle = fs::read_to_string(repo.join("src/sql/codegen/fragment/bundle.rs")).unwrap();
-    assert!(
-        bundle.contains("runtime_filter_projection: Some(prepared.runtime_filter_projection())")
-    );
-    let encoder = fs::read_to_string(repo.join("src/sql/codegen/proto_encode/plan.rs")).unwrap();
+    let bundle = fs::read_to_string(repo.join("src/protocol/native/encode/bundle.rs")).unwrap();
+    assert!(bundle.contains("prepared.scan_bindings()"));
+    assert!(bundle.contains("prepared.runtime_filter_projection()"));
+    assert!(!bundle.contains("NativePlanEncodeContext"));
+    let encoder = fs::read_to_string(repo.join("src/protocol/native/encode/plan.rs")).unwrap();
     assert!(!encoder.contains("project_runtime_filters"));
     let preparation =
         fs::read_to_string(repo.join("src/coordinator/prepare/scan_preparation.rs")).unwrap();
@@ -39869,8 +39928,11 @@ fn cgo_13_preparation_owns_native_scan_and_runtime_filter_projection() {
 
 #[test]
 fn coordinator_artifact_separation() {
-    let bundle_path = src_dir().join("sql/codegen/fragment/bundle.rs");
-    assert!(bundle_path.is_file(), "COOR-3B requires fragment/bundle.rs");
+    let bundle_path = src_dir().join("protocol/native/encode/bundle.rs");
+    assert!(
+        bundle_path.is_file(),
+        "COOR-3B requires protocol/native/encode/bundle.rs"
+    );
     let bundle = fs::read_to_string(bundle_path).expect("read native bundle");
     for required in [
         "struct NativeFragmentBundle",
@@ -39923,12 +39985,12 @@ fn coordinator_artifact_separation() {
     validate_native_bundle_construction_contract(&bundle)
         .expect("bundle construction must be unique to the file-private collector");
 
-    let fragment_dir = src_dir().join("sql/codegen/fragment");
+    let encoder_dir = src_dir().join("protocol/native/encode");
     assert!(
-        !fragment_dir.join("request.rs").exists(),
+        !encoder_dir.join("request.rs").exists(),
         "FragmentBuildRequest must be deleted"
     );
-    let production = production_rs_files(&fragment_dir)
+    let production = production_rs_files(&encoder_dir)
         .into_iter()
         .map(|path| fs::read_to_string(path).expect("read fragment source"))
         .collect::<String>();
@@ -39939,7 +40001,7 @@ fn coordinator_artifact_separation() {
         );
     }
     let test_build =
-        fs::read_to_string(fragment_dir.join("build.rs")).expect("read test-only fragment fixture");
+        fs::read_to_string(encoder_dir.join("build.rs")).expect("read test-only fragment fixture");
     assert!(
         !test_build.contains("struct TestBuildFixture"),
         "test fixture must pass prepared/native/boundary artifacts explicitly"

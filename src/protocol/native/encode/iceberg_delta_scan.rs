@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Deterministic Iceberg delta scan-to-protobuf mapping for the native boundary.
+
 use std::collections::HashMap;
 
 use crate::coordinator::prepare::scan::IcebergDeltaScanRuntimePlan;

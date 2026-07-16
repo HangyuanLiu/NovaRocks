@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Test-only full-plan encoder fixtures.
+
 use super::NativeFragmentBundle;
 use super::boundary_schema::{BoundarySchemaReport, project_boundary_reports};
 use crate::connector::ConnectorRegistry;
