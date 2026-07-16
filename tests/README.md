@@ -80,6 +80,28 @@ goldens. Finish tests by dropping transaction and store handles, then call
 `StateStoreRuntime::shutdown()`, and only after successful runtime shutdown run
 `docker/foundationdb/down.sh --docker`.
 
+## MySQL State Store Boundary
+
+`mysql-state-store-provider` pins the optional Tokio-native client to
+`mysql_async 0.37.0` with the minimal Rustls feature set. Default and
+feature-off builds retain the MySQL configuration vocabulary but do not include
+the async driver; selecting MySQL in those builds returns a typed
+`InvalidConfiguration` error and never falls back to SQLite.
+
+Task 1 covers only the dependency, nested `[state_store.mysql_client]`
+configuration, non-secret static validation, 3072-byte provider-effective key
+limit, and architecture ownership guard. Password values are not read during
+configuration loading, and no MySQL schema, transaction, or runtime provider is
+implemented in this task.
+
+Focused contract checks:
+
+```bash
+cargo test --test state_store_contract mysql_
+cargo test --lib state_store::limits::tests::mysql_
+cargo test --test architecture_guard state_store_mysql
+```
+
 ## About Rust Target Discovery
 
 Cargo auto-discovers `tests/*.rs`.  

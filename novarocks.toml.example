@@ -34,6 +34,29 @@ log_level = "info"
 # tls_verify_peers = "Check.Valid=1"
 # tls_password_env = "FDB_TLS_PASSWORD"
 
+# MySQL uses a feature-independent store vocabulary. Opening this provider
+# requires a build with `mysql-state-store-provider`; feature-off builds reject
+# it without falling back to SQLite. The password value is resolved from the
+# environment only when the MySQL runtime is constructed.
+# [state_store]
+# provider = "mysql"
+# cluster_id = "production-cluster"
+# database = "novarocks_control_plane"
+#
+# [state_store.mysql_client]
+# host = "mysql.internal.example"
+# port = 3306
+# username = "novarocks_state_store"
+# password_env = "NOVAROCKS_STATE_STORE_MYSQL_PASSWORD"
+# tls_mode = "verify_identity" # disabled, required, or verify_identity
+# tls_ca_path = "/run/secrets/mysql-ca.pem"
+# tls_cert_path = "/run/secrets/mysql-client.pem" # optional cert/key pair
+# tls_key_path = "/run/secrets/mysql-client-key.pem"
+# connect_timeout_ms = 1000
+# pool_min = 1
+# pool_max = 16
+# inactive_connection_ttl_ms = 30000
+
 [server]
 # Service bind host. Default: "127.0.0.1".
 host = "127.0.0.1"

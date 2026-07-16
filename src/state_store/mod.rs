@@ -35,7 +35,10 @@ mod foundationdb;
 #[doc(hidden)]
 pub use foundationdb::test_support::{FoundationDbCommitGateControl, arm_next_foundationdb_commit};
 
-pub use config::{FoundationDbClientConfig, StateStoreConfig, StateStoreProviderConfig};
+pub use config::{
+    FoundationDbClientConfig, MySqlClientConfig, MySqlTlsMode, StateStoreAppConfig,
+    StateStoreConfig, StateStoreProviderConfig,
+};
 pub use contract::{
     ChangeHint, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution,
     FeDeploymentView, Key, OperationId, Precondition, RangePage, ReadTransaction, StateRecord,
@@ -72,5 +75,13 @@ pub async fn open_state_store(
             #[cfg(feature = "foundationdb-provider")]
             return runtime.open_foundationdb_store(&config).await;
         }
+        StateStoreProviderConfig::Mysql { .. } => Err(StateStoreError::new(
+            StateStoreErrorKind::InvalidConfiguration,
+            if cfg!(feature = "mysql-state-store-provider") {
+                "MySQL provider runtime is not implemented"
+            } else {
+                "MySQL provider is not compiled in"
+            },
+        )),
     }
 }

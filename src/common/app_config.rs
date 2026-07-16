@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
 use crate::state_store::config::{
-    FoundationDbClientConfig, StateStoreConfig, StateStoreProviderConfig,
+    FoundationDbClientConfig, StateStoreAppConfig, StateStoreProviderConfig,
 };
 
 static CONFIG: OnceLock<RwLock<&'static NovaRocksConfig>> = OnceLock::new();
@@ -285,7 +285,7 @@ pub struct NovaRocksConfig {
     pub metadata: Option<MetadataConfig>,
 
     #[serde(default)]
-    pub state_store: Option<StateStoreConfig>,
+    pub state_store: Option<StateStoreAppConfig>,
 
     #[serde(default)]
     pub foundationdb_client: Option<FoundationDbClientConfig>,
@@ -363,37 +363,23 @@ fn validate_state_store_configuration(config: &NovaRocksConfig) -> Result<()> {
         state_store.validate()?;
     }
 
-    match (&config.state_store, &config.foundationdb_client) {
+    match (
+        config
+            .state_store
+            .as_ref()
+            .map(|state_store| &state_store.store.provider),
+        &config.foundationdb_client,
+    ) {
         (None, None)
-        | (
-            Some(StateStoreConfig {
-                provider: StateStoreProviderConfig::Sqlite { .. },
-                ..
-            }),
-            None,
-        ) => Ok(()),
-        (
-            Some(StateStoreConfig {
-                provider: StateStoreProviderConfig::Foundationdb { .. },
-                ..
-            }),
-            Some(client),
-        ) => client.validate(),
-        (
-            Some(StateStoreConfig {
-                provider: StateStoreProviderConfig::Foundationdb { .. },
-                ..
-            }),
-            None,
-        ) => bail!("InvalidStateStoreConfig: foundationdb provider requires [foundationdb_client]"),
+        | (Some(StateStoreProviderConfig::Sqlite { .. }), None)
+        | (Some(StateStoreProviderConfig::Mysql { .. }), None) => Ok(()),
+        (Some(StateStoreProviderConfig::Foundationdb { .. }), Some(client)) => client.validate(),
+        (Some(StateStoreProviderConfig::Foundationdb { .. }), None) => {
+            bail!("InvalidStateStoreConfig: foundationdb provider requires [foundationdb_client]")
+        }
         (None, Some(_))
-        | (
-            Some(StateStoreConfig {
-                provider: StateStoreProviderConfig::Sqlite { .. },
-                ..
-            }),
-            Some(_),
-        ) => bail!(
+        | (Some(StateStoreProviderConfig::Sqlite { .. }), Some(_))
+        | (Some(StateStoreProviderConfig::Mysql { .. }), Some(_)) => bail!(
             "InvalidStateStoreConfig: [foundationdb_client] requires the foundationdb state store provider"
         ),
     }
@@ -1630,7 +1616,7 @@ deployment_owner = "fe-a"
         let cfg = NovaRocksConfig::load_from_file(temp.path())?;
 
         assert!(matches!(
-            cfg.state_store.expect("state store config").provider,
+            cfg.state_store.expect("state store config").store.provider,
             StateStoreProviderConfig::Sqlite { .. }
         ));
         Ok(())

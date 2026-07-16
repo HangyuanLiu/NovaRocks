@@ -29,17 +29,372 @@ use futures::future::BoxFuture;
 use novarocks::state_store::{
     ChangeCursor, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution,
     ContinuationToken, Direction, FeDeploymentView, FoundationDbClientConfig, Key, KeyRange,
-    OperationId, Precondition, RangePage, RangeRequest, ReadTransaction, RunFailure, StateStore,
-    StateStoreConfig, StateStoreError, StateStoreErrorKind, StateStoreLimitOverrides,
-    StateStoreLimits, StateStoreMetrics, StateStoreOperation, StateStoreOutcome,
-    StateStoreProviderConfig, StateStoreRuntime, StoreIdentity, StoreRevision, TransactionId,
-    Value, VersionToken, WriteTransaction, derive_transaction_id, open_state_store,
-    run_side_effect_free,
+    MySqlClientConfig, MySqlTlsMode, OperationId, Precondition, RangePage, RangeRequest,
+    ReadTransaction, RunFailure, StateStore, StateStoreAppConfig, StateStoreConfig,
+    StateStoreError, StateStoreErrorKind, StateStoreLimitOverrides, StateStoreLimits,
+    StateStoreMetrics, StateStoreOperation, StateStoreOutcome, StateStoreProviderConfig,
+    StateStoreRuntime, StoreIdentity, StoreRevision, TransactionId, Value, VersionToken,
+    WriteTransaction, derive_transaction_id, open_state_store, run_side_effect_free,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use common::state_store_conformance::{FaultGate, FaultInjectingStateStore, ScriptedCommitResult};
+
+fn valid_mysql_client() -> MySqlClientConfig {
+    MySqlClientConfig {
+        host: "mysql.internal.example".to_owned(),
+        port: 3306,
+        username: "novarocks_state_store".to_owned(),
+        password_env: "NOVAROCKS_STATE_STORE_MYSQL_PASSWORD".to_owned(),
+        tls_mode: MySqlTlsMode::Required,
+        tls_ca_path: None,
+        tls_cert_path: None,
+        tls_key_path: None,
+        connect_timeout_ms: 1_000,
+        pool_min: 1,
+        pool_max: 16,
+        inactive_connection_ttl_ms: 30_000,
+    }
+}
+
+fn mysql_app_config(client: MySqlClientConfig) -> StateStoreAppConfig {
+    StateStoreAppConfig {
+        store: StateStoreConfig {
+            cluster_id: "cluster-a".to_owned(),
+            limits: StateStoreLimitOverrides::default(),
+            provider: StateStoreProviderConfig::Mysql {
+                database: "novarocks_control_plane".to_owned(),
+            },
+        },
+        mysql_client: Some(client),
+    }
+}
+
+#[test]
+fn mysql_config_parses_exact_nested_client_shape() -> anyhow::Result<()> {
+    let fixture_dir = tempfile::tempdir()?;
+    let ca = fixture_dir.path().join("ca.pem");
+    let cert = fixture_dir.path().join("client.pem");
+    let key = fixture_dir.path().join("client-key.pem");
+    for path in [&ca, &cert, &key] {
+        std::fs::write(path, b"test fixture")?;
+    }
+    let config_path = fixture_dir.path().join("novarocks.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[state_store]
+provider = "mysql"
+cluster_id = "production-cluster"
+database = "novarocks_control_plane"
+
+[state_store.mysql_client]
+host = "mysql.internal.example"
+port = 3306
+username = "novarocks_state_store"
+password_env = "NOVAROCKS_STATE_STORE_MYSQL_PASSWORD_UNSET"
+tls_mode = "verify_identity"
+tls_ca_path = "{}"
+tls_cert_path = "{}"
+tls_key_path = "{}"
+connect_timeout_ms = 1000
+pool_min = 1
+pool_max = 16
+inactive_connection_ttl_ms = 30000
+"#,
+            ca.display(),
+            cert.display(),
+            key.display()
+        ),
+    )?;
+
+    let loaded = novarocks::common::app_config::NovaRocksConfig::load_from_file(&config_path)?;
+    let app = loaded.state_store.expect("state store config");
+    assert!(matches!(
+        app.store.provider,
+        StateStoreProviderConfig::Mysql { ref database }
+            if database == "novarocks_control_plane"
+    ));
+    let client = app.mysql_client.expect("nested MySQL client");
+    assert_eq!(client.host, "mysql.internal.example");
+    assert_eq!(client.port, 3306);
+    assert_eq!(client.username, "novarocks_state_store");
+    assert_eq!(
+        client.password_env,
+        "NOVAROCKS_STATE_STORE_MYSQL_PASSWORD_UNSET"
+    );
+    assert_eq!(client.tls_mode, MySqlTlsMode::VerifyIdentity);
+    assert_eq!(client.tls_ca_path.as_deref(), Some(ca.as_path()));
+    assert_eq!(client.tls_cert_path.as_deref(), Some(cert.as_path()));
+    assert_eq!(client.tls_key_path.as_deref(), Some(key.as_path()));
+    assert_eq!(client.connect_timeout_ms, 1_000);
+    assert_eq!(client.pool_min, 1);
+    assert_eq!(client.pool_max, 16);
+    assert_eq!(client.inactive_connection_ttl_ms, 30_000);
+    Ok(())
+}
+
+#[test]
+fn mysql_config_rejects_cross_provider_and_unknown_fields() -> anyhow::Result<()> {
+    let fixtures = [
+        (
+            "non-MySQL fields are not valid",
+            r#"
+[state_store]
+provider = "mysql"
+cluster_id = "cluster-a"
+database = "novarocks_control_plane"
+path = "meta/state-store.sqlite"
+
+[state_store.mysql_client]
+host = "mysql.internal.example"
+port = 3306
+username = "novarocks"
+password_env = "NOVAROCKS_MYSQL_PASSWORD"
+tls_mode = "required"
+connect_timeout_ms = 1000
+pool_min = 1
+pool_max = 16
+inactive_connection_ttl_ms = 30000
+"#,
+        ),
+        (
+            "[state_store.mysql_client] requires the mysql state store provider",
+            r#"
+[state_store]
+provider = "sqlite"
+cluster_id = "cluster-a"
+path = "meta/state-store.sqlite"
+deployment_owner = "fe-a"
+
+[state_store.mysql_client]
+host = "mysql.internal.example"
+port = 3306
+username = "novarocks"
+password_env = "NOVAROCKS_MYSQL_PASSWORD"
+tls_mode = "required"
+connect_timeout_ms = 1000
+pool_min = 1
+pool_max = 16
+inactive_connection_ttl_ms = 30000
+"#,
+        ),
+        (
+            "mysql provider requires [state_store.mysql_client]",
+            r#"
+[state_store]
+provider = "mysql"
+cluster_id = "cluster-a"
+database = "novarocks_control_plane"
+"#,
+        ),
+        (
+            "unknown field",
+            r#"
+[state_store]
+provider = "mysql"
+cluster_id = "cluster-a"
+database = "novarocks_control_plane"
+
+[state_store.mysql_client]
+host = "mysql.internal.example"
+port = 3306
+username = "novarocks"
+password_env = "NOVAROCKS_MYSQL_PASSWORD"
+tls_mode = "required"
+connect_timeout_ms = 1000
+pool_min = 1
+pool_max = 16
+inactive_connection_ttl_ms = 30000
+dsn = "mysql://plaintext-secret"
+"#,
+        ),
+        (
+            "database",
+            r#"
+[state_store]
+provider = "mysql"
+cluster_id = "cluster-a"
+database = "invalid-database-name"
+
+[state_store.mysql_client]
+host = "mysql.internal.example"
+port = 3306
+username = "novarocks"
+password_env = "NOVAROCKS_MYSQL_PASSWORD"
+tls_mode = "required"
+connect_timeout_ms = 1000
+pool_min = 1
+pool_max = 16
+inactive_connection_ttl_ms = 30000
+"#,
+        ),
+    ];
+
+    for (expected, fixture) in fixtures {
+        let config_path = tempfile::NamedTempFile::new()?;
+        std::fs::write(config_path.path(), fixture)?;
+        let error = match novarocks::common::app_config::NovaRocksConfig::load_from_file(
+            config_path.path(),
+        ) {
+            Ok(_) => {
+                panic!("cross-provider, missing-client, and unknown fields must fail closed")
+            }
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(expected),
+            "expected {expected:?}, got {message:?} for fixture: {fixture}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn mysql_client_config_rejects_invalid_non_secret_shape() -> anyhow::Result<()> {
+    let fixture_dir = tempfile::tempdir()?;
+    let ca = fixture_dir.path().join("ca.pem");
+    let cert = fixture_dir.path().join("client.pem");
+    let key = fixture_dir.path().join("client-key.pem");
+    for path in [&ca, &cert, &key] {
+        std::fs::write(path, b"test fixture")?;
+    }
+
+    let mut valid = valid_mysql_client();
+    valid.tls_mode = MySqlTlsMode::VerifyIdentity;
+    valid.tls_ca_path = Some(ca.clone());
+    valid.tls_cert_path = Some(cert.clone());
+    valid.tls_key_path = Some(key);
+    mysql_app_config(valid)
+        .validate()
+        .expect("valid config must not resolve password_env during static validation");
+
+    let mut fixtures = Vec::new();
+    let mut client = valid_mysql_client();
+    client.host = " ".to_owned();
+    fixtures.push(("host", client));
+    let mut client = valid_mysql_client();
+    client.port = 0;
+    fixtures.push(("port", client));
+    let mut client = valid_mysql_client();
+    client.username = String::new();
+    fixtures.push(("username", client));
+    let mut client = valid_mysql_client();
+    client.password_env = "NOT-A-VARIABLE".to_owned();
+    fixtures.push(("password_env", client));
+    let mut client = valid_mysql_client();
+    client.connect_timeout_ms = 0;
+    fixtures.push(("connect_timeout_ms", client));
+    let mut client = valid_mysql_client();
+    client.connect_timeout_ms = 60_001;
+    fixtures.push(("connect_timeout_ms", client));
+    let mut client = valid_mysql_client();
+    client.pool_min = 0;
+    fixtures.push(("pool_min", client));
+    let mut client = valid_mysql_client();
+    client.pool_min = 17;
+    client.pool_max = 16;
+    fixtures.push(("pool_min", client));
+    let mut client = valid_mysql_client();
+    client.inactive_connection_ttl_ms = 0;
+    fixtures.push(("inactive_connection_ttl_ms", client));
+    let mut client = valid_mysql_client();
+    client.inactive_connection_ttl_ms = 86_400_001;
+    fixtures.push(("inactive_connection_ttl_ms", client));
+    let mut client = valid_mysql_client();
+    client.tls_mode = MySqlTlsMode::VerifyIdentity;
+    client.host = "127.0.0.1".to_owned();
+    client.tls_ca_path = Some(ca.clone());
+    fixtures.push(("host", client));
+    let mut client = valid_mysql_client();
+    client.tls_mode = MySqlTlsMode::VerifyIdentity;
+    fixtures.push(("tls_ca_path", client));
+    let mut client = valid_mysql_client();
+    client.tls_cert_path = Some(cert);
+    fixtures.push(("tls_key_path", client));
+    let mut client = valid_mysql_client();
+    client.tls_ca_path = Some(fixture_dir.path().join("missing-ca.pem"));
+    fixtures.push(("tls_ca_path", client));
+
+    for (field, client) in fixtures {
+        let error = mysql_app_config(client)
+            .validate()
+            .expect_err("invalid non-secret MySQL client shape must fail closed");
+        assert!(
+            error.to_string().contains(field),
+            "wrong error for {field}: {error}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn mysql_client_config_debug_redacts_connection_material() {
+    let config = MySqlClientConfig {
+        host: "secret.mysql.internal".to_owned(),
+        port: 3306,
+        username: "secret-user".to_owned(),
+        password_env: "SECRET_MYSQL_PASSWORD_ENV".to_owned(),
+        tls_mode: MySqlTlsMode::VerifyIdentity,
+        tls_ca_path: Some(PathBuf::from("/secret/ca.pem")),
+        tls_cert_path: Some(PathBuf::from("/secret/client.pem")),
+        tls_key_path: Some(PathBuf::from("/secret/client-key.pem")),
+        connect_timeout_ms: 1_000,
+        pool_min: 1,
+        pool_max: 16,
+        inactive_connection_ttl_ms: 30_000,
+    };
+
+    let debug = format!("{config:?}");
+    for secret in [
+        "secret.mysql.internal",
+        "secret-user",
+        "SECRET_MYSQL_PASSWORD_ENV",
+        "/secret/ca.pem",
+        "/secret/client.pem",
+        "/secret/client-key.pem",
+    ] {
+        assert!(!debug.contains(secret), "Debug leaked {secret}: {debug}");
+    }
+    for visible in [
+        "tls_ca_path_configured: true",
+        "tls_cert_path_configured: true",
+        "tls_key_path_configured: true",
+        "password_env_configured: true",
+    ] {
+        assert!(debug.contains(visible), "Debug omitted {visible}: {debug}");
+    }
+}
+
+#[cfg(not(feature = "mysql-state-store-provider"))]
+#[tokio::test]
+async fn mysql_config_feature_off_open_fails_without_fallback() {
+    let app = mysql_app_config(valid_mysql_client());
+    app.validate().expect("valid static MySQL configuration");
+    let runtime = StateStoreRuntime::local().expect("create feature-off local runtime");
+    let error = match open_state_store(
+        &runtime,
+        app.store,
+        FeDeploymentView {
+            active_fe_count: NonZeroUsize::new(3).expect("three FEs"),
+            topology_revision: Bytes::from_static(b"topology-r1"),
+        },
+    )
+    .await
+    {
+        Ok(_) => panic!("feature-off MySQL open must fail without SQLite fallback"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.kind(), StateStoreErrorKind::InvalidConfiguration);
+    assert_eq!(
+        error.to_string(),
+        "InvalidConfiguration: MySQL provider is not compiled in"
+    );
+}
 
 #[test]
 fn foundationdb_config_parses_exact_tagged_provider() -> anyhow::Result<()> {
@@ -357,7 +712,7 @@ fn assert_complete_tls_client_configuration(
 
     let state_store = loaded.state_store.expect("state store config");
     assert!(matches!(
-        state_store.provider,
+        state_store.store.provider,
         StateStoreProviderConfig::Foundationdb { cluster_file: loaded, keyspace_id }
             if loaded == cluster_file
                 && keyspace_id == Uuid::parse_str("22db595e-3031-48eb-8212-f56d3626ee41")?
@@ -412,7 +767,7 @@ disable_multi_version_client = true
     let runtime = StateStoreRuntime::local().expect("create feature-off local runtime");
     let error = match open_state_store(
         &runtime,
-        loaded.state_store.expect("state store config"),
+        loaded.state_store.expect("state store config").store,
         FeDeploymentView {
             active_fe_count: NonZeroUsize::new(3).expect("three FEs"),
             topology_revision: Bytes::from_static(b"topology-r1"),
