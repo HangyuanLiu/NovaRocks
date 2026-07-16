@@ -28,8 +28,8 @@ use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 
-use crate::catalog::schema::SqlType;
-use crate::sql::parser::ast::{ArithmeticOp, Expr, Literal};
+use crate::catalog::schema::{ColumnDefault, SqlType, validate_column_default};
+use crate::sql::parser::ast::{ArithmeticOp, DefaultLiteral, Expr, Literal};
 
 pub(crate) fn sqlparser_expr_to_custom_expr(expr: &sqlparser::ast::Expr) -> Result<Expr, String> {
     use sqlparser::ast as sqlast;
@@ -1452,6 +1452,236 @@ pub(crate) fn format_decimal128_value(value: i128, scale: i8) -> Result<String, 
     ))
 }
 
+pub(crate) fn default_literal_to_column_default(
+    literal: &DefaultLiteral,
+    column_type: &SqlType,
+) -> Result<Option<ColumnDefault>, String> {
+    if matches!(literal, DefaultLiteral::Null) {
+        return Ok(None);
+    }
+    if let DefaultLiteral::Decimal { scale, .. } = literal
+        && *scale < 0
+    {
+        return Err(format!("negative DECIMAL scale {scale} is not supported"));
+    }
+    if let SqlType::Decimal { scale, .. } = column_type
+        && *scale < 0
+    {
+        return Err(format!("negative DECIMAL scale {scale} is not supported"));
+    }
+
+    let value = match (literal, column_type) {
+        (DefaultLiteral::String(value), SqlType::Array(_)) => {
+            let json: JsonValue = serde_json::from_str(value)
+                .map_err(|error| format!("invalid ARRAY DEFAULT JSON: {error}"))?;
+            let elements = json
+                .as_array()
+                .ok_or_else(|| format!("ARRAY DEFAULT must be a JSON array, got: {value:?}"))?;
+            if !elements.is_empty() {
+                return Err(
+                    "non-empty ARRAY DEFAULT literals are not yet supported; use '[]'".to_string(),
+                );
+            }
+            ColumnDefault::Array(Vec::new())
+        }
+        (DefaultLiteral::String(value), SqlType::Map(_, _)) => {
+            let json: JsonValue = serde_json::from_str(value)
+                .map_err(|error| format!("invalid MAP DEFAULT JSON: {error}"))?;
+            let entries = json
+                .as_object()
+                .ok_or_else(|| format!("MAP DEFAULT must be a JSON object, got: {value:?}"))?;
+            if !entries.is_empty() {
+                return Err(
+                    "non-empty MAP DEFAULT literals are not yet supported; use '{}'".to_string(),
+                );
+            }
+            ColumnDefault::Map(Vec::new())
+        }
+        (DefaultLiteral::Bool(value), SqlType::Boolean) => ColumnDefault::Boolean(*value),
+        (DefaultLiteral::Int(value), SqlType::TinyInt) => {
+            i8::try_from(*value).map_err(|_| default_out_of_range("TINYINT", *value))?;
+            ColumnDefault::Int32(*value as i32)
+        }
+        (DefaultLiteral::Int(value), SqlType::SmallInt) => {
+            i16::try_from(*value).map_err(|_| default_out_of_range("SMALLINT", *value))?;
+            ColumnDefault::Int32(*value as i32)
+        }
+        (DefaultLiteral::Int(value), SqlType::Int) => {
+            i32::try_from(*value).map_err(|_| default_out_of_range("INT", *value))?;
+            ColumnDefault::Int32(*value as i32)
+        }
+        (DefaultLiteral::Int(value), SqlType::BigInt) => ColumnDefault::Int64(*value),
+        (DefaultLiteral::Float(value), SqlType::Float) => ColumnDefault::Float32 {
+            bits: (*value as f32).to_bits(),
+        },
+        (DefaultLiteral::Float(value), SqlType::Double) => ColumnDefault::Float64 {
+            bits: value.to_bits(),
+        },
+        (
+            DefaultLiteral::Decimal { unscaled, scale },
+            SqlType::Decimal {
+                precision,
+                scale: column_scale,
+            },
+        ) => {
+            if scale != column_scale {
+                return Err(format!(
+                    "DEFAULT value scale {scale} does not match column scale {column_scale}"
+                ));
+            }
+            ColumnDefault::Decimal {
+                unscaled: *unscaled,
+                precision: *precision,
+                scale: *scale,
+            }
+        }
+        (DefaultLiteral::String(value), SqlType::String | SqlType::Json) => {
+            ColumnDefault::String(value.clone())
+        }
+        (DefaultLiteral::Binary(value), SqlType::Binary | SqlType::Bitmap | SqlType::Hll) => {
+            ColumnDefault::Binary(value.clone())
+        }
+        (DefaultLiteral::Date(days), SqlType::Date) => ColumnDefault::Date {
+            days_since_epoch: *days,
+        },
+        (DefaultLiteral::DateTime(micros), SqlType::DateTime) => ColumnDefault::TimestampMicros {
+            micros_since_epoch: *micros,
+        },
+        (DefaultLiteral::DateTime(nanos), SqlType::DateTimeNs) => ColumnDefault::TimestampNanos {
+            nanos_since_epoch: *nanos,
+        },
+        (literal, column_type) => {
+            return Err(format!(
+                "DEFAULT value type does not match column type: literal={literal:?} column={column_type:?}"
+            ));
+        }
+    };
+
+    validate_column_default(&value)?;
+    Ok(Some(value))
+}
+
+pub(crate) fn column_default_to_ast_literal(
+    value: &ColumnDefault,
+    column_type: &SqlType,
+) -> Result<Literal, String> {
+    validate_column_default(value)?;
+    if let ColumnDefault::Decimal { scale, .. } = value
+        && *scale < 0
+    {
+        return Err(format!("negative DECIMAL scale {scale} is not supported"));
+    }
+    if let SqlType::Decimal { scale, .. } = column_type
+        && *scale < 0
+    {
+        return Err(format!("negative DECIMAL scale {scale} is not supported"));
+    }
+
+    match (value, column_type) {
+        (ColumnDefault::Boolean(value), SqlType::Boolean) => Ok(Literal::Bool(*value)),
+        (ColumnDefault::Int32(value), SqlType::TinyInt | SqlType::SmallInt | SqlType::Int) => {
+            Ok(Literal::Int(i64::from(*value)))
+        }
+        (ColumnDefault::Int64(value), SqlType::BigInt) => Ok(Literal::Int(*value)),
+        (ColumnDefault::Float32 { bits }, SqlType::Float) => {
+            Ok(Literal::Float(f64::from(f32::from_bits(*bits))))
+        }
+        (ColumnDefault::Float64 { bits }, SqlType::Double) => {
+            Ok(Literal::Float(f64::from_bits(*bits)))
+        }
+        (
+            ColumnDefault::Decimal {
+                unscaled,
+                precision,
+                scale,
+            },
+            SqlType::Decimal {
+                precision: column_precision,
+                scale: column_scale,
+            },
+        ) if precision == column_precision && scale == column_scale => {
+            Ok(Literal::String(format_decimal128_value(*unscaled, *scale)?))
+        }
+        (ColumnDefault::String(value), SqlType::String | SqlType::Json) => {
+            Ok(Literal::String(value.clone()))
+        }
+        (ColumnDefault::Binary(value), SqlType::Binary | SqlType::Bitmap | SqlType::Hll) => {
+            Ok(Literal::String(bytes_to_latin1_string(value)))
+        }
+        (ColumnDefault::Date { days_since_epoch }, SqlType::Date) => {
+            use chrono::NaiveDate;
+            const UNIX_EPOCH_DAY_OFFSET: i32 = 719_163;
+            let ce_days = UNIX_EPOCH_DAY_OFFSET
+                .checked_add(*days_since_epoch)
+                .ok_or_else(|| {
+                    format!(
+                        "write-default date value {days_since_epoch} is out of representable range"
+                    )
+                })?;
+            let date = NaiveDate::from_num_days_from_ce_opt(ce_days).ok_or_else(|| {
+                format!("write-default date value {days_since_epoch} is out of representable range")
+            })?;
+            Ok(Literal::Date(date.format("%Y-%m-%d").to_string()))
+        }
+        (
+            ColumnDefault::TimestampMicros { micros_since_epoch }
+            | ColumnDefault::TimestamptzMicros { micros_since_epoch },
+            SqlType::DateTime,
+        ) => {
+            use chrono::DateTime as ChronoDateTime;
+            let datetime = ChronoDateTime::from_timestamp_micros(*micros_since_epoch).ok_or_else(
+                || {
+                    format!(
+                        "write-default datetime value {micros_since_epoch} µs is out of representable range"
+                    )
+                },
+            )?;
+            Ok(Literal::String(
+                datetime.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string(),
+            ))
+        }
+        (
+            ColumnDefault::TimestampNanos { nanos_since_epoch }
+            | ColumnDefault::TimestamptzNanos { nanos_since_epoch },
+            SqlType::DateTimeNs,
+        ) => {
+            use chrono::DateTime as ChronoDateTime;
+            let datetime = ChronoDateTime::from_timestamp_nanos(*nanos_since_epoch);
+            Ok(Literal::String(
+                datetime
+                    .naive_utc()
+                    .format("%Y-%m-%d %H:%M:%S%.9f")
+                    .to_string(),
+            ))
+        }
+        (ColumnDefault::Array(elements), SqlType::Array(_)) => {
+            if !elements.is_empty() {
+                return Err(format!(
+                    "non-empty ARRAY write-default is not yet supported ({} elements)",
+                    elements.len()
+                ));
+            }
+            Ok(Literal::Array(Vec::new()))
+        }
+        (ColumnDefault::Map(entries), SqlType::Map(_, _)) => {
+            if !entries.is_empty() {
+                return Err(format!(
+                    "non-empty MAP write-default is not yet supported ({} entries)",
+                    entries.len()
+                ));
+            }
+            Ok(Literal::Map(Vec::new()))
+        }
+        (value, column_type) => Err(format!(
+            "write-default literal type does not match column type: literal={value:?} column={column_type:?}"
+        )),
+    }
+}
+
+fn default_out_of_range(type_name: &str, value: i64) -> String {
+    format!("DEFAULT value {value} is out of range for {type_name}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1507,6 +1737,363 @@ mod tests {
             parse_datetime_string_to_nanos("2262-04-12 00:00:00").unwrap_err(),
             "DATETIME literal '2262-04-12 00:00:00' out of nanosecond representable range"
         );
+    }
+
+    #[test]
+    fn default_literal_to_column_default_maps_supported_sql_types() {
+        let cases = [
+            (
+                DefaultLiteral::Bool(true),
+                SqlType::Boolean,
+                Some(ColumnDefault::Boolean(true)),
+            ),
+            (
+                DefaultLiteral::Int(i64::from(i8::MIN)),
+                SqlType::TinyInt,
+                Some(ColumnDefault::Int32(i32::from(i8::MIN))),
+            ),
+            (
+                DefaultLiteral::Int(i64::from(i16::MAX)),
+                SqlType::SmallInt,
+                Some(ColumnDefault::Int32(i32::from(i16::MAX))),
+            ),
+            (
+                DefaultLiteral::Int(i64::from(i32::MIN)),
+                SqlType::Int,
+                Some(ColumnDefault::Int32(i32::MIN)),
+            ),
+            (
+                DefaultLiteral::Int(i64::MAX),
+                SqlType::BigInt,
+                Some(ColumnDefault::Int64(i64::MAX)),
+            ),
+            (
+                DefaultLiteral::Float(-0.0),
+                SqlType::Float,
+                Some(ColumnDefault::Float32 {
+                    bits: (-0.0_f32).to_bits(),
+                }),
+            ),
+            (
+                DefaultLiteral::Float(f64::from_bits(0x7ff8_0000_0000_1234)),
+                SqlType::Double,
+                Some(ColumnDefault::Float64 {
+                    bits: 0x7ff8_0000_0000_1234,
+                }),
+            ),
+            (
+                DefaultLiteral::Decimal {
+                    unscaled: -12_345,
+                    scale: 2,
+                },
+                SqlType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+                Some(ColumnDefault::Decimal {
+                    unscaled: -12_345,
+                    precision: 10,
+                    scale: 2,
+                }),
+            ),
+            (
+                DefaultLiteral::String("value".to_string()),
+                SqlType::String,
+                Some(ColumnDefault::String("value".to_string())),
+            ),
+            (
+                DefaultLiteral::String(r#"{"k":1}"#.to_string()),
+                SqlType::Json,
+                Some(ColumnDefault::String(r#"{"k":1}"#.to_string())),
+            ),
+            (
+                DefaultLiteral::Binary(vec![0x00, 0x7f, 0x80, 0xff]),
+                SqlType::Binary,
+                Some(ColumnDefault::Binary(vec![0x00, 0x7f, 0x80, 0xff])),
+            ),
+            (
+                DefaultLiteral::Binary(vec![0x01, 0x02]),
+                SqlType::Bitmap,
+                Some(ColumnDefault::Binary(vec![0x01, 0x02])),
+            ),
+            (
+                DefaultLiteral::Binary(vec![0x03, 0x04]),
+                SqlType::Hll,
+                Some(ColumnDefault::Binary(vec![0x03, 0x04])),
+            ),
+            (
+                DefaultLiteral::Date(-1),
+                SqlType::Date,
+                Some(ColumnDefault::Date {
+                    days_since_epoch: -1,
+                }),
+            ),
+            (
+                DefaultLiteral::DateTime(1_234_567),
+                SqlType::DateTime,
+                Some(ColumnDefault::TimestampMicros {
+                    micros_since_epoch: 1_234_567,
+                }),
+            ),
+            (
+                DefaultLiteral::DateTime(1_234_567_890),
+                SqlType::DateTimeNs,
+                Some(ColumnDefault::TimestampNanos {
+                    nanos_since_epoch: 1_234_567_890,
+                }),
+            ),
+            (
+                DefaultLiteral::String("[]".to_string()),
+                SqlType::Array(Box::new(SqlType::Int)),
+                Some(ColumnDefault::Array(Vec::new())),
+            ),
+            (
+                DefaultLiteral::String("{}".to_string()),
+                SqlType::Map(Box::new(SqlType::String), Box::new(SqlType::Int)),
+                Some(ColumnDefault::Map(Vec::new())),
+            ),
+            (DefaultLiteral::Null, SqlType::Int, None),
+        ];
+
+        for (literal, sql_type, expected) in cases {
+            assert_eq!(
+                default_literal_to_column_default(&literal, &sql_type),
+                Ok(expected),
+                "literal={literal:?} sql_type={sql_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_literal_to_column_default_preserves_legacy_rejections() {
+        assert_eq!(
+            default_literal_to_column_default(&DefaultLiteral::Int(128), &SqlType::TinyInt)
+                .unwrap_err(),
+            "DEFAULT value 128 is out of range for TINYINT"
+        );
+        assert_eq!(
+            default_literal_to_column_default(&DefaultLiteral::Int(1), &SqlType::LargeInt)
+                .unwrap_err(),
+            "DEFAULT value type does not match column type: literal=Int(1) column=LargeInt"
+        );
+        assert_eq!(
+            default_literal_to_column_default(
+                &DefaultLiteral::Decimal {
+                    unscaled: 1,
+                    scale: -1,
+                },
+                &SqlType::Decimal {
+                    precision: 10,
+                    scale: 0,
+                },
+            )
+            .unwrap_err(),
+            "negative DECIMAL scale -1 is not supported"
+        );
+        assert_eq!(
+            default_literal_to_column_default(
+                &DefaultLiteral::Decimal {
+                    unscaled: 1,
+                    scale: -1,
+                },
+                &SqlType::Decimal {
+                    precision: 10,
+                    scale: -1,
+                },
+            )
+            .unwrap_err(),
+            "negative DECIMAL scale -1 is not supported"
+        );
+        assert_eq!(
+            default_literal_to_column_default(
+                &DefaultLiteral::String("[1]".to_string()),
+                &SqlType::Array(Box::new(SqlType::Int)),
+            )
+            .unwrap_err(),
+            "non-empty ARRAY DEFAULT literals are not yet supported; use '[]'"
+        );
+        assert_eq!(
+            default_literal_to_column_default(
+                &DefaultLiteral::String(r#"{"k":1}"#.to_string()),
+                &SqlType::Map(Box::new(SqlType::String), Box::new(SqlType::Int)),
+            )
+            .unwrap_err(),
+            "non-empty MAP DEFAULT literals are not yet supported; use '{}'"
+        );
+    }
+
+    #[test]
+    fn column_default_to_ast_literal_preserves_omitted_behavior() {
+        assert_eq!(
+            column_default_to_ast_literal(
+                &ColumnDefault::TimestampMicros {
+                    micros_since_epoch: 1_704_110_400_123_456,
+                },
+                &SqlType::DateTime,
+            )
+            .unwrap(),
+            Literal::String("2024-01-01 12:00:00".to_string())
+        );
+        assert_eq!(
+            column_default_to_ast_literal(
+                &ColumnDefault::TimestamptzMicros {
+                    micros_since_epoch: 0,
+                },
+                &SqlType::DateTime,
+            )
+            .unwrap(),
+            Literal::String("1970-01-01 00:00:00".to_string())
+        );
+        assert_eq!(
+            column_default_to_ast_literal(
+                &ColumnDefault::TimestampNanos {
+                    nanos_since_epoch: 1_704_164_645_123_456_789,
+                },
+                &SqlType::DateTimeNs,
+            )
+            .unwrap(),
+            Literal::String("2024-01-02 03:04:05.123456789".to_string())
+        );
+        assert_eq!(
+            column_default_to_ast_literal(
+                &ColumnDefault::Binary((0_u16..=255).map(|byte| byte as u8).collect()),
+                &SqlType::Binary,
+            )
+            .unwrap(),
+            Literal::String((0_u16..=255).map(|byte| char::from(byte as u8)).collect())
+        );
+        assert_eq!(
+            column_default_to_ast_literal(
+                &ColumnDefault::Array(Vec::new()),
+                &SqlType::Array(Box::new(SqlType::Int))
+            )
+            .unwrap(),
+            Literal::Array(Vec::new())
+        );
+        assert_eq!(
+            column_default_to_ast_literal(
+                &ColumnDefault::Array(vec![ColumnDefault::Int32(1)]),
+                &SqlType::Array(Box::new(SqlType::Int)),
+            )
+            .unwrap_err(),
+            "non-empty ARRAY write-default is not yet supported (1 elements)"
+        );
+        assert_eq!(
+            column_default_to_ast_literal(
+                &ColumnDefault::Map(Vec::new()),
+                &SqlType::Map(Box::new(SqlType::String), Box::new(SqlType::Int)),
+            )
+            .unwrap(),
+            Literal::Map(Vec::new())
+        );
+        assert_eq!(
+            column_default_to_ast_literal(
+                &ColumnDefault::Map(vec![(
+                    ColumnDefault::String("key".to_string()),
+                    ColumnDefault::Int32(1),
+                )]),
+                &SqlType::Map(Box::new(SqlType::String), Box::new(SqlType::Int)),
+            )
+            .unwrap_err(),
+            "non-empty MAP write-default is not yet supported (1 entries)"
+        );
+        assert_eq!(
+            column_default_to_ast_literal(
+                &ColumnDefault::Decimal {
+                    unscaled: 1,
+                    precision: 10,
+                    scale: -1,
+                },
+                &SqlType::Decimal {
+                    precision: 10,
+                    scale: 0,
+                },
+            )
+            .unwrap_err(),
+            "negative DECIMAL scale -1 is not supported"
+        );
+    }
+
+    #[test]
+    fn column_default_to_ast_literal_maps_positive_decimal_date_and_primitives() {
+        let cases = [
+            (
+                ColumnDefault::Boolean(true),
+                SqlType::Boolean,
+                Literal::Bool(true),
+            ),
+            (ColumnDefault::Int32(7), SqlType::TinyInt, Literal::Int(7)),
+            (
+                ColumnDefault::Int64(i64::MAX),
+                SqlType::BigInt,
+                Literal::Int(i64::MAX),
+            ),
+            (
+                ColumnDefault::Float32 {
+                    bits: 1.5_f32.to_bits(),
+                },
+                SqlType::Float,
+                Literal::Float(1.5),
+            ),
+            (
+                ColumnDefault::Float64 {
+                    bits: 2.5_f64.to_bits(),
+                },
+                SqlType::Double,
+                Literal::Float(2.5),
+            ),
+            (
+                ColumnDefault::Decimal {
+                    unscaled: 12_345,
+                    precision: 10,
+                    scale: 2,
+                },
+                SqlType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+                Literal::String("123.45".to_string()),
+            ),
+            (
+                ColumnDefault::String("value".to_string()),
+                SqlType::String,
+                Literal::String("value".to_string()),
+            ),
+            (
+                ColumnDefault::Date {
+                    days_since_epoch: -1,
+                },
+                SqlType::Date,
+                Literal::Date("1969-12-31".to_string()),
+            ),
+            (
+                ColumnDefault::Binary(vec![0x00, 0xff]),
+                SqlType::Bitmap,
+                Literal::String(bytes_to_latin1_string(&[0x00, 0xff])),
+            ),
+            (
+                ColumnDefault::Binary(vec![0x01, 0xfe]),
+                SqlType::Hll,
+                Literal::String(bytes_to_latin1_string(&[0x01, 0xfe])),
+            ),
+        ];
+
+        for (value, sql_type, expected) in cases {
+            assert_eq!(
+                column_default_to_ast_literal(&value, &sql_type),
+                Ok(expected),
+                "value={value:?} sql_type={sql_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn column_default_to_ast_literal_rejects_neutral_type_mismatch() {
+        let error =
+            column_default_to_ast_literal(&ColumnDefault::Int32(1), &SqlType::String).unwrap_err();
+        assert!(error.starts_with("write-default literal type does not match column type:"));
+        assert!(error.contains("Int32(1)"));
+        assert!(error.contains("column=String"));
     }
 
     #[test]

@@ -3222,11 +3222,20 @@ pub(crate) fn apply_add_at(
         data_type,
         &mut next_nested_id,
     )?;
+    let column_default = default
+        .map(|literal| crate::sql::literal::default_literal_to_column_default(literal, data_type))
+        .transpose()?
+        .flatten();
+    let iceberg_default = column_default
+        .as_ref()
+        .map(|value| {
+            crate::connector::iceberg::default_value::column_default_to_iceberg_literal(
+                value, &new_ty,
+            )
+        })
+        .transpose()?;
     let mut new_field = NestedField::optional(new_id, name, new_ty);
-    if let Some(lit) = default
-        && let Some(iceberg_lit) =
-            crate::connector::iceberg::default_value::default_literal_to_iceberg(lit, data_type)?
-    {
+    if let Some(iceberg_lit) = iceberg_default {
         new_field = new_field
             .with_initial_default(iceberg_lit.clone())
             .with_write_default(iceberg_lit);
@@ -3787,12 +3796,11 @@ pub(crate) fn alter_table_schema(
         ..
     } = &stmt.change
     {
-        let iceberg_lit = crate::connector::iceberg::default_value::default_literal_to_iceberg(
-            literal, data_type,
-        )?;
-        crate::connector::iceberg::default_value::require_v3_for_default(
+        let column_default =
+            crate::sql::literal::default_literal_to_column_default(literal, data_type)?;
+        crate::connector::iceberg::default_value::require_v3_for_column_default(
             format_version,
-            &iceberg_lit,
+            column_default.as_ref(),
         )?;
     }
 

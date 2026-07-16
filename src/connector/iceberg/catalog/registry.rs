@@ -41,7 +41,7 @@ use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 use crate::runtime::global_async_runtime::data_block_on;
 
 use crate::catalog::identifier::normalize_identifier;
-use crate::catalog::schema::SqlType;
+use crate::catalog::schema::{ColumnDefault, SqlType};
 use crate::common::types::UniqueId;
 use crate::connector::iceberg::commit::{
     CommitCtx, CommitOpKind, FastAppendCommit, IcebergCommitAction, IcebergCommitCollector,
@@ -1020,7 +1020,19 @@ pub(crate) fn load_table(
                 name: field.name().clone(),
                 data_type,
                 nullable: field.is_nullable(),
-                write_default: nested.write_default.clone(),
+                write_default: nested
+                    .write_default
+                    .as_ref()
+                    .map(|literal| {
+                        convert_loaded_write_default(
+                            literal,
+                            nested.field_type.as_ref(),
+                            &ns_name,
+                            &tbl_name,
+                            field.name(),
+                        )
+                    })
+                    .transpose()?,
                 logical_type,
             })
         })
@@ -1045,6 +1057,24 @@ pub(crate) fn load_table(
     }
 
     Ok(loaded)
+}
+
+fn convert_loaded_write_default(
+    literal: &IcebergLiteral,
+    field_type: &Type,
+    namespace: &str,
+    table: &str,
+    column: &str,
+) -> Result<ColumnDefault, String> {
+    crate::connector::iceberg::default_value::iceberg_literal_to_column_default(
+        literal,
+        field_type,
+    )
+    .map_err(|error| {
+        format!(
+            "convert Iceberg write-default for namespace `{namespace}`, table `{table}`, column `{column}` failed: {error}"
+        )
+    })
 }
 
 pub(crate) fn current_schema_id(
@@ -2191,6 +2221,30 @@ fn build_iceberg_schema(
                 i32::try_from(idx + 1).map_err(|_| "too many iceberg columns".to_string())?;
             let iceberg_type =
                 iceberg_type_for_sql_type(&column.data_type, &mut next_nested_field_id)?;
+            let column_default = column
+                .default
+                .as_ref()
+                .map(|literal| {
+                    crate::sql::literal::default_literal_to_column_default(
+                        literal,
+                        &column.data_type,
+                    )
+                })
+                .transpose()?
+                .flatten();
+            crate::connector::iceberg::default_value::require_v3_for_column_default(
+                format_version,
+                column_default.as_ref(),
+            )?;
+            let iceberg_default = column_default
+                .as_ref()
+                .map(|value| {
+                    crate::connector::iceberg::default_value::column_default_to_iceberg_literal(
+                        value,
+                        &iceberg_type,
+                    )
+                })
+                .transpose()?;
             // Honor NOT NULL: required = non-nullable, optional = nullable.
             let mut field = if column.nullable {
                 NestedField::optional(field_id, &column.name, iceberg_type)
@@ -2198,17 +2252,7 @@ fn build_iceberg_schema(
                 NestedField::required(field_id, &column.name, iceberg_type)
             };
             // Persist DEFAULT literal for v3; reject non-NULL defaults on v1/v2.
-            if let Some(default_literal) = &column.default
-                && let Some(iceberg_lit) =
-                    crate::connector::iceberg::default_value::default_literal_to_iceberg(
-                        default_literal,
-                        &column.data_type,
-                    )?
-            {
-                crate::connector::iceberg::default_value::require_v3_for_default(
-                    format_version,
-                    &Some(iceberg_lit.clone()),
-                )?;
+            if let Some(iceberg_lit) = iceberg_default {
                 field = field
                     .with_initial_default(iceberg_lit.clone())
                     .with_write_default(iceberg_lit);
@@ -3495,6 +3539,23 @@ mod table_property_tests {
         let expected = iceberg::spec::Literal::Primitive(iceberg::spec::PrimitiveLiteral::Int(5));
         assert_eq!(field.initial_default.as_ref(), Some(&expected));
         assert_eq!(field.write_default.as_ref(), Some(&expected));
+    }
+
+    #[test]
+    fn loaded_write_default_error_includes_table_identity_and_column() {
+        let error = convert_loaded_write_default(
+            &IcebergLiteral::Primitive(PrimitiveLiteral::String("wrong-type".to_string())),
+            &Type::Primitive(PrimitiveType::Int),
+            "analytics",
+            "orders",
+            "order_id",
+        )
+        .expect_err("type mismatch must fail");
+
+        assert!(error.contains("namespace `analytics`"), "{error}");
+        assert!(error.contains("table `orders`"), "{error}");
+        assert!(error.contains("column `order_id`"), "{error}");
+        assert!(error.contains("type does not match"), "{error}");
     }
 }
 

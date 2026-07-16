@@ -1294,7 +1294,22 @@ fn framework_locator_loaded_table(
                 name: field.name().clone(),
                 data_type: field.data_type().clone(),
                 nullable: field.is_nullable(),
-                write_default: nested.write_default.clone(),
+                write_default: nested
+                    .write_default
+                    .as_ref()
+                    .map(|literal| {
+                        crate::connector::iceberg::default_value::iceberg_literal_to_column_default(
+                            literal,
+                            nested.field_type.as_ref(),
+                        )
+                        .map_err(|e| {
+                            format!(
+                                "convert Iceberg MV target write-default for column `{}` failed: {e}",
+                                field.name()
+                            )
+                        })
+                    })
+                    .transpose()?,
                 logical_type: None,
             })
         })
@@ -1366,7 +1381,22 @@ fn iceberg_column_def_for_locator(
         name: field.name().clone(),
         data_type: field.data_type().clone(),
         nullable: field.is_nullable(),
-        write_default: nested.write_default.clone(),
+        write_default: nested
+            .write_default
+            .as_ref()
+            .map(|literal| {
+                crate::connector::iceberg::default_value::iceberg_literal_to_column_default(
+                    literal,
+                    nested.field_type.as_ref(),
+                )
+                .map_err(|e| {
+                    format!(
+                        "convert Iceberg MV locator write-default for column `{}` failed: {e}",
+                        field.name()
+                    )
+                })
+            })
+            .transpose()?,
         logical_type: None,
     })
 }

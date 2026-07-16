@@ -31,6 +31,7 @@ mod tests {
 
     use super::expr::encode_expr;
     use super::{instance, plan};
+    use crate::catalog::schema::ColumnDefault;
     use crate::coordinator::prepare::scan::ScanExecutionBindings;
     use crate::proto::{common, expr};
     use crate::runtime_filter::model::graph::RuntimeFilterGraph;
@@ -1254,9 +1255,11 @@ mod tests {
                 name: "amount".to_string(),
                 data_type: DataType::Decimal128(10, 2),
                 nullable: true,
-                write_default: Some(iceberg::spec::Literal::Primitive(
-                    iceberg::spec::PrimitiveLiteral::Int128(999),
-                )),
+                write_default: Some(ColumnDefault::Decimal {
+                    unscaled: 999,
+                    precision: 10,
+                    scale: 2,
+                }),
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
@@ -1341,7 +1344,7 @@ mod tests {
                 name: "tags".to_string(),
                 data_type: list_type.clone(),
                 nullable: true,
-                write_default: Some(iceberg::spec::Literal::List(vec![])),
+                write_default: Some(ColumnDefault::Array(vec![])),
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],

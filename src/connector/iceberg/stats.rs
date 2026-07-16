@@ -94,7 +94,13 @@ impl TableStatsProvider for IcebergTableStatsProvider {
         let snapshot_schema = snapshot.schema(metadata).map_err(|err| {
             StatsProviderError::Metadata(format!("resolve snapshot schema {snapshot_id}: {err}"))
         })?;
-        let stats_columns = columns_for_stats_schema(snapshot_schema.as_ref())?;
+        let stats_columns = columns_for_stats_schema(
+            snapshot_schema.as_ref(),
+            catalog,
+            namespace,
+            table,
+            snapshot_id,
+        )?;
 
         let data_files = if let Some(cached) = entry
             .cached_data_files(namespace, table, Some(snapshot_id))
@@ -163,6 +169,10 @@ fn iceberg_table_info_for_stats(
 
 fn columns_for_stats_schema(
     schema: &iceberg::spec::Schema,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+    snapshot_id: i64,
 ) -> Result<Vec<ColumnDef>, StatsProviderError> {
     let arrow_schema = iceberg::arrow::schema_to_arrow_schema(schema).map_err(|err| {
         StatsProviderError::Metadata(format!("convert snapshot schema to Arrow failed: {err}"))
@@ -190,7 +200,22 @@ fn columns_for_stats_schema(
                 name: field.name().clone(),
                 data_type,
                 nullable: field.is_nullable(),
-                write_default: iceberg_field.write_default.clone(),
+                write_default: iceberg_field
+                    .write_default
+                    .as_ref()
+                    .map(|literal| {
+                        crate::connector::iceberg::default_value::iceberg_literal_to_column_default(
+                            literal,
+                            iceberg_field.field_type.as_ref(),
+                        )
+                        .map_err(|error| {
+                            StatsProviderError::Metadata(format!(
+                                "convert Iceberg write-default for table `{catalog}.{namespace}.{table}`, snapshot `{snapshot_id}`, column `{}` failed: {error}",
+                                field.name(),
+                            ))
+                        })
+                    })
+                    .transpose()?,
                 logical_type: None,
             })
         })
@@ -412,6 +437,37 @@ mod tests {
             .expect_err("missing S3 credentials should be explicit");
 
         assert!(err.contains("aws.s3.access_key"), "{err}");
+    }
+
+    #[test]
+    fn stats_write_default_error_includes_table_snapshot_and_column_identity() {
+        let field = iceberg::spec::NestedField::optional(
+            1,
+            "order_id",
+            iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
+        )
+        .with_write_default(iceberg::spec::Literal::Primitive(
+            iceberg::spec::PrimitiveLiteral::String("wrong-type".to_string()),
+        ));
+        let schema = iceberg::spec::Schema::builder()
+            .with_fields(vec![field.into()])
+            .build()
+            .expect("schema fixture");
+
+        let error =
+            super::columns_for_stats_schema(&schema, "lakehouse", "analytics", "orders", 42)
+                .expect_err("type mismatch must fail");
+        let crate::connector::stats::StatsProviderError::Metadata(message) = error else {
+            panic!("expected metadata error, got {error:?}");
+        };
+
+        assert!(
+            message.contains("table `lakehouse.analytics.orders`"),
+            "{message}"
+        );
+        assert!(message.contains("snapshot `42`"), "{message}");
+        assert!(message.contains("column `order_id`"), "{message}");
+        assert!(message.contains("type does not match"), "{message}");
     }
 
     #[test]

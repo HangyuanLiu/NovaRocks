@@ -1032,8 +1032,8 @@ pub(crate) fn parse_default_literal(
     };
 
     // Type-check the literal against the column type up front so the parser
-    // fails fast (re-using the conversion helper from default_value.rs).
-    crate::connector::iceberg::default_value::default_literal_to_iceberg(&lit, data_type)?;
+    // fails fast without depending on a storage connector.
+    crate::sql::literal::default_literal_to_column_default(&lit, data_type)?;
 
     Ok(lit)
 }
@@ -1135,7 +1135,7 @@ fn parse_string_default(
                     "ARRAY DEFAULT must be a JSON array literal (e.g. '[]'), got: {s:?}"
                 ));
             }
-            // Store the JSON literal as-is; default_literal_to_iceberg converts it.
+            // Store the JSON literal as-is; the SQL default adapter converts it.
             Ok(DefaultLiteral::String(s.to_string()))
         }
         SqlType::Map(_, _) => {
@@ -1146,7 +1146,7 @@ fn parse_string_default(
                     "MAP DEFAULT must be a JSON object literal (e.g. '{{}}'), got: {s:?}"
                 ));
             }
-            // Store the JSON literal as-is; default_literal_to_iceberg converts it.
+            // Store the JSON literal as-is; the SQL default adapter converts it.
             Ok(DefaultLiteral::String(s.to_string()))
         }
         other => Err(format!(
