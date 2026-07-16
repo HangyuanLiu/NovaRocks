@@ -467,7 +467,7 @@ impl StateStoreRuntime {
     }
 
     #[cfg(feature = "mysql-state-store-provider")]
-    pub(crate) async fn mysql_test_hold_kv_lock(
+    pub(in crate::state_store) async fn mysql_test_hold_kv_lock(
         &self,
         database: &str,
         key: &[u8],
