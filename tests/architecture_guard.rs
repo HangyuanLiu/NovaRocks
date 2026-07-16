@@ -26,6 +26,8 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use quote::ToTokens;
+
 const NIDL_D3B_BASELINE_PATH: &str = "tests/proto_schema_baseline/novarocks_schema.json";
 const NIDL_D3B_WRITE_BASELINE_ENV: &str = "NOVA_WRITE_PROTO_SCHEMA_BASELINE";
 const NIDL_D3B_WRITE_BASELINE_COMMAND: &str = "NOVA_WRITE_PROTO_SCHEMA_BASELINE=1 cargo test --test architecture_guard nidl_d3b_current_schema_matches_baseline -- --nocapture";
@@ -43780,11 +43782,299 @@ fn rfd4_m2b2_direct_production_path_reference(
     Ok(audit.found)
 }
 
+fn rfd4_m2b2_visibility_is_outward(visibility: &syn::Visibility) -> bool {
+    match visibility {
+        syn::Visibility::Public(_) => true,
+        syn::Visibility::Restricted(restricted) => !restricted.path.is_ident("self"),
+        syn::Visibility::Inherited => false,
+    }
+}
+
+fn rfd4_m2b2_normalized_node_tokens(node: &impl ToTokens) -> String {
+    rust_use_tokens(&node.to_token_stream().to_string()).join(" ")
+}
+
+fn rfd4_m2b2_stable_ledger_digest(entries: &[String]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut digest = OFFSET_BASIS;
+    for entry in entries {
+        for byte in (entry.len() as u64)
+            .to_le_bytes()
+            .into_iter()
+            .chain(entry.bytes())
+        {
+            digest ^= u64::from(byte);
+            digest = digest.wrapping_mul(PRIME);
+        }
+    }
+    digest
+}
+
+fn rfd4_m2b2_collect_outward_surface_items(
+    items: &[syn::Item],
+    namespace: &str,
+    entries: &mut BTreeSet<String>,
+) {
+    let outward_type_names = items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Enum(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
+                Some(item.ident.to_string())
+            }
+            syn::Item::Struct(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
+                Some(item.ident.to_string())
+            }
+            syn::Item::Union(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
+                Some(item.ident.to_string())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let qualify = |surface: String| {
+        if namespace.is_empty() {
+            surface
+        } else {
+            format!("{namespace}::{surface}")
+        }
+    };
+    for item in items {
+        match item {
+            syn::Item::Const(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
+                entries.insert(qualify(format!(
+                    "const {} {} : {}",
+                    rfd4_m2b2_normalized_node_tokens(&item.vis),
+                    item.ident,
+                    rfd4_m2b2_normalized_node_tokens(&item.ty)
+                )));
+            }
+            syn::Item::Enum(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
+                entries.insert(qualify(format!(
+                    "enum {}",
+                    rfd4_m2b2_normalized_node_tokens(item)
+                )));
+            }
+            syn::Item::ExternCrate(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
+                entries.insert(qualify(format!(
+                    "extern-crate {}",
+                    rfd4_m2b2_normalized_node_tokens(item)
+                )));
+            }
+            syn::Item::Fn(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
+                entries.insert(qualify(format!(
+                    "fn {} {}",
+                    rfd4_m2b2_normalized_node_tokens(&item.vis),
+                    rfd4_m2b2_normalized_node_tokens(&item.sig)
+                )));
+            }
+            syn::Item::Impl(item) => {
+                let self_type_is_outward = match item.self_ty.as_ref() {
+                    syn::Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
+                        outward_type_names.contains(&segment.ident.to_string())
+                    }),
+                    _ => false,
+                };
+                if !self_type_is_outward {
+                    continue;
+                }
+                let mut header = item.clone();
+                header.items.clear();
+                let header = rfd4_m2b2_normalized_node_tokens(&header);
+                let trait_impl = item.trait_.is_some();
+                let mut members = Vec::new();
+                for member in &item.items {
+                    match member {
+                        syn::ImplItem::Const(member)
+                            if trait_impl || rfd4_m2b2_visibility_is_outward(&member.vis) =>
+                        {
+                            members.push(format!(
+                                "const {} {} {} : {}",
+                                rfd4_m2b2_normalized_node_tokens(&member.vis),
+                                member.ident,
+                                rfd4_m2b2_normalized_node_tokens(&member.generics),
+                                rfd4_m2b2_normalized_node_tokens(&member.ty)
+                            ));
+                        }
+                        syn::ImplItem::Fn(member)
+                            if trait_impl || rfd4_m2b2_visibility_is_outward(&member.vis) =>
+                        {
+                            members.push(format!(
+                                "fn {} {}",
+                                rfd4_m2b2_normalized_node_tokens(&member.vis),
+                                rfd4_m2b2_normalized_node_tokens(&member.sig)
+                            ));
+                        }
+                        syn::ImplItem::Type(member)
+                            if trait_impl || rfd4_m2b2_visibility_is_outward(&member.vis) =>
+                        {
+                            members.push(format!(
+                                "type {} {} {} = {}",
+                                rfd4_m2b2_normalized_node_tokens(&member.vis),
+                                member.ident,
+                                rfd4_m2b2_normalized_node_tokens(&member.generics),
+                                rfd4_m2b2_normalized_node_tokens(&member.ty)
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                if trait_impl || !members.is_empty() {
+                    entries.insert(qualify(format!("impl {header}")));
+                    for member in members {
+                        entries.insert(qualify(format!("impl-member {header} :: {member}")));
+                    }
+                }
+            }
+            syn::Item::Mod(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
+                entries.insert(qualify(format!(
+                    "mod {} {}",
+                    rfd4_m2b2_normalized_node_tokens(&item.vis),
+                    item.ident
+                )));
+                if let Some((_, nested)) = &item.content {
+                    let nested_namespace = if namespace.is_empty() {
+                        item.ident.to_string()
+                    } else {
+                        format!("{namespace}::{}", item.ident)
+                    };
+                    rfd4_m2b2_collect_outward_surface_items(nested, &nested_namespace, entries);
+                }
+            }
+            syn::Item::Static(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
+                entries.insert(qualify(format!(
+                    "static {} {} {} : {}",
+                    rfd4_m2b2_normalized_node_tokens(&item.vis),
+                    rfd4_m2b2_normalized_node_tokens(&item.mutability),
+                    item.ident,
+                    rfd4_m2b2_normalized_node_tokens(&item.ty)
+                )));
+            }
+            syn::Item::Struct(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
+                let mut surface = item.clone();
+                match &mut surface.fields {
+                    syn::Fields::Named(fields) => {
+                        let mut outward = syn::punctuated::Punctuated::new();
+                        for field in std::mem::take(&mut fields.named) {
+                            if rfd4_m2b2_visibility_is_outward(&field.vis) {
+                                outward.push(field);
+                            }
+                        }
+                        fields.named = outward;
+                    }
+                    syn::Fields::Unnamed(fields) => {
+                        let mut outward = syn::punctuated::Punctuated::new();
+                        for field in std::mem::take(&mut fields.unnamed) {
+                            if rfd4_m2b2_visibility_is_outward(&field.vis) {
+                                outward.push(field);
+                            }
+                        }
+                        fields.unnamed = outward;
+                    }
+                    syn::Fields::Unit => {}
+                }
+                entries.insert(qualify(format!(
+                    "struct {}",
+                    rfd4_m2b2_normalized_node_tokens(&surface)
+                )));
+            }
+            syn::Item::Trait(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
+                let mut header = item.clone();
+                header.items.clear();
+                let header = rfd4_m2b2_normalized_node_tokens(&header);
+                entries.insert(qualify(format!("trait {header}")));
+                for member in &item.items {
+                    let surface = match member {
+                        syn::TraitItem::Const(member) => format!(
+                            "const {} {} : {}",
+                            member.ident,
+                            rfd4_m2b2_normalized_node_tokens(&member.generics),
+                            rfd4_m2b2_normalized_node_tokens(&member.ty)
+                        ),
+                        syn::TraitItem::Fn(member) => {
+                            format!("fn {}", rfd4_m2b2_normalized_node_tokens(&member.sig))
+                        }
+                        syn::TraitItem::Type(member) => {
+                            format!("type {}", rfd4_m2b2_normalized_node_tokens(member))
+                        }
+                        _ => continue,
+                    };
+                    entries.insert(qualify(format!("trait-member {header} :: {surface}")));
+                }
+            }
+            syn::Item::TraitAlias(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
+                entries.insert(qualify(format!(
+                    "trait-alias {}",
+                    rfd4_m2b2_normalized_node_tokens(item)
+                )));
+            }
+            syn::Item::Type(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
+                entries.insert(qualify(format!(
+                    "type {}",
+                    rfd4_m2b2_normalized_node_tokens(item)
+                )));
+            }
+            syn::Item::Union(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
+                entries.insert(qualify(format!(
+                    "union {}",
+                    rfd4_m2b2_normalized_node_tokens(item)
+                )));
+            }
+            syn::Item::Use(item) if rfd4_m2b2_visibility_is_outward(&item.vis) => {
+                entries.insert(qualify(format!(
+                    "use {}",
+                    rfd4_m2b2_normalized_node_tokens(item)
+                )));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn rfd4_m2b2_outward_surface_inventory(text: &str) -> Result<Vec<String>, String> {
+    let mut file = syn::parse_file(text).map_err(|error| error.to_string())?;
+    runtime_filter_filter_cfg_file(&mut file)
+        .map_err(|_| "production cfg surface is unproven".to_string())?;
+    let mut entries = BTreeSet::new();
+    rfd4_m2b2_collect_outward_surface_items(&file.items, "", &mut entries);
+    Ok(entries.into_iter().collect())
+}
+
+fn rfd4_m2b2_allowed_owner_surface_violations(source_rel: &str, text: &str) -> Vec<String> {
+    let expected = match source_rel {
+        "src/runtime_filter/codec/contribution.rs" => (16, 3298738116778868376),
+        "src/runtime_filter/port/final_domain.rs" => (29, 1048925950792287758),
+        "src/runtime_filter/port/subscription.rs" => (30, 11963765021781840432),
+        "src/runtime_filter/router/loopback.rs" => (6, 12052013521078837082),
+        "src/runtime_filter/service/materialization.rs" => (31, 6587911673519581840),
+        "src/runtime_filter/service/mod.rs" => (11, 9284709797313322787),
+        "src/runtime_filter/service/registry.rs" => (54, 3681306317080543088),
+        "src/runtime_filter/service/subscription.rs" => (23, 10058530305415627337),
+        _ => return Vec::new(),
+    };
+    let inventory = match rfd4_m2b2_outward_surface_inventory(text) {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            return vec![format!(
+                "{source_rel}: allowed-owner outward surface must parse: {error}"
+            )];
+        }
+    };
+    let actual = (inventory.len(), rfd4_m2b2_stable_ledger_digest(&inventory));
+    if actual == expected {
+        Vec::new()
+    } else {
+        vec![format!(
+            "{source_rel}: outward surface ledger drifted: expected={expected:?}, actual={actual:?}, inventory={inventory:#?}"
+        )]
+    }
+}
+
 fn rfd4_m2b2_remote_reconstruction_violations(sources: &[(String, String)]) -> Vec<String> {
     const CODEC_OWNER: &str = "src/runtime_filter/codec/contribution.rs";
     const DEFINITION_OWNER: &str = "src/runtime_filter/port/final_domain.rs";
     let mut violations = Vec::new();
     for (source_rel, text) in sources {
+        violations.extend(rfd4_m2b2_allowed_owner_surface_violations(source_rel, text));
         let production = rust_sanitized_production_text(text);
         let tokens = rust_use_tokens(&production);
         let parsed = syn::parse_file(text);
@@ -44268,6 +44558,16 @@ fn decode_frame_header(
     let encoder_tokens =
         rfd4_m2b2_named_function_tokens(text, "encode_contribution_with_allocator")
             .unwrap_or_default();
+    let encoder_shape = (
+        encoder_tokens.len(),
+        rfd4_m2b2_stable_ledger_digest(&encoder_tokens),
+    );
+    let expected_encoder_shape = (536, 14172689981760313839);
+    if encoder_shape != expected_encoder_shape {
+        violations.push(format!(
+            "encode_contribution_with_allocator complete token body drifted: expected={expected_encoder_shape:?}, actual={encoder_shape:?}"
+        ));
+    }
     if rfd4_m2b2_token_sequence_count(&encoder_tokens, "encode_frame_header(&mut payload, kind);")
         != 1
         || rfd4_m2b2_token_sequence_count(&production_tokens, "encode_frame_header(") != 2
@@ -44277,6 +44577,16 @@ fn decode_frame_header(
 
     let decoder_tokens =
         rfd4_m2b2_named_function_tokens(text, "decode_contribution").unwrap_or_default();
+    let decoder_shape = (
+        decoder_tokens.len(),
+        rfd4_m2b2_stable_ledger_digest(&decoder_tokens),
+    );
+    let expected_decoder_shape = (447, 10274494198063611699);
+    if decoder_shape != expected_decoder_shape {
+        violations.push(format!(
+            "decode_contribution complete token body drifted: expected={expected_decoder_shape:?}, actual={decoder_shape:?}"
+        ));
+    }
     let canonical_decode_binding = rfd4_m2b2_token_sequence_count(
         &decoder_tokens,
         "let frame_kind = decode_frame_header(&mut reader)?;",
@@ -44333,6 +44643,7 @@ fn rfd4_m2b2_artifact_delivery_facade_violations(sources: &[(String, String)]) -
 
     let mut violations = Vec::new();
     for (source_rel, text) in sources {
+        violations.extend(rfd4_m2b2_allowed_owner_surface_violations(source_rel, text));
         if syn::parse_file(text).is_err() {
             violations.push(format!(
                 "{source_rel}: ArtifactDelivery ownership audit must parse source"
@@ -45100,6 +45411,32 @@ fn f() { call_local!(); }
         .is_empty(),
         "local-shadow macro calls must not be treated as canonical fence reconstruction"
     );
+
+    let allowed_owner_laundering = vec![
+        (
+            "src/runtime_filter/codec/contribution.rs".to_string(),
+            r#"
+use crate::runtime_filter::port::final_domain::CompletionFence;
+pub(crate) type HiddenFence = CompletionFence;
+pub(crate) struct FenceWrapper(pub(crate) CompletionFence);
+impl FenceWrapper {
+    pub(crate) fn rebuild() {
+        let _ = CompletionFence::try_from_remote_codec(todo!(), todo!(), todo!(), [0; 32]);
+    }
+}
+"#
+            .to_string(),
+        ),
+        (
+            "src/runtime_filter/service/producer.rs".to_string(),
+            "use crate::runtime_filter::codec::contribution::FenceWrapper; fn f() { FenceWrapper::rebuild(); }"
+                .to_string(),
+        ),
+    ];
+    assert!(
+        !rfd4_m2b2_remote_reconstruction_violations(&allowed_owner_laundering).is_empty(),
+        "an allowed CompletionFence owner must not launder reconstruction through new outward surfaces"
+    );
 }
 
 #[test]
@@ -45261,48 +45598,11 @@ fn decode_contribution(reader: &mut Reader) {
         "decoder must compare the exact MAGIC read and feed the live wire byte into from_tag"
     );
 
-    let canonical_header_flow = r#"
-const MAGIC: &[u8; 4] = b"NRFC";
-const CODEC_VERSION: u16 = 1;
-enum WireContributionKind { Membership, OrderedBound, TopKSummary, FinalDomain }
-impl WireContributionKind {
-    const fn tag(self) -> u8 { match self { Self::Membership => 1, Self::OrderedBound => 2, Self::TopKSummary => 3, Self::FinalDomain => 4 } }
-    const fn from_tag(tag: u8) -> Option<Self> { match tag { 1 => Some(Self::Membership), 2 => Some(Self::OrderedBound), 3 => Some(Self::TopKSummary), 4 => Some(Self::FinalDomain), _ => None } }
-}
-fn encode_frame_header(payload: &mut Vec<u8>, kind: WireContributionKind) {
-    payload.extend_from_slice(MAGIC);
-    payload.extend_from_slice(&CODEC_VERSION.to_be_bytes());
-    payload.push(kind.tag());
-    payload.push(0);
-}
-fn decode_frame_header(
-    reader: &mut Reader<'_>,
-) -> Result<WireContributionKind, ContributionCodecError> {
-    if reader.read_exact(MAGIC.len())? != MAGIC {
-        return Err(ContributionCodecError::Malformed);
-    }
-    if reader.read_u16()? != CODEC_VERSION {
-        return Err(ContributionCodecError::UnknownVersion);
-    }
-    let frame_kind = WireContributionKind::from_tag(reader.read_u8()?)
-        .ok_or(ContributionCodecError::UnknownKind)?;
-    if reader.read_u8()? != 0 {
-        return Err(ContributionCodecError::InvalidFlags);
-    }
-    Ok(frame_kind)
-}
-fn encode_contribution_with_allocator(payload: &mut Vec<u8>, kind: WireContributionKind) {
-    encode_frame_header(&mut payload, kind);
-}
-fn decode_contribution(reader: &mut Reader, expectation: Expectation) -> Result<(), ContributionCodecError> {
-    let frame_kind = decode_frame_header(&mut reader)?;
-    if frame_kind != expectation_kind(expectation) { return Err(ContributionCodecError::KindMismatch); }
-    match (frame_kind, expectation) { _ => {} }
-    Ok(())
-}
-"#;
+    let canonical_header_flow =
+        fs::read_to_string(src_dir().join("runtime_filter/codec/contribution.rs"))
+            .expect("read live contribution codec");
     assert!(
-        rfd4_m2b2_nrfc_execution_violations(canonical_header_flow).is_empty(),
+        rfd4_m2b2_nrfc_execution_violations(&canonical_header_flow).is_empty(),
         "the decision fixture must model the complete canonical header flow"
     );
 
@@ -45342,6 +45642,51 @@ fn decode_contribution(reader: &mut Reader, expectation: Expectation) -> Result<
     assert!(
         !rfd4_m2b2_nrfc_execution_violations(&shadowed_frame_kind).is_empty(),
         "the decoded frame_kind must not be ignored or shadowed"
+    );
+
+    let codec = canonical_header_flow;
+    let caller_overwrites_header = runtime_filter_replace_in_function_body(
+        &codec,
+        "encode_contribution_with_allocator",
+        "    encode_frame_header(&mut payload, kind);",
+        "    encode_frame_header(&mut payload, kind);\n    payload.clear();\n    payload.extend_from_slice(b\"ALT!\");",
+    );
+    assert!(
+        !rfd4_m2b2_nrfc_execution_violations(&caller_overwrites_header).is_empty(),
+        "the common encoder must not mutate the canonical header after its helper returns"
+    );
+
+    let decoder_early_return = runtime_filter_replace_in_function_body(
+        &codec,
+        "decode_contribution",
+        "    let frame_kind = decode_frame_header(&mut reader)?;",
+        "    let frame_kind = decode_frame_header(&mut reader)?;\n    return Err(ContributionCodecError::Malformed);",
+    );
+    assert!(
+        !rfd4_m2b2_nrfc_execution_violations(&decoder_early_return).is_empty(),
+        "the common decoder must not return before consuming the canonical header result"
+    );
+
+    let dead_expected_kind_check = runtime_filter_replace_in_function_body(
+        &codec,
+        "decode_contribution",
+        "    if frame_kind != expectation_kind(expectation) {\n        return Err(ContributionCodecError::KindMismatch);\n    }",
+        "    if false {\n        if frame_kind != expectation_kind(expectation) {\n            return Err(ContributionCodecError::KindMismatch);\n        }\n    }\n    if frame_kind != WireContributionKind::Membership {\n        return Err(ContributionCodecError::KindMismatch);\n    }",
+    );
+    assert!(
+        !rfd4_m2b2_nrfc_execution_violations(&dead_expected_kind_check).is_empty(),
+        "dead canonical decoder tokens must not mask a live alternate kind check"
+    );
+
+    let alternate_dispatch = runtime_filter_replace_in_function_body(
+        &codec,
+        "decode_contribution",
+        "    let contribution = match (frame_kind, expectation) {",
+        "    if false {\n        let _ = match (frame_kind, expectation) { _ => unreachable!() };\n    }\n    let contribution = match (WireContributionKind::Membership, expectation) {",
+    );
+    assert!(
+        !rfd4_m2b2_nrfc_execution_violations(&alternate_dispatch).is_empty(),
+        "dead canonical dispatch tokens must not mask a live alternate dispatch"
     );
 }
 
@@ -45468,6 +45813,30 @@ fn rfd4_m2b2_artifact_delivery_facade_detector_rejects_cross_file_reexports() {
     assert!(
         !rfd4_m2b2_artifact_delivery_facade_violations(&wrapper_struct).is_empty(),
         "wrapper structs must not expose ArtifactDelivery"
+    );
+
+    let allowed_owner_laundering = vec![
+        (
+            "src/runtime_filter/router/loopback.rs".to_string(),
+            r#"
+pub(crate) type HiddenDelivery = dyn crate::runtime_filter::port::subscription::ArtifactDelivery;
+pub(crate) trait HiddenDeliveryTrait: crate::runtime_filter::port::subscription::ArtifactDelivery {}
+pub(crate) struct DeliveryWrapper(pub(crate) Box<HiddenDelivery>);
+impl DeliveryWrapper {
+    pub(crate) fn deliver_hidden(&self) {}
+}
+"#
+            .to_string(),
+        ),
+        (
+            "src/service/grpc_runtime_filter_adapter.rs".to_string(),
+            "use crate::runtime_filter::router::loopback::DeliveryWrapper; fn f(value: &DeliveryWrapper) { value.deliver_hidden(); }"
+                .to_string(),
+        ),
+    ];
+    assert!(
+        !rfd4_m2b2_artifact_delivery_facade_violations(&allowed_owner_laundering).is_empty(),
+        "an allowed ArtifactDelivery owner must not launder delivery through new outward surfaces"
     );
 }
 

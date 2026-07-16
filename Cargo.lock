@@ -3135,6 +3135,7 @@ dependencies = [
  "prometheus",
  "prost 0.13.5",
  "protoc-bin-vendored",
+ "quote",
  "rand 0.8.5",
  "regex",
  "reqwest",
