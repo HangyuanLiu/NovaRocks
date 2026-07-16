@@ -500,10 +500,10 @@ fn mutation_logical_bytes(key: &Key, mutation: &Mutation) -> usize {
 
 fn classify_precommit_error(error: StateStoreError) -> CommitOutcome {
     match error.kind() {
-        StateStoreErrorKind::DeadlineExceeded | StateStoreErrorKind::LimitExceeded => {
-            CommitOutcome::DefiniteFailure(error)
+        StateStoreErrorKind::Transient | StateStoreErrorKind::ProviderUnavailable => {
+            CommitOutcome::TransientBeforeCommit(error)
         }
-        _ => CommitOutcome::TransientBeforeCommit(error),
+        _ => CommitOutcome::DefiniteFailure(error),
     }
 }
 
@@ -771,6 +771,31 @@ mod tests {
                 .kind(),
             StateStoreErrorKind::PreconditionFailed
         );
+    }
+
+    #[test]
+    fn precommit_errors_retry_only_transient_provider_failures() {
+        let cases = [
+            (StateStoreErrorKind::Corruption, false),
+            (StateStoreErrorKind::InvalidRequest, false),
+            (StateStoreErrorKind::Internal, false),
+            (StateStoreErrorKind::Transient, true),
+            (StateStoreErrorKind::ProviderUnavailable, true),
+            (StateStoreErrorKind::DeadlineExceeded, false),
+            (StateStoreErrorKind::LimitExceeded, false),
+        ];
+
+        for (kind, expect_transient) in cases {
+            let outcome = classify_precommit_error(StateStoreError::new(
+                kind,
+                "classified precommit test error",
+            ));
+            assert_eq!(
+                matches!(outcome, CommitOutcome::TransientBeforeCommit(_)),
+                expect_transient,
+                "unexpected classification for {kind:?}"
+            );
+        }
     }
 
     #[test]
