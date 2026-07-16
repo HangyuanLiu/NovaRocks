@@ -78,6 +78,16 @@ mysql_client() {
     --batch --skip-column-names --unbuffered "$@"
 }
 
+mysql_admin() {
+  run_with_timeout 25 docker compose \
+    --env-file "$NOVA_MYSQL_COMPOSE_ENV" \
+    -p "$NOVA_MYSQL_COMPOSE_PROJECT" \
+    -f "$NOVA_MYSQL_COMPOSE_FILE" \
+    exec -T mysql mysql \
+    --defaults-extra-file=/run/secrets/novarocks-mysql-provisioner.cnf \
+    --protocol=socket --batch --skip-column-names --raw "$@"
+}
+
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/novarocks-ss3-probes.XXXXXX")"
 background_pids=()
 cleanup() {
@@ -177,16 +187,20 @@ start_gate() {
 
 release_gate() {
   local gate_label="$1"
-  mysql_client --execute="KILL CONNECTION ${gate_connection_id};" >/dev/null
+  local release_pid="${2:-$gate_pid}"
+  local release_connection_id="${3:-$gate_connection_id}"
+  mysql_client --execute="KILL CONNECTION ${release_connection_id};" >/dev/null
   set +e
-  wait "$gate_pid"
+  wait "$release_pid"
   local gate_rc="$?"
   set -e
-  forget_background_pid "$gate_pid"
+  forget_background_pid "$release_pid"
   test "$gate_rc" -ne 124
-  gate_pid=""
-  gate_connection_id=""
   grep -E 'ERROR (1317|2013) ' "$tmp_dir/${gate_label}.err" >/dev/null
+  if [[ "$#" -eq 1 ]]; then
+    gate_pid=""
+    gate_connection_id=""
+  fi
 }
 
 mysql_client < "$SCRIPT_DIR/schema.sql"
@@ -357,10 +371,16 @@ mysql_client --execute="
   DELETE FROM ss3_probe_locks;
   INSERT INTO ss3_probe_locks VALUES (1, 0), (2, 0), (3, 0), (4, 0);
 "
-deadlock_gate="${barrier_prefix}_deadlock_gate"
+deadlock_a_gate="${barrier_prefix}_deadlock_a_gate"
+deadlock_b_gate="${barrier_prefix}_deadlock_b_gate"
 deadlock_a_ready="${barrier_prefix}_deadlock_a_ready"
 deadlock_b_ready="${barrier_prefix}_deadlock_b_ready"
-start_gate "$deadlock_gate" "deadlock-gate"
+start_gate "$deadlock_a_gate" "deadlock-a-gate"
+deadlock_a_gate_pid="$gate_pid"
+deadlock_a_gate_connection_id="$gate_connection_id"
+start_gate "$deadlock_b_gate" "deadlock-b-gate"
+deadlock_b_gate_pid="$gate_pid"
+deadlock_b_gate_connection_id="$gate_connection_id"
 set -m
 (
   set +e
@@ -369,9 +389,9 @@ set -m
     START TRANSACTION;
     UPDATE ss3_probe_locks SET value_bytes = value_bytes + 1 WHERE id = 1;
     SELECT CONCAT('deadlock_a_ready=', GET_LOCK('${deadlock_a_ready}', 0));
-    SELECT GET_LOCK('${deadlock_gate}', 15);
+    SELECT GET_LOCK('${deadlock_a_gate}', 15);
     UPDATE ss3_probe_locks SET value_bytes = value_bytes + 1 WHERE id = 2;
-    SELECT RELEASE_LOCK('${deadlock_gate}');
+    SELECT RELEASE_LOCK('${deadlock_a_gate}');
     SELECT RELEASE_LOCK('${deadlock_a_ready}');
     COMMIT;
   " >"$tmp_dir/deadlock-a.out" 2>"$tmp_dir/deadlock-a.err"
@@ -388,9 +408,9 @@ set -m
     START TRANSACTION;
     UPDATE ss3_probe_locks SET value_bytes = value_bytes + 1 WHERE id = 2;
     SELECT CONCAT('deadlock_b_ready=', GET_LOCK('${deadlock_b_ready}', 0));
-    SELECT GET_LOCK('${deadlock_gate}', 15);
+    SELECT GET_LOCK('${deadlock_b_gate}', 15);
     UPDATE ss3_probe_locks SET value_bytes = value_bytes + 1 WHERE id = 1;
-    SELECT RELEASE_LOCK('${deadlock_gate}');
+    SELECT RELEASE_LOCK('${deadlock_b_gate}');
     SELECT RELEASE_LOCK('${deadlock_b_ready}');
     COMMIT;
   " >"$tmp_dir/deadlock-b.out" 2>"$tmp_dir/deadlock-b.err"
@@ -401,7 +421,14 @@ set +m
 background_pids+=("$deadlock_b")
 wait_for_marker "$tmp_dir/deadlock-a.out" "deadlock_a_ready=1"
 wait_for_marker "$tmp_dir/deadlock-b.out" "deadlock_b_ready=1"
-release_gate "deadlock-gate"
+release_gate \
+  "deadlock-a-gate" \
+  "$deadlock_a_gate_pid" \
+  "$deadlock_a_gate_connection_id"
+release_gate \
+  "deadlock-b-gate" \
+  "$deadlock_b_gate_pid" \
+  "$deadlock_b_gate_connection_id"
 wait "$deadlock_a"
 forget_background_pid "$deadlock_a"
 wait "$deadlock_b"
@@ -414,6 +441,13 @@ else
   test "$deadlock_b_rc" = "0"
 fi
 cat "$tmp_dir/deadlock-a.err" "$tmp_dir/deadlock-b.err" | grep -F 'ERROR 1213 (40001)' >/dev/null
+mysql_admin --execute="SHOW ENGINE INNODB STATUS;" >"$tmp_dir/deadlock-innodb-status.out"
+grep -F 'LATEST DETECTED DEADLOCK' "$tmp_dir/deadlock-innodb-status.out" >/dev/null
+test "$(grep -c 'RECORD LOCKS' "$tmp_dir/deadlock-innodb-status.out")" -ge 2
+grep -F 'ss3_probe_locks' "$tmp_dir/deadlock-innodb-status.out" >/dev/null
+grep -F 'WHERE id = 1' "$tmp_dir/deadlock-innodb-status.out" >/dev/null
+grep -F 'WHERE id = 2' "$tmp_dir/deadlock-innodb-status.out" >/dev/null
+! grep -F 'GET_LOCK' "$tmp_dir/deadlock-innodb-status.out" >/dev/null
 printf 'PASS SS3_MYSQL_PROBE_DEADLOCK_1213_PASS\n'
 
 lock_gate="${barrier_prefix}_lock_gate"

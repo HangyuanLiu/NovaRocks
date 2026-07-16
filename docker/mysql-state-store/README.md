@@ -47,6 +47,11 @@ publishes a readiness marker only after establishing the transaction state
 under test, then blocks behind a gate connection until the coordinator performs
 the competing operation. Gate release uses the discovered connection ID, so
 snapshot, deadlock, and lock-timeout ordering does not depend on fixed sleeps.
+The deadlock probe gives each transaction an independent gate. Only after both
+transactions hold their initial InnoDB record lock does the coordinator release
+both gates, allowing each transaction to request the other row. The acceptance
+check then verifies that `SHOW ENGINE INNODB STATUS` reports the two PRIMARY
+record-lock waits and contains no named-lock operation.
 
 ## Auxiliary mechanism evidence
 
