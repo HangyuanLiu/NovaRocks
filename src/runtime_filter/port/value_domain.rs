@@ -30,7 +30,7 @@ use crate::runtime_filter::model::contract::{ChannelId, NullSemantics};
 use super::identity::LogicalVersion;
 use super::support::RetainedMemoryReservation;
 
-const FINGERPRINT_VERSION_TAG: &[u8] = b"novarocks.runtime-filter.value-domain-delta.v1";
+pub(crate) const FINGERPRINT_VERSION_TAG: &[u8] = b"novarocks.runtime-filter.value-domain-delta.v1";
 const CANONICAL_F32_NAN: u32 = 0x7fc0_0000;
 const CANONICAL_F64_NAN: u64 = 0x7ff8_0000_0000_0000;
 
@@ -179,6 +179,18 @@ impl CanonicalOutput for SizeOutput {
             .0
             .checked_add(bytes.len())
             .ok_or(ContributionSizeError::SizeOverflow)?;
+        Ok(())
+    }
+}
+
+struct VecOutput<'a>(&'a mut Vec<u8>);
+
+impl CanonicalOutput for VecOutput<'_> {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), ContributionSizeError> {
+        self.0
+            .try_reserve(bytes.len())
+            .map_err(|_| ContributionSizeError::SizeOverflow)?;
+        self.0.extend_from_slice(bytes);
         Ok(())
     }
 }
@@ -435,16 +447,6 @@ impl MembershipValues {
         &self,
         output: &mut Vec<u8>,
     ) -> Result<(), ContributionSizeError> {
-        struct VecOutput<'a>(&'a mut Vec<u8>);
-        impl CanonicalOutput for VecOutput<'_> {
-            fn write(&mut self, bytes: &[u8]) -> Result<(), ContributionSizeError> {
-                self.0
-                    .try_reserve(bytes.len())
-                    .map_err(|_| ContributionSizeError::SizeOverflow)?;
-                self.0.extend_from_slice(bytes);
-                Ok(())
-            }
-        }
         self.encode_canonical(&mut VecOutput(output))
     }
 
@@ -948,9 +950,20 @@ impl ValueDomainDelta {
     }
 
     pub(crate) fn estimated_contribution_bytes(&self) -> Result<usize, ContributionSizeError> {
+        self.canonical_encoded_len()
+    }
+
+    pub(crate) fn canonical_encoded_len(&self) -> Result<usize, ContributionSizeError> {
         let mut output = SizeOutput::default();
         self.encode_canonical(&mut output)?;
         Ok(output.0)
+    }
+
+    pub(crate) fn encode_canonical_into(
+        &self,
+        output: &mut Vec<u8>,
+    ) -> Result<(), ContributionSizeError> {
+        self.encode_canonical(&mut VecOutput(output))
     }
 
     pub(crate) fn fingerprint(&self) -> ContributionFingerprint {
@@ -1027,6 +1040,22 @@ mod tests {
         assert_eq!(left.fingerprint(), reordered.fingerprint());
         assert_ne!(left.fingerprint(), different_value.fingerprint());
         assert_ne!(left.fingerprint(), different_null.fingerprint());
+    }
+
+    #[test]
+    fn value_domain_codec_helpers_report_exact_appended_length() {
+        let delta = ValueDomainDelta::new(MembershipValues::utf8(["", "é", "東京"]), true);
+        let exact = delta.canonical_encoded_len().unwrap();
+        let mut canonical = Vec::new();
+        delta.encode_canonical_into(&mut canonical).unwrap();
+        let mut encoded = vec![0xaa, 0xbb];
+
+        delta.encode_canonical_into(&mut encoded).unwrap();
+
+        assert_eq!(canonical.len(), exact);
+        assert_eq!(encoded.len(), 2 + exact);
+        assert_eq!(&encoded[2..], canonical);
+        assert_eq!(delta.estimated_contribution_bytes(), Ok(exact));
     }
 
     #[test]
