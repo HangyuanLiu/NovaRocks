@@ -17,16 +17,20 @@
 
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use arrow::datatypes::{DataType, TimeUnit};
 
 use crate::common::largeint::LARGEINT_BYTE_WIDTH;
 use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
-use crate::runtime_filter::port::final_domain::{FinalDomainShard, RuntimeCompletionFenceContract};
+use crate::runtime_filter::port::final_domain::{
+    CompletionFence, FinalDomainError, FinalDomainShard, RuntimeCompletionFenceContract,
+};
 use crate::runtime_filter::port::identity::{ProducerSequence, ProducerStreamId};
 use crate::runtime_filter::port::ordered_bound::{
     OrderedBoundUpdate, OrderedScalar, OrderedTuple, RuntimeOrderContract,
 };
+use crate::runtime_filter::port::producer::RuntimeContractViolationKind;
 use crate::runtime_filter::port::topk_summary::{RuntimeTopKSummaryContract, TopKSummary};
 use crate::runtime_filter::port::value_domain::{
     ContributionSizeError, FINGERPRINT_VERSION_TAG, MembershipValues, ValueDomainDelta,
@@ -168,10 +172,19 @@ pub(crate) fn encoded_contribution_len(
             summary.canonical_body_len()?
         }
         (
-            RuntimeFilterContribution::FinalDomain(_),
-            ContributionCodecExpectation::FinalDomain { .. },
-        )
-        | _ => return Err(ContributionCodecError::KindMismatch),
+            RuntimeFilterContribution::FinalDomain(shard),
+            ContributionCodecExpectation::FinalDomain {
+                contract,
+                stream,
+                sequence,
+            },
+        ) => {
+            verify_final_domain_scope(shard, contract, stream, sequence)?;
+            size_of::<[u8; 32]>()
+                .checked_add(shard.domain().canonical_encoded_len()?)
+                .ok_or(ContributionCodecError::LengthOverflow)?
+        }
+        _ => return Err(ContributionCodecError::KindMismatch),
     };
     encoded_frame_len_from_body_len(body_len)
 }
@@ -245,6 +258,16 @@ pub(crate) fn decode_contribution(
             WireContributionKind::TopKSummary,
             ContributionCodecExpectation::TopKSummary(contract),
         ) => RuntimeFilterContribution::TopKSummary(decode_topk_body(body, contract)?),
+        (
+            WireContributionKind::FinalDomain,
+            ContributionCodecExpectation::FinalDomain {
+                contract,
+                stream,
+                sequence,
+            },
+        ) => RuntimeFilterContribution::FinalDomain(decode_final_domain_body(
+            body, contract, stream, sequence,
+        )?),
         _ => return Err(ContributionCodecError::KindMismatch),
     };
     let canonical = encode_contribution(&contribution, expectation, payload.len())?;
@@ -316,6 +339,23 @@ fn encode_contribution_with_allocator(
                 summary.canonical_body_len()?,
             )
         }
+        (
+            RuntimeFilterContribution::FinalDomain(shard),
+            ContributionCodecExpectation::FinalDomain {
+                contract,
+                stream,
+                sequence,
+            },
+        ) => {
+            verify_final_domain_scope(shard, contract, stream, sequence)?;
+            (
+                WireContributionKind::FinalDomain,
+                contract.digest().bytes(),
+                size_of::<[u8; 32]>()
+                    .checked_add(shard.domain().canonical_encoded_len()?)
+                    .ok_or(ContributionCodecError::LengthOverflow)?,
+            )
+        }
         _ => return Err(ContributionCodecError::KindMismatch),
     };
     let body_len = u64::try_from(body_len).map_err(|_| ContributionCodecError::LengthOverflow)?;
@@ -336,7 +376,10 @@ fn encode_contribution_with_allocator(
         RuntimeFilterContribution::TopKSummary(summary) => {
             summary.encode_canonical_body_into(&mut payload)?;
         }
-        _ => return Err(ContributionCodecError::KindMismatch),
+        RuntimeFilterContribution::FinalDomain(shard) => {
+            payload.extend_from_slice(&shard.fence_digest());
+            shard.domain().encode_canonical_into(&mut payload)?;
+        }
     }
     debug_assert_eq!(payload.len(), exact_len);
     Ok(EncodedContribution {
@@ -376,6 +419,18 @@ fn decode_membership_body(
     body: &[u8],
     expected_data_type: &DataType,
 ) -> Result<ValueDomainDelta, ContributionCodecError> {
+    decode_membership_body_with_policy(
+        body,
+        expected_data_type,
+        ContributionCodecError::NonCanonicalPayload,
+    )
+}
+
+fn decode_membership_body_with_policy(
+    body: &[u8],
+    expected_data_type: &DataType,
+    schema_mismatch_error: ContributionCodecError,
+) -> Result<ValueDomainDelta, ContributionCodecError> {
     let mut reader = Reader::new(body);
     let version_len =
         usize::try_from(reader.read_u64()?).map_err(|_| ContributionCodecError::LengthOverflow)?;
@@ -384,7 +439,7 @@ fn decode_membership_body(
     }
     let values = match expected_data_type {
         DataType::Boolean => {
-            expect_type_tag(&mut reader, 1)?;
+            expect_type_tag(&mut reader, 1, schema_mismatch_error)?;
             let count = read_fixed_count(&mut reader, 1)?;
             let mut values = reserve_values(count)?;
             for _ in 0..count {
@@ -397,7 +452,7 @@ fn decode_membership_body(
             MembershipValues::boolean(values)
         }
         DataType::Int8 => {
-            expect_type_tag(&mut reader, 2)?;
+            expect_type_tag(&mut reader, 2, schema_mismatch_error)?;
             let count = read_fixed_count(&mut reader, 1)?;
             let mut values = reserve_values(count)?;
             for _ in 0..count {
@@ -406,7 +461,7 @@ fn decode_membership_body(
             MembershipValues::int8(values)
         }
         DataType::Int16 => {
-            expect_type_tag(&mut reader, 3)?;
+            expect_type_tag(&mut reader, 3, schema_mismatch_error)?;
             let count = read_fixed_count(&mut reader, 2)?;
             let mut values = reserve_values(count)?;
             for _ in 0..count {
@@ -415,7 +470,7 @@ fn decode_membership_body(
             MembershipValues::int16(values)
         }
         DataType::Int32 => {
-            expect_type_tag(&mut reader, 4)?;
+            expect_type_tag(&mut reader, 4, schema_mismatch_error)?;
             let count = read_fixed_count(&mut reader, 4)?;
             let mut values = reserve_values(count)?;
             for _ in 0..count {
@@ -424,7 +479,7 @@ fn decode_membership_body(
             MembershipValues::int32(values)
         }
         DataType::Int64 => {
-            expect_type_tag(&mut reader, 5)?;
+            expect_type_tag(&mut reader, 5, schema_mismatch_error)?;
             let count = read_fixed_count(&mut reader, 8)?;
             let mut values = reserve_values(count)?;
             for _ in 0..count {
@@ -433,7 +488,7 @@ fn decode_membership_body(
             MembershipValues::int64(values)
         }
         DataType::FixedSizeBinary(width) if *width == LARGEINT_BYTE_WIDTH => {
-            expect_type_tag(&mut reader, 6)?;
+            expect_type_tag(&mut reader, 6, schema_mismatch_error)?;
             let count = read_fixed_count(&mut reader, 16)?;
             let mut values = reserve_values(count)?;
             for _ in 0..count {
@@ -442,7 +497,7 @@ fn decode_membership_body(
             MembershipValues::large_int(values)
         }
         DataType::Float32 => {
-            expect_type_tag(&mut reader, 7)?;
+            expect_type_tag(&mut reader, 7, schema_mismatch_error)?;
             let count = read_fixed_count(&mut reader, 4)?;
             let mut values = reserve_values(count)?;
             for _ in 0..count {
@@ -451,7 +506,7 @@ fn decode_membership_body(
             MembershipValues::float32(values)
         }
         DataType::Float64 => {
-            expect_type_tag(&mut reader, 8)?;
+            expect_type_tag(&mut reader, 8, schema_mismatch_error)?;
             let count = read_fixed_count(&mut reader, 8)?;
             let mut values = reserve_values(count)?;
             for _ in 0..count {
@@ -460,7 +515,7 @@ fn decode_membership_body(
             MembershipValues::float64(values)
         }
         DataType::Utf8 => {
-            expect_type_tag(&mut reader, 9)?;
+            expect_type_tag(&mut reader, 9, schema_mismatch_error)?;
             let count = read_count(&mut reader)?;
             ensure_count_bytes(&reader, count, 8)?;
             let mut values = reserve_values(count)?;
@@ -480,7 +535,7 @@ fn decode_membership_body(
             MembershipValues::utf8(values)
         }
         DataType::Date32 => {
-            expect_type_tag(&mut reader, 10)?;
+            expect_type_tag(&mut reader, 10, schema_mismatch_error)?;
             let count = read_fixed_count(&mut reader, 4)?;
             let mut values = reserve_values(count)?;
             for _ in 0..count {
@@ -489,20 +544,29 @@ fn decode_membership_body(
             MembershipValues::date32(values)
         }
         DataType::Timestamp(unit, timezone) => {
-            expect_type_tag(&mut reader, 11)?;
-            if reader.read_u8()? != time_unit_tag(unit) {
-                return Err(ContributionCodecError::NonCanonicalPayload);
+            expect_type_tag(&mut reader, 11, schema_mismatch_error)?;
+            let encoded_unit = reader.read_u8()?;
+            if encoded_unit != time_unit_tag(unit) {
+                return Err(if (1..=4).contains(&encoded_unit) {
+                    schema_mismatch_error
+                } else {
+                    ContributionCodecError::NonCanonicalPayload
+                });
             }
-            match (reader.read_u8()?, timezone) {
-                (0, None) => {}
-                (1, Some(expected_timezone)) => {
+            match reader.read_u8()? {
+                0 if timezone.is_none() => {}
+                0 => return Err(schema_mismatch_error),
+                1 => {
                     let len = usize::try_from(reader.read_u64()?)
                         .map_err(|_| ContributionCodecError::LengthOverflow)?;
                     let timezone_bytes = reader.read_exact(len)?;
                     std::str::from_utf8(timezone_bytes)
                         .map_err(|_| ContributionCodecError::NonCanonicalPayload)?;
+                    let Some(expected_timezone) = timezone else {
+                        return Err(schema_mismatch_error);
+                    };
                     if timezone_bytes != expected_timezone.as_bytes() {
-                        return Err(ContributionCodecError::NonCanonicalPayload);
+                        return Err(schema_mismatch_error);
                     }
                 }
                 _ => return Err(ContributionCodecError::NonCanonicalPayload),
@@ -515,9 +579,17 @@ fn decode_membership_body(
             MembershipValues::timestamp(unit.clone(), timezone.clone(), values)
         }
         DataType::Decimal128(precision, scale) => {
-            expect_type_tag(&mut reader, 12)?;
-            if reader.read_u8()? != *precision || reader.read_u8()? as i8 != *scale {
-                return Err(ContributionCodecError::NonCanonicalPayload);
+            expect_type_tag(&mut reader, 12, schema_mismatch_error)?;
+            let encoded_precision = reader.read_u8()?;
+            let encoded_scale = reader.read_u8()? as i8;
+            if encoded_precision != *precision || encoded_scale != *scale {
+                return Err(
+                    if decimal_metadata_is_valid(encoded_precision, encoded_scale) {
+                        schema_mismatch_error
+                    } else {
+                        ContributionCodecError::NonCanonicalPayload
+                    },
+                );
             }
             let count = read_fixed_count(&mut reader, 16)?;
             let mut values = reserve_values(count)?;
@@ -581,6 +653,125 @@ fn decode_topk_body(
         .map_err(|_| ContributionCodecError::NonCanonicalPayload)
 }
 
+fn decode_final_domain_body(
+    body: &[u8],
+    contract: &RuntimeCompletionFenceContract,
+    stream: ProducerStreamId,
+    sequence: ProducerSequence,
+) -> Result<FinalDomainShard, ContributionCodecError> {
+    let mut reader = Reader::new(body);
+    let encoded_fence_digest = reader.read_array::<32>()?;
+    let fence = CompletionFence::try_from_remote_codec(
+        contract.digest(),
+        stream,
+        sequence,
+        encoded_fence_digest,
+    )
+    .map_err(|_| ContributionCodecError::NonCanonicalPayload)?;
+    let domain = decode_final_domain_membership_body(
+        reader.read_exact(reader.remaining_len())?,
+        contract.membership_schema().data_type(),
+    )?;
+    let shard =
+        FinalDomainShard::try_new(contract, fence, domain).map_err(map_final_domain_error)?;
+    verify_final_domain_scope(&shard, contract, stream, sequence)?;
+    Ok(shard)
+}
+
+fn decode_final_domain_membership_body(
+    body: &[u8],
+    expected_data_type: &DataType,
+) -> Result<ValueDomainDelta, ContributionCodecError> {
+    match decode_membership_body_with_policy(
+        body,
+        expected_data_type,
+        ContributionCodecError::SchemaMismatch,
+    ) {
+        Ok(domain) => Ok(domain),
+        Err(ContributionCodecError::SchemaMismatch) => {
+            let encoded_data_type = infer_membership_data_type(body)?;
+            decode_membership_body(body, &encoded_data_type)?;
+            Err(ContributionCodecError::SchemaMismatch)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn infer_membership_data_type(body: &[u8]) -> Result<DataType, ContributionCodecError> {
+    let mut reader = Reader::new(body);
+    let version_len =
+        usize::try_from(reader.read_u64()?).map_err(|_| ContributionCodecError::LengthOverflow)?;
+    if reader.read_exact(version_len)? != FINGERPRINT_VERSION_TAG {
+        return Err(ContributionCodecError::NonCanonicalPayload);
+    }
+    Ok(match reader.read_u8()? {
+        1 => DataType::Boolean,
+        2 => DataType::Int8,
+        3 => DataType::Int16,
+        4 => DataType::Int32,
+        5 => DataType::Int64,
+        6 => DataType::FixedSizeBinary(LARGEINT_BYTE_WIDTH),
+        7 => DataType::Float32,
+        8 => DataType::Float64,
+        9 => DataType::Utf8,
+        10 => DataType::Date32,
+        11 => {
+            let unit = match reader.read_u8()? {
+                1 => TimeUnit::Second,
+                2 => TimeUnit::Millisecond,
+                3 => TimeUnit::Microsecond,
+                4 => TimeUnit::Nanosecond,
+                _ => return Err(ContributionCodecError::NonCanonicalPayload),
+            };
+            let timezone = match reader.read_u8()? {
+                0 => None,
+                1 => {
+                    let len = usize::try_from(reader.read_u64()?)
+                        .map_err(|_| ContributionCodecError::LengthOverflow)?;
+                    let bytes = reader.read_exact(len)?;
+                    let timezone = std::str::from_utf8(bytes)
+                        .map_err(|_| ContributionCodecError::NonCanonicalPayload)?;
+                    Some(Arc::from(timezone))
+                }
+                _ => return Err(ContributionCodecError::NonCanonicalPayload),
+            };
+            DataType::Timestamp(unit, timezone)
+        }
+        12 => {
+            let precision = reader.read_u8()?;
+            let scale = reader.read_u8()? as i8;
+            if !decimal_metadata_is_valid(precision, scale) {
+                return Err(ContributionCodecError::NonCanonicalPayload);
+            }
+            DataType::Decimal128(precision, scale)
+        }
+        _ => return Err(ContributionCodecError::NonCanonicalPayload),
+    })
+}
+
+fn verify_final_domain_scope(
+    shard: &FinalDomainShard,
+    contract: &RuntimeCompletionFenceContract,
+    stream: ProducerStreamId,
+    sequence: ProducerSequence,
+) -> Result<(), ContributionCodecError> {
+    shard
+        .verify_scope(contract, stream, sequence)
+        .map_err(|error| match error.kind() {
+            RuntimeContractViolationKind::TypeMismatch => ContributionCodecError::SchemaMismatch,
+            _ => ContributionCodecError::NonCanonicalPayload,
+        })
+}
+
+fn map_final_domain_error(error: FinalDomainError) -> ContributionCodecError {
+    match error {
+        FinalDomainError::ContractMismatch | FinalDomainError::DomainSchemaMismatch => {
+            ContributionCodecError::SchemaMismatch
+        }
+        _ => ContributionCodecError::NonCanonicalPayload,
+    }
+}
+
 fn decode_ordered_tuple(
     reader: &mut Reader<'_>,
     contract: &RuntimeOrderContract,
@@ -642,11 +833,24 @@ fn decode_ordered_scalar(
     })
 }
 
-fn expect_type_tag(reader: &mut Reader<'_>, expected: u8) -> Result<(), ContributionCodecError> {
-    if reader.read_u8()? != expected {
-        return Err(ContributionCodecError::NonCanonicalPayload);
+fn expect_type_tag(
+    reader: &mut Reader<'_>,
+    expected: u8,
+    mismatch_error: ContributionCodecError,
+) -> Result<(), ContributionCodecError> {
+    let actual = reader.read_u8()?;
+    if actual != expected {
+        return Err(if (1..=12).contains(&actual) {
+            mismatch_error
+        } else {
+            ContributionCodecError::NonCanonicalPayload
+        });
     }
     Ok(())
+}
+
+fn decimal_metadata_is_valid(precision: u8, scale: i8) -> bool {
+    (1..=38).contains(&precision) && scale <= 38 && (scale <= 0 || scale as u8 <= precision)
 }
 
 fn read_count(reader: &mut Reader<'_>) -> Result<usize, ContributionCodecError> {
@@ -784,10 +988,15 @@ mod tests {
 
     use super::*;
     use crate::common::largeint::LARGEINT_BYTE_WIDTH;
+    use crate::common::types::UniqueId;
     use crate::runtime_filter::model::contract::{
-        NullOrder, NullSemantics, OrderContract, OrderKeyContract, SortDirection,
-        TopKSummaryRequirement,
+        BindingId, ChannelId, CompletionFenceKind, NullOrder, NullSemantics, OrderContract,
+        OrderKeyContract, SortDirection, TopKSummaryRequirement,
     };
+    use crate::runtime_filter::port::final_domain::{
+        CollectingFinalDomainTestIssuer, CompletionFenceAuthority, FinalDomainTestIssuerTransition,
+    };
+    use crate::runtime_filter::port::identity::{DeploymentEpoch, PartitionId};
     use crate::runtime_filter::port::ordered_bound::{
         COMPARATOR_ALGORITHM_VERSION, OrderedScalar, OrderedTuple, RuntimeOrderContract,
         comparator_digest_for_test,
@@ -987,6 +1196,64 @@ mod tests {
             Ok(contribution)
         );
         encoded
+    }
+
+    fn final_domain_contract(data_type: &DataType) -> RuntimeCompletionFenceContract {
+        RuntimeCompletionFenceContract::try_from_install(
+            UniqueId { hi: 101, lo: 102 },
+            DeploymentEpoch::new(103),
+            ChannelId::new(104),
+            CompletionFenceKind::CommittedDomainFrozen,
+            &schema(data_type, NullSemantics::NullSafeEqual),
+        )
+        .unwrap()
+    }
+
+    fn final_domain_stream(binding: u32, instance: UniqueId, partition: u32) -> ProducerStreamId {
+        ProducerStreamId::new(
+            BindingId::new(binding),
+            instance,
+            PartitionId::new(partition),
+        )
+    }
+
+    fn final_domain_shard(
+        contract: &RuntimeCompletionFenceContract,
+        stream: ProducerStreamId,
+        sequence: ProducerSequence,
+        domain: ValueDomainDelta,
+    ) -> FinalDomainShard {
+        let authority = CompletionFenceAuthority::try_new(
+            Arc::new(contract.clone()),
+            stream.binding_id(),
+            stream.fragment_instance_id(),
+        )
+        .unwrap();
+        let issuer = match CollectingFinalDomainTestIssuer::new(authority, 1).close_driver() {
+            FinalDomainTestIssuerTransition::Frozen(issuer) => issuer,
+            FinalDomainTestIssuerTransition::Collecting(_) => {
+                panic!("the only open driver must freeze the test issuer")
+            }
+        };
+        issuer.issue_shard(stream, sequence, domain).unwrap()
+    }
+
+    fn encode_final_domain(
+        contract: &RuntimeCompletionFenceContract,
+        stream: ProducerStreamId,
+        sequence: ProducerSequence,
+        domain: ValueDomainDelta,
+    ) -> (RuntimeFilterContribution, EncodedContribution) {
+        let contribution = RuntimeFilterContribution::FinalDomain(final_domain_shard(
+            contract, stream, sequence, domain,
+        ));
+        let expectation = ContributionCodecExpectation::FinalDomain {
+            contract,
+            stream,
+            sequence,
+        };
+        let encoded = encode_contribution(&contribution, expectation, usize::MAX).unwrap();
+        (contribution, encoded)
     }
 
     #[test]
@@ -1882,6 +2149,369 @@ mod tests {
             [vec![Some(OrderedScalar::Utf8(Arc::from("exact")))]],
         );
         let expectation = ContributionCodecExpectation::TopKSummary(&contract);
+        let exact = encoded_contribution_len(&contribution, expectation).unwrap();
+
+        assert_eq!(
+            encode_contribution(&contribution, expectation, exact - 1),
+            Err(ContributionCodecError::EncodedSizeExceeded)
+        );
+        let encoded = encode_contribution(&contribution, expectation, exact).unwrap();
+        assert_eq!(encoded.payload().len(), exact);
+        assert_eq!(
+            decode_contribution(
+                encoded.payload(),
+                encoded.schema_digest(),
+                expectation,
+                exact - 1,
+            ),
+            Err(ContributionCodecError::EncodedSizeExceeded)
+        );
+        assert_eq!(
+            decode_contribution(
+                encoded.payload(),
+                encoded.schema_digest(),
+                expectation,
+                exact,
+            ),
+            Ok(contribution)
+        );
+    }
+
+    #[test]
+    fn final_domain_round_trip_reconstructs_exact_fence_scope() {
+        let contract = final_domain_contract(&DataType::Int64);
+        let instance = UniqueId { hi: 201, lo: 202 };
+        let stream = final_domain_stream(203, instance, 204);
+        let sequence = ProducerSequence::new(205);
+        let (contribution, encoded) = encode_final_domain(
+            &contract,
+            stream,
+            sequence,
+            ValueDomainDelta::new(MembershipValues::int64([1, 2]), true),
+        );
+        let expectation = ContributionCodecExpectation::FinalDomain {
+            contract: &contract,
+            stream,
+            sequence,
+        };
+
+        assert_eq!(encoded.schema_digest(), &contract.digest().bytes());
+        assert_eq!(
+            decode_contribution(
+                encoded.payload(),
+                encoded.schema_digest(),
+                expectation,
+                encoded.payload().len(),
+            ),
+            Ok(contribution)
+        );
+    }
+
+    #[test]
+    fn final_domain_body_contains_digest_but_not_route_identity() {
+        let contract = final_domain_contract(&DataType::Int64);
+        let stream = final_domain_stream(
+            0xa1b2_c3d4,
+            UniqueId {
+                hi: 0x1122_3344_5566_7788,
+                lo: 0x2233_4455_6677_8899,
+            },
+            0xb1c2_d3e4,
+        );
+        let sequence = ProducerSequence::new(0x3344_5566_7788_99aa);
+        let domain = ValueDomainDelta::new(MembershipValues::int64([7]), false);
+        let shard = final_domain_shard(&contract, stream, sequence, domain.clone());
+        let contribution = RuntimeFilterContribution::FinalDomain(shard.clone());
+        let encoded = encode_contribution(
+            &contribution,
+            ContributionCodecExpectation::FinalDomain {
+                contract: &contract,
+                stream,
+                sequence,
+            },
+            usize::MAX,
+        )
+        .unwrap();
+        let mut expected_body = shard.fence_digest().to_vec();
+        domain.encode_canonical_into(&mut expected_body).unwrap();
+
+        assert_eq!(&encoded.payload()[HEADER_LEN..], expected_body);
+    }
+
+    #[test]
+    fn final_domain_rejects_fence_digest_binding_finst_partition_sequence_mismatch() {
+        let contract = final_domain_contract(&DataType::Int64);
+        let instance = UniqueId { hi: 301, lo: 302 };
+        let stream = final_domain_stream(303, instance, 304);
+        let sequence = ProducerSequence::new(305);
+        let (contribution, encoded) = encode_final_domain(
+            &contract,
+            stream,
+            sequence,
+            ValueDomainDelta::new(MembershipValues::int64([1]), false),
+        );
+        let mismatched = [
+            (final_domain_stream(999, instance, 304), sequence),
+            (
+                final_domain_stream(303, UniqueId { hi: 999, lo: 302 }, 304),
+                sequence,
+            ),
+            (final_domain_stream(303, instance, 999), sequence),
+            (stream, ProducerSequence::new(999)),
+        ];
+        for (other_stream, other_sequence) in mismatched {
+            assert_eq!(
+                encode_contribution(
+                    &contribution,
+                    ContributionCodecExpectation::FinalDomain {
+                        contract: &contract,
+                        stream: other_stream,
+                        sequence: other_sequence,
+                    },
+                    usize::MAX,
+                ),
+                Err(ContributionCodecError::NonCanonicalPayload)
+            );
+            assert_eq!(
+                decode_contribution(
+                    encoded.payload(),
+                    encoded.schema_digest(),
+                    ContributionCodecExpectation::FinalDomain {
+                        contract: &contract,
+                        stream: other_stream,
+                        sequence: other_sequence,
+                    },
+                    usize::MAX,
+                ),
+                Err(ContributionCodecError::NonCanonicalPayload)
+            );
+        }
+
+        let mut bad_digest = encoded.payload().to_vec();
+        bad_digest[HEADER_LEN] ^= 1;
+        assert_eq!(
+            decode_contribution(
+                &bad_digest,
+                encoded.schema_digest(),
+                ContributionCodecExpectation::FinalDomain {
+                    contract: &contract,
+                    stream,
+                    sequence,
+                },
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::NonCanonicalPayload)
+        );
+    }
+
+    #[test]
+    fn final_domain_rejects_membership_schema_and_spliced_body_mismatch() {
+        let contract = final_domain_contract(&DataType::Int64);
+        let utf8_contract = final_domain_contract(&DataType::Utf8);
+        let stream = final_domain_stream(403, UniqueId { hi: 401, lo: 402 }, 404);
+        let sequence = ProducerSequence::new(405);
+        let (contribution, encoded) = encode_final_domain(
+            &contract,
+            stream,
+            sequence,
+            ValueDomainDelta::new(MembershipValues::int64([1]), false),
+        );
+        assert_eq!(
+            encode_contribution(
+                &contribution,
+                ContributionCodecExpectation::FinalDomain {
+                    contract: &utf8_contract,
+                    stream,
+                    sequence,
+                },
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::SchemaMismatch)
+        );
+        assert_eq!(
+            decode_contribution(
+                encoded.payload(),
+                encoded.schema_digest(),
+                ContributionCodecExpectation::FinalDomain {
+                    contract: &utf8_contract,
+                    stream,
+                    sequence,
+                },
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::SchemaMismatch)
+        );
+
+        let (_, utf8_encoded) = encode_final_domain(
+            &utf8_contract,
+            stream,
+            sequence,
+            ValueDomainDelta::new(MembershipValues::utf8(["spliced"]), false),
+        );
+        let mut spliced = encoded.payload().to_vec();
+        spliced.truncate(HEADER_LEN + 32);
+        spliced.extend_from_slice(&utf8_encoded.payload()[HEADER_LEN + 32..]);
+        let body_len = spliced.len() - HEADER_LEN;
+        spliced[40..48].copy_from_slice(&(body_len as u64).to_be_bytes());
+        assert_eq!(
+            decode_contribution(
+                &spliced,
+                encoded.schema_digest(),
+                ContributionCodecExpectation::FinalDomain {
+                    contract: &contract,
+                    stream,
+                    sequence,
+                },
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::SchemaMismatch)
+        );
+    }
+
+    #[test]
+    fn final_domain_keeps_invalid_schema_metadata_noncanonical() {
+        let stream = final_domain_stream(453, UniqueId { hi: 451, lo: 452 }, 454);
+        let sequence = ProducerSequence::new(455);
+
+        let int_contract = final_domain_contract(&DataType::Int64);
+        let (_, int_encoded) = encode_final_domain(
+            &int_contract,
+            stream,
+            sequence,
+            ValueDomainDelta::new(MembershipValues::int64([1]), false),
+        );
+        let type_tag_offset = HEADER_LEN + 32 + 8 + FINGERPRINT_VERSION_TAG.len();
+        let mut invalid_tag = int_encoded.payload().to_vec();
+        invalid_tag[type_tag_offset] = 99;
+        assert_eq!(
+            decode_contribution(
+                &invalid_tag,
+                int_encoded.schema_digest(),
+                ContributionCodecExpectation::FinalDomain {
+                    contract: &int_contract,
+                    stream,
+                    sequence,
+                },
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::NonCanonicalPayload)
+        );
+        let mut missing_fence_byte = int_encoded.payload()[..HEADER_LEN + 31].to_vec();
+        missing_fence_byte[40..48].copy_from_slice(&31_u64.to_be_bytes());
+        assert_eq!(
+            decode_contribution(
+                &missing_fence_byte,
+                int_encoded.schema_digest(),
+                ContributionCodecExpectation::FinalDomain {
+                    contract: &int_contract,
+                    stream,
+                    sequence,
+                },
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::Truncated)
+        );
+        let mut malformed_alternate_type = int_encoded.payload().to_vec();
+        malformed_alternate_type[type_tag_offset] = 1;
+        assert_eq!(
+            decode_contribution(
+                &malformed_alternate_type,
+                int_encoded.schema_digest(),
+                ContributionCodecExpectation::FinalDomain {
+                    contract: &int_contract,
+                    stream,
+                    sequence,
+                },
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::NonCanonicalPayload)
+        );
+
+        let timestamp_contract =
+            final_domain_contract(&DataType::Timestamp(TimeUnit::Second, None));
+        let (_, timestamp_encoded) = encode_final_domain(
+            &timestamp_contract,
+            stream,
+            sequence,
+            ValueDomainDelta::new(
+                MembershipValues::timestamp(TimeUnit::Second, None, [1]),
+                false,
+            ),
+        );
+        let mut invalid_unit = timestamp_encoded.payload().to_vec();
+        invalid_unit[type_tag_offset + 1] = 99;
+        assert_eq!(
+            decode_contribution(
+                &invalid_unit,
+                timestamp_encoded.schema_digest(),
+                ContributionCodecExpectation::FinalDomain {
+                    contract: &timestamp_contract,
+                    stream,
+                    sequence,
+                },
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::NonCanonicalPayload)
+        );
+        let mut invalid_timezone_marker = timestamp_encoded.payload().to_vec();
+        invalid_timezone_marker[type_tag_offset + 2] = 2;
+        assert_eq!(
+            decode_contribution(
+                &invalid_timezone_marker,
+                timestamp_encoded.schema_digest(),
+                ContributionCodecExpectation::FinalDomain {
+                    contract: &timestamp_contract,
+                    stream,
+                    sequence,
+                },
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::NonCanonicalPayload)
+        );
+
+        let decimal_contract = final_domain_contract(&DataType::Decimal128(5, 2));
+        let (_, decimal_encoded) = encode_final_domain(
+            &decimal_contract,
+            stream,
+            sequence,
+            ValueDomainDelta::new(MembershipValues::decimal128(5, 2, [1]).unwrap(), false),
+        );
+        for (precision, scale) in [(0, 2), (5, 39)] {
+            let mut invalid_decimal = decimal_encoded.payload().to_vec();
+            invalid_decimal[type_tag_offset + 1] = precision;
+            invalid_decimal[type_tag_offset + 2] = scale as u8;
+            assert_eq!(
+                decode_contribution(
+                    &invalid_decimal,
+                    decimal_encoded.schema_digest(),
+                    ContributionCodecExpectation::FinalDomain {
+                        contract: &decimal_contract,
+                        stream,
+                        sequence,
+                    },
+                    usize::MAX,
+                ),
+                Err(ContributionCodecError::NonCanonicalPayload)
+            );
+        }
+    }
+
+    #[test]
+    fn final_domain_exact_limit_succeeds_and_limit_minus_one_fails() {
+        let contract = final_domain_contract(&DataType::Utf8);
+        let stream = final_domain_stream(503, UniqueId { hi: 501, lo: 502 }, 504);
+        let sequence = ProducerSequence::new(505);
+        let contribution = RuntimeFilterContribution::FinalDomain(final_domain_shard(
+            &contract,
+            stream,
+            sequence,
+            ValueDomainDelta::new(MembershipValues::utf8(["exact"]), true),
+        ));
+        let expectation = ContributionCodecExpectation::FinalDomain {
+            contract: &contract,
+            stream,
+            sequence,
+        };
         let exact = encoded_contribution_len(&contribution, expectation).unwrap();
 
         assert_eq!(

@@ -125,6 +125,10 @@ impl RuntimeCompletionFenceContract {
     pub(crate) const fn digest(&self) -> CompletionFenceContractDigest {
         self.digest
     }
+
+    pub(crate) const fn membership_schema(&self) -> &ArtifactMembershipSchema {
+        &self.membership_schema
+    }
 }
 
 fn fence_kind_tag(kind: CompletionFenceKind) -> u8 {
@@ -299,6 +303,24 @@ impl CompletionFence {
         self.digest
     }
 
+    pub(crate) fn try_from_remote_codec(
+        contract_digest: CompletionFenceContractDigest,
+        stream: ProducerStreamId,
+        sequence: ProducerSequence,
+        encoded_digest: [u8; 32],
+    ) -> Result<Self, FinalDomainError> {
+        let expected_digest = fence_digest(contract_digest, stream, sequence);
+        if encoded_digest != expected_digest {
+            return Err(FinalDomainError::FenceIntegrityMismatch);
+        }
+        Ok(Self {
+            contract_digest,
+            stream,
+            sequence,
+            digest: expected_digest,
+        })
+    }
+
     const fn canonical_bytes(&self) -> usize {
         FENCE_DOMAIN.len()
             + size_of::<u16>()
@@ -411,6 +433,10 @@ impl FinalDomainShard {
 
     pub(crate) const fn domain(&self) -> &ValueDomainDelta {
         &self.domain
+    }
+
+    pub(crate) const fn fence_digest(&self) -> [u8; 32] {
+        self.fence.digest()
     }
 
     pub(crate) const fn replay_digest(&self) -> [u8; 32] {
@@ -667,6 +693,44 @@ mod tests {
             authority.issue(&wrong_issuer.proof, stream(3), ProducerSequence::new(4),),
             Err(FinalDomainError::FrozenProofMismatch)
         );
+    }
+
+    #[test]
+    fn remote_fence_reconstruction_does_not_change_local_frozen_issue_path() {
+        let contract = Arc::new(contract());
+        let authority = authority(contract.clone());
+        let issuer = frozen_issuer(&authority);
+        let stream = stream(3);
+        let sequence = ProducerSequence::new(4);
+        let local = issuer.issue(stream, sequence).unwrap();
+
+        assert_eq!(contract.membership_schema().data_type(), &DataType::Int64);
+        assert_eq!(
+            CompletionFence::try_from_remote_codec(
+                contract.digest(),
+                stream,
+                sequence,
+                local.digest(),
+            ),
+            Ok(local.clone())
+        );
+        let mut invalid_digest = local.digest();
+        invalid_digest[0] ^= 1;
+        assert_eq!(
+            CompletionFence::try_from_remote_codec(
+                contract.digest(),
+                stream,
+                sequence,
+                invalid_digest,
+            ),
+            Err(FinalDomainError::FenceIntegrityMismatch)
+        );
+
+        let collecting = CollectingFinalDomainTestIssuer::new(authority, 1);
+        assert!(matches!(
+            collecting.close_driver(),
+            FinalDomainTestIssuerTransition::Frozen(_)
+        ));
     }
 
     #[test]
