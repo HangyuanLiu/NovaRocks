@@ -270,10 +270,10 @@ mod tests {
     use super::*;
     use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::{BinOp, ExprKind, OutputColumn, TypedExpr};
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::optimizer::operator::{LogicalJoinOp, ScanOp};
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::scalar::{self, ScalarArena};
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     fn make_ctx(arena: ScalarArena) -> RewriteContext {
         let mut ctx = RewriteContext::for_query(std::iter::empty::<String>());

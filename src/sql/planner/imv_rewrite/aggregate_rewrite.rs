@@ -26,9 +26,6 @@ use crate::sql::analysis::expr_display::typed_expr_display_name;
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr, UnOp,
 };
-use crate::sql::catalog::{
-    IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter, TableDef,
-};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -50,6 +47,9 @@ use crate::sql::planner::payload::{
     AggregateCall, PlanFilterNode, PlanProjectNode, PlanScanNode, PlanValuesNode,
 };
 use crate::sql::planner::plan_output_columns as planner_plan_output_columns;
+use crate::sql::planner::table::{
+    IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter, TableDef,
+};
 
 pub(crate) struct RewriteAggregateStateRule;
 
@@ -137,7 +137,7 @@ pub(crate) fn build_aggregate_state_merge(
     aggregate_input: LogicalPlanNode,
     aggregate_required_output_columns: Option<HashSet<ColumnId>>,
     action_column: Option<ColumnId>,
-    branch_scope: Option<crate::sql::catalog::BranchScope>,
+    branch_scope: Option<crate::sql::planner::table::BranchScope>,
     ctx: &RewriteContext,
     ext: &ImvExtension,
 ) -> Result<LogicalPlanNode, String> {
@@ -236,8 +236,8 @@ fn target_state_old_scan(
     group_key_names: &[String],
     aggregate_state_names: &[String],
     row_id_column_name: &str,
-    branch_scope: Option<&crate::sql::catalog::BranchScope>,
-    old_source: crate::sql::catalog::ScanSource,
+    branch_scope: Option<&crate::sql::planner::table::BranchScope>,
+    old_source: crate::sql::planner::table::ScanSource,
     ctx: &RewriteContext,
 ) -> Result<LogicalPlanNode, String> {
     let locator_metadata_columns = target_state_locator_metadata_columns();
@@ -430,7 +430,7 @@ fn target_state_locator_metadata_columns() -> Vec<ColumnDef> {
 
 fn branch_scoped_old_input(
     old_scan: LogicalPlanNode,
-    branch_scope: Option<crate::sql::catalog::BranchScope>,
+    branch_scope: Option<crate::sql::planner::table::BranchScope>,
     layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
 ) -> Result<LogicalPlanNode, String> {
     let Some(scope) = branch_scope else {
@@ -457,7 +457,7 @@ fn branch_scoped_old_input(
 fn build_relational_aggregate_change_stream(
     old_input: LogicalPlanNode,
     signed_delta: LogicalPlanNode,
-    branch_scope: Option<crate::sql::catalog::BranchScope>,
+    branch_scope: Option<crate::sql::planner::table::BranchScope>,
     ctx: &RewriteContext,
     layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
 ) -> Result<LogicalPlanNode, String> {
@@ -738,7 +738,7 @@ fn aggregate_change_stream_project(
     delta_outputs: &[OutputColumn],
     old_outputs: &[OutputColumn],
     output_columns: &[OutputColumn],
-    branch_scope: Option<&crate::sql::catalog::BranchScope>,
+    branch_scope: Option<&crate::sql::planner::table::BranchScope>,
     layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
 ) -> Result<LogicalPlanNode, String> {
     let branch_marker = find_output_column_by_name(input_outputs, "__imv_change_branch")?;
@@ -968,7 +968,7 @@ fn branch_case_requires_runtime_cast(target: &DataType) -> bool {
 
 fn aggregate_change_stream_output_columns(
     layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
-    branch_scope: Option<&crate::sql::catalog::BranchScope>,
+    branch_scope: Option<&crate::sql::planner::table::BranchScope>,
     ctx: &RewriteContext,
 ) -> Result<Vec<OutputColumn>, String> {
     let mut columns = Vec::with_capacity(
@@ -1218,7 +1218,7 @@ fn int64_literal(value: i64) -> TypedExpr {
 }
 
 fn branch_scope_predicate(
-    scope: &crate::sql::catalog::BranchScope,
+    scope: &crate::sql::planner::table::BranchScope,
     outputs: &[OutputColumn],
 ) -> Result<TypedExpr, String> {
     let branch_column = find_output_column_by_name(outputs, &scope.branch_id_column_name)?;
@@ -2232,7 +2232,6 @@ mod tests {
         ApplyKeySource, BranchIdColumnContract, BranchUnionContract, MvPartitionContract,
     };
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
-    use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::common::ImvVersionRef;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -2243,6 +2242,7 @@ mod tests {
     };
     use crate::sql::planner::optimizer_bridge::logical::{to_logical_plan, to_optimizer_expr};
     use crate::sql::planner::payload::{AggregateCall, PlanScanNode};
+    use crate::sql::planner::table::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
 
     #[test]
     fn signed_state_function_maps_supported_aggregates() {
@@ -2608,7 +2608,8 @@ mod tests {
                         },
                         files: Vec::new(),
                         cloud_properties: BTreeMap::new(),
-                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                        binding:
+                            crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 },
                 alias: None,
@@ -3558,7 +3559,7 @@ mod tests {
                 aggregate_input,
                 None,
                 None,
-                Some(crate::sql::catalog::BranchScope {
+                Some(crate::sql::planner::table::BranchScope {
                     branch_id_column_name:
                         crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN
                             .to_string(),
@@ -3633,7 +3634,7 @@ mod tests {
             LogicalPlanKind::ImvDelta(LogicalImvDeltaNode {
                 is_root: true,
                 action_column: None,
-                branch_scope: Some(crate::sql::catalog::BranchScope {
+                branch_scope: Some(crate::sql::planner::table::BranchScope {
                     branch_id_column_name:
                         crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN
                             .to_string(),

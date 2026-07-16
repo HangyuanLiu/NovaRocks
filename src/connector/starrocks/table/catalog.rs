@@ -39,7 +39,8 @@ use super::model::{
 use crate::catalog::identifier::normalize_identifier;
 use crate::catalog::schema::ColumnDef;
 use crate::connector::starrocks::table::config::StarRocksTableConfig;
-use crate::engine::catalog::{InMemoryCatalog, ScanSource, TableDef};
+use crate::engine::catalog::InMemoryCatalog;
+use crate::sql::planner::table::{ScanSource, TableDef};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct StarRocksTableCatalog {

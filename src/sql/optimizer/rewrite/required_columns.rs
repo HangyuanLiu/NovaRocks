@@ -998,7 +998,6 @@ mod tests {
     use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::cte::CteId;
     use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn};
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::optimizer::operator::{
         AggregateOutputLayout, CTEAnchorOp, CTEConsumeOp, CTEProduceOp, ExceptOp, FilterOp,
         GenerateSeriesOp, ImvDeltaOp, IntersectOp, LimitOp, LogicalAggregateOp, LogicalJoinOp,
@@ -1006,6 +1005,7 @@ mod tests {
         SortOp, TableFunctionOp, UnionOp, ValuesOp, WindowOp,
     };
     use crate::sql::optimizer::scalar::{ScalarArena, SortKey};
+    use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -2581,7 +2581,7 @@ mod tests {
             }),
             vec![OptExpr::leaf(Operator::LogicalScan(ScanOp {
                 database: "db".to_string(),
-                table: crate::sql::catalog::TableDef {
+                table: crate::sql::planner::table::TableDef {
                     name: "t".to_string(),
                     columns: vec![crate::catalog::schema::ColumnDef {
                         name: "a".to_string(),
@@ -2591,7 +2591,7 @@ mod tests {
                         logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: crate::sql::catalog::ScanSource::StarRocks {
+                    source: crate::sql::planner::table::ScanSource::StarRocks {
                         db_id: 0,
                         table_id: 0,
                     },

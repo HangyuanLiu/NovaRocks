@@ -143,12 +143,12 @@ mod tests {
     use std::ptr;
 
     use super::bind_tree;
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::common::{JoinKind, LiteralValue};
     use crate::sql::optimizer::operator::{FilterOp, LogicalJoinOp, Operator, ScanOp};
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::pattern::{OpKind, Pattern};
     use crate::sql::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode};
+    use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
 
     fn bool_literal_scalar(arena: &mut ScalarArena) -> ScalarId {

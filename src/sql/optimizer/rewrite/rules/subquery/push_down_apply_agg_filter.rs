@@ -340,7 +340,6 @@ mod tests {
 
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, OutputColumn, TypedExpr};
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::ApplyKind;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -354,6 +353,7 @@ mod tests {
     use crate::sql::planner::payload::{
         AggregateCall, PlanFilterNode, PlanScanNode, PlanValuesNode,
     };
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     // ---- Column ID constants ------------------------------------------------
     const T2_K: ColumnId = ColumnId(1); // t2.k  (inner correlation column)
@@ -900,11 +900,11 @@ mod tests {
         let scan = LogicalPlanNode::new(
             LogicalPlanKind::Scan(PlanScanNode {
                 database: "default".to_string(),
-                table: crate::sql::catalog::TableDef {
+                table: crate::sql::planner::table::TableDef {
                     name: "t2".to_string(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: crate::sql::catalog::ScanSource::StarRocks {
+                    source: crate::sql::planner::table::ScanSource::StarRocks {
                         db_id: 0,
                         table_id: 0,
                     },

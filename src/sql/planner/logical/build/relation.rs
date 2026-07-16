@@ -17,10 +17,10 @@
 
 use crate::sql::analysis::cte::CTERegistry;
 use crate::sql::analysis::*;
-use crate::sql::catalog::{IcebergDataFileInfo, IcebergDeleteFileContent};
 use crate::sql::column_id::ColumnRefFactory;
 use crate::sql::planner::logical::*;
 use crate::sql::planner::payload::*;
+use crate::sql::planner::table::{IcebergDataFileInfo, IcebergDeleteFileContent};
 
 use super::output::adapt_plan_output_with_qualifier;
 use super::query::plan_scoped_query;
@@ -214,7 +214,7 @@ fn plan_iceberg_metadata_scan(
 ) -> Result<LogicalPlanNode, String> {
     use crate::catalog::schema::ColumnDef;
     use crate::sql::analyzer::iceberg_metadata::metadata_table_schema_for_source;
-    use crate::sql::catalog::{ScanSource, TableDef};
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     let cols =
         metadata_table_schema_for_source(rel.metadata_table_type.clone(), &rel.table.source)?;
@@ -316,10 +316,10 @@ struct PartitionMetadataAgg {
 
 fn build_iceberg_metadata_payload(
     metadata_table_type: &crate::connector::iceberg::IcebergMetadataTableType,
-    storage: &crate::sql::catalog::ScanSource,
+    storage: &crate::sql::planner::table::ScanSource,
 ) -> Result<Option<String>, String> {
     use crate::connector::iceberg::IcebergMetadataTableType;
-    use crate::sql::catalog::ScanSource;
+    use crate::sql::planner::table::ScanSource;
     match metadata_table_type {
         IcebergMetadataTableType::Partitions => {
             let ScanSource::IcebergDataFiles { files, .. } = storage else {
@@ -439,7 +439,7 @@ fn plan_iceberg_delta_scan(
     rel: IcebergDeltaScanRelation,
     factory: &mut ColumnRefFactory,
 ) -> Result<LogicalPlanNode, String> {
-    use crate::sql::catalog::{ScanSource, TableDef};
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     // Output schema: base columns + iceberg v3 row-lineage metadata columns.
     // The delta scan emits both: scanner-side projection re-uses the same
@@ -521,16 +521,16 @@ fn plan_iceberg_delta_scan(
 }
 
 fn iceberg_table_info(
-    source: &crate::sql::catalog::ScanSource,
-) -> Option<&crate::sql::catalog::IcebergTableInfo> {
+    source: &crate::sql::planner::table::ScanSource,
+) -> Option<&crate::sql::planner::table::IcebergTableInfo> {
     match source {
-        crate::sql::catalog::ScanSource::IcebergDataFiles { table, .. }
-        | crate::sql::catalog::ScanSource::IcebergMetadataTable { table, .. }
-        | crate::sql::catalog::ScanSource::IcebergDeltaTable { table, .. }
-        | crate::sql::catalog::ScanSource::IcebergVersionTable { table, .. } => Some(table),
-        crate::sql::catalog::ScanSource::StarRocks { .. }
-        | crate::sql::catalog::ScanSource::IcebergMvTargetState { .. }
-        | crate::sql::catalog::ScanSource::IcebergMvTargetLocator { .. } => None,
+        crate::sql::planner::table::ScanSource::IcebergDataFiles { table, .. }
+        | crate::sql::planner::table::ScanSource::IcebergMetadataTable { table, .. }
+        | crate::sql::planner::table::ScanSource::IcebergDeltaTable { table, .. }
+        | crate::sql::planner::table::ScanSource::IcebergVersionTable { table, .. } => Some(table),
+        crate::sql::planner::table::ScanSource::StarRocks { .. }
+        | crate::sql::planner::table::ScanSource::IcebergMvTargetState { .. }
+        | crate::sql::planner::table::ScanSource::IcebergMvTargetLocator { .. } => None,
     }
 }
 

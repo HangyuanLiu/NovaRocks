@@ -647,10 +647,10 @@ fn coalesce_zero(arena: &mut ScalarArena, value: ScalarId, output: &OutputColumn
 /// engine-side candidate preparation, which only hands the optimizer
 /// candidates whose base snapshots match the MV's refresh pins.
 fn same_iceberg_table(
-    a: &crate::sql::catalog::TableDef,
-    b: &crate::sql::catalog::TableDef,
+    a: &crate::sql::planner::table::TableDef,
+    b: &crate::sql::planner::table::TableDef,
 ) -> bool {
-    use crate::sql::catalog::ScanSource;
+    use crate::sql::planner::table::ScanSource;
     match (&a.source, &b.source) {
         (
             ScanSource::IcebergDataFiles { table: ta, .. },
@@ -665,9 +665,6 @@ mod tests {
     use super::*;
     use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
-    use crate::sql::catalog::{
-        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
-    };
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::cascades_rules::mv_rewrite::descriptor::{
         EquiEdge, JoinInput, JoinShape,
@@ -679,6 +676,9 @@ mod tests {
     };
     use crate::sql::planner::optimizer_bridge::scalar::materialize;
     use crate::sql::planner::payload::{AggregateCall, PlanFilterNode, PlanScanNode};
+    use crate::sql::planner::table::{
+        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
+    };
     use arrow::datatypes::DataType;
 
     // --- fixture helpers --------------------------------------------------

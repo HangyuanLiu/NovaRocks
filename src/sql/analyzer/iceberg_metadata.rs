@@ -25,7 +25,7 @@ use iceberg::spec::{PrimitiveType, TableMetadata, Type};
 use std::sync::Arc;
 
 use crate::connector::iceberg::IcebergMetadataTableType;
-use crate::sql::catalog::{IcebergTableInfo, ScanSource};
+use crate::sql::planner::table::{IcebergTableInfo, ScanSource};
 
 /// Inspect the trailing identifier part of a qualified name and, if it
 /// matches `__nr_meta_<type>__`, return the parts with the suffix stripped

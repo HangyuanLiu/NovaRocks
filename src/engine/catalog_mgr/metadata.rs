@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 
 use crate::catalog::identifier::TableIdentity;
 use crate::catalog::schema::ColumnDef;
-use crate::sql::catalog::{IcebergTableInfo, ScanSource, TableDef};
+use crate::sql::planner::table::{IcebergTableInfo, ScanSource, TableDef};
 
 /// Backend-specific locator for scan-binding. Carries identity only, never data.
 #[derive(Clone, Debug, PartialEq)]
@@ -107,7 +107,7 @@ impl TableMetadata {
                 table: info.clone(),
                 files: Vec::new(),
                 cloud_properties: cloud_properties.clone(),
-                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                binding: crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
             },
         };
         TableDef {
@@ -123,7 +123,7 @@ impl TableMetadata {
 mod tests {
     use super::*;
     use crate::catalog::schema::ColumnDef;
-    use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
+    use crate::sql::planner::table::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
     use arrow::datatypes::DataType;
     use std::collections::BTreeMap;
 
@@ -196,7 +196,7 @@ mod tests {
                 table: iceberg_info(),
                 files: vec![], // files should be dropped, not carried into TableMetadata
                 cloud_properties: Default::default(),
-                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                binding: crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
             },
         };
         let id = TableIdentity::new("ice", "ns", "t");
@@ -258,7 +258,7 @@ mod tests {
         assert!(files.is_empty());
         assert_eq!(
             binding,
-            crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot
+            crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot
         );
     }
 
@@ -272,7 +272,7 @@ mod tests {
                 table: iceberg_info(),
                 files: vec![],
                 cloud_properties: cloud_properties(),
-                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                binding: crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
             },
         };
         let id = TableIdentity::new("ice", "ns", "orders");

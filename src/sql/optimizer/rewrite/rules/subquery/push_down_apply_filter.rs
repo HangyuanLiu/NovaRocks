@@ -281,7 +281,6 @@ mod tests {
     use crate::sql::analysis::{
         BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::ApplyKind;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -295,6 +294,7 @@ mod tests {
     use crate::sql::planner::payload::{
         AggregateCall, PlanFilterNode, PlanScanNode, PlanValuesNode,
     };
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     // ---- Column ID constants -------------------------------------------------
     const T2_K: ColumnId = ColumnId(1); // t2.k  (inner correlation column)

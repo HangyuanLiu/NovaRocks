@@ -35,7 +35,7 @@ use std::sync::Arc;
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::dictionary::model::DictionaryOwner;
-use crate::sql::catalog::ScanSource;
+use crate::sql::planner::table::ScanSource;
 
 /// Enumerate dictionary owners for every table in `namespace_target`. Used by
 /// DROP DATABASE to invalidate dictionaries for all child tables before the

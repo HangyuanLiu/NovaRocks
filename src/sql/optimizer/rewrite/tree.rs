@@ -128,7 +128,6 @@ mod tests {
     use super::rewrite_with_rule;
     use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::OutputColumn;
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
         Operator, ProjectOp, ScalarProjectItem, ScanOp, ValuesOp,
@@ -140,6 +139,7 @@ mod tests {
     use crate::sql::optimizer::rewrite::result::{RewriteDiagnostic, RewriteResult};
     use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
     use crate::sql::optimizer::rewrite::trace::RewriteTraceEvent;
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     struct RenameScanRule;
 

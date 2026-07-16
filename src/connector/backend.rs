@@ -35,10 +35,10 @@ use crate::engine::mv::lifecycle::{
     CreateMvRequest, DropMvRequest, ListMvsRequest, MvListRow, RefreshCtx, RefreshError,
     RefreshOutcome, RefreshPlan, RefreshRequest,
 };
-use crate::sql::catalog::TableDef;
 use crate::sql::parser::ast::{
     AlterIcebergPartitionSpecStmt, IcebergPartitionFieldExpr, Literal, TableColumnDef, TableKeyDesc,
 };
+use crate::sql::planner::table::TableDef;
 
 /// Request to create a table. Unified shape across all catalog backends;
 /// backends ignore fields that don't apply to them (e.g. `bucket_count` is
@@ -219,7 +219,7 @@ pub(crate) trait TableSource: Send + Sync {
         &self,
         resolved: &ResolvedTable,
         metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
-    ) -> Result<crate::sql::catalog::TableDef, String> {
+    ) -> Result<crate::sql::planner::table::TableDef, String> {
         let _ = metadata_table_type;
         self.build_schema_table_def(resolved)
     }

@@ -23,7 +23,6 @@
 
 use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
 use crate::engine::mv::table_ref::IcebergTableRef;
-use crate::sql::catalog::{IcebergTableInfo, ScanSource};
 pub(crate) use crate::sql::common::ImvVersionRole;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -35,6 +34,7 @@ use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
 use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
 use crate::sql::planner::payload::PlanScanNode;
+use crate::sql::planner::table::{IcebergTableInfo, ScanSource};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ImvSnapshotWindow {
@@ -247,10 +247,10 @@ mod tests {
     use crate::catalog::schema::ColumnDef;
     use crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context;
     use crate::sql::analysis::OutputColumn;
-    use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
+    use crate::sql::planner::table::{IcebergSchemaDef, IcebergTableInfo, TableDef};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -294,7 +294,7 @@ mod tests {
                     table: iceberg_table_info(uuid),
                     files: Vec::new(),
                     cloud_properties: BTreeMap::new(),
-                    binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                    binding: crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
                 },
             },
             alias: None,

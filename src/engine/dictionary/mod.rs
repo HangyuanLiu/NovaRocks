@@ -31,8 +31,8 @@ use crate::meta::repository::dictionary::{
     DICTIONARY_STATE_ACTIVE, DICTIONARY_STATE_DROPPED, DICTIONARY_STATE_STALE,
     DictionaryMetaRepository, StoredDictionarySnapshot, StoredDictionaryValue,
 };
-use crate::sql::catalog::{ScanSource, TableDef};
 use crate::sql::optimizer::rewrite::context::QueryDictionaryProvider;
+use crate::sql::planner::table::{ScanSource, TableDef};
 
 #[derive(Clone, Default)]
 pub(crate) struct DictionaryManager {
@@ -526,7 +526,7 @@ mod tests {
     #[test]
     fn dictionary_provider_owner_for_starrocks_reads_identity_from_plan_node() {
         use crate::catalog::schema::ColumnDef;
-        use crate::sql::catalog::{ScanSource, TableDef};
+        use crate::sql::planner::table::{ScanSource, TableDef};
         use arrow::datatypes::DataType;
         use std::sync::Arc;
 
@@ -578,7 +578,9 @@ mod tests {
     #[test]
     fn dictionary_provider_loads_iceberg_data_files_snapshot() {
         use crate::catalog::schema::ColumnDef;
-        use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
+        use crate::sql::planner::table::{
+            IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
+        };
         use arrow::datatypes::DataType;
         use std::collections::BTreeMap;
         use std::sync::Arc;
@@ -645,7 +647,7 @@ mod tests {
                 table: iceberg,
                 files: vec![],
                 cloud_properties: BTreeMap::new(),
-                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                binding: crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
             },
         };
 
@@ -665,7 +667,9 @@ mod tests {
     #[test]
     fn dictionary_provider_skips_stale_iceberg_snapshot_after_table_advances() {
         use crate::catalog::schema::ColumnDef;
-        use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
+        use crate::sql::planner::table::{
+            IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
+        };
         use arrow::datatypes::DataType;
         use std::collections::BTreeMap;
         use std::sync::Arc;
@@ -731,7 +735,7 @@ mod tests {
                 table: iceberg,
                 files: vec![],
                 cloud_properties: BTreeMap::new(),
-                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                binding: crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
             },
         };
 

@@ -2447,9 +2447,6 @@ mod tests {
     use crate::sql::analysis::{
         ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
-    use crate::sql::catalog::{
-        IcebergDataFileInfo, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
-    };
     use crate::sql::optimizer::estimate::selectivity::estimate_selectivity;
     use crate::sql::optimizer::memo::Memo;
     use crate::sql::optimizer::operator::AggregateOutputLayout;
@@ -2463,6 +2460,9 @@ mod tests {
         intern_aggregate_calls, intern_exprs, intern_window_exprs,
     };
     use crate::sql::planner::payload::*;
+    use crate::sql::planner::table::{
+        IcebergDataFileInfo, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
+    };
     use arrow::datatypes::DataType;
 
     fn logical_plan_to_memo_for_test(plan: &LogicalPlanNode, memo: &mut Memo) -> GroupId {
@@ -2697,7 +2697,8 @@ mod tests {
                             partition_values: vec![],
                         }],
                         cloud_properties: Default::default(),
-                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                        binding:
+                            crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 },
                 alias: None,

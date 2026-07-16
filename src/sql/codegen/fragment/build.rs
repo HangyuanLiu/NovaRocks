@@ -86,7 +86,7 @@ mod tests {
     use crate::runtime_filter::model::graph::RuntimeFilterGraph;
     use crate::sql::analysis::cte::CteId;
     use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, TypedExpr};
-    use crate::sql::catalog::{CatalogProvider, IcebergDataFileBinding, ScanSource, TableDef};
+    use crate::sql::catalog::CatalogProvider;
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed::{
         BoundaryContract, BoundaryKind as PlannerBoundaryKind, DataPartition, DistributedNode,
@@ -95,6 +95,7 @@ mod tests {
     };
     use crate::sql::planner::payload::{PlanScanNode, PlanValuesNode};
     use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
+    use crate::sql::planner::table::{IcebergDataFileBinding, ScanSource, TableDef};
 
     struct EmptyCatalog;
 
@@ -159,7 +160,7 @@ mod tests {
 
     #[derive(Debug)]
     struct PlannedIcebergFiles {
-        files: Vec<crate::sql::catalog::IcebergDataFileInfo>,
+        files: Vec<crate::sql::planner::table::IcebergDataFileInfo>,
     }
 
     impl crate::connector::scan_planning::ConnectorScanPlanner for PlannedIcebergFiles {
@@ -204,8 +205,8 @@ mod tests {
     fn iceberg_schema_field(
         field_id: i32,
         name: &str,
-    ) -> crate::sql::catalog::IcebergSchemaFieldDef {
-        crate::sql::catalog::IcebergSchemaFieldDef {
+    ) -> crate::sql::planner::table::IcebergSchemaFieldDef {
+        crate::sql::planner::table::IcebergSchemaFieldDef {
             field_id,
             name: name.to_string(),
             initial_default: None,
@@ -216,8 +217,8 @@ mod tests {
         }
     }
 
-    fn iceberg_table_info() -> crate::sql::catalog::IcebergTableInfo {
-        crate::sql::catalog::IcebergTableInfo {
+    fn iceberg_table_info() -> crate::sql::planner::table::IcebergTableInfo {
+        crate::sql::planner::table::IcebergTableInfo {
             catalog: "test_catalog".to_string(),
             namespace: "test_db".to_string(),
             table: "test_table".to_string(),
@@ -225,7 +226,7 @@ mod tests {
             current_snapshot_id: Some(7),
             schema_id: 1,
             location: "s3://bucket/test_table".to_string(),
-            schema: crate::sql::catalog::IcebergSchemaDef {
+            schema: crate::sql::planner::table::IcebergSchemaDef {
                 fields: vec![
                     iceberg_schema_field(1, "id"),
                     iceberg_schema_field(3, "category"),
@@ -239,11 +240,11 @@ mod tests {
     fn equality_delete_file(
         equality_column_names: Vec<&str>,
         equality_field_ids: Vec<i32>,
-    ) -> crate::sql::catalog::IcebergDeleteFileInfo {
-        crate::sql::catalog::IcebergDeleteFileInfo {
+    ) -> crate::sql::planner::table::IcebergDeleteFileInfo {
+        crate::sql::planner::table::IcebergDeleteFileInfo {
             path: "s3://bucket/eq-delete.parquet".to_string(),
-            file_format: crate::sql::catalog::IcebergDeleteFileFormat::Parquet,
-            file_content: crate::sql::catalog::IcebergDeleteFileContent::Equality,
+            file_format: crate::sql::planner::table::IcebergDeleteFileFormat::Parquet,
+            file_content: crate::sql::planner::table::IcebergDeleteFileContent::Equality,
             length: Some(1),
             content_offset: None,
             content_size_in_bytes: None,
@@ -259,9 +260,9 @@ mod tests {
     }
 
     fn iceberg_data_file(
-        delete_files: Vec<crate::sql::catalog::IcebergDeleteFileInfo>,
-    ) -> crate::sql::catalog::IcebergDataFileInfo {
-        crate::sql::catalog::IcebergDataFileInfo {
+        delete_files: Vec<crate::sql::planner::table::IcebergDeleteFileInfo>,
+    ) -> crate::sql::planner::table::IcebergDataFileInfo {
+        crate::sql::planner::table::IcebergDataFileInfo {
             path: "s3://bucket/data.parquet".to_string(),
             size: 128,
             row_count: Some(10),
@@ -282,12 +283,12 @@ mod tests {
         path: &str,
         min: i32,
         max: i32,
-    ) -> crate::sql::catalog::IcebergDataFileInfo {
+    ) -> crate::sql::planner::table::IcebergDataFileInfo {
         let mut file = iceberg_data_file(Vec::new());
         file.path = path.to_string();
         file.column_stats = Some(HashMap::from([(
             "id".to_string(),
-            crate::sql::catalog::IcebergColumnStats {
+            crate::sql::planner::table::IcebergColumnStats {
                 null_count: Some(0),
                 value_count: Some(10),
                 column_size: None,
@@ -301,24 +302,24 @@ mod tests {
     fn iceberg_identity_partition_file(
         path: &str,
         id: i32,
-    ) -> crate::sql::catalog::IcebergDataFileInfo {
+    ) -> crate::sql::planner::table::IcebergDataFileInfo {
         let mut file = iceberg_data_file(Vec::new());
         file.path = path.to_string();
         file.partition_key = Some(format!("Struct([{id}])"));
-        file.partition_values = vec![crate::sql::catalog::IcebergPartitionFieldValue {
+        file.partition_values = vec![crate::sql::planner::table::IcebergPartitionFieldValue {
             source_column: "id".to_string(),
             field_name: "id".to_string(),
             transform: "identity".to_string(),
-            value: Some(crate::sql::catalog::IcebergPartitionValue::Int32(id)),
+            value: Some(crate::sql::planner::table::IcebergPartitionValue::Int32(id)),
         }];
         file
     }
 
-    fn position_delete_file(path: &str) -> crate::sql::catalog::IcebergDeleteFileInfo {
-        crate::sql::catalog::IcebergDeleteFileInfo {
+    fn position_delete_file(path: &str) -> crate::sql::planner::table::IcebergDeleteFileInfo {
+        crate::sql::planner::table::IcebergDeleteFileInfo {
             path: path.to_string(),
-            file_format: crate::sql::catalog::IcebergDeleteFileFormat::Parquet,
-            file_content: crate::sql::catalog::IcebergDeleteFileContent::Position,
+            file_format: crate::sql::planner::table::IcebergDeleteFileFormat::Parquet,
+            file_content: crate::sql::planner::table::IcebergDeleteFileContent::Position,
             length: Some(1),
             content_offset: None,
             content_size_in_bytes: None,
@@ -464,7 +465,9 @@ mod tests {
         }
     }
 
-    fn iceberg_registry(files: Vec<crate::sql::catalog::IcebergDataFileInfo>) -> ConnectorRegistry {
+    fn iceberg_registry(
+        files: Vec<crate::sql::planner::table::IcebergDataFileInfo>,
+    ) -> ConnectorRegistry {
         let mut registry = ConnectorRegistry::new();
         registry.register_scan_planner(std::sync::Arc::new(PlannedIcebergFiles { files }));
         registry

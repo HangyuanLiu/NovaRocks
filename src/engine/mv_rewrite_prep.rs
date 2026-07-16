@@ -25,12 +25,13 @@
 
 use std::sync::Arc;
 
-use crate::sql::catalog::{CatalogProvider, ScanSource};
+use crate::sql::catalog::CatalogProvider;
 use crate::sql::column_id::ColumnRefFactory;
 use crate::sql::optimizer::cascades_rules::mv_rewrite::{
     MvRewriteCandidate, descriptor::SpjgDescriptor,
 };
 use crate::sql::planner::logical::LogicalPlanNode;
+use crate::sql::planner::table::ScanSource;
 
 use super::StandaloneState;
 use super::query_stats::{QueryStatsPlan, QueryStatsProviders};
@@ -44,7 +45,7 @@ struct PreparedMvRewriteCandidate {
     mv: SpjgDescriptor,
     mv_scalars: crate::sql::optimizer::scalar::ScalarArena,
     target_database: String,
-    target_table: crate::sql::catalog::TableDef,
+    target_table: crate::sql::planner::table::TableDef,
 }
 
 fn supports_current_mv_rewrite_shape(desc: &SpjgDescriptor) -> bool {
@@ -338,8 +339,8 @@ mod tests {
         EquiEdge, JoinInput, JoinShape,
     };
 
-    fn table(name: &str) -> crate::sql::catalog::TableDef {
-        crate::sql::catalog::TableDef {
+    fn table(name: &str) -> crate::sql::planner::table::TableDef {
+        crate::sql::planner::table::TableDef {
             name: name.to_string(),
             columns: Vec::new(),
             iceberg_row_lineage_metadata_columns: Vec::new(),

@@ -21,12 +21,12 @@
 
 use std::collections::HashMap;
 
-use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::BinOp;
 use crate::sql::optimizer::operator::{Operator, ScanOp};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
+use crate::sql::planner::table::ScanSource;
 
 /// Physical identity of a scanned table. Two scans of the same physical table
 /// (e.g. a self-join's two legs, or an outer table re-scanned in a subquery)
@@ -249,12 +249,12 @@ mod tests {
 
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, TypedExpr};
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::scalar::{self, ScalarArena};
     use crate::sql::planner::logical::{LogicalJoinNode, LogicalPlanKind, LogicalPlanNode};
     use crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr;
     use crate::sql::planner::payload::PlanScanNode;
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     fn make_scan(table_id: i64, cols: Vec<(ColumnId, &str)>) -> LogicalPlanNode {
         LogicalPlanNode::new(

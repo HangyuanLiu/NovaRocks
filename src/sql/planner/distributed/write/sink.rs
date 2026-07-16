@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 
 use crate::catalog::schema::ColumnDef;
 use crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorInput;
-use crate::sql::catalog::{IcebergTableInfo, TableDef};
+use crate::sql::planner::table::{IcebergTableInfo, TableDef};
 
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergWriteSinkSpec {
@@ -75,7 +75,7 @@ impl IcebergWriteSinkSpec {
     ) -> Result<(), String> {
         self.iceberg.current_snapshot_id = planned_snapshot_id;
         match &mut self.target_table.source {
-            crate::sql::catalog::ScanSource::IcebergDataFiles { table, .. } => {
+            crate::sql::planner::table::ScanSource::IcebergDataFiles { table, .. } => {
                 table.current_snapshot_id = planned_snapshot_id;
                 Ok(())
             }
@@ -95,7 +95,7 @@ pub(crate) mod test_support {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::sql::catalog::{IcebergSchemaDef, IcebergSchemaFieldDef, ScanSource};
+    use crate::sql::planner::table::{IcebergSchemaDef, IcebergSchemaFieldDef, ScanSource};
 
     pub(crate) fn simple_sink_spec() -> IcebergWriteSinkSpec {
         let iceberg = IcebergTableInfo {
@@ -134,7 +134,7 @@ pub(crate) mod test_support {
                 table: iceberg.clone(),
                 files: Vec::new(),
                 cloud_properties: Default::default(),
-                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                binding: crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
             },
         };
 
@@ -251,7 +251,7 @@ mod tests {
             .expect("set planned snapshot");
 
         assert_eq!(spec.iceberg.current_snapshot_id, Some(42));
-        let crate::sql::catalog::ScanSource::IcebergDataFiles { table, .. } =
+        let crate::sql::planner::table::ScanSource::IcebergDataFiles { table, .. } =
             &spec.target_table.source
         else {
             panic!("expected IcebergDataFiles source");
@@ -261,7 +261,7 @@ mod tests {
         spec.set_planned_snapshot_id(None)
             .expect("clear planned snapshot");
         assert_eq!(spec.iceberg.current_snapshot_id, None);
-        let crate::sql::catalog::ScanSource::IcebergDataFiles { table, .. } =
+        let crate::sql::planner::table::ScanSource::IcebergDataFiles { table, .. } =
             &spec.target_table.source
         else {
             panic!("expected IcebergDataFiles source");

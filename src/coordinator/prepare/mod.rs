@@ -22,11 +22,11 @@ mod scan_preparation;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::connector::ConnectorRegistry;
-use crate::sql::catalog::ScanSource;
 use crate::sql::planner::distributed::{
     BoundaryContract, BoundaryKind, DistributedNode, DistributedNodeKind, FragmentEdgeKind,
     FragmentId,
 };
+use crate::sql::planner::table::ScanSource;
 
 #[cfg(test)]
 pub(crate) use projection::prepared_fragment_set_for_test;

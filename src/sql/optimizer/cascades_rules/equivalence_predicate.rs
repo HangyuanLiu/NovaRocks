@@ -352,10 +352,10 @@ fn apply_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::common::{BinOp, LiteralValue};
     use crate::sql::optimizer::operator::ScanOp;
     use crate::sql::optimizer::scalar::{HashableLiteral, ScalarId, ScalarNode};
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     use arrow::datatypes::DataType;
 

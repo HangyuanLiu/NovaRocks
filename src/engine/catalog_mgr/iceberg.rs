@@ -93,8 +93,8 @@ mod tests {
     use crate::engine::catalog_mgr::CatalogMgr;
     use crate::engine::catalog_mgr::catalog::Catalog;
     use crate::engine::catalog_mgr::metadata::TableBinding;
-    use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
     use crate::sql::parser::ast::AlterIcebergPartitionSpecStmt;
+    use crate::sql::planner::table::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
     use arrow::datatypes::DataType;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -191,7 +191,7 @@ mod tests {
                     },
                     files: vec![],
                     cloud_properties: Default::default(),
-                    binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                    binding: crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
                 },
             }
         }

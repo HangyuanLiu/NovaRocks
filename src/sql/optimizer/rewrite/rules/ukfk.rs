@@ -590,16 +590,16 @@ fn table_properties(scan: &ScanOp) -> HashMap<String, String> {
 }
 
 fn iceberg_table_info(
-    source: &crate::sql::catalog::ScanSource,
-) -> Option<&crate::sql::catalog::IcebergTableInfo> {
+    source: &crate::sql::planner::table::ScanSource,
+) -> Option<&crate::sql::planner::table::IcebergTableInfo> {
     match source {
-        crate::sql::catalog::ScanSource::IcebergDataFiles { table, .. }
-        | crate::sql::catalog::ScanSource::IcebergMetadataTable { table, .. }
-        | crate::sql::catalog::ScanSource::IcebergDeltaTable { table, .. }
-        | crate::sql::catalog::ScanSource::IcebergVersionTable { table, .. } => Some(table),
-        crate::sql::catalog::ScanSource::StarRocks { .. }
-        | crate::sql::catalog::ScanSource::IcebergMvTargetState { .. }
-        | crate::sql::catalog::ScanSource::IcebergMvTargetLocator { .. } => None,
+        crate::sql::planner::table::ScanSource::IcebergDataFiles { table, .. }
+        | crate::sql::planner::table::ScanSource::IcebergMetadataTable { table, .. }
+        | crate::sql::planner::table::ScanSource::IcebergDeltaTable { table, .. }
+        | crate::sql::planner::table::ScanSource::IcebergVersionTable { table, .. } => Some(table),
+        crate::sql::planner::table::ScanSource::StarRocks { .. }
+        | crate::sql::planner::table::ScanSource::IcebergMvTargetState { .. }
+        | crate::sql::planner::table::ScanSource::IcebergMvTargetLocator { .. } => None,
     }
 }
 
@@ -785,10 +785,10 @@ mod tests {
 
     use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::{LiteralValue, OutputColumn};
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::optimizer::operator::{AggregateOutputLayout, LogicalAggregateOp};
     use crate::sql::optimizer::rewrite::tree_binder::bind_tree;
     use crate::sql::optimizer::scalar::{HashableLiteral, ScalarNode};
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     fn output_col(id: u32, name: &str) -> OutputColumn {
         OutputColumn {

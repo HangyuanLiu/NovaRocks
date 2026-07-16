@@ -736,7 +736,6 @@ fn topn_phase_can_merge(outer: &TopNOp, inner: &TopNOp) -> bool {
 mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, LiteralValue, ProjectItem, SortItem, TypedExpr};
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
     use crate::sql::optimizer::operator::{
@@ -746,6 +745,7 @@ mod tests {
     use crate::sql::planner::optimizer_bridge::scalar::{
         intern_exprs, intern_project_items, intern_sort_items, materialize_sort_key,
     };
+    use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
 
     fn col(id: u32) -> TypedExpr {

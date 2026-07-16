@@ -2084,7 +2084,6 @@ mod tests {
     use crate::sql::analysis::{
         ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::ChangeStreamBranchKind;
     use crate::sql::planner::distributed::test_support::DistributedPlanDraftBuilder;
@@ -2108,6 +2107,7 @@ mod tests {
         PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalPlanStats, PhysicalSetOpNode,
         PlanSetOpKind, PlannerConfidence,
     };
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     fn stats() -> PhysicalPlanStats {
         PhysicalPlanStats {

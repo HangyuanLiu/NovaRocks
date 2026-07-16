@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::catalog::schema::ColumnDef;
-use crate::sql::catalog::{IcebergMvTargetStateScan, ScanSource};
+use crate::sql::planner::table::{IcebergMvTargetStateScan, ScanSource};
 
 pub(crate) fn build_target_state_scan_source(
     catalog: String,
@@ -30,8 +30,8 @@ pub(crate) fn build_target_state_scan_source(
     aggregate_state_names: Vec<String>,
     physical_column_names: Vec<String>,
     row_id_column_name: String,
-    row_filter: crate::sql::catalog::IcebergMvTargetStateRowFilter,
-    partition_constraint: crate::sql::catalog::IcebergMvTargetStatePartitionConstraint,
+    row_filter: crate::sql::planner::table::IcebergMvTargetStateRowFilter,
+    partition_constraint: crate::sql::planner::table::IcebergMvTargetStatePartitionConstraint,
 ) -> ScanSource {
     ScanSource::IcebergMvTargetState(IcebergMvTargetStateScan {
         catalog,
@@ -81,11 +81,11 @@ mod tests {
                 "sum_v_state".to_string(),
             ],
             "__row_id__".to_string(),
-            crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            crate::sql::planner::table::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
                 row_id_column_name: "__row_id__".to_string(),
                 branch_scope: None,
             },
-            crate::sql::catalog::IcebergMvTargetStatePartitionConstraint::Unpartitioned,
+            crate::sql::planner::table::IcebergMvTargetStatePartitionConstraint::Unpartitioned,
         );
 
         let ScanSource::IcebergMvTargetState(scan) = source else {
@@ -106,14 +106,14 @@ mod tests {
         assert_eq!(scan.row_id_column_name, "__row_id__");
         assert!(matches!(
             scan.row_filter,
-            crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            crate::sql::planner::table::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
                 branch_scope: None,
                 ..
             }
         ));
         assert!(matches!(
             scan.partition_constraint,
-            crate::sql::catalog::IcebergMvTargetStatePartitionConstraint::Unpartitioned
+            crate::sql::planner::table::IcebergMvTargetStatePartitionConstraint::Unpartitioned
         ));
     }
 }

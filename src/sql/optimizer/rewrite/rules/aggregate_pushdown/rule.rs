@@ -97,7 +97,6 @@ impl RewriteRule for AggregatePushdownRule {
 mod tests {
     use super::*;
     use crate::sql::analysis::OutputColumn;
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
         AggStage, AggregateOutputLayout, LogicalAggregateOp, Operator, ScanOp,
@@ -106,6 +105,7 @@ mod tests {
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::stats_input::OptimizerStatsInput;
+    use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
     use std::collections::HashMap;
 

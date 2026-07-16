@@ -160,13 +160,13 @@ mod tests {
     use super::*;
     use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{FilterOp, Operator, ScanOp};
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::tree_binder::bind_tree;
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
 
     fn test_col_id(name: &str) -> ColumnId {

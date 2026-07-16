@@ -569,11 +569,11 @@ mod tests {
         let mut memo = Memo::new();
         let scan_op = Operator::PhysicalScan(ScanOp {
             database: "db".into(),
-            table: crate::sql::catalog::TableDef {
+            table: crate::sql::planner::table::TableDef {
                 name: "t".into(),
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: crate::sql::catalog::ScanSource::StarRocks {
+                source: crate::sql::planner::table::ScanSource::StarRocks {
                     db_id: 0,
                     table_id: 0,
                 },
@@ -704,11 +704,11 @@ mod tests {
             id: 0,
             op: Operator::PhysicalScan(ScanOp {
                 database: "db".into(),
-                table: crate::sql::catalog::TableDef {
+                table: crate::sql::planner::table::TableDef {
                     name: "left_t".into(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: crate::sql::catalog::ScanSource::StarRocks {
+                    source: crate::sql::planner::table::ScanSource::StarRocks {
                         db_id: 0,
                         table_id: 0,
                     },
@@ -727,11 +727,11 @@ mod tests {
             id: 1,
             op: Operator::PhysicalScan(ScanOp {
                 database: "db".into(),
-                table: crate::sql::catalog::TableDef {
+                table: crate::sql::planner::table::TableDef {
                     name: "right_t".into(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: crate::sql::catalog::ScanSource::StarRocks {
+                    source: crate::sql::planner::table::ScanSource::StarRocks {
                         db_id: 0,
                         table_id: 0,
                     },
@@ -906,11 +906,11 @@ mod tests {
             id: 0,
             op: Operator::PhysicalScan(ScanOp {
                 database: "db".into(),
-                table: crate::sql::catalog::TableDef {
+                table: crate::sql::planner::table::TableDef {
                     name: "single_child".into(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: crate::sql::catalog::ScanSource::StarRocks {
+                    source: crate::sql::planner::table::ScanSource::StarRocks {
                         db_id: 0,
                         table_id: 0,
                     },
@@ -1189,11 +1189,11 @@ mod tests {
         // Create a group with only a logical expr (no physical).
         let logical_op = Operator::LogicalScan(ScanOp {
             database: "db".into(),
-            table: crate::sql::catalog::TableDef {
+            table: crate::sql::planner::table::TableDef {
                 name: "t".into(),
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: crate::sql::catalog::ScanSource::StarRocks {
+                source: crate::sql::planner::table::ScanSource::StarRocks {
                     db_id: 0,
                     table_id: 0,
                 },
@@ -1694,11 +1694,11 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::PhysicalScan(ScanOp {
                 database: "db".into(),
-                table: crate::sql::catalog::TableDef {
+                table: crate::sql::planner::table::TableDef {
                     name: "t".into(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: crate::sql::catalog::ScanSource::StarRocks {
+                    source: crate::sql::planner::table::ScanSource::StarRocks {
                         db_id: 0,
                         table_id: 0,
                     },
@@ -1783,11 +1783,11 @@ mod cascaded_derivation_tests {
     fn scan_op(table: &str) -> Operator {
         Operator::PhysicalScan(ScanOp {
             database: "db".into(),
-            table: crate::sql::catalog::TableDef {
+            table: crate::sql::planner::table::TableDef {
                 name: table.into(),
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: crate::sql::catalog::ScanSource::StarRocks {
+                source: crate::sql::planner::table::ScanSource::StarRocks {
                     db_id: 0,
                     table_id: 0,
                 },

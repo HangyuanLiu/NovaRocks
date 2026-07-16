@@ -25,12 +25,12 @@ pub(crate) mod expr_display;
 
 use arrow::datatypes::DataType;
 
-use crate::sql::catalog::TableDef;
 use crate::sql::column_id::ColumnId;
 pub(crate) use crate::sql::common::{
     BinOp, JoinKind, LambdaParam, LiteralValue, OutputColumn, UnOp, WindowBound, WindowFrame,
     WindowFrameType,
 };
+use crate::sql::planner::table::TableDef;
 
 // ---------------------------------------------------------------------------
 // Top-level query

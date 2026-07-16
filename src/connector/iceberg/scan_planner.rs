@@ -23,7 +23,7 @@ use crate::connector::iceberg::catalog::registry::IcebergCatalogRegistry;
 use crate::connector::scan_planning::{
     ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle, ScanHandle, Split,
 };
-use crate::sql::catalog::{IcebergDataFileInfo, IcebergTableInfo};
+use crate::sql::planner::table::{IcebergDataFileInfo, IcebergTableInfo};
 
 const CONNECTOR_ID: &str = "iceberg";
 
@@ -256,7 +256,7 @@ mod tests {
 
     use crate::catalog::schema::SqlType;
     use crate::connector::scan_planning::{ScanHandle, Split, validate_split_connectors};
-    use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo};
+    use crate::sql::planner::table::{IcebergSchemaDef, IcebergTableInfo};
     use crate::sql::{Literal, TableColumnDef};
 
     fn dummy_iceberg_table_info() -> IcebergTableInfo {
@@ -301,7 +301,7 @@ mod tests {
             current_snapshot_id: Some(7),
             schema_id: 0,
             location: "s3://bucket/t".to_string(),
-            schema: crate::sql::catalog::IcebergSchemaDef { fields: vec![] },
+            schema: crate::sql::planner::table::IcebergSchemaDef { fields: vec![] },
             serialized_metadata: None,
             serialized_metadata_rows: None,
         }

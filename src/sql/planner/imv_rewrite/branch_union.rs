@@ -136,7 +136,7 @@ impl LogicalRewriteRule for RewriteBranchUnionRule {
                 // Each branch becomes its own root delta sub-problem: `is_root` is
                 // per-sub-problem here, so the post-branch plan intentionally holds one
                 // root delta per branch (not a single global root).
-                let scope = crate::sql::catalog::BranchScope {
+                let scope = crate::sql::planner::table::BranchScope {
                     branch_id_column_name: ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
                     branch_id,
                 };
@@ -350,7 +350,6 @@ mod tests {
     use crate::sql::analysis::{
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
-    use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
@@ -364,6 +363,7 @@ mod tests {
     use crate::sql::planner::payload::{
         AggregateCall, PlanFilterNode, PlanProjectNode, PlanScanNode,
     };
+    use crate::sql::planner::table::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
 
     #[test]
     fn rewrites_top_union_of_aggregates_into_branch_scoped_merges() {
@@ -1209,7 +1209,8 @@ mod tests {
                         },
                         files: Vec::new(),
                         cloud_properties: BTreeMap::new(),
-                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                        binding:
+                            crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 },
                 alias: None,

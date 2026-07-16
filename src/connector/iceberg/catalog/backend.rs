@@ -28,11 +28,11 @@ use crate::connector::backend::{
     TableSource,
 };
 use crate::connector::iceberg::catalog::IcebergLoadedTable;
-use crate::sql::catalog::{
+use crate::sql::parser::ast::Literal;
+use crate::sql::planner::table::{
     IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo, ScanSource,
     TableDef,
 };
-use crate::sql::parser::ast::Literal;
 
 use super::registry::{
     IcebergCatalogEntry, IcebergCatalogRegistry, create_namespace as reg_create_namespace,
@@ -287,7 +287,9 @@ impl TableSource for IcebergTableSource {
             )
             .await
         })??;
-        if let crate::sql::catalog::ScanSource::IcebergDataFiles { table, .. } = &mut def.source {
+        if let crate::sql::planner::table::ScanSource::IcebergDataFiles { table, .. } =
+            &mut def.source
+        {
             table.serialized_metadata_rows = Some(rows);
         }
         Ok(def)
@@ -330,9 +332,9 @@ impl TableSource for IcebergTableSource {
             loaded,
             data_files,
             if snapshot_id.is_some() {
-                crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles
+                crate::sql::planner::table::IcebergDataFileBinding::ExplicitFiles
             } else {
-                crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot
+                crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot
             },
         )
     }
@@ -357,7 +359,7 @@ pub(crate) fn build_iceberg_table_def_with_files(
         table_name,
         loaded,
         data_files,
-        crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
+        crate::sql::planner::table::IcebergDataFileBinding::ExplicitFiles,
     )
 }
 
@@ -462,7 +464,7 @@ pub(crate) fn build_iceberg_table_def_for_delta_scan(
         build_iceberg_table_info(catalog_name, namespace, table_name, &loaded, schema)?;
     let source = empty_iceberg_scan_source(
         iceberg_table_info.clone(),
-        crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
+        crate::sql::planner::table::IcebergDataFileBinding::ExplicitFiles,
     );
     let mut iceberg_row_lineage_metadata_columns = iceberg_row_lineage_metadata_columns();
     iceberg_row_lineage_metadata_columns.push(ColumnDef {
@@ -496,7 +498,7 @@ fn build_iceberg_schema_table_def(
         Vec::new(),
         IcebergTableDefOptions {
             mode: IcebergTableDefMode::SchemaOnly,
-            binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+            binding: crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
         },
     )
 }
@@ -510,7 +512,7 @@ enum IcebergTableDefMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct IcebergTableDefOptions {
     mode: IcebergTableDefMode,
-    binding: crate::sql::catalog::IcebergDataFileBinding,
+    binding: crate::sql::planner::table::IcebergDataFileBinding,
 }
 
 fn build_iceberg_table_def_with_data_files(
@@ -520,7 +522,7 @@ fn build_iceberg_table_def_with_data_files(
     table_name: &str,
     loaded: IcebergLoadedTable,
     data_files: Vec<super::registry::DataFileWithStats>,
-    binding: crate::sql::catalog::IcebergDataFileBinding,
+    binding: crate::sql::planner::table::IcebergDataFileBinding,
 ) -> Result<TableDef, String> {
     build_iceberg_table_def_with_data_files_impl(
         entry,
@@ -880,7 +882,7 @@ pub(crate) fn row_lineage_enabled(metadata: &iceberg::spec::TableMetadata) -> bo
 /// catalog-owned scan sources instead of synthetic placeholder files.
 fn empty_iceberg_scan_source(
     table: IcebergTableInfo,
-    binding: crate::sql::catalog::IcebergDataFileBinding,
+    binding: crate::sql::planner::table::IcebergDataFileBinding,
 ) -> ScanSource {
     ScanSource::IcebergDataFiles {
         table,
@@ -1412,7 +1414,7 @@ mod tests {
             "t",
             v3_row_lineage_loaded_table(),
             vec![],
-            crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+            crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
         )
         .expect("table def");
 
@@ -1428,7 +1430,7 @@ mod tests {
             "t",
             v3_row_lineage_loaded_table(),
             vec![test_data_file()],
-            crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+            crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
         )
         .expect("table def");
 
@@ -1445,7 +1447,7 @@ mod tests {
             "t",
             v3_row_lineage_loaded_table(),
             vec![test_data_file_without_first_row_id()],
-            crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+            crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
         )
         .expect("table def");
 

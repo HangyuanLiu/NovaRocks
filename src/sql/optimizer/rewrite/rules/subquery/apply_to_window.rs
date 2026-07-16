@@ -545,7 +545,6 @@ mod tests {
     use crate::sql::analysis::{
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::common::ApplyKind;
     use crate::sql::optimizer::operator::Operator;
@@ -563,6 +562,7 @@ mod tests {
     use crate::sql::planner::payload::{
         AggregateCall, PlanFilterNode, PlanLimitNode, PlanProjectNode, PlanScanNode,
     };
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     fn check_preconditions(
         where_pred: &TypedExpr,

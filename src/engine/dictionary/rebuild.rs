@@ -38,7 +38,7 @@ use crate::meta::repository::id_scopes;
 use crate::runtime::query_result::QueryResult;
 #[cfg(test)]
 use crate::runtime::query_result::record_batch_to_chunk;
-use crate::sql::catalog::{ScanSource, TableDef};
+use crate::sql::planner::table::{ScanSource, TableDef};
 
 /// Rebuild active dictionary snapshots for `database.table`'s string-typed
 /// columns. Returns the number of snapshots that were persisted. Both

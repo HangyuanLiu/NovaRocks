@@ -24,9 +24,9 @@ use crate::engine::mv::refresh_context::IcebergMvRefreshContext;
 use crate::exec::node::iceberg_delta_scan::{
     DeltaScanDeleteSidePayload, IcebergDeltaDataColumnPayload,
 };
-use crate::sql::catalog::{IcebergTableInfo, ScanSource};
 use crate::sql::codegen::scan::iceberg_delta::IcebergDeltaScanRuntimePlan;
 use crate::sql::planner::payload::PlanScanNode;
+use crate::sql::planner::table::{IcebergTableInfo, ScanSource};
 
 impl ScanBindingResolver for IcebergMvRefreshContext {
     fn resolve_scan(
@@ -57,8 +57,10 @@ fn resolve_scan_source<V, S, L, D>(
 ) -> Result<Option<ResolvedScanExecution>, String>
 where
     V: FnOnce(&IcebergTableInfo, i64) -> Result<ScanSource, String>,
-    S: FnOnce(&crate::sql::catalog::IcebergMvTargetStateScan) -> Result<ScanSource, String>,
-    L: FnOnce(&crate::sql::catalog::IcebergMvTargetLocatorScan) -> Result<ScanSource, String>,
+    S: FnOnce(&crate::sql::planner::table::IcebergMvTargetStateScan) -> Result<ScanSource, String>,
+    L: FnOnce(
+        &crate::sql::planner::table::IcebergMvTargetLocatorScan,
+    ) -> Result<ScanSource, String>,
     D: FnOnce(&IcebergTableInfo, i64, i64) -> Result<IcebergDeltaScanRuntimePlan, String>,
 {
     let (kind, resolved) = match source {
@@ -302,7 +304,7 @@ mod tests {
         refresh_context_for_target_fixture, target_fixture_table_info,
         target_locator_refresh_fixture,
     };
-    use crate::sql::catalog::{
+    use crate::sql::planner::table::{
         IcebergDataFileBinding, IcebergDataFileInfo, IcebergMvTargetLocatorScan,
         IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter,
         IcebergMvTargetStateScan, IcebergSchemaDef, TableDef,

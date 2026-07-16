@@ -38,7 +38,6 @@ use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
 use crate::catalog::schema::{ColumnDefault, SqlType, validate_column_default};
 #[cfg(test)]
 use crate::sql::analysis::{ExprKind, TypedExpr};
-use crate::sql::catalog;
 use crate::sql::codegen::scan::connector::{
     StarRocksColumnSchemaDescriptor, StarRocksKeysTypeDescriptor, StarRocksScanSourceDescriptor,
     StarRocksTabletSchemaDescriptor,
@@ -63,6 +62,7 @@ use crate::sql::planner::physical::{
     AggMode, HashSource, JoinDistribution, JoinExecutionMode, PhysicalPlanKind, PlanSetOpKind,
     RedistributeMode, TopNPhase,
 };
+use crate::sql::planner::table as table_model;
 use crate::types::native_proto::encode_type;
 
 pub(crate) struct NativePlanEncodeContext<'a> {
@@ -1235,7 +1235,7 @@ fn encode_graph_runtime_filter_probe(
     })
 }
 
-fn encode_table_def(src: &catalog::TableDef) -> Result<plan::TableDef, String> {
+fn encode_table_def(src: &table_model::TableDef) -> Result<plan::TableDef, String> {
     encode_table_def_with_context(
         src,
         None,
@@ -1252,7 +1252,7 @@ fn encode_table_def(src: &catalog::TableDef) -> Result<plan::TableDef, String> {
 }
 
 fn encode_table_def_with_context(
-    src: &catalog::TableDef,
+    src: &table_model::TableDef,
     scan_node_id: Option<i32>,
     scan_columns: Option<&[AnalysisOutputColumn]>,
     binding: Option<&ResolvedScanBinding>,
@@ -1282,13 +1282,13 @@ fn encode_table_def_with_context(
     })
 }
 
-fn scan_source_requires_resolved_binding(source: &catalog::ScanSource) -> bool {
+fn scan_source_requires_resolved_binding(source: &table_model::ScanSource) -> bool {
     matches!(
         source,
-        catalog::ScanSource::IcebergDeltaTable { .. }
-            | catalog::ScanSource::IcebergVersionTable { .. }
-            | catalog::ScanSource::IcebergMvTargetState(_)
-            | catalog::ScanSource::IcebergMvTargetLocator(_)
+        table_model::ScanSource::IcebergDeltaTable { .. }
+            | table_model::ScanSource::IcebergVersionTable { .. }
+            | table_model::ScanSource::IcebergMvTargetState(_)
+            | table_model::ScanSource::IcebergMvTargetLocator(_)
     )
 }
 
@@ -1323,7 +1323,7 @@ fn resolved_binding_table_columns(
 }
 
 fn merged_bound_table_columns(
-    src: &catalog::TableDef,
+    src: &table_model::TableDef,
     scan_columns: &[AnalysisOutputColumn],
     binding: &ResolvedScanBinding,
 ) -> (
@@ -1563,7 +1563,7 @@ fn arrow_field_id(field: &Field) -> Result<i32, String> {
 
 fn scan_binding_for_source<'a>(
     node_id: i32,
-    source: &catalog::ScanSource,
+    source: &table_model::ScanSource,
     ctx: &'a NativePlanEncodeContext<'_>,
 ) -> Result<Option<&'a ResolvedScanBinding>, String> {
     let binding = ctx
@@ -1572,7 +1572,7 @@ fn scan_binding_for_source<'a>(
     let required = scan_source_requires_resolved_binding(source);
     if required && binding.is_none() {
         return Err(match source {
-            catalog::ScanSource::IcebergDeltaTable {
+            table_model::ScanSource::IcebergDeltaTable {
                 from_snapshot_id,
                 to_snapshot_id,
                 ..
@@ -1596,17 +1596,17 @@ fn scan_binding_for_source<'a>(
         ));
     }
     let valid_execution = match source {
-        catalog::ScanSource::IcebergDeltaTable { .. } => {
+        table_model::ScanSource::IcebergDeltaTable { .. } => {
             matches!(binding.execution, ResolvedScanExecution::IcebergDelta(_))
         }
-        catalog::ScanSource::IcebergDataFiles { .. }
-        | catalog::ScanSource::IcebergVersionTable { .. }
-        | catalog::ScanSource::IcebergMvTargetState(_)
-        | catalog::ScanSource::IcebergMvTargetLocator(_) => {
+        table_model::ScanSource::IcebergDataFiles { .. }
+        | table_model::ScanSource::IcebergVersionTable { .. }
+        | table_model::ScanSource::IcebergMvTargetState(_)
+        | table_model::ScanSource::IcebergMvTargetLocator(_) => {
             matches!(binding.execution, ResolvedScanExecution::IcebergFiles(_))
         }
-        catalog::ScanSource::IcebergMetadataTable { .. }
-        | catalog::ScanSource::StarRocks { .. } => false,
+        table_model::ScanSource::IcebergMetadataTable { .. }
+        | table_model::ScanSource::StarRocks { .. } => false,
     };
     if !valid_execution {
         return Err(format!(
@@ -1618,15 +1618,15 @@ fn scan_binding_for_source<'a>(
     Ok(Some(binding))
 }
 
-fn scan_source_kind(source: &catalog::ScanSource) -> &'static str {
+fn scan_source_kind(source: &table_model::ScanSource) -> &'static str {
     match source {
-        catalog::ScanSource::StarRocks { .. } => "StarRocks",
-        catalog::ScanSource::IcebergDataFiles { .. } => "IcebergDataFiles",
-        catalog::ScanSource::IcebergMetadataTable { .. } => "IcebergMetadataTable",
-        catalog::ScanSource::IcebergDeltaTable { .. } => "IcebergDeltaTable",
-        catalog::ScanSource::IcebergVersionTable { .. } => "IcebergVersionTable",
-        catalog::ScanSource::IcebergMvTargetState(_) => "IcebergMvTargetState",
-        catalog::ScanSource::IcebergMvTargetLocator(_) => "IcebergMvTargetLocator",
+        table_model::ScanSource::StarRocks { .. } => "StarRocks",
+        table_model::ScanSource::IcebergDataFiles { .. } => "IcebergDataFiles",
+        table_model::ScanSource::IcebergMetadataTable { .. } => "IcebergMetadataTable",
+        table_model::ScanSource::IcebergDeltaTable { .. } => "IcebergDeltaTable",
+        table_model::ScanSource::IcebergVersionTable { .. } => "IcebergVersionTable",
+        table_model::ScanSource::IcebergMvTargetState(_) => "IcebergMvTargetState",
+        table_model::ScanSource::IcebergMvTargetLocator(_) => "IcebergMvTargetLocator",
     }
 }
 
@@ -1638,7 +1638,7 @@ fn resolved_execution_kind(execution: &ResolvedScanExecution) -> &'static str {
 }
 
 fn encode_scan_source(
-    src: &catalog::ScanSource,
+    src: &table_model::ScanSource,
     scan_node_id: Option<i32>,
     binding: Option<&ResolvedScanBinding>,
     ctx: &NativePlanEncodeContext<'_>,
@@ -1658,10 +1658,10 @@ fn encode_scan_source(
                     .collect::<Result<Vec<_>, _>>()?,
                 cloud_properties: files.cloud_properties.clone().into_iter().collect(),
                 binding: match files.binding {
-                    catalog::IcebergDataFileBinding::CurrentSnapshot => {
+                    table_model::IcebergDataFileBinding::CurrentSnapshot => {
                         plan::IcebergDataFileBinding::CurrentSnapshot as i32
                     }
-                    catalog::IcebergDataFileBinding::ExplicitFiles => {
+                    table_model::IcebergDataFileBinding::ExplicitFiles => {
                         plan::IcebergDataFileBinding::ExplicitFiles as i32
                     }
                 },
@@ -1671,7 +1671,7 @@ fn encode_scan_source(
 
     Ok(plan::ScanSource {
         kind: Some(match src {
-            catalog::ScanSource::StarRocks { db_id, table_id } => {
+            table_model::ScanSource::StarRocks { db_id, table_id } => {
                 let node_id = scan_node_id.ok_or_else(|| {
                     "StarRocks table source is only valid on a native ScanNode".to_string()
                 })?;
@@ -1703,7 +1703,7 @@ fn encode_scan_source(
                     )),
                 })
             }
-            catalog::ScanSource::IcebergDataFiles {
+            table_model::ScanSource::IcebergDataFiles {
                 table,
                 files,
                 cloud_properties,
@@ -1716,15 +1716,15 @@ fn encode_scan_source(
                     .collect::<Result<Vec<_>, _>>()?,
                 cloud_properties: cloud_properties.clone().into_iter().collect(),
                 binding: match binding {
-                    catalog::IcebergDataFileBinding::CurrentSnapshot => {
+                    table_model::IcebergDataFileBinding::CurrentSnapshot => {
                         plan::IcebergDataFileBinding::CurrentSnapshot as i32
                     }
-                    catalog::IcebergDataFileBinding::ExplicitFiles => {
+                    table_model::IcebergDataFileBinding::ExplicitFiles => {
                         plan::IcebergDataFileBinding::ExplicitFiles as i32
                     }
                 },
             }),
-            catalog::ScanSource::IcebergMetadataTable {
+            table_model::ScanSource::IcebergMetadataTable {
                 table,
                 metadata_table_type,
                 serialized_table,
@@ -1737,7 +1737,7 @@ fn encode_scan_source(
                 cloud_properties: cloud_properties.clone().into_iter().collect(),
                 metadata_payload: metadata_payload.clone(),
             }),
-            catalog::ScanSource::IcebergDeltaTable {
+            table_model::ScanSource::IcebergDeltaTable {
                 table,
                 from_snapshot_id,
                 to_snapshot_id,
@@ -1764,13 +1764,13 @@ fn encode_scan_source(
                     ),
                 })
             }
-            catalog::ScanSource::IcebergVersionTable { table, snapshot_id } => {
+            table_model::ScanSource::IcebergVersionTable { table, snapshot_id } => {
                 Kind::IcebergVersionTable(plan::IcebergVersionTable {
                     table: Some(encode_iceberg_table_info(table)?),
                     snapshot_id: *snapshot_id,
                 })
             }
-            catalog::ScanSource::IcebergMvTargetState(scan) => {
+            table_model::ScanSource::IcebergMvTargetState(scan) => {
                 Kind::IcebergMvTargetState(plan::IcebergMvTargetState {
                     catalog: scan.catalog.clone(),
                     database: scan.database.clone(),
@@ -1789,16 +1789,16 @@ fn encode_scan_source(
                     row_id_column_name: scan.row_id_column_name.clone(),
                     row_filter: Some(encode_mv_target_state_row_filter(&scan.row_filter)),
                     partition_constraint: match scan.partition_constraint {
-                        catalog::IcebergMvTargetStatePartitionConstraint::Unpartitioned => {
+                        table_model::IcebergMvTargetStatePartitionConstraint::Unpartitioned => {
                             plan::IcebergMvTargetStatePartitionConstraint::Unpartitioned as i32
                         }
-                        catalog::IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired => {
+                        table_model::IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired => {
                             plan::IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired as i32
                         }
                     },
                 })
             }
-            catalog::ScanSource::IcebergMvTargetLocator(scan) => {
+            table_model::ScanSource::IcebergMvTargetLocator(scan) => {
                 Kind::IcebergMvTargetLocator(plan::IcebergMvTargetLocator {
                     catalog: scan.catalog.clone(),
                     database: scan.database.clone(),
@@ -2103,13 +2103,13 @@ fn validate_starrocks_schema_column(
 }
 
 fn encode_mv_target_state_row_filter(
-    src: &catalog::IcebergMvTargetStateRowFilter,
+    src: &table_model::IcebergMvTargetStateRowFilter,
 ) -> plan::IcebergMvTargetStateRowFilter {
     use plan::iceberg_mv_target_state_row_filter::Kind;
 
     plan::IcebergMvTargetStateRowFilter {
         kind: Some(match src {
-            catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            table_model::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
                 row_id_column_name,
                 branch_scope,
             } => Kind::DeltaInputRowIds(plan::DeltaInputRowIdsFilter {
@@ -2124,7 +2124,7 @@ fn encode_mv_target_state_row_filter(
 }
 
 fn encode_iceberg_table_info(
-    src: &catalog::IcebergTableInfo,
+    src: &table_model::IcebergTableInfo,
 ) -> Result<plan::IcebergTableInfo, String> {
     Ok(plan::IcebergTableInfo {
         catalog: src.catalog.clone(),
@@ -2141,7 +2141,7 @@ fn encode_iceberg_table_info(
 }
 
 fn encode_iceberg_schema_def(
-    src: &catalog::IcebergSchemaDef,
+    src: &table_model::IcebergSchemaDef,
 ) -> Result<plan::IcebergSchemaDef, String> {
     Ok(plan::IcebergSchemaDef {
         fields: src
@@ -2153,7 +2153,7 @@ fn encode_iceberg_schema_def(
 }
 
 fn encode_iceberg_schema_field(
-    src: &catalog::IcebergSchemaFieldDef,
+    src: &table_model::IcebergSchemaFieldDef,
 ) -> Result<plan::IcebergSchemaFieldDef, String> {
     Ok(plan::IcebergSchemaFieldDef {
         field_id: src.field_id,
@@ -2191,7 +2191,7 @@ fn encode_iceberg_schema_default_json(
 }
 
 fn encode_iceberg_data_file_info(
-    src: &catalog::IcebergDataFileInfo,
+    src: &table_model::IcebergDataFileInfo,
 ) -> Result<plan::IcebergDataFileInfo, String> {
     Ok(plan::IcebergDataFileInfo {
         path: src.path.clone(),
@@ -2231,7 +2231,7 @@ fn encode_iceberg_data_file_info(
     })
 }
 
-fn encode_iceberg_column_stats(src: &catalog::IcebergColumnStats) -> plan::IcebergColumnStats {
+fn encode_iceberg_column_stats(src: &table_model::IcebergColumnStats) -> plan::IcebergColumnStats {
     plan::IcebergColumnStats {
         null_count: src.null_count,
         value_count: src.value_count,
@@ -2242,23 +2242,23 @@ fn encode_iceberg_column_stats(src: &catalog::IcebergColumnStats) -> plan::Icebe
 }
 
 fn encode_iceberg_delete_file_info(
-    src: &catalog::IcebergDeleteFileInfo,
+    src: &table_model::IcebergDeleteFileInfo,
 ) -> plan::IcebergDeleteFileInfo {
     plan::IcebergDeleteFileInfo {
         path: src.path.clone(),
         file_format: match src.file_format {
-            catalog::IcebergDeleteFileFormat::Parquet => {
+            table_model::IcebergDeleteFileFormat::Parquet => {
                 plan::IcebergDeleteFileFormat::Parquet as i32
             }
-            catalog::IcebergDeleteFileFormat::Puffin => {
+            table_model::IcebergDeleteFileFormat::Puffin => {
                 plan::IcebergDeleteFileFormat::Puffin as i32
             }
         },
         file_content: match src.file_content {
-            catalog::IcebergDeleteFileContent::Position => {
+            table_model::IcebergDeleteFileContent::Position => {
                 plan::IcebergDeleteFileContent::Position as i32
             }
-            catalog::IcebergDeleteFileContent::Equality => {
+            table_model::IcebergDeleteFileContent::Equality => {
                 plan::IcebergDeleteFileContent::Equality as i32
             }
         },
@@ -2274,7 +2274,7 @@ fn encode_iceberg_delete_file_info(
 }
 
 fn encode_iceberg_partition_field_value(
-    src: &catalog::IcebergPartitionFieldValue,
+    src: &table_model::IcebergPartitionFieldValue,
 ) -> plan::IcebergPartitionFieldValue {
     plan::IcebergPartitionFieldValue {
         source_column: src.source_column.clone(),
@@ -2285,19 +2285,19 @@ fn encode_iceberg_partition_field_value(
 }
 
 fn encode_iceberg_partition_value(
-    src: &catalog::IcebergPartitionValue,
+    src: &table_model::IcebergPartitionValue,
 ) -> plan::IcebergPartitionValue {
     use plan::iceberg_partition_value::Value;
 
     plan::IcebergPartitionValue {
         value: Some(match src {
-            catalog::IcebergPartitionValue::Boolean(value) => Value::BoolValue(*value),
-            catalog::IcebergPartitionValue::Int32(value) => Value::Int32Value(*value),
-            catalog::IcebergPartitionValue::Int64(value) => Value::Int64Value(*value),
-            catalog::IcebergPartitionValue::Float(value) => Value::FloatValue(*value),
-            catalog::IcebergPartitionValue::Double(value) => Value::DoubleValue(*value),
-            catalog::IcebergPartitionValue::String(value) => Value::StringValue(value.clone()),
-            catalog::IcebergPartitionValue::Binary(value) => Value::BinaryValue(value.clone()),
+            table_model::IcebergPartitionValue::Boolean(value) => Value::BoolValue(*value),
+            table_model::IcebergPartitionValue::Int32(value) => Value::Int32Value(*value),
+            table_model::IcebergPartitionValue::Int64(value) => Value::Int64Value(*value),
+            table_model::IcebergPartitionValue::Float(value) => Value::FloatValue(*value),
+            table_model::IcebergPartitionValue::Double(value) => Value::DoubleValue(*value),
+            table_model::IcebergPartitionValue::String(value) => Value::StringValue(value.clone()),
+            table_model::IcebergPartitionValue::Binary(value) => Value::BinaryValue(value.clone()),
         }),
     }
 }
@@ -3447,11 +3447,11 @@ mod tests {
             true,
         ));
         let table = iceberg_table_info_for_test();
-        scan.table.source = catalog::ScanSource::IcebergDataFiles {
+        scan.table.source = table_model::ScanSource::IcebergDataFiles {
             table: table.clone(),
             files: Vec::new(),
             cloud_properties: BTreeMap::from([("region".to_string(), "test".to_string())]),
-            binding: catalog::IcebergDataFileBinding::CurrentSnapshot,
+            binding: table_model::IcebergDataFileBinding::CurrentSnapshot,
         };
         scan.required_columns = Some(vec!["order_id".to_string()]);
         let plan = plan.seal().expect("seal ordinary Iceberg fixture");
@@ -3462,7 +3462,7 @@ mod tests {
             .insert_binding(file_binding_for_test(
                 10,
                 table,
-                catalog::IcebergDataFileBinding::CurrentSnapshot,
+                table_model::IcebergDataFileBinding::CurrentSnapshot,
                 vec![bound_column_for_test(
                     1,
                     "order_id",
@@ -3490,20 +3490,22 @@ mod tests {
     #[test]
     fn refresh_file_bindings_drive_source_projection_metadata_and_hidden_reads() {
         let refresh_sources = [
-            catalog::ScanSource::IcebergVersionTable {
+            table_model::ScanSource::IcebergVersionTable {
                 table: iceberg_table_info_for_test(),
                 snapshot_id: 1,
             },
-            catalog::ScanSource::IcebergMvTargetLocator(catalog::IcebergMvTargetLocatorScan {
-                catalog: "ice".to_string(),
-                database: "db".to_string(),
-                table: "orders".to_string(),
-                target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
-                target_snapshot_id: Some(1),
-                apply_key_column: "bound_order_id".to_string(),
-                branch_id_column: None,
-            }),
-            catalog::ScanSource::IcebergMvTargetState(catalog::IcebergMvTargetStateScan {
+            table_model::ScanSource::IcebergMvTargetLocator(
+                table_model::IcebergMvTargetLocatorScan {
+                    catalog: "ice".to_string(),
+                    database: "db".to_string(),
+                    table: "orders".to_string(),
+                    target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
+                    target_snapshot_id: Some(1),
+                    apply_key_column: "bound_order_id".to_string(),
+                    branch_id_column: None,
+                },
+            ),
+            table_model::ScanSource::IcebergMvTargetState(table_model::IcebergMvTargetStateScan {
                 catalog: "ice".to_string(),
                 database: "db".to_string(),
                 table: "orders".to_string(),
@@ -3515,12 +3517,12 @@ mod tests {
                 aggregate_state_names: Vec::new(),
                 physical_column_names: vec!["bound_order_id".to_string()],
                 row_id_column_name: "bound_order_id".to_string(),
-                row_filter: catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+                row_filter: table_model::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
                     row_id_column_name: "bound_order_id".to_string(),
                     branch_scope: None,
                 },
                 partition_constraint:
-                    catalog::IcebergMvTargetStatePartitionConstraint::Unpartitioned,
+                    table_model::IcebergMvTargetStatePartitionConstraint::Unpartitioned,
             }),
         ];
 
@@ -3547,7 +3549,7 @@ mod tests {
             resolved_table
                 .schema
                 .fields
-                .push(catalog::IcebergSchemaFieldDef {
+                .push(table_model::IcebergSchemaFieldDef {
                     field_id: 2,
                     name: "tenant_id".to_string(),
                     initial_default: None,
@@ -3561,7 +3563,7 @@ mod tests {
                 .insert_binding(file_binding_for_test(
                     10,
                     resolved_table,
-                    catalog::IcebergDataFileBinding::ExplicitFiles,
+                    table_model::IcebergDataFileBinding::ExplicitFiles,
                     vec![
                         ResolvedScanColumn {
                             planner: output_column(1, "bound_order_id", DataType::Int64),
@@ -3700,7 +3702,7 @@ mod tests {
             .insert_binding(file_binding_for_test(
                 10,
                 iceberg_table_info_for_test(),
-                catalog::IcebergDataFileBinding::ExplicitFiles,
+                table_model::IcebergDataFileBinding::ExplicitFiles,
                 vec![bound_column_for_test(
                     1,
                     "order_id",
@@ -3734,11 +3736,11 @@ mod tests {
         let mut table = iceberg_table_info_for_test();
         table.schema.fields[0].name = "v".to_string();
         scan.table.columns = vec![column_def_for_test("v", DataType::LargeBinary, false)];
-        scan.table.source = catalog::ScanSource::IcebergDataFiles {
+        scan.table.source = table_model::ScanSource::IcebergDataFiles {
             table: table.clone(),
             files: Vec::new(),
             cloud_properties: BTreeMap::new(),
-            binding: catalog::IcebergDataFileBinding::ExplicitFiles,
+            binding: table_model::IcebergDataFileBinding::ExplicitFiles,
         };
         scan.columns = vec![
             output_column(1, "v", DataType::LargeBinary),
@@ -3766,7 +3768,7 @@ mod tests {
             .insert_binding(file_binding_for_test(
                 10,
                 table,
-                catalog::IcebergDataFileBinding::ExplicitFiles,
+                table_model::IcebergDataFileBinding::ExplicitFiles,
                 vec![ResolvedScanColumn {
                     planner: output_column(1, "v", DataType::LargeBinary),
                     source: column_def_for_test("v", DataType::LargeBinary, false),
@@ -3838,8 +3840,8 @@ mod tests {
 
     fn file_binding_for_test(
         node_id: i32,
-        table: catalog::IcebergTableInfo,
-        file_binding: catalog::IcebergDataFileBinding,
+        table: table_model::IcebergTableInfo,
+        file_binding: table_model::IcebergDataFileBinding,
         physical_columns: Vec<ResolvedScanColumn>,
         required_reads: Vec<ResolvedReadColumn>,
     ) -> ResolvedScanBinding {
@@ -3958,8 +3960,8 @@ mod tests {
         }
     }
 
-    fn iceberg_delta_table_for_test() -> catalog::TableDef {
-        catalog::TableDef {
+    fn iceberg_delta_table_for_test() -> table_model::TableDef {
+        table_model::TableDef {
             name: "orders".to_string(),
             columns: vec![crate::catalog::schema::ColumnDef {
                 name: "order_id".to_string(),
@@ -3969,7 +3971,7 @@ mod tests {
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: Vec::new(),
-            source: catalog::ScanSource::IcebergDeltaTable {
+            source: table_model::ScanSource::IcebergDeltaTable {
                 table: iceberg_table_info_for_test(),
                 from_snapshot_id: 1,
                 to_snapshot_id: 2,
@@ -3977,8 +3979,8 @@ mod tests {
         }
     }
 
-    fn iceberg_table_info_for_test() -> catalog::IcebergTableInfo {
-        catalog::IcebergTableInfo {
+    fn iceberg_table_info_for_test() -> table_model::IcebergTableInfo {
+        table_model::IcebergTableInfo {
             catalog: "ice".to_string(),
             namespace: "db".to_string(),
             table: "orders".to_string(),
@@ -3986,8 +3988,8 @@ mod tests {
             current_snapshot_id: Some(2),
             schema_id: 1,
             location: "file:///warehouse/orders".to_string(),
-            schema: catalog::IcebergSchemaDef {
-                fields: vec![catalog::IcebergSchemaFieldDef {
+            schema: table_model::IcebergSchemaDef {
+                fields: vec![table_model::IcebergSchemaFieldDef {
                     field_id: 1,
                     name: "order_id".to_string(),
                     initial_default: None,

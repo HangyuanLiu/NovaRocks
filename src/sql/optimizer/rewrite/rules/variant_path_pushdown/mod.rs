@@ -34,9 +34,6 @@ mod tests {
     use crate::sql::analysis::{
         BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
-    use crate::sql::catalog::{
-        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
-    };
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::tree::rewrite_with_rule;
@@ -44,6 +41,9 @@ mod tests {
     use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
     use crate::sql::planner::optimizer_bridge::logical::{to_logical_plan, to_optimizer_expr};
     use crate::sql::planner::payload::{PlanFilterNode, PlanProjectNode, PlanScanNode};
+    use crate::sql::planner::table::{
+        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
+    };
 
     fn add_column(
         factory: &Rc<RefCell<ColumnRefFactory>>,

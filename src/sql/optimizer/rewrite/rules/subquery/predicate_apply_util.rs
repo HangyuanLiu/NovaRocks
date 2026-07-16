@@ -608,10 +608,10 @@ mod tests {
 
     use super::*;
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::logical::LogicalPlanKind;
     use crate::sql::planner::payload::{PlanFilterNode, PlanProjectNode, PlanScanNode};
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     const INNER_K: ColumnId = ColumnId(1);
     const OUTER_K: ColumnId = ColumnId(2);

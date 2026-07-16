@@ -111,7 +111,6 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::{ApplyKind, ImvVersionRef, JoinKind, LiteralValue, OutputColumn};
     use crate::sql::optimizer::operator::{
@@ -121,6 +120,7 @@ mod tests {
         TableFunctionOp, TopNOp, TopNPhase, UnionOp, ValuesOp, WindowOp,
     };
     use crate::sql::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode};
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     fn bool_literal_scalar(arena: &mut ScalarArena) -> ScalarId {
         arena.intern(

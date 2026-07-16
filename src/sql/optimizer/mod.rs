@@ -339,9 +339,9 @@ fn validate_query_stats_bound(expr: &OptExpr) -> Result<(), String> {
 fn optimizer_rejects_unbound_scan_stats() {
     use arrow::datatypes::DataType;
 
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::common::OutputColumn;
     use crate::sql::optimizer::operator::{Operator, ScanOp};
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     let expr = OptExpr::leaf(Operator::LogicalScan(ScanOp {
         database: "db".to_string(),
@@ -1001,12 +1001,12 @@ mod is_known_rule_name_tests {
         DictionaryOwner, DictionarySnapshot, DictionaryState, DictionaryValue, DictionaryWatermark,
     };
     use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::optimizer::rewrite::context::{
         QueryDictionaryProvider, RewriteContext, current_dictionary_provider,
         with_dictionary_provider,
     };
+    use crate::sql::planner::table::{ScanSource, TableDef};
     use std::cell::RefCell;
 
     use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
@@ -1057,8 +1057,12 @@ mod is_known_rule_name_tests {
         )
     }
 
-    fn iceberg_info(catalog: &str, ns: &str, tbl: &str) -> crate::sql::catalog::IcebergTableInfo {
-        crate::sql::catalog::IcebergTableInfo {
+    fn iceberg_info(
+        catalog: &str,
+        ns: &str,
+        tbl: &str,
+    ) -> crate::sql::planner::table::IcebergTableInfo {
+        crate::sql::planner::table::IcebergTableInfo {
             catalog: catalog.to_string(),
             namespace: ns.to_string(),
             table: tbl.to_string(),
@@ -1066,7 +1070,7 @@ mod is_known_rule_name_tests {
             current_snapshot_id: None,
             schema_id: 0,
             location: String::new(),
-            schema: crate::sql::catalog::IcebergSchemaDef { fields: vec![] },
+            schema: crate::sql::planner::table::IcebergSchemaDef { fields: vec![] },
             serialized_metadata: None,
             serialized_metadata_rows: None,
         }
@@ -1090,7 +1094,7 @@ mod is_known_rule_name_tests {
                 table: iceberg_info(catalog, ns, tbl),
                 files: vec![],
                 cloud_properties: Default::default(),
-                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                binding: crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
             },
         }
     }
@@ -1660,10 +1664,11 @@ mod is_known_rule_name_tests {
     fn optimize_with_root_distribution_overrides_default_gather_root() {
         use crate::catalog::schema::ColumnDef;
         use crate::sql::analysis::ExprKind;
-        use crate::sql::catalog::{CatalogProvider, ScanSource, TableDef};
+        use crate::sql::catalog::CatalogProvider;
         use crate::sql::column_id::ColumnRefFactory;
         use crate::sql::optimizer::property::DistributionSpec;
         use crate::sql::planner::logical::LogicalPlanKind;
+        use crate::sql::planner::table::{ScanSource, TableDef};
 
         struct MinimalCatalog;
         impl CatalogProvider for MinimalCatalog {
@@ -1746,9 +1751,10 @@ mod is_known_rule_name_tests {
     fn optimize_preserves_ranking_window_partition_topn_sort() {
         use crate::catalog::schema::ColumnDef;
         use crate::exec::node::sort::SortTopNType;
-        use crate::sql::catalog::{CatalogProvider, ScanSource, TableDef};
+        use crate::sql::catalog::CatalogProvider;
         use crate::sql::optimizer::operator::Operator;
         use crate::sql::optimizer::optimized_tree::OptimizedOperatorNode;
+        use crate::sql::planner::table::{ScanSource, TableDef};
 
         struct RankingCatalog;
         impl CatalogProvider for RankingCatalog {
@@ -1873,8 +1879,9 @@ mod is_known_rule_name_tests {
     #[test]
     fn scalar_subquery_decorrelates_to_join() {
         use crate::catalog::schema::ColumnDef;
-        use crate::sql::catalog::{CatalogProvider, ScanSource, TableDef};
+        use crate::sql::catalog::CatalogProvider;
         use crate::sql::column_id::ColumnRefFactory;
+        use crate::sql::planner::table::{ScanSource, TableDef};
 
         // Minimal catalog providing t1(k1, k2) and t2(k1, k2) — the same
         // shape the planner and analyzer test modules use.

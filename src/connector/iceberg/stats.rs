@@ -30,8 +30,8 @@ use crate::connector::iceberg::catalog::registry::{extract_data_files_with_stats
 use crate::connector::stats::{
     ScanSourceIdentity, StatsProviderError, TableSnapshotRef, TableStatsProvider, TableStatsRequest,
 };
-use crate::sql::catalog::IcebergTableInfo;
 use crate::sql::optimizer::stats_input::{BaseTableStatistics, StatsMissingReason};
+use crate::sql::planner::table::IcebergTableInfo;
 
 pub(crate) struct IcebergTableStatsProvider {
     registry: Arc<RwLock<IcebergCatalogRegistry>>,

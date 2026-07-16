@@ -3954,9 +3954,8 @@ mod tests {
         ApplyClause, ApplyPredicateSpec, ApplyScalarSpec, BinOp, ExprKind, LiteralValue, Relation,
         SubqueryKind,
     };
-    use crate::sql::catalog::{
-        IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef, TableLookupMode,
-    };
+    use crate::sql::catalog::TableLookupMode;
+    use crate::sql::planner::table::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
 
     struct TestCatalog;
 
@@ -4403,7 +4402,8 @@ mod tests {
                         table: test_iceberg_table_info(),
                         files: vec![],
                         cloud_properties: Default::default(),
-                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                        binding:
+                            crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 }),
                 _ => Err(format!("table not found: {table}")),
@@ -4427,7 +4427,7 @@ mod tests {
                     ),
                     files: vec![],
                     cloud_properties: Default::default(),
-                    binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                    binding: crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
                 };
             }
             Ok(table_def)
@@ -6581,7 +6581,7 @@ mod tests {
                 ),
                 files: vec![],
                 cloud_properties: Default::default(),
-                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                binding: crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
             };
             table_def
         }

@@ -24,7 +24,6 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::sql::analysis::BinOp;
-use crate::sql::catalog::TableDef;
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::OutputColumn;
 use crate::sql::common::expr::JoinKind;
@@ -35,6 +34,7 @@ use crate::sql::optimizer::operator::{
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode, SortKey};
 use crate::sql::optimizer::scalar_expr;
+use crate::sql::planner::table::TableDef;
 
 /// What the alternative must reproduce at the matched group's top.
 ///
@@ -1057,11 +1057,11 @@ mod tests {
     use super::*;
     use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::logical::{LogicalAggregateNode, LogicalPlanKind, LogicalPlanNode};
     use crate::sql::planner::payload::{AggregateCall, PlanFilterNode, PlanScanNode, PlanSortNode};
+    use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
 
     fn col(id: u32, name: &str) -> OutputColumn {

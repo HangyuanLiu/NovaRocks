@@ -759,7 +759,6 @@ mod tests {
     use super::*;
     use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::{ExprKind, LiteralValue, ProjectItem, TypedExpr};
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::{ChangeStreamBranchKind, JoinKind, OutputColumn};
     use crate::sql::optimizer::operator::{
@@ -778,6 +777,7 @@ mod tests {
     use crate::sql::optimizer::statistics::{Confidence, CostEstimate, Statistics};
     use crate::sql::planner::optimizer_bridge::scalar::intern_project_items;
     use crate::sql::planner::physical::PhysicalPlanKind;
+    use crate::sql::planner::table::{ScanSource, TableDef};
     use std::sync::Arc;
 
     fn int_expr(v: i64) -> TypedExpr {

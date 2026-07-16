@@ -37,7 +37,7 @@ use crate::engine::mv::refresh_pin::RefreshSnapshotPin;
 use crate::engine::mv::table_ref::IcebergTableRef;
 use crate::meta::repository::mv::StoredMvDefinition;
 use crate::meta::repository::mv_contract::MvSchemaContract;
-use crate::sql::catalog::{
+use crate::sql::planner::table::{
     IcebergDataFileInfo, IcebergMvTargetLocatorScan, IcebergMvTargetStateScan,
     IcebergPartitionFieldValue, IcebergPartitionValue, IcebergSchemaDef, IcebergSchemaFieldDef,
     IcebergTableInfo, ScanSource,
@@ -837,7 +837,7 @@ impl IcebergMvRefreshContext {
             table: table.clone(),
             files,
             cloud_properties: entry.cloud_properties_map(),
-            binding: crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
+            binding: crate::sql::planner::table::IcebergDataFileBinding::ExplicitFiles,
         })
     }
 
@@ -905,7 +905,7 @@ impl IcebergMvRefreshContext {
             ));
         }
         match &scan.row_filter {
-            crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            crate::sql::planner::table::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
                 row_id_column_name,
                 branch_scope,
             } if row_id_column_name.eq_ignore_ascii_case(&scan.row_id_column_name) => {
@@ -915,7 +915,7 @@ impl IcebergMvRefreshContext {
                     &self.rewrite.schema_contract,
                 )?;
             }
-            crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            crate::sql::planner::table::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
                 row_id_column_name,
                 ..
             } => {
@@ -960,7 +960,7 @@ impl IcebergMvRefreshContext {
             table: target_table_info(self, scan)?,
             files,
             cloud_properties: self.target_entry.cloud_properties_map(),
-            binding: crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
+            binding: crate::sql::planner::table::IcebergDataFileBinding::ExplicitFiles,
         })
     }
 
@@ -1043,7 +1043,7 @@ impl IcebergMvRefreshContext {
             table: target_locator_table_info(self, scan)?,
             files,
             cloud_properties: self.target_entry.cloud_properties_map(),
-            binding: crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
+            binding: crate::sql::planner::table::IcebergDataFileBinding::ExplicitFiles,
         })
     }
 
@@ -1052,10 +1052,10 @@ impl IcebergMvRefreshContext {
         scan: &IcebergMvTargetStateScan,
     ) -> Result<Option<BTreeSet<crate::engine::mv::partition::MvPartitionKey>>, String> {
         match scan.partition_constraint {
-            crate::sql::catalog::IcebergMvTargetStatePartitionConstraint::Unpartitioned => {
+            crate::sql::planner::table::IcebergMvTargetStatePartitionConstraint::Unpartitioned => {
                 Ok(None)
             }
-            crate::sql::catalog::IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired => {
+            crate::sql::planner::table::IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired => {
                 match &self.affected_partitions {
                     crate::engine::mv::partition::AffectedTargetPartitions::Unpartitioned => {
                         Ok(None)
@@ -1151,7 +1151,7 @@ pub(crate) fn bind_target_state_file_positions(
 
 fn validate_target_state_branch_scope(
     scan: &IcebergMvTargetStateScan,
-    scope: Option<&crate::sql::catalog::BranchScope>,
+    scope: Option<&crate::sql::planner::table::BranchScope>,
     contract: &MvSchemaContract,
 ) -> Result<(), String> {
     let Some(scope) = scope else {
@@ -1494,7 +1494,7 @@ pub(crate) mod tests_support {
         ExpressionLineage, HiddenApplyKeyContract, MvSchemaContract, OutputColumnLineage,
         OutputContract, TargetContract, TargetVisibleColumn,
     };
-    use crate::sql::catalog::{
+    use crate::sql::planner::table::{
         IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter,
     };
 
@@ -2813,7 +2813,7 @@ mod tests {
         };
         assert_eq!(
             binding,
-            crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles
+            crate::sql::planner::table::IcebergDataFileBinding::ExplicitFiles
         );
         assert_eq!(table.catalog, "tgt");
         assert_eq!(table.namespace, "db");
@@ -2896,7 +2896,7 @@ mod tests {
                 },
             ],
             cloud_properties: BTreeMap::new(),
-            binding: crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
+            binding: crate::sql::planner::table::IcebergDataFileBinding::ExplicitFiles,
         }
     }
 
@@ -3028,12 +3028,12 @@ mod tests {
             aggregate_state_names: Vec::new(),
             physical_column_names: Vec::new(),
             row_id_column_name: "__row_id__".to_string(),
-            row_filter: crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            row_filter: crate::sql::planner::table::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
                 row_id_column_name: "__row_id__".to_string(),
                 branch_scope: None,
             },
             partition_constraint:
-                crate::sql::catalog::IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired,
+                crate::sql::planner::table::IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired,
         };
 
         let unknown_filter = ctx
