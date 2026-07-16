@@ -23,7 +23,6 @@ mod scan_preparation;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::connector::ConnectorRegistry;
-use crate::sql::planner::distributed::runtime_filter::project_runtime_filters;
 use crate::sql::planner::distributed::{
     BoundaryContract, BoundaryKind, DistributedNode, DistributedNodeKind, FragmentEdgeKind,
     FragmentId,
@@ -102,7 +101,8 @@ pub(crate) fn prepare_fragments(
         plan.boundaries().contracts(),
         &sealed_ids,
     )?;
-    let runtime_filter_projection = project_runtime_filters(plan)?;
+    let runtime_filter_projection =
+        crate::sql::planner::distributed::runtime_filter::project_runtime_filters(plan)?;
     let scan_bindings = prepare_scan_bindings(plan, connectors, resolver)?;
 
     let mut by_fragment = BTreeMap::new();

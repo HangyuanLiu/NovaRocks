@@ -37447,23 +37447,387 @@ fn coor_3b_old_codegen_scan_reexport_violations(
     Ok(violations)
 }
 
+const COOR_3B_RF_PROJECTION_FN: &str = "project_runtime_filters";
+const COOR_3B_RF_PROJECTION_PLANNER_OWNER: &str = "src/sql/planner/distributed/runtime_filter.rs";
+const COOR_3B_RF_PROJECTION_PREPARE_OWNER: &str = "src/coordinator/prepare/mod.rs";
+
+#[derive(Default)]
+struct Coor3bRuntimeFilterProjectionAudit {
+    definitions: Vec<String>,
+    use_bindings: Vec<(String, String, bool)>,
+    expression_paths: Vec<(Vec<String>, String)>,
+    visible_functions: BTreeSet<String>,
+    function_stack: Vec<String>,
+}
+
+impl Coor3bRuntimeFilterProjectionAudit {
+    fn current_function(&self) -> String {
+        self.function_stack
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "<module>".to_string())
+    }
+
+    fn collect_use_tree(&mut self, tree: &syn::UseTree, prefix: &mut Vec<String>, public: bool) {
+        match tree {
+            syn::UseTree::Path(path) => {
+                prefix.push(coor_3b_ident_text(&path.ident));
+                self.collect_use_tree(&path.tree, prefix, public);
+                prefix.pop();
+            }
+            syn::UseTree::Name(name) => {
+                let original = coor_3b_ident_text(&name.ident);
+                self.use_bindings.push((original.clone(), original, public));
+            }
+            syn::UseTree::Rename(rename) => {
+                self.use_bindings.push((
+                    coor_3b_ident_text(&rename.ident),
+                    coor_3b_ident_text(&rename.rename),
+                    public,
+                ));
+            }
+            syn::UseTree::Glob(_) => {
+                self.use_bindings
+                    .push((prefix.join("::"), "*".to_string(), public));
+            }
+            syn::UseTree::Group(group) => {
+                for item in &group.items {
+                    self.collect_use_tree(item, prefix, public);
+                }
+            }
+        }
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for Coor3bRuntimeFilterProjectionAudit {
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+            return;
+        }
+        syn::visit::visit_item(self, item);
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_impl_item_attrs(item)) {
+            return;
+        }
+        syn::visit::visit_impl_item(self, item);
+    }
+
+    fn visit_stmt(&mut self, statement: &'ast syn::Stmt) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_stmt_attrs(statement)) {
+            return;
+        }
+        syn::visit::visit_stmt(self, statement);
+    }
+
+    fn visit_expr(&mut self, expression: &'ast syn::Expr) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_expr_attrs(expression)) {
+            return;
+        }
+        syn::visit::visit_expr(self, expression);
+    }
+
+    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        self.collect_use_tree(
+            &item.tree,
+            &mut Vec::new(),
+            !matches!(item.vis, syn::Visibility::Inherited),
+        );
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        let name = coor_3b_ident_text(&item.sig.ident);
+        if name == COOR_3B_RF_PROJECTION_FN {
+            self.definitions.push(name.clone());
+        }
+        if !matches!(item.vis, syn::Visibility::Inherited) {
+            self.visible_functions.insert(name.clone());
+        }
+        self.function_stack.push(name);
+        syn::visit::visit_block(self, &item.block);
+        self.function_stack.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        let name = coor_3b_ident_text(&item.sig.ident);
+        if !matches!(item.vis, syn::Visibility::Inherited) {
+            self.visible_functions.insert(name.clone());
+        }
+        self.function_stack.push(name);
+        syn::visit::visit_block(self, &item.block);
+        self.function_stack.pop();
+    }
+
+    fn visit_expr_path(&mut self, expression: &'ast syn::ExprPath) {
+        if !expression.path.segments.is_empty() {
+            self.expression_paths.push((
+                expression
+                    .path
+                    .segments
+                    .iter()
+                    .map(|segment| coor_3b_ident_text(&segment.ident))
+                    .collect(),
+                self.current_function(),
+            ));
+        }
+        syn::visit::visit_expr_path(self, expression);
+    }
+}
+
+struct Coor3bRuntimeFilterProjectionSource {
+    path: String,
+    token_count: usize,
+    audit: Coor3bRuntimeFilterProjectionAudit,
+}
+
+fn coor_3b_runtime_filter_projection_owner_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
+    let mut violations = Vec::new();
+    let production_inventory = sources.iter().any(|source| source.path == "src/lib.rs");
+    if !production_inventory
+        && !sources.iter().any(|source| {
+            source.text.contains(COOR_3B_RF_PROJECTION_FN)
+                || (source.text.contains("runtime_filter") && source.text.contains('*'))
+        })
+    {
+        return violations;
+    }
+
+    let mut audited = Vec::new();
+    for source in sources {
+        let owner = matches!(
+            source.path.as_str(),
+            COOR_3B_RF_PROJECTION_PLANNER_OWNER | COOR_3B_RF_PROJECTION_PREPARE_OWNER
+        );
+        let may_contain_projection_glob =
+            source.text.contains("runtime_filter") && source.text.contains('*');
+        if !owner && !source.text.contains(COOR_3B_RF_PROJECTION_FN) && !may_contain_projection_glob
+        {
+            continue;
+        }
+        let production = rust_sanitized_production_text(&source.text);
+        let tokens = rust_use_tokens(&production);
+        let token_count = tokens
+            .iter()
+            .filter(|token| token.as_str() == COOR_3B_RF_PROJECTION_FN)
+            .count();
+        let has_runtime_filter_glob = tokens
+            .windows(3)
+            .any(|window| window[0] == "runtime_filter" && window[1] == "::" && window[2] == "*");
+        if !owner && token_count == 0 && !has_runtime_filter_glob {
+            continue;
+        }
+        let file = match syn::parse_file(&source.text) {
+            Ok(file) => file,
+            Err(error) => {
+                violations.push(format!(
+                    "runtime-filter-projection-owner: {}: parse failed: {error}",
+                    source.path
+                ));
+                continue;
+            }
+        };
+        let mut audit = Coor3bRuntimeFilterProjectionAudit::default();
+        syn::visit::Visit::visit_file(&mut audit, &file);
+        audited.push(Coor3bRuntimeFilterProjectionSource {
+            path: source.path.clone(),
+            token_count,
+            audit,
+        });
+    }
+
+    if production_inventory {
+        for owner in [
+            COOR_3B_RF_PROJECTION_PLANNER_OWNER,
+            COOR_3B_RF_PROJECTION_PREPARE_OWNER,
+        ] {
+            if !audited.iter().any(|source| source.path == owner) {
+                violations.push(format!(
+                    "runtime-filter-projection-owner: missing production owner {owner}"
+                ));
+            }
+        }
+    }
+
+    let mut exported_prepare_bindings = BTreeSet::new();
+    for source in &audited {
+        let projector_uses = source
+            .audit
+            .use_bindings
+            .iter()
+            .filter(|(original, binding, public)| {
+                original == COOR_3B_RF_PROJECTION_FN
+                    || (binding == "*"
+                        && (original.ends_with("sql::planner::distributed::runtime_filter")
+                            || (source.path == COOR_3B_RF_PROJECTION_PLANNER_OWNER
+                                && *public
+                                && original == "self")))
+            })
+            .collect::<Vec<_>>();
+        let aliases = projector_uses
+            .iter()
+            .map(|(_, binding, _)| binding.as_str())
+            .filter(|binding| *binding != "*")
+            .collect::<BTreeSet<_>>();
+        let references = source
+            .audit
+            .expression_paths
+            .iter()
+            .filter(|(path, _)| {
+                path.last().is_some_and(|name| {
+                    name == COOR_3B_RF_PROJECTION_FN || aliases.contains(name.as_str())
+                })
+            })
+            .map(|(path, function)| (path.clone(), function.clone()))
+            .collect::<Vec<_>>();
+
+        match source.path.as_str() {
+            COOR_3B_RF_PROJECTION_PLANNER_OWNER => {
+                if source.audit.definitions.len() != 1
+                    || source.token_count != 1
+                    || !projector_uses.is_empty()
+                    || !references.is_empty()
+                {
+                    violations.push(format!(
+                        "runtime-filter-projection-owner: {} must contain exactly one function definition and no other production reference; definitions={} tokens={} uses={} references={references:?}",
+                        source.path,
+                        source.audit.definitions.len(),
+                        source.token_count,
+                        projector_uses.len(),
+                    ));
+                }
+            }
+            COOR_3B_RF_PROJECTION_PREPARE_OWNER => {
+                let direct_prepare_reference = references.as_slice()
+                    == [(
+                        vec![
+                            "crate".to_string(),
+                            "sql".to_string(),
+                            "planner".to_string(),
+                            "distributed".to_string(),
+                            "runtime_filter".to_string(),
+                            COOR_3B_RF_PROJECTION_FN.to_string(),
+                        ],
+                        "prepare_fragments".to_string(),
+                    )];
+                if source.audit.definitions.is_empty()
+                    && source.token_count == 1
+                    && projector_uses.is_empty()
+                    && direct_prepare_reference
+                {
+                    continue;
+                }
+                violations.push(format!(
+                    "runtime-filter-projection-owner: {} must contain exactly one direct production reference inside prepare_fragments and no definition/use/re-export; definitions={} tokens={} uses={} references={references:?}",
+                    source.path,
+                    source.audit.definitions.len(),
+                    source.token_count,
+                    projector_uses.len(),
+                ));
+                for (_, binding, public) in projector_uses {
+                    if *public && binding != "*" {
+                        exported_prepare_bindings.insert(binding.clone());
+                    }
+                }
+                for (_, function) in references.iter().filter(|(_, function)| {
+                    function.as_str() != "prepare_fragments"
+                        && source.audit.visible_functions.contains(function.as_str())
+                }) {
+                    exported_prepare_bindings.insert(function.clone());
+                }
+            }
+            _ => {
+                if source.token_count != 0
+                    || !source.audit.definitions.is_empty()
+                    || !projector_uses.is_empty()
+                    || !references.is_empty()
+                {
+                    violations.push(format!(
+                        "runtime-filter-projection-owner: {} must not reference {}; definitions={} tokens={} uses={} references={references:?}",
+                        source.path,
+                        COOR_3B_RF_PROJECTION_FN,
+                        source.audit.definitions.len(),
+                        source.token_count,
+                        projector_uses.len(),
+                    ));
+                }
+            }
+        }
+    }
+
+    if !exported_prepare_bindings.is_empty() {
+        for source in sources {
+            if source.path == COOR_3B_RF_PROJECTION_PREPARE_OWNER {
+                continue;
+            }
+            if !exported_prepare_bindings
+                .iter()
+                .any(|binding| source.text.contains(binding))
+            {
+                continue;
+            }
+            let production = rust_sanitized_production_text(&source.text);
+            let tokens = rust_use_tokens(&production);
+            if !tokens
+                .iter()
+                .any(|token| exported_prepare_bindings.contains(token))
+            {
+                continue;
+            }
+            let file = match syn::parse_file(&source.text) {
+                Ok(file) => file,
+                Err(error) => {
+                    violations.push(format!(
+                        "runtime-filter-projection-owner: {}: wrapper consumer parse failed: {error}",
+                        source.path
+                    ));
+                    continue;
+                }
+            };
+            let mut audit = Coor3bRuntimeFilterProjectionAudit::default();
+            syn::visit::Visit::visit_file(&mut audit, &file);
+            let imported_aliases = audit
+                .use_bindings
+                .iter()
+                .filter(|(original, _, _)| exported_prepare_bindings.contains(original))
+                .map(|(_, binding, _)| binding.as_str())
+                .collect::<BTreeSet<_>>();
+            for (path, function) in &audit.expression_paths {
+                let Some(name) = path.last() else {
+                    continue;
+                };
+                if exported_prepare_bindings.contains(name)
+                    || imported_aliases.contains(name.as_str())
+                {
+                    violations.push(format!(
+                        "runtime-filter-projection-owner: {} function {function} consumes preparation projection wrapper `{name}`",
+                        source.path
+                    ));
+                }
+            }
+            for (original, binding, _) in &audit.use_bindings {
+                if exported_prepare_bindings.contains(original) {
+                    violations.push(format!(
+                        "runtime-filter-projection-owner: {} imports preparation projection wrapper `{original}` as `{binding}`",
+                        source.path
+                    ));
+                }
+            }
+        }
+    }
+
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
 fn coor_3b_forbidden_path_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
     let (bundle_type_names, mut violations) = coor_3b_native_bundle_type_names(sources);
+    violations.extend(coor_3b_runtime_filter_projection_owner_violations(sources));
     for source in sources {
         let production = rust_sanitized_production_text(&source.text);
         let compact = compact_line(&production);
         let tokens = rust_use_tokens(&production);
-
-        if tokens
-            .iter()
-            .any(|token| token == "project_runtime_filters")
-            && !matches!(
-                source.path.as_str(),
-                "src/coordinator/prepare/mod.rs" | "src/sql/planner/distributed/runtime_filter.rs"
-            )
-        {
-            violations.push(format!("runtime-filter-projection-owner: {}", source.path));
-        }
 
         if matches!(
             source.path.as_str(),
@@ -38384,6 +38748,104 @@ fn coordinator_runtime_filter_guard_rejects_scheduler_projection_call() {
 }
 
 #[test]
+fn coordinator_runtime_filter_guard_rejects_preparation_projection_wrapper() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/prepare/mod.rs",
+        "fn prepare_fragments(plan: &DistributedPlan) { let _ = project_runtime_filters(plan); } pub(crate) fn reproject(plan: &DistributedPlan) { let _ = project_runtime_filters(plan); }",
+        "runtime-filter-projection-owner",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_renamed_projection_reexport() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/prepare/mod.rs",
+        "pub(crate) use crate::sql::planner::distributed::runtime_filter::project_runtime_filters as reproject; fn prepare_fragments(plan: &DistributedPlan) { let _ = reproject(plan); }",
+        "runtime-filter-projection-owner",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_projection_glob_reexport() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/projection_escape.rs",
+        "pub(crate) use crate::sql::planner::distributed::runtime_filter::*;",
+        "runtime-filter-projection-owner",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_consumer_of_projection_wrapper() {
+    let sources = [
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/runtime_filter.rs",
+            "pub(crate) fn project_runtime_filters(plan: &DistributedPlan) {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/coordinator/prepare/mod.rs",
+            "fn prepare_fragments(plan: &DistributedPlan) { let _ = project_runtime_filters(plan); } pub(crate) fn reproject(plan: &DistributedPlan) { let _ = project_runtime_filters(plan); }",
+        ),
+        Cgo8GuardSource::new(
+            "src/sql/codegen/fragment/bundle.rs",
+            "use crate::coordinator::prepare::reproject as reroute; fn encode(plan: &DistributedPlan) { reroute(plan); }",
+        ),
+    ];
+    let violations = coor_3b_forbidden_path_violations(&sources);
+    assert!(
+        violations.iter().any(|violation| {
+            violation.contains("runtime-filter-projection-owner")
+                && violation.contains("src/sql/codegen/fragment/bundle.rs")
+                && violation.contains("reproject")
+        }),
+        "the aliased consumer of a preparation wrapper must be rejected explicitly: {violations:?}"
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_fails_closed_on_missing_and_duplicate_owners() {
+    let missing_reference = [
+        Cgo8GuardSource::new("src/lib.rs", "mod coordinator; mod sql;"),
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/runtime_filter.rs",
+            "pub(crate) fn project_runtime_filters(plan: &DistributedPlan) {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/coordinator/prepare/mod.rs",
+            "fn prepare_fragments(plan: &DistributedPlan) {}",
+        ),
+    ];
+    let missing_violations = coor_3b_runtime_filter_projection_owner_violations(&missing_reference);
+    assert!(
+        missing_violations.iter().any(|violation| {
+            violation.contains(COOR_3B_RF_PROJECTION_PREPARE_OWNER)
+                && violation.contains("exactly one direct production reference")
+        }),
+        "missing preparation reference must fail closed: {missing_violations:?}"
+    );
+
+    let duplicate_definition = [
+        Cgo8GuardSource::new("src/lib.rs", "mod coordinator; mod sql;"),
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/runtime_filter.rs",
+            "pub(crate) fn project_runtime_filters(plan: &DistributedPlan) {} fn project_runtime_filters(other: &DistributedPlan) {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/coordinator/prepare/mod.rs",
+            "fn prepare_fragments(plan: &DistributedPlan) { let _ = crate::sql::planner::distributed::runtime_filter::project_runtime_filters(plan); }",
+        ),
+    ];
+    let duplicate_violations =
+        coor_3b_runtime_filter_projection_owner_violations(&duplicate_definition);
+    assert!(
+        duplicate_violations.iter().any(|violation| {
+            violation.contains(COOR_3B_RF_PROJECTION_PLANNER_OWNER)
+                && violation.contains("definitions=2")
+        }),
+        "duplicate planner definition must fail closed: {duplicate_violations:?}"
+    );
+}
+
+#[test]
 fn coordinator_runtime_filter_guard_rejects_raw_graph_method() {
     assert_coor_3b_fixture_rejected(
         "src/coordinator/scheduler/runtime_filter.rs",
@@ -38531,7 +38993,17 @@ fn coordinator_runtime_filter_guard_rejects_graph_type_dependency() {
 fn coordinator_preparation_runtime_filter_guard_allows_projection_owner() {
     let sources = [Cgo8GuardSource::new(
         "src/coordinator/prepare/mod.rs",
-        "use crate::sql::planner::distributed::runtime_filter::{RuntimeFilterGraphProjection, project_runtime_filters}; fn plan(plan: &DistributedPlan) { let _ = project_runtime_filters(plan); }",
+        r#"
+// project_runtime_filters(plan) in a comment is ignored.
+const NOTE: &str = "project_runtime_filters(plan)";
+fn prepare_fragments(plan: &DistributedPlan) {
+    let _ = crate::sql::planner::distributed::runtime_filter::project_runtime_filters(plan);
+}
+#[cfg(test)]
+pub(crate) fn reproject(plan: &DistributedPlan) {
+    let _ = project_runtime_filters(plan);
+}
+"#,
     )];
     assert!(
         coor_3b_forbidden_path_violations(&sources).is_empty(),
@@ -38622,6 +39094,7 @@ fn coordinator_preparation_guard_ignores_comments_and_test_only_items() {
     let sources = [Cgo8GuardSource::new(
         "src/coordinator/prepare/mod.rs",
         "// struct MultiFragmentBuildResult; fn prepare(plan: &mut DistributedPlan) {}\n\
+         fn prepare_fragments(plan: &DistributedPlan) { let _ = crate::sql::planner::distributed::runtime_filter::project_runtime_filters(plan); }\n\
          #[cfg(test)] mod tests { fn clone_and_patch(plan: &DistributedPlan) { let mut patched = plan.clone(); patched.fragments_mut(); } }",
     )];
     assert!(
