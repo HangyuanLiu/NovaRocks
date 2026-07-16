@@ -18,7 +18,7 @@
 use std::time::Duration;
 
 use foundationdb::options::TransactionOption;
-use foundationdb::{Database, Transaction};
+use foundationdb::{Database, FdbError, Transaction};
 use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
 
@@ -27,6 +27,21 @@ use crate::state_store::{StateStoreError, StateStoreErrorKind, StoreIdentity};
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_AUTHORITATIVE_READ_ATTEMPTS: usize = 5;
+const NOT_COMMITTED_ERROR_CODE: i32 = 1020;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdentityCommitErrorDisposition {
+    AuthoritativeReload,
+    FailFast,
+}
+
+fn classify_identity_commit_error(error: FdbError) -> IdentityCommitErrorDisposition {
+    if error.code() == NOT_COMMITTED_ERROR_CODE || error.is_maybe_committed() {
+        IdentityCommitErrorDisposition::AuthoritativeReload
+    } else {
+        IdentityCommitErrorDisposition::FailFast
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct IdentitySnapshot {
@@ -66,7 +81,12 @@ pub(super) async fn open_identity(
                     high_watermark: [0; REVISION_BYTES],
                     retention_floor: [0; REVISION_BYTES],
                 }),
-                Ok(Err(_)) => authoritative_reload(database, codec, cluster_id, deadline).await,
+                Ok(Err(error)) => match classify_identity_commit_error(*error) {
+                    IdentityCommitErrorDisposition::AuthoritativeReload => {
+                        authoritative_reload(database, codec, cluster_id, deadline).await
+                    }
+                    IdentityCommitErrorDisposition::FailFast => Err(provider_error()),
+                },
                 Err(_) => authoritative_reload(database, codec, cluster_id, deadline).await,
             }
         }
@@ -237,9 +257,13 @@ fn provider_error() -> StateStoreError {
 
 #[cfg(test)]
 mod tests {
+    use foundationdb::FdbError;
     use uuid::Uuid;
 
-    use super::{IdentityRead, decode_identity_values};
+    use super::{
+        IdentityCommitErrorDisposition, IdentityRead, classify_identity_commit_error,
+        decode_identity_values,
+    };
     use crate::state_store::StateStoreErrorKind;
     use crate::state_store::foundationdb::codec::KeyspaceCodec;
 
@@ -326,5 +350,27 @@ mod tests {
         )
         .expect_err("cluster mismatch must fail");
         assert_eq!(error.kind(), StateStoreErrorKind::InvalidConfiguration);
+    }
+
+    #[test]
+    fn identity_commit_error_classifier_only_reloads_ambiguous_outcomes() {
+        for code in [1020, 1021, 1039] {
+            assert_eq!(
+                classify_identity_commit_error(FdbError::from_code(code)),
+                IdentityCommitErrorDisposition::AuthoritativeReload,
+                "error code {code} must be resolved by an authoritative reload"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_commit_error_classifier_fails_fast_for_deterministic_errors() {
+        for code in [1007, 2006, 6000] {
+            assert_eq!(
+                classify_identity_commit_error(FdbError::from_code(code)),
+                IdentityCommitErrorDisposition::FailFast,
+                "error code {code} must fail before observing another actor's identity"
+            );
+        }
     }
 }
