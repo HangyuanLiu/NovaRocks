@@ -10081,7 +10081,7 @@ fn runtime_filter_transport_ingress_boundary_violations(
     const SERVICE_INJECTION_OWNER: &str = "src/service/grpc_server.rs";
     const TRANSPORT_OWNER: &str = "src/runtime_filter/port/transport.rs";
 
-    if source_rel == TRANSPORT_OWNER {
+    if source_rel == TRANSPORT_OWNER || rfd4_m2a_routing_source_may_use_envelope_kind(source_rel) {
         return Vec::new();
     }
 
@@ -10381,8 +10381,13 @@ fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> V
     let mut violations = canonical_dependencies
         .iter()
         .filter(|canonical| {
-            !runtime_filter_task4_exact_path_ledger(source_rel, canonical)
-                .unwrap_or_else(|| runtime_filter_path_is_allowlisted(canonical, &allowed_prefixes))
+            if rfd4_m2a_routing_source_may_use_envelope_kind(source_rel) {
+                !rfd4_m2a_routing_dependency_is_allowed(source_rel, canonical)
+            } else {
+                !runtime_filter_task4_exact_path_ledger(source_rel, canonical).unwrap_or_else(
+                    || runtime_filter_path_is_allowlisted(canonical, &allowed_prefixes),
+                )
+            }
         })
         .map(|canonical| format!("{source_rel}: {}", canonical.join("::")))
         .collect::<BTreeSet<_>>();
@@ -10390,8 +10395,13 @@ fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> V
         external_dependencies
             .iter()
             .filter(|path| {
-                !runtime_filter_task4_exact_path_ledger(source_rel, path)
-                    .unwrap_or_else(|| runtime_filter_path_is_allowlisted(path, &allowed_prefixes))
+                if rfd4_m2a_routing_source_may_use_envelope_kind(source_rel) {
+                    !rfd4_m2a_routing_dependency_is_allowed(source_rel, path)
+                } else {
+                    !runtime_filter_task4_exact_path_ledger(source_rel, path).unwrap_or_else(|| {
+                        runtime_filter_path_is_allowlisted(path, &allowed_prefixes)
+                    })
+                }
             })
             .map(|path| format!("{source_rel}: external {}", path.join("::"))),
     );
@@ -10493,6 +10503,9 @@ fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> V
 fn runtime_filter_runtime_dependency_allowlist(
     source_rel: &str,
 ) -> Option<Vec<&'static [&'static str]>> {
+    if rfd4_m2a_routing_source_may_use_envelope_kind(source_rel) {
+        return Some(Vec::new());
+    }
     let allowed: Vec<&'static [&'static str]> = match source_rel {
         "src/runtime_filter/core/mod.rs" => vec![],
         "src/runtime_filter/core/channel.rs" => vec![
@@ -15642,7 +15655,9 @@ fn runtime_filter_channel_service_boundaries_are_default_deny_and_harness_only()
         .into_iter()
         .filter_map(|path| {
             let source_rel = rel(&path);
-            if source_rel == transport_source {
+            if source_rel == transport_source
+                || rfd4_m2a_routing_source_may_use_envelope_kind(&source_rel)
+            {
                 return None;
             }
             let text = fs::read_to_string(path).expect("production source must be readable");
@@ -35165,6 +35180,817 @@ fn cgo_9c_encoder_maps_sealed_plan_without_semantic_repair() {
     );
 }
 
+const RFD4_M2A_ROUTING_BOUNDARY_SOURCES: [&str; 3] = [
+    "src/runtime_filter/port/routing.rs",
+    "src/runtime_filter/deployment/routing_shard.rs",
+    "src/runtime_filter/router/role_graph.rs",
+];
+
+fn rfd4_m2a_routing_source_may_use_envelope_kind(source_rel: &str) -> bool {
+    RFD4_M2A_ROUTING_BOUNDARY_SOURCES.contains(&source_rel)
+}
+
+fn rfd4_m2a_routing_source_inventory_violations(actual: &BTreeSet<String>) -> Vec<String> {
+    let expected = RFD4_M2A_ROUTING_BOUNDARY_SOURCES
+        .into_iter()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    expected
+        .difference(actual)
+        .map(|path| format!("missing exact RFD-4/M2A routing source {path}"))
+        .chain(
+            actual
+                .difference(&expected)
+                .map(|path| format!("unknown RFD-4/M2A routing source {path}")),
+        )
+        .collect()
+}
+
+fn rfd4_m2a_routing_source_is_in_inventory_scope(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let parent = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str());
+    matches!(
+        (parent, file_name),
+        (Some("port"), name) if name.starts_with("routing") && name.ends_with(".rs")
+    ) || matches!(
+        (parent, file_name),
+        (Some("deployment"), name) if name.starts_with("routing") && name.ends_with(".rs")
+    ) || matches!(
+        (parent, file_name),
+        (Some("router"), name)
+            if (name.starts_with("role_graph") || name.starts_with("routing"))
+                && name.ends_with(".rs")
+    )
+}
+
+fn rfd4_m2a_dependency_is_exact_member(
+    dependency: &[String],
+    owner: &[&str],
+    allowed_members: &[&str],
+) -> bool {
+    dependency.len() == owner.len() + 1
+        && dependency
+            .iter()
+            .zip(owner.iter())
+            .all(|(actual, expected)| actual == expected)
+        && dependency
+            .last()
+            .is_some_and(|member| allowed_members.contains(&member.as_str()))
+}
+
+fn rfd4_m2a_routing_dependency_is_allowed(source_rel: &str, dependency: &[String]) -> bool {
+    let std_prefixes: &[&[&str]] = match source_rel {
+        "src/runtime_filter/port/routing.rs" => &[&["std", "error"], &["std", "fmt"]],
+        "src/runtime_filter/deployment/routing_shard.rs" => &[],
+        "src/runtime_filter/router/role_graph.rs" => &[&["std", "sync", "Arc"]],
+        _ => return false,
+    };
+    if runtime_filter_path_is_allowlisted(dependency, std_prefixes) {
+        return true;
+    }
+
+    let exact_paths: &[&[&str]] = match source_rel {
+        "src/runtime_filter/port/routing.rs" => &[
+            &["std", "collections", "BTreeMap"],
+            &["std", "collections", "BTreeSet"],
+            &["crate", "common", "types", "UniqueId"],
+            &["crate", "runtime", "endpoint", "RuntimeEndpoint"],
+            &["crate", "runtime_filter", "model", "contract", "BindingId"],
+            &["crate", "runtime_filter", "model", "contract", "ChannelId"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "identity",
+                "DeploymentEpoch",
+            ],
+            &["crate", "runtime_filter", "port", "identity", "RouteEdgeId"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "identity",
+                "RuntimeFilterParticipantId",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "transport",
+                "RuntimeFilterEnvelopeKind",
+            ],
+        ],
+        "src/runtime_filter/deployment/routing_shard.rs" => &[
+            &["std", "collections", "BTreeMap"],
+            &["std", "collections", "BTreeSet"],
+            &["crate", "common", "types", "UniqueId"],
+            &["crate", "coordinator", "scheduler", "LiveBackendSnapshot"],
+            &["crate", "runtime", "endpoint", "RuntimeEndpoint"],
+            &[
+                "crate",
+                "runtime_filter",
+                "deployment",
+                "role_graph",
+                "ChannelRoleGraph",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "deployment",
+                "role_graph",
+                "RoleGraph",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "deployment",
+                "role_graph",
+                "RouteEdge",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "deployment",
+                "role_graph",
+                "RouteKind",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "deployment",
+                "BindingInstanceIndex",
+            ],
+            &["crate", "runtime_filter", "deployment", "DeploymentError"],
+            &[
+                "crate",
+                "runtime_filter",
+                "deployment",
+                "participant_id_for_backend",
+            ],
+            &["crate", "runtime_filter", "model", "contract", "BindingId"],
+            &["crate", "runtime_filter", "model", "contract", "ChannelId"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "identity",
+                "DeploymentEpoch",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "identity",
+                "RuntimeFilterParticipantId",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "routing",
+                "RuntimeFilterChannelRoutingView",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "routing",
+                "RuntimeFilterRouteEndpointView",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "routing",
+                "RuntimeFilterRoutePeer",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "routing",
+                "RuntimeFilterRouteRole",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "routing",
+                "RuntimeFilterRoutingEdgeView",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "routing",
+                "RuntimeFilterRoutingShard",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "transport",
+                "RuntimeFilterEnvelopeKind",
+            ],
+        ],
+        "src/runtime_filter/router/role_graph.rs" => &[
+            &["crate", "common", "types", "UniqueId"],
+            &["crate", "runtime_filter", "model", "contract", "BindingId"],
+            &["crate", "runtime_filter", "model", "contract", "ChannelId"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "identity",
+                "DeploymentEpoch",
+            ],
+            &["crate", "runtime_filter", "port", "identity", "RouteEdgeId"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "routing",
+                "RuntimeFilterChannelRoutingView",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "routing",
+                "RuntimeFilterDeliveryRouteIntent",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "routing",
+                "RuntimeFilterProducerRouteIntent",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "routing",
+                "RuntimeFilterRemoteRoute",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "routing",
+                "RuntimeFilterRouteContractError",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "routing",
+                "RuntimeFilterRouteDecision",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "routing",
+                "RuntimeFilterRoutePeer",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "routing",
+                "RuntimeFilterRouteRole",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "routing",
+                "RuntimeFilterRoutingEdgeView",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "routing",
+                "RuntimeFilterRoutingShard",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "transport",
+                "RuntimeFilterEnvelopeKind",
+            ],
+        ],
+        _ => return false,
+    };
+    if runtime_filter_path_is_exactly_allowlisted(dependency, exact_paths) {
+        return true;
+    }
+
+    match source_rel {
+        "src/runtime_filter/port/routing.rs" => rfd4_m2a_dependency_is_exact_member(
+            dependency,
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "transport",
+                "RuntimeFilterEnvelopeKind",
+            ],
+            &[
+                "Ack",
+                "Artifact",
+                "Contribution",
+                "ProducerClosed",
+                "Unavailable",
+            ],
+        ),
+        "src/runtime_filter/deployment/routing_shard.rs" => {
+            rfd4_m2a_dependency_is_exact_member(
+                dependency,
+                &["std", "collections", "BTreeMap"],
+                &["new"],
+            ) || rfd4_m2a_dependency_is_exact_member(
+                dependency,
+                &["std", "collections", "BTreeSet"],
+                &["from", "new"],
+            ) || rfd4_m2a_dependency_is_exact_member(
+                dependency,
+                &["crate", "runtime", "endpoint", "RuntimeEndpoint"],
+                &["from_socket_addr"],
+            ) || rfd4_m2a_dependency_is_exact_member(
+                dependency,
+                &["crate", "runtime_filter", "deployment", "DeploymentError"],
+                &[
+                    "AmbiguousProducerInstance",
+                    "DuplicateBackend",
+                    "DuplicateRouteEdge",
+                    "InvalidRoutingShard",
+                    "UnknownRouteParticipant",
+                ],
+            ) || rfd4_m2a_dependency_is_exact_member(
+                dependency,
+                &[
+                    "crate",
+                    "runtime_filter",
+                    "deployment",
+                    "role_graph",
+                    "RouteKind",
+                ],
+                &[
+                    "FromAggregator",
+                    "Loopback",
+                    "ReplicaDirect",
+                    "ToAggregator",
+                ],
+            ) || rfd4_m2a_dependency_is_exact_member(
+                dependency,
+                &[
+                    "crate",
+                    "runtime_filter",
+                    "port",
+                    "routing",
+                    "RuntimeFilterChannelRoutingView",
+                ],
+                &["new"],
+            ) || rfd4_m2a_dependency_is_exact_member(
+                dependency,
+                &[
+                    "crate",
+                    "runtime_filter",
+                    "port",
+                    "routing",
+                    "RuntimeFilterRouteEndpointView",
+                ],
+                &["new"],
+            ) || rfd4_m2a_dependency_is_exact_member(
+                dependency,
+                &[
+                    "crate",
+                    "runtime_filter",
+                    "port",
+                    "routing",
+                    "RuntimeFilterRoutePeer",
+                ],
+                &["Loopback", "Remote"],
+            ) || rfd4_m2a_dependency_is_exact_member(
+                dependency,
+                &[
+                    "crate",
+                    "runtime_filter",
+                    "port",
+                    "routing",
+                    "RuntimeFilterRouteRole",
+                ],
+                &["Aggregator", "Consumer", "Producer"],
+            ) || rfd4_m2a_dependency_is_exact_member(
+                dependency,
+                &[
+                    "crate",
+                    "runtime_filter",
+                    "port",
+                    "routing",
+                    "RuntimeFilterRoutingEdgeView",
+                ],
+                &["new"],
+            ) || rfd4_m2a_dependency_is_exact_member(
+                dependency,
+                &[
+                    "crate",
+                    "runtime_filter",
+                    "port",
+                    "routing",
+                    "RuntimeFilterRoutingShard",
+                ],
+                &["new"],
+            ) || rfd4_m2a_dependency_is_exact_member(
+                dependency,
+                &[
+                    "crate",
+                    "runtime_filter",
+                    "port",
+                    "transport",
+                    "RuntimeFilterEnvelopeKind",
+                ],
+                &["Artifact", "Contribution", "ProducerClosed", "Unavailable"],
+            )
+        }
+        "src/runtime_filter/router/role_graph.rs" => {
+            rfd4_m2a_dependency_is_exact_member(
+                dependency,
+                &[
+                    "crate",
+                    "runtime_filter",
+                    "port",
+                    "routing",
+                    "RuntimeFilterRemoteRoute",
+                ],
+                &["new"],
+            ) || rfd4_m2a_dependency_is_exact_member(
+                dependency,
+                &[
+                    "crate",
+                    "runtime_filter",
+                    "port",
+                    "routing",
+                    "RuntimeFilterRouteContractError",
+                ],
+                &[
+                    "AmbiguousInboundRoute",
+                    "AmbiguousOutboundRoute",
+                    "ForbiddenInboundKind",
+                    "ForbiddenOutboundKind",
+                    "InboundTargetMismatch",
+                    "StaleEpoch",
+                    "UnknownChannel",
+                    "UnknownInboundProducerRoute",
+                    "UnknownInboundRoute",
+                    "UnknownOutboundRoute",
+                    "UnknownProducerInstance",
+                    "UnknownSourceRole",
+                ],
+            ) || rfd4_m2a_dependency_is_exact_member(
+                dependency,
+                &[
+                    "crate",
+                    "runtime_filter",
+                    "port",
+                    "routing",
+                    "RuntimeFilterRouteDecision",
+                ],
+                &["new"],
+            ) || rfd4_m2a_dependency_is_exact_member(
+                dependency,
+                &[
+                    "crate",
+                    "runtime_filter",
+                    "port",
+                    "routing",
+                    "RuntimeFilterRoutePeer",
+                ],
+                &["Loopback", "Remote"],
+            ) || rfd4_m2a_dependency_is_exact_member(
+                dependency,
+                &[
+                    "crate",
+                    "runtime_filter",
+                    "port",
+                    "routing",
+                    "RuntimeFilterRouteRole",
+                ],
+                &["Aggregator", "Producer"],
+            ) || rfd4_m2a_dependency_is_exact_member(
+                dependency,
+                &[
+                    "crate",
+                    "runtime_filter",
+                    "port",
+                    "transport",
+                    "RuntimeFilterEnvelopeKind",
+                ],
+                &["Artifact", "Contribution", "ProducerClosed", "Unavailable"],
+            )
+        }
+        _ => false,
+    }
+}
+
+fn rfd4_m2a_has_forbidden_source_indirection(production: &str) -> bool {
+    let tokens = rust_use_tokens(production);
+    tokens.windows(3).any(|window| {
+        window[0] == "include" && window[1] == "!" && matches!(window[2].as_str(), "(" | "[" | "{")
+    }) || tokens
+        .windows(2)
+        .any(|window| window[0] == "path" && window[1] == "=")
+}
+
+fn rfd4_m2a_has_envelope_kind_alias(production: &str) -> bool {
+    fn use_tree_renames_envelope_kind(tree: &syn::UseTree) -> bool {
+        match tree {
+            syn::UseTree::Group(group) => group.items.iter().any(use_tree_renames_envelope_kind),
+            syn::UseTree::Path(path) => use_tree_renames_envelope_kind(&path.tree),
+            syn::UseTree::Rename(rename) => rename.ident == "RuntimeFilterEnvelopeKind",
+            syn::UseTree::Glob(_) | syn::UseTree::Name(_) => false,
+        }
+    }
+
+    #[derive(Default)]
+    struct EnvelopeKindAliasAudit {
+        found: bool,
+    }
+
+    fn type_contains_envelope_kind(ty: &syn::Type) -> bool {
+        #[derive(Default)]
+        struct EnvelopeKindTypeAudit {
+            found: bool,
+        }
+
+        impl<'ast> syn::visit::Visit<'ast> for EnvelopeKindTypeAudit {
+            fn visit_path(&mut self, path: &'ast syn::Path) {
+                if path
+                    .segments
+                    .iter()
+                    .any(|segment| segment.ident == "RuntimeFilterEnvelopeKind")
+                {
+                    self.found = true;
+                }
+                syn::visit::visit_path(self, path);
+            }
+        }
+
+        let mut audit = EnvelopeKindTypeAudit::default();
+        syn::visit::Visit::visit_type(&mut audit, ty);
+        audit.found
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for EnvelopeKindAliasAudit {
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            if type_contains_envelope_kind(&item.ty) {
+                self.found = true;
+            }
+            syn::visit::visit_item_type(self, item);
+        }
+
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            if use_tree_renames_envelope_kind(&item.tree) {
+                self.found = true;
+            }
+            syn::visit::visit_item_use(self, item);
+        }
+    }
+
+    let Ok(file) = syn::parse_file(production) else {
+        return false;
+    };
+    let mut audit = EnvelopeKindAliasAudit::default();
+    syn::visit::Visit::visit_file(&mut audit, &file);
+    audit.found
+}
+
+fn rfd4_m2a_expr_contains_backend_identifier(expression: &syn::Expr) -> bool {
+    #[derive(Default)]
+    struct BackendIdentifierAudit {
+        found: bool,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for BackendIdentifierAudit {
+        fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+            if ident.to_string().to_ascii_lowercase().contains("backend") {
+                self.found = true;
+            }
+        }
+    }
+
+    let mut audit = BackendIdentifierAudit::default();
+    syn::visit::Visit::visit_expr(&mut audit, expression);
+    audit.found
+}
+
+fn rfd4_m2a_expr_is_backend_count(expression: &syn::Expr) -> bool {
+    fn ident_is_backend_count(ident: &syn::Ident) -> bool {
+        let ident = ident.to_string().to_ascii_lowercase();
+        ident.contains("backend")
+            && (ident.contains("count") || ident.contains("len") || ident.contains("num"))
+    }
+
+    match expression {
+        syn::Expr::Field(field) => matches!(
+            &field.member,
+            syn::Member::Named(ident) if ident_is_backend_count(ident)
+        ),
+        syn::Expr::Group(group) => rfd4_m2a_expr_is_backend_count(&group.expr),
+        syn::Expr::Paren(paren) => rfd4_m2a_expr_is_backend_count(&paren.expr),
+        syn::Expr::Path(path) => path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| ident_is_backend_count(&segment.ident)),
+        syn::Expr::MethodCall(call) => {
+            call.method == "len"
+                && call.args.is_empty()
+                && rfd4_m2a_expr_contains_backend_identifier(&call.receiver)
+        }
+        _ => false,
+    }
+}
+
+fn rfd4_m2a_expr_is_replica_redundancy_target(expression: &syn::Expr) -> bool {
+    match expression {
+        syn::Expr::Field(field) => matches!(
+            &field.member,
+            syn::Member::Named(ident) if ident == "replica_redundancy"
+        ),
+        syn::Expr::Group(group) => rfd4_m2a_expr_is_replica_redundancy_target(&group.expr),
+        syn::Expr::Paren(paren) => rfd4_m2a_expr_is_replica_redundancy_target(&paren.expr),
+        syn::Expr::Path(path) => path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "replica_redundancy"),
+        _ => false,
+    }
+}
+
+fn rfd4_m2a_has_fixed_three_backend_topology(production: &str) -> bool {
+    #[derive(Default)]
+    struct FixedTopologyAudit {
+        found: bool,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for FixedTopologyAudit {
+        fn visit_expr_binary(&mut self, expression: &'ast syn::ExprBinary) {
+            let is_comparison = matches!(
+                expression.op,
+                syn::BinOp::Eq(_)
+                    | syn::BinOp::Ne(_)
+                    | syn::BinOp::Lt(_)
+                    | syn::BinOp::Le(_)
+                    | syn::BinOp::Gt(_)
+                    | syn::BinOp::Ge(_)
+            );
+            if is_comparison
+                && ((rfd4_m2a_expr_is_backend_count(&expression.left)
+                    && runtime_filter_eval_const_u128(&expression.right) == Some(3))
+                    || (runtime_filter_eval_const_u128(&expression.left) == Some(3)
+                        && rfd4_m2a_expr_is_backend_count(&expression.right)))
+            {
+                self.found = true;
+            }
+            syn::visit::visit_expr_binary(self, expression);
+        }
+
+        fn visit_expr_assign(&mut self, expression: &'ast syn::ExprAssign) {
+            if rfd4_m2a_expr_is_replica_redundancy_target(&expression.left)
+                && runtime_filter_eval_const_u128(&expression.right) == Some(3)
+            {
+                self.found = true;
+            }
+            syn::visit::visit_expr_assign(self, expression);
+        }
+
+        fn visit_expr_struct(&mut self, expression: &'ast syn::ExprStruct) {
+            if expression.fields.iter().any(|field| {
+                matches!(
+                    &field.member,
+                    syn::Member::Named(ident) if ident == "replica_redundancy"
+                ) && runtime_filter_eval_const_u128(&field.expr) == Some(3)
+            }) {
+                self.found = true;
+            }
+            syn::visit::visit_expr_struct(self, expression);
+        }
+    }
+
+    let Ok(file) = syn::parse_file(production) else {
+        return false;
+    };
+    let mut audit = FixedTopologyAudit::default();
+    syn::visit::Visit::visit_file(&mut audit, &file);
+    audit.found
+}
+
+fn rfd4_m2a_routing_boundary_violations(source_rel: &str, text: &str) -> Vec<String> {
+    if !rfd4_m2a_routing_source_may_use_envelope_kind(source_rel) {
+        return vec![format!("unknown RFD-4/M2A routing source {source_rel}")];
+    }
+    let production = rust_sanitized_production_text(text);
+    if let Err(error) = syn::parse_file(text) {
+        return vec![format!(
+            "{source_rel}: RFD-4/M2A source must parse: {error}"
+        )];
+    }
+
+    let local_roots = runtime_filter_runtime_local_roots(text);
+    let dependencies = rust_production_canonical_paths(text, source_rel)
+        .into_iter()
+        .map(|canonical| runtime_filter_dependency_path(&canonical, source_rel))
+        .filter(|canonical| {
+            !canonical
+                .first()
+                .is_some_and(|root| local_roots.contains(root))
+                && !runtime_filter_path_is_rust_prelude(canonical)
+        })
+        .chain(runtime_filter_runtime_extern_crates(text))
+        .collect::<BTreeSet<_>>();
+    let mut violations = dependencies
+        .iter()
+        .filter(|dependency| {
+            dependency.iter().any(|segment| segment == "*")
+                || !rfd4_m2a_routing_dependency_is_allowed(source_rel, dependency)
+        })
+        .map(|dependency| {
+            format!(
+                "{source_rel}: forbidden RFD-4/M2A dependency {}",
+                dependency.join("::")
+            )
+        })
+        .collect::<BTreeSet<_>>();
+
+    if rfd4_m2a_has_forbidden_source_indirection(&production) {
+        violations.insert(format!(
+            "{source_rel}: routing boundaries forbid #[path] and include! indirection"
+        ));
+    }
+    if rfd4_m2a_has_envelope_kind_alias(&production) {
+        violations.insert(format!(
+            "{source_rel}: RuntimeFilterEnvelopeKind aliases are forbidden"
+        ));
+    }
+    for forbidden in [
+        "Join",
+        "TopN",
+        "Aggregate",
+        "Bloom",
+        "Bitset",
+        "RangeArtifact",
+        "is_partial",
+        "compat",
+    ] {
+        if rust_use_tokens(&production)
+            .iter()
+            .any(|token| token == forbidden)
+        {
+            violations.insert(format!(
+                "{source_rel}: forbidden payload or compatibility vocabulary {forbidden}"
+            ));
+        }
+    }
+
+    if source_rel == "src/runtime_filter/deployment/routing_shard.rs" {
+        if rfd4_m2a_has_fixed_three_backend_topology(&production) {
+            violations.insert(format!(
+                "{source_rel}: routing projection must not hard-code a three-backend topology"
+            ));
+        }
+        match runtime_filter_function_tokens(&production, "route_roles_and_kinds") {
+            Some(route_tokens)
+                if route_tokens
+                    .windows(3)
+                    .any(|window| window == ["RuntimeFilterEnvelopeKind", "::", "Ack"]) =>
+            {
+                violations.insert(format!(
+                    "{source_rel}: route kind matrix must allow Ack zero times"
+                ));
+            }
+            Some(_) => {}
+            None => {
+                violations.insert(format!(
+                    "{source_rel}: route kind matrix owner route_roles_and_kinds is missing"
+                ));
+            }
+        }
+    }
+
+    violations.into_iter().collect()
+}
+
 #[test]
 fn rfd2_deployment_module_stays_a_leaf() {
     // RFD-2's DeploymentCompiler consumes a SchedulingPlan; it must NOT rebuild a
@@ -35204,6 +36030,255 @@ fn rfd2_deployment_module_stays_a_leaf() {
             );
         }
     }
+}
+
+#[test]
+fn rfd4_m2a_routing_shard_and_router_keep_topology_payload_and_service_boundaries() {
+    let repo = Path::new(manifest_dir());
+    let actual_sources = rs_files(&repo.join("src/runtime_filter"))
+        .into_iter()
+        .filter(|path| rfd4_m2a_routing_source_is_in_inventory_scope(path))
+        .map(|path| rel(&path))
+        .collect::<BTreeSet<_>>();
+    let mut violations = rfd4_m2a_routing_source_inventory_violations(&actual_sources);
+    for source_rel in RFD4_M2A_ROUTING_BOUNDARY_SOURCES {
+        let source_path = repo.join(source_rel);
+        assert!(
+            source_path.is_file(),
+            "RFD-4/M2A source inventory requires {source_rel}"
+        );
+        let text = fs::read_to_string(source_path).expect("RFD-4/M2A source must be readable");
+        violations.extend(rfd4_m2a_routing_boundary_violations(source_rel, &text));
+    }
+    assert!(
+        violations.is_empty(),
+        "RFD-4/M2A routing boundaries must be exact and default-deny:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn rfd4_m2a_routing_boundary_detector_rejects_import_alias_reexport_and_path_bypasses() {
+    let source_rel = "src/runtime_filter/router/role_graph.rs";
+    for source in [
+        "use crate::runtime_filter::service::RuntimeFilterService;",
+        "use crate::runtime_filter::service::RuntimeFilterService as HiddenService;",
+        "pub use crate::runtime_filter::deployment::compiler as HiddenCompiler;",
+        "fn leak() { let _ = crate::service::grpc_client::GrpcClient::new(); }",
+        "use crate::proto as wire; fn leak() { let _ = wire::runtime_filter::Envelope::default(); }",
+        "extern crate tonic;",
+        "use crate::runtime_filter::port::routing::*;",
+        "use crate::runtime_filter::port::transport::RuntimeFilterEnvelope;",
+        "use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeIngress;",
+        "#[path = \"../../service/mod.rs\"] mod hidden;",
+        "include!(\"../../service/mod.rs\");",
+    ] {
+        assert!(
+            !rfd4_m2a_routing_boundary_violations(source_rel, source).is_empty(),
+            "RFD-4/M2A detector must reject production bypass: {source}"
+        );
+    }
+    assert!(
+        !runtime_filter_transport_ingress_boundary_violations(
+            "src/service/grpc_client.rs",
+            "use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeKind;",
+        )
+        .is_empty(),
+        "RuntimeFilterEnvelopeKind is exempt only for the three exact M2A routing owners"
+    );
+}
+
+#[test]
+fn rfd4_m2a_routing_boundary_detector_ignores_definite_cfg_test_fixtures() {
+    let source = r#"
+use std::sync::Arc;
+
+struct RoleRouter {
+    shard: Arc<()>,
+}
+
+#[cfg(test)]
+use crate::coordinator::scheduler::LiveBackendSnapshot;
+#[cfg(test)]
+pub use crate::runtime_filter::deployment::compiler as HiddenCompiler;
+#[cfg(test)]
+fn fixture() {
+    let _ = crate::service::grpc_client::GrpcClient::new();
+}
+#[cfg(test)]
+extern crate tonic;
+
+#[cfg(test)]
+mod tests {
+    use crate::runtime_filter::deployment::routing_shard::project_routing_shards;
+}
+"#;
+    let violations =
+        rfd4_m2a_routing_boundary_violations("src/runtime_filter/router/role_graph.rs", source);
+    assert!(
+        violations.is_empty(),
+        "definite cfg(test) projector and scheduler fixtures must not pollute production dependencies: {violations:?}"
+    );
+}
+
+#[test]
+fn rfd4_m2a_routing_boundary_detector_rejects_unknown_sources_and_inventory_drift() {
+    for path in [
+        "src/runtime_filter/deployment/routing.rs",
+        "src/runtime_filter/router/role_graph_shadow.rs",
+        "src/runtime_filter/router/routing_shadow.rs",
+    ] {
+        assert!(
+            rfd4_m2a_routing_source_is_in_inventory_scope(Path::new(path)),
+            "future Router routing owners must enter the exact inventory: {path}"
+        );
+    }
+
+    assert!(
+        !rfd4_m2a_routing_boundary_violations(
+            "src/runtime_filter/deployment/routing_shadow.rs",
+            "use std::collections::BTreeMap;",
+        )
+        .is_empty(),
+        "an unknown routing source must be default-denied"
+    );
+
+    let mut inventory = RFD4_M2A_ROUTING_BOUNDARY_SOURCES
+        .into_iter()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    assert!(rfd4_m2a_routing_source_inventory_violations(&inventory).is_empty());
+    inventory.insert("src/runtime_filter/deployment/routing_shadow.rs".to_string());
+    assert!(
+        !rfd4_m2a_routing_source_inventory_violations(&inventory).is_empty(),
+        "an unknown routing source must fail the exact inventory"
+    );
+}
+
+#[test]
+fn rfd4_m2a_routing_boundary_detector_rejects_future_model_contract_children() {
+    for source_rel in RFD4_M2A_ROUTING_BOUNDARY_SOURCES {
+        let source = if source_rel == "src/runtime_filter/deployment/routing_shard.rs" {
+            "use crate::runtime_filter::model::contract::ArtifactCapability;\n\
+             fn route_roles_and_kinds() {}"
+        } else {
+            "use crate::runtime_filter::model::contract::ArtifactCapability;"
+        };
+        let violations = rfd4_m2a_routing_boundary_violations(source_rel, source);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("ArtifactCapability")),
+            "{source_rel} must default-deny model semantic contracts: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn rfd4_m2a_routing_boundary_detector_rejects_nondeterministic_collections() {
+    for (source_rel, source) in [
+        (
+            "src/runtime_filter/port/routing.rs",
+            "use std::collections::HashMap;",
+        ),
+        (
+            "src/runtime_filter/deployment/routing_shard.rs",
+            "use std::collections::HashSet;\nfn route_roles_and_kinds() {}",
+        ),
+    ] {
+        let violations = rfd4_m2a_routing_boundary_violations(source_rel, source);
+        assert!(
+            !violations.is_empty(),
+            "{source_rel} must default-deny nondeterministic collections: {source}"
+        );
+    }
+}
+
+#[test]
+fn rfd4_m2a_routing_boundary_detector_allows_unrelated_type_aliases() {
+    let source = "use std::collections::BTreeMap;\ntype EdgeMap = BTreeMap<u8, u8>;";
+    let violations =
+        rfd4_m2a_routing_boundary_violations("src/runtime_filter/port/routing.rs", source);
+    assert!(
+        violations.is_empty(),
+        "unrelated routing-local type aliases must not be mistaken for EnvelopeKind aliases: {violations:?}"
+    );
+}
+
+#[test]
+fn rfd4_m2a_routing_boundary_detector_rejects_payload_ack_and_fixed_topology_semantics() {
+    for forbidden in [
+        "Join",
+        "TopN",
+        "Aggregate",
+        "Bloom",
+        "Bitset",
+        "RangeArtifact",
+        "is_partial",
+        "compat",
+    ] {
+        let source = format!("struct {forbidden};");
+        let violations = rfd4_m2a_routing_boundary_violations(
+            "src/runtime_filter/router/role_graph.rs",
+            &source,
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(forbidden)),
+            "forbidden semantic vocabulary `{forbidden}` must be rejected: {violations:?}"
+        );
+    }
+
+    for source in [
+        "fn route_roles_and_kinds() { let _ = RuntimeFilterEnvelopeKind::Ack; }",
+        "use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeKind::Ack as A;\n\
+         fn route_roles_and_kinds() { let _ = A; }",
+        "use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeKind;\n\
+         type K = RuntimeFilterEnvelopeKind;\n\
+         fn route_roles_and_kinds() { let _ = K::Ack; }",
+        "use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeKind as K;\n\
+         fn route_roles_and_kinds() { let _ = K::Ack; }",
+        "use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeKind;\n\
+         type Identity<T> = T;\n\
+         type K = Identity<RuntimeFilterEnvelopeKind>;\n\
+         fn route_roles_and_kinds() { let _ = K::Ack; }",
+        "fn route_roles_and_kinds() {} fn project(backends: &[u8]) { if backends.len() == 3 {} }",
+        "fn route_roles_and_kinds() {} fn project(backends: &[u8]) { if 3 == backends.len() {} }",
+        "fn route_roles_and_kinds() {} fn project(backends: &[u8]) { if backends.len() != 3 {} }",
+        "fn route_roles_and_kinds() {} fn project(backends: &[u8]) { let backend_count = backends.len(); if backend_count == 3 {} }",
+        "fn route_roles_and_kinds() {} struct Policy { replica_redundancy: u8 } fn project() { let _ = Policy { replica_redundancy: 3 }; }",
+        "fn route_roles_and_kinds() {} struct Policy { replica_redundancy: u8 } fn project(mut policy: Policy) { policy.replica_redundancy = 3; }",
+    ] {
+        assert!(
+            !rfd4_m2a_routing_boundary_violations(
+                "src/runtime_filter/deployment/routing_shard.rs",
+                source,
+            )
+            .is_empty(),
+            "Ack and fixed three-backend routing semantics must be rejected: {source}"
+        );
+    }
+
+    let unrelated_three = "fn route_roles_and_kinds() {} fn classify(x: u8) -> bool { x == 3 }";
+    let violations = rfd4_m2a_routing_boundary_violations(
+        "src/runtime_filter/deployment/routing_shard.rs",
+        unrelated_three,
+    );
+    assert!(
+        violations.is_empty(),
+        "an unrelated comparison with three must not be treated as fixed backend topology: {violations:?}"
+    );
+
+    let unrelated_backend_value = "fn route_roles_and_kinds() {} fn classify(backend_weight: u8) -> bool { backend_weight == 3 }";
+    let violations = rfd4_m2a_routing_boundary_violations(
+        "src/runtime_filter/deployment/routing_shard.rs",
+        unrelated_backend_value,
+    );
+    assert!(
+        violations.is_empty(),
+        "a backend-named value that is not a count must stay outside the topology detector: {violations:?}"
+    );
 }
 
 #[derive(Default)]

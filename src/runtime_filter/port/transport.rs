@@ -24,7 +24,7 @@ use crate::runtime_filter::port::identity::{
     DeploymentEpoch, PartitionId, ProducerSequence, RouteEdgeId,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum RuntimeFilterEnvelopeKind {
     Contribution,
     Artifact,

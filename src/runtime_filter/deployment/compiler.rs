@@ -23,6 +23,7 @@ use crate::runtime_filter::deployment::role_graph::{
     ChannelRoleInputs, ConsumerPlacement, ProducerPlacement, RoleGraph, RouteEdgeAllocator,
     build_channel_role_graph,
 };
+use crate::runtime_filter::deployment::routing_shard::project_routing_shards;
 use crate::runtime_filter::deployment::shard::{
     ChannelProjectionSpec, ConsumerBindingFacts, project_install_views,
 };
@@ -31,6 +32,7 @@ use crate::runtime_filter::deployment::wait_for::{
 };
 use crate::runtime_filter::deployment::{
     DeploymentError, RuntimeFilterDeploymentPlan, RuntimeFilterDeploymentPolicy,
+    participant_id_for_backend,
 };
 use crate::runtime_filter::model::contract::{
     BindingId, ChannelId, CompletionRequirement, CoverageWitnessId,
@@ -47,7 +49,8 @@ use crate::sql::planner::distributed::{FragmentEdge, FragmentId};
 /// Pipeline: `graph.validate()` -> build the fragment `ExecutionDependencyGraph`
 /// -> resolve per-(channel,binding) participant placement -> reject
 /// `BlockingSnapshot` feedback cycles via `validate_wait_for` -> build each
-/// channel's role graph -> project loopback install views -> assemble the plan.
+/// channel's role graph -> project loopback install views and remote-aware
+/// routing shards under one epoch -> assemble the plan.
 ///
 /// Pure and deterministic: never mutates `scheduling`, iterates only
 /// `BTreeMap`/`BTreeSet`, and never hardcodes backend/replica counts (they are
@@ -71,7 +74,15 @@ pub(crate) fn compile(
     // 3. Resolve per-(channel,binding) participant placement + the expected
     // finst instances from the scheduling plan. `participant == backend_idx`,
     // checked against the live snapshot.
-    let known_backends: BTreeSet<usize> = backends.entries().iter().map(|(id, _)| *id).collect();
+    let mut known_backends = BTreeSet::new();
+    for (backend_idx, _) in backends.entries() {
+        let _ = participant_id_for_backend(*backend_idx)?;
+        if !known_backends.insert(*backend_idx) {
+            return Err(DeploymentError::DuplicateBackend {
+                backend_idx: *backend_idx,
+            });
+        }
+    }
     let mut instances: BTreeMap<
         (ChannelId, BindingId, RuntimeFilterParticipantId),
         BTreeSet<UniqueId>,
@@ -99,7 +110,7 @@ pub(crate) fn compile(
                     backend_idx: p.backend_idx,
                 });
             }
-            let participant = RuntimeFilterParticipantId::new(p.backend_idx as u32);
+            let participant = participant_id_for_backend(p.backend_idx)?;
             participants.insert(participant);
             instances
                 .entry((binding.channel_id, binding.binding_id, participant))
@@ -226,8 +237,8 @@ pub(crate) fn compile(
         );
     }
 
-    // 6. Project loopback install views (remote routes stay in `role_graph`
-    // for RFD-4 to consume).
+    // 6. Project loopback install views and remote-aware routing shards
+    // atomically under the same epoch.
     let install_views = project_install_views(
         epoch,
         &role_graph,
@@ -237,17 +248,18 @@ pub(crate) fn compile(
         policy.core_budget,
         policy.materialization,
     )?;
+    let routing_shards = project_routing_shards(epoch, &role_graph, &instances, backends)?;
 
-    let participants: BTreeSet<RuntimeFilterParticipantId> = backends
-        .entries()
-        .iter()
-        .map(|(id, _)| RuntimeFilterParticipantId::new(*id as u32))
-        .collect();
+    let participants = known_backends
+        .into_iter()
+        .map(participant_id_for_backend)
+        .collect::<Result<BTreeSet<_>, _>>()?;
 
     Ok(RuntimeFilterDeploymentPlan {
         epoch,
         participants,
         install_views,
+        routing_shards,
         role_graph,
     })
 }
@@ -261,6 +273,7 @@ mod tests {
     use super::*;
     use crate::coordinator::scheduler::FragmentInstancePlacement;
     use crate::runtime::endpoint::RuntimeEndpoint;
+    use crate::runtime_filter::deployment::role_graph::RouteKind;
     use crate::runtime_filter::model::contract::{
         ArtifactCapability, ConsumerActivation, ContributionKind, LateApplyGranularity, NullOrder,
         NullSemantics, OrderContract, OrderKeyContract, PlanFragmentId, PlanNodeId,
@@ -306,6 +319,10 @@ mod tests {
             runtime_filter_prober_params: BTreeMap::new(),
             per_exch_num_senders: BTreeMap::new(),
         }
+    }
+
+    fn pid(raw: u32) -> RuntimeFilterParticipantId {
+        RuntimeFilterParticipantId::new(raw)
     }
 
     fn edge(source: u32, target: u32) -> FragmentEdge {
@@ -478,6 +495,253 @@ mod tests {
         };
         requirement.capabilities = BTreeSet::from([ArtifactCapability::OrderedRange]);
         binding
+    }
+
+    fn deployment_policy(replica_redundancy: u32) -> RuntimeFilterDeploymentPolicy {
+        RuntimeFilterDeploymentPolicy {
+            core_budget: RuntimeFilterCoreBudget::new(1024),
+            replica_redundancy,
+            materialization: MaterializationPolicy::for_test(),
+        }
+    }
+
+    fn all_of_compiler_fixture() -> (
+        RuntimeFilterGraph,
+        SchedulingPlan,
+        Vec<FragmentEdge>,
+        LiveBackendSnapshot,
+        RuntimeFilterDeploymentPolicy,
+    ) {
+        let mut channel = channel_spec(5);
+        channel.availability_coverage =
+            Coverage::AllOf(vec![Coverage::Leaf(CoverageWitnessId::new(1))]);
+        channel.terminal_coverage =
+            Coverage::AllOf(vec![Coverage::Leaf(CoverageWitnessId::new(1))]);
+        let mut graph = RuntimeFilterGraph::default();
+        graph.insert_channel(channel).unwrap();
+        graph.insert_binding(producer_binding(10, 5, 2)).unwrap();
+        graph
+            .insert_binding(consumer_binding(
+                11,
+                5,
+                1,
+                ConsumerActivation::BlockingSnapshot,
+            ))
+            .unwrap();
+
+        let mut by_fragment = BTreeMap::new();
+        by_fragment.insert(
+            1u32,
+            vec![
+                placement(1, 0, 2, UniqueId { hi: 1, lo: 1 }),
+                placement(1, 1, 11, UniqueId { hi: 1, lo: 2 }),
+            ],
+        );
+        by_fragment.insert(
+            2u32,
+            vec![
+                placement(2, 0, 2, UniqueId { hi: 1, lo: 3 }),
+                placement(2, 1, 7, UniqueId { hi: 1, lo: 4 }),
+            ],
+        );
+        let scheduling = SchedulingPlan {
+            root_fragment_id: 1,
+            by_fragment,
+            root_finst_id: UniqueId { hi: 1, lo: 1 },
+            root_backend_idx: 2,
+        };
+        let backends = LiveBackendSnapshot::new(vec![
+            (2, "10.0.0.2:9060".parse().unwrap()),
+            (7, "10.0.0.7:9060".parse().unwrap()),
+            (11, "10.0.0.11:9060".parse().unwrap()),
+            (99, "10.0.0.99:9060".parse().unwrap()),
+        ]);
+        (
+            graph,
+            scheduling,
+            vec![edge(2, 1)],
+            backends,
+            deployment_policy(2),
+        )
+    }
+
+    fn any_of_five_backend_compiler_fixture() -> (
+        RuntimeFilterGraph,
+        SchedulingPlan,
+        Vec<FragmentEdge>,
+        LiveBackendSnapshot,
+        RuntimeFilterDeploymentPolicy,
+    ) {
+        let mut channel = channel_spec(5);
+        channel.availability_coverage =
+            Coverage::AnyOf(vec![Coverage::Leaf(CoverageWitnessId::new(1))]);
+        channel.terminal_coverage =
+            Coverage::AnyOf(vec![Coverage::Leaf(CoverageWitnessId::new(1))]);
+        let mut graph = RuntimeFilterGraph::default();
+        graph.insert_channel(channel).unwrap();
+        graph.insert_binding(producer_binding(10, 5, 2)).unwrap();
+        graph
+            .insert_binding(consumer_binding(
+                11,
+                5,
+                1,
+                ConsumerActivation::NonBlockingLive {
+                    late_apply: LateApplyGranularity::Batch,
+                },
+            ))
+            .unwrap();
+
+        let producer_placements = (0..5)
+            .map(|backend_idx| {
+                placement(
+                    2,
+                    backend_idx,
+                    backend_idx,
+                    UniqueId {
+                        hi: 2,
+                        lo: backend_idx as i64,
+                    },
+                )
+            })
+            .collect();
+        let mut by_fragment = BTreeMap::new();
+        by_fragment.insert(1u32, vec![placement(1, 0, 4, UniqueId { hi: 1, lo: 1 })]);
+        by_fragment.insert(2u32, producer_placements);
+        let scheduling = SchedulingPlan {
+            root_fragment_id: 1,
+            by_fragment,
+            root_finst_id: UniqueId { hi: 1, lo: 1 },
+            root_backend_idx: 4,
+        };
+        let backends = LiveBackendSnapshot::new(
+            (0..5)
+                .map(|backend_idx| {
+                    (
+                        backend_idx,
+                        format!("10.0.0.{}:9060", backend_idx + 1).parse().unwrap(),
+                    )
+                })
+                .collect(),
+        );
+        (
+            graph,
+            scheduling,
+            vec![edge(2, 1)],
+            backends,
+            deployment_policy(1),
+        )
+    }
+
+    #[test]
+    fn compiler_atomically_returns_install_and_routing_views_with_same_epoch() {
+        let (graph, scheduling, edges, backends, policy) = all_of_compiler_fixture();
+        let plan = compile(
+            &graph,
+            &scheduling,
+            &edges,
+            &backends,
+            &policy,
+            DeploymentEpoch::new(9),
+        )
+        .unwrap();
+        assert!(!plan.install_views.is_empty());
+        assert!(!plan.routing_shards.is_empty());
+        for shard in plan.routing_shards.values() {
+            assert_eq!(shard.deployment_epoch(), plan.epoch);
+        }
+        for view in plan.install_views.values() {
+            assert_eq!(view.epoch(), plan.epoch);
+        }
+    }
+
+    #[test]
+    fn compiler_any_of_fanout_follows_replica_redundancy_without_hardcoded_three() {
+        for redundancy in [1, 2, 4] {
+            let (graph, scheduling, edges, backends, mut policy) =
+                any_of_five_backend_compiler_fixture();
+            policy.replica_redundancy = redundancy;
+            let plan = compile(
+                &graph,
+                &scheduling,
+                &edges,
+                &backends,
+                &policy,
+                DeploymentEpoch::new(9),
+            )
+            .unwrap();
+            let replica_routes = plan.role_graph.channels[&ChannelId::new(5)]
+                .routes
+                .iter()
+                .filter(|route| route.kind == RouteKind::ReplicaDirect)
+                .count();
+            let projected_outbound_routes = plan
+                .routing_shards
+                .values()
+                .filter_map(|shard| shard.channel(ChannelId::new(5)))
+                .map(|channel| channel.outbound_edges().len())
+                .sum::<usize>();
+            assert_eq!(replica_routes, redundancy as usize);
+            assert_eq!(projected_outbound_routes, replica_routes);
+        }
+    }
+
+    #[test]
+    fn compiler_does_not_emit_empty_routing_shard_for_roleless_backend() {
+        let (graph, scheduling, edges, backends, policy) = all_of_compiler_fixture();
+        let plan = compile(
+            &graph,
+            &scheduling,
+            &edges,
+            &backends,
+            &policy,
+            DeploymentEpoch::new(9),
+        )
+        .unwrap();
+        assert!(!plan.routing_shards.contains_key(&pid(99)));
+    }
+
+    #[test]
+    fn compiler_rejects_duplicate_live_backend_ids_before_placement_projection() {
+        let (graph, scheduling, edges, _, policy) = all_of_compiler_fixture();
+        let backends = LiveBackendSnapshot::new(vec![
+            (7, "10.0.0.7:9060".parse().unwrap()),
+            (7, "10.0.0.8:9060".parse().unwrap()),
+        ]);
+        assert!(matches!(
+            compile(
+                &graph,
+                &scheduling,
+                &edges,
+                &backends,
+                &policy,
+                DeploymentEpoch::new(9),
+            ),
+            Err(DeploymentError::DuplicateBackend { backend_idx: 7 })
+        ));
+    }
+
+    #[test]
+    fn compiler_rejects_backend_id_out_of_range_before_placement_projection() {
+        let backend_idx =
+            usize::try_from(u64::from(u32::MAX) + 1).expect("64-bit backend identity");
+        let (graph, scheduling, edges, _, policy) = all_of_compiler_fixture();
+        let backends = LiveBackendSnapshot::new(vec![
+            (0, "10.0.0.1:9060".parse().unwrap()),
+            (backend_idx, "10.0.0.2:9060".parse().unwrap()),
+        ]);
+        assert!(matches!(
+            compile(
+                &graph,
+                &scheduling,
+                &edges,
+                &backends,
+                &policy,
+                DeploymentEpoch::new(9),
+            ),
+            Err(DeploymentError::BackendIdOutOfRange {
+                backend_idx: rejected
+            }) if rejected == backend_idx
+        ));
     }
 
     #[test]
