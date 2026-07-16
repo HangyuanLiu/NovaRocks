@@ -9937,7 +9937,7 @@ fn production_cfg_requires_test(attributes: &[syn::Attribute]) -> bool {
 fn production_crate_self_alias_violations(source_rel: &str, text: &str) -> Vec<String> {
     #[derive(Default)]
     struct ExternSelfAudit {
-        aliases: Vec<String>,
+        findings: Vec<String>,
     }
     impl<'ast> syn::visit::Visit<'ast> for ExternSelfAudit {
         fn visit_item(&mut self, item: &'ast syn::Item) {
@@ -10012,27 +10012,67 @@ fn production_crate_self_alias_violations(source_rel: &str, text: &str) -> Vec<S
 
         fn visit_item_extern_crate(&mut self, extern_crate: &'ast syn::ItemExternCrate) {
             if extern_crate.ident.to_string() == "self" {
-                self.aliases.push(
-                    extern_crate
-                        .rename
-                        .as_ref()
-                        .map_or_else(|| "self".to_string(), |(_, alias)| alias.to_string()),
-                );
+                let alias = extern_crate
+                    .rename
+                    .as_ref()
+                    .map_or_else(|| "self".to_string(), |(_, alias)| alias.to_string());
+                self.findings
+                    .push(format!("`extern crate self as {alias}`"));
             }
+        }
+
+        fn visit_macro(&mut self, item: &'ast syn::Macro) {
+            fn contains_extern_crate(mut cursor: syn::buffer::Cursor<'_>) -> bool {
+                let mut previous_was_extern = false;
+                while !cursor.eof() {
+                    if let Some((inside, _, _, rest)) = cursor.any_group() {
+                        if contains_extern_crate(inside) {
+                            return true;
+                        }
+                        previous_was_extern = false;
+                        cursor = rest;
+                    } else if let Some((ident, rest)) = cursor.ident() {
+                        let ident = ident.to_string();
+                        if previous_was_extern && ident == "crate" {
+                            return true;
+                        }
+                        previous_was_extern = ident == "extern";
+                        cursor = rest;
+                    } else if let Some((_, rest)) = cursor.token_tree() {
+                        previous_was_extern = false;
+                        cursor = rest;
+                    } else {
+                        break;
+                    }
+                }
+                false
+            }
+
+            let tokens = syn::buffer::TokenBuffer::new2(item.tokens.clone());
+            if contains_extern_crate(tokens.begin()) {
+                self.findings
+                    .push("production macro tokens containing `extern crate`".to_string());
+            }
+            syn::visit::visit_macro(self, item);
         }
     }
 
-    let Ok(file) = syn::parse_file(text) else {
-        return Vec::new();
+    let file = match syn::parse_file(text) {
+        Ok(file) => file,
+        Err(error) => {
+            return vec![format!(
+                "{source_rel}: production Rust source must parse for canonical crate-root auditing: {error}"
+            )];
+        }
     };
     let mut audit = ExternSelfAudit::default();
     syn::visit::Visit::visit_file(&mut audit, &file);
     audit
-        .aliases
+        .findings
         .into_iter()
-        .map(|alias| {
+        .map(|finding| {
             format!(
-                "{source_rel}: production Rust sources must use canonical `crate::` paths, not `extern crate self as {alias}`"
+                "{source_rel}: production Rust sources must use canonical `crate::` paths, not {finding}"
             )
         })
         .collect()
@@ -16887,6 +16927,34 @@ fn assert_production_sources_require_the_canonical_crate_root() {
             "src/service/unknown_runtime_filter_adapter.rs",
             "fn leak() { #[cfg_attr(test, allow(dead_code))] { extern crate self as root; } }",
         ),
+        (
+            "src/service/unknown_runtime_filter_adapter.rs",
+            "macro_rules! alias_self { ($name:ident) => { extern crate self as $name; } } alias_self!(root);",
+        ),
+        (
+            "src/service/unknown_runtime_filter_adapter.rs",
+            "macro_rules! alias_crate { ($target:ident) => { extern crate $target as root; } } alias_crate!(self);",
+        ),
+        (
+            "src/service/unknown_runtime_filter_adapter.rs",
+            "mod nested { macro_rules! alias_self { ($name:ident) => { extern crate self as $name; } } }",
+        ),
+        (
+            "src/service/unknown_runtime_filter_adapter.rs",
+            "fn nested() { macro_rules! alias_self { ($name:ident) => { extern crate self as $name; } } }",
+        ),
+        (
+            "src/service/unknown_runtime_filter_adapter.rs",
+            "quote! { nested { extern crate self as root; } }",
+        ),
+        (
+            "src/service/unknown_runtime_filter_adapter.rs",
+            "#[cfg(any(test, feature = \"compat\"))] quote! { extern crate self as root; }",
+        ),
+        (
+            "src/service/unknown_runtime_filter_adapter.rs",
+            "#[cfg(any(test, feature = \"compat\"))] macro_rules! alias_self { ($name:ident) => { extern crate self as $name; } }",
+        ),
     ] {
         assert!(
             !production_crate_self_alias_violations(source_rel, source).is_empty(),
@@ -16902,6 +16970,11 @@ fn assert_production_sources_require_the_canonical_crate_root() {
         "trait T { #[cfg_attr(not(test), cfg(test))] fn fixture() { extern crate self as root; } }",
         "extern crate reqwest;",
         "extern crate reqwest as root;",
+        "macro_rules! ordinary { ($name:ident) => { fn $name() {} } } ordinary!(fixture);",
+        "const TEXT: &str = \"extern crate self as root;\"; // extern crate self as comment",
+        "const RAW_TEXT: &str = r#\"extern crate self as root;\"#;",
+        "#[cfg(test)] macro_rules! alias_self { ($name:ident) => { extern crate self as $name; } }",
+        "#[cfg(test)] quote! { extern crate self as root; }",
     ] {
         assert!(
             production_crate_self_alias_violations(
@@ -16909,9 +16982,20 @@ fn assert_production_sources_require_the_canonical_crate_root() {
                 source,
             )
             .is_empty(),
-            "test-only aliases and ordinary external crates remain legal: {source}"
+            "test-only aliases and macros, ordinary macros, and external crates remain legal: {source}"
         );
     }
+
+    let parse_violations = production_crate_self_alias_violations(
+        "src/service/unknown_runtime_filter_adapter.rs",
+        "fn broken(",
+    );
+    assert_eq!(parse_violations.len(), 1);
+    assert!(
+        parse_violations[0].contains("src/service/unknown_runtime_filter_adapter.rs")
+            && parse_violations[0].contains("must parse"),
+        "parse failures must fail closed with their source path: {parse_violations:?}"
+    );
 }
 
 #[test]
