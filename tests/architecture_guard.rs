@@ -8876,35 +8876,70 @@ fn runtime_filter_task4_bare_path_inventory(source_rel: &str) -> Option<&'static
     match source_rel {
         "src/runtime_filter/service/m3b_tests.rs" => Some(
             r#"
+Applied
 Arc
 ArmableMemoryAccount
+ArtifactPublished
+Ascending
 AtomicBool
 AtomicUsize
 BindingId
 COMPARATOR_ALGORITHM_VERSION
 CONSUMER
+Cancelled
 ChannelId
 Clock
+Completed
+ConflictingReplay
+ConflictingTerminalSequence
 CoverageWitnessId
 CrossChannelTopKEvents
+DataType
+DegradedLogical
+Descending
+Duplicate
+Duration
 Err
 Events
+FIRST
 Fixture
 Fn
+Idle
 Instant
+Int64
+InvalidPartition
+Last
 LivePollOutcome
 LiveTerminal
 LogicalVersion
+LogicalVersionPublished
+LoopbackDelivered
 MemoryAccountError
 Mutex
 None
+NullOrder
 Ok
 Option
 OrderContract
+OrderKeyContract
+OrderedBound
+OrderedBoundLoosened
+OrderedContractMismatch
+OrderedGlobalTightened
+Ordering
 PRODUCER_A
 PRODUCER_B
+PartitionId
+PendingFinalSnapshot
+ProducerHandle
+ProducerPortKind
+ProducerPortMismatch
+ProducerSequence
+Published
+ResourceLimit
 Result
 RouteEdgeId
+RuntimeContractViolationKind
 RuntimeFilterChannelDeployment
 RuntimeFilterClock
 RuntimeFilterEvent
@@ -8914,12 +8949,26 @@ RuntimeFilterPolicyRequirement
 RuntimeFilterService
 RuntimeTopKSummaryContract
 Self
+SeqCst
+SequenceOutsideTerminalRange
 Some
+SortDirection
+StreamAcceptedNoGlobalChange
+SubmitOutcome
+TerminalNoop
 TopKReentrantEvents
+TopKStreamUpdated
 TopKSummary
+TopKSummaryApplied
+TopKSummaryEqual
+TopKSummaryRejected
 TopKSummaryRequirement
+TopKSummaryStale
+Unavailable
+UnavailableReason
 UniqueId
 Vec
+_
 accepted
 accepted_bytes
 accepted_summary
@@ -8928,28 +8977,45 @@ active
 after
 after_account
 after_live
+any
+applied
 artifact
 assert
 assert_eq
 assert_ne
 before
 before_account
+before_live
+before_producer
 binding
+binding_id
 bool
 bundle
 bytes
 channel
 channel_id
+close_partition
 comparator_digest_for_test
+conflict
+conflicting
 consumer
 contract
 contract_for_submit
+count
 coverage
+crate
+current
+data_type
+deadline
 deployment
 derive
 direct
+direct_again
 direct_deployment
+direct_live
 direct_witness
+direction
+done_rx
 done_tx
 drop
 entered_rx
@@ -8957,65 +9023,118 @@ entered_tx
 error
 event
 events
+filter
+fired
 first
 fixture
 fixture_with_account
+fragment_instance_id
+from_secs
 i64
 identity
+if
 installed_service_with_sink
 instance
+is_empty
+is_none
+iter
 keys
+kind
+latest_version
 live
 lo
+load
+lock
 matches
 memory
+nested_applied
 nested_first
+nested_published
 nested_second
+new
+now
+null_order
+open_producer
 outcome
+outer_applied
 outer_first
+outer_published
 outer_second
 outer_summary
+outer_tightened
+outside_terminal
 panic
+panicked
+partition_id
 pending
 pending_producer
 plan
+poll_after
+port
 position
 predicate
+preflight
+previous
 producer
 producer_a
 producer_b
+ptr_eq
+published
 range_contract
+range_value
+recv_timeout
+reentered
 rejected
 release_rx
 release_tx
 replay
+replayed
 requirement
+retained_before_failure
+runtime_filter
 runtime_order
 satisfied
 satisfied_producer
 second
 second_summary
 self
+sequence
 service
 sink
 start
+stream
 submit
+submit_summary
 submits
+subscription
 summary
 summary_producer
 terminal
 test
+tightened
 topk
+topk_again
 topk_contract
 topk_deployment
 topk_deployment_with_ids
+topk_live
+typed
 uid
+unauthorized
+unwrap
+unwrap_err
+upgrade
 usize
 value
 values
 vec
+version
 violation
+weak_dispatcher
+weak_registry
+weak_service
 witnesses
+wrong
 wrong_contract
 wrong_plan
 "#,
@@ -9023,80 +9142,134 @@ wrong_plan
         "src/runtime_filter/service/m3c_tests.rs" => Some(
             r#"
 AdversarialEvents
+Applied
 Arc
 ArmableMemoryAccount
+ArtifactKind
+ArtifactPublished
 AtomicBool
 AtomicUsize
 BindingId
 BlockingCallMemoryAccount
 CHANNEL
 CONSUMER
+Cancelled
+ChannelAction
+ChannelCancelled
+ChannelCompleted
 ChannelId
+ChannelUnavailable
 Clock
+Completed
+ConflictingReplay
+Contract
 ContributionIdentity
 CoverageWitnessId
 DeploymentEpoch
+Duplicate
+Duration
+EmptyDomain
 Err
 Events
+FIRST
 FinalDomainProducerAdapter
+FinalDomainRejectionKind
+FinalDomainShardAccepted
+FinalDomainShardDuplicate
+FinalDomainShardRejected
 Fn
 FrozenFinalDomainTestIssuer
+Idle
 Instant
+LivePollOutcome
+LiveTerminal
+LogicalVersion
+LoopbackDelivered
 MemoryAccountError
 Mutex
 None
 Ok
 Option
+Ordering
 PRODUCER_A
 PRODUCER_B
 PartitionId
+PendingGap
+ProducerSequence
+ResourceLimit
 Result
+RuntimeContractViolationKind
 RuntimeFilterChannelDeployment
 RuntimeFilterClock
 RuntimeFilterEvent
 RuntimeFilterEventSink
 RuntimeFilterMemoryAccount
+RuntimeFilterParticipantId
 RuntimeFilterPolicyRequirement
 RuntimeFilterService
 Self
+SeqCst
 Some
+SubmitOutcome
+TerminalNoop
+UnauthorizedBinding
+Unavailable
+UnavailableReason
 UniqueId
+ValueSet
 Vec
 Weak
+accepted
+artifacts
 assert
 assert_coordinate
 assert_eq
 assert_ne
 barrier
 binding
+binding_id
 block_call
 blocking_memory_account
 bool
+bundle
 bytes
 call
+calls
 cancel_entered
 cancel_input
 cancel_issuer
 cancel_memory
 cancel_producer
 cancel_release
+cancel_rx
 cancel_service
 cancel_started_rx
 cancel_started_tx
 cancel_thread
 cancel_tx
 cancel_worker
+cancelled
 cancelling_service
 channel
 channel_id
+channels
+clone
+close_outcome
+close_partition
 close_worker
 collecting
+complete
+complete_outcome
 complete_rx
 complete_tx
 complete_worker
+count
 coverage
+current
+deadline
 deployment_for
 derive
+dispatcher
 drop
 duplicate_entered
 duplicate_input
@@ -9104,59 +9277,92 @@ duplicate_issuer
 duplicate_memory
 duplicate_producer
 duplicate_release
+duplicate_rx
 duplicate_service
 duplicate_tx
 duplicate_worker
+empty_bundle
 empty_events
 empty_issuer
 empty_live
 empty_producer
 empty_service
+empty_terminal
 entered
 entered_rx
 entered_tx
 epoch
 event
+event_count
 events
+expect
+expected
 expected_losing_terminal
+filter
+fragment_instance_id
+from_secs
 frozen
 frozen_issuer
 i64
 identity
 input
+installation_for_dispatch
 installed_service
 installed_service_for
 instance
 instances
 invalid
+is_none
 issuer
 issuer_a
 issuer_a0
 issuer_a1
 issuer_b
+iter
 iteration
+kind
+late_valid
+latest_version
+len
 live
 lo
+load
 local_partition_count
+map
 matches
 memory
+memory_calls_before
+new
+next
 next_dispatch_order
+now
 observed
+observed_next_order
 observed_public
 open_drivers
 open_final
 open_final_with_partitions
 order
+outcome
+outcomes
 outer_cancel_producer
 outer_input
 outer_producer
+outer_rx
+outer_temporary_bytes
 outer_tx
 outer_worker
 panic
+panicked
+participant_id
 partition
+partition_id
+pending_action_count
 permutations
+poll_after
 position
 predicate
+previous
 producer
 producer_a
 producer_a0
@@ -9165,27 +9371,38 @@ producer_b
 producer_instances
 producers
 query_id
+reason
 recorded
+recv_timeout
+registry
 reject_blocked
 rejected
 rejected_producer
+rejection
 rejection_thread
 release
 release_rx
 release_tx
 resource_events
+resource_producer
 resource_service
 result_rx
 result_tx
+retained_after_inner
+retained_before
 self
 sequence
 service
+service_weak
 shard
 shard_at
 snapshot
+snapshot_before
+stream
 submission_index
 submissions
 terminal
+terminal_action
 terminal_case
 terminal_rx
 terminal_tx
@@ -9196,14 +9413,24 @@ typed
 u32
 u64
 uid
+unavailable
 unavailable_events
+unavailable_issuer
+unavailable_live
 unavailable_memory
+unavailable_producer
 unavailable_service
 unreachable
+unwrap
+unwrap_err
+upgrade
 usize
 valid_a
 values
+version
+weak
 witness
+wrong
 wrong_channel_issuer
 wrong_channel_service
 wrong_epoch_issuer
@@ -9218,6 +9445,25 @@ wrong_inputs
 #[derive(Default)]
 struct RuntimeFilterBarePathAudit {
     paths: BTreeSet<String>,
+}
+
+impl RuntimeFilterBarePathAudit {
+    fn visit_macro_tokens(&mut self, tokens: &str) {
+        for token in rust_source_tokens(tokens) {
+            if token
+                .text
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+                && token
+                    .text
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                self.paths.insert(token.text);
+            }
+        }
+    }
 }
 
 impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterBarePathAudit {
@@ -9240,6 +9486,7 @@ impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterBarePathAudit {
         {
             self.paths.insert(segment.ident.to_string());
         }
+        self.visit_macro_tokens(&item.tokens.to_string());
         syn::visit::visit_macro(self, item);
     }
 }
@@ -9555,7 +9802,25 @@ fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> V
             "LogicalSnapshot",
         ]
         .into_iter()
-        .any(|owner| production.contains(owner));
+        .any(|owner| {
+            if owner != "ValueDomainDelta" {
+                return production.contains(owner);
+            }
+            canonical.iter().any(|path| {
+                path.last().is_some_and(|segment| segment == owner)
+                    && !runtime_filter_path_is_exactly_allowlisted(
+                        path,
+                        &[&[
+                            "crate",
+                            "runtime_filter",
+                            "model",
+                            "contract",
+                            "ContributionKind",
+                            "ValueDomainDelta",
+                        ]],
+                    )
+            })
+        });
         let references_concrete_event_sink = production.contains("RegistryRuntimeFilterEventSink")
             || canonical.iter().any(|path| {
                 path.last()
@@ -15174,6 +15439,8 @@ fn runtime_filter_task4_glob_bare_path_inventory_rejects_future_children() {
             "fn use_future_glob_child() { FutureGlobChild::new(); }",
             "fn call_future_glob_child() { future_glob_child(); }",
             "fn match_future_glob_child(value: usize) { let FutureGlobChild { .. } = value; }",
+            "fn assert_future_glob_child() { assert!(future_glob_child()); }",
+            "fn matches_future_glob_child(value: usize) { assert!(matches!(value, FutureGlobChild)); }",
         ] {
             let invalid = format!("{source}\n{future_child}\n");
             assert!(
@@ -16071,6 +16338,10 @@ fn runtime_filter_harness_only_detector_rejects_operator_rpc_and_encoder_calls()
             "src/service/grpc_client.rs",
             "fn wire(subscription: &dyn BlockingSnapshotSubscription) { service.subscribe(subscription); }",
         ),
+        (
+            "src/sql/planner/distributed/runtime_filter.rs",
+            "use crate::runtime_filter::port::value_domain::ValueDomainDelta; fn wire(_: ValueDomainDelta) {}",
+        ),
     ] {
         assert!(
             !runtime_filter_runtime_boundary_violations(source_rel, source).is_empty(),
@@ -16143,6 +16414,25 @@ fn runtime_filter_harness_only_detector_rejects_alias_reexports_and_call_decoys(
         )
         .is_empty(),
         "an unrelated private type alias stays legal"
+    );
+}
+
+#[test]
+fn runtime_filter_harness_only_detector_allows_model_value_domain_contributions() {
+    let source = r#"
+use crate::runtime_filter::model::contract::ContributionKind;
+
+fn accepts(contribution: ContributionKind) -> bool {
+    matches!(contribution, ContributionKind::ValueDomainDelta)
+}
+"#;
+    assert!(
+        runtime_filter_runtime_boundary_violations(
+            "src/sql/planner/distributed/runtime_filter.rs",
+            source,
+        )
+        .is_empty(),
+        "model ContributionKind::ValueDomainDelta is not the data-plane ValueDomainDelta port"
     );
 }
 
