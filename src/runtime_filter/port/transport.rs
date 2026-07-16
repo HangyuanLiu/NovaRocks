@@ -142,14 +142,6 @@ impl ContributionRouteIdentity {
                 "fragment instance id",
             ));
         }
-        if partition_id.get() == 0 {
-            return Err(RuntimeFilterTransportError::zero_identity("partition id"));
-        }
-        if sequence.get() == 0 {
-            return Err(RuntimeFilterTransportError::zero_identity(
-                "producer sequence",
-            ));
-        }
         Ok(Self {
             producer_binding_id,
             fragment_instance_id,
@@ -537,7 +529,39 @@ mod tests {
     }
 
     #[test]
-    fn route_identities_reject_zero_coordinates() {
+    fn contribution_identity_preserves_zero_based_partition_and_sequence() {
+        let route_identity = RuntimeFilterRouteIdentity::contribution(
+            ContributionRouteIdentity::try_new(
+                BindingId::new(4),
+                UniqueId { hi: 5, lo: 6 },
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+            )
+            .unwrap(),
+        );
+        let contribution = envelope(
+            RuntimeFilterEnvelopeKind::Contribution,
+            route_identity.clone(),
+            b"payload",
+        );
+        let producer_closed = envelope(
+            RuntimeFilterEnvelopeKind::ProducerClosed,
+            route_identity.clone(),
+            b"",
+        );
+
+        for accepted in [contribution, producer_closed] {
+            let identity = accepted
+                .route_identity()
+                .as_contribution()
+                .expect("contribution route identity");
+            assert_eq!(identity.partition_id(), PartitionId::new(0));
+            assert_eq!(identity.sequence(), ProducerSequence::new(0));
+        }
+    }
+
+    #[test]
+    fn route_identities_reject_only_invalid_non_ordinal_coordinates() {
         for result in [
             ContributionRouteIdentity::try_new(
                 BindingId::new(0),
@@ -550,18 +574,6 @@ mod tests {
                 UniqueId { hi: 0, lo: 0 },
                 PartitionId::new(7),
                 ProducerSequence::new(8),
-            ),
-            ContributionRouteIdentity::try_new(
-                BindingId::new(4),
-                UniqueId { hi: 5, lo: 6 },
-                PartitionId::new(0),
-                ProducerSequence::new(8),
-            ),
-            ContributionRouteIdentity::try_new(
-                BindingId::new(4),
-                UniqueId { hi: 5, lo: 6 },
-                PartitionId::new(7),
-                ProducerSequence::new(0),
             ),
         ] {
             assert!(result.is_err());

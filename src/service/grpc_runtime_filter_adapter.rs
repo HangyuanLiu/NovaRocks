@@ -399,6 +399,35 @@ mod tests {
     }
 
     #[test]
+    fn zero_based_contribution_coordinates_reach_ingress_unchanged() {
+        for kind in [
+            proto::filter::RuntimeFilterEnvelopeKind::Contribution,
+            proto::filter::RuntimeFilterEnvelopeKind::ProducerClosed,
+        ] {
+            let ingress = Arc::new(RecordingIngress::new(RuntimeFilterIngressResult::accepted()));
+            let mut request = valid_wire_envelope(kind);
+            let Some(proto::filter::runtime_filter_route_identity::Value::Contribution(identity)) =
+                request.route_identity.as_mut().unwrap().value.as_mut()
+            else {
+                unreachable!()
+            };
+            identity.partition_id = 0;
+            identity.sequence = 0;
+
+            handle_runtime_filter_envelope(ingress.clone(), request).unwrap();
+
+            let envelopes = ingress.take();
+            assert_eq!(envelopes.len(), 1);
+            let identity = envelopes[0]
+                .route_identity()
+                .as_contribution()
+                .expect("contribution identity");
+            assert_eq!(identity.partition_id(), PartitionId::new(0));
+            assert_eq!(identity.sequence(), ProducerSequence::new(0));
+        }
+    }
+
+    #[test]
     fn ingress_results_map_exactly_and_echo_validated_route() {
         let cases = [
             (
@@ -480,12 +509,6 @@ mod tests {
             },
             |identity: &mut proto::filter::RuntimeFilterContributionRouteIdentity| {
                 identity.fragment_instance_id = Some(proto::common::UniqueId { hi: 0, lo: 0 })
-            },
-            |identity: &mut proto::filter::RuntimeFilterContributionRouteIdentity| {
-                identity.partition_id = 0
-            },
-            |identity: &mut proto::filter::RuntimeFilterContributionRouteIdentity| {
-                identity.sequence = 0
             },
         ] {
             let mut request =
@@ -575,7 +598,7 @@ mod tests {
             malformed.push(request);
         }
 
-        assert_eq!(malformed.len(), 27);
+        assert_eq!(malformed.len(), 25);
         for request in malformed {
             let ingress = Arc::new(RecordingIngress::new(RuntimeFilterIngressResult::accepted()));
             let error = handle_runtime_filter_envelope(ingress.clone(), request).unwrap_err();
