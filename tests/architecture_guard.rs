@@ -9780,6 +9780,97 @@ fn runtime_filter_runtime_dependencies_are_allowed(source_rel: &str, text: &str)
         })
 }
 
+fn runtime_filter_transport_ingress_boundary_violations(
+    source_rel: &str,
+    text: &str,
+) -> Vec<String> {
+    const ADAPTER: &str = "src/service/grpc_runtime_filter_adapter.rs";
+    const SERVICE_INJECTION_OWNER: &str = "src/service/grpc_server.rs";
+    const TRANSPORT_OWNER: &str = "src/runtime_filter/port/transport.rs";
+
+    if source_rel == TRANSPORT_OWNER {
+        return Vec::new();
+    }
+
+    let canonical = rust_production_canonical_paths(text, source_rel);
+    let transport_prefix = [
+        "crate".to_string(),
+        "runtime_filter".to_string(),
+        "port".to_string(),
+        "transport".to_string(),
+    ];
+    let transport_paths = canonical
+        .iter()
+        .filter(|path| path.starts_with(&transport_prefix))
+        .collect::<Vec<_>>();
+
+    if source_rel == ADAPTER {
+        let forbidden_prefixes: &[&[&str]] = &[
+            &["crate", "runtime_filter", "core"],
+            &["crate", "runtime_filter", "router"],
+            &["crate", "runtime_filter", "service"],
+            &["crate", "runtime", "query_context"],
+            &["crate", "runtime", "runtime_filter_hub"],
+            &["crate", "runtime", "runtime_filter_worker"],
+            &["crate", "exec", "operators"],
+            &["crate", "lower"],
+            &["crate", "sql", "planner"],
+            &["crate", "service", "grpc_client"],
+            &["crate", "service", "exchange_sender"],
+        ];
+        return canonical
+            .iter()
+            .filter(|path| {
+                forbidden_prefixes.iter().any(|prefix| {
+                    path.iter()
+                        .map(String::as_str)
+                        .zip(prefix.iter().copied())
+                        .all(|(actual, expected)| actual == expected)
+                        && path.len() >= prefix.len()
+                })
+            })
+            .map(|path| {
+                format!(
+                    "{source_rel}: native runtime-filter ingress adapter cannot own {}",
+                    path.join("::")
+                )
+            })
+            .collect();
+    }
+
+    if source_rel == SERVICE_INJECTION_OWNER {
+        return transport_paths
+            .into_iter()
+            .filter(|path| {
+                path.as_slice()
+                    != [
+                        "crate",
+                        "runtime_filter",
+                        "port",
+                        "transport",
+                        "RuntimeFilterEnvelopeIngress",
+                    ]
+            })
+            .map(|path| {
+                format!(
+                    "{source_rel}: GrpcService may inject only the ingress trait, not consume {}",
+                    path.join("::")
+                )
+            })
+            .collect();
+    }
+
+    transport_paths
+        .into_iter()
+        .map(|path| {
+            format!(
+                "{source_rel}: runtime-filter transport ingress is owned by the named gRPC adapter: {}",
+                path.join("::")
+            )
+        })
+        .collect()
+}
+
 fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> Vec<String> {
     if !source_rel.starts_with("src/runtime_filter/") {
         let production = rust_sanitized_production_text(text);
@@ -9871,12 +9962,17 @@ fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> V
             }
             _ => false,
         };
-        return ((references_runtime_surface && (!allowed_owner || !allowed_reference))
+        let mut violations = ((references_runtime_surface
+            && (!allowed_owner || !allowed_reference))
             || (source_rel == "src/runtime/query_context.rs" && calls_data_plane)
             || !export_surface_violations.is_empty())
         .then(|| format!("{source_rel}: runtime-filter Service is harness-only before RFD-6"))
         .into_iter()
-        .collect();
+        .collect::<Vec<_>>();
+        violations.extend(runtime_filter_transport_ingress_boundary_violations(
+            source_rel, text,
+        ));
+        return violations;
     }
 
     let Some(allowed_prefixes) = runtime_filter_runtime_dependency_allowlist(source_rel) else {
@@ -9990,6 +10086,9 @@ fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> V
     }
     violations.extend(runtime_filter_global_registry_violations(source_rel, text));
     violations.extend(runtime_filter_materializer_semantic_violations(
+        source_rel, text,
+    ));
+    violations.extend(runtime_filter_transport_ingress_boundary_violations(
         source_rel, text,
     ));
     if matches!(
@@ -15126,6 +15225,39 @@ fn runtime_filter_graph_model_has_planner_neutral_boundaries() {
 fn runtime_filter_channel_service_boundaries_are_default_deny_and_harness_only() {
     let repo = Path::new(manifest_dir());
     let runtime_filter = repo.join("src/runtime_filter");
+    let transport_source = "src/runtime_filter/port/transport.rs";
+    let adapter_source = "src/service/grpc_runtime_filter_adapter.rs";
+    for source_rel in [transport_source, adapter_source] {
+        assert!(
+            repo.join(source_rel).is_file(),
+            "RFD-4/M1 native ingress source inventory requires {source_rel}"
+        );
+    }
+    let transport_prefix = [
+        "crate".to_string(),
+        "runtime_filter".to_string(),
+        "port".to_string(),
+        "transport".to_string(),
+    ];
+    let actual_transport_consumers = rs_files(&repo.join("src"))
+        .into_iter()
+        .filter_map(|path| {
+            let source_rel = rel(&path);
+            let text = fs::read_to_string(path).expect("production source must be readable");
+            rust_production_canonical_paths(&text, &source_rel)
+                .iter()
+                .any(|path| path.starts_with(&transport_prefix))
+                .then_some(source_rel)
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        actual_transport_consumers,
+        BTreeSet::from([
+            adapter_source.to_string(),
+            "src/service/grpc_server.rs".to_string(),
+        ]),
+        "the named adapter is the only transport DTO consumer; GrpcService may hold only the injected ingress trait"
+    );
     let mut violations = Vec::new();
     for path in rs_files(&runtime_filter) {
         let source_rel = rel(&path);
@@ -16356,6 +16488,75 @@ fn runtime_filter_harness_only_detector_rejects_operator_rpc_and_encoder_calls()
             "harness-only detector must reject {source_rel}: {source}"
         );
     }
+}
+
+#[test]
+fn rfd4_m1_transport_ingress_detector_is_named_adapter_only_and_default_deny() {
+    let adapter = "src/service/grpc_runtime_filter_adapter.rs";
+    assert!(
+        runtime_filter_transport_ingress_boundary_violations(
+            adapter,
+            "use crate::runtime_filter::port::transport::{RuntimeFilterEnvelope, RuntimeFilterEnvelopeIngress};",
+        )
+        .is_empty(),
+        "the named gRPC adapter is the sole transport DTO consumer"
+    );
+
+    for forbidden in [
+        "use crate::runtime_filter::core::channel::RuntimeFilterChannel;",
+        "use crate::runtime_filter::router::loopback::LoopbackRouter;",
+        "use crate::runtime_filter::service::RuntimeFilterService;",
+        "use crate::runtime::query_context::QueryContext;",
+        "use crate::runtime::runtime_filter_hub::RuntimeFilterHub;",
+        "use crate::runtime::runtime_filter_worker::RuntimeFilterWorker;",
+        "use crate::exec::operators::hash_join::HashJoinBuildOperator;",
+        "use crate::lower::fragment::lower_fragment;",
+        "use crate::sql::planner::Planner;",
+        "use crate::service::grpc_client::GrpcClient;",
+        "use crate::service::exchange_sender::ExchangeSender;",
+    ] {
+        assert!(
+            !runtime_filter_transport_ingress_boundary_violations(adapter, forbidden).is_empty(),
+            "the adapter must reject live execution ownership: {forbidden}"
+        );
+    }
+
+    for source_rel in [
+        "src/service/grpc_client.rs",
+        "src/service/internal_rpc.rs",
+        "src/exec/operators/hash_join/build.rs",
+        "src/sql/planner/mod.rs",
+        "src/sql/codegen/proto_encode/runtime_filter.rs",
+        "src/runtime/runtime_filter_worker.rs",
+        "src/runtime/runtime_filter_hub.rs",
+        "src/service/unknown_runtime_filter_adapter.rs",
+    ] {
+        assert!(
+            !runtime_filter_transport_ingress_boundary_violations(
+                source_rel,
+                "use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeIngress;",
+            )
+            .is_empty(),
+            "transport ingress must default-deny {source_rel}"
+        );
+    }
+
+    assert!(
+        runtime_filter_transport_ingress_boundary_violations(
+            "src/service/grpc_server.rs",
+            "use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeIngress;",
+        )
+        .is_empty(),
+        "GrpcService may hold the exact injected ingress trait"
+    );
+    assert!(
+        !runtime_filter_transport_ingress_boundary_violations(
+            "src/service/grpc_server.rs",
+            "use crate::runtime_filter::port::transport::RuntimeFilterEnvelope;",
+        )
+        .is_empty(),
+        "GrpcService must not consume transport DTOs"
+    );
 }
 
 #[test]
