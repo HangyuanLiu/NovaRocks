@@ -21,35 +21,15 @@ use anyhow::Result;
 use proc_macro2::{Group, TokenStream, TokenTree};
 use quote::quote;
 use syn::visit::Visit;
-use syn::{Attribute, Item, ItemMacro, ItemMod, ItemUse, Macro, UseTree};
+use syn::{Item, ItemMacro, ItemMod, ItemUse, Macro, UseTree};
 
 use crate::Violation;
-use crate::cfg::{analyze_attrs, production_possible};
+use crate::cfg::analyze_attrs;
 use crate::module_graph::{ModuleGraph, SourceUnit};
+use crate::production::{item_attrs, node_is_production};
 
 type Scope = Vec<String>;
 type AliasMap = BTreeMap<(Scope, String), Vec<String>>;
-
-fn item_attrs(item: &Item) -> &[Attribute] {
-    match item {
-        Item::Const(item) => &item.attrs,
-        Item::Enum(item) => &item.attrs,
-        Item::ExternCrate(item) => &item.attrs,
-        Item::Fn(item) => &item.attrs,
-        Item::ForeignMod(item) => &item.attrs,
-        Item::Impl(item) => &item.attrs,
-        Item::Macro(item) => &item.attrs,
-        Item::Mod(item) => &item.attrs,
-        Item::Static(item) => &item.attrs,
-        Item::Struct(item) => &item.attrs,
-        Item::Trait(item) => &item.attrs,
-        Item::TraitAlias(item) => &item.attrs,
-        Item::Type(item) => &item.attrs,
-        Item::Union(item) => &item.attrs,
-        Item::Use(item) => &item.attrs,
-        _ => &[],
-    }
-}
 
 fn path_segments(path: &syn::Path) -> Vec<String> {
     path.segments
@@ -130,7 +110,7 @@ struct AliasCollector<'a> {
 impl AliasCollector<'_> {
     fn visit_items(&mut self, items: &[Item]) {
         for item in items {
-            if !production_possible(item_attrs(item)).unwrap_or(true) {
+            if !node_is_production(item_attrs(item)) {
                 continue;
             }
             match item {
@@ -174,6 +154,7 @@ impl AliasCollector<'_> {
 struct MacroArm {
     matcher: Group,
     transcriber: Group,
+    forwards_macro: bool,
 }
 
 #[derive(Clone)]
@@ -217,6 +198,7 @@ fn macro_arms(tokens: TokenStream) -> Vec<MacroArm> {
             arms.push(MacroArm {
                 matcher: matcher.clone(),
                 transcriber: transcriber.clone(),
+                forwards_macro: token_stream_has_metavariable_invocation(transcriber.stream()),
             });
             index += 4;
         } else {
@@ -226,55 +208,180 @@ fn macro_arms(tokens: TokenStream) -> Vec<MacroArm> {
     arms
 }
 
-fn split_commas(tokens: TokenStream) -> Vec<TokenStream> {
-    let mut parts = vec![TokenStream::new()];
-    for token in tokens {
-        if matches!(&token, TokenTree::Punct(punct) if punct.as_char() == ',') {
-            parts.push(TokenStream::new());
-        } else {
-            parts.last_mut().unwrap().extend([token]);
-        }
-    }
-    parts
-}
-
-fn matcher_binding(tokens: &TokenStream) -> Option<String> {
-    let tokens = tokens.clone().into_iter().collect::<Vec<_>>();
-    if tokens.len() >= 4
-        && matches!(&tokens[0], TokenTree::Punct(punct) if punct.as_char() == '$')
-        && matches!(&tokens[1], TokenTree::Ident(_))
-        && matches!(&tokens[2], TokenTree::Punct(punct) if punct.as_char() == ':')
-        && matches!(&tokens[3], TokenTree::Ident(specifier)
-            if matches!(specifier.to_string().as_str(), "ident" | "path" | "tt"))
-    {
-        let TokenTree::Ident(ident) = &tokens[1] else {
-            unreachable!()
-        };
-        Some(ident.to_string())
-    } else {
-        None
-    }
-}
-
 fn normalized(tokens: &TokenStream) -> String {
     tokens.to_string().split_whitespace().collect()
 }
 
-fn match_arm(arm: &MacroArm, arguments: TokenStream) -> Option<BTreeMap<String, TokenStream>> {
-    let matcher = split_commas(arm.matcher.stream());
-    let arguments = split_commas(arguments);
-    if matcher.len() != arguments.len() {
-        return None;
-    }
-    let mut bindings = BTreeMap::new();
-    for (matcher, argument) in matcher.into_iter().zip(arguments) {
-        if let Some(binding) = matcher_binding(&matcher) {
-            bindings.insert(binding, argument);
-        } else if normalized(&matcher) != normalized(&argument) {
-            return None;
+fn token_stream_has_metavariable_invocation(tokens: TokenStream) -> bool {
+    let tokens = tokens.into_iter().collect::<Vec<_>>();
+    for (index, token) in tokens.iter().enumerate() {
+        if let TokenTree::Group(group) = token
+            && token_stream_has_metavariable_invocation(group.stream())
+        {
+            return true;
+        }
+        if index + 2 < tokens.len()
+            && matches!(&tokens[index], TokenTree::Punct(punct) if punct.as_char() == '$')
+            && matches!(&tokens[index + 1], TokenTree::Ident(_))
+            && matches!(&tokens[index + 2], TokenTree::Punct(punct) if punct.as_char() == '!')
+        {
+            return true;
         }
     }
-    Some(bindings)
+    false
+}
+
+fn token_stream_contains_dollar(tokens: TokenStream) -> bool {
+    tokens.into_iter().any(|token| match token {
+        TokenTree::Group(group) => token_stream_contains_dollar(group.stream()),
+        TokenTree::Punct(punct) => punct.as_char() == '$',
+        _ => false,
+    })
+}
+
+fn matcher_is_structurally_supported(tokens: TokenStream) -> bool {
+    let tokens = tokens.into_iter().collect::<Vec<_>>();
+    let mut index = 0usize;
+    while index < tokens.len() {
+        if let TokenTree::Group(group) = &tokens[index] {
+            if token_stream_contains_dollar(group.stream()) {
+                return false;
+            }
+            index += 1;
+            continue;
+        }
+        if !matches!(&tokens[index], TokenTree::Punct(punct) if punct.as_char() == '$') {
+            index += 1;
+            continue;
+        }
+        if index + 3 >= tokens.len()
+            || !matches!(&tokens[index + 1], TokenTree::Ident(_))
+            || !matches!(&tokens[index + 2], TokenTree::Punct(punct) if punct.as_char() == ':')
+            || !matches!(&tokens[index + 3], TokenTree::Ident(fragment)
+                if matches!(fragment.to_string().as_str(), "ident" | "path" | "tt"))
+        {
+            return false;
+        }
+        index += 4;
+    }
+    true
+}
+
+enum ArmMatch {
+    Matched(BTreeMap<String, TokenStream>),
+    NoMatch,
+    Unsupported,
+}
+
+fn token_equal(left: &TokenTree, right: &TokenTree) -> bool {
+    normalized(&TokenStream::from(left.clone())) == normalized(&TokenStream::from(right.clone()))
+}
+
+fn match_tokens(
+    matcher: &[TokenTree],
+    matcher_index: usize,
+    arguments: &[TokenTree],
+    argument_index: usize,
+    bindings: &mut BTreeMap<String, TokenStream>,
+) -> ArmMatch {
+    if matcher_index == matcher.len() {
+        return if argument_index == arguments.len() {
+            ArmMatch::Matched(bindings.clone())
+        } else {
+            ArmMatch::NoMatch
+        };
+    }
+    if matcher_index + 3 < matcher.len()
+        && matches!(&matcher[matcher_index], TokenTree::Punct(punct) if punct.as_char() == '$')
+        && matches!(&matcher[matcher_index + 1], TokenTree::Ident(_))
+        && matches!(&matcher[matcher_index + 2], TokenTree::Punct(punct) if punct.as_char() == ':')
+        && matches!(&matcher[matcher_index + 3], TokenTree::Ident(_))
+    {
+        let TokenTree::Ident(name) = &matcher[matcher_index + 1] else {
+            unreachable!()
+        };
+        let TokenTree::Ident(fragment) = &matcher[matcher_index + 3] else {
+            unreachable!()
+        };
+        let name = name.to_string();
+        let fragment = fragment.to_string();
+        let lengths = match fragment.as_str() {
+            "ident" if matches!(arguments.get(argument_index), Some(TokenTree::Ident(_))) => {
+                vec![1]
+            }
+            "tt" if argument_index < arguments.len() => vec![1],
+            "path" => (1..=arguments.len().saturating_sub(argument_index))
+                .rev()
+                .filter(|length| {
+                    syn::parse2::<syn::Path>(
+                        arguments[argument_index..argument_index + length]
+                            .iter()
+                            .cloned()
+                            .collect(),
+                    )
+                    .is_ok()
+                })
+                .collect(),
+            "ident" | "tt" => Vec::new(),
+            _ => return ArmMatch::Unsupported,
+        };
+        if fragment == "path" && lengths.is_empty() && argument_index < arguments.len() {
+            return ArmMatch::Unsupported;
+        }
+        for length in lengths {
+            let replacement = arguments[argument_index..argument_index + length]
+                .iter()
+                .cloned()
+                .collect();
+            let previous = bindings.insert(name.clone(), replacement);
+            match match_tokens(
+                matcher,
+                matcher_index + 4,
+                arguments,
+                argument_index + length,
+                bindings,
+            ) {
+                matched @ ArmMatch::Matched(_) => return matched,
+                ArmMatch::Unsupported => return ArmMatch::Unsupported,
+                ArmMatch::NoMatch => {}
+            }
+            if let Some(previous) = previous {
+                bindings.insert(name.clone(), previous);
+            } else {
+                bindings.remove(&name);
+            }
+        }
+        return ArmMatch::NoMatch;
+    }
+    if matches!(&matcher[matcher_index], TokenTree::Punct(punct) if punct.as_char() == '$') {
+        return ArmMatch::Unsupported;
+    }
+    let Some(argument) = arguments.get(argument_index) else {
+        return ArmMatch::NoMatch;
+    };
+    if !token_equal(&matcher[matcher_index], argument) {
+        return ArmMatch::NoMatch;
+    }
+    match_tokens(
+        matcher,
+        matcher_index + 1,
+        arguments,
+        argument_index + 1,
+        bindings,
+    )
+}
+
+fn match_arm(arm: &MacroArm, arguments: TokenStream) -> ArmMatch {
+    if !matcher_is_structurally_supported(arm.matcher.stream()) {
+        return ArmMatch::Unsupported;
+    }
+    match_tokens(
+        &arm.matcher.stream().into_iter().collect::<Vec<_>>(),
+        0,
+        &arguments.into_iter().collect::<Vec<_>>(),
+        0,
+        &mut BTreeMap::new(),
+    )
 }
 
 fn substitute(tokens: TokenStream, bindings: &BTreeMap<String, TokenStream>) -> TokenStream {
@@ -336,14 +443,13 @@ fn macro_definition_key(
     inventory: &MacroInventory,
     scope: &[String],
     path: &[String],
+    aliases: &AliasMap,
 ) -> Option<Vec<String>> {
-    let canonical = if path.first().is_some_and(|segment| segment == "crate") {
-        path.to_vec()
-    } else if path.len() > 1 {
-        let mut canonical = scope.to_vec();
-        canonical.extend_from_slice(path);
-        canonical
-    } else {
+    let canonical = canonicalize(path, scope, aliases);
+    if inventory.definitions.contains_key(&canonical) {
+        return Some(canonical);
+    }
+    if path.len() == 1 {
         let name = path.first()?;
         for depth in (1..=scope.len()).rev() {
             let mut key = scope[..depth].to_vec();
@@ -352,12 +458,8 @@ fn macro_definition_key(
                 return Some(key);
             }
         }
-        vec!["crate".to_string(), name.clone()]
-    };
-    inventory
-        .definitions
-        .contains_key(&canonical)
-        .then_some(canonical)
+    }
+    None
 }
 
 fn path_is_include(path: &[String], scope: &[String], aliases: &AliasMap) -> bool {
@@ -371,10 +473,26 @@ fn token_stream_mentions_include_argument(
     scope: &[String],
     aliases: &AliasMap,
 ) -> bool {
-    split_commas(tokens).into_iter().any(|argument| {
-        let tokens = argument.into_iter().collect::<Vec<_>>();
-        token_path(&tokens).is_some_and(|path| path_is_include(&path, scope, aliases))
-    })
+    let tokens = tokens.into_iter().collect::<Vec<_>>();
+    for (index, token) in tokens.iter().enumerate() {
+        if let TokenTree::Group(group) = token
+            && token_stream_mentions_include_argument(group.stream(), scope, aliases)
+        {
+            return true;
+        }
+        if !matches!(token, TokenTree::Ident(_)) {
+            continue;
+        }
+        for end in (index + 1..=tokens.len()).rev() {
+            let Some(path) = token_path(&tokens[index..end]) else {
+                continue;
+            };
+            if path_is_include(&path, scope, aliases) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn expanded_tokens_reach_include(
@@ -416,7 +534,7 @@ fn expanded_tokens_reach_include(
         if token_stream_mentions_include_argument(arguments.stream(), scope, aliases) {
             return true;
         }
-        let Some(key) = macro_definition_key(inventory, scope, &path) else {
+        let Some(key) = macro_definition_key(inventory, scope, &path, aliases) else {
             continue;
         };
         if !active.insert(key.clone()) {
@@ -424,8 +542,11 @@ fn expanded_tokens_reach_include(
         }
         let definition = &inventory.definitions[&key];
         for arm in &definition.arms {
-            let Some(bindings) = match_arm(arm, arguments.stream()) else {
-                continue;
+            let bindings = match match_arm(arm, arguments.stream()) {
+                ArmMatch::Matched(bindings) => bindings,
+                ArmMatch::NoMatch => continue,
+                ArmMatch::Unsupported if arm.forwards_macro => return true,
+                ArmMatch::Unsupported => continue,
             };
             let expanded = substitute(arm.transcriber.stream(), &bindings);
             if expanded_tokens_reach_include(
@@ -455,13 +576,17 @@ fn invocation_reaches_include(
     ) {
         return true;
     }
-    let Some(key) = macro_definition_key(inventory, &invocation.scope, &invocation.path) else {
+    let Some(key) = macro_definition_key(inventory, &invocation.scope, &invocation.path, aliases)
+    else {
         return false;
     };
     let definition = &inventory.definitions[&key];
     for arm in &definition.arms {
-        let Some(bindings) = match_arm(arm, invocation.arguments.clone()) else {
-            continue;
+        let bindings = match match_arm(arm, invocation.arguments.clone()) {
+            ArmMatch::Matched(bindings) => bindings,
+            ArmMatch::NoMatch => continue,
+            ArmMatch::Unsupported if arm.forwards_macro => return true,
+            ArmMatch::Unsupported => continue,
         };
         if expanded_tokens_reach_include(
             substitute(arm.transcriber.stream(), &bindings),
@@ -495,26 +620,15 @@ impl InventoryVisitor<'_> {
 }
 
 impl<'ast> Visit<'ast> for InventoryVisitor<'_> {
-    fn visit_item(&mut self, item: &'ast Item) {
-        if !production_possible(item_attrs(item)).unwrap_or(true) {
-            return;
-        }
-        syn::visit::visit_item(self, item);
-    }
+    crate::production::production_pruning_methods!();
 
     fn visit_item_mod(&mut self, item: &'ast ItemMod) {
-        if !production_possible(&item.attrs).unwrap_or(true) {
-            return;
-        }
         self.scope.push(item.ident.to_string());
         syn::visit::visit_item_mod(self, item);
         self.scope.pop();
     }
 
     fn visit_item_macro(&mut self, item: &'ast ItemMacro) {
-        if !production_possible(&item.attrs).unwrap_or(true) {
-            return;
-        }
         if item.mac.path.is_ident("macro_rules") {
             let Some(name) = item.ident.as_ref() else {
                 return;
@@ -570,29 +684,31 @@ impl RetirementVisitor<'_> {
         ]) {
             self.violations.push(Violation::new(
                 &self.source,
-                "reaches retired crate::sql::codegen namespace",
+                "reaches the retired SQL encoder namespace",
             ));
         }
     }
 }
 
 impl<'ast> Visit<'ast> for RetirementVisitor<'_> {
-    fn visit_item(&mut self, item: &'ast Item) {
-        if !production_possible(item_attrs(item)).unwrap_or(true) {
-            return;
-        }
-        syn::visit::visit_item(self, item);
-    }
+    crate::production::production_pruning_methods!();
 
     fn visit_item_mod(&mut self, item: &'ast ItemMod) {
-        if !production_possible(&item.attrs).unwrap_or(true) {
-            return;
-        }
-        let analysis = analyze_attrs(&item.attrs).unwrap_or_default();
+        let analysis =
+            analyze_attrs(&item.attrs).expect("module attributes were validated before traversal");
         if analysis
             .path_values
             .iter()
-            .any(|path| path.replace('\\', "/").contains("codegen"))
+            .zip(&analysis.path_conditions)
+            .any(|(path, activation)| {
+                analysis
+                    .item_condition
+                    .clone()
+                    .and(activation.clone())
+                    .production_possible()
+                    .expect("module attributes were validated before traversal")
+                    && path.replace('\\', "/").contains("codegen")
+            })
         {
             self.violations.push(Violation::new(
                 &self.source,
@@ -631,7 +747,7 @@ impl<'ast> Visit<'ast> for RetirementVisitor<'_> {
             ]) {
                 self.violations.push(Violation::new(
                     &self.source,
-                    "imports retired crate::sql::codegen namespace",
+                    "imports the retired SQL encoder namespace",
                 ));
             }
         }
@@ -658,6 +774,12 @@ impl<'ast> Visit<'ast> for RetirementVisitor<'_> {
     }
 
     fn visit_macro(&mut self, item: &'ast Macro) {
+        if crate::tokens::contains_path(item.tokens.clone(), &["crate", "sql", "codegen"]) {
+            self.violations.push(Violation::new(
+                &self.source,
+                "production macro tokens reach the retired SQL encoder namespace",
+            ));
+        }
         if self.restricted_scope() {
             let path = path_segments(&item.path);
             let known_safe = self.scope == ["crate"]

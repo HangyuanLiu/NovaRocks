@@ -70,22 +70,21 @@ impl CfgExpr {
         }
     }
 
-    pub(crate) fn production_possible(&self) -> bool {
+    pub(crate) fn production_possible(&self) -> Result<bool> {
         let mut atoms = BTreeSet::new();
         self.atoms(&mut atoms);
         let atoms = atoms.into_iter().collect::<Vec<_>>();
-        assert!(
-            atoms.len() <= 20,
-            "cfg expression has too many independent atoms"
-        );
-        (0..(1usize << atoms.len())).any(|mask| {
+        if atoms.len() > 20 {
+            bail!("cfg expression has too many independent atoms");
+        }
+        Ok((0..(1usize << atoms.len())).any(|mask| {
             let values = atoms
                 .iter()
                 .enumerate()
                 .map(|(index, atom)| (atom.clone(), mask & (1 << index) != 0))
                 .collect();
             self.evaluate(&values)
-        })
+        }))
     }
 }
 
@@ -209,7 +208,7 @@ pub(crate) fn analyze_attrs(attrs: &[Attribute]) -> Result<AttrAnalysis> {
 }
 
 pub(crate) fn production_possible(attrs: &[Attribute]) -> Result<bool> {
-    Ok(analyze_attrs(attrs)?.item_condition.production_possible())
+    analyze_attrs(attrs)?.item_condition.production_possible()
 }
 
 #[cfg(test)]
@@ -238,6 +237,7 @@ mod tests {
                 .clone()
                 .and(analysis.item_condition)
                 .production_possible()
+                .unwrap()
         );
     }
 }

@@ -23,6 +23,7 @@ use anyhow::{Context, Result, bail};
 use syn::{Item, ItemMod};
 
 use crate::cfg::{CfgExpr, analyze_attrs};
+use crate::production::validate_file;
 
 #[derive(Clone)]
 pub(crate) struct SourceUnit {
@@ -73,6 +74,8 @@ impl Builder<'_> {
             .with_context(|| format!("read module source {}", canonical.display()))?;
         let file = syn::parse_file(&source)
             .with_context(|| format!("parse Rust source {}", canonical.display()))?;
+        validate_file(&file)
+            .with_context(|| format!("validate production cfg in {}", canonical.display()))?;
         self.units.push(SourceUnit {
             path: canonical.clone(),
             scope: scope.clone(),
@@ -97,7 +100,7 @@ impl Builder<'_> {
             };
             let attrs = analyze_attrs(&module.attrs)?;
             let condition = parent_condition.clone().and(attrs.item_condition.clone());
-            if !condition.production_possible() {
+            if !condition.production_possible()? {
                 continue;
             }
             let name = module.ident.to_string();
@@ -139,7 +142,7 @@ impl Builder<'_> {
             if item_condition
                 .clone()
                 .and(activation.clone())
-                .production_possible()
+                .production_possible()?
             {
                 production_paths.push(path.clone());
             }

@@ -17,7 +17,9 @@
 
 mod cfg;
 mod module_graph;
+mod production;
 mod retirement;
+mod tokens;
 
 use std::fmt;
 use std::fs;
@@ -26,7 +28,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use syn::visit::Visit;
 
-use crate::cfg::production_possible;
 use crate::module_graph::{GraphOptions, build_module_graph};
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -51,41 +52,14 @@ impl fmt::Display for Violation {
 }
 
 struct NativeDependencyVisitor {
-    production: bool,
     violations: Vec<Violation>,
     source: String,
 }
 
 impl<'ast> Visit<'ast> for NativeDependencyVisitor {
-    fn visit_item(&mut self, item: &'ast syn::Item) {
-        let attrs: &[syn::Attribute] = match item {
-            syn::Item::Const(item) => &item.attrs,
-            syn::Item::Enum(item) => &item.attrs,
-            syn::Item::ExternCrate(item) => &item.attrs,
-            syn::Item::Fn(item) => &item.attrs,
-            syn::Item::ForeignMod(item) => &item.attrs,
-            syn::Item::Impl(item) => &item.attrs,
-            syn::Item::Macro(item) => &item.attrs,
-            syn::Item::Mod(item) => &item.attrs,
-            syn::Item::Static(item) => &item.attrs,
-            syn::Item::Struct(item) => &item.attrs,
-            syn::Item::Trait(item) => &item.attrs,
-            syn::Item::TraitAlias(item) => &item.attrs,
-            syn::Item::Type(item) => &item.attrs,
-            syn::Item::Union(item) => &item.attrs,
-            syn::Item::Use(item) => &item.attrs,
-            _ => &[],
-        };
-        if !production_possible(attrs).unwrap_or(true) {
-            return;
-        }
-        syn::visit::visit_item(self, item);
-    }
+    crate::production::production_pruning_methods!();
 
     fn visit_path(&mut self, path: &'ast syn::Path) {
-        if !self.production {
-            return;
-        }
         let joined = path
             .segments
             .iter()
@@ -105,6 +79,25 @@ impl<'ast> Visit<'ast> for NativeDependencyVisitor {
             }
         }
         syn::visit::visit_path(self, path);
+    }
+
+    fn visit_macro(&mut self, item: &'ast syn::Macro) {
+        for forbidden in [
+            &["OptimizerPhysicalNode"][..],
+            &["optimizer", "operator", "Operator"][..],
+            &["optimizer", "physical_tree"][..],
+        ] {
+            if crate::tokens::contains_path(item.tokens.clone(), forbidden) {
+                self.violations.push(Violation::new(
+                    &self.source,
+                    format!(
+                        "native encoder production macro tokens reference {}",
+                        forbidden.join("::")
+                    ),
+                ));
+            }
+        }
+        syn::visit::visit_macro(self, item);
     }
 }
 
@@ -128,7 +121,6 @@ pub fn audit_native_encoder(repo: &Path) -> Result<Vec<Violation>> {
     let mut violations = Vec::new();
     for unit in graph.units {
         let mut visitor = NativeDependencyVisitor {
-            production: true,
             violations: Vec::new(),
             source: unit.path.display().to_string(),
         };
@@ -175,12 +167,20 @@ pub fn audit_native_encoder(repo: &Path) -> Result<Vec<Violation>> {
 }
 
 pub fn audit_sql_codegen_retirement(repo: &Path) -> Result<Vec<Violation>> {
-    let mut violations = Vec::new();
-    for retired in ["src/sql/codegen", "src/sql/codegen.rs"] {
+    let retired_source = ["src", "sql", "codegen"].join("/");
+    let mut violations = physical_retirement_violations(repo)?;
+    for retired in [&retired_source, &format!("{retired_source}.rs")] {
         if fs::symlink_metadata(repo.join(retired)).is_ok() {
             violations.push(Violation::new(retired, "retired path still exists"));
         }
     }
+    violations.extend(audit_reachable_sql_retirement(repo)?);
+    violations.sort();
+    violations.dedup();
+    Ok(violations)
+}
+
+fn audit_reachable_sql_retirement(repo: &Path) -> Result<Vec<Violation>> {
     let src = repo.join("src");
     let graph = build_module_graph(
         &src,
@@ -192,7 +192,70 @@ pub fn audit_sql_codegen_retirement(repo: &Path) -> Result<Vec<Violation>> {
             forbid_production_path: false,
         },
     )?;
-    violations.extend(retirement::audit_graph(&graph)?);
+    let mut violations = retirement::audit_graph(&graph)?;
+    violations.sort();
+    violations.dedup();
+    Ok(violations)
+}
+
+fn physical_retirement_violations(repo: &Path) -> Result<Vec<Violation>> {
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty()
+            && haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+    }
+
+    fn visit(
+        path: &Path,
+        repo: &Path,
+        patterns: &[String],
+        violations: &mut Vec<Violation>,
+    ) -> Result<()> {
+        for entry in fs::read_dir(path)
+            .with_context(|| format!("read physical audit directory {}", path.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                if matches!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some("target" | "__pycache__")
+                ) {
+                    continue;
+                }
+                visit(&path, repo, patterns, violations)?;
+                continue;
+            }
+            let bytes = fs::read(&path)
+                .with_context(|| format!("read physical audit source {}", path.display()))?;
+            for pattern in patterns {
+                if contains(&bytes, pattern.as_bytes()) {
+                    violations.push(Violation::new(
+                        path.strip_prefix(repo)
+                            .unwrap_or(&path)
+                            .display()
+                            .to_string(),
+                        "contains a physical reference to the retired SQL encoder owner",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    let patterns = vec![
+        ["crate", "sql", "codegen"].join("::"),
+        ["sql", "codegen"].join("::"),
+        ["src", "sql", "codegen"].join("/"),
+    ];
+    let mut violations = Vec::new();
+    for root in ["src", "tools"] {
+        let path = repo.join(root);
+        if path.is_dir() {
+            visit(&path, repo, &patterns, &mut violations)?;
+        }
+    }
     violations.sort();
     violations.dedup();
     Ok(violations)
@@ -244,6 +307,14 @@ fn write_retirement_fixture(repo: &Path, lib: &str) -> Result<()> {
     fs::create_dir_all(repo.join("src"))?;
     fs::write(repo.join("src/lib.rs"), lib)?;
     Ok(())
+}
+
+fn retired_rust_path() -> String {
+    ["crate", "sql", "codegen"].join("::")
+}
+
+fn retired_source_path() -> String {
+    ["src", "sql", "codegen"].join("/")
 }
 
 pub fn run_self_tests() -> Result<()> {
@@ -325,6 +396,7 @@ mod owner;
 
     let invalid_retirement = [
         "pub mod sql { pub mod codegen; }",
+        "pub mod r#sql { pub mod r#codegen; }",
         "pub mod sql { use crate::protocol as codegen; }",
         "pub mod sql { include!(\"codegen/mod.rs\"); }",
         r#"
@@ -411,6 +483,12 @@ macro_rules! inject_with {
 }
 inject_with!("safe", source_loader);
 "#,
+        r#"
+macro_rules! collect {
+    ($($value:expr),*) => { vec![$($value),*] };
+}
+fn values() { let _ = collect!(1, 2, 3); }
+"#,
     ];
     for source in valid_retirement {
         let fixture = tempfile::tempdir()?;
@@ -420,6 +498,366 @@ inject_with!("safe", source_loader);
             "valid retirement fixture rejected: {source}"
         );
     }
+
+    for source in [
+        r#"
+struct Owner;
+impl Owner {
+    #[cfg(test)]
+    fn test_only(_: OptimizerPhysicalNode) {}
+}
+"#,
+        r#"
+trait Owner {
+    #[cfg_attr(not(test), cfg(test))]
+    fn test_only(_: OptimizerPhysicalNode);
+}
+"#,
+        r#"
+unsafe extern "C" {
+    #[cfg(test)]
+    fn test_only(value: OptimizerPhysicalNode);
+}
+"#,
+        r#"
+fn owner() {
+    #[cfg(test)]
+    let _: OptimizerPhysicalNode = unreachable!();
+    #[cfg(test)]
+    { let _: OptimizerPhysicalNode = unreachable!(); }
+}
+"#,
+        r#"
+fn owner() {
+    match 0 {
+        #[cfg(test)]
+        _ => { let _: OptimizerPhysicalNode = unreachable!(); }
+        _ => {}
+    }
+}
+"#,
+    ] {
+        let fixture = tempfile::tempdir()?;
+        write_native_fixture(fixture.path(), source)?;
+        assert!(
+            audit_native_encoder(fixture.path())?.is_empty(),
+            "test-only native AST escaped production pruning: {source}"
+        );
+    }
+
+    for source in [
+        r#"
+struct Owner;
+impl Owner {
+    fn production(_: OptimizerPhysicalNode) {}
+}
+"#,
+        r#"fn production(_: r#OptimizerPhysicalNode) {}"#,
+        r#"
+trait Owner {
+    fn production(_: OptimizerPhysicalNode);
+}
+"#,
+        r#"
+unsafe extern "C" {
+    fn production(value: OptimizerPhysicalNode);
+}
+"#,
+        r#"
+fn owner() {
+    let _: OptimizerPhysicalNode = unreachable!();
+}
+"#,
+        r#"
+fn owner() {
+    match 0 {
+        _ => { let _: OptimizerPhysicalNode = unreachable!(); }
+    }
+}
+"#,
+    ] {
+        let fixture = tempfile::tempdir()?;
+        write_native_fixture(fixture.path(), source)?;
+        assert!(
+            !audit_native_encoder(fixture.path())?.is_empty(),
+            "production native AST was not audited: {source}"
+        );
+    }
+
+    for template in [
+        r#"
+struct Owner;
+impl Owner {
+    #[cfg(test)]
+    fn test_only(_: PATH::Legacy) {}
+}
+"#,
+        r#"
+trait Owner {
+    #[cfg_attr(not(test), cfg(test))]
+    fn test_only(_: PATH::Legacy);
+}
+"#,
+        r#"
+unsafe extern "C" {
+    #[cfg(test)]
+    fn test_only(value: PATH::Legacy);
+}
+"#,
+        r#"
+fn owner() {
+    #[cfg(test)]
+    let _: PATH::Legacy = unreachable!();
+    #[cfg(test)]
+    { let _: PATH::Legacy = unreachable!(); }
+}
+"#,
+        r#"
+fn owner() {
+    match 0 {
+        #[cfg(test)]
+        _ => { let _: PATH::Legacy = unreachable!(); }
+        _ => {}
+    }
+}
+"#,
+    ] {
+        let fixture = tempfile::tempdir()?;
+        write_retirement_fixture(
+            fixture.path(),
+            &template.replace("PATH", &retired_rust_path()),
+        )?;
+        assert!(
+            audit_reachable_sql_retirement(fixture.path())?.is_empty(),
+            "test-only retirement AST escaped production pruning: {template}"
+        );
+    }
+
+    for template in [
+        r#"
+struct Owner;
+impl Owner {
+    fn production(_: PATH::Legacy) {}
+}
+"#,
+        r#"
+trait Owner {
+    fn production(_: PATH::Legacy);
+}
+"#,
+        r#"
+unsafe extern "C" {
+    fn production(value: PATH::Legacy);
+}
+"#,
+        r#"
+fn owner() {
+    let _: PATH::Legacy = unreachable!();
+}
+"#,
+        r#"
+fn owner() {
+    match 0 {
+        _ => { let _: PATH::Legacy = unreachable!(); }
+    }
+}
+"#,
+    ] {
+        let fixture = tempfile::tempdir()?;
+        write_retirement_fixture(
+            fixture.path(),
+            &template.replace("PATH", &retired_rust_path()),
+        )?;
+        assert!(
+            !audit_reachable_sql_retirement(fixture.path())?.is_empty(),
+            "production retirement AST was not audited: {template}"
+        );
+    }
+
+    for source in [
+        r#"macro_rules! hidden { () => { type Leak = OptimizerPhysicalNode; }; }"#,
+        r#"macro_rules! hidden { () => { type Leak = r#OptimizerPhysicalNode; }; }"#,
+        r#"macro_rules! hidden { () => { type Leak = optimizer::operator::Operator; }; }"#,
+        r#"macro_rules! hidden { () => { use optimizer::physical_tree::Leak; }; }"#,
+        r#"unknown!(OptimizerPhysicalNode);"#,
+    ] {
+        let fixture = tempfile::tempdir()?;
+        write_native_fixture(fixture.path(), source)?;
+        assert!(
+            !audit_native_encoder(fixture.path())?.is_empty(),
+            "native macro token escaped audit: {source}"
+        );
+    }
+
+    for source in [
+        r#"
+#[cfg(test)]
+macro_rules! hidden { () => { type Leak = OptimizerPhysicalNode; }; }
+"#,
+        r#"macro_rules! noise { () => { "OptimizerPhysicalNode optimizer::physical_tree"; }; }"#,
+    ] {
+        let fixture = tempfile::tempdir()?;
+        write_native_fixture(fixture.path(), source)?;
+        assert!(
+            audit_native_encoder(fixture.path())?.is_empty(),
+            "non-production native macro token was rejected: {source}"
+        );
+    }
+
+    for template in [
+        r#"macro_rules! hidden { () => { type Leak = PATH::Legacy; }; }"#,
+        r#"macro_rules! hidden { () => { use PATH::Legacy; }; }"#,
+        r#"unknown!(PATH::Legacy);"#,
+    ] {
+        let fixture = tempfile::tempdir()?;
+        write_retirement_fixture(
+            fixture.path(),
+            &template.replace("PATH", &retired_rust_path()),
+        )?;
+        assert!(
+            !audit_reachable_sql_retirement(fixture.path())?.is_empty(),
+            "retirement macro token escaped audit: {template}"
+        );
+    }
+
+    for template in [
+        r#"
+#[cfg(test)]
+macro_rules! hidden { () => { type Leak = PATH::Legacy; }; }
+"#,
+        r#"macro_rules! noise { () => { "PATH::Legacy"; }; }"#,
+    ] {
+        let fixture = tempfile::tempdir()?;
+        write_retirement_fixture(
+            fixture.path(),
+            &template.replace("PATH", &retired_rust_path()),
+        )?;
+        assert!(
+            audit_reachable_sql_retirement(fixture.path())?.is_empty(),
+            "non-production retirement macro token was rejected: {template}"
+        );
+    }
+
+    for source in [
+        r#"
+mod helpers {
+    #[macro_export]
+    macro_rules! source_loader { () => { include!("codegen/mod.rs"); }; }
+    #[macro_export]
+    macro_rules! inject { ($m:path) => { $m!(); }; }
+}
+self::inject!(crate::source_loader);
+"#,
+        r#"
+mod sql {
+    macro_rules! inject { ($m:path) => { $m!(); }; }
+    mod nested { super::inject!(crate::source_loader); }
+}
+mod helpers {
+    #[macro_export]
+    macro_rules! source_loader { () => { include!("codegen/mod.rs"); }; }
+}
+"#,
+        r#"
+mod helpers {
+    #[macro_export]
+    macro_rules! source_loader { () => { include!("codegen/mod.rs"); }; }
+    #[macro_export]
+    macro_rules! inject { ($m:path) => { $m!(); }; }
+}
+use crate::inject as loader;
+loader!(crate::source_loader);
+"#,
+        r#"
+mod helpers {
+    #[macro_export]
+    macro_rules! source_loader { () => { include!("codegen/mod.rs"); }; }
+    #[macro_export]
+    macro_rules! inject { ($m:path) => { $m!(); }; }
+}
+pub use crate::inject as loader;
+self::loader!(crate::source_loader);
+"#,
+        r#"
+macro_rules! inject {
+    ("safe" $tag:ident $m:path) => { println!("safe"); };
+    ("load" $tag:ident $m:path) => { $m!("codegen/mod.rs"); };
+}
+inject!("load" tag include);
+"#,
+        r#"
+macro_rules! inject {
+    ($($m:path),+) => { $m!("codegen/mod.rs"); };
+}
+inject!(println);
+"#,
+        r#"
+macro_rules! inject {
+    (($m:path)) => { $m!("codegen/mod.rs"); };
+}
+inject!((println));
+"#,
+        r#"
+use std::include as loader;
+unknown_wrapper!(self::loader);
+"#,
+    ] {
+        let fixture = tempfile::tempdir()?;
+        write_retirement_fixture(fixture.path(), source)?;
+        assert!(
+            !audit_sql_codegen_retirement(fixture.path())?.is_empty(),
+            "qualified include wrapper escaped audit: {source}"
+        );
+    }
+
+    let fixture = tempfile::tempdir()?;
+    write_retirement_fixture(
+        fixture.path(),
+        r#"
+#[cfg_attr(test, path = "codegen.rs")]
+mod owner;
+"#,
+    )?;
+    fs::write(fixture.path().join("src/owner.rs"), "pub struct Owner;")?;
+    assert!(
+        audit_sql_codegen_retirement(fixture.path())?.is_empty(),
+        "test-only path activation must not resurrect the retired source"
+    );
+
+    for relative in ["src/orphan.rs", "tools/audit_helper.py"] {
+        let fixture = tempfile::tempdir()?;
+        write_retirement_fixture(fixture.path(), "pub struct Owner;")?;
+        let path = fixture.path().join(relative);
+        fs::create_dir_all(path.parent().unwrap())?;
+        fs::write(
+            &path,
+            format!("# unreachable physical reference: {}", retired_rust_path()),
+        )?;
+        assert!(
+            !audit_sql_codegen_retirement(fixture.path())?.is_empty(),
+            "physical retirement inventory missed {relative}"
+        );
+    }
+
+    let fixture = tempfile::tempdir()?;
+    write_retirement_fixture(fixture.path(), "pub struct Owner;")?;
+    let retired = fixture.path().join(retired_source_path());
+    fs::create_dir_all(&retired)?;
+    assert!(!audit_sql_codegen_retirement(fixture.path())?.is_empty());
+
+    let fixture = tempfile::tempdir()?;
+    write_native_fixture(
+        fixture.path(),
+        "#[cfg(not(test, feature = \"broken\"))] fn uncertain() {}",
+    )?;
+    assert!(audit_native_encoder(fixture.path()).is_err());
+
+    let fixture = tempfile::tempdir()?;
+    write_retirement_fixture(
+        fixture.path(),
+        "#[cfg(not(test, feature = \"broken\"))] fn uncertain() {}",
+    )?;
+    assert!(audit_sql_codegen_retirement(fixture.path()).is_err());
     Ok(())
 }
 
