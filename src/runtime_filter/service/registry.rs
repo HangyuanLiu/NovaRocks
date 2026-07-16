@@ -898,27 +898,50 @@ fn validate_channel_routing_contract(
     channel: &RuntimeFilterChannelDeployment,
     routing: &RuntimeFilterChannelRoutingView,
 ) -> Result<bool, InstallContractError> {
+    let is_local_aggregator = routing
+        .local_roles()
+        .contains(&RuntimeFilterRouteRole::Aggregator);
     for (binding_id, producer) in channel.producers() {
         for fragment_instance_id in producer.expected_fragment_instances() {
-            if routing
+            let participant_id = routing
                 .producer_participant(*binding_id, *fragment_instance_id)
-                .is_none()
+                .ok_or_else(|| {
+                    install_error(
+                        InstallContractErrorKind::UnsupportedChannelContract,
+                        format!(
+                            "producer binding {} instance {:?} is missing from routing producer index",
+                            binding_id.get(),
+                            fragment_instance_id
+                        ),
+                    )
+                })?;
+            if !is_local_aggregator && participant_id != local_participant_id {
+                return Err(install_error(
+                    InstallContractErrorKind::UnsupportedChannelContract,
+                    format!(
+                        "non-aggregator producer binding {} instance {:?} maps to remote participant {:?}",
+                        binding_id.get(),
+                        fragment_instance_id,
+                        participant_id
+                    ),
+                ));
+            }
+            if participant_id == local_participant_id
+                && !routing
+                    .local_roles()
+                    .contains(&RuntimeFilterRouteRole::Producer(*binding_id))
             {
                 return Err(install_error(
                     InstallContractErrorKind::UnsupportedChannelContract,
                     format!(
-                        "producer binding {} instance {:?} is missing from routing producer index",
-                        binding_id.get(),
-                        fragment_instance_id
+                        "local producer binding {} has no matching local Producer role",
+                        binding_id.get()
                     ),
                 ));
             }
         }
     }
 
-    let is_local_aggregator = routing
-        .local_roles()
-        .contains(&RuntimeFilterRouteRole::Aggregator);
     if is_local_aggregator {
         for ((binding_id, fragment_instance_id), _) in routing.producer_instances() {
             let installed = channel.producers().get(binding_id).is_some_and(|producer| {
@@ -937,6 +960,62 @@ fn validate_channel_routing_contract(
                 ));
             }
         }
+
+        let authorized_sources = routing
+            .producer_instances()
+            .iter()
+            .map(|((binding_id, _), participant_id)| (*binding_id, *participant_id))
+            .collect::<BTreeSet<_>>();
+        for edge in routing.inbound_edges().iter().filter(|edge| {
+            matches!(edge.source().role(), RuntimeFilterRouteRole::Producer(_))
+                && edge.target().participant_id() == local_participant_id
+                && edge.target().role() == RuntimeFilterRouteRole::Aggregator
+        }) {
+            let RuntimeFilterRouteRole::Producer(binding_id) = edge.source().role() else {
+                unreachable!("inbound producer edges were filtered by source role")
+            };
+            if !authorized_sources.contains(&(binding_id, edge.source().participant_id())) {
+                return Err(install_error(
+                    InstallContractErrorKind::UnsupportedChannelContract,
+                    "aggregator inbound producer edge source has no authorized producer instance",
+                ));
+            }
+        }
+        for (binding_id, source_participant_id) in authorized_sources {
+            let matching_edges = routing
+                .inbound_edges()
+                .iter()
+                .filter(|edge| {
+                    edge.source().participant_id() == source_participant_id
+                        && edge.source().role() == RuntimeFilterRouteRole::Producer(binding_id)
+                        && edge.target().participant_id() == local_participant_id
+                        && edge.target().role() == RuntimeFilterRouteRole::Aggregator
+                })
+                .collect::<Vec<_>>();
+            if matching_edges.len() != 1 {
+                return Err(install_error(
+                    InstallContractErrorKind::UnsupportedChannelContract,
+                    format!(
+                        "aggregator producer binding {} source participant {:?} requires exactly one inbound Producer-to-Aggregator edge",
+                        binding_id.get(),
+                        source_participant_id
+                    ),
+                ));
+            }
+            let allowed_kinds = matching_edges[0].allowed_kinds();
+            if !allowed_kinds.contains(&RuntimeFilterEnvelopeKind::Contribution)
+                || !allowed_kinds.contains(&RuntimeFilterEnvelopeKind::ProducerClosed)
+            {
+                return Err(install_error(
+                    InstallContractErrorKind::UnsupportedChannelContract,
+                    format!(
+                        "aggregator producer binding {} source participant {:?} inbound edge must allow Contribution and ProducerClosed",
+                        binding_id.get(),
+                        source_participant_id
+                    ),
+                ));
+            }
+        }
     }
 
     if !channel.consumers().is_empty() {
@@ -946,39 +1025,6 @@ fn validate_channel_routing_contract(
         return Err(install_error(
             InstallContractErrorKind::UnsupportedChannelContract,
             "consumerless channel requires local Aggregator authority",
-        ));
-    }
-    let inbound_producer_edges = routing.inbound_edges().iter().filter(|edge| {
-        matches!(edge.source().role(), RuntimeFilterRouteRole::Producer(binding)
-            if channel.producers().contains_key(&binding))
-            && edge.target().participant_id() == local_participant_id
-            && edge.target().role() == RuntimeFilterRouteRole::Aggregator
-            && edge
-                .allowed_kinds()
-                .contains(&RuntimeFilterEnvelopeKind::Contribution)
-    });
-    let inbound_producer_edges = inbound_producer_edges.collect::<Vec<_>>();
-    if inbound_producer_edges.is_empty() {
-        return Err(install_error(
-            InstallContractErrorKind::UnsupportedChannelContract,
-            "consumerless aggregator requires an inbound producer edge",
-        ));
-    }
-    let has_authorized_source = inbound_producer_edges.iter().any(|edge| {
-        let RuntimeFilterRouteRole::Producer(binding_id) = edge.source().role() else {
-            unreachable!("inbound producer edges were filtered by source role")
-        };
-        routing
-            .producer_instances()
-            .iter()
-            .any(|((indexed_binding, _), participant)| {
-                *indexed_binding == binding_id && *participant == edge.source().participant_id()
-            })
-    });
-    if !has_authorized_source {
-        return Err(install_error(
-            InstallContractErrorKind::UnsupportedChannelContract,
-            "consumerless aggregator inbound producer edge source has no authorized producer instance",
         ));
     }
     Ok(true)
@@ -2615,9 +2661,31 @@ mod tests {
         source_participant: RuntimeFilterParticipantId,
         target_participant: RuntimeFilterParticipantId,
     ) -> RuntimeFilterRoutingEdgeView {
-        RuntimeFilterRoutingEdgeView::new(
+        inbound_to_aggregator_with(
             channel_id,
             RouteEdgeId::new(901),
+            binding_id,
+            source_participant,
+            target_participant,
+            BTreeSet::from([
+                RuntimeFilterEnvelopeKind::Contribution,
+                RuntimeFilterEnvelopeKind::ProducerClosed,
+                RuntimeFilterEnvelopeKind::Unavailable,
+            ]),
+        )
+    }
+
+    fn inbound_to_aggregator_with(
+        channel_id: ChannelId,
+        route_edge_id: RouteEdgeId,
+        binding_id: BindingId,
+        source_participant: RuntimeFilterParticipantId,
+        target_participant: RuntimeFilterParticipantId,
+        allowed_kinds: BTreeSet<RuntimeFilterEnvelopeKind>,
+    ) -> RuntimeFilterRoutingEdgeView {
+        RuntimeFilterRoutingEdgeView::new(
+            channel_id,
+            route_edge_id,
             RuntimeFilterRouteEndpointView::new(
                 source_participant,
                 RuntimeFilterRouteRole::Producer(binding_id),
@@ -2630,11 +2698,7 @@ mod tests {
                 participant_id: source_participant,
                 endpoint: RuntimeEndpoint::new("remote-producer", 9060).unwrap(),
             },
-            BTreeSet::from([
-                RuntimeFilterEnvelopeKind::Contribution,
-                RuntimeFilterEnvelopeKind::ProducerClosed,
-                RuntimeFilterEnvelopeKind::Unavailable,
-            ]),
+            allowed_kinds,
         )
         .unwrap()
     }
@@ -2817,6 +2881,59 @@ mod tests {
     }
 
     #[test]
+    fn non_aggregator_rejects_core_producer_instance_mapped_to_remote_participant() {
+        let core = core_view([(1, channel(1, 10, 20, 30, 40))]);
+        let participant = core.local_participant_id();
+        let routing = routing_shard(
+            core.epoch(),
+            participant,
+            ChannelId::new(1),
+            BTreeSet::from([
+                RuntimeFilterRouteRole::Producer(BindingId::new(10)),
+                RuntimeFilterRouteRole::Consumer(BindingId::new(30)),
+            ]),
+            BTreeMap::from([(
+                (BindingId::new(10), uid(10)),
+                RuntimeFilterParticipantId::new(4),
+            )]),
+            Vec::new(),
+        );
+
+        assert_install_error(
+            registry()
+                .install(participant_install(core, routing))
+                .unwrap_err(),
+            InstallContractErrorKind::UnsupportedChannelContract,
+            "non-aggregator producer binding 10 instance",
+        );
+    }
+
+    #[test]
+    fn local_mapped_core_producer_requires_matching_local_role() {
+        let core = core_view([(1, channel(1, 10, 20, 30, 40))]);
+        let participant = core.local_participant_id();
+        let routing = routing_shard(
+            core.epoch(),
+            participant,
+            ChannelId::new(1),
+            BTreeSet::from([
+                RuntimeFilterRouteRole::Consumer(BindingId::new(30)),
+                RuntimeFilterRouteRole::Aggregator,
+            ]),
+            BTreeMap::from([((BindingId::new(10), uid(10)), participant)]),
+            Vec::new(),
+        );
+
+        assert_install_error(
+            registry()
+                .install(participant_install(core, routing))
+                .unwrap_err(),
+            InstallContractErrorKind::UnsupportedChannelContract,
+            "local producer binding 10 has no matching local Producer role",
+        );
+    }
+
+    #[test]
     fn install_rejects_aggregator_core_missing_authorized_remote_instance() {
         let core = core_view([(1, channel(1, 10, 20, 30, 40))]);
         let participant = core.local_participant_id();
@@ -2848,6 +2965,162 @@ mod tests {
                 .unwrap_err(),
             InstallContractErrorKind::UnsupportedChannelContract,
             "aggregator core is missing routing-authorized producer",
+        );
+    }
+
+    #[test]
+    fn aggregator_rejects_missing_inbound_edge_for_one_authorized_source() {
+        let base = channel(1, 10, 20, 30, 40);
+        let channel = RuntimeFilterChannelDeployment::new(
+            base.channel_id(),
+            base.logical_domain().clone(),
+            base.lifecycle(),
+            base.availability_coverage().clone(),
+            base.terminal_coverage().clone(),
+            base.reduction_requirement(),
+            base.allowed_contribution_kinds().clone(),
+            base.completion_requirement(),
+            base.policy(),
+            base.core_budget(),
+            base.materialization_policy(),
+            BTreeMap::from([(
+                BindingId::new(10),
+                ProducerDeployment::new(
+                    CoverageWitnessId::new(20),
+                    BTreeSet::from([uid(10), uid(11)]),
+                ),
+            )]),
+            BTreeMap::new(),
+        );
+        let core = core_view([(1, channel)]);
+        let participant = core.local_participant_id();
+        let source_a = RuntimeFilterParticipantId::new(4);
+        let source_b = RuntimeFilterParticipantId::new(5);
+        let routing = routing_shard(
+            core.epoch(),
+            participant,
+            ChannelId::new(1),
+            BTreeSet::from([RuntimeFilterRouteRole::Aggregator]),
+            BTreeMap::from([
+                ((BindingId::new(10), uid(10)), source_a),
+                ((BindingId::new(10), uid(11)), source_b),
+            ]),
+            vec![inbound_to_aggregator(
+                ChannelId::new(1),
+                BindingId::new(10),
+                source_a,
+                participant,
+            )],
+        );
+
+        assert_install_error(
+            registry()
+                .install(participant_install(core, routing))
+                .unwrap_err(),
+            InstallContractErrorKind::UnsupportedChannelContract,
+            "producer binding 10 source participant",
+        );
+    }
+
+    #[test]
+    fn aggregator_rejects_contribution_only_inbound_edge() {
+        let core = core_view([(1, without_consumers(&channel(1, 10, 20, 30, 40)))]);
+        let participant = core.local_participant_id();
+        let remote = RuntimeFilterParticipantId::new(4);
+        let routing = routing_shard(
+            core.epoch(),
+            participant,
+            ChannelId::new(1),
+            BTreeSet::from([RuntimeFilterRouteRole::Aggregator]),
+            BTreeMap::from([((BindingId::new(10), uid(10)), remote)]),
+            vec![inbound_to_aggregator_with(
+                ChannelId::new(1),
+                RouteEdgeId::new(901),
+                BindingId::new(10),
+                remote,
+                participant,
+                BTreeSet::from([RuntimeFilterEnvelopeKind::Contribution]),
+            )],
+        );
+
+        assert_install_error(
+            registry()
+                .install(participant_install(core, routing))
+                .unwrap_err(),
+            InstallContractErrorKind::UnsupportedChannelContract,
+            "must allow Contribution and ProducerClosed",
+        );
+    }
+
+    #[test]
+    fn consumerful_aggregator_without_inbound_producer_edge_is_rejected() {
+        let core = core_view([(1, channel(1, 10, 20, 30, 40))]);
+        let participant = core.local_participant_id();
+        let routing = routing_shard(
+            core.epoch(),
+            participant,
+            ChannelId::new(1),
+            BTreeSet::from([
+                RuntimeFilterRouteRole::Producer(BindingId::new(10)),
+                RuntimeFilterRouteRole::Consumer(BindingId::new(30)),
+                RuntimeFilterRouteRole::Aggregator,
+            ]),
+            BTreeMap::from([((BindingId::new(10), uid(10)), participant)]),
+            Vec::new(),
+        );
+
+        assert_install_error(
+            registry()
+                .install(participant_install(core, routing))
+                .unwrap_err(),
+            InstallContractErrorKind::UnsupportedChannelContract,
+            "requires exactly one inbound Producer-to-Aggregator edge",
+        );
+    }
+
+    #[test]
+    fn aggregator_rejects_duplicate_inbound_edges_for_authorized_source() {
+        let core = core_view([(1, without_consumers(&channel(1, 10, 20, 30, 40)))]);
+        let participant = core.local_participant_id();
+        let remote = RuntimeFilterParticipantId::new(4);
+        let routing = routing_shard(
+            core.epoch(),
+            participant,
+            ChannelId::new(1),
+            BTreeSet::from([RuntimeFilterRouteRole::Aggregator]),
+            BTreeMap::from([((BindingId::new(10), uid(10)), remote)]),
+            vec![
+                inbound_to_aggregator_with(
+                    ChannelId::new(1),
+                    RouteEdgeId::new(901),
+                    BindingId::new(10),
+                    remote,
+                    participant,
+                    BTreeSet::from([
+                        RuntimeFilterEnvelopeKind::Contribution,
+                        RuntimeFilterEnvelopeKind::ProducerClosed,
+                    ]),
+                ),
+                inbound_to_aggregator_with(
+                    ChannelId::new(1),
+                    RouteEdgeId::new(902),
+                    BindingId::new(10),
+                    remote,
+                    participant,
+                    BTreeSet::from([
+                        RuntimeFilterEnvelopeKind::Contribution,
+                        RuntimeFilterEnvelopeKind::ProducerClosed,
+                    ]),
+                ),
+            ],
+        );
+
+        assert_install_error(
+            registry()
+                .install(participant_install(core, routing))
+                .unwrap_err(),
+            InstallContractErrorKind::UnsupportedChannelContract,
+            "requires exactly one inbound Producer-to-Aggregator edge",
         );
     }
 
@@ -2946,7 +3219,7 @@ mod tests {
                     .install(participant_install(core, routing))
                     .unwrap_err(),
                 InstallContractErrorKind::UnsupportedChannelContract,
-                "consumerless aggregator requires an inbound producer edge",
+                "requires exactly one inbound Producer-to-Aggregator edge",
             );
         }
     }
@@ -2977,7 +3250,7 @@ mod tests {
                     .install(participant_install(core, routing))
                     .unwrap_err(),
                 InstallContractErrorKind::UnsupportedChannelContract,
-                "inbound producer edge source has no authorized producer instance",
+                "aggregator inbound producer edge source has no authorized producer instance",
             );
         }
     }
