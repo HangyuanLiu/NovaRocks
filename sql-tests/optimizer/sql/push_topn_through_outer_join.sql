@@ -17,9 +17,10 @@
 
 -- @tags=optimizer,topn,outer_join
 -- Test Objective:
--- Lock in PushTopNThroughJoin plan-shape coverage. LEFT/RIGHT OUTER JOIN
--- preserved-side ORDER BY can push a TopN below the join; null-producing-side
--- and disabled-rule cases must not.
+-- Lock in PushTopNThroughJoin plan-shape coverage. LEFT OUTER JOIN
+-- preserved-side ORDER BY can push a TopN below the join. RIGHT OUTER JOIN
+-- remains fail-closed until preserved-side aliases are executable across
+-- exchanges; null-producing-side and disabled-rule cases must not push.
 
 DROP TABLE IF EXISTS ${case_db}.topn_outer_left;
 DROP TABLE IF EXISTS ${case_db}.topn_outer_right;

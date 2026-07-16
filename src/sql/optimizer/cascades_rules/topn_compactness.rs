@@ -20,6 +20,7 @@ use crate::sql::optimizer::binder::Binding;
 use crate::sql::optimizer::memo::{GroupId, MExpr, Memo};
 use crate::sql::optimizer::operator::{Operator, ProjectOp, SortOp, TopNOp, TopNPhase, UnionOp};
 use crate::sql::optimizer::pattern::{OpKind, Pattern};
+use crate::sql::optimizer::property::ColumnIdSet;
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 use crate::sql::optimizer::scalar::{
     ColumnDisplay, ScalarArena, ScalarNode, SortKey as ScalarSortKey,
@@ -435,9 +436,28 @@ fn push_one_project(
     if topn.phase != TopNPhase::Final || topn.is_split {
         return vec![];
     }
-    let Some(remapped_items) =
-        remap_sort_keys_through_project(&memo.scalars, &topn.items, &project.items)
+    let Some(&project_child) = project_children.first() else {
+        return vec![];
+    };
+    let Some(child_props) = memo
+        .groups
+        .get(project_child)
+        .and_then(|group| group.logical_props.as_ref())
     else {
+        return vec![];
+    };
+    let source_columns = ColumnIdSet::from_columns(
+        child_props
+            .output_columns
+            .iter()
+            .map(|column| column.column_id),
+    );
+    let Some(remapped_items) = remap_sort_keys_through_project(
+        &memo.scalars,
+        &topn.items,
+        &project.items,
+        &source_columns,
+    ) else {
         return vec![];
     };
 
@@ -780,7 +800,12 @@ mod tests {
             }),
             children: vec![],
         };
-        memo.new_group(scan)
+        let group = memo.new_group(scan);
+        memo.groups[group].logical_props = Some(LogicalProperties::new(
+            vec![output_column(1, "c1"), output_column(2, "c2")],
+            0.0,
+        ));
+        group
     }
 
     fn output_column(id: u32, name: &str) -> crate::sql::analysis::OutputColumn {
@@ -1370,6 +1395,7 @@ mod tests {
         let mut memo = Memo::new();
         let scan_group = scan_group(&mut memo);
         let inner_group = topn_group(&mut memo, 3, 0, TopNPhase::Final, false, scan_group);
+        memo.groups[inner_group].logical_props = memo.groups[scan_group].logical_props.clone();
         let project_group = project_group_with_items(
             &mut memo,
             vec![project_item(col(1), 10, "alias_c1")],
@@ -1440,6 +1466,33 @@ mod tests {
         assert!(
             out.is_empty(),
             "computed Project expressions must fail closed"
+        );
+    }
+
+    #[test]
+    fn project_pushdown_rejects_source_slot_missing_from_child() {
+        let mut memo = Memo::new();
+        let child_group = values_group(&mut memo, &[30]);
+        let project_group = project_group_with_items(
+            &mut memo,
+            vec![project_item(col(29), 29, "merged_key")],
+            child_group,
+        );
+        let topn = topn_with_item(
+            &mut memo,
+            sort_item(29),
+            7,
+            0,
+            TopNPhase::Final,
+            false,
+            project_group,
+        );
+
+        let out = project_pushdown_rule().apply(&topn, &mut memo);
+
+        assert!(
+            out.is_empty(),
+            "TopN must not move below a Project when its source slot is not produced by the child"
         );
     }
 
