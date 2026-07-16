@@ -162,6 +162,10 @@ enum ProcessNetworkState {
     Stopped {
         pid: u32,
     },
+    Failed {
+        pid: u32,
+        error: StateStoreError,
+    },
 }
 
 #[cfg(feature = "foundationdb-provider")]
@@ -170,7 +174,7 @@ static PROCESS_NETWORK: Mutex<ProcessNetworkState> = Mutex::new(ProcessNetworkSt
 #[cfg(feature = "foundationdb-provider")]
 struct FoundationDbRuntime {
     shared: Arc<FoundationDbRuntimeShared>,
-    owner: Option<FoundationDbNetworkOwner>,
+    network: FoundationDbNetworkLifecycle,
 }
 
 #[cfg(feature = "foundationdb-provider")]
@@ -186,8 +190,38 @@ struct FoundationDbRuntimeShared {
 
 #[cfg(feature = "foundationdb-provider")]
 struct FoundationDbNetworkOwner {
-    stop: Option<NetworkStop>,
+    stop: Option<Box<dyn NetworkStopAction>>,
     thread: Option<JoinHandle<Result<(), StateStoreError>>>,
+}
+
+#[cfg(feature = "foundationdb-provider")]
+enum FoundationDbNetworkLifecycle {
+    Running(FoundationDbNetworkOwner),
+    Failed {
+        error: StateStoreError,
+        thread: Option<JoinHandle<Result<(), StateStoreError>>>,
+    },
+    Stopped,
+}
+
+#[cfg(feature = "foundationdb-provider")]
+trait NetworkStopAction: Send {
+    fn stop(self: Box<Self>) -> Result<(), StateStoreError>;
+}
+
+#[cfg(feature = "foundationdb-provider")]
+struct NativeNetworkStop(NetworkStop);
+
+#[cfg(feature = "foundationdb-provider")]
+impl NetworkStopAction for NativeNetworkStop {
+    fn stop(self: Box<Self>) -> Result<(), StateStoreError> {
+        self.0.stop().map_err(|_| {
+            StateStoreError::new(
+                StateStoreErrorKind::ProviderUnavailable,
+                "FoundationDB network stop failed",
+            )
+        })
+    }
 }
 
 #[cfg(feature = "foundationdb-provider")]
@@ -246,13 +280,25 @@ impl FoundationDbRuntime {
                         "FoundationDB network is stopped and cannot restart in this process",
                     ));
                 }
+                ProcessNetworkState::Failed {
+                    pid: owner_pid,
+                    error,
+                } => {
+                    if *owner_pid != pid {
+                        return Err(StateStoreError::new(
+                            StateStoreErrorKind::InvalidConfiguration,
+                            "FoundationDB network failed in a different process",
+                        ));
+                    }
+                    return Err(error.clone());
+                }
             }
         }
 
         let owner = match start_foundationdb_network(&config) {
             Ok(owner) => owner,
             Err(error) => {
-                mark_process_network_stopped(pid);
+                mark_process_network_failed(pid, error.clone());
                 return Err(error);
             }
         };
@@ -274,7 +320,7 @@ impl FoundationDbRuntime {
                 databases: Mutex::new(HashMap::new()),
                 drained: Notify::new(),
             }),
-            owner: Some(owner),
+            network: FoundationDbNetworkLifecycle::Running(owner),
         })
     }
 
@@ -323,8 +369,8 @@ impl FoundationDbRuntime {
 
     async fn shutdown(&mut self) -> Result<(), StateStoreError> {
         self.shared.validate_pid()?;
-        if self.owner.is_none() {
-            return Ok(());
+        if let Some(result) = self.network.terminal_result() {
+            return result;
         }
         if self
             .shared
@@ -353,51 +399,159 @@ impl FoundationDbRuntime {
         }
 
         self.shared.drop_database_registry();
-        let mut owner = self.owner.take().ok_or_else(|| {
+        match self.network.stop_and_join() {
+            Ok(()) => {
+                mark_process_network_stopped(self.shared.pid);
+                Ok(())
+            }
+            Err(error) => {
+                mark_process_network_failed(self.shared.pid, error.clone());
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "foundationdb-provider")]
+impl FoundationDbNetworkLifecycle {
+    fn terminal_result(&mut self) -> Option<Result<(), StateStoreError>> {
+        match self {
+            Self::Running(_) => None,
+            Self::Stopped => Some(Ok(())),
+            Self::Failed { error, thread } => {
+                Self::reap_finished_thread(thread);
+                Some(Err(error.clone()))
+            }
+        }
+    }
+
+    fn stop_and_join(&mut self) -> Result<(), StateStoreError> {
+        let owner = match self {
+            Self::Running(owner) => owner,
+            Self::Stopped => return Ok(()),
+            Self::Failed { error, thread } => {
+                Self::reap_finished_thread(thread);
+                return Err(error.clone());
+            }
+        };
+        let stop = match owner.stop.take() {
+            Some(stop) => stop,
+            None => {
+                let error = StateStoreError::new(
+                    StateStoreErrorKind::Internal,
+                    "FoundationDB runtime lost its stop handle",
+                );
+                let thread = owner.thread.take();
+                *self = Self::Failed {
+                    error: error.clone(),
+                    thread,
+                };
+                return Err(error);
+            }
+        };
+        let stop_result = catch_unwind(AssertUnwindSafe(|| stop.stop())).map_err(|_| {
             StateStoreError::new(
-                StateStoreErrorKind::Internal,
-                "FoundationDB runtime lost network ownership",
+                StateStoreErrorKind::ProviderUnavailable,
+                "FoundationDB network stop panicked",
             )
-        })?;
-        let stop = owner.stop.take().ok_or_else(|| {
-            StateStoreError::new(
-                StateStoreErrorKind::Internal,
-                "FoundationDB runtime lost its stop handle",
-            )
-        })?;
-        catch_unwind(AssertUnwindSafe(|| stop.stop()))
-            .map_err(|_| {
-                StateStoreError::new(
-                    StateStoreErrorKind::ProviderUnavailable,
-                    "FoundationDB network stop panicked",
-                )
-            })?
-            .map_err(|_| {
-                StateStoreError::new(
-                    StateStoreErrorKind::ProviderUnavailable,
-                    "FoundationDB network stop failed",
-                )
-            })?;
-        let thread = owner.thread.take().ok_or_else(|| {
-            StateStoreError::new(
-                StateStoreErrorKind::Internal,
-                "FoundationDB runtime lost its network thread",
-            )
-        })?;
-        let thread_result = catch_unwind(AssertUnwindSafe(|| thread.join())).map_err(|_| {
-            StateStoreError::new(
+        });
+        let stop_result = match stop_result {
+            Ok(result) => result,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = stop_result {
+            let thread = owner.thread.take();
+            *self = Self::Failed {
+                error: error.clone(),
+                thread,
+            };
+            return Err(error);
+        }
+
+        let thread = match owner.thread.take() {
+            Some(thread) => thread,
+            None => {
+                let error = StateStoreError::new(
+                    StateStoreErrorKind::Internal,
+                    "FoundationDB runtime lost its network thread",
+                );
+                *self = Self::Failed {
+                    error: error.clone(),
+                    thread: None,
+                };
+                return Err(error);
+            }
+        };
+        let joined = catch_unwind(AssertUnwindSafe(|| thread.join()));
+        let result = match joined {
+            Err(_) => Err(StateStoreError::new(
                 StateStoreErrorKind::ProviderUnavailable,
                 "FoundationDB network join panicked",
-            )
-        })?;
-        thread_result.map_err(|_| {
-            StateStoreError::new(
+            )),
+            Ok(Err(_)) => Err(StateStoreError::new(
                 StateStoreErrorKind::ProviderUnavailable,
                 "FoundationDB network thread panicked",
-            )
-        })??;
-        mark_process_network_stopped(self.shared.pid);
-        Ok(())
+            )),
+            Ok(Ok(Err(error))) => Err(error),
+            Ok(Ok(Ok(()))) => Ok(()),
+        };
+        match result {
+            Ok(()) => {
+                *self = Self::Stopped;
+                Ok(())
+            }
+            Err(error) => {
+                *self = Self::Failed {
+                    error: error.clone(),
+                    thread: None,
+                };
+                Err(error)
+            }
+        }
+    }
+
+    fn reap_finished_thread(thread: &mut Option<JoinHandle<Result<(), StateStoreError>>>) {
+        if thread.as_ref().is_some_and(JoinHandle::is_finished) {
+            if let Some(handle) = thread.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn retains_join_ownership(&self) -> bool {
+        matches!(
+            self,
+            Self::Running(FoundationDbNetworkOwner {
+                thread: Some(_),
+                ..
+            })
+        ) || matches!(
+            self,
+            Self::Failed {
+                thread: Some(_),
+                ..
+            }
+        )
+    }
+
+    #[cfg(test)]
+    fn failed_thread_is_finished(&self) -> bool {
+        matches!(self, Self::Failed { thread: Some(thread), .. } if thread.is_finished())
+    }
+}
+
+#[cfg(feature = "foundationdb-provider")]
+impl Drop for FoundationDbNetworkLifecycle {
+    fn drop(&mut self) {
+        let Self::Failed { thread, .. } = self else {
+            return;
+        };
+        Self::reap_finished_thread(thread);
+        if thread.is_some() {
+            eprintln!("FoundationDB failed network thread still owns process-global native state");
+            std::process::abort();
+        }
     }
 }
 
@@ -700,16 +854,36 @@ fn start_foundationdb_network(
                 "FoundationDB network thread could not be started",
             )
         })?;
-    let stop = catch_unwind(AssertUnwindSafe(|| wait.wait())).map_err(|_| {
-        StateStoreError::new(
-            StateStoreErrorKind::ProviderUnavailable,
-            "FoundationDB network startup wait panicked",
-        )
-    })?;
-    Ok(FoundationDbNetworkOwner {
-        stop: Some(stop),
-        thread: Some(thread),
+    finish_foundationdb_network_start(thread, || {
+        catch_unwind(AssertUnwindSafe(|| wait.wait()))
+            .map(|stop| Box::new(NativeNetworkStop(stop)) as Box<dyn NetworkStopAction>)
+            .map_err(|_| {
+                StateStoreError::new(
+                    StateStoreErrorKind::ProviderUnavailable,
+                    "FoundationDB network startup wait panicked",
+                )
+            })
     })
+}
+
+#[cfg(feature = "foundationdb-provider")]
+fn finish_foundationdb_network_start(
+    thread: JoinHandle<Result<(), StateStoreError>>,
+    wait: impl FnOnce() -> Result<Box<dyn NetworkStopAction>, StateStoreError>,
+) -> Result<FoundationDbNetworkOwner, StateStoreError> {
+    match wait() {
+        Ok(stop) => Ok(FoundationDbNetworkOwner {
+            stop: Some(stop),
+            thread: Some(thread),
+        }),
+        Err(error) => {
+            // NetworkWait only panics when its shared mutex is poisoned. The runner
+            // uses that same mutex before entering the native loop, so it has already
+            // terminated and can be joined without a stop handle.
+            let _ = catch_unwind(AssertUnwindSafe(|| thread.join()));
+            Err(error)
+        }
+    }
 }
 
 #[cfg(feature = "foundationdb-provider")]
@@ -728,5 +902,212 @@ fn mark_process_network_stopped(pid: u32) {
     match PROCESS_NETWORK.lock() {
         Ok(mut process) => *process = ProcessNetworkState::Stopped { pid },
         Err(poisoned) => *poisoned.into_inner() = ProcessNetworkState::Stopped { pid },
+    }
+}
+
+#[cfg(feature = "foundationdb-provider")]
+fn mark_process_network_failed(pid: u32, error: StateStoreError) {
+    match PROCESS_NETWORK.lock() {
+        Ok(mut process) => *process = ProcessNetworkState::Failed { pid, error },
+        Err(poisoned) => *poisoned.into_inner() = ProcessNetworkState::Failed { pid, error },
+    }
+}
+
+#[cfg(all(test, feature = "foundationdb-provider"))]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Instant as StdInstant;
+
+    static TEST_PROCESS_STATE: Mutex<()> = Mutex::new(());
+
+    struct TestNetworkStop {
+        action: Box<dyn FnOnce() -> Result<(), StateStoreError> + Send>,
+    }
+
+    impl NetworkStopAction for TestNetworkStop {
+        fn stop(self: Box<Self>) -> Result<(), StateStoreError> {
+            (self.action)()
+        }
+    }
+
+    fn test_stop(
+        action: impl FnOnce() -> Result<(), StateStoreError> + Send + 'static,
+    ) -> Box<dyn NetworkStopAction> {
+        Box::new(TestNetworkStop {
+            action: Box::new(action),
+        })
+    }
+
+    fn test_runtime(
+        stop: Box<dyn NetworkStopAction>,
+        thread: JoinHandle<Result<(), StateStoreError>>,
+    ) -> FoundationDbRuntime {
+        FoundationDbRuntime {
+            shared: Arc::new(FoundationDbRuntimeShared {
+                pid: std::process::id(),
+                accepting: AtomicBool::new(true),
+                in_flight: AtomicUsize::new(0),
+                provider_handles: AtomicUsize::new(0),
+                next_database_id: AtomicU64::new(1),
+                databases: Mutex::new(HashMap::new()),
+                drained: Notify::new(),
+            }),
+            network: FoundationDbNetworkLifecycle::Running(FoundationDbNetworkOwner {
+                stop: Some(stop),
+                thread: Some(thread),
+            }),
+        }
+    }
+
+    fn reset_process_state() {
+        *PROCESS_NETWORK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = ProcessNetworkState::Never;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_stop_failure_is_stable_and_retains_join_ownership() {
+        let _guard = TEST_PROCESS_STATE.lock().unwrap();
+        reset_process_state();
+        let (release_tx, release_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            release_rx.recv().expect("release failed network thread");
+            Ok(())
+        });
+        let expected = StateStoreError::new(
+            StateStoreErrorKind::ProviderUnavailable,
+            "injected network stop failure",
+        );
+        let injected = expected.clone();
+        let mut runtime = test_runtime(test_stop(move || Err(injected)), thread);
+
+        let first = runtime
+            .shutdown()
+            .await
+            .expect_err("stop failure must surface");
+        assert_eq!(first, expected);
+        assert!(runtime.network.retains_join_ownership());
+        let second = runtime
+            .shutdown()
+            .await
+            .expect_err("repeated shutdown must return the stable failure");
+        assert_eq!(second, expected);
+        assert!(runtime.network.retains_join_ownership());
+
+        release_tx.send(()).expect("release failed network thread");
+        while !runtime.network.failed_thread_is_finished() {
+            std::thread::yield_now();
+        }
+        let third = runtime
+            .shutdown()
+            .await
+            .expect_err("reaping must preserve the stable failure");
+        assert_eq!(third, expected);
+        assert!(!runtime.network.retains_join_ownership());
+        reset_process_state();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_join_failure_is_stable_instead_of_becoming_success() {
+        let _guard = TEST_PROCESS_STATE.lock().unwrap();
+        reset_process_state();
+        let expected = StateStoreError::new(
+            StateStoreErrorKind::ProviderUnavailable,
+            "injected network runner failure",
+        );
+        let injected = expected.clone();
+        let thread = std::thread::spawn(move || Err(injected));
+        let mut runtime = test_runtime(test_stop(|| Ok(())), thread);
+
+        let first = runtime
+            .shutdown()
+            .await
+            .expect_err("join failure must surface");
+        assert_eq!(first, expected);
+        let second = runtime
+            .shutdown()
+            .await
+            .expect_err("consumed join failure must remain terminal");
+        assert_eq!(second, expected);
+        reset_process_state();
+    }
+
+    #[test]
+    fn startup_wait_failure_joins_the_spawned_thread_and_poison_is_stable() {
+        let _guard = TEST_PROCESS_STATE.lock().unwrap();
+        reset_process_state();
+        let completed = Arc::new(AtomicBool::new(false));
+        let thread_completed = Arc::clone(&completed);
+        let thread = std::thread::spawn(move || {
+            thread_completed.store(true, Ordering::Release);
+            Err(StateStoreError::new(
+                StateStoreErrorKind::ProviderUnavailable,
+                "injected startup runner failure",
+            ))
+        });
+        let wait_error = StateStoreError::new(
+            StateStoreErrorKind::ProviderUnavailable,
+            "injected startup wait failure",
+        );
+
+        let result = finish_foundationdb_network_start(thread, || Err(wait_error.clone()));
+        let result = match result {
+            Ok(_) => panic!("startup wait failure must surface"),
+            Err(error) => error,
+        };
+        assert_eq!(result, wait_error);
+        assert!(completed.load(Ordering::Acquire));
+        mark_process_network_failed(std::process::id(), wait_error.clone());
+        let repeated = FoundationDbRuntime::boot(FoundationDbClientConfig {
+            disable_multi_version_client: true,
+            tls_cert_path: None,
+            tls_key_path: None,
+            tls_ca_path: None,
+            tls_verify_peers: None,
+            tls_password_env: None,
+        });
+        let repeated = match repeated {
+            Ok(_) => panic!("poisoned process runtime must reject later boot"),
+            Err(error) => error,
+        };
+        assert_eq!(repeated, wait_error);
+        reset_process_state();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn operation_handle_blocks_five_second_shutdown_then_allows_retry() {
+        let _guard = TEST_PROCESS_STATE.lock().unwrap();
+        reset_process_state();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            stop_rx.recv().expect("network stop signal");
+            Ok(())
+        });
+        let mut runtime = test_runtime(
+            test_stop(move || {
+                stop_tx.send(()).expect("signal network stop");
+                Ok(())
+            }),
+            thread,
+        );
+        let operation = runtime
+            .shared
+            .acquire_operation()
+            .expect("acquire real operation handle");
+
+        let started = StdInstant::now();
+        let timeout = runtime
+            .shutdown()
+            .await
+            .expect_err("live operation must block shutdown");
+        assert_eq!(timeout.kind(), StateStoreErrorKind::DeadlineExceeded);
+        assert!(started.elapsed() >= Duration::from_millis(4_900));
+        drop(operation);
+        runtime
+            .shutdown()
+            .await
+            .expect("shutdown must retry after operation drain");
+        reset_process_state();
     }
 }
