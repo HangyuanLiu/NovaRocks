@@ -731,13 +731,8 @@ pub(crate) fn analyze_visible_query(
         .expect("standalone connector registry read lock")
         .clone();
     let catalog_mgr = crate::engine::catalog_mgr_snapshot(state);
-    let provider = crate::engine::build_analyzer_provider(
-        None,
-        &catalog,
-        &catalog_mgr,
-        &connectors,
-        crate::sql::catalog::TableLookupMode::SchemaOnly,
-    );
+    let provider =
+        crate::engine::build_analyzer_provider(None, &catalog, &catalog_mgr, &connectors);
     let (resolved, _cte_registry, _factory) =
         crate::sql::analyzer::analyze(&query, &provider, current_database)
             .map_err(|e| format!("aggregate MV visible type analysis failed: {e}"))?;

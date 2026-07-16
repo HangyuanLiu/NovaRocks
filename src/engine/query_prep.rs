@@ -1006,7 +1006,6 @@ mod tests {
             &local,
             &mgr,
             &connectors,
-            crate::sql::catalog::TableLookupMode::SchemaOnly,
         );
         let query = parse_query_for_table_names("SELECT * FROM parted");
 

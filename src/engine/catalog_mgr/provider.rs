@@ -28,7 +28,6 @@ pub(crate) struct CatalogMgrProvider<'a> {
     local: &'a InMemoryCatalog,
     catalog_mgr: &'a CatalogMgr,
     connectors: &'a ConnectorRegistry,
-    default_mode: TableLookupMode,
 }
 
 impl<'a> CatalogMgrProvider<'a> {
@@ -37,14 +36,12 @@ impl<'a> CatalogMgrProvider<'a> {
         local: &'a InMemoryCatalog,
         catalog_mgr: &'a CatalogMgr,
         connectors: &'a ConnectorRegistry,
-        default_mode: TableLookupMode,
     ) -> Self {
         Self {
             current_catalog,
             local,
             catalog_mgr,
             connectors,
-            default_mode,
         }
     }
 
@@ -64,12 +61,6 @@ impl<'a> CatalogMgrProvider<'a> {
                 .catalog_mgr
                 .resolve(catalog, database, table)
                 .map(|metadata| metadata.to_table_def()),
-            TableLookupMode::ExplainStats => {
-                let backend = self.connectors.catalog_backend("iceberg")?;
-                let source = self.connectors.table_source("iceberg")?;
-                let resolved = backend.load_table_for_read(catalog, database, table)?;
-                source.build_table_def(&resolved)
-            }
             TableLookupMode::IcebergMetadata {
                 metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType::Partitions,
             } => {
@@ -104,7 +95,7 @@ impl<'a> CatalogMgrProvider<'a> {
 
 impl CatalogProvider for CatalogMgrProvider<'_> {
     fn get_table(&self, database: &str, table: &str) -> Result<TableDef, String> {
-        self.get_table_with_mode(None, database, table, self.default_mode.clone())
+        self.get_table_with_mode(None, database, table, TableLookupMode::SchemaOnly)
     }
 
     fn get_table_in_catalog(
@@ -113,7 +104,7 @@ impl CatalogProvider for CatalogMgrProvider<'_> {
         database: &str,
         table: &str,
     ) -> Result<TableDef, String> {
-        self.get_table_with_mode(catalog, database, table, self.default_mode.clone())
+        self.get_table_with_mode(catalog, database, table, TableLookupMode::SchemaOnly)
     }
 
     fn get_table_with_mode(
@@ -151,6 +142,7 @@ mod tests {
     use crate::connector::iceberg::IcebergMetadataTableType;
     use crate::engine::catalog::InMemoryCatalog;
     use crate::engine::catalog_mgr::catalog::Catalog;
+    use crate::engine::catalog_mgr::iceberg::IcebergCatalog;
     use crate::engine::catalog_mgr::metadata::{TableBinding, TableMetadata};
     use crate::sql::catalog::TableLookupMode;
     use crate::sql::parser::ast::AlterIcebergPartitionSpecStmt;
@@ -331,13 +323,7 @@ mod tests {
             schema_calls: Arc::clone(&schema_calls),
         }));
         (
-            CatalogMgrProvider::new(
-                Some("ice"),
-                local,
-                mgr,
-                connectors,
-                TableLookupMode::SchemaOnly,
-            ),
+            CatalogMgrProvider::new(Some("ice"), local, mgr, connectors),
             full_calls,
             schema_calls,
         )
@@ -349,19 +335,71 @@ mod tests {
         let mut mgr = CatalogMgr::new();
         mgr.register(Arc::new(FixedIceCatalog));
         let connectors = crate::connector::ConnectorRegistry::default();
-        let provider = CatalogMgrProvider::new(
-            Some("ice"),
-            &local,
-            &mgr,
-            &connectors,
-            TableLookupMode::SchemaOnly,
-        );
+        let provider = CatalogMgrProvider::new(Some("ice"), &local, &mgr, &connectors);
 
         let table = provider.get_table("db", "orders").expect("resolve");
 
         assert_eq!(table.name, "orders");
         assert!(matches!(table.source, ScanSource::IcebergDataFiles { .. }));
         assert!(local.get("db", "orders").is_err());
+    }
+
+    #[test]
+    fn ordinary_lookup_cannot_be_switched_to_full_scan_binding_mode() {
+        let local = InMemoryCatalog::default();
+        let mut mgr = CatalogMgr::new();
+        mgr.register(Arc::new(FixedIceCatalog));
+        let mut connectors = crate::connector::ConnectorRegistry::default();
+        let full_calls = Arc::new(AtomicUsize::new(0));
+        connectors.register_catalog_backend(Arc::new(TrackingBackend {
+            loads: Arc::new(AtomicUsize::new(0)),
+        }));
+        connectors.register_table_source(Arc::new(TrackingSource {
+            full_calls: Arc::clone(&full_calls),
+            schema_calls: Arc::new(AtomicUsize::new(0)),
+        }));
+        let provider = CatalogMgrProvider::new(Some("ice"), &local, &mgr, &connectors);
+
+        let _ = provider.get_table("db", "orders").expect("ordinary lookup");
+
+        assert_eq!(
+            full_calls.load(Ordering::SeqCst),
+            0,
+            "ordinary catalog lookup must never build a full scan binding"
+        );
+    }
+
+    #[test]
+    fn ordinary_lookup_populates_schema_cache_without_full_scan_binding() {
+        let local = InMemoryCatalog::default();
+        let loads = Arc::new(AtomicUsize::new(0));
+        let full_calls = Arc::new(AtomicUsize::new(0));
+        let schema_calls = Arc::new(AtomicUsize::new(0));
+        let mut mgr = CatalogMgr::new();
+        mgr.register(Arc::new(IcebergCatalog::new(
+            "ice",
+            Arc::new(TrackingBackend {
+                loads: Arc::clone(&loads),
+            }),
+            Arc::new(TrackingSource {
+                full_calls: Arc::clone(&full_calls),
+                schema_calls: Arc::clone(&schema_calls),
+            }),
+        )));
+        let connectors = crate::connector::ConnectorRegistry::default();
+        let provider = CatalogMgrProvider::new(Some("ice"), &local, &mgr, &connectors);
+
+        let first = provider
+            .get_table("db", "orders")
+            .expect("schema cache miss");
+        let second = provider
+            .get_table("db", "orders")
+            .expect("schema cache hit");
+
+        assert_eq!(first.name, second.name);
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        assert_eq!(schema_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(full_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
