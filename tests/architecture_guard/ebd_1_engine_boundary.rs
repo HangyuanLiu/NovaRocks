@@ -13768,119 +13768,119 @@ fn ebd_5a1_public_forwarding_reexports(source: &GuardSource) -> BTreeSet<String>
         .collect()
 }
 
-fn ebd_5a1_runtime_alias_and_wrapper_violations(source: &GuardSource) -> BTreeSet<String> {
-    fn runtime_symbol(path: &[String]) -> Option<&'static str> {
-        const RUNTIME_PATHS: &[(&[&str], &str)] = &[
-            (
-                &["crate", "catalog", "memory", "MemoryCatalog"],
-                "MemoryCatalog",
-            ),
-            (
-                &["crate", "catalog", "registry", "CatalogRegistry"],
-                "CatalogRegistry",
-            ),
-            (
-                &["crate", "catalog", "schema_cache", "SchemaCache"],
-                "SchemaCache",
-            ),
-            (
-                &["crate", "catalog", "service", "CatalogService"],
-                "CatalogService",
-            ),
-            (
-                &[
-                    "crate",
-                    "sql",
-                    "catalog",
-                    "provider",
-                    "CatalogServiceProvider",
-                ],
+fn ebd_5a1_runtime_symbol(path: &[String]) -> Option<&'static str> {
+    const RUNTIME_PATHS: &[(&[&str], &str)] = &[
+        (
+            &["crate", "catalog", "memory", "MemoryCatalog"],
+            "MemoryCatalog",
+        ),
+        (
+            &["crate", "catalog", "registry", "CatalogRegistry"],
+            "CatalogRegistry",
+        ),
+        (
+            &["crate", "catalog", "schema_cache", "SchemaCache"],
+            "SchemaCache",
+        ),
+        (
+            &["crate", "catalog", "service", "CatalogService"],
+            "CatalogService",
+        ),
+        (
+            &[
+                "crate",
+                "sql",
+                "catalog",
+                "provider",
                 "CatalogServiceProvider",
-            ),
-        ];
-        RUNTIME_PATHS
-            .iter()
-            .find(|(candidate, _)| {
-                path.iter()
-                    .map(String::as_str)
-                    .eq(candidate.iter().copied())
-            })
-            .map(|(_, symbol)| *symbol)
+            ],
+            "CatalogServiceProvider",
+        ),
+    ];
+    RUNTIME_PATHS
+        .iter()
+        .find(|(candidate, _)| {
+            path.iter()
+                .map(String::as_str)
+                .eq(candidate.iter().copied())
+        })
+        .map(|(_, symbol)| *symbol)
+}
+
+fn ebd_5a1_runtime_types_in_type(
+    ty: &syn::Type,
+    source_path: &str,
+    inline_modules: &[String],
+    aliases: &RustScopedAliases,
+) -> BTreeSet<String> {
+    struct Visitor<'a> {
+        source_path: &'a str,
+        inline_modules: &'a [String],
+        aliases: &'a RustScopedAliases,
+        found: BTreeSet<String>,
     }
 
-    fn runtime_types(
-        ty: &syn::Type,
-        source_path: &str,
-        inline_modules: &[String],
-        aliases: &RustScopedAliases,
-    ) -> BTreeSet<String> {
-        struct Visitor<'a> {
-            source_path: &'a str,
-            inline_modules: &'a [String],
-            aliases: &'a RustScopedAliases,
-            found: BTreeSet<String>,
-        }
-
-        impl<'ast> syn::visit::Visit<'ast> for Visitor<'_> {
-            fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
-                let segments = path
-                    .path
-                    .segments
-                    .iter()
-                    .map(|segment| segment.ident.to_string())
-                    .collect::<Vec<_>>();
-                let resolved = rust_resolve_scoped_paths(
-                    &segments,
-                    self.inline_modules,
-                    self.aliases,
-                    &mut BTreeSet::new(),
-                    0,
-                )
-                .unwrap_or_else(|| {
-                    vec![RustScopedUsePath {
-                        segments: segments.clone(),
-                        inline_modules: self.inline_modules.to_vec(),
-                    }]
+    impl<'ast> syn::visit::Visit<'ast> for Visitor<'_> {
+        fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
+            let segments = path
+                .path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>();
+            let resolved = rust_resolve_scoped_paths(
+                &segments,
+                self.inline_modules,
+                self.aliases,
+                &mut BTreeSet::new(),
+                0,
+            )
+            .unwrap_or_else(|| {
+                vec![RustScopedUsePath {
+                    segments: segments.clone(),
+                    inline_modules: self.inline_modules.to_vec(),
+                }]
+            });
+            let alias_resolved = resolved.iter().any(|target| {
+                target.segments != segments || target.inline_modules != self.inline_modules
+            });
+            for resolved in resolved {
+                let canonical = rust_canonical_path_segments_in_scope(
+                    &resolved.segments,
+                    self.source_path,
+                    &resolved.inline_modules,
+                );
+                let direct_symbol = (!alias_resolved).then(|| {
+                    segments.last().and_then(|symbol| {
+                        EBD_5A1_REQUIRED_OWNERS
+                            .iter()
+                            .any(|(_, required)| symbol == required)
+                            .then_some(symbol.as_str())
+                    })
                 });
-                let alias_resolved = resolved.iter().any(|target| {
-                    target.segments != segments || target.inline_modules != self.inline_modules
-                });
-                for resolved in resolved {
-                    let canonical = rust_canonical_path_segments_in_scope(
-                        &resolved.segments,
-                        self.source_path,
-                        &resolved.inline_modules,
-                    );
-                    let direct_symbol = (!alias_resolved).then(|| {
-                        segments.last().and_then(|symbol| {
-                            EBD_5A1_REQUIRED_OWNERS
-                                .iter()
-                                .any(|(_, required)| symbol == required)
-                                .then_some(symbol.as_str())
-                        })
-                    });
-                    if let Some(symbol) = canonical
-                        .as_deref()
-                        .and_then(runtime_symbol)
-                        .or(direct_symbol.flatten())
-                    {
-                        self.found.insert(symbol.to_string());
-                    }
+                if let Some(symbol) = canonical
+                    .as_deref()
+                    .and_then(ebd_5a1_runtime_symbol)
+                    .or(direct_symbol.flatten())
+                {
+                    self.found.insert(symbol.to_string());
                 }
-                syn::visit::visit_type_path(self, path);
             }
+            syn::visit::visit_type_path(self, path);
         }
-
-        let mut visitor = Visitor {
-            source_path,
-            inline_modules,
-            aliases,
-            found: BTreeSet::new(),
-        };
-        syn::visit::Visit::visit_type(&mut visitor, ty);
-        visitor.found
     }
 
+    let mut visitor = Visitor {
+        source_path,
+        inline_modules,
+        aliases,
+        found: BTreeSet::new(),
+    };
+    syn::visit::Visit::visit_type(&mut visitor, ty);
+    visitor.found
+}
+
+fn ebd_5a1_runtime_alias_and_wrapper_violations(source: &GuardSource) -> BTreeSet<String> {
     struct Visitor<'a> {
         path: &'a str,
         aliases: &'a RustScopedAliases,
@@ -13893,7 +13893,12 @@ fn ebd_5a1_runtime_alias_and_wrapper_violations(source: &GuardSource) -> BTreeSe
             if ebd_5a1_attrs_are_test_only(&item.attrs) {
                 return;
             }
-            for symbol in runtime_types(&item.ty, self.path, &self.inline_modules, self.aliases) {
+            for symbol in ebd_5a1_runtime_types_in_type(
+                &item.ty,
+                self.path,
+                &self.inline_modules,
+                self.aliases,
+            ) {
                 self.violations.insert(format!(
                     "catalog-runtime-type-alias: {}|{}|{symbol}",
                     self.path, item.ident
@@ -13911,9 +13916,12 @@ fn ebd_5a1_runtime_alias_and_wrapper_violations(source: &GuardSource) -> BTreeSe
                 .any(|(path, symbol)| self.path == *path && item.ident == *symbol);
             if !canonical_owner && item.fields.len() == 1 {
                 let field = item.fields.iter().next().expect("single struct field");
-                for symbol in
-                    runtime_types(&field.ty, self.path, &self.inline_modules, self.aliases)
-                {
+                for symbol in ebd_5a1_runtime_types_in_type(
+                    &field.ty,
+                    self.path,
+                    &self.inline_modules,
+                    self.aliases,
+                ) {
                     self.violations.insert(format!(
                         "catalog-runtime-wrapper: {}|{}|{symbol}",
                         self.path, item.ident
@@ -14021,8 +14029,13 @@ fn ebd_5a1_connector_state_registration_violations(
     }
 
     impl SignatureTypes {
-        fn inspect(signature: &syn::Signature) -> Self {
-            fn type_contains(ty: &syn::Type, names: &[&str]) -> bool {
+        fn inspect(
+            signature: &syn::Signature,
+            source_path: &str,
+            inline_modules: &[String],
+            aliases: &RustScopedAliases,
+        ) -> Self {
+            fn type_contains_leaf(ty: &syn::Type, names: &[&str]) -> bool {
                 struct Visitor<'a> {
                     names: &'a [&'a str],
                     found: bool,
@@ -14055,20 +14068,17 @@ fn ebd_5a1_connector_state_registration_violations(
                 let syn::Pat::Ident(binding) = input.pat.as_ref() else {
                     continue;
                 };
-                if type_contains(&input.ty, &["StandaloneState"]) {
+                if type_contains_leaf(&input.ty, &["StandaloneState"]) {
                     result.state = true;
                 }
-                if type_contains(
-                    &input.ty,
-                    &[
-                        "CatalogMgr",
-                        "CatalogRegistry",
-                        "CatalogService",
-                        "MemoryCatalog",
-                        "SchemaCache",
-                        "StandaloneCatalogService",
-                    ],
-                ) {
+                let runtime_type =
+                    !ebd_5a1_runtime_types_in_type(&input.ty, source_path, inline_modules, aliases)
+                        .is_empty()
+                        || type_contains_leaf(
+                            &input.ty,
+                            &["CatalogMgr", "StandaloneCatalogService"],
+                        );
+                if runtime_type {
                     result.catalog_params.insert(binding.ident.to_string());
                 }
             }
@@ -14267,7 +14277,12 @@ fn ebd_5a1_connector_state_registration_violations(
         }
 
         fn inspect(&mut self, signature: &syn::Signature, block: &syn::Block) {
-            let signature_types = SignatureTypes::inspect(signature);
+            let signature_types = SignatureTypes::inspect(
+                signature,
+                self.source_path,
+                &self.inline_modules,
+                self.aliases,
+            );
             let mut body = FunctionBody::new(signature_types.catalog_params.clone());
             syn::visit::Visit::visit_block(&mut body, block);
             let name = signature.ident.to_string();
@@ -14432,16 +14447,7 @@ fn ebd_5a1_connector_state_registration_violations(
 fn ebd_5a1_engine_forwarding_facade_violations(
     sources: &BTreeMap<&str, &GuardSource>,
 ) -> BTreeSet<String> {
-    const RUNTIME_TYPES: &[&str] = &[
-        "CatalogRegistry",
-        "CatalogService",
-        "CatalogServiceProvider",
-        "MemoryCatalog",
-        "SchemaCache",
-        "StandaloneCatalogService",
-    ];
-
-    fn type_contains(ty: &syn::Type, names: &[&str]) -> bool {
+    fn type_contains_leaf(ty: &syn::Type, names: &[&str]) -> bool {
         struct Visitor<'a> {
             names: &'a [&'a str],
             found: bool,
@@ -14467,7 +14473,12 @@ fn ebd_5a1_engine_forwarding_facade_violations(
         visitor.found
     }
 
-    fn binding_names(signature: &syn::Signature, names: &[&str]) -> BTreeSet<String> {
+    fn runtime_binding_names(
+        signature: &syn::Signature,
+        source_path: &str,
+        inline_modules: &[String],
+        aliases: &RustScopedAliases,
+    ) -> BTreeSet<String> {
         signature
             .inputs
             .iter()
@@ -14478,7 +14489,27 @@ fn ebd_5a1_engine_forwarding_facade_violations(
                 let syn::Pat::Ident(binding) = input.pat.as_ref() else {
                     return None;
                 };
-                type_contains(&input.ty, names).then(|| binding.ident.to_string())
+                (!ebd_5a1_runtime_types_in_type(&input.ty, source_path, inline_modules, aliases)
+                    .is_empty()
+                    || type_contains_leaf(&input.ty, &["StandaloneCatalogService"]))
+                .then(|| binding.ident.to_string())
+            })
+            .collect()
+    }
+
+    fn state_binding_names(signature: &syn::Signature) -> BTreeSet<String> {
+        signature
+            .inputs
+            .iter()
+            .filter_map(|input| {
+                let syn::FnArg::Typed(input) = input else {
+                    return None;
+                };
+                let syn::Pat::Ident(binding) = input.pat.as_ref() else {
+                    return None;
+                };
+                type_contains_leaf(&input.ty, &["StandaloneState"])
+                    .then(|| binding.ident.to_string())
             })
             .collect()
     }
@@ -14528,13 +14559,24 @@ fn ebd_5a1_engine_forwarding_facade_violations(
         }
     }
 
-    fn is_thin_forwarder(signature: &syn::Signature, block: &syn::Block) -> bool {
-        let runtime_bindings = binding_names(signature, RUNTIME_TYPES);
-        let state_bindings = binding_names(signature, &["StandaloneState"]);
+    fn is_thin_forwarder(
+        signature: &syn::Signature,
+        block: &syn::Block,
+        source_path: &str,
+        inline_modules: &[String],
+        aliases: &RustScopedAliases,
+    ) -> bool {
+        let runtime_bindings =
+            runtime_binding_names(signature, source_path, inline_modules, aliases);
+        let state_bindings = state_binding_names(signature);
         let exposes_runtime = !runtime_bindings.is_empty()
             || match &signature.output {
                 syn::ReturnType::Default => false,
-                syn::ReturnType::Type(_, ty) => type_contains(ty, RUNTIME_TYPES),
+                syn::ReturnType::Type(_, ty) => {
+                    !ebd_5a1_runtime_types_in_type(ty, source_path, inline_modules, aliases)
+                        .is_empty()
+                        || type_contains_leaf(ty, &["StandaloneCatalogService"])
+                }
             };
         let Some(syn::Stmt::Expr(expr, _)) = block.stmts.first() else {
             return false;
@@ -14546,12 +14588,20 @@ fn ebd_5a1_engine_forwarding_facade_violations(
 
     struct Visitor<'a> {
         path: &'a str,
+        aliases: &'a RustScopedAliases,
+        inline_modules: Vec<String>,
         violations: BTreeSet<String>,
     }
 
     impl Visitor<'_> {
         fn inspect(&mut self, signature: &syn::Signature, block: &syn::Block) {
-            if is_thin_forwarder(signature, block) {
+            if is_thin_forwarder(
+                signature,
+                block,
+                self.path,
+                &self.inline_modules,
+                self.aliases,
+            ) {
                 self.violations.insert(format!(
                     "catalog-runtime-engine-forwarding-facade: {}|{}",
                     self.path, signature.ident
@@ -14580,6 +14630,19 @@ fn ebd_5a1_engine_forwarding_facade_violations(
                 syn::visit::visit_item_impl(self, item);
             }
         }
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if ebd_5a1_attrs_are_test_only(&item.attrs) {
+                return;
+            }
+            if let Some((_, items)) = &item.content {
+                self.inline_modules.push(item.ident.to_string());
+                for nested in items {
+                    syn::visit::Visit::visit_item(self, nested);
+                }
+                self.inline_modules.pop();
+            }
+        }
     }
 
     let declared = sources
@@ -14601,8 +14664,11 @@ fn ebd_5a1_engine_forwarding_facade_violations(
             let Ok(file) = syn::parse_file(&source.text) else {
                 continue;
             };
+            let aliases = rust_production_scoped_aliases(&source.text);
             let mut visitor = Visitor {
                 path: &source.path,
+                aliases: &aliases,
+                inline_modules: Vec::new(),
                 violations: BTreeSet::new(),
             };
             syn::visit::Visit::visit_file(&mut visitor, &file);
@@ -15116,6 +15182,12 @@ fn ebd_5a1_detector_rejects_cross_file_connector_registration_forwarding() {
         GuardSource::new(
             "src/connector/inspect.rs",
             r#"
+use crate::unrelated::service::Service;
+
+fn inspect_unrelated(service: &Service) {
+    service.inspect();
+}
+
 fn inspect_catalog(service: &StandaloneCatalogService) {
     service.catalog_names();
 }
@@ -15146,7 +15218,9 @@ fn install_standalone_catalogs(state: &StandaloneState) {
     invalid.push(GuardSource::new(
         "src/connector/iceberg.rs",
         r#"
-pub(super) fn install_catalog(service: &StandaloneCatalogService) {
+use crate::catalog::service::CatalogService as Service;
+
+pub(super) fn install_catalog(service: &Service<(), ()>) {
     service.register_catalog(build_catalog());
 }
 "#,
@@ -15313,6 +15387,12 @@ struct StandaloneState { catalog_service: Arc<StandaloneCatalogService> }
         GuardSource::new(
             "src/engine/query_flow.rs",
             r#"
+use crate::unrelated::service::Service;
+
+fn inspect_unrelated(service: &Service) {
+    service.inspect();
+}
+
 fn execute_query(state: &StandaloneState, request: QueryRequest) -> QueryResult {
     let table = state.catalog_service.resolve_table(&request)?;
     let plan = plan_query(table, request)?;
@@ -15339,8 +15419,10 @@ struct StandaloneState { catalog_service: Arc<StandaloneCatalogService> }
     valid.push(GuardSource::new(
         "src/engine/catalog_facade.rs",
         r#"
+use crate::catalog::service::CatalogService as Service;
+
 pub(crate) fn register_catalog(
-    service: &CatalogService<(), ()>,
+    service: &Service<(), ()>,
     catalog: Arc<dyn Catalog>,
 ) {
     service.register_catalog(catalog);
