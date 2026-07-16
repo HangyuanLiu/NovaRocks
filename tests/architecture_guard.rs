@@ -10022,24 +10022,19 @@ fn production_crate_self_alias_violations(source_rel: &str, text: &str) -> Vec<S
         }
 
         fn visit_macro(&mut self, item: &'ast syn::Macro) {
-            fn contains_extern_crate(mut cursor: syn::buffer::Cursor<'_>) -> bool {
-                let mut previous_was_extern = false;
+            fn contains_extern_token(mut cursor: syn::buffer::Cursor<'_>) -> bool {
                 while !cursor.eof() {
                     if let Some((inside, _, _, rest)) = cursor.any_group() {
-                        if contains_extern_crate(inside) {
+                        if contains_extern_token(inside) {
                             return true;
                         }
-                        previous_was_extern = false;
                         cursor = rest;
                     } else if let Some((ident, rest)) = cursor.ident() {
-                        let ident = ident.to_string();
-                        if previous_was_extern && ident == "crate" {
+                        if ident.to_string() == "extern" {
                             return true;
                         }
-                        previous_was_extern = ident == "extern";
                         cursor = rest;
                     } else if let Some((_, rest)) = cursor.token_tree() {
-                        previous_was_extern = false;
                         cursor = rest;
                     } else {
                         break;
@@ -10049,9 +10044,9 @@ fn production_crate_self_alias_violations(source_rel: &str, text: &str) -> Vec<S
             }
 
             let tokens = syn::buffer::TokenBuffer::new2(item.tokens.clone());
-            if contains_extern_crate(tokens.begin()) {
+            if contains_extern_token(tokens.begin()) {
                 self.findings
-                    .push("production macro tokens containing `extern crate`".to_string());
+                    .push("production macro tokens containing `extern`".to_string());
             }
             syn::visit::visit_macro(self, item);
         }
@@ -16955,6 +16950,22 @@ fn assert_production_sources_require_the_canonical_crate_root() {
             "src/service/unknown_runtime_filter_adapter.rs",
             "#[cfg(any(test, feature = \"compat\"))] macro_rules! alias_self { ($name:ident) => { extern crate self as $name; } }",
         ),
+        (
+            "src/service/unknown_runtime_filter_adapter.rs",
+            "macro_rules! emit_alias { ($e:ident, $c:ident, $target:ident, $name:ident) => { $e $c $target as $name; } } emit_alias!(extern, crate, self, root);",
+        ),
+        (
+            "src/service/unknown_runtime_filter_adapter.rs",
+            "macro_rules! alias_crate { ($crate_keyword:tt) => { extern $crate_keyword self as root; } } alias_crate!(crate);",
+        ),
+        (
+            "src/service/unknown_runtime_filter_adapter.rs",
+            "macro_rules! forward { ($tokens:tt) => { emit_alias!($tokens); } } forward!((extern, crate, self, root));",
+        ),
+        (
+            "src/service/unknown_runtime_filter_adapter.rs",
+            "macro_rules! load_external { () => { extern crate reqwest; } } load_external!();",
+        ),
     ] {
         assert!(
             !production_crate_self_alias_violations(source_rel, source).is_empty(),
@@ -16971,6 +16982,7 @@ fn assert_production_sources_require_the_canonical_crate_root() {
         "extern crate reqwest;",
         "extern crate reqwest as root;",
         "macro_rules! ordinary { ($name:ident) => { fn $name() {} } } ordinary!(fixture);",
+        "macro_rules! crate_path { ($name:ident) => { $crate::$name } }",
         "const TEXT: &str = \"extern crate self as root;\"; // extern crate self as comment",
         "const RAW_TEXT: &str = r#\"extern crate self as root;\"#;",
         "#[cfg(test)] macro_rules! alias_self { ($name:ident) => { extern crate self as $name; } }",
@@ -16982,7 +16994,7 @@ fn assert_production_sources_require_the_canonical_crate_root() {
                 source,
             )
             .is_empty(),
-            "test-only aliases and macros, ordinary macros, and external crates remain legal: {source}"
+            "test-only macros, ordinary macros, `$crate`, and AST external crates remain legal: {source}"
         );
     }
 
