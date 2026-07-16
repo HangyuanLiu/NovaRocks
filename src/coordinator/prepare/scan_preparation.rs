@@ -33,7 +33,7 @@ use crate::sql::planner::distributed::{
 };
 use crate::sql::planner::payload::PlanScanNode;
 
-pub(crate) fn prepare_scan_bindings(
+pub(super) fn prepare_scan_bindings(
     plan: &DistributedPlan,
     connectors: &ConnectorRegistry,
     resolver: Option<&dyn ScanBindingResolver>,
@@ -915,7 +915,7 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
-    use super::{prepare_scan_bindings, store_planned_starrocks_scan};
+    use super::{collect_scan_bindings, prepare_scan_bindings, store_planned_starrocks_scan};
     use crate::connector::ConnectorRegistry;
     use crate::connector::scan_planning::{
         BeginScanContext, ConnectorScanPlanner, ScanHandle, Split, SplitPlanningContext,
@@ -1024,6 +1024,18 @@ mod tests {
             _scan: &PlanScanNode,
         ) -> Result<Option<ResolvedScanExecution>, String> {
             Err("boom".to_string())
+        }
+    }
+
+    struct EmptyResolver;
+
+    impl ScanBindingResolver for EmptyResolver {
+        fn resolve_scan(
+            &self,
+            _node_id: i32,
+            _scan: &PlanScanNode,
+        ) -> Result<Option<ResolvedScanExecution>, String> {
+            Ok(None)
         }
     }
 
@@ -1312,18 +1324,34 @@ mod tests {
         assert_eq!(file.length, 128);
     }
 
-    // Duplicate scan `node_id`s (both within one fragment and across fragments)
-    // can no longer reach scan preparation: node-id uniqueness is enforced at the
-    // seal boundary by `validate_global_node_ids`
-    // (src/sql/planner/distributed/validation.rs), so every `DistributedPlan` —
-    // including the ones built by the test helpers here — is already dedup'd
-    // before `prepare_scan_bindings` runs. That invariant is covered by
-    // `distributed_plan_rejects_duplicate_node_id_across_fragments`. Scan
-    // preparation keeps its own node-id dedup (`seen_scan_node_ids`, the
-    // "duplicate scan node_id" / "duplicate StarRocks scan planning" checks) as
-    // unreachable defense-in-depth; it has no scan-prep-unique duplicate (e.g. no
-    // range-id-level dedup) that a valid sealed plan could trigger, so there is
-    // nothing left for a scan-prep test to assert here.
+    #[test]
+    fn duplicate_scan_node_defense_reports_exact_error() {
+        let root = scan_node(10, IcebergDataFileBinding::ExplicitFiles);
+        let registry = registry(vec![data_file("s3://bucket/explicit.parquet")]);
+        let mut seen_scan_node_ids = std::collections::BTreeSet::new();
+        let mut bindings = crate::coordinator::prepare::scan::ScanExecutionBindings::default();
+
+        collect_scan_bindings(
+            0,
+            &root,
+            &registry,
+            None,
+            &mut seen_scan_node_ids,
+            &mut bindings,
+        )
+        .expect("first scan preparation");
+        let err = collect_scan_bindings(
+            0,
+            &root,
+            &registry,
+            None,
+            &mut seen_scan_node_ids,
+            &mut bindings,
+        )
+        .expect_err("duplicate scan node must fail before re-planning");
+
+        assert_eq!(err, "duplicate scan node_id=10");
+    }
 
     #[test]
     fn metadata_scan_uses_native_sentinel_range() {
@@ -1433,9 +1461,63 @@ mod tests {
             Err(err) => err,
         };
 
-        assert!(err.contains("IcebergVersionTable"), "{err}");
-        assert!(err.contains("node_id=47"), "{err}");
-        assert!(err.contains("boom"), "{err}");
+        assert_eq!(
+            err,
+            "scan binding resolver failed for required source IcebergVersionTable node_id=47: boom"
+        );
+    }
+
+    #[test]
+    fn resolver_ok_none_reports_exact_required_source_error() {
+        let mut root = scan_node(48, IcebergDataFileBinding::ExplicitFiles);
+        replace_scan_source(
+            &mut root,
+            ScanSource::IcebergVersionTable {
+                table: iceberg_table(),
+                snapshot_id: 6,
+            },
+        );
+
+        let err = match prepare_scan_bindings(
+            &plan(root),
+            &ConnectorRegistry::new(),
+            Some(&EmptyResolver),
+        ) {
+            Ok(_) => panic!("empty resolver result must fail preparation"),
+            Err(err) => err,
+        };
+
+        assert_eq!(
+            err,
+            "scan binding resolver returned no binding for required source IcebergVersionTable node_id=48"
+        );
+    }
+
+    #[test]
+    fn resolver_failure_precedes_invalid_physical_projection() {
+        let mut root = scan_node(49, IcebergDataFileBinding::ExplicitFiles);
+        let DistributedNodeKind::Scan(scan) = &mut root.payload else {
+            panic!("test root must be a scan");
+        };
+        scan.columns[0].name = "missing".to_string();
+        scan.table.source = ScanSource::IcebergVersionTable {
+            table: iceberg_table(),
+            snapshot_id: 6,
+        };
+
+        let err = match prepare_scan_bindings(
+            &plan(root),
+            &ConnectorRegistry::new(),
+            Some(&ErrorResolver),
+        ) {
+            Ok(_) => panic!("resolver error must win over physical projection error"),
+            Err(err) => err,
+        };
+
+        assert_eq!(
+            err,
+            "scan binding resolver failed for required source IcebergVersionTable node_id=49: boom"
+        );
     }
 
     #[test]
@@ -1985,6 +2067,24 @@ mod tests {
         assert_eq!(source.table_id, 20);
         assert_eq!(source.schema_id, 30);
         assert!(bindings.binding(42).is_none());
+
+        let duplicate = PlannedNativeStarRocksScan {
+            ranges: Vec::new(),
+            source: StarRocksScanSourceDescriptor {
+                catalog_name: "other_catalog".to_string(),
+                db_id: 11,
+                table_id: 21,
+                schema_id: 31,
+                storage_columns: Vec::new(),
+                tablet_schema: test_starrocks_tablet_schema_descriptor(31, &[]),
+            },
+        };
+        let err = store_planned_starrocks_scan(0, 42, duplicate, &mut bindings)
+            .expect_err("duplicate StarRocks planning must fail before partial insertion");
+        assert_eq!(
+            err,
+            "duplicate StarRocks scan planning fragment_id=0 node_id=42"
+        );
     }
 
     #[test]

@@ -118,6 +118,16 @@ impl DistributedPlan {
     pub(crate) fn write_contracts(&self) -> &WriteContractCatalog {
         &self.data.write_contracts
     }
+
+    #[cfg(test)]
+    pub(in crate::sql::planner::distributed) fn remove_fragment_output_for_test(
+        &mut self,
+        fragment_id: FragmentId,
+    ) {
+        self.data
+            .fragment_edge_outputs
+            .remove_fragment_output_for_test(fragment_id);
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

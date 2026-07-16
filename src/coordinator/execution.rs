@@ -44,10 +44,15 @@ use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
 use crate::coordinator::dispatch::{FetchOutcome, FragmentDispatcher, FragmentSubmission};
 use crate::coordinator::ports::{CoordinatorExecutionPorts, CoordinatorObserver};
+use crate::coordinator::prepare::{
+    PreparedFragment, PreparedFragmentRole, PreparedFragmentSet, PreparedOutputColumn,
+};
 use crate::coordinator::profile::{
     StandaloneQueryProfileGuard, standalone_query_profile_count, take_standalone_query_profiles,
 };
 use crate::coordinator::report::{StandaloneQueryFailureGuard, take_standalone_query_failure};
+#[cfg(test)]
+use crate::coordinator::scheduler::SchedulingPlan;
 use crate::coordinator::scheduler::{FragmentInstancePlacement, FragmentScheduler};
 use crate::coordinator::write::report::{WriteAbortInput, WriteCommitInput, WriterKey};
 use crate::coordinator::write::{RegisteredWriteCoordinator, WriteCoordinator};
@@ -57,10 +62,7 @@ use crate::runtime::profile::RuntimeProfileTree;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::query_state::QueryState;
 use crate::sql::analysis::cte::CteId;
-use crate::sql::codegen::fragment::{
-    FragmentOutputKind, FragmentSchedulingMetadata, MultiFragmentBuildResult, OutputColumn,
-    RuntimeFilterPlanResult,
-};
+use crate::sql::codegen::fragment::{NativeFragmentBundle, RuntimeFilterPlanResult};
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::{FragmentEdge, FragmentEdgeKind, FragmentId};
 
@@ -88,24 +90,41 @@ pub(crate) struct CoordinatedQueryResult {
 /// every instance through the `FragmentDispatcher`. Results are collected by
 /// polling the dispatcher for the root fragment's chunks.
 pub(crate) struct ExecutionCoordinator {
-    build_result: MultiFragmentBuildResult,
+    prepared: PreparedFragmentSet,
+    native_bundle: NativeFragmentBundle,
+    runtime_filters: Option<RuntimeFilterPlanResult>,
     execution_ports: CoordinatorExecutionPorts,
     scheduler: Arc<FragmentScheduler>,
     query_options: Option<QueryOptions>,
+    #[cfg(test)]
+    scheduled_plan_test_drift: Option<ScheduledPlanTestDrift>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum ScheduledPlanTestDrift {
+    Missing,
+    Unknown,
 }
 
 impl ExecutionCoordinator {
     pub(crate) fn new(
-        build_result: MultiFragmentBuildResult,
+        prepared: PreparedFragmentSet,
+        native_bundle: NativeFragmentBundle,
+        runtime_filters: Option<RuntimeFilterPlanResult>,
         execution_ports: CoordinatorExecutionPorts,
         scheduler: Arc<FragmentScheduler>,
         query_options: Option<QueryOptions>,
     ) -> Self {
         Self {
-            build_result,
+            prepared,
+            native_bundle,
+            runtime_filters,
             execution_ports,
             scheduler,
             query_options,
+            #[cfg(test)]
+            scheduled_plan_test_drift: None,
         }
     }
 
@@ -121,24 +140,18 @@ impl ExecutionCoordinator {
         self,
         collect_profiles: bool,
     ) -> Result<CoordinatedQueryResult, String> {
-        let MultiFragmentBuildResult {
-            fragment_schedules,
-            native_fragments,
-            root_fragment_id,
-            topology,
-            edges,
-            boundary_schemas,
-            rf_plan,
-            ..
-        } = self.build_result;
+        let prepared = self.prepared;
+        let native_bundle = self.native_bundle;
+        let runtime_filters = self.runtime_filters;
         let query_options = self.query_options;
+        #[cfg(test)]
+        let scheduled_plan_test_drift = self.scheduled_plan_test_drift;
         let CoordinatorExecutionPorts {
             dispatcher,
             report_endpoint,
             observer,
         } = self.execution_ports;
         let scheduler = self.scheduler;
-        let native_fragments_by_id = native_fragments;
         // ---------------------------------------------------------------
         // 1. Allocate query id and run the scheduler.
         // ---------------------------------------------------------------
@@ -152,12 +165,13 @@ impl ExecutionCoordinator {
             hi: query_base,
             lo: query_base,
         };
+        let edges = prepared.scheduling_view().edges().to_vec();
 
         debug!(
             "coordinator topology: fragments={} edges={} root={} backends={}",
-            native_fragments_by_id.len(),
+            native_bundle.fragment_ids().len(),
             edges.len(),
-            root_fragment_id,
+            prepared.scheduling_view().execution_anchor(),
             scheduler.backends().len()
         );
         for e in &edges {
@@ -177,27 +191,18 @@ impl ExecutionCoordinator {
             );
         }
 
-        validate_fragment_schedule_payloads(
-            &fragment_schedules,
-            &native_fragments_by_id,
-            root_fragment_id,
-            &boundary_schemas,
-        )?;
-        let live = scheduler.live_backend_snapshot().entries();
-        let mut plan = scheduler.assign_with_live(
-            &fragment_schedules,
-            &edges,
-            &topology,
+        validate_prepared_native_payloads(&prepared, &native_bundle)?;
+        let plan = scheduler.schedule(
+            prepared.scheduling_view(),
             query_id.clone(),
-            live,
+            runtime_filters.as_ref(),
         )?;
-        scheduler.fill_destinations_with_live(&mut plan, &edges, live)?;
-        if let Some(rf) = rf_plan.as_ref() {
-            scheduler.fill_runtime_filter_params_with_live(&mut plan, rf, live)?;
-        }
-        scheduler.fill_per_exch_num_senders(&mut plan, &edges);
-        validate_native_scheduling_plan(&fragment_schedules, &native_fragments_by_id, &plan)?;
+        #[cfg(test)]
+        let plan = apply_scheduled_plan_test_drift(plan, scheduled_plan_test_drift);
+        validate_artifact_fragment_sets(&prepared, &native_bundle, &plan)?;
+        validate_scheduling_placements(&plan)?;
         let execution_root_fragment_id = plan.root_fragment_id;
+        let mut native_fragments_by_id = native_bundle.into_fragments().collect::<BTreeMap<_, _>>();
 
         // ---------------------------------------------------------------
         // 2. Build per-edge / CTE consumer indices used for sink wiring.
@@ -252,16 +257,16 @@ impl ExecutionCoordinator {
         }
         // CTE consumers may also be expressed via `cte_exchange_nodes` on the
         // consumer fragment when no explicit edge carries them.
-        for schedule in &fragment_schedules {
+        for schedule in prepared.scheduling_view().fragments() {
             for (cte_id, exchange_node_id, receive_producer_column_ids) in
-                &schedule.cte_exchange_nodes
+                schedule.boundary_projection().cte_exchange_nodes()
             {
                 let consumers = cte_consumers.entry(*cte_id).or_default();
                 if !consumers.iter().any(|(fid, nid, _, _, _)| {
-                    *fid == schedule.fragment_id && *nid == *exchange_node_id
+                    *fid == schedule.fragment_id() && *nid == *exchange_node_id
                 }) {
                     consumers.push((
-                        schedule.fragment_id,
+                        schedule.fragment_id(),
                         *exchange_node_id,
                         crate::proto::plan::DataPartition {
                             kind: crate::proto::plan::PartitionKind::Unpartitioned as i32,
@@ -302,11 +307,6 @@ impl ExecutionCoordinator {
             })
             .collect();
 
-        let schedule_by_id: BTreeMap<FragmentId, &FragmentSchedulingMetadata> = fragment_schedules
-            .iter()
-            .map(|fr| (fr.fragment_id, fr))
-            .collect();
-
         // Build a fragment-id -> instance count map from the scheduling plan.
         // Builder numbers must equal the number of build-side instances, not a
         // hardcoded 1.
@@ -325,30 +325,34 @@ impl ExecutionCoordinator {
         let mut expected_writers = Vec::new();
 
         for (&fragment_id, placements) in &plan.by_fragment {
-            let schedule = *schedule_by_id
-                .get(&fragment_id)
-                .ok_or_else(|| format!("fragment {fragment_id} missing from native schedules"))?;
+            let schedule = prepared
+                .fragment(fragment_id)
+                .ok_or_else(|| format!("fragment {fragment_id} missing from prepared set"))?;
+            let native_template = native_fragments_by_id
+                .remove(&fragment_id)
+                .ok_or_else(|| format!("native fragment bundle missing fragment {fragment_id}"))?;
             let is_root = fragment_id == execution_root_fragment_id;
             let stream_edge = stream_edge_by_source.get(&fragment_id).copied();
             let router_edges = router_edges_by_source.get(&fragment_id);
             let is_terminal_write = stream_edge.is_none()
                 && router_edges.is_none()
-                && schedule.cte_id.is_none()
-                && schedule.output_kind.is_terminal_write();
-            let is_producer =
-                stream_edge.is_some() || router_edges.is_some() || schedule.cte_id.is_some();
+                && schedule.boundary_projection().cte_id().is_none()
+                && schedule.execution_role().is_terminal_write();
+            let is_producer = stream_edge.is_some()
+                || router_edges.is_some()
+                || schedule.boundary_projection().cte_id().is_some();
             validate_fragment_output_kind(
                 fragment_id,
                 is_root,
                 is_terminal_write,
                 is_producer,
-                schedule.output_kind,
+                schedule.execution_role(),
             )?;
 
             // Classify the fragment once.
             if !is_root
                 && !is_terminal_write
-                && schedule.cte_id.is_none()
+                && schedule.boundary_projection().cte_id().is_none()
                 && stream_edge.is_none()
                 && router_edges.is_none()
             {
@@ -364,7 +368,7 @@ impl ExecutionCoordinator {
                 is_terminal_write,
                 stream_edge.is_some(),
                 router_edges.is_some(),
-                schedule.cte_id.is_some(),
+                schedule.boundary_projection().cte_id().is_some(),
             )?;
 
             for placement in placements {
@@ -384,12 +388,7 @@ impl ExecutionCoordinator {
                     });
                 }
 
-                let mut native_fragment = native_fragments_by_id
-                    .get(&fragment_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        format!("native fragment build missing fragment {fragment_id}")
-                    })?;
+                let mut native_fragment = native_template.clone();
                 if !is_root && !is_terminal_write && stream_edge.is_none() {
                     if let Some((router_group_id, branch_edges)) = router_edges {
                         patch_native_iceberg_change_stream_router_sink(
@@ -399,7 +398,7 @@ impl ExecutionCoordinator {
                             branch_edges,
                             &plan.by_fragment,
                         )?;
-                    } else if let Some(cte_id) = schedule.cte_id {
+                    } else if let Some(cte_id) = schedule.boundary_projection().cte_id() {
                         let consumers = cte_consumers.get(&cte_id).cloned().unwrap_or_default();
                         patch_native_cte_multicast_sink(
                             &mut native_fragment,
@@ -411,9 +410,11 @@ impl ExecutionCoordinator {
                     }
                 }
                 let typed_result_sink = is_root && needs_fragment_status_report;
-                let native_rf_builder_number =
-                    runtime_filter_builder_number_for_instance(rf_plan.as_ref(), &instance_counts);
-                let native_rf_max_size = if rf_plan.is_some() {
+                let native_rf_builder_number = runtime_filter_builder_number_for_instance(
+                    runtime_filters.as_ref(),
+                    &instance_counts,
+                );
+                let native_rf_max_size = if runtime_filters.is_some() {
                     16_i64 * 1024 * 1024
                 } else {
                     0
@@ -439,6 +440,13 @@ impl ExecutionCoordinator {
             }
         }
 
+        if !native_fragments_by_id.is_empty() {
+            return Err(format!(
+                "native fragments remained after submission assembly: {:?}",
+                native_fragments_by_id.keys().collect::<Vec<_>>()
+            ));
+        }
+
         if !submissions_by_fragment.contains_key(&execution_root_fragment_id) {
             return Err("root fragment produced no placement".to_string());
         }
@@ -447,7 +455,7 @@ impl ExecutionCoordinator {
         // receivers / result buffers register before any upstream producer can
         // send. The order is the planner-sealed projection, not recomputed here.
         let mut submissions: Vec<(usize, FragmentSubmission)> = Vec::new();
-        for &fragment_id in topology.topological_fragment_order().iter().rev() {
+        for &fragment_id in prepared.scheduling_view().topological_order().iter().rev() {
             if let Some(mut fragment_submissions) = submissions_by_fragment.remove(&fragment_id) {
                 submissions.append(&mut fragment_submissions);
             }
@@ -476,10 +484,10 @@ impl ExecutionCoordinator {
             .and_then(|q| q.query_timeout)
             .map(|t| t as i64 * 1000)
             .unwrap_or(300_000); // 5 minute default
-        let root_schedule = schedule_by_id
-            .get(&execution_root_fragment_id)
-            .ok_or_else(|| "root fragment not found in native schedules".to_string())?;
-        let root_uses_result_buffer = !root_schedule.output_kind.is_terminal_write();
+        let root_schedule = prepared
+            .fragment(execution_root_fragment_id)
+            .ok_or_else(|| "root fragment not found in prepared set".to_string())?;
+        let root_uses_result_buffer = !root_schedule.execution_role().is_terminal_write();
         let expected_root_chunk_schema = if root_uses_result_buffer {
             Some(build_root_expected_chunk_schema(root_schedule)?)
         } else {
@@ -513,11 +521,12 @@ impl ExecutionCoordinator {
 
         let chunks = align_fetch_chunks_to_output_columns(
             fetch_result.chunks,
-            &root_schedule.output_columns,
+            root_schedule.boundary_projection().output_columns(),
         )?;
         let query_result = QueryResult {
             columns: root_schedule
-                .output_columns
+                .boundary_projection()
+                .output_columns()
                 .iter()
                 .map(|c| QueryResultColumn {
                     name: c.name.clone(),
@@ -555,9 +564,9 @@ fn query_result_or_write_abort_error(
 }
 
 fn build_root_expected_chunk_schema(
-    root_fragment: &FragmentSchedulingMetadata,
+    root_fragment: &PreparedFragment,
 ) -> Result<ChunkSchemaRef, String> {
-    let output_columns = &root_fragment.output_columns;
+    let output_columns = root_fragment.boundary_projection().output_columns();
     if output_columns.is_empty() {
         return Ok(Arc::new(ChunkSchema::empty()));
     }
@@ -581,7 +590,7 @@ fn build_root_expected_chunk_schema(
 
 fn align_fetch_chunks_to_output_columns(
     chunks: Vec<Chunk>,
-    output_columns: &[OutputColumn],
+    output_columns: &[PreparedOutputColumn],
 ) -> Result<Vec<Chunk>, String> {
     chunks
         .into_iter()
@@ -591,7 +600,7 @@ fn align_fetch_chunks_to_output_columns(
 
 fn align_fetch_chunk_to_output_columns(
     chunk: Chunk,
-    output_columns: &[OutputColumn],
+    output_columns: &[PreparedOutputColumn],
 ) -> Result<Chunk, String> {
     if chunk.batch.num_columns() != output_columns.len() {
         return Err(format!(
@@ -752,18 +761,18 @@ fn validate_fragment_output_kind(
     is_root: bool,
     is_terminal_write: bool,
     is_producer: bool,
-    output_kind: FragmentOutputKind,
+    output_kind: PreparedFragmentRole,
 ) -> Result<(), String> {
     if is_root {
         return match output_kind {
-            FragmentOutputKind::Result | FragmentOutputKind::TerminalWrite => Ok(()),
-            FragmentOutputKind::NonTerminal => Err(format!(
+            PreparedFragmentRole::Result | PreparedFragmentRole::TerminalWrite => Ok(()),
+            PreparedFragmentRole::NonTerminal => Err(format!(
                 "root fragment {fragment_id} must have Result or TerminalWrite output kind"
             )),
         };
     }
     if is_terminal_write {
-        return (output_kind == FragmentOutputKind::TerminalWrite)
+        return (output_kind == PreparedFragmentRole::TerminalWrite)
             .then_some(())
             .ok_or_else(|| {
                 format!(
@@ -772,7 +781,7 @@ fn validate_fragment_output_kind(
             });
     }
     if is_producer {
-        return (output_kind == FragmentOutputKind::NonTerminal)
+        return (output_kind == PreparedFragmentRole::NonTerminal)
             .then_some(())
             .ok_or_else(|| {
                 format!(
@@ -783,45 +792,36 @@ fn validate_fragment_output_kind(
     Ok(())
 }
 
-fn validate_fragment_schedule_payloads(
-    fragment_schedules: &[FragmentSchedulingMetadata],
-    native_fragments: &BTreeMap<FragmentId, crate::proto::plan::PlanFragment>,
-    root_fragment_id: FragmentId,
-    boundary_schemas: &[crate::sql::codegen::fragment::BoundarySchemaReport],
+fn validate_prepared_native_payloads(
+    prepared: &PreparedFragmentSet,
+    native_bundle: &NativeFragmentBundle,
 ) -> Result<(), String> {
-    let schedule_ids: BTreeSet<FragmentId> =
-        fragment_schedules.iter().map(|fr| fr.fragment_id).collect();
-    let native_ids: BTreeSet<FragmentId> = native_fragments.keys().copied().collect();
-    if schedule_ids.len() != fragment_schedules.len() {
-        return Err("native fragment_schedules contain duplicate fragment ids".to_string());
-    }
-    if !native_ids.contains(&root_fragment_id) {
-        return Err(format!(
-            "native fragment build is missing root fragment id={root_fragment_id}"
-        ));
-    }
-    if native_ids != schedule_ids {
-        return Err(format!(
-            "native fragment ids {:?} do not match fragment_schedules ids {:?}",
-            native_ids, schedule_ids
-        ));
-    }
-    for (&fragment_id, fragment) in native_fragments {
+    let prepared_ids = prepared.fragment_ids();
+    for (fragment_id, fragment) in native_bundle.fragments_in_id_order() {
         if fragment.fragment_id != fragment_id {
             return Err(format!(
-                "native fragment map key {fragment_id} does not match encoded fragment id {}",
+                "native fragment bundle key {fragment_id} does not match encoded fragment id {}",
                 fragment.fragment_id
             ));
         }
     }
-    for (index, boundary) in boundary_schemas.iter().enumerate() {
-        if let Some(fragment_id) = boundary.fragment_id {
-            let fragment_id = FragmentId::try_from(fragment_id).map_err(|_| {
-                format!("boundary schema {index} has negative fragment id={fragment_id}")
-            })?;
-            if !schedule_ids.contains(&fragment_id) {
+    for fragment_id in &prepared_ids {
+        native_bundle.get(*fragment_id).ok_or_else(|| {
+            format!("native fragment bundle missing prepared fragment id={fragment_id}")
+        })?;
+        let fragment = prepared
+            .fragment(*fragment_id)
+            .ok_or_else(|| format!("prepared fragment set missing id={fragment_id}"))?;
+        for (index, boundary) in fragment
+            .boundary_projection()
+            .contracts()
+            .iter()
+            .enumerate()
+        {
+            if !prepared_ids.contains(&boundary.fragment_id) {
                 return Err(format!(
-                    "boundary schema {index} references missing fragment id={fragment_id}"
+                    "prepared boundary {index} for fragment {fragment_id} references missing fragment id={}",
+                    boundary.fragment_id
                 ));
             }
         }
@@ -829,21 +829,38 @@ fn validate_fragment_schedule_payloads(
     Ok(())
 }
 
-fn validate_native_scheduling_plan(
-    fragment_schedules: &[FragmentSchedulingMetadata],
-    native_fragments: &BTreeMap<FragmentId, crate::proto::plan::PlanFragment>,
+fn validate_artifact_fragment_sets(
+    prepared: &PreparedFragmentSet,
+    native_bundle: &NativeFragmentBundle,
+    scheduling: &crate::coordinator::scheduler::SchedulingPlan,
+) -> Result<(), String> {
+    let expected = prepared.fragment_ids();
+    let native = native_bundle.fragment_ids().collect::<BTreeSet<_>>();
+    if native != expected {
+        return Err(fragment_set_mismatch("native", &expected, &native));
+    }
+    let scheduled = scheduling.fragment_ids().collect::<BTreeSet<_>>();
+    if scheduled != expected {
+        return Err(fragment_set_mismatch("scheduled", &expected, &scheduled));
+    }
+    Ok(())
+}
+
+fn fragment_set_mismatch(
+    label: &str,
+    expected: &BTreeSet<FragmentId>,
+    actual: &BTreeSet<FragmentId>,
+) -> String {
+    let missing = expected.difference(actual).copied().collect::<Vec<_>>();
+    let unknown = actual.difference(expected).copied().collect::<Vec<_>>();
+    format!(
+        "{label} fragment ids mismatch: expected={expected:?} actual={actual:?} missing={missing:?} unknown={unknown:?}"
+    )
+}
+
+fn validate_scheduling_placements(
     plan: &crate::coordinator::scheduler::SchedulingPlan,
 ) -> Result<(), String> {
-    let schedule_ids: BTreeSet<FragmentId> =
-        fragment_schedules.iter().map(|fr| fr.fragment_id).collect();
-    let native_ids: BTreeSet<FragmentId> = native_fragments.keys().copied().collect();
-    let placement_ids: BTreeSet<FragmentId> = plan.by_fragment.keys().copied().collect();
-    if native_ids != schedule_ids || native_ids != placement_ids {
-        return Err(format!(
-            "native scheduling plan fragment id set mismatch: native={native_ids:?}, \
-             schedules={schedule_ids:?}, placements={placement_ids:?}"
-        ));
-    }
     for (&fragment_id, placements) in &plan.by_fragment {
         if placements.is_empty() {
             return Err(format!(
@@ -1763,6 +1780,31 @@ fn notify_write_commit_wait_observer(commit_error: &str) {
     }
 }
 
+#[cfg(test)]
+fn apply_scheduled_plan_test_drift(
+    mut plan: SchedulingPlan,
+    drift: Option<ScheduledPlanTestDrift>,
+) -> SchedulingPlan {
+    match drift {
+        None => {}
+        Some(ScheduledPlanTestDrift::Missing) => {
+            plan.by_fragment.remove(&plan.root_fragment_id);
+        }
+        Some(ScheduledPlanTestDrift::Unknown) => {
+            let mut placement = plan
+                .by_fragment
+                .values()
+                .flat_map(|placements| placements.iter())
+                .next()
+                .cloned()
+                .expect("real scheduler must produce an anchor placement");
+            placement.fragment_id = 99;
+            plan.by_fragment.insert(99, vec![placement]);
+        }
+    }
+    plan
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1777,6 +1819,11 @@ mod native_contract_tests {
     use crate::coordinator::ports::CoordinatorObserver;
     use crate::coordinator::write::report::FragmentExecStatusReport;
     use crate::proto::plan as native_plan;
+    use crate::sql::planner::distributed::{
+        DataPartition, DataSink, DistributedNode, DistributedNodeKind, PlanFragment,
+    };
+    use crate::sql::planner::payload::PlanValuesNode;
+    use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 
     #[derive(Default)]
     struct CountingCoordinatorObserver(AtomicUsize);
@@ -1787,16 +1834,88 @@ mod native_contract_tests {
         }
     }
 
-    fn schedule(fragment_id: FragmentId) -> FragmentSchedulingMetadata {
-        FragmentSchedulingMetadata {
-            fragment_id,
-            has_scan_nodes: false,
-            output_kind: FragmentOutputKind::Result,
-            native_scan_ranges: BTreeMap::new(),
+    fn real_execution_artifacts() -> (PreparedFragmentSet, NativeFragmentBundle) {
+        let fragment = PlanFragment {
+            fragment_id: 7,
+            root: DistributedNode {
+                node_id: 70,
+                fragment_id: 7,
+                tuple_ids: vec![70],
+                nullable_tuple_ids: Vec::new(),
+                limit: -1,
+                runtime_filter_binding_ids: Vec::new(),
+                children: Vec::new(),
+                stats: PhysicalPlanStats {
+                    output_row_count: 0.0,
+                    row_count_confidence: PlannerConfidence::Fallback,
+                    column_statistics: Default::default(),
+                    cost_estimate: None,
+                    broadcast_decision: None,
+                },
+                payload: DistributedNodeKind::Values(PlanValuesNode {
+                    rows: Vec::new(),
+                    columns: Vec::new(),
+                }),
+            },
+            data_partition: DataPartition::unpartitioned(),
+            output_partition: DataPartition::unpartitioned(),
+            sink: DataSink::Result,
+            output_exprs: None,
             output_columns: Vec::new(),
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
+        };
+        let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
+            fragments: vec![fragment],
+            root_fragment_id: 7,
+            edges: Vec::new(),
+            runtime_filter_graph: crate::runtime_filter::model::graph::RuntimeFilterGraph::default(),
+        };
+        let prepared = crate::coordinator::prepare::prepare_fragments(
+            &plan,
+            &crate::connector::ConnectorRegistry::new(),
+            None,
+        )
+        .expect("prepare production execution artifact");
+        let native_bundle =
+            crate::sql::codegen::fragment::encode_native_fragment_bundle(&plan, &prepared)
+                .expect("encode production execution artifact");
+        (prepared, native_bundle)
+    }
+
+    fn coordinator_for_artifact_test(
+        prepared: PreparedFragmentSet,
+        native_bundle: NativeFragmentBundle,
+        scheduler: Arc<FragmentScheduler>,
+        scheduled_plan_test_drift: Option<ScheduledPlanTestDrift>,
+        dispatcher: Arc<CapturingDispatcher>,
+    ) -> ExecutionCoordinator {
+        ExecutionCoordinator {
+            prepared,
+            native_bundle,
+            runtime_filters: None,
+            execution_ports: CoordinatorExecutionPorts::new(
+                dispatcher,
+                crate::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 9030)
+                    .expect("report endpoint"),
+                Arc::new(CountingCoordinatorObserver::default()),
+            ),
+            scheduler,
+            query_options: None,
+            scheduled_plan_test_drift,
         }
+    }
+
+    fn prepared(fragment_ids: &[FragmentId]) -> PreparedFragmentSet {
+        crate::coordinator::prepare::prepared_fragment_set_for_test(
+            fragment_ids
+                .iter()
+                .map(|&fragment_id| (fragment_id, PreparedFragmentRole::Result, Vec::new()))
+                .collect(),
+            fragment_ids.to_vec(),
+            *fragment_ids.last().expect("prepared test fragment"),
+            Vec::new(),
+        )
     }
 
     fn placement(fragment_id: FragmentId, instance_lo: i64) -> FragmentInstancePlacement {
@@ -1961,7 +2080,7 @@ mod native_contract_tests {
         submissions: Mutex<Vec<(usize, FragmentId, UniqueId)>>,
         submit_count: AtomicUsize,
         fail_on_submit: Option<usize>,
-        cancellations: Mutex<Vec<UniqueId>>,
+        cancellations: Mutex<Vec<(usize, Vec<UniqueId>)>>,
         fetch_behavior: TestFetchBehavior,
         fetch_count: AtomicUsize,
         first_fetch: std::sync::atomic::AtomicBool,
@@ -2050,11 +2169,11 @@ mod native_contract_tests {
             }
         }
 
-        fn cancel_fragments(&self, _backend_idx: usize, finst_ids: &[UniqueId]) {
+        fn cancel_fragments(&self, backend_idx: usize, finst_ids: &[UniqueId]) {
             self.cancellations
                 .lock()
                 .unwrap()
-                .extend_from_slice(finst_ids);
+                .push((backend_idx, finst_ids.to_vec()));
         }
 
         fn backend_count(&self) -> usize {
@@ -2138,125 +2257,109 @@ mod native_contract_tests {
 
     #[test]
     fn native_output_kind_validation_is_exhaustive() {
-        use crate::sql::codegen::fragment::FragmentOutputKind;
-
-        validate_fragment_output_kind(1, true, false, false, FragmentOutputKind::Result)
+        validate_fragment_output_kind(1, true, false, false, PreparedFragmentRole::Result)
             .expect("result root");
-        validate_fragment_output_kind(1, true, true, false, FragmentOutputKind::TerminalWrite)
+        validate_fragment_output_kind(1, true, true, false, PreparedFragmentRole::TerminalWrite)
             .expect("write-only root");
         let err =
-            validate_fragment_output_kind(1, true, false, false, FragmentOutputKind::NonTerminal)
+            validate_fragment_output_kind(1, true, false, false, PreparedFragmentRole::NonTerminal)
                 .expect_err("root cannot be nonterminal");
         assert!(err.contains("root fragment 1"), "{err}");
 
-        validate_fragment_output_kind(2, false, false, true, FragmentOutputKind::NonTerminal)
+        validate_fragment_output_kind(2, false, false, true, PreparedFragmentRole::NonTerminal)
             .expect("non-root producer");
         for output_kind in [
-            FragmentOutputKind::Result,
-            FragmentOutputKind::TerminalWrite,
+            PreparedFragmentRole::Result,
+            PreparedFragmentRole::TerminalWrite,
         ] {
             let err = validate_fragment_output_kind(2, false, false, true, output_kind)
                 .expect_err("producer must be nonterminal");
             assert!(err.contains("producer fragment 2"), "{err}");
         }
 
-        validate_fragment_output_kind(3, false, true, false, FragmentOutputKind::TerminalWrite)
+        validate_fragment_output_kind(3, false, true, false, PreparedFragmentRole::TerminalWrite)
             .expect("non-root terminal writer");
-        for output_kind in [FragmentOutputKind::Result, FragmentOutputKind::NonTerminal] {
+        for output_kind in [
+            PreparedFragmentRole::Result,
+            PreparedFragmentRole::NonTerminal,
+        ] {
             let err = validate_fragment_output_kind(3, false, true, false, output_kind)
                 .expect_err("terminal writer must use terminal output kind");
             assert!(err.contains("terminal write fragment 3"), "{err}");
         }
     }
 
-    #[test]
-    fn native_payload_validation_rejects_schedule_and_encoded_id_drift() {
-        let schedules = vec![schedule(7)];
-        let err = validate_fragment_schedule_payloads(
-            &schedules,
-            &BTreeMap::from([(
-                8,
-                native_plan::PlanFragment {
-                    fragment_id: 8,
-                    ..Default::default()
-                },
-            )]),
-            8,
-            &[],
-        )
-        .expect_err("schedule/native id drift must fail");
-        assert!(err.contains("do not match"), "{err}");
-
-        let err = validate_fragment_schedule_payloads(
-            &schedules,
-            &BTreeMap::from([(
-                7,
-                native_plan::PlanFragment {
-                    fragment_id: 9,
-                    ..Default::default()
-                },
-            )]),
-            7,
-            &[],
-        )
-        .expect_err("map/encoded fragment id drift must fail");
-        assert!(err.contains("map key 7"), "{err}");
+    fn assert_native_bundle_drift_rejected(
+        drift: crate::sql::codegen::fragment::NativeBundleTestDrift,
+        expected_error: &str,
+    ) {
+        let (prepared, native_bundle) = real_execution_artifacts();
+        let native_bundle =
+            crate::sql::codegen::fragment::corrupt_native_fragment_bundle_for_execution_test(
+                native_bundle,
+                drift,
+            );
+        let inner = CapturingDispatcher::new(None);
+        let scheduler = Arc::new(FragmentScheduler::new(vec![std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            9030,
+        ))]));
+        let error =
+            coordinator_for_artifact_test(prepared, native_bundle, scheduler, None, inner.clone())
+                .execute_with_write_outcome()
+                .expect_err("native bundle drift must fail before dispatch");
+        assert!(error.contains(expected_error), "{error}");
+        assert_eq!(inner.submit_count.load(Ordering::SeqCst), 0);
     }
 
     #[test]
-    fn native_scheduling_plan_validation_rejects_fragment_set_drift_before_side_effects() {
-        let schedules = vec![schedule(3), schedule(7)];
-        let fragments = BTreeMap::from([
-            (
-                3,
-                native_plan::PlanFragment {
-                    fragment_id: 3,
-                    ..Default::default()
-                },
-            ),
-            (
-                7,
-                native_plan::PlanFragment {
-                    fragment_id: 7,
-                    ..Default::default()
-                },
-            ),
-        ]);
-        let plan = crate::coordinator::scheduler::SchedulingPlan {
-            root_fragment_id: 7,
-            by_fragment: BTreeMap::from([(7, vec![placement(7, 7)])]),
-            root_finst_id: UniqueId { hi: 92_000, lo: 7 },
-            root_backend_idx: 0,
-        };
-        let mut side_effects = 0;
+    fn coordinator_rejects_missing_native_fragment_before_dispatch() {
+        assert_native_bundle_drift_rejected(
+            crate::sql::codegen::fragment::NativeBundleTestDrift::Missing(7),
+            "missing prepared fragment id=7",
+        );
+    }
 
-        let err = validate_native_scheduling_plan(&schedules, &fragments, &plan)
-            .map(|()| side_effects += 1)
-            .expect_err("scheduling-plan fragment set drift must fail");
+    #[test]
+    fn coordinator_rejects_unknown_native_fragment_before_dispatch() {
+        assert_native_bundle_drift_rejected(
+            crate::sql::codegen::fragment::NativeBundleTestDrift::Unknown(99),
+            "native fragment ids mismatch",
+        );
+    }
 
-        assert!(err.contains("fragment id set"), "{err}");
-        assert_eq!(side_effects, 0);
+    fn assert_scheduled_drift_rejected(drift: ScheduledPlanTestDrift, expected_error: &str) {
+        let (prepared, native_bundle) = real_execution_artifacts();
+        let inner = CapturingDispatcher::new(None);
+        let scheduler = Arc::new(FragmentScheduler::new(vec![std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            9030,
+        ))]));
+        let error = coordinator_for_artifact_test(
+            prepared,
+            native_bundle,
+            scheduler,
+            Some(drift),
+            inner.clone(),
+        )
+        .execute_with_write_outcome()
+        .expect_err("scheduled drift must fail before dispatch");
+        assert!(error.contains(expected_error), "{error}");
+        assert_eq!(inner.submit_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn coordinator_rejects_missing_scheduled_fragment_before_dispatch() {
+        assert_scheduled_drift_rejected(ScheduledPlanTestDrift::Missing, "missing=[7]");
+    }
+
+    #[test]
+    fn coordinator_rejects_unknown_scheduled_fragment_before_dispatch() {
+        assert_scheduled_drift_rejected(ScheduledPlanTestDrift::Unknown, "unknown=[99]");
     }
 
     #[test]
     fn native_scheduling_plan_validation_rejects_empty_non_root_placements() {
-        let schedules = vec![schedule(3), schedule(7)];
-        let fragments = BTreeMap::from([
-            (
-                3,
-                native_plan::PlanFragment {
-                    fragment_id: 3,
-                    ..Default::default()
-                },
-            ),
-            (
-                7,
-                native_plan::PlanFragment {
-                    fragment_id: 7,
-                    ..Default::default()
-                },
-            ),
-        ]);
         let plan = crate::coordinator::scheduler::SchedulingPlan {
             root_fragment_id: 7,
             by_fragment: BTreeMap::from([(3, Vec::new()), (7, vec![placement(7, 7)])]),
@@ -2265,7 +2368,7 @@ mod native_contract_tests {
         };
         let mut side_effects = 0;
 
-        let err = validate_native_scheduling_plan(&schedules, &fragments, &plan)
+        let err = validate_scheduling_placements(&plan)
             .map(|()| side_effects += 1)
             .expect_err("empty non-root placements must fail");
 
@@ -2275,14 +2378,6 @@ mod native_contract_tests {
 
     #[test]
     fn native_scheduling_plan_validation_rejects_placement_fragment_id_drift() {
-        let schedules = vec![schedule(7)];
-        let fragments = BTreeMap::from([(
-            7,
-            native_plan::PlanFragment {
-                fragment_id: 7,
-                ..Default::default()
-            },
-        )]);
         let plan = crate::coordinator::scheduler::SchedulingPlan {
             root_fragment_id: 7,
             by_fragment: BTreeMap::from([(7, vec![placement(8, 7)])]),
@@ -2291,7 +2386,7 @@ mod native_contract_tests {
         };
         let mut side_effects = 0;
 
-        let err = validate_native_scheduling_plan(&schedules, &fragments, &plan)
+        let err = validate_scheduling_placements(&plan)
             .map(|()| side_effects += 1)
             .expect_err("placement fragment id drift must fail");
 
@@ -2377,7 +2472,7 @@ mod native_contract_tests {
         assert!(err.contains("native submit failed on call 2"), "{err}");
         assert_eq!(
             *inner.cancellations.lock().unwrap(),
-            vec![UniqueId { hi: 92_000, lo: 1 }]
+            vec![(1, vec![UniqueId { hi: 92_000, lo: 1 }])]
         );
         assert_eq!(observer.0.load(Ordering::SeqCst), 1);
     }
@@ -2673,10 +2768,13 @@ mod native_contract_tests {
             .expect_err("native lifecycle failure must surface");
             assert!(err.contains(expected), "{err}");
             let mut canceled = inner.cancellations.lock().unwrap().clone();
-            canceled.sort();
+            canceled.sort_by_key(|(backend_idx, _)| *backend_idx);
             assert_eq!(
                 canceled,
-                vec![UniqueId { hi, lo: 1 }, UniqueId { hi, lo: 2 }]
+                vec![
+                    (0, vec![UniqueId { hi, lo: 2 }]),
+                    (1, vec![UniqueId { hi, lo: 1 }]),
+                ]
             );
         }
 
@@ -2714,10 +2812,13 @@ mod native_contract_tests {
         .expect_err("disconnect must surface");
         assert!(err.contains("client disconnected"), "{err}");
         let mut canceled = inner.cancellations.lock().unwrap().clone();
-        canceled.sort();
+        canceled.sort_by_key(|(backend_idx, _)| *backend_idx);
         assert_eq!(
             canceled,
-            vec![UniqueId { hi, lo: 1 }, UniqueId { hi, lo: 2 }]
+            vec![
+                (0, vec![UniqueId { hi, lo: 2 }]),
+                (1, vec![UniqueId { hi, lo: 1 }]),
+            ]
         );
     }
 
@@ -2955,7 +3056,7 @@ mod native_contract_tests {
         let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).unwrap();
         let aligned = align_fetch_chunks_to_output_columns(
             vec![chunk],
-            &[OutputColumn {
+            &[PreparedOutputColumn {
                 name: "col1".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
@@ -2992,7 +3093,7 @@ mod native_contract_tests {
         let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).unwrap();
         let err = align_fetch_chunks_to_output_columns(
             vec![chunk],
-            &[OutputColumn {
+            &[PreparedOutputColumn {
                 name: "price".to_string(),
                 data_type: DataType::Decimal128(20, 2),
                 nullable: false,

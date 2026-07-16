@@ -269,7 +269,9 @@ pub(crate) fn execute_dml_change_stream_write(
     query_opts: Option<&QueryOptions>,
 ) -> Result<DmlChangeStreamWriteExecution, String> {
     let crate::engine::PlannedIcebergChangeStreamWrite {
-        build_result,
+        prepared,
+        native_bundle,
+        runtime_filters,
         commit_plan,
         #[cfg(test)]
         topology,
@@ -279,7 +281,9 @@ pub(crate) fn execute_dml_change_stream_write(
         return dml_change_stream_write_execution(result, commit_plan);
     }
     let result = crate::engine::execute_planned_iceberg_change_stream_write(
-        build_result,
+        prepared,
+        native_bundle,
+        runtime_filters,
         query_opts.cloned(),
     )?;
     dml_change_stream_write_execution(result, commit_plan)

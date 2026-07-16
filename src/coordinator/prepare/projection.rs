@@ -1,0 +1,270 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use arrow::datatypes::DataType;
+
+use super::scan::ScanExecutionBindings;
+use crate::runtime::scan_range::ScanRangeParams;
+use crate::sql::analysis::cte::CteId;
+use crate::sql::column_id::ColumnId;
+use crate::sql::planner::distributed::{BoundaryContract, FragmentEdge, FragmentId};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedOutputColumn {
+    pub(crate) name: String,
+    pub(crate) data_type: DataType,
+    pub(crate) nullable: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PreparedFragmentRole {
+    Result,
+    TerminalWrite,
+    NonTerminal,
+}
+
+impl PreparedFragmentRole {
+    pub(crate) fn is_terminal_write(self) -> bool {
+        matches!(self, Self::TerminalWrite)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedBoundaryProjection {
+    output_columns: Vec<PreparedOutputColumn>,
+    cte_id: Option<CteId>,
+    cte_exchange_nodes: Vec<(CteId, i32, Vec<ColumnId>)>,
+    contracts: Vec<BoundaryContract>,
+}
+
+impl PreparedBoundaryProjection {
+    pub(crate) fn output_columns(&self) -> &[PreparedOutputColumn] {
+        &self.output_columns
+    }
+
+    pub(crate) fn cte_id(&self) -> Option<CteId> {
+        self.cte_id
+    }
+
+    pub(crate) fn cte_exchange_nodes(&self) -> &[(CteId, i32, Vec<ColumnId>)] {
+        &self.cte_exchange_nodes
+    }
+
+    pub(crate) fn contracts(&self) -> &[BoundaryContract] {
+        &self.contracts
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedFragment {
+    fragment_id: FragmentId,
+    scan_node_ids: Vec<i32>,
+    execution_role: PreparedFragmentRole,
+    boundary_projection: PreparedBoundaryProjection,
+}
+
+impl PreparedFragment {
+    pub(crate) fn fragment_id(&self) -> FragmentId {
+        self.fragment_id
+    }
+
+    pub(crate) fn scan_node_ids(&self) -> &[i32] {
+        &self.scan_node_ids
+    }
+
+    pub(crate) fn has_scan_nodes(&self) -> bool {
+        !self.scan_node_ids.is_empty()
+    }
+
+    pub(crate) fn execution_role(&self) -> PreparedFragmentRole {
+        self.execution_role
+    }
+
+    pub(crate) fn boundary_projection(&self) -> &PreparedBoundaryProjection {
+        &self.boundary_projection
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PreparedPlanProjection {
+    topological_fragment_order: Vec<FragmentId>,
+    execution_anchor_fragment_id: FragmentId,
+    edges: Vec<FragmentEdge>,
+}
+
+pub(crate) struct PreparedFragmentSet {
+    by_fragment: BTreeMap<FragmentId, PreparedFragment>,
+    scan_bindings: ScanExecutionBindings,
+    projection: PreparedPlanProjection,
+}
+
+impl PreparedFragmentSet {
+    pub(super) fn new(
+        by_fragment: BTreeMap<FragmentId, PreparedFragment>,
+        scan_bindings: ScanExecutionBindings,
+        topological_fragment_order: Vec<FragmentId>,
+        execution_anchor_fragment_id: FragmentId,
+        edges: Vec<FragmentEdge>,
+    ) -> Self {
+        Self {
+            by_fragment,
+            scan_bindings,
+            projection: PreparedPlanProjection {
+                topological_fragment_order,
+                execution_anchor_fragment_id,
+                edges,
+            },
+        }
+    }
+
+    pub(crate) fn scheduling_view(&self) -> FragmentSchedulingView<'_> {
+        FragmentSchedulingView {
+            by_fragment: &self.by_fragment,
+            projection: &self.projection,
+            scan_bindings: &self.scan_bindings,
+        }
+    }
+
+    pub(crate) fn scan_bindings(&self) -> &ScanExecutionBindings {
+        &self.scan_bindings
+    }
+
+    pub(crate) fn fragment_ids(&self) -> BTreeSet<FragmentId> {
+        self.by_fragment.keys().copied().collect()
+    }
+
+    pub(crate) fn fragment(&self, fragment_id: FragmentId) -> Option<&PreparedFragment> {
+        self.by_fragment.get(&fragment_id)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FragmentSchedulingView<'a> {
+    by_fragment: &'a BTreeMap<FragmentId, PreparedFragment>,
+    projection: &'a PreparedPlanProjection,
+    scan_bindings: &'a ScanExecutionBindings,
+}
+
+impl<'a> FragmentSchedulingView<'a> {
+    pub(crate) fn fragment_ids(self) -> impl ExactSizeIterator<Item = FragmentId> + 'a {
+        self.by_fragment.keys().copied()
+    }
+
+    pub(crate) fn fragments(self) -> impl ExactSizeIterator<Item = &'a PreparedFragment> + 'a {
+        self.by_fragment.values()
+    }
+
+    pub(crate) fn fragment(self, fragment_id: FragmentId) -> Option<&'a PreparedFragment> {
+        self.by_fragment.get(&fragment_id)
+    }
+
+    pub(crate) fn topological_order(self) -> &'a [FragmentId] {
+        &self.projection.topological_fragment_order
+    }
+
+    pub(crate) fn execution_anchor(self) -> FragmentId {
+        self.projection.execution_anchor_fragment_id
+    }
+
+    pub(crate) fn edges(self) -> &'a [FragmentEdge] {
+        &self.projection.edges
+    }
+
+    pub(crate) fn scan_ranges(
+        self,
+        fragment_id: FragmentId,
+        node_id: i32,
+    ) -> Option<&'a [ScanRangeParams]> {
+        self.scan_bindings.scan_ranges(fragment_id, node_id)
+    }
+
+    pub(crate) fn boundary_projection(
+        self,
+        fragment_id: FragmentId,
+    ) -> Option<&'a PreparedBoundaryProjection> {
+        self.fragment(fragment_id)
+            .map(PreparedFragment::boundary_projection)
+    }
+}
+
+pub(super) fn prepared_fragment(
+    fragment_id: FragmentId,
+    scan_node_ids: Vec<i32>,
+    execution_role: PreparedFragmentRole,
+    output_columns: Vec<PreparedOutputColumn>,
+    cte_id: Option<CteId>,
+    cte_exchange_nodes: Vec<(CteId, i32, Vec<ColumnId>)>,
+    contracts: Vec<BoundaryContract>,
+) -> PreparedFragment {
+    PreparedFragment {
+        fragment_id,
+        scan_node_ids,
+        execution_role,
+        boundary_projection: PreparedBoundaryProjection {
+            output_columns,
+            cte_id,
+            cte_exchange_nodes,
+            contracts,
+        },
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn prepared_fragment_set_for_test(
+    fragments: Vec<(
+        FragmentId,
+        PreparedFragmentRole,
+        Vec<(i32, Vec<ScanRangeParams>)>,
+    )>,
+    topological_fragment_order: Vec<FragmentId>,
+    execution_anchor_fragment_id: FragmentId,
+    edges: Vec<FragmentEdge>,
+) -> PreparedFragmentSet {
+    let mut by_fragment = BTreeMap::new();
+    let mut scan_bindings = ScanExecutionBindings::default();
+    for (fragment_id, role, scan_nodes) in fragments {
+        let mut scan_node_ids = Vec::new();
+        for (node_id, ranges) in scan_nodes {
+            scan_node_ids.push(node_id);
+            scan_bindings
+                .insert_scan_ranges(fragment_id, node_id, ranges)
+                .expect("unique test scan range key");
+        }
+        scan_node_ids.sort_unstable();
+        by_fragment.insert(
+            fragment_id,
+            prepared_fragment(
+                fragment_id,
+                scan_node_ids,
+                role,
+                Vec::new(),
+                None,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+    }
+    PreparedFragmentSet::new(
+        by_fragment,
+        scan_bindings,
+        topological_fragment_order,
+        execution_anchor_fragment_id,
+        edges,
+    )
+}

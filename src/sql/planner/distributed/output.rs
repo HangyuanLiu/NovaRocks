@@ -972,6 +972,14 @@ impl FragmentEdgeOutputCatalog {
             .map(|columns| columns.as_slice())
     }
 
+    #[cfg(test)]
+    pub(in crate::sql::planner::distributed) fn remove_fragment_output_for_test(
+        &mut self,
+        fragment_id: FragmentId,
+    ) {
+        self.fragment_outputs.remove(&fragment_id);
+    }
+
     /// The finalized projection of the stream edge whose destination Exchange
     /// receiver is `(target_fragment_id, target_exchange_node_id)`, or `None` for
     /// an Exchange node that is not the destination of a finalized stream edge

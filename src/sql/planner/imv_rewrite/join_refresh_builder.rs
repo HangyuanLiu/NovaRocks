@@ -1401,19 +1401,19 @@ mod tests {
         )
         .expect("coalesce plan");
         let optimized_tree = optimize_for_test(plan);
-        let catalog = crate::engine::catalog::InMemoryCatalog::default();
         let connectors = crate::connector::ConnectorRegistry::default();
 
         let result = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
             .and_then(crate::sql::planner::pipeline::build_distributed_plan)
             .and_then(|distributed_plan| {
-                crate::sql::codegen::fragment::build(
-                    crate::sql::codegen::fragment::FragmentBuildRequest::result(
-                        &distributed_plan,
-                        &catalog,
-                        &connectors,
-                        None,
-                    ),
+                let prepared = crate::coordinator::prepare::prepare_fragments(
+                    &distributed_plan,
+                    &connectors,
+                    None,
+                )?;
+                crate::sql::codegen::fragment::encode_native_fragment_bundle(
+                    &distributed_plan,
+                    &prepared,
                 )
             });
 

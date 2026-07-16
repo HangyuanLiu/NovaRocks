@@ -88,6 +88,10 @@ pub(crate) fn rebuild_test_plan(
         .expect("rebuilt test distributed plan must pass production minimal seal")
 }
 
+pub(crate) fn remove_fragment_output_for_test(plan: &mut DistributedPlan, fragment_id: FragmentId) {
+    plan.remove_fragment_output_for_test(fragment_id);
+}
+
 macro_rules! distributed_plan_draft_builder_for_test {
     (
         $fragments:ident,
