@@ -108,13 +108,13 @@ fn reorder_insert_row(
             None => {
                 let column = &target_columns[*target_idx];
                 let literal = match &column.write_default {
-                    Some(iceberg_lit) => {
+                    Some(write_default) => {
                         let sql_type =
                             arrow_data_type_to_sql_type(&column.data_type).map_err(|e| {
                                 format!("INSERT write-default for `{}`: {e}", column.name)
                             })?;
-                        crate::connector::iceberg::default_value::iceberg_literal_to_ast(
-                            iceberg_lit,
+                        crate::sql::literal::column_default_to_ast_literal(
+                            write_default,
                             &sql_type,
                         )?
                     }
@@ -661,8 +661,53 @@ fn build_local_literal_array(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::schema::ColumnDefault;
     use crate::sql::catalog::ColumnDef;
-    use arrow::datatypes::DataType;
+    use arrow::datatypes::{DataType, Field, Fields};
+
+    fn test_column(
+        name: &str,
+        data_type: DataType,
+        write_default: Option<ColumnDefault>,
+    ) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type,
+            nullable: true,
+            write_default,
+            logical_type: None,
+        }
+    }
+
+    fn omitted_default_literal(
+        data_type: DataType,
+        write_default: Option<ColumnDefault>,
+    ) -> Result<Literal, String> {
+        let target_columns = vec![
+            test_column("provided", DataType::Int32, None),
+            test_column("omitted", data_type, write_default),
+        ];
+        let reordered = reorder_insert_rows(
+            &[vec![Literal::Int(1)]],
+            &["provided".to_string()],
+            &target_columns,
+        )?;
+        Ok(reordered[0][1].clone())
+    }
+
+    fn test_map_type(key: DataType, value: DataType) -> DataType {
+        DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    Arc::new(Field::new("key", key, false)),
+                    Arc::new(Field::new("value", value, true)),
+                ])),
+                false,
+            )),
+            false,
+        )
+    }
 
     #[test]
     fn reorder_insert_row_uses_write_default_for_omitted_column() {
@@ -678,9 +723,7 @@ mod tests {
                 name: "b".to_string(),
                 data_type: DataType::Int32,
                 nullable: true,
-                write_default: Some(iceberg::spec::Literal::Primitive(
-                    iceberg::spec::PrimitiveLiteral::Int(5),
-                )),
+                write_default: Some(ColumnDefault::Int32(5)),
                 logical_type: None,
             },
         ];
@@ -817,6 +860,111 @@ mod tests {
         let insert_columns = vec!["a".to_string()];
         let result = reorder_insert_rows(&rows, &insert_columns, &target_columns).expect("reorder");
         assert_eq!(result[0][1], Literal::Null);
+    }
+
+    #[test]
+    fn reorder_insert_row_characterizes_neutral_write_defaults() {
+        let full_binary = (0_u16..=255).map(|byte| byte as u8).collect::<Vec<_>>();
+        let cases = vec![
+            (
+                "integer",
+                DataType::Int32,
+                ColumnDefault::Int32(5),
+                Literal::Int(5),
+            ),
+            (
+                "string",
+                DataType::Utf8,
+                ColumnDefault::String("value".to_string()),
+                Literal::String("value".to_string()),
+            ),
+            (
+                "decimal",
+                DataType::Decimal128(10, 2),
+                ColumnDefault::Decimal {
+                    unscaled: 12_345,
+                    precision: 10,
+                    scale: 2,
+                },
+                Literal::String("123.45".to_string()),
+            ),
+            (
+                "date",
+                DataType::Date32,
+                ColumnDefault::Date {
+                    days_since_epoch: -1,
+                },
+                Literal::Date("1969-12-31".to_string()),
+            ),
+            (
+                "datetime",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                ColumnDefault::TimestampMicros {
+                    micros_since_epoch: 1_704_110_400_123_456,
+                },
+                Literal::String("2024-01-01 12:00:00".to_string()),
+            ),
+            (
+                "datetime-ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                ColumnDefault::TimestampNanos {
+                    nanos_since_epoch: 1_704_164_645_123_456_789,
+                },
+                Literal::String("2024-01-02 03:04:05.123456789".to_string()),
+            ),
+            (
+                "binary",
+                DataType::Binary,
+                ColumnDefault::Binary(full_binary.clone()),
+                Literal::String(crate::sql::literal::bytes_to_latin1_string(&full_binary)),
+            ),
+            (
+                "empty-array",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                ColumnDefault::Array(Vec::new()),
+                Literal::Array(Vec::new()),
+            ),
+            (
+                "empty-map",
+                test_map_type(DataType::Int32, DataType::Utf8),
+                ColumnDefault::Map(Vec::new()),
+                Literal::Map(Vec::new()),
+            ),
+        ];
+
+        for (name, data_type, write_default, expected) in cases {
+            assert_eq!(
+                omitted_default_literal(data_type, Some(write_default)),
+                Ok(expected),
+                "case={name}"
+            );
+        }
+    }
+
+    #[test]
+    fn reorder_insert_row_characterizes_non_empty_collection_default_errors() {
+        let list_error = omitted_default_literal(
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            Some(ColumnDefault::Array(vec![ColumnDefault::Int32(1)])),
+        )
+        .unwrap_err();
+        assert_eq!(
+            list_error,
+            "non-empty ARRAY write-default is not yet supported (1 elements)"
+        );
+
+        let map_error = omitted_default_literal(
+            test_map_type(DataType::Int32, DataType::Utf8),
+            Some(ColumnDefault::Map(vec![(
+                ColumnDefault::Int32(1),
+                ColumnDefault::String("value".to_string()),
+            )])),
+        )
+        .unwrap_err();
+        assert_eq!(
+            map_error,
+            "non-empty MAP write-default is not yet supported (1 entries)"
+        );
     }
 }
 

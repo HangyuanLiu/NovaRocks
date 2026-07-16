@@ -12,243 +12,358 @@
 //! and INSERT write path.
 
 use iceberg::spec::{
-    FormatVersion, Literal as IcebergLiteral, Map as IcebergMap, PrimitiveLiteral,
+    FormatVersion, Literal as IcebergLiteral, Map as IcebergMap, PrimitiveLiteral, PrimitiveType,
+    Type,
 };
 
-use crate::catalog::schema::SqlType;
-use crate::sql::parser::ast::{DefaultLiteral, Literal as AstLiteral};
+use crate::catalog::schema::{ColumnDefault, validate_column_default};
 
-/// Convert an AST `DefaultLiteral` to an `iceberg::spec::Literal` validated
-/// against the column's SqlType.  Returns `Ok(None)` for `DefaultLiteral::Null`
-/// (which is not persisted) and `Err` when the literal does not fit the
-/// column's type or the type itself is unsupported.
-pub(crate) fn default_literal_to_iceberg(
-    literal: &DefaultLiteral,
-    column_type: &SqlType,
-) -> Result<Option<IcebergLiteral>, String> {
-    if matches!(literal, DefaultLiteral::Null) {
-        return Ok(None);
-    }
-
-    // Array and Map defaults are stored as JSON strings in DefaultLiteral::String
-    // (produced by parse_string_default).  Handle them before the primitive match.
-    match (literal, column_type) {
-        (DefaultLiteral::String(s), SqlType::Array(_)) => {
-            // parse_string_default already validated the value is a JSON array.
-            let v: serde_json::Value =
-                serde_json::from_str(s).map_err(|e| format!("invalid ARRAY DEFAULT JSON: {e}"))?;
-            let arr = v
-                .as_array()
-                .ok_or_else(|| format!("ARRAY DEFAULT must be a JSON array, got: {s:?}"))?;
-            if !arr.is_empty() {
-                return Err(
-                    "non-empty ARRAY DEFAULT literals are not yet supported; use '[]'".to_string(),
-                );
-            }
-            return Ok(Some(IcebergLiteral::List(vec![])));
-        }
-        (DefaultLiteral::String(s), SqlType::Map(_, _)) => {
-            // parse_string_default already validated the value is a JSON object.
-            let v: serde_json::Value =
-                serde_json::from_str(s).map_err(|e| format!("invalid MAP DEFAULT JSON: {e}"))?;
-            let obj = v
-                .as_object()
-                .ok_or_else(|| format!("MAP DEFAULT must be a JSON object, got: {s:?}"))?;
-            if !obj.is_empty() {
-                return Err(
-                    "non-empty MAP DEFAULT literals are not yet supported; use '{}'".to_string(),
-                );
-            }
-            return Ok(Some(IcebergLiteral::Map(IcebergMap::new())));
-        }
-        _ => {}
-    }
-
-    let prim = match (literal, column_type) {
-        (DefaultLiteral::Bool(b), SqlType::Boolean) => PrimitiveLiteral::Boolean(*b),
-        (DefaultLiteral::Int(v), SqlType::TinyInt) => {
-            i8::try_from(*v).map_err(|_| out_of_range("TINYINT", *v))?;
-            PrimitiveLiteral::Int(*v as i32)
-        }
-        (DefaultLiteral::Int(v), SqlType::SmallInt) => {
-            i16::try_from(*v).map_err(|_| out_of_range("SMALLINT", *v))?;
-            PrimitiveLiteral::Int(*v as i32)
-        }
-        (DefaultLiteral::Int(v), SqlType::Int) => {
-            i32::try_from(*v).map_err(|_| out_of_range("INT", *v))?;
-            PrimitiveLiteral::Int(*v as i32)
-        }
-        (DefaultLiteral::Int(v), SqlType::BigInt) => PrimitiveLiteral::Long(*v),
-        (DefaultLiteral::Float(v), SqlType::Float) => {
-            PrimitiveLiteral::Float(ordered_float::OrderedFloat(*v as f32))
-        }
-        (DefaultLiteral::Float(v), SqlType::Double) => {
-            PrimitiveLiteral::Double(ordered_float::OrderedFloat(*v))
-        }
-        (
-            DefaultLiteral::Decimal { unscaled, scale },
-            SqlType::Decimal {
-                scale: col_scale, ..
-            },
-        ) => {
-            if *scale != *col_scale {
-                return Err(format!(
-                    "DEFAULT value scale {scale} does not match column scale {col_scale}"
-                ));
-            }
-            PrimitiveLiteral::Int128(*unscaled)
-        }
-        (DefaultLiteral::String(s), SqlType::String | SqlType::Json) => {
-            PrimitiveLiteral::String(s.clone())
-        }
-        (DefaultLiteral::Date(d), SqlType::Date) => PrimitiveLiteral::Int(*d),
-        (DefaultLiteral::DateTime(t), SqlType::DateTime) => PrimitiveLiteral::Long(*t),
-        (DefaultLiteral::DateTime(t), SqlType::DateTimeNs) => PrimitiveLiteral::Long(*t),
-        (DefaultLiteral::Binary(b), SqlType::Binary | SqlType::Bitmap | SqlType::Hll) => {
-            PrimitiveLiteral::Binary(b.clone())
-        }
-        (lit, ty) => {
-            return Err(format!(
-                "DEFAULT value type does not match column type: literal={lit:?} column={ty:?}"
-            ));
-        }
-    };
-    Ok(Some(IcebergLiteral::Primitive(prim)))
-}
-
-fn out_of_range(type_name: &str, value: i64) -> String {
-    format!("DEFAULT value {value} is out of range for {type_name}")
-}
-
-/// Format an unscaled `i128` with the given decimal `scale` as a human-readable
-/// decimal string (e.g. `unscaled=999, scale=2` → `"9.99"`).
-fn i128_unscaled_to_decimal_string(unscaled: i128, scale: u32) -> String {
-    if scale == 0 {
-        return unscaled.to_string();
-    }
-    let negative = unscaled < 0;
-    let abs = unscaled.unsigned_abs();
-    let factor = 10_u128.pow(scale);
-    let int_part = abs / factor;
-    let frac_part = abs % factor;
-    // Zero-pad the fractional part to exactly `scale` digits.
-    let s = format!("{int_part}.{frac_part:0>scale$}", scale = scale as usize);
-    if negative { format!("-{s}") } else { s }
-}
-
-/// Convert an `iceberg::spec::Literal` back to an AST `Literal` for use in the
-/// INSERT write path (filling omitted columns with their write_default).
-///
-/// Returns `Err` for types that are not yet supported by the INSERT path
-/// (Binary/Bitmap/HLL).  Decimal and DateTime are fully supported and
-/// return `AstLiteral::String` that the downstream `build_local_literal_array`
-/// can parse.
-pub(crate) fn iceberg_literal_to_ast(
+pub(crate) fn iceberg_literal_to_column_default(
     literal: &IcebergLiteral,
-    column_type: &SqlType,
-) -> Result<AstLiteral, String> {
-    match (literal, column_type) {
-        (IcebergLiteral::Primitive(PrimitiveLiteral::Boolean(b)), SqlType::Boolean) => {
-            Ok(AstLiteral::Bool(*b))
-        }
+    iceberg_type: &Type,
+) -> Result<ColumnDefault, String> {
+    let value = iceberg_literal_to_nested_column_default(Some(literal), iceberg_type)?;
+    validate_column_default(&value)?;
+    Ok(value)
+}
+
+fn iceberg_literal_to_nested_column_default(
+    literal: Option<&IcebergLiteral>,
+    iceberg_type: &Type,
+) -> Result<ColumnDefault, String> {
+    let Some(literal) = literal else {
+        return Ok(ColumnDefault::Null);
+    };
+
+    match (literal, iceberg_type) {
         (
-            IcebergLiteral::Primitive(PrimitiveLiteral::Int(v)),
-            SqlType::TinyInt | SqlType::SmallInt | SqlType::Int,
-        ) => Ok(AstLiteral::Int(*v as i64)),
-        (IcebergLiteral::Primitive(PrimitiveLiteral::Long(v)), SqlType::BigInt) => {
-            Ok(AstLiteral::Int(*v))
-        }
-        (IcebergLiteral::Primitive(PrimitiveLiteral::Float(v)), SqlType::Float) => {
-            Ok(AstLiteral::Float(v.0 as f64))
-        }
-        (IcebergLiteral::Primitive(PrimitiveLiteral::Double(v)), SqlType::Double) => {
-            Ok(AstLiteral::Float(v.0))
-        }
+            IcebergLiteral::Primitive(PrimitiveLiteral::Boolean(value)),
+            Type::Primitive(PrimitiveType::Boolean),
+        ) => Ok(ColumnDefault::Boolean(*value)),
         (
-            IcebergLiteral::Primitive(PrimitiveLiteral::String(s)),
-            SqlType::String | SqlType::Json,
-        ) => Ok(AstLiteral::String(s.clone())),
-        (IcebergLiteral::Primitive(PrimitiveLiteral::Int(days)), SqlType::Date) => {
-            // Convert days-since-epoch back to "YYYY-MM-DD" string.
-            use chrono::NaiveDate;
-            const UNIX_EPOCH_DAY_OFFSET: i32 = 719163;
-            let date = NaiveDate::from_num_days_from_ce_opt(UNIX_EPOCH_DAY_OFFSET + days)
-                .ok_or_else(|| {
-                    format!("write-default date value {days} is out of representable range")
-                })?;
-            Ok(AstLiteral::Date(date.format("%Y-%m-%d").to_string()))
-        }
+            IcebergLiteral::Primitive(PrimitiveLiteral::Int(value)),
+            Type::Primitive(PrimitiveType::Int),
+        ) => Ok(ColumnDefault::Int32(*value)),
+        (
+            IcebergLiteral::Primitive(PrimitiveLiteral::Long(value)),
+            Type::Primitive(PrimitiveType::Long),
+        ) => Ok(ColumnDefault::Int64(*value)),
+        (
+            IcebergLiteral::Primitive(PrimitiveLiteral::Float(value)),
+            Type::Primitive(PrimitiveType::Float),
+        ) => Ok(ColumnDefault::Float32 {
+            bits: value.0.to_bits(),
+        }),
+        (
+            IcebergLiteral::Primitive(PrimitiveLiteral::Double(value)),
+            Type::Primitive(PrimitiveType::Double),
+        ) => Ok(ColumnDefault::Float64 {
+            bits: value.0.to_bits(),
+        }),
         (
             IcebergLiteral::Primitive(PrimitiveLiteral::Int128(unscaled)),
-            SqlType::Decimal { scale, .. },
-        ) => {
-            // Convert unscaled i128 + scale back to a decimal string like "9.99".
-            // build_local_literal_array handles Literal::String for Decimal128 columns.
-            let s = i128_unscaled_to_decimal_string(*unscaled, *scale as u32);
-            Ok(AstLiteral::String(s))
-        }
-        (IcebergLiteral::Primitive(PrimitiveLiteral::Long(micros)), SqlType::DateTime) => {
-            // Convert microseconds-since-epoch back to "YYYY-MM-DD HH:MM:SS" string.
-            // build_local_literal_array handles Literal::String for Timestamp columns.
-            use chrono::DateTime as ChronoDateTime;
-            let dt = ChronoDateTime::from_timestamp_micros(*micros).ok_or_else(|| {
-                format!("write-default datetime value {micros} µs is out of representable range")
-            })?;
-            Ok(AstLiteral::String(
-                dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string(),
-            ))
-        }
-        (IcebergLiteral::Primitive(PrimitiveLiteral::Long(nanos)), SqlType::DateTimeNs) => {
-            // Convert nanoseconds-since-epoch back to "YYYY-MM-DD HH:MM:SS.nnnnnnnnn" string.
-            // build_local_literal_array handles Literal::String for Timestamp columns.
-            use chrono::DateTime as ChronoDateTime;
-            let dt = ChronoDateTime::from_timestamp_nanos(*nanos);
-            Ok(AstLiteral::String(
-                dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.9f").to_string(),
-            ))
-        }
+            Type::Primitive(PrimitiveType::Decimal { precision, scale }),
+        ) => Ok(ColumnDefault::Decimal {
+            unscaled: *unscaled,
+            precision: u8::try_from(*precision)
+                .map_err(|_| format!("Iceberg DECIMAL precision {precision} does not fit u8"))?,
+            scale: i8::try_from(*scale)
+                .map_err(|_| format!("Iceberg DECIMAL scale {scale} does not fit i8"))?,
+        }),
         (
-            IcebergLiteral::Primitive(PrimitiveLiteral::Binary(b)),
-            SqlType::Binary | SqlType::Bitmap | SqlType::Hll,
+            IcebergLiteral::Primitive(PrimitiveLiteral::String(value)),
+            Type::Primitive(PrimitiveType::String),
+        ) => Ok(ColumnDefault::String(value.clone())),
+        (
+            IcebergLiteral::Primitive(PrimitiveLiteral::Binary(value)),
+            Type::Primitive(PrimitiveType::Binary),
+        ) => Ok(ColumnDefault::Binary(value.clone())),
+        (
+            IcebergLiteral::Primitive(PrimitiveLiteral::Int(days_since_epoch)),
+            Type::Primitive(PrimitiveType::Date),
+        ) => Ok(ColumnDefault::Date {
+            days_since_epoch: *days_since_epoch,
+        }),
+        (
+            IcebergLiteral::Primitive(PrimitiveLiteral::Long(micros_since_midnight)),
+            Type::Primitive(PrimitiveType::Time),
+        ) => Ok(ColumnDefault::TimeMicros {
+            micros_since_midnight: *micros_since_midnight,
+        }),
+        (
+            IcebergLiteral::Primitive(PrimitiveLiteral::Long(micros_since_epoch)),
+            Type::Primitive(PrimitiveType::Timestamp),
+        ) => Ok(ColumnDefault::TimestampMicros {
+            micros_since_epoch: *micros_since_epoch,
+        }),
+        (
+            IcebergLiteral::Primitive(PrimitiveLiteral::Long(micros_since_epoch)),
+            Type::Primitive(PrimitiveType::Timestamptz),
+        ) => Ok(ColumnDefault::TimestamptzMicros {
+            micros_since_epoch: *micros_since_epoch,
+        }),
+        (
+            IcebergLiteral::Primitive(PrimitiveLiteral::Long(nanos_since_epoch)),
+            Type::Primitive(PrimitiveType::TimestampNs),
+        ) => Ok(ColumnDefault::TimestampNanos {
+            nanos_since_epoch: *nanos_since_epoch,
+        }),
+        (
+            IcebergLiteral::Primitive(PrimitiveLiteral::Long(nanos_since_epoch)),
+            Type::Primitive(PrimitiveType::TimestamptzNs),
+        ) => Ok(ColumnDefault::TimestamptzNanos {
+            nanos_since_epoch: *nanos_since_epoch,
+        }),
+        (
+            IcebergLiteral::Primitive(PrimitiveLiteral::UInt128(value)),
+            Type::Primitive(PrimitiveType::Uuid),
+        ) => Ok(ColumnDefault::Uuid(value.to_be_bytes())),
+        (
+            IcebergLiteral::Primitive(PrimitiveLiteral::Binary(bytes)),
+            Type::Primitive(PrimitiveType::Fixed(size)),
         ) => {
-            // Represent the byte slice as a Latin-1 string so that
-            // build_local_literal_array (DataType::Binary/LargeBinary) can
-            // round-trip it via latin1_string_to_bytes.  Only bytes in 0..=255
-            // are valid Latin-1; since they are all u8 this is always safe.
-            let s: String = b.iter().map(|&byte| byte as char).collect();
-            Ok(AstLiteral::String(s))
-        }
-        // Empty ARRAY/MAP defaults: produce the empty collection AST node.
-        // Non-empty collection defaults are not yet supported.
-        (IcebergLiteral::List(elems), SqlType::Array(_)) => {
-            if !elems.is_empty() {
+            let byte_len = u64::try_from(bytes.len())
+                .map_err(|_| "FIXED default byte length does not fit u64".to_string())?;
+            if byte_len != *size {
                 return Err(format!(
-                    "non-empty ARRAY write-default is not yet supported ({} elements)",
-                    elems.len()
+                    "FIXED default size {size} does not match byte length {byte_len}"
                 ));
             }
-            Ok(AstLiteral::Array(vec![]))
+            Ok(ColumnDefault::Fixed {
+                size: *size,
+                bytes: bytes.clone(),
+            })
         }
-        (IcebergLiteral::Map(map), SqlType::Map(_, _)) => {
-            if !map.is_empty() {
+        (IcebergLiteral::Struct(value), Type::Struct(struct_type)) => {
+            if value.fields().len() != struct_type.fields().len() {
                 return Err(format!(
-                    "non-empty MAP write-default is not yet supported ({} entries)",
-                    map.len()
+                    "Iceberg struct default has {} fields but type has {} fields",
+                    value.fields().len(),
+                    struct_type.fields().len()
                 ));
             }
-            Ok(AstLiteral::Map(vec![]))
+            let fields = value
+                .iter()
+                .zip(struct_type.fields())
+                .map(|(field_value, field)| {
+                    Ok((
+                        field.name.clone(),
+                        iceberg_literal_to_nested_column_default(
+                            field_value,
+                            field.field_type.as_ref(),
+                        )?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(ColumnDefault::Struct(fields))
         }
-        (lit, ty) => Err(format!(
-            "write-default literal type does not match column type: literal={lit:?} column={ty:?}"
+        (IcebergLiteral::List(elements), Type::List(list_type)) => Ok(ColumnDefault::Array(
+            elements
+                .iter()
+                .map(|element| {
+                    iceberg_literal_to_nested_column_default(
+                        element.as_ref(),
+                        list_type.element_field.field_type.as_ref(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        (IcebergLiteral::Map(map), Type::Map(map_type)) => Ok(ColumnDefault::Map(
+            map.clone()
+                .into_iter()
+                .map(|(key, value)| {
+                    Ok((
+                        iceberg_literal_to_nested_column_default(
+                            Some(&key),
+                            map_type.key_field.field_type.as_ref(),
+                        )?,
+                        iceberg_literal_to_nested_column_default(
+                            value.as_ref(),
+                            map_type.value_field.field_type.as_ref(),
+                        )?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        )),
+        (IcebergLiteral::Primitive(PrimitiveLiteral::AboveMax | PrimitiveLiteral::BelowMin), _) => {
+            Err("Iceberg bound sentinel cannot be used as a column default".to_string())
+        }
+        (_, Type::Primitive(PrimitiveType::Variant)) => {
+            Err("Iceberg Variant column defaults are not supported".to_string())
+        }
+        (literal, iceberg_type) => Err(format!(
+            "Iceberg default literal type does not match authoritative type: literal={literal:?} type={iceberg_type:?}"
         )),
     }
 }
 
-/// Reject non-NULL defaults on tables whose format-version is not v3.
-/// `None` is the no-default case and is always accepted.
-pub(crate) fn require_v3_for_default(
+pub(crate) fn column_default_to_iceberg_literal(
+    value: &ColumnDefault,
+    iceberg_type: &Type,
+) -> Result<IcebergLiteral, String> {
+    validate_column_default(value)?;
+    column_default_to_nested_iceberg_literal(value, iceberg_type)?.ok_or_else(|| {
+        "top-level column default cannot be converted to an Iceberg NULL literal".to_string()
+    })
+}
+
+fn column_default_to_nested_iceberg_literal(
+    value: &ColumnDefault,
+    iceberg_type: &Type,
+) -> Result<Option<IcebergLiteral>, String> {
+    let primitive = match (value, iceberg_type) {
+        (ColumnDefault::Null, _) => return Ok(None),
+        (ColumnDefault::Boolean(value), Type::Primitive(PrimitiveType::Boolean)) => {
+            PrimitiveLiteral::Boolean(*value)
+        }
+        (ColumnDefault::Int32(value), Type::Primitive(PrimitiveType::Int)) => {
+            PrimitiveLiteral::Int(*value)
+        }
+        (ColumnDefault::Int64(value), Type::Primitive(PrimitiveType::Long)) => {
+            PrimitiveLiteral::Long(*value)
+        }
+        (ColumnDefault::Float32 { bits }, Type::Primitive(PrimitiveType::Float)) => {
+            PrimitiveLiteral::Float(ordered_float::OrderedFloat(f32::from_bits(*bits)))
+        }
+        (ColumnDefault::Float64 { bits }, Type::Primitive(PrimitiveType::Double)) => {
+            PrimitiveLiteral::Double(ordered_float::OrderedFloat(f64::from_bits(*bits)))
+        }
+        (
+            ColumnDefault::Decimal {
+                unscaled,
+                precision,
+                scale,
+            },
+            Type::Primitive(PrimitiveType::Decimal {
+                precision: iceberg_precision,
+                scale: iceberg_scale,
+            }),
+        ) => {
+            if *scale < 0 {
+                return Err(format!("negative DECIMAL scale {scale} is not supported"));
+            }
+            if u32::from(*precision) != *iceberg_precision
+                || u32::try_from(*scale).ok() != Some(*iceberg_scale)
+            {
+                return Err(format!(
+                    "column DECIMAL({precision},{scale}) does not match Iceberg DECIMAL({iceberg_precision},{iceberg_scale})"
+                ));
+            }
+            PrimitiveLiteral::Int128(*unscaled)
+        }
+        (ColumnDefault::String(value), Type::Primitive(PrimitiveType::String)) => {
+            PrimitiveLiteral::String(value.clone())
+        }
+        (ColumnDefault::Binary(value), Type::Primitive(PrimitiveType::Binary)) => {
+            PrimitiveLiteral::Binary(value.clone())
+        }
+        (ColumnDefault::Date { days_since_epoch }, Type::Primitive(PrimitiveType::Date)) => {
+            PrimitiveLiteral::Int(*days_since_epoch)
+        }
+        (
+            ColumnDefault::TimeMicros {
+                micros_since_midnight,
+            },
+            Type::Primitive(PrimitiveType::Time),
+        ) => PrimitiveLiteral::Long(*micros_since_midnight),
+        (
+            ColumnDefault::TimestampMicros { micros_since_epoch },
+            Type::Primitive(PrimitiveType::Timestamp),
+        ) => PrimitiveLiteral::Long(*micros_since_epoch),
+        (
+            ColumnDefault::TimestamptzMicros { micros_since_epoch },
+            Type::Primitive(PrimitiveType::Timestamptz),
+        ) => PrimitiveLiteral::Long(*micros_since_epoch),
+        (
+            ColumnDefault::TimestampNanos { nanos_since_epoch },
+            Type::Primitive(PrimitiveType::TimestampNs),
+        ) => PrimitiveLiteral::Long(*nanos_since_epoch),
+        (
+            ColumnDefault::TimestamptzNanos { nanos_since_epoch },
+            Type::Primitive(PrimitiveType::TimestamptzNs),
+        ) => PrimitiveLiteral::Long(*nanos_since_epoch),
+        (ColumnDefault::Uuid(bytes), Type::Primitive(PrimitiveType::Uuid)) => {
+            PrimitiveLiteral::UInt128(u128::from_be_bytes(*bytes))
+        }
+        (
+            ColumnDefault::Fixed { size, bytes },
+            Type::Primitive(PrimitiveType::Fixed(iceberg_size)),
+        ) => {
+            if size != iceberg_size {
+                return Err(format!(
+                    "FIXED default size {size} does not match Iceberg FIXED size {iceberg_size}"
+                ));
+            }
+            PrimitiveLiteral::Binary(bytes.clone())
+        }
+        (ColumnDefault::Struct(fields), Type::Struct(struct_type)) => {
+            if fields.len() != struct_type.fields().len() {
+                return Err(format!(
+                    "column struct default has {} fields but Iceberg type has {} fields",
+                    fields.len(),
+                    struct_type.fields().len()
+                ));
+            }
+            let mut values = Vec::with_capacity(fields.len());
+            for ((name, field_value), field) in fields.iter().zip(struct_type.fields()) {
+                if name != &field.name {
+                    return Err(format!(
+                        "column struct default field {name:?} does not match Iceberg field {:?}",
+                        field.name
+                    ));
+                }
+                values.push(column_default_to_nested_iceberg_literal(
+                    field_value,
+                    field.field_type.as_ref(),
+                )?);
+            }
+            return Ok(Some(IcebergLiteral::Struct(values.into_iter().collect())));
+        }
+        (ColumnDefault::Array(elements), Type::List(list_type)) => {
+            let values = elements
+                .iter()
+                .map(|element| {
+                    column_default_to_nested_iceberg_literal(
+                        element,
+                        list_type.element_field.field_type.as_ref(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(Some(IcebergLiteral::List(values)));
+        }
+        (ColumnDefault::Map(entries), Type::Map(map_type)) => {
+            let mut map = IcebergMap::new();
+            for (key, value) in entries {
+                let key = column_default_to_nested_iceberg_literal(
+                    key,
+                    map_type.key_field.field_type.as_ref(),
+                )?
+                .ok_or_else(|| "map key cannot be NULL".to_string())?;
+                let value = column_default_to_nested_iceberg_literal(
+                    value,
+                    map_type.value_field.field_type.as_ref(),
+                )?;
+                if map.insert(key, value).is_some() {
+                    return Err("duplicate map key after Iceberg conversion".to_string());
+                }
+            }
+            return Ok(Some(IcebergLiteral::Map(map)));
+        }
+        (_, Type::Primitive(PrimitiveType::Variant)) => {
+            return Err("Iceberg Variant column defaults are not supported".to_string());
+        }
+        (value, iceberg_type) => {
+            return Err(format!(
+                "column default type does not match authoritative Iceberg type: default={value:?} type={iceberg_type:?}"
+            ));
+        }
+    };
+    Ok(Some(IcebergLiteral::Primitive(primitive)))
+}
+
+pub(crate) fn require_v3_for_column_default(
     format_version: FormatVersion,
-    default: &Option<IcebergLiteral>,
+    default: Option<&ColumnDefault>,
 ) -> Result<(), String> {
     if default.is_some() && !matches!(format_version, FormatVersion::V3) {
         return Err("non-NULL DEFAULT requires Iceberg format-version 3; \
@@ -391,205 +506,434 @@ pub(crate) fn literal_to_constant_array(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::schema::ColumnDefault;
+    use iceberg::spec::{ListType, MapType, NestedField, PrimitiveType, Struct, StructType, Type};
 
-    #[test]
-    fn bool_default_round_trips() {
-        let lit = default_literal_to_iceberg(&DefaultLiteral::Bool(true), &SqlType::Boolean)
-            .expect("bool default")
-            .expect("not null");
-        assert!(matches!(
-            lit,
-            IcebergLiteral::Primitive(PrimitiveLiteral::Boolean(true))
-        ));
-    }
-
-    #[test]
-    fn int_overflow_rejected_for_tinyint() {
-        let err = default_literal_to_iceberg(&DefaultLiteral::Int(200), &SqlType::TinyInt)
-            .expect_err("overflow");
-        assert!(err.contains("TINYINT"));
-    }
-
-    #[test]
-    fn decimal_scale_mismatch_rejected() {
-        let err = default_literal_to_iceberg(
-            &DefaultLiteral::Decimal {
-                unscaled: 1234,
-                scale: 3,
-            },
-            &SqlType::Decimal {
-                precision: 10,
-                scale: 2,
-            },
-        )
-        .expect_err("scale mismatch");
-        assert!(err.contains("scale"));
-    }
-
-    #[test]
-    fn null_returns_none() {
-        let lit =
-            default_literal_to_iceberg(&DefaultLiteral::Null, &SqlType::Int).expect("null default");
-        assert!(lit.is_none());
-    }
-
-    #[test]
-    fn type_mismatch_rejected() {
-        let err = default_literal_to_iceberg(&DefaultLiteral::String("x".into()), &SqlType::Int)
-            .expect_err("type mismatch");
-        assert!(err.contains("type does not match"));
-    }
-
-    #[test]
-    fn iceberg_to_ast_literal_int() {
-        use crate::sql::parser::ast::Literal as AstLiteral;
-        let iceberg = IcebergLiteral::Primitive(PrimitiveLiteral::Int(7));
-        let ast = iceberg_literal_to_ast(&iceberg, &SqlType::Int).expect("convert");
-        assert_eq!(ast, AstLiteral::Int(7));
-    }
-
-    #[test]
-    fn iceberg_to_ast_literal_string() {
-        use crate::sql::parser::ast::Literal as AstLiteral;
-        let iceberg = IcebergLiteral::Primitive(PrimitiveLiteral::String("hi".into()));
-        let ast = iceberg_literal_to_ast(&iceberg, &SqlType::String).expect("convert");
-        assert_eq!(ast, AstLiteral::String("hi".into()));
-    }
-
-    #[test]
-    fn iceberg_to_ast_literal_unsupported_type_errors() {
-        // Binary write-default is now supported via Latin-1 byte-to-char encoding.
-        // This test verifies that a Binary literal round-trips through iceberg_literal_to_ast.
-        let iceberg = IcebergLiteral::Primitive(PrimitiveLiteral::Binary(b"abc".to_vec()));
-        let ast = iceberg_literal_to_ast(&iceberg, &SqlType::Binary)
-            .expect("binary write-default should now succeed");
-        assert_eq!(ast, AstLiteral::String("abc".to_string()));
-    }
-
-    #[test]
-    fn write_default_decimal_fills_correct_value() {
-        // 9.99 → unscaled 999 at scale 2
-        let iceberg = IcebergLiteral::Primitive(PrimitiveLiteral::Int128(999));
-        let ast = iceberg_literal_to_ast(
-            &iceberg,
-            &SqlType::Decimal {
-                precision: 10,
-                scale: 2,
-            },
-        )
-        .expect("decimal write-default");
-        assert_eq!(ast, AstLiteral::String("9.99".to_string()));
-
-        // Negative: -0.01 → unscaled -1 at scale 2
-        let neg = IcebergLiteral::Primitive(PrimitiveLiteral::Int128(-1));
-        let ast_neg = iceberg_literal_to_ast(
-            &neg,
-            &SqlType::Decimal {
-                precision: 10,
-                scale: 2,
-            },
-        )
-        .expect("negative decimal");
-        assert_eq!(ast_neg, AstLiteral::String("-0.01".to_string()));
-
-        // Zero scale: integer decimal
-        let int_dec = IcebergLiteral::Primitive(PrimitiveLiteral::Int128(42));
-        let ast_int = iceberg_literal_to_ast(
-            &int_dec,
-            &SqlType::Decimal {
-                precision: 5,
-                scale: 0,
-            },
-        )
-        .expect("zero-scale decimal");
-        assert_eq!(ast_int, AstLiteral::String("42".to_string()));
-    }
-
-    #[test]
-    fn write_default_date_fills_correct_value() {
-        // Days since Unix epoch: 2024-01-01 = 19723 days after 1970-01-01
-        // Verify by computing: days from 1970-01-01 to 2024-01-01
-        // 2024 - 1970 = 54 years, accounting for leap years: 19723
-        let days_2024_01_01: i32 = 19723;
-        let iceberg = IcebergLiteral::Primitive(PrimitiveLiteral::Int(days_2024_01_01));
-        let ast = iceberg_literal_to_ast(&iceberg, &SqlType::Date).expect("date write-default");
-        assert_eq!(ast, AstLiteral::Date("2024-01-01".to_string()));
-
-        // Epoch itself
-        let epoch = IcebergLiteral::Primitive(PrimitiveLiteral::Int(0));
-        let ast_epoch = iceberg_literal_to_ast(&epoch, &SqlType::Date).expect("epoch");
-        assert_eq!(ast_epoch, AstLiteral::Date("1970-01-01".to_string()));
-    }
-
-    #[test]
-    fn write_default_datetime_fills_correct_value() {
-        // 2024-01-01 12:00:00 UTC in microseconds since epoch
-        // = 19723 days * 86400 s/day + 12*3600 s = 1704110400 s = 1704110400_000000 µs
-        let micros_2024_01_01_noon: i64 = 1_704_110_400_000_000;
-        let iceberg = IcebergLiteral::Primitive(PrimitiveLiteral::Long(micros_2024_01_01_noon));
-        let ast =
-            iceberg_literal_to_ast(&iceberg, &SqlType::DateTime).expect("datetime write-default");
-        assert_eq!(ast, AstLiteral::String("2024-01-01 12:00:00".to_string()));
-
-        // Epoch
-        let epoch = IcebergLiteral::Primitive(PrimitiveLiteral::Long(0));
-        let ast_epoch = iceberg_literal_to_ast(&epoch, &SqlType::DateTime).expect("epoch datetime");
+    fn assert_iceberg_default_round_trip(
+        literal: IcebergLiteral,
+        iceberg_type: Type,
+        expected: ColumnDefault,
+    ) {
         assert_eq!(
-            ast_epoch,
-            AstLiteral::String("1970-01-01 00:00:00".to_string())
+            iceberg_literal_to_column_default(&literal, &iceberg_type).unwrap(),
+            expected
+        );
+        assert_eq!(
+            column_default_to_iceberg_literal(&expected, &iceberg_type).unwrap(),
+            literal
         );
     }
 
     #[test]
-    fn iceberg_to_ast_literal_date_round_trips() {
-        let epoch = IcebergLiteral::Primitive(PrimitiveLiteral::Int(0));
-        let ast = iceberg_literal_to_ast(&epoch, &SqlType::Date).expect("epoch");
-        assert_eq!(ast, AstLiteral::Date("1970-01-01".to_string()));
+    fn iceberg_default_primitive_types_round_trip() {
+        let cases = [
+            (
+                IcebergLiteral::Primitive(PrimitiveLiteral::Boolean(true)),
+                Type::Primitive(PrimitiveType::Boolean),
+                ColumnDefault::Boolean(true),
+            ),
+            (
+                IcebergLiteral::Primitive(PrimitiveLiteral::Int(i32::MIN)),
+                Type::Primitive(PrimitiveType::Int),
+                ColumnDefault::Int32(i32::MIN),
+            ),
+            (
+                IcebergLiteral::Primitive(PrimitiveLiteral::Long(i64::MAX)),
+                Type::Primitive(PrimitiveType::Long),
+                ColumnDefault::Int64(i64::MAX),
+            ),
+            (
+                IcebergLiteral::Primitive(PrimitiveLiteral::Int128(-12_345)),
+                Type::Primitive(PrimitiveType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                }),
+                ColumnDefault::Decimal {
+                    unscaled: -12_345,
+                    precision: 10,
+                    scale: 2,
+                },
+            ),
+            (
+                IcebergLiteral::Primitive(PrimitiveLiteral::String("value".to_string())),
+                Type::Primitive(PrimitiveType::String),
+                ColumnDefault::String("value".to_string()),
+            ),
+            (
+                IcebergLiteral::Primitive(PrimitiveLiteral::Binary(vec![0x00, 0x80, 0xff])),
+                Type::Primitive(PrimitiveType::Binary),
+                ColumnDefault::Binary(vec![0x00, 0x80, 0xff]),
+            ),
+            (
+                IcebergLiteral::Primitive(PrimitiveLiteral::Int(-1)),
+                Type::Primitive(PrimitiveType::Date),
+                ColumnDefault::Date {
+                    days_since_epoch: -1,
+                },
+            ),
+            (
+                IcebergLiteral::Primitive(PrimitiveLiteral::Long(86_399_999_999)),
+                Type::Primitive(PrimitiveType::Time),
+                ColumnDefault::TimeMicros {
+                    micros_since_midnight: 86_399_999_999,
+                },
+            ),
+            (
+                IcebergLiteral::Primitive(PrimitiveLiteral::Long(-1)),
+                Type::Primitive(PrimitiveType::Timestamp),
+                ColumnDefault::TimestampMicros {
+                    micros_since_epoch: -1,
+                },
+            ),
+            (
+                IcebergLiteral::Primitive(PrimitiveLiteral::Long(1)),
+                Type::Primitive(PrimitiveType::Timestamptz),
+                ColumnDefault::TimestamptzMicros {
+                    micros_since_epoch: 1,
+                },
+            ),
+            (
+                IcebergLiteral::Primitive(PrimitiveLiteral::Long(-2)),
+                Type::Primitive(PrimitiveType::TimestampNs),
+                ColumnDefault::TimestampNanos {
+                    nanos_since_epoch: -2,
+                },
+            ),
+            (
+                IcebergLiteral::Primitive(PrimitiveLiteral::Long(2)),
+                Type::Primitive(PrimitiveType::TimestamptzNs),
+                ColumnDefault::TimestamptzNanos {
+                    nanos_since_epoch: 2,
+                },
+            ),
+            (
+                IcebergLiteral::Primitive(PrimitiveLiteral::Binary(vec![0x00, 0x7f, 0xff])),
+                Type::Primitive(PrimitiveType::Fixed(3)),
+                ColumnDefault::Fixed {
+                    size: 3,
+                    bytes: vec![0x00, 0x7f, 0xff],
+                },
+            ),
+        ];
 
-        let day_before = IcebergLiteral::Primitive(PrimitiveLiteral::Int(-1));
-        let ast = iceberg_literal_to_ast(&day_before, &SqlType::Date).expect("pre-epoch");
-        assert_eq!(ast, AstLiteral::Date("1969-12-31".to_string()));
+        for (literal, iceberg_type, expected) in cases {
+            assert_iceberg_default_round_trip(literal, iceberg_type, expected);
+        }
     }
 
     #[test]
-    fn iceberg_to_ast_literal_struct_against_decimal_reports_type_mismatch() {
-        // Catch-all must surface "type does not match" rather than the
-        // not-yet-supported branch when the literal is structurally wrong
-        // for the column.
-        let iceberg = IcebergLiteral::Primitive(PrimitiveLiteral::String("oops".into()));
-        let err = iceberg_literal_to_ast(
-            &iceberg,
-            &SqlType::Decimal {
-                precision: 10,
-                scale: 2,
-            },
-        )
-        .expect_err("type mismatch");
-        assert!(err.contains("does not match"));
+    fn iceberg_default_float_bits_round_trip_including_non_finite() {
+        for bits in [(-0.0_f32).to_bits(), 0x7fc0_1234, f32::INFINITY.to_bits()] {
+            assert_iceberg_default_round_trip(
+                IcebergLiteral::Primitive(PrimitiveLiteral::Float(ordered_float::OrderedFloat(
+                    f32::from_bits(bits),
+                ))),
+                Type::Primitive(PrimitiveType::Float),
+                ColumnDefault::Float32 { bits },
+            );
+            let IcebergLiteral::Primitive(PrimitiveLiteral::Float(outbound)) =
+                column_default_to_iceberg_literal(
+                    &ColumnDefault::Float32 { bits },
+                    &Type::Primitive(PrimitiveType::Float),
+                )
+                .unwrap()
+            else {
+                panic!("expected Iceberg float literal");
+            };
+            assert_eq!(outbound.0.to_bits(), bits);
+        }
+        for bits in [
+            (-0.0_f64).to_bits(),
+            0x7ff8_0000_0000_1234,
+            f64::NEG_INFINITY.to_bits(),
+        ] {
+            assert_iceberg_default_round_trip(
+                IcebergLiteral::Primitive(PrimitiveLiteral::Double(ordered_float::OrderedFloat(
+                    f64::from_bits(bits),
+                ))),
+                Type::Primitive(PrimitiveType::Double),
+                ColumnDefault::Float64 { bits },
+            );
+            let IcebergLiteral::Primitive(PrimitiveLiteral::Double(outbound)) =
+                column_default_to_iceberg_literal(
+                    &ColumnDefault::Float64 { bits },
+                    &Type::Primitive(PrimitiveType::Double),
+                )
+                .unwrap()
+            else {
+                panic!("expected Iceberg double literal");
+            };
+            assert_eq!(outbound.0.to_bits(), bits);
+        }
     }
 
     #[test]
-    fn v2_rejects_non_null_default() {
-        let err = require_v3_for_default(
-            iceberg::spec::FormatVersion::V2,
-            &Some(IcebergLiteral::Primitive(PrimitiveLiteral::Int(5))),
-        )
-        .expect_err("v2 reject");
-        assert!(err.contains("format-version 3"));
+    fn iceberg_default_uuid_uses_network_byte_order() {
+        let parsed = uuid::Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+        let bytes = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        assert_eq!(parsed.into_bytes(), bytes);
+        let iceberg_type = Type::Primitive(PrimitiveType::Uuid);
+        let literal = IcebergLiteral::Primitive(PrimitiveLiteral::UInt128(parsed.as_u128()));
+        assert_iceberg_default_round_trip(
+            literal.clone(),
+            iceberg_type.clone(),
+            ColumnDefault::Uuid(bytes),
+        );
+        assert_eq!(
+            literal.try_into_json(&iceberg_type).unwrap(),
+            serde_json::Value::String("00112233-4455-6677-8899-aabbccddeeff".to_string())
+        );
     }
 
     #[test]
-    fn v3_accepts_non_null_default() {
-        require_v3_for_default(
-            iceberg::spec::FormatVersion::V3,
-            &Some(IcebergLiteral::Primitive(PrimitiveLiteral::Int(5))),
-        )
-        .expect("v3 accept");
+    fn iceberg_default_rejects_timezone_cross_targets() {
+        let cases = [
+            (
+                ColumnDefault::TimestampMicros {
+                    micros_since_epoch: 1,
+                },
+                Type::Primitive(PrimitiveType::Timestamptz),
+            ),
+            (
+                ColumnDefault::TimestamptzMicros {
+                    micros_since_epoch: 1,
+                },
+                Type::Primitive(PrimitiveType::Timestamp),
+            ),
+            (
+                ColumnDefault::TimestampNanos {
+                    nanos_since_epoch: 1,
+                },
+                Type::Primitive(PrimitiveType::TimestamptzNs),
+            ),
+            (
+                ColumnDefault::TimestamptzNanos {
+                    nanos_since_epoch: 1,
+                },
+                Type::Primitive(PrimitiveType::TimestampNs),
+            ),
+        ];
+
+        for (value, iceberg_type) in cases {
+            assert!(
+                column_default_to_iceberg_literal(&value, &iceberg_type)
+                    .unwrap_err()
+                    .contains("does not match authoritative Iceberg type"),
+                "value={value:?} iceberg_type={iceberg_type:?}"
+            );
+        }
     }
 
     #[test]
-    fn v2_accepts_null_default() {
-        require_v3_for_default(iceberg::spec::FormatVersion::V2, &None).expect("v2 + null ok");
+    fn iceberg_default_nested_round_trip_preserves_name_order_and_nulls() {
+        let map_type = Type::Map(MapType::new(
+            Arc::new(NestedField::required(
+                4,
+                "key",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                5,
+                "value",
+                Type::Primitive(PrimitiveType::Int),
+            )),
+        ));
+        let list_type = Type::List(ListType::new(Arc::new(NestedField::optional(
+            3,
+            "element",
+            map_type.clone(),
+        ))));
+        let struct_type = Type::Struct(StructType::new(vec![
+            Arc::new(NestedField::optional(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Int),
+            )),
+            Arc::new(NestedField::optional(2, "items", list_type)),
+        ]));
+
+        let mut map = IcebergMap::new();
+        map.insert(
+            IcebergLiteral::Primitive(PrimitiveLiteral::String("first".to_string())),
+            Some(IcebergLiteral::Primitive(PrimitiveLiteral::Int(1))),
+        );
+        map.insert(
+            IcebergLiteral::Primitive(PrimitiveLiteral::String("second".to_string())),
+            None,
+        );
+        let literal = IcebergLiteral::Struct(Struct::from_iter([
+            Some(IcebergLiteral::Primitive(PrimitiveLiteral::Int(7))),
+            Some(IcebergLiteral::List(vec![
+                Some(IcebergLiteral::Map(map)),
+                None,
+            ])),
+        ]));
+        let expected = ColumnDefault::Struct(vec![
+            ("id".to_string(), ColumnDefault::Int32(7)),
+            (
+                "items".to_string(),
+                ColumnDefault::Array(vec![
+                    ColumnDefault::Map(vec![
+                        (
+                            ColumnDefault::String("first".to_string()),
+                            ColumnDefault::Int32(1),
+                        ),
+                        (
+                            ColumnDefault::String("second".to_string()),
+                            ColumnDefault::Null,
+                        ),
+                    ]),
+                    ColumnDefault::Null,
+                ]),
+            ),
+        ]);
+
+        assert_iceberg_default_round_trip(literal, struct_type, expected);
+    }
+
+    #[test]
+    fn iceberg_default_rejects_invalid_type_shape_and_map_keys() {
+        assert!(
+            iceberg_literal_to_column_default(
+                &IcebergLiteral::Primitive(PrimitiveLiteral::AboveMax),
+                &Type::Primitive(PrimitiveType::Int),
+            )
+            .unwrap_err()
+            .contains("bound sentinel")
+        );
+        assert!(
+            iceberg_literal_to_column_default(
+                &IcebergLiteral::Primitive(PrimitiveLiteral::Binary(vec![1, 2])),
+                &Type::Primitive(PrimitiveType::Fixed(3)),
+            )
+            .unwrap_err()
+            .contains("FIXED")
+        );
+        assert!(
+            column_default_to_iceberg_literal(
+                &ColumnDefault::Decimal {
+                    unscaled: 1,
+                    precision: 10,
+                    scale: -1,
+                },
+                &Type::Primitive(PrimitiveType::Decimal {
+                    precision: 10,
+                    scale: 0,
+                }),
+            )
+            .unwrap_err()
+            .contains("negative DECIMAL scale")
+        );
+
+        let map_type = Type::Map(MapType::new(
+            Arc::new(NestedField::required(
+                1,
+                "key",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                2,
+                "value",
+                Type::Primitive(PrimitiveType::Int),
+            )),
+        ));
+        assert!(
+            column_default_to_iceberg_literal(
+                &ColumnDefault::Map(vec![(ColumnDefault::Null, ColumnDefault::Int32(1))]),
+                &map_type,
+            )
+            .unwrap_err()
+            .contains("map key")
+        );
+        assert!(
+            column_default_to_iceberg_literal(
+                &ColumnDefault::Map(vec![
+                    (
+                        ColumnDefault::String("duplicate".to_string()),
+                        ColumnDefault::Int32(1),
+                    ),
+                    (
+                        ColumnDefault::String("duplicate".to_string()),
+                        ColumnDefault::Int32(2),
+                    ),
+                ]),
+                &map_type,
+            )
+            .unwrap_err()
+            .contains("duplicate map key")
+        );
+        assert!(
+            iceberg_literal_to_column_default(
+                &IcebergLiteral::Primitive(PrimitiveLiteral::Binary(Vec::new())),
+                &Type::Primitive(PrimitiveType::Variant),
+            )
+            .unwrap_err()
+            .contains("Variant")
+        );
+    }
+
+    #[test]
+    fn iceberg_default_rejects_struct_shape_and_positive_decimal_mismatches() {
+        let struct_type = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+            1,
+            "expected",
+            Type::Primitive(PrimitiveType::Int),
+        ))]));
+        assert!(
+            column_default_to_iceberg_literal(&ColumnDefault::Struct(Vec::new()), &struct_type)
+                .unwrap_err()
+                .contains("fields")
+        );
+        assert!(
+            column_default_to_iceberg_literal(
+                &ColumnDefault::Struct(vec![("actual".to_string(), ColumnDefault::Int32(1),)]),
+                &struct_type,
+            )
+            .unwrap_err()
+            .contains("does not match Iceberg field")
+        );
+
+        let decimal = ColumnDefault::Decimal {
+            unscaled: 123,
+            precision: 10,
+            scale: 2,
+        };
+        assert!(
+            column_default_to_iceberg_literal(
+                &decimal,
+                &Type::Primitive(PrimitiveType::Decimal {
+                    precision: 11,
+                    scale: 2,
+                }),
+            )
+            .unwrap_err()
+            .contains("does not match Iceberg DECIMAL")
+        );
+        assert!(
+            column_default_to_iceberg_literal(
+                &decimal,
+                &Type::Primitive(PrimitiveType::Decimal {
+                    precision: 10,
+                    scale: 3,
+                }),
+            )
+            .unwrap_err()
+            .contains("does not match Iceberg DECIMAL")
+        );
+    }
+
+    #[test]
+    fn require_v3_for_column_default_preserves_legacy_error() {
+        assert_eq!(
+            require_v3_for_column_default(FormatVersion::V2, Some(&ColumnDefault::Int32(1)),)
+                .unwrap_err(),
+            "non-NULL DEFAULT requires Iceberg format-version 3; set TBLPROPERTIES('format-version'='3')"
+        );
+        require_v3_for_column_default(FormatVersion::V3, Some(&ColumnDefault::Int32(1))).unwrap();
+        require_v3_for_column_default(FormatVersion::V2, None).unwrap();
     }
 
     use arrow::array::{Array, Int32Array, StringArray};
@@ -628,90 +972,6 @@ mod tests {
         let err =
             literal_to_constant_array(&lit, &DataType::Float64, 1).expect_err("type mismatch");
         assert!(err.contains("unsupported"), "unexpected error: {err}");
-    }
-
-    // --- Binary default ---
-
-    #[test]
-    fn binary_default_from_string_literal() {
-        // DefaultLiteral::Binary constructed from raw bytes (as parse_string_default would do)
-        // should convert to an Iceberg PrimitiveLiteral::Binary.
-        let bytes = b"abc".to_vec();
-        let lit =
-            default_literal_to_iceberg(&DefaultLiteral::Binary(bytes.clone()), &SqlType::Binary)
-                .expect("binary default")
-                .expect("not null");
-        assert!(
-            matches!(lit, IcebergLiteral::Primitive(PrimitiveLiteral::Binary(ref b)) if *b == bytes),
-            "unexpected literal: {lit:?}"
-        );
-    }
-
-    #[test]
-    fn binary_default_empty_string() {
-        let lit = default_literal_to_iceberg(&DefaultLiteral::Binary(vec![]), &SqlType::Binary)
-            .expect("empty binary default")
-            .expect("not null");
-        assert!(
-            matches!(lit, IcebergLiteral::Primitive(PrimitiveLiteral::Binary(ref b)) if b.is_empty()),
-            "expected empty binary literal: {lit:?}"
-        );
-    }
-
-    // --- Array empty default ---
-
-    #[test]
-    fn array_empty_default_from_string_literal() {
-        // parse_string_default stores '[]' as DefaultLiteral::String("[]") for Array types.
-        // default_literal_to_iceberg must convert it to IcebergLiteral::List(vec![]).
-        let lit = default_literal_to_iceberg(
-            &DefaultLiteral::String("[]".to_string()),
-            &SqlType::Array(Box::new(SqlType::Int)),
-        )
-        .expect("array empty default")
-        .expect("not null");
-        assert!(
-            matches!(lit, IcebergLiteral::List(ref v) if v.is_empty()),
-            "expected empty List literal: {lit:?}"
-        );
-    }
-
-    #[test]
-    fn array_non_empty_literal_rejected() {
-        let err = default_literal_to_iceberg(
-            &DefaultLiteral::String("[1,2,3]".to_string()),
-            &SqlType::Array(Box::new(SqlType::Int)),
-        )
-        .expect_err("non-empty array should be rejected");
-        assert!(err.contains("non-empty ARRAY"), "unexpected error: {err}");
-    }
-
-    // --- Map empty default ---
-
-    #[test]
-    fn map_empty_default_from_string_literal() {
-        // parse_string_default stores '{}' as DefaultLiteral::String("{}") for Map types.
-        // default_literal_to_iceberg must convert it to IcebergLiteral::Map(empty).
-        let lit = default_literal_to_iceberg(
-            &DefaultLiteral::String("{}".to_string()),
-            &SqlType::Map(Box::new(SqlType::String), Box::new(SqlType::Int)),
-        )
-        .expect("map empty default")
-        .expect("not null");
-        assert!(
-            matches!(lit, IcebergLiteral::Map(ref m) if m.is_empty()),
-            "expected empty Map literal: {lit:?}"
-        );
-    }
-
-    #[test]
-    fn map_non_empty_literal_rejected() {
-        let err = default_literal_to_iceberg(
-            &DefaultLiteral::String(r#"{"k":1}"#.to_string()),
-            &SqlType::Map(Box::new(SqlType::String), Box::new(SqlType::Int)),
-        )
-        .expect_err("non-empty map should be rejected");
-        assert!(err.contains("non-empty MAP"), "unexpected error: {err}");
     }
 
     // --- literal_to_constant_array for List and Map ---

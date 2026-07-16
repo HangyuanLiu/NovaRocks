@@ -3866,6 +3866,19 @@ fn ebd_4b1_type_shape(ty: &syn::Type) -> Option<String> {
                 .collect::<Option<Vec<_>>>()?
                 .join(",")
         )),
+        syn::Type::Array(array) => {
+            let syn::Expr::Lit(length) = &array.len else {
+                return None;
+            };
+            let syn::Lit::Int(length) = &length.lit else {
+                return None;
+            };
+            Some(format!(
+                "[{};{}]",
+                ebd_4b1_type_shape(&array.elem)?,
+                length.base10_digits()
+            ))
+        }
         _ => None,
     }
 }
@@ -4003,6 +4016,10 @@ fn ebd_4b1_audit_schema_owner(source: &GuardSource) -> BTreeSet<String> {
         )]);
     };
     let mut violations = ebd_4b1_audit_schema_dependencies(source);
+    violations.remove(&format!(
+        "catalog-schema-forbidden-local-path: {}|crate",
+        source.path
+    ));
     let mut counter = SqlTypeEnumCounter { count: 0 };
     syn::visit::Visit::visit_file(&mut counter, &file);
     if counter.count != 1 {
@@ -5574,6 +5591,1391 @@ pub struct ColumnDef { pub logical_type: Option<SqlType> }
         ebd_4b1_audit_column_def(&qself_inner)
             .iter()
             .any(|item| item.contains("Option"))
+    );
+}
+
+const EBD_4B2A_OWNER: &str = "src/catalog/schema.rs";
+const EBD_4B2A_EXPECTED_VARIANTS: &[&str] = &[
+    "Null",
+    "Boolean(bool)",
+    "Int32(i32)",
+    "Int64(i64)",
+    "Float32{bits:u32}",
+    "Float64{bits:u64}",
+    "Decimal{unscaled:i128,precision:u8,scale:i8}",
+    "String(String)",
+    "Binary(Vec<u8>)",
+    "Date{days_since_epoch:i32}",
+    "TimeMicros{micros_since_midnight:i64}",
+    "TimestampMicros{micros_since_epoch:i64}",
+    "TimestamptzMicros{micros_since_epoch:i64}",
+    "TimestampNanos{nanos_since_epoch:i64}",
+    "TimestamptzNanos{nanos_since_epoch:i64}",
+    "Uuid([u8;16])",
+    "Fixed{size:u64,bytes:Vec<u8>}",
+    "Struct(Vec<(String,ColumnDefault)>)",
+    "Array(Vec<ColumnDefault>)",
+    "Map(Vec<(ColumnDefault,ColumnDefault)>)",
+];
+
+fn is_exact_catalog_schema_column_default_path(path: &[String]) -> bool {
+    let segments = path.iter().map(String::as_str).collect::<Vec<_>>();
+    segments == ["crate", "catalog", "schema", "ColumnDefault"]
+}
+
+fn is_catalog_schema_column_default_path(path: &[String]) -> bool {
+    let segments = path.iter().map(String::as_str).collect::<Vec<_>>();
+    segments.starts_with(&["crate", "catalog", "schema", "ColumnDefault"])
+}
+
+fn is_iceberg_literal_path(path: &[String]) -> bool {
+    let segments = path.iter().map(String::as_str).collect::<Vec<_>>();
+    segments.starts_with(&["iceberg", "spec", "Literal"])
+}
+
+fn is_connector_iceberg_path(path: &[String]) -> bool {
+    let segments = path.iter().map(String::as_str).collect::<Vec<_>>();
+    segments.starts_with(&["crate", "connector", "iceberg"])
+}
+
+fn ebd_4b2a_resolve_type_path(
+    path: &[String],
+    source: &GuardSource,
+    aliases: &RustScopedAliases,
+    inline_modules: &[String],
+) -> Vec<Vec<String>> {
+    rust_resolve_scoped_paths(path, inline_modules, aliases, &mut BTreeSet::new(), 0)
+        .unwrap_or_else(|| {
+            vec![RustScopedUsePath {
+                segments: path.to_vec(),
+                inline_modules: inline_modules.to_vec(),
+            }]
+        })
+        .into_iter()
+        .filter_map(|resolved| {
+            if is_iceberg_literal_path(&resolved.segments) {
+                return Some(resolved.segments);
+            }
+            rust_canonical_path_segments_in_scope(
+                &resolved.segments,
+                &source.path,
+                &resolved.inline_modules,
+            )
+        })
+        .collect()
+}
+
+fn ebd_4b2a_audit_schema_owner(source: &GuardSource) -> BTreeSet<String> {
+    struct ColumnDefaultCounter {
+        enums: usize,
+        validators: usize,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for ColumnDefaultCounter {
+        fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+            if item.ident == "ColumnDefault" {
+                self.enums += 1;
+            }
+            syn::visit::visit_item_enum(self, item);
+        }
+
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if item.sig.ident == "validate_column_default" {
+                self.validators += 1;
+            }
+            syn::visit::visit_item_fn(self, item);
+        }
+    }
+
+    let Ok(file) = syn::parse_file(&source.text) else {
+        return BTreeSet::from([format!(
+            "catalog-default-owner-parse-failed: {}",
+            source.path
+        )]);
+    };
+    let mut violations = ebd_4b1_audit_schema_dependencies(source);
+    violations.remove(&format!(
+        "catalog-schema-forbidden-local-path: {}|crate",
+        source.path
+    ));
+    let mut counter = ColumnDefaultCounter {
+        enums: 0,
+        validators: 0,
+    };
+    syn::visit::Visit::visit_file(&mut counter, &file);
+    if counter.enums != 1 {
+        violations.insert(format!(
+            "catalog-default-owner-enum-count: expected=1 actual={}",
+            counter.enums
+        ));
+    }
+    if counter.validators != 1 {
+        violations.insert(format!(
+            "catalog-default-validator-count: expected=1 actual={}",
+            counter.validators
+        ));
+    }
+
+    let canonical = file.items.iter().find_map(|item| match item {
+        syn::Item::Enum(item) if item.ident == "ColumnDefault" => Some(item),
+        _ => None,
+    });
+    let Some(canonical) = canonical else {
+        violations.insert("catalog-default-owner-enum-missing: ColumnDefault".to_string());
+        return violations;
+    };
+    if !ebd_4b1_is_pub(&canonical.vis) {
+        violations
+            .insert("catalog-default-owner-visibility: ColumnDefault must be pub".to_string());
+    }
+    if !canonical.generics.params.is_empty() || canonical.generics.where_clause.is_some() {
+        violations.insert("catalog-default-owner-generics-forbidden: ColumnDefault".to_string());
+    }
+    for attribute in &canonical.attrs {
+        if !ebd_4b1_attribute_is(attribute, "derive") && !ebd_4b1_attribute_is(attribute, "doc") {
+            violations.insert(format!(
+                "catalog-default-owner-semantic-attribute-forbidden: {}",
+                attribute
+                    .path()
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect::<Vec<_>>()
+                    .join("::")
+            ));
+        }
+    }
+    for variant in &canonical.variants {
+        for attribute in &variant.attrs {
+            if !ebd_4b1_attribute_is(attribute, "doc") {
+                violations.insert(format!(
+                    "catalog-default-variant-semantic-attribute-forbidden: {}|{}",
+                    variant.ident,
+                    attribute
+                        .path()
+                        .segments
+                        .iter()
+                        .map(|segment| segment.ident.to_string())
+                        .collect::<Vec<_>>()
+                        .join("::")
+                ));
+            }
+        }
+        for field in &variant.fields {
+            for attribute in &field.attrs {
+                if !ebd_4b1_attribute_is(attribute, "doc") {
+                    violations.insert(format!(
+                        "catalog-default-field-semantic-attribute-forbidden: {}|{}",
+                        variant.ident,
+                        attribute
+                            .path()
+                            .segments
+                            .iter()
+                            .map(|segment| segment.ident.to_string())
+                            .collect::<Vec<_>>()
+                            .join("::")
+                    ));
+                }
+            }
+        }
+    }
+
+    let expected_derives = BTreeSet::from([
+        "Clone".to_string(),
+        "Debug".to_string(),
+        "Eq".to_string(),
+        "PartialEq".to_string(),
+    ]);
+    match ebd_4b1_derive_set(canonical) {
+        Some(actual) if actual == expected_derives => {}
+        Some(actual) => {
+            violations.insert(format!(
+                "catalog-default-owner-derives: expected={expected_derives:?} actual={actual:?}"
+            ));
+        }
+        None => {
+            violations
+                .insert("catalog-default-owner-derives-parse-failed: ColumnDefault".to_string());
+        }
+    }
+
+    let actual_variants = canonical
+        .variants
+        .iter()
+        .map(ebd_4b1_variant_shape)
+        .collect::<Option<Vec<_>>>();
+    let expected_variants = EBD_4B2A_EXPECTED_VARIANTS
+        .iter()
+        .map(|variant| (*variant).to_string())
+        .collect::<Vec<_>>();
+    match actual_variants {
+        Some(actual) if actual == expected_variants => {}
+        Some(actual) => {
+            violations.insert(format!(
+                "catalog-default-owner-variants: expected={expected_variants:?} actual={actual:?}"
+            ));
+        }
+        None => {
+            violations.insert(
+                "catalog-default-owner-variant-shape-unsupported: ColumnDefault".to_string(),
+            );
+        }
+    }
+
+    let validator = file.items.iter().find_map(|item| match item {
+        syn::Item::Fn(item) if item.sig.ident == "validate_column_default" => Some(item),
+        _ => None,
+    });
+    let validator_is_exact = validator.is_some_and(|item| {
+        ebd_4b1_is_pub_crate(&item.vis)
+            && item.sig.constness.is_none()
+            && item.sig.asyncness.is_none()
+            && item.sig.unsafety.is_none()
+            && item.sig.abi.is_none()
+            && item.sig.generics.params.is_empty()
+            && item.sig.generics.where_clause.is_none()
+            && item.sig.inputs.len() == 1
+            && item.sig.inputs.first().is_some_and(|argument| match argument {
+                syn::FnArg::Typed(argument) => {
+                    matches!(argument.pat.as_ref(), syn::Pat::Ident(ident) if ident.ident == "value")
+                        && matches!(argument.ty.as_ref(), syn::Type::Reference(reference)
+                            if reference.mutability.is_none()
+                                && matches!(reference.elem.as_ref(), syn::Type::Path(path)
+                                    if path.qself.is_none() && path.path.is_ident("ColumnDefault")))
+                }
+                syn::FnArg::Receiver(_) => false,
+            })
+            && matches!(&item.sig.output,
+                syn::ReturnType::Type(_, ty)
+                    if ebd_4b1_type_shape(ty).as_deref() == Some("Result<(),String>"))
+    });
+    if !validator_is_exact {
+        violations.insert(
+            "catalog-default-validator-signature: expected pub(crate) fn validate_column_default(&ColumnDefault) -> Result<(), String>"
+                .to_string(),
+        );
+    }
+    violations
+}
+
+fn ebd_4b2a_audit_column_def(source: &GuardSource) -> BTreeSet<String> {
+    let Ok(file) = syn::parse_file(&source.text) else {
+        return BTreeSet::from([format!(
+            "catalog-default-column-def-parse-failed: {}",
+            source.path
+        )]);
+    };
+    let Some(column_def) = file.items.iter().find_map(|item| match item {
+        syn::Item::Struct(item) if item.ident == "ColumnDef" => Some(item),
+        _ => None,
+    }) else {
+        return BTreeSet::from(["catalog-default-column-def-missing".to_string()]);
+    };
+    let actual_fields = column_def
+        .fields
+        .iter()
+        .filter_map(|field| field.ident.as_ref().map(ToString::to_string))
+        .collect::<Vec<_>>();
+    let expected_fields = [
+        "name",
+        "data_type",
+        "nullable",
+        "write_default",
+        "logical_type",
+    ];
+    let mut violations = BTreeSet::new();
+    if actual_fields != expected_fields {
+        violations.insert(format!(
+            "catalog-default-column-def-fields: expected={expected_fields:?} actual={actual_fields:?}"
+        ));
+    }
+    let Some(field) = column_def.fields.iter().find(|field| {
+        field
+            .ident
+            .as_ref()
+            .is_some_and(|ident| ident == "write_default")
+    }) else {
+        violations.insert("catalog-default-column-def-write-default-missing".to_string());
+        return violations;
+    };
+    let Some((inner_path, plain_prelude)) = ebd_4b1_option_inner_path(&field.ty) else {
+        violations.insert(
+            "catalog-default-column-def-write-default-must-be-Option-ColumnDefault".to_string(),
+        );
+        return violations;
+    };
+    let (imports, aliases) = ebd_4b1_module_scope_inputs(&file);
+    if plain_prelude
+        && (aliases.contains_key(&(Vec::new(), "Option".to_string()))
+            || ebd_4b1_file_defines_root_type_name(&file, "Option"))
+    {
+        violations
+            .insert("catalog-default-column-def-write-default-must-use-prelude-Option".to_string());
+        return violations;
+    }
+    let canonical = ebd_4b2a_resolve_type_path(&inner_path, source, &aliases, &[]);
+    let canonical_schema_glob =
+        ebd_4b1_canonical_schema_glob_scopes(source, &imports, &aliases).contains(&Vec::new());
+    let exact = !canonical.is_empty()
+        && canonical
+            .iter()
+            .all(|path| is_exact_catalog_schema_column_default_path(path));
+    let exact_through_glob = inner_path == ["ColumnDefault"] && canonical_schema_glob;
+    if !exact && !exact_through_glob {
+        violations.insert(format!(
+            "catalog-default-column-def-write-default-not-canonical: {}",
+            canonical
+                .iter()
+                .map(|path| path.join("::"))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    if canonical.iter().any(|path| is_iceberg_literal_path(path)) {
+        violations.insert("catalog-default-column-def-vendor-literal-forbidden".to_string());
+    }
+    violations
+}
+
+fn ebd_4b2a_iceberg_literal_glob_scopes(
+    source: &GuardSource,
+    imports: &[Ebd4b1ModuleUseStatement],
+    aliases: &RustScopedAliases,
+) -> BTreeSet<Vec<String>> {
+    let mut scopes = BTreeSet::new();
+    for import in imports {
+        let direct_iceberg_glob = import
+            .segments
+            .iter()
+            .map(String::as_str)
+            .eq(["iceberg", "spec", "*"]);
+        let resolved = resolve_forwarding_paths(
+            &import.segments,
+            &source.path,
+            &import.inline_modules,
+            aliases,
+            &mut BTreeSet::new(),
+            0,
+        )
+        .unwrap_or_else(|| {
+            vec![RustScopedUsePath {
+                segments: import.segments.clone(),
+                inline_modules: import.inline_modules.clone(),
+            }]
+        });
+        if direct_iceberg_glob
+            || resolved.into_iter().any(|path| {
+                path.segments
+                    .iter()
+                    .map(String::as_str)
+                    .eq(["iceberg", "spec", "*"])
+            })
+        {
+            scopes.insert(import.inline_modules.clone());
+        }
+    }
+    scopes
+}
+
+fn ebd_4b2a_type_contains_iceberg_literal(
+    ty: &syn::Type,
+    source: &GuardSource,
+    aliases: &RustScopedAliases,
+    iceberg_glob_scopes: &BTreeSet<Vec<String>>,
+    inline_modules: &[String],
+) -> bool {
+    struct IcebergLiteralTypeAudit<'a> {
+        source: &'a GuardSource,
+        aliases: &'a RustScopedAliases,
+        iceberg_glob_scopes: &'a BTreeSet<Vec<String>>,
+        inline_modules: &'a [String],
+        found: bool,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for IcebergLiteralTypeAudit<'_> {
+        fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
+            if path.qself.is_none() {
+                let segments = path
+                    .path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect::<Vec<_>>();
+                let resolved = ebd_4b2a_resolve_type_path(
+                    &segments,
+                    self.source,
+                    self.aliases,
+                    self.inline_modules,
+                );
+                if resolved.iter().any(|path| is_iceberg_literal_path(path))
+                    || segments == ["Literal"]
+                        && self.iceberg_glob_scopes.contains(self.inline_modules)
+                {
+                    self.found = true;
+                }
+            }
+            syn::visit::visit_type_path(self, path);
+        }
+    }
+
+    let mut audit = IcebergLiteralTypeAudit {
+        source,
+        aliases,
+        iceberg_glob_scopes,
+        inline_modules,
+        found: false,
+    };
+    syn::visit::Visit::visit_type(&mut audit, ty);
+    audit.found
+}
+
+fn ebd_4b2a_is_exact_iceberg_literal_option(
+    ty: &syn::Type,
+    source: &GuardSource,
+    aliases: &RustScopedAliases,
+    iceberg_glob_scopes: &BTreeSet<Vec<String>>,
+    inline_modules: &[String],
+) -> bool {
+    let Some((inner, _)) = ebd_4b1_option_inner_path(ty) else {
+        return false;
+    };
+    let resolved = ebd_4b2a_resolve_type_path(&inner, source, aliases, inline_modules);
+    (!resolved.is_empty() && resolved.iter().all(|path| is_iceberg_literal_path(path)))
+        || inner == ["Literal"] && iceberg_glob_scopes.contains(inline_modules)
+}
+
+fn ebd_4b2a_audit_catalog_raw_iceberg_literals(source: &GuardSource) -> BTreeSet<String> {
+    struct CatalogRawLiteralAudit<'a> {
+        source: &'a GuardSource,
+        aliases: &'a RustScopedAliases,
+        iceberg_glob_scopes: &'a BTreeSet<Vec<String>>,
+        inline_modules: Vec<String>,
+        violations: BTreeSet<String>,
+    }
+
+    impl CatalogRawLiteralAudit<'_> {
+        fn type_contains_literal(&self, ty: &syn::Type) -> bool {
+            ebd_4b2a_type_contains_iceberg_literal(
+                ty,
+                self.source,
+                self.aliases,
+                self.iceberg_glob_scopes,
+                &self.inline_modules,
+            )
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for CatalogRawLiteralAudit<'_> {
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            for field in &item.fields {
+                if !self.type_contains_literal(&field.ty) {
+                    continue;
+                }
+                let field_name = field
+                    .ident
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "<unnamed>".to_string());
+                let owned_by_column_def_guard =
+                    item.ident == "ColumnDef" && field_name == "write_default";
+                let allowed_iceberg_schema_field = item.ident == "IcebergSchemaFieldDef"
+                    && self.inline_modules.is_empty()
+                    && matches!(field_name.as_str(), "initial_default" | "write_default")
+                    && ebd_4b2a_is_exact_iceberg_literal_option(
+                        &field.ty,
+                        self.source,
+                        self.aliases,
+                        self.iceberg_glob_scopes,
+                        &self.inline_modules,
+                    );
+                if !owned_by_column_def_guard && !allowed_iceberg_schema_field {
+                    self.violations.insert(format!(
+                        "catalog-default-raw-iceberg-literal-forbidden: {}|struct {}|{}",
+                        self.source.path, item.ident, field_name
+                    ));
+                }
+            }
+            syn::visit::visit_item_struct(self, item);
+        }
+
+        fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+            for variant in &item.variants {
+                for field in &variant.fields {
+                    if self.type_contains_literal(&field.ty) {
+                        self.violations.insert(format!(
+                            "catalog-default-raw-iceberg-literal-forbidden: {}|enum {}|{}",
+                            self.source.path, item.ident, variant.ident
+                        ));
+                    }
+                }
+            }
+            syn::visit::visit_item_enum(self, item);
+        }
+
+        fn visit_item_union(&mut self, item: &'ast syn::ItemUnion) {
+            for field in &item.fields.named {
+                if self.type_contains_literal(&field.ty) {
+                    self.violations.insert(format!(
+                        "catalog-default-raw-iceberg-literal-forbidden: {}|union {}",
+                        self.source.path, item.ident
+                    ));
+                }
+            }
+            syn::visit::visit_item_union(self, item);
+        }
+
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            if self.type_contains_literal(&item.ty) {
+                self.violations.insert(format!(
+                    "catalog-default-raw-iceberg-literal-forbidden: {}|type {}",
+                    self.source.path, item.ident
+                ));
+            }
+            syn::visit::visit_item_type(self, item);
+        }
+
+        fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+            for transcriber in ebd_4b1_macro_rule_transcribers(item) {
+                let Some(file) = ebd_4b2a_macro_transcriber_file(&transcriber) else {
+                    continue;
+                };
+                for generated in &file.items {
+                    match generated {
+                        syn::Item::Struct(generated) => {
+                            for field in &generated.fields {
+                                if self.type_contains_literal(&field.ty) {
+                                    self.violations.insert(format!(
+                                        "catalog-default-macro-raw-iceberg-literal-forbidden: {}|struct {}",
+                                        self.source.path, generated.ident
+                                    ));
+                                }
+                            }
+                        }
+                        syn::Item::Enum(generated) => {
+                            for variant in &generated.variants {
+                                for field in &variant.fields {
+                                    if self.type_contains_literal(&field.ty) {
+                                        self.violations.insert(format!(
+                                            "catalog-default-macro-raw-iceberg-literal-forbidden: {}|enum {}|{}",
+                                            self.source.path, generated.ident, variant.ident
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        syn::Item::Union(generated) => {
+                            for field in &generated.fields.named {
+                                if self.type_contains_literal(&field.ty) {
+                                    self.violations.insert(format!(
+                                        "catalog-default-macro-raw-iceberg-literal-forbidden: {}|union {}",
+                                        self.source.path, generated.ident
+                                    ));
+                                }
+                            }
+                        }
+                        syn::Item::Type(generated) => {
+                            if self.type_contains_literal(&generated.ty) {
+                                self.violations.insert(format!(
+                                    "catalog-default-macro-raw-iceberg-literal-forbidden: {}|type {}",
+                                    self.source.path, generated.ident
+                                ));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            syn::visit::visit_item_macro(self, item);
+        }
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            let Some((_, items)) = &item.content else {
+                return;
+            };
+            self.inline_modules.push(item.ident.to_string());
+            for item in items {
+                syn::visit::Visit::visit_item(self, item);
+            }
+            self.inline_modules.pop();
+        }
+    }
+
+    let Ok(file) = syn::parse_file(&source.text) else {
+        return BTreeSet::from([format!(
+            "catalog-default-raw-iceberg-literal-parse-failed: {}",
+            source.path
+        )]);
+    };
+    let (imports, aliases) = ebd_4b1_module_scope_inputs(&file);
+    let iceberg_glob_scopes = ebd_4b2a_iceberg_literal_glob_scopes(source, &imports, &aliases);
+    let mut audit = CatalogRawLiteralAudit {
+        source,
+        aliases: &aliases,
+        iceberg_glob_scopes: &iceberg_glob_scopes,
+        inline_modules: Vec::new(),
+        violations: BTreeSet::new(),
+    };
+    syn::visit::Visit::visit_file(&mut audit, &file);
+    audit.violations
+}
+
+fn ebd_4b2a_audit_parser_connector_dependency(source: &GuardSource) -> BTreeSet<String> {
+    remove_redundant_descendant_paths(
+        rust_all_source_canonical_paths(&source.text, &source.path)
+            .into_iter()
+            .filter(|path| is_connector_iceberg_path(path))
+            .collect(),
+    )
+    .into_iter()
+    .map(|path| {
+        format!(
+            "catalog-default-parser-connector-dependency: {}|{}",
+            source.path,
+            path.join("::")
+        )
+    })
+    .collect()
+}
+
+fn ebd_4b2a_macro_generated_definition(tokens: &[String]) -> Option<&str> {
+    const TYPE_NAMESPACE_ITEMS: &[&str] = &["enum", "struct", "union", "trait", "type", "mod"];
+    tokens.windows(2).find_map(|pair| {
+        (TYPE_NAMESPACE_ITEMS.contains(&pair[0].as_str()) && pair[1] == "ColumnDefault")
+            .then_some(pair[0].as_str())
+    })
+}
+
+fn ebd_4b2a_macro_transcriber_file(tokens: &[String]) -> Option<syn::File> {
+    let mut normalized = Vec::new();
+    let mut index = 0usize;
+    while index < tokens.len() {
+        if tokens.get(index).is_some_and(|token| token == "$")
+            && tokens.get(index + 1).is_some_and(|token| token == "crate")
+        {
+            normalized.push("crate".to_string());
+            index += 2;
+        } else {
+            normalized.push(tokens[index].clone());
+            index += 1;
+        }
+    }
+    syn::parse_file(&normalized.join(" ")).ok()
+}
+
+fn ebd_4b2a_type_contains_column_default(
+    ty: &syn::Type,
+    source: &GuardSource,
+    aliases: &RustScopedAliases,
+    canonical_glob_scopes: &BTreeSet<Vec<String>>,
+    inline_modules: &[String],
+) -> bool {
+    struct ColumnDefaultTypeAudit<'a> {
+        source: &'a GuardSource,
+        aliases: &'a RustScopedAliases,
+        canonical_glob_scopes: &'a BTreeSet<Vec<String>>,
+        inline_modules: &'a [String],
+        found: bool,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for ColumnDefaultTypeAudit<'_> {
+        fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
+            if path.qself.is_none() {
+                let segments = path
+                    .path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect::<Vec<_>>();
+                let resolved = ebd_4b2a_resolve_type_path(
+                    &segments,
+                    self.source,
+                    self.aliases,
+                    self.inline_modules,
+                );
+                if resolved
+                    .iter()
+                    .any(|path| is_catalog_schema_column_default_path(path))
+                    || segments == ["ColumnDefault"]
+                        && (self.source.path == EBD_4B2A_OWNER
+                            || self.canonical_glob_scopes.contains(self.inline_modules))
+                {
+                    self.found = true;
+                }
+            }
+            syn::visit::visit_type_path(self, path);
+        }
+    }
+
+    let mut audit = ColumnDefaultTypeAudit {
+        source,
+        aliases,
+        canonical_glob_scopes,
+        inline_modules,
+        found: false,
+    };
+    syn::visit::Visit::visit_type(&mut audit, ty);
+    audit.found
+}
+
+fn ebd_4b2a_audit_definitions_and_forwarding(sources: &[GuardSource]) -> BTreeSet<String> {
+    struct ColumnDefaultDefinitionAudit<'a> {
+        source: &'a GuardSource,
+        aliases: &'a RustScopedAliases,
+        canonical_glob_scopes: &'a BTreeSet<Vec<String>>,
+        inline_modules: Vec<String>,
+        violations: BTreeSet<String>,
+    }
+
+    impl ColumnDefaultDefinitionAudit<'_> {
+        fn audit_alias_target(&mut self, name: &str, path: &[String], kind: &str) {
+            let canonical =
+                ebd_4b2a_resolve_type_path(path, self.source, self.aliases, &self.inline_modules);
+            if canonical
+                .iter()
+                .any(|path| is_catalog_schema_column_default_path(path))
+                || path == ["ColumnDefault"]
+                    && self.canonical_glob_scopes.contains(&self.inline_modules)
+            {
+                self.violations.insert(format!(
+                    "{kind}: {}|{}|crate::catalog::schema::ColumnDefault",
+                    self.source.path, name
+                ));
+            }
+        }
+
+        fn audit_wrapper<'a>(
+            &mut self,
+            name: &str,
+            kind: &str,
+            fields: impl IntoIterator<Item = &'a syn::Field>,
+        ) {
+            let fields = fields.into_iter().collect::<Vec<_>>();
+            let contains_default = fields.iter().any(|field| {
+                ebd_4b2a_type_contains_column_default(
+                    &field.ty,
+                    self.source,
+                    self.aliases,
+                    self.canonical_glob_scopes,
+                    &self.inline_modules,
+                )
+            });
+            let looks_like_default_vocabulary =
+                name.to_ascii_lowercase().contains("default") || fields.len() == 1;
+            if contains_default && looks_like_default_vocabulary {
+                self.violations.insert(format!(
+                    "catalog-default-wrapper-forbidden: {}|{kind}|{name}",
+                    self.source.path
+                ));
+            }
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for ColumnDefaultDefinitionAudit<'_> {
+        fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+            let is_canonical = item.ident == "ColumnDefault"
+                && self.source.path == EBD_4B2A_OWNER
+                && self.inline_modules.is_empty();
+            if item.ident == "ColumnDefault" && !is_canonical {
+                self.violations.insert(format!(
+                    "catalog-default-secondary-enum: {}|ColumnDefault",
+                    self.source.path
+                ));
+            }
+            if !is_canonical {
+                self.audit_wrapper(
+                    &item.ident.to_string(),
+                    "enum",
+                    item.variants
+                        .iter()
+                        .flat_map(|variant| variant.fields.iter()),
+                );
+            }
+            syn::visit::visit_item_enum(self, item);
+        }
+
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            if item.ident == "ColumnDefault" {
+                self.violations.insert(format!(
+                    "catalog-default-secondary-struct: {}|ColumnDefault",
+                    self.source.path
+                ));
+            }
+            self.audit_wrapper(&item.ident.to_string(), "struct", item.fields.iter());
+            syn::visit::visit_item_struct(self, item);
+        }
+
+        fn visit_item_union(&mut self, item: &'ast syn::ItemUnion) {
+            if item.ident == "ColumnDefault" {
+                self.violations.insert(format!(
+                    "catalog-default-secondary-union: {}|ColumnDefault",
+                    self.source.path
+                ));
+            }
+            self.audit_wrapper(&item.ident.to_string(), "union", item.fields.named.iter());
+            syn::visit::visit_item_union(self, item);
+        }
+
+        fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
+            if item.ident == "ColumnDefault" {
+                self.violations.insert(format!(
+                    "catalog-default-secondary-trait: {}|ColumnDefault",
+                    self.source.path
+                ));
+            }
+            syn::visit::visit_item_trait(self, item);
+        }
+
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            if item.ident == "ColumnDefault" {
+                self.violations.insert(format!(
+                    "catalog-default-type-alias: {}|ColumnDefault",
+                    self.source.path
+                ));
+            }
+            if let Some(path) = ebd_4b1_direct_alias_rhs_path(&item.ty) {
+                self.audit_alias_target(
+                    &item.ident.to_string(),
+                    &path,
+                    "catalog-default-type-alias-target",
+                );
+            }
+            syn::visit::visit_item_type(self, item);
+        }
+
+        fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+            for transcriber in ebd_4b1_macro_rule_transcribers(item) {
+                if let Some(kind) = ebd_4b2a_macro_generated_definition(&transcriber) {
+                    self.violations.insert(format!(
+                        "catalog-default-macro-generated-definition: {}|{kind}|ColumnDefault",
+                        self.source.path
+                    ));
+                }
+                for (name, path) in ebd_4b1_macro_generated_direct_aliases(&transcriber) {
+                    self.audit_alias_target(&name, &path, "catalog-default-macro-generated-alias");
+                }
+                if let Some(file) = ebd_4b2a_macro_transcriber_file(&transcriber) {
+                    for generated in &file.items {
+                        match generated {
+                            syn::Item::Struct(generated) => self.audit_wrapper(
+                                &generated.ident.to_string(),
+                                "macro-struct",
+                                generated.fields.iter(),
+                            ),
+                            syn::Item::Enum(generated) => self.audit_wrapper(
+                                &generated.ident.to_string(),
+                                "macro-enum",
+                                generated
+                                    .variants
+                                    .iter()
+                                    .flat_map(|variant| variant.fields.iter()),
+                            ),
+                            syn::Item::Union(generated) => self.audit_wrapper(
+                                &generated.ident.to_string(),
+                                "macro-union",
+                                generated.fields.named.iter(),
+                            ),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            syn::visit::visit_item_macro(self, item);
+        }
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if item.ident == "ColumnDefault" {
+                self.violations.insert(format!(
+                    "catalog-default-secondary-module: {}|ColumnDefault",
+                    self.source.path
+                ));
+            }
+            let Some((_, items)) = &item.content else {
+                return;
+            };
+            self.inline_modules.push(item.ident.to_string());
+            for item in items {
+                syn::visit::Visit::visit_item(self, item);
+            }
+            self.inline_modules.pop();
+        }
+    }
+
+    let mut violations = BTreeSet::new();
+    for source in sources {
+        let Ok(file) = syn::parse_file(&source.text) else {
+            violations.insert(format!(
+                "catalog-default-definition-parse-failed: {}",
+                source.path
+            ));
+            continue;
+        };
+        let (imports, aliases) = ebd_4b1_module_scope_inputs(&file);
+        let canonical_glob_scopes =
+            ebd_4b1_canonical_schema_glob_scopes(source, &imports, &aliases);
+        let mut audit = ColumnDefaultDefinitionAudit {
+            source,
+            aliases: &aliases,
+            canonical_glob_scopes: &canonical_glob_scopes,
+            inline_modules: Vec::new(),
+            violations: BTreeSet::new(),
+        };
+        syn::visit::Visit::visit_file(&mut audit, &file);
+        violations.extend(audit.violations);
+
+        if source.path == EBD_4B2A_OWNER {
+            continue;
+        }
+        for import in imports {
+            if import.visibility == "private" {
+                continue;
+            }
+            let Some(resolved) = resolve_forwarding_paths(
+                &import.segments,
+                &source.path,
+                &import.inline_modules,
+                &aliases,
+                &mut BTreeSet::new(),
+                0,
+            ) else {
+                continue;
+            };
+            for target in resolved {
+                let Some(canonical) = rust_canonical_path_segments_in_scope(
+                    &target.segments,
+                    &source.path,
+                    &target.inline_modules,
+                ) else {
+                    continue;
+                };
+                if is_catalog_schema_column_default_path(&canonical)
+                    || is_catalog_schema_module_path(&canonical)
+                    || is_catalog_schema_glob_path(&canonical)
+                {
+                    violations.insert(format!(
+                        "catalog-default-forwarding-reexport: {}|{}|{}",
+                        source.path,
+                        import.visibility,
+                        canonical.join("::")
+                    ));
+                }
+            }
+        }
+    }
+    violations
+}
+
+#[test]
+fn ebd_4b2a_detector_requires_exact_column_default_owner() {
+    let valid = GuardSource::new(
+        EBD_4B2A_OWNER,
+        r#"
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ColumnDefault {
+    Null,
+    Boolean(bool),
+    Int32(i32),
+    Int64(i64),
+    Float32 { bits: u32 },
+    Float64 { bits: u64 },
+    Decimal { unscaled: i128, precision: u8, scale: i8 },
+    String(String),
+    Binary(Vec<u8>),
+    Date { days_since_epoch: i32 },
+    TimeMicros { micros_since_midnight: i64 },
+    TimestampMicros { micros_since_epoch: i64 },
+    TimestamptzMicros { micros_since_epoch: i64 },
+    TimestampNanos { nanos_since_epoch: i64 },
+    TimestamptzNanos { nanos_since_epoch: i64 },
+    Uuid([u8; 16]),
+    Fixed { size: u64, bytes: Vec<u8> },
+    Struct(Vec<(String, ColumnDefault)>),
+    Array(Vec<ColumnDefault>),
+    Map(Vec<(ColumnDefault, ColumnDefault)>),
+}
+pub(crate) fn validate_column_default(value: &ColumnDefault) -> Result<(), String> {
+    let _ = value;
+    Ok(())
+}
+"#,
+    );
+    let valid_violations = ebd_4b2a_audit_schema_owner(&valid);
+    assert!(
+        valid_violations.is_empty(),
+        "valid owner fixture was rejected: {valid_violations:?}"
+    );
+
+    for (from, to) in [
+        ("pub enum ColumnDefault", "pub(crate) enum ColumnDefault"),
+        ("PartialEq, Eq", "PartialEq"),
+        ("Float32 { bits: u32 }", "Float32(f32)"),
+        (
+            "Decimal { unscaled: i128, precision: u8, scale: i8 }",
+            "Decimal { unscaled: i128, scale: i8, precision: u8 }",
+        ),
+        (
+            "pub(crate) fn validate_column_default",
+            "pub fn validate_column_default",
+        ),
+    ] {
+        let invalid = GuardSource::new(EBD_4B2A_OWNER, &valid.text.replacen(from, to, 1));
+        assert!(
+            !ebd_4b2a_audit_schema_owner(&invalid).is_empty(),
+            "owner mutation was missed: {from} -> {to}"
+        );
+    }
+}
+
+#[test]
+fn ebd_4b2a_detector_rejects_old_column_field_but_allows_iceberg_schema_field() {
+    let canonical = GuardSource::new(
+        "src/sql/catalog.rs",
+        r#"
+use crate::catalog::schema::{ColumnDefault, SqlType};
+pub struct ColumnDef {
+    pub name: String,
+    pub data_type: DataType,
+    pub nullable: bool,
+    pub write_default: Option<ColumnDefault>,
+    pub logical_type: Option<SqlType>,
+}
+pub struct IcebergSchemaFieldDef {
+    pub initial_default: Option<iceberg::spec::Literal>,
+    pub write_default: Option<iceberg::spec::Literal>,
+}
+"#,
+    );
+    assert!(ebd_4b2a_audit_column_def(&canonical).is_empty());
+    assert!(
+        ebd_4b2a_audit_catalog_raw_iceberg_literals(&canonical).is_empty(),
+        "the exact IcebergSchemaFieldDef exception must remain allowed"
+    );
+    let canonical_glob = GuardSource::new(
+        "src/sql/catalog.rs",
+        r#"
+use iceberg::spec::*;
+pub struct ColumnDef {
+    pub name: String,
+    pub data_type: DataType,
+    pub nullable: bool,
+    pub write_default: Option<crate::catalog::schema::ColumnDefault>,
+    pub logical_type: Option<crate::catalog::schema::SqlType>,
+}
+pub struct IcebergSchemaFieldDef {
+    pub initial_default: Option<Literal>,
+    pub write_default: Option<Literal>,
+}
+"#,
+    );
+    assert!(
+        ebd_4b2a_audit_catalog_raw_iceberg_literals(&canonical_glob).is_empty(),
+        "semantic root IcebergSchemaFieldDef fields must allow an Iceberg spec glob import"
+    );
+
+    for old_field in [
+        "pub write_default: Option<iceberg::spec::Literal>",
+        "pub write_default: Option<::iceberg::spec::Literal>",
+    ] {
+        let old = GuardSource::new(
+            "src/sql/catalog.rs",
+            &canonical
+                .text
+                .replace("pub write_default: Option<ColumnDefault>", old_field),
+        );
+        let violations = ebd_4b2a_audit_column_def(&old);
+        assert!(
+            violations
+                .iter()
+                .any(|item| item.contains("write-default-not-canonical")),
+            "old field fixture was missed: {violations:?}"
+        );
+    }
+
+    for import in [
+        "use iceberg::spec::Literal as VendorDefault;",
+        "use iceberg::spec::{Literal as VendorDefault, Type};",
+        "#[cfg(test)] use iceberg::spec::Literal as VendorDefault;",
+    ] {
+        let aliased = GuardSource::new(
+            "src/sql/catalog.rs",
+            &format!(
+                "{import}\n{}",
+                canonical
+                    .text
+                    .replace("Option<ColumnDefault>", "Option<VendorDefault>")
+            ),
+        );
+        assert!(
+            !ebd_4b2a_audit_column_def(&aliased).is_empty(),
+            "vendor alias fixture was missed: {import}"
+        );
+    }
+
+    for forbidden in [
+        r#"
+pub struct ColumnDef { pub name: String, pub data_type: DataType, pub nullable: bool, pub write_default: Option<crate::catalog::schema::ColumnDefault>, pub logical_type: Option<crate::catalog::schema::SqlType> }
+pub struct IcebergSchemaFieldDef { pub initial_default: Option<iceberg::spec::Literal>, pub write_default: Option<iceberg::spec::Literal> }
+pub struct OtherSchemaField { pub write_default: Option<iceberg::spec::Literal> }
+"#,
+        r#"
+pub struct ColumnDef { pub name: String, pub data_type: DataType, pub nullable: bool, pub write_default: Option<crate::catalog::schema::ColumnDefault>, pub logical_type: Option<crate::catalog::schema::SqlType> }
+pub struct IcebergSchemaFieldDef { pub initial_default: Option<iceberg::spec::Literal>, pub write_default: Option<iceberg::spec::Literal> }
+type VendorDefault = iceberg::spec::Literal;
+"#,
+        r#"
+use iceberg::spec::Literal as VendorDefault;
+pub struct ColumnDef { pub name: String, pub data_type: DataType, pub nullable: bool, pub write_default: Option<crate::catalog::schema::ColumnDefault>, pub logical_type: Option<crate::catalog::schema::SqlType> }
+pub struct IcebergSchemaFieldDef { pub initial_default: Option<iceberg::spec::Literal>, pub write_default: Option<iceberg::spec::Literal> }
+enum OtherDefault { Value(VendorDefault) }
+"#,
+        r#"
+pub struct ColumnDef { pub name: String, pub data_type: DataType, pub nullable: bool, pub write_default: Option<crate::catalog::schema::ColumnDefault>, pub logical_type: Option<crate::catalog::schema::SqlType> }
+pub struct IcebergSchemaFieldDef { pub initial_default: Option<iceberg::spec::Literal>, pub write_default: Option<iceberg::spec::Literal>, pub fallback_default: Option<iceberg::spec::Literal> }
+"#,
+        r#"
+pub struct ColumnDef { pub name: String, pub data_type: DataType, pub nullable: bool, pub write_default: Option<crate::catalog::schema::ColumnDefault>, pub logical_type: Option<crate::catalog::schema::SqlType> }
+pub struct IcebergSchemaFieldDef { pub initial_default: Option<iceberg::spec::Literal>, pub write_default: Option<iceberg::spec::Literal> }
+mod nested { pub struct IcebergSchemaFieldDef { pub initial_default: Option<iceberg::spec::Literal>, pub write_default: Option<iceberg::spec::Literal> } }
+"#,
+        r#"
+pub struct ColumnDef { pub name: String, pub data_type: DataType, pub nullable: bool, pub write_default: Option<crate::catalog::schema::ColumnDefault>, pub logical_type: Option<crate::catalog::schema::SqlType> }
+pub struct IcebergSchemaFieldDef { pub initial_default: Option<iceberg::spec::Literal>, pub write_default: Option<iceberg::spec::Literal> }
+macro_rules! raw_holder { () => { struct DefaultValue(iceberg::spec::Literal); } }
+raw_holder!();
+"#,
+    ] {
+        let source = GuardSource::new("src/sql/catalog.rs", forbidden);
+        assert!(
+            !ebd_4b2a_audit_catalog_raw_iceberg_literals(&source).is_empty(),
+            "raw Iceberg literal escape was missed: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn ebd_4b2a_detector_rejects_secondary_alias_forward_and_macro_owners() {
+    let allowed = [
+        GuardSource::new(
+            "src/sql/literal.rs",
+            r###"
+use crate::catalog::schema::ColumnDefault;
+fn consume(value: ColumnDefault) { let _ = value; }
+const TEXT: &str = "pub use crate::catalog::schema::ColumnDefault";
+const RAW: &str = r#"type ColumnDefault = iceberg::spec::Literal"#;
+// struct ColumnDefault(iceberg::spec::Literal);
+"###,
+        ),
+        GuardSource::new(
+            "src/sql/catalog_consumer.rs",
+            r#"
+use crate::catalog::schema::ColumnDefault;
+struct ColumnDef {
+    name: String,
+    data_type: DataType,
+    nullable: bool,
+    write_default: Option<ColumnDefault>,
+    logical_type: Option<SqlType>,
+}
+"#,
+        ),
+        GuardSource::new(
+            EBD_4B2A_OWNER,
+            "#[derive(Clone, Debug, PartialEq, Eq)] pub enum ColumnDefault { Null }",
+        ),
+    ];
+    assert!(
+        ebd_4b2a_audit_definitions_and_forwarding(&allowed).is_empty(),
+        "legitimate use or lexical noise must be allowed"
+    );
+
+    let invalid = [
+        GuardSource::new("src/sql/secondary.rs", "pub enum ColumnDefault { Null }"),
+        GuardSource::new(
+            "src/sql/alias.rs",
+            "pub type DefaultValue = crate::catalog::schema::ColumnDefault;",
+        ),
+        GuardSource::new(
+            "src/sql/forward.rs",
+            "pub use crate::catalog::schema::ColumnDefault as DefaultValue;",
+        ),
+        GuardSource::new(
+            "src/sql/grouped_forward.rs",
+            "pub(crate) use crate::catalog::schema::{ColumnDefault as DefaultValue, SqlType};",
+        ),
+        GuardSource::new(
+            "src/sql/glob_forward.rs",
+            "pub use crate::catalog::schema::*;",
+        ),
+        GuardSource::new(
+            "src/sql/macro_owner.rs",
+            "macro_rules! owner { () => { struct ColumnDefault; } } owner!();",
+        ),
+        GuardSource::new(
+            "src/sql/macro_alias.rs",
+            "macro_rules! owner { () => { type DefaultValue = $crate::catalog::schema::ColumnDefault; } } owner!();",
+        ),
+        GuardSource::new(
+            "src/sql/test_owner.rs",
+            "#[cfg(test)] mod tests { pub struct ColumnDefault; }",
+        ),
+        GuardSource::new(
+            "src/sql/direct_wrapper.rs",
+            "use crate::catalog::schema::ColumnDefault; struct DefaultValue(ColumnDefault);",
+        ),
+        GuardSource::new(
+            "src/sql/named_wrapper.rs",
+            "use crate::catalog::schema::ColumnDefault; struct DefaultEnvelope { value: ColumnDefault }",
+        ),
+        GuardSource::new(
+            "src/sql/alias_wrapper.rs",
+            "use crate::catalog::schema::ColumnDefault as Neutral; struct DefaultAlias { value: Neutral }",
+        ),
+        GuardSource::new(
+            "src/sql/glob_wrapper.rs",
+            "use crate::catalog::schema::*; enum DefaultChoice { Wrapped(ColumnDefault), Missing }",
+        ),
+        GuardSource::new(
+            "src/sql/relative_wrapper.rs",
+            "struct Wrapper(crate::catalog::schema::ColumnDefault);",
+        ),
+        GuardSource::new(
+            "src/sql/cfg_wrapper.rs",
+            "#[cfg(test)] mod tests { use crate::catalog::schema::ColumnDefault; struct DefaultValue { value: ColumnDefault } }",
+        ),
+        GuardSource::new(
+            "src/sql/macro_tuple_wrapper.rs",
+            "macro_rules! wrapper { () => { struct DefaultValue($crate::catalog::schema::ColumnDefault); } } wrapper!();",
+        ),
+        GuardSource::new(
+            "src/sql/macro_named_wrapper.rs",
+            "macro_rules! wrapper { () => { struct DefaultEnvelope { value: $crate::catalog::schema::ColumnDefault } } } wrapper!();",
+        ),
+        GuardSource::new(
+            "src/sql/macro_enum_wrapper.rs",
+            "macro_rules! wrapper { () => { enum DefaultChoice { Value($crate::catalog::schema::ColumnDefault), Missing } } } wrapper!();",
+        ),
+        GuardSource::new(
+            "src/sql/macro_union_wrapper.rs",
+            "macro_rules! wrapper { () => { union DefaultUnion { value: std::mem::ManuallyDrop<$crate::catalog::schema::ColumnDefault> } } } wrapper!();",
+        ),
+    ];
+    let violations = ebd_4b2a_audit_definitions_and_forwarding(&invalid);
+    for path in [
+        "secondary.rs",
+        "alias.rs",
+        "forward.rs",
+        "grouped_forward.rs",
+        "glob_forward.rs",
+        "macro_owner.rs",
+        "macro_alias.rs",
+        "test_owner.rs",
+        "direct_wrapper.rs",
+        "named_wrapper.rs",
+        "alias_wrapper.rs",
+        "glob_wrapper.rs",
+        "relative_wrapper.rs",
+        "cfg_wrapper.rs",
+        "macro_tuple_wrapper.rs",
+        "macro_named_wrapper.rs",
+        "macro_enum_wrapper.rs",
+        "macro_union_wrapper.rs",
+    ] {
+        assert!(
+            violations.iter().any(|item| item.contains(path)),
+            "definition fixture was missed: {path}; got {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn ebd_4b2a_detector_rejects_parser_connector_paths_and_ignores_noise() {
+    let allowed = GuardSource::new(
+        "src/sql/parser/dialect/create_table.rs",
+        r###"
+use crate::sql::literal::default_literal_to_column_default;
+// crate::connector::iceberg::default_value::default_literal_to_iceberg();
+const TEXT: &str = "crate::connector::iceberg";
+const RAW: &str = r#"use crate::connector::iceberg::*;"#;
+fn validate() { let _ = default_literal_to_column_default; }
+"###,
+    );
+    assert!(ebd_4b2a_audit_parser_connector_dependency(&allowed).is_empty());
+
+    for dependency in [
+        "use crate::connector::iceberg::default_value; fn validate() { let _ = default_value::default_literal_to_iceberg; }",
+        "use crate::connector::{iceberg::default_value}; fn validate() { let _ = default_value::default_literal_to_iceberg; }",
+        "use crate::connector::iceberg as vendor; fn validate() { let _ = vendor::default_value::default_literal_to_iceberg; }",
+        "use crate::connector::iceberg::*; fn validate() { let _ = default_value::default_literal_to_iceberg; }",
+        "use super::super::super::super::connector::iceberg::default_value; fn validate() { let _ = default_value::default_literal_to_iceberg; }",
+        "#[cfg(test)] mod tests { use crate::connector::iceberg::default_value; fn validate() { let _ = default_value::default_literal_to_iceberg; } }",
+    ] {
+        let invalid = GuardSource::new("src/sql/parser/dialect/create_table.rs", dependency);
+        assert!(
+            !ebd_4b2a_audit_parser_connector_dependency(&invalid).is_empty(),
+            "parser dependency fixture was missed: {dependency}"
+        );
+    }
+}
+
+#[test]
+fn ebd_4b2a_catalog_write_default_boundary_is_complete() {
+    let sources = ebd_4b1_collect_repo_sources();
+    let mut violations = BTreeSet::new();
+
+    if let Some(owner) = sources.iter().find(|source| source.path == EBD_4B2A_OWNER) {
+        violations.extend(ebd_4b2a_audit_schema_owner(owner));
+    } else {
+        violations.insert(format!("catalog-default-owner-missing: {EBD_4B2A_OWNER}"));
+    }
+    if let Some(catalog) = sources
+        .iter()
+        .find(|source| source.path == "src/sql/catalog.rs")
+    {
+        violations.extend(ebd_4b2a_audit_column_def(catalog));
+        violations.extend(ebd_4b2a_audit_catalog_raw_iceberg_literals(catalog));
+    } else {
+        violations
+            .insert("catalog-default-column-def-owner-missing: src/sql/catalog.rs".to_string());
+    }
+    if let Some(parser) = sources
+        .iter()
+        .find(|source| source.path == "src/sql/parser/dialect/create_table.rs")
+    {
+        violations.extend(ebd_4b2a_audit_parser_connector_dependency(parser));
+    } else {
+        violations.insert(
+            "catalog-default-parser-owner-missing: src/sql/parser/dialect/create_table.rs"
+                .to_string(),
+        );
+    }
+    violations.extend(ebd_4b2a_audit_definitions_and_forwarding(&sources));
+
+    let actual = current_source_tree_snapshot();
+    let actual_counts = [
+        actual.engine_files.len(),
+        actual.engine_module_declarations.len(),
+        actual
+            .external_engine_dependencies
+            .values()
+            .map(BTreeSet::len)
+            .sum(),
+        actual
+            .standalone_state_dependencies
+            .values()
+            .map(BTreeSet::len)
+            .sum(),
+        actual.forwarding_reexports.len(),
+    ];
+    let expected_counts = [88, 86, 224, 58, 17];
+    if actual_counts != expected_counts {
+        violations.insert(format!(
+            "catalog-default-ebd-1-baseline-drift: expected={expected_counts:?} actual={actual_counts:?}"
+        ));
+    }
+
+    assert!(
+        violations.is_empty(),
+        "EBD-4B2A catalog write-default boundary failed:\n{}",
+        violations.into_iter().collect::<Vec<_>>().join("\n")
     );
 }
 

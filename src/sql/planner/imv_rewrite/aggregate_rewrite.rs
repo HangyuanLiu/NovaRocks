@@ -1500,7 +1500,22 @@ fn target_column_from_field(field: &NestedField) -> Result<ColumnDef, String> {
         name: field.name.clone(),
         data_type: iceberg_type_to_arrow(field.field_type.as_ref(), &field.name)?,
         nullable: !field.required,
-        write_default: field.write_default.clone(),
+        write_default: field
+            .write_default
+            .as_ref()
+            .map(|literal| {
+                crate::connector::iceberg::default_value::iceberg_literal_to_column_default(
+                    literal,
+                    field.field_type.as_ref(),
+                )
+                .map_err(|e| {
+                    format!(
+                        "convert Iceberg IMV aggregate write-default for column `{}` failed: {e}",
+                        field.name
+                    )
+                })
+            })
+            .transpose()?,
         logical_type: None,
     })
 }

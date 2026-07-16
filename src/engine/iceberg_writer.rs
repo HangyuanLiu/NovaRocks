@@ -865,7 +865,22 @@ pub(crate) fn iceberg_insert_columns_from_schema(
                 name: field.name().clone(),
                 data_type,
                 nullable: field.is_nullable(),
-                write_default: nested.write_default.clone(),
+                write_default: nested
+                    .write_default
+                    .as_ref()
+                    .map(|literal| {
+                        crate::connector::iceberg::default_value::iceberg_literal_to_column_default(
+                            literal,
+                            nested.field_type.as_ref(),
+                        )
+                        .map_err(|e| {
+                            format!(
+                                "convert Iceberg insert write-default for column `{}` failed: {e}",
+                                field.name()
+                            )
+                        })
+                    })
+                    .transpose()?,
                 logical_type: None,
             })
         })
@@ -901,8 +916,7 @@ fn omitted_column_expr_sql(column: &ColumnDef) -> Result<String, String> {
         return Ok("NULL".to_string());
     };
     let sql_type = arrow_data_type_to_sql_type(&column.data_type)?;
-    let literal =
-        crate::connector::iceberg::default_value::iceberg_literal_to_ast(write_default, &sql_type)?;
+    let literal = crate::sql::literal::column_default_to_ast_literal(write_default, &sql_type)?;
     literal_to_sql_for_arrow_type(&literal, &column.data_type)
 }
 
@@ -1338,10 +1352,12 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
     use sqlparser::ast as sqlast;
 
+    use crate::catalog::schema::ColumnDefault;
+
     fn test_column(
         name: &str,
         data_type: DataType,
-        write_default: Option<iceberg::spec::Literal>,
+        write_default: Option<ColumnDefault>,
     ) -> crate::sql::catalog::ColumnDef {
         crate::sql::catalog::ColumnDef {
             name: name.to_string(),
@@ -1750,13 +1766,7 @@ mod tests {
     fn append_source_to_query_values_reorders_columns_and_fills_defaults() {
         let target_columns = vec![
             test_column("a", DataType::Int32, None),
-            test_column(
-                "b",
-                DataType::Int32,
-                Some(iceberg::spec::Literal::Primitive(
-                    iceberg::spec::PrimitiveLiteral::Int(5),
-                )),
-            ),
+            test_column("b", DataType::Int32, Some(ColumnDefault::Int32(5))),
             test_column("c", DataType::Int32, None),
         ];
         let source = InsertSource::Values(vec![vec![
@@ -1779,6 +1789,119 @@ mod tests {
         assert_eq!(
             rendered,
             vec!["CAST(10 AS INT)", "CAST(5 AS INT)", "CAST(30 AS INT)"]
+        );
+    }
+
+    #[test]
+    fn omitted_column_expr_characterizes_neutral_write_defaults() {
+        let full_binary = (0_u16..=255).map(|byte| byte as u8).collect::<Vec<_>>();
+        let full_binary_sql = format!(
+            "X'{}'",
+            (0_u16..=255)
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<String>()
+        );
+        let cases = vec![
+            (
+                "integer",
+                DataType::Int32,
+                Some(ColumnDefault::Int32(5)),
+                "5".to_string(),
+            ),
+            (
+                "string",
+                DataType::Utf8,
+                Some(ColumnDefault::String("value".to_string())),
+                "'value'".to_string(),
+            ),
+            (
+                "decimal",
+                DataType::Decimal128(10, 2),
+                Some(ColumnDefault::Decimal {
+                    unscaled: 12_345,
+                    precision: 10,
+                    scale: 2,
+                }),
+                "'123.45'".to_string(),
+            ),
+            (
+                "date",
+                DataType::Date32,
+                Some(ColumnDefault::Date {
+                    days_since_epoch: -1,
+                }),
+                "'1969-12-31'".to_string(),
+            ),
+            (
+                "datetime",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                Some(ColumnDefault::TimestampMicros {
+                    micros_since_epoch: 1_704_110_400_123_456,
+                }),
+                "'2024-01-01 12:00:00'".to_string(),
+            ),
+            (
+                "datetime-ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                Some(ColumnDefault::TimestampNanos {
+                    nanos_since_epoch: 1_704_164_645_123_456_789,
+                }),
+                "'2024-01-02 03:04:05.123456789'".to_string(),
+            ),
+            (
+                "binary",
+                DataType::Binary,
+                Some(ColumnDefault::Binary(full_binary)),
+                full_binary_sql,
+            ),
+            (
+                "empty-array",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                Some(ColumnDefault::Array(Vec::new())),
+                "[]".to_string(),
+            ),
+            (
+                "empty-map",
+                test_map_type(DataType::Int32, DataType::Utf8),
+                Some(ColumnDefault::Map(Vec::new())),
+                "map()".to_string(),
+            ),
+            ("missing", DataType::Int32, None, "NULL".to_string()),
+        ];
+
+        for (name, data_type, write_default, expected) in cases {
+            let column = test_column(name, data_type, write_default);
+            assert_eq!(
+                omitted_column_expr_sql(&column),
+                Ok(expected),
+                "case={name}"
+            );
+        }
+    }
+
+    #[test]
+    fn omitted_column_expr_characterizes_non_empty_collection_default_errors() {
+        let list_column = test_column(
+            "items",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            Some(ColumnDefault::Array(vec![ColumnDefault::Int32(1)])),
+        );
+        assert_eq!(
+            omitted_column_expr_sql(&list_column).unwrap_err(),
+            "non-empty ARRAY write-default is not yet supported (1 elements)"
+        );
+
+        let map_column = test_column(
+            "attributes",
+            test_map_type(DataType::Int32, DataType::Utf8),
+            Some(ColumnDefault::Map(vec![(
+                ColumnDefault::Int32(1),
+                ColumnDefault::String("value".to_string()),
+            )])),
+        );
+        assert_eq!(
+            omitted_column_expr_sql(&map_column).unwrap_err(),
+            "non-empty MAP write-default is not yet supported (1 entries)"
         );
     }
 
@@ -1939,13 +2062,7 @@ mod tests {
     fn append_source_to_query_from_query_column_list_wraps_projection() {
         let target_columns = vec![
             test_column("a", DataType::Int32, None),
-            test_column(
-                "b",
-                DataType::Int32,
-                Some(iceberg::spec::Literal::Primitive(
-                    iceberg::spec::PrimitiveLiteral::Int(7),
-                )),
-            ),
+            test_column("b", DataType::Int32, Some(ColumnDefault::Int32(7))),
             test_column("c", DataType::Int32, None),
         ];
         let source = InsertSource::FromQuery(Box::new(parse_query("SELECT x, y FROM src")));

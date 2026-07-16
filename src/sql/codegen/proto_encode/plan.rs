@@ -35,7 +35,7 @@ use crate::proto::{common, plan};
 use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
 // Consumed only by `#[cfg(test)]` encoder fixtures (the production write/router
 // encoding reads finalized planner types, not these analysis constructors).
-use crate::catalog::schema::SqlType;
+use crate::catalog::schema::{ColumnDefault, SqlType, validate_column_default};
 #[cfg(test)]
 use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::catalog;
@@ -1397,19 +1397,48 @@ fn encode_column_def(src: &catalog::ColumnDef) -> Result<plan::ColumnDef, String
 
 fn encode_column_write_default_json(
     column: &catalog::ColumnDef,
-    literal: &iceberg::spec::Literal,
+    value: &ColumnDefault,
 ) -> Result<String, String> {
+    validate_column_default(value)?;
     let iceberg_type = iceberg_type_for_column_def(column)?;
-    literal
-        .clone()
-        .try_into_json(&iceberg_type)
-        .map(|json| json.to_string())
-        .map_err(|err| {
-            format!(
-                "encode write_default_json for column `{}` as {:?}: {err}",
-                column.name, iceberg_type
-            )
-        })
+    let normalized_value;
+    let value = match (value, &iceberg_type) {
+        (
+            ColumnDefault::TimestamptzMicros { micros_since_epoch },
+            Type::Primitive(PrimitiveType::Timestamp),
+        ) => {
+            normalized_value = ColumnDefault::TimestampMicros {
+                micros_since_epoch: *micros_since_epoch,
+            };
+            &normalized_value
+        }
+        (
+            ColumnDefault::TimestamptzNanos { nanos_since_epoch },
+            Type::Primitive(PrimitiveType::TimestampNs),
+        ) => {
+            normalized_value = ColumnDefault::TimestampNanos {
+                nanos_since_epoch: *nanos_since_epoch,
+            };
+            &normalized_value
+        }
+        _ => value,
+    };
+    crate::connector::iceberg::default_value::column_default_to_iceberg_literal(
+        value,
+        &iceberg_type,
+    )
+    .and_then(|literal| {
+        literal
+            .try_into_json(&iceberg_type)
+            .map(|json| json.to_string())
+            .map_err(|err| err.to_string())
+    })
+    .map_err(|err| {
+        format!(
+            "encode write_default_json for column `{}` as {:?}: {err}",
+            column.name, iceberg_type
+        )
+    })
 }
 
 fn iceberg_type_for_column_def(column: &catalog::ColumnDef) -> Result<Type, String> {
@@ -2598,7 +2627,7 @@ fn usize_to_u32(value: usize) -> Result<u32, String> {
 
 #[cfg(test)]
 mod tests {
-    use arrow::datatypes::DataType;
+    use std::collections::HashMap;
 
     use super::*;
     use crate::coordinator::prepare::scan::{
@@ -2620,6 +2649,277 @@ mod tests {
         RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
     };
     use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
+    use arrow::datatypes::{DataType, TimeUnit};
+
+    fn encode_write_default_json_for_test(
+        data_type: DataType,
+        value: ColumnDefault,
+    ) -> Result<Option<String>, String> {
+        encode_column_def(&catalog::ColumnDef {
+            name: "defaulted".to_string(),
+            data_type,
+            nullable: true,
+            write_default: Some(value),
+            logical_type: None,
+        })
+        .map(|column| column.write_default_json)
+    }
+
+    fn field_with_iceberg_id(
+        id: i32,
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+    ) -> Arc<Field> {
+        Arc::new(
+            Field::new(name, data_type, nullable).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                id.to_string(),
+            )])),
+        )
+    }
+
+    #[test]
+    fn column_write_default_json_preserves_primitive_and_temporal_lexical_bytes() {
+        let cases = [
+            (
+                "boolean",
+                DataType::Boolean,
+                ColumnDefault::Boolean(true),
+                "true",
+            ),
+            ("integer", DataType::Int32, ColumnDefault::Int32(-7), "-7"),
+            (
+                "decimal",
+                DataType::Decimal128(10, 2),
+                ColumnDefault::Decimal {
+                    unscaled: 999,
+                    precision: 10,
+                    scale: 2,
+                },
+                "\"9.99\"",
+            ),
+            (
+                "date",
+                DataType::Date32,
+                ColumnDefault::Date {
+                    days_since_epoch: 0,
+                },
+                "\"1970-01-01\"",
+            ),
+            (
+                "time",
+                DataType::Time64(TimeUnit::Microsecond),
+                ColumnDefault::TimeMicros {
+                    micros_since_midnight: 0,
+                },
+                "\"00:00:00\"",
+            ),
+            (
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                ColumnDefault::TimestampMicros {
+                    micros_since_epoch: 1_234_567,
+                },
+                "\"1970-01-01T00:00:01.234567\"",
+            ),
+            (
+                "timestamptz-normalized",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                ColumnDefault::TimestamptzMicros {
+                    micros_since_epoch: 1_234_567,
+                },
+                "\"1970-01-01T00:00:01.234567\"",
+            ),
+            (
+                "timestamp-ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                ColumnDefault::TimestampNanos {
+                    nanos_since_epoch: 1_234_567_890,
+                },
+                "\"1970-01-01T00:00:01.234567890\"",
+            ),
+            (
+                "binary",
+                DataType::Binary,
+                ColumnDefault::Binary(vec![0x00, 0x0f, 0x10, 0xff]),
+                "\"0f10ff\"",
+            ),
+        ];
+
+        for (name, data_type, literal, expected) in cases {
+            assert_eq!(
+                encode_write_default_json_for_test(data_type, literal)
+                    .unwrap_or_else(|error| panic!("encode {name} write default: {error}"))
+                    .as_deref(),
+                Some(expected),
+                "case={name}"
+            );
+        }
+    }
+
+    #[test]
+    fn column_write_default_json_preserves_empty_and_nested_collection_lexical_bytes() {
+        let empty_list_type =
+            DataType::List(field_with_iceberg_id(1, "element", DataType::Int32, true));
+        assert_eq!(
+            encode_write_default_json_for_test(empty_list_type, ColumnDefault::Array(Vec::new()),)
+                .unwrap()
+                .as_deref(),
+            Some("[]")
+        );
+
+        let empty_map_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        field_with_iceberg_id(2, "key", DataType::Utf8, false),
+                        field_with_iceberg_id(3, "value", DataType::Int32, true),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        assert_eq!(
+            encode_write_default_json_for_test(empty_map_type, ColumnDefault::Map(Vec::new()),)
+                .unwrap()
+                .as_deref(),
+            Some(r#"{"keys":[],"values":[]}"#)
+        );
+
+        let list_type = DataType::List(field_with_iceberg_id(11, "element", DataType::Int32, true));
+        let map_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        field_with_iceberg_id(13, "key", DataType::Utf8, false),
+                        field_with_iceberg_id(14, "value", DataType::Int32, true),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        let nested_type = DataType::Struct(
+            vec![
+                field_with_iceberg_id(10, "items", list_type, true),
+                field_with_iceberg_id(12, "attributes", map_type, true),
+            ]
+            .into(),
+        );
+        let nested_literal = ColumnDefault::Struct(vec![
+            (
+                "items".to_string(),
+                ColumnDefault::Array(vec![ColumnDefault::Int32(1), ColumnDefault::Null]),
+            ),
+            (
+                "attributes".to_string(),
+                ColumnDefault::Map(vec![
+                    (
+                        ColumnDefault::String("first".to_string()),
+                        ColumnDefault::Int32(2),
+                    ),
+                    (
+                        ColumnDefault::String("second".to_string()),
+                        ColumnDefault::Null,
+                    ),
+                ]),
+            ),
+        ]);
+        assert_eq!(
+            encode_write_default_json_for_test(nested_type, nested_literal)
+                .unwrap()
+                .as_deref(),
+            Some(r#"{"10":[1,null],"12":{"keys":["first","second"],"values":[2,null]}}"#)
+        );
+    }
+
+    #[test]
+    fn column_write_default_json_preserves_non_finite_as_legacy_null() {
+        let cases = [
+            (
+                "float-nan",
+                DataType::Float32,
+                ColumnDefault::Float32 { bits: 0x7fc0_1234 },
+            ),
+            (
+                "float-positive-infinity",
+                DataType::Float32,
+                ColumnDefault::Float32 {
+                    bits: f32::INFINITY.to_bits(),
+                },
+            ),
+            (
+                "float-negative-infinity",
+                DataType::Float32,
+                ColumnDefault::Float32 {
+                    bits: f32::NEG_INFINITY.to_bits(),
+                },
+            ),
+            (
+                "double-nan",
+                DataType::Float64,
+                ColumnDefault::Float64 {
+                    bits: 0x7ff8_0000_0000_1234,
+                },
+            ),
+            (
+                "double-positive-infinity",
+                DataType::Float64,
+                ColumnDefault::Float64 {
+                    bits: f64::INFINITY.to_bits(),
+                },
+            ),
+            (
+                "double-negative-infinity",
+                DataType::Float64,
+                ColumnDefault::Float64 {
+                    bits: f64::NEG_INFINITY.to_bits(),
+                },
+            ),
+        ];
+
+        for (name, data_type, literal) in cases {
+            assert_eq!(
+                encode_write_default_json_for_test(data_type, literal)
+                    .unwrap_or_else(|error| panic!("encode {name} write default: {error}"))
+                    .as_deref(),
+                Some("null"),
+                "case={name}"
+            );
+        }
+    }
+
+    #[test]
+    fn column_write_default_json_preserves_uuid_and_fixed_unsupported_errors() {
+        let cases = [
+            (
+                DataType::FixedSizeBinary(16),
+                ColumnDefault::Uuid(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff_u128.to_be_bytes()),
+                "native plan cannot encode write_default_json for Arrow type FixedSizeBinary(16) without a logical Iceberg type",
+            ),
+            (
+                DataType::FixedSizeBinary(4),
+                ColumnDefault::Fixed {
+                    size: 4,
+                    bytes: vec![0x00, 0x7f, 0x80, 0xff],
+                },
+                "Arrow-to-native TypeDesc conversion does not support data type FixedSizeBinary(4)",
+            ),
+        ];
+
+        for (data_type, literal, expected) in cases {
+            assert_eq!(
+                encode_write_default_json_for_test(data_type, literal).unwrap_err(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn rfd_5a_graph_projection_encodes_native_runtime_filter_wire_fields() {
