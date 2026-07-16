@@ -37456,6 +37456,7 @@ struct Coor3bRuntimeFilterProjectionAudit {
     definitions: Vec<String>,
     use_bindings: Vec<(String, String, bool)>,
     expression_paths: Vec<(Vec<String>, String)>,
+    macro_mentions: usize,
     visible_functions: BTreeSet<String>,
     function_stack: Vec<String>,
 }
@@ -37477,11 +37478,25 @@ impl Coor3bRuntimeFilterProjectionAudit {
             }
             syn::UseTree::Name(name) => {
                 let original = coor_3b_ident_text(&name.ident);
-                self.use_bindings.push((original.clone(), original, public));
+                if original == "self" {
+                    if let Some(binding) = prefix.last() {
+                        self.use_bindings
+                            .push((prefix.join("::"), binding.clone(), public));
+                    }
+                } else {
+                    let mut path = prefix.clone();
+                    path.push(original.clone());
+                    self.use_bindings.push((path.join("::"), original, public));
+                }
             }
             syn::UseTree::Rename(rename) => {
+                let mut path = prefix.clone();
+                let original = coor_3b_ident_text(&rename.ident);
+                if original != "self" {
+                    path.push(original);
+                }
                 self.use_bindings.push((
-                    coor_3b_ident_text(&rename.ident),
+                    path.join("::"),
                     coor_3b_ident_text(&rename.rename),
                     public,
                 ));
@@ -37514,6 +37529,13 @@ impl<'ast> syn::visit::Visit<'ast> for Coor3bRuntimeFilterProjectionAudit {
         syn::visit::visit_impl_item(self, item);
     }
 
+    fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_trait_item_attrs(item)) {
+            return;
+        }
+        syn::visit::visit_trait_item(self, item);
+    }
+
     fn visit_stmt(&mut self, statement: &'ast syn::Stmt) {
         if nfe_4_syn_attrs_require_test(nfe_4_syn_stmt_attrs(statement)) {
             return;
@@ -37526,6 +37548,21 @@ impl<'ast> syn::visit::Visit<'ast> for Coor3bRuntimeFilterProjectionAudit {
             return;
         }
         syn::visit::visit_expr(self, expression);
+    }
+
+    fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+        if nfe_4_syn_attrs_require_test(&arm.attrs) {
+            return;
+        }
+        syn::visit::visit_arm(self, arm);
+    }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        self.macro_mentions += rust_use_tokens(&rust_lexically_sanitized(&mac.tokens.to_string()))
+            .iter()
+            .filter(|token| token.as_str() == COOR_3B_RF_PROJECTION_FN)
+            .count();
+        syn::visit::visit_macro(self, mac);
     }
 
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
@@ -37577,8 +37614,41 @@ impl<'ast> syn::visit::Visit<'ast> for Coor3bRuntimeFilterProjectionAudit {
 
 struct Coor3bRuntimeFilterProjectionSource {
     path: String,
-    token_count: usize,
+    has_projection_glob: bool,
     audit: Coor3bRuntimeFilterProjectionAudit,
+}
+
+fn coor_3b_resolve_use_binding_path(path: &str, bindings: &[(String, String, bool)]) -> String {
+    let aliases = bindings
+        .iter()
+        .filter(|(_, binding, _)| binding != "*")
+        .map(|(target, binding, _)| (binding.as_str(), target.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let mut segments = path
+        .split("::")
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut resolving = BTreeSet::new();
+    for _ in 0..32 {
+        let Some(first) = segments.first().cloned() else {
+            break;
+        };
+        let Some(target) = aliases.get(first.as_str()) else {
+            break;
+        };
+        if !resolving.insert(first) {
+            break;
+        }
+        let mut resolved = target
+            .split("::")
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        resolved.extend(segments.into_iter().skip(1));
+        segments = resolved;
+    }
+    segments.join("::")
 }
 
 fn coor_3b_runtime_filter_projection_owner_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
@@ -37605,16 +37675,16 @@ fn coor_3b_runtime_filter_projection_owner_violations(sources: &[Cgo8GuardSource
         {
             continue;
         }
-        let production = rust_sanitized_production_text(&source.text);
-        let tokens = rust_use_tokens(&production);
-        let token_count = tokens
-            .iter()
-            .filter(|token| token.as_str() == COOR_3B_RF_PROJECTION_FN)
-            .count();
-        let has_runtime_filter_glob = tokens
-            .windows(3)
-            .any(|window| window[0] == "runtime_filter" && window[1] == "::" && window[2] == "*");
-        if !owner && token_count == 0 && !has_runtime_filter_glob {
+        let has_projection_glob = may_contain_projection_glob
+            && rust_production_use_statements(&source.text)
+                .iter()
+                .filter_map(|import| import.split_once('|').map(|(_, path)| path))
+                .map(|path| path.split(" as ").next().unwrap_or(path))
+                .any(|path| {
+                    path.ends_with("sql::planner::distributed::runtime_filter::*")
+                        || (source.path == COOR_3B_RF_PROJECTION_PLANNER_OWNER && path == "self::*")
+                });
+        if !owner && !source.text.contains(COOR_3B_RF_PROJECTION_FN) && !has_projection_glob {
             continue;
         }
         let file = match syn::parse_file(&source.text) {
@@ -37631,7 +37701,7 @@ fn coor_3b_runtime_filter_projection_owner_violations(sources: &[Cgo8GuardSource
         syn::visit::Visit::visit_file(&mut audit, &file);
         audited.push(Coor3bRuntimeFilterProjectionSource {
             path: source.path.clone(),
-            token_count,
+            has_projection_glob,
             audit,
         });
     }
@@ -37651,12 +37721,23 @@ fn coor_3b_runtime_filter_projection_owner_violations(sources: &[Cgo8GuardSource
 
     let mut exported_prepare_bindings = BTreeSet::new();
     for source in &audited {
-        let projector_uses = source
+        let resolved_use_bindings = source
             .audit
             .use_bindings
             .iter()
+            .map(|(original, binding, public)| {
+                (
+                    coor_3b_resolve_use_binding_path(original, &source.audit.use_bindings),
+                    binding.clone(),
+                    *public,
+                )
+            })
+            .collect::<Vec<_>>();
+        let projector_uses = resolved_use_bindings
+            .iter()
             .filter(|(original, binding, public)| {
                 original == COOR_3B_RF_PROJECTION_FN
+                    || original.ends_with(&format!("::{COOR_3B_RF_PROJECTION_FN}"))
                     || (binding == "*"
                         && (original.ends_with("sql::planner::distributed::runtime_filter")
                             || (source.path == COOR_3B_RF_PROJECTION_PLANNER_OWNER
@@ -37684,16 +37765,18 @@ fn coor_3b_runtime_filter_projection_owner_violations(sources: &[Cgo8GuardSource
         match source.path.as_str() {
             COOR_3B_RF_PROJECTION_PLANNER_OWNER => {
                 if source.audit.definitions.len() != 1
-                    || source.token_count != 1
                     || !projector_uses.is_empty()
                     || !references.is_empty()
+                    || source.audit.macro_mentions != 0
+                    || source.has_projection_glob
                 {
                     violations.push(format!(
-                        "runtime-filter-projection-owner: {} must contain exactly one function definition and no other production reference; definitions={} tokens={} uses={} references={references:?}",
+                        "runtime-filter-projection-owner: {} must contain exactly one function definition and no other production reference; definitions={} uses={} references={references:?} macro_mentions={} projection_glob={}",
                         source.path,
                         source.audit.definitions.len(),
-                        source.token_count,
                         projector_uses.len(),
+                        source.audit.macro_mentions,
+                        source.has_projection_glob,
                     ));
                 }
             }
@@ -37711,18 +37794,20 @@ fn coor_3b_runtime_filter_projection_owner_violations(sources: &[Cgo8GuardSource
                         "prepare_fragments".to_string(),
                     )];
                 if source.audit.definitions.is_empty()
-                    && source.token_count == 1
                     && projector_uses.is_empty()
                     && direct_prepare_reference
+                    && source.audit.macro_mentions == 0
+                    && !source.has_projection_glob
                 {
                     continue;
                 }
                 violations.push(format!(
-                    "runtime-filter-projection-owner: {} must contain exactly one direct production reference inside prepare_fragments and no definition/use/re-export; definitions={} tokens={} uses={} references={references:?}",
+                    "runtime-filter-projection-owner: {} must contain exactly one direct production reference inside prepare_fragments and no definition/use/re-export; definitions={} uses={} references={references:?} macro_mentions={} projection_glob={}",
                     source.path,
                     source.audit.definitions.len(),
-                    source.token_count,
                     projector_uses.len(),
+                    source.audit.macro_mentions,
+                    source.has_projection_glob,
                 ));
                 for (_, binding, public) in projector_uses {
                     if *public && binding != "*" {
@@ -37737,18 +37822,20 @@ fn coor_3b_runtime_filter_projection_owner_violations(sources: &[Cgo8GuardSource
                 }
             }
             _ => {
-                if source.token_count != 0
-                    || !source.audit.definitions.is_empty()
+                if !source.audit.definitions.is_empty()
                     || !projector_uses.is_empty()
                     || !references.is_empty()
+                    || source.audit.macro_mentions != 0
+                    || source.has_projection_glob
                 {
                     violations.push(format!(
-                        "runtime-filter-projection-owner: {} must not reference {}; definitions={} tokens={} uses={} references={references:?}",
+                        "runtime-filter-projection-owner: {} must not reference {}; definitions={} uses={} references={references:?} macro_mentions={} projection_glob={}",
                         source.path,
                         COOR_3B_RF_PROJECTION_FN,
                         source.audit.definitions.len(),
-                        source.token_count,
                         projector_uses.len(),
+                        source.audit.macro_mentions,
+                        source.has_projection_glob,
                     ));
                 }
             }
@@ -37789,7 +37876,12 @@ fn coor_3b_runtime_filter_projection_owner_violations(sources: &[Cgo8GuardSource
             let imported_aliases = audit
                 .use_bindings
                 .iter()
-                .filter(|(original, _, _)| exported_prepare_bindings.contains(original))
+                .filter(|(original, _, _)| {
+                    original
+                        .rsplit("::")
+                        .next()
+                        .is_some_and(|name| exported_prepare_bindings.contains(name))
+                })
                 .map(|(_, binding, _)| binding.as_str())
                 .collect::<BTreeSet<_>>();
             for (path, function) in &audit.expression_paths {
@@ -37806,7 +37898,11 @@ fn coor_3b_runtime_filter_projection_owner_violations(sources: &[Cgo8GuardSource
                 }
             }
             for (original, binding, _) in &audit.use_bindings {
-                if exported_prepare_bindings.contains(original) {
+                if original
+                    .rsplit("::")
+                    .next()
+                    .is_some_and(|name| exported_prepare_bindings.contains(name))
+                {
                     violations.push(format!(
                         "runtime-filter-projection-owner: {} imports preparation projection wrapper `{original}` as `{binding}`",
                         source.path
@@ -38775,6 +38871,24 @@ fn coordinator_runtime_filter_guard_rejects_projection_glob_reexport() {
 }
 
 #[test]
+fn coordinator_runtime_filter_guard_rejects_aliased_runtime_filter_glob_reexport() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/projection_escape.rs",
+        "use crate::sql::planner::distributed::runtime_filter as rf; pub(crate) use rf::*;",
+        "runtime-filter-projection-owner",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_aliased_distributed_runtime_filter_glob_reexport() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/projection_escape.rs",
+        "use crate::sql::planner::distributed as dp; pub(crate) use dp::runtime_filter::*;",
+        "runtime-filter-projection-owner",
+    );
+}
+
+#[test]
 fn coordinator_runtime_filter_guard_rejects_consumer_of_projection_wrapper() {
     let sources = [
         Cgo8GuardSource::new(
@@ -39008,6 +39122,51 @@ pub(crate) fn reproject(plan: &DistributedPlan) {
     assert!(
         coor_3b_forbidden_path_violations(&sources).is_empty(),
         "preparation may consume the sealed Graph projection API"
+    );
+}
+
+#[test]
+fn coordinator_preparation_runtime_filter_guard_ignores_cfg_test_trait_default_method() {
+    let sources = [Cgo8GuardSource::new(
+        "src/coordinator/prepare/mod.rs",
+        r#"
+fn prepare_fragments(plan: &DistributedPlan) {
+    let _ = crate::sql::planner::distributed::runtime_filter::project_runtime_filters(plan);
+}
+trait TestOnlyProjection {
+    #[cfg(test)]
+    fn reproject(plan: &DistributedPlan) {
+        let _ = project_runtime_filters(plan);
+    }
+}
+"#,
+    )];
+    assert!(
+        coor_3b_forbidden_path_violations(&sources).is_empty(),
+        "a cfg(test) trait default method is outside production projection ownership"
+    );
+}
+
+#[test]
+fn coordinator_preparation_runtime_filter_guard_ignores_cfg_test_match_arm() {
+    let sources = [Cgo8GuardSource::new(
+        "src/coordinator/prepare/mod.rs",
+        r#"
+fn prepare_fragments(plan: &DistributedPlan) {
+    let _ = crate::sql::planner::distributed::runtime_filter::project_runtime_filters(plan);
+    match 0 {
+        #[cfg(test)]
+        _ => {
+            let _ = project_runtime_filters(plan);
+        }
+        _ => {}
+    }
+}
+"#,
+    )];
+    assert!(
+        coor_3b_forbidden_path_violations(&sources).is_empty(),
+        "a cfg(test) match arm is outside production projection ownership"
     );
 }
 
