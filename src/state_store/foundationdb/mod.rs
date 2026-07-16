@@ -15,10 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod budget;
 mod codec;
 mod identity;
+mod range;
+mod txn;
 
 use async_trait::async_trait;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use self::codec::KeyspaceCodec;
@@ -35,7 +39,7 @@ pub(super) struct FoundationDbStateStore {
     codec: KeyspaceCodec,
     identity: StoreIdentity,
     limits: StateStoreLimits,
-    metrics: StateStoreMetrics,
+    metrics: Arc<StateStoreMetrics>,
 }
 
 impl FoundationDbStateStore {
@@ -55,7 +59,7 @@ impl FoundationDbStateStore {
             codec,
             identity,
             limits,
-            metrics: StateStoreMetrics::new("foundationdb"),
+            metrics: Arc::new(StateStoreMetrics::new("foundationdb")),
         })
     }
 
@@ -82,18 +86,15 @@ impl StateStore for FoundationDbStateStore {
     }
 
     async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
-        let _operation = self.lease.acquire_operation()?;
-        let _ = &self.codec;
-        Err(Self::unavailable())
+        Ok(Box::new(self.begin_read_transaction()?))
     }
 
     async fn begin_write(
         &self,
-        _transaction_id: TransactionId,
+        transaction_id: TransactionId,
         _purpose: &str,
     ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
-        let _operation = self.lease.acquire_operation()?;
-        Err(Self::unavailable())
+        Ok(Box::new(self.begin_write_transaction(transaction_id)?))
     }
 
     async fn poll_changes(
