@@ -31,6 +31,10 @@ mod sqlite;
 #[cfg(feature = "foundationdb-provider")]
 mod foundationdb;
 
+#[cfg(all(feature = "foundationdb-provider", feature = "state-store-test-hooks"))]
+#[doc(hidden)]
+pub use foundationdb::test_support::{FoundationDbCommitGateControl, arm_next_foundationdb_commit};
+
 pub use config::{FoundationDbClientConfig, StateStoreConfig, StateStoreProviderConfig};
 pub use contract::{
     ChangeHint, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution,

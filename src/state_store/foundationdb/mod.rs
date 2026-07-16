@@ -16,9 +16,13 @@
 // under the License.
 
 mod budget;
+mod changes;
 mod codec;
+mod commit;
 mod identity;
 mod range;
+#[cfg(feature = "state-store-test-hooks")]
+pub(super) mod test_support;
 mod txn;
 
 use async_trait::async_trait;
@@ -30,8 +34,8 @@ use self::identity::open_identity;
 use super::runtime::ProviderHandle;
 use super::{
     ChangePage, ChangePollRequest, CommitResolution, ReadTransaction, StateStore, StateStoreError,
-    StateStoreErrorKind, StateStoreLimits, StateStoreMetrics, StateStoreMetricsSnapshot,
-    StoreIdentity, TransactionId, WriteTransaction,
+    StateStoreLimits, StateStoreMetrics, StateStoreMetricsSnapshot, StoreIdentity, TransactionId,
+    WriteTransaction,
 };
 
 pub(super) struct FoundationDbStateStore {
@@ -61,13 +65,6 @@ impl FoundationDbStateStore {
             limits,
             metrics: Arc::new(StateStoreMetrics::new("foundationdb")),
         })
-    }
-
-    fn unavailable() -> StateStoreError {
-        StateStoreError::new(
-            StateStoreErrorKind::ProviderUnavailable,
-            "FoundationDB state transactions are not initialized",
-        )
     }
 }
 
@@ -99,10 +96,29 @@ impl StateStore for FoundationDbStateStore {
 
     async fn poll_changes(
         &self,
-        _request: &ChangePollRequest,
+        request: &ChangePollRequest,
     ) -> Result<ChangePage, StateStoreError> {
         let _operation = self.lease.acquire_operation()?;
-        Err(Self::unavailable())
+        let database = self.lease.database()?;
+        let result = changes::poll_changes(
+            database.as_ref(),
+            &self.codec,
+            &self.identity,
+            &self.limits,
+            request,
+        )
+        .await;
+        if let Ok(page) = &result {
+            self.metrics.record_page_records(page.hints.len() as u64);
+            let bytes = page.hints.iter().fold(0_u64, |total, hint| {
+                total.saturating_add(
+                    u64::try_from(hint.key.as_bytes().len() + hint.revision.as_bytes().len())
+                        .unwrap_or(u64::MAX),
+                )
+            });
+            self.metrics.record_bytes_read(bytes);
+        }
+        result
     }
 
     async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
@@ -112,9 +128,17 @@ impl StateStore for FoundationDbStateStore {
 
     async fn resolve_commit(
         &self,
-        _transaction_id: &TransactionId,
+        transaction_id: &TransactionId,
     ) -> Result<CommitResolution, StateStoreError> {
         let _operation = self.lease.acquire_operation()?;
-        Err(Self::unavailable())
+        let database = self.lease.database()?;
+        commit::resolve_commit(
+            database.as_ref(),
+            &self.codec,
+            &self.limits,
+            *transaction_id,
+            self.metrics.as_ref(),
+        )
+        .await
     }
 }

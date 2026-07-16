@@ -23,11 +23,13 @@ use std::path::PathBuf;
 use bytes::Bytes;
 use foundationdb::Database;
 use foundationdb::options::TransactionOption;
+#[cfg(feature = "state-store-test-hooks")]
+use novarocks::state_store::arm_next_foundationdb_commit;
 use novarocks::state_store::{
-    CommitOutcome, Direction, FeDeploymentView, FoundationDbClientConfig, Key, KeyRange,
-    Precondition, RangeRequest, StateStore, StateStoreConfig, StateStoreErrorKind,
-    StateStoreLimitOverrides, StateStoreProviderConfig, StateStoreRuntime, TransactionId, Value,
-    open_state_store,
+    ChangePollRequest, CommitOutcome, CommitResolution, Direction, FeDeploymentView,
+    FoundationDbClientConfig, Key, KeyRange, Precondition, RangeRequest, StateStore,
+    StateStoreConfig, StateStoreErrorKind, StateStoreLimitOverrides, StateStoreProviderConfig,
+    StateStoreRuntime, TransactionId, Value, open_state_store,
 };
 use uuid::Uuid;
 
@@ -475,6 +477,286 @@ async fn transaction_scenarios(runtime: &StateStoreRuntime) {
     drop(store);
 }
 
+async fn durable_commit_and_change_scenarios(runtime: &StateStoreRuntime) {
+    let store = open_state_store(
+        runtime,
+        transaction_store_config("durable-cluster", Uuid::new_v4()),
+        deployment(),
+    )
+    .await
+    .expect("open durable commit keyspace");
+
+    let tombstoned = TransactionId::from(Uuid::new_v4());
+    assert_eq!(
+        store
+            .resolve_commit(&tombstoned)
+            .await
+            .expect("create absent resolution tombstone"),
+        CommitResolution::NotCommitted
+    );
+    assert_eq!(
+        store
+            .resolve_commit(&tombstoned)
+            .await
+            .expect("repeat stable tombstone resolution"),
+        CommitResolution::NotCommitted
+    );
+    let mut rejected = store
+        .begin_write(tombstoned, "reuse tombstoned transaction")
+        .await
+        .expect("begin tombstoned transaction");
+    rejected
+        .put(
+            key(Bytes::from_static(b"tombstoned")),
+            value(Bytes::from_static(b"must-not-commit")),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage tombstoned transaction");
+    assert!(matches!(
+        rejected.commit().await,
+        CommitOutcome::DefiniteFailure(ref error)
+            if error.kind() == StateStoreErrorKind::InvalidRequest
+    ));
+
+    let precondition_id = TransactionId::from(Uuid::new_v4());
+    seed(store.as_ref(), &[(b"precondition", b"present")]).await;
+    let mut mismatch = store
+        .begin_write(precondition_id, "durable precondition failure")
+        .await
+        .expect("begin precondition failure");
+    mismatch
+        .put(
+            key(Bytes::from_static(b"precondition")),
+            value(Bytes::from_static(b"rejected")),
+            Precondition::Absent,
+        )
+        .await
+        .expect("stage precondition failure");
+    assert!(matches!(
+        mismatch.commit().await,
+        CommitOutcome::Conflict(_)
+    ));
+    assert_eq!(
+        store
+            .resolve_commit(&precondition_id)
+            .await
+            .expect("resolve precondition failure"),
+        CommitResolution::NotCommitted
+    );
+
+    let baseline = store
+        .poll_changes(&ChangePollRequest {
+            after: None,
+            page_size: store.limits().max_page_size,
+        })
+        .await
+        .expect("poll durable scenario baseline")
+        .next_cursor;
+    let committed_id = TransactionId::from(Uuid::new_v4());
+    let mut committed = store
+        .begin_write(committed_id, "durable committed transaction")
+        .await
+        .expect("begin committed transaction");
+    for item in [b"change-c", b"change-a", b"change-b"] {
+        committed
+            .put(
+                key(Bytes::from_static(item)),
+                value(Bytes::from_static(b"value")),
+                Precondition::Any,
+            )
+            .await
+            .expect("stage committed change");
+    }
+    let receipt = match committed.commit().await {
+        CommitOutcome::Committed(receipt) => receipt,
+        other => panic!("expected durable commit, got {other:?}"),
+    };
+    assert_eq!(
+        store
+            .resolve_commit(&committed_id)
+            .await
+            .expect("resolve committed transaction"),
+        CommitResolution::Committed(receipt.clone())
+    );
+
+    let mut duplicate = store
+        .begin_write(committed_id, "duplicate committed transaction")
+        .await
+        .expect("begin duplicate committed transaction");
+    duplicate
+        .put(
+            key(Bytes::from_static(b"duplicate-must-not-apply")),
+            value(Bytes::from_static(b"value")),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage duplicate transaction");
+    assert_eq!(
+        duplicate.commit().await,
+        CommitOutcome::Committed(receipt.clone())
+    );
+
+    let first = store
+        .poll_changes(&ChangePollRequest {
+            after: Some(baseline),
+            page_size: 2,
+        })
+        .await
+        .expect("poll first same-revision page");
+    assert_eq!(first.hints.len(), 2);
+    assert!(
+        first
+            .hints
+            .iter()
+            .all(|hint| hint.revision == receipt.revision)
+    );
+    let second = store
+        .poll_changes(&ChangePollRequest {
+            after: Some(first.next_cursor),
+            page_size: 2,
+        })
+        .await
+        .expect("poll final same-revision page");
+    assert_eq!(second.hints.len(), 1);
+    assert_eq!(second.high_watermark, receipt.revision);
+    assert_eq!(
+        first
+            .hints
+            .iter()
+            .chain(second.hints.iter())
+            .map(|hint| hint.key.as_bytes())
+            .collect::<Vec<_>>(),
+        vec![
+            b"change-a".as_slice(),
+            b"change-b".as_slice(),
+            b"change-c".as_slice(),
+        ]
+    );
+    let identity = store.identity().await.expect("read durable identity");
+    let (cursor_revision, cursor_sequence) = second
+        .next_cursor
+        .decode(identity.store_id)
+        .expect("decode exhausted cursor");
+    assert_eq!(cursor_revision, receipt.revision);
+    assert_eq!(cursor_sequence, u32::MAX);
+
+    let empty_id = TransactionId::from(Uuid::new_v4());
+    let empty = store
+        .begin_write(empty_id, "high watermark without changes")
+        .await
+        .expect("begin empty transaction");
+    let empty_receipt = match empty.commit().await {
+        CommitOutcome::Committed(receipt) => receipt,
+        other => panic!("expected empty durable commit, got {other:?}"),
+    };
+    let empty_page = store
+        .poll_changes(&ChangePollRequest {
+            after: Some(second.next_cursor),
+            page_size: 2,
+        })
+        .await
+        .expect("poll high-watermark-only commit");
+    assert!(empty_page.hints.is_empty());
+    assert_eq!(empty_page.high_watermark, empty_receipt.revision);
+
+    drop(store);
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+async fn cancellation_safe_supervisor_scenarios(runtime: &StateStoreRuntime) {
+    let store = open_state_store(
+        runtime,
+        transaction_store_config("supervisor-cluster", Uuid::new_v4()),
+        deployment(),
+    )
+    .await
+    .expect("open supervisor keyspace");
+
+    let cancellation_control =
+        arm_next_foundationdb_commit(true, false, false).expect("arm pre-native gate");
+    let cancellation_id = TransactionId::from(Uuid::new_v4());
+    let mut cancellation = store
+        .begin_write(cancellation_id, "cancel commit waiter")
+        .await
+        .expect("begin cancellation transaction");
+    cancellation
+        .put(
+            key(Bytes::from_static(b"cancel-owner")),
+            value(Bytes::from_static(b"committed-by-owner")),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage cancellation transaction");
+    let waiter = tokio::spawn(async move { cancellation.commit().await });
+    cancellation_control.wait_pre_native().await;
+    assert_eq!(
+        store
+            .resolve_commit(&cancellation_id)
+            .await
+            .expect("resolve held cancellation transaction"),
+        CommitResolution::Unresolved
+    );
+    waiter.abort();
+    assert!(waiter.await.expect_err("cancel waiter").is_cancelled());
+    cancellation_control.release_pre_native();
+    cancellation_control.wait_response().await;
+    assert!(matches!(
+        await_terminal(store.as_ref(), cancellation_id).await,
+        CommitResolution::Committed(_)
+    ));
+
+    let response_control =
+        arm_next_foundationdb_commit(false, true, true).expect("arm response-loss gate");
+    let response_id = TransactionId::from(Uuid::new_v4());
+    let mut response = store
+        .begin_write(response_id, "lose committed response")
+        .await
+        .expect("begin response-loss transaction");
+    response
+        .put(
+            key(Bytes::from_static(b"response-loss")),
+            value(Bytes::from_static(b"committed")),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage response-loss transaction");
+    let waiter = tokio::spawn(async move { response.commit().await });
+    response_control.wait_response().await;
+    assert!(matches!(
+        store
+            .resolve_commit(&response_id)
+            .await
+            .expect("resolve committed response-loss transaction"),
+        CommitResolution::Committed(_)
+    ));
+    response_control.release_response();
+    assert!(matches!(
+        waiter.await.expect("join response-loss waiter"),
+        CommitOutcome::CommitUnknown(_)
+    ));
+
+    drop(store);
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+async fn await_terminal(store: &dyn StateStore, transaction_id: TransactionId) -> CommitResolution {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let resolution = store
+                .resolve_commit(&transaction_id)
+                .await
+                .expect("resolve supervised transaction");
+            if !matches!(resolution, CommitResolution::Unresolved) {
+                return resolution;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("supervised transaction reaches durable terminal")
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn foundationdb_suite() {
     let mut runtime = StateStoreRuntime::foundationdb(client_config())
@@ -521,6 +803,9 @@ async fn foundationdb_suite() {
     assert_eq!(corruption.kind(), StateStoreErrorKind::Corruption);
 
     transaction_scenarios(&runtime).await;
+    durable_commit_and_change_scenarios(&runtime).await;
+    #[cfg(feature = "state-store-test-hooks")]
+    cancellation_safe_supervisor_scenarios(&runtime).await;
 
     drop(right);
     drop(left);

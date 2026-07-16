@@ -22,22 +22,23 @@ use std::time::Instant as StdInstant;
 use async_trait::async_trait;
 use bytes::Bytes;
 use foundationdb::options::{MutationType, TransactionOption};
-use foundationdb::{Database, FdbError, Transaction};
+use foundationdb::{Database, Transaction};
 use tokio::time::{Instant, timeout_at};
 
 use super::FoundationDbStateStore;
 use super::budget::TransactionBudget;
 use super::codec::KeyspaceCodec;
+use super::commit::{
+    PreparedCommit, PreparedFailure, supervise_commit, supervise_pre_dispatch_failure,
+};
 use super::range::range_page;
 use crate::state_store::runtime::OperationHandle;
 use crate::state_store::{
-    CommitOutcome, CommitReceipt, Key, Precondition, RangePage, RangeRequest, ReadTransaction,
-    StateRecord, StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetrics,
-    StateStoreOperation, StateStoreOutcome, StoreRevision, TransactionId, Value, VersionToken,
-    WriteTransaction,
+    CommitOutcome, Key, Precondition, RangePage, RangeRequest, ReadTransaction, StateRecord,
+    StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetrics, StateStoreOperation,
+    StateStoreOutcome, TransactionId, Value, VersionToken, WriteTransaction,
 };
 
-const NOT_COMMITTED_ERROR_CODE: i32 = 1020;
 const PROVISIONAL_VERSION_TAG: &[u8] = b"fdb-provisional-v1\0";
 
 #[derive(Clone, Debug)]
@@ -70,17 +71,24 @@ pub(super) struct FoundationDbReadTransaction {
 }
 
 pub(super) struct FoundationDbWriteTransaction {
+    database: Arc<Database>,
     transaction: Option<Transaction>,
     codec: KeyspaceCodec,
     limits: StateStoreLimits,
     deadline: Instant,
     metrics: Arc<StateStoreMetrics>,
-    _operation: OperationHandle,
+    operation: OperationHandle,
     transaction_id: TransactionId,
     mutations: Vec<(Key, Mutation)>,
     pub(super) overlay: BTreeMap<Key, Mutation>,
     budget: TransactionBudget,
     range_frozen: bool,
+}
+
+enum CommitPreparation {
+    Ready(PreparedCommit),
+    DurableFailure(PreparedFailure, CommitOutcome),
+    Immediate(CommitOutcome),
 }
 
 impl FoundationDbStateStore {
@@ -118,12 +126,13 @@ impl FoundationDbStateStore {
             let database = self.lease.database()?;
             let transaction = create_raw_transaction(database.as_ref(), &self.limits, deadline)?;
             Ok(FoundationDbWriteTransaction {
+                database,
                 transaction: Some(transaction),
                 codec: self.codec.clone(),
                 limits: self.limits.clone(),
                 deadline,
                 metrics: Arc::clone(&self.metrics),
-                _operation: operation,
+                operation,
                 transaction_id,
                 mutations: Vec::new(),
                 overlay: BTreeMap::new(),
@@ -136,7 +145,7 @@ impl FoundationDbStateStore {
     }
 }
 
-fn create_raw_transaction(
+pub(super) fn create_raw_transaction(
     database: &Database,
     limits: &StateStoreLimits,
     deadline: Instant,
@@ -266,13 +275,17 @@ impl FoundationDbWriteTransaction {
         Ok(bytes)
     }
 
-    async fn commit_inner(mut self) -> CommitOutcome {
+    async fn prepare_commit(mut self) -> CommitPreparation {
         let transaction = match self.transaction.take() {
             Some(transaction) => transaction,
-            None => return CommitOutcome::DefiniteFailure(transaction_finished()),
+            None => {
+                return CommitPreparation::Immediate(CommitOutcome::DefiniteFailure(
+                    transaction_finished(),
+                ));
+            }
         };
         if Instant::now() >= self.deadline {
-            return CommitOutcome::DefiniteFailure(deadline_error());
+            return CommitPreparation::Immediate(CommitOutcome::DefiniteFailure(deadline_error()));
         }
 
         let mut touched = BTreeSet::new();
@@ -281,14 +294,28 @@ impl FoundationDbWriteTransaction {
         for key in &touched {
             let record = match load_record(&transaction, &self.codec, key, self.deadline).await {
                 Ok(record) => record,
-                Err(error) => return classify_precommit_error(error),
+                Err(error) => return CommitPreparation::Immediate(classify_precommit_error(error)),
             };
             base.insert(key.clone(), record);
         }
 
         let changed = match replay_for_commit(&self.mutations, &base) {
             Ok(changed) => changed,
-            Err(error) => return CommitOutcome::Conflict(error),
+            Err(error) => {
+                drop(transaction);
+                return CommitPreparation::DurableFailure(
+                    PreparedFailure {
+                        database: self.database,
+                        codec: self.codec,
+                        limits: self.limits,
+                        deadline: self.deadline,
+                        metrics: self.metrics,
+                        _operation: self.operation,
+                        transaction_id: self.transaction_id,
+                    },
+                    CommitOutcome::Conflict(error),
+                );
+            }
         };
         for (key, mutation) in &self.overlay {
             let physical_key = self.codec.record_key(key.as_bytes());
@@ -307,8 +334,8 @@ impl FoundationDbWriteTransaction {
             let sequence = match u32::try_from(sequence) {
                 Ok(sequence) => sequence,
                 Err(_) => {
-                    return CommitOutcome::DefiniteFailure(limit_error(
-                        "transaction change sequence exceeds FoundationDB range",
+                    return CommitPreparation::Immediate(CommitOutcome::DefiniteFailure(
+                        limit_error("transaction change sequence exceeds FoundationDB range"),
                     ));
                 }
             };
@@ -330,26 +357,15 @@ impl FoundationDbWriteTransaction {
             &self.codec.committed_value_operand(),
             MutationType::SetVersionstampedValue,
         );
-        let versionstamp = transaction.get_versionstamp();
-        let commit = transaction.commit();
-        let committed = match timeout_at(self.deadline, commit).await {
-            Ok(Ok(committed)) => committed,
-            Ok(Err(error)) => return classify_commit_error(*error),
-            Err(_) => return CommitOutcome::CommitUnknown(deadline_error()),
-        };
-        drop(committed);
-        let revision = match timeout_at(self.deadline, versionstamp).await {
-            Ok(Ok(revision)) => revision,
-            Ok(Err(_)) => return CommitOutcome::CommitUnknown(provider_error()),
-            Err(_) => return CommitOutcome::CommitUnknown(deadline_error()),
-        };
-        let revision = match StoreRevision::try_from(Bytes::copy_from_slice(revision.as_ref())) {
-            Ok(revision) if revision.as_bytes().len() == 10 => revision,
-            _ => return CommitOutcome::CommitUnknown(corruption_error()),
-        };
-        CommitOutcome::Committed(CommitReceipt {
+        CommitPreparation::Ready(PreparedCommit {
+            database: self.database,
+            transaction,
+            codec: self.codec,
+            limits: self.limits,
+            deadline: self.deadline,
+            metrics: self.metrics,
+            _operation: self.operation,
             transaction_id: self.transaction_id,
-            revision,
         })
     }
 }
@@ -507,22 +523,6 @@ fn classify_precommit_error(error: StateStoreError) -> CommitOutcome {
     }
 }
 
-fn classify_commit_error(error: FdbError) -> CommitOutcome {
-    if error.code() == NOT_COMMITTED_ERROR_CODE {
-        CommitOutcome::Conflict(StateStoreError::new(
-            StateStoreErrorKind::Conflict,
-            "FoundationDB transaction conflicted",
-        ))
-    } else if error.is_retryable_not_committed() {
-        CommitOutcome::TransientBeforeCommit(provider_error())
-    } else {
-        CommitOutcome::CommitUnknown(StateStoreError::new(
-            StateStoreErrorKind::Transient,
-            "FoundationDB transaction commit outcome is unknown",
-        ))
-    }
-}
-
 fn ensure_active(deadline: Instant) -> Result<(), StateStoreError> {
     if Instant::now() >= deadline {
         return Err(deadline_error());
@@ -583,13 +583,6 @@ fn provider_error() -> StateStoreError {
     StateStoreError::new(
         StateStoreErrorKind::ProviderUnavailable,
         "FoundationDB state transaction failed",
-    )
-}
-
-fn corruption_error() -> StateStoreError {
-    StateStoreError::new(
-        StateStoreErrorKind::Corruption,
-        "FoundationDB state transaction returned malformed data",
     )
 }
 
@@ -691,9 +684,16 @@ impl WriteTransaction for FoundationDbWriteTransaction {
     async fn commit(self: Box<Self>) -> CommitOutcome {
         let metrics = Arc::clone(&self.metrics);
         let started = StdInstant::now();
-        let outcome = (*self).commit_inner().await;
-        record_commit(&metrics, started, &outcome);
-        outcome
+        match (*self).prepare_commit().await {
+            CommitPreparation::Ready(prepared) => supervise_commit(prepared, started).await,
+            CommitPreparation::DurableFailure(prepared, outcome) => {
+                supervise_pre_dispatch_failure(prepared, outcome, started).await
+            }
+            CommitPreparation::Immediate(outcome) => {
+                record_commit(&metrics, started, &outcome);
+                outcome
+            }
+        }
     }
 }
 
@@ -796,35 +796,5 @@ mod tests {
                 "unexpected classification for {kind:?}"
             );
         }
-    }
-
-    #[test]
-    fn post_dispatch_commit_errors_fail_closed_unless_known_not_committed() {
-        assert!(matches!(
-            classify_commit_error(FdbError::from_code(1020)),
-            CommitOutcome::Conflict(_)
-        ));
-
-        let retryable_not_committed = FdbError::from_code(1007);
-        assert!(retryable_not_committed.is_retryable_not_committed());
-        assert!(matches!(
-            classify_commit_error(retryable_not_committed),
-            CommitOutcome::TransientBeforeCommit(_)
-        ));
-
-        let maybe_committed = FdbError::from_code(1021);
-        assert!(maybe_committed.is_maybe_committed());
-        assert!(matches!(
-            classify_commit_error(maybe_committed),
-            CommitOutcome::CommitUnknown(_)
-        ));
-        assert!(matches!(
-            classify_commit_error(FdbError::from_code(1031)),
-            CommitOutcome::CommitUnknown(_)
-        ));
-        assert!(matches!(
-            classify_commit_error(FdbError::from_code(9999)),
-            CommitOutcome::CommitUnknown(_)
-        ));
     }
 }
