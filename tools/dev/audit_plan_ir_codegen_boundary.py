@@ -19,6 +19,7 @@
 from pathlib import Path
 import re
 import sys
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 BLOCKED_NATIVE_ENCODER_REFERENCES = [
@@ -172,7 +173,49 @@ def balanced_end(source: str, start: int, opening: str, closing: str) -> int:
 
 def rust_item_end(sanitized: str, start: int) -> int:
     """Find the end of the item following an outer attribute."""
-    paren = bracket = angle = 0
+    header_end = len(sanitized)
+    for terminator in ("=", ";", "{"):
+        position = sanitized.find(terminator, start)
+        if position != -1:
+            header_end = min(header_end, position)
+    header_words = re.findall(
+        r"\b[A-Za-z_][A-Za-z0-9_]*\b", sanitized[start:header_end]
+    )
+    declaration_keywords = {
+        "const",
+        "enum",
+        "extern",
+        "fn",
+        "impl",
+        "macro_rules",
+        "mod",
+        "static",
+        "struct",
+        "trait",
+        "type",
+        "union",
+        "use",
+    }
+    declaration = next(
+        (word for word in header_words if word in declaration_keywords), None
+    )
+    body_item = declaration in {
+        "enum",
+        "fn",
+        "impl",
+        "macro_rules",
+        "mod",
+        "struct",
+        "trait",
+        "union",
+    }
+    if declaration == "const":
+        const_index = header_words.index("const")
+        body_item = header_words[const_index + 1 : const_index + 2] == ["fn"]
+    if declaration == "extern":
+        body_item = "crate" not in header_words
+
+    paren = bracket = brace = 0
     index = start
     while index < len(sanitized):
         char = sanitized[index]
@@ -184,20 +227,20 @@ def rust_item_end(sanitized: str, start: int) -> int:
             bracket += 1
         elif char == "]":
             bracket = max(bracket - 1, 0)
-        elif char == "<":
-            angle += 1
-        elif char == ">":
-            angle = max(angle - 1, 0)
-        elif paren == bracket == angle == 0 and char == ";":
+        elif char == "{":
+            if paren == bracket == brace == 0 and body_item:
+                end = balanced_end(sanitized, index, "{", "}")
+                cursor = end
+                while cursor < len(sanitized) and sanitized[cursor].isspace():
+                    cursor += 1
+                if cursor < len(sanitized) and sanitized[cursor] == ";":
+                    cursor += 1
+                return cursor
+            brace += 1
+        elif char == "}":
+            brace = max(brace - 1, 0)
+        elif paren == bracket == brace == 0 and char == ";":
             return index + 1
-        elif paren == bracket == angle == 0 and char == "{":
-            end = balanced_end(sanitized, index, "{", "}")
-            cursor = end
-            while cursor < len(sanitized) and sanitized[cursor].isspace():
-                cursor += 1
-            if cursor < len(sanitized) and sanitized[cursor] == ";":
-                cursor += 1
-            return cursor
         index += 1
     return len(sanitized)
 
@@ -253,6 +296,101 @@ def native_encoder_production_inventory(
     return nonempty, "\n".join(text for _, text in production)
 
 
+def rust_external_modules(production: str) -> list[str]:
+    tokens = [
+        match.group(0)
+        for match in re.finditer(
+            r"r#[A-Za-z_][A-Za-z0-9_]*|[A-Za-z_][A-Za-z0-9_]*|::|[{};#!\[\]]",
+            production,
+        )
+    ]
+    modules = []
+    brace_depth = 0
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "{":
+            brace_depth += 1
+            index += 1
+            continue
+        if token == "}":
+            brace_depth = max(brace_depth - 1, 0)
+            index += 1
+            continue
+        if (
+            brace_depth == 0
+            and tokens[index : index + 3] == ["#", "[", "path"]
+        ):
+            raise AssertionError("production #[path] module indirection is forbidden")
+        if brace_depth == 0 and token == "mod" and index + 2 < len(tokens):
+            name = tokens[index + 1].removeprefix("r#")
+            terminator = tokens[index + 2]
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) and terminator == ";":
+                modules.append(name)
+                index += 3
+                continue
+        index += 1
+    return modules
+
+
+def reachable_rust_module_sources(
+    root_file: Path, boundary_root: Path
+) -> list[tuple[Path, str]]:
+    boundary = boundary_root.resolve(strict=True)
+    root = root_file.resolve(strict=True)
+    try:
+        root.relative_to(boundary)
+    except ValueError as error:
+        raise AssertionError("module graph root escapes its boundary") from error
+
+    sources: list[tuple[Path, str]] = []
+    visited: set[Path] = set()
+    active: set[Path] = set()
+
+    def visit(path: Path) -> None:
+        canonical = path.resolve(strict=True)
+        try:
+            canonical.relative_to(boundary)
+        except ValueError as error:
+            raise AssertionError(f"module path escapes encoder boundary: {path}") from error
+        if canonical in active:
+            raise AssertionError(f"module graph cycle detected at {path}")
+        if canonical in visited:
+            raise AssertionError(f"module source is reachable more than once: {path}")
+
+        active.add(canonical)
+        source = canonical.read_text(encoding="utf-8")
+        production = rust_production_text(source)
+        sources.append((canonical, source))
+        for module in rust_external_modules(production):
+            module_root = (
+                canonical.parent
+                if canonical.name == "mod.rs"
+                else canonical.parent / canonical.stem
+            )
+            candidates = [
+                candidate
+                for candidate in (
+                    module_root / f"{module}.rs",
+                    module_root / module / "mod.rs",
+                )
+                if candidate.exists()
+            ]
+            if len(candidates) != 1:
+                raise AssertionError(
+                    f"module {module!r} from {canonical} has "
+                    f"{len(candidates)} resolvable source files"
+                )
+            visit(candidates[0])
+        active.remove(canonical)
+        visited.add(canonical)
+
+    visit(root)
+    if not sources:
+        raise AssertionError("reachable native encoder module inventory is empty")
+    return sources
+
+
 def native_encoder_violations(sources: list[tuple[str, str]]) -> list[str]:
     _, production = native_encoder_production_inventory(sources)
     violations = [
@@ -279,16 +417,77 @@ fn forbidden(_: OptimizerPhysicalNode) {}
 fn test_helper(_: OptimizerPhysicalNode) {}
 fn production_inventory_marker() {}
 """
+    comparison_then_forbidden = """
+#[cfg(test)]
+const TEST_COMPARISON: bool = 1 < 2;
+fn forbidden(_: OptimizerPhysicalNode) {}
+"""
+    shift_then_forbidden = """
+#[cfg(test)]
+const TEST_SHIFT: usize = 1 << 2;
+fn forbidden(_: OptimizerPhysicalNode) {}
+"""
     assert native_encoder_violations(
         [("early_test_then_forbidden.rs", early_test_then_forbidden)]
     ) == ["OptimizerPhysicalNode"]
     assert not native_encoder_violations(
         [("forbidden_only_in_test.rs", forbidden_only_in_test)]
     )
+    assert native_encoder_violations(
+        [("comparison_then_forbidden.rs", comparison_then_forbidden)]
+    ) == ["OptimizerPhysicalNode"]
+    assert native_encoder_violations(
+        [("shift_then_forbidden.rs", shift_then_forbidden)]
+    ) == ["OptimizerPhysicalNode"]
     inventory, _ = native_encoder_production_inventory(
         [("inventory.rs", "fn production_inventory_marker() {}")]
     )
     assert inventory == ["inventory.rs"]
+
+    with tempfile.TemporaryDirectory(prefix="plan-ir-codegen-audit-") as directory:
+        encoder_root = Path(directory) / "encode"
+        encoder_root.mkdir()
+        (encoder_root / "mod.rs").write_text(
+            "#[cfg(test)] mod tests;\nmod live;\n", encoding="utf-8"
+        )
+        (encoder_root / "live.rs").write_text(
+            "fn production_inventory_marker() {}\n", encoding="utf-8"
+        )
+        (encoder_root / "tests.rs").write_text(
+            "fn ignored(_: OptimizerPhysicalNode) {}\n", encoding="utf-8"
+        )
+        reachable = reachable_rust_module_sources(
+            encoder_root / "mod.rs", encoder_root
+        )
+        assert [path.name for path, _ in reachable] == ["mod.rs", "live.rs"]
+
+        (encoder_root / "mod.rs").write_text("mod missing;\n", encoding="utf-8")
+        try:
+            reachable_rust_module_sources(encoder_root / "mod.rs", encoder_root)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("missing production modules must fail closed")
+
+        (encoder_root / "mod.rs").write_text(
+            '#[path = "../escape.rs"] mod escape;\n', encoding="utf-8"
+        )
+        try:
+            reachable_rust_module_sources(encoder_root / "mod.rs", encoder_root)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("module path escapes must fail closed")
+
+        (encoder_root / "mod.rs").write_text("mod cycle;\n", encoding="utf-8")
+        (encoder_root / "cycle.rs").unlink(missing_ok=True)
+        try:
+            (encoder_root / "cycle.rs").symlink_to(encoder_root / "mod.rs")
+            reachable_rust_module_sources(encoder_root / "mod.rs", encoder_root)
+        except (AssertionError, OSError):
+            pass
+        else:
+            raise AssertionError("module cycles must fail closed")
     print("plan IR codegen boundary audit self-tests passed")
 
 
@@ -304,12 +503,12 @@ def run_audit() -> None:
     if "scalar_arena" in read("src/sql/planner/distributed/seal.rs"):
         fail("DistributedPlan must not carry scalar_arena")
 
-    encoder_root = ROOT / "src/protocol/native/encode"
-    encoder_sources = [
-        (str(path.relative_to(ROOT)), path.read_text(encoding="utf-8"))
-        for path in sorted(encoder_root.rglob("*.rs"))
-    ]
     try:
+        encoder_root = ROOT / "src/protocol/native/encode"
+        reachable = reachable_rust_module_sources(encoder_root / "mod.rs", encoder_root)
+        encoder_sources = [
+            (str(path.relative_to(ROOT)), source) for path, source in reachable
+        ]
         violations = native_encoder_violations(encoder_sources)
     except AssertionError as error:
         fail(str(error))

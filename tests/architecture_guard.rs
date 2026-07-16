@@ -24703,15 +24703,9 @@ fn cgo_13_sql_codegen_source_retirement_violations(source_rel: &str, text: &str)
             .contains(&tokens.as_str())
         }
 
-        fn is_include_macro(&self, item: &syn::Macro) -> bool {
-            let path = item
-                .path
-                .segments
-                .iter()
-                .map(|segment| coor_3b_ident_text(&segment.ident))
-                .collect::<Vec<_>>();
+        fn path_is_include_macro(&self, path: &[String]) -> bool {
             rust_resolve_scoped_paths(
-                &path,
+                path,
                 &self.inline_modules,
                 self.aliases,
                 &mut BTreeSet::new(),
@@ -24719,7 +24713,7 @@ fn cgo_13_sql_codegen_source_retirement_violations(source_rel: &str, text: &str)
             )
             .unwrap_or_else(|| {
                 vec![RustScopedUsePath {
-                    segments: path,
+                    segments: path.to_vec(),
                     inline_modules: self.inline_modules.clone(),
                 }]
             })
@@ -24729,6 +24723,45 @@ fn cgo_13_sql_codegen_source_retirement_violations(source_rel: &str, text: &str)
                     .segments
                     .last()
                     .is_some_and(|segment| segment == "include")
+            })
+        }
+
+        fn is_include_macro(&self, item: &syn::Macro) -> bool {
+            let path = item
+                .path
+                .segments
+                .iter()
+                .map(|segment| coor_3b_ident_text(&segment.ident))
+                .collect::<Vec<_>>();
+            self.path_is_include_macro(&path)
+        }
+
+        fn definition_contains_include_macro(&self, item: &syn::Macro) -> bool {
+            if !item.path.is_ident("macro_rules") {
+                return false;
+            }
+            let tokens = rust_use_tokens(&item.tokens.to_string());
+            tokens.iter().enumerate().any(|(bang, token)| {
+                if token != "!" || bang == 0 {
+                    return false;
+                }
+                let mut start = bang - 1;
+                while start >= 2
+                    && tokens[start - 1] == "::"
+                    && tokens[start - 2].chars().all(is_ident_char)
+                {
+                    start -= 2;
+                }
+                let path = tokens[start..bang]
+                    .iter()
+                    .filter(|token| token.as_str() != "::")
+                    .cloned()
+                    .collect::<Vec<_>>();
+                !path.is_empty()
+                    && path
+                        .iter()
+                        .all(|segment| segment.chars().all(is_ident_char))
+                    && self.path_is_include_macro(&path)
             })
         }
     }
@@ -24793,10 +24826,10 @@ fn cgo_13_sql_codegen_source_retirement_violations(source_rel: &str, text: &str)
         }
 
         fn visit_macro(&mut self, item: &'ast syn::Macro) {
-            if self.is_include_macro(item)
-                && self.in_restricted_namespace()
-                && !self.is_known_safe_root_generated_include(item)
-            {
+            let direct_include =
+                self.is_include_macro(item) && !self.is_known_safe_root_generated_include(item);
+            let wrapped_include = self.definition_contains_include_macro(item);
+            if self.in_restricted_namespace() && (direct_include || wrapped_include) {
                 self.violations.push(format!(
                     "{} uses production include! at crate root or inside the SQL namespace",
                     self.source_rel
@@ -25029,6 +25062,27 @@ fn cgo_13_sql_codegen_retirement_detector_is_source_aware_and_non_vacuous() {
             "src/sql/mod.rs",
             "use std::include as inject; inject!(concat!(\"code\", \"gen/mod.rs\"));",
         ),
+        (
+            "crate-root include macro wrapper",
+            "src/lib.rs",
+            r#"
+macro_rules! inject_generated {
+    () => { include!(concat!(env!("OUT_DIR"), "/generated.rs")); };
+}
+inject_generated!();
+"#,
+        ),
+        (
+            "SQL aliased include macro wrapper",
+            "src/sql/mod.rs",
+            r#"
+use std::include as inject;
+macro_rules! inject_codegen {
+    () => { inject!(concat!("code", "gen/mod.rs")); };
+}
+inject_codegen!();
+"#,
+        ),
     ];
     let missed_invalid = invalid
         .into_iter()
@@ -25057,6 +25111,16 @@ pub(crate) use crate::protocol::native::encode as codegen;
 mod legacy;
 #[cfg(test)]
 include!("codegen/mod.rs");
+#[cfg(test)]
+macro_rules! test_include_wrapper {
+    () => { include!("codegen/mod.rs"); };
+}
+#[cfg(test)]
+test_include_wrapper!();
+macro_rules! unrelated_wrapper {
+    () => { println!("not an include"); };
+}
+unrelated_wrapper!();
 extern crate self as harmless_root;
 use harmless_root::protocol::native::encode::NativeFragmentBundle;
 "#;
