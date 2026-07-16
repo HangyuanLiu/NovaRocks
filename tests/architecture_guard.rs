@@ -23832,12 +23832,12 @@ fn nfe_3_fe_owned_helpers_are_raw_starrocks_idl_free() {
 fn nfe_3_native_planning_owners_are_named_explicitly() {
     let repo = Path::new(manifest_dir());
     let expected_owners = [
-        "src/sql/codegen/scan/connector.rs",
         "src/sql/codegen/scan/iceberg_delta.rs",
         "src/sql/codegen/proto_encode/iceberg_delta_scan.rs",
         "src/sql/planner/distributed/build/runtime_filter_binding.rs",
     ];
     let retired_owners = [
+        "src/sql/codegen/scan/connector.rs",
         "src/sql/codegen/connector_scan_wire.rs",
         "src/sql/codegen/iceberg_delta_scan_wire.rs",
         "src/sql/planner/distributed/build/runtime_filter_wire.rs",
@@ -23867,7 +23867,7 @@ fn nfe_3_native_planning_owners_are_named_explicitly() {
         (
             "src/sql/codegen/scan/mod.rs",
             scan_mod.as_str(),
-            &["pub(crate) mod connector;", "pub(crate) mod iceberg_delta;"][..],
+            &["pub(crate) mod iceberg_delta;"][..],
         ),
         (
             "src/sql/planner/distributed/build/mod.rs",
@@ -23906,7 +23906,7 @@ fn nfe_3_native_planning_owners_are_named_explicitly() {
         }
     }
 
-    let planning_path = repo.join("src/sql/codegen/scan/connector.rs");
+    let planning_path = repo.join("src/connector/scan_model/starrocks.rs");
     let encoder_path = repo.join("src/sql/codegen/proto_encode/plan.rs");
     if planning_path.is_file() {
         let planning = fs::read_to_string(&planning_path).unwrap();
@@ -24644,10 +24644,6 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
             "RuntimeFilterPlanResult",
             "src/sql/codegen/fragment/runtime_filter.rs (1)",
         ),
-        (
-            "StarRocksScanSourceDescriptor",
-            "src/sql/codegen/scan/connector.rs (1)",
-        ),
     ] {
         let owners = rust_named_declaration_owners(
             &codegen_sources,
@@ -24659,6 +24655,16 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
                 "{name} must have one final declaration owner, got {owners:?}"
             ));
         }
+    }
+    let starrocks_codegen_owners = rust_named_declaration_owners(
+        &codegen_sources,
+        "StarRocksScanSourceDescriptor",
+        rust_named_type_declaration_count,
+    );
+    if !starrocks_codegen_owners.is_empty() {
+        violations.push(format!(
+            "StarRocksScanSourceDescriptor must not be owned by SQL codegen, got {starrocks_codegen_owners:?}"
+        ));
     }
     violations.extend(cgo_8_delta_owner_violations(
         &cgo_8_production_source_texts(repo),

@@ -21,11 +21,10 @@ use crate::catalog::schema::ColumnDef;
 use crate::connector::iceberg::scan_model::{
     IcebergDataFileBinding, IcebergDataFileInfo, IcebergTableInfo,
 };
+use crate::connector::scan_model::starrocks::StarRocksScanSourceDescriptor;
 use crate::runtime::scan_range::ScanRangeParams;
 use crate::sql::analysis::OutputColumn;
-use crate::sql::codegen::scan::{
-    connector::StarRocksScanSourceDescriptor, iceberg_delta::IcebergDeltaScanRuntimePlan,
-};
+use crate::sql::codegen::scan::iceberg_delta::IcebergDeltaScanRuntimePlan;
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::FragmentId;
 use crate::sql::planner::payload::PlanScanNode;
@@ -536,14 +535,14 @@ mod tests {
         assert!(range_err.contains("fragment_id=3"));
         assert!(range_err.contains("node_id=61"));
 
-        let source = crate::sql::codegen::scan::connector::StarRocksScanSourceDescriptor {
+        let source = crate::connector::scan_model::starrocks::StarRocksScanSourceDescriptor {
             catalog_name: "default_catalog".to_string(),
             db_id: 1,
             table_id: 2,
             schema_id: 3,
             storage_columns: Vec::new(),
             tablet_schema:
-                crate::sql::codegen::scan::connector::test_starrocks_tablet_schema_descriptor(
+                crate::connector::scan_model::starrocks::test_starrocks_tablet_schema_descriptor(
                     3,
                     &[],
                 ),
@@ -558,14 +557,14 @@ mod tests {
                 .table_id,
             2
         );
-        let duplicate = crate::sql::codegen::scan::connector::StarRocksScanSourceDescriptor {
+        let duplicate = crate::connector::scan_model::starrocks::StarRocksScanSourceDescriptor {
             catalog_name: "default_catalog".to_string(),
             db_id: 1,
             table_id: 2,
             schema_id: 3,
             storage_columns: Vec::new(),
             tablet_schema:
-                crate::sql::codegen::scan::connector::test_starrocks_tablet_schema_descriptor(
+                crate::connector::scan_model::starrocks::test_starrocks_tablet_schema_descriptor(
                     3,
                     &[],
                 ),

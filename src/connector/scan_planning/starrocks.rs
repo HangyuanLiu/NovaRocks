@@ -15,4 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod iceberg_delta;
+use crate::connector::ConnectorRegistry;
+use crate::connector::scan_model::starrocks::PlannedNativeStarRocksScan;
+use crate::sql::planner::payload::PlanScanNode;
+
+pub(crate) fn plan_native_starrocks_scan(
+    scan_node_id: i32,
+    scan: &PlanScanNode,
+    connectors: &ConnectorRegistry,
+) -> Result<PlannedNativeStarRocksScan, String> {
+    #[cfg(not(feature = "compat"))]
+    {
+        let _ = (scan_node_id, scan, connectors);
+        Err("StarRocks native scan planning requires feature compat".to_string())
+    }
+    #[cfg(feature = "compat")]
+    {
+        crate::connector::starrocks::table::scan_adapter::plan_native_starrocks_scan_with_compat(
+            scan_node_id,
+            scan,
+            connectors,
+        )
+    }
+}

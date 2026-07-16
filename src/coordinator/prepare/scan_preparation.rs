@@ -18,14 +18,13 @@
 use crate::connector::ConnectorRegistry;
 use crate::connector::iceberg::scan_model::IcebergDataFileBinding;
 use crate::connector::iceberg::scan_range::IcebergScanRangeContext;
+use crate::connector::scan_model::starrocks::PlannedNativeStarRocksScan;
+use crate::connector::scan_planning::starrocks::plan_native_starrocks_scan;
 use crate::connector::scan_planning::{BeginScanContext, SplitPlanningContext, TableHandle};
 use crate::coordinator::prepare::scan::{
     ResolvedIcebergFileScan, ResolvedReadColumn, ResolvedReadReason, ResolvedScanBinding,
     ResolvedScanColumn, ResolvedScanColumnKind, ResolvedScanExecution, ScanBindingResolver,
     ScanExecutionBindings,
-};
-use crate::sql::codegen::scan::connector::{
-    PlannedNativeStarRocksScan, plan_native_starrocks_scan_node,
 };
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::{
@@ -118,7 +117,7 @@ fn prepare_scan_node(
             );
         }
         ScanSource::StarRocks { .. } => {
-            let planned = plan_native_starrocks_scan_node(node_id, scan, connectors)?;
+            let planned = plan_native_starrocks_scan(node_id, scan, connectors)?;
             return store_planned_starrocks_scan(fragment_id, node_id, planned, bindings);
         }
         source if scan_source_requires_resolver(source) => {
@@ -1925,7 +1924,7 @@ mod tests {
 
     #[test]
     fn starrocks_planning_result_stores_ranges_and_source_descriptor() {
-        use crate::sql::codegen::scan::connector::{
+        use crate::connector::scan_model::starrocks::{
             PlannedNativeStarRocksScan, StarRocksScanSourceDescriptor,
             StarRocksStorageColumnDescriptor, test_starrocks_tablet_schema_descriptor,
         };
