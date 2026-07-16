@@ -226,6 +226,7 @@ pub(crate) fn remap_sort_keys_through_project(
     arena: &ScalarArena,
     items: &[ScalarSortKey],
     project_items: &[ScalarProjectItem],
+    source_columns: &ColumnIdSet,
 ) -> Option<Vec<ScalarSortKey>> {
     items
         .iter()
@@ -236,6 +237,13 @@ pub(crate) fn remap_sort_keys_through_project(
                 .find(|project_item| project_item.output_column_id == output_col)?;
             let source_col = scalar_expr_to_column_id(arena, project_item.expr)?;
             if source_col == ColumnId::UNSET || project_item.output_column_id == ColumnId::UNSET {
+                return None;
+            }
+            if !source_columns.contains(source_col) {
+                // A Project output id can represent a slot materialized only at
+                // the Project boundary, such as a FULL OUTER USING merged
+                // column. Pushdown is valid only when the child exposes the
+                // remapped source slot directly.
                 return None;
             }
             Some(ScalarSortKey {
@@ -484,13 +492,20 @@ mod tests {
         let project_items = intern_project_items(&mut arena, &project_items);
         let sort_10 = intern_sort_items(&mut arena, &[sort_item(10, true, false)]);
         let sort_11 = intern_sort_items(&mut arena, &[sort_item(11, true, false)]);
+        let source_columns = ColumnIdSet::from_columns([ColumnId(1)]);
 
         assert_eq!(
             passthrough_project_column_remap(&arena, &project_items),
             vec![(ColumnId(10), ColumnId(1))]
         );
-        assert!(remap_sort_keys_through_project(&arena, &sort_10, &project_items).is_some());
-        assert!(remap_sort_keys_through_project(&arena, &sort_11, &project_items).is_none());
+        assert!(
+            remap_sort_keys_through_project(&arena, &sort_10, &project_items, &source_columns)
+                .is_some()
+        );
+        assert!(
+            remap_sort_keys_through_project(&arena, &sort_11, &project_items, &source_columns)
+                .is_none()
+        );
     }
 
     #[test]
@@ -520,21 +535,72 @@ mod tests {
                 expr_display: None,
             },
         ];
+        let source_columns = ColumnIdSet::from_columns([ColumnId(1)]);
 
         assert_eq!(
             passthrough_project_column_remap(&arena, &project_items),
             vec![(ColumnId(10), ColumnId(1))]
         );
-        let remapped = remap_sort_keys_through_project(&arena, &[output_key], &project_items)
-            .expect("sort key should remap through passthrough scalar project");
+        let remapped =
+            remap_sort_keys_through_project(&arena, &[output_key], &project_items, &source_columns)
+                .expect("sort key should remap through passthrough scalar project");
         assert_eq!(remapped.len(), 1);
         assert_eq!(remapped[0].expr, source_key.expr);
         assert_eq!(remapped[0].display, project_items[0].expr_display);
 
         let literal_output_key = scalar_col(&mut arena, 11, DataType::Int64, false);
         assert!(
-            remap_sort_keys_through_project(&arena, &[literal_output_key], &project_items)
-                .is_none()
+            remap_sort_keys_through_project(
+                &arena,
+                &[literal_output_key],
+                &project_items,
+                &source_columns
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn project_remap_rejects_source_missing_from_child() {
+        let mut arena = ScalarArena::new();
+        let identity = scalar_col(&mut arena, 29, DataType::Int64, true);
+        let project_items = vec![ScalarProjectItem {
+            expr: identity.expr,
+            output_name: "k1".to_string(),
+            output_column_id: ColumnId(29),
+            expr_display: Some(ColumnDisplay {
+                qualifier: None,
+                column: "k1".to_string(),
+            }),
+        }];
+        let source_columns = ColumnIdSet::from_columns([ColumnId(30)]);
+
+        assert!(
+            remap_sort_keys_through_project(&arena, &[identity], &project_items, &source_columns)
+                .is_none(),
+            "a source slot that is not produced by the child must not be pushed below the Project"
+        );
+    }
+
+    #[test]
+    fn project_remap_accepts_unqualified_identity_produced_by_child() {
+        let mut arena = ScalarArena::new();
+        let identity = scalar_col(&mut arena, 5, DataType::Int64, true);
+        let project_items = vec![ScalarProjectItem {
+            expr: identity.expr,
+            output_name: "id".to_string(),
+            output_column_id: ColumnId(5),
+            expr_display: Some(ColumnDisplay {
+                qualifier: None,
+                column: "id".to_string(),
+            }),
+        }];
+        let source_columns = ColumnIdSet::from_columns([ColumnId(5)]);
+
+        assert!(
+            remap_sort_keys_through_project(&arena, &[identity], &project_items, &source_columns)
+                .is_some(),
+            "an identity projection is executable when the child exposes the same slot"
         );
     }
 
@@ -548,9 +614,11 @@ mod tests {
         let mut arena = ScalarArena::new();
         let project_items = intern_project_items(&mut arena, &project_items);
         let sort_10 = intern_sort_items(&mut arena, &[sort_item(10, false, true)]);
+        let source_columns = ColumnIdSet::from_columns([ColumnId(1)]);
 
-        let remapped = remap_sort_keys_through_project(&arena, &sort_10, &project_items)
-            .expect("sort item should remap through passthrough project");
+        let remapped =
+            remap_sort_keys_through_project(&arena, &sort_10, &project_items, &source_columns)
+                .expect("sort item should remap through passthrough project");
 
         assert_eq!(remapped.len(), 1);
         assert!(!remapped[0].asc);

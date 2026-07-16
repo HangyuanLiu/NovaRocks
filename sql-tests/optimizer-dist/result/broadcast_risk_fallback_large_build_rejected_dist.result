@@ -39,6 +39,10 @@ PLAN FRAGMENT 3
 
 -- query 5
 Explain String
+RUNTIME FILTER GRAPH
+  runtime filter channel 0
+    producer binding 0, fragment = 1, node = 10, expr = (b.k)
+    consumer binding 1, fragment = 1, node = 4, expr = (k), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
@@ -55,11 +59,7 @@ PLAN FRAGMENT 1
 11:HASH AGGREGATE (LOCAL) (rows=1 cost={cpu=80 memory=8 network=0 total=56}) stats={rows=1 conf=estimated}
   aggregations: count()
   10:HASH JOIN (BROADCAST, INNER, eq: [p.k = b.k]) (rows=10 cost={cpu=1170 memory=800 network=160 total=2425}) colstats={col#3[min=1 max=1000 ndv=10 null_frac=0], col#4[min=1 max=10 ndv=10 null_frac=0]} bcast={build=80B ht=266.7B be=3 fanout=480B budget=1GB risk_mult=2.0x} stats={rows=10 conf=estimated}
-    build runtime filters:
-    - filter_id = 0, build_expr = (b.k)
     4:PROJECT [k] (rows=1000 cost={cpu=10 memory=0 network=0 total=5}) colstats={col#3[min=1 max=1000 ndv=1000 null_frac=0]} stats={rows=1000 conf=estimated}
-        probe runtime filters:
-        - filter_id = 0, probe_expr = (p.k)
       3:PROJECT [generate_series AS k] (rows=1000 cost={cpu=10 memory=0 network=0 total=5}) colstats={col#1[min=1 max=1000 ndv=1000 null_frac=0]} stats={rows=1000 conf=estimated}
         2:GENERATE_SERIES(1, 1000, 1) (rows=1000 cost={cpu=20 memory=0 network=0 total=10}) colstats={col#1[min=1 max=1000 ndv=1000 null_frac=0]} stats={rows=1000}
     9:GATHER (rows=10 cost={cpu=16777216 memory=4 network=80 total=8388736}) colstats={col#4[min=1 max=10 ndv=10 null_frac=0]} stats={rows=10 conf=estimated}

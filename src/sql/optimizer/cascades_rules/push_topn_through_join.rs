@@ -50,7 +50,8 @@ impl Rule for PushTopNThroughJoin {
             return Vec::new();
         }
 
-        let Some(join_group) = memo.groups.get(expr.children[0]).cloned() else {
+        let join_group_id = expr.children[0];
+        let Some(join_group) = memo.groups.get(join_group_id).cloned() else {
             return Vec::new();
         };
         let mut candidates = Vec::new();
@@ -66,7 +67,13 @@ impl Rule for PushTopNThroughJoin {
 
         let mut results = Vec::new();
         for (join, join_children) in candidates {
-            results.extend(rewrite_topn_through_join(topn, &join, &join_children, memo));
+            results.extend(rewrite_topn_through_join(
+                topn,
+                &join,
+                &join_children,
+                join_group_id,
+                memo,
+            ));
         }
         results
     }
@@ -88,7 +95,10 @@ impl Rule for PushTopNThroughJoin {
         let Operator::LogicalJoin(join) = binding.op(memo, 1).clone() else {
             return Vec::new();
         };
-        rewrite_topn_through_join(&topn, &join, binding.children(1), memo)
+        let Some(&join_group_id) = binding.children(0).first() else {
+            return Vec::new();
+        };
+        rewrite_topn_through_join(&topn, &join, binding.children(1), join_group_id, memo)
     }
 }
 
@@ -96,6 +106,7 @@ fn rewrite_topn_through_join(
     topn: &TopNOp,
     join: &LogicalJoinOp,
     join_children: &[GroupId],
+    join_group_id: GroupId,
     memo: &mut Memo,
 ) -> Vec<NewExpr> {
     if join_children.len() != 2 {
@@ -108,6 +119,9 @@ fn rewrite_topn_through_join(
         return Vec::new();
     };
     if window.offset != 0 {
+        return Vec::new();
+    }
+    if !is_primary_join_alternative(memo, join_group_id, join, join_children) {
         return Vec::new();
     }
 
@@ -160,6 +174,30 @@ fn rewrite_topn_through_join(
     }]
 }
 
+fn is_primary_join_alternative(
+    memo: &Memo,
+    join_group_id: GroupId,
+    join: &LogicalJoinOp,
+    join_children: &[GroupId],
+) -> bool {
+    let Some(group) = memo.groups.get(join_group_id) else {
+        return false;
+    };
+    let Some(primary) = group
+        .logical_exprs
+        .iter()
+        .find(|expr| matches!(expr.op, Operator::LogicalJoin(_)))
+    else {
+        return false;
+    };
+    let Operator::LogicalJoin(primary_join) = &primary.op else {
+        return false;
+    };
+    primary_join.join_type == join.join_type
+        && primary_join.condition == join.condition
+        && primary.children == join_children
+}
+
 fn seed_pushed_topn_group_props_if_missing(memo: &mut Memo, group_id: GroupId) {
     if memo.groups[group_id].logical_props.is_none() {
         seed_pushed_topn_group_props(memo, group_id);
@@ -205,7 +243,6 @@ fn seed_pushed_topn_group_props(memo: &mut Memo, group_id: GroupId) {
 fn preserved_child_index(join_type: JoinKind) -> Option<usize> {
     match join_type {
         JoinKind::LeftOuter => Some(0),
-        JoinKind::RightOuter => Some(1),
         _ => None,
     }
 }
@@ -301,14 +338,29 @@ mod tests {
         right: GroupId,
         condition: Option<crate::sql::optimizer::scalar::ScalarId>,
     ) -> GroupId {
-        memo.new_group(MExpr {
+        let output_columns = memo.groups[left]
+            .logical_props
+            .as_ref()
+            .into_iter()
+            .flat_map(|props| props.output_columns.iter().cloned())
+            .chain(
+                memo.groups[right]
+                    .logical_props
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|props| props.output_columns.iter().cloned()),
+            )
+            .collect();
+        let group = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: kind,
                 condition,
             }),
             children: vec![left, right],
-        })
+        });
+        memo.groups[group].logical_props = Some(LogicalProperties::new(output_columns, 0.0));
+        group
     }
 
     fn eq_condition(
@@ -531,7 +583,7 @@ mod tests {
     }
 
     #[test]
-    fn right_outer_pushes_topn_to_right_preserved_side() {
+    fn right_outer_fails_closed_until_stream_projection_is_executable() {
         let mut memo = Memo::new();
         let left = values_group(&mut memo, &[1]);
         let right = values_group(&mut memo, &[2]);
@@ -549,8 +601,49 @@ mod tests {
 
         let out = PushTopNThroughJoin.apply(&topn, &mut memo);
 
-        assert_eq!(out.len(), 1);
-        assert_rewrite_pushes_preserved_side(&memo, &out[0], right, left, 1);
+        assert!(
+            out.is_empty(),
+            "right outer TopN pushdown must remain disabled until the preserved-side sort alias is executable across stream boundaries"
+        );
+    }
+
+    #[test]
+    fn commuted_left_outer_alternative_does_not_reenable_right_outer_pushdown() {
+        let mut memo = Memo::new();
+        let left = values_group(&mut memo, &[1]);
+        let right = values_group(&mut memo, &[2]);
+        let join = join_group(&mut memo, JoinKind::RightOuter, left, right);
+        let commuted_id = memo.next_expr_id();
+        memo.groups[join].logical_exprs.push(MExpr {
+            id: commuted_id,
+            op: Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::LeftOuter,
+                condition: None,
+            }),
+            children: vec![right, left],
+        });
+        let item = sort_key(&mut memo, 2);
+        let topn_group = topn_group(
+            &mut memo,
+            item,
+            Some(10),
+            Some(0),
+            TopNPhase::Final,
+            false,
+            join,
+        );
+        let bindings = bind(&PushTopNThroughJoin.pattern(), &memo, topn_group, 0);
+        assert_eq!(bindings.len(), 2);
+
+        let rewrites = bindings
+            .iter()
+            .flat_map(|binding| PushTopNThroughJoin.apply_bound(binding, &mut memo))
+            .collect::<Vec<_>>();
+
+        assert!(
+            rewrites.is_empty(),
+            "the commuted LEFT OUTER alternative must not bypass the original RIGHT OUTER fail-closed guard"
+        );
     }
 
     #[test]
