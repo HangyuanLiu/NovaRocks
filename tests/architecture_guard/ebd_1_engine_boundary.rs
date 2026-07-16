@@ -8988,23 +8988,66 @@ fn ebd_4b3b_resolution_helper_is_metadata_only(block: &syn::Block) -> bool {
         result_uses_resolved_metadata(result, &metadata_binding, &planner_binding)
     }
 
+    fn is_external_catalog_pattern(pattern: &syn::Pat) -> bool {
+        let syn::Pat::TupleStruct(pattern) = pattern else {
+            return false;
+        };
+        ebd_4b3b_path_ends_with(&pattern.path, "Some")
+            && pattern.elems.len() == 1
+            && matches!(
+                pattern.elems.first(),
+                Some(syn::Pat::Ident(binding)) if binding.subpat.is_none()
+            )
+    }
+
+    fn external_resolution_tail_is_exact(block: &syn::Block) -> bool {
+        let [syn::Stmt::Expr(tail, None)] = block.stmts.as_slice() else {
+            return false;
+        };
+        let syn::Expr::Match(match_expr) = unwrap_expr(tail) else {
+            return false;
+        };
+        let Some(effective_catalog) = method_call(&match_expr.expr, "effective_catalog") else {
+            return false;
+        };
+        if path_ident(&effective_catalog.receiver).as_deref() != Some("self")
+            || effective_catalog.args.len() != 1
+            || effective_catalog
+                .args
+                .first()
+                .and_then(path_ident)
+                .as_deref()
+                != Some("catalog")
+        {
+            return false;
+        }
+
+        let external_arms = match_expr
+            .arms
+            .iter()
+            .filter(|arm| is_external_catalog_pattern(&arm.pat))
+            .collect::<Vec<_>>();
+        let [external_arm] = external_arms.as_slice() else {
+            return false;
+        };
+        if external_arm.guard.is_some() {
+            return false;
+        }
+        let syn::Expr::Block(external_body) = unwrap_expr(&external_arm.body) else {
+            return false;
+        };
+        resolution_branch_is_exact(&external_body.block)
+    }
+
     #[derive(Default)]
     struct ResolutionVisitor {
         resolve_calls: usize,
         catalog_table_calls: usize,
         planner_table_calls: usize,
         forbidden_calls: usize,
-        exact_resolution_branches: usize,
     }
 
     impl<'ast> syn::visit::Visit<'ast> for ResolutionVisitor {
-        fn visit_expr_block(&mut self, item: &'ast syn::ExprBlock) {
-            if resolution_branch_is_exact(&item.block) {
-                self.exact_resolution_branches += 1;
-            }
-            syn::visit::visit_expr_block(self, item);
-        }
-
         fn visit_expr_method_call(&mut self, item: &'ast syn::ExprMethodCall) {
             match item.method.to_string().as_str() {
                 "resolve" => self.resolve_calls += 1,
@@ -9028,7 +9071,7 @@ fn ebd_4b3b_resolution_helper_is_metadata_only(block: &syn::Block) -> bool {
         && visitor.planner_table_calls == 1
         && visitor.catalog_table_calls == 0
         && visitor.forbidden_calls == 0
-        && visitor.exact_resolution_branches == 1
+        && external_resolution_tail_is_exact(block)
 }
 
 fn ebd_4b3b_schema_only_helper_is_metadata_only(block: &syn::Block) -> bool {
@@ -9413,6 +9456,52 @@ impl CatalogServiceProvider {
             .iter()
             .any(|item| item.contains("neutral-resolution-helper-shape")),
         "a fake CatalogTable must not satisfy one-resolution metadata provenance: {violations:?}"
+    );
+}
+
+#[test]
+fn ebd_4b3b_detector_rejects_unreachable_metadata_provenance_decoy() {
+    let sources = vec![GuardSource::new(
+        EBD_4B3B_PROVIDER,
+        r#"
+struct CatalogServiceProvider;
+impl CatalogServiceProvider {
+    fn resolve_table_for_analysis_once(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+    ) -> Result<ResolvedAnalyzerTable, String> {
+        if false {
+            let _ = {
+                let metadata = self
+                    .service
+                    .registry()
+                    .read()
+                    .expect("catalog service registry read lock")
+                    .resolve(catalog.unwrap(), database, table)?;
+                let planner = metadata.to_table_def();
+                Ok(ResolvedAnalyzerTable {
+                    catalog: metadata.table,
+                    planner,
+                })
+            };
+        }
+        Ok(ResolvedAnalyzerTable {
+            catalog: CatalogTable::default(),
+            planner: TableDef::default(),
+        })
+    }
+}
+"#,
+    )];
+
+    let violations = ebd_4b3b_audit_statistics_lookup_decoupling(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|item| item.contains("neutral-resolution-helper-shape")),
+        "unreachable metadata provenance must not validate a fake tail result: {violations:?}"
     );
 }
 
