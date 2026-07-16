@@ -24671,6 +24671,343 @@ fn cgo_13_sql_codegen_source_retirement_violations(source_rel: &str, text: &str)
         canonical.into_iter().collect()
     }
 
+    #[derive(Clone)]
+    struct MacroWrapperDefinition {
+        parameters: Vec<String>,
+        tokens: Vec<String>,
+    }
+
+    struct MacroWrapperInvocation {
+        scope: Vec<String>,
+        path: Vec<String>,
+        arguments: Vec<Vec<String>>,
+    }
+
+    struct MacroWrapperInventory {
+        inline_modules: Vec<String>,
+        definitions: BTreeMap<(Vec<String>, String), MacroWrapperDefinition>,
+        invocations: Vec<MacroWrapperInvocation>,
+    }
+
+    fn macro_arguments(tokens: &[String]) -> Vec<Vec<String>> {
+        let mut arguments = Vec::new();
+        let mut current = Vec::new();
+        let mut delimiters = Vec::new();
+        for token in tokens {
+            match token.as_str() {
+                "(" => {
+                    delimiters.push(")");
+                    current.push(token.clone());
+                }
+                "[" => {
+                    delimiters.push("]");
+                    current.push(token.clone());
+                }
+                "{" => {
+                    delimiters.push("}");
+                    current.push(token.clone());
+                }
+                ")" | "]" | "}" => {
+                    delimiters.pop();
+                    current.push(token.clone());
+                }
+                "," if delimiters.is_empty() => {
+                    arguments.push(std::mem::take(&mut current));
+                }
+                _ => current.push(token.clone()),
+            }
+        }
+        if !current.is_empty() || !arguments.is_empty() {
+            arguments.push(current);
+        }
+        arguments
+    }
+
+    fn macro_call_at(tokens: &[String], bang: usize) -> Option<(Vec<String>, Vec<Vec<String>>)> {
+        if tokens.get(bang)? != "!" || bang == 0 {
+            return None;
+        }
+        let mut start = bang - 1;
+        if tokens
+            .get(start.wrapping_sub(1))
+            .is_some_and(|token| token == "$")
+        {
+            return None;
+        }
+        while start >= 2
+            && tokens[start - 1] == "::"
+            && tokens[start - 2].chars().all(is_ident_char)
+        {
+            start -= 2;
+        }
+        let path = tokens[start..bang]
+            .iter()
+            .filter(|token| token.as_str() != "::")
+            .cloned()
+            .collect::<Vec<_>>();
+        if path.is_empty()
+            || !path
+                .iter()
+                .all(|segment| segment.chars().all(is_ident_char))
+        {
+            return None;
+        }
+        let opening = tokens.get(bang + 1)?;
+        let closing = match opening.as_str() {
+            "(" => ")",
+            "[" => "]",
+            "{" => "}",
+            _ => return None,
+        };
+        let mut depth = 1usize;
+        let mut end = bang + 2;
+        while end < tokens.len() && depth > 0 {
+            if tokens[end] == *opening {
+                depth += 1;
+            } else if tokens[end] == closing {
+                depth -= 1;
+            }
+            end += 1;
+        }
+        (depth == 0).then(|| {
+            (
+                path,
+                macro_arguments(&tokens[bang + 2..end.saturating_sub(1)]),
+            )
+        })
+    }
+
+    impl MacroWrapperInventory {
+        fn record_macro(&mut self, item: &syn::Macro) {
+            let path = item
+                .path
+                .segments
+                .iter()
+                .map(|segment| coor_3b_ident_text(&segment.ident))
+                .collect::<Vec<_>>();
+            self.invocations.push(MacroWrapperInvocation {
+                scope: self.inline_modules.clone(),
+                path,
+                arguments: macro_arguments(&rust_use_tokens(&item.tokens.to_string())),
+            });
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for MacroWrapperInventory {
+        fn visit_item(&mut self, item: &'ast syn::Item) {
+            if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+                return;
+            }
+            syn::visit::visit_item(self, item);
+        }
+
+        fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
+            if nfe_4_syn_attrs_require_test(&module.attrs) {
+                return;
+            }
+            self.inline_modules.push(coor_3b_ident_text(&module.ident));
+            syn::visit::visit_item_mod(self, module);
+            self.inline_modules.pop();
+        }
+
+        fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+            if nfe_4_syn_attrs_require_test(&item.attrs) {
+                return;
+            }
+            if item.mac.path.is_ident("macro_rules") {
+                let Some(name) = item.ident.as_ref().map(coor_3b_ident_text) else {
+                    return;
+                };
+                let tokens = rust_use_tokens(&item.mac.tokens.to_string());
+                let mut parameters = Vec::new();
+                for window in tokens.windows(4) {
+                    if window[0] == "$"
+                        && window[2] == ":"
+                        && matches!(window[3].as_str(), "ident" | "path" | "tt")
+                        && !parameters.contains(&window[1])
+                    {
+                        parameters.push(window[1].clone());
+                    }
+                }
+                self.definitions.insert(
+                    (self.inline_modules.clone(), name),
+                    MacroWrapperDefinition { parameters, tokens },
+                );
+            } else {
+                self.record_macro(&item.mac);
+            }
+        }
+
+        fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+            if nfe_4_syn_attrs_require_test(nfe_4_syn_impl_item_attrs(item)) {
+                return;
+            }
+            syn::visit::visit_impl_item(self, item);
+        }
+
+        fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+            if nfe_4_syn_attrs_require_test(nfe_4_syn_trait_item_attrs(item)) {
+                return;
+            }
+            syn::visit::visit_trait_item(self, item);
+        }
+
+        fn visit_stmt(&mut self, stmt: &'ast syn::Stmt) {
+            if nfe_4_syn_attrs_require_test(nfe_4_syn_stmt_attrs(stmt)) {
+                return;
+            }
+            syn::visit::visit_stmt(self, stmt);
+        }
+
+        fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+            if nfe_4_syn_attrs_require_test(nfe_4_syn_expr_attrs(expr)) {
+                return;
+            }
+            syn::visit::visit_expr(self, expr);
+        }
+
+        fn visit_macro(&mut self, item: &'ast syn::Macro) {
+            self.record_macro(item);
+        }
+    }
+
+    fn macro_definition_key(
+        definitions: &BTreeMap<(Vec<String>, String), MacroWrapperDefinition>,
+        scope: &[String],
+        path: &[String],
+    ) -> Option<(Vec<String>, String)> {
+        let name = path.last()?.clone();
+        if path.len() == 1 || path.first().is_some_and(|segment| segment == "self") {
+            for depth in (0..=scope.len()).rev() {
+                let key = (scope[..depth].to_vec(), name.clone());
+                if definitions.contains_key(&key) {
+                    return Some(key);
+                }
+            }
+        }
+        None
+    }
+
+    fn macro_path_is_include(
+        path: &[String],
+        scope: &[String],
+        aliases: &RustScopedAliases,
+    ) -> bool {
+        rust_resolve_scoped_paths(path, scope, aliases, &mut BTreeSet::new(), 0)
+            .unwrap_or_else(|| {
+                vec![RustScopedUsePath {
+                    segments: path.to_vec(),
+                    inline_modules: scope.to_vec(),
+                }]
+            })
+            .iter()
+            .any(|resolved| {
+                resolved
+                    .segments
+                    .last()
+                    .is_some_and(|segment| segment == "include")
+            })
+    }
+
+    fn macro_argument_path(argument: &[String]) -> Option<Vec<String>> {
+        let path = argument
+            .iter()
+            .filter(|token| token.as_str() != "::")
+            .cloned()
+            .collect::<Vec<_>>();
+        (!path.is_empty()
+            && path
+                .iter()
+                .all(|segment| segment.chars().all(is_ident_char)))
+        .then_some(path)
+    }
+
+    fn production_macro_wrapper_reaches_include(
+        file: &syn::File,
+        aliases: &RustScopedAliases,
+    ) -> bool {
+        let mut inventory = MacroWrapperInventory {
+            inline_modules: Vec::new(),
+            definitions: BTreeMap::new(),
+            invocations: Vec::new(),
+        };
+        syn::visit::Visit::visit_file(&mut inventory, file);
+
+        let mut dangerous = inventory
+            .definitions
+            .iter()
+            .map(|(key, definition)| {
+                let parameters = definition
+                    .parameters
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, parameter)| {
+                        definition
+                            .tokens
+                            .windows(3)
+                            .any(|window| {
+                                window[0] == "$" && window[1] == *parameter && window[2] == "!"
+                            })
+                            .then_some(index)
+                    })
+                    .collect::<BTreeSet<_>>();
+                (key.clone(), parameters)
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        loop {
+            let mut changed = false;
+            for (key, definition) in &inventory.definitions {
+                for bang in 0..definition.tokens.len() {
+                    let Some((callee_path, arguments)) = macro_call_at(&definition.tokens, bang)
+                    else {
+                        continue;
+                    };
+                    let Some(callee_key) =
+                        macro_definition_key(&inventory.definitions, &key.0, &callee_path)
+                    else {
+                        continue;
+                    };
+                    let callee_dangerous = dangerous.get(&callee_key).cloned().unwrap_or_default();
+                    for callee_parameter in callee_dangerous {
+                        let Some(argument) = arguments.get(callee_parameter) else {
+                            continue;
+                        };
+                        if argument.len() != 2 || argument[0] != "$" {
+                            continue;
+                        }
+                        let Some(parameter) = definition
+                            .parameters
+                            .iter()
+                            .position(|parameter| parameter == &argument[1])
+                        else {
+                            continue;
+                        };
+                        changed |= dangerous.entry(key.clone()).or_default().insert(parameter);
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        inventory.invocations.iter().any(|invocation| {
+            let Some(key) =
+                macro_definition_key(&inventory.definitions, &invocation.scope, &invocation.path)
+            else {
+                return false;
+            };
+            dangerous.get(&key).into_iter().flatten().any(|parameter| {
+                invocation
+                    .arguments
+                    .get(*parameter)
+                    .and_then(|argument| macro_argument_path(argument))
+                    .is_some_and(|path| macro_path_is_include(&path, &invocation.scope, aliases))
+            })
+        })
+    }
+
     struct IncludeAudit<'a> {
         source_rel: &'a str,
         aliases: &'a RustScopedAliases,
@@ -24861,6 +25198,11 @@ fn cgo_13_sql_codegen_source_retirement_violations(source_rel: &str, text: &str)
         };
         syn::visit::Visit::visit_file(&mut audit, file);
         violations.extend(audit.violations);
+        if production_macro_wrapper_reaches_include(file, &aliases) {
+            violations.push(format!(
+                "{source_rel} passes production include! through a macro metavariable wrapper"
+            ));
+        }
     } else if let Err(error) = &parsed {
         violations.push(format!(
             "{source_rel} cannot be parsed while checking codegen retirement: {error}"
@@ -25083,6 +25425,41 @@ macro_rules! inject_codegen {
 inject_codegen!();
 "#,
         ),
+        (
+            "crate-root include metavariable wrapper",
+            "src/lib.rs",
+            r#"
+macro_rules! inject_with {
+    ($m:ident) => { $m!(concat!(env!("OUT_DIR"), "/generated.rs")); };
+}
+inject_with!(include);
+"#,
+        ),
+        (
+            "SQL aliased include metavariable wrapper",
+            "src/sql/mod.rs",
+            r#"
+use std::include as inject;
+macro_rules! inject_with {
+    ($m:path) => { $m!(concat!("code", "gen/mod.rs")); };
+}
+inject_with!(inject);
+"#,
+        ),
+        (
+            "nested include metavariable wrapper",
+            "src/sql/mod.rs",
+            r#"
+use std::include as inject;
+macro_rules! inner {
+    ($m:tt) => { $m!(concat!("code", "gen/mod.rs")); };
+}
+macro_rules! outer {
+    ($m:path) => { inner!($m); };
+}
+outer!(inject);
+"#,
+        ),
     ];
     let missed_invalid = invalid
         .into_iter()
@@ -25121,6 +25498,16 @@ macro_rules! unrelated_wrapper {
     () => { println!("not an include"); };
 }
 unrelated_wrapper!();
+macro_rules! ordinary_metavariable_wrapper {
+    ($m:ident) => { $m!("ordinary"); };
+}
+ordinary_metavariable_wrapper!(println);
+#[cfg(test)]
+macro_rules! test_metavariable_wrapper {
+    ($m:tt) => { $m!("codegen/mod.rs"); };
+}
+#[cfg(test)]
+test_metavariable_wrapper!(include);
 extern crate self as harmless_root;
 use harmless_root::protocol::native::encode::NativeFragmentBundle;
 "#;

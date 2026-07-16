@@ -17,6 +17,7 @@
 # under the License.
 
 from pathlib import Path
+import itertools
 import re
 import sys
 import tempfile
@@ -132,31 +133,39 @@ def cfg_tokens(predicate: str) -> list[str]:
 def cfg_requires_test(predicate: str) -> bool:
     tokens = cfg_tokens(predicate)
 
-    def parse(cursor: int) -> tuple[bool, int]:
+    def parse(cursor: int) -> tuple[set[bool], int]:
         if cursor >= len(tokens):
-            return False, cursor
+            return {False, True}, cursor
         name = tokens[cursor]
         cursor += 1
         if cursor >= len(tokens) or tokens[cursor] != "(":
-            return name == "test", cursor
+            if cursor < len(tokens) and tokens[cursor] == "=":
+                cursor = min(cursor + 2, len(tokens))
+            return ({False} if name == "test" else {False, True}), cursor
         cursor += 1
-        children: list[bool] = []
+        children: list[set[bool]] = []
         while cursor < len(tokens) and tokens[cursor] != ")":
             child, cursor = parse(cursor)
             children.append(child)
             if cursor < len(tokens) and tokens[cursor] == ",":
                 cursor += 1
-            elif cursor < len(tokens) and tokens[cursor] == "=":
-                cursor += 2
         cursor += int(cursor < len(tokens) and tokens[cursor] == ")")
         if name == "all":
-            return any(children), cursor
+            possible = {
+                all(values) for values in itertools.product(*children)
+            }
+            return possible or {True}, cursor
         if name == "any":
-            return bool(children) and all(children), cursor
-        return False, cursor
+            possible = {
+                any(values) for values in itertools.product(*children)
+            }
+            return possible or {False}, cursor
+        if name == "not" and len(children) == 1:
+            return {not value for value in children[0]}, cursor
+        return {False, True}, cursor
 
-    required, _ = parse(0)
-    return required
+    possible, _ = parse(0)
+    return True not in possible
 
 
 def balanced_end(source: str, start: int, opening: str, closing: str) -> int:
@@ -296,7 +305,61 @@ def native_encoder_production_inventory(
     return nonempty, "\n".join(text for _, text in production)
 
 
+def rust_attributes(source: str) -> list[str]:
+    attributes = []
+    index = 0
+    while index < len(source):
+        if source[index] != "#":
+            index += 1
+            continue
+        cursor = index + 1
+        if cursor < len(source) and source[cursor] == "!":
+            cursor += 1
+        while cursor < len(source) and source[cursor].isspace():
+            cursor += 1
+        if cursor >= len(source) or source[cursor] != "[":
+            index += 1
+            continue
+        end = balanced_end(source, cursor, "[", "]")
+        if end == len(source) and source[-1:] != "]":
+            raise AssertionError("unterminated Rust attribute")
+        attributes.append(source[cursor + 1 : end - 1].strip())
+        index = end
+    return attributes
+
+
+def split_top_level_once(source: str, separator: str) -> tuple[str, str] | None:
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    stack: list[str] = []
+    for index, char in enumerate(source):
+        if char in pairs:
+            stack.append(pairs[char])
+        elif stack and char == stack[-1]:
+            stack.pop()
+        elif char == separator and not stack:
+            return source[:index], source[index + 1 :]
+    return None
+
+
+def audit_production_path_attributes(production: str) -> None:
+    for attribute in rust_attributes(production):
+        if re.match(r"^path\b", attribute):
+            raise AssertionError("production #[path] module indirection is forbidden")
+        cfg_attr = re.fullmatch(r"cfg_attr\s*\((.*)\)", attribute, flags=re.DOTALL)
+        if not cfg_attr:
+            continue
+        parts = split_top_level_once(cfg_attr.group(1), ",")
+        if parts is None:
+            raise AssertionError("malformed production cfg_attr")
+        predicate, generated = parts
+        if re.search(r"\bpath\b", generated) and not cfg_requires_test(predicate):
+            raise AssertionError(
+                "production-possible cfg_attr path indirection is forbidden"
+            )
+
+
 def rust_external_modules(production: str) -> list[str]:
+    audit_production_path_attributes(production)
     tokens = [
         match.group(0)
         for match in re.finditer(
@@ -317,11 +380,6 @@ def rust_external_modules(production: str) -> list[str]:
             brace_depth = max(brace_depth - 1, 0)
             index += 1
             continue
-        if (
-            brace_depth == 0
-            and tokens[index : index + 3] == ["#", "[", "path"]
-        ):
-            raise AssertionError("production #[path] module indirection is forbidden")
         if brace_depth == 0 and token == "mod" and index + 2 < len(tokens):
             name = tokens[index + 1].removeprefix("r#")
             terminator = tokens[index + 2]
@@ -478,6 +536,63 @@ fn forbidden(_: OptimizerPhysicalNode) {}
             pass
         else:
             raise AssertionError("module path escapes must fail closed")
+
+        (encoder_root / "owner.rs").write_text(
+            "fn production_inventory_marker() {}\n", encoding="utf-8"
+        )
+        (encoder_root / "prod.rs").write_text(
+            "fn forbidden(_: OptimizerPhysicalNode) {}\n", encoding="utf-8"
+        )
+        production_possible_path_attrs = [
+            '#[cfg_attr(not(test), path = "prod.rs")] mod owner;\n',
+            '#[cfg_attr(any(test, feature = "prod"), path = "prod.rs")] mod owner;\n',
+            '#[cfg_attr(not(all(test, feature = "only_test")), path = "prod.rs")] mod owner;\n',
+            (
+                '#[allow(dead_code)]\n'
+                '#[cfg_attr(not(test), cfg_attr(feature = "prod", path = "prod.rs"))]\n'
+                "mod owner;\n"
+            ),
+            (
+                '#[cfg_attr(test, path = "tests.rs")]\n'
+                '#[cfg_attr(feature = "prod", path = "prod.rs")]\n'
+                "mod owner;\n"
+            ),
+        ]
+        for source in production_possible_path_attrs:
+            (encoder_root / "mod.rs").write_text(source, encoding="utf-8")
+            try:
+                reachable_rust_module_sources(encoder_root / "mod.rs", encoder_root)
+            except AssertionError:
+                pass
+            else:
+                raise AssertionError(
+                    "production-possible cfg_attr path indirection must fail closed"
+                )
+
+        production_safe_path_attrs = [
+            '#[cfg_attr(test, path = "tests.rs")] mod owner;\n',
+            (
+                '#[cfg_attr(all(test, feature = "only_test"), path = "tests.rs")]\n'
+                "mod owner;\n"
+            ),
+            (
+                '#[cfg_attr(not(not(test)), path = "tests.rs")]\n'
+                '#[cfg_attr(any(all(test, feature = "x"), all(test, feature = "y")), '
+                'path = "tests.rs")]\n'
+                "mod owner;\n"
+            ),
+            (
+                '#[doc = "path = prod.rs"]\n'
+                '// #[cfg_attr(not(test), path = "prod.rs")]\n'
+                "mod owner;\n"
+            ),
+        ]
+        for source in production_safe_path_attrs:
+            (encoder_root / "mod.rs").write_text(source, encoding="utf-8")
+            reachable = reachable_rust_module_sources(
+                encoder_root / "mod.rs", encoder_root
+            )
+            assert [path.name for path, _ in reachable] == ["mod.rs", "owner.rs"]
 
         (encoder_root / "mod.rs").write_text("mod cycle;\n", encoding="utf-8")
         (encoder_root / "cycle.rs").unlink(missing_ok=True)
